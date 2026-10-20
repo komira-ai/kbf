@@ -4,7 +4,7 @@
 
 use std::io::{BufRead as _, BufReader};
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use kbf_cli::config::group_of;
@@ -19,11 +19,11 @@ const BIN: &str = env!("CARGO_BIN_EXE_kbf");
 /// The stand-in `crun` the container driver's check runs `--version` on.
 const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-crun");
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("config-process-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("config-process-{name}"),
+    )
 }
 
 fn write(path: &Path, text: &str, mode: u32) {
@@ -342,7 +342,8 @@ fn check_refuses_what_a_start_refuses() {
     // A mode given none of its flags reads the host's file: with no file there, the file
     // is what the refusal names (a list of every missing flag would send the operator to
     // the wrong place). With some of its flags, the flags are the start.
-    let none = scratch("check-no-file").join("absent.toml");
+    let empty = scratch("check-no-file");
+    let none = empty.join("absent.toml");
     let r = run(&strings(&[
         "daemon",
         "--check",

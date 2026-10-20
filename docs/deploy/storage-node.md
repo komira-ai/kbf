@@ -327,6 +327,20 @@ kbf-server \
   version 3, objects held back by the guard, the bytes held and how long it took. A
   pass that fails is logged and runs again at the next start; until then nothing is
   evicted.
+- Joining a farm that holds data (a node registered with `--frontend`): a node whose
+  instance id (its advertise address) the farm has not seen, registering more than a
+  minute after the farm's first active member, is written `joining` whatever it says of
+  its index, and the frontend logs a warning. A joining node takes writes but is rank 1 of
+  nothing and is read last, so it never answers `FindMissingBlobs` for blobs it never got.
+  It stays `joining` through restarts and caught-up beats until the operator runs
+  `kbf cluster member <id> --state active`. Nothing copies the blobs that existed before
+  it joined: promote it when that is acceptable. Nodes that start within a minute of each
+  other to make a farm are active at once, but a farm whose nodes start more than a
+  minute apart leaves the later ones `joining` (safe, and visible in `GET /v1/members`),
+  and the storage update gate (`NotActive`) waits on a joining peer until it is promoted.
+  A `down` member cannot be promoted until it registers again, and then it is `joining`
+  again. A replacement host that reuses an advertise address is a known instance, so it
+  registers active with an empty store (a known limit: the instance id is the address).
 - The rebuild of the index (a node registered with `--frontend`, over either kind of cold
   store): a metadata log that has not finished one (a new or wiped directory, or an
   upgrade of a node that has run before) makes the node register as catching up, serve

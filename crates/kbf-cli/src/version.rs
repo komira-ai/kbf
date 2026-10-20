@@ -10,6 +10,12 @@
 //!   `resume`, `takeover` and `stand-down` (`docs/api.md`);
 //! - `commit`: the first 12 hex digits of the commit built, or `unknown` for a build
 //!   with no git checkout ([`kbf_server::BUILD_COMMIT`]);
+//! - `meta_log`: the highest metadata-log machine version this build runs
+//!   ([`kbf_server::raft_log::RUNS`], read through `.get()`; there is no second copy of the
+//!   number). A rollout compares it across two builds: going from N to N-1 is reversible
+//!   only if `meta_log(N) <= meta_log(N-1)`, because a log raised past what N-1 runs
+//!   cannot be opened by it. A build that does not print the field is unknown, and
+//!   unknown is not reversible;
 //! - `min_protocol` and `protocol`: the oldest and the newest `kbf.worker.v1` protocol
 //!   version this binary speaks ([`kbf_server::worker`]); the daemon half speaks exactly
 //!   `protocol` (a test pins the two halves equal);
@@ -46,6 +52,10 @@ pub fn identity() -> Value {
         kbf_server::managed::ADMIN_PROTOCOL.into(),
     );
     fields.insert("commit".to_owned(), kbf_server::BUILD_COMMIT.into());
+    fields.insert(
+        "meta_log".to_owned(),
+        kbf_server::raft_log::RUNS.get().into(),
+    );
     fields.insert(
         "min_protocol".to_owned(),
         kbf_server::worker::OLDEST_PROTOCOL_VERSION.into(),

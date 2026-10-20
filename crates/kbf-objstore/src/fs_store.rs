@@ -76,6 +76,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use crate::body::{self, BodyStream};
+use crate::released::{Gate, Released};
 use crate::types::Token;
 use crate::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectInfo, ObjectKey, ObjectStore,
@@ -209,11 +210,65 @@ struct Inner {
     window: usize,
     /// How many times a listing read every header: once per listing, not per page.
     walks: AtomicU64,
-    /// Held for the store's life: closing it releases the lock.
-    _lock: File,
+    /// Held for the store's life; released when the last handle is dropped
+    /// ([`Inner`]'s `Drop`).
+    lock: DirLock,
+    /// Opened when the lock is released ([`Released`]).
+    released: Arc<Gate>,
+    /// The store's directory, for [`Released`] to name.
+    dir: PathBuf,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Unlock, then open the gate, so whoever waits finds the directory free. A lock
+        // that cannot be unlocked is released with the file at the end of this drop,
+        // just after the gate opens (an `unlock` on an open file does not fail).
+        self.released.release(|| {
+            self.lock.unlock();
+        });
+    }
+}
+
+/// The store directory's `LOCK` file with its `flock` held.
+///
+/// An `flock` belongs to the open file description, not to the descriptor, and a
+/// description lives until every copy of the descriptor is closed. A process forked
+/// while the store is open (any spawn of a child by another thread of this process)
+/// carries a copy until it execs, so closing the file would leave the directory locked
+/// for as long as that takes. Unlocking first, which no copy outlives, frees the
+/// directory as soon as the last handle's drop returns; dropping the lock does it too,
+/// for the ways out of `open` that never reach an [`Inner`].
+struct DirLock(File);
+
+impl DirLock {
+    fn unlock(&self) {
+        // An error leaves the close that follows to release the lock, as before.
+        let _ = self.0.unlock();
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        self.unlock();
+    }
 }
 
 impl FsStore {
+    /// A watch for this store's close: [`Released::wait_within`] completes once every handle on
+    /// it, clones included, has been dropped and the directory is unlocked. It holds no
+    /// handle, so it does not keep the store open.
+    #[must_use]
+    pub fn released(&self) -> Released {
+        let weak: std::sync::Weak<Inner> = Arc::downgrade(&self.inner);
+        let holders: std::sync::Weak<dyn Send + Sync> = weak;
+        Released::new(
+            holders,
+            Arc::clone(&self.inner.released),
+            self.inner.dir.clone(),
+        )
+    }
+
     /// Opens the store in `dir`, creating the directory and its layout if missing,
     /// locking it, and removing every file left in `tmp/`. A write is refused while the
     /// file system would be left with less than `floor` free.
@@ -237,16 +292,18 @@ impl FsStore {
     ) -> Result<Self, FsStoreError> {
         fs::create_dir_all(dir).map_err(open_failed("create", dir))?;
         let lock_path = dir.join("LOCK");
-        let lock = File::options()
+        let file = File::options()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&lock_path)
             .map_err(open_failed("open", &lock_path))?;
-        lock.try_lock().map_err(|source| FsStoreError::Locked {
+        file.try_lock().map_err(|source| FsStoreError::Locked {
             path: lock_path.clone(),
             source,
         })?;
+        // From here every way out of the open, an error included, unlocks.
+        let lock = DirLock(file);
         let objects = dir.join("objects");
         for shard in 0..=u8::MAX {
             let path = objects.join(format!("{shard:02x}"));
@@ -271,7 +328,9 @@ impl FsStore {
                 listing: Mutex::new(None),
                 window: LISTING_WINDOW,
                 walks: AtomicU64::new(0),
-                _lock: lock,
+                lock,
+                released: Arc::new(Gate::default()),
+                dir: dir.to_path_buf(),
             }),
         })
     }

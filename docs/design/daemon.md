@@ -424,7 +424,43 @@ back; `crun delete --force` closes the lease. That is four `crun` processes.
   moment at which the container is stopped but its exit code is not recorded (#658). A
   non-zero status is the farm's failure rather than the action's only if `crun` wrote an
   error record to its `--log` (JSON) file; the lookup failures of `program.rs` (exit 127
-  and 126) and `ETXTBSY` are read from that log (`crun: <message>`).
+  and 126) and `ETXTBSY` are read from that log (`crun: <message>`) and from the init's report
+  (below).
+- **The container's first process is `kbf-init`, not the action** (`init/kbf_init.rs`,
+  built by `crates/kbf-driver-container/build.rs`, embedded in the daemon, installed
+  at `<scratch>/oci-bin/kbf-init` and bound read-only at `/dev/kbf-init`, in the
+  container's own `/dev` tmpfs, so the image is never written to). `process.args` is
+  `/dev/kbf-init -- <argv>`. In a pid namespace pid 1 adopts every orphan, and a pid 1
+  that never waits leaves each one a zombie: a test that kills its process group and
+  asks `kill(-pgid, 0)` is told the group lives (the mopm pilot, `test_proc.zig`). A
+  host's init and Buildbarn's runner reap, so the sandbox must. The init (about 200
+  lines, standard library only, linked statically so it runs in any image whatever its
+  libc) runs the action as its child with `/dev/null` for stdin, passes every signal it
+  can catch to the child, reaps every process that ends, and exits when the child
+  does, with the child's exit code or `128 + n` for signal `n`: the same status
+  `crun run` gave when the action was pid 1, and the kernel ends the rest of the
+  namespace as before. It costs one more process (one pid of `pids.max`, about a
+  megabyte). The action is pid 2 (`$$` shows it), and a signal it sends itself is now
+  delivered (pid 1 ignores signals without a handler). Other options were refused: no
+  OCI or `crun` setting makes a runtime init; a subreaper in the daemon cannot catch
+  the orphans, because they are reparented inside the namespace, to its pid 1.
+  Looking the program up is the init's work now, with `crun`'s rules: a name with a
+  slash as it is (relative to the working directory), a bare name on the `Command`'s
+  `PATH` only (no `PATH`: not found). It cannot start the program: it writes one line in
+  `crun`'s own words to its stdin (a file of the lease, `init-report`, which the
+  driver opens and only the init holds; the program's stdin is `/dev/null`) and exits
+  127 (not found) or 126 (anything else, `ETXTBSY` included), and the driver reads
+  that line where it reads `crun`'s log. The init is not dumpable (`PR_SET_DUMPABLE` 0; the action it execs is
+  dumpable again), so the action, the same user in the same pid namespace, cannot open the report
+  file through `/proc/1/fd/0` to forge a report, or trace the init.
+  The init also closes every descriptor above stderr first and makes SIGCHLD the default again; looks
+  a bare name up with `faccessat(X_OK, AT_EACCESS)` per `PATH` entry, as `crun` does; and treats a step of
+  its own sandbox that fails (`close_range`, the two `prctl`s) as the node's failure (a `kbf-init: ...` line
+  on stderr and in the report, exit 126, the program not started). Only the init's report is read as
+  the action's lookup failure: anything `crun` itself reports about an exec is about the init (a noexec
+  scratch mount, a bad binary) and is the farm's failure, with a message saying so. So everything above about 127, 126 and the
+  `ETXTBSY` retry holds unchanged. Building the daemon needs the C library's static
+  archive (`libc.a`).
 - **Namespaces:** pid, network (new, nothing configured: loopback only; `crun` brings
   `lo` up), ipc, uts, mount, cgroup and user. Container ids `0..65536` map to the first
   range of at least 65,536 in the daemon user's `/etc/subuid` and `/etc/subgid`; the
@@ -448,12 +484,21 @@ back; `crun delete --force` closes the lease. That is four `crun` processes.
   (`lowerdir` the input root, `upperdir` the lease's upper, options pinned to
   `userxattr,metacopy=off,redirect_dir=nofollow,index=off,xino=off`); `/tmp`, `/var/tmp`,
   `/run` and `/root` are directories of the lease on disk (not tmpfs, which would count
-  against the lease's memory); `/etc/hosts` and `/etc/hostname` are small read-only
-  files. An action that writes to another place in the image fails with `EROFS`. Shared read-only
+  against the lease's memory); `/etc/hosts` (`localhost` for IPv4 and IPv6), `/etc/hostname` and `/etc/resolv.conf`
+  (`nameserver 127.0.0.1` and `options timeout:1 attempts:1`; nothing listens: a name outside
+  `hosts` fails at once with glibc's `EAI_AGAIN`, as on a worker without a reachable resolver,
+  and musl, which sends on an unconnected socket, waits at most about 2 s) are small read-only
+  files the lease writes. The action runs as uid and gid 1000, subordinate id 1000 of the
+  range, so permission checks are real (a mode-000 file is refused); the lease's writable
+  directories and the overlay are owned by that id while it runs. The image's own
+  `nsswitch.conf` is left as it is (the images the farm names have `hosts: files dns`). Uid 1000 has no passwd entry in most
+  images, so `whoami` and `getpwuid` fail; `HOME=/root` is the action's own writable directory. Image
+  files of mode 0700 or 0600 owned by the image's root are no longer readable by actions (the same
+  as on a worker that runs actions as an unprivileged user). An action that writes to another place in the image fails with `EROFS`. Shared read-only
   trees (`SharedMount`: a host directory and a destination below `/kbf/root`) are bound
   read-only after the overlay; the tree store that fills them is the daemon's.
 - **Helper containers** (`oci/helper.rs`) do the work that needs a user namespace with
-  the daemon user as id 0 and the range as ids `1..` (so the action's root is `1:1`), or,
+  the daemon user as id 0 and the range as ids `1..` (so the action's user, uid 1000, is `1001:1001`), or,
   for an image's unpack, an action's own mapping. A helper runs one program, never a
   shell: this daemon's binary in its `__chown-dirs` mode (with `--whole` trees, so the
   whole hand-over is one process and walks by descriptor, never following a symlink) or

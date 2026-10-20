@@ -14,13 +14,11 @@ use std::path::{Path, PathBuf};
 
 use clap::error::ErrorKind;
 use kbf_cli::{Invocation, config, names};
+use kbf_testkit::dir::TestDir;
 
-/// The scratch directory a test may write under (the workspace's `target/`), empty.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("config-file-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// A fresh, empty scratch directory under the workspace's `target/`, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("config-file-{name}"))
 }
 
 /// A file named `kbf.toml` in `dir` holding `text`, with permission bits `mode`.

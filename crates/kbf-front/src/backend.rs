@@ -472,14 +472,17 @@ impl Blobs for Held<'_> {
     }
 }
 
-/// The blobs of a farm, routed by its map.
+/// The blobs of a farm, routed by its map. A file is missing when no owner a read would
+/// try holds it ([`Router::find_missing_anywhere`]), not when its primary lacks it: a
+/// primary that has just joined holds nothing of what it now owns, and refusing the run
+/// for that would refuse every action whose inputs the client no longer uploads.
 impl Blobs for Router {
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<bytes::Bytes>> {
         Box::pin(Router::read_blob(self, digest))
     }
 
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>> {
-        Box::pin(Router::find_missing(self, digests))
+        Box::pin(Router::find_missing_anywhere(self, digests))
     }
 }
 

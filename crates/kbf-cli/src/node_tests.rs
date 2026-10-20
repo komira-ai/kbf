@@ -12,12 +12,11 @@ use crate::parse_from;
 
 const FRONTEND: &str = "https://farm.example:8990";
 
-/// A scratch directory of this test run.
-fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-cli-node-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    std::fs::canonicalize(&dir).expect("canonical")
+/// A scratch directory (canonical path) removed when it drops. A unit test gets no
+/// `CARGO_TARGET_TMPDIR`, so it is under the system's temporary directory.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    let temp = std::fs::canonicalize(std::env::temp_dir()).expect("canonical");
+    kbf_testkit::dir::TestDir::under(temp, &format!("kbf-cli-node-{name}"))
 }
 
 /// A `kbf.toml` for node-02 with `extra` lines, its state under `root`.
@@ -83,14 +82,15 @@ fn strings(argv: &[OsString]) -> Vec<String> {
 }
 
 struct Case {
-    root: std::path::PathBuf,
     store: Store,
+    /// Last, so it drops after the store that has files in it.
+    root: kbf_testkit::dir::TestDir,
 }
 
 fn case(name: &str) -> Case {
     let root = scratch(name);
     let store = Store::open(&root.join("state")).expect("state dir");
-    Case { root, store }
+    Case { store, root }
 }
 
 fn pki(c: &Case, file: &str) -> String {
@@ -155,6 +155,45 @@ fn a_daemon_only_node_runs_kbf_daemon_with_the_frontends_endpoints() {
     let argv = strings(&argv);
     assert!(argv.contains(&"--cas=https://blobs.example:8981".to_owned()));
     assert!(argv.contains(&"--driver=container".to_owned()));
+}
+
+/// Catches the cold store the frontend sends (the URI of the store it has registered,
+/// percent-encoded as `S3Uri::node_uri` writes it) not being the store the storage half
+/// starts on: the flag is the stored text, byte for byte, and the mode's own parser reads
+/// it back as the store that was registered, with its region and put settings.
+#[test]
+fn the_storage_half_starts_on_the_cold_store_the_frontend_sent() {
+    use kbf_server::stores::{S3Uri, StoreUri};
+    let registered = match "s3://farm-cold/cold/main/?endpoint=http://s3.test:9000\
+                            &region=eu-west-1&conditional-put=true&min-put-rate=2048"
+        .parse::<StoreUri>()
+    {
+        Ok(StoreUri::S3(s3)) => s3,
+        other => panic!("not an S3 store: {other:?}"),
+    };
+    let sent_uri = S3Uri::node_uri(&registered);
+    let c = case("sent-cold-store");
+    let config = config(&c.root, "[storage]\n");
+    let mut stored = sent(&["storage"]);
+    stored.cold_store.clone_from(&sent_uri);
+    let node = enrolled(&["storage"], stored);
+    let argv = plan(
+        &config,
+        &node,
+        &c.store,
+        Driver::Container,
+        &[],
+        want(names::STORAGE),
+    )
+    .expect("a plan");
+    assert!(
+        strings(&argv).contains(&format!("--cold-store={sent_uri}")),
+        "{argv:?}"
+    );
+    let Ok(Invocation::Storage(flags)) = parse_from(argv) else {
+        panic!("not a storage invocation");
+    };
+    assert_eq!(flags.server.cold_store, Some(StoreUri::S3(registered)));
 }
 
 /// Catches a storage-only node that does not listen where the frontend said, does not

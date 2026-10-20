@@ -76,11 +76,17 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
                     flags.server.api_token_file.as_deref(),
                     Some(std::path::Path::new("/etc/kbf/api-token"))
                 );
+                // The state store is the Postgres of the settings (the example's is the
+                // host's socket), read by kbf's own URI parser: a password-free URI.
                 assert_eq!(
                     flags.server.state_store,
-                    Some(kbf_server::StateStoreUri::Sqlite(
-                        "/var/lib/kbf-server/state/state.db".into()
-                    ))
+                    Some(kbf_server::StateStoreUri::local_postgres())
+                );
+                // `kbf frontend` refuses a Postgres store together with a control socket
+                // (a start would exit 2), so the unit gives none.
+                assert!(
+                    flags.handover.is_none(),
+                    "the postgres unit gives a handover flag"
                 );
             }
             Invocation::Registered(_) => {
@@ -314,12 +320,10 @@ fn kbf_deploy_renders_exactly_the_modes_kbf_takes() {
     assert_eq!(deploy, help);
 }
 
-/// The scratch directory `name` under the workspace's `target/`, empty.
-fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// A fresh, empty scratch directory for `name` under the workspace's `target/`, removed
+/// when it drops.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
 /// The real host, but a command it runs keeps this test's `LLVM_PROFILE_FILE`:

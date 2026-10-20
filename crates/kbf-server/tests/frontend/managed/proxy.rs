@@ -28,7 +28,16 @@ async fn a_candidate_behind_the_proxy_gates_its_operator_port() {
         &store,
     )
     .await;
-    assert_eq!(candidate.role().await["role"], "candidate");
+    // Its admin port takes the proxy's secret too (see `admin_secret`).
+    let (code, view) = super::admin_secret::admin_call(
+        &candidate,
+        "GET",
+        "/v1/admin/role",
+        Some(&hex::encode(SECRET)),
+    )
+    .await;
+    assert_eq!(code, 200, "{view}");
+    assert_eq!(view["role"], "candidate");
     until("the candidate is ready", async || {
         readyz(candidate.api).await == 200
     })

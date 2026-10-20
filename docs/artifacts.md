@@ -18,18 +18,20 @@ build.
 
 ## Pull request labels
 
-Two labels opt a pull request in to the work that is otherwise skipped, to spare the
-small macOS runner pool. Adding either to an open pull request starts a run.
+A pull request runs the two jobs of `ci.yml` (`lint`, and `test` on the fast set) and nothing
+else; the full suite, the macOS jobs and the packages run on a push to `main` or
+`feature/arch-v2` (`beta.yml`). One label opts a pull request in to more, to spare the small
+macOS runner pool. Adding it to an open pull request starts a run.
 
 | Label | Effect |
 |---|---|
 | `needs-artifacts` | `artifacts.yml` builds, packages and sums the files for the pull request (never for the darwin-arm64 job of a pull request into `feature/arch-v2`, which no label enables: nothing is attested from a pull request, and the push to `feature/arch-v2` builds it) |
-| `macos` | `ci.yml`'s `native-macos` job runs on a pull request into `feature/arch-v2`, where it is skipped without the label. Pushes, pull requests into `main` and the merge queue run it as before. The job builds and tests on its own runner; it does not use the darwin-arm64 artifacts build |
 
-`ci.yml` runs on the `labeled` event so that the label starts something. Any label added
-to a pull request therefore starts a whole `ci` run, which replaces the pull request's
-earlier run: add the labels together, before the run you want to keep. The condition of
-`native-macos` is pinned by `crates/kbf-it/tests/release_artifacts`.
+`artifacts.yml` runs on the `labeled` event so that the label starts something. Any label
+added to a pull request therefore starts a whole `artifacts` run, which replaces the pull
+request's earlier run: add labels together, before the run you want to keep. `native-macos`
+and `pkg-macos` run in `beta.yml` on every push and never on a pull request; that is pinned
+by `crates/kbf-it/tests/release_artifacts`.
 
 ## What is built
 
@@ -117,7 +119,7 @@ words, in either order): one JSON object on one line of stdout, exit 0, the fiel
 sorted by name.
 
 ```text
-{"admin_protocol":1,"commit":"0123456789ab","min_protocol":1,"profile":"release","protocol":1,"state_schema":1,"version":"0.1.0"}
+{"admin_protocol":1,"commit":"0123456789ab","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"state_schema":1,"version":"0.1.0"}
 ```
 
 - `admin_protocol`: the version of the admin calls of `kbf --mode frontend` (`GET role`,
@@ -126,6 +128,10 @@ sorted by name.
   changes meaning raises it.
 - `commit`: the first 12 hex digits of the commit built (`unknown` for a build with no
   git checkout); compare it with the first 12 of the commit in the asset's name.
+- `meta_log`: the highest metadata-log machine version the binary runs
+  (`kbf_server::raft_log::RUNS`). Going from release N to N-1 is reversible only if
+  `meta_log(N) <= meta_log(N-1)`; a build that prints no `meta_log` is unknown, and
+  unknown is not reversible.
 - `profile`: `release` for every asset here (the workflow refuses a `debug` one).
 - `protocol` and `min_protocol`: the newest and the oldest `kbf.worker.v1` version the
   binary speaks. The daemon half speaks exactly `protocol`; the server half accepts
@@ -324,16 +330,24 @@ fails and changes nothing; the files it lacks are uploaded (`cargo xtask release
 publish`).
 
 Two further verbs read the annotated `v*` tag, whose message is the gamma verdict
-(`docs/design/kbf-cicd.md`, section 8.1; `release.yml` does not run them yet).
-`cargo xtask release verdict` refuses a lightweight tag, a commit not on main, a message
+(`docs/design/kbf-cicd.md`, section 8.1). `verify` runs both, on a checkout of the whole
+history (the tag object and `origin/main` must be there): `cargo xtask release verdict`
+refuses a lightweight tag, a commit not on main, a message
 that is not a green gamma verdict, a verdict that names another commit, tag or set (the
 set hash is the SHA-256 of `SHA256SUMS`, `kbf_gate::SetHash::of_sums`), a bake under 24
 hours, and a thin bake without a recorded `min-load` waiver; it prints `set-hash=<hex>`.
-`cargo xtask release notes` runs the same checks and writes the notes. `release publish`
-takes that hash as `--set-hash` and publishes nothing when the files are another set.
+`cargo xtask release notes` runs the same checks and writes the notes, which `verify`
+uploads as the artifact `release-notes`, so a dry run shows them. `verify` passes the hash
+to `publish` as a job output, and `release publish` takes it as `--set-hash` and publishes
+nothing when the files are another set. The `publish` job runs in the `prod` environment,
+whose required reviewer approves it.
 
-The workflow can also be run by hand (`workflow_dispatch`) with a commit SHA. Only
-`verify` runs then: every check above, and nothing is published. On every pull request
+The workflow can also be run by hand (`workflow_dispatch`) with a commit SHA and the
+annotated tag to check. Only `verify` runs then: every check above, and nothing is
+published (`publish` runs only for a pushed tag, and only `publish` holds a write scope).
+`crates/kbf-it/tests/release_workflow` holds the file to this: the verdict step, the
+`prod` environment, a `v*` tag push and a dispatch as the only triggers (no pull request),
+pinned actions and an empty top-level `permissions`. On every pull request
 into `main`, CI asks GitHub the same on-`main` question for the pull request's base
 commit (which must pass) and its merge commit (which must be refused), so a check that
 accepts every commit, or none, fails there (`cargo xtask release main-control`).

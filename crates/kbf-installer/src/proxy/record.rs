@@ -35,7 +35,7 @@ pub(super) trait Durable {
     fn dir(&self, dir: &Path) -> std::io::Result<()>;
 }
 
-struct Fsync;
+pub(super) struct Fsync;
 
 impl Durable for Fsync {
     fn file(&self, file: &File) -> std::io::Result<()> {

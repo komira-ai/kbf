@@ -8,7 +8,7 @@
 
 use std::io::{BufRead as _, BufReader};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -20,6 +20,7 @@ use kbf_proto::reapi::{
     Action, ActionResult, Command as ReapiCommand, Digest, Directory, ExecuteRequest,
     ExecuteResponse, FindMissingBlobsRequest, Platform, Tree,
 };
+use kbf_testkit::dir::TestDir;
 use kbf_transfer::{Cas as _, TransferConfig, Transfers, fetch};
 use prost::Message as _;
 use tonic::transport::{Channel, Endpoint};
@@ -45,14 +46,10 @@ const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-crun");
 /// The mode this file runs.
 const MODE: &str = "all-in-one";
 
-/// A fresh directory for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = node::scratch_root()
-        .join("kbf-all-in-one")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// A fresh directory for one test, removed when it drops (declare it before the
+/// processes that write into it).
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(node::scratch_root().join("kbf-all-in-one"), name)
 }
 
 /// The flags of a one-node farm in `dir`: the server's worker listener on `worker` under

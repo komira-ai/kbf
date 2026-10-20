@@ -119,7 +119,7 @@ fn records_of_an_instance_the_header_does_not_list_are_still_filtered() {
     // refused here, since its newest chunk names b; the records are read page by page.)
     let mut life = Life::fresh(Limits::default());
     let (inv, _) = closed_build(&mut life);
-    let key = IndexRoot::default().invid(&inv.key);
+    let key = IndexRoot::default().header(&inv.key, life.writer_id);
     let row = life.index.inner.get(&key).unwrap().unwrap();
     let mut header = InvocationHeader::decode(row.value.as_slice()).unwrap();
     header.instances = vec!["a".into()];
@@ -281,7 +281,7 @@ fn an_invocations_instances_are_read_from_its_header_row_alone() {
     let err = futures::executor::block_on(reader.invocation_instances(&inv.key)).unwrap_err();
     assert!(matches!(err, ReadError::Row { .. }), "{err}");
     // The index itself failing is its own error, not no invocation.
-    life.index.fail_gets.store(true, Ordering::SeqCst);
+    life.index.fail_scans.store(true, Ordering::SeqCst);
     let err = futures::executor::block_on(reader.invocation_instances(&inv.key)).unwrap_err();
     assert!(matches!(err, ReadError::Index(_)), "{err}");
 }

@@ -617,3 +617,21 @@ fn the_audit_log_is_newest_first_and_bounded() {
         .collect();
     assert_eq!(newest, [12, 11, 10]);
 }
+
+/// Catches: a registry row family the write-rule table does not name (a superseded
+/// frontend would then be unable to tell it may not write it, and a test of the swap would
+/// not know it): every key the rows build is a fenced family.
+#[test]
+fn every_key_the_registry_builds_is_a_fenced_family() {
+    use crate::write_rules::{Rule, classify};
+    let name: ConnectionName = "cold".parse().expect("a name");
+    for key in [
+        rows::conn_key(&name),
+        rows::bind_key(BindingRole::Cold),
+        rows::audit_key(1),
+        rows::GEN_KEY.to_owned(),
+    ] {
+        let got = classify(&key, &kbf_history::IndexRoot::default());
+        assert_eq!(got.map(|c| c.rule), Some(Rule::Fenced), "{key}");
+    }
+}

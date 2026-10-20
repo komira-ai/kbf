@@ -7,7 +7,7 @@ re-check their state before acting on this page, because the table in section 12
 ## 0. The plan in one page
 
 Every merge runs a **beta**: GitHub Actions stands up a whole farm on loopback (a frontend, three storage-and-daemon nodes,
-one plain daemon, a pinned Envoy in front), runs real Buck2 builds, then updates every role while a build is running and
+one plain daemon; Buck2 dials the frontend's REAPI port directly), runs real Buck2 builds, then updates every role while a build is running and
 kills a node while a build is running. The assertions are numbers, not logs: zero failed actions, zero lost blobs, and
 under-replicated blobs back to zero.
 
@@ -90,7 +90,7 @@ Where kbf differs, and why:
 4. **There is a time gate.** kci has no bake, soak or metric gate, and no rollback verb. All three are new here.
 5. **Code is not shared.** kci is Mojo on Buck2; kbf is Rust with `xtask`. The stage file is plain data checked by a Rust lint.
 6. **kci's DEPLOY step** (a cloud resource graph apply) does not describe restarting kbf processes on a host. The
-   deploy here is the pull updater and the frontend-ordered node steps of `split-mode-updates.md`.
+   deploy here is the frontend update of `frontend-proxy.md`, then the pull updater's node steps.
 
 ### 2.1 The stage file [P]
 
@@ -192,10 +192,9 @@ rough budget, to be measured before it is relied on:
 
 | process | role | expected footprint |
 |---|---|---|
-| frontend (two instances during a swap) | scheduler, state store, Envoy upstream | a few hundred MB each |
+| frontend (two instances during a swap) | scheduler, state store | a few hundred MB each |
 | 3 storage-and-daemon nodes | storage, plus a worker each | the largest; segment size and cache caps set small by the harness |
 | 1 plain daemon | worker | small |
-| Envoy | pinned version | about 100 MB |
 | Buck2 client, plus the actions | the load | the variable part |
 
 The rule that keeps it inside the box: the harness sets segment size, cache and tier limits to test values, and the load is
@@ -218,7 +217,7 @@ B-0, not the 20 of T5, which is a likely memory risk. The cost that matters is w
 merge path. Record job duration in the result document so a creeping beta shows in the numbers.
 
 **Container runtime [V].** The project runs containers with crun only. The harness today uses a stand-in runtime over a planted cgroup tree.
-Real crun needs cgroup v2 delegation and a systemd scope; the crun jobs in `ci.yml` arrange that with a `Delegate=yes`
+Real crun needs cgroup v2 delegation and a systemd scope; the crun jobs in `beta.yml` arrange that with a `Delegate=yes`
 unit, and the same approach is to be tried for crun on `ubuntu-24.04`. Until that is shown to work (#936), **B-0 uses the
 stand-in**, and the page says what that weakens: the `//:pause` and compile loads run through no real container path, so
 beta proves the update and failure paths and not container execution (covered by the existing real-runtime jobs). The
@@ -237,8 +236,8 @@ The proposal is to grow it into a library (`rehearsal`) that two test cells shar
 
 - `procs`: a supervisor with `start(role)`, `term(role)`, `kill(role)` (SIGKILL), `restart(role)`, and logs per process kept as
   artifacts. No role is started any way but the rendered unit line, so the unit text stays under test.
-- **Envoy**: the pinned version (the one `test-x86` already fetches by checksum) started from the `box` topology render
-  (#925), with the frontend as instances `a` and `b`. The Buck2 client goes through Envoy, never straight to a frontend.
+- **Envoy**: dropped from B0 per the no-Envoy ruling (the box Envoy kit is gone). The Buck2 client dials the frontend's
+  REAPI port directly; B0 moves behind the kbf-installer proxy in a follow-up, once the proxy lands.
 - **Cold store**: a directory by default (fast, no service); the `file://`-versus-MinIO difference is covered by the
   existing `objstore-s3` job and is not a beta concern.
 - **Load**: the pinned Buck2 (the `kbf-cell m2` machinery **[F]**) runs builds in a loop for the whole scenario. Three
@@ -249,7 +248,42 @@ The proposal is to grow it into a library (`rehearsal`) that two test cells shar
 - **The update under test is the real update code**, not a script that restarts processes: the frontend handover command,
   the node step and the pull-updater client and root helper, in that order of availability (milestones B2 to B4 below). The
   one honest deviation is that the supervisor, not systemd, starts the processes; the `systemctl` edge is covered by gamma.
-  The root helper runs under `sudo` on the runner (`sudo-test` already does this in `ci.yml` **[F]**).
+  The root helper runs under `sudo` on the runner (`sudo-test` already does this in `beta.yml` **[F]**).
+
+**Status of the first change (#942).** The helpers above are now the library `crates/kbf-harness`, which `kbf-cli`'s
+rehearsal drives: `Farm` (a supervisor with `kill`, `term`, `restart`, a process table and a report of every process's
+output for a hang), the metrics scraper, the gates, the result document, the Buck2 load, and `kbf-beta b0`, which runs scenario B0 and writes `beta-result.json`. `.github/workflows/beta.yml` runs it on
+the merge queue and on a push; it builds its own binaries, so the result says it is unattested. Running it showed what
+the design did not know:
+
+- `kbf storage-and-daemon` runs the container driver only, and the stand-in `crun` runs one planted argv whatever a
+  build sends, so B0 runs three `kbf storage` nodes and two plain `kbf daemon` processes with `--driver=native` (the
+  result says no container path was exercised). The rehearsal keeps the stand-in over storage-and-daemon nodes.
+- The `kbf storage` unit renders neither `--frontend` nor `--advertise-addr`, so the harness adds both. It registers the
+  nodes with the frontend. (Envoy is dropped from B0 per the no-Envoy ruling; B0 moves behind the kbf-installer proxy in
+  a follow-up. Buck2 dials the frontend's REAPI port directly.)
+- The frontend holds no cache, so `kbf_cache_lost_blobs` and `kbf_cache_blob_losses_total` are the storage nodes': a
+  storage node serves `/metrics` on `--metrics-listen` (plain HTTP, off unless given; no unit renders it, so the harness
+  adds it on a port of its own). B0 scrapes each node as well as the frontend, and the two loss gates sum the nodes and
+  fail closed when any node's series is absent or the node does not answer.
+- Buck2 reads the remote execution client's address and CA when its daemon starts and ignores them on a command line, and
+  refuses a `grpcs://` address: the harness appends them to the copy of the project's `.buckconfig`.
+- A farm's processes bind their own ports, so the harness cannot hold the sockets, and a port found by binding port 0 and
+  closing is free only until another program takes it. Each farm claims a block of 64 ports below the kernel's ephemeral
+  range by holding a file lock named for the block (the kernel drops the lock when the holder dies), skips a block with any
+  port in use, and takes every port from its block: two farms of one process or one host
+  never share a port.
+- A run that is cancelled or times out must leave nothing behind. Every farm process leads a process group of its own,
+  ending a process ends its group, and the kernel kills a farm process whose harness dies (SIGKILL included). SIGTERM and
+  SIGINT make `kbf-beta` end through its normal exits: the farm is stopped within one bound, the Buck2 daemons of the loops
+  are killed (also if the run panics), and the result document ends `FAILED` with the reason. The frontend's control
+  socket is removed. The Buck2 daemons are not the harness's children (each leads a session of its own, started by a
+  client that has ended), so the kernel does not kill them: before the farm starts, the harness starts a sentinel,
+  `kbf-beta reap`, in a session of its own with no parent-death signal and a pipe the harness holds as its input. A run
+  that ends tells it `done`; a run that dies by any means, SIGKILL included, closes the pipe with no `done`, and the
+  sentinel kills the daemons of the loops and removes the control socket. Only a SIGKILL of the sentinel too leaves them.
+- Keys are written mode 0600 into directories of mode 0700, and none is under `logs/`, which the workflow uploads (a test
+  scans it). The stand-in `buck2` is a binary of `kbf-harness`, not of `kbf-cli`, so no release builds it.
 
 ### 4.4 Scenarios and gates
 
@@ -304,7 +338,7 @@ useful alone and each required from the day its blocking pull requests land (B-2
 
 | milestone | adds | blocked on |
 |---|---|---|
-| B-0 | harness library, the pinned Envoy, the real Buck2 load, B0, smoke in the merge queue (on the stand-in runtime, section 4.2) | #925 box render; the runner measurement (M21) before smoke is required |
+| B-0 | harness library, the real Buck2 load, B0, smoke in the merge queue (on the stand-in runtime, section 4.2) | #925 box render; the runner measurement (M21) before smoke is required |
 | B-1 | B5, B6, B7 (kill-a-node, kill-a-daemon, crash matrix required) | #900, #939 (write failover) |
 | B-2 | B1, B3 (node and daemon roll) | #912, #913, #914, #917 (the metrics and the picker) |
 | B-3 | B2, B8 (frontend swap through Envoy, all-in-one) | #930, #937, #938, the wiring PR of #901, #925, #934 |
@@ -338,10 +372,19 @@ runs with attestation verification off; that is a test-farm setting, not a defau
 
 Offering is dry-run by default (`--plan`): it prints what would change and which gates it read.
 
+The verb is `cargo xtask release offer` (`crates/xtask/src/release/offer.rs`), not a `kbf` subcommand: the pinned `gh` and the
+online verification belong to the operator side. It makes no network write. Its output is the file `--out <path>` names (no default, so a refusal cannot leave a stale default-named file): `offer.json`
+(`kbf_gate::OfferDoc`: commit, set hash, the beta run or a recorded waiver, `reversible`, the previous commit, the platforms found
+complete), which the deploy reads; the desired-state write stays the deploy's. Until a beta result is attested, `--waive-beta
+<reason> --operator <name>` is the only way past, for gamma only, and the waiver is recorded in `offer.json`. `reversible` is true
+only when both builds state `meta_log` (in `kbf --version --json`) and `meta_log(N) <= meta_log(N-1)`; unknown is not reversible.
+
 ### 5.2 The deploy is a test
 
-The pull updater, the node steps and the frontend handover in the order of `split-mode-updates.md` run on the real farm
-with real builds in flight. The deploy is a test because it is checked as one:
+The deploy (`kbf-installer deploy`, `gamma-deploy.md`) runs on the real farm with real builds in flight: it updates the
+frontend through the proxy's update API first (`frontend-proxy.md` sections 4, 5 and 9: a swap that drops no stream, a
+bake, then the new frontend offers the commit), and then watches the pull updater roll the nodes, one storage node at a
+time. The deploy is a test because it is checked as one:
 
 - **No build failed from a dropped connection**: `kbf_frontend_relay_untraced` is 0 at every scrape of the deploy, and every
   build that was in flight at any point of the deploy (the evaluator records the invocation ids at deploy start and at every
@@ -436,6 +479,29 @@ The evaluator is deliberately not a dashboard: a person reading a graph is not a
 `gamma-verdict.json`: commit, set hash, desired generation, deploy start and end, bake start and end, each gate with measured value and
 threshold, the minimum-load numbers and any waiver. It is a record, not a credential: no host reads it. A red verdict triggers
 section 8; a green one makes the commit publishable (the tag of 8.1 carries it).
+
+### 7.2 Hand-off, baseline and automatic rollback
+
+The deploy and the evaluator are separate processes, so one file passes between them, the **hand-off**: commit, set hash, the
+evaluator's run id, the deploy's start (and end, once it has one), the generation the deploy set, whether the release is
+**reversible** (8.3: the offer knows, the evaluator only reads it; the field has no default) and the commit the deploy
+replaced. `kbf-bake run --handoff FILE` takes all of it from there.
+
+The **baseline** is taken at deploy start, for the deploy's start time, by `kbf-bake baseline`. The farm keeps no time
+series, so the error ratio is failed over executed actions across the closed invocations of the seven days before the
+deploy (`GET /v1/invocations?since&until`), and the latency baseline is the p99 of the evaluator's own earlier scrapes
+(`kbf-bake sample`, kept in a ledger file by something that runs it regularly). A baseline the records or the ledger cannot
+give (a partial list, no executed action, a ledger that does not reach back the seven days) is written down as absent with its
+reason, `baseline` exits 4, and the gate that needs it is red. The error ratio of the records is the records' measure and
+not the `kbf_execute_errors_total` ratio the gate holds the bake to; it is the closest the records give.
+
+**Automatic rollback** is off unless `--auto-rollback` is given (with `--handoff`, `--rollback-url` and
+`--rollback-token-file`). It is offered only when the bake ends red on a gate that had a measurement over its limit, the
+hand-off says the release is reversible, and it names the previous commit and the generation. The offer is
+`POST /v1/update/desired` with `expect_generation`, so a desired commit someone else moved since is a `409` and nothing is
+written; it is made once and never retried. A soft gate never ends a bake, a green or extended end never rolls back, a gate
+that is red only for want of a series or a baseline is no evidence against the release, and an irreversible release pages
+and offers nothing. The cancel hold of Q6 is not built: it is the owner's decision.
 
 ## 8. Stage 3: prod, and rollback
 
@@ -551,7 +617,7 @@ one issue with one done criterion. "Blocked by" names open pull requests or othe
 
 | # | Missing piece | Done when | Blocked by | Issue |
 |---|---|---|---|---|
-| M1 | Harness library plus B-0: supervisor, pinned Envoy, real Buck2 load, B0, smoke in the merge queue | B0 green on a hosted runner on every merge; smoke measured, then required | #925; M21 |  #942 |
+| M1 | Harness library plus B-0: supervisor, real Buck2 load, B0, smoke in the merge queue | B0 green on a hosted runner on every merge; smoke measured, then required | #925; M21 |  #942 |
 | M2 | Rolling update of every role under a running build (B1 to B4, B8) | each scenario red on its planted mutant and green; 0 failed actions, 0 lost blobs | M1, #912, #913, #914, #917, #930, #937, #938, #934 |  #943 |
 | M3 | Kill a storage node and a daemon during a build (B5, B6); crash matrix (B7) required | scenarios green, matrix a required job | M1, #900, #939 |  #944 |
 | M4 | N/N-1: wire lint, state-store goldens, mixed-version run both ways (B9) | lint refuses a planted removed field; B9 green | M1, M16 |  #945 |

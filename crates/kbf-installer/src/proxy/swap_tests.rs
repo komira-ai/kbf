@@ -39,13 +39,13 @@ fn untouched(w: &World, pid: u32) {
     assert!(hits.is_empty(), "pid {pid} was signalled: {hits:?}");
 }
 
-/// A world where the old child drains late: permits, executions and queued operations
-/// clear one after the other.
+/// A world where the old child drains late: permits, streams and sessions clear one after
+/// the other.
 fn draining_world() -> (World, ProcIdent) {
     let (w, old) = World::with_old();
     w.permits(Slot::A, 3, Some(secs(400)));
     w.busy(Slot::A, 2, Some(secs(500)));
-    w.queued(Slot::A, 1, Some(secs(600)));
+    w.sessions(Slot::A, 1, Some(secs(600)));
     (w, old)
 }
 
@@ -85,13 +85,13 @@ fn a_swap_runs_every_phase_in_order_and_retires_the_old_child_last() {
 }
 
 #[test]
-fn the_old_child_is_retired_only_when_streams_executions_and_queue_are_all_zero() {
+fn the_old_child_is_retired_only_when_permits_streams_and_sessions_are_all_zero() {
     let (w, old) = draining_world();
     assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Done));
     let at = w.when("terminate pid 100").expect("retired");
     assert!(
         at >= secs(600),
-        "retired at {at:?}, before the queue emptied at 600 s"
+        "retired at {at:?}, before the sessions closed at 600 s"
     );
     assert_eq!(w.count("terminate"), 1);
 }
@@ -104,12 +104,16 @@ fn an_old_child_that_never_drains_is_never_signalled_in_24_hours() {
             Box::new(|w: &World| w.permits(Slot::A, 1, None)) as Box<dyn Fn(&World)>,
         ),
         (
-            "an execution stays open",
+            "a stream stays open",
             Box::new(|w: &World| w.busy(Slot::A, 1, None)),
         ),
         (
-            "a queued operation stays",
-            Box::new(|w: &World| w.queued(Slot::A, 1, None)),
+            "a worker session stays open",
+            Box::new(|w: &World| w.sessions(Slot::A, 1, None)),
+        ),
+        (
+            "the gate never opened the slot, so it cannot be retired",
+            Box::new(|w: &World| w.st.borrow_mut().never_opened.push(Slot::A)),
         ),
         (
             "the child cannot be asked",
@@ -626,4 +630,38 @@ fn an_old_child_that_cannot_resume_leaves_the_new_child_serving_and_fails_the_ro
     before(&w, "admin:resume B", "release_into B");
     assert_eq!(w.holders(), vec![Slot::B]);
     assert_eq!(w.count("terminate"), 0, "neither child is retired");
+}
+
+/// Catches a frontend swap that starts the new child serving: it must wait (`--await-takeover`)
+/// so that the takeover, after the old child quiesced, is the only moment it holds the
+/// generation.
+#[test]
+fn the_new_child_of_a_frontend_swap_is_started_to_wait_for_the_takeover() {
+    let (w, old) = World::with_old();
+    assert_eq!(
+        go(&w, plan(Mode::Frontend), old),
+        Ok(Phase::Done),
+        "{:#?}",
+        w.log()
+    );
+    assert_eq!(w.count("admin:takeover B"), 1, "{:#?}", w.log());
+    assert_eq!(w.st.borrow().starts, vec![(Slot::B, Start::Candidate)]);
+    assert_eq!(w.holders(), vec![Slot::B]);
+}
+
+/// Catches a takeover sent without the plan's limit (the child's own deadline): a swap that
+/// passes zero or a constant leaves the child with a bound the plan did not choose, so both
+/// the switch and the cold start after a restart must pass `timing.takeover`.
+#[test]
+fn the_takeover_carries_the_plans_limit() {
+    let (w, old) = World::with_old();
+    let mut p = plan(Mode::Frontend);
+    p.timing.takeover = Duration::from_millis(7_321);
+    assert_eq!(go(&w, p, old), Ok(Phase::Done), "{:#?}", w.log());
+    assert_eq!(
+        w.count("admin:takeover B limit 7321 ms"),
+        1,
+        "{:#?}",
+        w.log()
+    );
 }

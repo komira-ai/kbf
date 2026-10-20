@@ -787,3 +787,116 @@ fn retention_keeps_the_running_the_previous_and_one_more() {
     let done = revert(&mut exec, &layout, &mut Vec::new()).expect("revert");
     assert_eq!(done.to, c(B));
 }
+
+/// Catches a first release that is put on trial, or whose links and state disagree: on a host
+/// with no release `first` writes the state with `current` and no trial (nothing to go back
+/// to, so no pending confirm), points `current` at it and leaves `previous` unset, and a
+/// repeat changes nothing.
+///
+/// Mutants to plant: `pending_confirm` set in `first`; the state written after the links;
+/// the repeat arm removed (the repeat then fails with `NotFirst`).
+#[test]
+fn the_first_release_becomes_current_with_no_trial() {
+    let (mut exec, layout) = host("first");
+    seed(&exec, A, 1_000);
+    first(&mut exec, &layout, &c(A), &mut Vec::new()).expect("first");
+    let state = Locked::acquire(&layout)
+        .expect("lock")
+        .read()
+        .expect("read")
+        .expect("a state");
+    assert_eq!(state.current, Some(c(A)));
+    assert_eq!((state.previous, state.pending_confirm), (None, None));
+    assert_eq!(link(&exec, "current"), at(A));
+    assert_eq!(link(&exec, "previous"), None);
+    first(&mut exec, &layout, &c(A), &mut Vec::new()).expect("a repeat");
+    assert_eq!(link(&exec, "current"), at(A));
+}
+
+/// Catches a first release taken for a host that already runs one, and one that is not on
+/// the host: another release current is `NotFirst` (setup never replaces a release: that is
+/// an update), and a release with no binary is `NotInstalled`; neither writes a state.
+///
+/// Mutants to plant: the `NotFirst` guard removed; the `has_binary` check removed.
+#[test]
+fn a_first_release_never_replaces_one_and_must_be_installed() {
+    let (mut exec, layout) = host("first-refused");
+    running(&exec, &layout, A, &[B]);
+    let err = first(&mut exec, &layout, &c(B), &mut Vec::new()).expect_err("refused");
+    assert!(
+        matches!(&err, ReleaseError::NotFirst(x) if *x == c(B)),
+        "{err:?}"
+    );
+    assert_eq!(
+        state_of(&layout).current,
+        Some(c(A)),
+        "the state is as it was"
+    );
+    let (mut bare, layout) = host("first-missing");
+    let err = first(&mut bare, &layout, &c(D), &mut Vec::new()).expect_err("refused");
+    assert!(
+        matches!(&err, ReleaseError::NotInstalled(x) if *x == c(D)),
+        "{err:?}"
+    );
+    assert!(state::read_unlocked(&layout).expect("read").is_none());
+}
+
+/// Catches a frontend stage of a release that is not on the host: it records a `staged` that
+/// names nothing a confirm could swap in, and holds every other update off as busy. A release
+/// with no directory and one whose directory holds no binary are both `NotInstalled`, and
+/// neither writes the state; the same release installed is staged, and staging it again
+/// changes nothing.
+///
+/// Mutants to plant: the `has_binary` check removed from `stage_frontend`; the state written
+/// before the check.
+#[test]
+fn a_frontend_stage_needs_the_release_on_the_host_and_writes_nothing_otherwise() {
+    let (exec, layout) = host("stage-frontend");
+    running(&exec, &layout, A, &[B]);
+    fs::create_dir_all(exec.at(&format!("/var/lib/kbf-installer/releases/{E}"))).expect("empty");
+    let was = state_of(&layout);
+
+    for missing in [D, E] {
+        let err = stage_frontend(&exec, &layout, &c(missing)).expect_err("not on the host");
+        assert!(
+            matches!(&err, ReleaseError::NotInstalled(x) if *x == c(missing)),
+            "{err:?}"
+        );
+        assert_eq!(state_of(&layout), was, "{missing}: the state is as it was");
+    }
+
+    stage_frontend(&exec, &layout, &c(B)).expect("staged");
+    let staged = state_of(&layout);
+    assert_eq!(staged.staged, Some(c(B)));
+    assert_eq!(
+        (&staged.current, &staged.previous),
+        (&was.current, &was.previous)
+    );
+    stage_frontend(&exec, &layout, &c(B)).expect("a repeat");
+    assert_eq!(state_of(&layout), staged);
+}
+
+/// Catches a first release that stays staged once it is current, as an `activate` of a staged
+/// release does not: a `staged` that names the first release (the operator staged it before
+/// setup made it current) is cleared, and a `staged` that names another release stays (it
+/// is another decision's).
+///
+/// Mutants to plant: `staged` carried over unchanged; `staged` cleared whatever it names.
+#[test]
+fn a_first_release_that_was_staged_is_current_and_no_longer_staged() {
+    for (staged, want) in [(A, None), (B, Some(c(B)))] {
+        let (mut exec, layout) = host(&format!("first-staged-{staged}"));
+        seed(&exec, A, 1_000);
+        Locked::acquire(&layout)
+            .expect("lock")
+            .write(&State {
+                staged: Some(c(staged)),
+                ..State::default()
+            })
+            .expect("state");
+        first(&mut exec, &layout, &c(A), &mut Vec::new()).expect("first");
+        let state = state_of(&layout);
+        assert_eq!(state.current, Some(c(A)), "{staged}");
+        assert_eq!(state.staged, want, "{staged}");
+    }
+}

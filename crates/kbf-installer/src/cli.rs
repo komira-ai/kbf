@@ -61,6 +61,8 @@ pub enum Verb {
     Quiesce,
     /// Validate the installer's configuration, trust files and path chain.
     Check,
+    /// Serve the frontend host's public port: route each stream to the active child frontend.
+    Proxy(ProxyArgs),
     #[command(hide = true)]
     Stage,
     #[command(hide = true)]
@@ -80,12 +82,6 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// The mode as `--mode` spells it (clap's own name for it, so there is one spelling).
-    pub fn name(self) -> String {
-        self.to_possible_value()
-            .map_or_else(String::new, |v| v.get_name().to_owned())
-    }
-
     /// Whether this mode keeps its state in the Postgres database the installer owns (the
     /// frontend and all-in-one modes; the others keep none).
     pub fn keeps_state_in_database(self) -> bool {
@@ -104,25 +100,38 @@ pub struct SetupArgs {
     /// The kbf mode this host runs (`kbf --mode=...`).
     #[arg(long, value_enum)]
     pub mode: Mode,
-    /// Where releases are fetched from.
-    #[arg(long, value_enum, default_value = "frontend")]
-    pub release_source: ReleaseSource,
+    /// Where releases are fetched from. Default: the frontend for the modes that enroll,
+    /// a file server (`url`) for `frontend` and `all-in-one`.
+    #[arg(long, value_enum)]
+    pub release_source: Option<ReleaseSource>,
     /// The https base URL of the file server, for --release-source url.
     #[arg(long)]
     pub release_url: Option<String>,
-    /// Refuse orders below this generation.
+    /// Refuse orders below this generation. A floor only goes up.
     #[arg(long)]
     pub min_generation: Option<u64>,
-    /// The first release to install (40 hex characters).
+    /// The first release to install (40 hex characters); needs --release-source url.
     #[arg(long)]
     pub commit: Option<CommitId>,
+    /// The frontend to enroll with, as https://host[:port]. For `storage`, `daemon` and
+    /// `storage-and-daemon`; written to kbf.toml.
+    #[arg(long)]
+    pub frontend_url: Option<String>,
+    /// The enrollment token (a file of mode 0600 or tighter); setup keeps a copy that only
+    /// kbf reads. For the modes that enroll.
+    #[arg(long)]
+    pub token_file: Option<String>,
+    /// The state database, as postgres:///NAME?host=SOCKET_DIR (no password). Required for
+    /// `frontend` and `all-in-one`: written to installer.toml and, as `state-store`, to
+    /// kbf.toml, and setup creates (or brings forward) its schema. The server, the database
+    /// and the role exist before setup runs.
+    #[arg(long)]
+    pub database: Option<String>,
     /// Enable the units without starting them.
     #[arg(long)]
     pub no_start: bool,
-    /// installer.toml, under the host root: for `--mode frontend` and `all-in-one`, its
-    /// `database` key names the state database whose schema `setup` creates (or brings
-    /// forward); without `--apply` it only reports what it would do. Read for those two modes
-    /// only. The same flag, with the same meaning, as on `run`.
+    /// The installer.toml `setup` writes (and reads, to keep what it does not set), under the
+    /// host root. The same flag, with the same meaning, as on `run`.
     #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]
     pub installer_config: kbf_host::HostPath,
 }
@@ -225,6 +234,16 @@ pub struct RunArgs {
 }
 
 #[derive(Args)]
+pub struct ProxyArgs {
+    /// The installer.toml whose `[proxy]` table configures the proxy.
+    #[arg(long, default_value = "/etc/kbf/installer.toml")]
+    pub config: std::path::PathBuf,
+    /// Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing.
+    #[arg(long)]
+    pub check: bool,
+}
+
+#[derive(Args)]
 pub struct BootArgs {
     #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(120..=1800))]
     pub window_secs: u64,
@@ -245,31 +264,33 @@ impl Verb {
             Verb::BootCheck(_) => "boot-check",
             Verb::Quiesce => "quiesce",
             Verb::Check => "check",
+            Verb::Proxy(_) => "proxy",
             Verb::Stage => "stage",
             Verb::Activate => "activate",
             Verb::FetchChild => "fetch-child",
         }
     }
 
-    /// Every verb but `status` and `check` needs root.
+    /// Every verb but `status`, `check` and `proxy` (which runs as the unprivileged service
+    /// user) needs root.
     pub fn needs_root(&self) -> bool {
-        !matches!(self, Verb::Status | Verb::Check)
+        !matches!(self, Verb::Status | Verb::Check | Verb::Proxy(_))
     }
 
     /// The pull request of the contract (section 9) that builds the verb, `None` for the
-    /// verbs that exist (`run`, `boot-check`, the operator's verbs and `setup` for the modes with a database).
+    /// verbs that exist (`run`, `boot-check`, `proxy`, the operator's verbs and `setup`).
     pub fn built_by(&self) -> Option<&'static str> {
         match self {
             Verb::Run(_)
             | Verb::BootCheck(_)
+            | Verb::Proxy(_)
             | Verb::Confirm(_)
             | Verb::Revert(_)
             | Verb::Rollback(_)
             | Verb::Gc(_)
-            | Verb::Quiesce => None,
-            // Only its database step is built; the rest of `setup` is not.
-            Verb::Setup(a) if a.mode.keeps_state_in_database() => None,
-            Verb::Setup(_) | Verb::Check => Some("P10"),
+            | Verb::Quiesce
+            | Verb::Setup(_) => None,
+            Verb::Check => Some("P10"),
             Verb::Status => Some("P4"),
             Verb::Update(_) => Some("P13"),
             Verb::Activate => Some("P5"),

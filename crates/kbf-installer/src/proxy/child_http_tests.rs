@@ -179,6 +179,23 @@ fn a_post_sends_its_length_and_body_after_the_headers() {
 }
 
 #[test]
+fn json_and_and_put_the_content_type_after_the_callers_headers_in_order() {
+    // Catches: a JSON type spelled other than a child's write gate reads it
+    // (`application/json`); `and` dropping a header or putting them in another order.
+    let fixture = Fixture::answer(b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\r\n".to_vec());
+    let addr = fixture.addr;
+    let both = headers(&[("X-Kbf-Proxy-Auth", "s3cret")]).and(&Headers::json());
+    fixture.client(limits()).post("/x", &both, b"{}").unwrap();
+    assert_eq!(
+        String::from_utf8(fixture.request()).unwrap(),
+        format!(
+            "POST /x HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: 2\r\n\
+             X-Kbf-Proxy-Auth: s3cret\r\nContent-Type: application/json\r\n\r\n{{}}"
+        )
+    );
+}
+
+#[test]
 fn a_status_outside_2xx_comes_back_with_its_body_and_success_turns_it_into_an_error() {
     // Catches: a refusal's body lost (a 409 carries the role view); a 4xx returned as Ok
     // by `success`.

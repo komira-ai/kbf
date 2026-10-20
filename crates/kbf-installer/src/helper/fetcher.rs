@@ -2,7 +2,8 @@
 //! where the release is (the order record's locators), returns the release installed and
 //! verified in its directory, or says why not. The cycle calls it for every activation of a
 //! commit that is not `current` (the fetcher re-verifies a directory already on the host; a
-//! directory is not proof) and changes nothing else until it returns.
+//! directory is not proof) and changes nothing else until it returns. A frontend's
+//! `frontend_update` calls it too, with no components: the source is the installer's own.
 //!
 //! The real fetcher (the unprivileged fetch child and the checks of
 //! `docs/design/pull-updates.md` 7.1 and 7.2) is wired in by a later change; until then
@@ -52,7 +53,9 @@ pub enum FetchError {
 /// Pulls and installs a release.
 pub trait Fetcher {
     /// Fetch, verify and install the release `rec` names into its directory under
-    /// `releases/`. Never moves `current` or `previous`.
+    /// `releases/`. Never moves `current` or `previous`, and never writes the state: the
+    /// caller that keeps the release records it (`staged` for a frontend update, `current`
+    /// for an activation), so a release it then refuses leaves nothing behind in the state.
     fn fetch(&self, rec: &ReleaseLocator) -> Result<InstalledRelease, FetchError>;
 }
 

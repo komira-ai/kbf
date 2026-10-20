@@ -49,7 +49,12 @@ pub struct State {
     /// The release `previous` should point to: what a rollback goes back to. Only ever a
     /// confirmed release.
     pub previous: Option<CommitId>,
-    /// A release verified and ready to swap in.
+    /// The one release installed and waiting for a decision: a frontend update staged by the
+    /// proxy's order (until its confirm makes it current or its revert drops it) or by the
+    /// operator's `stage`. Every verb that makes a release current clears it when it names
+    /// that release: `activate`, `first`, the frontend's confirm, `revert`, and the operator's
+    /// `install` and `rollback`. The verify pipeline does not write it; whoever keeps a
+    /// verified release does.
     pub staged: Option<CommitId>,
     /// A release swapped in and not yet confirmed.
     pub pending_confirm: Option<PendingConfirm>,
@@ -225,10 +230,24 @@ impl Files {
 
 /// The deploy lock, held: the only way to read the state for a change and to write it.
 /// Dropping it releases the lock.
+///
+/// An `flock` belongs to the open file description, not to the descriptor, and a
+/// description lives until every copy of the descriptor is closed. A process forked while
+/// the lock is held (any spawn of a child by another thread of this process) carries a
+/// copy until it execs, so closing the file would leave the host locked for as long as
+/// that takes. Dropping unlocks first, which no copy outlives, so the lock can be taken
+/// again once the drop returns.
 #[derive(Debug)]
 pub struct Locked {
-    _lock: File,
+    lock: File,
     files: Files,
+}
+
+impl Drop for Locked {
+    fn drop(&mut self) {
+        // An error leaves the close that follows to release the lock, as before.
+        let _ = self.lock.unlock();
+    }
 }
 
 impl Locked {
@@ -259,7 +278,7 @@ impl Locked {
             .map_err(fail)?;
         lock.lock().map_err(fail)?;
         Ok(Locked {
-            _lock: lock,
+            lock,
             files: Files::of(host),
         })
     }
@@ -289,7 +308,7 @@ impl Locked {
             std::thread::sleep(Duration::from_millis(20));
         }
         Ok(Locked {
-            _lock: lock,
+            lock,
             files: Files::of(host),
         })
     }

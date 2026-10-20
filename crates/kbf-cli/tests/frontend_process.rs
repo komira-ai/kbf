@@ -6,11 +6,12 @@
 //! children.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use kbf_cas_conformance::Subject;
+use kbf_testkit::dir::TestDir;
 use kbf_transfer::{TransferConfig, Transfers};
 use tonic::transport::Endpoint;
 
@@ -113,8 +114,10 @@ fn frontend(storage: &str, more: &[&str]) -> Proc {
 
 /// One node and one frontend process per [`Subject::fresh`].
 struct Through {
-    scratch: PathBuf,
+    // The processes come first: fields drop in order, and the directory they write in
+    // must outlive them.
     procs: Mutex<Vec<Proc>>,
+    scratch: TestDir,
 }
 
 impl Subject for Through {
@@ -133,20 +136,16 @@ impl Subject for Through {
     }
 
     fn scratch(&self) -> &Path {
-        std::fs::create_dir_all(&self.scratch).expect("scratch");
-        &self.scratch
+        self.scratch.path()
     }
 }
 
 impl Through {
     /// A subject with a scratch directory of its own: each test makes one.
     fn new() -> Self {
-        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Self {
-            scratch: Path::new(env!("CARGO_TARGET_TMPDIR"))
-                .join(format!("frontend-process-{}-{n}", std::process::id())),
             procs: Mutex::new(Vec::new()),
+            scratch: TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-process"),
         }
     }
 }
@@ -176,8 +175,7 @@ fn get(api: &str, path: &str) -> (u16, String) {
 /// `storage` once it is stopped) or does not exit 0 on SIGTERM.
 #[test]
 fn the_frontend_process_is_ready_with_its_node_and_stops_on_sigterm() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("frontend-health-{}", std::process::id()));
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-health");
     let mut node = node(&dir);
     let mut front = frontend(&node.field("storage="), &["--readyz-store-timeout-ms=500"]);
     let api = front.field("api=");
@@ -237,8 +235,7 @@ fn a_refused_frontend_start_exits_2() {
 /// holder, prints no start line.
 #[test]
 fn a_frontend_process_with_a_sqlite_state_store_is_ready_and_holds_the_file() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("frontend-state-{}", std::process::id()));
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-state");
     let node = node(&dir);
     let state = dir.join("state").join("state.db");
     let flag = format!("--state-store=sqlite://{}", state.display());
@@ -271,8 +268,7 @@ fn a_frontend_process_with_a_sqlite_state_store_is_ready_and_holds_the_file() {
 /// would otherwise hold its ports for ever).
 #[test]
 fn a_frontend_process_serves_the_admin_calls_as_active_or_as_candidate() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("frontend-admin-{}", std::process::id()));
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-admin");
     let node = node(&dir);
     let storage = format!("--storage=http://{}", node.field("storage="));
     let start = |state: &str, more: &[&str]| {
@@ -341,8 +337,7 @@ fn without_password(url: &str) -> String {
 fn a_frontend_process_with_a_postgres_state_store_is_ready_over_the_installers_schema() {
     let url = std::env::var("KBF_TEST_POSTGRES_URL")
         .expect("KBF_TEST_POSTGRES_URL names a database the test may create schemas in");
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("frontend-postgres-{}", std::process::id()));
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-postgres");
     let node = node(&dir);
     // The flag refuses a password (the command line is world-readable), so the process
     // gets the URL without one; the server the job runs trusts its loopback clients.

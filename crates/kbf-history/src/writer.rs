@@ -22,13 +22,22 @@
 //!   backlog drains: the rows come back from the object's footer with no LIST. The
 //!   invocations held are bounded by [`Limits::invocations`] (idle ones forgotten
 //!   first, then new ones refused, `stage="invocations"`).
-//! - **Headers.** A newly seen invocation's stored header (a previous life's, or this
-//!   writer's from before it forgot the invocation) is read after the drain, at most
+//! - **Headers.** Each writer keeps a header row of its own per invocation
+//!   (`ui/invid/<inv>/<writer>`), counting the records it wrote; the reader adds the rows
+//!   of every writer up, so no row has two writers. A newly seen invocation's stored
+//!   header (this writer's own, from before it forgot the invocation) is read after the
+//!   drain, at most
 //!   [`Limits::header_reads_per_step`] a step, and merged with what the writer added
 //!   meanwhile. Until the read succeeds no header row is written, so a failed read
 //!   never replaces the stored header with a fresh count. A header row that did not
 //!   commit is written again from the writer's state, and its invocation held until
 //!   one does: a closed invocation gets no later chunk to carry it.
+//! - **A superseded writer.** Once another process holds the state store's generation
+//!   (`StoreError::Fenced`), a batch is sent as two transactions: the rows this writer may
+//!   still write around the fence (`IndexRoot::permit`: its own chunk and header rows and
+//!   the inserts) and the rest, which the fence refuses and which are dropped and counted
+//!   as any refused index row is. The first refusal costs the step no transaction, so a
+//!   last step before a stop writes the rows that may land.
 //! - **Catalog and status rows.** A run of a shape the writer has not seen puts the
 //!   shape's `ui/shape` row once; a run of a test shape adds to its `ui/status` row by
 //!   read-modify-write with the by-status entry in the same transaction (see
@@ -44,7 +53,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use kbf_objstore::{ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
-use kbf_state::{Cond, Txn, Versioned};
+use kbf_state::{Cond, StoreError, Txn, Versioned};
 use prost::Message;
 
 use crate::container::{self, Encoded, Footer, Header};
@@ -240,6 +249,12 @@ struct Core {
     /// The last stream block refill failed: the next step spends its budget on rows,
     /// so a counter that keeps failing never starves them.
     refill_failed: bool,
+    /// A transaction was refused as fenced: another process holds the state store's
+    /// generation. From then on a batch is sent as two transactions, the rows this
+    /// writer may still write ([`IndexRoot::permit`](crate::IndexRoot::permit)) and
+    /// the rest, so the refusal of the shared rows does not take the pointer rows of a
+    /// chunk down with it.
+    fenced: bool,
 }
 
 impl<O: ObjectStore> Writer<O> {
@@ -275,6 +290,7 @@ impl<O: ObjectStore> Writer<O> {
                 drops: Drops::default(),
                 index_failed: false,
                 refill_failed: false,
+                fenced: false,
             },
         }
     }
@@ -342,7 +358,7 @@ impl<O: ObjectStore> Writer<O> {
     /// answering.
     async fn read_headers(&mut self) {
         for key in self.core.unread() {
-            let row = self.core.index.root().invid(&key);
+            let row = self.core.index.root().header(&key, self.core.writer);
             let Ok(stored) = self.core.index.get(row).await else {
                 return;
             };
@@ -372,7 +388,9 @@ impl<O: ObjectStore> Writer<O> {
             if batch.is_empty() {
                 return;
             }
-            budget = self.apply(batch, budget).await;
+            for part in self.core.parts(batch) {
+                budget = self.apply(part, budget).await;
+            }
         }
     }
 
@@ -400,6 +418,16 @@ impl<O: ObjectStore> Writer<O> {
                     let at = owner[conflict.index.min(owner.len() - 1)];
                     let (key, _) = batch.remove(at);
                     self.core.conflicted(&key);
+                }
+                Err(StoreError::Fenced) if self.core.fence_seen() => {
+                    // Refused whole, which wrote nothing and costs the step nothing: the
+                    // rows come back, and the next try (in this step, if it has budget
+                    // left, so a last step before a stop gets there too) sends the ones
+                    // this writer may still write on their own.
+                    for (key, row) in batch {
+                        self.core.enqueue(key, row);
+                    }
+                    return budget + 1;
                 }
                 Err(_) => {
                     self.core.index_failed = true;
@@ -473,6 +501,30 @@ impl<O: ObjectStore> Writer<O> {
 }
 
 impl Core {
+    /// Notes a fenced refusal and says whether it is the first one of a writer that can
+    /// still write rows of its own: the batch is then tried again, split. A refusal of a
+    /// writer with nothing exempt, or of a batch already split, is a failed write.
+    fn fence_seen(&mut self) -> bool {
+        let first = !self.fenced && self.index.is_exempting();
+        self.fenced = true;
+        first
+    }
+
+    /// `batch` as the transactions it is sent in: one, or after a fenced refusal two,
+    /// the rows this writer may write around the fence first, then the rest.
+    fn parts(&self, batch: Vec<(String, Row)>) -> Vec<Vec<(String, Row)>> {
+        if !self.fenced {
+            return vec![batch];
+        }
+        let (own, rest): (Vec<_>, Vec<_>) = batch
+            .into_iter()
+            .partition(|(key, row)| row.permitted(key, &|op| self.index.exempts(op)));
+        [own, rest]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect()
+    }
+
     /// Takes the queued events into the invocations' chunks.
     fn take_events(&mut self, now_ms: u64) {
         self.minter.forget_before(Day::from_ms(now_ms));
@@ -490,7 +542,9 @@ impl Core {
             && !s.unread
             && !s.unsaved
             && !self.ready.iter().any(|c| &c.inv == key)
-            && !self.pending.contains(&self.index.root().invid(key))
+            && !self
+                .pending
+                .contains(&self.index.root().header(key, self.writer))
     }
 
     /// Forgets idle invocations that are closed or were last seen before yesterday
@@ -575,7 +629,7 @@ impl Core {
         state.unsaved = true;
         let mut row = self.header_row(inv);
         row.origin = origin;
-        self.enqueue(self.index.root().invid(inv), row);
+        self.enqueue(self.index.root().header(inv, self.writer), row);
     }
 
     /// `inv`'s header row as the writer holds it, with the list entry of each instance
@@ -621,9 +675,9 @@ impl Core {
         if saved.is_empty() {
             return;
         }
-        let rows = self.index.root();
+        let (rows, writer) = (self.index.root(), self.writer);
         for (key, s) in &mut self.invs {
-            s.unsaved &= !saved.contains(rows.invid(key).as_str());
+            s.unsaved &= !saved.contains(rows.header(key, writer).as_str());
         }
     }
 
@@ -634,13 +688,13 @@ impl Core {
         if self.index_failed {
             return;
         }
-        let rows = self.index.root().clone();
+        let (rows, writer) = (self.index.root().clone(), self.writer);
         let unsaved: Vec<InvKey> = (self.invs.iter())
             .filter(|(_, s)| s.unsaved)
             .map(|(key, _)| key.clone())
             .collect();
         for key in unsaved {
-            let row = rows.invid(&key);
+            let row = rows.header(&key, writer);
             if !self.pending.contains(&row) {
                 let _refused = self.pending.insert(row, self.header_row(&key));
             }
@@ -1127,7 +1181,12 @@ impl Core {
         // stored header is read), so the footer's is put back only for one forgotten.
         if !self.invs.contains_key(&inv) {
             let header = summary.header.unwrap_or_default().encode_to_vec();
-            self.queue_row(rows.invid(&inv), header, Cond::Absent, Some(object.clone()));
+            self.queue_row(
+                rows.header(&inv, writer),
+                header,
+                Cond::Absent,
+                Some(object.clone()),
+            );
         }
         if row.runs > 0 {
             let value = StreamRow {
@@ -1194,7 +1253,7 @@ fn note(h: &mut InvocationHeader, instance: &str, time_ms: u64) {
 
 /// Lists `instance` in `h`, or, with [`MAX_INSTANCES`] listed, marks the list
 /// truncated: the names are the client's, so the header stays bounded.
-fn add_instance(h: &mut InvocationHeader, instance: &str) {
+pub(crate) fn add_instance(h: &mut InvocationHeader, instance: &str) {
     if let Err(at) = h.instances.binary_search_by(|i| i.as_str().cmp(instance)) {
         if h.instances.len() >= MAX_INSTANCES {
             h.instances_truncated = true;
@@ -1205,7 +1264,7 @@ fn add_instance(h: &mut InvocationHeader, instance: &str) {
 }
 
 /// The earlier of two times, where 0 is "none yet".
-fn earliest(a: u64, b: u64) -> u64 {
+pub(crate) fn earliest(a: u64, b: u64) -> u64 {
     match (a, b) {
         (0, t) | (t, 0) => t,
         (a, b) => a.min(b),

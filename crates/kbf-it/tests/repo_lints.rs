@@ -34,6 +34,8 @@
 //!   built, and again on the packaged tarball with `build-commit check-asset`), signing and
 //!   `darwin-asset`-checking every macOS binary, or docs/artifacts.md describing
 //!   another set (module `release_artifacts`);
+//! - the beta smoke workflow's Buck2 pin and its actions' commits drifting from
+//!   the copies they are of `ci.yml`'s (module `beta_pins`);
 //! - the coverage job's `kbf-coverage --run-id/--repo/--artifact` flags drifting from
 //!   the run and the artifact the job uploads, which breaks the download command the
 //!   ratchet prints (module `coverage_wiring`);
@@ -46,9 +48,11 @@
 mod attested_assets;
 mod attested_bundles;
 mod bake_operator_side;
+mod beta_pins;
 mod coverage_wiring;
 mod interpreters;
 mod release_artifacts;
+mod release_workflow;
 mod test_spawns;
 mod workflows;
 

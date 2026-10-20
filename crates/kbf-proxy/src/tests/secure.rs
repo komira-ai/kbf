@@ -38,6 +38,7 @@ fn identity(role: PeerRole) -> Identity {
     Identity {
         node_id: "node-1.farm".into(),
         role,
+        ips: Vec::new(),
     }
 }
 
@@ -61,14 +62,15 @@ async fn call(client: &mut Client, path: &str) -> String {
 
 /// One cell of the matrix: a proxy in `mode` whose client presented `role` (a verified
 /// certificate, or none) and `bearer`, calling `path`. Also checks the child saw the call
-/// if and only if it was let through to a child path.
+/// if and only if it was let through to a child path (`/metrics` asks the child too).
 async fn cell(mode: Buck2Auth, role: Option<PeerRole>, bearer: Option<&str>, path: &str) -> String {
     let rig = Rig::start_secure(mode, Access::Plain(role.map(identity))).await;
     let mut client = rig.client().await;
     client.bearer = bearer.map(str::to_owned);
     let got = call(&mut client, path).await;
     let reached = rig.a.state.dispatches();
-    let expected = usize::from(got == "ok" && matches!(route_of(path), Route::Child(_)));
+    let expected =
+        usize::from(got == "ok" && matches!(route_of(path), Route::Child(_) | Route::Metrics));
     assert_eq!(
         reached, expected,
         "{path} {mode:?} {role:?} {bearer:?}: {got}"
@@ -250,10 +252,27 @@ async fn an_identity_that_cannot_be_a_header_is_refused() {
     let bad = Identity {
         node_id: "bad\nname".into(),
         role: PeerRole::Daemon,
+        ips: Vec::new(),
     };
     let rig = Rig::start_secure(Buck2Auth::None, Access::Plain(Some(bad))).await;
     let reply = rig.client().await.unary(WORKER).await;
     assert_eq!(reply.grpc_status().as_deref(), Some("7"), "{reply:?}");
+    assert_eq!(rig.a.state.dispatches(), 0);
+}
+
+/// A refusal is sent from the request headers, so the stream is closed before the client's
+/// message is. A client that sends its message after the answer has landed must still read the
+/// answer (RFC 9113 section 8.1), not fail on the closed stream.
+///
+/// Kills: a test client that treats `InactiveStreamId` from `send_data` as a failure of the
+/// call, which failed `bind_run_hold_release_and_shutdown` when the refusal won the race.
+#[tokio::test(start_paused = true)]
+async fn a_refusal_that_beats_the_message_is_still_read() {
+    let rig = Rig::start_secure(Buck2Auth::Bearer, Access::Plain(None)).await;
+    let mut client = rig.client().await;
+    let reply = client.unary_after(CAPS, Duration::from_secs(1)).await;
+    assert_eq!(reply.grpc_status().as_deref(), Some("16"), "{reply:?}");
+    assert!(reply.error.is_none(), "{reply:?}");
     assert_eq!(rig.a.state.dispatches(), 0);
 }
 
@@ -330,6 +349,7 @@ async fn http_paths_are_refused_with_http_statuses() {
     let bad = Identity {
         node_id: "bad\nname".into(),
         role: PeerRole::Daemon,
+        ips: Vec::new(),
     };
     let rig = Rig::start_secure(Buck2Auth::None, Access::Plain(Some(bad))).await;
     let reply = rig.client().await.plain("GET", OPERATOR, b"").await;

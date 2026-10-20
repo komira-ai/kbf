@@ -16,6 +16,7 @@ use kbf_enroll::renew::{
     near_expiry, renew,
 };
 use kbf_enroll::store::{Node, Store, StoreError};
+use kbf_testkit::dir::TestDir;
 use kbf_types::{RefusalReason, Role, RoleSet, Token};
 use support::fake::{self, LIFE_S, Running, Spoil};
 use support::{config_for, facts, scratch};
@@ -27,6 +28,8 @@ struct Harness {
     token: Token,
     store: Store,
     node: Node,
+    /// Last, so it drops after the store that has files in it.
+    _root: TestDir,
 }
 
 async fn enrolled(name: &str) -> Harness {
@@ -60,6 +63,7 @@ async fn enrolled(name: &str) -> Harness {
         token,
         store,
         node,
+        _root: root,
     }
 }
 

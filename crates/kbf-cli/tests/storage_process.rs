@@ -5,7 +5,7 @@
 //! in-process: the store, its metadata log and its listener are the child's.
 
 use std::io::{BufRead as _, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +13,7 @@ use bytes::Bytes;
 use kbf_cas_conformance::Subject;
 use kbf_storage::Storage as _;
 use kbf_storage::service::RemoteStorage;
+use kbf_testkit::dir::TestDir;
 use kbf_transfer::{TransferConfig, Transfers};
 use tonic::transport::Endpoint;
 
@@ -85,19 +86,17 @@ fn spawn(flags: &[&str], env: &[(&str, &str)]) -> Node {
 
 /// One `kbf storage` process per [`Subject::fresh`], each over empty stores.
 struct Process {
-    scratch: PathBuf,
+    // The nodes come first: fields drop in order, and the directory they write in must
+    // outlive them.
     nodes: Mutex<Vec<Node>>,
+    scratch: TestDir,
 }
 
 impl Process {
     fn new() -> Self {
-        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("storage-process-{}-{n}", std::process::id()));
         Self {
-            scratch,
             nodes: Mutex::new(Vec::new()),
+            scratch: TestDir::under(env!("CARGO_TARGET_TMPDIR"), "storage-process"),
         }
     }
 }
@@ -114,8 +113,7 @@ impl Subject for Process {
     }
 
     fn scratch(&self) -> &Path {
-        std::fs::create_dir_all(&self.scratch).expect("scratch");
-        &self.scratch
+        self.scratch.path()
     }
 }
 
@@ -126,8 +124,7 @@ kbf_cas_conformance::tests!(Process::new());
 /// use them (the conformance suite above is the daemon's side).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_storage_client_reads_what_it_wrote_in_another_process() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("storage-client-{}", std::process::id()));
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "storage-client");
     let node = start(&dir, &[]);
     let channel = Endpoint::from_shared(format!("http://{}", node.addr))
         .expect("endpoint")
@@ -188,8 +185,7 @@ fn a_refused_start_exits_2_and_a_state_store_is_refused() {
 /// does not exit 0 on SIGTERM.
 #[test]
 fn the_s3_and_hot_store_shapes_start_and_stop_on_sigterm() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("storage-shapes-{}", std::process::id()));
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "storage-shapes");
     let meta = format!("--meta-dir={}", dir.join("s3-meta").display());
     let keys = [("AWS_ACCESS_KEY_ID", "a"), ("AWS_SECRET_ACCESS_KEY", "b")];
     let mut s3 = spawn(
@@ -215,8 +211,7 @@ fn the_s3_and_hot_store_shapes_start_and_stop_on_sigterm() {
 /// file, not to a start). Loopback without TLS is every other test here.
 #[test]
 fn plain_text_off_loopback_is_a_refused_start() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("storage-off-loopback-{}", std::process::id()));
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "storage-off-loopback");
     let cold = format!("--cold-store=file://{}", dir.join("cold").display());
     let meta = format!("--meta-dir={}", dir.join("meta").display());
     // A node that wrongly starts serves until it is killed: wait a while, then kill it

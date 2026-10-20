@@ -10,7 +10,7 @@ mod cluster_support;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
-use cluster_support::{cluster, cluster_stdin, kbf, token_file};
+use cluster_support::{Tmp, cluster, cluster_stdin, kbf, token_file};
 
 const TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
 
@@ -18,13 +18,14 @@ const TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
 const SENTINEL: &str = "SENTINEL-secret-0f3a9c71d2e84b65a1c0";
 
 /// A file holding `content` with `mode`, under the test directory.
-fn file(name: &str, content: &str, mode: u32) -> String {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kbf-cluster-os");
-    std::fs::create_dir_all(&dir).expect("a directory");
-    let path = dir.join(format!("{name}-{}", std::process::id()));
-    std::fs::write(&path, content).expect("write");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
-    path.display().to_string()
+fn file(name: &str, content: &str, mode: u32) -> Tmp {
+    let tmp = Tmp::new(&format!("kbf-cluster-os-{name}"), "file", content);
+    std::fs::set_permissions(
+        Path::new(tmp.as_str()),
+        std::fs::Permissions::from_mode(mode),
+    )
+    .expect("chmod");
+    tmp
 }
 
 /// The JSON of a request's body, without its `null` members: the shared DTOs
@@ -357,7 +358,7 @@ fn a_secret_file_others_can_read_is_refused_before_any_call() {
         ]);
         assert_eq!(code, Some(1), "{mode:o}: {err}");
         assert!(out.is_empty(), "{mode:o}: {out}");
-        assert!(err.contains(&path), "{mode:o}: {err}");
+        assert!(err.contains(path.as_str()), "{mode:o}: {err}");
         assert!(
             !err.contains(&gone),
             "{mode:o}: the server was called: {err}"
@@ -376,8 +377,10 @@ fn a_secret_that_is_missing_or_empty_is_refused_naming_its_source() {
     let gone = kbf_testkit::port::dead_addr().to_string();
     let empty = file("empty", "", 0o600);
     let newline = file("newline", "\n", 0o600);
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).display().to_string();
-    let missing = format!("{dir}/kbf-cluster-os/no-such-file");
+    let holder =
+        kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-cluster-os-dir");
+    let dir = holder.display().to_string();
+    let missing = format!("{dir}/no-such-file");
     for (source, stdin, names) in [
         (vec!["--secret-file", &empty], "", empty.as_str()),
         (vec!["--secret-file", &newline], "", newline.as_str()),

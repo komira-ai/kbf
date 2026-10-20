@@ -658,6 +658,17 @@ impl<D> ExecutionService<D> {
         window.dir_reads += walked.dirs_read;
         absent.extend(walked.absent);
         if !absent.is_empty() {
+            tracing::warn!(
+                %action,
+                count = absent.len(),
+                first = %absent
+                    .iter()
+                    .take(REFUSED_LOGGED)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "execute refused: input blob(s) are not in the CAS"
+            );
             return Err(missing(&absent));
         }
 
@@ -862,6 +873,9 @@ fn lease_kind(platform: &Platform) -> Result<LeaseKind, Status> {
             ))
         })
 }
+
+/// How many of the digests an Execute refused for missing inputs a log line names.
+const REFUSED_LOGGED: usize = 5;
 
 /// FAILED_PRECONDITION with one `MISSING` violation per blob, as REAPI asks.
 fn missing(digests: &[Digest]) -> Status {

@@ -208,12 +208,13 @@ impl World {
     /// Waits until the writer has put the header of `inv` with `records` runs and hits
     /// counted: its chunks and their rows are in the stores.
     pub async fn flushed(&self, inv: &str, records: u64) {
-        let key = IndexRoot::default().invid(&InvKey::from_record_id(inv));
+        let prefix = IndexRoot::default().header_rows(&InvKey::from_record_id(inv));
         for _ in 0..500 {
-            let row = self.state.fake.get(&key).expect("a read");
-            let counted = row
-                .and_then(|row| InvocationHeader::decode(row.value.as_slice()).ok())
-                .map_or(0, |h| h.runs + h.hits);
+            // Each writer keeps a header row of its own: the records are the sum.
+            let counted: u64 = (self.state.fake.scan_prefix(&prefix).expect("a read").iter())
+                .filter_map(|(_, row)| InvocationHeader::decode(row.value.as_slice()).ok())
+                .map(|h| h.runs + h.hits)
+                .sum();
             if counted >= records {
                 return;
             }
@@ -224,13 +225,7 @@ impl World {
 
     /// The header row of `inv`.
     pub fn header(&self, inv: &str) -> InvocationHeader {
-        let key = IndexRoot::default().invid(&InvKey::from_record_id(inv));
-        let row = self
-            .state
-            .fake
-            .get(&key)
-            .expect("a read")
-            .expect("a header");
+        let (_, row) = header_row(&self.state, inv).expect("a header");
         InvocationHeader::decode(row.value.as_slice()).expect("a header")
     }
 
@@ -240,8 +235,24 @@ impl World {
     }
 }
 
+/// The header row a writer keeps of `inv` (the first, if several writers wrote one).
+fn header_row(state: &Hooked, inv: &str) -> Option<(String, kbf_state::Versioned)> {
+    let prefix = IndexRoot::default().header_rows(&InvKey::from_record_id(inv));
+    state
+        .fake
+        .scan_prefix(&prefix)
+        .expect("a read")
+        .into_iter()
+        .next()
+}
+
+/// Replaces `inv`'s header row (the writer's own, which is the one a reader finds first;
+/// the row of a build before headers were per writer if none exists).
 pub fn set_header(state: &Hooked, inv: &str, header: &InvocationHeader) {
-    let key = IndexRoot::default().invid(&InvKey::from_record_id(inv));
+    let key = header_row(state, inv).map_or_else(
+        || IndexRoot::default().invid(&InvKey::from_record_id(inv)),
+        |(key, _)| key,
+    );
     let put = kbf_state::Txn::new().put(key, header.encode_to_vec(), kbf_state::Cond::Any);
     state.fake.txn(put).expect("a write").expect("no conflict");
 }

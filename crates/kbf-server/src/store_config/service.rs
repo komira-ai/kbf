@@ -130,7 +130,7 @@ impl ColdStoreService {
         }
         let peer = match presented {
             Presented::Proxy(identity) => match (identity.role, identity.node_id.as_deref()) {
-                (Some(PeerRole::Storage), Some(node)) => PeerCert::proxied(node),
+                (Some(PeerRole::Storage), Some(node)) => PeerCert::proxied(node, &identity.ips),
                 (Some(PeerRole::Storage) | None, _) => {
                     return Err(Status::unauthenticated(
                         "the proxy forwarded no node id and storage role",

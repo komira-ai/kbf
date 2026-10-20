@@ -249,6 +249,26 @@ impl Gates {
         gates
     }
 
+    /// Waits, at most 30 seconds, until the background thread finished its start-up
+    /// (the snapshot and the drain to the budget) and stands at [`Point::PassStarts`]:
+    /// from then on it does nothing until the cache is stopped. Only on [`Gates::new`].
+    /// A test that changes what the budget leaves the entries calls this first, or the
+    /// start-up drain may run beside its own `evict` and take half of the evictions.
+    pub fn wait_started(&self) {
+        let state = lock(&self.state);
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(30), |s| {
+                !s.reached.iter().any(|p| p == "PassStarts")
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            !timeout.timed_out(),
+            "the background thread never started; points: {:?}",
+            state.reached
+        );
+    }
+
     /// Gates with no hold: the background thread runs as in a daemon.
     pub fn running() -> Arc<Self> {
         Arc::new(Self::default())

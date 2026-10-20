@@ -36,6 +36,8 @@
 //!   `--version --json`, and on macOS the quarantine attribute and the code signature.
 //! - [`envoy`]: the Envoy of a frontend host, rendered from settings and checked (a library
 //!   for the frontend-update path, with no command line).
+//! - [`proxy_verb`]: `kbf-installer proxy`, the host of the `kbf-proxy` runtime (the one
+//!   public port of a frontend host); it shares nothing with the root helper above.
 //! - [`proxy`]: the frontend proxy's update machinery, against traits (no socket, no child):
 //!   the swap orchestrator, and in `proxy::api` the update API (routes, bearer-token check,
 //!   the actor that owns one update, idempotent request ids).
@@ -66,11 +68,13 @@ pub mod helper;
 pub mod installer_toml;
 pub mod layout;
 pub mod proxy;
+pub mod proxy_verb;
 pub mod record;
 pub mod refusal;
 pub mod release;
 pub mod run;
 pub mod settings;
+pub mod setup;
 pub mod spool;
 pub mod stage;
 pub mod state;
@@ -142,3 +146,5 @@ impl fmt::Display for CommitId {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod units_tests;

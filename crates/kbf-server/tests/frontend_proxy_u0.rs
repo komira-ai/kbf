@@ -122,35 +122,56 @@ fn the_history_index_of_a_superseded_frontend_is_refused_by_the_production_handl
 }
 
 /// The design's claim as a requirement: a fenced child can still append rows under its own
-/// writer id. FAILS today (the handle has no exempt family). Catches a U2 that adds the
-/// sticky flag but forgets that history and logs ride the same handle: the old child's
-/// open streams would then lose their run records.
+/// writer id. The plain handle refuses (the test above); the handle a history writer is
+/// given (`Store::own_keys` with the writer's permit) writes the rows of that writer
+/// around the fence and nothing else: a chunk row of another writer, and a shared row such as
+/// the stream counter, are still refused. Catches a U2 that adds the sticky flag but forgets
+/// that history rides the same handle (the old child's open streams would lose their run
+/// records), and an exemption wider than the writer's own rows.
 #[test]
-#[ignore = "U0 red: Fenced refuses every write, so section 8's 'old child appends history/log rows' has no code path; U2 adds an unfenced append handle"]
 fn a_fenced_child_can_append_rows_under_its_own_writer_id() {
     let fake = Hooked::new();
     let old = Fenced::take(Arc::clone(&fake.fake) as Arc<dyn Store>, None).expect("gen 1");
+    let root = IndexRoot::default();
+    let own = old
+        .own_keys(root.permit(WriterId(1)))
+        .expect("a fenced handle makes an own-keys handle");
     let _new = Fenced::take(Arc::clone(&fake.fake) as Arc<dyn Store>, Some(1)).expect("gen 2");
-    let key = IndexRoot::default().ichunk(&InvKey::from_record_id("r"), WriterId(1), 1);
-    let appended = old.txn(Txn::new().put(key, "row", Cond::Absent));
+    let inv = InvKey::from_record_id("r");
+    let appended = own.txn(Txn::new().put(root.ichunk(&inv, WriterId(1), 1), "row", Cond::Absent));
     assert!(
         matches!(appended, Ok(Ok(_))),
         "the design lets the old child append under its own writer id: {appended:?}"
     );
+    let foreign = own.txn(Txn::new().put(root.ichunk(&inv, WriterId(2), 1), "row", Cond::Absent));
+    assert_eq!(
+        foreign.unwrap_err(),
+        StoreError::Fenced,
+        "another writer's row"
+    );
+    let shared = own.txn(Txn::new().next(root.streams_counter()));
+    assert_eq!(
+        shared.unwrap_err(),
+        StoreError::Fenced,
+        "the stream counter"
+    );
 }
 
 /// Design section 8 says each history row has one writer because "keys are prefixed by the
-/// writing child's own instance id". In the code only the `ichunk` rows carry the writer
-/// id; the invocation header, the list entries, the shape rows and the stream counter are
-/// shared by every writer. Pins which key builders take a writer, so U2's table starts from
-/// the code and not from the design's guess.
+/// writing child's own instance id". In the code the `ichunk` rows and the per-writer header
+/// rows carry the writer id; the list entries, the shape rows and the stream counter are
+/// shared by every writer (the entries are inserts of an empty value, the rest are fenced).
+/// Pins which key builders take a writer, so U2's table starts from the code and not from the
+/// design's guess.
 #[test]
-fn only_the_history_chunk_rows_carry_the_writer_id() {
+fn only_the_history_chunk_and_header_rows_carry_the_writer_id() {
     let root = IndexRoot::default();
     let inv = InvKey::from_record_id("r");
     let (a, b) = (WriterId(0xa), WriterId(0xb));
     assert_ne!(root.ichunk(&inv, a, 1), root.ichunk(&inv, b, 1));
     assert!(root.ichunk(&inv, a, 1).contains(&a.to_string()));
+    assert_ne!(root.header(&inv, a), root.header(&inv, b));
+    assert!(root.header(&inv, a).starts_with(&root.header_rows(&inv)));
     // Everything below is the same key whichever writer asks for it.
     assert!(root.invid(&inv).starts_with("ui/invid/"));
     assert_eq!(root.streams_counter(), "ui/streams");
@@ -158,7 +179,7 @@ fn only_the_history_chunk_rows_carry_the_writer_id() {
     assert!(root.shape_prefix("main").starts_with("ui/shape/"));
     assert!(
         !root.invid(&inv).contains(&a.to_string()),
-        "ui/invid/<inv> is one row for every writer (written with Cond::Any for a header)"
+        "ui/invid/<inv> is the row every writer shared before headers were per writer"
     );
 }
 

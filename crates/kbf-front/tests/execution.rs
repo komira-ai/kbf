@@ -731,6 +731,20 @@ async fn execute_is_measured_phase_by_phase() {
     }
 }
 
+/// Turns warn logging on for the process, discarding it: the refusal line of an Execute
+/// builds its arguments only when a subscriber wants it, and the coverage of this binary's
+/// copy of `submission` must run them.
+fn warnings_enabled() {
+    static ON: std::sync::Once = std::sync::Once::new();
+    ON.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("the only subscriber");
+    });
+}
+
 /// Catches: an Execute that fails before the scheduler (an input missing, so
 /// FAILED_PRECONDITION; the scheduler refusing, so UNAVAILABLE) not counted as an error,
 /// one observed as reaching the scheduler when it did not, `in_flight` left raised by
@@ -738,6 +752,7 @@ async fn execute_is_measured_phase_by_phase() {
 /// error with its gauges lowered.
 #[tokio::test]
 async fn failed_and_abandoned_executes_count_as_errors() {
+    warnings_enabled();
     let script = Arc::new(Script::default());
     let farm = Farm::with_execution(Arc::clone(&script)).await;
     let metrics = &farm.cache.metrics().execute;

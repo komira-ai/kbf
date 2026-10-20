@@ -7,7 +7,8 @@
 //! [`BLOCK_SIZE`] the history writer reserves ahead of need from the `ui/streams`
 //! counter; when no block is at hand the [`Minter`] takes a fallback id from an
 //! in-process counter in a range no block uses (top bit set, then the writer's 7-bit
-//! frontend index, then 16 bits), so minting never waits on the state store. Fallback
+//! frontend index, then 16 bits; [`Minter::for_writer`] starts each process at a point of
+//! its own), so minting never waits on the state store. Fallback
 //! ids are not durable and are reused after a restart; the `ui/stream` row key carries
 //! the stream's open time, so a reused id still resolves to its own chunk.
 //!
@@ -201,6 +202,18 @@ struct MintState {
 }
 
 impl Minter {
+    /// A minter whose fallback ids are drawn from a point of the range that `writer`
+    /// picks (its low 16 bits are the first id's low bits, the next 7 the frontend
+    /// index), so two processes over one store (the two children of a swap) do not mint
+    /// the same fallback stream id when their counter refills fail. The writer id is a
+    /// hash of the instance id, so the points are spread over the 2^23 ids of the range.
+    #[must_use]
+    pub fn for_writer(writer: u64) -> Minter {
+        let minter = Minter::new(((writer >> 16) & 0x7F) as u8);
+        minter.state().fallback = (writer & 0xFFFF) as u16;
+        minter
+    }
+
     /// A minter for the writer whose frontend index is `frontend` (0 on the single
     /// frontend; only its low 7 bits are used). It holds no block: until the writer
     /// reserves one, ids come from the fallback range.
@@ -529,5 +542,31 @@ mod tests {
         })
         .join();
         assert!(m.mint(&inv(1), T).opened_stream);
+    }
+
+    #[test]
+    fn two_children_with_failing_refills_mint_different_fallback_ids() {
+        // Catches: every process starting its fallback counter at 0 on frontend 0, so
+        // the two children of a swap, each without a block (the old child's refill is
+        // fenced), hand the same stream id to different invocations and a reader
+        // resolving by stream id and time can take one's chunk for the other's.
+        let ids = |instance: &str| {
+            let m = Minter::for_writer(crate::keys::WriterId::from_instance(instance).0);
+            (0..200u8)
+                .map(|n| m.mint(&inv(n), T).id.stream())
+                .collect::<Vec<_>>()
+        };
+        let (a, b) = (ids("child-a"), ids("child-b"));
+        assert!(a.iter().chain(&b).all(|s| s.is_fallback()));
+        assert_ne!(a[0], b[0], "they start at different points");
+        assert!(
+            a.iter().all(|s| !b.contains(s)),
+            "and their ids do not meet"
+        );
+        assert_eq!(
+            a,
+            ids("child-a"),
+            "a writer's own ids are the same after a restart"
+        );
     }
 }

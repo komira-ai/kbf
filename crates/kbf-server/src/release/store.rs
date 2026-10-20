@@ -1,11 +1,17 @@
 //! The release store: a directory of immutable files.
 //!
 //! ```text
-//! <dir>/files/<sha256>                          a tarball, named by the digest of its bytes
+//! <dir>/files/<sha256>                          a tarball, or an attestation bundle, named by
+//!                                               the digest of its bytes
 //! <dir>/index/<commit>/<platform>/<name>        "<sha256> <size>\n": what a component is
 //! <dir>/index/<commit>/<platform>/<name>.attestation    its build attestation bundle
 //! ```
 //!
+//! - **A bundle has two names, one file.** The attestation is stored under the index and
+//!   hard-linked into `files/` under its own digest, so that `Fetch` and a `url` mirror of
+//!   `files/` serve it like a tarball (`ReleaseService.Describe` names it by that digest).
+//!   The link is made by every put of the bundle, the repeat of identical bytes included,
+//!   which also repairs a bundle stored before the link existed.
 //! - **Immutable per key.** A key (commit, platform, component) names the same bytes for
 //!   good: a second write of the same bytes changes nothing, of other bytes is
 //!   [`PutError::Conflict`]. An entry is created with a hard link, which fails when the
@@ -368,11 +374,26 @@ impl ReleaseStore {
             return Err(PutError::Empty);
         }
         let created = Self::publish_for(key, &self.attestation_path(key), &bundle).await?;
+        let sha256 = Sha256Hex::of_digest(&Sha256::digest(&bundle));
+        self.link_bundle(key, &sha256)
+            .await
+            .map_err(PutError::Disk)?;
         Ok(Stored {
             created,
-            sha256: Sha256Hex::of_digest(&Sha256::digest(&bundle)),
+            sha256,
             size: bundle.len() as u64,
         })
+    }
+
+    /// Names the stored bundle of `key` in `files/` by its digest `sha256`: the same file,
+    /// not a copy. A name that exists already is the same bytes (it is their digest).
+    async fn link_bundle(&self, key: &Key, sha256: &Sha256Hex) -> io::Result<()> {
+        let to = self.files.join(sha256.as_str());
+        match tokio::fs::hard_link(self.attestation_path(key), to).await {
+            Ok(()) => sync_dir(&self.files).await,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// The stored tarball of `key`.
@@ -400,7 +421,8 @@ impl ReleaseStore {
         read_optional(&self.attestation_path(key)).await
     }
 
-    /// The stored tarball whose digest is `sha256`, open.
+    /// The stored file whose digest is `sha256` (a tarball, or an attestation bundle),
+    /// open.
     ///
     /// # Errors
     /// The directory fails.

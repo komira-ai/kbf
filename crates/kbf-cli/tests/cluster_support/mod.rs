@@ -9,6 +9,35 @@ use std::process::Command;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// A file a test made in a directory of its own, with the file's path as text. The
+/// directory (and the file) go when this is dropped.
+pub struct Tmp {
+    path: String,
+    _dir: kbf_testkit::dir::TestDir,
+}
+
+impl Tmp {
+    /// A file `name` holding `content`, in a directory made for it under the target
+    /// directory's tmp.
+    pub fn new(dir_name: &str, name: &str, content: &str) -> Self {
+        let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), dir_name);
+        let path = dir.join(name);
+        std::fs::write(&path, content).expect("write");
+        Self {
+            path: path.display().to_string(),
+            _dir: dir,
+        }
+    }
+}
+
+impl std::ops::Deref for Tmp {
+    type Target = String;
+
+    fn deref(&self) -> &String {
+        &self.path
+    }
+}
+
 pub const BIN: &str = env!("CARGO_BIN_EXE_kbf");
 
 /// How long a test waits for the binary to call the server: a hang deadline.
@@ -92,12 +121,12 @@ pub fn kbf_stdin(args: &[&str], stdin: &str) -> (Option<i32>, String, String) {
 }
 
 /// A token file holding `token` (the client does not check its mode).
-pub fn token_file(name: &str, token: &str) -> String {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("kbf-cluster");
-    std::fs::create_dir_all(&dir).expect("a directory");
-    let path = dir.join(format!("{name}-{}", std::process::id()));
-    std::fs::write(&path, format!("{token}\n")).expect("write");
-    path.display().to_string()
+pub fn token_file(name: &str, token: &str) -> Tmp {
+    Tmp::new(
+        &format!("kbf-cluster-{name}"),
+        "token",
+        &format!("{token}\n"),
+    )
 }
 
 /// Runs `kbf cluster --api <server> <args>` against a server answering `status` and

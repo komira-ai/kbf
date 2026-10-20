@@ -86,9 +86,9 @@ fn remove_if_stale(path: &Path) -> Result<(), SignerError> {
 /// Takes the exclusive lock of `path`'s starters: `flock` on `<path>.lock` (mode 0600,
 /// never through a symlink) in the socket's directory. Two starters that both found a
 /// stale socket would otherwise both remove it and both bind; the one that cannot take
-/// the lock fails without touching the socket. The lock is the returned descriptor: it
-/// lasts as long as that is open.
-fn lock_starters(path: &Path) -> Result<OwnedFd, SignerError> {
+/// the lock fails without touching the socket. The lock is the returned [`StartersLock`]:
+/// it lasts until that is dropped.
+fn lock_starters(path: &Path) -> Result<StartersLock, SignerError> {
     let mut name = path.as_os_str().to_owned();
     name.push(".lock");
     let fd = rustix::fs::open(
@@ -101,7 +101,25 @@ fn lock_starters(path: &Path) -> Result<OwnedFd, SignerError> {
     // or a serving signer holds it), nothing is touched.
     rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive)
         .map_err(|_| SignerError::AlreadyServing(path.to_path_buf()))?;
-    Ok(fd)
+    Ok(StartersLock(fd))
+}
+
+/// The `<path>.lock` file of a socket path with its `flock` held.
+///
+/// An `flock` belongs to the open file description, not to the descriptor, and a
+/// description lives until every copy of the descriptor is closed. A process forked while
+/// the lock is held (any spawn of a child by another thread of this process) carries a
+/// copy until it execs, so closing the file would leave the path locked for as long as
+/// that takes. Dropping unlocks first, which no copy outlives, so the path can be bound
+/// again once the drop returns.
+#[derive(Debug)]
+struct StartersLock(OwnedFd);
+
+impl Drop for StartersLock {
+    fn drop(&mut self) {
+        // An error leaves the close that follows to release the lock, as before.
+        let _ = rustix::fs::flock(&self.0, FlockOperation::Unlock);
+    }
 }
 
 /// A socket bound by [`bind`], and the lock that keeps a second signer off its path. It
@@ -110,7 +128,7 @@ fn lock_starters(path: &Path) -> Result<OwnedFd, SignerError> {
 #[derive(Debug)]
 pub struct Bound {
     listener: UnixListener,
-    _lock: OwnedFd,
+    _lock: StartersLock,
 }
 
 impl Deref for Bound {
@@ -267,5 +285,35 @@ impl<S: Signer> SignerServer<S> {
             Ok(signature) => (wire::OK, signature),
             Err(e) => (wire::FAILED, e.0.into_bytes()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kbf_testkit::forked::ForkedChild;
+
+    use super::*;
+
+    /// Catches: a starters' lock the drop releases only by closing its descriptor, which a
+    /// process forked while it was held keeps held until it execs: a second starter is
+    /// then refused with `AlreadyServing` for as long as a child is between fork and exec.
+    /// The child here is held before exec until the lock has been taken again, so the
+    /// interleaving is the failing one every time. The lock alone is taken, not `bind`:
+    /// the bound socket has the same property (a forked child keeps the listener open,
+    /// and so answering), which is not what this test is about.
+    ///
+    /// Mutant: the `Drop` of `StartersLock` removed.
+    #[test]
+    fn a_child_forked_while_the_lock_was_held_does_not_keep_it_after_the_drop() {
+        let dir = std::env::temp_dir().join(format!("kbf-signer-unit-{}", std::process::id()));
+        prepare_dir(&dir).expect("a directory of mode 0700");
+        let socket = dir.join("sock");
+        let first = lock_starters(&socket).expect("the first lock");
+        let child = ForkedChild::before_exec();
+        drop(first);
+        let again = lock_starters(&socket);
+        drop(again.expect("a lock after the drop, with the forked child still alive"));
+        child.finish();
+        fs::remove_dir_all(&dir).expect("remove");
     }
 }
