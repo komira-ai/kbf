@@ -75,9 +75,9 @@ pub struct InstallerToml {
     /// The node identity the fetch child is lent, for the frontend source.
     pub node_cert: Option<PathBuf>,
     pub node_key: Option<PathBuf>,
-    /// The `[proxy]` table, read by `kbf-installer proxy` and, for `listen`, by `setup`. The
-    /// operator writes it; [`InstallerToml::render`] writes it back whole (with the defaults
-    /// filled in), so a `setup` run that rewrites the file keeps it.
+    /// The `[proxy]` table, read by `kbf-installer proxy`. `setup` writes the keys it has
+    /// flags for on a `--proxy` host and keeps the rest; [`InstallerToml::render`] writes the
+    /// whole table, so a file that is read and rendered keeps every key of it.
     pub proxy: Option<ProxyConfig>,
     /// The state database of a frontend or all-in-one host: a `postgres://` URL without a
     /// password (the file is world-readable). `crate::database` reads this file a second time,
@@ -380,8 +380,9 @@ impl InstallerToml {
         }
     }
 
-    /// The canonical text: every key in a fixed order, the unset optional ones left out, then
-    /// the `[proxy]` table if there is one.
+    /// The canonical text: every key in a fixed order, the unset optional ones left out. The
+    /// `[proxy]` table, when there is one, comes last with every key it has, defaults
+    /// included, so what an operator hand-edited in it survives a rewrite.
     pub fn render(&self) -> String {
         let mut out = String::new();
         match &self.source {
@@ -427,19 +428,68 @@ impl InstallerToml {
             out.push_str(&format!("backup_keep = {n}\n"));
         }
         if let Some(proxy) = &self.proxy {
-            #[derive(serde::Serialize)]
-            struct Table<'a> {
-                proxy: &'a ProxyConfig,
-            }
-            out.push('\n');
-            out.push_str(&toml::to_string(&Table { proxy }).expect("a proxy table is TOML"));
+            render_proxy(proxy, &mut out);
         }
         out
     }
 }
 
+/// The `[proxy]` table, every key, in the order of `kbf_proxy::config::ProxyConfig`; its
+/// sub-tables follow its plain keys. Paths go through [`toml_string`].
+fn render_proxy(p: &ProxyConfig, out: &mut String) {
+    let path = |p: &std::path::Path| toml_string(&p.display().to_string());
+    out.push_str("\n[proxy]\n");
+    if let Some(listen) = p.listen {
+        out.push_str(&format!("listen = \"{listen}\"\n"));
+    }
+    out.push_str(&format!(
+        "operator_token_file = {}\n",
+        path(&p.operator_token_file)
+    ));
+    if let Some(file) = &p.server_cert_file {
+        out.push_str(&format!("server_cert_file = {}\n", path(file)));
+    }
+    if let Some(file) = &p.server_key_file {
+        out.push_str(&format!("server_key_file = {}\n", path(file)));
+    }
+    out.push_str(&format!("client_ca_file = {}\n", path(&p.client_ca_file)));
+    out.push_str(&format!("buck2_auth = \"{}\"\n", p.buck2_auth.name()));
+    if let Some(file) = &p.buck2_token_file {
+        out.push_str(&format!("buck2_token_file = {}\n", path(file)));
+    }
+    out.push_str(&format!("proxy_auth_file = {}\n", path(&p.proxy_auth_file)));
+    out.push_str(&format!("state_dir = {}\n", path(&p.state_dir)));
+    out.push_str(&format!("hold_max_s = {}\n", p.hold_max_s));
+    for cert in &p.server_cert {
+        out.push_str("\n[[proxy.server_cert]]\n");
+        let names: Vec<String> = cert.names.iter().map(|n| toml_string(n)).collect();
+        out.push_str(&format!("names = [{}]\n", names.join(", ")));
+        out.push_str(&format!("cert_file = {}\n", path(&cert.cert_file)));
+        out.push_str(&format!("key_file = {}\n", path(&cert.key_file)));
+        if cert.default {
+            out.push_str("default = true\n");
+        }
+    }
+    out.push_str("\n[proxy.upstream]\n");
+    out.push_str(&format!("base_port = {}\n", p.upstream.base_port));
+    let l = &p.limits;
+    out.push_str("\n[proxy.limits]\n");
+    for (key, value) in [
+        ("pre_stream_timeout_s", l.pre_stream_timeout_s),
+        ("max_connections", l.max_connections as u64),
+        ("max_connections_per_ip", l.max_connections_per_ip as u64),
+        ("max_streams", l.max_streams as u64),
+        ("memory_budget_mib", l.memory_budget_mib),
+        ("max_header_list_bytes", u64::from(l.max_header_list_bytes)),
+        ("keepalive_interval_s", l.keepalive_interval_s),
+        ("keepalive_ack_s", l.keepalive_ack_s),
+    ] {
+        out.push_str(&format!("{key} = {value}\n"));
+    }
+}
+
 /// `text` as a TOML basic string: Rust's `{:?}` is not TOML (it writes `\'` and `\u{..}`).
-fn toml_string(text: &str) -> String {
+pub(crate) fn toml_string(text: &str) -> String {
     let mut out = String::from("\"");
     for c in text.chars() {
         match c {
