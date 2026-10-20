@@ -74,7 +74,7 @@ fn a_proxy_host_gets_the_proxy_table_and_a_kbf_toml_without_tls_files() {
 /// Catches a proxy host that still enables `kbf-frontend.service` (two things would then
 /// want the same ports and the same state), or one that leaves the proxy's units out or in the
 /// wrong order (the socket holds the port before the service takes it): exactly the socket,
-/// the service, the backup timer and the installer's own, the first two enabled and not started.
+/// the service and the installer's own, the first two enabled and not started.
 #[test]
 fn a_proxy_host_enables_the_proxy_units_and_not_the_frontend_instance() {
     let mut exec = proxy_host();
@@ -84,7 +84,6 @@ fn a_proxy_host_enables_the_proxy_units_and_not_the_frontend_instance() {
         [
             "run /usr/bin/systemctl enable -- kbf-proxy.socket",
             "run /usr/bin/systemctl enable -- kbf-proxy.service",
-            "run /usr/bin/systemctl enable --now -- kbf-backup.timer",
             "run /usr/bin/systemctl enable --now -- kbf-installer.service",
         ]
     );
@@ -105,7 +104,6 @@ fn a_frontend_host_without_the_flag_is_what_it_was() {
         systemctl(&exec),
         [
             "run /usr/bin/systemctl enable -- kbf-frontend.service",
-            "run /usr/bin/systemctl enable --now -- kbf-backup.timer",
             "run /usr/bin/systemctl enable --now -- kbf-installer.service",
         ]
     );
@@ -140,7 +138,7 @@ fn a_rerun_of_a_proxy_host_is_a_no_op() {
     let mut exec = proxy_host();
     go_ok(&FakeOs::linux(), &mut exec, &proxy_raw());
     let steps = exec.log.len();
-    let units = ["kbf-proxy.socket", "kbf-proxy.service", "kbf-backup.timer"];
+    let units = ["kbf-proxy.socket", "kbf-proxy.service"];
     go_ok(&settled(&units), &mut exec, &proxy_raw());
     assert_eq!(exec.log.len(), steps, "{:?}", &exec.log[steps..]);
 }

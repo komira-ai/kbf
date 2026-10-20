@@ -23,11 +23,6 @@ pub const FETCH_TIMEOUT_S: std::ops::RangeInclusive<u32> = 60..=3600;
 pub const MAX_COMPONENT_BYTES_CEILING: u64 = 1 << 30;
 /// A day: the longest minimum gap between two activations.
 pub const MIN_ACTIVATION_INTERVAL_CEILING_S: u32 = 86_400;
-/// The backups `kbf-installer backup` keeps (`backup_keep`): at least the newest one, at most a
-/// year of daily dumps.
-pub const BACKUP_KEEP: std::ops::RangeInclusive<u32> = 1..=365;
-/// What `backup_keep` is when the file does not say.
-pub const DEFAULT_BACKUP_KEEP: u32 = 7;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,7 +43,6 @@ struct Raw {
     /// keys are closed the same way.
     proxy: Option<toml::Value>,
     database: Option<String>,
-    backup_keep: Option<u32>,
 }
 
 /// Where releases are fetched from.
@@ -84,10 +78,6 @@ pub struct InstallerToml {
     /// leniently (only this key, and it refuses a password); this field exists so that the
     /// closed reader here does not reject the key, and it has no other consumer.
     pub database: Option<String>,
-    /// How many backups of the state database `kbf-installer backup` keeps; `None` is
-    /// [`DEFAULT_BACKUP_KEEP`]. Read by `crate::backup`, which refuses a file this reader
-    /// refuses.
-    pub backup_keep: Option<u32>,
 }
 
 impl Default for InstallerToml {
@@ -106,7 +96,6 @@ impl Default for InstallerToml {
             node_key: None,
             proxy: None,
             database: None,
-            backup_keep: None,
         }
     }
 }
@@ -334,15 +323,6 @@ impl InstallerToml {
             MIN_ACTIVATION_INTERVAL_CEILING_S,
             &mut problems,
         );
-        if let Some(n) = raw.backup_keep
-            && !BACKUP_KEEP.contains(&n)
-        {
-            problems.push(format!(
-                "backup_keep = {n}: must be {} to {}",
-                BACKUP_KEEP.start(),
-                BACKUP_KEEP.end()
-            ));
-        }
         let node_cert = absolute("node_cert", &raw.node_cert, &mut problems);
         let node_key = absolute("node_key", &raw.node_key, &mut problems);
         if node_cert.is_some() != node_key.is_some() && problems.is_empty() {
@@ -374,7 +354,6 @@ impl InstallerToml {
                 node_key,
                 proxy,
                 database: raw.database,
-                backup_keep: raw.backup_keep,
             }),
             _ => Err(ConfigError::Invalid(problems)),
         }
@@ -423,9 +402,6 @@ impl InstallerToml {
         }
         if let Some(url) = &self.database {
             out.push_str(&format!("database = {}\n", toml_string(url)));
-        }
-        if let Some(n) = self.backup_keep {
-            out.push_str(&format!("backup_keep = {n}\n"));
         }
         if let Some(proxy) = &self.proxy {
             render_proxy(proxy, &mut out);

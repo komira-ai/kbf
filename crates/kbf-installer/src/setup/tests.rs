@@ -750,15 +750,9 @@ fn each_mode_enables_its_own_units() {
         } else {
             " --now"
         };
-        // The modes that keep their state in Postgres also get the backup timer, started
-        // (the schema it dumps is made before the units are enabled).
-        let backup = mode
-            .keeps_state_in_database()
-            .then(|| "run /usr/bin/systemctl enable --now -- kbf-backup.timer".to_owned());
         let expected: Vec<String> = units
             .iter()
             .map(|u| format!("run /usr/bin/systemctl enable{now} -- {u}"))
-            .chain(backup)
             .chain(["run /usr/bin/systemctl enable --now -- kbf-installer.service".to_owned()])
             .collect();
         assert_eq!(enables, expected, "{mode:?}");
@@ -1692,8 +1686,8 @@ mod proxy_tests;
 #[path = "proxy_listen_tests.rs"]
 mod proxy_listen;
 
-#[path = "backup_dropin_tests.rs"]
-mod backup_dropin;
+#[path = "old_backup_tests.rs"]
+mod old_backup;
 
 /// Catches the journal's `kit` flag not reaching the `kbf.toml` decision: on the same Mac with
 /// the same kit file, a finished kit migration (`DoneKit`) lets setup add its keys and keep the
