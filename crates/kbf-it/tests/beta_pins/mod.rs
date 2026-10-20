@@ -1,18 +1,20 @@
-//! The beta smoke workflow (`.github/workflows/beta.yml`) fetches the same Buck2
-//! as `ci.yml` and runs the same actions, and its text says so by copying `ci.yml`'s pins:
-//! `BUCK2_VERSION`, `BUCK2_SHA256` and each action's commit.
-//! A bump in `ci.yml` that leaves a copy behind would have the smoke test other bytes than
+//! The beta smoke job (`smoke` in `.github/workflows/beta.yml`) fetches the same Buck2
+//! as the other jobs of that workflow (the M1 and M2 cells) and runs the same actions, and
+//! its text says so by copying their pins: `BUCK2_VERSION`, `BUCK2_SHA256` and each
+//! action's commit.
+//! A bump in one job that leaves a copy behind would have the smoke test other bytes than
 //! the rest of CI, with nothing red to say so. [`mismatches`] compares them: every pin the
-//! smoke job sets must be set in some job of `ci.yml`, to the same value in every job that
-//! sets it, and every action the smoke job uses must be used by `ci.yml` at the same commit.
+//! smoke job sets must be set in some other job, to the same value in every job that sets
+//! it, and every action the smoke job uses must be used by another job at the same commit.
 
 use std::collections::BTreeMap;
 
 use super::workflows;
 
-/// The smoke workflow and the one it copies from.
+/// The workflow that holds the smoke job and the jobs it copies from.
 const BETA: &str = ".github/workflows/beta.yml";
-const CI: &str = ".github/workflows/ci.yml";
+/// What a message calls the jobs the smoke job copies from.
+const CI: &str = ".github/workflows/beta.yml (another job)";
 
 /// The job of the smoke workflow that holds the pins.
 const JOB: &str = "smoke";
@@ -32,7 +34,7 @@ fn mismatches(beta: &str, ci: &str) -> Result<Vec<String>, String> {
     let beta_env = workflows::job_env(beta, JOB)?;
     let mut ci_env: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     let mut ci_uses: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for job in workflows::job_names(ci)? {
+    for job in workflows::job_names(ci)?.into_iter().filter(|j| j != JOB) {
         for (key, value) in workflows::job_env(ci, &job)? {
             ci_env.entry(key).or_default().push((job.clone(), value));
         }
@@ -84,10 +86,11 @@ fn mismatches(beta: &str, ci: &str) -> Result<Vec<String>, String> {
 
 #[test]
 fn the_beta_workflow_copies_the_pins_of_ci() {
-    // Catches: a Buck2 or action bump in ci.yml that leaves beta.yml on the old pin.
+    // Catches: a Buck2 or action bump in another job of beta.yml that leaves the smoke job on
+    // the old pin.
     let root = super::repo_root();
     let read = |path: &str| std::fs::read_to_string(root.join(path)).expect(path);
-    assert_eq!(mismatches(&read(BETA), &read(CI)), Ok(Vec::new()));
+    assert_eq!(mismatches(&read(BETA), &read(BETA)), Ok(Vec::new()));
 }
 
 /// The rules [`mismatches`] reads the two workflows by, on planted ones.
