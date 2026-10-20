@@ -32,7 +32,8 @@ pub struct Ours<'a> {
     pub extra: &'a [Setting],
 }
 
-/// The tables of the file, in the order they are written. A table not listed follows them.
+/// The tables of the file, in the order they are written: every table a setting can be in
+/// (a test renders each mode's file and compares it with its golden, so a missing one fails).
 const TABLE_ORDER: [&str; 9] = [
     "frontend",
     "enroll",
@@ -56,13 +57,7 @@ impl Ours<'_> {
              # keys it writes; run setup again to change these.\n",
         );
         out.push_str(&format!("mode = \"{}\"\n", self.mode));
-        let mut tables: Vec<&str> = TABLE_ORDER.to_vec();
-        for (at, _, _) in &keys {
-            if !at.is_empty() && !tables.contains(at) {
-                tables.push(*at);
-            }
-        }
-        for at in tables {
+        for at in TABLE_ORDER {
             let mut first = true;
             for (_, key, value) in keys.iter().filter(|(t, _, _)| *t == at) {
                 if first {
@@ -180,8 +175,17 @@ pub fn decide(current: Option<&str>, ours: &Ours<'_>) -> Decision {
     if differ.is_empty() {
         Decision::Keep
     } else {
+        let api = differ
+            .iter()
+            .any(|d| d.starts_with("[listener] api-listen"));
+        let way = if api {
+            "edit them by hand, or pass --api-listen with the address in the file (a run without it \
+             means the default 127.0.0.1:8982)"
+        } else {
+            "edit them by hand"
+        };
         Decision::Refuse(format!(
-            "{} holds other settings and these keys differ from the flags ({}): edit them by hand",
+            "{} holds other settings and these keys differ from the flags ({}): {way}",
             super::paths::KBF_TOML,
             differ.join("; ")
         ))

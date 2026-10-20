@@ -251,7 +251,7 @@ fn the_same_flags_again_change_nothing_and_a_changed_flag_rewrites_once() {
     go_ok(&FakeOs::linux(), &mut exec, &raw);
     let before = text(&exec, KBF_TOML);
     exec.log.clear();
-    let os = settled(&["kbf-frontend@a.service"]);
+    let os = settled(&["kbf-frontend.service"]);
     let out = go_ok(&os, &mut exec, &raw);
     assert!(exec.log.is_empty(), "{:?}", exec.log);
     assert!(out.contains(kbf_host::plan::NOTHING_TO_DO), "{out}");
@@ -367,6 +367,11 @@ fn a_file_with_the_operators_settings_is_kept_when_the_new_keys_match_and_refuse
         assert_eq!(err.exit(), Exit::NeedsOperator, "{key}");
         let shown = err.to_string();
         assert!(shown.contains(key), "{key}: {shown}");
+        assert_eq!(
+            shown.contains("--api-listen"),
+            key == "[listener] api-listen",
+            "{key}: the way forward is named: {shown}"
+        );
         assert!(
             !shown.contains(to) || key == "[identity] node-id",
             "{key}: {shown}"
@@ -420,7 +425,7 @@ fn a_file_that_is_not_what_its_kind_needs_is_refused_before_anything_is_written(
         perms: Perms::new(0o755),
         owner: ROOT,
     };
-    let cases: [(&str, Option<Entry>, &str); 10] = [
+    let cases: [(&str, Option<Entry>, &str); 11] = [
         ("/etc/kbf/reapi.key", None, "no such file"),
         (
             "/etc/kbf/reapi.key",
@@ -446,6 +451,11 @@ fn a_file_that_is_not_what_its_kind_needs_is_refused_before_anything_is_written(
         (
             "/etc/kbf/reapi.pem",
             Some(file(0o664, ROOT)),
+            "writable by its group or by others",
+        ),
+        (
+            "/etc/kbf/reapi.pem",
+            Some(file(0o646, ROOT)),
             "writable by its group or by others",
         ),
         (
@@ -480,6 +490,11 @@ fn a_file_that_is_not_what_its_kind_needs_is_refused_before_anything_is_written(
     let raw = frontend();
     let mut exec = host_for(&raw);
     put(&mut exec, "/etc/kbf/reapi.key", 0o700, KBF_SERVER, "key");
+    go_ok(&FakeOs::linux(), &mut exec, &raw);
+    // A certificate the service user owns passes as root's does.
+    let raw = frontend();
+    let mut exec = host_for(&raw);
+    put(&mut exec, "/etc/kbf/ca.pem", 0o644, KBF_SERVER, "cert");
     go_ok(&FakeOs::linux(), &mut exec, &raw);
     // The all-in-one daemon half's files get the same look.
     let raw = all_in_one();

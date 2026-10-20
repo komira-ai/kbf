@@ -387,49 +387,47 @@ fn check_refuses_what_a_start_refuses() {
     );
 }
 
-/// Catches `kbf check-args` changed from what `kbf-deploy` calls: it still parses the
-/// flags and exits 0, with nothing on stdout and none of the host's checks (a certificate
-/// that is not there is fine), and it says on stderr, in one line, that it is deprecated
-/// and what to use. Exit 2 is kept for flags a start refuses.
+/// Catches `--check` that passes a command line a start refuses for its words, not its
+/// host: a flag no mode has, and a mode that is not one (`cluster` is a command, not a
+/// mode). Each exits 2 in both spellings of the mode, with the refusal as the first line
+/// of standard error, nothing on standard output, and a data directory a start would make
+/// still absent. `kbf-deploy` used to ask this of `kbf check-args`.
 #[test]
-fn check_args_still_parses_and_says_it_is_deprecated() {
-    let ok = run(&strings(&[
-        "check-args",
-        "daemon",
+fn check_refuses_an_unknown_flag_and_a_word_that_is_not_a_mode() {
+    let dir = scratch("check-unknown-flag");
+    let data = dir.join("data");
+    let node = [
         "--driver=container",
         "--server=https://127.0.0.1:1",
         "--ca-cert=/nonexistent/ca.pem",
         "--cert=/nonexistent/node.pem",
         "--key=/nonexistent/node.key",
         "--node-id=n",
-    ]));
-    assert_eq!(ok.code, Some(0), "{}", ok.err);
-    assert!(ok.out.is_empty());
-    assert_eq!(ok.err.lines().count(), 1, "{}", ok.err);
-    assert!(
-        ok.err.contains("deprecated") && ok.err.contains("--check"),
-        "{}",
-        ok.err
-    );
-    let bad = run(&strings(&["check-args", "daemon", "--bogus-flag"]));
-    assert_eq!(bad.code, Some(2));
-    // The refusal is the first line, which `kbf-deploy` reports; the note is the last.
-    assert!(
-        bad.err
-            .lines()
-            .next()
-            .is_some_and(|l| l.contains("unexpected argument '--bogus-flag'")),
-        "{}",
-        bad.err
-    );
-    assert!(
-        bad.err
-            .lines()
-            .last()
-            .is_some_and(|l| l.contains("deprecated")),
-        "{}",
-        bad.err
-    );
+    ];
+    for mode in ["daemon", "--mode=daemon"] {
+        let mut words = vec![mode.to_owned(), "--check".to_owned()];
+        words.extend(node.iter().map(|f| (*f).to_owned()));
+        words.push(format!("--data-dir={}", data.display()));
+        words.push("--bogus-flag".to_owned());
+        let r = run(&words);
+        assert_eq!(r.code, Some(2), "{mode}: {}", r.err);
+        assert!(r.out.is_empty(), "{mode}: {}", r.out);
+        assert!(
+            r.err
+                .lines()
+                .next()
+                .is_some_and(|l| l.contains("unexpected argument '--bogus-flag'")),
+            "{mode}: {}",
+            r.err
+        );
+        assert!(!data.exists(), "{mode}: --check made {}", data.display());
+    }
+    for word in ["cluster", "no-such-mode"] {
+        let r = run(&strings(&[&format!("--mode={word}"), "--check"]));
+        assert_eq!(r.code, Some(2), "{word}: {}", r.err);
+        assert!(r.out.is_empty(), "{word}: {}", r.out);
+        assert!(r.err.contains(word), "{word}: {}", r.err);
+    }
 }
 
 /// A running `kbf storage`, killed when dropped.

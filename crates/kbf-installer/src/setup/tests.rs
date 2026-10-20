@@ -646,7 +646,7 @@ fn a_missing_service_user_is_refused_before_any_write() {
 #[test]
 fn each_mode_enables_its_own_units() {
     let want: [(Mode, &[&str]); 5] = [
-        (Mode::Frontend, &["kbf-frontend@a.service"]),
+        (Mode::Frontend, &["kbf-frontend.service"]),
         (Mode::Storage, &["kbf-storage.service"]),
         (Mode::Daemon, &["kbf-daemon.service"]),
         (Mode::StorageAndDaemon, &["kbf-storage-and-daemon.service"]),
@@ -1270,9 +1270,20 @@ fn each_failure_has_its_exit_code_and_word() {
             "fetch",
         ),
         (
-            SetupError::OldLayout("/x".into()),
+            SetupError::OldLayout {
+                path: "/x".into(),
+                fetch_user: "kbf-fetch",
+            },
             Exit::NeedsOperator,
             "old_layout",
+        ),
+        (
+            SetupError::ShadowUnit {
+                path: "/x".into(),
+                unit: "u",
+            },
+            Exit::NeedsOperator,
+            "unit_shadow",
         ),
         (
             SetupError::Release(crate::release::ReleaseError::NoPrevious),
@@ -1485,8 +1496,18 @@ fn every_failure_reads_as_a_sentence() {
             "no release fetcher",
         ),
         (
-            SetupError::OldLayout("/usr/local/kbf".into()),
+            SetupError::OldLayout {
+                path: "/usr/local/kbf".into(),
+                fetch_user: "kbf-fetch",
+            },
             "/usr/local/kbf",
+        ),
+        (
+            SetupError::ShadowUnit {
+                path: "/etc/systemd/system/a.service".into(),
+                unit: "a.service",
+            },
+            "shadows the packaged unit a.service",
         ),
         (
             SetupError::Release(crate::release::ReleaseError::NoPrevious),
@@ -1540,3 +1561,6 @@ mod kbf_settings_tests;
 
 #[path = "proxy_tests.rs"]
 mod proxy_tests;
+
+#[path = "proxy_listen_tests.rs"]
+mod proxy_listen;

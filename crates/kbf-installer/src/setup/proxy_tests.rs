@@ -1,5 +1,5 @@
 //! Tests of `setup --proxy` (B-g): the `[proxy]` table written into `installer.toml`, the
-//! units enabled instead of `kbf-frontend@a.service`, what a rerun does with a table that is
+//! units enabled instead of `kbf-frontend.service`, what a rerun does with a table that is
 //! there, and a refusal for each flag that would write a value nothing reads. The helpers
 //! are `tests.rs`'s. Each test says the defect it catches; the mutants planted to see them go
 //! red are in the pull request.
@@ -71,7 +71,7 @@ fn a_proxy_host_gets_the_proxy_table_and_a_kbf_toml_without_tls_files() {
     assert_eq!(table.operator_token_file.to_str(), Some(API_TOKEN));
 }
 
-/// Catches a proxy host that still enables `kbf-frontend@a.service` (two things would then
+/// Catches a proxy host that still enables `kbf-frontend.service` (two things would then
 /// want the same ports and the same state), or one that leaves the proxy's units out or in the
 /// wrong order (the socket holds the port before the service takes it): exactly the socket,
 /// the service and the installer's own, the first two enabled and not started.
@@ -90,7 +90,7 @@ fn a_proxy_host_enables_the_proxy_units_and_not_the_frontend_instance() {
 }
 
 /// Catches a host without `--proxy` changing: its `installer.toml` has no `[proxy]` table, its
-/// unit is `kbf-frontend@a.service`, and the proxy's units are not touched.
+/// unit is `kbf-frontend.service`, and the proxy's units are not touched.
 #[test]
 fn a_frontend_host_without_the_flag_is_what_it_was() {
     let mut exec = proxy_host();
@@ -103,7 +103,7 @@ fn a_frontend_host_without_the_flag_is_what_it_was() {
     assert_eq!(
         systemctl(&exec),
         [
-            "run /usr/bin/systemctl enable -- kbf-frontend@a.service",
+            "run /usr/bin/systemctl enable -- kbf-frontend.service",
             "run /usr/bin/systemctl enable --now -- kbf-installer.service",
         ]
     );
@@ -127,7 +127,7 @@ fn a_dry_run_shows_the_proxy_plan_and_changes_nothing() {
         out.contains("DRY-RUN: run /usr/bin/systemctl enable -- kbf-proxy.socket"),
         "{out}"
     );
-    assert!(!out.contains("kbf-frontend@a"), "{out}");
+    assert!(!out.contains("kbf-frontend.service"), "{out}");
     assert!(exec.log.is_empty(), "{:?}", exec.log);
 }
 
@@ -184,6 +184,71 @@ fn a_proxy_rerun_keeps_the_keys_it_has_no_flag_for() {
         "the file was rewritten: {:?}",
         exec.log
     );
+}
+
+/// A proxy host's file whose certificates are a `[[proxy.server_cert]]` list (the default
+/// entry is the certificate the flags name, a second one is chosen by name) instead of the
+/// single pair, spelled as `render` writes it.
+fn sni_list() -> String {
+    let single = "server_cert_file = \"/etc/kbf/reapi.pem\"\nserver_key_file = \"/etc/kbf/reapi.key\"\n";
+    assert!(PROXY_GOLDEN.contains(single));
+    PROXY_GOLDEN.replace(single, "").replace(
+        "\n[proxy.upstream]",
+        "\n[[proxy.server_cert]]\nnames = []\ncert_file = \"/etc/kbf/reapi.pem\"\nkey_file = \"/etc/kbf/reapi.key\"\ndefault = true\n\n[[proxy.server_cert]]\nnames = [\"a.example\"]\ncert_file = \"/etc/kbf/a.pem\"\nkey_file = \"/etc/kbf/a.key\"\n\n[proxy.upstream]",
+    )
+}
+
+/// Catches `setup` dropping or rewriting the proxy's `[[server_cert]]` list on a rerun (the
+/// flags name the pair, the table holds it as the default entry): the table is one the
+/// proxy's own parser accepts with both entries, the file is left byte for byte, no write of
+/// it is planned.
+#[test]
+fn a_rerun_passes_a_server_cert_list_through_unchanged() {
+    let mut exec = proxy_host();
+    let there = sni_list();
+    let parsed = InstallerToml::parse(&there).expect("the proxy's parser takes the list");
+    assert_eq!(parsed.proxy.as_ref().map(|p| p.server_cert.len()), Some(2));
+    assert_eq!(parsed.render(), there);
+    put(&mut exec, INSTALLER_TOML, 0o644, ROOT, &there);
+    go_ok(&FakeOs::linux(), &mut exec, &proxy_raw());
+    assert_eq!(text(&exec, INSTALLER_TOML), there);
+    assert!(
+        !exec
+            .log
+            .iter()
+            .any(|s| matches!(s, Step::WriteFile { path, .. } if path.as_str() == INSTALLER_TOML)),
+        "the file was rewritten: {:?}",
+        exec.log
+    );
+}
+
+/// Catches a rewrite over a list: flags that differ from the list's default entry, or from
+/// another owned key, are refused naming the key and no value, and the file stays as it was.
+/// The list is the operator's, so the table counts as tuned.
+#[test]
+fn a_differing_owned_key_over_a_server_cert_list_is_refused() {
+    let there = sni_list();
+    let edits: [(&str, fn(&mut Raw)); 2] = [
+        ("server_cert_file", |r| {
+            r.kbf.reapi_tls_cert = some("/etc/kbf/other.pem")
+        }),
+        ("upstream.base_port", |r| {
+            r.proxy.proxy_base_port = Some(19_000)
+        }),
+    ];
+    for (key, edit) in edits {
+        let mut exec = proxy_host();
+        put(&mut exec, "/etc/kbf/other.pem", 0o644, ROOT, "cert");
+        put(&mut exec, INSTALLER_TOML, 0o644, ROOT, &there);
+        let mut raw = proxy_raw();
+        edit(&mut raw);
+        let err = go(&FakeOs::linux(), &mut exec, &raw, APPLY).expect_err(key);
+        assert_eq!(err.exit(), Exit::NeedsOperator, "{key}");
+        let shown = err.to_string();
+        assert!(shown.contains(&format!("({key})")), "{key}: {shown}");
+        assert!(!shown.contains("other.pem") && !shown.contains("19000"), "{shown}");
+        assert_eq!(text(&exec, INSTALLER_TOML), there, "{key}");
+    }
 }
 
 /// One row per key `setup` owns: the key as the refusal names it, and the golden file with
@@ -332,16 +397,16 @@ fn a_kbf_toml_with_the_children_tls_keys_is_refused_on_a_proxy_host() {
 fn an_enabled_frontend_instance_is_named_and_left_alone() {
     let mut exec = proxy_host();
     let mut os = FakeOs::linux();
-    os.enabled.insert("kbf-frontend@a.service".to_owned());
+    os.enabled.insert("kbf-frontend.service".to_owned());
     let out = go_ok(&os, &mut exec, &proxy_raw());
     assert!(
-        out.contains("kbf-frontend@a.service is enabled and the proxy starts the frontend itself"),
+        out.contains("kbf-frontend.service is enabled and the proxy starts the frontend itself"),
         "{out}"
     );
     assert!(
         systemctl(&exec)
             .iter()
-            .all(|c| !c.contains("disable") && !c.contains("frontend@a")),
+            .all(|c| !c.contains("disable") && !c.contains("kbf-frontend.service")),
         "{:?}",
         systemctl(&exec)
     );

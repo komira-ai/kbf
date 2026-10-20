@@ -40,13 +40,16 @@ use crate::identity::{DenyList, Peers};
 use crate::listen::Binder;
 use crate::members::{Members, MembershipError};
 use crate::members_rpc::MembershipService;
+use crate::object_store::delivery::Delivery;
 use crate::proxy_auth::{ProxyAuthLayer, ProxySecret, gate_requests};
 use crate::state_store::StateStore;
+use crate::store_config::service::ColdStoreService;
 use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
 use crate::worker_roles::WorkerRolesLayer;
 use kbf_mapsync::MapSource;
+use kbf_proto::kbf::enroll::v1::cold_store_server::ColdStoreServer;
 use kbf_proto::kbf::map::v1::membership_server::MembershipServer;
 
 /// How the server listens and paces its daemons.
@@ -423,21 +426,48 @@ pub(crate) fn map_of(
 
 /// The membership service storage nodes register with, when there are members to keep:
 /// under worker TLS only the storage role may call it, each certificate for the names it
-/// holds and not if the listener's deny list refuses it. Not generic, for the same reason
-/// as [`sweeping`].
+/// holds and not if the listener's deny list refuses it. With a `delivery` its answers
+/// carry the registration generation and its heartbeats are recorded as acks. Not generic,
+/// for the same reason as [`sweeping`].
 pub(crate) fn membership(
     members: Option<Arc<Members>>,
     peers: &Peers,
+    delivery: Option<&Delivery>,
 ) -> Option<MembershipServer<MembershipService>> {
-    let (admission, deny_list) = match peers {
-        Peers::Certified { deny_list } => (Admission::Certified, deny_list.clone()),
-        Peers::Unauthenticated => (Admission::Open, None),
+    let (admission, deny_list) = admitted(peers);
+    let service = MembershipService::new(members?, admission).with_deny_list(deny_list);
+    let service = match delivery {
+        Some(delivery) => {
+            service.with_store_config(Arc::clone(&delivery.source), Arc::clone(&delivery.acks))
+        }
+        None => service,
     };
+    Some(service.server())
+}
+
+/// The `ColdStore` service storage nodes fetch the registered cold store from, when there
+/// are a registration to serve and members to check a caller against: admitted as
+/// [`membership`] admits, and refusing the nodes the operator's `deny/` rows name at every
+/// call. Not generic, for the same reason as [`sweeping`].
+pub(crate) fn cold_store(
+    members: Option<Arc<Members>>,
+    peers: &Peers,
+    delivery: Option<&Delivery>,
+) -> Option<ColdStoreServer<ColdStoreService>> {
+    let (admission, deny_list) = admitted(peers);
     Some(
-        MembershipService::new(members?, admission)
+        ColdStoreService::new(Arc::clone(&delivery?.source), admission)
             .with_deny_list(deny_list)
+            .with_denied_rows(Some(members?))
             .server(),
     )
+}
+
+fn admitted(peers: &Peers) -> (Admission, Option<DenyList>) {
+    match peers {
+        Peers::Certified { deny_list } => (Admission::Certified, deny_list.clone()),
+        Peers::Unauthenticated => (Admission::Open, None),
+    }
 }
 
 /// Expires members while the server runs. Never completes; with no state store there
@@ -709,6 +739,7 @@ where
         .as_ref()
         .map(|s| crate::update::Rows::new(Arc::clone(&s.store)));
     let update_store = state.as_ref().map(|s| Arc::clone(&s.store));
+    let update_members = members.clone();
     let farm = Arc::new(farm.with_state(state)?);
     // One start, one bind budget: the three listeners wait for a late interface together.
     let binder = Binder::new();
@@ -827,7 +858,7 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    let membership = membership(members.clone(), &peers);
+    let membership = membership(members.clone(), &peers, None);
     let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,
@@ -890,10 +921,15 @@ where
         // and they never delay it. It stops when the serving future does.
         let history = crate::history::spawn(history);
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
-        // The rolling-update controller; it starts no host until `auto_nodes` is set.
-        let _updates =
-            crate::update::spawn_controller(Arc::clone(&farm), update_store, listeners.tick)
-                .map(AbortOnDrop);
+        // The rolling-update controller; it starts hosts for the desired release unless the
+        // operator wrote `auto_nodes` false or paused it.
+        let _updates = crate::update::spawn_controller(
+            Arc::clone(&farm),
+            update_store,
+            update_members,
+            listeners.tick,
+        )
+        .map(AbortOnDrop);
         // `reapi_incoming` carries the REAPI TLS when there is any, so the health
         // service is served over the same TLS as the REAPI routes; the authenticator is
         // already applied to those routes alone (above).

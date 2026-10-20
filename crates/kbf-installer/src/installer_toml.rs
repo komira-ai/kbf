@@ -415,15 +415,19 @@ impl InstallerToml {
 fn render_proxy(p: &ProxyConfig, out: &mut String) {
     let path = |p: &std::path::Path| toml_string(&p.display().to_string());
     out.push_str("\n[proxy]\n");
+    if let Some(listen) = p.listen {
+        out.push_str(&format!("listen = \"{listen}\"\n"));
+    }
     out.push_str(&format!(
         "operator_token_file = {}\n",
         path(&p.operator_token_file)
     ));
-    out.push_str(&format!(
-        "server_cert_file = {}\n",
-        path(&p.server_cert_file)
-    ));
-    out.push_str(&format!("server_key_file = {}\n", path(&p.server_key_file)));
+    if let Some(file) = &p.server_cert_file {
+        out.push_str(&format!("server_cert_file = {}\n", path(file)));
+    }
+    if let Some(file) = &p.server_key_file {
+        out.push_str(&format!("server_key_file = {}\n", path(file)));
+    }
     out.push_str(&format!("client_ca_file = {}\n", path(&p.client_ca_file)));
     out.push_str(&format!("buck2_auth = \"{}\"\n", p.buck2_auth.name()));
     if let Some(file) = &p.buck2_token_file {
@@ -432,6 +436,16 @@ fn render_proxy(p: &ProxyConfig, out: &mut String) {
     out.push_str(&format!("proxy_auth_file = {}\n", path(&p.proxy_auth_file)));
     out.push_str(&format!("state_dir = {}\n", path(&p.state_dir)));
     out.push_str(&format!("hold_max_s = {}\n", p.hold_max_s));
+    for cert in &p.server_cert {
+        out.push_str("\n[[proxy.server_cert]]\n");
+        let names: Vec<String> = cert.names.iter().map(|n| toml_string(n)).collect();
+        out.push_str(&format!("names = [{}]\n", names.join(", ")));
+        out.push_str(&format!("cert_file = {}\n", path(&cert.cert_file)));
+        out.push_str(&format!("key_file = {}\n", path(&cert.key_file)));
+        if cert.default {
+            out.push_str("default = true\n");
+        }
+    }
     out.push_str("\n[proxy.upstream]\n");
     out.push_str(&format!("base_port = {}\n", p.upstream.base_port));
     let l = &p.limits;

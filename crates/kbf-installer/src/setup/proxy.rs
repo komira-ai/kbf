@@ -4,7 +4,7 @@
 //! `--mode=frontend --proxy` makes the host one that `kbf-installer proxy` serves: the proxy
 //! owns the public port (the socket unit's), starts the frontend children itself on loopback
 //! ports counted up from `--proxy-base-port`, and terminates TLS. So `setup` writes the proxy's
-//! table, enables the proxy's two units instead of `kbf-frontend@a.service`, and leaves the
+//! table, enables the proxy's two units instead of `kbf-frontend.service`, and leaves the
 //! TLS files out of `kbf.toml` (the children speak plain h2c behind the proxy):
 //!
 //! | flag | key of `[proxy]` |
@@ -23,6 +23,9 @@
 //!
 //! The table is read and written as `kbf_proxy::config::ProxyConfig`, so a key of it that
 //! `setup` has no flag for is kept by a rerun (`take_owned` copies the owned keys only). A
+//! `[[proxy.server_cert]]` list is the operator's: its default entry stands for the single
+//! pair the flags give, so a rerun whose flags name that entry's files keeps the list as it
+//! is, and flags that differ from it are refused, never written over the list. A
 //! `kbf.toml` that still has the `[tls]` keys of a host before the proxy is refused
 //! ([`leftover_tls_keys`]): the children would serve TLS behind a proxy that speaks h2c.
 //!
@@ -73,7 +76,7 @@ impl AuthFlag {
 pub struct ProxyFlags {
     /// Set this frontend host up behind `kbf-installer proxy`: write the `[proxy]` table of
     /// installer.toml and enable kbf-proxy.socket and kbf-proxy.service instead of
-    /// kbf-frontend@a.service. Only for `--mode=frontend`. The proxy takes --reapi-tls-cert,
+    /// kbf-frontend.service. Only for `--mode=frontend`. The proxy takes --reapi-tls-cert,
     /// --reapi-tls-key and --worker-client-ca; the listener flags are not taken.
     #[arg(long)]
     pub proxy: bool,
@@ -302,8 +305,14 @@ fn differing(a: &ProxyConfig, b: &ProxyConfig) -> Vec<&'static str> {
             a.operator_token_file != b.operator_token_file,
             "operator_token_file",
         ),
-        (a.server_cert_file != b.server_cert_file, "server_cert_file"),
-        (a.server_key_file != b.server_key_file, "server_key_file"),
+        (
+            default_cert(a).map(|c| c.0) != default_cert(b).map(|c| c.0),
+            "server_cert_file",
+        ),
+        (
+            default_cert(a).map(|c| c.1) != default_cert(b).map(|c| c.1),
+            "server_key_file",
+        ),
         (a.client_ca_file != b.client_ca_file, "client_ca_file"),
         (a.buck2_auth != b.buck2_auth, "buck2_auth"),
         (a.buck2_token_file != b.buck2_token_file, "buck2_token_file"),
@@ -317,11 +326,30 @@ fn differing(a: &ProxyConfig, b: &ProxyConfig) -> Vec<&'static str> {
     .collect()
 }
 
-/// Copy the keys `setup` owns from `from` into `to`.
+/// The certificate and key `setup` owns: the single pair, or, in a table with a
+/// `[[server_cert]]` list, the entry that is the default (the only one, or the one marked).
+/// The flags `--reapi-tls-cert` and `--reapi-tls-key` are compared with this pair.
+fn default_cert(c: &ProxyConfig) -> Option<(&std::path::Path, &std::path::Path)> {
+    if let (Some(cert), Some(key)) = (&c.server_cert_file, &c.server_key_file) {
+        return Some((cert, key));
+    }
+    let entry = c
+        .server_cert
+        .iter()
+        .find(|e| e.default)
+        .or_else(|| (c.server_cert.len() == 1).then(|| &c.server_cert[0]))?;
+    Some((&entry.cert_file, &entry.key_file))
+}
+
+/// Copy the keys `setup` owns from `from` into `to`. The `[[server_cert]]` list is the
+/// operator's: a table that has one keeps it and keeps its certificates, so a difference in
+/// them is left for the caller to refuse.
 fn take_owned(from: &ProxyConfig, to: &mut ProxyConfig) {
     to.operator_token_file = from.operator_token_file.clone();
-    to.server_cert_file = from.server_cert_file.clone();
-    to.server_key_file = from.server_key_file.clone();
+    if to.server_cert.is_empty() {
+        to.server_cert_file = from.server_cert_file.clone();
+        to.server_key_file = from.server_key_file.clone();
+    }
     to.client_ca_file = from.client_ca_file.clone();
     to.buck2_auth = from.buck2_auth;
     to.buck2_token_file = from.buck2_token_file.clone();

@@ -57,6 +57,9 @@ pub enum Verb {
     Gc(GcArgs),
     /// Run before each start of a release on trial; counts the start.
     BootCheck(BootArgs),
+    /// Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's
+    /// tree, or put it back with `--rollback`. A dry run without `--apply`.
+    Migrate(MigrateArgs),
     /// For maintainer scripts: take the lock; exit 5 while a swap is pending.
     Quiesce,
     /// Validate the installer's configuration, trust files and path chain.
@@ -179,12 +182,13 @@ pub struct ServiceArgs {
 
 impl ServiceArgs {
     /// Whether the service this installer restarts is the unit of a mode that keeps its state
-    /// in the database (`kbf-frontend@<instance>.service`, `kbf-all-in-one.service` or its
+    /// in the database (`kbf-frontend.service`, `kbf-frontend@<instance>.service`, `kbf-all-in-one.service` or its
     /// template `kbf-all-in-one@<instance>.service`): the installer is not told the host's
     /// mode, the unit it restarts is the one place that names it. A launchd label names no mode.
     pub fn runs_database_mode(&self) -> bool {
         self.unit.as_deref().is_some_and(|u| {
             u == "kbf-all-in-one.service"
+                || u == "kbf-frontend.service"
                 || (["kbf-frontend@", "kbf-all-in-one@"]
                     .iter()
                     .any(|p| u.starts_with(p))
@@ -219,8 +223,14 @@ pub struct RunArgs {
     /// The order spool: owned by the service user, mode 0700, inside a root-owned parent.
     #[arg(long, default_value = "/var/lib/kbf-installer/orders", value_parser = kbf_host::HostPath::new)]
     pub orders_dir: kbf_host::HostPath,
-    #[command(flatten)]
-    pub service: ServiceArgs,
+    /// The systemd unit to restart after a swap (Linux). Without it and without
+    /// `--launchd-label`, the unit of the mode in the host's kbf.toml, which is how the one
+    /// packaged kbf-installer.service serves every mode.
+    #[arg(long, conflicts_with = "launchd_label")]
+    pub unit: Option<String>,
+    /// The launchd label to kickstart after a swap (macOS).
+    #[arg(long)]
+    pub launchd_label: Option<String>,
     /// The confirm window the boot check gives a release on trial (120 to 1800).
     #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(120..=1800))]
     pub window_secs: u64,
@@ -235,9 +245,48 @@ pub struct RunArgs {
     pub passes: Option<u64>,
     /// installer.toml, under the host root: its `database` key is the state database the
     /// installer migrates to what a release needs before that release is activated. Required
-    /// when the unit restarted after a swap is a frontend's or the all-in-one's.
+    /// when the unit restarted after a swap is a frontend's or the all-in-one's, unless the
+    /// unit comes from kbf.toml's mode (no --unit): then /etc/kbf/installer.toml is the default.
     #[arg(long, value_parser = kbf_host::HostPath::new)]
     pub installer_config: Option<kbf_host::HostPath>,
+}
+
+impl RunArgs {
+    /// The service this `run` restarts, when the flags name it; `None` when neither does.
+    pub fn named_service(&self) -> Option<ServiceArgs> {
+        (self.unit.is_some() || self.launchd_label.is_some()).then(|| ServiceArgs {
+            unit: self.unit.clone(),
+            launchd_label: self.launchd_label.clone(),
+        })
+    }
+}
+
+#[derive(Args)]
+pub struct MigrateArgs {
+    /// Put the old layout back instead (refused once the installer has moved the host on).
+    #[arg(long)]
+    pub rollback: bool,
+    /// A unit that runs kbf from `/usr/local/kbf/current`, to repoint at the installer's tree
+    /// (repeat for several; `.service`, or `.plist` for launchd).
+    #[arg(long = "unit", value_parser = crate::migrate::Unit::new)]
+    pub units: Vec<crate::migrate::Unit>,
+    /// The old helper's unit: stopped and disabled, so the installer is the only manager.
+    #[arg(long, value_parser = crate::migrate::Unit::new)]
+    pub helper_unit: Option<crate::migrate::Unit>,
+    /// The installer's own unit, which a rollback stops and disables first.
+    #[arg(long, value_parser = crate::migrate::Unit::new)]
+    pub installer_unit: Option<crate::migrate::Unit>,
+    /// Where the host gets its releases: decides where the replay floor is seeded from.
+    #[arg(long, value_enum, default_value = "url")]
+    pub release_source: ReleaseSource,
+    /// The lowest generation an order may carry: the floor when there is no frontend to ask.
+    /// Without it and without a frontend the host starts with no generation floor, and the
+    /// run says so.
+    #[arg(long)]
+    pub min_generation: Option<u64>,
+    /// The unprivileged user the old binaries' `--version --json` runs as.
+    #[arg(long, default_value = "kbf-fetch")]
+    pub fetch_user: String,
 }
 
 #[derive(Args)]
@@ -269,6 +318,7 @@ impl Verb {
             Verb::Rollback(_) => "rollback",
             Verb::Gc(_) => "gc",
             Verb::BootCheck(_) => "boot-check",
+            Verb::Migrate(_) => "migrate",
             Verb::Quiesce => "quiesce",
             Verb::Check => "check",
             Verb::Proxy(_) => "proxy",
@@ -284,8 +334,38 @@ impl Verb {
         !matches!(self, Verb::Status | Verb::Check | Verb::Proxy(_))
     }
 
+    /// Whether the verb changes what a host runs or how it is managed, so it must not run
+    /// while the old layout's state is the host's and unmigrated (the old helper and the
+    /// installer never both manage one host; `migrate` is how that ends). `status`, `check`,
+    /// `boot-check`, `quiesce` and `migrate` itself change no release; `fetch-child` is the
+    /// unprivileged process a verb that does manage the host starts, and manages nothing.
+    ///
+    /// Every verb is named (no `_`): a verb added later does not compile until it says
+    /// which it is.
+    pub fn manages_host(&self) -> bool {
+        match self {
+            Verb::Setup(_)
+            | Verb::Run(_)
+            | Verb::Update(_)
+            | Verb::Confirm(_)
+            | Verb::Revert(_)
+            | Verb::Rollback(_)
+            | Verb::Gc(_)
+            | Verb::Stage
+            | Verb::Activate => true,
+            Verb::Status
+            | Verb::Check
+            | Verb::BootCheck(_)
+            | Verb::Quiesce
+            | Verb::Migrate(_)
+            | Verb::Proxy(_)
+            | Verb::FetchChild => false,
+        }
+    }
+
     /// The pull request of the contract (section 9) that builds the verb, `None` for the
-    /// verbs that exist (`run`, `boot-check`, `proxy`, the operator's verbs and `setup`).
+    /// verbs that exist (`run`, `boot-check`, `proxy`, the operator's verbs, `setup` and
+    /// `migrate`).
     pub fn built_by(&self) -> Option<&'static str> {
         match self {
             Verb::Run(_)
@@ -295,6 +375,7 @@ impl Verb {
             | Verb::Revert(_)
             | Verb::Rollback(_)
             | Verb::Gc(_)
+            | Verb::Migrate(_)
             | Verb::Quiesce
             | Verb::Setup(_) => None,
             Verb::Check => Some("P10"),

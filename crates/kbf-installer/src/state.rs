@@ -49,7 +49,12 @@ pub struct State {
     /// The release `previous` should point to: what a rollback goes back to. Only ever a
     /// confirmed release.
     pub previous: Option<CommitId>,
-    /// A release verified and ready to swap in.
+    /// The one release installed and waiting for a decision: a frontend update staged by the
+    /// proxy's order (until its confirm makes it current or its revert drops it) or by the
+    /// operator's `stage`. Every verb that makes a release current clears it when it names
+    /// that release: `activate`, `first`, the frontend's confirm, `revert`, and the operator's
+    /// `install` and `rollback`. The verify pipeline does not write it; whoever keeps a
+    /// verified release does.
     pub staged: Option<CommitId>,
     /// A release swapped in and not yet confirmed.
     pub pending_confirm: Option<PendingConfirm>,
@@ -245,24 +250,32 @@ impl Drop for Locked {
     }
 }
 
+/// Make the directory of the layout's lock file (0755) when it is missing: it is on a tmpfs,
+/// and a host the installer never ran on has none. [`Locked::acquire`] does it; a caller of
+/// [`Locked::acquire_within`], which does not, on a host that may be new does it first.
+pub fn make_lock_dir(host: &Layout) -> Result<(), StateError> {
+    use std::os::unix::fs::DirBuilderExt;
+    let path = host.join(&host.lock());
+    // A lock path always has a parent; the root stands in for the impossible case.
+    let dir = path.parent().unwrap_or(Path::new("/"));
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(dir)
+        .map_err(|source| StateError::Lock { path, source })
+}
+
 impl Locked {
     /// Take the exclusive lock on the layout's lock file (`/run/kbf-installer/lock`; the
     /// directory is made, 0755, when missing), waiting while another run holds it. The lock
     /// file is made (mode 0600) when missing.
     pub fn acquire(host: &Layout) -> Result<Locked, StateError> {
+        make_lock_dir(host)?;
         let path = host.join(&host.lock());
         let fail = |source| StateError::Lock {
             path: path.clone(),
             source,
         };
-        use std::os::unix::fs::DirBuilderExt;
-        // A lock path always has a parent; the root stands in for the impossible case.
-        let dir = path.parent().unwrap_or(std::path::Path::new("/"));
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o755)
-            .create(dir)
-            .map_err(fail)?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)

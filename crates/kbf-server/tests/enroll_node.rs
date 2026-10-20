@@ -186,6 +186,30 @@ fn facts() -> NodeFacts {
     }
 }
 
+/// The frontend restarted over the farm's store and CA with `worker_endpoint` as its
+/// `--enroll-worker-endpoint`: another listener, on another port.
+fn restart(farm: &Farm, worker_endpoint: &str) -> (u16, kbf_server::enroll::start::Serving) {
+    let mut flags = flags_for(farm.ca_dir.clone(), Limits::DEFAULT, true, 86_400);
+    flags.settings.worker_endpoint = worker_endpoint.to_owned();
+    let prepared = prepare(&flags).expect("prepared");
+    assert_eq!(prepared.ca().pin(), farm.pin, "the same CA");
+    let port = prepared.local().port();
+    let mut serving = prepared.serve(Arc::clone(&farm.store)).expect("serving");
+    let listener = std::mem::replace(&mut serving.listener, Box::pin(std::future::pending()));
+    tokio::spawn(listener);
+    (port, serving)
+}
+
+/// A connection to the frontend listening on `port` (the node's configured URL names the
+/// first listener's).
+async fn dial_at(node: &Node, token: &Token, port: u16) -> Frontend {
+    let mut url = node.config.frontend.clone();
+    url.port = port;
+    connect(&url, Anchor::Pin(*token.pin()))
+        .await
+        .expect("connect")
+}
+
 async fn dial(node: &Node, token: &Token) -> Frontend {
     connect(&node.config.frontend, Anchor::Pin(*token.pin()))
         .await
@@ -564,4 +588,146 @@ async fn an_external_signer_start_uses_the_signers_root_and_makes_no_key() {
         .expect("prepared against the signer");
     assert_eq!(prepared.ca().pin(), authority.pin());
     assert!(!ca_dir.join("ca.key").exists(), "the frontend holds no key");
+}
+
+/// Registers the cold store in the farm's registry, as an operator does, and returns the
+/// key pair it registered (id and secret) so a test can look for them.
+fn register_cold(farm: &Farm) -> (&'static str, &'static str) {
+    use kbf_server::enroll::OsRandom;
+    use kbf_server::object_store::Registry;
+    use kbf_types::object_store_api::{BindingPut, BindingRole, ConnectionPut, Secret};
+    const KEY_ID: &str = "AKIDE2EKEYID";
+    const SECRET: &str = "e2e-secret-access-key-value";
+    let registry = Registry::open(
+        Arc::clone(&farm.store),
+        &scratch("registry-secrets"),
+        Arc::new(OsRandom),
+    )
+    .expect("registry");
+    let name = "cold".parse().expect("name");
+    registry
+        .put_connection(
+            &name,
+            &ConnectionPut {
+                endpoint: "http://objects.test:9000".to_owned(),
+                region: None,
+                access_key_id: KEY_ID.to_owned(),
+                secret_access_key: Secret::new(SECRET.to_owned()),
+                conditional_put: None,
+                min_put_rate: None,
+                expect_generation: None,
+                verify: None,
+            },
+        )
+        .expect("connection");
+    registry
+        .put_binding(
+            BindingRole::Cold,
+            &BindingPut {
+                connection: name,
+                bucket: "farm".to_owned(),
+                prefix: "cold/".to_owned(),
+                expect_generation: None,
+                verify: None,
+            },
+        )
+        .expect("binding");
+    (KEY_ID, SECRET)
+}
+
+const STORE: &str = "s3://farm/cold/?endpoint=http%3A%2F%2Fobjects.test%3A9000&region=us-east-1";
+
+/// A storage node enrolled over TLS while a store is registered holds the store in the
+/// `node.json` its client wrote, and no key.
+///
+/// Catches: the frontend's answer reaching a real node with no cold store (the node
+/// refuses to start its storage half), and the registered key pair reaching a node's disk.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_storage_node_enrolled_after_the_registration_holds_the_cold_store() {
+    let farm = start("cold-store", Limits::DEFAULT).await;
+    let (key_id, secret) = register_cold(&farm);
+    let token = farm.token(0x3333, &[Role::Storage], 1);
+    let node = node("cold-store-node", &farm, &token, true);
+    let enrolled = enroll_with(&node, &token, &[Role::Storage])
+        .await
+        .expect("enrolled");
+    assert_eq!(enrolled.config.cold_store, STORE);
+    let on_disk =
+        std::fs::read_to_string(node.config.state_dir.join("pki/node.json")).expect("node.json");
+    assert!(on_disk.contains(STORE), "{on_disk}");
+    assert!(
+        !on_disk.contains(key_id) && !on_disk.contains(secret),
+        "{on_disk}"
+    );
+}
+
+/// A node enrolled before the registration holds the store after its next renewal.
+///
+/// Catches: a store registered later that never reaches a node that only renews (the
+/// configuration generation not following the registry's).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_storage_node_enrolled_before_the_registration_is_sent_the_store_at_renewal() {
+    let farm = start("cold-store-late", Limits::DEFAULT).await;
+    let token = farm.token(0x4444, &[Role::Storage], 1);
+    let node = node("cold-store-late-node", &farm, &token, true);
+    let first = enroll_with(&node, &token, &[Role::Storage])
+        .await
+        .expect("enrolled");
+    assert_eq!(first.config.cold_store, "", "nothing was registered yet");
+
+    register_cold(&farm);
+    farm.advance(120);
+    let frontend = dial(&node, &token).await;
+    let renewed = renew(&frontend, &node.store, unix_now() + 120)
+        .await
+        .expect("renewed");
+    assert_eq!(renewed.config.cold_store, STORE);
+    assert!(renewed.config.generation > first.config.generation);
+}
+
+/// A node enrolled while the frontend named one worker endpoint, renewing through the same
+/// frontend restarted (same CA, same registry) with another, holds the other afterwards, on
+/// disk as well; a restart with the same flags re-sends nothing.
+///
+/// Catches: step 2b of the cutover needing a re-enrollment of every node (the configuration
+/// generation ignoring the `--enroll-worker-endpoint` flag), and a node.json rewritten with
+/// a new generation at every renewal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_is_sent_the_worker_endpoint_the_restarted_frontend_names() {
+    let farm = start("endpoint-moved", Limits::DEFAULT).await;
+    let token = farm.token(0x5555, &[Role::Daemon], 1);
+    let node = node("endpoint-moved-node", &farm, &token, false);
+    let first = enroll_with(&node, &token, &[Role::Daemon])
+        .await
+        .expect("enrolled");
+    assert_eq!(first.config.worker_endpoint, "https://localhost:7443");
+
+    // The same flags: nothing to send.
+    let (port, _same) = restart(&farm, "https://localhost:7443");
+    farm.advance(120);
+    let renewed = renew(
+        &dial_at(&node, &token, port).await,
+        &node.store,
+        unix_now() + 120,
+    )
+    .await
+    .expect("renewed");
+    assert_eq!(renewed.config, first.config);
+
+    // A new `--enroll-worker-endpoint`: the next renewal carries it.
+    let (port, _moved) = restart(&farm, "https://proxy.test:443");
+    farm.advance(120);
+    let renewed = renew(
+        &dial_at(&node, &token, port).await,
+        &node.store,
+        unix_now() + 240,
+    )
+    .await
+    .expect("renewed");
+    assert_eq!(renewed.config.worker_endpoint, "https://proxy.test:443");
+    assert_ne!(renewed.config.generation, first.config.generation);
+    let on_disk =
+        std::fs::read_to_string(node.config.state_dir.join("pki/node.json")).expect("node.json");
+    assert!(on_disk.contains("https://proxy.test:443"), "{on_disk}");
+    assert!(!on_disk.contains("https://localhost:7443"), "{on_disk}");
 }

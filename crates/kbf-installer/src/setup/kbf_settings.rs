@@ -123,98 +123,94 @@ struct Spec {
     need: Need,
 }
 
-const fn spec(
-    flag: Option<&'static str>,
-    table: &'static str,
-    key: &'static str,
-    kind: Want,
-    takes: Takes,
-    need: Need,
-) -> Spec {
-    Spec {
-        flag,
-        table,
-        key,
-        kind,
-        takes,
-        need,
-    }
+// Macros, not `const fn`s: the table is a constant, and a function run only at compile time
+// has no coverage.
+macro_rules! spec {
+    ($flag:expr, $table:expr, $key:expr, $kind:expr, $takes:expr, $need:expr $(,)?) => {
+        Spec {
+            flag: $flag,
+            table: $table,
+            key: $key,
+            kind: $kind,
+            takes: $takes,
+            need: $need,
+        }
+    };
 }
 
-const fn f(name: &'static str, table: &'static str, kind: Want, takes: Takes, need: Need) -> Spec {
-    spec(Some(name), table, name, kind, takes, need)
+/// A setting whose flag has the name of its key.
+macro_rules! same {
+    ($name:expr, $table:expr, $kind:expr, $takes:expr, $need:expr $(,)?) => {
+        spec!(Some($name), $table, $name, $kind, $takes, $need)
+    };
 }
 
-const fn renamed(
-    flag: &'static str,
-    table: &'static str,
-    key: &'static str,
-    kind: Want,
-    takes: Takes,
-    need: Need,
-) -> Spec {
-    spec(Some(flag), table, key, kind, takes, need)
+/// A setting whose flag is named differently from its key.
+macro_rules! renamed {
+    ($flag:expr, $table:expr, $key:expr, $kind:expr, $takes:expr, $need:expr $(,)?) => {
+        spec!(Some($flag), $table, $key, $kind, $takes, $need)
+    };
 }
 
 /// The settings, in the order of the written file within each table.
 const SPECS: [Spec; 20] = [
-    f(
+    same!(
         "listen",
         "listener",
         Want::Addr,
         Takes::Serving,
         Need::Optional,
     ),
-    f(
+    same!(
         "worker-listen",
         "listener",
         Want::Addr,
         Takes::Serving,
         Need::Optional,
     ),
-    f(
+    same!(
         "api-listen",
         "listener",
         Want::Addr,
         Takes::Serving,
         Need::Default("127.0.0.1:8982"),
     ),
-    f(
+    same!(
         "reapi-tls-cert",
         "tls",
         Want::Cert,
         Takes::Serving,
         Need::Optional,
     ),
-    f(
+    same!(
         "reapi-tls-key",
         "tls",
         Want::Key,
         Takes::Serving,
         Need::Optional,
     ),
-    f(
+    same!(
         "worker-tls-cert",
         "tls",
         Want::Cert,
         Takes::Serving,
         Need::Optional,
     ),
-    f(
+    same!(
         "worker-tls-key",
         "tls",
         Want::Key,
         Takes::Serving,
         Need::Optional,
     ),
-    f(
+    same!(
         "worker-client-ca",
         "tls",
         Want::Cert,
         Takes::Serving,
         Need::Optional,
     ),
-    renamed(
+    renamed!(
         "storage-url",
         "storage-client",
         "storage",
@@ -222,42 +218,42 @@ const SPECS: [Spec; 20] = [
         Takes::Frontend,
         Need::Required,
     ),
-    f(
+    same!(
         "storage-ca",
         "storage-client",
         Want::Cert,
         Takes::Frontend,
         Need::Optional,
     ),
-    f(
+    same!(
         "storage-client-cert",
         "storage-client",
         Want::Cert,
         Takes::Frontend,
         Need::Optional,
     ),
-    f(
+    same!(
         "storage-client-key",
         "storage-client",
         Want::Key,
         Takes::Frontend,
         Need::Optional,
     ),
-    f(
+    same!(
         "cold-store",
         "stores",
         Want::FileUri,
         Takes::AllInOne,
         Need::Required,
     ),
-    f(
+    same!(
         "meta-dir",
         "stores",
         Want::Dir,
         Takes::AllInOne,
         Need::Required,
     ),
-    renamed(
+    renamed!(
         "daemon-server",
         "identity",
         "server",
@@ -265,7 +261,7 @@ const SPECS: [Spec; 20] = [
         Takes::AllInOne,
         Need::Required,
     ),
-    renamed(
+    renamed!(
         "daemon-ca-cert",
         "identity",
         "ca-cert",
@@ -273,7 +269,7 @@ const SPECS: [Spec; 20] = [
         Takes::AllInOne,
         Need::Required,
     ),
-    renamed(
+    renamed!(
         "daemon-cert",
         "identity",
         "cert",
@@ -281,7 +277,7 @@ const SPECS: [Spec; 20] = [
         Takes::AllInOne,
         Need::Required,
     ),
-    renamed(
+    renamed!(
         "daemon-key",
         "identity",
         "key",
@@ -289,14 +285,14 @@ const SPECS: [Spec; 20] = [
         Takes::AllInOne,
         Need::Required,
     ),
-    f(
+    same!(
         "node-id",
         "identity",
         Want::NodeId,
         Takes::AllInOne,
         Need::Required,
     ),
-    spec(
+    spec!(
         None,
         "daemon",
         "driver",
@@ -399,30 +395,36 @@ pub struct KbfFlags {
 }
 
 impl KbfFlags {
+    /// The flags by name, as given.
+    fn slots(&self) -> [(&'static str, &Option<String>); 19] {
+        [
+            ("listen", &self.listen),
+            ("worker-listen", &self.worker_listen),
+            ("api-listen", &self.api_listen),
+            ("reapi-tls-cert", &self.reapi_tls_cert),
+            ("reapi-tls-key", &self.reapi_tls_key),
+            ("worker-tls-cert", &self.worker_tls_cert),
+            ("worker-tls-key", &self.worker_tls_key),
+            ("worker-client-ca", &self.worker_client_ca),
+            ("storage-url", &self.storage_url),
+            ("storage-ca", &self.storage_ca),
+            ("storage-client-cert", &self.storage_client_cert),
+            ("storage-client-key", &self.storage_client_key),
+            ("cold-store", &self.cold_store),
+            ("meta-dir", &self.meta_dir),
+            ("daemon-server", &self.daemon_server),
+            ("daemon-ca-cert", &self.daemon_ca_cert),
+            ("daemon-cert", &self.daemon_cert),
+            ("daemon-key", &self.daemon_key),
+            ("node-id", &self.node_id),
+        ]
+    }
+
     pub(super) fn get(&self, flag: &str) -> Option<&str> {
-        let v = match flag {
-            "listen" => &self.listen,
-            "worker-listen" => &self.worker_listen,
-            "api-listen" => &self.api_listen,
-            "reapi-tls-cert" => &self.reapi_tls_cert,
-            "reapi-tls-key" => &self.reapi_tls_key,
-            "worker-tls-cert" => &self.worker_tls_cert,
-            "worker-tls-key" => &self.worker_tls_key,
-            "worker-client-ca" => &self.worker_client_ca,
-            "storage-url" => &self.storage_url,
-            "storage-ca" => &self.storage_ca,
-            "storage-client-cert" => &self.storage_client_cert,
-            "storage-client-key" => &self.storage_client_key,
-            "cold-store" => &self.cold_store,
-            "meta-dir" => &self.meta_dir,
-            "daemon-server" => &self.daemon_server,
-            "daemon-ca-cert" => &self.daemon_ca_cert,
-            "daemon-cert" => &self.daemon_cert,
-            "daemon-key" => &self.daemon_key,
-            "node-id" => &self.node_id,
-            _ => return None,
-        };
-        v.as_deref()
+        self.slots()
+            .into_iter()
+            .find(|(name, _)| *name == flag)
+            .and_then(|(_, value)| value.as_deref())
     }
 
     /// Check the flags for `mode`: the settings to write, or a line per problem pushed to
@@ -596,6 +598,13 @@ fn check_node_id(value: &str) -> Result<(), &'static str> {
     }
 }
 
+/// Whether `rest` is a host with a lone trailing `/` and nothing else odd.
+fn plain_but_slash(rest: &str) -> bool {
+    rest.trim_end_matches('/')
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
+}
+
 /// `http://host[:port]` or `https://host[:port]` (`https` only when `tls_only`), with no
 /// user, password, path, query or fragment. Plain `http` is for a loopback host, as `kbf`
 /// refuses it anywhere else.
@@ -616,6 +625,9 @@ fn check_url(value: &str, tls_only: bool) -> Result<(), &'static str> {
     let plain = rest
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'));
+    if rest.ends_with('/') && plain_but_slash(rest) {
+        return Err("must have no trailing slash: http(s)://host[:port] and nothing after it");
+    }
     if rest.is_empty() || !plain {
         return Err("must be http(s)://host[:port] and nothing after it");
     }
@@ -649,16 +661,16 @@ pub fn check_files(
     service: Option<u32>,
 ) -> Result<(), SetupError> {
     let mut problems = Vec::new();
-    for setting in settings {
-        let Some(s) = SPECS
+    for s in SPECS
+        .iter()
+        .filter(|s| matches!(s.kind, Want::Cert | Want::Key))
+    {
+        let Some(setting) = settings
             .iter()
-            .find(|s| s.table == setting.table && s.key == setting.key)
+            .find(|setting| setting.table == s.table && setting.key == s.key)
         else {
             continue;
         };
-        if !matches!(s.kind, Want::Cert | Want::Key) {
-            continue;
-        }
         if let Err(rule) = check_file(exec, s.kind, &setting.value, service) {
             problems.push(format!("--{}: {rule}", s.flag.unwrap_or(s.key)));
         }
