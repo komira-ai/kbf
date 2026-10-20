@@ -1,8 +1,7 @@
 # Rendered by `kbf-deploy linux render-units --mode storage`; installed as
 # /etc/systemd/system/kbf-storage.service (kbf docs/design/architecture-v2.md,
-# sections 1 and 11). `check-units --mode storage` parses the flags below with
-# `kbf check-args storage`. No state store: a storage node reaches it only through a
-# frontend (section 6).
+# sections 1 and 11). `kbf --mode=storage --check` parses the flags below. No state
+# store: a storage node reaches it only through a frontend (section 6).
 [Unit]
 Description=kbf build farm storage node
 Wants=network-online.target

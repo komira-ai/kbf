@@ -313,7 +313,9 @@ async fn both_kinds_answer_the_scheduler_calls_alike() {
         assert_eq!(hit, ActionResult::default());
 
         assert!(backend.leadership().is_none());
-        assert!(backend.render_metrics().contains("kbf_"), "{remote}");
+        let text = backend.render_metrics();
+        assert!(text.contains("kbf_"), "{remote}");
+        assert_in_flight_families(&text);
         assert_eq!(format!("{backend:?}"), "Backend(..)");
     }
 }
@@ -358,6 +360,32 @@ impl Trio {
             map: Arc::new(map),
             previous: None,
         }
+    }
+
+    /// The same farm with every member's boot known (non-zero), so the router can say
+    /// what its "held" answers rest on ([`kbf_route::Router::epoch`]).
+    fn booted(mut self) -> Self {
+        let members = self
+            .map
+            .members()
+            .iter()
+            .cloned()
+            .map(|mut m| {
+                m.boot = 1;
+                m
+            })
+            .collect();
+        let map = Map::new(
+            self.map.generation(),
+            members,
+            Rule::Rendezvous,
+            self.map.r(),
+            1,
+            Vec::new(),
+        )
+        .expect("a map");
+        self.map = Arc::new(map);
+        self
     }
 
     /// The same farm after a change: `map` is generation 2 and the map it replaced is
@@ -578,7 +606,9 @@ async fn scheduler_calls(backend: &Backend, held: (Digest, Bytes), root: (Digest
     assert_eq!(hit, ActionResult::default());
 
     assert!(backend.leadership().is_none());
-    assert!(backend.render_metrics().contains("kbf_"));
+    let text = backend.render_metrics();
+    assert!(text.contains("kbf_"));
+    assert_in_flight_families(&text);
     assert_eq!(format!("{backend:?}"), "Backend(..)");
 }
 
@@ -687,4 +717,92 @@ async fn the_routed_kind_uses_the_storage_node_until_the_map_has_two_members() {
         first.put(stored.1.clone()).await.expect("stored");
     }
     scheduler_calls(&backend, held, root).await;
+}
+
+/// Catches: a frontend backend whose `/metrics` text leaves out `kbf_bytes_in_flight` or
+/// `kbf_bytes_in_flight_peak` (the proxy kinds once rendered only their own counters).
+///
+/// Mutant: `Remote::render_metrics` returning `self.metrics.render()` alone.
+fn assert_in_flight_families(text: &str) {
+    for family in ["kbf_bytes_in_flight", "kbf_bytes_in_flight_peak"] {
+        assert!(
+            text.contains(&format!("# TYPE {family} gauge\n{family} ")),
+            "{family} missing from\n{text}"
+        );
+    }
+}
+
+/// A tree of a root over three directories of ten files each, every blob stored on the node
+/// the map writes it to; the walk of it reads four directories and asks about 30 files.
+async fn stored_tree(trio: &Trio) -> (Digest, usize) {
+    let files: Vec<_> = (0..30).map(|n| blob(&format!("file {n}"))).collect();
+    let subs: Vec<_> = files
+        .chunks(10)
+        .map(|chunk| dir(&chunk.iter().map(|f| f.0).collect::<Vec<_>>(), &[]))
+        .collect();
+    let root = dir(&[], &subs.iter().map(|d| d.0).collect::<Vec<_>>());
+    for held in files.iter().chain(&subs).chain([&root]) {
+        trio.store(held).await;
+    }
+    (root.0, 4)
+}
+
+/// Catches: the routed kind's walk forgetting nothing the router can vouch for, or never
+/// remembering: the second walk of a tree the farm held (a build's next Execute over the
+/// same toolchain) skips it, with no read and no FindMissing, because the router gave the
+/// map's epoch to the walk. Mutant: `Blobs::epoch` for the router returning `None` (the
+/// memory would never fire and every other test stays green): the second walk reads all
+/// four directories again. Under a map with a member of unknown boot there is no epoch
+/// and the second walk reads again.
+#[tokio::test]
+async fn the_routed_walk_skips_a_tree_it_found_held() {
+    let trio = Arc::new(Trio::new().booted());
+    let (root, dirs) = stored_tree(&trio).await;
+    let (routed, _) = trio.backends();
+
+    let first = routed.walk_inputs(root).await.expect("first walk");
+    assert!(first.absent.is_empty(), "{:?}", first.absent);
+    assert_eq!((first.dirs_read, first.dirs_skipped), (dirs as u64, 0));
+    assert_eq!((first.files_checked, first.file_asks), (30, 1));
+
+    let second = routed.walk_inputs(root).await.expect("second walk");
+    assert!(second.absent.is_empty());
+    assert_eq!(
+        (second.dirs_read, second.dirs_skipped),
+        (0, 1),
+        "the root was verified, so it alone is skipped"
+    );
+    assert_eq!((second.files_checked, second.file_asks), (0, 0));
+
+    // A member whose boot is unknown: the router cannot tell a restart, so nothing is kept.
+    let unknown = Arc::new(Trio::new());
+    let (root, dirs) = stored_tree(&unknown).await;
+    let (routed, _) = unknown.backends();
+    routed.walk_inputs(root).await.expect("first walk");
+    let again = routed.walk_inputs(root).await.expect("second walk");
+    assert_eq!((again.dirs_read, again.dirs_skipped), (dirs as u64, 0));
+}
+
+/// Catches: a single storage node's walk remembering what it found held. Nothing about
+/// one node says that a restart or a lost blob did not happen between two walks, so
+/// [`Backend::remote`] has no epoch and every walk reads the whole tree. Mutant: `Held`
+/// answering an epoch (`Some(1)`): the second walk skips the root.
+#[tokio::test]
+async fn a_walk_over_one_storage_node_never_skips() {
+    let cache = Arc::new(Cache::memory());
+    let held = blob("held");
+    let sub = dir(&[held.0], &[]);
+    let root = dir(&[], &[sub.0]);
+    put(&cache, &[&held, &sub, &root]).await;
+    let (_, remote) = both(&cache);
+
+    for round in 0..3 {
+        let walked = remote.walk_inputs(root.0).await.expect("walk");
+        assert!(walked.absent.is_empty(), "round {round}");
+        assert_eq!(
+            (walked.dirs_read, walked.dirs_skipped, walked.files_checked),
+            (2, 0, 1),
+            "round {round}"
+        );
+    }
 }

@@ -153,7 +153,7 @@ fn a_run_that_stopped_at_the_database_is_finished_by_running_again() {
     };
     assert_eq!(installer_writes(&exec), 1);
     let up = Server::fresh();
-    let mut os = settled(&["kbf-frontend@a.service"]);
+    let mut os = settled(&["kbf-frontend.service"]);
     os.users.push(user("kbf-server", 989));
     let out = go_on(&os, &mut exec, &Unwired, &up, &raw(Mode::Frontend), APPLY).expect("finished");
     assert_eq!(
@@ -197,12 +197,15 @@ fn the_database_flag_is_required_where_there_is_state_and_refused_with_a_passwor
     for mode in [Mode::Frontend, Mode::AllInOne] {
         let mut r = raw(mode);
         r.database = None;
-        let why = r.validate().expect_err("required").join("; ");
+        let why = r
+            .validate(Platform::Linux)
+            .expect_err("required")
+            .join("; ");
         assert!(why.contains("--database is required"), "{why}");
     }
     let mut r = raw(Mode::Daemon);
     r.database = Some(DATABASE.to_owned());
-    let why = r.validate().expect_err("refused").join("; ");
+    let why = r.validate(Platform::Linux).expect_err("refused").join("; ");
     assert!(why.contains("--database is for the modes"), "{why}");
     for bad in [
         "postgres://kbf:hunter2@db.example/kbf",
@@ -210,7 +213,7 @@ fn the_database_flag_is_required_where_there_is_state_and_refused_with_a_passwor
     ] {
         let mut r = raw(Mode::Frontend);
         r.database = Some(bad.to_owned());
-        let why = r.validate().expect_err("refused").join("; ");
+        let why = r.validate(Platform::Linux).expect_err("refused").join("; ");
         assert!(why.contains("password"), "{bad}: {why}");
         assert!(!why.contains("hunter2") && !why.contains(bad), "{why}");
     }
@@ -222,13 +225,13 @@ fn the_database_flag_is_required_where_there_is_state_and_refused_with_a_passwor
     ] {
         let mut r = raw(Mode::Frontend);
         r.database = Some(bad.to_owned());
-        let why = r.validate().expect_err("refused").join("; ");
+        let why = r.validate(Platform::Linux).expect_err("refused").join("; ");
         assert!(why.contains("not a usable Postgres URL"), "{bad}: {why}");
         assert!(!why.contains(bad), "{why}");
     }
     let mut ok = raw(Mode::Frontend);
     ok.database = Some("postgresql:///kbf?host=/run/postgresql".to_owned());
-    assert!(ok.validate().is_ok());
+    assert!(ok.validate(Platform::Linux).is_ok());
 }
 
 /// Catches a setup that writes a settings file somewhere the unit does not read: the unit
@@ -237,21 +240,28 @@ fn the_database_flag_is_required_where_there_is_state_and_refused_with_a_passwor
 #[test]
 fn setup_writes_the_installer_toml_the_unit_reads() {
     let mut r = raw(Mode::Daemon);
-    r.installer_config = "/srv/other.toml".to_owned();
-    let why = r.validate().expect_err("refused").join("; ");
+    r.installer_config = Some("/srv/other.toml".to_owned());
+    let why = r.validate(Platform::Linux).expect_err("refused").join("; ");
     assert!(why.contains("--installer-config is for run"), "{why}");
 }
 
-/// Catches a setup that goes ahead on a host the retired helper still manages (contract
-/// section 8: the two never both manage one host): either of its roots, on any mode, stops it
-/// before a step with exit 5 and the path; a host without them is not affected.
-///
-/// Mutants to plant: one of the two paths dropped from the list; the check moved after the
-/// first plan is applied.
-#[test]
-fn an_unmigrated_old_layout_stops_setup_before_any_step() {
-    for old in ["/usr/local/kbf", "/var/lib/kbf-deploy"] {
-        let mut exec = host();
+const OLD_TREE: &str = "/usr/local/kbf";
+const OLD_STATE: &str = "/var/lib/kbf-deploy";
+const SD_UNIT: &str = "kbf-storage-and-daemon.service";
+const SD_FILE: &str = "/etc/systemd/system/kbf-storage-and-daemon.service";
+const RETIRED_COPY: &str =
+    "/var/lib/kbf-installer/migration-units/kbf-storage-and-daemon.service.retired";
+const OLD_FLAGS: &str =
+    "[Service]\nExecStart=/var/lib/kbf-installer/releases/current/kbf --meta-dir /x\n";
+const DRY: Options = Options {
+    apply: false,
+    no_start: false,
+};
+
+/// A host that still has the old layout's two roots, as a migrated host does (they are its
+/// rollback path).
+fn with_old_roots(mut exec: FakeExec) -> FakeExec {
+    for old in [OLD_TREE, OLD_STATE] {
         exec.entries.insert(
             hp(old),
             Entry::Dir {
@@ -259,54 +269,219 @@ fn an_unmigrated_old_layout_stops_setup_before_any_step() {
                 owner: ROOT,
             },
         );
-        let err = go(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon), APPLY).expect_err("refused");
-        assert!(
-            matches!(&err, SetupError::OldLayout { path, .. } if path == old),
-            "{err:?}"
-        );
-        assert_eq!(
-            (err.exit(), err.code()),
-            (Exit::NeedsOperator, "old_layout")
-        );
-        assert!(exec.log.is_empty(), "{old}: {:?}", exec.log);
+    }
+    exec
+}
+
+fn after(
+    os: &FakeOs,
+    exec: &mut FakeExec,
+    standing: Standing,
+    mode: Mode,
+    options: Options,
+) -> Result<String, SetupError> {
+    go_after(
+        os,
+        exec,
+        &Unwired,
+        &Server::fresh(),
+        standing,
+        &raw(mode),
+        options,
+    )
+}
+
+/// Catches a setup that refuses every host a migration finished: `migrate` keeps
+/// `/usr/local/kbf` and `/var/lib/kbf-deploy` on purpose (they are the rollback path), so a
+/// check on those paths refuses a migrated host for ever. With the journal saying the
+/// migration is done, `setup` goes on, on Linux and on a Mac, in every mode, and none of its
+/// steps touches the old roots.
+///
+/// Mutants to plant: the path check of the old code put back (red: `Unmigrated`); the
+/// journal's answer ignored.
+#[test]
+fn a_migrated_host_keeps_its_old_roots_and_passes_setup() {
+    for (os, mode) in [
+        (FakeOs::linux(), Mode::Daemon),
+        (FakeOs::linux(), Mode::StorageAndDaemon),
+        (FakeOs::linux(), Mode::Frontend),
+        (FakeOs::mac(), Mode::Daemon),
+    ] {
+        let mut exec = with_old_roots(host());
+        let out = after(
+            &os,
+            &mut exec,
+            Standing::Done(&["kbf-daemon.service"]),
+            mode,
+            APPLY,
+        )
+        .expect("a migrated host passes");
+        assert!(!exec.log.is_empty(), "setup did its work: {out}");
+        for step in &exec.log {
+            let said = step.to_string();
+            assert!(
+                !said.contains(OLD_TREE) && !said.contains(OLD_STATE),
+                "{said}"
+            );
+        }
+        assert!(exec.entries.contains_key(&hp(OLD_TREE)));
     }
 }
 
-/// Catches a refusal that leaves the operator guessing: the message of the old-layout stop
-/// names the command that would clear it, with the fetch account of the platform (`kbf-fetch`
-/// on Linux, `_kbf-fetch` on a Mac), says the host is not accepted after it yet (today's
-/// behaviour), and the hand route that works today.
+/// Catches a setup that goes ahead beside the old helper: while the journal does not say
+/// the migration finished, setup stops before any step with exit 5 and code `unmigrated`,
+/// dry run or apply, on either platform, and names the command that clears it with the
+/// platform's fetch account. A journal that cannot be read stops it too (`migrate`, exit 1).
+/// The root check comes first: a user who is not root is told so, not told about the layout.
 ///
-/// Mutants to plant: the fetch account the same on both platforms; `--apply` left out of the
-/// command; the hand route dropped.
+/// Mutants to plant: the refusal dropped (red: setup goes on); `--apply` or `--fetch-user`
+/// left out of the message; the check moved after the first plan is applied; the fetch
+/// account the same on both platforms.
 #[test]
-fn the_old_layout_refusal_names_the_command_and_the_hand_route() {
+fn an_unmigrated_old_layout_is_refused_naming_migrate_before_any_step() {
     for (os, fetch) in [
         (FakeOs::linux(), "--fetch-user kbf-fetch"),
         (FakeOs::mac(), "--fetch-user _kbf-fetch"),
     ] {
-        let mut exec = host();
-        exec.entries.insert(
-            hp("/usr/local/kbf"),
-            Entry::Dir {
-                perms: Perms::new(0o755),
-                owner: ROOT,
-            },
+        for options in [APPLY, DRY] {
+            let mut exec = with_old_roots(host());
+            let err = after(&os, &mut exec, Standing::Unmigrated, Mode::Daemon, options)
+                .expect_err("refused");
+            assert_eq!(
+                (err.exit(), err.code()),
+                (Exit::NeedsOperator, "unmigrated")
+            );
+            let said = err.to_string();
+            assert!(
+                said.contains(&format!(
+                    "kbf-installer migrate --apply {fetch} [--unit UNIT]"
+                )),
+                "{said}"
+            );
+            assert!(said.contains(OLD_STATE), "{said}");
+            assert!(!said.contains('\n'), "one line: {said}");
+            assert!(exec.log.is_empty(), "{:?}", exec.log);
+        }
+    }
+    let mut exec = host();
+    let err = after(
+        &FakeOs::linux(),
+        &mut exec,
+        Standing::Damaged,
+        Mode::Daemon,
+        APPLY,
+    )
+    .expect_err("refused");
+    assert!(matches!(err, SetupError::Migrate(_)), "{err:?}");
+    assert_eq!((err.exit(), err.code()), (Exit::Failed, "migrate"));
+    assert!(err.to_string().contains("migration.json"), "{err}");
+    assert!(exec.log.is_empty(), "{:?}", exec.log);
+
+    let mut os = FakeOs::linux();
+    os.euid = 1000;
+    let err =
+        after(&os, &mut host(), Standing::Unmigrated, Mode::Daemon, APPLY).expect_err("not root");
+    assert!(matches!(err, SetupError::NotRoot { .. }), "{err:?}");
+}
+
+/// Catches a migrated host that setup leaves on the old unit: the file `migrate` repointed
+/// (journalled by name) is the old layout's unit, and it shadows the packaged one. Setup
+/// keeps its bytes in the migration's backup directory, takes the file out, reloads systemd
+/// and enables the packaged unit, in that order, although the host says the name is enabled
+/// (the old file's enable link names the same unit). The dry run prints the retire line and
+/// changes nothing. A second run finds nothing to retire.
+///
+/// Mutants to plant: the copy not kept (red: no backup); the remove dropped (red: file
+/// still there); the reload dropped or after the enable; the enable left to `unit_enabled`
+/// (red: no enable); the dry run applying.
+#[test]
+fn a_journalled_shadow_is_retired_with_its_original_kept() {
+    let mut os = FakeOs::linux();
+    os.enabled.insert(SD_UNIT.to_owned());
+    let mut exec = released(host(), Platform::Linux);
+    put(&mut exec, SD_FILE, 0o644, ROOT, OLD_FLAGS);
+    let standing = Standing::Done(&[SD_UNIT]);
+
+    let dry = after(&os, &mut exec, standing, Mode::StorageAndDaemon, DRY).expect("dry run");
+    assert!(
+        dry.contains(&format!(
+            "DRY-RUN: retire {SD_FILE} (shadows the packaged unit; original kept)\n"
+        )),
+        "{dry}"
+    );
+    assert!(exec.log.is_empty(), "{:?}", exec.log);
+    assert_eq!(text(&exec, SD_FILE), OLD_FLAGS);
+
+    let out = after(&os, &mut exec, standing, Mode::StorageAndDaemon, APPLY).expect("setup");
+    assert!(
+        out.contains(&format!(
+            "+ retire {SD_FILE} (shadows the packaged unit; original kept)\n"
+        )),
+        "{out}"
+    );
+    assert_eq!(text(&exec, RETIRED_COPY), OLD_FLAGS);
+    assert_eq!(file_meta(&exec, RETIRED_COPY), (0o600, ROOT));
+    assert!(!exec.entries.contains_key(&hp(SD_FILE)));
+    let at = |what: &str| {
+        exec.log
+            .iter()
+            .position(|s| s.to_string().contains(what))
+            .unwrap_or_else(|| panic!("{what}: {:?}", exec.log))
+    };
+    let kept = at("migration-units/kbf-storage-and-daemon.service.retired");
+    let removed = at(&format!("remove {SD_FILE}"));
+    let reload = at("daemon-reload");
+    let enable = at(&format!("enable --now -- {SD_UNIT}"));
+    assert!(
+        kept < removed && removed < reload && reload < enable,
+        "{:?}",
+        exec.log
+    );
+    assert_eq!(
+        cmds(&exec)
+            .iter()
+            .filter(|c| c.contains("daemon-reload"))
+            .count(),
+        1
+    );
+
+    exec.log.clear();
+    let again = after(&os, &mut exec, standing, Mode::StorageAndDaemon, APPLY).expect("again");
+    assert!(!again.contains("retire"), "{again}");
+    assert!(cmds(&exec).iter().all(|c| !c.contains("daemon-reload")));
+}
+
+/// Catches a setup that deletes a unit file it did not see the migration take over: a file
+/// at the mode's unit name that the journal does not name (on an unmigrated-looking host
+/// with no old layout, or a migrated host whose journal lists other units) stops setup with
+/// exit 5 and the file's name, before any step; the file is still there.
+///
+/// Mutants to plant: every shadow retired whatever the journal says (red: no refusal); the
+/// journal's list compared by prefix.
+#[test]
+fn an_unjournalled_shadow_is_refused_and_left_alone() {
+    for standing in [
+        Standing::Fresh,
+        Standing::Done(&["kbf-daemon.service"]),
+        Standing::Done(&[]),
+    ] {
+        let mut exec = released(host(), Platform::Linux);
+        put(&mut exec, SD_FILE, 0o644, ROOT, OLD_FLAGS);
+        let err = after(
+            &FakeOs::linux(),
+            &mut exec,
+            standing,
+            Mode::StorageAndDaemon,
+            APPLY,
+        )
+        .expect_err("refused");
+        assert_eq!(
+            (err.exit(), err.code()),
+            (Exit::NeedsOperator, "unit_shadow")
         );
-        let err = go(&os, &mut exec, &raw(Mode::Daemon), APPLY).expect_err("refused");
-        let said = err.to_string();
-        assert!(
-            said.contains(&format!(
-                "kbf-installer migrate --apply {fetch} [--unit UNIT]"
-            )),
-            "{said}"
-        );
-        assert!(said.contains("komira-ai/kbf#1083"), "{said}");
-        assert!(
-            said.contains("move /usr/local/kbf and /var/lib/kbf-deploy aside by hand"),
-            "{said}"
-        );
-        assert!(!said.contains('\n'), "one line: {said}");
+        assert!(err.to_string().contains(SD_FILE), "{err}");
+        assert!(exec.log.is_empty(), "{:?}", exec.log);
+        assert_eq!(text(&exec, SD_FILE), OLD_FLAGS);
     }
 }
 
@@ -314,11 +489,10 @@ fn the_old_layout_refusal_names_the_command_and_the_hand_route() {
 /// on the old flags: a regular file at `/etc/systemd/system/<the mode's unit>` (systemd reads
 /// `/etc` before `/usr/lib`, and `setup` skips a unit that is already enabled) stops setup
 /// with exit 5 and `unit_shadow` before any step, dry run or apply, naming the file and the
-/// fix. The frontend's instance is shadowed by its template's file too. A link (what
-/// `systemctl link` makes), another mode's file, and no file are not refused.
+/// fix. A link (what `systemctl link` makes), another mode's file, and no file are not
+/// refused.
 ///
-/// Mutants to plant: the check dropped; the check on the unit name only (frontend template
-/// missed); the check refusing a link; the check refusing another mode's file; the check after
+/// Mutants to plant: the check dropped; the check refusing a link; the check refusing another mode's file; the check after
 /// the first plan is applied.
 #[test]
 fn a_regular_file_shadowing_the_packaged_unit_stops_setup_before_any_step() {
@@ -327,8 +501,7 @@ fn a_regular_file_shadowing_the_packaged_unit_stops_setup_before_any_step() {
         (Mode::Daemon, "kbf-daemon.service"),
         (Mode::Storage, "kbf-storage.service"),
         (Mode::AllInOne, "kbf-all-in-one.service"),
-        (Mode::Frontend, "kbf-frontend@a.service"),
-        (Mode::Frontend, "kbf-frontend@.service"),
+        (Mode::Frontend, "kbf-frontend.service"),
     ];
     for (mode, file) in cases {
         let path = format!("/etc/systemd/system/{file}");
@@ -473,9 +646,12 @@ fn another_scheduler_key_makes_the_file_the_operators() {
     let theirs = format!(
         "mode = \"frontend\"\n[scheduler]\nstate-store = \"{DATABASE}\"\nheartbeat-interval-ms = 500\n"
     );
-    assert_eq!(decide(Some(&theirs), &ours), Decision::Keep);
+    assert_eq!(
+        decide(Some(&theirs), &ours, "/etc/kbf/kbf.toml"),
+        Decision::Keep
+    );
     let other = theirs.replace(DATABASE, "postgres:///other?host=/run/postgresql");
-    let Decision::Refuse(why) = decide(Some(&other), &ours) else {
+    let Decision::Refuse(why) = decide(Some(&other), &ours, "/etc/kbf/kbf.toml") else {
         panic!("refused");
     };
     assert!(why.contains("[scheduler] state-store"), "{why}");
@@ -523,6 +699,7 @@ fn setup_creates_the_schema_over_a_real_server() {
     let backend = Backend {
         releases: &Unwired,
         schemas: &Postgres,
+        migrations: &Standing::Fresh,
     };
     let say = |options: Options| {
         let mut out = Vec::new();
@@ -631,7 +808,7 @@ fn an_error_about_a_file_never_repeats_the_database_url() {
         state_store: Some(DATABASE),
     };
     let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = \"postgres:///other?host=/run/postgresql\"\nheartbeat-interval-ms = 500\n";
-    let Decision::Refuse(why) = decide(Some(theirs), &ours) else {
+    let Decision::Refuse(why) = decide(Some(theirs), &ours, "/etc/kbf/kbf.toml") else {
         panic!("refused");
     };
     assert!(why.contains("[scheduler] state-store"), "{why}");
@@ -658,7 +835,7 @@ fn an_invalid_config_file_is_refused_without_its_text() {
         state_store: Some(DATABASE),
     };
     let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = postgres://u:PW@h/x\n";
-    let Decision::Refuse(why) = decide(Some(theirs), &ours) else {
+    let Decision::Refuse(why) = decide(Some(theirs), &ours, "/etc/kbf/kbf.toml") else {
         panic!("refused");
     };
     assert!(why.contains("not valid TOML"), "{why}");
@@ -690,7 +867,7 @@ fn an_invalid_config_file_is_refused_without_its_text() {
 fn the_first_release_is_fetched_by_the_host_fetcher_not_the_unwired_one() {
     use crate::helper::fetcher::{Fetcher, ReleaseLocator};
     let (_, layout) = scratch("first-release-fetcher");
-    let fetcher = crate::setup::first_release_fetcher(layout, crate::layout::path(INSTALLER_TOML));
+    let fetcher = crate::setup::first_release_fetcher(layout, None);
     let got = fetcher.fetch(&ReleaseLocator {
         commit: c(A),
         components: Vec::new(),
@@ -698,5 +875,139 @@ fn the_first_release_is_fetched_by_the_host_fetcher_not_the_unwired_one() {
     assert!(
         matches!(&got, Err(FetchError::Unavailable(why)) if !why.is_empty()),
         "{got:?}"
+    );
+}
+
+/// The `<key>`s of the property list's `PathState`: the files its `KeepAlive` waits for.
+fn gate_files(plist: &str) -> Vec<String> {
+    let after = plist
+        .split("<key>PathState</key>")
+        .nth(1)
+        .expect("PathState");
+    let dict = after.split("</dict>").next().expect("a dict");
+    dict.split("<key>")
+        .skip(1)
+        .map(|k| k.split("</key>").next().expect("closed").to_owned())
+        .collect()
+}
+
+/// Catches `setup` writing `installer.toml` where the launchd job does not wait for it: the
+/// job's `KeepAlive` is gated on that file, so on a Mac that setup wrote it elsewhere
+/// (`/etc/kbf`, the Linux path) the installer job would never run and the daemon would find
+/// no `kbf.toml`. Runs the Mac plan, then compares the real plist's gate with the files the
+/// plan wrote, and checks nothing went under `/etc/kbf`.
+#[test]
+fn the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac() {
+    let mut exec = released(host(), Platform::MacOs);
+    go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
+
+    let files: Vec<String> = exec
+        .entries
+        .iter()
+        .filter(|(_, e)| matches!(e, Entry::File { .. }))
+        .map(|(p, _)| p.to_string())
+        .collect();
+    let written: Vec<&String> = files
+        .iter()
+        .filter(|p| p.ends_with("/installer.toml"))
+        .collect();
+    let plist = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/macos/com.komira.kbf-installer.plist"),
+    )
+    .expect("the packaged property list");
+    assert_eq!(
+        written,
+        gate_files(&plist).iter().collect::<Vec<_>>(),
+        "setup wrote installer.toml somewhere the launchd gate does not wait"
+    );
+    // The node job reads kbf.toml from the layout; setup wrote it there.
+    assert!(
+        files.iter().any(|p| p == Platform::MacOs.kbf_toml()),
+        "{files:?}"
+    );
+    assert!(
+        !files.iter().any(|p| p.starts_with("/etc/kbf")),
+        "a Mac keeps nothing in /etc/kbf: {files:?}"
+    );
+    // The configuration directory is made where the files go, and no Linux one is made.
+    let dirs: Vec<String> = exec
+        .entries
+        .iter()
+        .filter(|(_, e)| matches!(e, Entry::Dir { .. }))
+        .map(|(p, _)| p.to_string())
+        .collect();
+    assert!(
+        dirs.iter().any(|d| d == "/usr/local/etc/kbf"),
+        "no Mac config directory: {dirs:?}"
+    );
+    assert!(
+        !dirs.iter().any(|d| d.starts_with("/etc/kbf")),
+        "a Linux config directory on a Mac: {dirs:?}"
+    );
+}
+
+/// Catches one of the config paths left on the Linux directory on one platform (a Mac
+/// `api_token` or `config_dir` at `/etc/kbf` reaches no test that runs the daemon plan):
+/// each file sits directly in its platform's `config_dir`, which is `/etc/kbf` on Linux and
+/// `/usr/local/etc/kbf` on macOS, and the `Layout` paths are the `Platform` ones.
+///
+/// Mutants seen red: the Mac `config_dir` and the Mac `api_token` each set to the Linux path.
+#[test]
+fn every_config_path_lies_in_its_platforms_config_dir() {
+    for (platform, dir) in [
+        (Platform::Linux, "/etc/kbf"),
+        (Platform::MacOs, "/usr/local/etc/kbf"),
+    ] {
+        assert_eq!(platform.config_dir(), dir);
+        let layout = crate::layout::Layout::new(kbf_host::Root::new("/").expect("root"), platform);
+        assert_eq!(layout.config_dir().to_string(), dir);
+        for (file, path, held) in [
+            ("kbf.toml", platform.kbf_toml(), layout.kbf_toml()),
+            (
+                "installer.toml",
+                platform.installer_toml(),
+                layout.installer_toml(),
+            ),
+            (
+                "enroll.token",
+                platform.enroll_token(),
+                layout.enroll_token(),
+            ),
+            ("api-token", platform.api_token(), layout.api_token()),
+        ] {
+            assert_eq!(
+                std::path::Path::new(path).parent(),
+                Some(std::path::Path::new(dir)),
+                "{platform:?} {file}: {path}"
+            );
+            assert_eq!(held.to_string(), path, "{platform:?} {file}");
+        }
+    }
+}
+
+/// Catches `--installer-config` being pinned to the Linux path on a Mac: the only value setup
+/// accepts there is the Mac's own, and the Linux one is refused.
+#[test]
+fn setup_accepts_only_the_platforms_installer_toml_as_installer_config() {
+    let mut r = raw(Mode::Daemon);
+    r.installer_config = Some("/usr/local/etc/kbf/installer.toml".to_owned());
+    r.validate(Platform::MacOs).expect("the Mac's own file");
+    let why = r
+        .validate(Platform::Linux)
+        .expect_err("not Linux's")
+        .join("; ");
+    assert!(
+        why.contains("setup writes /etc/kbf/installer.toml"),
+        "{why}"
+    );
+    r.installer_config = Some("/etc/kbf/installer.toml".to_owned());
+    let why = r
+        .validate(Platform::MacOs)
+        .expect_err("not the Mac's")
+        .join("; ");
+    assert!(
+        why.contains("setup writes /usr/local/etc/kbf/installer.toml"),
+        "{why}"
     );
 }

@@ -74,8 +74,9 @@ pub struct InstallerToml {
     /// The node identity the fetch child is lent, for the frontend source.
     pub node_cert: Option<PathBuf>,
     pub node_key: Option<PathBuf>,
-    /// The `[proxy]` table, read by `kbf-installer proxy`. `setup` does not write it (the
-    /// operator does), so [`InstallerToml::render`] leaves it out.
+    /// The `[proxy]` table, read by `kbf-installer proxy` and, for `listen`, by `setup`. The
+    /// operator writes it; [`InstallerToml::render`] writes it back whole (with the defaults
+    /// filled in), so a `setup` run that rewrites the file keeps it.
     pub proxy: Option<ProxyConfig>,
     /// The state database of a frontend or all-in-one host: a `postgres://` URL without a
     /// password (the file is world-readable). `crate::database` reads this file a second time,
@@ -407,9 +408,8 @@ impl InstallerToml {
         }
     }
 
-    /// The canonical text: every key in a fixed order, the unset optional ones left out. The
-    /// `[proxy]` table is not written: it is the operator's, and a caller that rewrites a
-    /// file keeps it.
+    /// The canonical text: every key in a fixed order, the unset optional ones left out, then
+    /// the `[proxy]` table if there is one.
     pub fn render(&self) -> String {
         let mut out = String::new();
         match &self.source {
@@ -450,6 +450,14 @@ impl InstallerToml {
         }
         if let Some(url) = &self.database {
             out.push_str(&format!("database = {}\n", toml_string(url)));
+        }
+        if let Some(proxy) = &self.proxy {
+            #[derive(serde::Serialize)]
+            struct Table<'a> {
+                proxy: &'a ProxyConfig,
+            }
+            out.push('\n');
+            out.push_str(&toml::to_string(&Table { proxy }).expect("a proxy table is TOML"));
         }
         out
     }

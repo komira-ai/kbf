@@ -31,10 +31,10 @@
 //!
 //! The binary builds a [`RealFetcher`] for each fetch, with
 //! [`HostFetcher`](super::fetcher_host::HostFetcher), from `installer.toml` and the host's
-//! [`Parts`]. Until the helper has a real lease source the fetch does not get through for an
-//! activation (the cycle checks leases before it fetches, and the pipeline checks again, and
-//! [`leases::NotWired`](super::leases::NotWired) refuses both), nor for a first or frontend
-//! release (the pipeline's check).
+//! [`Parts`]. For an activation the cycle checks the helper's leases before it fetches, and
+//! the pipeline checks again with the fetch's own lease source (both come from
+//! [`leases::for_restart`](super::leases::for_restart) in the binary); a frontend update
+//! (setup's first release too) skips the pipeline's lease step.
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;

@@ -30,7 +30,8 @@
 //!    meet the operator's floor and be understood by this installer. An activation that
 //!    carries no expected facts is refused; a `frontend_update` may leave them out, and
 //!    then only the commit and the release profile are checked.
-//! 6. **Leases**: root observes ([`crate::helper::leases`]) that none is live.
+//! 6. **Leases**: root observes ([`crate::helper::leases`]) that none is live. A
+//!    `frontend_update` is not held by them: it moves no node link.
 //! 7. **Install**: `VERIFIED` is written into the directory, which is renamed to
 //!    `releases/<commit>/`, and the parent is synced. A directory already there is the
 //!    same release (the same `VERIFIED` marker and the same bytes) or a refusal; a
@@ -93,7 +94,7 @@ pub enum OrderKind {
     Activate,
     /// The frontend's own update: the facts may be left out (`expected` is `None`). Its
     /// order record is a locator and carries none, so only the commit and the release
-    /// profile are checked.
+    /// profile are checked. It waits for no lease: it moves no node link.
     FrontendUpdate,
 }
 
@@ -347,13 +348,23 @@ impl Verifier for Pipeline<'_> {
         }
         let (version, platform) = version.expect("an order names a component");
 
-        match self.leases.live() {
-            Ok(0) => {}
-            Ok(n) => return Err(Refusal::Lease(format!("{n} leases are live"))),
-            Err(why) => {
-                return Err(Refusal::Lease(format!(
-                    "cannot tell whether any is live: {why}"
-                )));
+        // A frontend update moves no node link, and the swap and the proxy own the
+        // frontend's streams: no lease is waited for. (Setup's first release is one, and a
+        // host that has never run its unit has no cgroup to read.) Every kind is named, so
+        // a new one has to say whether it waits.
+        let waits_for_leases = match order.kind {
+            OrderKind::Activate => true,
+            OrderKind::FrontendUpdate => false,
+        };
+        if waits_for_leases {
+            match self.leases.live() {
+                Ok(0) => {}
+                Ok(n) => return Err(Refusal::Lease(format!("{n} leases are live"))),
+                Err(why) => {
+                    return Err(Refusal::Lease(format!(
+                        "cannot tell whether any is live: {why}"
+                    )));
+                }
             }
         }
 

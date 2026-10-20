@@ -4,6 +4,11 @@
 //! and the digest is claimed at the commit. Appends pass through a queue of
 //! [`STORE_CHUNKS_IN_FLIGHT`] chunks, so a stream holds a few chunks and the store's
 //! part, whatever its size.
+//!
+//! **Not counted** in `kbf_bytes_in_flight`: each appended chunk is copied
+//! (`Bytes::copy_from_slice`) into that queue, so up to [`STORE_CHUNKS_IN_FLIGHT`] copies
+//! and the store's part are resident beside the counted message they were copied from;
+//! the gauge understates resident memory by that much.
 
 use std::sync::Arc;
 
