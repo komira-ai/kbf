@@ -652,14 +652,15 @@ fn leftover_tls_keys_are_only_the_ones_in_a_tls_table() {
 /// and no key file is an error naming the flag, not a table.
 #[test]
 fn a_plan_the_proxy_would_refuse_is_not_merged() {
-    let plan = ProxyPlan {
-        base_port: DEFAULT_BASE_PORT,
-        buck2_auth: kbf_proxy::auth::Buck2Auth::Bearer,
-        buck2_token_file: None,
-        server_cert: "/etc/kbf/reapi.pem".to_owned(),
-        server_key: "/etc/kbf/reapi.key".to_owned(),
-        client_ca: "/etc/kbf/ca.pem".to_owned(),
-    };
+    let mut raw = proxy_raw();
+    raw.proxy.buck2_auth = Some(AuthFlag::Bearer);
+    raw.proxy.buck2_token_file = some("/etc/kbf/bearer");
+    let mut plan: ProxyPlan = raw
+        .validate(Platform::Linux)
+        .expect("valid")
+        .proxy
+        .expect("a plan");
+    plan.buck2_token_file = None;
     let err = plan.merge(None).expect_err("refused");
     assert!(err.to_string().contains("--proxy"), "{err}");
 }
