@@ -4,8 +4,8 @@
 //! It validates its flags, then makes the host what they say: the fetch account (and for the
 //! modes that run actions, the `kbf` user's subid range and lingering), the installer's tree
 //! with its `orders/` directory, the enrollment token (node modes), the first operator token
-//! (frontend and all-in-one hosts, once), `/etc/kbf/installer.toml`, the first release
-//! (`--commit`), `/etc/kbf/kbf.toml`, and last the units enabled for the mode.
+//! (frontend and all-in-one hosts, once), `installer.toml`, the first release
+//! (`--commit`), `kbf.toml` (both in `/etc/kbf`, `/usr/local/etc/kbf` on a Mac), and last the units enabled for the mode.
 //!
 //! - It is root's: [`Os::euid`] is checked first, so only a fake that says 0 gets past it
 //!   without root. It refuses while the retired `kbf-helper`/`kbf-deploy` layout is on the
@@ -22,6 +22,9 @@
 //!   `--commit` stops before `kbf.toml` with that reason). On a frontend or all-in-one host the
 //!   state database's schema is created or brought forward ([`Schemas`]) once `installer.toml`
 //!   is written, and a unit that makes a frontend is enabled and never started.
+//! - `[proxy] listen` of `installer.toml` (the operator's key) becomes the drop-in
+//!   `kbf-proxy.socket.d/listen.conf` on Linux, and no key removes the drop-in. Setup never
+//!   reloads systemd or restarts the socket: it says that is needed.
 //! - `kbf.toml` is written after every file a unit needs, and the units after it.
 
 pub mod backend;
@@ -160,27 +163,26 @@ pub struct Options {
 /// The `installer.toml` this run leaves: the file that is there with the flags' settings put
 /// in, or the defaults with them. A file that is not valid is not overwritten (the operator
 /// decides), and a floor never goes down.
-pub fn installer_file(
+pub fn installer_settings(
     exec: &dyn Exec,
     v: &Valid,
     platform: Platform,
-) -> Result<String, SetupError> {
-    let path = HostPath::new(paths::INSTALLER_TOML)?;
+) -> Result<InstallerToml, SetupError> {
+    let installer_toml = paths::installer_toml(platform);
+    let path = HostPath::new(installer_toml)?;
     let mut settings = match exec.inspect(&path)? {
         None => InstallerToml::default(),
         Some(Entry::File { bytes, .. }) => {
             let text = String::from_utf8_lossy(&bytes);
             InstallerToml::parse(&text).map_err(|e| {
                 SetupError::NeedsOperator(format!(
-                    "{e}\nfix {} or remove it, then run setup again",
-                    paths::INSTALLER_TOML
+                    "{e}\nfix {installer_toml} or remove it, then run setup again"
                 ))
             })?
         }
         Some(_) => {
             return Err(SetupError::NeedsOperator(format!(
-                "{} is not a regular file",
-                paths::INSTALLER_TOML
+                "{installer_toml} is not a regular file"
             )));
         }
     };
@@ -188,8 +190,7 @@ pub fn installer_file(
         if floor < settings.min_generation {
             return Err(SetupError::NeedsOperator(format!(
                 "--min-generation {floor} is below the {} in {}: a floor only goes up; lower it by editing the file",
-                settings.min_generation,
-                paths::INSTALLER_TOML
+                settings.min_generation, installer_toml
             )));
         }
         settings.min_generation = floor;
@@ -203,7 +204,7 @@ pub fn installer_file(
         }
         _ => (None, None),
     };
-    Ok(settings.render())
+    Ok(settings)
 }
 
 /// The role whose certificate and key the fetch child is lent: the daemon's if the host has
@@ -240,22 +241,17 @@ fn refuse_old_layout(exec: &dyn Exec, platform: Platform) -> Result<(), SetupErr
 }
 
 /// Stops `setup` where a regular file in `/etc/systemd/system` has the name of the mode's
-/// packaged unit (or of its template): systemd reads `/etc` before `/usr/lib`, and `setup`
+/// packaged unit: systemd reads `/etc` before `/usr/lib`, and `setup`
 /// does not enable a unit that is already enabled, so the host would go on running the old
 /// file's flags. A link is what `systemctl link` makes and is not a shadow with other flags.
 fn refuse_shadow_unit(exec: &dyn Exec, mode: Mode) -> Result<(), SetupError> {
     for unit in plan::mode_units(mode) {
-        let template = unit
-            .split_once('@')
-            .map(|(name, _)| format!("{name}@.service"));
-        for name in std::iter::once((*unit).to_owned()).chain(template) {
-            let path = format!("/etc/systemd/system/{name}");
-            if matches!(
-                exec.inspect(&HostPath::new(&path)?)?,
-                Some(Entry::File { .. })
-            ) {
-                return Err(SetupError::ShadowUnit { path, unit });
-            }
+        let path = format!("/etc/systemd/system/{unit}");
+        if matches!(
+            exec.inspect(&HostPath::new(&path)?)?,
+            Some(Entry::File { .. })
+        ) {
+            return Err(SetupError::ShadowUnit { path, unit });
         }
     }
     Ok(())
@@ -300,7 +296,7 @@ pub fn run(
     if options.apply {
         os.trusted_binary()?;
     }
-    let valid = raw.validate().map_err(SetupError::Invalid)?;
+    let valid = raw.validate(os.platform()).map_err(SetupError::Invalid)?;
     let ctx = plan::context(os, valid.mode)?;
     refuse_old_layout(&*exec, ctx.platform)?;
     if ctx.platform == Platform::Linux {
@@ -377,7 +373,7 @@ pub fn cli(
         min_generation: args.min_generation,
         commit: args.commit.clone(),
         database: args.database.clone(),
-        installer_config: args.installer_config.to_string(),
+        installer_config: args.installer_config.as_ref().map(ToString::to_string),
     };
     let options = Options {
         apply,

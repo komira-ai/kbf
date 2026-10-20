@@ -7,16 +7,8 @@ use super::*;
 /// The kill wait the sweeps here get.
 const WAIT: Duration = Duration::from_secs(5);
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps")
-        .join("kbf-driver-native-unit")
-        .join(format!("sweep-{name}-{}", std::process::id()));
-    // Absent unless a run with this pid left it.
-    let _ = kbf_outputs::remove_tree(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    let dir = crate::unit_dir(&format!("sweep-{name}"));
     // Logging on, so the sweep's messages are written (and their arguments run).
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     dir
