@@ -59,6 +59,9 @@ const GROUPS: &[(&str, &[&str])] = &[
             "listen",
             "metrics-listen",
             "reapi-max-streams",
+            "release-poll-every-secs",
+            "release-poll-refs",
+            "release-poll-repo",
             "releases-dir",
             "shutdown-timeout-secs",
             "storage-listen",
@@ -161,6 +164,9 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "storage-node",
         &[
+            "auto-promote",
+            "handoff-allow-degraded",
+            "handoff-settle-secs",
             "member-dwell-secs",
             "member-ttl-secs",
             "storage-weight",

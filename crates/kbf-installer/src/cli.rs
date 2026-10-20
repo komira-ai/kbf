@@ -269,11 +269,13 @@ pub struct GcArgs {
 #[derive(Args)]
 pub struct RunArgs {
     /// Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it.
-    #[arg(long, default_value = "/var/lib/kbf-installer", value_parser = kbf_host::HostPath::new)]
-    pub update_dir: kbf_host::HostPath,
+    /// Default: the host's state directory (`/var/lib/kbf-installer`, `/var/db/kbf-installer` on a Mac).
+    #[arg(long, value_parser = kbf_host::HostPath::new)]
+    pub update_dir: Option<kbf_host::HostPath>,
     /// The order spool: owned by the service user, mode 0700, inside a root-owned parent.
-    #[arg(long, default_value = "/var/lib/kbf-installer/orders", value_parser = kbf_host::HostPath::new)]
-    pub orders_dir: kbf_host::HostPath,
+    /// Default: `orders` in the state directory.
+    #[arg(long, value_parser = kbf_host::HostPath::new)]
+    pub orders_dir: Option<kbf_host::HostPath>,
     /// The systemd unit to restart after a swap (Linux). Without it and without
     /// `--launchd-label`, the unit of the mode in the host's kbf.toml, which is how the one
     /// packaged kbf-installer.service serves every mode.
@@ -303,6 +305,20 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
+    /// Root's directory, as the flag gives it; else the host's own.
+    pub fn update_dir_in(&self, layout: &crate::layout::Layout) -> kbf_host::HostPath {
+        self.update_dir
+            .clone()
+            .unwrap_or_else(|| layout.update_dir())
+    }
+
+    /// The order spool, as the flag gives it; else the host's own.
+    pub fn orders_dir_in(&self, layout: &crate::layout::Layout) -> kbf_host::HostPath {
+        self.orders_dir
+            .clone()
+            .unwrap_or_else(|| layout.orders_dir())
+    }
+
     /// The service this `run` restarts, when the flags name it; `None` when neither does.
     pub fn named_service(&self) -> Option<ServiceArgs> {
         (self.unit.is_some() || self.launchd_label.is_some()).then(|| ServiceArgs {
