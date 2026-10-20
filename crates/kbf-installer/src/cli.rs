@@ -342,6 +342,7 @@ impl Verb {
             | Verb::Confirm(_)
             | Verb::Revert(_)
             | Verb::Rollback(_)
+            | Verb::RecordRelease(_)
             | Verb::Gc(_)
             | Verb::Stage
             | Verb::Activate => true,

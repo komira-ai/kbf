@@ -591,10 +591,10 @@ async fn a_cold_start_that_cannot_read_status_reports_each_try_and_stops_cleanly
     let boot = state.join("boot.json");
     let began = Instant::now();
     let text = loop {
-        if let Ok(text) = fs::read_to_string(&boot) {
-            if text.contains("retrying") {
-                break text;
-            }
+        if let Ok(text) = fs::read_to_string(&boot)
+            && text.contains("retrying")
+        {
+            break text;
         }
         assert!(began.elapsed() < Duration::from_secs(60), "no boot.json");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -612,7 +612,7 @@ async fn a_cold_start_that_cannot_read_status_reports_each_try_and_stops_cleanly
     std::io::Read::read_to_string(&mut proxy.stderr.take().expect("stderr"), &mut err)
         .expect("stderr text");
     assert!(
-        err.contains("cold start (attempt 1 of 10): status-unreadable"),
+        err.contains("cold start retrying (attempt 1 of 10): status-unreadable"),
         "{err}"
     );
     assert!(err.contains(", next try in 2 s"), "{err}");

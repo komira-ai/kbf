@@ -837,13 +837,14 @@ fn the_verbs_that_manage_a_host_wait_for_its_migration() {
 /// Mutants to plant: `Verb::FetchChild` or `Verb::Migrate(_)` moved to the `true` arm; `Verb::Setup(_)` to the `false` one.
 #[test]
 fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
-    let held: [&[&str]; 9] = [
+    let held: [&[&str]; 10] = [
         &["setup", "--mode=frontend"],
         &RUN,
         &["update", "--commit", B, "--frontend"],
         &["confirm", "--id=1-5", "--unit", "kbf.service"],
         &["revert", "--id=1-5", "--unit", "kbf.service"],
         &["rollback", "--unit", "kbf.service"],
+        &["record-release", "--commit", A],
         &["gc"],
         &["stage"],
         &["activate"],
