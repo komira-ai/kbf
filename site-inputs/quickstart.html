@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quick start - kbf</title>
+<meta name="description" content="From a host to a first remote build with kbf.">
+<link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="style.css">
+<script src="site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header"><div class="wrap bar">
+<a class="brand" href="index.html" aria-label="kbf home"><span class="gt" aria-hidden="true">&gt;</span>kbf</a>
+<nav class="site-nav" aria-label="Site"><ul>
+<li><a href="install.html">Install</a></li>
+<li><a href="quickstart.html" aria-current="page">Quick start</a></li>
+<li><a href="config.html">Configuration</a></li>
+<li><a href="updates.html">Updates</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul></nav>
+</div></header>
+<main id="main" class="wrap">
+<h1>Quick start</h1>
+<p class="lede">From a host to your first remote build. Each step is tagged: <span class="tag tag-ok">works today</span> is in the code, <span class="tag tag-planned">specified</span> is decided in the design documents and not built yet.</p>
+
+<div class="notice">
+  <p><strong>One rule for the command line.</strong> A host's role is a flag, <code>--mode=frontend|storage|daemon|storage-and-daemon|all-in-one</code>, or <code>mode = "..."</code> in <code>/etc/kbf/kbf.toml</code>. It is never a subcommand. Today's <code>kbf</code> still takes the mode as a word (<code>kbf all-in-one</code>); that form stays as an alias until the flag lands.</p>
+</div>
+
+<ol class="steps">
+  <li>
+    <h3>Install kbf-installer <span class="tag tag-planned">specified</span></h3>
+    <p><code>kbf-installer</code> is the one package of the farm: it installs and verifies the <code>kbf</code> release, runs as a service, and takes update orders. Pick a channel on the <a href="install.html">install page</a>.</p>
+    <div class="code"><pre><span class="c"># Any Linux host: the install script</span>
+<span class="p">$</span> curl -fsSL https://kbf.dev/install.sh | sudo sh</pre></div>
+    <div class="code"><pre><span class="c"># Debian and Ubuntu</span>
+<span class="p">$</span> sudo apt install ./kbf-installer_VERSION_amd64.deb</pre></div>
+  </li>
+  <li>
+    <h3>Set up a mode <span class="tag tag-planned">specified</span></h3>
+    <p>Installing starts nothing. <code>setup</code> fetches and verifies the first release, writes <code>/etc/kbf/kbf.toml</code>, creates the users and directories, and starts the units. For a single machine:</p>
+    <div class="code"><pre><span class="p">$</span> sudo kbf-installer setup --mode=all-in-one</pre></div>
+    <p>A frontend host needs a Postgres database you provide; <code>setup</code> creates the schema. A storage or daemon host passes <code>--token-file</code> with its enrollment token. The flags are in the <a href="https://github.com/komira-ai/kbf/blob/feature/arch-v2/docs/design/kbf-installer.md">installer contract</a>.</p>
+  </li>
+  <li>
+    <h3>Check the settings <span class="tag tag-ok">works today</span></h3>
+    <p>Every mode reads its settings from <code>kbf.toml</code> and takes <code>--check</code>, which prints every missing prerequisite and exits non-zero. All keys are on the <a href="config.html">configuration page</a>.</p>
+    <div class="code"><pre><span class="p">$</span> kbf all-in-one --check</pre></div>
+  </li>
+  <li>
+    <h3>Point Buck2 at the frontend <span class="tag tag-ok">works today</span></h3>
+    <p>In the <code>.buckconfig</code> of your project, send actions, cache reads and blobs to the frontend's REAPI address (port 8980 by default) and use SHA-256 digests:</p>
+    <div class="code"><pre>[buck2]
+  digest_algorithms = SHA256
+
+[buck2_re_client]
+  engine_address = grpc://FRONTEND:8980
+  action_cache_address = grpc://FRONTEND:8980
+  cas_address = grpc://FRONTEND:8980
+  tls = false
+  instance_name = main</pre></div>
+    <p>Replace <code>FRONTEND</code> with your frontend's name. Without a certificate the listener speaks plain text; turn on TLS with <code>reapi-tls-cert</code> and <code>reapi-tls-key</code> and set <code>tls = true</code>.</p>
+  </li>
+  <li>
+    <h3>Build <span class="tag tag-ok">works today</span></h3>
+    <p>Run a build with remote execution enabled. A second run, on any machine, is answered from the cache.</p>
+    <div class="code"><pre><span class="p">$</span> buck2 build //... --prefer-remote</pre></div>
+  </li>
+</ol>
+
+<p>Next: <a href="updates.html">how updates work</a>, or <a href="architecture.html">the architecture</a>.</p>
+</main>
+<footer class="site-footer"><div class="wrap"><p>kbf is licensed under the Apache License 2.0.</p>
+<ul><li><a href="https://github.com/komira-ai/kbf">Source on GitHub</a></li></ul></div></footer>
+</body>
+</html>

@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remote execution build farm - kbf</title>
+<meta name="description" content="kbf is an open-source remote execution build farm for Buck2 and Bazel.">
+<link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="style.css">
+<script src="site.js" defer></script>
+<script src="demo/trace.js" defer></script>
+<script src="demo/cast.js" defer></script>
+<script src="demo.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header"><div class="wrap bar">
+<a class="brand" href="index.html" aria-label="kbf home"><span class="gt" aria-hidden="true">&gt;</span>kbf</a>
+<nav class="site-nav" aria-label="Site"><ul>
+<li><a href="install.html">Install</a></li>
+<li><a href="quickstart.html">Quick start</a></li>
+<li><a href="config.html">Configuration</a></li>
+<li><a href="updates.html">Updates</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul></nav>
+</div></header>
+<main id="main">
+<section class="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <p class="eyebrow"><span class="pill">Early development</span> <span class="muted">open source, Apache 2.0</span></p>
+      <h1 class="display">Remote builds on <em>your own machines</em>.</h1>
+      <p class="lede">kbf is a remote execution build farm for <a href="https://buck2.build">Buck2</a> and <a href="https://bazel.build">Bazel</a>. Your build tool sends actions to one address; kbf runs them on your workers and keeps every result in a shared, content-addressed cache.</p>
+      <div class="install-block">
+        <p class="install-label"><strong>Install</strong> <span class="tag tag-planned">published with the first release</span></p>
+        <div class="cmd cmd-lg cmd-xl"><pre><code><span class="prompt">$ </span>curl -fsSL https://kbf.dev/install.sh | sudo sh</code></pre></div>
+        <p class="install-note">The script verifies what it downloads and starts nothing. Other channels are on the <a href="install.html">install page</a>.</p>
+      </div>
+      <p class="actions hero-links"><a class="button button-primary" href="quickstart.html">Quick start</a> <a class="button" href="#demo-title">Watch a real build</a></p>
+    </div>
+  </div>
+</section>
+
+<section class="band" id="get-started">
+  <div class="wrap">
+    <p class="kicker">Get started</p>
+    <h2>From a host to a remote build in three steps</h2>
+    <ol class="stepper">
+      <li>
+        <span class="num" aria-hidden="true">1</span>
+        <h3>Install the installer</h3>
+        <p><code>kbf-installer</code> installs and verifies kbf, then takes update orders. Installing starts nothing. <span class="tag tag-planned">specified</span></p>
+        <div class="cmd"><pre><code><span class="prompt">$ </span>curl -fsSL https://kbf.dev/install.sh | sudo sh</code></pre></div>
+      </li>
+      <li>
+        <span class="num" aria-hidden="true">2</span>
+        <h3>Set up a mode</h3>
+        <p>One host can run everything; a farm splits the roles. <span class="tag tag-planned">specified</span></p>
+        <div class="cmd"><pre><code><span class="prompt">$ </span>sudo kbf-installer setup --mode=all-in-one</code></pre></div>
+      </li>
+      <li>
+        <span class="num" aria-hidden="true">3</span>
+        <h3>Point Buck2 at it</h3>
+        <p>In your <code>.buckconfig</code>, send actions and cache reads to the frontend. <span class="tag tag-ok">works today</span></p>
+        <div class="cmd"><pre><code>[buck2_re_client]
+  engine_address = grpc://FRONTEND:8980
+  action_cache_address = grpc://FRONTEND:8980
+  cas_address = grpc://FRONTEND:8980</code></pre></div>
+      </li>
+    </ol>
+    <p>The <a href="quickstart.html">quick start</a> has every flag and what is built today.</p>
+  </div>
+</section>
+
+<section class="band" id="demo-section">
+  <div class="wrap">
+    <p class="kicker">Demo</p>
+    <h2 id="demo-title">A real build, replayed</h2>
+    <p class="lede">A person writes a target, runs the build, and watches the farm work. This is a recorded run of the farm building a slice of a real project, replayed: the terminal is what the build tool printed, and the picture is what the farm did in the same window. Time is compressed.</p>
+
+    <div class="demo" id="demo">
+      <div class="panes">
+        <section class="pane" aria-labelledby="ed-title">
+          <div class="pane-bar">
+            <span class="dots" aria-hidden="true"></span>
+            <h3 id="ed-title" class="visually-hidden">Editor</h3>
+            <div role="tablist" aria-label="Build file" class="tabs js-only">
+              <button type="button" role="tab" id="tab-buck" aria-selected="true" aria-controls="ed-buck-wrap">BUCK</button>
+              <button type="button" role="tab" id="tab-bazel" aria-selected="false" aria-controls="ed-bazel-wrap">BUILD.bazel</button>
+            </div>
+            <span class="pane-path" id="ed-path"></span>
+          </div>
+          <div id="ed-buck-wrap" role="tabpanel" aria-labelledby="tab-buck"><pre class="pane-body"><code id="ed-buck"></code></pre></div>
+          <div id="ed-bazel-wrap" role="tabpanel" aria-labelledby="tab-bazel" hidden><pre class="pane-body"><code id="ed-bazel"></code></pre></div>
+          <p class="pane-note small muted" id="ed-bazel-note" hidden>This is the same target in Bazel. komira builds with Buck2, not Bazel, so this tab is how the same rule would read in a Bazel workspace, not a file from the recording.</p>
+        </section>
+        <section class="pane" aria-labelledby="term-title">
+          <div class="pane-bar"><span class="dots" aria-hidden="true"></span><h3 id="term-title" class="pane-title">Terminal</h3></div>
+          <pre class="pane-body term-body" id="term" role="log" aria-live="off" tabindex="0"></pre>
+        </section>
+      </div>
+
+      <div class="controls js-only">
+        <button type="button" class="button button-primary" id="play">Play</button>
+        <button type="button" class="button" id="skip">Skip the typing</button>
+        <label for="scrub"><span class="visually-hidden">Position in the build</span><input type="range" id="scrub" min="0" max="1000" value="0"></label>
+        <label for="speed">Speed <select id="speed"><option value="15">15x</option><option value="30" selected>30x</option><option value="60">60x</option><option value="120">120x</option></select></label>
+      </div>
+
+      <div class="demo-grid">
+        <figure class="stage flow">
+          <div class="svg-scroll"><svg id="flow" viewBox="0 0 990 440" role="img" aria-labelledby="flow-t flow-d"></svg></div>
+          <figcaption class="small muted">Amber dots: a lease going from the frontend to a daemon. Blue dots: an action answered from the cache, or a daemon sending outputs to storage. Red: a remote action that failed. Dots show direction, not size; the counters are exact.</figcaption>
+        </figure>
+        <ul class="stats js-only" aria-live="off">
+          <li class="wide"><span class="n" id="st-time">0:00</span><span class="k">build time</span></li>
+          <li><span class="n n-accent" id="st-waiting">0</span><span class="k">actions Buck2 is waiting on</span></li>
+          <li><span class="n n-accent" id="st-running">0</span><span class="k">running on daemons</span></li>
+          <li><span class="n" id="st-hits">0</span><span class="k">answered from the cache</span></li>
+          <li><span class="n" id="st-remote">0</span><span class="k">remote runs finished</span></li>
+          <li><span class="n" id="st-granted">0</span><span class="k">leases granted</span></li>
+          <li><span class="n" id="st-failed">0</span><span class="k">remote runs failed</span></li>
+        </ul>
+      </div>
+      <p class="no-js">This demo replays a recording with a script, and scripts are off. The totals are below.</p>
+
+      <div class="demo-facts">
+        <p><strong>The recording:</strong> one cold build of a slice of a real project on a test farm of <span id="tot-nodes">2</span> daemons, started with <code>buck2 build</code> from a list of targets. The build client reported <span id="tot-commands"></span> commands: <span id="tot-cached"></span> answered from the cache (<span id="tot-pct"></span>%), <span id="tot-remote"></span> run remotely, <span id="tot-local"></span> local. It took <span id="tot-duration"></span> and ended <strong id="tot-outcome"></strong>: <span id="tot-failed"></span> remote actions failed, and the terminal shows what the build client printed for them.</p>
+        <p><strong>What was kept:</strong> the terminal text is the build client's own output at its real relative times, with host names, addresses, paths, ids and digests removed. The farm side is the frontend's lease log, <span id="tot-grants"></span> leases, with the daemons renamed daemon-1 and up. Cache hits are grouped into <span id="tot-binms"></span> ms steps, because the recording has over a thousand and the picture draws one flash per step. <a href="https://github.com/komira-ai/kbf/tree/feature/arch-v2/site/demo">The data is in the repository.</a></p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band" id="why">
+  <div class="wrap">
+    <p class="kicker">Why we built it</p>
+    <h2>A farm for the work that needs real machines</h2>
+    <p class="lede">We wanted one open farm that runs the whole build, including the tests that need a real Mac, a real display or a real device, and that keeps what happened.</p>
+    <ul class="why-grid">
+      <li>
+        <h3>UI, Mac and iOS tests on real machines</h3>
+        <p>These tests need a logged-in macOS session, Xcode and, for iOS, a device on a cable. kbf runs actions on Mac nodes as plain processes with their process tree, memory and network watched.</p>
+        <div class="tags"><span class="tag tag-ok">Mac daemon: works today</span><span class="tag tag-planned">iOS devices: specified</span></div>
+      </li>
+      <li>
+        <h3>Utilization you do not tune by hand</h3>
+        <p>In our experience, fitting actions to machines is hard to configure. kbf has no per-action reservations: it admits actions by CPUs and a memory ladder, and sizes cgroups from what it measures.</p>
+        <div class="tags"><span class="tag tag-ok">works today</span></div>
+      </li>
+      <li>
+        <h3>Open source, all of it</h3>
+        <p>Some other farms are not completely open source. kbf is licensed under the Apache License 2.0.</p>
+        <div class="tags"><span class="tag tag-ok">works today</span></div>
+      </li>
+      <li>
+        <h3>Every build kept, and a way to read it</h3>
+        <p>kbf records the attempts and cache hits of each invocation. We are designing a UI to explore all logs and metrics, and an API that an AI agent can use to fetch results.</p>
+        <div class="tags"><span class="tag tag-ok">build history: works today</span><span class="tag tag-planned">logs and metrics UI: specified</span><span class="tag tag-planned">AI fetch: specified</span></div>
+      </li>
+    </ul>
+    <p class="actions"><a class="button" href="story.html">Read the story: from one laptop to a farm</a></p>
+  </div>
+</section>
+
+<section class="band band-planned" id="architecture">
+  <div class="wrap">
+    <p class="kicker">Architecture and the rest</p>
+    <h2>Four parts, one binary</h2>
+    <ul class="parts">
+      <li><h3>frontend</h3><p>The one address clients, daemons and storage nodes know. Serves REAPI and schedules actions. Its state lives in a Postgres database you provide.</p></li>
+      <li><h3>storage</h3><p>The content-addressable store and action cache: an SSD hot tier, flushed in the background to an object store.</p></li>
+      <li><h3>daemon</h3><p>The worker. It fetches inputs, runs each action in isolation and uploads outputs. Linux and macOS.</p></li>
+      <li><h3>all-in-one</h3><p>The parts in one process, for a single machine or a first try.</p></li>
+    </ul>
+    <p>A host takes a role with <code>--mode</code>: <code>frontend</code>, <code>storage</code>, <code>daemon</code>, <code>storage-and-daemon</code> or <code>all-in-one</code>. Read <a href="architecture.html">the architecture</a>, <a href="config.html">every setting</a> and <a href="updates.html">how a farm updates itself</a>.</p>
+    <p class="status small"><strong>Status.</strong> Early development. The project is design-first: interfaces and tests land before features, and nothing here is ready for production use yet. Expect breaking changes. Each step on these pages says whether it works today or is specified.</p>
+  </div>
+</section>
+</main>
+<footer class="site-footer"><div class="wrap"><p>kbf is licensed under the Apache License 2.0.</p>
+<ul><li><a href="https://github.com/komira-ai/kbf">Source on GitHub</a></li></ul></div></footer>
+</body>
+</html>
