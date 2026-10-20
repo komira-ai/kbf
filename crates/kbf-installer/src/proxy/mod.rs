@@ -96,6 +96,7 @@ pub mod child_http;
 pub mod child_real;
 pub mod gate_real;
 pub mod handover;
+pub mod handover_swap;
 pub mod model;
 pub mod orders;
 pub mod ports;

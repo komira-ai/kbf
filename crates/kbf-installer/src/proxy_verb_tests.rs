@@ -85,6 +85,22 @@ fn the_update_apis_numbers_and_places_come_from_the_file_and_the_flags() {
         check: false,
     };
     let cfg = handover_config(&args, &loaded);
+    // The children's ports are the upstream table's: in a slot the operator listener is at
+    // offset 2 and the admin calls at 3, slot B ten ports above slot A, all on loopback; and
+    // the operator token is the one the proxy checks callers against.
+    let at = |port| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    assert_eq!(
+        cfg.slots,
+        SlotAddrs {
+            admin: [at(18003), at(18013)],
+            operator: [at(18002), at(18012)],
+        }
+    );
+    assert_eq!(
+        cfg.operator_token_file,
+        PathBuf::from("/etc/kbf/operator.token")
+    );
+    assert!(!cfg.gate.is_filled());
     assert_eq!(
         (
             cfg.state_dir,
@@ -331,7 +347,17 @@ fn handover(name: &str) -> HandoverConfig {
         status_file: root.join("status.json"),
         confirm_window_s: 900,
         fetch_timeout_s: 900,
+        slots: SlotAddrs {
+            admin: [loopback(18003), loopback(18013)],
+            operator: [loopback(18002), loopback(18012)],
+        },
+        operator_token_file: root.join("operator.token"),
+        gate: GateSlot::new(),
     }
+}
+
+fn loopback(port: u16) -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::LOCALHOST, port))
 }
 
 /// Catches a proxy that cannot be bound being reported as served: a descriptor that is not a
@@ -646,6 +672,27 @@ fn a_death_during_a_drain_is_noted_and_does_not_end_the_drain() {
     assert!(died.load(Ordering::SeqCst));
 }
 
+/// Catches a swap thread that dies without stopping the proxy, or that stops it as a second
+/// signal (which ends the process at once): the death is remembered so that `outcome` fails the
+/// verb, it drains once and starts the clock a first signal starts, and with a drain already
+/// under way it is noted and drains nothing more.
+#[test]
+fn a_dead_handover_driver_stops_the_proxy_once_and_fails_the_verb() {
+    let stop = Arc::new(Stop {
+        seen: AtomicBool::new(false),
+        bound: Duration::from_millis(30),
+        exit: death_exit,
+    });
+    let died = AtomicBool::new(false);
+    let mut drains = 0;
+    handover_died("the swap stopped: x", &stop, &died, || drains += 1);
+    assert_eq!(drains, 1);
+    assert!(died.load(Ordering::SeqCst));
+    assert!(outcome(Ok(()), &died).is_err());
+    handover_died("again", &stop, &died, || drains += 1);
+    assert_eq!(drains, 1, "a second death drained again");
+}
+
 /// Catches a start-up line that does not say what the API does: it names the files, the
 /// staging deadline (the fetch limit of 900 s and five minutes) and that a `POST` is refused,
 /// and why.
@@ -657,7 +704,7 @@ fn the_start_up_line_says_what_the_update_api_will_do() {
         update_line(&parts, &cfg),
         format!(
             "update API on (status {}, orders {}, staging deadline 1200 s); \
-             a POST is refused: handover driver not wired",
+             a POST is refused: proxy not bound yet",
             cfg.status_file.display(),
             cfg.orders_dir.display()
         )

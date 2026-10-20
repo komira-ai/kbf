@@ -1,8 +1,9 @@
 //! `kbf-installer proxy` as a service manager runs it: a process with one activated socket.
 //! Nothing here needs root or a child frontend; the proxy has no active child, so every
 //! backend path is `UNAVAILABLE` and `/readyz` is 503, which is what the supervisor-less verb
-//! promises. The update route (`/v1/update/frontend`) is the update API with no handover driver
-//! behind it: it answers its status and refuses a `POST`, and the tests at the end say how.
+//! promises. The update route (`/v1/update/frontend`) is the update API with the handover driver
+//! behind it: on this host (no `releases/` directory, no child) it answers its status and
+//! refuses a `POST`, and the tests at the end say how.
 
 #![cfg(target_os = "linux")]
 
@@ -658,19 +659,21 @@ async fn the_update_route_is_the_update_api() {
     assert!(state_of(&config).join("orders.json").is_file());
 }
 
-/// Catches a `POST` that goes as far as an order while nothing can take the update over
-/// (the swap is not wired into the verb): the API refuses with 503 and its reason, no order
-/// is in the spool, and no request id was saved, so the same request is a fresh one when the
-/// driver is there.
+/// Catches a `POST` that goes as far as an order while nothing can take the update over: the
+/// verb binds the real handover driver, and on a host with no `releases/` directory (this
+/// test host, the verb having no flag for the install root) it refuses with 503 and its reason
+/// before anything is saved. No order is in the spool and no request id was saved, so the same
+/// request is a fresh one on a host that can take it.
 #[tokio::test(flavor = "current_thread")]
-async fn a_post_is_refused_while_no_handover_driver_is_wired_and_writes_nothing() {
+async fn a_post_is_refused_by_the_handover_driver_and_writes_nothing() {
     let (_proxy, addr, ca, config) = serving("update-post").await;
     let body = post_body("r1");
     let (status, text) = call(addr, &ca, "POST", UPDATE, Some(TOKEN), body.as_bytes()).await;
     assert_eq!(status, 503, "{text}");
     let answer = json(&text);
     assert_eq!(answer["error"], "handover_unavailable", "{text}");
-    assert_eq!(answer["message"], "handover driver not wired", "{text}");
+    let message = answer["message"].as_str().unwrap_or_default();
+    assert!(message.contains("releases directory"), "{text}");
     assert_eq!(names_in(&orders_dir_of(&config)), Vec::<String>::new());
     assert!(!state_of(&config).join("requests.json").exists());
 }

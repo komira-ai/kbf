@@ -1,6 +1,6 @@
 //! What the update API is made of when the proxy verb hosts it: every seam of
 //! [`Parts`](super::api::core::Parts) bound to its real implementation in one function,
-//! [`parts`], and the one seam that has no implementation yet bound to a refusal.
+//! [`parts`].
 //!
 //! | seam | here |
 //! |---|---|
@@ -11,37 +11,31 @@
 //! | `clock`, `hook` | the system clock; no crash points |
 //! | `config` | the confirm window of `installer.toml`, and a staging deadline sized by its `fetch_timeout_s` ([`staging_deadline`]) |
 //! | `compat` | [`StubGate`]: everything is compatible until the gate (R1, R4) is built |
-//! | `supervisor` | `NotWired`: no swap runs behind the API yet |
+//! | `supervisor` | [`Handover`](super::handover_swap::Handover): the swap, built over the proxy's gate once the verb has bound the proxy and filled [`HandoverConfig::gate`] |
 //!
 //! **One spool per `orders/` directory.** [`OrderSpool::open`] removes the half-written files
 //! of an earlier run, so a second spool over the same directory, in this process or another,
 //! would delete the file the first is writing. [`parts`] opens the only one. The swap writes
-//! its `confirm` and `revert` orders through the same counter, so the supervisor that
-//! replaces `NotWired` takes a clone of that spool (a clone shares the counter and the lock)
-//! for its `SpoolRootOrders`, and never opens `orders/` itself.
+//! its `confirm` and `revert` orders through the same counter, so the supervisor takes a clone
+//! of that spool (a clone shares the counter and the lock) for its `SpoolRootOrders`, and never
+//! opens `orders/` itself.
 //!
-//! **What the API does without a driver.** A `GET` answers the status of "no update". A `POST`
-//! is refused with 503 `handover_unavailable` before its request id is saved or an order
-//! written ([`Supervisor::start_blocked`]), so the root half does not fetch and stage a
-//! release that nothing can take over. Nothing here changes what the proxy serves.
+//! **Before the proxy is bound.** [`parts`] runs before `Proxy::bind` (so that a spool error is
+//! a usage error before anything is bound), and the swap needs the proxy's gate, which only
+//! exists after it. The supervisor [`parts`] returns therefore waits for [`HandoverConfig::gate`],
+//! a slot the verb fills right after the bind: until then its status is idle and a `POST` is
+//! refused ("proxy not bound yet", [`start_blocked`](super::api::traits::Supervisor::start_blocked)), nothing written. It is built
+//! on its first call after the fill, which is `Core::new` asking for the status, so an update a
+//! predecessor left in flight is resumed before the API serves. See
+//! [`super::handover_swap`].
 //!
 //! **Fail fast, on purpose.** An order spool that cannot be opened ends the start
 //! ([`HandoverError::Orders`]), and with it the data plane: the verb exits 2, which the unit
-//! does not restart. While no driver is wired the spool is not even written to, so this is a
-//! choice and not a need: a host whose `orders/` the service user cannot use is a host where
+//! does not restart. A host whose `orders/` the service user cannot use is a host where
 //! the update API could never work, and a proxy that serves while its update route is dead
 //! hides that until the first update. The alternative is to serve and answer 503 on the update
 //! route only; take it by returning a `Parts` over a spool that refuses, not by skipping the
 //! error here.
-//!
-//! **What the swap adapter's PR changes here.**
-//! - The adapter needs the proxy's gate, which the verb builds after it has bound its
-//!   listeners, and [`parts`] is called before the bind (so that a spool error is a usage error
-//!   before anything is bound). The adapter's PR builds the parts after the gate exists, or
-//!   passes the gate in [`HandoverConfig`]. `Core::new` asks the supervisor for its status
-//!   (the resume of an update in flight), so the supervisor must exist before the `Core`.
-//! - [`HandoverConfig`] holds only what the seams above read. The adapter's PR adds what it
-//!   needs besides: the slot addresses, the proxy secret and the token path.
 
 use std::io;
 use std::path::PathBuf;
@@ -49,11 +43,8 @@ use std::sync::Arc;
 
 use super::api::core::{Config, NoCrash, Parts, StagingDeadline};
 use super::api::idempotency::Idempotency;
-use super::api::traits::{
-    JsonFileStatus, Retired, StubGate, Supervisor, SupervisorError, SupervisorStatus, SystemClock,
-    UpdateSpec,
-};
-use super::model::Phase;
+use super::api::traits::{JsonFileStatus, StubGate, SystemClock};
+use super::handover_swap::{GateSlot, Handover, SlotAddrs};
 use super::orders::{OrderSpool, SpoolError};
 use super::running_binary::RunningBinary;
 
@@ -71,6 +62,12 @@ pub struct HandoverConfig {
     pub confirm_window_s: u32,
     /// How long the root half's fetch may take (`fetch_timeout_s` of `installer.toml`).
     pub fetch_timeout_s: u32,
+    /// The loopback ports of the two children's admin and operator listeners, by slot.
+    pub slots: SlotAddrs,
+    /// The operator token the swap presents to a child's operator API (`desired`).
+    pub operator_token_file: PathBuf,
+    /// Set once by the verb right after the bind; the supervisor waits for it.
+    pub gate: GateSlot,
 }
 
 /// Why [`parts`] could not build the API's seams.
@@ -121,9 +118,7 @@ pub fn parts(cfg: &HandoverConfig) -> Result<Parts, HandoverError> {
 /// [`parts`] over a spool and a binary identity it is given.
 fn assemble(cfg: &HandoverConfig, spool: OrderSpool, binary: RunningBinary) -> Parts {
     Parts {
-        // The swap's supervisor goes here, with `spool.clone()` for its `SpoolRootOrders`
-        // (before `spool` moves into `orders`).
-        supervisor: Box::new(NotWired),
+        supervisor: Box::new(Handover::new(cfg, spool.clone())),
         orders: Box::new(spool),
         status: Box::new(JsonFileStatus::new(&cfg.status_file)),
         compat: Box::new(StubGate),
@@ -135,41 +130,6 @@ fn assemble(cfg: &HandoverConfig, spool: OrderSpool, binary: RunningBinary) -> P
             window_s: cfg.confirm_window_s,
             staging_deadline: staging_deadline(cfg.fetch_timeout_s),
         },
-    }
-}
-
-/// The words of every refusal of a handover that has no driver.
-pub const NOT_WIRED: &str = "handover driver not wired";
-
-/// The supervisor of an API with no swap behind it: it has no update and starts none. A
-/// `POST` is refused up front ([`Supervisor::start_blocked`]); `start` itself, which only an
-/// update accepted by an earlier process that had a driver could reach, fails, and the API
-/// ends that update `failed` at step `start` and reverts its staged release.
-struct NotWired;
-
-impl Supervisor for NotWired {
-    fn start_blocked(&self) -> Option<String> {
-        Some(NOT_WIRED.to_owned())
-    }
-
-    fn start(&mut self, _spec: &UpdateSpec) -> Result<(), SupervisorError> {
-        Err(SupervisorError::Failed(NOT_WIRED.to_owned()))
-    }
-
-    fn abort(&mut self) -> Result<Phase, SupervisorError> {
-        Err(SupervisorError::NotOpen)
-    }
-
-    fn rollback(&mut self) -> Result<Phase, SupervisorError> {
-        Err(SupervisorError::NotOpen)
-    }
-
-    fn force_retire(&mut self, _reason: &str) -> Result<Retired, SupervisorError> {
-        Err(SupervisorError::NotOpen)
-    }
-
-    fn status(&self) -> SupervisorStatus {
-        SupervisorStatus::default()
     }
 }
 

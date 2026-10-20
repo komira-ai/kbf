@@ -208,10 +208,24 @@ impl Rig {
         Config {
             mode: Mode::Frontend,
             timing: quick(),
-            state_dir: dir,
+            state_dir: dir.clone(),
             active: Slot::A,
             rollback_after_switch: false,
+            releases_dir: dir,
         }
+    }
+
+    /// A process runs in `slot` (a candidate nobody asked for, left from before).
+    pub fn occupy(&self, slot: Slot) {
+        let mut st = self.st();
+        let pid = st.next_pid;
+        st.next_pid += 1;
+        st.procs[ix(slot)] = Some(Proc {
+            alive: true,
+            state: RoleState::Candidate,
+            holder: false,
+            ident: ident_of(pid, &c(B)),
+        });
     }
 }
 
