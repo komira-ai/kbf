@@ -186,35 +186,144 @@ fn a_proxy_rerun_keeps_the_keys_it_has_no_flag_for() {
     );
 }
 
+/// One row per key `setup` owns: the key as the refusal names it, and the golden file with
+/// only that key different from what `proxy_raw`'s flags say.
+fn owned_rows() -> [(&'static str, String); 7] {
+    let golden = |from: &str, to: &str| {
+        assert!(PROXY_GOLDEN.contains(from), "{from}");
+        PROXY_GOLDEN.replacen(from, to, 1)
+    };
+    [
+        (
+            "operator_token_file",
+            golden(
+                "operator_token_file = \"/etc/kbf/api-token\"",
+                "operator_token_file = \"/etc/kbf/zz-token\"",
+            ),
+        ),
+        (
+            "server_cert_file",
+            golden("/etc/kbf/reapi.pem", "/etc/kbf/zz.pem"),
+        ),
+        (
+            "server_key_file",
+            golden("/etc/kbf/reapi.key", "/etc/kbf/zz.key"),
+        ),
+        (
+            "client_ca_file",
+            golden(
+                "client_ca_file = \"/etc/kbf/ca.pem\"",
+                "client_ca_file = \"/etc/kbf/zz-ca.pem\"",
+            ),
+        ),
+        (
+            "buck2_auth",
+            golden("buck2_auth = \"none\"", "buck2_auth = \"mtls\""),
+        ),
+        (
+            "buck2_token_file",
+            golden(
+                "buck2_auth = \"none\"\n",
+                "buck2_auth = \"none\"\nbuck2_token_file = \"/etc/kbf/zz-bearer\"\n",
+            ),
+        ),
+        (
+            "upstream.base_port",
+            golden("base_port = 18000", "base_port = 19000"),
+        ),
+    ]
+}
+
 /// Catches a Keep that ignores a differing owned key (`setup` then says nothing and the proxy
-/// binds the old ports): with other settings in the table, a different `--proxy-base-port`
-/// refuses (exit 5), names the key and not the value, and writes nothing.
+/// runs on the old value), for every key `setup` owns and not only the port: with other
+/// settings in the table (`hold_max_s`), the one key differing from the flags refuses
+/// (exit 5), names that key and no other, never a value, and writes nothing. A comparison
+/// dropped or mislabelled in `differing` fails its row.
 #[test]
 fn a_differing_key_in_a_tuned_table_is_refused_not_overwritten() {
+    for (key, golden) in owned_rows() {
+        let mut exec = proxy_host();
+        let there = golden.replace("hold_max_s = 20", "hold_max_s = 33");
+        put(&mut exec, INSTALLER_TOML, 0o644, ROOT, &there);
+        let err = go(&FakeOs::linux(), &mut exec, &proxy_raw(), APPLY).expect_err(key);
+        assert_eq!(err.exit(), Exit::NeedsOperator, "{key}");
+        let shown = err.to_string();
+        assert!(shown.contains(&format!("({key})")), "{key}: {shown}");
+        for value in ["19000", "18000", "zz-", "zz.", "mtls"] {
+            assert!(!shown.contains(value), "{key}: {shown}");
+        }
+        assert_eq!(text(&exec, INSTALLER_TOML), there, "{key}");
+        assert!(exec.log.is_empty(), "{key}: {:?}", exec.log);
+    }
+}
+
+/// Catches a refusal where there is nothing to lose, and a rewrite that leaves an owned key
+/// behind: for every key `setup` owns, a table that differs from the flags in that key only
+/// and is the defaults otherwise is rewritten to the golden file (so `take_owned` must copy
+/// every key it owns, or the row refuses instead).
+#[test]
+fn a_differing_key_in_an_untuned_table_is_rewritten() {
+    for (key, there) in owned_rows() {
+        let mut exec = proxy_host();
+        put(&mut exec, INSTALLER_TOML, 0o644, ROOT, &there);
+        go_ok(&FakeOs::linux(), &mut exec, &proxy_raw());
+        assert_eq!(text(&exec, INSTALLER_TOML), PROXY_GOLDEN, "{key}");
+    }
+}
+
+/// Catches a Keep that is not one: for every owned key, the same flags over a tuned table that
+/// holds the flags' value leave the file byte for byte, so no key of `differing` can report a
+/// difference where there is none.
+#[test]
+fn an_owned_key_equal_to_its_flag_is_kept() {
     let mut exec = proxy_host();
-    let there = tuned().replace("base_port = 18000", "base_port = 19000");
+    put(&mut exec, INSTALLER_TOML, 0o644, ROOT, &tuned());
+    go_ok(&FakeOs::linux(), &mut exec, &proxy_raw());
+    assert_eq!(text(&exec, INSTALLER_TOML), tuned());
+}
+
+/// Catches a rerun that deletes what a newer `[proxy]` table holds and `setup` has no flag
+/// for (the `[[proxy.server_cert]]` list of SNI): the file is refused or kept with the list,
+/// never rewritten without it.
+#[test]
+fn a_proxy_table_key_setup_does_not_know_is_not_dropped() {
+    let there = format!(
+        "{PROXY_GOLDEN}\n[[proxy.server_cert]]\nnames = [\"reapi.example.com\"]\ncert_file = \"/etc/kbf/reapi.pem\"\nkey_file = \"/etc/kbf/reapi.key\"\ndefault = true\n"
+    );
+    let mut exec = proxy_host();
     put(&mut exec, INSTALLER_TOML, 0o644, ROOT, &there);
+    let kept = match go(&FakeOs::linux(), &mut exec, &proxy_raw(), APPLY) {
+        Err(_) => text(&exec, INSTALLER_TOML) == there,
+        Ok(_) => text(&exec, INSTALLER_TOML).contains("server_cert"),
+    };
+    assert!(kept, "{}", text(&exec, INSTALLER_TOML));
+}
+
+/// Catches a converted host whose `kbf.toml` still has the TLS keys of the host before the
+/// proxy: its children would serve TLS behind a proxy that speaks h2c to them. `setup` refuses
+/// (exit 5) naming each key and not its path, and writes nothing; without `--proxy` the same
+/// file is accepted as before.
+#[test]
+fn a_kbf_toml_with_the_children_tls_keys_is_refused_on_a_proxy_host() {
+    let old = FRONTEND_TOML.replace(
+        "api-token-file = \"/etc/kbf/api-token\"\n",
+        "api-token-file = \"/etc/kbf/api-token\"\nreapi-tls-cert = \"/etc/kbf/reapi.pem\"\nreapi-tls-key = \"/etc/kbf/reapi.key\"\nworker-client-ca = \"/etc/kbf/ca.pem\"\nworker-tls-cert = \"/etc/kbf/w.pem\"\nworker-tls-key = \"/etc/kbf/w.key\"\n",
+    );
+    assert_ne!(old, FRONTEND_TOML);
+    let mut exec = proxy_host();
+    put(&mut exec, KBF_TOML, 0o640, ROOT, &old);
     let err = go(&FakeOs::linux(), &mut exec, &proxy_raw(), APPLY).expect_err("refused");
     assert_eq!(err.exit(), Exit::NeedsOperator);
     let shown = err.to_string();
-    assert!(shown.contains("upstream.base_port"), "{shown}");
     assert!(
-        !shown.contains("19000") && !shown.contains("18000"),
+        shown.contains(
+            "(reapi-tls-cert, reapi-tls-key, worker-client-ca, worker-tls-cert, worker-tls-key)"
+        ),
         "{shown}"
     );
-    assert_eq!(text(&exec, INSTALLER_TOML), there);
+    assert!(!shown.contains("/etc/kbf/reapi"), "{shown}");
+    assert_eq!(text(&exec, KBF_TOML), old);
     assert!(exec.log.is_empty(), "{:?}", exec.log);
-}
-
-/// Catches a refusal where there is nothing to lose: a table that differs from the flags in
-/// the keys setup owns and is the defaults otherwise is rewritten to say what the flags say.
-#[test]
-fn a_differing_key_in_an_untuned_table_is_rewritten() {
-    let mut exec = proxy_host();
-    let there = PROXY_GOLDEN.replace("base_port = 18000", "base_port = 19000");
-    put(&mut exec, INSTALLER_TOML, 0o644, ROOT, &there);
-    go_ok(&FakeOs::linux(), &mut exec, &proxy_raw());
-    assert_eq!(text(&exec, INSTALLER_TOML), PROXY_GOLDEN);
 }
 
 /// Catches a table written beside a frontend unit that is still enabled: setup does not stop
@@ -343,8 +452,9 @@ fn the_proxy_needs_its_certificate_key_and_client_ca() {
 }
 
 /// Catches `--proxy-base-port` limits that drift from the proxy's (1024 to 65521, so both
-/// slots fit) and a range over the ports a default host uses (the public socket's 8980 and
-/// the operator API's 8982): the edges on both sides, for slot A and for slot B.
+/// slots fit) and a range over the ports a default host uses (the public socket's 8980, the
+/// operator API's 8982 and the storage node's 8990): the edges on both sides, for slot A and
+/// for slot B.
 #[test]
 fn the_base_port_is_in_range_and_clear_of_the_default_ports() {
     let check = |port: u16| {
@@ -352,7 +462,7 @@ fn the_base_port_is_in_range_and_clear_of_the_default_ports() {
         raw.proxy.proxy_base_port = Some(port);
         raw.validate().map(|_| ()).map_err(|p| p.join("; "))
     };
-    for ok in [1024, 8965, 8983, 18_000, 65_521] {
+    for ok in [1024, 8965, 8975, 8983, 8985, 8991, 18_000, 65_521] {
         assert!(check(ok).is_ok(), "{ok}: {:?}", check(ok));
     }
     for (bad, rule) in [
@@ -362,6 +472,8 @@ fn the_base_port_is_in_range_and_clear_of_the_default_ports() {
         (8970, "would cover"),
         (8976, "would cover"),
         (8982, "would cover"),
+        (8986, "would cover"),
+        (8990, "would cover"),
     ] {
         let found = check(bad).expect_err("refused");
         assert!(found.contains(rule), "{bad}: {found}");

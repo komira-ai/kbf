@@ -21,6 +21,11 @@
 //! is; when they differ and the rest is the defaults it is rewritten; when they differ and the
 //! table holds other settings `setup` refuses, naming the keys, since a rewrite would lose them.
 //!
+//! The table is read and written as `kbf_proxy::config::ProxyConfig`, so a key of it that
+//! `setup` has no flag for is kept by a rerun (`take_owned` copies the owned keys only). A
+//! `kbf.toml` that still has the `[tls]` keys of a host before the proxy is refused
+//! ([`leftover_tls_keys`]): the children would serve TLS behind a proxy that speaks h2c.
+//!
 //! No message carries a value, only the key or flag and the rule.
 
 use clap::ValueEnum;
@@ -38,8 +43,9 @@ use crate::installer_toml::toml_string;
 pub const DEFAULT_BASE_PORT: u16 = 18_000;
 
 /// The ports of a default host that the children's range must not cover: the proxy socket
-/// unit's public port and the operator API's `kbf.toml` default.
-const RESERVED_PORTS: [u16; 2] = [8980, 8982];
+/// unit's public port, the operator API's `kbf.toml` default, and the storage node's port that
+/// the documentation and the packaged examples use (a storage node can share the host).
+const RESERVED_PORTS: [u16; 3] = [8980, 8982, 8990];
 
 /// The ports a slot uses above its base (REAPI, worker, operator, admin, enrollment).
 const SLOT_SPAN: u16 = 4;
@@ -190,6 +196,37 @@ impl ProxyFlags {
 
 /// The `kbf.toml` keys (and flags) whose files the proxy reads, not the children.
 const TLS_KEYS: [&str; 3] = ["reapi-tls-cert", "reapi-tls-key", "worker-client-ca"];
+
+/// The `[tls]` keys of `kbf.toml` that a `--proxy` host's children must not have: the proxy
+/// reads the files (`TLS_KEYS`), and the worker pair belongs to a listener the children do not
+/// have. A child that finds one of them serves TLS where the proxy speaks plain h2c to it.
+const CHILD_TLS_KEYS: [&str; 5] = [
+    "reapi-tls-cert",
+    "reapi-tls-key",
+    "worker-client-ca",
+    "worker-tls-cert",
+    "worker-tls-key",
+];
+
+/// The keys of `[tls]` in the `kbf.toml` text that `--proxy` makes wrong, in the order of
+/// [`CHILD_TLS_KEYS`]; a text that does not parse has none here (the `kbf.toml` check refuses
+/// it by itself).
+///
+/// `setup` refuses a host that has any rather than noting them: `kbf.toml` is the file the
+/// operator's other settings are in, so `setup` cannot remove the keys, and a note is read
+/// after the proxy's units are enabled, when the first start would fail on the TLS mismatch.
+pub fn leftover_tls_keys(kbf_toml: &str) -> Vec<&'static str> {
+    let Ok(table) = kbf_toml.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let Some(tls) = table.get("tls").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+    CHILD_TLS_KEYS
+        .into_iter()
+        .filter(|key| tls.contains_key(*key))
+        .collect()
+}
 
 /// A reserved port inside either slot's range, if any.
 fn reserved_in_range(base: u16) -> Option<u16> {
