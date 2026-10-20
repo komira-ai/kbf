@@ -375,6 +375,13 @@ struct Presubmit<'a> {
     walk: Duration,
     submit: Duration,
     dir_reads: u64,
+    /// Of a walk over a store: Directories skipped as verified, the time reading
+    /// Directories and the time asking about files, the FindMissing calls and the files.
+    dirs_skipped: u64,
+    dirs: Duration,
+    files: Duration,
+    file_asks: u64,
+    files_checked: u64,
     _in_flight: crate::metrics::Raised<'a>,
 }
 
@@ -389,6 +396,11 @@ impl<'a> Presubmit<'a> {
             walk: Duration::ZERO,
             submit: Duration::ZERO,
             dir_reads: 0,
+            dirs_skipped: 0,
+            dirs: Duration::ZERO,
+            files: Duration::ZERO,
+            file_asks: 0,
+            files_checked: 0,
             _in_flight: metrics.execute_presubmit_in_flight.raise(),
         }
     }
@@ -409,6 +421,11 @@ impl Drop for Presubmit<'_> {
             walk_ms = self.walk.as_millis(),
             submit_ms = self.submit.as_millis(),
             dir_reads = self.dir_reads,
+            dirs_skipped = self.dirs_skipped,
+            dirs_ms = self.dirs.as_millis(),
+            files_ms = self.files.as_millis(),
+            file_asks = self.file_asks,
+            files_checked = self.files_checked,
             "Execute spent {PRESUBMIT_WARN:?} or more before its first operation"
         );
     }
@@ -656,6 +673,12 @@ impl<D> ExecutionService<D> {
             .observe_duration(window.walk);
         let walked = walked?;
         window.dir_reads += walked.dirs_read;
+        window.dirs_skipped += walked.dirs_skipped;
+        window.dirs += walked.dirs_time;
+        window.files += walked.files_time;
+        window.file_asks += walked.file_asks;
+        window.files_checked += walked.files_checked;
+        self.observe_phases(&walked);
         absent.extend(walked.absent);
         if !absent.is_empty() {
             tracing::warn!(
@@ -693,6 +716,20 @@ impl<D> ExecutionService<D> {
             described: command.map(Described::of).unwrap_or_default(),
         };
         Ok((submission, command_digest))
+    }
+
+    /// The phases of a walk over a store in the metrics (a walk by the in-process cache
+    /// has none to report: its figures are zero and it counts its own).
+    fn observe_phases(&self, walked: &crate::input_tree::Walked) {
+        let m = self.cache.metrics();
+        m.execute_walk_dirs_read.add(walked.dirs_read);
+        m.execute_walk_dirs_skipped.add(walked.dirs_skipped);
+        m.execute_walk_file_asks.add(walked.file_asks);
+        m.execute_walk_files_checked.add(walked.files_checked);
+        if walked.phased {
+            m.execute_walk_dirs.observe_duration(walked.dirs_time);
+            m.execute_walk_files.observe_duration(walked.files_time);
+        }
     }
 
     /// A blob's bytes, or `None` if it is not held. Anything else (unreachable, store
