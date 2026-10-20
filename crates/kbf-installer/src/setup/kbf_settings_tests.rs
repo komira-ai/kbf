@@ -251,7 +251,7 @@ fn the_same_flags_again_change_nothing_and_a_changed_flag_rewrites_once() {
     go_ok(&FakeOs::linux(), &mut exec, &raw);
     let before = text(&exec, KBF_TOML);
     exec.log.clear();
-    let os = settled(&["kbf-frontend@a.service"]);
+    let os = settled(&["kbf-frontend.service"]);
     let out = go_ok(&os, &mut exec, &raw);
     assert!(exec.log.is_empty(), "{:?}", exec.log);
     assert!(out.contains(kbf_host::plan::NOTHING_TO_DO), "{out}");
