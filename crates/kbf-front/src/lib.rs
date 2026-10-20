@@ -63,6 +63,7 @@ mod described;
 mod execution;
 mod finished_row;
 mod input_tree;
+mod input_walk;
 mod meta_log;
 pub mod metrics;
 mod proxy;

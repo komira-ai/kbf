@@ -28,6 +28,8 @@
 //!   change in `crates/xtask/tests/pkg_macos.rs`): it prints `kbf-installer-stub` and
 //!   its arguments on stdout and on stderr, and exits 0, so `--version` passes the
 //!   signing check and a job that runs it leaves its arguments in its log.
+//!   With `XTASK_FAKE_INSTALLER_VERSION=<stamp>` and the one argument `--version` it
+//!   prints `kbf-installer 0.1.0+<stamp>` instead.
 //! - Run as `gh attestation verify <file> <flags>`, it appends its arguments as one line
 //!   to `gh-args` next to it, and verifies the file when `attested` next to it holds
 //!   the line `<SHA-256 of the file> <flags>`: the store of attestations, each the file
@@ -65,7 +67,8 @@
 //! attestation store: `accepts-all` (every file verifies, whatever the flags) or
 //! `ignores-bytes` (a file verifies when any attestation has its flags). Of a bundle:
 //! `bundle-any-file` (a bundle verifies any file whose flags it lists) or
-//! `bundle-any-commit` (`--source-digest` is not compared). Of the API:
+//! `bundle-any-commit` (`--source-digest` is not compared) or `bundle-deb-bundle-any` (a
+//! bundle named for a `.deb` verifies any file whose flags it lists). Of the API:
 //! `api-fails` (every `gh api` exits 1 with an HTTP 502) or `api-garbage` (every `gh
 //! api` prints something that is not JSON). Of releases: `release-fails` (every `gh
 //! release` command exits 1). Of sudo:
@@ -136,6 +139,15 @@ fn kbf(argv0: &str, args: &[String]) -> ExitCode {
 
 /// `kbf-installer`, the stand-in: its arguments, once on each output.
 fn installer_stub(args: &[String]) -> ExitCode {
+    // `XTASK_FAKE_INSTALLER_VERSION=<stamp>` makes `--version` answer as the real
+    // installer does, `kbf-installer 0.1.0+<stamp>`, for the tests of `pkg-config
+    // --version-of`.
+    if let (Ok(stamp), [flag]) = (std::env::var("XTASK_FAKE_INSTALLER_VERSION"), args)
+        && flag == "--version"
+    {
+        println!("kbf-installer 0.1.0+{stamp}");
+        return ExitCode::SUCCESS;
+    }
     let line = format!("kbf-installer-stub {}", args.join(" "));
     println!("{line}");
     eprintln!("{line}");
@@ -307,7 +319,8 @@ fn verify_bundle(dir: &Path, sha256: &str, file: &str, bundle: &str, rest: &[Str
     // so the artifacts controls pass and the beta control is the one reached.
     let beta = flags.iter().any(|f| f.ends_with("/beta.yml"));
     let by_commit = !(defect("bundle-any-commit") || (beta && defect("beta-bundle-any-commit")));
-    let by_bytes = !defect("bundle-any-file");
+    let by_bytes = !(defect("bundle-any-file")
+        || (defect("bundle-deb-bundle-any") && bundle.ends_with(".deb.sigstore.json")));
     let wanted = if by_commit {
         flags.join(" ")
     } else {

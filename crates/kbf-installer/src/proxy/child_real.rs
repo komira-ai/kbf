@@ -26,6 +26,7 @@ use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child as Process, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
@@ -86,8 +87,29 @@ type Identify = fn(u32, &Path) -> Result<(OwnedFd, ProcIdent), String>;
 /// other, instead of being a failure to start.
 fn identify_started(pid: u32, program: &Path) -> Result<(OwnedFd, ProcIdent), String> {
     let pidfd = pidfd_of(pid).map_err(|e| e.to_string())?;
-    let ident = decide(ident_of(pid), || zombie_ident(pid, program))?;
+    let ident = decide(ident_of(pid), || {
+        // A child that is mid-exit has dropped its address space (no `exe`) but is not yet
+        // a zombie (state `R`); the pidfd turns readable when it becomes one.
+        await_exit(&pidfd, EXIT_WINDOW);
+        zombie_ident(pid, program)
+    })?;
     Ok((pidfd, ident))
+}
+
+/// How long a child that is exiting is given to become a zombie. The kernel does it within
+/// microseconds of dropping the address space; the bound only keeps a stuck exit from
+/// hanging `spawn`.
+const EXIT_WINDOW: Duration = Duration::from_secs(5);
+
+/// Waits until the process behind `pidfd` has exited, at most `limit`.
+fn await_exit(pidfd: &OwnedFd, limit: Duration) {
+    let mut fds = [PollFd::new(pidfd, PollFlags::IN)];
+    let wait = Timespec {
+        tv_sec: i64::try_from(limit.as_secs()).unwrap_or(i64::MAX),
+        tv_nsec: i64::from(limit.subsec_nanos()),
+    };
+    // An interrupted or timed-out wait just lets the caller look again.
+    let _ = poll(&mut fds, Some(&wait));
 }
 
 /// The identity to record from what reading it returned: a read that found the process gone

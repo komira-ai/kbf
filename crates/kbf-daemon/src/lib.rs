@@ -15,6 +15,7 @@
 //! - [`connect`]: which server to try next, and the wait between rounds of attempts;
 //!   the daemon never stops trying.
 //! - [`report`]: the node report and its hash.
+//! - [`reach`]: the start-up check that the storage members answer a connect.
 //! - [`status`]: the node's software status (OS, kernel, daemon, Xcodes).
 //! - [`driver_watch`]: the driver's report channel, one part per source that feeds it.
 //! - [`cpu_pool`]: [`CpuPool`], the threads (`--cpu-threads`) for work that keeps a core
@@ -62,6 +63,7 @@ pub mod numa;
 pub mod phases;
 mod plane;
 pub mod pressure;
+pub mod reach;
 pub mod report;
 pub mod runtime;
 pub mod runtimes;

@@ -186,6 +186,30 @@ fn facts() -> NodeFacts {
     }
 }
 
+/// The frontend restarted over the farm's store and CA with `worker_endpoint` as its
+/// `--enroll-worker-endpoint`: another listener, on another port.
+fn restart(farm: &Farm, worker_endpoint: &str) -> (u16, kbf_server::enroll::start::Serving) {
+    let mut flags = flags_for(farm.ca_dir.clone(), Limits::DEFAULT, true, 86_400);
+    flags.settings.worker_endpoint = worker_endpoint.to_owned();
+    let prepared = prepare(&flags).expect("prepared");
+    assert_eq!(prepared.ca().pin(), farm.pin, "the same CA");
+    let port = prepared.local().port();
+    let mut serving = prepared.serve(Arc::clone(&farm.store)).expect("serving");
+    let listener = std::mem::replace(&mut serving.listener, Box::pin(std::future::pending()));
+    tokio::spawn(listener);
+    (port, serving)
+}
+
+/// A connection to the frontend listening on `port` (the node's configured URL names the
+/// first listener's).
+async fn dial_at(node: &Node, token: &Token, port: u16) -> Frontend {
+    let mut url = node.config.frontend.clone();
+    url.port = port;
+    connect(&url, Anchor::Pin(*token.pin()))
+        .await
+        .expect("connect")
+}
+
 async fn dial(node: &Node, token: &Token) -> Frontend {
     connect(&node.config.frontend, Anchor::Pin(*token.pin()))
         .await
@@ -659,4 +683,51 @@ async fn a_storage_node_enrolled_before_the_registration_is_sent_the_store_at_re
         .expect("renewed");
     assert_eq!(renewed.config.cold_store, STORE);
     assert!(renewed.config.generation > first.config.generation);
+}
+
+/// A node enrolled while the frontend named one worker endpoint, renewing through the same
+/// frontend restarted (same CA, same registry) with another, holds the other afterwards, on
+/// disk as well; a restart with the same flags re-sends nothing.
+///
+/// Catches: step 2b of the cutover needing a re-enrollment of every node (the configuration
+/// generation ignoring the `--enroll-worker-endpoint` flag), and a node.json rewritten with
+/// a new generation at every renewal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_is_sent_the_worker_endpoint_the_restarted_frontend_names() {
+    let farm = start("endpoint-moved", Limits::DEFAULT).await;
+    let token = farm.token(0x5555, &[Role::Daemon], 1);
+    let node = node("endpoint-moved-node", &farm, &token, false);
+    let first = enroll_with(&node, &token, &[Role::Daemon])
+        .await
+        .expect("enrolled");
+    assert_eq!(first.config.worker_endpoint, "https://localhost:7443");
+
+    // The same flags: nothing to send.
+    let (port, _same) = restart(&farm, "https://localhost:7443");
+    farm.advance(120);
+    let renewed = renew(
+        &dial_at(&node, &token, port).await,
+        &node.store,
+        unix_now() + 120,
+    )
+    .await
+    .expect("renewed");
+    assert_eq!(renewed.config, first.config);
+
+    // A new `--enroll-worker-endpoint`: the next renewal carries it.
+    let (port, _moved) = restart(&farm, "https://proxy.test:443");
+    farm.advance(120);
+    let renewed = renew(
+        &dial_at(&node, &token, port).await,
+        &node.store,
+        unix_now() + 240,
+    )
+    .await
+    .expect("renewed");
+    assert_eq!(renewed.config.worker_endpoint, "https://proxy.test:443");
+    assert_ne!(renewed.config.generation, first.config.generation);
+    let on_disk =
+        std::fs::read_to_string(node.config.state_dir.join("pki/node.json")).expect("node.json");
+    assert!(on_disk.contains("https://proxy.test:443"), "{on_disk}");
+    assert!(!on_disk.contains("https://localhost:7443"), "{on_disk}");
 }

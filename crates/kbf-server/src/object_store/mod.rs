@@ -50,6 +50,7 @@
 //! client speaks TLS), bucket and prefix, and that a probe of the store passed.
 
 pub mod api;
+pub mod delivery;
 pub mod probe;
 mod registry;
 mod rows;

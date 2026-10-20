@@ -38,6 +38,7 @@ futures.workspace = true
 # The deploy docs' unit reader and the rendered deploy units (src/deploy_doc_tests.rs).
 kbf-deploy.workspace = true
 kbf-it.workspace = true
+kbf-map.workspace = true
 kbf-types.workspace = true
 # The CAS the restart test's daemon reads its action from (tests/binary.rs).
 kbf-front.workspace = true
