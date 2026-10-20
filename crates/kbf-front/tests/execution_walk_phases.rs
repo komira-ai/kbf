@@ -310,6 +310,11 @@ struct Job {
 }
 
 fn job() -> Job {
+    job_running("walk")
+}
+
+/// [`job`] with a Command of its own: the same input tree, another action.
+fn job_running(argument: &str) -> Job {
     let files: Vec<Blob> = (0..4)
         .map(|n| blob(format!("file {n}").into_bytes()))
         .collect();
@@ -335,7 +340,7 @@ fn job() -> Job {
     );
     let command = blob(
         Command {
-            arguments: vec!["walk".to_owned()],
+            arguments: vec![argument.to_owned()],
             ..Default::default()
         }
         .encode_to_vec(),
@@ -510,6 +515,52 @@ async fn an_execute_reports_what_its_walk_read_skipped_and_spent() {
     ] {
         assert!(text.lines().any(|l| l == line), "{line} missing");
     }
+}
+
+/// Catches the warning's (or the metric's) `dirs_present_checked` fed from
+/// `dir_cache_hits`: the two are 2 and 2 for an Execute that takes both Directories
+/// from the cache, so nothing told them apart. Two Executes of different actions over
+/// one input tree start together. One reads both Directories; the other waits
+/// for each read and takes the Directory it produced, so it has 2 cache hits (both
+/// merged) and has asked the store about none of them: `dirs_present_checked` 0. A
+/// cached Directory is the only one the store is asked about.
+#[tokio::test(start_paused = true)]
+async fn a_directory_taken_from_a_read_in_flight_is_a_hit_and_is_not_asked_about() {
+    let _ = log_lines();
+    let farm = Farm::new().await;
+    let (first, second) = (job_running("first"), job_running("second"));
+    farm.store(&[&first.action, &second.action]).await;
+    farm.store(&first.blobs.iter().collect::<Vec<_>>()).await;
+    farm.store(&[&second.blobs[0]]).await;
+    let (service, backend) = farm.service();
+    let m = backend.metrics();
+
+    tokio::join!(execute(&service, &first), execute(&service, &second));
+
+    // Which of the two reads is down to who polls first; the other waits.
+    let (mut read, mut waited) = (warning(&first, 0), warning(&second, 0));
+    if field(&read, "dir_reads") == "0" {
+        std::mem::swap(&mut read, &mut waited);
+    }
+    assert_eq!(field(&read, "dir_reads"), "2", "{read}");
+    assert_eq!(field(&read, "dir_cache_hits"), "0", "{read}");
+    assert_eq!(field(&read, "dirs_present_checked"), "0", "{read}");
+    assert_eq!(field(&read, "files_checked"), "4", "{read}");
+    assert_eq!(field(&waited, "dir_reads"), "0", "{waited}");
+    assert_eq!(field(&waited, "dirs_skipped"), "0", "{waited}");
+    assert_eq!(field(&waited, "dir_cache_hits"), "2", "{waited}");
+    assert_eq!(
+        field(&waited, "dirs_present_checked"),
+        "0",
+        "a Directory taken from a read in flight was not asked about: {waited}"
+    );
+    assert_eq!(field(&waited, "files_checked"), "4", "{waited}");
+
+    assert_eq!(m.execute_walk_dirs_read.get(), 2);
+    assert_eq!(m.execute_dir_cache_misses.get(), 2);
+    assert_eq!(m.execute_dir_cache_hits.get(), 2);
+    assert_eq!(m.execute_dir_cache_merged.get(), 2);
+    assert_eq!(m.execute_dir_cache_present_checked.get(), 0);
 }
 
 /// Where the global subscriber writes.

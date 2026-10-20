@@ -106,6 +106,44 @@ async fn a_loss_found_through_the_cache_clears_the_verified_memory() {
     assert_eq!(store.ask_calls(), asks + 2);
 }
 
+/// Catches: Directories taken from the content cache that are not recorded in the
+/// verified memory, so a walk answered through the cache leaves nothing for the next to
+/// skip. Walked at t=0 (every Directory read and verified), the tree is walked again
+/// past the time to live: the memory has expired, every Directory comes from the cache
+/// and the store is asked about them, no read. That walk records the tree; a third walk
+/// inside the time to live skips it (the root, which is all it need ask about) with no
+/// FindMissing and no cache lookup at all.
+#[tokio::test(start_paused = true)]
+async fn a_walk_answered_through_the_cache_records_its_tree_as_verified() {
+    let (tree, root) = chains(3, 3);
+    let store = Store::fixed(tree, READ).at_epoch(EPOCH);
+    let trees = Trees::default();
+    walk(&store, root, &trees).await.expect("walk");
+
+    tokio::time::advance(VERIFIED_TTL).await;
+    let (reads, asks) = (store.total_reads(), store.ask_calls());
+    let cached = walk(&store, root, &trees).await.expect("walk");
+    assert_eq!(
+        (cached.dirs_skipped, cached.dir_cache_hits, cached.dirs_read),
+        (0, 10, 0),
+        "expired: all taken from the cache"
+    );
+    assert_eq!(store.ask_calls(), asks + 1, "and asked about");
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let skipped = walk(&store, root, &trees).await.expect("walk");
+    assert!(skipped.dirs_skipped > 0, "{}", skipped.dirs_skipped);
+    assert_eq!(
+        (skipped.dir_cache_hits, skipped.dirs_present_checked),
+        (0, 0),
+        "the tree was believed, not taken from the cache again"
+    );
+    assert_eq!(skipped.dirs_read, 0);
+    assert!(skipped.absent.is_empty());
+    assert_eq!(store.ask_calls(), asks + 1, "no FindMissing for it");
+    assert_eq!(store.total_reads(), reads, "and no read");
+}
+
 /// Catches: a failure (a Directory the store cannot read) below a lost cached Directory
 /// reported instead of the loss, and one below a kept cached Directory swallowed. `a`
 /// names `c`, whose read fails; walking `a` caches `a` and fails. Under a root with
@@ -286,6 +324,12 @@ async fn concurrent_walks_share_one_read_of_each_directory() {
 /// cancelled), and one that takes the dropped read's silence for an answer. The first
 /// walk is dropped half way through its first read; the second, which was waiting on it,
 /// takes over and finishes, having read the root itself.
+///
+/// A waiter that never settles must fail an assertion, not hang: when the dropped read
+/// leaves its flight behind, the waiter finds the flight's gate closed again and again
+/// without the clock moving, so a `timeout` on it never fires. The walks are driven by
+/// hand instead: polled, the clock advanced a quarter of a read, and polled again, for
+/// at most 25 reads of virtual time (the walk needs about 5), then asserted finished.
 #[tokio::test(start_paused = true)]
 async fn a_walk_waiting_on_a_read_that_is_dropped_reads_it_itself() {
     let (tree, root) = chains(3, 3);
@@ -294,11 +338,21 @@ async fn a_walk_waiting_on_a_read_that_is_dropped_reads_it_itself() {
     let leader = timeout(READ / 2, walk(&store, root, &trees));
     let follower = async {
         sleep(Duration::from_millis(1)).await;
-        timeout(Duration::from_secs(60), walk(&store, root, &trees)).await
+        walk(&store, root, &trees).await
     };
-    let (leader, follower) = tokio::join!(leader, follower);
+    let both = async { tokio::join!(leader, follower) };
+    tokio::pin!(both);
+    let mut done = None;
+    for _ in 0..100 {
+        if let std::task::Poll::Ready(ended) = futures::poll!(both.as_mut()) {
+            done = Some(ended);
+            break;
+        }
+        tokio::time::advance(READ / 4).await;
+    }
+    let (leader, follower) = done.expect("the waiting walk reads the dropped Directory itself");
     assert!(leader.is_err(), "dropped half way through the read");
-    let follower = follower.expect("not left waiting").expect("walk");
+    let follower = follower.expect("walk");
     assert!(follower.absent.is_empty());
     assert_eq!(follower.dirs_read, 10);
     assert_eq!(
