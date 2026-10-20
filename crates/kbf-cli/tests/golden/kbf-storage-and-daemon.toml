@@ -56,7 +56,7 @@ daemon-user = "_kbf"
 # data-dir = "DIR"
 # Lowers the size the cache and the trees are budgeted from (half and a quarter of it), under the filesystem's automatic one
 # data-max-bytes = "BYTES"
-# On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets the running ones finish and report, waits for their acknowledgements, then exits 0. A second signal, or this many seconds after the first, stops it at once and abandons the leases still running. Used by `kbf daemon`; the combined modes stop their daemon half with the other half
+# On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets the running ones finish and report, waits for their acknowledgements, then exits 0. A second signal, or this many seconds after the first, stops it at once and abandons the leases still running. Used by `kbf daemon` and `kbf storage-and-daemon`; `kbf all-in-one` stops its daemon half with the server half
 drain-deadline-secs = 600
 # How leases run; once per runtime. The daemon runs each lease on the driver that serves its kind and refuses to start when two serve the same kind. The node's own driver (native or container) is set up first, whatever the order given
 # driver = []

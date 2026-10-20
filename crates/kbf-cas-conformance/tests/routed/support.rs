@@ -301,6 +301,7 @@ pub fn plane(fake: &Arc<Fake>, config: &TransferConfig) -> Arc<RoutedCas> {
     let view = MapView {
         map: Arc::new(map),
         previous: None,
+        earlier: Vec::new(),
     };
     let router = Router::new(Arc::new(Fixed(view)), Arc::new(Only(Arc::clone(fake))));
     Arc::new(RoutedCas::new(router, config))

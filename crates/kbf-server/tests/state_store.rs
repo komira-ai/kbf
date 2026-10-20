@@ -48,6 +48,8 @@ mod handover;
 mod result_ack;
 #[path = "state_store/subject.rs"]
 mod subject;
+#[path = "state_store/takeover.rs"]
+mod takeover;
 mod thread_log;
 
 const GIB: u64 = 1 << 30;

@@ -14,7 +14,7 @@
 - The payload is `cargo xtask installer-tarball`: the Debian package's file list, read
   from the same Rust list (`xtask::pkg::files`, which the deb and rpm are built from), so
   paths and modes cannot drift: `usr/bin/kbf-installer` and the pinned `gh` 0755, the
-  `kbf-*.service` units and `kbf.slice`, exactly the three trust files, and
+  `kbf-*.service` and `kbf-*.timer` units and `kbf.slice`, exactly the three trust files, and
   `usr/lib/sysusers.d/kbf-installer.conf` and `usr/lib/tmpfiles.d/kbf-installer.conf`
   (the files under `packaging/linux/`), with fixed owners and times so the same inputs
   are the same bytes. It holds no kbf release; `setup` installs the first one.

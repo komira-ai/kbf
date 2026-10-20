@@ -46,6 +46,15 @@ pub struct Journal {
     /// rollback starts again at its own).
     pub stopped: Vec<Unit>,
     pub adopted: Vec<Adopted>,
+    /// A host the Mac kit installed: it has no old state directory and no old lock, so a
+    /// rollback takes and leaves none.
+    #[serde(default)]
+    pub kit: bool,
+    /// A kit host's rollback moved `installer.toml` and the installer's tree aside under this
+    /// suffix (`.rolled-back-<UTC time>`), chosen once so a rollback run again finishes with
+    /// the same one.
+    #[serde(default)]
+    pub aside: Option<String>,
 }
 
 impl Journal {
@@ -57,7 +66,14 @@ impl Journal {
             helper_unit,
             stopped: Vec::new(),
             adopted: Vec::new(),
+            kit: false,
+            aside: None,
         }
+    }
+
+    /// A kit migration was begun and not finished: its plist may be the repointed one.
+    pub fn kit_begun(&self) -> bool {
+        self.kit && self.phase == Phase::Started
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Journal, String> {

@@ -184,15 +184,6 @@ impl Worker {
             && request.resources.memory_bytes >= self.capacity.memory_bytes
     }
 
-    /// Whether `request` would run with no other lease on it, once its bookings end: a
-    /// whole-machine lease, or an action at its whole memory ([`Worker::exclusive`]),
-    /// that it could run at all. A worker with less memory than the action asks for is
-    /// "exclusive" by the comparison alone and runs nothing of it, so it does not count.
-    pub(crate) fn would_run_alone(&self, request: &Request) -> bool {
-        self.capacity.fits(&request.resources)
-            && (request.kind == LeaseKind::WholeMachine || self.exclusive(request))
-    }
-
     /// Whether `request` can be placed on it now, platform and kind aside: an action
     /// if no whole-machine lease holds it, its free CPUs, GPUs and VM slots hold the
     /// request, and its memory capacity is at least the request's memory; a
@@ -491,15 +482,15 @@ impl Scheduler {
     /// ([`Worker::has_room`]), though what they hold ranks the workers; a
     /// whole-machine lease only on a worker that holds no lease, and it books all of it.
     ///
-    /// A whole-machine operation, or an action at the whole memory of a worker that
-    /// could run it (it runs alone there: [`Worker::would_run_alone`]), that fits
-    /// nowhere holds one such worker (the one it held last round while that still could,
-    /// else the one with fewest leases): no operation after it in queue order (less
-    /// urgent, or as urgent and younger) is placed there, so the worker empties as its
-    /// leases end. Work before it in queue order still is, so a reservation never holds
-    /// back more urgent work. It lasts while the operation is queued and the worker could
-    /// run it. No other operation holds a worker: an action below every such worker's
-    /// memory waits for cores to free like any other, however small another worker is.
+    /// A whole-machine operation that fits nowhere holds one worker that could run it
+    /// (the one it held last round while that still could, else the one with fewest
+    /// leases): no operation after it in queue order (less urgent, or as urgent and
+    /// younger) is placed there, so the worker empties as its leases end. Work before
+    /// it in queue order still is, so a reservation never holds back more urgent work.
+    /// It lasts while the operation is queued and the worker could run it. No other
+    /// operation holds a worker: an action at a worker's whole memory (the last step of
+    /// the memory ladder) waits until some worker has no lease, and under sustained
+    /// spread load that wait can be long, since nothing reserves a worker for it.
     ///
     /// Every queued operation is also checked against what live workers could ever give
     /// it: one that no live worker satisfies, or that is larger than every one that
@@ -532,6 +523,7 @@ impl Scheduler {
                 servable.verdict(&self.workers, request)
             };
             if !fitted
+                && request.kind == LeaseKind::WholeMachine
                 && verdict == Verdict::Servable
                 && let Some(name) = servable.reserve(
                     &self.workers,

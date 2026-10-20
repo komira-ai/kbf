@@ -708,3 +708,73 @@ fn a_container_driver_child_is_given_the_settings_file_of_its_root_not_of_its_bi
     assert_eq!(std::fs::read(&file).expect("the file"), b"");
     assert!(!bin.join("kbf.toml").exists());
 }
+
+#[test]
+fn a_farm_posts_with_its_token_and_finds_the_member_of_a_node_by_its_address() {
+    // Catches: an operator call made without the farm's token (the API refuses it), a node
+    // mapped to the member of another (node 2's address is `loopback(2)`, and
+    // it must not match `loopback(2)` followed by another digit), and a member that is not listed taken for
+    // one. Mutants: `member_of` matching on the id; the prefix without its colon; `post`
+    // sending no token.
+    let d = dir("operator-calls");
+    let mut farm = Farm::supervise(&d, vec![sleeper(Role::Node(1), &d)]);
+    let json = format!(
+        r#"{{"members":[{{"id":1,"addr":"{near}0:9","state":"active"}},{{"id":2,"addr":"https://{own}:9","state":"down"}}]}}"#,
+        near = loopback(2),
+        own = loopback(2),
+    );
+    let answer: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{json}",
+            json.len()
+        )
+        .into_boxed_str(),
+    );
+    let (port, server) = crate::api::tests::serve(answer);
+    farm.api = port;
+    let member = farm.member_of(2).expect("node 2's member");
+    assert_eq!((member.id, member.state.as_str()), (2, "down"));
+    server.join().expect("server");
+    let (port, server) = crate::api::tests::serve(answer);
+    farm.api = port;
+    assert_eq!(farm.member_of(4), None);
+    server.join().expect("server");
+
+    let (port, server) = crate::api::tests::serve("HTTP/1.1 200 OK\r\n\r\n{}");
+    farm.api = port;
+    assert_eq!(
+        farm.post("/v1/members/2", "{}"),
+        Some((200, "{}".to_owned()))
+    );
+    let request = server.join().expect("server");
+    assert!(request.contains(&format!("Authorization: Bearer {API_TOKEN}\r\n")));
+    let (port, server) = crate::api::tests::serve(answer);
+    farm.api = port;
+    assert_eq!(farm.members().expect("members").len(), 2);
+    server.join().expect("server");
+    farm.stop_all();
+}
+
+#[test]
+fn a_farm_scans_the_logs_of_every_generation_for_a_line() {
+    // Catches: `Farm::log_hits` reading the farm's current generation only, or another
+    // directory than the one its logs are in. Mutant: scanning `Proc::log` instead.
+    let d = dir("log-scan");
+    let marker = d.join("marker");
+    std::fs::write(&marker, "run dropped; cleaning up\n").expect("marker");
+    let mut farm = Farm::supervise(&d, vec![chatty(Role::Node(1), &marker, &d)]);
+    farm.wait("the first generation to print", |f| {
+        (!f.log_hits("run dropped").is_empty()).then_some(())
+    });
+    farm.term(Role::Node(1));
+    farm.restart(Role::Node(1));
+    // `tail` prints the file again: one line in the first generation's log, one in the second's.
+    let hits = farm.wait("the second generation to print", |f| {
+        let hits = f.log_hits("run dropped");
+        (hits.len() == 2).then_some(hits)
+    });
+    assert!(hits[0].starts_with("node-1.1.out: "), "{hits:?}");
+    assert!(hits[1].starts_with("node-1.out: "), "{hits:?}");
+    assert!(farm.log_hits("lease failed").is_empty());
+    farm.stop_all();
+}

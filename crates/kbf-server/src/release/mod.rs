@@ -18,6 +18,9 @@
 //! - The offers, [`offers::Offers`]: the `UpdateOffer` each platform is to be sent over its
 //!   nodes' sessions, built from the desired release and what the store holds.
 //!
+//! - The poller, [`poll`]: on the active frontend, proposes the newest GitHub release of a `v*`
+//!   tag as an `update/proposed/<commit>` row. It never writes `update/desired`.
+//!
 //! The frontend mounts the routers on its operator API and the service on its worker
 //! listener where it starts. Trust is the host's: the store neither opens a tarball nor
 //! checks an attestation.
@@ -28,6 +31,7 @@ pub mod grpc;
 pub mod http;
 pub mod key;
 pub mod offers;
+pub mod poll;
 pub mod store;
 
 pub use grpc::service;

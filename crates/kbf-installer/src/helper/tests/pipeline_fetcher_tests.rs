@@ -56,6 +56,26 @@ impl PipelineFetcher {
 
 impl Fetcher for PipelineFetcher {
     fn fetch(&self, rec: &ReleaseLocator) -> Result<InstalledRelease, FetchError> {
+        self.run(rec, None)
+    }
+
+    fn fetch_activation(
+        &self,
+        rec: &ReleaseLocator,
+        expected: &Facts,
+    ) -> Result<InstalledRelease, FetchError> {
+        self.run(rec, Some(expected))
+    }
+}
+
+impl PipelineFetcher {
+    /// An activation expects the facts of its order; a frontend update is a locator, and the
+    /// pipeline then checks only the commit and the profile.
+    fn run(
+        &self,
+        rec: &ReleaseLocator,
+        expected: Option<&Facts>,
+    ) -> Result<InstalledRelease, FetchError> {
         let rejected = |why: &dyn std::fmt::Display| FetchError::Rejected(why.to_string());
         let owner = Owner {
             uid: me().uid,
@@ -112,25 +132,15 @@ impl Fetcher for PipelineFetcher {
             leases: &leases,
             owner,
         };
-        // An activation names its component and expects the facts; a frontend update is a
-        // locator, and the pipeline then checks only the commit and the profile.
-        let activation = !rec.components.is_empty();
-        let expected = Facts {
-            platform: "linux-x86_64".to_owned(),
-            protocol: 7,
-            min_protocol: 6,
-            state_schema: 3,
-            profile: "release".to_owned(),
-        };
         let order = Order {
-            kind: if activation {
+            kind: if expected.is_some() {
                 OrderKind::Activate
             } else {
                 OrderKind::FrontendUpdate
             },
             commit: &rec.commit,
             components: std::slice::from_ref(&locator),
-            expected: activation.then_some(&expected),
+            expected,
         };
         let staged = pipeline
             .verify(

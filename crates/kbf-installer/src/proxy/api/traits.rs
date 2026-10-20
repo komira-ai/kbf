@@ -145,6 +145,12 @@ pub struct RunningUpdate {
     pub to: CommitId,
     pub phase: Phase,
     pub since_s: u64,
+    /// The slot of the child that is SERVING requests now, not the candidate and not the
+    /// child that was started last: the old child's slot until the switch, the new child's
+    /// from `switched` on, and the old child's again after a rollback or a revert (the new
+    /// child was stood down). `GET /v1/update/frontend` reports it as `active_slot`, and
+    /// `kbf-installer deploy` reads it to follow the frontend across a handover
+    /// (docs/design/frontend-proxy.md section 4).
     pub active_slot: Slot,
     pub old: Option<OldChild>,
     pub new: NewChild,
@@ -195,6 +201,12 @@ pub enum SupervisorError {
 /// The U7 swap. Every call is made by the one actor, so an implementation sees them one
 /// at a time. `start` is idempotent on `update_id`.
 pub trait Supervisor: Send {
+    /// Why `start` cannot be called at all, when that is known before an update is
+    /// accepted. `POST` then answers 503 with this text, and saves no `request_id` and
+    /// writes no order, so the installer does not fetch a release that nothing can take
+    /// over. `None` is a supervisor that can start.
+    fn start_blocked(&self) -> Option<String>;
+
     fn start(&mut self, spec: &UpdateSpec) -> Result<(), SupervisorError>;
     fn abort(&mut self) -> Result<Phase, SupervisorError>;
     fn rollback(&mut self) -> Result<Phase, SupervisorError>;

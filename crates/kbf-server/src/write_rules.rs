@@ -168,6 +168,12 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
             "members (joiner mark)",
             "unfilled/3",
         ),
+        // The maps the last bumps replaced (`members/pins.rs`).
+        fenced(
+            Keys::Under("handoff/pin/"),
+            "members (map pins)",
+            "handoff/pin/00000000000000000001",
+        ),
         fenced(
             Keys::Under("deny/"),
             "members and kbf-enroll-registry",
@@ -201,6 +207,12 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
             Keys::Under("update/host/"),
             "update/rows",
             "update/host/node-a",
+        ),
+        // The release poller's proposals (`update/proposal.rs`): never `update/desired`.
+        fenced(
+            Keys::Under("update/proposed/"),
+            "update/proposal (release poller)",
+            "update/proposed/0000000000000000000000000000000000000000",
         ),
         fenced(
             Keys::Under("update/order/"),

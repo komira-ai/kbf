@@ -242,10 +242,10 @@ impl Router {
 /// for a run of promotions during one call, and a bound on a map that never settles.
 pub const MAX_MAP_REFETCHES: usize = 8;
 
-/// This generation's read order of `digest`, then the previous generation's.
+/// This generation's read order of `digest`, then each retained earlier generation's, newest
+/// first.
 pub(crate) fn read_order<'a>(view: &'a MapView, digest: &Digest) -> Vec<&'a Member> {
-    view.map
-        .read_order_with_previous(view.previous.as_deref(), digest)
+    view.map.read_order_with_history(&view.history(), digest)
 }
 
 /// The owners a write of `digest` may go to: its write owners that are not down, primary

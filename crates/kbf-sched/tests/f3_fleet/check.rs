@@ -480,20 +480,6 @@ impl Check {
                     }
                 }
             };
-            // An action at the whole memory of a worker that could run it that fits
-            // nowhere now holds a worker (F4 and F1 model which); this reference does
-            // not, so it fails loudly if F3's world ever sends one.
-            let alone = names.iter().any(|w| {
-                let capacity = self.workers[w].capacity;
-                usable(w, false)
-                    && capacity.fits(&request.resources)
-                    && exclusive(capacity, request.resources)
-            });
-            self.ensure(
-                !(fit.is_none() && class == Class::Servable && alone),
-                "I11",
-                || format!("{id} runs alone and fits nowhere: the scheduler holds a worker for it"),
-            );
             let op = self.ops.get_mut(&id).expect("queued ops exist");
             op.since = match (class, op.last_class) {
                 (Class::Unservable, Some(Class::Unservable)) => op.since,

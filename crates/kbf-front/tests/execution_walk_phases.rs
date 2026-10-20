@@ -263,6 +263,7 @@ impl MapSource for Farm {
         Some(MapView {
             map: Arc::clone(&self.map),
             previous: None,
+            earlier: Vec::new(),
         })
     }
 
@@ -310,6 +311,11 @@ struct Job {
 }
 
 fn job() -> Job {
+    job_running("walk")
+}
+
+/// [`job`] with a Command of its own: the same input tree, another action.
+fn job_running(argument: &str) -> Job {
     let files: Vec<Blob> = (0..4)
         .map(|n| blob(format!("file {n}").into_bytes()))
         .collect();
@@ -335,7 +341,7 @@ fn job() -> Job {
     );
     let command = blob(
         Command {
-            arguments: vec!["walk".to_owned()],
+            arguments: vec![argument.to_owned()],
             ..Default::default()
         }
         .encode_to_vec(),
@@ -413,6 +419,8 @@ async fn an_execute_reports_what_its_walk_read_skipped_and_spent() {
     let cold = warning(&job, 0);
     assert_eq!(field(&cold, "dir_reads"), "2", "{cold}");
     assert_eq!(field(&cold, "dirs_skipped"), "0", "{cold}");
+    assert_eq!(field(&cold, "dir_cache_hits"), "0", "{cold}");
+    assert_eq!(field(&cold, "dirs_present_checked"), "0", "{cold}");
     assert_eq!(
         field(&cold, "dirs_ms"),
         "12000",
@@ -432,6 +440,8 @@ async fn an_execute_reports_what_its_walk_read_skipped_and_spent() {
     let warm = warning(&job, 1);
     assert_eq!(field(&warm, "dir_reads"), "0", "{warm}");
     assert_eq!(field(&warm, "dirs_skipped"), "1", "{warm}");
+    assert_eq!(field(&warm, "dir_cache_hits"), "0", "{warm}");
+    assert_eq!(field(&warm, "dirs_present_checked"), "0", "{warm}");
     assert_eq!(field(&warm, "dirs_ms"), "0", "{warm}");
     assert_eq!(field(&warm, "files_ms"), "0", "{warm}");
     assert_eq!(field(&warm, "file_asks"), "0", "{warm}");
@@ -456,6 +466,102 @@ async fn an_execute_reports_what_its_walk_read_skipped_and_spent() {
         "the cold walk's 3 s, the warm 0"
     );
     assert_eq!(m.execute_walk.sum(), 15_000_000_000);
+    assert_eq!(
+        m.execute_walk_dir_read.count(),
+        2,
+        "each read of the cold walk"
+    );
+    assert_eq!(m.execute_walk_dir_read.sum(), 12_000_000_000);
+    assert_eq!(m.execute_dir_cache_misses.get(), 2);
+    assert_eq!(m.execute_dir_cache_hits.get(), 0);
+    assert_eq!(m.execute_dir_cache_present_checked.get(), 0);
+    // The root names 3 files and a Directory, the other one file: 5 digests and two
+    // entries of 160 bytes of overhead.
+    let held = 5 * std::mem::size_of::<Digest>() as u64 + 2 * 160;
+    assert_eq!(m.execute_dir_cache_bytes.get(), held);
+
+    // Past the verified memory's 45 s the tree is not skipped; its Directories are in
+    // the content cache, so none is read, and the store is asked about the two of them
+    // with the four files, in one call. The Execute spends the files' 3 s only.
+    tokio::time::advance(Duration::from_secs(46)).await;
+    execute(&service, &job).await;
+    let cached = warning(&job, 2);
+    assert_eq!(field(&cached, "dir_reads"), "0", "{cached}");
+    assert_eq!(field(&cached, "dirs_skipped"), "0", "{cached}");
+    assert_eq!(field(&cached, "dir_cache_hits"), "2", "{cached}");
+    assert_eq!(field(&cached, "dirs_present_checked"), "2", "{cached}");
+    assert_eq!(field(&cached, "dirs_ms"), "0", "{cached}");
+    assert_eq!(field(&cached, "files_ms"), "3000", "{cached}");
+    assert_eq!(field(&cached, "file_asks"), "1", "{cached}");
+    assert_eq!(field(&cached, "files_checked"), "4", "{cached}");
+    assert_eq!(field(&cached, "walk_ms"), "3000", "{cached}");
+    assert_eq!(field(&cached, "presubmit_ms"), "15000", "{cached}");
+    assert_eq!(m.execute_dir_cache_hits.get(), 2);
+    assert_eq!(m.execute_dir_cache_present_checked.get(), 2);
+    assert_eq!(m.execute_dir_cache_misses.get(), 2, "no new lead");
+    assert_eq!(m.execute_dir_cache_merged.get(), 0);
+    assert_eq!(m.execute_dir_cache_evictions.get(), 0);
+    assert_eq!(m.execute_dir_cache_bytes.get(), held);
+    assert_eq!(m.execute_walk_dirs_read.get(), 2, "nothing read");
+    assert_eq!(m.execute_walk_dir_read.count(), 2, "and so nothing timed");
+    assert_eq!(m.execute_walk_files.count(), 3);
+    assert_eq!(m.execute_walk_files.sum(), 6_000_000_000);
+
+    let text = backend.render_metrics();
+    for line in [
+        "kbf_execute_dir_cache_hits_total 2",
+        "kbf_execute_dir_cache_misses_total 2",
+        "kbf_execute_dir_cache_present_checked_total 2",
+        "kbf_execute_walk_dir_read_seconds_count 2",
+    ] {
+        assert!(text.lines().any(|l| l == line), "{line} missing");
+    }
+}
+
+/// Catches the warning's (or the metric's) `dirs_present_checked` fed from
+/// `dir_cache_hits`: the two are 2 and 2 for an Execute that takes both Directories
+/// from the cache, so nothing told them apart. Two Executes of different actions over
+/// one input tree start together. One reads both Directories; the other waits
+/// for each read and takes the Directory it produced, so it has 2 cache hits (both
+/// merged) and has asked the store about none of them: `dirs_present_checked` 0. A
+/// cached Directory is the only one the store is asked about.
+#[tokio::test(start_paused = true)]
+async fn a_directory_taken_from_a_read_in_flight_is_a_hit_and_is_not_asked_about() {
+    let _ = log_lines();
+    let farm = Farm::new().await;
+    let (first, second) = (job_running("first"), job_running("second"));
+    farm.store(&[&first.action, &second.action]).await;
+    farm.store(&first.blobs.iter().collect::<Vec<_>>()).await;
+    farm.store(&[&second.blobs[0]]).await;
+    let (service, backend) = farm.service();
+    let m = backend.metrics();
+
+    tokio::join!(execute(&service, &first), execute(&service, &second));
+
+    // Which of the two reads is down to who polls first; the other waits.
+    let (mut read, mut waited) = (warning(&first, 0), warning(&second, 0));
+    if field(&read, "dir_reads") == "0" {
+        std::mem::swap(&mut read, &mut waited);
+    }
+    assert_eq!(field(&read, "dir_reads"), "2", "{read}");
+    assert_eq!(field(&read, "dir_cache_hits"), "0", "{read}");
+    assert_eq!(field(&read, "dirs_present_checked"), "0", "{read}");
+    assert_eq!(field(&read, "files_checked"), "4", "{read}");
+    assert_eq!(field(&waited, "dir_reads"), "0", "{waited}");
+    assert_eq!(field(&waited, "dirs_skipped"), "0", "{waited}");
+    assert_eq!(field(&waited, "dir_cache_hits"), "2", "{waited}");
+    assert_eq!(
+        field(&waited, "dirs_present_checked"),
+        "0",
+        "a Directory taken from a read in flight was not asked about: {waited}"
+    );
+    assert_eq!(field(&waited, "files_checked"), "4", "{waited}");
+
+    assert_eq!(m.execute_walk_dirs_read.get(), 2);
+    assert_eq!(m.execute_dir_cache_misses.get(), 2);
+    assert_eq!(m.execute_dir_cache_hits.get(), 2);
+    assert_eq!(m.execute_dir_cache_merged.get(), 2);
+    assert_eq!(m.execute_dir_cache_present_checked.get(), 0);
 }
 
 /// Where the global subscriber writes.

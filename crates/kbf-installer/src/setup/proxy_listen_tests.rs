@@ -5,7 +5,7 @@
 use super::*;
 use crate::setup::paths::{PROXY_LISTEN_DROPIN, PROXY_SOCKET_DIR};
 
-const UNITS: &[&str] = &["kbf-frontend.service"];
+const UNITS: &[&str] = &["kbf-frontend.service", "kbf-backup.timer"];
 
 /// The operator's `[proxy]` table, with `extra` on top of it.
 fn table(extra: &str) -> String {
@@ -179,7 +179,7 @@ fn an_invalid_listen_is_refused_naming_the_key() {
 /// writing under /etc/systemd).
 #[test]
 fn a_mac_gets_no_dropin() {
-    let mut exec = with_toml(&table("listen = \"192.0.2.10:8443\"\n"));
+    let mut exec = provisioned(with_toml(&table("listen = \"192.0.2.10:8443\"\n")));
     go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
     assert!(dropin_steps(&exec).is_empty());
 }
