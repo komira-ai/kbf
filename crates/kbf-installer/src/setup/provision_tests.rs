@@ -590,6 +590,42 @@ fn a_server_that_cannot_be_asked_is_refused_in_setups_words() {
     );
 }
 
+/// Catches a `psql` that was killed by a signal (the OOM killer, a `kill`) being worded as an
+/// exit status it never had: it has no exit code, so the refusal says `none` and still gives
+/// the way out, and names none of the operator's values.
+///
+/// Mutant seen red: the missing code worded as `0`.
+#[test]
+fn a_psql_killed_by_a_signal_is_refused_with_no_exit_code() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let mut exec = released(host(), Platform::Linux);
+    exec.answer = Box::new(|cmd| {
+        if cmd.program.as_str() != provision::PSQL {
+            return Ok(reply(0, "", ""));
+        }
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(9),
+            stdout: Vec::new(),
+            stderr: b"secretrole secretdb /run/secretsock".to_vec(),
+        })
+    });
+    let out = go_on(
+        &linux(),
+        &mut exec,
+        &Unwired,
+        &Server::fresh(),
+        &flags(),
+        APPLY,
+    );
+    let text = refusal(out);
+    assert!(text.contains("(exit status none)"), "{text}");
+    assert!(
+        text.contains("run setup without --create-local-database"),
+        "{text}"
+    );
+    no_names(&text);
+}
+
 /// Catches `--create-local-database` on a Mac, which has no `postgres` account to switch to
 /// and no `/usr/bin/psql`: a usage error, before anything is asked.
 #[test]
