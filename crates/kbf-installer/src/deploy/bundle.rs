@@ -79,27 +79,20 @@ fn read_from(input: &mut dyn Read, commit: &CommitId) -> Result<Bundle, String> 
             .and_then(|n| n.to_str())
             .ok_or("an entry has no usable name")?
             .to_owned();
-        if file == SUMS {
+        // The checksum file is read as the tarballs are: capped, and never empty.
+        let (kind, cap) = if file == SUMS {
             if sums.is_some() {
                 return Err(format!("{file} appears twice"));
             }
-            let mut bytes = Vec::new();
-            entry
-                .by_ref()
-                .take(MAX_SUMS + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|e| format!("reading {file}: {e}"))?;
-            if bytes.is_empty() || bytes.len() as u64 > MAX_SUMS {
-                return Err(format!("{file} is empty or larger than {MAX_SUMS} bytes"));
-            }
-            sums = Some(bytes);
-            continue;
-        }
-        let (platform, name) = classify(&file, commit)?;
-        let cap = if name.ends_with(".attestation") {
-            MAX_ATTESTATION
+            (None, MAX_SUMS)
         } else {
-            MAX_TARBALL
+            let (platform, name) = classify(&file, commit)?;
+            let cap = if name.ends_with(".attestation") {
+                MAX_ATTESTATION
+            } else {
+                MAX_TARBALL
+            };
+            (Some((platform, name)), cap)
         };
         let mut bytes = Vec::new();
         entry
@@ -113,6 +106,10 @@ fn read_from(input: &mut dyn Read, commit: &CommitId) -> Result<Bundle, String> 
         if bytes.is_empty() {
             return Err(format!("{file} is empty"));
         }
+        let Some((platform, name)) = kind else {
+            sums = Some(bytes);
+            continue;
+        };
         if out
             .iter()
             .any(|e: &Entry| e.platform == platform && e.name == name)

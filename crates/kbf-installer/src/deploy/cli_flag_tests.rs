@@ -43,6 +43,7 @@ impl Rig {
             root,
             config_owner: current_uid(),
             frontend: absent_frontend(self),
+            installer_root: self.dir.clone(),
         }
     }
 
@@ -530,4 +531,42 @@ fn a_gamma_apply_with_no_offer_is_refused_before_the_farm_is_asked() {
     assert!(err.contains("--no-offer"), "{err}");
     let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
     assert_eq!(line["offer"]["kind"], "waived");
+}
+
+/// Proves a gamma apply with a valid but old offer gets as far as reading the offer and
+/// building the probe, and ends in the offer's own refusal (exit 3, `offer_stale`) on the
+/// summary line; and that settings the host does not trust stop the deploy before it starts
+/// (exit 2), since the user the probe runs as comes from them. Catches an offer that is parsed
+/// and then not applied, and a probe built from settings nobody vouched for.
+///
+/// Mutant planted: the probe error ignored (the deploy goes on with no probe).
+#[test]
+fn a_stale_offer_ends_the_deploy_and_untrusted_settings_stop_it() {
+    let rig = Rig::new("stale");
+    let (code, out, _) = rig.go(
+        &["--apply", "--stage", "gamma", "--offer", &rig.offer_file()],
+        b"",
+        true,
+    );
+    assert_eq!(code, 3, "{out}");
+    let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(line["reason"], "offer_stale");
+    assert_eq!(line["offer"]["kind"], "offer");
+    if current_uid() == 0 {
+        return;
+    }
+    let layout = crate::layout::Layout::linux(kbf_host::Root::new(&rig.dir).unwrap());
+    let settings = layout.join(&layout.settings());
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(&settings, "RUN_AS_UID=65534\n").unwrap();
+    let (code, out, err) = rig.go(
+        &["--apply", "--stage", "gamma", "--offer", &rig.offer_file()],
+        b"",
+        true,
+    );
+    assert_eq!((code, out.as_str()), (2, ""), "{err}");
+    assert!(
+        err.contains("installer.conf") || err.contains("settings"),
+        "{err}"
+    );
 }

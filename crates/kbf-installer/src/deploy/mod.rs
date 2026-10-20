@@ -325,7 +325,6 @@ impl Run<'_> {
         let refused = |(reason, detail): offer::Refused| fail(Exit::Refused, reason, detail);
         self.sum.offer = self.opts.offer.record();
         match &self.opts.offer {
-            OfferPolicy::Unchecked => Ok(()),
             OfferPolicy::Missing(stage) => Err(fail(
                 Exit::Refused,
                 "offer_required",
@@ -334,7 +333,7 @@ impl Run<'_> {
                     stage.word()
                 ),
             )),
-            OfferPolicy::Waived(_) => Ok(()),
+            OfferPolicy::Unchecked | OfferPolicy::Waived(_) => Ok(()),
             OfferPolicy::Offer {
                 stage,
                 doc,

@@ -466,6 +466,7 @@ fn the_offer_file_is_read_only_through_the_validated_parse() {
 struct Plays {
     stdout: String,
     code: i32,
+    timed_out: bool,
     asked: std::sync::Mutex<Vec<crate::run::Spawn>>,
 }
 
@@ -476,7 +477,7 @@ impl crate::run::Runner for std::sync::Arc<Plays> {
             code: Some(self.code),
             stdout: self.stdout.clone().into_bytes(),
             stderr: Vec::new(),
-            timed_out: false,
+            timed_out: self.timed_out,
         })
     }
 }
@@ -516,6 +517,7 @@ fn the_host_probe_unpacks_the_binary_and_reads_its_meta_log() {
         let plays = std::sync::Arc::new(Plays {
             stdout,
             code,
+            timed_out: false,
             asked: Default::default(),
         });
         // Not root here, so the probe cannot chown its scratch directory to the user.
@@ -546,6 +548,7 @@ fn the_host_probe_unpacks_the_binary_and_reads_its_meta_log() {
         Box::new(std::sync::Arc::new(Plays {
             stdout: version("", short),
             code: 0,
+            timed_out: false,
             asked: Default::default(),
         })),
     );
@@ -563,9 +566,126 @@ fn the_host_probe_unpacks_the_binary_and_reads_its_meta_log() {
     let plays = std::sync::Arc::new(Plays {
         stdout: version("", short),
         code: 0,
+        timed_out: false,
         asked: Default::default(),
     });
     let as_me = HostProbe::new(dir.join("work"), Some(me), Box::new(plays.clone()));
     assert_eq!(as_me.meta_log(&commit, &tarball()), Ok(None));
     assert_eq!(plays.asked.lock().unwrap()[0].run_as, Some(me));
+}
+
+/// (d) Proves a probe that cannot run says so rather than answering: a binary that times out,
+/// a scratch directory that cannot be made, and a build with no probe all refuse. Catches a
+/// timeout read as a number and a failure read as "no meta_log".
+///
+/// Mutants planted: the timeout let through; `NoProbe` answering `Ok(None)`.
+#[test]
+fn a_probe_that_cannot_run_refuses() {
+    let (_, dir) = crate::testkit::host_root("deploy-offer-probe-fail");
+    let commit = c(TARGET);
+    let short = &TARGET[..12];
+    let said = format!(
+        "{{\"commit\":\"{short}\",\"min_protocol\":3,\"profile\":\"release\",\"protocol\":4,\"state_schema\":1,\"version\":\"0.1.0\"}}"
+    );
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut b = tar::Builder::new(&mut gz);
+    let mut h = tar::Header::new_gnu();
+    h.set_size(1);
+    h.set_mode(0o755);
+    h.set_cksum();
+    b.append_data(&mut h, "kbf", &b"x"[..]).unwrap();
+    b.finish().unwrap();
+    drop(b);
+    let tarball = gz.finish().unwrap();
+    let slow = std::sync::Arc::new(Plays {
+        stdout: said.clone(),
+        code: 0,
+        timed_out: true,
+        asked: Default::default(),
+    });
+    let probe = HostProbe::new(dir.join("work"), None, Box::new(slow));
+    assert!(
+        probe
+            .meta_log(&commit, &tarball)
+            .unwrap_err()
+            .contains("ended")
+    );
+    // A file where the work directory's parent should be.
+    std::fs::write(dir.join("blocker"), b"").unwrap();
+    let fine = std::sync::Arc::new(Plays {
+        stdout: said,
+        code: 0,
+        timed_out: false,
+        asked: Default::default(),
+    });
+    let blocked = HostProbe::new(dir.join("blocker").join("work"), None, Box::new(fine));
+    assert!(
+        blocked
+            .meta_log(&commit, &tarball)
+            .unwrap_err()
+            .starts_with("probe:")
+    );
+    assert!(NoProbe.meta_log(&commit, &tarball).is_err());
+    assert!(HostProbe::at(&dir, false).is_ok());
+    assert!(HostProbe::at(&dir, true).is_ok());
+}
+
+/// Proves `SHA256SUMS` is read as `<sha256>  <name>` lines and nothing looser: a binary mark,
+/// a path before the name and blank lines are accepted; a short or upper-case digest, a
+/// missing name, no separator and a name listed twice with two digests are refused (a reader
+/// that took the first would not see the second).
+///
+/// Mutants planted: the digest length not checked; the hex alphabet not checked; an empty
+/// name accepted; a conflicting duplicate accepted.
+#[test]
+fn the_checksum_file_is_read_strictly() {
+    let (a, b) = ("a".repeat(64), "b".repeat(64));
+    let read = |text: &str| offer::parse_sums(text.as_bytes());
+    let ok = read(&format!(
+        "{a}  kbf-1.tar.gz\n\n{b} *dist/kbf-2.tar.gz\n{a}  kbf-1.tar.gz\n"
+    ))
+    .unwrap();
+    assert_eq!(ok.len(), 2);
+    assert_eq!(ok["kbf-2.tar.gz"], b);
+    for bad in [
+        format!("{}  x\n", "a".repeat(63)),
+        format!("{}  x\n", "A".repeat(64)),
+        format!("{}  x\n", "g".repeat(64)),
+        format!("{a}  \n"),
+        format!("{a}  dir/\n"),
+        format!("{a} x\n"),
+        format!("{a}\n"),
+        format!("{a}  x\n{b}  x\n"),
+    ] {
+        assert!(read(&bad).is_err(), "{bad:?}");
+    }
+    assert!(offer::parse_sums(&[0xff, 0xfe]).is_err());
+}
+
+/// Proves the bundle reader takes one non-empty `SHA256SUMS` of at most `MAX_SUMS` bytes and
+/// refuses two, an empty one, a larger one and one cut short.
+///
+/// Mutants planted: a second `SHA256SUMS` accepted; the empty file accepted; the cap removed;
+/// a read error ignored.
+#[test]
+fn the_bundle_reads_one_bounded_checksum_file() {
+    let commit = c(TARGET);
+    let tar_name = tar_name("kbf", "linux-x86_64");
+    let with = |sums: &[&[u8]]| {
+        let mut files: Vec<(&str, &[u8])> = vec![(tar_name.as_str(), b"t")];
+        files.extend(sums.iter().map(|s| ("SHA256SUMS", *s)));
+        tarball(&files)
+    };
+    let read = |bytes: &[u8]| bundle::read_bundle(bytes, &commit);
+    assert_eq!(
+        read(&with(&[b"sums"])).unwrap().sums.as_deref(),
+        Some(&b"sums"[..])
+    );
+    assert_eq!(read(&with(&[])).unwrap().sums, None);
+    assert!(read(&with(&[b"one", b"two"])).is_err());
+    assert!(read(&with(&[b""])).is_err());
+    let big = vec![b'x'; bundle::MAX_SUMS as usize + 1];
+    assert!(read(&with(&[&big])).is_err());
+    let whole = tarball(&[("SHA256SUMS", &[b'x'; 2000][..])]);
+    assert!(read(&whole[..512 + 100]).is_err());
 }

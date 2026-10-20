@@ -181,22 +181,15 @@ pub(super) fn check_header(
     Ok(())
 }
 
-/// The file name a bundle entry has in the release (and in `SHA256SUMS`).
+/// The file name a tarball has in the release (and in `SHA256SUMS`).
 fn asset_name(entry: &Entry, commit: &CommitId) -> String {
-    let (component, attestation) = match entry.name.strip_suffix(".attestation") {
-        Some(c) => (c, ".attestation"),
-        None => (entry.name.as_str(), ""),
-    };
-    format!(
-        "{component}-{commit}-{}.tar.gz{attestation}",
-        entry.platform
-    )
+    format!("{}-{commit}-{}.tar.gz", entry.name, entry.platform)
 }
 
 /// The digests `SHA256SUMS` lists, by file name (`<hex>  <name>` per line, a path in front
 /// of the name ignored). A name listed twice with two digests, or a line of another shape,
 /// is an error: a reader that took the first would not see the second.
-fn parse_sums(sums: &[u8]) -> Result<BTreeMap<String, String>, String> {
+pub(super) fn parse_sums(sums: &[u8]) -> Result<BTreeMap<String, String>, String> {
     let text = std::str::from_utf8(sums).map_err(|_| "SHA256SUMS is not UTF-8".to_owned())?;
     let mut out = BTreeMap::new();
     for (n, line) in text.lines().enumerate() {
@@ -354,16 +347,17 @@ pub struct HostProbe {
 }
 
 impl HostProbe {
-    /// The host's probe: its settings name the user; a deploy that is not root runs the
-    /// binary as itself (it is a plan, and cannot switch).
-    pub fn host(root: bool) -> Result<HostProbe, String> {
-        let base = kbf_host::Root::new("/").map_err(|e| e.to_string())?;
+    /// The probe of the host whose files are under `root` (`/` for the real one): its
+    /// settings name the user; a deploy that is not root runs the binary as itself (it is a
+    /// plan, and cannot switch).
+    pub fn at(root: &Path, as_root: bool) -> Result<HostProbe, String> {
+        let base = kbf_host::Root::new(root).map_err(|e| e.to_string())?;
         let layout = Layout::new(base.clone(), Platform::current());
         let settings = Settings::load(&kbf_host::HostExec::new(base), &layout)
             .map_err(|e| format!("installer settings: {e}"))?;
         Ok(HostProbe {
             work: layout.join(&layout.work_dir()),
-            run_as: root.then_some(settings.run_as),
+            run_as: as_root.then_some(settings.run_as),
             runner: Box::new(SystemRunner),
         })
     }

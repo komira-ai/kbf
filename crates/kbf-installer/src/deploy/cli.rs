@@ -437,6 +437,9 @@ pub(super) struct Host {
     /// files belong to whoever runs them.
     pub config_owner: u32,
     pub frontend: FrontendConfig,
+    /// Where the installer's own files (its settings, its work directory) are: `/`, except
+    /// in the unit tests.
+    pub installer_root: PathBuf,
 }
 
 impl Host {
@@ -445,6 +448,7 @@ impl Host {
             root: is_root(),
             config_owner: if cfg!(test) { current_uid() } else { 0 },
             frontend: FrontendConfig::host(),
+            installer_root: PathBuf::from("/"),
         }
     }
 }
@@ -511,7 +515,7 @@ pub(super) fn run(
         Box::new(NoSmoke)
     };
     let probe: Box<dyn Probe> = match &parsed.options.offer {
-        OfferPolicy::Offer { .. } => match HostProbe::host(host.root) {
+        OfferPolicy::Offer { .. } => match HostProbe::at(&host.installer_root, host.root) {
             Ok(p) => Box::new(p),
             Err(why) => return usage(err, &why),
         },
