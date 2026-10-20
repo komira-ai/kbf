@@ -1,4 +1,4 @@
-//! The two isolation suites of the black-box crate (crates/kbf-blackbox/README.md):
+//! The two isolation suites of the black-box crate (crates/kbf-daemon-test/README.md):
 //! `no_residue` (nothing is left behind on a node after real builds) and `no_cross_access`
 //! (one action's data is not reachable by another on the same node).
 //!

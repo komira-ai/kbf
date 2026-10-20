@@ -1,23 +1,16 @@
-# kbf-blackbox
+# kbf-daemon-test
 
-The black-box suites of the beta stage (design: T009). Tests only: the crate has no
-library and no binary, and every dependency is a dev-dependency. A test starts the real
-`kbf` processes through `kbf-harness` and talks to them as a deployer's client would
-(REAPI, the operator API, the command line); it links no `kbf-server` or `kbf-node` code.
+The black-box suites of the daemon, a beta stage test (design: T009, T018). Tests only: the
+crate has no library and no binary, and every dependency is a dev-dependency. A test starts
+the real `kbf` processes through `kbf-harness` and talks to them as a deployer's client would
+(REAPI); it links no `kbf-server` or `kbf-node` code. One crate per component under test,
+named for it (`kbf-all-in-one-test` is the all-in-one farm's). The Mac legs go here as more
+test targets.
 
-## Suite A: all-in-one, end to end
+## No residue, no cross-action data access (T018)
 
-`tests/all_in_one.rs` (test binary `kbf-blackbox::all_in_one`) holds suite A: a farm of
-rendered units (a frontend, storage-and-daemon nodes, a plain daemon) driven end to end.
-Today it holds one test, `a_storage_node_takes_a_lease_and_runs_an_action`: an `Execute`
-reaches a node's daemon half, the action runs under the stand-in `crun`, and its output is
-read back through the frontend. It is the proof that the wiring works; the planned-restart
-test of `kbf-cli/tests/rehearsal_in_a_box.rs` moves here next.
-
-## Suites 1 and 2: no residue, no cross-action data access (T018)
-
-`tests/isolation/main.rs` (test binary `kbf-blackbox::isolation`) holds both, in
-`no_residue.rs` and `no_cross_access.rs`, over one set of helpers (`common/`). Linux legs
+`tests/isolation/main.rs` (test binary `kbf-daemon-test::isolation`) holds both suites, in
+`no_residue.rs` and `no_cross_access.rs`, over one set of helpers (`common/`, below). Linux legs
 only; the Mac legs are jerry's (see "The Mac seam").
 
 ### What a green run proves, and what it does not
@@ -89,42 +82,55 @@ and its existing knobs.
 
 ### The Mac seam
 
-Tests call `common::node::NodeView` and the probes built on it, never `/proc` or cgroup paths.
-Jerry's Mac legs add `MacNode` implementing it (per-slot users, simulators, `whole-machine`
-lease directories, launchd jobs, the UI session) where the tests pick `LinuxNode`, plus a
-`Rig` that starts a Mac farm; the two files then run unchanged. The Mac-shaped methods are
-already on the trait (`slot_users`, `session_leftovers`, `home_dirs`, `isolation`), empty on
-Linux; `Isolation::PerUid` tells the cross-action probes that a live read of another
-action's file must be DENIED by uid and mode, where on the Linux stand-in it must succeed
+Tests call `kbf_testkit::node_view::NodeView` and the probes built on it
+(`kbf_testkit::probe`), never `/proc` or cgroup paths. Both live in `kbf-testkit`, so a Mac
+leg imports them like any other crate: no `#[path]` include. Jerry's Mac legs add a test
+target to THIS crate (`tests/<name>/main.rs`) with a `MacNode` implementing the trait
+(per-slot users, simulators, `whole-machine` lease directories, launchd jobs, the UI
+session) where the isolation suites pick `LinuxNode`, plus a `Rig` that starts a Mac farm;
+the checks then run against it unchanged. The Mac-shaped methods are already on the trait
+(`slot_users`, `session_leftovers`, `home_dirs`, `isolation`), empty on Linux;
+`Isolation::PerUid` tells the cross-action probes that a live read of another action's file
+must be DENIED by uid and mode, where on the Linux stand-in it must succeed
 (`Isolation::Nothing`) and on real `crun` it must not even resolve (`MountNs`). A Mac method
 not written yet must `unimplemented!("mac leg: ...")`, so a missing leg is loud.
+
+### Where the helpers live
+
+| helper | crate | why |
+|---|---|---|
+| `NodeView`, `Isolation`, `Proc`; the probes over files (`walk`, `Snapshot`, `clean_since`, `scan`, `files_containing`, `world_writable`, ...); `canary`, `noise`; `Tree`, `Job` | `kbf-testkit` | no protocol and no platform in them, and `kbf-testkit` takes no kbf crate (every crate may depend on it); unit-tested in `kbf-testkit/tests/` |
+| the REAPI channel, `upload_action`, `execute` | `kbf-harness` (`reapi`) | they name `kbf-proto` and `tonic`; shared with `kbf-all-in-one-test`; unit-tested in `kbf-harness/src/reapi_tests.rs` |
+| `LinuxNode`, the `/proc` and cgroup probes (`processes_of`, `open_fds`, ...), `Rig` (one node, the stand-in `crun`'s knobs) | here, `tests/isolation/common/` | Linux-only or specific to this farm; part of a test binary the pull-request gate does not run |
 
 ### Running
 
 `cargo build -p kbf-cli --bins` first (the farm's processes are found beside the test
-binary), then `cargo test -p kbf-blackbox --test isolation`. Each test starts its own farm
+binary), then `cargo test -p kbf-daemon-test --test isolation`. Each test starts its own farm
 (ports and directories are the farm's own, nothing is shared between tests), so tests may
 run side by side; process scans are keyed on the test's farm directory.
 
 ## How to add a test
 
-1. Put it in `tests/all_in_one.rs` (a new suite is a new file in `tests/`, named for the
-   suite). Start the farm with `start(name, topology)`, wait with `ready`, drive it with
-   the helpers of the file, and `farm.stop()` at the end; a failed `Farm::start` panics
-   with the processes' last lines.
+1. Put it in `tests/isolation/no_residue.rs` or `no_cross_access.rs` (a new suite is a new
+   test target: a directory `tests/<name>/main.rs`). Start a node with `Rig::start(name)`,
+   plant the action with `rig.plant(..)`, run it with `rig.run(&job)`, and look with the
+   probes. A failed `Farm::start` panics with the processes' last lines.
 2. Say in the test's doc comment which defect it catches, and plant that defect once to see
-   it red.
-3. Keep the file under 1000 lines; a second suite goes in its own file.
+   it red (a `planted_` test beside it makes the same probe return `Err`).
+3. Keep the files under 1000 lines.
 
 ## Where it runs: beta, not the pull-request gate
 
-- `.config/nextest.toml`: the `pr` profile's `default-filter` excludes `package(kbf-blackbox)`;
+- `.config/nextest.toml`: the `pr` profile's `default-filter` excludes `package(kbf-daemon-test)`;
   the default profile (the whole run of `.github/workflows/beta.yml`, job `test-x86`) runs it.
 - Coverage: the pull-request job measures every crate at 99% under `cargo llvm-cov`. The
   test files here are `#![cfg(not(coverage))]`, so that job compiles them empty and the
   crate has no records (an unlisted crate with none passes); a normal build and the beta run
-  compile them whole. This crate needs no line in `coverage-floors`.
+  compile them whole. This crate needs no line in `coverage-floors`. The helpers in
+  `kbf-testkit` and `kbf-harness` ARE measured by that job, which is why they have tests of
+  their own.
 - The processes are found beside the test binary, so build them first when running one
   package: `cargo build -p kbf-cli --bins` (`kbf` and the stand-in `crun`). `cargo test
   --workspace` and the beta run build them already.
-- Linux only: `kbf-harness` is.
+- Linux only for the suites above: `kbf-harness` is.

@@ -1370,6 +1370,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-all-in-one-test"
+version = "0.1.0"
+dependencies = [
+ "kbf-harness",
+ "kbf-testkit",
+ "kbf-transfer",
+ "tokio",
+]
+
+[[package]]
 name = "kbf-auth"
 version = "0.1.0"
 dependencies = [
@@ -1424,21 +1434,6 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
- "tokio",
- "tonic",
-]
-
-[[package]]
-name = "kbf-blackbox"
-version = "0.1.0"
-dependencies = [
- "kbf-harness",
- "kbf-proto",
- "kbf-testkit",
- "kbf-transfer",
- "prost",
- "prost-types",
- "rustix",
  "tokio",
  "tonic",
 ]
@@ -1580,6 +1575,19 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "kbf-daemon-test"
+version = "0.1.0"
+dependencies = [
+ "kbf-harness",
+ "kbf-proto",
+ "kbf-testkit",
+ "kbf-transfer",
+ "rustix",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -1780,17 +1788,24 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "flate2",
+ "futures",
  "kbf-deploy",
  "kbf-it",
+ "kbf-proto",
  "kbf-testkit",
  "kbf-transfer",
+ "kbf-types",
  "libc",
+ "prost",
+ "prost-types",
  "rcgen",
  "rustix",
  "serde",
  "serde_json",
  "thiserror",
  "time",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]

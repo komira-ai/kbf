@@ -14,7 +14,7 @@
 //! not residue: the input cache, the trees, the image store, `daemon-instance`
 //! (`NodeView::kept`, exact paths, never a prefix).
 //!
-//! Each check is a function of the probes of `common/probe.rs`; each `planted_` test makes a
+//! Each check is a function of the probes of `kbf_testkit::probe` (and `common/linux.rs`); each `planted_` test makes a
 //! deliberately leaky action (or switches on a stand-in `crun` knob) and asserts the same
 //! probe returns `Err`, so none of them can pass by not looking.
 

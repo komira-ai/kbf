@@ -1,7 +1,11 @@
-//! The black-box probes: functions over the files and processes of a node that return
-//! `Err(what)` when they see residue or a leak. Every probe is used by a test that must pass
-//! on a clean run and by a `planted_` test that must see it return `Err` (README.md
-//! "Red first"), so a probe that cannot fail does not get in.
+//! The black-box probes: functions over the files of a node, and a [`NodeView`] of it, that
+//! return `Err(what)` when they see residue or a leak. Platform-neutral: the Linux node's
+//! `/proc` and cgroup probes are `kbf-daemon-test`'s (`tests/isolation/common/linux.rs`), the
+//! Mac legs' are theirs, and both implement [`NodeView`].
+//!
+//! Every probe is used by a test that must pass on a clean run and by a `planted_` test that
+//! must see it return `Err` (`crates/kbf-daemon-test/README.md`, "Checks, and the planted
+//! leak that turns each red"), so a probe that cannot fail does not get in.
 //!
 //! A probe never skips what it cannot read: any error other than "gone" (ENOENT, ESRCH
 //! for a process that ended between the listing and the read) is an `Err`. The stand-in
@@ -13,7 +17,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::node::{NodeView, Proc};
+use crate::node_view::{NodeView, Proc};
 
 /// The name a lease's directory and cgroup start with: `LEASE_PREFIX` of
 /// kbf-driver-container's container.rs, "Lease scratch" of docs/design/daemon.md. Kept as
@@ -26,26 +30,37 @@ pub const LEASE_PREFIX: &str = "kbf-lease-";
 /// `Execute` returns.
 pub const SETTLE: Duration = Duration::from_secs(10);
 
+/// What kind of path an [`Entry`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
+    /// A regular file.
     File,
+    /// A directory.
     Dir,
+    /// A symbolic link (never followed).
     Link,
+    /// A fifo, a socket or a device.
     Other,
 }
 
 /// What a walk saw of one path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry {
+    /// The kind of path.
     pub kind: Kind,
     /// Apparent length in bytes.
     pub len: u64,
     /// Allocated bytes (blocks of 512).
     pub alloc: u64,
+    /// The permission and set-id bits.
     pub mode: u32,
+    /// Device and inode: a hard link is the same file under two names.
+    pub id: (u64, u64),
 }
 
 impl Entry {
+    /// Whether the path is a directory.
+    #[must_use]
     pub fn is_dir(&self) -> bool {
         self.kind == Kind::Dir
     }
@@ -85,6 +100,7 @@ fn entry_of(path: &Path) -> Result<Option<Entry>, String> {
         len: meta.len(),
         alloc: meta.blocks() * 512,
         mode: meta.mode() & 0o7777,
+        id: (meta.dev(), meta.ino()),
     }))
 }
 
@@ -106,7 +122,7 @@ pub fn walk_pruned(
     while let Some(dir) = todo.pop() {
         let listing = match std::fs::read_dir(&dir) {
             Ok(l) => l,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && dir != root => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(io(&dir, &e)),
         };
         for item in listing {
@@ -133,26 +149,17 @@ pub fn walk(root: &Path) -> Result<BTreeMap<PathBuf, Entry>, String> {
 /// The allocated and apparent bytes below `root` (a file or a directory), each inode
 /// once.
 pub fn bytes_below(root: &Path) -> Result<(u64, u64), String> {
-    let mut seen = BTreeSet::new();
-    let (mut alloc, mut apparent) = (0, 0);
-    let mut count = |path: &Path| -> Result<(), String> {
-        let meta = std::fs::symlink_metadata(path).map_err(|e| io(path, &e))?;
-        if seen.insert((meta.dev(), meta.ino())) {
-            alloc += meta.blocks() * 512;
-            apparent += meta.len();
-        }
-        Ok(())
-    };
-    count(root)?;
-    if !entry_of(root)?.is_some_and(|e| e.is_dir()) {
-        return Ok((alloc, apparent));
-    }
-    for rel in walk(root)?.keys() {
-        match count(&root.join(rel)) {
-            Ok(()) => {}
-            // Gone since the walk: the walk is not a snapshot of a busy tree.
-            Err(e) if e.contains("No such file") => {}
-            Err(e) => return Err(e),
+    let top = entry_of(root)?.ok_or_else(|| format!("{}: missing", root.display()))?;
+    let mut seen = BTreeSet::from([top.id]);
+    let (mut alloc, mut apparent) = (top.alloc, top.len);
+    if top.is_dir() {
+        // What the walk saw: a path gone since is not counted, and the walk is not a
+        // snapshot of a busy tree.
+        for entry in walk(root)?.values() {
+            if seen.insert(entry.id) {
+                alloc += entry.alloc;
+                apparent += entry.len;
+            }
         }
     }
     Ok((alloc, apparent))
@@ -310,6 +317,18 @@ impl Snapshot {
 /// # Errors
 /// What is left, one finding per item.
 pub fn clean_since(node: &dyn NodeView, before: &Snapshot) -> Result<(), String> {
+    clean_since_within(node, before, SETTLE)
+}
+
+/// [`clean_since`] with `settle` in place of [`SETTLE`] for the processes.
+///
+/// # Errors
+/// What is left, one finding per item.
+pub fn clean_since_within(
+    node: &dyn NodeView,
+    before: &Snapshot,
+    settle: Duration,
+) -> Result<(), String> {
     let now = Snapshot::take(node).map_err(|e| format!("cannot look: {e}"))?;
     let mut bad = now.residue_since(before);
     // The files, cgroups and users above are asserted at once; only a process gets SETTLE to
@@ -317,7 +336,7 @@ pub fn clean_since(node: &dyn NodeView, before: &Snapshot) -> Result<(), String>
     // used here and a run with SETTLE of zero is just as green: what the tests prove is the
     // immediate assertions above and the first look below. The margin is for a real
     // kernel's reaping of a process group, tier R.
-    let end = Instant::now() + SETTLE;
+    let end = Instant::now() + settle;
     loop {
         let procs: Vec<Proc> = node
             .processes()
@@ -342,331 +361,6 @@ pub fn clean_since(node: &dyn NodeView, before: &Snapshot) -> Result<(), String>
         Ok(())
     } else {
         Err(bad.join("; "))
-    }
-}
-
-fn gone(e: &std::io::Error) -> bool {
-    // ENOENT, or ESRCH for a process that ended while it was being read.
-    matches!(e.raw_os_error(), Some(2 | 3))
-}
-
-/// What `/proc/<pid>/stat` says of a process.
-#[derive(Clone, Copy, Debug)]
-struct Stat {
-    state: char,
-    ppid: u32,
-    /// The process group id.
-    pgrp: u32,
-    /// The session id.
-    session: u32,
-}
-
-/// `/proc/<pid>/stat`. `None` for a process that ended.
-fn stat_of(pid: u32) -> Result<Option<Stat>, String> {
-    let path = PathBuf::from(format!("/proc/{pid}/stat"));
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if gone(&e) => return Ok(None),
-        Err(e) => return Err(io(&path, &e)),
-    };
-    // `pid (comm) S ppid ...`, and comm may hold parentheses and spaces.
-    let after = text
-        .rsplit_once(')')
-        .ok_or_else(|| format!("{}: unparsable", path.display()))?
-        .1;
-    let mut words = after.split_whitespace();
-    let state = words
-        .next()
-        .and_then(|s| s.chars().next())
-        .ok_or_else(|| format!("{}: no state", path.display()))?;
-    let mut number = |what: &str| -> Result<u32, String> {
-        words
-            .next()
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| format!("{}: no {what} in {text:?}", path.display()))
-    };
-    let (ppid, pgrp, session) = (number("parent")?, number("group")?, number("session")?);
-    Ok(Some(Stat {
-        state,
-        ppid,
-        pgrp,
-        session,
-    }))
-}
-
-fn proc_file(pid: u32, name: &str) -> Result<Option<Vec<u8>>, String> {
-    let path = PathBuf::from(format!("/proc/{pid}/{name}"));
-    match std::fs::read(&path) {
-        Ok(b) => Ok(Some(b)),
-        Err(e) if gone(&e) => Ok(None),
-        Err(e) => Err(io(&path, &e)),
-    }
-}
-
-/// Like [`proc_file`], but a file the user is denied reads as empty (see the caller).
-fn proc_file_or_denied(pid: u32, name: &str) -> Result<Vec<u8>, String> {
-    let path = PathBuf::from(format!("/proc/{pid}/{name}"));
-    match std::fs::read(&path) {
-        Ok(b) => Ok(b),
-        Err(e) if gone(&e) || e.kind() == std::io::ErrorKind::PermissionDenied => Ok(Vec::new()),
-        Err(e) => Err(io(&path, &e)),
-    }
-}
-
-fn pids() -> Result<Vec<u32>, String> {
-    let mut all = Vec::new();
-    for entry in read_dir(Path::new("/proc"))? {
-        if let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse().ok()) {
-            all.push(pid);
-        }
-    }
-    Ok(all)
-}
-
-/// The processes that belong to the farm in `farm` and are not one of its `roles`: those
-/// whose command line, environment (the stand-in `crun` gives each action `ROOT`, `UPPER`
-/// and `CG`, all below the farm) or working directory name the farm's directory, and the
-/// children of any of them, and the zombies of the roles. A process of another user cannot be
-/// ours and is not read.
-///
-/// A process is also the farm's, whatever its command line, environment and working
-/// directory say (an orphan that cleared its environment, went to `/` and was
-/// reparented to init), when it is a member of one of the cgroups `members` lists, or when
-/// its process group or session is one of `groups`: the group of a farm role, or the group
-/// and session an action was started as. Not found by any of these: a process that left
-/// the farm's groups and sessions (`setsid`), cleared its environment and went to `/`, on a
-/// kernel where the stand-in's cgroups hold no `cgroup.procs`. That is tier R
-/// (`tier_r_an_orphan_that_hid_is_found_by_its_cgroup`).
-///
-/// # Errors
-/// A process of this user cannot be read for a reason other than having ended.
-pub fn processes_of(
-    farm: &Path,
-    roles: &[u32],
-    groups: &[u32],
-    members: &BTreeSet<u32>,
-) -> Result<BTreeSet<Proc>, String> {
-    let me = std::process::id();
-    let mine = std::fs::metadata("/proc/self").map_err(|e| io(Path::new("/proc/self"), &e))?;
-    let needle = farm.to_string_lossy().into_owned().into_bytes();
-    let has = |hay: &[u8]| hay.windows(needle.len()).any(|w| w == needle.as_slice());
-    let mut stats = BTreeMap::new();
-    for pid in pids()? {
-        if pid == me {
-            continue;
-        }
-        match std::fs::metadata(format!("/proc/{pid}")) {
-            Ok(m) if m.uid() == mine.uid() => {}
-            Ok(_) => continue,
-            Err(e) if gone(&e) => continue,
-            Err(e) => return Err(io(Path::new("/proc"), &e)),
-        }
-        if let Some(stat) = stat_of(pid)? {
-            stats.insert(pid, stat);
-        }
-    }
-    let mut ours = BTreeMap::new();
-    for (
-        &pid,
-        &Stat {
-            state,
-            ppid,
-            pgrp,
-            session,
-        },
-    ) in &stats
-    {
-        if roles.contains(&pid) {
-            continue;
-        }
-        let Some(cmd) = proc_file(pid, "cmdline")? else {
-            continue;
-        };
-        // A process that is not dumpable (it ran a setuid or capable program) refuses its
-        // environment and working directory to its own user; such a process of the farm is
-        // found by its command line or by its parent, below.
-        let env = proc_file_or_denied(pid, "environ")?;
-        let cwd = match std::fs::read_link(format!("/proc/{pid}/cwd")) {
-            Ok(p) => p.to_string_lossy().into_owned().into_bytes(),
-            Err(e) if gone(&e) => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Vec::new(),
-            // A zombie has no working directory to read.
-            Err(_) if state == 'Z' => Vec::new(),
-            Err(e) => return Err(io(Path::new("/proc"), &e)),
-        };
-        let zombie_of_roles = state == 'Z' && roles.contains(&ppid);
-        let grouped = groups.contains(&pgrp) || groups.contains(&session);
-        if has(&cmd)
-            || has(&env)
-            || has(&cwd)
-            || zombie_of_roles
-            || grouped
-            || members.contains(&pid)
-        {
-            ours.insert(
-                pid,
-                Proc {
-                    pid,
-                    state,
-                    cmd: String::from_utf8_lossy(&cmd)
-                        .replace('\0', " ")
-                        .trim()
-                        .to_owned(),
-                },
-            );
-        }
-    }
-    // The children of ours are ours (a daemonised child that changed its environment, a
-    // process whose environment is unreadable).
-    loop {
-        let more: Vec<u32> = stats
-            .iter()
-            .filter(|(pid, st)| ours.contains_key(&st.ppid) && !ours.contains_key(pid))
-            .map(|(&pid, _)| pid)
-            .collect();
-        if more.is_empty() {
-            break;
-        }
-        for pid in more {
-            let state = stats[&pid].state;
-            let cmd = proc_file(pid, "cmdline")?.unwrap_or_default();
-            ours.insert(
-                pid,
-                Proc {
-                    pid,
-                    state,
-                    cmd: String::from_utf8_lossy(&cmd)
-                        .replace('\0', " ")
-                        .trim()
-                        .to_owned(),
-                },
-            );
-        }
-    }
-    Ok(ours.into_values().collect())
-}
-
-/// The pids listed in the `cgroup.procs` files below `tree` (a cgroup tree). The stand-in's
-/// planted tree has none, so this is empty there; on a real cgroup v2 mount it is the
-/// membership the kernel keeps, which no process can leave by changing its environment,
-/// working directory, group or session. A missing `tree` is an error.
-///
-/// # Errors
-/// `tree` is missing, or a file of it cannot be read or parsed.
-pub fn cgroup_members(tree: &Path) -> Result<BTreeSet<u32>, String> {
-    let mut members = BTreeSet::new();
-    for (rel, entry) in walk(tree)? {
-        if entry.kind != Kind::File || rel.file_name().is_none_or(|n| n != "cgroup.procs") {
-            continue;
-        }
-        let path = tree.join(&rel);
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(io(&path, &e)),
-        };
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            let pid = line
-                .trim()
-                .parse()
-                .map_err(|_| format!("{}: not a pid: {line:?}", path.display()))?;
-            members.insert(pid);
-        }
-    }
-    Ok(members)
-}
-
-/// The zombies whose parent is one of `parents`.
-///
-/// # Errors
-/// A process cannot be read.
-pub fn zombie_children(parents: &[u32]) -> Result<BTreeSet<Proc>, String> {
-    let mut found = BTreeSet::new();
-    for pid in pids()? {
-        if let Some(Stat {
-            state: 'Z', ppid, ..
-        }) = stat_of(pid)?
-            && parents.contains(&ppid)
-        {
-            found.insert(Proc {
-                pid,
-                state: 'Z',
-                cmd: String::new(),
-            });
-        }
-    }
-    Ok(found)
-}
-
-/// Whether process `pid` is alive and not a zombie.
-pub fn alive(pid: u32) -> Result<bool, String> {
-    Ok(stat_of(pid)?.is_some_and(|st| st.state != 'Z' && st.state != 'X'))
-}
-
-/// The open file descriptors of `pid`: number and what it points at.
-///
-/// # Errors
-/// The process cannot be read (a process that ended gives an empty list).
-pub fn open_fds(pid: u32) -> Result<Vec<(u32, String)>, String> {
-    let dir = PathBuf::from(format!("/proc/{pid}/fd"));
-    let listing = match std::fs::read_dir(&dir) {
-        Ok(l) => l,
-        Err(e) if gone(&e) => return Ok(Vec::new()),
-        Err(e) => return Err(io(&dir, &e)),
-    };
-    let mut fds = Vec::new();
-    for item in listing {
-        let item = item.map_err(|e| io(&dir, &e))?;
-        let Some(n) = item.file_name().to_str().and_then(|n| n.parse().ok()) else {
-            continue;
-        };
-        match std::fs::read_link(item.path()) {
-            Ok(target) => fds.push((n, target.to_string_lossy().into_owned())),
-            Err(e) if gone(&e) => {}
-            Err(e) => return Err(io(&item.path(), &e)),
-        }
-    }
-    fds.sort();
-    Ok(fds)
-}
-
-/// The test process's own descriptors before it started any farm: what the test was
-/// started with (a build tool's lock file, say) and every child inherits down the chain.
-static INHERITED: std::sync::OnceLock<Vec<(u32, String)>> = std::sync::OnceLock::new();
-
-/// Remembers the test process's descriptors, once, before the first farm starts.
-pub fn note_inherited() {
-    INHERITED.get_or_init(|| open_fds(std::process::id()).unwrap_or_default());
-}
-
-/// The descriptors of an action that are not the ones it is meant to have: 0 is the null
-/// device, 1 and 2 are the lease's `stdout` and `stderr` files (the daemon opens them,
-/// crun.rs `FileIo`), nothing else, except what the test itself was started with
-/// ([`note_inherited`]). `Err` names each other one.
-pub fn unexpected_fds(fds: &[(u32, String)]) -> Result<(), String> {
-    let given = INHERITED.get().cloned().unwrap_or_default();
-    let mut bad = Vec::new();
-    for (n, target) in fds {
-        if *n > 2 && given.contains(&(*n, target.clone())) {
-            continue;
-        }
-        let base = Path::new(target)
-            .file_name()
-            .map(|b| b.to_string_lossy().into_owned());
-        let wanted = match n {
-            0 => target == "/dev/null",
-            1 => base.as_deref() == Some("stdout") && target.contains(LEASE_PREFIX),
-            2 => base.as_deref() == Some("stderr") && target.contains(LEASE_PREFIX),
-            _ => false,
-        };
-        if !wanted {
-            bad.push(format!("fd {n} -> {target}"));
-        }
-    }
-    if bad.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("inherited descriptors: {}", bad.join(", ")))
     }
 }
 
@@ -722,35 +416,23 @@ pub fn files_containing(
     scan(&[farm.to_owned()], needle, &is_store)
 }
 
-/// Whether `abs` is named for the digest of what it holds, the way the daemon's input cache
-/// names its entries: `<sha256 hex>-<size>`, with `.x` for an executable.
-fn content_addressed_file(abs: &Path) -> bool {
-    let Some(name) = abs.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-        return false;
-    };
-    let name = name.strip_suffix(".x").unwrap_or(&name);
-    let Some((hash, size)) = name.split_once('-') else {
-        return false;
-    };
-    let Ok(bytes) = std::fs::read(abs) else {
-        return false;
-    };
-    let digest = kbf_transfer::digest_of(&bytes);
-    digest.hash == hash && size.parse() == Ok(digest.size_bytes)
-}
-
 /// Every file of the node's content-addressed stores (`NodeView::content_addressed`) that
-/// holds `needle` and is NOT named for the digest of its content: a copy of an action's
+/// holds `needle` and is NOT named for the digest of its content (`named_for_content` says
+/// whether a path is: the digest is the product's, so the caller brings it): a copy of an action's
 /// data under any other name (`copy-1`, a digest of other bytes) is a leak, while the
 /// action's own input held once under its digest is the cache working.
 ///
 /// # Errors
 /// As [`scan`].
-pub fn canary_outside_digests(node: &dyn NodeView, needle: &[u8]) -> Result<Vec<PathBuf>, String> {
+pub fn canary_outside_digests(
+    node: &dyn NodeView,
+    needle: &[u8],
+    named_for_content: &dyn Fn(&Path) -> bool,
+) -> Result<Vec<PathBuf>, String> {
     let mut leaks = Vec::new();
     for root in node.content_addressed() {
         for hit in scan(&[root], needle, &|_| false)? {
-            if !content_addressed_file(&hit) {
+            if !named_for_content(&hit) {
                 leaks.push(hit);
             }
         }

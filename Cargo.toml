@@ -247,7 +247,7 @@ xtask = { path = "crates/xtask" }
 [workspace.lints.rust]
 # `kbf_loom` swaps kbf-proxy's atomics for loom's (`cargo xtask proxy-loom`). Not `loom`:
 # tokio reads `cfg(loom)` too and then needs a loom dependency of its own.
-# `coverage` is set by cargo-llvm-cov (crates/kbf-blackbox compiles its tests out under it).
+# `coverage` is set by cargo-llvm-cov (crates/kbf-all-in-one-test and crates/kbf-daemon-test compile their tests out under it).
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kbf_loom)", "cfg(coverage)"] }
 
 [workspace.lints.clippy]
