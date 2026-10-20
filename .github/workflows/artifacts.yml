@@ -38,14 +38,17 @@ on:
 
 permissions: {}
 
-# A pull request's newer run replaces its older one, and so does a newer push to
-# feature/arch-v2: only its head needs attested files, and a superseded push run would
-# otherwise hold a macOS runner for hours (each push had its own group, and pushes
-# queued 2-4 h behind each other for the few macOS runners). Every commit on main still
-# gets its own group, so no main commit's run is cancelled or dropped while queued.
+# A pull request's newer run replaces its older one. Pushes to feature/arch-v2 share one
+# group but a RUNNING build is never cancelled: GitHub keeps one running and one pending
+# run per group, and a newer push replaces only the pending one. Under steady merges a
+# cancel-in-progress group never finished an attested release (every run was cancelled by
+# the next merge), and a host roll needs one; this way there is always a recent finished
+# release, and runs still never queue up behind each other for the few macOS runners.
+# Every commit on main still gets its own group, so no main commit's run is cancelled or
+# dropped while queued.
 concurrency:
   group: artifacts-${{ github.event_name }}-${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && github.sha || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/feature/arch-v2') }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always

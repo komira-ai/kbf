@@ -8,7 +8,6 @@ mod hooked;
 mod support;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,14 +34,12 @@ fn config() -> MembershipConfig {
     }
 }
 
+/// The token file is in a directory of its own, removed once the token is read.
 fn token() -> ApiToken {
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-api-denied");
-    std::fs::create_dir_all(&dir).expect("a token directory");
-    let path = dir.join(format!("token-{}-{n}", std::process::id()));
+    let dir =
+        kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-api-denied");
+    let path = dir.join("token");
     std::fs::write(&path, format!("{TOKEN}\n")).expect("write the token");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     ApiToken::from_file(&path).expect("a usable token")

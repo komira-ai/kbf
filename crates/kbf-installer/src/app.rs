@@ -92,6 +92,20 @@ impl From<ReleaseError> for Failure {
     }
 }
 
+/// A release error keeps the exit of the release verbs; files that are not a release are a
+/// refusal (exit 2), not a failure to try again.
+impl From<crate::record_release::RecordError> for Failure {
+    fn from(e: crate::record_release::RecordError) -> Failure {
+        match e {
+            crate::record_release::RecordError::Release(e) => Failure::from(e),
+            other => Failure {
+                exit: Exit::Refused,
+                why: other.to_string(),
+            },
+        }
+    }
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -390,6 +404,24 @@ fn operate(
     .map_err(Failure::from)
 }
 
+fn record_release(
+    root: PathBuf,
+    euid: u32,
+    apply: bool,
+    commit: &crate::CommitId,
+) -> Result<(), Failure> {
+    let (layout, mut exec) = host(root)?;
+    crate::record_release::record(
+        &mut exec,
+        &layout,
+        euid,
+        commit,
+        apply,
+        &mut std::io::stderr(),
+    )
+    .map_err(Failure::from)
+}
+
 fn gc(root: PathBuf, apply: bool, keep: usize) -> Result<(), Failure> {
     let (layout, mut exec) = host(root)?;
     let procs = HostProcs::new(layout.platform());
@@ -531,6 +563,7 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
             o.revert(&n.id.to_string())
         }),
         Verb::Rollback(s) => operate(root_of(cli), cli.apply, s.restart(), |o| o.rollback()),
+        Verb::RecordRelease(a) => record_release(root_of(cli), euid, cli.apply, &a.commit),
         Verb::Gc(g) => gc(root_of(cli), cli.apply, g.keep),
         Verb::Quiesce => quiesce(root_of(cli)),
         other => {
