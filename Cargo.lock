@@ -1435,6 +1435,7 @@ dependencies = [
  "kbf-map",
  "kbf-peer",
  "kbf-proto",
+ "kbf-testkit",
  "kbf-types",
  "rcgen",
  "ring",
@@ -1810,6 +1811,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "kbf-testkit",
  "kbf-types",
  "rcgen",
  "rustix",
@@ -1839,6 +1841,7 @@ dependencies = [
  "httparse",
  "hyper",
  "kbf-cli",
+ "kbf-gate",
  "kbf-host",
  "kbf-installer",
  "kbf-proto",
@@ -2398,6 +2401,7 @@ name = "kbf-threads"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "kbf-testkit",
  "rustix",
  "thiserror",
  "tokio",

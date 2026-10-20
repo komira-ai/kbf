@@ -52,25 +52,40 @@ impl SpoolRootOrders {
     }
 
     fn read(&self) -> Result<Option<InstallerStatus>, PortError> {
-        let file = match File::open(&self.status) {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(unreadable(&self.status, &e)),
-        };
-        let mut bytes = Vec::new();
-        file.take(MAX_STATUS + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| unreadable(&self.status, &e))?;
-        if bytes.len() as u64 > MAX_STATUS {
-            return Err(PortError(format!(
-                "{} is over {MAX_STATUS} bytes",
-                self.status.display()
-            )));
-        }
-        serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|e| PortError(format!("{} does not parse: {e}", self.status.display())))
+        read_status(&self.status)
     }
+}
+
+/// The root half's `status.json` at `path`, whole; `None` when there is no file. Errors as
+/// the module doc says.
+fn read_status(path: &Path) -> Result<Option<InstallerStatus>, PortError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(path, &e)),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_STATUS + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| unreadable(path, &e))?;
+    if bytes.len() as u64 > MAX_STATUS {
+        return Err(PortError(format!(
+            "{} is over {MAX_STATUS} bytes",
+            path.display()
+        )));
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| PortError(format!("{} does not parse: {e}", path.display())))
+}
+
+/// `installed_commit` of the `status.json` at `path`: the release the root half runs. The
+/// proxy's boot reads it with no spool; [`RootOrders::installed`] reads the same fact.
+///
+/// # Errors
+/// The file cannot be read, is over [`MAX_STATUS`] bytes, or does not parse.
+pub fn installed_commit(path: &Path) -> Result<Option<CommitId>, PortError> {
+    Ok(read_status(path)?.and_then(|status| status.installed_commit))
 }
 
 fn unreadable(path: &Path, e: &io::Error) -> PortError {
@@ -87,7 +102,7 @@ impl RootOrders for SpoolRootOrders {
     }
 
     fn installed(&self) -> Result<Option<CommitId>, PortError> {
-        Ok(self.read()?.and_then(|status| status.installed_commit))
+        installed_commit(&self.status)
     }
 
     fn confirm(&self, commit: &CommitId) -> Result<(), PortError> {

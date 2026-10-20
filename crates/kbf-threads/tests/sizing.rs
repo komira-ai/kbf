@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
+use kbf_testkit::dir::TestDir;
 use kbf_threads::{PoolArgs, ReserveError, Sizes, ThreadArgs, Topology};
 
 #[derive(Parser)]
@@ -47,41 +48,12 @@ fn args(flags: &[&str]) -> ThreadArgs {
 }
 
 /// A sysfs tree whose cpu0 reports `siblings` in the file `name`.
-fn sysfs(name: &str, siblings: &str) -> tempdir::Dir {
-    let dir = tempdir::Dir::new();
+fn sysfs(name: &str, siblings: &str) -> TestDir {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "threads");
     let topo = dir.path().join("devices/system/cpu/cpu0/topology");
     std::fs::create_dir_all(&topo).expect("topology dir");
     std::fs::write(topo.join(name), siblings).expect("write list");
     dir
-}
-
-mod tempdir {
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-
-    /// A scratch directory under the build's target directory, removed on drop.
-    pub struct Dir(PathBuf);
-
-    impl Dir {
-        pub fn new() -> Self {
-            let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
-            let n = NEXT.fetch_add(1, Ordering::SeqCst);
-            let path = base.join(format!("threads-{}-{n}", std::process::id()));
-            std::fs::create_dir_all(&path).expect("scratch dir");
-            Self(path)
-        }
-        pub fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 }
 
 #[test]
@@ -114,7 +86,7 @@ fn core_cpus_list_is_read_when_the_other_name_is_absent() {
 
 #[test]
 fn no_topology_files_is_one_thread_per_core() {
-    let empty = tempdir::Dir::new();
+    let empty = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "threads");
     let topology = Topology::detect_in(empty.path(), 8);
     assert_eq!((topology.threads_per_core(), topology.physical()), (1, 8));
     let junk = sysfs("thread_siblings_list", "not a list");
