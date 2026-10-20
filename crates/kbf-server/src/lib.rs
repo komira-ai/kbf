@@ -74,6 +74,7 @@ pub mod api_client;
 pub mod blobs;
 #[cfg(test)]
 mod build_commit;
+pub mod cold_apply;
 pub mod config;
 pub mod drain;
 pub mod enroll;
@@ -127,6 +128,8 @@ pub mod storage_node;
 pub mod store_config;
 pub mod stores;
 pub mod streams;
+#[cfg(test)]
+mod test_dir;
 mod timeout;
 pub mod token;
 pub mod update;

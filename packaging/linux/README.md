@@ -27,6 +27,20 @@ inputs, and `crates/xtask/src/pkg_linux.rs` is the one place that says what goes
   unchanged; `/var/lib/kbf-installer` is made by `kbf-installer setup`, not at install);
 - all of it `root:root`, with one time (`SOURCE_DATE_EPOCH`) on every file and the package.
 
+### Which frontend unit
+
+A frontend host enables exactly one of two units; they bind the same ports.
+
+- `kbf-frontend.service`: a host **without** the frontend proxy. One process, `kbf
+  --mode=frontend --config /etc/kbf/kbf.toml`, run from `/var/lib/kbf-installer/releases/current/kbf`
+  (no slots, no `--instance`, no `--handover-socket`); listeners, state store and certificates
+  are `kbf.toml`'s. An update is a restart after `kbf-installer confirm` flips `current`.
+- `kbf-proxy` (the unprivileged proxy that starts the frontend as its child from
+  `releases/<commit>/kbf`): a host **with** the proxy does not enable a frontend unit.
+- `kbf-frontend@.service`: the handover model (instances `a` and `b`, a control socket, a
+  slot per instance). It is kept until the proxy work removes it (frontend-proxy units U7c);
+  `kbf-installer setup` enables `kbf-frontend.service`, never the template.
+
 It refuses anything else (a unit named neither `kbf-*.service` nor `kbf.slice`, a fourth trust file, no unit).
 
 Dependencies: deb `crun, uidmap, systemd, ca-certificates`; rpm the same with Fedora's name
@@ -51,6 +65,35 @@ user or directory is created by a script.
   the users. `purge` (deb) does the same and drops the package's record: the package owns
   none of what `setup` and the operator write, so it deletes none of it.
 
+## In CI: the real package, attested
+
+`ci.yml`'s `packages` job builds the deb and the rpm from the test-only stub and the
+fixtures under `testdata/` on every pull request (x86_64). `artifacts.yml` builds the real
+one: each Linux job (`linux-x86_64` on `ubuntu-24.04`, `linux-arm64` on
+`ubuntu-24.04-arm`, each with its own pinned nfpm and `gh`) runs the same verbs on the
+`kbf-installer` it has just built, with a trust directory `cargo xtask pkg-trust` writes (the
+pinned `gh`, the Sigstore trusted root `gh` fetched, and an `installer.conf` whose
+`SOURCE_REFS` is the branch the package is attested on), installs it in a fresh Ubuntu
+container (`cargo xtask pkg-install-test`, with `--probe`s that the packaged `gh` runs and
+the binary names the commit), and `cargo xtask pkg-asset` makes
+`kbf-installer-<commit>-<platform>.deb` an asset, listed in `SHA256SUMS` and attested with
+a bundle ([docs/artifacts.md](../../docs/artifacts.md#the-kbf-installer-package-deb)).
+Two call sites, one way to build: both go through `pkg-config` and `pkg-build`.
+
+## What the units run
+
+- `kbf-installer.service` runs `/usr/bin/kbf-installer run`. It names no unit: `run` restarts
+  the unit `setup` enabled for the `mode` of `/etc/kbf/kbf.toml` (on a frontend or all-in-one
+  host it also reads the state database from `/etc/kbf/installer.toml`), so one packaged unit
+  serves every mode. `--unit` and `--launchd-label` still name the service by hand. The unit has
+  no `ExecStartPre=`: the contract's `check` is not built, and a stub would fail every start.
+- Each mode unit runs `/var/lib/kbf-installer/releases/current/kbf`, the link the installer
+  creates and flips (`layout.rs`), after `kbf-installer boot-check`. The frontend template
+  runs its `slots/%i` link.
+- `crates/kbf-it/tests/package_installer_verbs.rs` parses every `kbf-installer` command line of
+  these units, and of the macOS property list, with the binary's own parser and refuses a verb that
+  is not built; it also holds the exec path to the layout's.
+
 ## Commands
 
 ```
@@ -71,7 +114,7 @@ configuration).
 
 ## CI
 
-The `packages` job of `.github/workflows/ci.yml` fetches the pinned nfpm, builds the
+The `packages` job of `.github/workflows/beta.yml` fetches the pinned nfpm, builds the
 test-only `kbf-installer-stub` and the packages, then runs `pkg-install-test` on the deb
 in Ubuntu and the rpm in Fedora. The real binary replaces the stub by one path change:
 the `--binary` of `pkg-config`.

@@ -2,7 +2,7 @@
 //! the action-lease side of the same starvation). Three workers of 4 cores heartbeat
 //! every second: `w0` and `w1` run the container and whole-machine drivers, `w2` the
 //! container driver only. One-core CI actions arrive at random and run 5-60 s, about
-//! 80% of the farm, and first fit keeps `w0` and `w1` busy: without a reservation they
+//! 80% of the farm, and the spread keeps `w0` and `w1` busy: without a reservation they
 //! never empty while the stream lasts. Now and then a whole-machine lease arrives, at
 //! CI or batch QoS, and runs 20-90 s. The control log is in process: a `Commit` is fed
 //! straight back.

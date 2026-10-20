@@ -16,7 +16,7 @@ use cluster_support::{cluster, kbf, token_file};
 fn each_verb_sends_its_call_and_prints_the_answer() {
     let token = token_file("each", "kbf-test-token-0123456789abcdef0123456789");
     let bearer = "authorization: bearer kbf-test-token-0123456789abcdef0123456789";
-    let cases: [(&[&str], &str, &str); 7] = [
+    let cases: [(&[&str], &str, &str); 9] = [
         (&["status"], "GET /v1/nodes HTTP/1.1", ""),
         (
             &["status", "--frontend"],
@@ -54,6 +54,32 @@ fn each_verb_sends_its_call_and_prints_the_answer() {
             &["member", "7", "--state", "draining", "--token-file", &token],
             "POST /v1/members/7 HTTP/1.1",
             r#"{"state":"draining"}"#,
+        ),
+        (
+            &[
+                "member",
+                "7",
+                "--state",
+                "planned-down",
+                "--token-file",
+                &token,
+            ],
+            "POST /v1/members/7 HTTP/1.1",
+            r#"{"state":"planned_down"}"#,
+        ),
+        (
+            &[
+                "member",
+                "7",
+                "--state",
+                "planned-down",
+                "--for-secs",
+                "600",
+                "--token-file",
+                &token,
+            ],
+            "POST /v1/members/7 HTTP/1.1",
+            r#"{"for_secs":600,"state":"planned_down"}"#,
         ),
     ];
     for (args, line, body) in cases {
@@ -123,7 +149,7 @@ fn a_refusal_or_no_answer_exits_1_and_says_why() {
 /// Catches a command line that is accepted and means something else: `drain` with no
 /// target or with both, a deadline for the frontend (it has none), `undrain --frontend`
 /// (a frontend drain is not undone), a write with no token file, and an unknown verb,
-/// all exit 2 with clap's message, and `check-args` does not take `cluster` as a mode.
+/// all exit 2 with clap's message.
 #[test]
 fn a_command_line_that_names_no_single_call_exits_2() {
     let rows: [&[&str]; 7] = [
@@ -148,8 +174,6 @@ fn a_command_line_that_names_no_single_call_exits_2() {
         assert_eq!(code, Some(2), "{argv:?}: {err}");
         assert!(out.is_empty(), "{argv:?}: {out}");
     }
-    let (code, _, err) = kbf(&["check-args", "cluster", "status"]);
-    assert_eq!(code, Some(2), "{err}");
 }
 
 /// Catches `cluster` missing from `kbf --help` (nothing else would tell an operator it

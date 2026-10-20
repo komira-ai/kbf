@@ -4,18 +4,11 @@ use super::*;
 
 /// A fresh scratch directory for one unit test, beside the test binary, and the
 /// directory open.
-fn scratch(name: &str) -> (std::path::PathBuf, Arc<OwnedFd>) {
-    let exe = std::env::current_exe().expect("test binary");
-    let dir = exe
-        .parent()
-        .expect("deps directory")
-        .join("kbf-driver-container-unit")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
+fn scratch(name: &str) -> (kbf_testkit::dir::TestDir, Arc<OwnedFd>) {
+    let dir = crate::unit_dir(&format!("hashing-{name}"));
     let fd = rustix::fs::openat(
         rustix::fs::CWD,
-        &dir,
+        &*dir,
         crate::outputs::DIRECTORY,
         Mode::empty(),
     )

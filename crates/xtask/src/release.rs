@@ -23,6 +23,11 @@
 //!   gamma verdict for that tag, that commit (on main) and the set `<dir>`'s `SHA256SUMS`
 //!   hashes to, after a bake of 24 hours or more. Prints `set-hash=<hex>`, which
 //!   `publish --set-hash` must be given.
+//! - `release offer <dir> --repo <owner/repo> --commit <sha> --platform <p>... (--beta-result
+//!   <file> | --waive-beta <reason> --operator <name>) [--previous <sha> --version-json <file>
+//!   --previous-version-json <file>] [--plan] --out <offer.json>` ([`offer`]): the checks
+//!   that make a commit offerable, and `offer.json`, the record a deploy reads. It sets
+//!   nothing on any farm.
 //! - `release notes <dir> ... --out <file>` ([`notes`]): the same checks, then the
 //!   release's notes: commits since the previous `v*` tag, the verdict's summary, what
 //!   is not reversible, the gamma escapes and what is withdrawn.
@@ -35,6 +40,7 @@
 
 mod git;
 pub mod notes;
+pub mod offer;
 pub mod verdict;
 
 use std::io::Write;
@@ -196,11 +202,13 @@ pub fn main_control(gh: &Path, repo: &str, on: &str, off: &str) -> Result<String
 }
 
 /// Whether `name` is an asset of `commit`: `<binary>-<commit>-<platform>` and
-/// `.tar.gz` or `.cdx.json`.
+/// `.tar.gz`, `.cdx.json` or `.deb` (the package; nfpm's own `kbf-installer_<version>_
+/// <arch>.deb` names no commit and is not one).
 fn is_asset_of(name: &str, commit: &str) -> bool {
     let stem = name
         .strip_suffix(".tar.gz")
-        .or_else(|| name.strip_suffix(".cdx.json"));
+        .or_else(|| name.strip_suffix(".cdx.json"))
+        .or_else(|| name.strip_suffix(".deb"));
     let parts = stem.and_then(|s| s.split_once(&format!("-{commit}-")));
     parts
         .is_some_and(|(binary, platform)| !binary.is_empty() && Platform::named(platform).is_some())
@@ -231,12 +239,27 @@ fn checked(dir: &Path, commit: &str) -> Result<(Vec<String>, Vec<String>), Error
         .map(|l| l.name.as_str())
         .filter(|n| n.ends_with(".tar.gz"))
         .collect();
-    names.extend(tarballs.iter().map(|t| bundles::name_of(t)));
+    let packages: Vec<&str> = lines
+        .iter()
+        .map(|l| l.name.as_str())
+        .filter(|n| n.ends_with(".deb"))
+        .collect();
+    names.extend(
+        tarballs
+            .iter()
+            .chain(&packages)
+            .map(|t| bundles::name_of(t)),
+    );
+    let and_packages = if packages.is_empty() {
+        String::new()
+    } else {
+        format!(" and {} package(s)", packages.len())
+    };
     let printed = vec![
         sums_line,
         format!("names: every listed file is an asset of {commit}"),
         format!(
-            "bundles: each of the {} tarballs has one provenance bundle",
+            "bundles: each of the {} tarballs{and_packages} has one provenance bundle",
             tarballs.len()
         ),
     ];
@@ -278,7 +301,7 @@ impl Release<'_> {
              rebuilds nothing.\n\nVerify an asset before use:\n\n```text\ngh attestation \
              verify <asset> --repo {repo} --signer-workflow \
              {repo}/.github/workflows/{ARTIFACTS_WORKFLOW} --source-ref refs/heads/{MAIN} \
-             --deny-self-hosted-runners\n```\n\nEach tarball also has its provenance bundle, \
+             --deny-self-hosted-runners\n```\n\nEach tarball and each `.deb` package also has its provenance bundle, \
              `<asset>{SUFFIX}`, which verifies it with no network but a trusted root \
              (`gh attestation trusted-root > trusted_root.jsonl`):\n\n```text\ngh attestation \
              verify <asset> --bundle <asset>{SUFFIX} --custom-trusted-root trusted_root.jsonl \

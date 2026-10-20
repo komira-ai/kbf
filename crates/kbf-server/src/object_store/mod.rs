@@ -50,6 +50,7 @@
 //! client speaks TLS), bucket and prefix, and that a probe of the store passed.
 
 pub mod api;
+pub mod delivery;
 pub mod probe;
 mod registry;
 mod rows;
@@ -58,7 +59,7 @@ mod secrets;
 #[cfg(test)]
 mod tests;
 
-pub use registry::{Registry, RegistryError, SWEEP_GRACE, Written};
+pub use registry::{ColdStoreView, Registry, RegistryError, SWEEP_GRACE, Written, cold_store_view};
 pub use secrets::{SecretError, SecretFiles};
 
 /// A point of the write order at which a test can stop the process (see

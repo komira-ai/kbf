@@ -1346,9 +1346,11 @@ dependencies = [
  "kbf-daemon",
  "kbf-driver-container",
  "kbf-front",
+ "kbf-harness",
  "kbf-meta",
  "kbf-node",
  "kbf-objstore",
+ "kbf-outputs",
  "kbf-proto",
  "kbf-segments",
  "kbf-server",
@@ -1433,6 +1435,7 @@ dependencies = [
  "kbf-map",
  "kbf-peer",
  "kbf-proto",
+ "kbf-testkit",
  "kbf-types",
  "rcgen",
  "ring",
@@ -1485,7 +1488,7 @@ dependencies = [
  "kbf-driver-container",
  "kbf-enroll",
  "kbf-front",
- "kbf-host",
+ "kbf-harness",
  "kbf-installer",
  "kbf-node",
  "kbf-peer",
@@ -1755,6 +1758,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-harness"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "flate2",
+ "kbf-deploy",
+ "kbf-it",
+ "kbf-testkit",
+ "kbf-transfer",
+ "libc",
+ "rcgen",
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "kbf-history"
 version = "0.1.0"
 dependencies = [
@@ -1789,6 +1811,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "kbf-testkit",
  "kbf-types",
  "rcgen",
  "rustix",
@@ -1861,6 +1884,7 @@ dependencies = [
 name = "kbf-it"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bytes",
  "clap",
  "futures",
@@ -1871,14 +1895,19 @@ dependencies = [
  "kbf-daemon",
  "kbf-deploy",
  "kbf-front",
+ "kbf-host",
  "kbf-installer",
+ "kbf-map",
  "kbf-objstore",
  "kbf-proto",
  "kbf-proxy",
  "kbf-server",
+ "kbf-state",
+ "kbf-storage",
  "kbf-testkit",
  "kbf-threads",
  "kbf-transfer",
+ "kbf-types",
  "proc-macro2",
  "prost",
  "rcgen",
@@ -2032,6 +2061,7 @@ dependencies = [
  "kbf-driver-native",
  "kbf-front",
  "kbf-it",
+ "kbf-map",
  "kbf-outputs",
  "kbf-proto",
  "kbf-server",
@@ -2370,6 +2400,7 @@ name = "kbf-threads"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "kbf-testkit",
  "rustix",
  "thiserror",
  "tokio",
@@ -4905,6 +4936,8 @@ dependencies = [
  "flate2",
  "hex",
  "kbf-gate",
+ "kbf-installer",
+ "kbf-testkit",
  "lzma-rs",
  "rcgen",
  "rustix",

@@ -98,6 +98,8 @@ reconnect-ms = 1000
 [listener]
 # The address callers dial, where --storage-listen is not routable. Default: the address the node bound.
 # advertise-addr = "HOST:PORT"
+# Serves GET /metrics (Prometheus text) over plain HTTP here. Off unless given. Reads are open to whoever reaches it: bind it where only operators do.
+# metrics-listen = "ADDR"
 # Where the node serves gRPC. Without the TLS flags it serves plain text, and the address must be loopback.
 storage-listen = "127.0.0.1:8982"
 # How often, in seconds, a TLS listener looks at its certificate, key and client CA files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is applied to the next TLS handshake, with no restart and without ending a connection already open: renew a certificate by replacing the files. Files that do not make a working configuration (unreadable, not PEM, a key that is not the certificate's, an expired certificate, a renewal caught between its two writes) are logged and counted in `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving; the next look finds them whole and applies them. The files must be good at start

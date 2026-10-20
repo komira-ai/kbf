@@ -37,6 +37,20 @@ pub enum MemberState {
 }
 
 impl MemberState {
+    /// The state as an operator reads it: the lower-case, underscored name `GET
+    /// /v1/storage` shows. Exhaustive: a new state fails to compile here instead of
+    /// reaching operators unnamed.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Joining => "joining",
+            Self::CatchingUp => "catching_up",
+            Self::Active => "active",
+            Self::Draining => "draining",
+            Self::Down => "down",
+        }
+    }
+
     /// Whether the member can be a write owner.
     #[must_use]
     pub const fn takes_writes(self) -> bool {
@@ -325,6 +339,122 @@ impl Map {
         for m in previous.map_or_else(Vec::new, |p| p.read_members(digest)) {
             if !order.iter().any(|seen| seen.id == m.id) {
                 order.push(m);
+            }
+        }
+        order
+    }
+
+    /// A copy of this map in which member `id` is in `state`, and everything else is as it
+    /// is (same generation, members, weights and replication); `None` if `id` is not a
+    /// member.
+    ///
+    /// It answers "what would placement be if this member were promoted": a `Joining`
+    /// member assumed `Active` is a settled owner, so the copy's owner lists, read orders
+    /// and [`Map::placement_fingerprint`] are those of the map after the promotion. The
+    /// copy is for computing, never for publishing: it carries the original generation.
+    #[must_use]
+    pub fn assuming(&self, id: MemberId, state: MemberState) -> Option<Map> {
+        let mut copy = self.clone();
+        copy.members.iter_mut().find(|m| m.id == id)?.state = state;
+        Some(copy)
+    }
+
+    /// The write owners of `digest` ([`Map::write_owners`]) if member `id` were in
+    /// `state`; `None` if `id` is not a member.
+    ///
+    /// For a `Joining` member assumed `Active` this is what the member will own once
+    /// promoted: with equal weights it owns about `r / N` of the digests and is rank 1 for
+    /// about `1 / N`, where as `Joining` it is never rank 1 (and at `r` = 1 owns nothing).
+    /// Assumed `Draining` it owns nothing. Costs one map clone; for many digests call
+    /// [`Map::assuming`] once.
+    #[must_use]
+    pub fn owners_assuming(
+        &self,
+        id: MemberId,
+        state: MemberState,
+        digest: &Digest,
+    ) -> Option<Vec<MemberId>> {
+        self.assuming(id, state).map(|m| m.write_owners(digest))
+    }
+
+    /// The read order of `digest` ([`Map::read_order`]) if member `id` were in `state`;
+    /// `None` if `id` is not a member. A joiner assumed `Active` is read in rank order
+    /// among the settled owners instead of last.
+    #[must_use]
+    pub fn read_order_assuming(
+        &self,
+        id: MemberId,
+        state: MemberState,
+        digest: &Digest,
+    ) -> Option<Vec<MemberId>> {
+        self.assuming(id, state).map(|m| m.read_order(digest))
+    }
+
+    /// A 64-bit fingerprint of everything that decides which members own a digest, and
+    /// nothing else, so that a report made against one map can be checked against another:
+    /// equal fingerprints mean equal [`Map::write_owners`] and [`Map::read_order`] for every
+    /// digest, and a different one means some digest moved.
+    ///
+    /// It covers the rule, the replication factor and, for each member in id order, the
+    /// id, weight and the member's *placement class*. `Joining` and `CatchingUp`
+    /// are one class (placement treats them alike); `Active`, `Draining` and `Down` are
+    /// each their own. It leaves out the generation, addresses, boot counters, zones, the
+    /// protocol floor, the deny list and the order the members were listed in, none of which
+    /// move a digest. Zone is left out because placement does not read it today (ranking
+    /// scores only digest, id and weight); when zone-aware placement exists it is a new
+    /// layout, and the fingerprint (a new function, see below) adds zone then.
+    ///
+    /// The value is SipHash-2-4 with fixed keys over a fixed byte layout (see the code), so
+    /// it is the same in every build and process. Changing the layout is a new function,
+    /// not an edit of this one: processes of different versions compare these values.
+    #[must_use]
+    pub fn placement_fingerprint(&self) -> u64 {
+        use std::hash::Hasher;
+
+        use siphasher::sip::SipHasher24;
+
+        let mut h = SipHasher24::new_with_keys(
+            u64::from_be_bytes(*b"kbf-plfp"),
+            u64::from_be_bytes(*b"placemnt"),
+        );
+        let Rule::Rendezvous = self.rule;
+        h.write_u8(1); // rule: Rendezvous
+        h.write_u8(self.r);
+        let mut members: Vec<&Member> = self.members.iter().collect();
+        members.sort_by_key(|m| m.id);
+        h.write_u64(members.len() as u64);
+        for m in members {
+            h.write_u64(m.id.0);
+            h.write_u32(m.weight);
+            h.write_u8(match m.state {
+                MemberState::Joining | MemberState::CatchingUp => 0,
+                MemberState::Active => 1,
+                MemberState::Draining => 2,
+                MemberState::Down => 3,
+            });
+        }
+        h.finish()
+    }
+
+    /// The read order across this generation and the retained earlier ones: this map's
+    /// [`Map::read_order`] first, then each map of `history` in the order given (newest
+    /// first), each contributing its read order without the members already listed. A
+    /// member is listed once, as the earliest map that has it gives it (the `Member` with
+    /// the address it had there), so a blob written several generations back is found
+    /// through a member that has since left. With an empty `history` this is
+    /// [`Map::read_order`]; with one map it is [`Map::read_order_with_previous`].
+    #[must_use]
+    pub fn read_order_with_history<'a>(
+        &'a self,
+        history: &[&'a Map],
+        digest: &Digest,
+    ) -> Vec<&'a Member> {
+        let mut order = self.read_members(digest);
+        for map in history {
+            for m in map.read_members(digest) {
+                if !order.iter().any(|seen| seen.id == m.id) {
+                    order.push(m);
+                }
             }
         }
         order

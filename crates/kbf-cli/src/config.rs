@@ -57,6 +57,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "http2-keepalive-interval-secs",
             "http2-keepalive-timeout-secs",
             "listen",
+            "metrics-listen",
             "reapi-max-streams",
             "releases-dir",
             "shutdown-timeout-secs",
@@ -86,6 +87,7 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "scheduler",
         &[
+            "default-platform",
             "finished-retention-secs",
             "heartbeat-interval-ms",
             "input-tree-cache-bytes",

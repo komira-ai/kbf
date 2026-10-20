@@ -93,14 +93,17 @@ listener:
   other gate, the token included: the secret says who forwarded the request, not that the
   caller may write.
 - Every `x-kbf-*` header is removed from every request, whatever the result, so nothing
-  past this check can read one. The proxy sets `x-kbf-node-id` and `x-kbf-role` for a call
+  past this check can read one. The proxy sets `x-kbf-node-id`, `x-kbf-role` and `x-kbf-node-ips` for a call
   whose client certificate it verified; the worker listener takes those (and no TLS flag)
   in place of a certificate: the role table, the `Hello.node_id` binding, the blob calls
   and `Membership`'s role check use them. A `Hello` whose node id is not the proxy's
   `x-kbf-node-id` is refused `PERMISSION_DENIED`. A `Membership` registration
-  or heartbeat has no certificate names behind the proxy: the one name is the proxied node
-  id, so the host of its instance id and its address must be that name (up to ASCII case; an IP
-  address is refused). The proxied role must be `storage`.
+  or heartbeat has no certificate behind the proxy: its names are the proxied node id and
+  the IP addresses in `x-kbf-node-ips` (those of the verified leaf; see
+  `docs/design/frontend-proxy.md` section 3), so the host of its instance id and its address
+  must be that name (up to ASCII case) or one of those addresses (exact equality). A
+  malformed, repeated or oversized `x-kbf-node-ips` is refused `PERMISSION_DENIED`; without
+  one, an IP host is refused. The proxied role must be `storage`.
 
 What the flag does not do, and what the proxy must do:
 
@@ -259,8 +262,9 @@ message yet: the daemon is not told, and the server simply sends it no new `Star
 
 ## `POST /v1/members/{id}`
 
-An operator sets a storage member's state. The body is `{"state": "active"}` or
-`{"state": "draining"}`; the answer is `{"id": N, "state": "...", "generation": G}`,
+An operator sets a storage member's state. The body is `{"state": "active"}`,
+`{"state": "draining"}` or `{"state": "planned_down"}` (which may add `"for_secs": N`, 1 to
+86400, default 900); the answer is `{"id": N, "state": "...", "generation": G}`,
 the map's generation after the change. `down` is the store's verdict, `catching_up` is what a registration says and `joining` is
 written by a registration (a new node in a farm with data), so none of them is accepted (`400`, as is
 any other body). `404` for an id that has no live row (it expired, or never
@@ -271,6 +275,32 @@ by a refused request.
 
 When a member becomes `active` the cluster also records that it has formed (see below),
 in the same transaction.
+
+**A planned restart.** `planned_down` takes an `active` member out of the write path at
+once, for a restart an operator is about to make; any other state answers `409`. A member
+is `down` in the map only a TTL (15 s by default) after its last heartbeat. Until then a write whose
+primary is the stopped node dials it first and then moves on to the next owner, which costs
+a connection attempt per write, and an action-cache commit does not move on at all and is
+refused `UNAVAILABLE`, which a client retries for about a second and a half. After this call the
+map (one new generation, in the answer) has the member `down`, so every router, chain
+primary and repair worker that holds the map sends writes to the other owner and reads
+the member's blobs from it, and a node or daemon that holds an older map reads it like
+any `down` member (the wire has no new state). The member keeps serving what reaches it
+and keeps heartbeating until it stops; a heartbeat does not undo this, until `for_secs` has
+passed: the first heartbeat after that returns it to `active` (a controller that died, or a
+restart that never came, does not strand a healthy node out of service). The `down/<id>`
+mark that keeps its slot for the dwell (the same time as for a member that fails) is
+written in the same transaction, with a value that says an operator planned it:
+[`GET /v1/storage`](#get-v1storage) shows `"state": "down", "planned_down": true` for it.
+The end of the plan is kept in the member's row, which a frontend built before it drops when it
+rewrites the row, so nothing is planned down while a frontend of an older build serves the same
+state store. Asking again for a member already planned down is the same plan with its end moved to
+`for_secs` from now: `200`, the same answer, no new generation. It is undone by
+`{"state": "active"}` (a restart that did not happen), or by the member
+registering again after the restart: `active` if its index is whole, `catching_up` while
+it rebuilds, the mark deleted. If it never returns, it leaves the map at the end of the
+dwell counted from this call, as any `down` member does. It survives a restart of the
+frontend: it is in the store.
 
 **When a member is `active` without this call.** A registration that says the node's
 index is whole enters `active`, in a fresh cluster and in a formed one alike: it is the
@@ -561,7 +591,18 @@ must be a subset of the token's); and only then the CA: each CSR is parsed
 verifies) and a certificate is issued for it. A CSR is therefore parsed only for a caller
 who proved the secret. The answer carries one certificate per role, the CA bundle (PEM),
 the frontend's clock (`server_time`), `renew_after` (half-way through the shortest life)
-and the `NodeConfig`. A storage node must send `advertise` (`host:port`) and no other node
+and the `NodeConfig`. A node granted the `storage` role is told the farm's cold store in
+`NodeConfig.cold_store`: the store registered with `kbf cluster object-store` (the `cold`
+binding), as `s3://bucket/prefix/?endpoint=...&region=...`, with `conditional-put` and
+`min-put-rate` when they are not the defaults. The URI is built from the registered
+endpoint, region, bucket, prefix and settings only: **never** the access key id, the secret
+or any other query key (the key pair reaches a node through `ColdStore.GetStoreConfig`, over
+its storage certificate). A farm with nothing registered sends an empty `cold_store`, and a
+daemon-only node is sent none. A storage node that holds none asks once at its next start. A
+registry that cannot be read refuses the call (`StoreUnavailable`) before the token is
+spent. The node uses the `cold_store` it is sent with its own process credentials, so the
+frontend decides which endpoint receives the node's signed requests: the same trust as the
+worker and CAS endpoints the frontend already sends in `NodeConfig`. A storage node must send `advertise` (`host:port`) and no other node
 may; the host may not be a frontend name, `localhost`, or a loopback, unspecified,
 link-local or multicast address. Set `node.advertise` in `kbf.toml` on a storage node.
 
@@ -573,6 +614,19 @@ captured CSR replayed under a new field is refused `MalformedRequest`); `issued_
 within five minutes of the frontend's clock; the same CSR was not seen in the last ten
 minutes and the node did not renew in the last minute. Certificates are issued for the
 same keys. The answer carries `config` only when the node's `config_generation` differs.
+
+**When a node gets a new config.** `NodeConfig.generation` is a digest of the rest of the
+config as that node receives it (roles, `worker_endpoint`, `cas_endpoint`, `storage_port`,
+`cold_store`, and the other fields), with the low bit set so it is never 0. It changes
+exactly when something the node is sent changes: a frontend restarted with another
+`--enroll-worker-endpoint`, `--enroll-cas-endpoint` or `--enroll-storage-port`, or a cold
+store registered, changed or taken back (a daemon-only node is not sent the store, so
+that does not change its generation). A restart with the same flags changes nothing. The
+number is **not ordered**: the node keeps it and `Renew` compares it for equality, so a
+frontend put back to an earlier endpoint sends that configuration again. A node stores
+the new config in `node.json` at the renewal that carries it, but the running process
+does not re-dial: it uses the endpoint at its next start. Moving a farm's endpoints is
+therefore "renew, then restart each node within the dwell", and no re-enrollment.
 
 **Refusals** are exactly a `RefusalReason`: the gRPC status code is `reason.code()` and
 the message is `reason.message()`, byte for byte, with no detail. The node client
@@ -658,7 +712,9 @@ no registered member.
 ```json
 { "members_total": 3, "members_active": 3, "not_active": [], "silent": [],
   "unreported": [], "debts_total": 3, "under_replicated_blobs": 3,
-  "reasons": ["3 blobs owed"] }
+  "reasons": ["3 blobs owed"],
+  "nodes": [ { "id": 1, "state": "active", "planned_down": false, "repair_debts": 3, "open_writes": 0, "generation": 12 },
+             { "id": 2, "state": "active", "planned_down": false, "repair_debts": 0, "open_writes": null, "generation": 12 } ] }
 ```
 
 - `under_replicated_blobs`: the number, or `null` while unknown. A gate treats `null` as
@@ -671,6 +727,17 @@ no registered member.
 - `reasons`: why the number is not zero, in that order, as a rollout would say it
   (`member 3 not active`, `member 2 silent`, `5 blobs owed`); empty when it is known to be
   zero.
+- `nodes`: every registered member in any state (`planned_down` is true for a `down`
+  member an operator planned, [above](#post-v1membersid)), with what its newest report says:
+  `repair_debts` (the copies it owes), `open_writes` (the `Write` calls, action-cache
+  commits and daemon segment uploads it has open now, an upload from `Begin` until its
+  commit ends, as a primary or a replica) and `generation` (the map it held when
+  it counted). A value is `null` when the member's report is older than the freshness
+  window, when it has not reported, or when it cannot say (an older node does not count its
+  writes). `null` is unknown, never zero: whoever reads it fails closed. A node is idle for a
+  rollout only when every other member is `ACTIVE` and fresh, no copy is owed anywhere, and
+  the node itself reports no open write from a map at least as new as the one that stopped
+  routing writes to it (`Members::node_idle`, in-process, with the reasons).
 
 The number is as old as the newest heartbeat. A copy owed since then is not in it, so
 whoever acts on a zero keeps new writes away from the node first (drains it), then reads
@@ -1033,6 +1100,13 @@ families: the REAPI listener (clients) and the worker listener (daemons' uploads
 outputs and reads of inputs). The counts are in memory and start at 0 with the
 process.
 
+A storage node (`kbf storage`, and the storage half of `kbf storage-and-daemon`) has no
+operator API and serves this one route, plain HTTP, on `--metrics-listen <addr>`
+(off unless given; the same open read as above, so bind it where only operators do). It
+answers the families of its own cache, among them `kbf_cache_lost_blobs` and
+`kbf_cache_blob_losses_total`, the node's TLS reloads, and, in
+`kbf storage-and-daemon`, the one cache's fill.
+
 Each request family counts from the start of its handler to its answer. A call whose
 caller goes away before the answer counts as an error.
 
@@ -1048,6 +1122,7 @@ caller goes away before the answer counts as an error.
 | `kbf_execute_requests_total`, `_errors_total` | counter | Execute calls ended, and those that ended in an error status or were dropped by their caller before the done operation (an operation that finished with a failed `ExecuteResponse` is not one) |
 | `kbf_execute_in_flight` | gauge | Execute and WaitExecution streams open |
 | `kbf_under_replicated_blobs` | gauge | the sum over all registered storage members of the blobs each owes a second copy, exported **only while it is known** (every registered member `ACTIVE` and reporting within the window); absent otherwise, never 0. Frontends with a state store. [`GET /v1/storage`](#get-v1storage) says why it is unknown |
+| `kbf_member_repair_debts{member}`, `kbf_member_open_writes{member}` | gauge | per storage member, the copies it owes and the writes it has open now, one sample per member, **only for a value that is known** (fresh report, and the node says it counts); a member with no sample is unknown, never 0. Frontends with a state store. [`GET /v1/storage`](#get-v1storage) lists the same per node |
 | `kbf_storage_health_known` | gauge | 1 when `kbf_under_replicated_blobs` is exported, 0 when it is unknown (including a membership that cannot be read). Frontends with a state store |
 | `kbf_front_open_executions` | gauge | Execute and WaitExecution operation streams alive: raised when the stream is made (before its first item is read), lowered when it ends or its caller drops it. A call still being authorized or prepared, and one answered from the action cache, is not in it. `GET /v1/frontend/drain` reports it |
 | `kbf_front_executes_started_total` | counter | Execute calls the front took (not refused because it is draining), cache hits included |
@@ -1071,6 +1146,7 @@ caller goes away before the answer counts as an error.
 | `kbf_execute_walk_seconds`, `kbf_execute_dir_reads_total` | histogram, counter | the input-tree check of one Execute, whole (directories read concurrently or taken from memory, subtrees skipped, presence checks, any wait for a check another request is running), and the Directory blobs read from the store, counted as each read starts |
 | `kbf_execute_submit_seconds`, `kbf_sched_lock_wait_seconds` | histogram | the scheduler's submit called from an Execute, and the part of it spent waiting for the scheduler's lock |
 | `kbf_sched_queued`, `kbf_sched_leases` | gauge | operations waiting for a lease, and leases granted or running on all nodes, as of the last submit or scheduler tick (at most a tick old) |
+| `kbf_bytes_in_flight`, `kbf_bytes_in_flight_peak` | gauge, gauge | bytes this process holds in memory for requests in flight now (a ByteStream Write's receive buffer or the message in hand, a Read's window, a BatchUpdateBlobs's blobs, a Segments upload's buffer, and the same on a storage node's Write), and the most it has held at once since the process started (never reset). Counted from the allocation of a buffer until the last reference to it is dropped, however the request ended. Not counted: the segment writer's own buffer, the object store's and write tier's internals, and gRPC's copies of a message. Always printed. The daemon does not serve `/metrics` yet |
 | `kbf_tier_in_flight`, `kbf_tier_wait_seconds`, `kbf_tier_call_seconds` | gauge, histogram | write-tier file calls queued on or running on the blocking pool; the wait of one for a pool thread; and one whole, hand-over to answer. Always printed, 0 without a write tier; a wait near the call time says the pool is full |
 | `kbf_storage_open_write_fds`, `kbf_storage_write_pool_queue`, `kbf_storage_write_pool_direct_total` | gauge, gauge, counter | block files the write tier holds open for writing, as of the last write-pool step (at most `--write-pool-writers` plus one, for the blobs the pool writes); blobs waiting for a pool writer; and blobs the pool sent straight to the object store because its queue (`--write-pool-queue`) was full or the tier did not take them. Always printed, 0 without a write tier |
 | `kbf_input_directories_cached_total` | counter | Directories the input check took from the decoded-directory cache: the blob is touched and its presence checked, nothing is read |
