@@ -217,7 +217,7 @@ B-0, not the 20 of T5, which is a likely memory risk. The cost that matters is w
 merge path. Record job duration in the result document so a creeping beta shows in the numbers.
 
 **Container runtime [V].** The project runs containers with crun only. The harness today uses a stand-in runtime over a planted cgroup tree.
-Real crun needs cgroup v2 delegation and a systemd scope; the crun jobs in `ci.yml` arrange that with a `Delegate=yes`
+Real crun needs cgroup v2 delegation and a systemd scope; the crun jobs in `beta.yml` arrange that with a `Delegate=yes`
 unit, and the same approach is to be tried for crun on `ubuntu-24.04`. Until that is shown to work (#936), **B-0 uses the
 stand-in**, and the page says what that weakens: the `//:pause` and compile loads run through no real container path, so
 beta proves the update and failure paths and not container execution (covered by the existing real-runtime jobs). The
@@ -248,7 +248,7 @@ The proposal is to grow it into a library (`rehearsal`) that two test cells shar
 - **The update under test is the real update code**, not a script that restarts processes: the frontend handover command,
   the node step and the pull-updater client and root helper, in that order of availability (milestones B2 to B4 below). The
   one honest deviation is that the supervisor, not systemd, starts the processes; the `systemctl` edge is covered by gamma.
-  The root helper runs under `sudo` on the runner (`sudo-test` already does this in `ci.yml` **[F]**).
+  The root helper runs under `sudo` on the runner (`sudo-test` already does this in `beta.yml` **[F]**).
 
 **Status of the first change (#942).** The helpers above are now the library `crates/kbf-harness`, which `kbf-cli`'s
 rehearsal drives: `Farm` (a supervisor with `kill`, `term`, `restart`, a process table and a report of every process's

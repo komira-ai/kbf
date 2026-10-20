@@ -11,6 +11,7 @@ mod hold;
 mod keepalive;
 mod kit;
 mod lifetime;
+mod operator;
 pub(crate) mod pki;
 mod ready;
 mod reload;

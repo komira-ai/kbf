@@ -1,11 +1,14 @@
 //! The controller, run by the frontend: [`spawn`] starts a task that looks once per `every`
 //! (the farm's tick) when the server has a state store to keep the rows in.
 //!
-//! **Nothing runs unasked.** The controller does not read `update/policy.auto_nodes`; this
-//! does: with it false (the default) the controller still moves hosts already in a step
-//! (so turning the switch off does not strand a cordoned host) and starts none
-//! ([`Controller::tick_gated`]). There is no operator trigger yet that starts a run with
-//! `auto_nodes` off.
+//! **A run is the operator's write.** The controller starts hosts when `update/policy.auto_nodes`
+//! is true, and an `update/policy` row that was never written reads as true
+//! ([`Policy::default`](super::Policy)): only an operator writes `update/desired` (the poller
+//! only proposes a release), so the desired write is the click, and `pause` is the stop. An
+//! operator who wrote `auto_nodes` false starts nothing: the controller still moves hosts
+//! already in a step (so turning the switch off does not strand a cordoned host) and starts
+//! none ([`Controller::tick_gated`]). Before this, an unset policy read as false and no
+//! route could set it, so no run could start.
 //!
 //! The controller blocks on the store, so each look is a blocking task. Its errors are logged
 //! once while they last.
@@ -32,22 +35,25 @@ use kbf_types::FarmTime;
 use super::session::ports;
 use super::{Controller, ControllerError, RowError, Rows, Tick};
 use crate::farm::Farm;
+use crate::members::Members;
 
 /// Starts the controller over `store` on the current runtime; the returned handle stops it.
-/// `None` without a state store. The controller's epoch is the farm's: the one `Welcome`
-/// names.
+/// `None` without a state store or without the members that live in it. The controller's
+/// epoch is the farm's: the one `Welcome` names.
 #[must_use]
 pub fn spawn(
     farm: Arc<Farm>,
     store: Option<Arc<dyn Store>>,
+    members: Option<Arc<Members>>,
     every: Duration,
 ) -> Option<AbortHandle> {
-    store.map(|store| tokio::spawn(run(farm, store, every)).abort_handle())
+    let (store, members) = store.zip(members)?;
+    Some(tokio::spawn(run(farm, store, members, every)).abort_handle())
 }
 
-async fn run(farm: Arc<Farm>, store: Arc<dyn Store>, every: Duration) {
+async fn run(farm: Arc<Farm>, store: Arc<dyn Store>, members: Arc<Members>, every: Duration) {
     let rows = Rows::new(Arc::clone(&store));
-    let (transport, source) = ports(Arc::clone(&farm), rows.clone());
+    let (transport, source) = ports(Arc::clone(&farm), rows.clone(), members);
     let mut controller = Controller::new(
         store,
         farm.lease_epoch(),
@@ -107,12 +113,9 @@ async fn step(
     now: FarmTime,
 ) -> Option<(Controller, Result<Tick, ControllerError>)> {
     tokio::task::spawn_blocking(move || {
-        // An unreadable policy starts nothing: the controller reads it again and says why.
-        let auto = rows
-            .policy_if_set()
-            .ok()
-            .flatten()
-            .is_some_and(|p| p.auto_nodes);
+        // An unreadable policy starts nothing: the controller reads it again and says why. A
+        // policy never written is the defaults, and they start hosts.
+        let auto = rows.policy().is_ok_and(|p| p.auto_nodes);
         let tick = controller.tick_gated(now, auto);
         (controller, tick)
     })
@@ -178,7 +181,11 @@ mod tests {
             kbf_sched::UNSERVABLE_WAIT,
             kbf_sched::FINISHED_RETENTION,
         ));
-        let (transport, _) = ports(farm, rows.clone());
+        let members = Arc::new(Members::new(
+            Arc::clone(&store),
+            crate::members::MembershipConfig::default(),
+        ));
+        let (transport, _) = ports(farm, rows.clone(), members);
         let controller = Controller::new(store, 1, Box::new(transport), Box::new(Panics));
         assert!(
             step(controller, rows, FarmTime::from_millis(2))
