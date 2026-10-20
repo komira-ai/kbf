@@ -47,4 +47,5 @@ then set the three variables last. The first deploy is a person's to watch: what
 built" decides whether it can end `0`.
 
 A deploy can hold the `gamma` concurrency group for up to four hours. A run for a commit that is no longer the highest
-release tag is refused before anything reaches the host, and so is a run whose offer is more than 72 hours old.
+release tag is refused before anything is sent to the host; a run whose offer is more than 72 hours old is refused by the
+host (`offer_stale`) before it changes the farm.
