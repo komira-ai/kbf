@@ -45,8 +45,33 @@ fn mac_accounts(
     exec.answer = Box::new(move |cmd| {
         let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
         let program = cmd.program.as_str();
+        let there = exists || seen.get();
+        let (uid, home) = if seen.get() {
+            (300, "/var/empty")
+        } else {
+            (uid, home)
+        };
         if program.ends_with("dscl") {
             return Ok(match args.as_slice() {
+                // The lookup: all four keys, in dscl's own (alphabetical) order.
+                [
+                    ".",
+                    "-read",
+                    RECORD,
+                    "UniqueID",
+                    "PrimaryGroupID",
+                    "NFSHomeDirectory",
+                    "UserShell",
+                ] if there => reply(
+                    0,
+                    &format!(
+                        "NFSHomeDirectory: {home}\nPrimaryGroupID: {uid}\nUniqueID: {uid}\nUserShell: /usr/bin/false\n"
+                    ),
+                    "",
+                ),
+                [".", "-read", _, "UniqueID", ..] => {
+                    reply(56, "", "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)\n")
+                }
                 [".", "-create", RECORD, "IsHidden", _] => {
                     seen.set(true);
                     reply(0, "", "")
@@ -60,16 +85,11 @@ fn mac_accounts(
                 _ => reply(0, "", ""),
             });
         }
-        let there = exists || seen.get();
-        let (uid, home) = if seen.get() {
-            (300, "/var/empty")
+        // `id -G`; a Mac has no `getent`, so asking for it is a failure here.
+        Ok(if program.ends_with("getent") {
+            reply(127, "", "getent: not found")
         } else {
-            (uid, home)
-        };
-        Ok(match (program.ends_with("getent"), there) {
-            (true, false) => reply(2, "", ""),
-            (true, true) => reply(0, &format!("_kbf-fetch:*:{uid}:{uid}::{home}:/x\n"), ""),
-            (false, _) => reply(0, &format!("{uid}\n"), ""),
+            reply(0, &format!("{uid}\n"), "")
         })
     });
     (exec, Accounts { made })

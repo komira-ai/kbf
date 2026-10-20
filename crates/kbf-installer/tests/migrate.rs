@@ -12,6 +12,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use kbf_installer::layout::{Layout, Platform};
+use kbf_installer::migrate::roots::Roots;
 use kbf_installer::testkit::{A, B};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-installer");
@@ -43,13 +45,33 @@ fn old_host(name: &str) -> PathBuf {
         "{{\"schema\": 1, \"current\": \"{A}\", \"previous\": \"{B}\", \"staged\": null, \
          \"pending_confirm\": null, \"order_floor\": 0}}"
     );
-    let old = root.join("var/lib/kbf-deploy");
+    let old = old_state(&root);
     fs::create_dir_all(&old).expect("old state dir");
     fs::write(old.join("state.json"), state).expect("state");
     // Whatever the umask of whoever runs the test: root's files, as the migration demands.
     fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).expect("mode");
     fs::set_permissions(old.join("state.json"), fs::Permissions::from_mode(0o600)).expect("mode");
     root
+}
+
+/// The host as the binary lays it out: the platform it was built for.
+fn host(root: &Path) -> Layout {
+    Layout::new(
+        kbf_host::Root::new(root).expect("absolute"),
+        Platform::current(),
+    )
+}
+
+/// The old tools' state directory of this platform (`var/lib/kbf-deploy` on Linux,
+/// `var/db/kbf-deploy` on macOS), under `root`.
+fn old_state(root: &Path) -> PathBuf {
+    host(root).join(&Roots::new(Platform::current()).old_state)
+}
+
+/// The installer's own state directory of this platform, under `root`.
+fn state_dir(root: &Path) -> PathBuf {
+    let host = host(root);
+    host.join(&host.state_dir())
 }
 
 fn migrate(root: &Path, args: &[&str]) -> Output {
@@ -73,7 +95,7 @@ fn text(bytes: &[u8]) -> String {
 #[test]
 fn a_host_with_no_old_layout_has_nothing_to_migrate_and_nothing_to_roll_back() {
     let root = old_host("nothing");
-    fs::remove_file(root.join("var/lib/kbf-deploy/state.json")).expect("rm");
+    fs::remove_file(old_state(&root).join("state.json")).expect("rm");
     for args in [&[][..], &["--apply"], &["--min-generation", "5", "--apply"]] {
         let out = migrate(&root, args);
         assert_eq!(
@@ -88,7 +110,7 @@ fn a_host_with_no_old_layout_has_nothing_to_migrate_and_nothing_to_roll_back() {
             text(&out.stdout)
         );
     }
-    assert!(!root.join("var/lib/kbf-installer").exists());
+    assert!(!state_dir(&root).exists());
     let out = migrate(&root, &["--rollback", "--apply"]);
     assert_eq!(out.status.code(), Some(5), "{}", text(&out.stderr));
 }
@@ -126,8 +148,8 @@ fn refusals_exit_with_the_contract_codes() {
 
     let out = migrate(&root, &["--unit", "../x.service"]);
     assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
-    assert!(!root.join("var/lib/kbf-installer").exists());
-    assert!(!root.join("var/lib/kbf-deploy/MIGRATED").exists());
+    assert!(!state_dir(&root).exists());
+    assert!(!old_state(&root).join("MIGRATED").exists());
 }
 
 /// Catches a `--root` that is not a path from `/` being accepted: it is exit 1 with the
