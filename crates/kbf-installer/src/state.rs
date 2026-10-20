@@ -51,9 +51,10 @@ pub struct State {
     pub previous: Option<CommitId>,
     /// The one release installed and waiting for a decision: a frontend update staged by the
     /// proxy's order (until its confirm makes it current or its revert drops it) or by the
-    /// operator's `stage`. `activate`, `first`, the frontend's confirm and the operator's
-    /// `install` clear it when they make that release current. The verify pipeline does not
-    /// write it; whoever keeps a verified release does.
+    /// operator's `stage`. Every verb that makes a release current clears it when it names
+    /// that release: `activate`, `first`, the frontend's confirm, `revert`, and the operator's
+    /// `install` and `rollback`. The verify pipeline does not write it; whoever keeps a
+    /// verified release does.
     pub staged: Option<CommitId>,
     /// A release swapped in and not yet confirmed.
     pub pending_confirm: Option<PendingConfirm>,
