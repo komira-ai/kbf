@@ -1027,6 +1027,18 @@ fn the_verbs_that_manage_a_host_wait_for_its_migration() {
 /// Mutants to plant: `Verb::FetchChild` or `Verb::Migrate(_)` moved to the `true` arm; `Verb::Setup(_)` to the `false` one.
 #[test]
 fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
+    let digest = "a".repeat(64);
+    let fetch_child = [
+        "fetch-child",
+        "--kind",
+        "url",
+        "--url",
+        "http://h.example",
+        "--sha256",
+        digest.as_str(),
+        "--limit",
+        "10",
+    ];
     let held: [&[&str]; 10] = [
         &["setup", "--mode=frontend"],
         &RUN,
@@ -1045,7 +1057,7 @@ fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
         &["boot-check"],
         &["quiesce"],
         &["migrate"],
-        &["fetch-child"],
+        &fetch_child,
     ];
     for args in held {
         assert!(parse(args).verb.manages_host(), "{args:?} is held");
