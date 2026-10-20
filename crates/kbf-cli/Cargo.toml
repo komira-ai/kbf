@@ -111,6 +111,9 @@ kbf-front.workspace = true
 # image store layout; the macOS tests of this package (tests/macos_daemon.rs) build without it.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 kbf-driver-container.workspace = true
+# The farm of real `kbf` processes the rehearsal (tests/rehearsal_in_a_box.rs) drives, and
+# the stand-in `podman`'s store (tests/support, through kbf-all-in-one's node.rs).
+kbf-harness.workspace = true
 
 [lints]
 workspace = true
