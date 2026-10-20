@@ -81,8 +81,8 @@ use kbf_proxy::slot::Slot as GateSlot;
 use kbf_testkit::dir::TestDir;
 use kbf_testkit::reaped::{self, Reaped};
 use proxy_support::{
-    Open, actions, api_get, connect, free_base, frontend_args, kbf_command, open_executions,
-    proxy_config, proxy_get, storage_node, store, until, until_ready, within,
+    Open, actions, api_get, connect, free_base, frontend_args, kbf_command, kbf_path, link_kbf,
+    open_executions, proxy_config, proxy_get, storage_node, store, until, until_ready, within,
 };
 
 /// Streams that arrive while the swap holds, between the old process's stop and the new
@@ -205,7 +205,7 @@ impl Child for Procs {
         Ok(ProcIdent {
             pid,
             start_time: 0,
-            exe: self.dir.join("bin/kbf"),
+            exe: kbf_path(&self.dir),
         })
     }
 
@@ -437,12 +437,7 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
     // Declared first, so it drops last: the children are reaped before it is removed.
     let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "proxy-aio-soak");
     let dir = scratch.path().to_path_buf();
-    std::fs::create_dir_all(dir.join("bin")).expect("scratch");
-    std::os::unix::fs::symlink(
-        std::env::current_exe().expect("this binary"),
-        dir.join("bin/kbf"),
-    )
-    .expect("link kbf");
+    link_kbf(&dir);
 
     let log = Arc::new(Log::default());
     let node = storage_node(&dir, "node");

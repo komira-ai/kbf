@@ -59,10 +59,22 @@ pub fn own_config(dir: &Path, args: &[String]) -> Vec<String> {
     own
 }
 
+/// The path of the `kbf` link [`link_kbf`] makes in `dir`.
+pub fn kbf_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("bin/kbf")
+}
+
+/// Links this test binary as `bin/kbf` under `dir`: run through that name it answers as `kbf`.
+pub fn link_kbf(dir: &Path) {
+    std::fs::create_dir_all(dir.join("bin")).expect("scratch");
+    std::os::unix::fs::symlink(std::env::current_exe().expect("this binary"), kbf_path(dir))
+        .expect("link kbf");
+}
+
 /// The command that starts `kbf` from the link in `dir` with `args` and a config of the
 /// test's own ([`own_config`]).
 pub fn kbf_command(dir: &Path, args: &[String]) -> Command {
-    let mut command = Command::new(dir.join("bin/kbf"));
+    let mut command = Command::new(kbf_path(dir));
     command.args(own_config(dir, args));
     command
 }

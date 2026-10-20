@@ -50,7 +50,7 @@ use kbf_proxy::control::NoUpdates;
 use kbf_proxy::slot::{Retire, Slot};
 use kbf_testkit::dir::TestDir;
 use proxy_support::{
-    Child, Open, actions, api_get, connect, free_base, frontend_args, open_executions,
+    Child, Open, actions, api_get, connect, free_base, frontend_args, link_kbf, open_executions,
     own_config, proxy_config, proxy_get, storage_node, store, until, until_ready, within,
 };
 
@@ -74,12 +74,7 @@ fn the_flip_with_two_hundred_streams_drops_none_and_each_child_serves_its_own() 
     // Declared first, so it drops last: the children are reaped before it is removed.
     let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "proxy-soak");
     let dir = scratch.path().to_path_buf();
-    std::fs::create_dir_all(dir.join("bin")).expect("scratch");
-    std::os::unix::fs::symlink(
-        std::env::current_exe().expect("this binary"),
-        dir.join("bin/kbf"),
-    )
-    .expect("link kbf");
+    link_kbf(&dir);
 
     let (node_a, node_b) = (storage_node(&dir, "node-a"), storage_node(&dir, "node-b"));
     let base = free_base();
