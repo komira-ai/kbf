@@ -103,6 +103,15 @@ impl Platform {
         Platform::named(std::env::consts::OS)
     }
 
+    /// The user database this platform has: `getent` on Linux, `dscl` on a Mac. The platform
+    /// is the layout's, not the build's, so a rehearsal and a test see the platform they plan.
+    pub fn user_db(self) -> kbf_host::user::UserDb {
+        match self {
+            Platform::Linux => kbf_host::user::UserDb::Getent,
+            Platform::MacOs => kbf_host::user::UserDb::Dscl,
+        }
+    }
+
     /// The platform Rust calls `os` (`macos`, else Linux).
     pub fn named(os: &str) -> Platform {
         if os == "macos" {

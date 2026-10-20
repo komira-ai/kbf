@@ -436,6 +436,8 @@ pub struct StorageHandle {
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
     _background: Background,
+    /// The flush report and tail passes a registered node's heartbeats carry ([`crate::fill`]).
+    _fill: Option<AbortOnDrop>,
     /// When the cold store is a directory: completes when its lock is released.
     cold_released: Option<kbf_objstore::Released>,
     maps: Arc<MapHolder>,
@@ -525,6 +527,7 @@ impl StorageHandle {
             serving,
             _flusher,
             _background,
+            _fill,
             cold_released,
             maps,
             catch_up,
@@ -538,6 +541,7 @@ impl StorageHandle {
         drop((
             _flusher,
             _background,
+            _fill,
             maps,
             catch_up,
             repairs,
@@ -663,6 +667,15 @@ where
     let cache = cache
         .with_writes(flags.server.write_config())
         .with_write_pool(flags.server.write_pool_config());
+    // A registered node dates what it stages by the map it holds, so it can say what it has
+    // flushed ([`crate::fill`]); it flushes everything, as without the gate.
+    let cache = if registered.joiner.is_some() {
+        cache.with_flush_gate(Arc::new(crate::fill::FlushesAll::new(Arc::clone(
+            &registered.node,
+        ))))
+    } else {
+        cache
+    };
     let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
     let cache = Arc::new(cache);
     let (metrics, _metrics) = metrics
@@ -674,6 +687,18 @@ where
     });
     let catch_up = registered.catch_up.clone();
     let _background = crate::rebuild::spawn(&cache, &catch_up, pass, rebuild);
+    // The registration's heartbeats say what this reports: the flush, and the tail passes the
+    // frontend's fence asks for.
+    let _fill = registered.joiner.as_ref().map(|(joiner, joined)| {
+        let fill = crate::fill::run(
+            Arc::clone(&cache),
+            joiner.fill(),
+            Arc::clone(&registered.node),
+            catch_up.clone(),
+            joined.interval,
+        );
+        AbortOnDrop(tokio::spawn(fill))
+    });
     let storage = Arc::new(CacheStorage::new(cache, flags.segments()));
     let stop = Box::pin(shutdown()?);
     let node = bind_node(flags, listener, registered, storage, repair_dir, stop)?;
@@ -687,6 +712,7 @@ where
         serving: node.serving,
         _flusher,
         _background,
+        _fill,
         cold_released,
         maps: node.maps,
         catch_up,
