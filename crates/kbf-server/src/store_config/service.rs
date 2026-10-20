@@ -12,6 +12,11 @@
 //! - when the frontend keeps an enrollment registry, that the node (the certificate's first
 //!   DNS name, the node id enrollment gives it) is an `Active` row in it.
 //!
+//! Behind the reverse proxy there is no certificate: the identity is the node id the proxy
+//! forwarded, so only a `node` deny entry (or a `deny/` row naming the node) can match it, never
+//! a serial or a key. `with_registry` (enrollment revocation) is not wired in the frontend until
+//! the enroll listener lands.
+//!
 //! Without the registry only the first two apply, so a frontend that does not run
 //! enrollment still refuses a denied node. **Plain text refuses**: under
 //! [`Admission::Open`] (no worker TLS) the listener's role table lets every call through
@@ -40,7 +45,7 @@ use tonic::{Request, Response, Status};
 use super::{SourceError, StoreConfigSource};
 use crate::identity::{DenyList, PeerCert, Presented, presented};
 use crate::members::Members;
-use crate::members_rpc::{blocking, refuse_denied};
+use crate::members_rpc::refuse_denied;
 
 /// The `ColdStore` service over a registration `source`.
 pub struct ColdStoreService {
@@ -151,9 +156,14 @@ impl ColdStoreService {
         let members = self.denied_rows.clone();
         let registry = self.registry.clone();
         let checked = peer.clone();
-        blocking(move || {
+        on_blocking(move || {
             if let Some(members) = &members {
-                refuse_denied(&checked, &members.denied()?)?;
+                // Fixed text: the store's own error is not for a node.
+                let denied = members
+                    .denied()
+                    .map_err(|_| Status::unavailable("the denied nodes could not be read"))?;
+                refuse_denied(&checked, &denied)
+                    .map_err(|e| Status::permission_denied(e.to_string()))?;
             }
             Ok(())
         })

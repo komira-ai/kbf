@@ -241,22 +241,17 @@ fn refuse_old_layout(exec: &dyn Exec, platform: Platform) -> Result<(), SetupErr
 }
 
 /// Stops `setup` where a regular file in `/etc/systemd/system` has the name of the mode's
-/// packaged unit (or of its template): systemd reads `/etc` before `/usr/lib`, and `setup`
+/// packaged unit: systemd reads `/etc` before `/usr/lib`, and `setup`
 /// does not enable a unit that is already enabled, so the host would go on running the old
 /// file's flags. A link is what `systemctl link` makes and is not a shadow with other flags.
 fn refuse_shadow_unit(exec: &dyn Exec, mode: Mode) -> Result<(), SetupError> {
     for unit in plan::mode_units(mode) {
-        let template = unit
-            .split_once('@')
-            .map(|(name, _)| format!("{name}@.service"));
-        for name in std::iter::once((*unit).to_owned()).chain(template) {
-            let path = format!("/etc/systemd/system/{name}");
-            if matches!(
-                exec.inspect(&HostPath::new(&path)?)?,
-                Some(Entry::File { .. })
-            ) {
-                return Err(SetupError::ShadowUnit { path, unit });
-            }
+        let path = format!("/etc/systemd/system/{unit}");
+        if matches!(
+            exec.inspect(&HostPath::new(&path)?)?,
+            Some(Entry::File { .. })
+        ) {
+            return Err(SetupError::ShadowUnit { path, unit });
         }
     }
     Ok(())

@@ -186,8 +186,9 @@ fn the_runtime_units_exec_the_layouts_current_release() {
             .filter(|c| c.starts_with(&current_kbf()))
             .count();
     }
-    // Four mode units, a check and a start each (the frontend template runs its slot).
-    assert_eq!(checked, 8);
+    // Five mode units, a check and a start each: the four node modes and the plain
+    // frontend (kbf-frontend.service); the frontend template runs its slot.
+    assert_eq!(checked, 10);
 }
 
 /// `(file, from, to, rule)`: one defect per rule, planted in a copy of the real file.
