@@ -20,7 +20,7 @@
 pub const FLAGGED: &[&str] = &[
     "crates/kbf-cli/tests/storage_process.rs",
     "crates/kbf-harness/src/farm.rs",
-    "crates/kbf-it/tests/proxy_soak.rs",
+    "crates/kbf-it/tests/proxy_support/mod.rs",
 ];
 
 /// Test files that start `kbf` with no settings file of their own: the process tests of
