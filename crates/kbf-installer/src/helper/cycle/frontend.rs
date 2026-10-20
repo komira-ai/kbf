@@ -3,8 +3,9 @@
 //! unit, so none owes a restart:
 //!
 //! - `frontend_update{commit}`: the fetcher pulls, verifies and installs the release into
-//!   `releases/<commit>/` (no component list: the source is the installer's own), the state's
-//!   `staged` names it, and its facts go to `status.json` under `staged{}`. No link moves.
+//!   `releases/<commit>/` (no component list: the source is the installer's own); once the
+//!   checks below pass, this half (never the fetcher) makes the state's `staged` name it,
+//!   and its facts go to `status.json` under `staged{}`. No link moves.
 //! - `confirm{commit}`: if `commit` is the staged release and no node swap is on trial,
 //!   `previous` then `current` are flipped to it, state first. A repeat finds it current.
 //! - `revert{commit}`: if `commit` is the staged release it is dropped from `staged`.
