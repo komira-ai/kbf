@@ -111,6 +111,11 @@ struct Member {
     bytes: Vec<u8>,
 }
 
+/// What a tar reader's error says of the archive.
+fn not_a_tar(e: std::io::Error) -> String {
+    format!("not a tar: {e}")
+}
+
 /// The regular files of the gzip-compressed tar `tgz`.
 fn members(tgz: &[u8]) -> Result<Vec<Member>, String> {
     let mut tar = Vec::new();
@@ -119,8 +124,8 @@ fn members(tgz: &[u8]) -> Result<Vec<Member>, String> {
         .map_err(|e| format!("not a gzip stream: {e}"))?;
     let mut archive = tar::Archive::new(&tar[..]);
     let mut found = Vec::new();
-    for entry in archive.entries().map_err(|e| format!("not a tar: {e}"))? {
-        let mut entry = entry.map_err(|e| format!("not a tar: {e}"))?;
+    for entry in archive.entries().map_err(not_a_tar)? {
+        let mut entry = entry.map_err(not_a_tar)?;
         if entry.header().entry_type() != tar::EntryType::Regular {
             continue;
         }

@@ -669,3 +669,30 @@ fn directory_entries_of_the_data_tarball_are_not_files_of_the_package() {
     fix.dirs = true;
     assert_eq!(found("dirs", &fix, MAIN), Vec::<String>::new());
 }
+
+#[test]
+fn files_the_check_needs_that_are_not_there_are_errors_not_findings() {
+    // Catches: a missing deb, tarball or pinned gh, a binary that does not run and a
+    // header cut short taken for a refusal of the package (or a panic): the job's own
+    // inputs being absent is a failure of the job.
+    let fix = Fix::new();
+    let (dir, deb, tarball, gh) = world("absent", &fix, &fix.binary, Platform::LinuxX86_64);
+    let none = dir.join("none");
+    let c = check(Platform::LinuxX86_64, &tarball, MAIN, Some(&gh));
+    let err = asset(&none, COMMIT, &Mode::VerifyOnly, &c).expect_err("no deb");
+    assert!(!matches!(err, Error::Refused(_)), "{err:?}");
+    let bytes = std::fs::read(&deb).expect("deb");
+    let c = check(Platform::LinuxX86_64, &none, MAIN, Some(&gh));
+    let err = problems(&bytes, &c).expect_err("no tarball");
+    assert!(!matches!(err, Error::Refused(_)), "{err:?}");
+    let c = check(Platform::LinuxX86_64, &tarball, MAIN, Some(&none));
+    let err = problems(&bytes, &c).expect_err("no gh");
+    assert!(!matches!(err, Error::Refused(_)), "{err:?}");
+    assert!(binary_version(&none).is_err());
+    let empty = dir.join("empty");
+    std::fs::create_dir(&empty).expect("dir");
+    assert!(sole(&empty, "deb").is_err());
+    // A header cut short: 8 bytes of magic and 10 of a member header.
+    let got = problems_of("short-header", &[&b"!<arch>\n"[..], &[b'x'; 10]].concat());
+    assert_eq!(got, ["a truncated ar member header"]);
+}

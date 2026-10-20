@@ -473,3 +473,32 @@ fn pkg_asset_adds_the_package_as_the_asset_or_only_verifies_it() {
     let refused = run(&other.join("p.deb"), &["--verify-only"]);
     assert_eq!(refused.status.code(), Some(1), "{}", text(&refused.stderr));
 }
+
+#[test]
+fn pkg_asset_names_a_directory_without_a_package() {
+    // Catches: a directory with no deb in it going on to the checks as if it were the
+    // package, instead of failing the run with what is missing.
+    let dir = scratch("asset-no-package");
+    let empty = dir.join("empty");
+    std::fs::create_dir_all(&empty).expect("dir");
+    let out = xtask(&[
+        "pkg-asset",
+        "--package",
+        s(&empty),
+        "--platform",
+        "linux-x86_64",
+        "--commit",
+        COMMIT,
+        "--binary-tarball",
+        s(&dir.join("none.tar.gz")),
+        "--expect-ref",
+        MAIN,
+        "--verify-only",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("expected one .deb file in"),
+        "{}",
+        text(&out.stderr)
+    );
+}
