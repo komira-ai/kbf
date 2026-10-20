@@ -11,6 +11,7 @@ use clap::Parser;
 use serde_json::{Value, json};
 
 use super::api::{Operator, Reply, Request};
+use super::observe::NoObserve;
 use super::update::{finish, installer_exit, request_id, run};
 use super::{Check, Clock, Env, NoCheck, NoProbe, NoSmoke, Options};
 use crate::cli::{Cli, Verb};
@@ -131,6 +132,7 @@ fn go(api: &Api, nodes: bool) -> (Exit, Value) {
         smoke: &NoSmoke,
         check: &check as &dyn Check,
         probe: &NoProbe,
+        observe: &NoObserve,
     };
     let mut out = Vec::new();
     let exit = finish(&env, &options(nodes), &mut out);

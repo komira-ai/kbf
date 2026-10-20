@@ -172,6 +172,12 @@ fn the_api_and_the_token_default_to_the_proxy_the_host_names() {
         assert_eq!(config.api.as_deref(), Some(api), "{listen}");
         assert_eq!(config.token_file, Some(TOKEN.into()), "{listen}");
         assert_eq!(config.api_ca, None);
+        // The proxy table places the children the gates observe.
+        assert_eq!(
+            config.observe_base_port.as_deref(),
+            Some("18000"),
+            "{listen}"
+        );
     }
 }
 

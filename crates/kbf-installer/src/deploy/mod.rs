@@ -382,6 +382,8 @@ pub fn update_frontend(env: &Env, opts: &Options) -> (Summary, Exit) {
         env,
         opts,
         sum: Summary::new(&opts.commit, env.clock.now()),
+        gates: Gates::new(false),
+        observed: None,
         expected: BTreeMap::new(),
     };
     let outcome = run.step("frontend", |r| r.update_frontend());

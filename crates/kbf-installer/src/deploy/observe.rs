@@ -142,6 +142,15 @@ pub trait Observe {
     fn resolve(&self, serving: Option<Slot>) -> Result<Observed<'_>, String>;
 }
 
+/// No frontend to observe: for a verb that runs no gates (`update`). Resolving is an error.
+pub struct NoObserve;
+
+impl Observe for NoObserve {
+    fn resolve(&self, _: Option<Slot>) -> Result<Observed<'_>, String> {
+        Err("this verb observes no frontend".to_owned())
+    }
+}
+
 /// One fixed address (`--observe`): a frontend that does not move.
 pub struct Fixed {
     pub addr: SocketAddr,

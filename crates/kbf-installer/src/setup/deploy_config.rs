@@ -253,6 +253,9 @@ pub fn resolve(
         api_server_name: want.server_name.clone(),
         token_file: Some(token_file.into()),
         stage: Some(want.stage.word().to_owned()),
+        // The gates read the frontend proxy's children, which the `[proxy.upstream]` table
+        // places; with no table here the operator gives `--observe-base-port` to `deploy`.
+        observe_base_port: proxy.map(|p| p.upstream.base_port.to_string()),
         ..HostConfig::default()
     }))
 }
@@ -343,6 +346,11 @@ pub fn plan(exec: &dyn Exec, ctx: &Ctx, want: &HostConfig) -> Result<Outcome, Se
         api_server_name: want.api_server_name.clone(),
         token_file: want.token_file.clone(),
         stage: want.stage.clone(),
+        // Setup's own derivation wins; an operator's value stays when it derived none.
+        observe_base_port: want
+            .observe_base_port
+            .clone()
+            .or_else(|| current.as_ref().and_then(|c| c.observe_base_port.clone())),
         ..current.unwrap_or_default()
     };
     let view = View(exec);

@@ -654,14 +654,18 @@ fn the_config_setup_writes_is_all_a_deploy_needs() {
         api_server_name: Some("farm.example".to_owned()),
         token_file: Some(rig.token.clone()),
         stage: Some("gamma".to_owned()),
+        observe_base_port: Some("18000".to_owned()),
         ..HostConfig::default()
     };
     fs::write(&config, written.render()).unwrap();
     fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
     let lock = rig.dir.join("deploy.lock");
+    let result = rig.dir.join("result.json");
     let args = [
         "--commit",
         &rig.commit,
+        "--result",
+        result.to_str().unwrap(),
         "--config",
         config.to_str().unwrap(),
         "--lock",
