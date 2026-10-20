@@ -48,8 +48,8 @@ ExecStartPre=+/usr/bin/kbf-installer boot-check
 # and exits 2 for those. Anything that can become ready later (a listen address, a peer,
 # a DNS name, a mount) is not refused here: it exits 75 (not ready, restarted), so a check
 # that runs before the bind retry never leaves the unit down for good (kbf#998, #1000).
-ExecStartPre=/var/lib/kbf-installer/current/kbf --mode=all-in-one --check
-ExecStart=/var/lib/kbf-installer/current/kbf --mode=all-in-one
+ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=all-in-one --check
+ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=all-in-one
 # kbf drains on SIGTERM: new Execute calls are refused, open streams run until their
 # action is done (Buck2 does not recover a stream that breaks), with no deadline, then
 # the server exits. A stop that ends sooner fails every build in flight, so systemd sends

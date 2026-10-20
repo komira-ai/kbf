@@ -155,6 +155,10 @@ struct State {
     credentials: Option<(String, String)>,
     /// The signing regions of the requests so far.
     regions: std::collections::BTreeSet<String>,
+    /// The next AbortMultipartUpload is to be held ([`FakeS3::hold_next_abort`]).
+    hold_abort: bool,
+    /// AbortMultipartUpload requests held and not yet dropped.
+    held_aborts: usize,
 }
 
 /// An S3 service on loopback (module docs). It serves until the runtime it was
@@ -240,6 +244,20 @@ impl FakeS3 {
         self.lock().failures.push(failure);
     }
 
+    /// Holds the next AbortMultipartUpload request unanswered and unhandled: the
+    /// request is read, then waits for its caller to close the connection (it went
+    /// away) and is dropped, never having reached the store. Once.
+    pub fn hold_next_abort(&self) {
+        self.lock().hold_abort = true;
+    }
+
+    /// AbortMultipartUpload requests held by [`FakeS3::hold_next_abort`] and not yet
+    /// dropped.
+    #[must_use]
+    pub fn held_aborts(&self) -> usize {
+        self.lock().held_aborts
+    }
+
     /// Multipart uploads begun and neither completed nor aborted.
     #[must_use]
     pub fn incomplete_uploads(&self) -> usize {
@@ -301,6 +319,20 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<State>>) -> Option<()> {
         let rest = buf.split_off(head_end + len);
         request.body = buf.split_off(head_end);
         buf = rest;
+        let held = {
+            let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+            let abort = request.method == "DELETE" && request.query.contains_key("uploadId");
+            let held = abort && std::mem::take(&mut state.hold_abort);
+            state.held_aborts += usize::from(held);
+            held
+        };
+        if held {
+            // Until the caller closes the connection; then the request is lost.
+            let _ = tokio::io::copy(&mut sock, &mut tokio::io::sink()).await;
+            let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.held_aborts -= 1;
+            return None;
+        }
         let answer = {
             let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
             handle(&mut state, &request)
