@@ -99,8 +99,8 @@ jobs:
   # `coverage-floors` (crates/kbf-coverage): every crate must reach 99.00% of lines and
   # 99.00% of branches, or the floor its line in that file lists for it (the crates under
   # 99% today, each with an open issue). A floor may only rise: the last step fails a pull
-  # request whose file lowers one. The gate is measured on this set only: no Postgres,
-  # S3, crun, root or Mac test is in it.
+  # request whose file lowers one. The gate is measured on the fast set plus the Postgres
+  # tests (a throwaway server, below): no S3, crun, root or Mac test is in it.
   # Branch coverage (`--branch`, rustc's `-Zcoverage-options=branch`) is unstable, so this
   # job alone builds with a pinned nightly; every other job stays on the toolchain in
   # rust-toolchain.toml. The nightly may warn where stable does not, so `-D warnings` is off
@@ -110,7 +110,20 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # The same throwaway server as beta.yml's state-postgres job, so the Postgres tests count.
+    services:
+      postgres:
+        image: postgres@sha256:2a0d0fe14825b0939f78a8cad5cd4e6aa68bf94d0e5dd96e24b6d23af4315545
+        env:
+          POSTGRES_PASSWORD: kbf-ci-throwaway
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     env:
+      KBF_TEST_POSTGRES_URL: postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres
+      # pg_dump and pg_restore for the installer's backup test come from here.
+      KBF_TEST_PG_BIN: /usr/lib/postgresql/17/bin
       RUSTFLAGS: ""
       COVERAGE_TOOLCHAIN: nightly-2026-10-01
       LLVM_COV_VERSION: 0.9.1
@@ -147,11 +160,50 @@ jobs:
       # writing them for kbf-front's async service methods (LLVM 23.1 in this nightly;
       # it looks like LLVM issue 220574). Lines and branches, all the gate reads, are
       # unaffected: their totals match llvm-cov's own text report.
+      # pg_dump and pg_restore as new as the server (17), because a dump tool older than
+      # its server refuses to run. The runner image has no PostgreSQL apt repository:
+      # postgresql-common's own script adds the project's (with its signing key) and
+      # updates the package lists.
+      - run: sudo apt-get install -y --no-install-recommends postgresql-common
+      - run: sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+      - run: sudo apt-get install -y --no-install-recommends postgresql-client-17
       - run: mkdir -p target/coverage
       - name: Run the fast tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --profile pr
+      # The tests that need the server, as beta.yml's state-postgres job runs them (they are
+      # `#[ignore]`d, so the run above skips them); their counters join the run's in the
+      # report below. The kbf-state step builds with its `postgres` feature; the steps after
+      # it select tests of the workspace build by filter, not by `-p ... --test`: a build of
+      # one package leaves out the dev-dependency features of the others, so it would build
+      # kbf-installer again without `test-sandbox` and put a copy of its code in the report
+      # that no test runs. The installer's backup round trip
+      # (backup::tests::real_server_round_trip) is in the installer filter.
+      - name: Run the Postgres tests of kbf-state under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-state --features postgres -- --include-ignored
+      - name: Run the installer's Postgres tests under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored all -E 'package(kbf-installer) & (test(database::) or test(setup_creates_the_schema) or test(backup::tests::real_server_round_trip))'
+      - name: Run the server's Postgres tests under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored all -E 'package(kbf-server) & binary(state_store_postgres)'
+      - name: Run the server's restart tests over Postgres under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored all -E 'package(kbf-server) & binary(state_store) & test(over_postgres)'
+      - name: Run the two-children swap over Postgres under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored all -E 'package(kbf-server) & binary(frontend) & test(two_children::fifty_builds_across_a_takeover_over_postgres)'
+      - name: Run the frontend process test over Postgres under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored all -E 'package(kbf-cli) & binary(frontend_process) & test(postgres_state_store)'
       - name: Report
         env:
           LLVM_COV_FLAGS: -skip-functions
