@@ -198,8 +198,14 @@ fn evidence_refuses_a_job_list_it_cannot_trust() {
     let verify = ("verify", "success");
     let rows = jobs(&[verify, ("publish", "success")])["jobs"].clone();
     let cases = [
-        (Some(jobs(&[verify, ("deliver", "success")])), "no job named publish"),
-        (Some(json!({ "total_count": 150, "jobs": rows })), "not whole"),
+        (
+            Some(jobs(&[verify, ("deliver", "success")])),
+            "no job named publish",
+        ),
+        (
+            Some(json!({ "total_count": 150, "jobs": rows })),
+            "not whole",
+        ),
         (Some(json!({ "jobs": rows })), "not whole"),
         (Some(json!({})), "not whole"),
         (None, "are gone"),

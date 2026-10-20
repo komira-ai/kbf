@@ -396,9 +396,8 @@ fn held_steps_check_every_name_and_fill_every_placeholder() {
         assert!(!left, "{placeholder}");
     }
     assert!(lines.contains(&sudoers_line(USER).unwrap()));
-    let refused = |repo: &str, host: &str, user: &str, tag: &str| {
-        usage(held_steps(repo, host, user, tag))
-    };
+    let refused =
+        |repo: &str, host: &str, user: &str, tag: &str| usage(held_steps(repo, host, user, tag));
     has(&refused("kbf", HOST, USER, TAG), "--repo");
     has(&refused(REPO, "198.51.100.7", USER, TAG), "--host");
     has(&refused(REPO, HOST, "root", TAG), "--user");

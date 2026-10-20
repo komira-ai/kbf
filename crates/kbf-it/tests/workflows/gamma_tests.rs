@@ -472,7 +472,10 @@ fn the_stage_file_lists_gamma_as_an_actions_stage_with_its_jobs() {
     let root = crate::repo_root();
     let stages = std::fs::read_to_string(root.join(super::stages::STAGE_FILE)).expect("stages");
     let workflows = workflow_files();
-    assert_eq!(super::stages::check(&stages, &workflows), Vec::<String>::new());
+    assert_eq!(
+        super::stages::check(&stages, &workflows),
+        Vec::<String>::new()
+    );
     assert!(stages.contains("gamma.yml#offer"));
     assert!(stages.contains("gamma.yml#deploy"));
     let checked = |change: &dyn Fn(&str) -> String| {
