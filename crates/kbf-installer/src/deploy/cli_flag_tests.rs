@@ -778,13 +778,12 @@ fn an_offer_on_standard_input_is_judged_before_the_farm_is_asked() {
     let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
     assert_eq!(line["reason"], "offer_missing");
     assert!(line.get("offer").is_none(), "{out}");
-    if current_uid() == 0 {
-        return;
-    }
+    // A settings file the host refuses whoever owns it (the unprivileged user is never root),
+    // so this holds for any uid the test runs as.
     let layout = crate::layout::Layout::linux(kbf_host::Root::new(&rig.dir).unwrap());
     let settings = layout.join(&layout.settings());
     fs::create_dir_all(settings.parent().unwrap()).unwrap();
-    fs::write(&settings, "RUN_AS_UID=65534\n").unwrap();
+    fs::write(&settings, "RUN_AS_UID=0\n").unwrap();
     let (code, out, err) = go(&[(&release, b"tarball"), ("offer.json", offer.as_slice())]);
     assert_eq!((code, out.as_str()), (2, ""), "{err}");
 }

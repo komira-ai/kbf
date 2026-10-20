@@ -18,9 +18,11 @@
 //!   the unprivileged user, names the offer's `meta_log` in `--version --json` (a mismatch refuses, and so does
 //!   an offer that claims a number where the binary names none, or the reverse);
 //! - every platform the farm runs is one the offer found complete;
-//! - an offer that claims `reversible` is borne out by the build this host runs now: its
-//!   `meta_log` is at least the offer's ([`check_reversible`]). An offer that claims no
-//!   reversibility is not asked: an irreversible release is deployed, and recorded as one.
+//!
+//! An offer that claims `reversible` is also asked of the build this host runs now: it is
+//! reversible only if that build's `meta_log` is at least the offer's
+//! ([`check_reversible`]). This refuses nothing. A claim the host cannot bear out is
+//! deployed and recorded as `host_reversible: false`; an irreversible release is never held.
 //!
 //! The offer is a file (`--offer offer.json`) or the bundle's own `offer.json`
 //! (`--offer -`, [`OfferPolicy::InBundle`]); the checks are the same. A caller through
@@ -381,35 +383,30 @@ pub(super) fn check_platforms<'a>(
     ))
 }
 
-/// An offer that claims `reversible` is borne out by the build this host runs now.
+/// The host's own word on an offer that claims `reversible`: does the build this host runs
+/// now bear the claim out? `Some(true)` if so, `Some(false)` if not, `None` when the offer
+/// claims no reversibility (the probe is not called).
 ///
 /// The offer's `previous` and `previous_meta_log` are its author's word about a farm the
 /// author could not see, so the host does not take them. Going back from the offered build
 /// to the one this host runs is reversible only if `meta_log(offered) <= meta_log(running)`,
 /// and the host reads the second number from its own `current` build. Unknown is never
-/// reversible, so a running build that names no `meta_log`, or cannot be asked, bears out
-/// nothing, and the claim is refused as `offer_reversible_overclaim`.
+/// reversible: a running build that names no `meta_log`, or cannot be asked, gives
+/// `Some(false)`.
 ///
-/// An offer that claims no reversibility is not asked and the probe is not called: an
-/// irreversible release is deployed all the same, recorded as the offer says. `Ok(Some(true))`
-/// is a claim that held; `Ok(None)` is no claim to check.
+/// This never refuses. An irreversible release is deployed all the same, and the answer is
+/// recorded as `host_reversible` for the bake's hand-off and the release notes, which must
+/// treat the release as one that cannot be rolled back. Holding a release for it would stop
+/// every following release too, since each makes the same claim against the same host.
 ///
 /// This is the frontend host's build only. A node at another commit than this host's
 /// `current` one is not covered.
-pub fn check_reversible(doc: &OfferDoc, probe: &dyn Probe) -> Result<Option<bool>, Refused> {
+pub fn check_reversible(doc: &OfferDoc, probe: &dyn Probe) -> Option<bool> {
     if !doc.reversible {
-        return Ok(None);
+        return None;
     }
-    let offered = doc.meta_log;
-    let detail = match probe.running_meta_log() {
-        Ok(held) if reversible(offered, held) => return Ok(Some(true)),
-        Ok(held) => format!("this host runs meta_log {held:?}, the offer's {offered:?}"),
-        Err(ProbeFault::Unattested(e) | ProbeFault::Failed(e)) => e,
-    };
-    Err(refuse(
-        "offer_reversible_overclaim",
-        format!("the offer claims it is reversible, but {detail}"),
-    ))
+    let answer = probe.running_meta_log();
+    Some(answer.is_ok_and(|held| reversible(doc.meta_log, held)))
 }
 
 /// Why a probe gave no answer.
@@ -436,7 +433,7 @@ pub trait Probe {
     /// The `meta_log` of `kbf --version --json` of the build this host runs now (its
     /// `current` release), which an offer that claims `reversible` is checked against
     /// ([`check_reversible`]). `Ok(None)` is a build that names none. A probe that cannot
-    /// say gives the default, which refuses such an offer.
+    /// say gives the default, which reads as not reversible.
     fn running_meta_log(&self) -> Result<Option<u64>, ProbeFault> {
         Err(ProbeFault::Failed(
             "this build cannot read the running meta_log".to_owned(),

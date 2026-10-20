@@ -135,8 +135,8 @@ fn an_offer_in_the_bundle_lets_the_deploy_through_and_is_recorded() {
 /// irreversible release refused or held (it deploys, recorded as irreversible), and a host
 /// that reads its running build whatever the offer claims.
 ///
-/// Mutants to plant: `check_reversible` refusing an offer with `reversible: false`; the
-/// early return for `reversible: false` removed (the probe is asked).
+/// Mutants to plant: `check_reversible` answering `Some(false)` for an offer that claims no
+/// reversibility; the early return for `reversible: false` removed (the probe is asked).
 #[test]
 fn an_irreversible_offer_is_deployed_and_the_host_is_not_asked() {
     let mut fields = Fields::good();
@@ -153,18 +153,19 @@ fn an_irreversible_offer_is_deployed_and_the_host_is_not_asked() {
     }
 }
 
-/// Proves a claim of `reversible` is refused (`offer_reversible_overclaim`, exit 3, the farm
-/// untouched) unless the build this host runs has a `meta_log` at least the offer's, for a
-/// file's offer and the bundle's alike. The offer's own numbers (4 against a
-/// `previous_meta_log` of 5) are not what is checked: running 3 is below, running none is
-/// unknown, and a probe that cannot say (either fault) is unknown too. Running 4 (equal) and 9
-/// pass. Catches the check skipped, unknown or an error read as reversible, and the boundary
-/// off by one.
+/// Proves a claim of `reversible` the host cannot bear out never holds the release: the
+/// deploy goes through, exit 0 and every file uploaded, and the summary says
+/// `host_reversible: false` where the host runs a build with a `meta_log` below the offer's
+/// (3 against 4), a build that names none, or cannot be asked (either fault); it says `true`
+/// at 4 (equal) and 9. The offer's own numbers (4 against a `previous_meta_log` of 5) are not
+/// what is checked. File's offer and the bundle's alike. Catches an irreversible release held
+/// (the next release would be held too, against the same host), unknown or an error read as
+/// reversible, and the boundary off by one.
 ///
 /// Mutants to plant: `check_reversible` not called; `Ok(None)` read as reversible; `<` for
-/// `<=`; a probe error read as reversible.
+/// `<=`; a probe error read as reversible; any of the four cases refused again.
 #[test]
-fn a_claim_of_reversible_the_running_build_does_not_bear_out_is_refused() {
+fn a_claim_of_reversible_the_running_build_does_not_bear_out_is_deployed_as_not_reversible() {
     let cases: [(Result<Option<u64>, ProbeFault>, bool); 6] = [
         (Ok(Some(3)), false),
         (Ok(None), false),
@@ -178,13 +179,9 @@ fn a_claim_of_reversible_the_running_build_does_not_bear_out_is_refused() {
             let probe = Both::new(Some(4), running.clone());
             let (f, s) = deploy_probing(under, Some(bundle), &probe);
             let held = s.offer.as_ref().and_then(|o| o.host_reversible);
-            if bears_out {
-                assert_eq!((s.exit, s.reason.as_str()), (0, ""), "{}", s.line());
-                assert_eq!(held, Some(true), "{}", s.line());
-            } else {
-                refused(&f, &s, "offer_reversible_overclaim");
-                assert_eq!(held, None, "{}", s.line());
-            }
+            assert_eq!((s.exit, s.reason.as_str()), (0, ""), "{}", s.line());
+            assert_eq!(f.requests("PUT"), 2, "{}", s.line());
+            assert_eq!(held, Some(bears_out), "{}", s.line());
             assert_eq!(probe.asked.get(), 1);
         }
     }
@@ -255,9 +252,10 @@ fn the_bundle_must_carry_a_readable_offer() {
 }
 
 /// Proves a plan (no `--apply`) with an offer in the bundle runs the checks an apply runs: the
-/// good bundle plans and records the host's confirmation, and a claim the running build does
-/// not bear out and an offer for another commit are each refused, with nothing uploaded and no
-/// update asked for. Catches the offer or the reversibility check run only when applying.
+/// good bundle plans and records the host's confirmation, a claim the running build does not
+/// bear out plans too and is recorded as not reversible, and an offer for another commit is
+/// refused, with nothing uploaded and no update asked for. Catches the offer or the
+/// reversibility check run only when applying.
 ///
 /// Mutant to plant: the checks of the bundle's offer made `apply`-only.
 #[test]
@@ -272,11 +270,86 @@ fn a_plan_with_an_offer_in_the_bundle_runs_the_same_checks() {
     assert_eq!((f.requests("PUT"), f.requests("POST")), (0, 0));
     assert_eq!(s.offer.unwrap().host_reversible, Some(true));
     let (f, s) = plan(&Fields::good(), Some(3));
-    refused(&f, &s, "offer_reversible_overclaim");
+    assert_eq!((s.exit, s.reason.as_str()), (0, ""), "{}", s.line());
+    assert_eq!((f.requests("PUT"), f.requests("POST")), (0, 0));
+    assert_eq!(s.offer.unwrap().host_reversible, Some(false));
     let mut other = Fields::good();
     other.commit = OLD;
     let (f, s) = plan(&other, Some(5));
     refused(&f, &s, "offer_wrong_commit");
+}
+
+/// Proves an `offer.json` in the bundle is read only under `--offer -`: under a file's offer,
+/// `--no-offer` and no offer at all, the deploy is refused as a bad bundle (exit 2) before
+/// anything is uploaded, as any stray entry is. Catches an offer in the bundle silently
+/// ignored while the deploy is judged by another (or none).
+///
+/// Mutant to plant: the stray entry let through under the policies that do not read it.
+#[test]
+fn an_offer_in_the_bundle_is_refused_under_a_policy_that_does_not_read_it() {
+    let offer = offer_of(&Fields::good());
+    let policies = [
+        policy(Stage::Gamma, Fields::good().doc()),
+        OfferPolicy::Waived(Stage::Gamma),
+        OfferPolicy::Unchecked,
+    ];
+    for under in policies {
+        let probe = Both::new(Some(4), Ok(Some(5)));
+        let (f, s) = deploy_probing(under, Some(bundle_carrying(Some(&offer))), &probe);
+        assert_eq!(
+            (s.exit, s.reason.as_str()),
+            (2, "bad_bundle"),
+            "{}",
+            s.line()
+        );
+        assert_eq!((f.requests("PUT"), f.requests("POST")), (0, 0));
+        assert_eq!(probe.asked.get(), 0);
+    }
+}
+
+/// Proves a deploy whose policy takes the offer from the bundle stops, as `offer_missing`,
+/// when it is asked for that offer before the bundle was read, in the bundle check and in the
+/// preflight alike: the gate does not pass for want of an offer. The run cannot get there
+/// through `deploy`, so the test builds the run and asks. Catches a gate that treats a missing
+/// offer as no offer to check.
+///
+/// Mutants to plant: the `(InBundle, None)` arm of `offer_in_force` returning `Ok(None)`.
+#[test]
+fn a_bundle_offer_not_yet_read_stops_the_checks_that_need_it() {
+    let f = farm(two_nodes());
+    let mut o = opts(true);
+    o.offer = in_bundle();
+    let clock = Clk(f.now.clone());
+    let (smoke, check) = (FixedSmoke(SmokeResult::Pass), FixedCheck(Ok(true)));
+    let observed = Obs(&f);
+    let probe = NeverRunning(Some(4));
+    let env = Env {
+        api: &f,
+        observe: &observed,
+        clock: &clock,
+        smoke: &smoke,
+        check: &check,
+        probe: &probe,
+    };
+    let mut run = Run {
+        env: &env,
+        opts: &o,
+        sum: Summary::new(&o.commit, clock.now()),
+        gates: Gates::new(true),
+        observed: None,
+        expected: BTreeMap::new(),
+        offer_doc: None,
+    };
+    let bytes = good_bundle();
+    let read = bundle::read_bundle(&bytes[..], &o.commit).unwrap();
+    let at_check = run.check_offer_bundle(&read);
+    let at_preflight = run.preflight();
+    for outcome in [at_check, at_preflight] {
+        let stopped = outcome.expect_err("no offer to check by");
+        assert_eq!(stopped.reason, "offer_missing");
+        assert_eq!(stopped.exit.code(), 3);
+    }
+    assert_eq!(f.requests("PUT"), 0);
 }
 
 /// Proves the platforms an offer in the bundle found complete are checked against the farm's,

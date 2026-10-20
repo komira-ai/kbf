@@ -284,14 +284,20 @@ pub(crate) struct Run<'a> {
 }
 
 impl Run<'_> {
-    /// The stage and the offer this deploy runs under, once there is one: a file's from the
-    /// start, the bundle's once the bundle is read.
-    fn offer_in_force(&self) -> Option<(Stage, &OfferDoc)> {
-        let from_bundle = self.offer_doc.as_ref();
-        match &self.opts.offer {
-            OfferPolicy::Offer { stage, doc, .. } => Some((*stage, doc.as_ref())),
-            OfferPolicy::InBundle { stage, .. } => from_bundle.map(|doc| (*stage, doc)),
-            _ => None,
+    /// The stage and the offer this deploy runs under: a file's from the start, the bundle's
+    /// once the bundle is read, none under the other policies. A policy that takes its offer
+    /// from the bundle, asked before that offer was read, is `offer_missing`: a gate that
+    /// cannot find its offer stops the run, it does not pass.
+    fn offer_in_force(&self) -> Result<Option<(Stage, &OfferDoc)>, Fail> {
+        match (&self.opts.offer, &self.offer_doc) {
+            (OfferPolicy::Offer { stage, doc, .. }, _) => Ok(Some((*stage, doc.as_ref()))),
+            (OfferPolicy::InBundle { stage, .. }, Some(doc)) => Ok(Some((*stage, doc))),
+            (OfferPolicy::InBundle { .. }, None) => Err(fail(
+                Exit::Refused,
+                "offer_missing",
+                "the bundle's offer was not read before it was needed",
+            )),
+            _ => Ok(None),
         }
     }
 
@@ -479,9 +485,17 @@ impl Run<'_> {
 
     /// `--offer -`: the offer is the bundle's own `offer.json`. Read it, record it in the
     /// summary at once (so a refusal below carries it), and judge it as a file's is: the stage,
-    /// the commit and the age. Any other policy is left as it is.
+    /// the commit and the age. Under any other policy the bundle must not carry an
+    /// `offer.json` at all: an offer that is there but not the one judged is a stray entry.
     fn read_bundle_offer(&mut self, bundle: &bundle::Bundle) -> Result<(), Fail> {
         let OfferPolicy::InBundle { stage, max_age } = &self.opts.offer else {
+            if bundle.offer.is_some() {
+                return Err(fail(
+                    Exit::Usage,
+                    "bad_bundle",
+                    "the bundle carries offer.json, which only --offer - reads",
+                ));
+            }
             return Ok(());
         };
         let entry = bundle.offer.as_deref();
@@ -498,7 +512,7 @@ impl Run<'_> {
     /// set, the files and the staged `kbf`'s `meta_log`, then a claim of `reversible` against
     /// the build this host runs. With no offer there is nothing to ask.
     fn check_offer_bundle(&mut self, bundle: &bundle::Bundle) -> Result<(), Fail> {
-        let Some((stage, doc)) = self.offer_in_force() else {
+        let Some((stage, doc)) = self.offer_in_force()? else {
             return Ok(());
         };
         let probe = self.env.probe;
@@ -510,9 +524,10 @@ impl Run<'_> {
             probe,
         )
         .map_err(refused)?;
-        // The record the offer step made, with the host's own word on `reversible` added.
+        // The record the offer step made, with the host's own word on `reversible` added. It
+        // never stops the deploy: an irreversible release is deployed and recorded as one.
         let mut record = OfferRecord::of(stage.word(), doc);
-        record.host_reversible = offer::check_reversible(doc, probe).map_err(refused)?;
+        record.host_reversible = offer::check_reversible(doc, probe);
         self.sum.offer = Some(record);
         Ok(())
     }
@@ -603,7 +618,7 @@ impl Run<'_> {
                 format!("no platform for {}", unknown.join(", ")),
             ));
         }
-        if let Some((_, doc)) = self.offer_in_force() {
+        if let Some((_, doc)) = self.offer_in_force()? {
             offer::check_platforms(doc, &wanted).map_err(refused)?;
         }
         let releases = self.get_json("/v1/releases").map_err(io)?;

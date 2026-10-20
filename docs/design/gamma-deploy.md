@@ -96,7 +96,9 @@ release it is about to move is the one the offer is for. Nothing is taken from a
   (`--offer -`, which needs `--bundle -`, and is the only form `sudo` allows). In the bundle it
   is the entry named exactly `offer.json`: one entry, not empty, at most 64 KiB, read and not
   uploaded (`Offer.json` and `offer.json.attestation` are no release file, so they are exit 2
-  as any stray entry is). Either way it is parsed only through the validated `OfferDoc` parse,
+  as any stray entry is). An `offer.json` in a bundle given to any other deploy (a file's offer,
+  `--no-offer`) is refused too, as a bad bundle, exit 2: an offer that is there but not the one
+  judged is not ignored. Either way it is parsed only through the validated `OfferDoc` parse,
   and every check below is the same. A bundle with no such entry is refused as `offer_missing`
   and one whose entry is not an offer as `offer_unreadable`; neither repeats what the entry
   held. The bundle's offer can be read only once the bundle is, so the `offer` step passes for
@@ -129,17 +131,19 @@ release it is about to move is the one the offer is for. Nothing is taken from a
   probe all run (they only read and write a scratch directory, and run an attested binary as
   the unprivileged user); only the upload and the update are skipped. A dry run therefore
   cannot say OK for a bundle the apply would refuse.
-- **Reversibility**: an offer that claims `reversible: true` is checked against the build this
-  host runs now. The host runs `<current release>/kbf --version --json` as the installer's
-  `RUN_AS` user (never root; as itself in a plan) and takes its `meta_log`; the claim holds only
-  if the offer's `meta_log` is at most that number. A running build that names none, or does
-  not answer, is unknown, and unknown is not reversible: the claim is refused as
-  `offer_reversible_overclaim` before the first upload. A claim that holds is recorded as
-  `offer.host_reversible: true`. An offer that claims `reversible: false` is not asked: the
-  probe is not run, the deploy goes on, and the summary has no `host_reversible`. An
-  irreversible release is deployed all the same; it is the bake that must know it cannot go
-  back. The offer's `previous` and `previous_meta_log` stay the author's word: they are
-  recorded, never checked against the farm.
+- **Reversibility**: an offer that claims `reversible: true` is asked of the build this host
+  runs now, for a file's offer and the bundle's alike. The host runs
+  `<current release>/kbf --version --json` as the installer's `RUN_AS` user (never root; as
+  itself in a plan) and takes its `meta_log`; the claim holds only if the offer's `meta_log` is
+  at most that number. The host's answer is recorded as `offer.host_reversible`: `true` where
+  it holds, `false` where the running build is below, names none or does not answer (unknown
+  is not reversible). This never refuses a deploy: a release is deployed whether or not it can
+  be rolled back, because holding it would hold the next one too (it makes the same claim
+  against the same host). The bake's hand-off and the release notes read `host_reversible`,
+  not the offer's `reversible`, to know whether a rollback is possible. An offer that claims
+  `reversible: false` is not asked: the probe is not run, and the summary has no
+  `host_reversible`. The offer's `previous` and `previous_meta_log` stay the author's word:
+  they are recorded, never checked against the farm.
 - **What the offer does not prove.** It is an unsigned record. `host_reversible` reads the build
   of the frontend host only: a node still at another commit than the host's `current` one is
   not covered, so the bake must not treat `reversible` as proof that a rollback works on every
@@ -152,13 +156,15 @@ release it is about to move is the one the offer is for. Nothing is taken from a
 - **Platforms**: every platform the farm runs (the nodes' and the host's) is one the offer found
   complete (`offer_platform`).
 
-All of them are checked before the first upload, in the steps `offer` (stage, commit, age of a
-file's offer), then `bundle` (a bundle's offer, set, files, `meta_log`, `reversible`) and
-`preflight` (platforms); a refusal is exit 3 and the farm is untouched. The summary's `offer`
-object carries the offer's `commit`, `set_hash`, `created`, `reversible`, `previous`, `meta_log`
-and `previous_meta_log`, copied from the validated document, and the host's own `host_reversible`
-when it confirmed the claim, for the bake's hand-off file; the deploy does not write that file
-itself. Not built: the offer
+All of them but the platforms are checked before the first upload, in the steps `offer` (stage,
+commit, age of a file's offer) and `bundle` (a bundle's offer, set, files, `meta_log`, and the
+host's word on `reversible`, which refuses nothing). The platforms are checked in `preflight`,
+which runs after the bundle's files are stored: an `offer_platform` refusal (exit 3) comes after
+the uploads, which only add files under the commit's key. Every other offer refusal is exit 3 and
+the store is untouched. The summary's `offer` object carries the offer's `commit`, `set_hash`,
+`created`, `reversible`, `previous`, `meta_log` and `previous_meta_log`, copied from the
+validated document, and the host's own `host_reversible` where the offer claims `reversible`,
+for the bake's hand-off file; the deploy does not write that file itself. Not built: the offer
 does not yet bound the generation (`expect_generation`), which stays with the update API.
 
 ## Steps
