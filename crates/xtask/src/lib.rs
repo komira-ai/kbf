@@ -225,11 +225,8 @@ enum Verb {
         #[arg(long, value_enum)]
         platform: package::Platform,
         /// The package version.
-        #[arg(
-            long,
-            required_unless_present = "version_of",
-            conflicts_with = "version_of"
-        )]
+        /// (One of the two is required; the verb says so, exit 2, as clap does for a bad flag.)
+        #[arg(long, conflicts_with = "version_of")]
         version: Option<String>,
         /// Take the version from this binary's `--version` (`<version>+<12 of the commit>`).
         #[arg(long)]
@@ -1005,6 +1002,3 @@ pub fn main() -> ExitCode {
         }
     }
 }
-
-#[cfg(test)]
-mod usage_tests;

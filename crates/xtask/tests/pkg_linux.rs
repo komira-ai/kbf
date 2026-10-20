@@ -225,6 +225,12 @@ fn pkg_config_takes_the_version_from_the_binary_or_from_the_flag_and_not_both() 
     assert_eq!(both.status.code(), Some(2), "{}", text(&both.stderr));
     let neither = run(&[], "neither");
     assert_eq!(neither.status.code(), Some(2), "{}", text(&neither.stderr));
+    assert!(
+        text(&neither.stderr).contains("--version or --version-of"),
+        "{}",
+        text(&neither.stderr)
+    );
+    assert!(!dir.join("neither").exists());
 }
 
 #[test]
