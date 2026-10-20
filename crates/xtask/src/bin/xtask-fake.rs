@@ -42,6 +42,8 @@
 //! - Run as `gh api <path>`, it prints the value under the key `<path>` of the JSON
 //!   object in `gh-api.json` next to it, or `gh: Not Found (HTTP 404)` on stderr and
 //!   exits 1 when there is none: the GitHub API, as a test wrote it.
+//!   An answer of the form `{"$sequence": [a, b, ...]}` is `a` on the first call of that
+//!   path, `b` on the next, and the last one from then on.
 //! - Run as `gh api <path> -X POST --input -`, it reads a JSON body on stdin. For
 //!   `repos/<repo>/git/tags` it stores a tag object under `repos/<repo>/git/tags/<id>` (its
 //!   tagger is `komira-release-bot[bot]`) and answers `{"sha": <id>}`. For
@@ -382,9 +384,10 @@ fn api(dir: &Path, path: &str) -> ExitCode {
         eprintln!("gh: Error (HTTP {code})");
         return ExitCode::FAILURE;
     }
-    match api_store(dir).get(path) {
+    let mut store = api_store(dir);
+    match store.get(path).cloned() {
         Some(answer) => {
-            println!("{answer}");
+            println!("{}", next_answer(dir, &mut store, path, answer));
             ExitCode::SUCCESS
         }
         None => {
@@ -392,6 +395,29 @@ fn api(dir: &Path, path: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The answer to give now: `answer` itself, or, when it is `{"$sequence": [a, b, ...]}`, `a`,
+/// which is dropped from the store for the next call unless it is the last (a state that
+/// changes between two looks: a run that is going, then done).
+fn next_answer(
+    dir: &Path,
+    store: &mut serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    answer: serde_json::Value,
+) -> serde_json::Value {
+    let Some(steps) = answer.get("$sequence").and_then(|s| s.as_array()) else {
+        return answer;
+    };
+    let first = steps[0].clone();
+    if steps.len() > 1 {
+        store.insert(
+            path.to_owned(),
+            serde_json::json!({ "$sequence": steps[1..] }),
+        );
+        write_answers(dir, store.clone());
+    }
+    first
 }
 
 /// A tag object as the API stores it: the id is the hash of its parts.

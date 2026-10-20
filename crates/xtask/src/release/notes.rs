@@ -1,6 +1,8 @@
 //! `release notes`: the notes of a release, from the commits since the previous release
-//! and the gamma verdict that was checked (docs/design/kbf-cicd.md, section 8.1, item 3).
-//! A dry run shows them as an artifact of the verify job before anyone approves.
+//! and the verdict that was checked, of the stage [`super::verdict::GATE_STAGE`]
+//! (docs/design/kbf-cicd.md, section 8.1, item 3). A dry run shows them as an artifact of
+//! the verify job. What is not reversible is listed for every stage: nothing halts a release
+//! for it, so the notes are where it is said.
 
 use kbf_gate::{Floor, ResultDoc, Verdict};
 
@@ -53,14 +55,14 @@ fn render(doc: &ResultDoc, tag: &str, since: Option<&str>, commits: &[String]) -
         out.push_str(&format!("- and {} more\n", commits.len() - MAX_COMMITS));
     }
 
-    let mut gamma = Vec::new();
-    // A verified verdict has a finished, forward bake, so this always yields one line.
-    gamma.extend(
+    let mut detail = Vec::new();
+    // A Gamma verdict has a finished, forward bake; a Beta one has none.
+    detail.extend(
         bake_secs(doc)
             .flatten()
             .map(|secs| format!("bake: {}h {:02}m", secs / 3600, secs % 3600 / 60)),
     );
-    gamma.extend(doc.load.map(|l| {
+    detail.extend(doc.load.map(|l| {
         format!(
             "load: {}, {}, {}",
             floor("actions", l.actions),
@@ -75,12 +77,13 @@ fn render(doc: &ResultDoc, tag: &str, since: Option<&str>, commits: &[String]) -
         } else {
             ""
         };
-        gamma.push(format!("gate {}: {measured}{mark}", g.name));
+        detail.push(format!("gate {}: {measured}{mark}", g.name));
     }
     for w in &doc.waivers {
-        gamma.push(format!("waived {} by {}: {}", w.what, w.by, w.reason));
+        detail.push(format!("waived {} by {}: {}", w.what, w.by, w.reason));
     }
-    section(&mut out, "Gamma verdict", &gamma, "No detail recorded.");
+    let title = format!("{:?} verdict", doc.stage);
+    section(&mut out, &title, &detail, "No detail recorded.");
     section(
         &mut out,
         "Not reversible",
