@@ -22,12 +22,16 @@
 //! one is presented, decides who may call each path, tells the child who the caller is,
 //! routes each stream to the active child, keeps an upstream pool per (slot, generation,
 //! target) and runs the hold gate.
+//! `/readyz` is the proxy's own answer: it polls the active child's operator listener
+//! (`GET /readyz`, once a second) and is 200 only while the last poll of that child passed.
 
 // The I/O modules are not part of the loom build (`--cfg kbf_loom`): the models cover only
 // `slot`, and tokio and hyper are not loom-aware.
 pub mod auth;
 #[cfg(not(kbf_loom))]
 mod body;
+#[cfg(not(kbf_loom))]
+mod child_metrics;
 pub mod config;
 pub mod control;
 #[cfg(not(kbf_loom))]
@@ -45,6 +49,8 @@ mod limits;
 mod metrics;
 #[cfg(not(kbf_loom))]
 mod pool;
+#[cfg(not(kbf_loom))]
+mod probe;
 #[cfg(not(kbf_loom))]
 mod proxy;
 pub mod replay;

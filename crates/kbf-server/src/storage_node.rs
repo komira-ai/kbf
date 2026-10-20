@@ -1,8 +1,8 @@
 //! `kbf storage`: the storage node (`docs/design/architecture-v2.md`, sections 3 and 13
 //! P2). The cache the server has, the same stores and the same write tier, served over
 //! gRPC by [`kbf_storage::service`] and nothing else: no REAPI, no scheduler, no
-//! worker streams, no operator API, and no state store (the node reaches that only
-//! through a frontend, section 6).
+//! worker streams, no operator API (only `GET /metrics`, on `--metrics-listen` when
+//! given), and no state store (the node reaches that only through a frontend, section 6).
 //!
 //! **The flags** are `kbf-server`'s own for what a storage node keeps (the object
 //! stores, the metadata log, the write tier and its bounds, the logs, the thread pools,
@@ -57,7 +57,7 @@ use kbf_front::{
 use kbf_log::{FarmLogId, MachineVersion};
 use kbf_mapsync::MapHolder;
 use kbf_meta::{NodeWriter, Retention};
-use kbf_objstore::{KeyPrefix, ObjectStore};
+use kbf_objstore::{KeyPrefix, ObjectStore, StillHeld};
 use kbf_storage::repair::{RepairConfig, Repairs};
 use kbf_storage::service::CatchUp;
 use kbf_store::StdFs;
@@ -68,11 +68,13 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 use crate::cold_apply::{ColdPick, Fixed, Registrable};
 use crate::join::{self, Joined, Joiner};
+use crate::listen::Binder;
 use crate::members::LastBoot;
+use crate::metrics::bind_node_sockets;
 use crate::node_map::NodeMap;
 use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, Registered, bind_node};
-use crate::serve::{ServeError, StorageListener, StorageSocket, bind_storage_socket};
+use crate::serve::{ServeError, StorageListener, StorageSocket};
 use crate::start::{AbortOnDrop, open_cold_file};
 use crate::startup_pass::StartPass;
 use crate::stores::{FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
@@ -115,6 +117,8 @@ const REGISTRATION: [&str; 4] = [
     "storage_zone",
     "storage_weight",
 ];
+/// The id of `--metrics-listen`.
+const METRICS: &str = "metrics_listen";
 /// The ids of the three TLS flags, in the order [`StorageFlags::tls`] reads them.
 const TLS: [&str; 3] = ["storage_tls_cert", "storage_tls_key", "storage_client_ca"];
 
@@ -126,6 +130,8 @@ pub struct StorageFlags {
     pub server: Args,
     /// Where the node listens.
     pub listen: SocketAddr,
+    /// Where the node serves `GET /metrics` over plain HTTP, if anywhere.
+    pub metrics: Option<SocketAddr>,
     /// The server certificate, its key and the client CA, all three or none.
     pub tls: Option<[PathBuf; 3]>,
     /// The frontend to register with (`http://` or `https://`), if any.
@@ -183,6 +189,16 @@ pub fn command() -> Command {
             .help(
                 "Where the node serves gRPC. Without the TLS flags it serves plain text, and \
                  the address must be loopback.",
+            ),
+    )
+    .arg(
+        Arg::new(METRICS)
+            .long("metrics-listen")
+            .value_name("ADDR")
+            .value_parser(clap::value_parser!(SocketAddr))
+            .help(
+                "Serves GET /metrics (Prometheus text) over plain HTTP here. Off unless given. \
+                 Reads are open to whoever reaches it: bind it where only operators do.",
             ),
     )
     .arg(path(
@@ -287,6 +303,7 @@ pub fn parse(m: &ArgMatches) -> Result<StorageFlags, clap::Error> {
     Ok(StorageFlags {
         server,
         listen,
+        metrics: m.get_one::<SocketAddr>(METRICS).copied(),
         tls,
         frontend,
         advertise,
@@ -402,20 +419,31 @@ impl StorageFlags {
     }
 }
 
+/// How long [`StorageHandle::serve`] waits for the cold store's lock after serving ends.
+/// A stop that works finishes it in milliseconds (the abort of the cache's tasks and the
+/// end of its writer threads); ten seconds is far past that and short of any supervisor's
+/// patience. Past it the lock is left to the process's exit.
+pub const COLD_RELEASE_DEADLINE: Duration = Duration::from_secs(10);
+
 /// A started storage node: bound, its write tier attached and its flusher (and any
 /// start-up pass) running, not yet serving.
 pub struct StorageHandle {
     /// Where the node listens.
     pub addr: SocketAddr,
+    /// Where it serves `/metrics`, when `--metrics-listen` is given.
+    pub metrics: Option<SocketAddr>,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
     _background: Background,
+    /// When the cold store is a directory: completes when its lock is released.
+    cold_released: Option<kbf_objstore::Released>,
     maps: Arc<MapHolder>,
     catch_up: CatchUp,
     repairs: Option<Arc<Repairs>>,
     _joiner: Option<AbortOnDrop>,
     _repair: Option<AbortOnDrop>,
+    _metrics: Option<AbortOnDrop>,
 }
 
 impl StorageHandle {
@@ -450,20 +478,78 @@ impl StorageHandle {
     }
 
     /// Serves until the shutdown future given to [`start_storage`] completes and the
-    /// calls in flight end.
+    /// calls in flight end. With a `file://` cold store it then waits for the store's
+    /// lock to be released, so a start over the same directories can follow at once: the
+    /// node's tasks are aborted and the cache they and the service held is closed, but
+    /// its own background tasks and writer threads end after it is dropped, not before.
+    /// The wait is bounded by [`COLD_RELEASE_DEADLINE`]; past it this logs one warning
+    /// (the store's directory and how many handles are alive) and returns, because the
+    /// process's exit releases the lock whatever still holds it, and the units run this
+    /// with `TimeoutStopSec=infinity`, where a wait with no end would be a stop with none.
+    ///
+    /// The other serve paths (`storage_half::serve`, `start::serve`) wait for nothing: the
+    /// process exits when they return, and its exit frees the lock.
+    ///
+    /// The tasks that hold handles on the cold store, to look at when the warning shows:
+    /// the cache's touch flusher (`kbf-front`, `cache/touches.rs`) and its write-pool
+    /// threads (`cache/pool.rs`).
     ///
     /// # Errors
     /// The listener fails while serving.
     pub async fn serve(self) -> Result<(), ServeError> {
+        let (served, released) = self.serve_checked(COLD_RELEASE_DEADLINE).await;
+        if let Err(held) = released {
+            tracing::warn!(
+                dir = %held.dir.display(),
+                clones = held.clones,
+                limit = ?held.limit,
+                "the cold store is still open after serving ended; its lock is released when the process exits"
+            );
+        }
+        served
+    }
+
+    /// [`StorageHandle::serve`] without the warning, saying whether the cold store was
+    /// released within `limit` (on the runtime's clock): what the tests call, so a
+    /// handle leaked by the node fails a test instead of hanging it or passing unseen.
+    /// The result of serving comes first.
+    #[doc(hidden)]
+    pub async fn serve_checked(
+        self,
+        limit: Duration,
+    ) -> (Result<(), ServeError>, Result<(), StillHeld>) {
         let Self {
+            addr: _,
+            metrics: _,
+            start_line: _,
             serving,
             _flusher,
             _background,
+            cold_released,
+            maps,
+            catch_up,
+            repairs,
             _joiner,
             _repair,
-            ..
+            _metrics,
         } = self;
-        serving.await
+        let served = serving.await;
+        // Everything the handle holds goes, so what is left holding the stores is not it.
+        drop((
+            _flusher,
+            _background,
+            maps,
+            catch_up,
+            repairs,
+            _joiner,
+            _repair,
+            _metrics,
+        ));
+        let released = match cold_released {
+            Some(released) => released.wait_within(limit).await,
+            None => Ok(()),
+        };
+        (served, released)
     }
 }
 
@@ -534,6 +620,7 @@ where
     let meta = RaftMetaLog::open_dir(&stores.meta_dir, Retention::default(), prefix_root).await?;
     let (prefix, log) = (meta.store_prefix(), meta.log_id());
     let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
+    let cold_released = files.as_ref().map(kbf_objstore::FsStore::released);
     let pass = files.map(|files| StartPass::over_raft(files, grace));
     // After the log is open: it refuses a directory that holds files it did not write.
     let repair_dir = stores.meta_dir.join(REPAIR_DIR);
@@ -543,7 +630,7 @@ where
         stores.hot.as_ref(),
         (meta, cold, prefix, log),
         (shutdown, &repair_dir),
-        pass,
+        (pass, cold_released),
         RebuildConfig::default(),
     )
     .await
@@ -558,7 +645,10 @@ async fn assemble<C, S, F>(
     hot: Option<&Hot>,
     (meta, cold, prefix, log): (RaftMetaLog<StdFs>, C, KeyPrefix, FarmLogId),
     (shutdown, repair_dir): (S, &Path),
-    pass: Option<StartPass<RaftMetaLog<StdFs>>>,
+    (pass, cold_released): (
+        Option<StartPass<RaftMetaLog<StdFs>>>,
+        Option<kbf_objstore::Released>,
+    ),
     rebuild: RebuildConfig,
 ) -> Result<StorageHandle, Box<dyn Error>>
 where
@@ -566,13 +656,18 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
-    let socket = bind_storage_socket(listener.listen)?;
+    // One start, one bind budget for both listeners, spent before the first await (a
+    // `Binder` is not `Send`).
+    let (socket, metrics) = bind_node_sockets(listener.listen, flags.metrics, &Binder::new())?;
     let (cache, registered) = open_cache(flags, socket, (meta, cold, prefix, log)).await?;
     let cache = cache
         .with_writes(flags.server.write_config())
         .with_write_pool(flags.server.write_pool_config());
     let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
     let cache = Arc::new(cache);
+    let (metrics, _metrics) = metrics
+        .map(|m| m.serve(Arc::clone(&cache), None, listener.tls.clone()))
+        .unzip();
     let _flusher = tier.map(|_| {
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
@@ -584,6 +679,7 @@ where
     let node = bind_node(flags, listener, registered, storage, repair_dir, stop)?;
     Ok(StorageHandle {
         addr: node.addr,
+        metrics,
         start_line: format!(
             "kbf-storage {SERVER_VERSION} storage={} log={log}",
             node.addr
@@ -591,11 +687,13 @@ where
         serving: node.serving,
         _flusher,
         _background,
+        cold_released,
         maps: node.maps,
         catch_up,
         repairs: node.repairs,
         _joiner: node.joiner,
         _repair: node.repair,
+        _metrics,
     })
 }
 
@@ -788,3 +886,7 @@ mod tests;
 #[cfg(test)]
 #[path = "storage_rebuild_tests.rs"]
 mod rebuild_tests;
+
+#[cfg(test)]
+#[path = "storage_release_tests.rs"]
+mod release_tests;
