@@ -1,5 +1,6 @@
-//! Test fixtures shared by the modules' tests: a runner that plays the programs, a
-//! trusted host, tarballs and inboxes.
+//! Test fixtures shared by the modules' tests (and, with the `testkit` feature, by the
+//! integration tests): a runner that plays the programs, a trusted host, tarballs and
+//! inboxes.
 
 use std::cell::RefCell;
 use std::io;

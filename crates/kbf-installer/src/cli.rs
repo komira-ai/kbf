@@ -52,6 +52,11 @@ pub enum Verb {
     Revert(ActivationArgs),
     /// Point `current` at `previous`, with no confirm window.
     Rollback(ServiceArgs),
+    /// Record a release placed on the host by hand as its first
+    ///
+    /// Checks its files, writes its `VERIFIED` marker and makes it current, so the frontend
+    /// proxy can start it. The operator vouches for the commit; nothing is fetched or attested.
+    RecordRelease(RecordReleaseArgs),
     /// Remove the releases nothing needs: current, previous, staged, the swap on trial and any a
     /// process executes from stay, and so do the newest `--keep` others.
     Gc(GcArgs),
@@ -64,14 +69,21 @@ pub enum Verb {
     Quiesce,
     /// Validate the installer's configuration, trust files and path chain.
     Check,
+    /// Dump the state database to the backup directory and keep the newest few; run by
+    /// kbf-backup.timer as the service user, who connects as the role installer.toml's database URL names.
+    Backup(BackupArgs),
+    /// Restore a backup into an empty state database, as the service user, who connects as the role installer.toml's database URL names.
+    Restore(RestoreArgs),
     /// Serve the frontend host's public port: route each stream to the active child frontend.
     Proxy(ProxyArgs),
     #[command(hide = true)]
     Stage,
     #[command(hide = true)]
     Activate,
+    /// Internal: pull one component to standard output. The installer starts it itself, as the
+    /// fetch user, with fixed flags; it is not a command for a person.
     #[command(hide = true)]
-    FetchChild,
+    FetchChild(crate::fetch::child::ChildArgs),
 }
 
 /// The `kbf` modes a host can be set up for. There is no `node` mode.
@@ -138,9 +150,10 @@ pub struct SetupArgs {
     #[command(flatten)]
     pub kbf: crate::setup::kbf_settings::KbfFlags,
     /// The installer.toml `setup` writes (and reads, to keep what it does not set), under the
-    /// host root. The same flag, with the same meaning, as on `run`.
-    #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]
-    pub installer_config: kbf_host::HostPath,
+    /// host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which
+    /// is the only value setup accepts. The same flag, with the same meaning, as on `run`.
+    #[arg(long, value_parser = kbf_host::HostPath::new)]
+    pub installer_config: Option<kbf_host::HostPath>,
 }
 
 #[derive(Args)]
@@ -160,6 +173,13 @@ pub struct ActivationArgs {
     pub id: ActivationId,
     #[command(flatten)]
     pub service: ServiceArgs,
+}
+
+#[derive(Args)]
+pub struct RecordReleaseArgs {
+    /// The release to record (40 hex characters): `releases/<commit>/kbf` must be there.
+    #[arg(long)]
+    pub commit: CommitId,
 }
 
 /// The service a swap restarts, by its own flag (never from an order).
@@ -243,7 +263,7 @@ pub struct RunArgs {
     /// installer.toml, under the host root: its `database` key is the state database the
     /// installer migrates to what a release needs before that release is activated. Required
     /// when the unit restarted after a swap is a frontend's or the all-in-one's, unless the
-    /// unit comes from kbf.toml's mode (no --unit): then /etc/kbf/installer.toml is the default.
+    /// unit comes from kbf.toml's mode (no --unit): then the host's installer.toml (/etc/kbf, /usr/local/etc/kbf on a Mac) is the default.
     #[arg(long, value_parser = kbf_host::HostPath::new)]
     pub installer_config: Option<kbf_host::HostPath>,
 }
@@ -287,13 +307,54 @@ pub struct MigrateArgs {
 }
 
 #[derive(Args)]
+pub struct BackupArgs {
+    /// installer.toml, under the host root: its `database` key names the database to dump and
+    /// its `backup_keep` how many backups stay (default 7).
+    #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]
+    pub installer_config: kbf_host::HostPath,
+    /// The backup directory: made 0700 when it is not there, owned by the user that runs this.
+    #[arg(long, default_value = "/var/lib/kbf-server/backups", value_parser = kbf_host::HostPath::new)]
+    pub dir: kbf_host::HostPath,
+    /// The `pg_dump` program (a name looked up in PATH, or a path).
+    #[arg(long, default_value = "pg_dump")]
+    pub pg_dump: String,
+    /// The `pg_restore` program, which checks the dump can be read.
+    #[arg(long, default_value = "pg_restore")]
+    pub pg_restore: String,
+}
+
+#[derive(Args)]
+pub struct RestoreArgs {
+    /// The backup to restore (a file `backup` wrote).
+    #[arg(long, value_parser = kbf_host::HostPath::new)]
+    pub file: kbf_host::HostPath,
+    /// installer.toml, under the host root: its `database` key names the database to restore
+    /// into (unless --database does), which must be empty of kbf's schema.
+    #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]
+    pub installer_config: kbf_host::HostPath,
+    /// Restore into this database instead, for a restore test: a bare NAME (a database on the
+    /// server and socket installer.toml names, for the role it names) or a URL with no
+    /// password.
+    #[arg(long)]
+    pub database: Option<String>,
+    /// The `pg_restore` program (a name looked up in PATH, or a path).
+    #[arg(long, default_value = "pg_restore")]
+    pub pg_restore: String,
+}
+
+#[derive(Args)]
 pub struct ProxyArgs {
-    /// The installer.toml whose `[proxy]` table configures the proxy.
-    #[arg(long, default_value = "/etc/kbf/installer.toml")]
-    pub config: std::path::PathBuf,
+    /// The installer.toml whose `[proxy]` table configures the proxy (default: the platform's,
+    /// `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac).
+    #[arg(long)]
+    pub config: Option<std::path::PathBuf>,
     /// Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing.
     #[arg(long)]
     pub check: bool,
+    /// Root's directory: the proxy reads `status.json` here, to start the installed release
+    /// when no frontend child is running.
+    #[arg(long, default_value = "/var/lib/kbf-installer")]
+    pub update_dir: std::path::PathBuf,
 }
 
 #[derive(Args)]
@@ -313,28 +374,35 @@ impl Verb {
             Verb::Confirm(_) => "confirm",
             Verb::Revert(_) => "revert",
             Verb::Rollback(_) => "rollback",
+            Verb::RecordRelease(_) => "record-release",
             Verb::Gc(_) => "gc",
             Verb::BootCheck(_) => "boot-check",
             Verb::Migrate(_) => "migrate",
             Verb::Quiesce => "quiesce",
             Verb::Check => "check",
+            Verb::Backup(_) => "backup",
+            Verb::Restore(_) => "restore",
             Verb::Proxy(_) => "proxy",
             Verb::Stage => "stage",
             Verb::Activate => "activate",
-            Verb::FetchChild => "fetch-child",
+            Verb::FetchChild(_) => "fetch-child",
         }
     }
 
-    /// Every verb but `status`, `check` and `proxy` (which runs as the unprivileged service
-    /// user) needs root.
+    /// Every verb but `status`, `check`, `proxy` (which runs as the unprivileged service
+    /// user), `backup` and `restore` needs root. `backup` and `restore` run as the user that
+    /// is the database's role under peer authentication, which root is not.
     pub fn needs_root(&self) -> bool {
-        !matches!(self, Verb::Status | Verb::Check | Verb::Proxy(_))
+        !matches!(
+            self,
+            Verb::Status | Verb::Check | Verb::Proxy(_) | Verb::Backup(_) | Verb::Restore(_)
+        )
     }
 
     /// Whether the verb changes what a host runs or how it is managed, so it must not run
     /// while the old layout's state is the host's and unmigrated (the old helper and the
     /// installer never both manage one host; `migrate` is how that ends). `status`, `check`,
-    /// `boot-check`, `quiesce` and `migrate` itself change no release; `fetch-child` is the
+    /// `boot-check`, `quiesce`, `backup`, `restore` and `migrate` itself change no release; `fetch-child` is the
     /// unprivileged process a verb that does manage the host starts, and manages nothing.
     ///
     /// Every verb is named (no `_`): a verb added later does not compile until it says
@@ -347,6 +415,7 @@ impl Verb {
             | Verb::Confirm(_)
             | Verb::Revert(_)
             | Verb::Rollback(_)
+            | Verb::RecordRelease(_)
             | Verb::Gc(_)
             | Verb::Stage
             | Verb::Activate => true,
@@ -356,7 +425,9 @@ impl Verb {
             | Verb::Quiesce
             | Verb::Migrate(_)
             | Verb::Proxy(_)
-            | Verb::FetchChild => false,
+            | Verb::Backup(_)
+            | Verb::Restore(_)
+            | Verb::FetchChild(_) => false,
         }
     }
 
@@ -371,16 +442,19 @@ impl Verb {
             | Verb::Confirm(_)
             | Verb::Revert(_)
             | Verb::Rollback(_)
+            | Verb::RecordRelease(_)
             | Verb::Gc(_)
             | Verb::Migrate(_)
             | Verb::Quiesce
-            | Verb::Setup(_) => None,
+            | Verb::Backup(_)
+            | Verb::Restore(_)
+            | Verb::Setup(_)
+            | Verb::FetchChild(_) => None,
             Verb::Check => Some("P10"),
             Verb::Status => Some("P4"),
             Verb::Update(_) => Some("P13"),
             Verb::Activate => Some("P5"),
             Verb::Stage => Some("P8"),
-            Verb::FetchChild => Some("P7"),
         }
     }
 }

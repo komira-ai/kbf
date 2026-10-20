@@ -95,9 +95,12 @@ jobs:
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # The fast tests and their coverage: the `pr` profile of .config/nextest.toml (every test
-  # but the slow ones, which beta.yml runs) under cargo-llvm-cov, then the ratchet in
-  # `coverage-baseline` (crates/kbf-coverage), line and branch coverage per crate. The
-  # ratchet is measured on this set only: no Postgres, S3, crun, root or Mac test is in it.
+  # but the slow ones, which beta.yml runs) under cargo-llvm-cov, then the gate in
+  # `coverage-floors` (crates/kbf-coverage): every crate must reach 99.00% of lines and
+  # 99.00% of branches, or the floor its line in that file lists for it (the crates under
+  # 99% today, each with an open issue). A floor may only rise: the last step fails a pull
+  # request whose file lowers one. The gate is measured on the fast set plus the Postgres
+  # tests (a throwaway server, below): no S3, crun, root or Mac test is in it.
   # Branch coverage (`--branch`, rustc's `-Zcoverage-options=branch`) is unstable, so this
   # job alone builds with a pinned nightly; every other job stays on the toolchain in
   # rust-toolchain.toml. The nightly may warn where stable does not, so `-D warnings` is off
@@ -107,7 +110,20 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # The same throwaway server as beta.yml's state-postgres job, so the Postgres tests count.
+    services:
+      postgres:
+        image: postgres@sha256:2a0d0fe14825b0939f78a8cad5cd4e6aa68bf94d0e5dd96e24b6d23af4315545
+        env:
+          POSTGRES_PASSWORD: kbf-ci-throwaway
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     env:
+      KBF_TEST_POSTGRES_URL: postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres
+      # pg_dump and pg_restore for the installer's backup test come from here.
+      KBF_TEST_PG_BIN: /usr/lib/postgresql/17/bin
       RUSTFLAGS: ""
       COVERAGE_TOOLCHAIN: nightly-2026-10-01
       LLVM_COV_VERSION: 0.9.1
@@ -135,38 +151,100 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      # The cache holds target/, and a push run left the WORKSPACE's instrumented test binaries
+      # and coverage profiles in target/llvm-cov-target. `llvm-cov report` reads every
+      # instrumented binary and profile there, so a run that restored them merged a binary built
+      # from older sources (its old lines, now blank or doc lines, reported as missed) or failed
+      # ('profile file is not compatible'). `llvm-cov clean --workspace` removes the workspace's
+      # own artifacts and profiles and keeps the dependencies' builds, which are what the cache
+      # is for.
+      - name: Drop the workspace's coverage artifacts the cache restored
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
       # nextest runs a process per test, so a test's line coverage must not rest on another
       # test of the process: a `tracing` macro evaluates its fields only when a subscriber is
       # registered, so a test that runs one installs its own (`tracing::subscriber::set_default`
-      # or `with_default`). Equal ratchet numbers to `cargo test` depend on it.
+      # or `with_default`). Equal numbers to `cargo test` depend on it.
       # `-skip-functions` leaves the per-function records (FN, FNDA) out of the lcov
       # export. With branch coverage on, llvm-cov's lcov exporter segfaults while
       # writing them for kbf-front's async service methods (LLVM 23.1 in this nightly;
-      # it looks like LLVM issue 220574). Lines and branches, all the ratchet reads, are
+      # it looks like LLVM issue 220574). Lines and branches, all the gate reads, are
       # unaffected: their totals match llvm-cov's own text report.
+      # pg_dump and pg_restore as new as the server (17), because a dump tool older than
+      # its server refuses to run. The runner image has no PostgreSQL apt repository:
+      # postgresql-common's own script adds the project's (with its signing key) and
+      # updates the package lists.
+      - run: sudo apt-get install -y --no-install-recommends postgresql-common
+      - run: sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+      - run: sudo apt-get install -y --no-install-recommends postgresql-client-17
       - run: mkdir -p target/coverage
       - name: Run the fast tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --profile pr
+      # The tests that need the server, as beta.yml's state-postgres job runs them (they are
+      # `#[ignore]`d, so the run above skips them); their counters join the run's in the
+      # report below. The kbf-state step builds with its `postgres` feature; the steps after
+      # it select tests of the workspace build by filter, not by `-p ... --test`: a build of
+      # one package leaves out the dev-dependency features of the others, so it would build
+      # kbf-installer again without `test-sandbox` and put a copy of its code in the report
+      # that no test runs. They run the `#[ignore]`d tests only (`--run-ignored only`): the
+      # others ran above, and some (the installer's database:: ones) write files in a scratch
+      # directory another test of the full run creates. The installer's backup round trip
+      # (backup::tests::real_server_round_trip) is in the installer filter.
+      - name: Run the Postgres tests of kbf-state under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-state --features postgres -- --include-ignored
+      - name: Run the installer's Postgres tests under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-installer) & (test(database::) or test(setup_creates_the_schema) or test(backup::tests::real_server_round_trip))'
+      - name: Run the server's Postgres tests under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-server) & binary(state_store_postgres)'
+      - name: Run the server's restart tests over Postgres under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-server) & binary(state_store) & test(over_postgres)'
+      - name: Run the two-children swap over Postgres under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-server) & binary(frontend) & test(two_children::fifty_builds_across_a_takeover_over_postgres)'
+      - name: Run the frontend process test over Postgres under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-cli) & binary(frontend_process) & test(postgres_state_store)'
       - name: Report
         env:
           LLVM_COV_FLAGS: -skip-functions
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov report --branch --lcov --output-path target/coverage/lcov.info
-      # When every failure is coverage that improved, the step prints (and puts in the
-      # job summary) the `kbf-coverage tighten` command that downloads this run's
-      # `coverage` artifact and lowers coverage-baseline; --artifact must name the
-      # upload below.
-      - name: Per-crate table and ratchet
-        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- --lcov target/coverage/lcov.info --root "$GITHUB_WORKSPACE" --baseline coverage-baseline --write-baseline target/coverage/coverage-baseline.measured --summary-file "$GITHUB_STEP_SUMMARY" --run-id "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --artifact coverage
+      # Fails when a crate is under its threshold; floors that could rise are printed in
+      # the log and the job summary (`kbf-coverage raise` lifts them) and do not fail.
+      - name: Per-crate table and 99% gate
+        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- --lcov target/coverage/lcov.info --root "$GITHUB_WORKSPACE" --floors coverage-floors --summary-file "$GITHUB_STEP_SUMMARY"
+      # The base's floors file, checked out beside this one; a base without one (the change
+      # that adds the file) has nothing to compare, and the step says so.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          sparse-checkout: coverage-floors
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Floors are not lower than the base's
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base base/coverage-floors --floors coverage-floors
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
           name: coverage
-          path: |
-            target/coverage/lcov.info
-            target/coverage/coverage-baseline.measured
+          path: target/coverage/lcov.info
           if-no-files-found: error
+      # and the cache it saves holds none of this run's workspace coverage artifacts either
+      - if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

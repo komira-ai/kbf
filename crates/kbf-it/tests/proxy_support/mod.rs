@@ -3,7 +3,7 @@
 //! proxy, the `Execute` streams a Buck2 build holds open, and reads of a child's own count
 //! of them. Each soak says in its own header what it proves with them.
 
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::io::{BufReader, Read as _, Write as _};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{ChildStdout, Command, ExitCode, Stdio};
@@ -54,28 +54,42 @@ pub fn own_config(dir: &Path, args: &[String]) -> Vec<String> {
     if args.iter().any(|a| a.starts_with("--config")) {
         return args.to_vec();
     }
-    let file = dir.join("kbf.toml");
-    std::fs::write(&file, "").expect("empty config");
-    // The child refuses a settings file that group or other can write.
-    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        .expect("config mode");
     let mut own = args.to_vec();
-    own.insert(1, format!("--config={}", file.display()));
+    own.insert(1, kbf_testkit::config::flag(dir));
     own
+}
+
+/// The path of the `kbf` link [`link_kbf`] makes in `dir`.
+pub fn kbf_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("bin/kbf")
+}
+
+/// Links this test binary as `bin/kbf` under `dir`: run through that name it answers as `kbf`.
+pub fn link_kbf(dir: &Path) {
+    std::fs::create_dir_all(dir.join("bin")).expect("scratch");
+    std::os::unix::fs::symlink(std::env::current_exe().expect("this binary"), kbf_path(dir))
+        .expect("link kbf");
+}
+
+/// The command that starts `kbf` from the link in `dir` with `args` and a config of the
+/// test's own ([`own_config`]).
+pub fn kbf_command(dir: &Path, args: &[String]) -> Command {
+    let mut command = Command::new(kbf_path(dir));
+    command.args(own_config(dir, args));
+    command
 }
 
 impl Child {
     pub fn start(dir: &Path, name: &str, args: &[String]) -> Self {
         let log = std::fs::File::create(dir.join(format!("{name}.log"))).expect("log file");
-        let mut command = Command::new(dir.join("bin/kbf"));
-        command
-            .args(own_config(dir, args))
-            .stdout(Stdio::piped())
-            .stderr(log);
+        let mut command = kbf_command(dir, args);
+        command.stdout(Stdio::piped()).stderr(log);
         let mut process = reaped::spawn(&mut command, 3).expect("spawn kbf");
-        let mut stdout = BufReader::new(process.stdout.take().expect("stdout"));
-        let mut line = String::new();
-        stdout.read_line(&mut line).expect("a start line");
+        let (line, stdout) = reaped::first_line(
+            process.stdout.take().expect("stdout"),
+            Duration::from_secs(60),
+        )
+        .unwrap_or_else(|e| panic!("no start line from {name}: {e}"));
         Self {
             process,
             line,

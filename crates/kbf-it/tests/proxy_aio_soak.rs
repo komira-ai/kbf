@@ -60,7 +60,7 @@ use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -81,8 +81,8 @@ use kbf_proxy::slot::Slot as GateSlot;
 use kbf_testkit::dir::TestDir;
 use kbf_testkit::reaped::{self, Reaped};
 use proxy_support::{
-    Open, actions, api_get, connect, free_base, frontend_args, open_executions, own_config,
-    proxy_config, proxy_get, storage_node, store, until, until_ready, within,
+    Open, actions, api_get, connect, free_base, frontend_args, kbf_command, kbf_path, link_kbf,
+    open_executions, proxy_config, proxy_get, storage_node, store, until, until_ready, within,
 };
 
 /// Streams that arrive while the swap holds, between the old process's stop and the new
@@ -189,12 +189,11 @@ impl Child for Procs {
         let name = format!("frontend-{slot:?}");
         let out = std::fs::File::create(self.dir.join(format!("{name}.log")))
             .map_err(|e| PortError(e.to_string()))?;
-        let mut command = Command::new(self.dir.join("bin/kbf"));
+        let mut command = kbf_command(
+            &self.dir,
+            &frontend_args(&self.storage, slot_base(self.base, slot)),
+        );
         command
-            .args(own_config(
-                &self.dir,
-                &frontend_args(&self.storage, slot_base(self.base, slot)),
-            ))
             .stdout(Stdio::from(
                 out.try_clone().map_err(|e| PortError(e.to_string()))?,
             ))
@@ -206,7 +205,7 @@ impl Child for Procs {
         Ok(ProcIdent {
             pid,
             start_time: 0,
-            exe: self.dir.join("bin/kbf"),
+            exe: kbf_path(&self.dir),
         })
     }
 
@@ -438,12 +437,7 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
     // Declared first, so it drops last: the children are reaped before it is removed.
     let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "proxy-aio-soak");
     let dir = scratch.path().to_path_buf();
-    std::fs::create_dir_all(dir.join("bin")).expect("scratch");
-    std::os::unix::fs::symlink(
-        std::env::current_exe().expect("this binary"),
-        dir.join("bin/kbf"),
-    )
-    .expect("link kbf");
+    link_kbf(&dir);
 
     let log = Arc::new(Log::default());
     let node = storage_node(&dir, "node");
@@ -539,6 +533,7 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
         (client, driver)
     });
     let swap_over = AtomicBool::new(false);
+    let checks_over = AtomicBool::new(false);
     let (end, notes) = std::thread::scope(|scope| {
         // The deadline: a swap still running at SWAP_BOUND is stopped (its next sleep fails).
         scope.spawn(|| {
@@ -567,6 +562,11 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
             let mut swap = Swap::begin(ports, plan.clone(), Some(old.clone())).expect("begin");
             let end = swap.run();
             swap_over.store(true, Ordering::SeqCst);
+            // The new child was forked on this thread, and the kernel's death signal ends it
+            // when this thread does (`reaped::spawn`): stay until the checks on it are done.
+            while !checks_over.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             (end, swap.notes().to_vec())
         });
         // A failed check in the body stops the swap before the scope joins it.
@@ -697,6 +697,7 @@ child ready, or a hold that ran out, shows here)"
             until("B's executions end", || open_executions(&api_b) == 0).await;
             });
         }));
+        checks_over.store(true, Ordering::SeqCst);
         if let Err(panic) = body {
             clock.stop.store(true, Ordering::SeqCst);
             swap_over.store(true, Ordering::SeqCst);

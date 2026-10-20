@@ -29,6 +29,20 @@ Every directory on the way to the tool is 0755 root:wheel. The package creates n
 configuration, no release and no user (`kbf`, `_kbf-fetch`, `kbf-verify` and the lease
 users are made by `setup`, as root; a payload cannot make users).
 
+### The release asset
+
+`artifacts.yml`'s `darwin-arm64` job builds the real package from the signed `kbf-installer` it has
+just built: `cargo xtask pkg-trust` writes the trust directory from the pinned darwin `gh`, the
+Sigstore trusted root that `gh` fetched and the branch the package is attested on
+(`installer.conf` is `SOURCE_REFS=<that ref>` and nothing else; per-host settings are written by
+`kbf-installer setup`, not shipped), `cargo xtask pkg build --version-of` writes the package,
+`cargo xtask pkg-macos-install-test` installs it as root on the runner and checks it, and
+`cargo xtask pkg-macos-asset` makes it `kbf-installer-<commit>-darwin-arm64.pkg`, listed in
+`SHA256SUMS.darwin-arm64` and attested with its own bundle. The gh pinned for it is in
+`artifacts.yml` (`GH_VERSION`, `GH_SHA256_AARCH64_DARWIN`). See
+[docs/artifacts.md](../../docs/artifacts.md#the-kbf-installer-package-pkg-macos). The trust files
+are 0755 (`gh`) and 0644, root:wheel, like the Linux package's.
+
 ### Written in Rust, not by `pkgbuild`
 
 nfpm builds the Linux packages and does not write a `.pkg`. `pkgbuild` and `productbuild`
@@ -72,7 +86,7 @@ for the node's daemon, `MAC_DAEMON_LABEL`) and waits for `installer.toml` under
 `/usr/local/etc/kbf`; the tool is at `bin/kbf-installer` in the prefix. If the real
 layout (`layout.rs`, contract P2) puts the macOS configuration or the tool elsewhere,
 change the property list and `GATE`/`PROGRAM` in `crates/xtask/src/pkg.rs`; the tests
-follow the constants. `kbf-installer setup` writes `installer.toml` at `/etc/kbf/installer.toml` on every platform (`setup/paths.rs`), while `layout.rs` and `GATE` name `/usr/local/etc/kbf` for a Mac: the two disagree, and a Mac's job waits for a file `setup` does not write. Until the real binary builds on the runner, CI packages a stub
+follow the constants. Every configuration path `kbf-installer` uses (`setup`, `run`, `proxy`) comes from `layout.rs`: `/etc/kbf` on Linux, `/usr/local/etc/kbf` on a Mac, so on a Mac `setup` writes `installer.toml`, `kbf.toml` and the tokens where the property list's gate and `GATE` wait. `setup::tests` (`the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac`) compares the plist's gate with the file the Mac plan writes. Until the real binary builds on the runner, CI packages a stub
 (`xtask-fake` run as `kbf-installer`, which prints its arguments); `INSTALLER` in
 `crates/xtask/tests/pkg_macos.rs` is the one path to change, and the step that needs the
 real tool (`check` refusing a user-owned prefix) runs when it is.

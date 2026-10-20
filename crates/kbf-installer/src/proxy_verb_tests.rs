@@ -248,7 +248,7 @@ fn errors_map_to_exit_codes_and_words() {
 fn a_descriptor_the_runtime_cannot_use_is_a_failure_to_start() {
     let config = load(&file("serve", PROXY.as_bytes())).expect("valid");
     let regular = OwnedFd::from(fs::File::open(file("fd", b"x")).expect("open"));
-    match serve(config, regular) {
+    match serve(config, regular, Path::new("/nonexistent")) {
         Err(VerbError::Failed(text)) => {
             assert!(text.starts_with("cannot start the proxy: "), "{text}");
         }
@@ -262,15 +262,17 @@ fn a_descriptor_the_runtime_cannot_use_is_a_failure_to_start() {
 fn check_stops_at_the_table_and_a_run_needs_its_socket() {
     let path = file("run", PROXY.as_bytes());
     let args = |check| ProxyArgs {
-        config: path.clone(),
+        config: Some(path.clone()),
         check,
+        update_dir: "/nonexistent".into(),
     };
     assert_eq!(run(&args(true)), Ok(()));
     let text = usage_of(run(&args(false)));
     assert!(text.contains("LISTEN_PID"), "{text}");
     let missing = ProxyArgs {
-        config: path.with_file_name("none.toml"),
+        config: Some(path.with_file_name("none.toml")),
         check: true,
+        update_dir: "/nonexistent".into(),
     };
     assert!(usage_of(run(&missing)).contains("No such file"));
 }
@@ -336,4 +338,64 @@ fn a_second_stop_signal_ends_the_process_at_once() {
 #[test]
 fn the_production_stop_bound_is_ten_seconds() {
     assert_eq!(STOP_BOUND, Duration::from_secs(10));
+}
+
+/// Catches `Stop::production` carrying another bound or another exit than the verb's: its
+/// fields are pinned here. It does not see which `Stop` `serve` builds (a literal `Stop` in
+/// `serve` would pass); `serve` takes its stop from `Stop::production` and reads as such.
+#[test]
+fn the_production_stop_ends_the_process_after_the_bound() {
+    let stop = Stop::production();
+    assert_eq!(stop.bound, STOP_BOUND);
+    assert_eq!(
+        stop.exit as usize,
+        std::process::exit as fn(i32) -> ! as usize
+    );
+    assert!(!stop.seen.load(Ordering::SeqCst));
+}
+
+/// Catches a start that reads as served when it did not: the log line says which slot serves an
+/// adopted child, and that new streams stay held, with the reason, for a held start and for a
+/// supervisor that could not even build its admin client.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_supervisors_line_says_what_the_start_did() {
+    use crate::proxy::model::Slot;
+    use crate::proxy::supervisor::Startup;
+    assert_eq!(
+        startup_line(Ok(Startup::Adopted { active: Slot::B })),
+        "the frontend child in slot B serves"
+    );
+    assert_eq!(
+        startup_line(Ok(Startup::Held("both slots have a live child".into()))),
+        "no frontend child adopted, new streams stay held: both slots have a live child"
+    );
+    assert_eq!(
+        startup_line(Err("the proxy secret is not a header value".into())),
+        "no frontend child adopted, new streams stay held: the proxy secret is not a header value"
+    );
+}
+
+/// Catches a `proxy` that reads `/etc/kbf/installer.toml` on a Mac, where `setup` writes
+/// `/usr/local/etc/kbf/installer.toml`: with no `--config` the file is the platform's, and a
+/// flag wins.
+#[test]
+fn proxy_reads_the_installer_toml_setup_wrote_on_the_platform() {
+    let args = |config| ProxyArgs {
+        config,
+        check: true,
+        update_dir: "/nonexistent".into(),
+    };
+    assert_eq!(
+        config_path(&args(None), Platform::Linux),
+        PathBuf::from("/etc/kbf/installer.toml")
+    );
+    assert_eq!(
+        config_path(&args(None), Platform::MacOs),
+        PathBuf::from("/usr/local/etc/kbf/installer.toml")
+    );
+    assert_eq!(
+        config_path(&args(Some(PathBuf::from("/x.toml"))), Platform::MacOs),
+        PathBuf::from("/x.toml")
+    );
 }

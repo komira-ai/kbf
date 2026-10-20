@@ -95,6 +95,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{sleep, timeout};
 use tonic::transport::Endpoint;
 
+use crate::acks;
 use crate::clock::{Clock, SystemClock};
 use crate::config::{ConfigError, DaemonConfig};
 use crate::connect::{
@@ -110,6 +111,7 @@ use crate::report::NodeReport;
 use crate::runtimes::Runtimes;
 use crate::status::{DriverReport, Software};
 use crate::update_link::UpdateLink;
+use crate::welcome;
 use crate::window::StartWindow;
 
 /// The `kbf.worker.v1` protocol version this daemon speaks.
@@ -130,9 +132,13 @@ pub enum Event {
     /// The server cancelled a running lease; its kill has begun.
     Cancelled(LeaseId),
     /// The server decided a Result: `accepted` says whether it became the operation's
-    /// result. Either way the daemon forgets the Result: it is neither resent nor
-    /// listed in heartbeats any more.
-    ResultAcknowledged { lease: LeaseId, accepted: bool },
+    /// result, `reason` why (unspecified from a server that predates it). Either way the
+    /// daemon forgets the Result: it is neither resent nor listed in heartbeats any more.
+    ResultAcknowledged {
+        lease: LeaseId,
+        accepted: bool,
+        reason: worker::ResultAckReason,
+    },
     /// No heartbeat sent in the last two intervals has been acknowledged.
     HeartbeatGap { silent_for: Duration },
     /// An acknowledgement arrived after a gap.
@@ -866,9 +872,15 @@ impl Daemon {
                 "the first server message is not Welcome".into(),
             ));
         };
-        if w.protocol_version != PROTOCOL_VERSION {
+        let oldest = welcome::OLDEST_PROTOCOL_VERSION;
+        if !welcome::acceptable(
+            w.protocol_version,
+            oldest,
+            PROTOCOL_VERSION,
+            PROTOCOL_VERSION,
+        ) {
             return Err(SessionError::Protocol(format!(
-                "server speaks protocol version {}, this daemon {PROTOCOL_VERSION}",
+                "server speaks protocol version {}, this daemon {oldest} to {PROTOCOL_VERSION}",
                 w.protocol_version
             )));
         }
@@ -945,10 +957,12 @@ impl Daemon {
                 if let Some(id) = ack.lease_id.map(lease_id) {
                     self.unacked.remove(&id);
                     self.granted.remove(&id);
-                    tracing::info!(lease = %id, accepted = ack.accepted, "result acknowledged");
+                    let reason = acks::reason(&ack);
+                    acks::log(id, ack.accepted, reason);
                     self.emit(Event::ResultAcknowledged {
                         lease: id,
                         accepted: ack.accepted,
+                        reason,
                     });
                 }
             }
@@ -1143,6 +1157,11 @@ impl Daemon {
         result.action_digest = self.granted.get(&id).and_then(|g| g.action.clone());
         if let Some(tx) = tx {
             send(tx, daemon_message::Message::Result(result.clone()));
+        }
+        if self.unacked.len() >= self.config.max_unacked {
+            tracing::error!(lease = %id, kept = self.unacked.len(), "too many unacknowledged results: this one is sent once and not kept");
+            self.granted.remove(&id);
+            return;
         }
         self.unacked.insert(id, result);
     }

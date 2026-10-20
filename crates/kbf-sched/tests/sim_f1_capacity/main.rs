@@ -14,7 +14,7 @@
 //! L1's bound is each scenario's `horizon`, set with a wide margin (F1.4's is 23,200 s),
 //! not the catalog's "backlog plus G plus one round". Here L1 proves that the work
 //! finishes and that the world quiesces; how soon work is placed is checked by the
-//! reference first fit every round (I11), not by L1.
+//! reference placement every round (I11), not by L1.
 //!
 //! Each scenario also asserts that its sweep
 //! reached the situations it is about, so a check that cannot fail shows up as a

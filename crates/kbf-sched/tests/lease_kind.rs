@@ -235,9 +235,10 @@ fn waiting_whole_machine_leases_hold_different_workers() {
     for n in 1..=9 {
         h.submit(u64::from(n), action(n));
     }
-    // `a` is too small for an action: eight on `b`, one on `c`.
+    // `a` is too small for an action; the rest spread over `b` and `c`: five on `b`, four
+    // on `c`, the emptier.
     let grants = h.grants();
-    assert_eq!(grants.iter().filter(|g| g.worker == w("c")).count(), 1);
+    assert_eq!(grants.iter().filter(|g| g.worker == w("c")).count(), 4);
 
     for n in 10..=12 {
         h.submit(u64::from(n), whole(n));
@@ -339,9 +340,9 @@ fn a_reservation_holds_one_worker_and_moves_when_it_cannot_run_there() {
     for n in 1..=9 {
         h.submit(u64::from(n), action(n));
     }
-    // First fit: eight on `a`, one on `b`.
+    // Spread: five on `a`, four on `b`, the emptier.
     let grants = h.grants();
-    assert_eq!(grants.iter().filter(|g| g.worker == w("b")).count(), 1);
+    assert_eq!(grants.iter().filter(|g| g.worker == w("b")).count(), 4);
 
     h.submit(10, whole(10));
     assert!(h.grants().is_empty());

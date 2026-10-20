@@ -16,7 +16,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use kbf_host::{HostExec, HostPath, Root};
 
 use crate::activate;
-use crate::cli::{BootArgs, Cli, MigrateArgs, ReleaseSource, RunArgs, ServiceArgs, Verb};
+use crate::backup;
+use crate::cli::{
+    BackupArgs, BootArgs, Cli, MigrateArgs, ReleaseSource, RestoreArgs, RunArgs, ServiceArgs, Verb,
+};
 use crate::database::Database;
 use crate::exit::Exit;
 use crate::helper::cycle::{Config, Helper, HelperError};
@@ -92,6 +95,20 @@ impl From<ReleaseError> for Failure {
     }
 }
 
+/// A release error keeps the exit of the release verbs; files that are not a release are a
+/// refusal (exit 2), not a failure to try again.
+impl From<crate::record_release::RecordError> for Failure {
+    fn from(e: crate::record_release::RecordError) -> Failure {
+        match e {
+            crate::record_release::RecordError::Release(e) => Failure::from(e),
+            other => Failure {
+                exit: Exit::Refused,
+                why: other.to_string(),
+            },
+        }
+    }
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -121,9 +138,9 @@ struct Target {
 
 /// The target of `run`: the service its flags name, else (Linux) the unit of the mode in the
 /// host's `kbf.toml`, which is how the one packaged `kbf-installer.service` serves every mode.
-/// A unit found that way on a frontend or all-in-one host reads `/etc/kbf/installer.toml`
-/// when `--installer-config` is not given (`setup` wrote it there); a Mac names its launchd
-/// label in the property list.
+/// A unit found that way on a frontend or all-in-one host reads the host's `installer.toml`
+/// (`/etc/kbf`, `/usr/local/etc/kbf` on a Mac) when `--installer-config` is not given (`setup`
+/// wrote it there); a Mac names its launchd label in the property list.
 fn target_of(root: &Path, args: &RunArgs) -> Result<Target, Failure> {
     if let Some(service) = args.named_service() {
         return Ok(Target {
@@ -133,10 +150,8 @@ fn target_of(root: &Path, args: &RunArgs) -> Result<Target, Failure> {
     }
     let (layout, _) = host(root.to_path_buf()).map_err(usage)?;
     let service = derived_service(&layout, layout.platform())?;
-    // INSTALLER_TOML is a constant absolute host path, so it always parses.
-    let default = (args.installer_config.is_none() && service.runs_database_mode()).then(|| {
-        HostPath::new(setup::paths::INSTALLER_TOML).expect("INSTALLER_TOML is an absolute path")
-    });
+    let default = (args.installer_config.is_none() && service.runs_database_mode())
+        .then(|| layout.installer_toml());
     let installer_config = args.installer_config.clone().or(default);
     Ok(Target {
         service,
@@ -269,7 +284,7 @@ fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), Failure> {
 /// belongs to root. Under `--root` (a rehearsal, a test) the tree is the caller's own, so the
 /// owner to expect is the caller: nobody gains anything by it, since root and a stranger
 /// alike only reach what they already could.
-fn owner_uid(rehearsal: bool, euid: u32) -> u32 {
+pub(crate) fn owner_uid(rehearsal: bool, euid: u32) -> u32 {
     if rehearsal { euid } else { 0 }
 }
 
@@ -392,6 +407,24 @@ fn operate(
     .map_err(Failure::from)
 }
 
+fn record_release(
+    root: PathBuf,
+    euid: u32,
+    apply: bool,
+    commit: &crate::CommitId,
+) -> Result<(), Failure> {
+    let (layout, mut exec) = host(root)?;
+    crate::record_release::record(
+        &mut exec,
+        &layout,
+        euid,
+        commit,
+        apply,
+        &mut std::io::stderr(),
+    )
+    .map_err(Failure::from)
+}
+
 fn gc(root: PathBuf, apply: bool, keep: usize) -> Result<(), Failure> {
     let (layout, mut exec) = host(root)?;
     let procs = HostProcs::new(layout.platform());
@@ -409,6 +442,91 @@ fn gc(root: PathBuf, apply: bool, keep: usize) -> Result<(), Failure> {
 fn quiesce(root: PathBuf) -> Result<(), Failure> {
     let (layout, _) = host(root)?;
     operator::quiesce(&layout, operator::LOCK_WAIT).map_err(Failure::from)
+}
+
+/// What `backup` and `restore` say when they work, on the error stream (standard output is
+/// for `--json`).
+fn progress(err: &mut dyn Write, text: &str) {
+    // A closed pipe is the reader's business; the exit code still tells.
+    let _ = writeln!(err, "kbf-installer: {text}");
+}
+
+/// `kbf-installer backup`: without `--apply` it says what it would do and touches nothing.
+fn run_backup(
+    tool: &dyn backup::Tool,
+    root: PathBuf,
+    apply: bool,
+    args: &BackupArgs,
+    err: &mut dyn Write,
+) -> Result<(), Failure> {
+    let settings = backup::Settings::read(&under(&root, &args.installer_config)?)?;
+    let dir = under(&root, &args.dir)?;
+    if !apply {
+        progress(
+            err,
+            &format!(
+                "backup: dry run: would dump the state database into {}, keeping the newest {}",
+                dir.display(),
+                settings.keep
+            ),
+        );
+        return Ok(());
+    }
+    let spec = backup::Spec {
+        dir: &dir,
+        url: &settings.url,
+        keep: settings.keep,
+        pg_dump: &args.pg_dump,
+        pg_restore: &args.pg_restore,
+    };
+    let done = backup::backup(tool, &spec, now())?;
+    progress(
+        err,
+        &format!(
+            "backup: wrote {} ({} bytes); removed {} old",
+            done.file.display(),
+            done.bytes,
+            done.removed.len()
+        ),
+    );
+    Ok(())
+}
+
+/// `kbf-installer restore`: without `--apply` it says what it would do and touches nothing.
+fn run_restore(
+    tool: &dyn backup::Tool,
+    root: PathBuf,
+    apply: bool,
+    args: &RestoreArgs,
+    err: &mut dyn Write,
+) -> Result<(), Failure> {
+    let url = match &args.database {
+        // A bare name: a scratch database on the configured server, for the configured role.
+        Some(name) if !name.contains(['/', ':']) => {
+            let settings = backup::Settings::read(&under(&root, &args.installer_config)?)?;
+            settings.target.url_for(name)?
+        }
+        Some(url) => {
+            crate::database::check_url("the --database flag", url)
+                .map_err(|e| Failure::from(e.to_string()))?;
+            url.clone()
+        }
+        None => backup::Settings::read(&under(&root, &args.installer_config)?)?.url,
+    };
+    let file = under(&root, &args.file)?;
+    if !apply {
+        progress(
+            err,
+            &format!(
+                "restore: dry run: would restore {} into the state database",
+                file.display()
+            ),
+        );
+        return Ok(());
+    }
+    backup::restore(tool, &args.pg_restore, &url, &file)?;
+    progress(err, &format!("restore: restored {}", file.display()));
+    Ok(())
 }
 
 /// The directory the host's paths are under: `/`, except in a build with the sandbox flag.
@@ -488,6 +606,8 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
             serde_json::json!({"verb": name, "error": "needs_root", "euid": euid}),
         );
     }
+    // What `backup` and `restore` report when they work; written once `say` is done with `err`.
+    let mut said = Vec::new();
     // The old helper and the installer never both manage one host: while the old layout's
     // state is the host's and no migration finished, the verbs that manage it wait.
     // (A verb that is not built yet only says so; the PR that builds it calls this first.)
@@ -533,8 +653,31 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
             o.revert(&n.id.to_string())
         }),
         Verb::Rollback(s) => operate(root_of(cli), cli.apply, s.restart(), |o| o.rollback()),
+        Verb::RecordRelease(a) => record_release(root_of(cli), euid, cli.apply, &a.commit),
         Verb::Gc(g) => gc(root_of(cli), cli.apply, g.keep),
         Verb::Quiesce => quiesce(root_of(cli)),
+        // The fetch child writes the component to `out` (standard output, a pipe the root
+        // parent reads) and says why it could not on `err`, one line. It runs as the fetch
+        // user, so no root check applies, and it prints no JSON: its output is the bytes.
+        Verb::FetchChild(args) => {
+            let written = crate::fetch::child::fetch(args, out).and_then(|n| {
+                out.flush().map_err(crate::fetch::child::ChildFault::Out)?;
+                Ok(n)
+            });
+            return match written {
+                Ok(_) => Exit::Ok,
+                Err(why) => {
+                    let _ = writeln!(err, "fetch-child: {why}");
+                    Exit::Failed
+                }
+            };
+        }
+        Verb::Backup(args) => {
+            run_backup(&backup::Process, root_of(cli), cli.apply, args, &mut said)
+        }
+        Verb::Restore(args) => {
+            run_restore(&backup::Process, root_of(cli), cli.apply, args, &mut said)
+        }
         other => {
             let phase = other.built_by().unwrap_or("?");
             return say(
@@ -550,7 +693,10 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         }
     };
     match result {
-        Ok(()) => Exit::Ok,
+        Ok(()) => {
+            let _ = err.write_all(&said);
+            Exit::Ok
+        }
         Err(Failure { exit, why }) => say(
             exit,
             format!("kbf-installer: {why}"),

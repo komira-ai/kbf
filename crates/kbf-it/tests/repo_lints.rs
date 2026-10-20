@@ -20,6 +20,10 @@
 //!   interpreter and has no `[test-interpreters]` row; and a row of that file that is
 //!   stale, repeated, malformed or under `[workflow]` (rules in `interpreters/mod.rs`,
 //!   planted trees for the test-code rule in `test_spawns/mod.rs`);
+//! - test or harness code that names the `kbf` binary (its cargo path, a `bin/kbf` path, a
+//!   link called `kbf`) in a file on neither list of `kbf_spawns/mod.rs`: the helpers that
+//!   add `--config` from `kbf_testkit::config::flag`, and the counted allowance of
+//!   `kbf-cli` process tests that do not yet; a stale row, and a helper that lost its flag;
 //! - an asset `.github/workflows/artifacts.yml` packages with no `actions/attest-sbom`
 //!   step for it and its own SBOM in the attest job, or such a step for an asset no
 //!   job packages (module `attested_assets`);
@@ -36,11 +40,14 @@
 //!   another set (module `release_artifacts`);
 //! - the beta smoke workflow's Buck2 pin and its actions' commits drifting from
 //!   the copies they are of `ci.yml`'s (module `beta_pins`);
-//! - the coverage job's `kbf-coverage --run-id/--repo/--artifact` flags drifting from
-//!   the run and the artifact the job uploads, which breaks the download command the
-//!   ratchet prints (module `coverage_wiring`);
+//! - the test job's coverage gate step skipped by a condition, or its no-lowering check on
+//!   pull requests dropped or made conditional on something else, which lets floors fall
+//!   (module `coverage_wiring`);
 //! - the bake evaluator named anywhere under `.github/` (a workflow, a local action or any
 //!   other file): it runs on the operator's side, never in Actions (module `bake_operator_side`);
+//! - a test scratch directory made by joining a name onto the system temporary directory
+//!   instead of with `kbf_testkit::dir::TestDir`, outside a short list that says why each
+//!   does not leak (module `scratch_dirs`, whose docs say what it misses);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
 //!   scanned or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
@@ -51,8 +58,10 @@ mod bake_operator_side;
 mod beta_pins;
 mod coverage_wiring;
 mod interpreters;
+mod kbf_spawns;
 mod release_artifacts;
 mod release_workflow;
+mod scratch_dirs;
 mod test_spawns;
 mod workflows;
 
@@ -882,4 +891,31 @@ mod selection {
             );
         }
     }
+}
+
+#[test]
+fn every_test_that_starts_kbf_gives_it_a_config_of_its_own_or_is_a_listed_allowance() {
+    // Catches: a new test or harness file that starts the `kbf` binary with no
+    // `--config`, so the child reads the host's /etc/kbf/kbf.toml and the test passes or
+    // fails by the host (rules, lists and planted trees in `kbf_spawns/mod.rs`); a helper
+    // that stopped calling `kbf_testkit::config::flag`; a stale row. The allowance is
+    // pinned at its count, so it cannot grow without this line changing.
+    let root = repo_root();
+    let files = listed_files(&root);
+    let read = |f: &str| {
+        read_bytes(&root.join(f)).map(|b| String::from_utf8(b).expect("UTF-8 Rust source"))
+    };
+    let (naming, problems) =
+        kbf_spawns::scan(&files, read, (kbf_spawns::FLAGGED, kbf_spawns::ALLOWANCE));
+    assert!(problems.is_empty(), "kbf spawns:\n{}", problems.join("\n"));
+    assert!(
+        naming.len() >= kbf_spawns::ALLOWANCE.len(),
+        "the scan found {} starts of kbf; it reads too little",
+        naming.len()
+    );
+    assert_eq!(
+        kbf_spawns::ALLOWANCE.len(),
+        17,
+        "the allowance only shrinks"
+    );
 }

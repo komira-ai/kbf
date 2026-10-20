@@ -938,6 +938,10 @@ mod tests {
     fn the_same_kill_of_another_operation_differs() {
         let killed = |pick: usize| {
             let mut sim = Sim::new(3);
+            // Placement spreads two operations over two nodes: keep `b` out of it.
+            sim.feed(Event::Cordon {
+                worker: WorkerId::new("b"),
+            });
             sim.submit(1);
             sim.submit(2);
             assert_eq!(sim.running[0].worker, sim.running[1].worker, "one node");

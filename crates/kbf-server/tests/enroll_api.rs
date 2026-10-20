@@ -3,7 +3,6 @@
 //! in `src/enroll/api/tests.rs`.)
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use kbf_server::api_client::OperatorClient;
@@ -25,16 +24,12 @@ impl PinSource for FixedPin {
     }
 }
 
+/// The token file is in a directory of its own, removed once the token is read.
 fn token_file() -> ApiToken {
     use std::os::unix::fs::PermissionsExt;
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-enroll-api");
-    std::fs::create_dir_all(&dir).expect("a token directory");
-    // One file per call: tests in this binary run in parallel in one process, so a
-    // name keyed by the process id alone let one test truncate the file while another
-    // read it ("a usable token: Content").
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = dir.join(format!("token-{}-{n}", std::process::id()));
+    let dir =
+        kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-enroll-api");
+    let path = dir.join("token");
     std::fs::write(&path, format!("{TOKEN}\n")).expect("write the token");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     ApiToken::from_file(&path).expect("a usable token")

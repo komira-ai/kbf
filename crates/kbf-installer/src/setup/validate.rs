@@ -12,6 +12,7 @@ use super::paths;
 use crate::CommitId;
 use crate::cli::{Mode, ReleaseSource};
 use crate::installer_toml::{Source, https_base_named};
+use crate::layout::Platform;
 use kbf_state::postgres::PostgresConfig;
 
 /// The flags as the command line gave them.
@@ -28,8 +29,8 @@ pub struct Raw {
     pub database: Option<String>,
     /// The listener, certificate and storage-client flags of a frontend or all-in-one host.
     pub kbf: KbfFlags,
-    /// `--installer-config`, as the host path it names.
-    pub installer_config: String,
+    /// `--installer-config`, as the host path it names; `None` is the platform's default.
+    pub installer_config: Option<String>,
 }
 
 /// The flags, valid.
@@ -59,7 +60,7 @@ pub fn enrolls(mode: Mode) -> bool {
 
 impl Raw {
     /// Check every flag; the `Err` lists each problem.
-    pub fn validate(&self) -> Result<Valid, Vec<String>> {
+    pub fn validate(&self, platform: Platform) -> Result<Valid, Vec<String>> {
         let mut problems = Vec::new();
         let node = enrolls(self.mode);
         let name = mode_name(self.mode);
@@ -99,10 +100,14 @@ impl Raw {
 
         let database = self.database(&mut problems);
         let kbf = self.kbf.validate(self.mode, &mut problems);
-        if self.installer_config != paths::INSTALLER_TOML {
+        let installer_toml = paths::installer_toml(platform);
+        if self
+            .installer_config
+            .as_deref()
+            .is_some_and(|given| given != installer_toml)
+        {
             problems.push(format!(
-                "setup writes {}, where the installer's unit reads it: --installer-config is for run",
-                paths::INSTALLER_TOML
+                "setup writes {installer_toml}, where the installer's unit reads it: --installer-config is for run"
             ));
         }
         let source = self.source(node, &mut problems);

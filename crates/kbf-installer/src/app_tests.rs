@@ -40,7 +40,6 @@ fn stubs() -> Vec<(Vec<&'static str>, &'static str, &'static str)> {
         (vec!["check"], "check", "P10"),
         (vec!["stage"], "stage", "P8"),
         (vec!["activate"], "activate", "P5"),
-        (vec!["fetch-child"], "fetch-child", "P7"),
     ]
 }
 
@@ -76,6 +75,38 @@ fn only_status_and_check_run_without_root() {
                 "{name}: {err}"
             );
         }
+    }
+}
+
+/// The fetch child is built (P7) and runs as the fetch user, not as root: it is not gated on
+/// root, it prints nothing on standard output but the component's bytes (never JSON, whatever
+/// the global flag), and it says why it fetched nothing in one line on standard error.
+///
+/// Catches the child inheriting the "needs root" gate (it would never start as `kbf-fetch`) and
+/// a child that prints prose where the parent counts bytes.
+#[test]
+fn the_fetch_child_is_no_root_verb_and_reports_in_one_line() {
+    let digest = "a".repeat(64);
+    for json in [false, true] {
+        let mut args = vec!["fetch-child"];
+        if json {
+            args.insert(0, "--json");
+        }
+        args.extend([
+            "--kind",
+            "url",
+            "--url",
+            "http://h.example",
+            "--sha256",
+            &digest,
+            "--limit",
+            "10",
+        ]);
+        let (exit, out, err) = run_as(1000, &args);
+        assert_eq!(exit, Exit::Failed, "{err}");
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(err.starts_with("fetch-child: "), "{err}");
     }
 }
 
@@ -117,8 +148,9 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
     // Not a mutating verb: it has no dry run to leave out.
     assert!(
         !Verb::Proxy(ProxyArgs {
-            config: file,
-            check: true
+            config: Some(file),
+            check: true,
+            update_dir: "/var/lib/kbf-installer".into(),
         })
         .needs_root()
     );
@@ -245,7 +277,8 @@ fn no_command_takes_a_positional_argument() {
     assert!(found.is_empty(), "{found:?}");
 }
 
-/// Catches the public verb list drifting from the contract's table (section 2): the visible
+/// Catches the public verb list drifting from the contract's table (section 2) plus the
+/// state database's `backup` and `restore` (frontend-proxy.md section 11): the visible
 /// verbs, and that the three internal ones stay out of the help.
 #[test]
 fn the_visible_verbs_are_the_contracts() {
@@ -265,11 +298,14 @@ fn the_visible_verbs_are_the_contracts() {
             "confirm",
             "revert",
             "rollback",
+            "record-release",
             "gc",
             "boot-check",
             "migrate",
             "quiesce",
             "check",
+            "backup",
+            "restore",
             "proxy"
         ]
     );
@@ -562,6 +598,48 @@ fn the_operators_verbs_run_through_the_dispatcher_with_their_own_exits() {
         exit(Operator::NeedsOperator("x".to_owned())),
         Exit::NeedsOperator
     );
+}
+
+/// Catches `record-release` not running through the dispatcher, or its refusals leaving with
+/// another exit: as root, files that are not a release (a release that was never placed, a
+/// binary that is not the executable this host runs, a host root that is not absolute) end with
+/// the exit of the refusal and the program on the line; a release error keeps the exit of
+/// the release verbs.
+///
+/// Mutants planted: the verb dispatched to `gc`; the refusal folded into the failure exit.
+#[test]
+fn record_release_runs_through_the_dispatcher_and_refuses_what_is_not_a_release() {
+    use crate::record_release::RecordError;
+    use crate::release::ReleaseError;
+    let (_, root) = seeded("record-release");
+    let root_arg = root.to_str().expect("text");
+    for commit in [A, B] {
+        let (exit, _, err) = run_as(
+            0,
+            &[
+                "--root",
+                root_arg,
+                "--apply",
+                "record-release",
+                "--commit",
+                commit,
+            ],
+        );
+        assert_eq!(exit, Exit::Refused, "{commit}: {err}");
+        assert!(err.starts_with("kbf-installer: "), "{err}");
+    }
+    let (exit, _, err) = run_as(0, &["--root", "relative", "record-release", "--commit", A]);
+    assert_eq!(exit, Exit::Failed, "{err}");
+
+    let release = |e: ReleaseError| Failure::from(RecordError::Release(e)).exit;
+    assert_eq!(release(ReleaseError::NotFirst(c(A))), Exit::Failed);
+    let read = io::Error::from(io::ErrorKind::NotFound);
+    let refused = Failure::from(RecordError::Read {
+        path: "p".to_owned(),
+        source: read,
+    });
+    assert_eq!(refused.exit, Exit::Refused);
+    assert!(refused.why.contains("cannot read p"), "{}", refused.why);
 }
 
 /// Catches a frontend or all-in-one unit that activates releases with no database migration
@@ -952,13 +1030,26 @@ fn the_verbs_that_manage_a_host_wait_for_its_migration() {
 /// Mutants to plant: `Verb::FetchChild` or `Verb::Migrate(_)` moved to the `true` arm; `Verb::Setup(_)` to the `false` one.
 #[test]
 fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
-    let held: [&[&str]; 9] = [
+    let digest = "a".repeat(64);
+    let fetch_child = [
+        "fetch-child",
+        "--kind",
+        "url",
+        "--url",
+        "http://h.example",
+        "--sha256",
+        digest.as_str(),
+        "--limit",
+        "10",
+    ];
+    let held: [&[&str]; 10] = [
         &["setup", "--mode=frontend"],
         &RUN,
         &["update", "--commit", B, "--frontend"],
         &["confirm", "--id=1-5", "--unit", "kbf.service"],
         &["revert", "--id=1-5", "--unit", "kbf.service"],
         &["rollback", "--unit", "kbf.service"],
+        &["record-release", "--commit", A],
         &["gc"],
         &["stage"],
         &["activate"],
@@ -969,7 +1060,7 @@ fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
         &["boot-check"],
         &["quiesce"],
         &["migrate"],
-        &["fetch-child"],
+        &fetch_child,
     ];
     for args in held {
         assert!(parse(args).verb.manages_host(), "{args:?} is held");
@@ -1202,3 +1293,6 @@ fn a_path_is_not_joined_to_a_relative_root() {
         PathBuf::from("/srv/root/etc/kbf/installer.toml")
     );
 }
+
+#[path = "app_backup_tests.rs"]
+mod backup_cli;
