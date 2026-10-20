@@ -222,9 +222,9 @@ jobs:
       # container installs, runs and removes it; `pkg-asset` then refuses it unless it holds the
       # binary of the tarball checked above and trusts that branch, and lists it in SHA256SUMS.
       - name: Fetch the pinned gh, for the package's trust directory
-        run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_amd64.tar.gz" --sha256 "$$GH_SHA256_X86_64_LINUX" --out "$RUNNER_TEMP/tools/gh" --extract tar.gz --member "gh_${GH_VERSION}_linux_amd64/bin/gh"
+        run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_amd64.tar.gz" --sha256 "$GH_SHA256_X86_64_LINUX" --out "$RUNNER_TEMP/tools/gh" --extract tar.gz --member "gh_${GH_VERSION}_linux_amd64/bin/gh"
       - name: Fetch nfpm (pinned version, checked by SHA-256)
-        run: cargo xtask fetch --url "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" --sha256 "$$NFPM_SHA256_X86_64_LINUX" --out "$RUNNER_TEMP/tools/nfpm" --extract tar.gz --member nfpm
+        run: cargo xtask fetch --url "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" --sha256 "$NFPM_SHA256_X86_64_LINUX" --out "$RUNNER_TEMP/tools/nfpm" --extract tar.gz --member nfpm
       - name: Fetch the Sigstore trusted root with the pinned gh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -318,9 +318,9 @@ jobs:
       # container installs, runs and removes it; `pkg-asset` then refuses it unless it holds the
       # binary of the tarball checked above and trusts that branch, and lists it in SHA256SUMS.
       - name: Fetch the pinned gh, for the package's trust directory
-        run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_arm64.tar.gz" --sha256 "$$GH_SHA256_AARCH64_LINUX" --out "$RUNNER_TEMP/tools/gh" --extract tar.gz --member "gh_${GH_VERSION}_linux_arm64/bin/gh"
+        run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_arm64.tar.gz" --sha256 "$GH_SHA256_AARCH64_LINUX" --out "$RUNNER_TEMP/tools/gh" --extract tar.gz --member "gh_${GH_VERSION}_linux_arm64/bin/gh"
       - name: Fetch nfpm (pinned version, checked by SHA-256)
-        run: cargo xtask fetch --url "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_arm64.tar.gz" --sha256 "$$NFPM_SHA256_AARCH64_LINUX" --out "$RUNNER_TEMP/tools/nfpm" --extract tar.gz --member nfpm
+        run: cargo xtask fetch --url "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_arm64.tar.gz" --sha256 "$NFPM_SHA256_AARCH64_LINUX" --out "$RUNNER_TEMP/tools/nfpm" --extract tar.gz --member nfpm
       - name: Fetch the Sigstore trusted root with the pinned gh
         env:
           GH_TOKEN: ${{ github.token }}

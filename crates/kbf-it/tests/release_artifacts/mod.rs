@@ -373,6 +373,41 @@ fn flag<'a>(words: &[&'a str], flag: &str) -> Option<&'a str> {
     words.get(at + 1).copied()
 }
 
+/// Every tool a job fetches (`cargo xtask fetch ... --sha256 <value>`) is pinned by a
+/// workflow variable that exists and holds 64 lowercase hex digits: `--sha256 "$NAME"`.
+/// (A `"$$NAME"`, which the shell reads as its process id followed by `NAME`, passes the
+/// lint of the step and fails the job on the first run.)
+fn fetch_pins(workflow: &str, job: &str, steps: &[workflows::Step], out: &mut Vec<String>) {
+    for step in steps {
+        for line in lines(step) {
+            let Some(words) = args(line, "cargo xtask fetch ") else {
+                continue;
+            };
+            let pin = flag(&words, "--sha256").unwrap_or_default();
+            let name = pin.strip_prefix('$').unwrap_or_default();
+            let named = !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+            let defined = named
+                && workflow.lines().any(|l| {
+                    l.trim_start()
+                        .strip_prefix(name)
+                        .and_then(|rest| rest.strip_prefix(": "))
+                        .is_some_and(|v| {
+                            v.len() == 64
+                                && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                        })
+                });
+            if !defined {
+                out.push(format!(
+                    "`{job}`: `{line}` pins its download with --sha256 {pin:?}, which is not `$NAME` of a workflow variable holding 64 lowercase hex digits"
+                ));
+            }
+        }
+    }
+}
+
 /// The `kbf-installer` deb: see the module docs.
 fn packages(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
     let made = attested_assets::packaged_debs(workflow)?;
@@ -479,6 +514,7 @@ fn packages(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
                 }
             }
         }
+        fetch_pins(workflow, platform, &steps, out);
         let env = workflows::job_env(workflow, platform)?;
         let got = env
             .iter()
@@ -1446,6 +1482,48 @@ mod rules {
             &[
                 "is made an asset before `cargo xtask build-commit check-asset` of the tarball whose binary it holds",
             ],
+        );
+    }
+
+    #[test]
+    fn a_fetched_tool_is_pinned_by_a_workflow_variable_that_exists() {
+        // Catches: `--sha256 "$$NAME"` (the shell's process id, then NAME), a pin that is
+        // a variable nobody defines, a literal digest, a lower-case name, a digest of the
+        // wrong length, and no pin at all, in the Linux jobs that fetch gh and nfpm for
+        // the package.
+        let hex = "ab".repeat(32);
+        let pins = |w: &str| {
+            let mut out = Vec::new();
+            for job in PACKAGES {
+                let steps = workflows::job_steps(w, job).expect("job");
+                fetch_pins(w, job, &steps, &mut out);
+            }
+            out
+        };
+        let base = good().replacen("jobs:\n", &format!("env:\n  GH_SHA: {hex}\njobs:\n"), 1);
+        let fetch = "      - name: Fetch\n        run: cargo xtask fetch --url u --sha256 \"$GH_SHA\" --out o\n";
+        let with =
+            |w: &str, line: &str| w.replacen("    steps:\n", &format!("    steps:\n{line}"), 3);
+        let good_pins = pins(&with(&base, fetch));
+        assert!(good_pins.is_empty(), "{good_pins:?}");
+        for bad in [
+            fetch.replace("\"$GH_SHA\"", "\"$$GH_SHA\""),
+            fetch.replace("$GH_SHA", "$OTHER_SHA"),
+            fetch.replace("$GH_SHA", &hex),
+            fetch.replace(" --sha256 \"$GH_SHA\"", ""),
+            fetch.replace("$GH_SHA", "$gh_sha"),
+        ] {
+            let got = pins(&with(&base, &bad));
+            assert!(
+                got.iter()
+                    .any(|p| p.contains("pins its download with --sha256")),
+                "{bad}: {got:?}"
+            );
+        }
+        let short = base.replace(&hex, &hex[..63]);
+        assert!(
+            !pins(&with(&short, fetch)).is_empty(),
+            "a 63-digit pin is not a pin"
         );
     }
 
