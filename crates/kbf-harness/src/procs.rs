@@ -70,6 +70,31 @@ pub fn log_files(logs: &Path, name: &str, generation: usize) -> (PathBuf, PathBu
     )
 }
 
+/// Every line of the `.out` and `.err` files directly in `logs` (every process, every
+/// generation) that holds `needle`, each as `file: line`, files in name order.
+#[must_use]
+pub fn log_hits(logs: &Path, needle: &str) -> Vec<String> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(logs)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "out" || x == "err"))
+        .collect();
+    files.sort();
+    let mut hits = Vec::new();
+    for file in files {
+        let name = file.file_name().map(|n| n.to_string_lossy().into_owned());
+        let text = String::from_utf8_lossy(&std::fs::read(&file).unwrap_or_default()).into_owned();
+        hits.extend(
+            text.lines()
+                .filter(|l| l.contains(needle))
+                .map(|l| format!("{}: {l}", name.as_deref().unwrap_or_default())),
+        );
+    }
+    hits
+}
+
 /// The file in `logs` that holds the process group id of generation `generation` of process
 /// `name` while it runs: a number and a newline. The sentinel kills the groups of the files
 /// there are when the harness dies.

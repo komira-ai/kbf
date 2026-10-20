@@ -61,6 +61,7 @@ mod closure;
 mod cpu;
 mod default_platform;
 mod described;
+mod dir_cache;
 mod execution;
 mod finished_row;
 mod input_tree;
@@ -95,11 +96,11 @@ pub use crate::cache::{
     ADOPT_RECORDS, Admitted, BATCH_BLOBS, BATCH_BYTES, BATCH_READS_IN_FLIGHT, BUFFERED_BLOB_BYTES,
     BlobRead, Cache, CacheError, DEFAULT_REAPI_STREAMS, DEFAULT_WORKER_STREAMS, EVICT_BATCH,
     EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound, FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX,
-    FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound, HeldObject, Losses, MAX_ADMISSION_BYTES,
-    MAX_DECODED_BLOB_BYTES, NEEDS_V3, ObjectKeys, PASS_OPENS_PER_SEC, PUT_BACKOFF,
-    PUT_BACKOFF_FACTOR, PassReport, PoolConfig, READ_WINDOW_BYTES, RebuildConfig, RebuildReport,
-    RecordStream, STREAM_WINDOW_BYTES, StreamedRecord, TierStartError, TierStartup, TouchConfig,
-    VerifiedBlob, WriteConfig,
+    FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushReport, FlushRound, HeldObject, Losses,
+    MAX_ADMISSION_BYTES, MAX_DECODED_BLOB_BYTES, NEEDS_V3, ObjectKeys, PASS_OPENS_PER_SEC,
+    PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, PoolConfig, READ_WINDOW_BYTES, RebuildConfig,
+    RebuildReport, RecordStream, STREAM_WINDOW_BYTES, StreamedRecord, TailReport, TailState,
+    TierStartError, TierStartup, TouchConfig, VerifiedBlob, WriteConfig,
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;

@@ -881,3 +881,337 @@ fn the_child_admin_offers_a_release_to_the_operator_port_of_its_slot() {
         }
     }
 }
+
+/// Migration on the cold start: the database a test cannot reach, with secrets in its URL.
+mod migration {
+    use kbf_state::postgres::PostgresConfig;
+    use kbf_state::postgres::schema::{self, Outcome};
+
+    use super::*;
+    use crate::fixtures::{FakeRunner, ran, version_json};
+    use crate::proxy::root_orders::StatusFile;
+
+    const URL: &str = "postgres://kbf_marker_user:hunter2_marker@127.0.0.1:1/kbf_marker_db";
+    const SECRETS: [&str; 4] = [
+        "hunter2_marker",
+        "kbf_marker_user",
+        "kbf_marker_db",
+        "127.0.0.1",
+    ];
+
+    fn unreachable_db() -> Database {
+        Database::new(
+            PostgresConfig::parse(URL).expect("parses"),
+            schema::embedded(),
+        )
+    }
+
+    /// What `commit --version --json` prints for a release that needs schema `schema`.
+    fn declares(commit: &str, schema: u32) -> String {
+        version_json(commit, "release")
+            .replace("\"state_schema\":7", &format!("\"state_schema\":{schema}"))
+    }
+
+    fn says(stdout: String) -> FakeRunner {
+        FakeRunner::new(move |_| Ok(ran(0, &stdout, "")))
+    }
+
+    /// One progress report: its state, its reason word and the port's own text.
+    type Line = (&'static str, Option<&'static str>, Option<String>);
+
+    /// Every progress report with the port's own text, as the log gets it.
+    #[derive(Default)]
+    struct Told(RefCell<Vec<Line>>);
+
+    impl Report for Told {
+        fn progress(&self, progress: &Progress, detail: Option<&str>) {
+            self.0
+                .borrow_mut()
+                .push((progress.state, progress.reason, detail.map(str::to_owned)));
+        }
+    }
+
+    fn nothing_applied(schema: u32) -> Result<Outcome, kbf_state::postgres::schema::SchemaError> {
+        Ok(Outcome {
+            from: None,
+            to: schema,
+            ran: Vec::new(),
+        })
+    }
+
+    /// Catches a verb whose migrator is not the database's: the constructor the verb calls
+    /// must build a `DbMigrator`, which asks the database (here unreachable, so `database_error`),
+    /// not a hook that says yes. For a release `status.json` calls staged it reads the schema
+    /// there; for the installed one it runs the release's own program (here a stand-in that
+    /// refuses `--version`), which is `schema_unknown`. No part of the URL is in either.
+    ///
+    /// Mutants seen red: `host_migrator` returning a hook that migrates nothing (both `Ok`);
+    /// the installed probe not given (`not_staged`).
+    #[test]
+    fn the_verbs_migrator_asks_the_database_and_the_release() {
+        let rig = rig("supervisor-host-migrator");
+        let status = state_dir(&rig).join("status.json");
+        let facts = StatusFile::new(&status);
+        let m = host_migrator(unreachable_db(), &facts, &rig.child);
+        std::fs::write(
+            &status,
+            format!(
+                "{{\"installed_commit\":\"{A}\",\"staged_commit\":\"{A}\",\"staged\":{{\"protocol\":1,\"min_protocol\":1,\"state_schema\":1}}}}\n"
+            ),
+        )
+        .expect("status.json");
+        let staged = m.migrate_forward(&c(A)).unwrap_err().0;
+        assert!(staged.starts_with("database_error: "), "{staged}");
+        std::fs::write(&status, format!("{{\"installed_commit\":\"{A}\"}}\n")).expect("status");
+        let installed = m.migrate_forward(&c(A)).unwrap_err().0;
+        assert!(installed.starts_with("schema_unknown: "), "{installed}");
+        for text in [staged, installed] {
+            for secret in SECRETS {
+                assert!(!text.contains(secret), "{secret} in {text}");
+            }
+        }
+    }
+
+    /// Catches a cold start that goes on after a migration refusal: the database is down, so
+    /// every attempt fails as `migration-failed` with the refusal's word in the log, no process
+    /// is started or recorded, the child's admin port is never asked, the streams stay held, and
+    /// the operator gets a fix. Neither the held reason nor the log carries the URL.
+    ///
+    /// Mutants seen red: the refusal ignored by the boot (a process was recorded); the fix of
+    /// `migration-failed` removed.
+    #[test]
+    fn a_refused_migration_holds_with_its_reason_and_starts_nothing() {
+        let rig = rig("supervisor-cold-migration-refused");
+        let (gate, _runner) = gate();
+        let env = Env::new(&rig, &gate);
+        env.install(A);
+        verify(&rig, A);
+        let runner = says(declares(A, 1));
+        let facts = StatusFile::new(&env.status);
+        let m = host_migrator_with(&runner, unreachable_db(), &facts, &rig.child);
+        let told = Told::default();
+        let boot = Boot {
+            migrator: &m,
+            report: &told,
+            ..env.boot()
+        };
+        let outcome = adopt_children(&gate, &rig.child, &state_dir(&rig), &boot);
+        // Whatever a defect started is stopped when the test ends.
+        let _stop = Cleanup(
+            &rig.child,
+            rig.child
+                .recorded(Slot::A)
+                .map(|r| r.ident)
+                .into_iter()
+                .collect(),
+        );
+        let Startup::Held(why) = outcome else {
+            panic!("started on a database that is down");
+        };
+        assert!(why.contains("migration-failed"), "{why}");
+        assert_eq!(rig.child.recorded(Slot::A), None, "a process was started");
+        assert_eq!(env.admin.polls.get(), 0);
+        assert!(gate.handle.snapshot().holding);
+        assert_eq!(gate.active(), None);
+        let told = told.0.borrow();
+        let failed: Vec<_> = told
+            .iter()
+            .filter(|(_, reason, _)| reason.is_some())
+            .collect();
+        assert_eq!(failed.len(), 3, "{told:?}");
+        for (_, reason, detail) in failed {
+            assert_eq!(*reason, Some("migration-failed"));
+            let detail = detail.as_deref().expect("the port's text");
+            assert!(detail.starts_with("database_error: "), "{detail}");
+            for secret in SECRETS {
+                assert!(
+                    !detail.contains(secret) && !why.contains(secret),
+                    "{secret}"
+                );
+            }
+        }
+        assert!(
+            Reason::MigrationFailed
+                .fix()
+                .is_some_and(|fix| fix.contains("database_busy") && fix.contains("restart")),
+        );
+    }
+
+    /// Catches a migration that runs after the process or not on the release that starts: the
+    /// installed release asks its own binary for its schema, the migration runs with it and the
+    /// bound, and at that moment no process is recorded; afterwards the release runs and serves.
+    ///
+    /// Mutants seen red: the migrator called after `spawn` (a process was already recorded);
+    /// the schema taken from the installer's newest instead of the release's.
+    #[test]
+    fn the_installed_release_is_migrated_for_its_own_schema_before_it_is_spawned() {
+        let rig = rig("supervisor-cold-migrates-first");
+        let (gate, _runner) = gate();
+        let env = Env::new(&rig, &gate);
+        env.install(A);
+        verify(&rig, A);
+        let runner = says(declares(A, 5));
+        let facts = StatusFile::new(&env.status);
+        let seen = RefCell::new(Vec::new());
+        let m = host_migrator_with(&runner, unreachable_db(), &facts, &rig.child).with_apply(
+            Box::new(|_, schema, wait| {
+                seen.borrow_mut()
+                    .push((schema, wait, rig.child.recorded(Slot::A).is_some()));
+                nothing_applied(schema)
+            }),
+        );
+        let boot = Boot {
+            migrator: &m,
+            ..env.boot()
+        };
+        let outcome = adopt_children(&gate, &rig.child, &state_dir(&rig), &boot);
+        let recorded = rig.child.recorded(Slot::A).expect("started after");
+        let _stop = Cleanup(&rig.child, vec![recorded.ident]);
+        assert_eq!(outcome, Startup::Adopted { active: Slot::A });
+        assert_eq!(*seen.borrow(), [(5, Duration::from_secs(30), false)]);
+        assert_eq!(runner.calls().len(), 1);
+        assert!(runner.calls()[0].program.ends_with("kbf-act"));
+    }
+
+    /// The tests that need a Postgres server. The module is named `database` so the CI
+    /// steps that run the `#[ignore]`d tests (they select `database::`) pick them up.
+    mod database {
+        use super::*;
+
+        /// Real server, own database: a cold start against a fresh database creates the schema
+        /// (kbf opens on it), and the next cold start finds it done and changes nothing. The
+        /// database is created for this test alone, so no other test process shares its schema.
+        /// No part of the URL is in anything the log is given.
+        ///
+        /// Mutants seen red: the hook migrating nothing (no schema; kbf's open refused);
+        /// the `schema_version` row written again on the second start (the row changed).
+        #[test]
+        #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+        fn a_cold_start_creates_the_schema_on_a_fresh_database_and_the_next_changes_nothing() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let url = std::env::var("KBF_TEST_POSTGRES_URL").expect("KBF_TEST_POSTGRES_URL");
+
+            /// A database created for one test and dropped with it.
+            struct Own {
+                name: String,
+                url: String,
+            }
+
+            impl Own {
+                fn new(url: &str) -> Own {
+                    let name = format!(
+                        "kbf_cold_{}_{}",
+                        std::process::id(),
+                        NEXT.fetch_add(1, Ordering::Relaxed)
+                    );
+                    let mut admin =
+                        postgres::Client::connect(url, postgres::NoTls).expect("connects");
+                    admin
+                        .batch_execute(&format!("CREATE DATABASE {name}"))
+                        .expect("creates");
+                    let (base, _) = url.rsplit_once('/').expect("a database in the URL");
+                    Own {
+                        url: format!("{base}/{name}"),
+                        name,
+                    }
+                }
+            }
+
+            impl Drop for Own {
+                fn drop(&mut self) {
+                    let base = self.url.rsplit_once('/').map_or("", |(base, _)| base);
+                    if let Ok(mut admin) =
+                        postgres::Client::connect(&format!("{base}/postgres"), postgres::NoTls)
+                    {
+                        let _ = admin.batch_execute(&format!(
+                            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                            self.name
+                        ));
+                    }
+                }
+            }
+
+            let own = Own::new(&url);
+            let config = PostgresConfig::parse(&own.url).expect("parses");
+            let mut client =
+                postgres::Client::connect(&own.url, postgres::NoTls).expect("connects");
+            let rows = |client: &mut postgres::Client| -> Vec<String> {
+                client
+                    .query(
+                        "SELECT version::text || ' ' || applied_at::text FROM kbf_state.schema_version ORDER BY version",
+                        &[],
+                    )
+                    .expect("the version table")
+                    .iter()
+                    .map(|r| r.get::<_, String>(0))
+                    .collect()
+            };
+            let absent = client
+                .query_one("SELECT to_regclass('kbf_state.schema_version')::text", &[])
+                .expect("catalog");
+            assert_eq!(
+                absent.get::<_, Option<String>>(0),
+                None,
+                "the database is fresh"
+            );
+
+            let rig = rig("supervisor-cold-real-database");
+            let runner = says(declares(A, 1));
+            let facts = StatusFile::new(state_dir(&rig).join("status.json"));
+            let m = host_migrator_with(
+                &runner,
+                Database::new(config.clone(), schema::embedded()),
+                &facts,
+                &rig.child,
+            );
+            let told = Told::default();
+            let start = |child: &ProcChild| {
+                let (gate, _runner) = gate();
+                let env = Env::new(&rig, &gate);
+                env.install(A);
+                verify(&rig, A);
+                let boot = Boot {
+                    migrator: &m,
+                    report: &told,
+                    ..env.boot()
+                };
+                let outcome = adopt_children(&gate, child, &state_dir(&rig), &boot);
+                (outcome, child.recorded(Slot::A).map(|r| r.ident))
+            };
+
+            let (outcome, started) = start(&rig.child);
+            let first = started.expect("the release started");
+            let _stop = Cleanup(&rig.child, vec![first.clone()]);
+            assert_eq!(outcome, Startup::Adopted { active: Slot::A });
+            assert_eq!(schema::current(&config), Ok(1));
+            kbf_state::postgres::PostgresStore::open(&config).expect("kbf opens on what was made");
+            let made = rows(&mut client);
+            assert_eq!(made.len(), 1, "{made:?}");
+
+            // The host restarts: nothing runs, the next start finds the schema in place.
+            rig.child.terminate(&first).expect("signal");
+            wait_for("exit", || !alive(first.pid));
+            let after = rig.restarted();
+            let (outcome, started) = start(&after);
+            let second = started.expect("started again");
+            let _stop = Cleanup(&after, vec![second.clone()]);
+            assert_eq!(outcome, Startup::Adopted { active: Slot::A });
+            assert_ne!(first, second, "a new process");
+            assert_eq!(
+                rows(&mut client),
+                made,
+                "the second start changed the schema"
+            );
+            for (_, _, detail) in told.0.borrow().iter() {
+                for secret in own.url.split(['/', '@', ':']).filter(|part| part.len() > 4) {
+                    assert!(
+                        detail.as_deref().is_none_or(|d| !d.contains(secret)),
+                        "{secret} in {detail:?}"
+                    );
+                }
+            }
+        }
+    }
+}

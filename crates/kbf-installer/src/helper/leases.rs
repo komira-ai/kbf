@@ -192,7 +192,7 @@ fn is_unit_of(unit: &str, modes: &[Mode]) -> bool {
     family(unit).is_some_and(|f| {
         modes
             .iter()
-            .flat_map(|m| mode_units(*m))
+            .flat_map(|m| mode_units(*m, false))
             .any(|u| family(u) == Some(f))
     })
 }

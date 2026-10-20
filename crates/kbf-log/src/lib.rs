@@ -10,7 +10,7 @@
 //! (docs/design/write-path.md, section 6.5); [`Format::V3`], which adds
 //! `EvictObjects`; or [`Format::V4`], which adds node writers (`SetWriter`, and object
 //! ids naming a storage node's member and boot) and the commands of a rebuild of the
-//! index. Any other format is refused on both sides, and so is a command under a format
+//! index; or [`Format::V5`], which adds `ReseatStaged`. Any other format is refused on both sides, and so is a command under a format
 //! before the one it joined, so a binary never writes or reads an encoding the log does
 //! not allow.
 //!
@@ -66,6 +66,9 @@ impl Format {
     /// `RebuildDone`).
     pub const V4: Self = Self(4);
 
+    /// Format 4 plus `ReseatStaged`.
+    pub const V5: Self = Self(5);
+
     /// Format number `n`, which may not be one this binary supports.
     #[must_use]
     pub const fn new(n: u32) -> Self {
@@ -80,7 +83,7 @@ impl Format {
 
     /// Whether this binary writes and reads the format.
     const fn known(self) -> bool {
-        matches!(self, Self::V1 | Self::V2 | Self::V3 | Self::V4)
+        matches!(self, Self::V1 | Self::V2 | Self::V3 | Self::V4 | Self::V5)
     }
 }
 

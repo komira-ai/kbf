@@ -211,6 +211,7 @@ fn status(e: MembershipError) -> Status {
         }
         MembershipError::NotRegistered(_) => Status::not_found(message),
         MembershipError::Contended => Status::aborted(message),
+        MembershipError::PinsFull { .. } => Status::resource_exhausted(message),
         MembershipError::Store(_) => Status::unavailable(message),
         MembershipError::NotSettable(_)
         | MembershipError::NotActive { .. }
@@ -228,6 +229,18 @@ fn announced(source: Option<&Arc<dyn StoreConfigSource>>) -> u64 {
     source.generation().unwrap_or_else(|e| {
         tracing::warn!("cold-store registration generation: {e}");
         0
+    })
+}
+
+/// The maps `members` retains from before generation `newest`, newest first, as they go on the
+/// wire (`retained_previous`): what a node that has just started has not seen. Reads no store.
+fn retained(members: &Members, newest: u64) -> Vec<pb::Map> {
+    members.view().map_or_else(Vec::new, |(_, history)| {
+        history
+            .iter()
+            .filter(|map| map.generation() < newest)
+            .map(|map| pb::Map::from(&**map))
+            .collect()
     })
 }
 
@@ -297,6 +310,7 @@ impl Membership for MembershipService {
             member_id: joined.id.0,
             boot: joined.boot,
             heartbeat_interval_ms: u64::try_from(beat.as_millis()).unwrap_or(u64::MAX),
+            retained_previous: retained(&self.members, joined.map.generation()),
             map: Some(pb::Map::from(&joined.map)),
             objstore_generation,
         }))
@@ -321,7 +335,7 @@ impl Membership for MembershipService {
             .store_config
             .as_ref()
             .map(|(source, _)| Arc::clone(source));
-        let (map_generation, map, objstore_generation) = blocking(move || {
+        let (map_generation, map, objstore_generation, retained_previous) = blocking(move || {
             if let Some(peer) = &peer {
                 // The map's list, read before the row is touched: a refused beat must not
                 // renew the row, or a denied node would never lapse.
@@ -340,7 +354,10 @@ impl Membership for MembershipService {
             } else {
                 None
             };
-            Ok((generation, newer, announced(source.as_ref())))
+            let earlier = newer
+                .as_ref()
+                .map_or_else(Vec::new, |map| retained(&members, map.generation()));
+            Ok((generation, newer, announced(source.as_ref()), earlier))
         })
         .await?;
         // Only an accepted heartbeat counts: a refused or superseded one never reaches here.
@@ -355,6 +372,9 @@ impl Membership for MembershipService {
             map_generation,
             map: map.as_ref().map(pb::Map::from),
             objstore_generation,
+            retained_previous,
+            // The frontend opens no tail fence yet.
+            tail_epoch: 0,
         }))
     }
 }

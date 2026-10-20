@@ -9,7 +9,7 @@
 
 use kbf_host::{Cmd, Entry, Exec, HostPath, Owner, Perms, Plan, Planner, RunUser};
 
-use super::kbf_toml::{self, Decision, Ours};
+use super::kbf_toml::{self, Decision, Ours, UpdateDirs};
 use super::os::{DSCL, LAUNCHCTL, Os, SYSTEMCTL, View};
 use super::paths;
 use super::validate::{Valid, mode_name};
@@ -29,7 +29,21 @@ const MAC_ID_TO: u32 = 400;
 /// The launchd labels: the installer's plist is the package's; the daemon's is the release's.
 pub const MAC_INSTALLER_LABEL: &str = "com.komira.kbf-installer";
 pub const MAC_DAEMON_LABEL: &str = "com.komira.kbf-daemon";
+/// The units of a frontend host behind the proxy.
+pub const PROXY_UNITS: &[&str] = &["kbf-proxy.socket", "kbf-proxy.service"];
+/// The frontend instance a host without the proxy runs.
+const FRONTEND_UNIT: &str = "kbf-frontend.service";
 pub const INSTALLER_UNIT: &str = "kbf-installer.service";
+/// The daily backup of the state database (`kbf-backup.service` is what it starts): enabled on
+/// the modes that keep their state in Postgres, started with them when `--no-start` is absent
+/// (the schema it dumps is made earlier in the same run).
+pub const BACKUP_TIMER: &str = "kbf-backup.timer";
+/// The unit the timer starts, and the drop-in that gives it its `User=` and state directory: the package's file
+/// carries neither, and its `AssertPathExists=` on this drop-in fails it rather than run as
+/// root where setup has not written it.
+pub const BACKUP_SERVICE_DIR: &str = "/etc/systemd/system/kbf-backup.service.d";
+pub const BACKUP_USER_DROPIN: &str =
+    "/etc/systemd/system/kbf-backup.service.d/10-service-user.conf";
 /// The longest token file setup reads.
 const MAX_TOKEN_BYTES: u64 = 4096;
 
@@ -61,9 +75,14 @@ fn file(
 /// The units a mode is run by. The names are the static unit files of the package
 /// (`packaging/linux/units`); the installer's own service is separate, since it runs
 /// whatever the mode.
-pub fn mode_units(mode: Mode) -> &'static [&'static str] {
+///
+/// A frontend behind the proxy (`proxy`) is run by the proxy's units, which start the frontend
+/// children themselves: `kbf-frontend.service` is never enabled beside them. The socket is
+/// first, so it holds the public port before the service takes it.
+pub fn mode_units(mode: Mode, proxy: bool) -> &'static [&'static str] {
     match mode {
-        Mode::Frontend => &["kbf-frontend.service"],
+        Mode::Frontend if proxy => PROXY_UNITS,
+        Mode::Frontend => &[FRONTEND_UNIT],
         Mode::Storage => &["kbf-storage.service"],
         Mode::Daemon => &["kbf-daemon.service"],
         Mode::StorageAndDaemon => &["kbf-storage-and-daemon.service"],
@@ -72,16 +91,43 @@ pub fn mode_units(mode: Mode) -> &'static [&'static str] {
 }
 
 /// The user a mode's unit runs as on Linux (`User=` of the package's units).
-fn service_user_name(mode: Mode) -> &'static str {
+pub(crate) fn service_user_name(mode: Mode) -> &'static str {
     match mode {
         Mode::Frontend | Mode::Storage => "kbf-server",
         Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne => "kbf",
     }
 }
 
+/// The state directory under `/var/lib` the backup unit of a mode makes: the one the mode's
+/// own unit makes (the frontend's `kbf-server`, the all-in-one unit's `kbf`), so the backups
+/// sit in the directory of the user that owns them and no stray directory is made.
+fn backup_state_dir(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Frontend | Mode::Storage => "kbf-server",
+        Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne => "kbf",
+    }
+}
+
+/// The drop-in text that makes `kbf-backup.service` run as `user`, the mode's service user (the
+/// one `service_user_name` names), with the mode's state directory `state`: `StateDirectory=`
+/// and the verb's `--dir` are set together, since the packaged unit carries the frontend's.
+/// The names are a fixed set, so nothing here needs escaping.
+pub fn backup_user_dropin(user: &str, state: &str) -> String {
+    format!(
+        "# Written by `kbf-installer setup`: the user the backup runs as and the state directory it\n# writes to, those of the mode's own unit. The package's kbf-backup.service carries neither.\n[Service]\nUser={user}\nStateDirectory=\nStateDirectory={state}\nExecStart=\nExecStart=/usr/bin/kbf-installer --apply backup --dir /var/lib/{state}/backups\n"
+    )
+}
+
 /// Whether the host runs actions in containers: it then needs a subid range and lingering.
 fn runs_actions(mode: Mode) -> bool {
     matches!(mode, Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne)
+}
+
+/// Whether the mode's daemon takes update orders: the one `kbf` starts with a storage map. The
+/// in-process daemon of `all-in-one` refuses `--update-dir` (`kbf-node`'s `start_over`), so it
+/// is not written there.
+pub fn takes_orders(mode: Mode) -> bool {
+    matches!(mode, Mode::Daemon | Mode::StorageAndDaemon)
 }
 
 /// Whether the host serves the operator API, which needs a token.
@@ -104,6 +150,9 @@ pub struct Ctx {
     pub root: Owner,
     /// The user the mode's unit runs as (Linux); a Mac runs the daemon as root.
     pub service: Option<RunUser>,
+    /// The migration's journal says a Mac the kit installed was adopted (kit, phase done):
+    /// its `kbf.toml` is the kit's and `setup` only adds to it.
+    pub kit_adopted: bool,
 }
 
 impl Ctx {
@@ -136,6 +185,7 @@ pub fn context(os: &dyn Os, mode: Mode) -> Result<Ctx, SetupError> {
         layout: Layout::new(kbf_host::Root::new("/")?, platform),
         root: os.root_owner(),
         service,
+        kit_adopted: false,
     })
 }
 
@@ -234,6 +284,89 @@ fn free_mac_id(users: &str, groups: &str) -> Result<u32, SetupError> {
         .ok_or(SetupError::NoFreeId)
 }
 
+/// What an existing fetch account must be, for the confinement of the fetch child to mean
+/// what the design says (`kbf-installer.md`: the child runs as `kbf-fetch`, `_kbf-fetch` on a
+/// Mac, with no fallback to another user): a system account (not root, below the first
+/// ordinary id), no login shell, no home. These are the values `setup` creates it with and
+/// the package's sysusers entry makes.
+struct FetchShape {
+    below: u32,
+    home: &'static str,
+    shells: &'static [&'static str],
+}
+
+fn fetch_shape(platform: Platform) -> FetchShape {
+    match platform {
+        Platform::Linux => FetchShape {
+            below: 1000,
+            home: "/nonexistent",
+            shells: &["/usr/sbin/nologin", "/sbin/nologin"],
+        },
+        Platform::MacOs => FetchShape {
+            below: 500,
+            home: "/var/empty",
+            shells: &["/usr/bin/false"],
+        },
+    }
+}
+
+/// Refuses an existing fetch account that is not the shape `setup` makes: the reason names
+/// the account and the field. Nothing is changed on the host, since a wrong account may be
+/// someone's, and the operator decides what to do with it.
+fn check_fetch_shape(os: &dyn Os, user: &RunUser) -> Result<(), SetupError> {
+    let want = fetch_shape(os.platform());
+    let shell = os.login_shell(&user.name)?;
+    let mut wrong = Vec::new();
+    if user.uid == 0 || user.uid >= want.below {
+        wrong.push(format!(
+            "uid {} (a system account: 1 to {})",
+            user.uid,
+            want.below - 1
+        ));
+    }
+    if user.gid == 0 || user.gid >= want.below {
+        wrong.push(format!(
+            "gid {} (a system group: 1 to {})",
+            user.gid,
+            want.below - 1
+        ));
+    }
+    if user.home != want.home {
+        wrong.push(format!("home {:?} (want {:?})", user.home, want.home));
+    }
+    if !want.shells.contains(&shell.as_str()) {
+        wrong.push(format!("shell {shell:?} (want {:?})", want.shells[0]));
+    }
+    if wrong.is_empty() {
+        return Ok(());
+    }
+    Err(SetupError::NeedsOperator(format!(
+        "the account {} exists and is not the fetch account setup makes: {}; the fetch child runs as it with no fallback to another user, so fix or remove the account, then run again",
+        user.name,
+        wrong.join(", ")
+    )))
+}
+
+/// The fetch account is there with the right shape, or its creation is a step of `p`. One
+/// function for `setup` and for `migrate` (which needs the account for the version probe
+/// before `setup` can have run), so there is one definition of the account.
+pub fn ensure_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os) -> Result<(), SetupError> {
+    let name = fetch_user(os.platform());
+    match os.user(name)? {
+        Some(user) => check_fetch_shape(os, &user),
+        None => create_fetch_user(p, os, name),
+    }
+}
+
+/// The plan that makes the fetch account, empty when it is there already; reads the host,
+/// changes nothing.
+pub fn fetch_user_plan(os: &dyn Os, exec: &dyn Exec) -> Result<Plan, SetupError> {
+    let view = View(exec);
+    let mut p = Planner::new(&view);
+    ensure_fetch_user(&mut p, os)?;
+    Ok(p.finish())
+}
+
 fn create_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os, name: &str) -> Result<(), SetupError> {
     match os.platform() {
         Platform::Linux => p.run(
@@ -296,16 +429,30 @@ pub fn before_release(
         .transpose()?;
     let settings = installer_settings(exec, v, platform)?;
     let listen = settings.proxy.as_ref().and_then(|p| p.listen);
-    let settings = settings.render();
+    if v.proxy.is_some()
+        && let Some(Entry::File { bytes, .. }) = exec.inspect(&hp(paths::kbf_toml(platform))?)?
+    {
+        let left = super::proxy::leftover_tls_keys(&String::from_utf8_lossy(&bytes));
+        if !left.is_empty() {
+            return Err(SetupError::NeedsOperator(format!(
+                "{} has [tls] keys ({}) that a --proxy host does not take: the proxy holds the certificates and the children speak plain h2c behind it; remove them by hand, then run setup again",
+                paths::kbf_toml(platform),
+                left.join(", ")
+            )));
+        }
+    }
+    let mut notes = Vec::new();
+    if v.proxy.is_none() && settings.proxy.is_some() {
+        notes.push(
+            "installer.toml has a [proxy] table and --proxy was not given: the table is kept, and the frontend unit is enabled as on a host without the proxy; give --proxy if this host runs the proxy"
+                .to_owned(),
+        );
+    }
 
     let view = View(exec);
     let mut p = Planner::new(&view);
-    let mut notes = Vec::new();
 
-    let fetch = fetch_user(platform);
-    if os.user(fetch)?.is_none() {
-        create_fetch_user(&mut p, os, fetch)?;
-    }
+    ensure_fetch_user(&mut p, os)?;
     if let (Some(user), true) = (&ctx.service, runs_actions(v.mode)) {
         add_subids(&mut p, user, "subuid", &os.subuid()?)?;
         add_subids(&mut p, user, "subgid", &os.subgid()?)?;
@@ -320,7 +467,7 @@ pub fn before_release(
     dir(&mut p, paths::etc_dir(platform), 0o755, root)?;
     let state_dir = ctx.layout.state_dir().to_string();
     dir(&mut p, &state_dir, 0o755, root)?;
-    dir(&mut p, &format!("{state_dir}/orders"), 0o700, service)?;
+    dir(&mut p, ctx.layout.orders_dir().as_str(), 0o700, service)?;
 
     // The tokens belong to the user whose process reads them: both loaders refuse a token
     // file another user owns, or one with a mode other than 0600 or 0400.
@@ -336,7 +483,7 @@ pub fn before_release(
         paths::installer_toml(platform),
         0o644,
         root,
-        settings.into_bytes(),
+        settings.render().into_bytes(),
     )?;
     if platform == Platform::Linux {
         proxy_listen(&mut p, root, listen, &mut notes)?;
@@ -441,12 +588,21 @@ pub fn after_release(
 
     let platform = ctx.platform;
     let kbf_toml_path = paths::kbf_toml(platform);
+    let (update_dir, orders_dir) = (
+        ctx.layout.update_dir().to_string(),
+        ctx.layout.orders_dir().to_string(),
+    );
     let ours = Ours {
         mode: mode_name(v.mode),
         frontend_url: v.frontend_url.as_deref(),
         token_file: v.token_file.as_ref().map(|_| paths::enroll_token(platform)),
         api_token_file: serves_api(v.mode).then_some(paths::api_token(platform)),
         state_store: v.database.as_deref(),
+        update: takes_orders(v.mode).then_some(UpdateDirs {
+            update_dir: &update_dir,
+            orders_dir: &orders_dir,
+        }),
+        extra: &v.kbf,
     };
     let current = match exec.inspect(&hp(kbf_toml_path)?)? {
         Some(Entry::File { bytes, .. }) => Some(String::from_utf8_lossy(&bytes).into_owned()),
@@ -457,7 +613,11 @@ pub fn after_release(
         }
         None => None,
     };
-    match kbf_toml::decide(current.as_deref(), &ours, kbf_toml_path) {
+    let decision = match (&current, ctx.kit_adopted) {
+        (Some(text), true) => kbf_toml::decide_adopted(text, &ours, kbf_toml_path),
+        _ => kbf_toml::decide(current.as_deref(), &ours, kbf_toml_path),
+    };
+    match decision {
         Decision::Write(text) => {
             let existed = current.is_some();
             // root:<service group> 0640: the service reads it, nobody else; only root writes.
@@ -496,17 +656,18 @@ fn units(
     no_start: bool,
     retired: &[&str],
 ) -> Result<Vec<String>, SetupError> {
-    let platform = ctx.platform;
     let mut notes = Vec::new();
     // The mode's units are started when the operator did not forbid it and a release is
     // there to run. The installer's own service has nothing to wait for. A unit that makes a
     // frontend is never started here: starting one takes the state database and the public
     // port, which only the operator decides.
     let start_mode = if v.mode.keeps_state_in_database() {
-        notes.push(
+        notes.push(if v.proxy.is_some() {
+            "the proxy units are enabled, not started: start kbf-proxy.socket and kbf-proxy.service when the database, the TLS files and the port are ready"
+        } else {
             "the frontend unit is enabled, not started: start it when the database, the TLS files and the port are ready"
-                .to_owned(),
-        );
+        }
+        .to_owned());
         false
     } else if no_start {
         notes.push("--no-start: units are enabled, not started".to_owned());
@@ -520,7 +681,7 @@ fn units(
     } else {
         true
     };
-    match platform {
+    match ctx.platform {
         Platform::MacOs => {
             let wanted = [
                 (MAC_INSTALLER_LABEL, !no_start),
@@ -538,14 +699,43 @@ fn units(
             }
         }
         Platform::Linux => {
-            let wanted = mode_units(v.mode)
+            if v.proxy.is_some() && os.unit_enabled(FRONTEND_UNIT)? {
+                notes.push(format!(
+                    "{FRONTEND_UNIT} is enabled and the proxy starts the frontend itself: setup does not stop or disable it; do both (systemctl disable --now) before starting the proxy, since the two never run together"
+                ));
+            }
+            // The backup runs as the service user, written before the timer is enabled.
+            let mut dropin_changed = false;
+            if v.mode.keeps_state_in_database() {
+                // The name is the one the frontend unit runs as: `service_user_name`, a fixed set.
+                let user = service_user_name(v.mode);
+                dir(p, BACKUP_SERVICE_DIR, 0o755, ctx.root)?;
+                let state = backup_state_dir(v.mode);
+                let changed = file(
+                    p,
+                    BACKUP_USER_DROPIN,
+                    0o644,
+                    ctx.root,
+                    backup_user_dropin(user, state).into_bytes(),
+                )?;
+                // systemd keeps the old definition of a unit until a reload: a drop-in that is
+                // new or changed (a mode change) on a timer that is enabled already needs one
+                // (`systemctl enable` does its own, so a timer enabled below needs none).
+                dropin_changed = changed;
+            }
+            let backup = v
+                .mode
+                .keeps_state_in_database()
+                .then_some((BACKUP_TIMER, !no_start));
+            let wanted = mode_units(v.mode, v.proxy.is_some())
                 .iter()
                 .map(|u| (*u, start_mode))
+                .chain(backup)
                 .chain([(INSTALLER_UNIT, !no_start)]);
             // A unit file was taken out of `/etc/systemd/system`: systemd reads the packaged
             // unit of that name from the next reload, and it is enabled whatever was said of
             // the old file (the enable symlink of the old file named the same unit).
-            if !retired.is_empty() {
+            if !retired.is_empty() || (dropin_changed && os.unit_enabled(BACKUP_TIMER)?) {
                 p.run(Cmd::new(hp(SYSTEMCTL)?).arg("daemon-reload"));
             }
             for (unit, now) in wanted {

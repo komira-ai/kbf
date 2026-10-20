@@ -1,0 +1,53 @@
+# kbf state database backup: `kbf-installer backup` runs `pg_dump` (custom format) of the
+# database installer.toml names into /var/lib/kbf-server/backups (the frontend's; the drop-in sets /var/lib/kbf/backups on all-in-one), keeps the newest
+# `backup_keep` (default 7) and exits non-zero on any failure, so systemd marks the unit
+# failed. Started by kbf-backup.timer; `systemctl start kbf-backup.service` takes one now.
+# Static unit: shipped by the kbf-installer package (installed under /usr/lib/systemd/system/),
+# disabled, with no rendering and no @PLACEHOLDER@ in it. `kbf-installer setup` enables the
+# timer on the hosts that keep their state in Postgres (frontend, all-in-one).
+#
+# It runs as the service user of the host's mode, whose name this file does not carry:
+# `kbf-installer setup` writes it into a drop-in (kbf-server on a frontend, kbf on an
+# all-in-one host: the User= of the mode's own unit), and the unit asserts that drop-in, so
+# without it the unit fails (rather than run as root, or be skipped, which systemd counts as
+# success and nothing would say that no backup ran). The database's socket is peer-authenticated, so that user,
+# through a pg_ident map or by being the role, is the role the `database` URL names; no
+# password exists anywhere. The backups are that user's alone (the directory is 0700, each
+# file 0600, both set by the verb, which refuses a directory owned by another user).
+# StateDirectory= and the verb's --dir are the mode's own unit's too: this file carries the
+# frontend's (kbf-server), and the drop-in replaces both on an all-in-one host (kbf).
+# docs/deploy/kbf-installer-setup.md, "Backup and restore"; docs/design/frontend-proxy.md,
+# section 11.
+[Unit]
+Description=kbf state database backup (pg_dump)
+# Gated on its own configuration, which `setup` writes with the database.
+ConditionPathExists=/etc/kbf/installer.toml
+# The drop-in that gives the unit its User=, StateDirectory= and ExecStart=; written by
+# setup. An assert, not a condition: a missing drop-in fails the unit, where a failed
+# condition would skip it with exit 0 and no backup would ever run.
+AssertPathExists=/etc/systemd/system/kbf-backup.service.d/10-service-user.conf
+# The server on this host, when it is started by systemd (the name is the Debian and the
+# Fedora one); no Wants=: a database that is down fails the backup, which is what a failed
+# unit is for.
+After=postgresql.service
+
+[Service]
+Type=oneshot
+StateDirectory=kbf-server
+StateDirectoryMode=0750
+UMask=0077
+ExecStart=/usr/bin/kbf-installer --apply backup
+# A dump of a large state must be allowed to finish; one that never does must not hold the
+# timer for ever.
+TimeoutStartSec=2h
+# A backup must never slow the farm's builds.
+Nice=10
+IOSchedulingClass=idle
+# Only the dump's own reach: the socket, the backup directory, nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX

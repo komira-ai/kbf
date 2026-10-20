@@ -35,6 +35,8 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 # The checks every data plane must pass (tests/conformance.rs).
 kbf-cas-conformance.workspace = true
+# A SIGTERM sent to the test process (src/run.rs).
+libc.workspace = true
 # The CPU pool the output walk hashes on (tests/one_read.rs).
 kbf-daemon.workspace = true
 # The driver's output walk (tests/memory.rs, tests/one_read.rs).

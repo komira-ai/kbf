@@ -79,6 +79,7 @@ async fn only_owners_of_this_generation_are_reported() {
     let cell = Cell::with(MapView {
         map: now.clone(),
         previous: Some(before.clone()),
+        earlier: Vec::new(),
     });
     let (router, hook) = repairing(cell, &cluster, limit(10, 1));
     let (blob, digest) = blob_where(|d| {

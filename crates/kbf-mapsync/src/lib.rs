@@ -31,7 +31,7 @@ use kbf_map::Map;
 use tokio::sync::watch;
 
 pub use fake::FakeMapSource;
-pub use holder::MapHolder;
+pub use holder::{MapHolder, RETAINED_MAPS};
 
 /// The map a frontend holds, and when it changes.
 ///

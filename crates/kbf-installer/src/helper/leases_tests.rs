@@ -220,7 +220,7 @@ fn the_daemons_lease_source_reads_its_units_cgroup_and_a_missing_one_cannot_tell
 fn every_unit_a_mode_can_name_is_classified_and_reads_its_own_cgroup() {
     use clap::ValueEnum;
     for mode in crate::cli::Mode::value_variants() {
-        let units = crate::setup::plan::mode_units(*mode);
+        let units = crate::setup::plan::mode_units(*mode, false);
         assert!(!units.is_empty(), "{mode:?} names no unit");
         for unit in units {
             let root = scratch_dir("leases-lockstep");
@@ -341,7 +341,11 @@ fn only_the_frontend_modes_units_are_a_frontends() {
     use clap::ValueEnum;
     let table: Vec<_> = Mode::value_variants()
         .iter()
-        .flat_map(|mode| mode_units(*mode).iter().map(move |unit| (*mode, *unit)))
+        .flat_map(|mode| {
+            mode_units(*mode, false)
+                .iter()
+                .map(move |unit| (*mode, *unit))
+        })
         .collect();
     let judged: Vec<_> = table
         .iter()

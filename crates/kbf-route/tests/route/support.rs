@@ -694,6 +694,7 @@ pub fn view(map: &Arc<Map>) -> MapView {
     MapView {
         map: Arc::clone(map),
         previous: None,
+        earlier: Vec::new(),
     }
 }
 

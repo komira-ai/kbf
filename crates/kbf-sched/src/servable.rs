@@ -104,7 +104,9 @@ impl Servable {
     /// The platform and room are decided first and the load only ranks the workers that
     /// pass: a Mac is never the least loaded worker for Linux work. A whole-machine lease,
     /// and an action at the whole host's memory, go only to a worker with no lease, so
-    /// every candidate has nothing booked and the first by name is taken.
+    /// every candidate has nothing booked and the first by name is taken. Such an action
+    /// waits until some worker's free memory meets its request; nothing reserves a worker
+    /// for it.
     ///
     /// A worker in `avoid` (one the operation's earlier runs ended on as the farm's
     /// fault) is skipped while a worker placement may use outside it could run the
@@ -149,18 +151,12 @@ impl Servable {
         Some((name, booked, device))
     }
 
-    /// The worker to hold for a `request` that fits nowhere now and would run with no
-    /// other lease on it ([`Worker::would_run_alone`]): a whole-machine lease, or an
-    /// action at the whole memory of a worker that could run it. `kept` if it still
-    /// could, else the one it would run alone on which holds the fewest leases, then has
-    /// the least booked, then comes first by name. Never one in `reserved`, nor one in
-    /// `avoid` while [`Servable::fit`] skips it.
-    ///
-    /// Placement spreads work over the workers: left to itself, none would ever empty
-    /// while work keeps arriving, hence the hold. A request that asks for less than the
-    /// memory of every worker that could run it holds nothing, however small another
-    /// worker of the farm is, and a bigger worker that has room for it beside others is
-    /// not held: it takes the request when its cores free.
+    /// The worker to hold for a whole-machine `request` that fits nowhere now: `kept`
+    /// if it still could run it, else the one that could which holds the fewest leases,
+    /// then has the least booked, then comes first by name. Never one in `reserved`,
+    /// nor one in `avoid` while [`Servable::fit`] skips it. Only a whole-machine lease
+    /// holds a worker (the caller asks only for one); an action at a worker's whole
+    /// memory waits until some worker has no lease, and nothing reserves one for it.
     pub(crate) fn reserve(
         &mut self,
         workers: &BTreeMap<WorkerId, Worker>,
@@ -178,7 +174,7 @@ impl Servable {
             .filter(|name| {
                 !reserved.contains(*name)
                     && !skip.contains(*name)
-                    && workers[*name].would_run_alone(request)
+                    && workers[*name].capacity.fits(&request.resources)
             })
             .collect();
         if let Some(kept) = kept.filter(|kept| candidates.contains(kept)) {
