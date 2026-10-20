@@ -73,6 +73,8 @@ installer's unit reads it, and refuses another path. A Mac is a node only (`--mo
    modes `database`. Settings a flag does not cover are kept from the file that is there. A
    file that does not parse (it is closed: an unknown key, a wrong type or a value out of
    bounds is refused) is left alone (exit 5). The release source is read only from this file.
+   The operator's `[proxy]` table is kept (written back whole, defaults filled in). Its `listen`
+   key is read here, as below.
 7. Frontend and all-in-one: the state database's schema is created, or brought forward, by the
    installer's own migrations; a dry run asks the server and says what it would do. With
    `--create-local-database` the role and the database are made first. `setup` then logs in
@@ -108,6 +110,22 @@ order makes the half-done host safe: `kbf.toml` and the units come last, so a st
 no config that a unit would start from. Changed flags rewrite the files they own atomically and
 never restart anything; a floor only goes up; a file `setup` cannot safely rewrite stops it
 with exit 5.
+
+**The proxy's public address.** `kbf-proxy.socket` ships listening on port 8980. A frontend or
+all-in-one host that needs another address sets `listen = "host:port"` in the `[proxy]` table
+of `installer.toml` (an IPv6 host in brackets; port 1 to 65535; the table must be complete, as
+the proxy reads it too). On Linux `setup` then writes
+`/etc/systemd/system/kbf-proxy.socket.d/listen.conf` (root:root 0644, atomically) with exactly
+
+    [Socket]
+    ListenStream=
+    ListenStream=<the address>
+
+The empty first line clears the packaged port. With no `listen`, `setup` writes no drop-in and
+removes the one an earlier run wrote. Changing the file never restarts anything: the output
+says to run `systemctl daemon-reload` and then `systemctl restart kbf-proxy.socket`, which the
+operator does when the public port may drop the connections waiting in it. A bad `listen`
+stops `setup` with exit 5 and names the key, never the value.
 
 **Proxy units.** The bundled proxy's units (`kbf-proxy.service` and `.socket`) are not on
 `feature/arch-v2` yet (kbf#1153), so a frontend or all-in-one host enables the units that exist

@@ -157,6 +157,45 @@ fn a_daemon_only_node_runs_kbf_daemon_with_the_frontends_endpoints() {
     assert!(argv.contains(&"--driver=container".to_owned()));
 }
 
+/// Catches the cold store the frontend sends (the URI of the store it has registered,
+/// percent-encoded as `S3Uri::node_uri` writes it) not being the store the storage half
+/// starts on: the flag is the stored text, byte for byte, and the mode's own parser reads
+/// it back as the store that was registered, with its region and put settings.
+#[test]
+fn the_storage_half_starts_on_the_cold_store_the_frontend_sent() {
+    use kbf_server::stores::{S3Uri, StoreUri};
+    let registered = match "s3://farm-cold/cold/main/?endpoint=http://s3.test:9000\
+                            &region=eu-west-1&conditional-put=true&min-put-rate=2048"
+        .parse::<StoreUri>()
+    {
+        Ok(StoreUri::S3(s3)) => s3,
+        other => panic!("not an S3 store: {other:?}"),
+    };
+    let sent_uri = S3Uri::node_uri(&registered);
+    let c = case("sent-cold-store");
+    let config = config(&c.root, "[storage]\n");
+    let mut stored = sent(&["storage"]);
+    stored.cold_store.clone_from(&sent_uri);
+    let node = enrolled(&["storage"], stored);
+    let argv = plan(
+        &config,
+        &node,
+        &c.store,
+        Driver::Container,
+        &[],
+        want(names::STORAGE),
+    )
+    .expect("a plan");
+    assert!(
+        strings(&argv).contains(&format!("--cold-store={sent_uri}")),
+        "{argv:?}"
+    );
+    let Ok(Invocation::Storage(flags)) = parse_from(argv) else {
+        panic!("not a storage invocation");
+    };
+    assert_eq!(flags.server.cold_store, Some(StoreUri::S3(registered)));
+}
+
 /// Catches a storage-only node that does not listen where the frontend said, does not
 /// serve with the storage role's own certificate and the farm CA, does not register under
 /// the address callers dial (its `kbf.toml` advertise, else its id and the frontend's
