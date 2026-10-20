@@ -73,9 +73,9 @@ pub mod trees;
 #[cfg(target_os = "macos")]
 pub mod uid;
 mod update_link;
-mod welcome;
 #[cfg(target_os = "linux")]
 pub mod usage;
+mod welcome;
 mod window;
 
 /// The daemon's version as it reports it (`daemon_version` in `Hello` and

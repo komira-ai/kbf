@@ -174,7 +174,9 @@ impl Worker for WorkerService {
             return Err(Status::invalid_argument("Hello has no node_id"));
         }
         self.peers.admit(peer.as_ref(), &hello.node_id).await?;
-        let reported = reported(&hello).map_err(Status::invalid_argument)?;
+        let mut reported = reported(&hello).map_err(Status::invalid_argument)?;
+        // The stream speaks what `Welcome` names, which a newer daemon's `Hello` may exceed.
+        reported.protocol = Some(version);
         let worker = WorkerId::new(hello.node_id);
         let instance = DaemonInstance::new(hello.instance_id);
         let predecessor = DaemonInstance::new(hello.predecessor_instance_id);
@@ -219,20 +221,24 @@ impl Worker for WorkerService {
     }
 }
 
-/// The version a session speaks, which `Welcome` names: the version the `Hello` names
-/// (`hello`), when it lies in `oldest..=newest` (so it is also the lesser of `hello`
-/// and `newest`). A daemon checks that `Welcome` names the version it sent, so naming
-/// `newest` instead would end every session of an older daemon this server accepts.
+/// The version a session speaks, which `Welcome` names: the lesser of `hello`, the
+/// version the `Hello` names, and `newest`, when `hello` is at least `oldest`.
+///
+/// A `Hello` in `oldest..=newest` is answered with its own version, which a daemon of
+/// that version requires (it checks that `Welcome` names the version it sent). A `Hello`
+/// above `newest` is a daemon newer than this server: it is answered with `newest`, and a
+/// daemon newer than this server must accept a `Welcome` below its own version (the daemon
+/// does, down to the oldest it speaks). A `Hello` below `oldest` is refused.
 ///
 /// # Errors
-/// FAILED_PRECONDITION: `hello` is below `oldest` or above `newest`.
+/// FAILED_PRECONDITION: `hello` is below `oldest`.
 fn negotiate(hello: u32, oldest: u32, newest: u32) -> Result<u32, Status> {
-    if !(oldest..=newest).contains(&hello) {
+    if hello < oldest {
         return Err(Status::failed_precondition(format!(
             "protocol version {hello} is not accepted; this server speaks {oldest} to {newest}"
         )));
     }
-    Ok(hello)
+    Ok(hello.min(newest))
 }
 
 /// One stream after its first `Hello`.

@@ -11,7 +11,7 @@ pub(crate) const OLDEST_PROTOCOL_VERSION: u32 = 1;
 /// Whether a `Welcome` naming `welcome` answers a `Hello` that named `hello_sent`, for a
 /// daemon speaking `oldest` to `newest`.
 pub(crate) fn acceptable(welcome: u32, oldest: u32, hello_sent: u32, newest: u32) -> bool {
-    welcome == newest && hello_sent == newest && welcome >= oldest
+    (oldest..=hello_sent.min(newest)).contains(&welcome)
 }
 
 #[cfg(test)]
