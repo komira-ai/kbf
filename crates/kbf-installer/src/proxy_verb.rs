@@ -491,8 +491,9 @@ fn serve(
         operator_token_file: config.operator_token_file.clone(),
         status: handover.status_file.clone(),
     };
+    // Off Linux nothing supervises the proxy, so neither the database nor the host root is used.
     #[cfg(not(target_os = "linux"))]
-    let _ = database;
+    let _ = (database, root);
     let parts = handover::parts(handover)?;
     unblock_stop_signals();
     let (handle, runner) = Proxy::bind(config, listener).map_err(VerbError::starting)?;
