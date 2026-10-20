@@ -122,8 +122,8 @@ pub use denials::Denial;
 mod assign;
 mod join;
 mod pins;
-use pins::pin_key;
 pub use assign::{LastBoot, MAX_SEED};
+use pins::pin_key;
 mod look;
 pub use look::{MemberLook, MembersLook};
 
