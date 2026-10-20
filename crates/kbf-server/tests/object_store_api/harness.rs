@@ -39,14 +39,12 @@ pub fn loopback() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 40_000))
 }
 
-fn unique(label: &str) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::SeqCst);
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-server-object-store-api")
-        .join(format!("{label}-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+/// A directory of its own, removed when it drops.
+fn unique(label: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-server-object-store-api-{label}"),
+    )
 }
 
 /// The 32 bytes the proxy presents, hex, as the `x-kbf-proxy-auth` value.
@@ -54,7 +52,8 @@ pub const PROXY_SECRET: [u8; 32] = [0x5a; 32];
 
 pub fn proxy_secret() -> Arc<ProxySecret> {
     use std::os::unix::fs::PermissionsExt as _;
-    let path = unique("proxy").join("secret");
+    let dir = unique("proxy");
+    let path = dir.join("secret");
     std::fs::write(&path, PROXY_SECRET).expect("write the secret");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     Arc::new(ProxySecret::from_file(&path).expect("a usable secret"))
@@ -68,7 +67,8 @@ pub fn gated(router: Router, proxy: Option<Arc<ProxySecret>>) -> Router {
 
 pub fn token_file() -> ApiToken {
     use std::os::unix::fs::PermissionsExt as _;
-    let path = unique("token").join("token");
+    let dir = unique("token");
+    let path = dir.join("token");
     std::fs::write(&path, format!("{TOKEN}\n")).expect("write the token");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     ApiToken::from_file(&path).expect("a usable token")
@@ -301,6 +301,8 @@ pub struct Farm {
     pub dir: PathBuf,
     pub store: Arc<Fake>,
     pub flaky: Arc<Flaky>,
+    /// Last, so the directory is removed after the registry over it is gone.
+    _root: kbf_testkit::dir::TestDir,
 }
 
 impl Farm {
@@ -322,7 +324,8 @@ impl Farm {
         clock.advance(std::time::Duration::from_secs(1_000));
         let store = Arc::new(Fake::with_flaw(clock, Flaw::None));
         let flaky = Flaky::over(store.clone());
-        let dir = unique("secrets").join("objstore");
+        let root = unique("secrets");
+        let dir = root.join("objstore");
         let registry = Arc::new(
             Registry::open(flaky.clone(), &dir, Arc::new(Counting(AtomicU64::new(1))))
                 .expect("a registry"),
@@ -346,6 +349,7 @@ impl Farm {
             dir,
             store,
             flaky,
+            _root: root,
         }
     }
 

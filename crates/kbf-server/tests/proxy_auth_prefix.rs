@@ -10,8 +10,6 @@
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use kbf_server::proxy_auth::ProxySecret;
 use sha2::{Digest as _, Sha256};
@@ -24,14 +22,11 @@ fn presented_secret() -> String {
 }
 
 fn secret() -> ProxySecret {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-proxy-auth-prefix");
-    std::fs::create_dir_all(&dir).expect("a directory");
-    let path = dir.join(format!(
-        "secret-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
+    let dir = kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        "kbf-server-proxy-auth-prefix",
+    );
+    let path = dir.join("secret");
     std::fs::write(&path, SECRET).expect("write the file");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     ProxySecret::from_file(&path).expect("a usable secret")
