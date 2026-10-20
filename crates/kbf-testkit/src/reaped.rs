@@ -176,9 +176,16 @@ pub fn spawn(command: &mut Command, keep_below: i32) -> io::Result<Reaped> {
     {
         // SAFETY: the hook makes only async-signal-safe calls (`prctl`, `getppid`).
         let parent = unsafe { libc::getpid() };
-        unsafe { command.pre_exec(move || die_with_parent(parent)) };
+        unsafe { command.pre_exec(death_hook(parent)) };
     }
     command.spawn().map(Reaped)
+}
+
+/// The `pre_exec` hook [`spawn`] installs for the death signal. Its own function so a test can
+/// run it in the test process: inside the forked child no coverage is recorded.
+#[cfg(target_os = "linux")]
+fn death_hook(parent: i32) -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
+    move || die_with_parent(parent)
 }
 
 /// The `pre_exec` hook [`spawn`] installs. Its own function so a test can run it in the
@@ -307,6 +314,37 @@ mod tests {
         // Clear the signal this call set on the test thread: it must not outlive the check.
         // SAFETY: `prctl` with `PR_SET_PDEATHSIG` takes two integers.
         unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, 0) };
+    }
+
+    /// Catches a hook that refuses the real parent, or that sets no signal: run here with the
+    /// true parent pid it succeeds and the thread's death signal is SIGKILL.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_death_signal_hook_accepts_the_real_parent_and_arms_sigkill() {
+        // SAFETY: reads this process's own parent pid.
+        let real = unsafe { libc::getppid() };
+        death_hook(real)().expect("the real parent is accepted");
+        let mut armed: libc::c_int = 0;
+        // SAFETY: `PR_GET_PDEATHSIG` writes one int through the pointer.
+        let got = unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut armed as *mut libc::c_int) };
+        // Clear the signal before asserting: it must not outlive the check.
+        // SAFETY: `prctl` with `PR_SET_PDEATHSIG` takes two integers.
+        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, 0) };
+        assert_eq!(got, 0);
+        assert_eq!(armed, libc::SIGKILL);
+    }
+
+    /// Catches a guard that waits out the whole grace period (or kills) for a child that stops
+    /// on SIGTERM: such a child is gone well before [`GRACE`] ends.
+    #[test]
+    fn dropping_the_guard_of_a_child_that_stops_on_sigterm_does_not_wait_out_the_grace() {
+        let child = spawn(Command::new("sleep").arg("30"), 3).expect("spawn");
+        let pid = child.id().cast_signed();
+        let started = Instant::now();
+        drop(child);
+        assert!(started.elapsed() < GRACE);
+        // SAFETY: signal 0 only probes; the pid was reaped by the guard.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     }
 
     /// Catches a verdict that lets a failed `prctl` through: a non-zero result is an error even
