@@ -80,6 +80,7 @@ pub mod drain;
 pub mod enroll;
 pub mod farm;
 mod fault;
+pub mod fill;
 mod flag_set;
 pub mod fleet;
 pub mod front_maps;
