@@ -20,7 +20,7 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 
 fn scratch() -> PathBuf {
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    kbf_host::testkit::scratch(&format!("installer-backup-{n}"))
+    kbf_host::testkit::scratch(&format!("installer-backup-{}-{n}", std::process::id()))
 }
 
 fn mode(path: &Path) -> u32 {
