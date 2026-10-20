@@ -897,34 +897,47 @@ async fn a_node_without_a_journal_says_it_cannot_say() {
 /// A node started with `--frontend` that the frontend admits but sends no map it can read
 /// (`map` is what the frontend sends, which a test replaces), listening, and a client of
 /// its storage service.
+///
+/// The directory is the first of the three, so a caller that binds all three drops it last.
 async fn unmapped_node(
     map: &Arc<Mutex<pb::Map>>,
     name: &str,
-) -> (kbf_server::storage_node::StorageHandle, RemoteStorage) {
+) -> (
+    kbf_testkit::dir::TestDir,
+    kbf_server::storage_node::StorageHandle,
+    RemoteStorage,
+) {
     let url = format!("--frontend=http://{}", serve_membership(map));
-    let node = start_storage(&flags(&dir(name), &[url]).expect("flags"), never)
+    let node_dir = dir(name);
+    let node = start_storage(&flags(&node_dir, &[url]).expect("flags"), never)
         .await
         .expect("starts");
     let channel = Endpoint::from_shared(format!("http://{}", node.addr))
         .expect("endpoint")
         .connect_lazy();
-    (node, RemoteStorage::new(channel, 0))
+    (node_dir, node, RemoteStorage::new(channel, 0))
 }
 
 /// A node started with `--frontend` at `f`, listening, and a client of its storage
-/// service.
+/// service. The directory is the first of the three, so a caller that binds all three
+/// drops it last.
 async fn waiting_node(
     f: &Frontend,
     name: &str,
-) -> (kbf_server::storage_node::StorageHandle, RemoteStorage) {
+) -> (
+    kbf_testkit::dir::TestDir,
+    kbf_server::storage_node::StorageHandle,
+    RemoteStorage,
+) {
     let url = format!("--frontend=http://{}", f.worker);
-    let node = start_storage(&flags(&dir(name), &[url]).expect("flags"), never)
+    let node_dir = dir(name);
+    let node = start_storage(&flags(&node_dir, &[url]).expect("flags"), never)
         .await
         .expect("starts");
     let channel = Endpoint::from_shared(format!("http://{}", node.addr))
         .expect("endpoint")
         .connect_lazy();
-    (node, RemoteStorage::new(channel, 0))
+    (node_dir, node, RemoteStorage::new(channel, 0))
 }
 
 /// A map of one active member, which a node can read.
@@ -953,7 +966,7 @@ fn readable_map() -> pb::Map {
 #[tokio::test]
 async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
     let sent = Arc::new(Mutex::new(pb::Map::default()));
-    let (node, client) = unmapped_node(&sent, "gate").await;
+    let (_node_dir, node, client) = unmapped_node(&sent, "gate").await;
     let (maps, catch_up) = (node.maps(), node.catch_up());
     let mut segments = SegmentsClient::new(
         Endpoint::from_shared(format!("http://{}", node.addr))
@@ -1520,7 +1533,7 @@ async fn a_node_that_copies_nothing_keeps_no_repair_journal() {
     assert!(!d.join("meta").join("repair").exists());
 
     let f = frontend(None);
-    let (plain, _) = waiting_node(&f, "plain-no-journal").await;
+    let (_plain_dir, plain, _) = waiting_node(&f, "plain-no-journal").await;
     assert!(plain.repairs().is_none());
 }
 
