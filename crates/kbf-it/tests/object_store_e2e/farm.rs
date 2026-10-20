@@ -11,7 +11,6 @@
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +32,7 @@ use kbf_server::worker_roles::WorkerRolesLayer;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
 use kbf_storage::service::{Admission, ROLE_URI_PREFIX};
+use kbf_testkit::dir::TestDir;
 use kbf_types::object_store_api::{BindingRole, MemberStanding, NodeConvergence, NodeStatus};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -72,16 +72,6 @@ pub const NEW: Keys = Keys {
 pub const BUCKET: &str = "bkt";
 pub const PREFIX: &str = "kbf/";
 
-fn unique(label: &str) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::SeqCst);
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-it-object-store-e2e")
-        .join(format!("{label}-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
-}
-
 /// What survives a frontend's death: the state store, the secret directory, the CA, the
 /// S3 service, and the address the nodes dial.
 pub struct Farm {
@@ -94,6 +84,8 @@ pub struct Farm {
     /// The worker listener's port once a frontend has bound it: a restarted frontend binds
     /// the same one, for the nodes' `--frontend` is fixed at their start.
     worker_port: Mutex<Option<u16>>,
+    /// Removes the scratch directory last, after the nodes that use it are gone.
+    _scratch: TestDir,
 }
 
 impl Farm {
@@ -103,7 +95,11 @@ impl Farm {
         s3.require_credentials(keys.id, keys.secret);
         let clock = Arc::new(ManualClock::default());
         let store = Arc::new(Fake::with_flaw(Arc::clone(&clock), Flaw::None));
-        let root = unique(label);
+        let scratch = TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            &format!("kbf-it-object-store-e2e-{label}"),
+        );
+        let root = scratch.path().to_path_buf();
         let token = root.join("token");
         std::fs::write(&token, format!("{TOKEN}\n")).expect("write the token");
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).expect("chmod");
@@ -114,6 +110,7 @@ impl Farm {
             root,
             token,
             worker_port: Mutex::new(None),
+            _scratch: scratch,
         }
     }
 
