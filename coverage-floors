@@ -9,7 +9,6 @@
 # one, and CI fails a pull request whose floors are lower than its base's. Each listed
 # crate has an open issue to reach 99%.
 # crate lines-floor branches-floor
-kbf-all-in-one     98.09  93.75
 kbf-driver-native      -  98.98
 kbf-front              -  98.48
 kbf-guest          97.97  93.47
