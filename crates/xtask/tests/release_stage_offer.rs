@@ -482,12 +482,22 @@ fn a_release_file_a_kbf_changed_while_it_ran_is_refused_not_bundled() {
     // Catches: the release verified once, before the runs, and bundled as the runs left it
     // (the offer's own check of the files left to a stand-in): the runner's `kbf` appends a
     // byte to the linux-arm64 tarball and makes its line of SHA256SUMS say so, which the
-    // hashes agree with and only the attestation of the file does not.
+    // hashes agree with and only the attestation of the file does not: the bundle's subject
+    // digest is the old file's, so the refusal names the file's bundle and the digest
+    // mismatch, and is not the SHA256SUMS line check.
     let answer = identity(SHA, 4);
-    let tamper = format!("tamper kbf-{SHA}-linux-arm64.tar.gz\n{answer}");
+    let name = format!("kbf-{SHA}-linux-arm64.tar.gz");
+    let tamper = format!("tamper {name}\n{answer}");
     let f = world("changed", standard(&tamper), Prev::Nothing);
-    let ran = f.run(&[], None);
-    f.assert_refused(ran, "no build provenance attestation signed by");
+    let (code, out, err) = f.run(&[], None);
+    assert_eq!(code, Some(1), "{err}");
+    let named = format!("{name}.sigstore.json: has the subject digest sha256:");
+    assert!(err.contains(&named), "wanted {named:?} in {err}");
+    assert!(err.contains(", not the tarball's sha256:"), "{err}");
+    assert!(!err.contains("does not match its line"), "{err}");
+    assert_eq!(out, "");
+    assert!(!f.out().exists(), "out/ was made");
+    assert!(f.tmp_is_empty(), "the scratch directory was left");
 }
 
 #[test]

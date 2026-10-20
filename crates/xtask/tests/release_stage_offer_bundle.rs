@@ -268,7 +268,16 @@ fn the_binary_runs_with_no_environment_and_in_its_own_directory() {
     version_json(&kbf, &out, LONG).expect("the answer");
     let home = dir.canonicalize().expect("the directory");
     let want = format!("cwd={}\n", home.display());
-    assert_eq!(std::fs::read_to_string(&out).expect("out"), want);
+    let got = std::fs::read_to_string(&out).expect("out");
+    // Under llvm-cov the instrumented child's own profiling runtime sets `__LLVM_PROFILE_*`
+    // variables in it; they are not inherited, so only the runtime's own are let through.
+    let kept: String = got
+        .split_inclusive('\n')
+        .filter(|l| !l.starts_with("__LLVM_PROFILE") && !l.starts_with("LLVM_PROFILE"))
+        .collect();
+    assert_eq!(kept, want, "{got}");
+    // The control's canary must not have reached the binary.
+    assert!(!got.contains("CANARY"), "{got}");
 }
 
 #[test]
