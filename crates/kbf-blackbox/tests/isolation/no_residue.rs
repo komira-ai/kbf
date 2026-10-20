@@ -475,28 +475,47 @@ fn planted_escaping_process_is_seen() {
 }
 
 /// What an orphan that hid looks like: no farm path in its command line, an empty
-/// environment, working directory `/`, reparented to init (a shell starts it in the
-/// background and ends), and, when `group` is given, in that process group. Its pid.
-fn hidden_orphan(program: &str, group: Option<i32>) -> u32 {
+/// environment, working directory `/`, reparented to init (`kbf-act` starts it and
+/// ends), and, when `group` is given, in that process group. Its pid.
+fn hidden_orphan(steps: &[&str], group: Option<i32>) -> u32 {
     use std::os::unix::process::CommandExt as _;
-    let mut shell = std::process::Command::new("/bin/sh");
-    shell
-        .args([
-            "-c",
-            &format!("{program} >/dev/null 2>&1 </dev/null & echo $!"),
-        ])
+    static LINK: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    // The act steps run through a link to this test binary named `kbf-act`
+    // (`kbf_testkit::act_test_hook!`); no shell is involved.
+    let link = LINK.get_or_init(|| {
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("hidden-orphan-act-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let link = dir.join(kbf_testkit::act::NAME);
+        kbf_testkit::act::link_self(&link).expect("link kbf-act");
+        link
+    });
+    let pid_file = link.with_file_name(format!(
+        "pid-{}",
+        HIDDEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut act = std::process::Command::new(link);
+    act.args(["spawn-child", "--pid"])
+        .arg(&pid_file)
+        .args(steps)
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
         .current_dir("/")
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .process_group(group.unwrap_or(0));
-    let out = shell.output().expect("the shell");
-    String::from_utf8_lossy(&out.stdout)
+    assert!(
+        act.status().expect("kbf-act").success(),
+        "spawn-child failed"
+    );
+    std::fs::read_to_string(&pid_file)
+        .expect("the orphan's pid file")
         .trim()
         .parse()
         .expect("the orphan's pid")
 }
+
+static HIDDEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// R4 red, orphans that hid (S6b): a process with an empty environment and working
 /// directory `/`, reparented to init, is found by the process group of a farm role (the
@@ -524,11 +543,14 @@ fn planted_hidden_orphans_are_found_by_group_session_and_cgroup() {
         .spawn()
         .expect("the group leader");
     let leader_id = leader.id();
-    let by_group = hidden_orphan("sleep 607", Some(i32::try_from(leader_id).expect("pid")));
+    let by_group = hidden_orphan(
+        &["sleep", "607"],
+        Some(i32::try_from(leader_id).expect("pid")),
+    );
     // By session: the orphan leads a session of its own (what a lease's action is started as).
-    let by_session = hidden_orphan("exec setsid sleep 608", None);
+    let by_session = hidden_orphan(&["setsid", ";;", "sleep", "608"], None);
     // By cgroup: no group of ours, no session, nothing in its environment.
-    let by_cgroup = hidden_orphan("sleep 609", None);
+    let by_cgroup = hidden_orphan(&["sleep", "609"], None);
     let _reap = KillOnDrop(vec![by_group, by_session, by_cgroup]);
     for pid in [by_group, by_session, by_cgroup] {
         assert!(probe::alive(pid).expect("alive"), "orphan {pid} ended");
@@ -580,7 +602,7 @@ fn planted_hidden_orphan_in_the_daemons_group_is_seen() {
         .find(|p| p.ended.is_none())
         .expect("a live role")
         .pid;
-    let orphan = hidden_orphan("sleep 610", Some(i32::try_from(role).expect("pid")));
+    let orphan = hidden_orphan(&["sleep", "610"], Some(i32::try_from(role).expect("pid")));
     let _reap = KillOnDrop(vec![orphan]);
     let seen = clean(&mut rig, &base).expect_err("a hidden orphan");
     assert!(seen.contains(&format!("process left: {orphan}")), "{seen}");
