@@ -27,6 +27,18 @@
 //!   anything absent has seen a loss, so nothing verified before then is believed).
 //!   An entry is written only when the whole walk found nothing absent and nothing
 //!   failed, never from a partial result.
+//! - **Directories are cached by content** ([`DirCache`]). A walk that reaches a Directory
+//!   whose decoded content it holds does not read it, and does not take it for held
+//!   either: the digest goes into the FindMissing calls the walk makes for its files
+//!   (batched the same way, [`FILES_PER_ASK`] a call), and a digest the store reports
+//!   missing is exactly an absent Directory: the loss handling is the same, and the
+//!   verified memory is cleared. So a blob that was evicted or lost is still found, and
+//!   an Execute never runs on inputs the store does not hold. The walk goes on below a
+//!   cached Directory before the store has answered; if the answer is that it is gone,
+//!   what was found below it (files, Directories, failures) is dropped from the report,
+//!   so the answer is the one a walk that stopped there gives. Content not cached is
+//!   read, once for all the walks that want it at the same time. The verified memory
+//!   above still skips even the FindMissing, within [`VERIFIED_TTL`].
 //! - **Deterministic.** What the walk answers does not depend on which read finishes
 //!   first. Directories that are not held and files that are missing are sorted sets.
 //!   When a read fails for another reason (the node cannot say, a Directory does not
@@ -38,6 +50,7 @@
 //!   answer for a store that has not changed does not.)
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -48,7 +61,8 @@ use kbf_storage::StorageError;
 use kbf_types::Digest;
 use tokio::time::Instant;
 
-use crate::input_tree::{Walked, decode};
+use crate::dir_cache::{DirCache, Lookup};
+use crate::input_tree::{Decoded, Walked, decode};
 
 /// The most Directory blobs one [`walk`] reads from the store at once. The tree of a
 /// request is the only bound on its fan-out, so this is what keeps a few hundred
@@ -92,6 +106,9 @@ pub(crate) struct Trees {
     inner: Mutex<Remembered>,
     capacity: usize,
     ttl: Duration,
+    /// What the Directories decode to, whatever became of their subtrees: by digest, so
+    /// it never goes stale, and no claim that anything is held.
+    dirs: DirCache,
 }
 
 #[derive(Default)]
@@ -130,7 +147,17 @@ impl Trees {
             inner: Mutex::new(Remembered::default()),
             capacity,
             ttl,
+            dirs: DirCache::default(),
         }
+    }
+
+    /// The same, with a content cache of at most `bytes` ([`crate::dir_cache::DIR_CACHE_BYTES`] by default;
+    /// zero keeps no content and shares no reads).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_dir_cache(mut self, bytes: u64) -> Self {
+        self.dirs = DirCache::new(bytes);
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, Remembered> {
@@ -207,17 +234,105 @@ impl Trees {
     }
 }
 
-/// The input check over a store: every Directory under `root` is read
-/// ([`DIRS_IN_FLIGHT`] at once) unless `trees` remembers it verified, and the files they
-/// name are asked about in batches. A Directory the store does not hold, or holds but
-/// cannot read, is reported absent and nothing under it is looked at; the report lists
-/// absent directories (sorted) before absent files (sorted), as `Cache::walk_inputs`
-/// does.
+/// The input check over a store: every Directory under `root` is taken from `trees`'
+/// content cache, or read ([`DIRS_IN_FLIGHT`] at once), unless `trees` remembers it
+/// verified; the files they name, and the cached Directories themselves, are asked about
+/// in batches. A Directory the store does not hold, or holds but cannot read, is
+/// reported absent and nothing under it is looked at; the report lists absent
+/// directories (sorted) before absent files (sorted), as `Cache::walk_inputs` does.
 ///
 /// # Errors
 /// The store could not answer, or a Directory it holds does not decode.
 pub(crate) async fn walk(storage: &dyn Blobs, root: Digest, trees: &Trees) -> Answer<Walked> {
     walk_bounded(storage, root, DIRS_IN_FLIGHT, trees).await
+}
+
+/// How a Directory came to a walk that did not find it cached.
+enum Fetched {
+    /// Read from the store by this walk; the entries that pushed out of the cache.
+    Read(Arc<Decoded>, u64),
+    /// Read by another walk while this one waited.
+    Merged(Arc<Decoded>),
+}
+
+/// One Directory fetched: which, how long its read took (`None` if this walk did not
+/// read), and what came of it.
+struct Fetch {
+    dir: Digest,
+    took: Option<Duration>,
+    outcome: Answer<Fetched>,
+}
+
+/// Reads `dir` for everyone who wants it: leads the read when `first` says to, or waits
+/// for the walk that does and looks again.
+async fn fetch<'a>(
+    storage: &'a dyn Blobs,
+    cache: &'a DirCache,
+    dir: Digest,
+    first: Lookup<'a>,
+) -> Fetch {
+    let mut look = first;
+    loop {
+        match look {
+            Lookup::Cached(decoded) => {
+                return Fetch {
+                    dir,
+                    took: None,
+                    outcome: Ok(Fetched::Merged(decoded)),
+                };
+            }
+            Lookup::Follow(gate) => {
+                // Closed, never given a permit: this returns when the read ends.
+                let _ended = gate.acquire().await;
+                look = cache.lookup(&dir);
+            }
+            Lookup::Lead(lead) => {
+                let began = Instant::now();
+                let blob = storage.read_blob(&dir).await;
+                let took = began.elapsed();
+                let outcome = match blob {
+                    Err(e) => Err(e),
+                    Ok(bytes) => decode(&dir, &bytes)
+                        .map(|decoded| {
+                            let decoded = Arc::new(decoded);
+                            Fetched::Read(Arc::clone(&decoded), lead.finish(decoded))
+                        })
+                        .map_err(StorageError::from),
+                };
+                return Fetch {
+                    dir,
+                    took: Some(took),
+                    outcome,
+                };
+            }
+        }
+    }
+}
+
+/// What the walk has found so far, and where it goes next.
+struct Frontier {
+    seen: BTreeSet<Digest>,
+    queue: VecDeque<Digest>,
+    /// The files named by the Directories taken.
+    files: BTreeSet<Digest>,
+    /// The Directories taken and what each names.
+    graph: HashMap<Digest, Arc<Decoded>>,
+}
+
+impl Frontier {
+    /// `dir` is held, and `decoded` is what it names: its files are to be asked about
+    /// and its subdirectories to be taken.
+    fn take(&mut self, dir: Digest, decoded: Arc<Decoded>) {
+        self.files.extend(decoded.files.iter().copied());
+        self.queue.extend(
+            decoded
+                .dirs
+                .iter()
+                .copied()
+                .filter(|d| self.seen.insert(*d)),
+        );
+        self.graph.insert(dir, decoded);
+    }
 }
 
 /// [`walk`] with at most `reads_in_flight` Directory reads open (at least one).
@@ -231,62 +346,93 @@ pub(crate) async fn walk_bounded(
     let begun = Instant::now();
     // Read before the first read: the walk is remembered only under the epoch it began in.
     let epoch = storage.epoch();
-    let mut seen = BTreeSet::from([root]);
-    let mut queue = VecDeque::from([root]);
+    let cache = &trees.dirs;
+    let mut found = Frontier {
+        seen: BTreeSet::from([root]),
+        queue: VecDeque::from([root]),
+        files: BTreeSet::new(),
+        graph: HashMap::new(),
+    };
     let mut reading = FuturesUnordered::new();
-    let (mut absent_dirs, mut files) = (BTreeSet::new(), BTreeSet::new());
+    let mut absent_dirs = BTreeSet::new();
+    // The Directories taken from the cache: held as far as the store has said, which it
+    // has not yet.
+    let mut cached = BTreeSet::new();
     let mut held_dirs = Vec::new();
-    let (mut dirs_read, mut dirs_skipped) = (0, 0);
+    let mut walked = Walked::default();
     // The oldest verification a skipped subtree rests on.
     let mut verified_at = begun;
-    let mut failure: Option<(Digest, StorageError)> = None;
+    let mut failures: Vec<(Digest, StorageError)> = Vec::new();
     loop {
         while reading.len() < reads_in_flight {
-            let Some(dir) = queue.pop_front() else { break };
+            let Some(dir) = found.queue.pop_front() else {
+                break;
+            };
             if let Some(at) = epoch.and_then(|e| trees.fresh(e, &dir, Instant::now())) {
-                dirs_skipped += 1;
+                walked.dirs_skipped += 1;
                 verified_at = verified_at.min(at);
                 continue;
             }
-            reading.push(async move { (dir, storage.read_blob(&dir).await) });
-        }
-        let Some((dir, blob)) = reading.next().await else {
-            break;
-        };
-        let failed = match blob {
-            Err(StorageError::NotFound(_) | StorageError::Unreachable(_)) => {
-                absent_dirs.insert(dir);
-                None
-            }
-            Err(e) => Some(e),
-            Ok(bytes) => {
-                dirs_read += 1;
-                match decode(&dir, &bytes) {
-                    Ok(decoded) => {
-                        held_dirs.push(dir);
-                        files.extend(decoded.files.iter().copied());
-                        queue.extend(decoded.dirs.iter().copied().filter(|d| seen.insert(*d)));
-                        None
+            match cache.lookup(&dir) {
+                Lookup::Cached(decoded) => {
+                    walked.dir_cache_hits += 1;
+                    cached.insert(dir);
+                    held_dirs.push(dir);
+                    found.take(dir, decoded);
+                }
+                first => {
+                    if matches!(first, Lookup::Lead(_)) {
+                        walked.dir_cache_misses += 1;
                     }
-                    Err(e) => Some(StorageError::from(e)),
+                    reading.push(fetch(storage, cache, dir, first));
                 }
             }
+        }
+        let Some(Fetch { dir, took, outcome }) = reading.next().await else {
+            break;
         };
-        if let Some(e) = failed
-            && failure.as_ref().is_none_or(|(was, _)| dir < *was)
-        {
-            failure = Some((dir, e));
+        walked.read_times.extend(took);
+        match outcome {
+            Err(StorageError::NotFound(_) | StorageError::Unreachable(_)) => {
+                absent_dirs.insert(dir);
+            }
+            Err(e) => failures.push((dir, e)),
+            Ok(fetched) => {
+                held_dirs.push(dir);
+                let decoded = match fetched {
+                    Fetched::Read(decoded, evicted) => {
+                        walked.dirs_read += 1;
+                        walked.dir_cache_evicted += evicted;
+                        decoded
+                    }
+                    Fetched::Merged(decoded) => {
+                        walked.dir_cache_hits += 1;
+                        walked.dir_cache_merged += 1;
+                        decoded
+                    }
+                };
+                found.take(dir, decoded);
+            }
         }
     }
-    let dirs_time = begun.elapsed();
-    if let Some((_, e)) = failure {
+    walked.dirs_time = begun.elapsed();
+    walked.dir_cache_bytes = cache.bytes();
+    walked.dirs_present_checked = cached.len() as u64;
+    // Nothing is asked of a walk that failed unless a cached Directory might hide the
+    // failure (below one that turns out to be gone).
+    if cached.is_empty()
+        && let Some((_, e)) = smallest(&mut failures, |_| true)
+    {
         return Err(e);
     }
-    let files: Vec<Digest> = files.into_iter().collect();
+    // A Directory is asked about once whatever names it. The cached ones are asked about
+    // with the files: a cached Directory is trusted only if the store still holds it.
+    let mut asking: Vec<Digest> = found.files.iter().copied().collect();
+    asking.extend(cached.iter().filter(|d| !found.files.contains(d)));
     let files_began = Instant::now();
     // Built before the stream: a closure inside it makes the future not `Send` for every
     // lifetime of a chunk.
-    let asks: Vec<BoxFuture<'_, Answer<Vec<Digest>>>> = files
+    let asks: Vec<BoxFuture<'_, Answer<Vec<Digest>>>> = asking
         .chunks(FILES_PER_ASK)
         .map(|chunk| storage.find_missing(chunk))
         .collect();
@@ -294,28 +440,80 @@ pub(crate) async fn walk_bounded(
         .buffered(ASKS_IN_FLIGHT)
         .try_collect()
         .await?;
-    let files_time = files_began.elapsed();
-    let absent_files: BTreeSet<Digest> = asked.into_iter().flatten().collect();
+    walked.files_time = files_began.elapsed();
+    let missing: BTreeSet<Digest> = asked.into_iter().flatten().collect();
+    let lost: BTreeSet<Digest> = cached.intersection(&missing).copied().collect();
+    let (absent_dirs, absent_files) = if lost.is_empty() {
+        if let Some((_, e)) = smallest(&mut failures, |_| true) {
+            return Err(e);
+        }
+        (absent_dirs, missing)
+    } else {
+        // A cached Directory the store lost is absent exactly as one the walk failed to
+        // read is, and nothing under it counts: what the walk saw below it (it went on
+        // under the cached content, not knowing) is dropped.
+        let (dirs, files) = below_lost(root, &found.graph, &lost);
+        if let Some((_, e)) = smallest(&mut failures, |d| dirs.contains(d)) {
+            return Err(e);
+        }
+        let absent_dirs = absent_dirs
+            .into_iter()
+            .chain(lost.iter().copied())
+            .filter(|d| dirs.contains(d))
+            .collect();
+        let absent_files = missing
+            .into_iter()
+            .filter(|f| files.contains(f) && !lost.contains(f))
+            .collect();
+        (absent_dirs, absent_files)
+    };
     let absent: Vec<Digest> = absent_dirs.into_iter().chain(absent_files).collect();
     if let Some(epoch) = epoch {
         if !absent.is_empty() {
             trees.distrust(Instant::now());
         } else if storage.epoch() == Some(epoch) {
-            // Every Directory read has its files held and its Directories read or
-            // remembered: nothing was absent and nothing failed.
+            // Every Directory taken has its files held and its Directories taken or
+            // remembered, and the store has said it holds the cached ones: nothing was
+            // absent and nothing failed.
             trees.record(epoch, &held_dirs, verified_at);
         }
     }
-    Ok(Walked {
-        absent,
-        dirs_read,
-        dirs_skipped,
-        files_checked: files.len() as u64,
-        file_asks: files.len().div_ceil(FILES_PER_ASK) as u64,
-        dirs_time,
-        files_time,
-        phased: true,
-    })
+    walked.absent = absent;
+    walked.files_checked = found.files.len() as u64;
+    walked.file_asks = asking.len().div_ceil(FILES_PER_ASK) as u64;
+    walked.phased = true;
+    Ok(walked)
+}
+
+/// The failure of the smallest digest among those `of` accepts.
+fn smallest(
+    failures: &mut Vec<(Digest, StorageError)>,
+    of: impl Fn(&Digest) -> bool,
+) -> Option<(Digest, StorageError)> {
+    failures
+        .drain(..)
+        .filter(|(dir, _)| of(dir))
+        .min_by_key(|(dir, _)| *dir)
+}
+
+/// The Directories and the files of the tree under `root` that a walk which stopped at
+/// every Directory of `lost` reaches: the lost ones are in the first set (they are
+/// named), nothing under them is in either.
+fn below_lost(
+    root: Digest,
+    graph: &HashMap<Digest, Arc<Decoded>>,
+    lost: &BTreeSet<Digest>,
+) -> (BTreeSet<Digest>, BTreeSet<Digest>) {
+    let (mut dirs, mut files) = (BTreeSet::from([root]), BTreeSet::new());
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let Some(decoded) = graph.get(&dir).filter(|_| !lost.contains(&dir)) else {
+            continue;
+        };
+        files.extend(decoded.files.iter().copied());
+        stack.extend(decoded.dirs.iter().copied().filter(|d| dirs.insert(*d)));
+    }
+    (dirs, files)
 }
 
 #[cfg(test)]
@@ -325,3 +523,7 @@ mod tests;
 #[cfg(test)]
 #[path = "input_walk_memory_tests.rs"]
 mod memory_tests;
+
+#[cfg(test)]
+#[path = "input_walk_dircache_tests.rs"]
+mod dircache_tests;

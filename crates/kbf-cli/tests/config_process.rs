@@ -551,3 +551,88 @@ fn a_start_with_a_bad_file_exits_2_and_makes_nothing() {
         );
     }
 }
+
+/// Catches a `kbf.toml` that `kbf-installer setup` writes and `kbf` does not accept. The five
+/// files the installer's tests pin (`kbf-installer/tests/golden/kbf_toml`, one per mode) are
+/// put under a scratch directory with the certificates, keys and token they name, and `kbf
+/// --mode=<mode> --config <file> --check` must exit 0 and print `ok` (a node that enrolls says it is configured and not enrolled yet): a key `kbf` does not
+/// have, a key in the wrong table, a required flag the file lacks, a certificate of the wrong
+/// role and a private key of the wrong mode each fail it (`--check` reads the same flags a
+/// start does and starts nothing).
+#[test]
+fn the_kbf_toml_that_setup_writes_passes_check_in_every_mode() {
+    let goldens =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-installer/tests/golden/kbf_toml");
+    for mode in names::MODES {
+        let dir = scratch(&format!("installer-{}", mode.name));
+        let etc = dir.join("etc");
+        std::fs::create_dir_all(&etc).expect("etc");
+        let pki = Pki::new(&etc);
+        pki.issue(&etc, "reapi", Row::FrontendWorker, &["localhost"], false);
+        pki.issue(
+            &etc,
+            "worker",
+            Row::FrontendWorker,
+            &["localhost", "127.0.0.1", "farm.example"],
+            false,
+        );
+        pki.issue(&etc, "node", Row::Daemon, &["farm-1"], false);
+        write(&etc.join("api-token"), "a-token-of-no-importance\n", 0o600);
+        // A token of the right form: `--check` parses it and calls no frontend.
+        let token = kbf_types::Token::new(
+            kbf_types::TokenId::from_bits(1),
+            kbf_types::TokenSecret::from_bytes([7; 32]),
+            kbf_types::CaPin::from_bytes([9; 32]),
+        );
+        write(&etc.join("enroll.token"), &token.to_line(), 0o600);
+        let golden = std::fs::read_to_string(goldens.join(format!("{}.toml", mode.name)))
+            .unwrap_or_else(|e| panic!("the installer's golden for {}: {e}", mode.name));
+        // The golden names the paths of a host; this one is a scratch directory.
+        let text = golden
+            .replace("/etc/kbf/", &format!("{}/", etc.display()))
+            .replace("/var/lib/kbf-meta", &dir.join("meta").display().to_string())
+            .replace("/var/lib/kbf", &dir.join("data").display().to_string());
+        // A node's directories default to places only a service user may make; the test's own
+        // are the operator's keys that `setup` leaves to the operator.
+        let here = dir.display();
+        let mut text = text;
+        if [names::DAEMON, names::STORAGE, names::STORAGE_AND_DAEMON].contains(&mode.name) {
+            text.push_str(&format!("\n[dirs]\nstate = \"{here}/state\"\n"));
+        }
+        if [names::STORAGE, names::STORAGE_AND_DAEMON].contains(&mode.name) {
+            text.push_str(&format!(
+                "\n[storage]\nhot_dir = \"{here}/hot\"\nmeta_dir = \"{here}/meta\"\n"
+            ));
+        }
+        if [names::DAEMON, names::STORAGE_AND_DAEMON].contains(&mode.name) {
+            text.push_str(&format!("\n[daemon]\ndata_dir = \"{here}/data\"\n"));
+        }
+        let file = dir.join("kbf.toml");
+        write(&file, &text, 0o600);
+        let mut args = vec![
+            format!("--mode={}", mode.name),
+            "--check".to_owned(),
+            format!("--config={}", file.display()),
+        ];
+        // The stand-in `crun` for the one mode that runs builds without enrolling; a daemon flag on
+        // the line of a node that enrolls would make it a node that does not.
+        if mode.name == names::ALL_IN_ONE {
+            args.push(format!("--oci-runtime={FAKE_CRUN}"));
+        }
+        let r = run_in(&args, &host_env(&dir));
+        assert_eq!(r.code, Some(0), "{}: {}\n{text}", mode.name, r.err);
+        let enrolls =
+            [names::DAEMON, names::STORAGE, names::STORAGE_AND_DAEMON].contains(&mode.name);
+        // A node that enrolls says so instead of `ok`: the file is accepted, the host is not
+        // enrolled yet.
+        if enrolls {
+            let want = format!(
+                "mode {} is configured; this node is not enrolled yet",
+                mode.name
+            );
+            assert!(r.out.contains(&want), "{}: {}", mode.name, r.out);
+        } else {
+            assert_eq!(r.out, format!("kbf {}: ok\n", mode.name), "{}", mode.name);
+        }
+    }
+}
