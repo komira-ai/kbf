@@ -279,7 +279,12 @@ async fn a_start_with_a_label_flag_exits_2_naming_it_and_enrolls_nothing() {
     let out = kbf(words).await;
 
     assert_eq!(out.code, Some(2), "{}", out.stderr);
-    assert!(out.stderr.contains("--label"), "{}", out.stderr);
+    // The usage line of a daemon that had the flag would name it too: say what is wrong.
+    assert!(
+        out.stderr.contains("unexpected argument") && out.stderr.contains("--label"),
+        "{}",
+        out.stderr
+    );
     assert!(
         !root.join("state/pki/node.json").exists(),
         "enrolled although the mode refused its flags"
