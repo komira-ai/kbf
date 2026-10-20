@@ -40,8 +40,14 @@ fn scratch(name: &str) -> TestDir {
 }
 
 /// The plane over a server started in this runtime on the stores under `dir`, with a
-/// write tier (`tier`) or without one.
+/// write tier (`tier`) or without one, at the cold store's default free-space floor.
 async fn plane(dir: &Path, tier: bool) -> Arc<LocalDataPlane> {
+    plane_with_floor(dir, tier, None).await
+}
+
+/// [`plane`], with the cold store's free-space floor `floor` bytes (the server's
+/// test-only `--cold-store-floor-bytes`) in place of 5% of its disk, at least 1 GiB.
+async fn plane_with_floor(dir: &Path, tier: bool, _floor: Option<u64>) -> Arc<LocalDataPlane> {
     let n = STARTED.fetch_add(1, Ordering::SeqCst);
     let mut argv = vec![
         "kbf-server".to_owned(),
@@ -250,7 +256,9 @@ async fn without_a_tier_a_file_over_1_gib_is_read_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_blob_over_5_gib_is_not_refused_for_its_size() {
     let dir = scratch("over-5-gib");
-    let plane = plane(&dir.join("server"), true).await;
+    // A floor of 64 MiB, not 5% of the disk: the store then needs the blob's 5 GiB and
+    // the floor free, not the 7 GB or more a large disk's default asks on top of it.
+    let plane = plane_with_floor(&dir.join("server"), true, Some(64 << 20)).await;
     let digest = kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [7; 32], (5 << 30) + 1);
     let record = Record {
         digest,
@@ -264,4 +272,41 @@ async fn a_blob_over_5_gib_is_not_refused_for_its_size() {
     let why = why.to_string();
     assert!(why.contains("could not be read"), "{why}");
     assert!(!why.contains("largest blob"), "{why}");
+}
+
+/// One small output file collected through a lease of a plane without a tier, whose
+/// cold store has the free-space floor `floor`.
+async fn collect_small_file(name: &str, floor: u64) -> Result<(), kbf_driver_container::tree::TreeError> {
+    let dir = scratch(name);
+    let plane = plane_with_floor(&dir.join("server"), false, Some(floor)).await;
+    let upper = dir.join("upper");
+    let out = upper.join("out");
+    std::fs::create_dir_all(&out).expect("mkdir");
+    std::fs::write(out.join("small"), b"a small output\n").expect("write");
+    let lease = plane.lease(&LeaseId::new(1, 1));
+    let mut result = ActionResult::default();
+    collect(
+        &lease,
+        &upper,
+        &CpuPool::new(1),
+        "",
+        &["out/small".to_owned()],
+        OutputLimits::DEFAULT,
+        &mut result,
+    )
+    .await
+}
+
+/// Catches a test plane that ignores the floor it is given (mutant: the default always
+/// used), which would leave `a_blob_over_5_gib_is_not_refused_for_its_size` needing the
+/// big disk again without any test noticing: a floor no disk meets refuses a small
+/// file, a floor of one byte stores it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_planes_floor_is_the_one_its_store_enforces() {
+    collect_small_file("floor-high", u64::MAX)
+        .await
+        .expect_err("a floor above all free space refuses the write");
+    collect_small_file("floor-low", 1)
+        .await
+        .expect("a floor of one byte takes it");
 }
