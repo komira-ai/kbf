@@ -71,7 +71,7 @@
       ],
       "defaultAction": "SCMP_ACT_ERRNO",
       "defaultErrnoRet": 38,
-      "syscalls": "22 entries"
+      "syscalls": "26 entries"
     },
     "uidMappings": [
       {

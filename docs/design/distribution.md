@@ -236,7 +236,6 @@ already deleted; the all-in-one tests run `kbf all-in-one`.
 - `kbf-helper` (folded into `kbf-installer`), and later the `kbf-server` and `kbf-daemon`
   binaries (after the farm and the Macs run `kbf --mode=<mode>`); the old subcommand forms, which are aliases until then;
 - `kbf frontend handover` and its unit rule, once the installer performs the baton in the frontend update;
-  `kbf check-args`, once `--check` exists on every mode;
 - `kbf-deploy`, last: `host` becomes the installer, `linux render-units|install-units` become package units,
   `envoy` becomes the installer's config render, `log`, backups and image pull become API routes, and the MDM,
   object-store provisioning and pilot kits leave the product.
