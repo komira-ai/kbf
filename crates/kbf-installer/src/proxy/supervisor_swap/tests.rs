@@ -514,8 +514,8 @@ fn the_slot_that_serves_after_an_update_follows_how_it_ended() {
     let new = Slot::B;
     let old = Slot::A;
     let never = || -> bool { panic!("the store is not asked") };
-    assert_eq!(active_after(&intent(Phase::Done, None), never), new);
-    assert_eq!(active_after(&intent(Phase::RolledBack, None), never), old);
+    assert_eq!(active_after(&intent(Phase::Done, None), &never), new);
+    assert_eq!(active_after(&intent(Phase::RolledBack, None), &never), old);
     for (step, serves) in [
         (Step::Confirm, new),
         (Step::Rollback, new),
@@ -525,20 +525,20 @@ fn the_slot_that_serves_after_an_update_follows_how_it_ended() {
         (Step::Start, old),
     ] {
         assert_eq!(
-            active_after(&intent(Phase::Failed, Some(step)), never),
+            active_after(&intent(Phase::Failed, Some(step)), &never),
             serves,
             "failed at {step:?}"
         );
     }
     let restart = intent(Phase::Failed, Some(Step::Restart));
     assert_eq!(
-        active_after(&restart, || true),
+        active_after(&restart, &|| true),
         new,
         "the store says it holds"
     );
-    assert_eq!(active_after(&restart, || false), old);
-    assert_eq!(active_after(&intent(Phase::Switched, None), never), new);
-    assert_eq!(active_after(&intent(Phase::Quiescing, None), never), old);
+    assert_eq!(active_after(&restart, &|| false), old);
+    assert_eq!(active_after(&intent(Phase::Switched, None), &never), new);
+    assert_eq!(active_after(&intent(Phase::Quiescing, None), &never), old);
 }
 
 fn rig_config(h: &Harness, timing: Timing, spawn: Spawn) -> SwapSupervisor {

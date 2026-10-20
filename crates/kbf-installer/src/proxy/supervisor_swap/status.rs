@@ -19,7 +19,7 @@ pub(super) fn serving_live(intent: &Intent) -> Slot {
 /// The slot that serves once the update has ended in a terminal phase. `new_holds` asks the
 /// store's answer, and is read only for the one ending the record alone cannot tell apart
 /// (a restart that failed after the switch, or before it).
-pub(super) fn active_after(intent: &Intent, new_holds: impl FnOnce() -> bool) -> Slot {
+pub(super) fn active_after(intent: &Intent, new_holds: &dyn Fn() -> bool) -> Slot {
     let new_serves = match intent.phase {
         Phase::Done => true,
         Phase::RolledBack => false,

@@ -108,7 +108,7 @@ pub struct Parts {
     pub old_proc: Box<dyn Fn(Slot) -> Option<ProcIdent> + Send + Sync>,
     /// Runs once on the swap thread when it dies of a panic or a port it cannot do without;
     /// the verb passes what stops its process loudly. Not run for a shutdown.
-    pub on_death: Box<dyn Fn(&str) + Send + Sync>,
+    pub on_death: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 /// What the supervisor is told besides its ports.
@@ -182,7 +182,7 @@ impl SwapSupervisor {
         };
         let active = intent
             .as_ref()
-            .map_or(config.active, |i| status::active_after(i, || false));
+            .map_or(config.active, |i| status::active_after(i, &|| false));
         let resume = intent.clone().filter(|i| !i.phase.is_terminal());
         let open = resume.as_ref().map(|i| i.update_id.clone());
         let me = SwapSupervisor {
@@ -280,7 +280,7 @@ fn run(parts: &Parts, shared: &Shared, job: Job) -> Result<Phase, Halt> {
     let intent = swap.intent().clone();
     let new = intent.new_slot;
     let holds = || parts.admin.role(new).is_ok_and(|r| r.holder);
-    shared.lock().active = status::active_after(&intent, holds);
+    shared.lock().active = status::active_after(&intent, &holds);
     Ok(phase)
 }
 

@@ -200,7 +200,7 @@ impl Rig {
             clock: self.clone(),
             requests: Arc::clone(requests),
             old_proc: Box::new(move |slot| rig.ident(slot)),
-            on_death: Box::new(on_death),
+            on_death: Arc::new(on_death),
         }
     }
 
