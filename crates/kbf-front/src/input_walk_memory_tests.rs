@@ -306,6 +306,40 @@ async fn the_memory_is_bounded_and_least_recently_used_goes_first() {
     assert_eq!(none.len(), 0);
 }
 
+/// Catches: a default memory sized differently from the figure the farm was sized for
+/// ([`VERIFIED_ENTRIES`], 2^18 Directories at about 100 bytes: a farm's worth of
+/// toolchains and sources, about 26 MB). `Trees::default` holds exactly that many and
+/// drops the least recently used beyond them. The literal is asserted beside the
+/// constant on purpose: a test that only reads the constant passes for any value, and the
+/// figure is a sizing decision a change must make on purpose.
+#[test]
+fn the_default_memory_holds_exactly_the_sized_number_of_directories() {
+    assert_eq!(
+        VERIFIED_ENTRIES,
+        1 << 18,
+        "the sizing the docs and RAM budget rest on"
+    );
+    let trees = Trees::default();
+    let now = Instant::now();
+    // Adopts the epoch, as the walk's first lookup does.
+    assert!(trees.fresh(EPOCH, &file("adopt"), now).is_none());
+    let all: Vec<Digest> = (0..VERIFIED_ENTRIES + 5)
+        .map(|n| file(&format!("directory {n}")))
+        .collect();
+    trees.record(EPOCH, &all, now);
+    assert_eq!(trees.len(), VERIFIED_ENTRIES);
+    assert!(
+        trees.fresh(EPOCH, &all[4], now).is_none(),
+        "the oldest five went"
+    );
+    assert!(trees.fresh(EPOCH, &all[5], now).is_some());
+    assert!(
+        trees
+            .fresh(EPOCH, &all[VERIFIED_ENTRIES + 4], now)
+            .is_some()
+    );
+}
+
 /// Catches: an answer that differs because of the memory. 300 random trees with every
 /// hazard, walked three times on one memory: each walk answers what a memoryless serial
 /// walk does; a walk that was not clean leaves nothing, so it reads as much each time; a
