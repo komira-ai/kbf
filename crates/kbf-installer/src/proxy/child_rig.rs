@@ -65,10 +65,23 @@ impl Rig {
         *self.steps.lock().expect("lock") = steps.iter().map(|s| (*s).to_owned()).collect();
     }
 
-    /// A second `ProcChild` over the same host: the proxy after a restart.
+    /// A second `ProcChild` over the same host: the proxy after a restart. It holds nothing
+    /// and starts what `steps` holds, as the first does.
     pub(super) fn restarted(&self) -> ProcChild {
         let layout = self.child.layout.clone();
-        ProcChild::new(layout, self.dir.clone(), Box::new(|_, _| Vec::new())).with_binary("kbf-act")
+        let seen = Arc::clone(&self.steps);
+        ProcChild::new(
+            layout,
+            self.dir.clone(),
+            Box::new(move |_, _| {
+                seen.lock()
+                    .expect("lock")
+                    .iter()
+                    .map(OsString::from)
+                    .collect()
+            }),
+        )
+        .with_binary("kbf-act")
     }
 }
 
