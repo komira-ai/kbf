@@ -14,6 +14,7 @@
 
 mod support;
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,13 +28,14 @@ use support::{MemoryCas, Spec, config, scratch, stderr, stdout, work};
 const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// A sandboxed runtime and an unsandboxed one (the control), each with its own
-/// scratch root under `name`.
+/// scratch root under `dir`. The caller owns `dir` and keeps it for the whole test: a
+/// scratch directory is removed when dropped, so one made here would be gone before the
+/// first run, with the lease root the runtimes just made.
 fn runtimes(
-    name: &str,
+    dir: &Path,
     cas: &Arc<MemoryCas>,
 ) -> (NativeRuntime<MemoryCas>, NativeRuntime<MemoryCas>) {
-    let dir = scratch(name);
-    let sandboxed = config(&dir);
+    let sandboxed = config(dir);
     assert!(matches!(sandboxed.isolation, Isolation::Sandbox(_)));
     let mut open = config(&dir.join("unsandboxed"));
     open.isolation = Isolation::None;
@@ -66,7 +68,8 @@ async fn run_long(
 #[tokio::test]
 async fn no_action_reaches_coredevice() {
     let cas = Arc::new(MemoryCas::default());
-    let (sandboxed, open) = runtimes("coredevice", &cas);
+    let dir = scratch("coredevice");
+    let (sandboxed, open) = runtimes(&dir, &cas);
     let script = "xcrun devicectl list devices";
     let service = "com.apple.CoreDevice.CoreDeviceService";
     for (seq, network) in [(1, "off"), (2, "on")] {
@@ -130,7 +133,8 @@ fn lookup(names: &[&str]) -> String {
 #[tokio::test]
 async fn no_action_reaches_remoted() {
     let cas = Arc::new(MemoryCas::default());
-    let (sandboxed, open) = runtimes("remoted", &cas);
+    let dir = scratch("remoted");
+    let (sandboxed, open) = runtimes(&dir, &cas);
     let script = format!(
         "/usr/libexec/remotectl dumpstate; {}",
         lookup(&["com.apple.remoted"])
@@ -171,7 +175,8 @@ async fn no_action_reaches_remoted() {
 #[tokio::test]
 async fn no_action_looks_up_another_device_service() {
     let cas = Arc::new(MemoryCas::default());
-    let (sandboxed, open) = runtimes("device-services", &cas);
+    let dir = scratch("device-services");
+    let (sandboxed, open) = runtimes(&dir, &cas);
     let names = [
         "com.apple.CoreDevice.remotepairingd",
         "com.apple.remoted.coredevice",
@@ -221,7 +226,8 @@ if (connect($s, sockaddr_un("/var/run/usbmuxd"))) { print "connected\n" } else {
 #[tokio::test]
 async fn no_action_reaches_usbmuxd() {
     let cas = Arc::new(MemoryCas::default());
-    let (sandboxed, open) = runtimes("usbmuxd", &cas);
+    let dir = scratch("usbmuxd");
+    let (sandboxed, open) = runtimes(&dir, &cas);
     let spec = Spec::argv(&["/usr/bin/perl", "-e", CONNECT]);
     for (seq, network) in [(1, "off"), (2, "on")] {
         let spec = spec.clone().property("network", network);
