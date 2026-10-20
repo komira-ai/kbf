@@ -197,6 +197,12 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
             "update/rows",
             "update/host/node-a",
         ),
+        // The release poller's proposals (`update/proposal.rs`): never `update/desired`.
+        fenced(
+            Keys::Under("update/proposed/"),
+            "update/proposal (release poller)",
+            "update/proposed/0000000000000000000000000000000000000000",
+        ),
         fenced(
             Keys::Under("update/order/"),
             "update/rows (counter)",

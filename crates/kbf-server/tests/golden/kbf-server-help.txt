@@ -245,6 +245,21 @@ Options:
           
           [default: 300]
 
+      --release-poll-every-secs <SECONDS>
+          How often, in seconds, the active frontend asks GitHub for new releases of `--release-poll-repo` and records the newest one the farm could run as a proposal (`proposals` of `GET /v1/update`). A proposal starts nothing: only an operator's `POST /v1/update/desired` does. The question is one conditional request with no credential, so an unchanged feed costs nothing. 0 turns the poller off. It needs `--state-store`, which holds the proposals
+          
+          [default: 300]
+
+      --release-poll-repo <OWNER/NAME>
+          The GitHub repository, `owner/name`, whose releases of `v*` tags are polled
+          
+          [default: komira-ai/kbf]
+
+      --release-poll-refs <REF>
+          The refs a polled release may have been built from, as its notes say, separated by commas; a release built from another is ignored and counted
+          
+          [default: main]
+
       --history-index-root <ROOT>
           Where history's index rows live in the state store: `ui/`, or `<prefix>ui/` for a prefix that ends in `/`, so that one state store can hold several farms' history apart. Left out, it is `ui/`. Needs `--history-objects`
 

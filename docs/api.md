@@ -1204,6 +1204,14 @@ could not keep. Without the flag these families are absent and nothing is record
 | `kbf_history_pending_rows` | gauge | index rows the writer has not applied yet |
 | `kbf_history_open_invocations` | gauge | invocations the writer holds state for |
 
+The release poller (`--release-poll-every-secs`, on the active frontend) adds these families
+while it runs; without it they are absent.
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_release_poll_polls_total`, `kbf_release_poll_not_modified_total`, `kbf_release_poll_proposals_total`, `kbf_release_poll_errors_total` | counter | the release poller's polls begun, polls answered "not modified", proposals written and polls that failed (the request, the feed or the update rows); present only when the poller runs |
+| `kbf_release_poll_ignored_total{reason}` | counter | feed entries that were not candidates, by the first reason met: `malformed`, `draft`, `prerelease`, `not_version_tag`, `no_commit`, `ref_not_allowed`, `no_checksums`, `unattested` |
+
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
 nodes' slots means work is waiting that placement cannot use (look at the node's booking and
 `GET /v1/nodes`). `kbf_sched_queued` low while buck2 has many Executes open means they have not
@@ -1782,7 +1790,14 @@ row of the state store. Without `--state-store` every answer is `503` naming it;
 for the whole of its retries is `503` with `Retry-After: 1`: send it again.
 
 - `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms"},
-  "paused": bool, "policy": null | {...}, "releases": <the body of GET /v1/releases>}`. `policy`
+  "paused": bool, "policy": null | {...}, "proposals": [...], "releases": <the body of GET /v1/releases>}`.
+  `proposals` are the releases the release poller found (`--release-poll-every-secs`), oldest
+  first, each `{"commit", "tag", "published_at_secs", "proposed_at_ms"}`: the newest published
+  GitHub release of a `v*` tag whose notes name an allowed ref and a commit and that lists
+  `SHA256SUMS` and a provenance bundle for each tarball. Nothing is verified and nothing is
+  started: a proposal is a suggestion, and the run starts when an operator offers the commit
+  with `POST /v1/update/desired`. The poller asks GitHub's public API with no credential, on
+  the active frontend only, with a conditional request, and backs off after a failure. `policy`
   is the `update/policy` row when the operator wrote one (`paused`, `auto_nodes`,
   `auto_frontend`, `new_work_only_to_updated`, `accept_failing_builds`, `max_hosts_out`,
   `min_serving` and the limits in seconds), else `null`; `paused` is its flag (false without

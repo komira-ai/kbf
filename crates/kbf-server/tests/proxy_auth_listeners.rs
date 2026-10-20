@@ -119,6 +119,7 @@ fn start_denying(with_proxy: bool, deny_list: Option<DenyList>) -> Server_ {
         token: Some(token()),
         local_cache: None,
         releases: None,
+        poll: None,
     };
     let cache: Arc<MemoryCache> = Arc::new(Cache::memory());
     let proxy = with_proxy.then(|| Behind {

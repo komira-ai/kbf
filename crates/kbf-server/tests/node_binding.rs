@@ -666,6 +666,7 @@ async fn a_revoked_daemon_cannot_report_its_status() {
         token: None,
         local_cache: None,
         releases: None,
+        poll: None,
     };
     let bound = bind_server_with_api(Arc::new(Cache::memory()), listeners, Some(api), pending())
         .expect("bind");
@@ -738,6 +739,7 @@ async fn a_revoked_daemon_cannot_report_its_update_status() {
         token: None,
         local_cache: None,
         releases: None,
+        poll: None,
     };
     let farm_get = kbf_auth::Policy::from_json(
         r#"{"authenticationPolicy": {"allow": {}}, "farm": {"getAuthorizer": {"allow": {}}}}"#,

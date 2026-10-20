@@ -14,6 +14,15 @@ clap.workspace = true
 form_urlencoded.workspace = true
 hex.workspace = true
 futures.workspace = true
+# The release poller's one request to the GitHub API (release/poll/github.rs): hyper's
+# connection API over rustls on the ring provider tonic's `tls-ring` builds, trusting the
+# system's roots; no HTTP client crate.
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+rustls.workspace = true
+rustls-native-certs.workspace = true
+tokio-rustls.workspace = true
 kbf-auth.workspace = true
 kbf-ca.workspace = true
 kbf-front.workspace = true
