@@ -26,6 +26,7 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use runc::error::Error;
@@ -75,9 +76,11 @@ impl Spawner for KillOnDrop {
     }
 }
 
-/// `Io` that gives `crun run` the lease's stdout and stderr files, and no stdin.
+/// `Io` that gives `crun run` the lease's stdout and stderr files, and as stdin the file
+/// the container's init reports a program it could not start in (`oci::init`).
 #[derive(Debug)]
 struct FileIo {
+    stdin: std::fs::File,
     stdout: std::fs::File,
     stderr: std::fs::File,
 }
@@ -85,7 +88,7 @@ struct FileIo {
 #[async_trait]
 impl Io for FileIo {
     async fn set(&self, cmd: &mut Command) -> std::io::Result<()> {
-        cmd.stdin(std::process::Stdio::null());
+        cmd.stdin(self.stdin.try_clone()?);
         cmd.stdout(self.stdout.try_clone()?);
         cmd.stderr(self.stderr.try_clone()?);
         Ok(())
@@ -135,6 +138,7 @@ impl Crun {
         lease: &Path,
         id: &str,
         bundle: &Path,
+        stdin: std::fs::File,
         stdout: std::fs::File,
         stderr: std::fs::File,
     ) -> RunEnd {
@@ -142,7 +146,11 @@ impl Crun {
             Ok(client) => client,
             Err(e) => return RunEnd::Failed(e),
         };
-        let opts = CreateOpts::new().io(Arc::new(FileIo { stdout, stderr }));
+        let opts = CreateOpts::new().io(Arc::new(FileIo {
+            stdin,
+            stdout,
+            stderr,
+        }));
         match client.run(id, bundle, Some(&opts)).await {
             Ok(()) => RunEnd::Exited(0),
             Err(Error::CommandFailed { status, .. }) => RunEnd::Exited(code_of(status)),
@@ -208,9 +216,12 @@ impl Crun {
         let state = state_dir(lease);
         let deleted = self.blocking(&state, &["delete", "--force", id], "delete");
         // A `crun run` killed with its container (a sweep's case) deletes its own state as
-        // it exits, and a `crun delete` that lost that race fails on the directory it
-        // listed: with the state gone there is nothing left to delete.
-        if deleted.is_err() && !state.join(id).exists() {
+        // it exits, and a `crun delete` that lost that race fails on what it listed or
+        // loaded (the directory, or the `config.json` the other removed first, with the
+        // directory itself still there for a moment): once the state is gone there is
+        // nothing left to delete. The state of a delete that failed for another reason
+        // stays, and that failure is returned after the wait.
+        if deleted.is_err() && wait_gone(&state.join(id), STATE_REMOVAL_WAIT) {
             return Ok(());
         }
         deleted
@@ -255,6 +266,25 @@ impl Crun {
     }
 }
 
+/// How long a failed `crun delete` waits for the container's state to be removed by
+/// the `crun run` that owns it. That run is removing it already; the wait ends the moment
+/// the directory is gone.
+const STATE_REMOVAL_WAIT: Duration = Duration::from_secs(3);
+
+/// Whether `path` is gone, polling until `limit` has passed.
+fn wait_gone(path: &Path, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if !path.exists() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +306,7 @@ mod tests {
     async fn the_file_io_has_nothing_to_close_after_the_start() {
         let null = || std::fs::File::open("/dev/null").expect("/dev/null");
         FileIo {
+            stdin: null(),
             stdout: null(),
             stderr: null(),
         }

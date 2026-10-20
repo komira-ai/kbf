@@ -10,6 +10,10 @@
 //! - `upper OUT IN`: `IN`, ASCII upper-cased;
 //! - `join OUT IN...`: the files, one after the other;
 //! - `pause OUT SECS SALT`: sleeps `SECS` seconds, then writes `SALT`;
+//! - `fill OUT KIB SALT`: writes `KIB` KiB of text, lines of 64 hexadecimal digits, drawn
+//!   from a generator seeded by `SALT`: the same salt always gives the same bytes, another
+//!   salt gives other bytes. An action that makes new blobs for the farm to store (the beta
+//!   harness's uploader, `crates/kbf-it/beta/buck2`);
 //! - `hog OUT MIB`: touches `MIB` MiB of distinct, incompressible memory at
 //!   [`HOG_MIB_PER_SEC`] and holds all of it until done, then writes `MIB`. Slow on
 //!   purpose: a lease over its cap keeps pushing into swap for several of the swap
@@ -56,6 +60,7 @@ fn run(args: &[String]) -> Result<u8, Error> {
             std::thread::sleep(Duration::from_secs(number(secs)?));
             format!("{salt}\n").into_bytes()
         }
+        ("fill", [kib, salt]) => fill(number(kib)?, salt)?,
         ("hog", [mib]) => {
             let mib = number(mib)?;
             drop(crate::touch(mib, crate::pace(HOG_MIB_PER_SEC)));
@@ -69,6 +74,38 @@ fn run(args: &[String]) -> Result<u8, Error> {
     };
     create(out, &bytes)?;
     Ok(0)
+}
+
+/// The most KiB `fill` writes: an action that asks for more is a mistake in the project.
+const FILL_MAX_KIB: u64 = 1 << 20;
+
+/// `kib` KiB of lines of 64 hexadecimal digits from a xorshift generator seeded by an FNV-1a
+/// hash of `salt` (so the bytes are a function of the salt alone).
+fn fill(kib: u64, salt: &str) -> Result<Vec<u8>, Error> {
+    if kib > FILL_MAX_KIB {
+        return Err(Error::Usage(format!(
+            "fill: {kib} KiB is over {FILL_MAX_KIB}"
+        )));
+    }
+    let hash = salt.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    // A zero state would stay zero.
+    let mut state = hash | 1;
+    // At most 1 GiB: it fits a `usize` anywhere.
+    let want = (kib * 1024) as usize;
+    let mut out = String::with_capacity(want + 65);
+    while out.len() < want {
+        for _ in 0..4 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.push_str(&format!("{state:016x}"));
+        }
+        out.push('\n');
+    }
+    out.truncate(want);
+    Ok(out.into_bytes())
 }
 
 /// The lines of `text` in byte order, each ending in a newline.
