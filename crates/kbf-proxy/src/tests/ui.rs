@@ -103,6 +103,31 @@ async fn the_ui_is_open_and_reaches_the_child_whole() {
     assert_eq!(recorded(&seen), want);
 }
 
+/// An open `/ui` request carries no identity, but the child is told where each browser
+/// connected from, so it can tell them apart: two browsers, two addresses, each seen as its own.
+///
+/// Kills: the address not forwarded on the `/ui` route (the route that branches to
+/// `proxy_child` with its own arguments); one address for every browser (the proxy's, or the
+/// first one's).
+#[tokio::test(start_paused = true)]
+async fn each_browser_is_known_to_the_child_by_its_own_address() {
+    let seen = Seen::default();
+    let rig = rig(&seen, true).await;
+    for (ip, path) in [("192.0.2.10", "/ui/runs/a"), ("198.51.100.4", "/ui/runs/b")] {
+        let mut client = rig.client_from(ip.parse().expect("an address")).await;
+        client.bearer = None;
+        let reply = client.plain("GET", path, b"").await;
+        assert_eq!(reply.status, Some(200), "{path}");
+        let headers = rig.a.state.headers_of(path);
+        assert_eq!(headers.len(), 1, "{path}");
+        assert_eq!(
+            headers[0].get("x-kbf-client-addr").map(|v| v.as_bytes()),
+            Some(ip.as_bytes()),
+            "{path}"
+        );
+    }
+}
+
 /// Every method but GET and HEAD is a 405 at the proxy that names the two allowed, and the
 /// child is never asked.
 ///

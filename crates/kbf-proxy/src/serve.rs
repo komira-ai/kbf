@@ -141,12 +141,14 @@ impl<U: UpdateHandler + 'static> Service<U> {
         match route {
             Route::Child(target) => {
                 let core = Arc::clone(&self.core);
-                proxy_child(core, pending, target, request, peer.identity.clone()).await
+                let identity = peer.identity.clone();
+                proxy_child(core, pending, target, request, identity, peer.ip).await
             }
             Route::Ui => {
                 let core = Arc::clone(&self.core);
                 let target = Target::Operator;
-                proxy_child(core, pending, target, request, peer.identity.clone()).await
+                let identity = peer.identity.clone();
+                proxy_child(core, pending, target, request, identity, peer.ip).await
             }
             Route::Update => self.update(request).await,
             Route::Health => text(StatusCode::OK, "ok"),
