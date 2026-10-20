@@ -542,6 +542,70 @@ fn an_unreadable_listing_or_build_is_red() {
     red_at(&s, name::INFLIGHT, "absent", "end");
 }
 
+/// Proves a listing the gates cannot trust is red for gate A at the preflight (exit 3): a
+/// partial listing; a `next_page` that leaves the listing (another host, `..`, `//`, another
+/// route); a listing that never ends; an id that could not go in a path (empty, over 128
+/// bytes, a character outside the id set, `.`, `..`). Then, for a build's actions, a
+/// `next_page` that leaves the route and one that never ends are red for gate C. The detail
+/// says only that the series is absent, so each case is told from a green run by the verdict.
+/// Catches a partial listing read as complete, a link followed off the route, an endless
+/// listing read forever, and each clause of the id check dropped.
+///
+/// Mutants planted (red): the partial refusal inverted; `same_route` read as `true`; the
+/// `..` clause of `safe_id` removed.
+#[test]
+fn a_listing_that_cannot_be_trusted_is_red() {
+    let open = "GET /v1/invocations?state=open*";
+    let cases: [&str; 11] = [
+        r#"{"invocations":[],"partial":true}"#,
+        r#"{"invocations":[],"next_page":"https://elsewhere/v1/invocations?x=1"}"#,
+        r#"{"invocations":[],"next_page":"/v1/invocations?a=1/../b"}"#,
+        r#"{"invocations":[],"next_page":"/v1/invocations?a=1//b"}"#,
+        r#"{"invocations":[],"next_page":"/v1/other?a=1"}"#,
+        r#"{"invocations":[],"next_page":"/v1/invocations?page_token=1"}"#,
+        r#"{"invocations":[{"id":""}]}"#,
+        r#"{"invocations":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
+        r#"{"invocations":[{"id":"a b"}]}"#,
+        r#"{"invocations":[{"id":"."}]}"#,
+        r#"{"invocations":[{"id":".."}]}"#,
+    ];
+    for (n, body) in cases.into_iter().enumerate() {
+        let mut f = farm(two_nodes());
+        f.broken.push(Broken::new(open, Breaks::Body(body)));
+        let (s, _) = run_gated(&f, &format!("untrusted-listing-{n}"));
+        assert_eq!(
+            (s.exit, s.reason.as_str()),
+            (3, "gate_red"),
+            "{body}: {}",
+            s.line()
+        );
+        for part in [name::INFLIGHT, "absent", "preflight"] {
+            assert!(
+                s.detail.contains(part),
+                "`{part}` missing for {body}: {}",
+                s.detail
+            );
+        }
+    }
+
+    for (n, body) in [
+        r#"{"actions":[],"next_page":"/v1/invocations/b-x/other?a=1"}"#,
+        r#"{"actions":[],"next_page":"/v1/invocations/b-x/actions?page_token=1"}"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut f = farm(two_nodes());
+        f.builds = vec![build("b-x", 22, Some(27), &[])];
+        f.broken.push(Broken::new(
+            "GET /v1/invocations/b-x/actions*",
+            Breaks::Body(body),
+        ));
+        let (s, _) = run_gated(&f, &format!("untrusted-actions-{n}"));
+        red_at(&s, name::FARM_FAILURES, "absent", "b-x");
+    }
+}
+
 // ---- gate F ------------------------------------------------------------------------
 
 /// Proves a node that reverts by its own timer is a red row for gate F naming the node, with
