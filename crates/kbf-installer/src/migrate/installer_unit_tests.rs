@@ -195,3 +195,42 @@ fn no_installer_unit_named_none_is_enabled() {
     assert!(!rig.events.borrow().iter().any(|e| e.contains("installer")));
     guard(&rig.layout, me()).expect("done");
 }
+
+/// Catches a plan that says the installer's unit will be enabled when it is enabled already (an
+/// operator who acts on the plan would look for a change that is not coming), and a plan that
+/// names an installer unit when the operator named none (a kit Mac). Both are plans only:
+/// nothing is run beyond questions.
+///
+/// Mutants seen red: the dry run's `is_enabled` answer ignored (the plan line is always "enable
+/// it"); the `Option` ignored in the plan (the unit's name constant is used).
+#[test]
+fn a_dry_run_plans_around_an_enabled_installer_unit_and_a_missing_one() {
+    let mut rig = Rig::linux("installer-dry-enabled");
+    rig.enabled
+        .borrow_mut()
+        .insert("kbf-installer.service".to_owned());
+    let shown = run_migrate(&mut rig, &never(), Mode::DryRun)
+        .expect("plan")
+        .to_string();
+    assert!(
+        shown.contains("kbf-installer.service: it is enabled already: leave it"),
+        "{shown}"
+    );
+    assert!(!shown.contains("enable it and start it, last"), "{shown}");
+    assert!(rig.events.borrow().is_empty());
+
+    let mut rig = Rig::linux("installer-dry-none");
+    let mut m = rig.migration();
+    m.installer_unit = None;
+    let hooks = Hooks {
+        runner: &runner(),
+        verifier: &never(),
+        frontend: &NoFrontend,
+    };
+    let shown = migrate(&m, &mut rig.host, &hooks, Mode::DryRun)
+        .expect("plan")
+        .to_string();
+    assert!(!shown.contains("kbf-installer.service"), "{shown}");
+    assert!(shown.contains("copy or verify each release"), "{shown}");
+    assert!(rig.events.borrow().is_empty());
+}
