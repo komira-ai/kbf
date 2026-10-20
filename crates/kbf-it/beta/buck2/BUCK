@@ -1,0 +1,63 @@
+# The three kinds of load scenario B0 puts on the farm (crates/kbf-harness, `load`). Each
+# takes `-c kbf_beta.salt=S`: a new salt makes every action a new action, so it runs on the
+# farm instead of being answered from the action cache.
+#
+# - compile: `//:joined`, a chain of four short actions (a salted source, `sort`, `upper`,
+#   `join`). The farm has no compiler toolchain on the box, so this is the stand-in for
+#   a short compile, and exercises inputs that are outputs of earlier actions.
+# - pause: `//:pause`, an action that sleeps `-c kbf_beta.sleep_secs=N` seconds (30 in the
+#   scenario) and so holds a lease, and a slot, for that long.
+# - upload: `//:fill_0` to `//:fill_3`, actions that write `-c kbf_beta.fill_kib=K` KiB of
+#   new bytes each, so the farm stores new blobs while the other builds run.
+load(":defs.bzl", "act")
+
+act(
+    name = "seed",
+    args = [
+        read_config("kbf_beta", "seed_kib", "4"),
+        read_config("kbf_beta", "salt", ""),
+    ],
+    verb = "fill",
+)
+
+act(
+    name = "sorted",
+    srcs = [":seed"],
+    verb = "sort",
+)
+
+act(
+    name = "shout",
+    srcs = [":sorted"],
+    verb = "upper",
+)
+
+act(
+    name = "joined",
+    srcs = [
+        ":sorted",
+        ":shout",
+    ],
+    verb = "join",
+)
+
+act(
+    name = "pause",
+    args = [
+        read_config("kbf_beta", "sleep_secs", "0"),
+        read_config("kbf_beta", "salt", ""),
+    ],
+    verb = "pause",
+)
+
+[
+    act(
+        name = "fill_%d" % i,
+        args = [
+            read_config("kbf_beta", "fill_kib", "256"),
+            read_config("kbf_beta", "salt", "") + "-%d" % i,
+        ],
+        verb = "fill",
+    )
+    for i in range(4)
+]

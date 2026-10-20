@@ -26,6 +26,7 @@ use crate::helper::serve::{FileIdentity, Flow, PASS_INTERVAL, Serve};
 use crate::helper::service::HostProcs;
 use crate::helper::{fetcher, leases};
 use crate::layout::{Layout, Platform};
+use crate::proxy_verb;
 use crate::release::ReleaseError;
 use crate::setup;
 
@@ -135,14 +136,17 @@ fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failu
         starts: args.starts,
         min_activation_interval_secs: args.min_activation_interval_secs,
     };
-    // The release fetcher and the lease source are wired by later changes; until then an
-    // activation of a release that is not installed, and every activation, is refused.
+    // The leases are those of the unit restarted after a swap, read below the host root's
+    // cgroup mount. The release fetcher is wired by a later change; until then an
+    // activation of a release that is not installed is refused.
+    let cgroups = HostPath::new(leases::CGROUP_ROOT).expect("CGROUP_ROOT is an absolute path");
+    let lease_source = leases::for_restart(&cfg.restart, &layout.join(&cgroups));
     let mut helper = Helper::new(
         layout,
         exec,
         cfg,
         Box::new(fetcher::NotWired),
-        Box::new(leases::NotWired),
+        lease_source,
         Box::new(HostProcs::new(platform)),
     );
     if let Some(database) = database {
@@ -304,6 +308,16 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
             format!("kbf-installer: {name} needs root: run it with sudo (effective uid is {euid})"),
             serde_json::json!({"verb": name, "error": "needs_root", "euid": euid}),
         );
+    }
+    if let Verb::Proxy(args) = &cli.verb {
+        return match proxy_verb::run(args) {
+            Ok(()) => Exit::Ok,
+            Err(e) => say(
+                e.exit(),
+                format!("kbf-installer: {name}: {e}"),
+                serde_json::json!({"verb": name, "error": e.code(), "message": e.to_string()}),
+            ),
+        };
     }
     let result = match &cli.verb {
         // `setup` checks for root itself and prints its steps ahead of its own result.

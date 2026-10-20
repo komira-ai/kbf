@@ -93,14 +93,17 @@ listener:
   other gate, the token included: the secret says who forwarded the request, not that the
   caller may write.
 - Every `x-kbf-*` header is removed from every request, whatever the result, so nothing
-  past this check can read one. The proxy sets `x-kbf-node-id` and `x-kbf-role` for a call
+  past this check can read one. The proxy sets `x-kbf-node-id`, `x-kbf-role` and `x-kbf-node-ips` for a call
   whose client certificate it verified; the worker listener takes those (and no TLS flag)
   in place of a certificate: the role table, the `Hello.node_id` binding, the blob calls
   and `Membership`'s role check use them. A `Hello` whose node id is not the proxy's
   `x-kbf-node-id` is refused `PERMISSION_DENIED`. A `Membership` registration
-  or heartbeat has no certificate names behind the proxy: the one name is the proxied node
-  id, so the host of its instance id and its address must be that name (up to ASCII case; an IP
-  address is refused). The proxied role must be `storage`.
+  or heartbeat has no certificate behind the proxy: its names are the proxied node id and
+  the IP addresses in `x-kbf-node-ips` (those of the verified leaf; see
+  `docs/design/frontend-proxy.md` section 3), so the host of its instance id and its address
+  must be that name (up to ASCII case) or one of those addresses (exact equality). A
+  malformed, repeated or oversized `x-kbf-node-ips` is refused `PERMISSION_DENIED`; without
+  one, an IP host is refused. The proxied role must be `storage`.
 
 What the flag does not do, and what the proxy must do:
 
@@ -1096,6 +1099,13 @@ no blob, build or node. Every listener that serves the cache counts into the sam
 families: the REAPI listener (clients) and the worker listener (daemons' uploads of
 outputs and reads of inputs). The counts are in memory and start at 0 with the
 process.
+
+A storage node (`kbf storage`, and the storage half of `kbf storage-and-daemon`) has no
+operator API and serves this one route, plain HTTP, on `--metrics-listen <addr>`
+(off unless given; the same open read as above, so bind it where only operators do). It
+answers the families of its own cache, among them `kbf_cache_lost_blobs` and
+`kbf_cache_blob_losses_total`, the node's TLS reloads, and, in
+`kbf storage-and-daemon`, the one cache's fill.
 
 Each request family counts from the start of its handler to its answer. A call whose
 caller goes away before the answer counts as an error.

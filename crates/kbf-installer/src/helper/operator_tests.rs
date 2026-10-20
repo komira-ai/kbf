@@ -248,6 +248,37 @@ fn rollback_goes_to_previous_and_only_when_nothing_is_on_trial() {
     assert_eq!(err.exit_code(), 5, "{err}");
 }
 
+/// Catches a revert or a rollback that puts a release back as `current` while `staged` still
+/// names it. The proxy can stage the release that is `previous` (`stage_frontend` refuses
+/// only the current one), and the host then showed a running release as "staged", refused
+/// every other frontend update as busy, and would let the frontend's confirm of it write
+/// `previous` = `current`. A `staged` that names another release is another decision's and
+/// stays.
+///
+/// Mutants planted: `staged` carried over by `revert_in`; the same in `rollback_in`;
+/// `staged` cleared whatever it names in either.
+#[test]
+fn a_revert_or_rollback_drops_a_staged_release_it_puts_back_and_keeps_another() {
+    for (pending, verb) in [(true, "revert"), (false, "rollback")] {
+        for (staged, want) in [(A, None), (C, Some(c(C)))] {
+            let mut rig = Rig::new(&format!("staged-{verb}-{staged}"), pending);
+            release(&rig.exec.root, C);
+            crate::activate::stage_frontend(&rig.exec, &rig.layout, &c(staged)).expect("staged");
+            assert_eq!(rig.state().staged, Some(c(staged)), "{verb} {staged}");
+
+            let done = if pending {
+                rig.op(true).revert(ACTIVATION)
+            } else {
+                rig.op(true).rollback()
+            };
+            done.expect("moved");
+            let state = rig.state();
+            assert_eq!(state.current, Some(c(A)), "{verb} {staged}");
+            assert_eq!(state.staged, want, "{verb} {staged}");
+        }
+    }
+}
+
 /// Catches `gc` removing what must stay and a dry run that removes: current, previous, the
 /// pending swap and a release a process runs stay; the others go only with `apply`; and a
 /// host whose processes cannot be listed removes nothing (exit 1).

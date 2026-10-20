@@ -5,6 +5,7 @@ use super::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::cli::ProxyArgs;
 use crate::layout::{Layout, Platform};
 use crate::state::{Locked, PendingConfirm, State};
 use crate::testkit::{A, B, c, host_root_on};
@@ -76,6 +77,51 @@ fn only_status_and_check_run_without_root() {
             );
         }
     }
+}
+
+/// Catches the proxy verb asking for root (it runs as the service user), a refused table
+/// leaving as anything but a usage error with its path, and `--json` losing the reason.
+#[test]
+fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
+    let dir = crate::testkit::host_root("proxy-dispatch").1;
+    let file = dir.join("installer.toml");
+    fs::write(&file, "min_generation = 1\n").expect("write");
+    let path = file.display().to_string();
+    let (exit, out, err) = run_as(1000, &["proxy", "--check", "--config", &path]);
+    assert_eq!(exit, Exit::Usage);
+    assert!(out.is_empty());
+    assert!(
+        err.starts_with(&format!("kbf-installer: proxy: {path}: ")) && err.contains("no [proxy]"),
+        "{err}"
+    );
+    let (exit, out, _) = run_as(1000, &["--json", "proxy", "--check", "--config", &path]);
+    assert_eq!(exit, Exit::Usage);
+    let v: Value = serde_json::from_str(out.trim_end()).expect("one json object");
+    assert_eq!(
+        (v["verb"].as_str(), v["error"].as_str()),
+        (Some("proxy"), Some("usage"))
+    );
+    assert!(
+        v["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no [proxy]"))
+    );
+
+    fs::write(
+        &file,
+        "[proxy]\noperator_token_file = \"/a\"\nserver_cert_file = \"/b\"\nserver_key_file = \"/c\"\nclient_ca_file = \"/d\"\n[proxy.upstream]\nbase_port = 18000\n",
+    )
+    .expect("write");
+    let (exit, out, err) = run_as(1000, &["proxy", "--check", "--config", &path]);
+    assert_eq!((exit, out.as_str(), err.as_str()), (Exit::Ok, "", ""));
+    // Not a mutating verb: it has no dry run to leave out.
+    assert!(
+        !Verb::Proxy(ProxyArgs {
+            config: file,
+            check: true
+        })
+        .needs_root()
+    );
 }
 
 /// Catches `--json` printing prose, or putting the object on the error stream where a
@@ -222,7 +268,8 @@ fn the_visible_verbs_are_the_contracts() {
             "gc",
             "boot-check",
             "quiesce",
-            "check"
+            "check",
+            "proxy"
         ]
     );
     let hidden: Vec<_> = cmd
@@ -630,6 +677,42 @@ fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
     let why = step.before_start(1).expect_err("no server to migrate");
     assert!(!why.is_empty());
     assert!(with(&[]).schema_step_mut().is_none(), "no flag, no step");
+}
+
+/// Catches `run` building a helper that cannot tell about leases (the stub every build had
+/// until a lease source was wired): the helper `run` builds reads the lease cgroups of the
+/// unit it restarts, below the host root's `/sys/fs/cgroup`, so a populated lease of
+/// `kbf-daemon.service` is one live lease. A unit that never ran (no cgroup), a unit of no
+/// mode and a launchd label each cannot tell, with the reason: the activation is refused
+/// (fail closed), and `run` itself still starts for them.
+///
+/// Mutants seen red: `leases::NotWired` left in `build_helper` (the daemon's lease reads as
+/// "cannot tell"); the cgroup root taken as the real `/sys/fs/cgroup` instead of the host
+/// root's.
+#[test]
+fn run_builds_a_helper_whose_lease_source_reads_the_restarted_units_cgroup() {
+    let (_, root) = seeded("run-lease-source");
+    let lease = root.join("sys/fs/cgroup/kbf.slice/kbf-daemon.service/actions/kbf-lease-1-1");
+    fs::create_dir_all(&lease).expect("lease cgroup");
+    fs::write(lease.join("cgroup.events"), "populated 1\n").expect("events");
+    let source = |flags: &[&str]| {
+        let mut argv = vec!["--root", root.to_str().expect("text"), "run"];
+        argv.extend_from_slice(flags);
+        let Verb::Run(args) = parse(&argv).verb else {
+            panic!("a run");
+        };
+        match build_helper(root.clone(), &args) {
+            Ok(helper) => helper.leases().live(),
+            Err(f) => panic!("{}", f.why),
+        }
+    };
+    assert_eq!(source(&["--unit", "kbf-daemon.service"]), Ok(1));
+    let err = source(&["--unit", "kbf-frontend@a.service"]).expect_err("never ran");
+    assert!(err.contains("no such cgroup"), "{err}");
+    let err = source(&["--unit", "kbf.service"]).expect_err("no mode's unit");
+    assert!(err.contains("is no unit of any mode"), "{err}");
+    let err = source(&["--launchd-label", "com.example.kbf"]).expect_err("not wired");
+    assert!(err.contains("no lease source wired"), "{err}");
 }
 
 /// Catches `run --installer-config` reading the config under a host root that is not an

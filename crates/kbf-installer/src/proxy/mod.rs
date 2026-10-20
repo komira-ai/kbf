@@ -6,14 +6,33 @@
 //! side) and for an all-in-one host (stop, hold, start); recovery after a proxy restart
 //! ([`Swap::adopt`]); the operator's rollback; the retire rule; and [`FileRecorder`], the
 //! fsynced `update.json`; and [`orders::OrderSpool`], the one writer of every order the
-//! proxy puts in `orders/`. What is not: the proxy itself and the real child control
-//! (U4b, U7b), the update API ([`api`], U8a). [`child_http`] is the blocking
-//! loopback client that the real child control and the fleet read call a child's ports
-//! with (U8b); [`admin`] is the `ChildAdmin` built on it, and nothing else calls it yet.
+//! proxy puts in `orders/`. The update API is in [`api`] (U8a).
+//!
+//! Real implementations of the ports (U7b), each behind the trait it implements:
+//! - [`gate_real::ProxyGate`], the `Gate` on `kbf-proxy`'s hold gate (it keeps the
+//!   `HoldGuard`, opens a slot at its first release, adopts running children out of the
+//!   startup hold);
+//! - [`child_real::ProcChild`] (Linux), the `Child` on processes watched by pidfd;
+//! - [`runtime::SystemClock`] and [`runtime::RequestQueue`], the `Clock` and the `Requests`;
+//! - [`supervisor`] (Linux), the proxy's start: adopt the children a previous proxy left.
+//!
+//! Child control over HTTP: [`child_http`] is the blocking loopback client that the real
+//! child control and the fleet read call a child's ports with (U8b); [`admin`] is the
+//! `ChildAdmin` built on it (`admin_protocol` 1, sending the proxy secret header on every
+//! call), and nothing else calls it yet.
+//!
+//! Still fakes, stated: `Migrator` (who migrates is open), `RootOrders` (the orders spool
+//! and `status.json` reader belong to the update API's unit, U8b). Until the proxy verb
+//! wires [`admin`] in, it cannot run a swap or resume one, start a first child or choose
+//! between two live ones, so [`supervisor::adopt_children`] adopts a child only when no
+//! update is in flight.
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
 //!   [`ports::ChildAdmin::resume`].
+//! - **Start.** A frontend host starts the new child as a candidate (`--await-takeover`,
+//!   [`model::Start`]); an all-in-one host starts the new process, and the old release put
+//!   back after a failed start, to serve at once, because no takeover is ever sent there.
 //! - **Q8** open streams come from the proxy ([`ports::Gate::open_streams`]); open
 //!   streams and open worker sessions from the child's admin role view
 //!   ([`ports::ChildAdmin::open_counts`]); queued operations do not gate retire.
@@ -24,7 +43,10 @@
 //! - **update.json** keeps the recorded process identity of both children
 //!   ([`model::Intent::old_proc`], `new_proc`), which FP section 4 does not list: adoption
 //!   needs pid, start time and executable. A candidate spawned and not yet recorded when
-//!   the proxy dies is not found again (U7b should write a pid file at spawn).
+//!   the proxy dies is found again only by the start-up adoption: `spawn` writes
+//!   `<slot>.json` (pid, start time, executable, commit) before it returns
+//!   ([`child_real::ProcChild::recorded`]), and [`supervisor::adopt_children`] reads it;
+//!   [`Swap::adopt`] reads `update.json` alone.
 //! - **confirm** is sent once the bake passes and is idempotent at the root half, because
 //!   a restart between the confirm and the `nodes` record sends it again.
 //! - **abort** ends an update as `failed` with step `abort`, not `rolled_back`; so does an
@@ -44,8 +66,8 @@
 //! - **All-in-one stop**: after `quiesce`, the proxy sends SIGTERM to the old process
 //!   ([`aio`]).
 //! - A dead new child during the bake (the proxy running) leaves the update parked in
-//!   `baking` (red) until the operator rolls back; the proxy-supervised respawn with an
-//!   epoch bump is U7b.
+//!   `baking` (red) until the operator rolls back; nothing respawns a dead bake child in
+//!   this code, and nothing but a proxy restart looks at a child that died outside an update.
 //! - **Restart reconcile** ([`recover`]): retire never signals the recorded-active slot,
 //!   so a restart past the switch first checks that slot. If the new child is dead (or
 //!   not ours any more: a recycled pid) or does not hold the generation while the old
@@ -61,6 +83,9 @@ pub mod admin;
 mod aio;
 pub mod api;
 pub mod child_http;
+#[cfg(target_os = "linux")]
+pub mod child_real;
+pub mod gate_real;
 pub mod model;
 pub mod orders;
 pub mod ports;
@@ -69,6 +94,9 @@ mod recover;
 mod retire;
 pub mod root_orders;
 pub mod running_binary;
+pub mod runtime;
+#[cfg(target_os = "linux")]
+pub mod supervisor;
 mod swap;
 
 #[cfg(test)]
@@ -77,12 +105,18 @@ mod admin_tests;
 mod aio_tests;
 #[cfg(test)]
 mod child_http_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod child_rig;
 #[cfg(test)]
 mod confirm_boundary_tests;
 #[cfg(test)]
 mod fakes;
 #[cfg(test)]
 mod fault_tests;
+#[cfg(test)]
+mod gate_real_tests;
+#[cfg(test)]
+mod gate_tests;
 #[cfg(test)]
 mod orders_tests;
 #[cfg(test)]

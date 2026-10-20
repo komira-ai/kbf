@@ -13,7 +13,7 @@ use super::kbf_toml::{self, Decision, Ours};
 use super::os::{DSCL, LAUNCHCTL, Os, SYSTEMCTL, View};
 use super::paths;
 use super::validate::{Valid, mode_name};
-use super::{SetupError, installer_file};
+use super::{SetupError, installer_settings};
 use crate::cli::Mode;
 use crate::layout::{Layout, Platform};
 
@@ -89,7 +89,7 @@ fn serves_api(mode: Mode) -> bool {
     matches!(mode, Mode::Frontend | Mode::AllInOne)
 }
 
-fn fetch_user(platform: Platform) -> &'static str {
+pub fn fetch_user(platform: Platform) -> &'static str {
     match platform {
         Platform::Linux => "kbf-fetch",
         Platform::MacOs => "_kbf-fetch",
@@ -294,7 +294,9 @@ pub fn before_release(
         .as_deref()
         .map(|file| read_token(exec, file))
         .transpose()?;
-    let settings = installer_file(exec, v, platform)?;
+    let settings = installer_settings(exec, v, platform)?;
+    let listen = settings.proxy.as_ref().and_then(|p| p.listen);
+    let settings = settings.render();
 
     let view = View(exec);
     let mut p = Planner::new(&view);
@@ -336,10 +338,51 @@ pub fn before_release(
         root,
         settings.into_bytes(),
     )?;
+    if platform == Platform::Linux {
+        proxy_listen(&mut p, root, listen, &mut notes)?;
+    }
     Ok(Outcome {
         plan: p.finish(),
         notes,
     })
+}
+
+/// The text of the drop-in that moves `kbf-proxy.socket` to `addr`: the empty `ListenStream=`
+/// clears the packaged port first (without it the socket would listen on both).
+pub fn proxy_listen_dropin(addr: std::net::SocketAddr) -> String {
+    format!("[Socket]\nListenStream=\nListenStream={addr}\n")
+}
+
+/// Makes `listen.conf` say `listen` (written atomically, root's, 0644), or removes it when
+/// the operator set no address. Systemd reads drop-ins at `daemon-reload` and a socket takes
+/// a new address at its next restart: setup does neither (the proxy socket is the public
+/// port, and restarting it is the operator's call), so it says so.
+fn proxy_listen(
+    p: &mut Pl<'_, '_>,
+    root: Owner,
+    listen: Option<std::net::SocketAddr>,
+    notes: &mut Vec<String>,
+) -> Result<(), SetupError> {
+    let changed = match listen {
+        Some(addr) => {
+            dir(p, paths::PROXY_SOCKET_DIR, 0o755, root)?;
+            file(
+                p,
+                paths::PROXY_LISTEN_DROPIN,
+                0o644,
+                root,
+                proxy_listen_dropin(addr).into_bytes(),
+            )?
+        }
+        None => p.absent(hp(paths::PROXY_LISTEN_DROPIN)?)?,
+    };
+    if changed {
+        notes.push(format!(
+            "{} changed: run `systemctl daemon-reload`, then `systemctl restart kbf-proxy.socket` to move the public port; setup does not (a restart of the socket drops connections waiting in it)",
+            paths::PROXY_LISTEN_DROPIN
+        ));
+    }
+    Ok(())
 }
 
 /// The first operator token: made once, when the file is not there. It is never printed; the
