@@ -102,12 +102,8 @@ impl<'a> Tokens<'a> {
                 query.append_pair(name, value);
             }
         }
-        let query = query.finish();
-        let url = if query.is_empty() {
-            self.here.to_owned()
-        } else {
-            format!("{}?{query}", self.here)
-        };
+        // `set` names a token, so the query is never empty.
+        let url = format!("{}?{}", self.here, query.finish());
         Href::root_relative(&url).expect("a build page's path is root-relative")
     }
 }

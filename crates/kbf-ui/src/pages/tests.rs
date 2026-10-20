@@ -121,6 +121,15 @@ fn builds_lists_the_builds_with_their_result() {
         "{html}"
     );
     assert!(!html.contains("Next page"), "{html}");
+
+    // The last page of a list that has builds: no next link.
+    let last = json!({"invocations": [crate::tests::listed(ID, "closed", 0)]});
+    let fake = Fake::default().json("/v1/invocations", &last);
+    let (status, html) = page(&fake, "/ui/builds");
+    assert_eq!(status, 200, "{html}");
+    assert!(html.contains("<span class=\"pill ok\">ok</span>"), "{html}");
+    assert!(!html.contains("Next page"), "{html}");
+    assert!(!html.contains("Partial:"), "{html}");
 }
 
 /// Catches: a filter the page does not take, a duplicated one or a state that is not

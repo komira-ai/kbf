@@ -384,17 +384,24 @@ fn what_the_failure_lacks_is_said() {
     );
     assert!(!html.contains("Download the whole log"), "{html}");
 
-    // On the Build page the same failure's stderr cell says it was not read.
+    // On the Build page the same failure's stderr cell says it was not read; a failure
+    // with no class and no stderr says "none" in both cells.
+    let mut bare = failure(&digest('7', 20), "//app:bare", &Value::Null);
+    bare["failure"] = Value::Null;
     let fake = Fake::default()
         .json(&base, &invocation(ID))
         .json(
             &failures_url(),
             &json!({"failures": [failure(
-            &action_digest(), "//app:lib", &stderr_tail(&Value::Null, true))]}),
+            &action_digest(), "//app:lib", &stderr_tail(&Value::Null, true)), bare]}),
         )
         .json(&format!("{base}/actions"), &json!({"actions": []}));
     let (_, html) = page(&fake, &format!("/ui/builds/{ID}"));
     assert!(html.contains("<td>not read (4.0 KiB)</td>"), "{html}");
+    assert!(
+        html.contains("<td>none</td><td>1</td><td>main</td><td>none</td>"),
+        "{html}"
+    );
 
     // An empty, cut command with no platform or timeout; the whole log as the tail.
     let mut f = failure(
@@ -405,6 +412,8 @@ fn what_the_failure_lacks_is_said() {
     f["command"] = json!({"arguments": [], "environment_names": [], "working_directory": "",
         "platform": {}, "timeout_micros": null, "output_paths": [], "truncated": true});
     f["stdout"] = Value::Null;
+    // The tail came, but the API gave no link to the log: the tail alone.
+    f["stderr"]["href"] = Value::Null;
     let fake = Fake::default()
         .json(
             &format!("{base}/actions/{}", action_digest()),
@@ -412,6 +421,8 @@ fn what_the_failure_lacks_is_said() {
         )
         .json(&failures_url(), &json!({"failures": [f]}));
     let (_, html) = page(&fake, &action_path(&action_digest()));
+    assert!(html.contains("whole log, 4.0 KiB. </p><pre>"), "{html}");
+    assert!(!html.contains("Download the whole log"), "{html}");
     assert!(html.contains("<dt>Platform</dt><dd>none</dd>"), "{html}");
     assert!(html.contains("<dt>Timeout</dt><dd>none set</dd>"), "{html}");
     assert!(html.contains("Cut: the API drops strings"), "{html}");
