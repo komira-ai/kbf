@@ -225,8 +225,8 @@ pub struct Cli {
     /// On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets
     /// the running ones finish and report, waits for their acknowledgements, then exits
     /// 0. A second signal, or this many seconds after the first, stops it at once and
-    /// abandons the leases still running. Used by `kbf daemon`; the combined modes stop
-    /// their daemon half with the other half.
+    /// abandons the leases still running. Used by `kbf daemon` and `kbf
+    /// storage-and-daemon`; `kbf all-in-one` stops its daemon half with the server half.
     #[arg(long, default_value_t = 600)]
     drain_deadline_secs: u64,
     /// Where the kernel reports memory pressure stall information. For tests only.
@@ -510,25 +510,52 @@ impl NodeHandle {
     /// The signal handlers cannot be installed, or no storage member is reachable from
     /// this host ([`kbf_daemon::reach`]).
     pub fn serve(self) -> Result<(), Error> {
-        // A signal handler is registered with the runtime's reactor, so the runtime's
-        // context is entered while it is made.
-        let (term, int) = {
+        let signals = {
             let _context = self.tokio.enter();
-            (
-                signal(SignalKind::terminate())?,
-                signal(SignalKind::interrupt())?,
-            )
+            Signals::install()?
         };
-        let (signals, received) = tokio::sync::mpsc::unbounded_channel();
-        let deadline = self.drain_deadline;
+        self.serve_alongside(signals, std::future::pending())
+    }
+
+    /// [`Self::serve`] for a daemon beside another half in the same process, on `signals`
+    /// the caller installed earlier ([`Signals::install`]: one that arrived since then is
+    /// the first, so a stop during the other half's start is not lost). The first signal
+    /// drains as `serve` does (the half beside it is not told until the drain is over, so
+    /// a running lease still reaches its blobs through it), and `other` completing (that
+    /// half stopped on its own) stops the daemon at once, abandoning the leases still
+    /// running.
+    ///
+    /// # Errors
+    /// As [`Self::serve`], less the handlers.
+    pub fn serve_alongside(
+        self,
+        signals: Signals,
+        other: impl Future<Output = ()>,
+    ) -> Result<(), Error> {
+        let (sender, received) = tokio::sync::mpsc::unbounded_channel();
+        self.tokio.spawn(forward(signals, sender));
+        self.drain_on(received, other)
+    }
+
+    /// Drains on the first of `received` and ends at the second, at the drain deadline,
+    /// or when `other` completes, whichever is first ([`Daemon::run_draining`]).
+    fn drain_on(
+        self,
+        received: tokio::sync::mpsc::UnboundedReceiver<()>,
+        other: impl Future<Output = ()>,
+    ) -> Result<(), Error> {
         let Self {
             tokio,
             daemon,
+            drain_deadline,
             reach,
-            ..
         } = self;
-        tokio.spawn(forward(term, int, signals));
-        let serving = Box::pin(daemon.run_draining(received, deadline));
+        let serving = Box::pin(async {
+            tokio::select! {
+                () = daemon.run_draining(received, drain_deadline) => {}
+                () = other => tracing::warn!("the half beside the daemon stopped: stopping"),
+            }
+        });
         tokio.block_on(serve_or_refuse(serving, reach))
     }
 
@@ -973,19 +1000,41 @@ fn native_runtime<C: Cas>(
 /// What the native driver's surveys send the daemon, merged.
 type Reports = tokio::sync::watch::Receiver<kbf_daemon::DriverReport>;
 
+/// The SIGTERM and SIGINT handlers of a process.
+pub struct Signals {
+    term: Signal,
+    int: Signal,
+}
+
+impl Signals {
+    /// Installs the handlers now, in the context of the tokio runtime that is entered:
+    /// from here on a signal is kept until [`Self::recv`] takes it, not given its default
+    /// action (which ends the process).
+    ///
+    /// # Errors
+    /// The handlers cannot be installed.
+    pub fn install() -> std::io::Result<Self> {
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// The next SIGTERM or SIGINT (two that arrived before it count as one), by name.
+    pub async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.term.recv() => "SIGTERM",
+            _ = self.int.recv() => "SIGINT",
+        }
+    }
+}
+
 /// Sends a `()` on `signals` for every SIGTERM or SIGINT, until the receiver is gone.
-async fn forward(
-    mut term: Signal,
-    mut int: Signal,
-    signals: tokio::sync::mpsc::UnboundedSender<()>,
-) {
+async fn forward(mut signals: Signals, sender: tokio::sync::mpsc::UnboundedSender<()>) {
     loop {
-        let name = tokio::select! {
-            _ = term.recv() => "SIGTERM",
-            _ = int.recv() => "SIGINT",
-        };
+        let name = signals.recv().await;
         tracing::info!("{name}: shutting down");
-        if signals.send(()).is_err() {
+        if sender.send(()).is_err() {
             return;
         }
     }
@@ -2111,6 +2160,53 @@ mod tests {
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
+    /// Catches a daemon beside another half that does not drain on the first signal
+    /// (`drain_on` running the daemon with `run`, which ignores signals), and one that
+    /// keeps running when the half beside it has stopped. An idle node with a signal
+    /// waiting returns at once, and so does one whose other half has stopped, with no
+    /// signal; each runs on a thread the test waits on for 5 s, so a defect fails here
+    /// instead of hanging the run.
+    #[test]
+    fn a_daemon_beside_another_half_drains_on_a_signal_and_stops_when_the_other_does() {
+        let dir = scratch("drain-on");
+        tls_files(&dir);
+        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+        let cli = Cli::try_parse_from([
+            "kbf-daemon".to_owned(),
+            "--server=https://127.0.0.1:1".to_owned(),
+            flag("ca-cert", &dir.join("ca.pem")),
+            flag("cert", &dir.join("node.pem")),
+            flag("key", &dir.join("node.key")),
+            "--node-id=mac-1".to_owned(),
+            "--driver=native".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
+            flag("data-dir", &dir),
+            flag("xcode-apps", &dir.join("Applications")),
+        ])
+        .expect("flags");
+        let ends = |signalled: bool| {
+            let node = start_with(&cli, remote).expect("starts");
+            let (signals, received) = tokio::sync::mpsc::unbounded_channel();
+            if signalled {
+                signals.send(()).expect("sent");
+            }
+            let (ended, result) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let other = async move {
+                    if signalled {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                ended.send(node.drain_on(received, other).is_ok()).ok();
+                drop(signals);
+            });
+            result.recv_timeout(Duration::from_secs(5))
+        };
+        assert_eq!(ends(true), Ok(true), "no drain on the first signal");
+        assert_eq!(ends(false), Ok(true), "the other half's stop was ignored");
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
     /// Catches a daemon that starts with storage-liveness flags it cannot honour: a zero
     /// value, or a ping timeout past the interval, is refused by `start` (and by
     /// `start_with`, as the same check) before any driver is set up, naming the flag.
@@ -2159,13 +2255,27 @@ mod tests {
 mod signal_tests {
     use std::time::Duration;
 
-    use tokio::signal::unix::{SignalKind, signal};
-
-    use super::forward;
+    use super::{Signals, forward};
 
     fn raise(signal: libc::c_int) {
         // SAFETY: raise(3) on this process, whose handler for `signal` the test installed.
         assert_eq!(unsafe { libc::raise(signal) }, 0);
+    }
+
+    /// Catches handlers that do not keep a signal sent before they are read (the start of
+    /// the other half of `kbf storage-and-daemon` takes long, and a SIGTERM in it must
+    /// still be the first signal): one sent after `install` and before `recv` is
+    /// received, by its name, and is not the default action that ends this test.
+    #[tokio::test]
+    async fn a_signal_sent_before_it_is_read_is_kept() {
+        let mut signals = Signals::install().expect("handlers");
+        raise(libc::SIGTERM);
+        let within = Duration::from_secs(10);
+        let name = tokio::time::timeout(within, signals.recv()).await;
+        assert_eq!(name.expect("kept"), "SIGTERM");
+        raise(libc::SIGINT);
+        let name = tokio::time::timeout(within, signals.recv()).await;
+        assert_eq!(name.expect("kept"), "SIGINT");
     }
 
     /// Catches a forwarder that drops a signal (the daemon would never drain), one that
@@ -2174,10 +2284,9 @@ mod signal_tests {
     /// nobody listens.
     #[tokio::test]
     async fn each_sigterm_and_sigint_is_one_signal_and_the_task_ends_with_its_receiver() {
-        let term = signal(SignalKind::terminate()).expect("SIGTERM handler");
-        let int = signal(SignalKind::interrupt()).expect("SIGINT handler");
+        let signals = Signals::install().expect("handlers");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let task = tokio::spawn(forward(term, int, tx));
+        let task = tokio::spawn(forward(signals, tx));
         let within = Duration::from_secs(10);
         raise(libc::SIGTERM);
         tokio::time::timeout(within, rx.recv())
