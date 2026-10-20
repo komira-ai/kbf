@@ -549,13 +549,20 @@ mod tests {
         let mut d = running();
         d.apply(message(7, Msg::Cancel { stream: 0, lease }));
         d.apply(message(8, Msg::Cancel { stream: 2, lease }));
-        assert_eq!(runs(&d), [lease], "a Cancel of another stream dropped the run");
+        assert_eq!(
+            runs(&d),
+            [lease],
+            "a Cancel of another stream dropped the run"
+        );
         d.apply(input(30_000, Event::Timer { tag: T_POLL }));
         assert!(d.reported().contains(&lease), "the run was lost");
 
         let mut d = running();
         d.apply(message(7, Msg::Cancel { stream: 1, lease }));
-        assert!(runs(&d).is_empty(), "a Cancel of the current stream was ignored");
+        assert!(
+            runs(&d).is_empty(),
+            "a Cancel of the current stream was ignored"
+        );
         d.apply(input(30_000, Event::Timer { tag: T_POLL }));
         assert!(!d.reported().contains(&lease), "a cancelled run reported");
     }
