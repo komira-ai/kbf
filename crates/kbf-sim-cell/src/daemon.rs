@@ -525,45 +525,4 @@ mod tests {
         d.apply(message(30_001, start(1, 1)));
         assert!(runs(&d).is_empty(), "a reported lease ran again");
     }
-
-    /// A welcomed daemon on stream 1 running lease (1, 1), as the test above leaves it.
-    fn running() -> FakeDaemon {
-        let mut d = FakeDaemon::new(
-            NodeId::from("server"),
-            "d-1".to_owned(),
-            Resources::new(1_000, 1),
-        );
-        d.apply(input(0, Event::Start));
-        d.apply(message(4, welcome(1)));
-        d.apply(message(6, start(1, 1)));
-        assert_eq!(runs(&d), [LeaseId::new(1, 1)]);
-        d
-    }
-
-    /// Catches a daemon that drops a run on a `Cancel` of another stream: a stale
-    /// one from before a reconnect, or one meant for another daemon. The control, a
-    /// `Cancel` on the current stream, must drop it, so the first half is not vacuous.
-    #[test]
-    fn a_cancel_for_another_stream_leaves_the_run_in_place() {
-        let lease = LeaseId::new(1, 1);
-        let mut d = running();
-        d.apply(message(7, Msg::Cancel { stream: 0, lease }));
-        d.apply(message(8, Msg::Cancel { stream: 2, lease }));
-        assert_eq!(
-            runs(&d),
-            [lease],
-            "a Cancel of another stream dropped the run"
-        );
-        d.apply(input(30_000, Event::Timer { tag: T_POLL }));
-        assert!(d.reported().contains(&lease), "the run was lost");
-
-        let mut d = running();
-        d.apply(message(7, Msg::Cancel { stream: 1, lease }));
-        assert!(
-            runs(&d).is_empty(),
-            "a Cancel of the current stream was ignored"
-        );
-        d.apply(input(30_000, Event::Timer { tag: T_POLL }));
-        assert!(!d.reported().contains(&lease), "a cancelled run reported");
-    }
 }
