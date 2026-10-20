@@ -616,7 +616,9 @@ fn the_kbf_toml_that_setup_writes_passes_check_in_every_mode() {
             "--check".to_owned(),
             format!("--config={}", file.display()),
         ];
-        if [names::DAEMON, names::STORAGE_AND_DAEMON, names::ALL_IN_ONE].contains(&mode.name) {
+        // The stand-in `crun` for the one mode that runs builds without enrolling; a daemon flag on
+        // the line of a node that enrolls would make it a node that does not.
+        if mode.name == names::ALL_IN_ONE {
             args.push(format!("--oci-runtime={FAKE_CRUN}"));
         }
         let r = run_in(&args, &host_env(&dir));
