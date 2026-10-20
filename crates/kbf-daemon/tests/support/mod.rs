@@ -343,9 +343,16 @@ impl Peer {
 
     /// Acknowledges the Result of lease `term.seq`, or of no lease at all.
     pub fn ack_result(&self, lease: Option<(u64, u64)>, accepted: bool) {
+        self.ack_result_reason(lease, accepted, 0);
+    }
+
+    /// Acknowledges the Result of lease `term.seq`, with the wire value `reason` (0: none,
+    /// as a server that predates the field).
+    pub fn ack_result_reason(&self, lease: Option<(u64, u64)>, accepted: bool, reason: i32) {
         self.send(server_message::Message::ResultAck(ResultAck {
             lease_id: lease.map(|(term, seq)| LeaseId { term, seq }),
             accepted,
+            reason,
         }));
     }
 
@@ -877,6 +884,34 @@ impl<R: Runtime> Harness<R> {
             runtimes,
             runtime,
             Duration::from_secs(40),
+            configure,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Starts a server and a daemon that keep at most `max_unacked` Results for resending.
+    pub async fn with_max_unacked(
+        name: &str,
+        runtime: Arc<R>,
+        fence_after: Duration,
+        max_unacked: usize,
+    ) -> Self {
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let configure = |config: &mut DaemonConfig| {
+            config.max_unacked = max_unacked;
+        };
+        Self::build_with(
+            name,
+            runtimes,
+            runtime,
+            fence_after,
             configure,
             None,
             None,

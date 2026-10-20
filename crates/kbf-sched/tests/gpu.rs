@@ -160,8 +160,9 @@ fn a_one_gpu_node_holds_one_gpu_lease_at_a_time() {
     );
 }
 
-/// Catches: a GPU request placed on a node without a GPU (first fit would pick `a`, the
-/// first in name order), and one placed on a node with fewer GPUs than it asks for.
+/// Catches: a GPU request placed on a node without a GPU (`a`, the first in name order
+/// and the least loaded, would be picked), and one placed on a node with fewer GPUs than
+/// it asks for.
 #[test]
 fn a_gpu_request_waits_for_a_node_with_a_gpu() {
     let mut h = Harness::new();

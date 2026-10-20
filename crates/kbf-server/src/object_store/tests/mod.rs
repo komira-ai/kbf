@@ -18,6 +18,7 @@ use kbf_state::{
     Changes, Commit, CommitStats, Conflict, ManualClock, Op, Revision, ScanPage, ScanRange, Store,
     StoreError, StoreTime, Txn, Versioned,
 };
+use kbf_testkit::dir::TestDir;
 use kbf_types::object_store_api::{
     AuditOutcome, BindingPut, ConnectionName, ConnectionPut, Secret,
 };
@@ -58,12 +59,9 @@ impl Random for NoRandom {
     }
 }
 
-pub(super) fn scratch(label: &str) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("kbf-objstore-{label}-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+/// A scratch directory, removed when it drops.
+pub(super) fn scratch(label: &str) -> TestDir {
+    crate::test_dir::scratch_dir(&format!("kbf-objstore-{label}"))
 }
 
 pub(super) fn fake() -> Arc<Fake> {
@@ -181,7 +179,8 @@ impl Store for FailsAudit {
 #[test]
 fn a_first_put_leaves_a_row_a_private_file_and_one_audit_row() {
     let store = as_store(&fake());
-    let dir = scratch("first").join("secrets/objstore");
+    let root = scratch("first");
+    let dir = root.join("secrets/objstore");
     let reg = open(&store, &dir);
     let written = reg.put_connection(&name("cold"), &put(SENTINEL)).unwrap();
     assert_eq!(written.generation, 1);
@@ -216,7 +215,8 @@ fn a_first_put_leaves_a_row_a_private_file_and_one_audit_row() {
 #[test]
 fn the_same_put_again_changes_nothing_but_the_audit_log() {
     let store = as_store(&fake());
-    let dir = scratch("same").join("s");
+    let root = scratch("same");
+    let dir = root.join("s");
     let reg = open(&store, &dir);
     reg.put_connection(&name("cold"), &put(SENTINEL)).unwrap();
     let again = reg.put_connection(&name("cold"), &put(SENTINEL)).unwrap();
@@ -259,7 +259,8 @@ fn the_same_put_again_changes_nothing_but_the_audit_log() {
 #[test]
 fn a_change_that_keeps_the_secret_keeps_its_file() {
     let store = as_store(&fake());
-    let dir = scratch("keep").join("s");
+    let root = scratch("keep");
+    let dir = root.join("s");
     let reg = open(&store, &dir);
     reg.put_connection(&name("cold"), &put(SENTINEL)).unwrap();
     let mut changed = put(SENTINEL);
@@ -284,7 +285,8 @@ fn a_change_that_keeps_the_secret_keeps_its_file() {
 #[test]
 fn a_new_secret_is_a_new_version_and_the_old_one_goes_after_the_row() {
     let store = as_store(&fake());
-    let dir = scratch("rotate").join("s");
+    let root = scratch("rotate");
+    let dir = root.join("s");
     let reg = open(&store, &dir);
     reg.put_connection(&name("cold"), &put("old-secret"))
         .unwrap();
@@ -307,7 +309,8 @@ fn a_new_secret_is_a_new_version_and_the_old_one_goes_after_the_row() {
 #[test]
 fn a_stale_expect_generation_writes_nothing() {
     let store = as_store(&fake());
-    let dir = scratch("expect").join("s");
+    let root = scratch("expect");
+    let dir = root.join("s");
     let reg = open(&store, &dir);
     reg.put_connection(&name("cold"), &put("one")).unwrap();
     let mut stale = put("two");
@@ -342,7 +345,8 @@ fn a_stale_expect_generation_writes_nothing() {
 #[test]
 fn the_row_and_its_audit_commit_together_or_not_at_all() {
     let inner = as_store(&fake());
-    let dir = scratch("atomic").join("s");
+    let root = scratch("atomic");
+    let dir = root.join("s");
     let failing: Arc<dyn Store> = Arc::new(FailsAudit(Arc::clone(&inner)));
     let reg = open(&failing, &dir);
     let err = reg
@@ -367,7 +371,8 @@ fn the_row_and_its_audit_commit_together_or_not_at_all() {
 #[test]
 fn concurrent_puts_serialize_and_leave_one_file() {
     let store = as_store(&fake());
-    let dir = scratch("threads").join("s");
+    let root = scratch("threads");
+    let dir = root.join("s");
     let reg = Arc::new(open(&store, &dir));
     let handles: Vec<_> = ["alpha", "beta", "gamma", "delta"]
         .into_iter()
@@ -389,7 +394,8 @@ fn concurrent_puts_serialize_and_leave_one_file() {
 #[test]
 fn a_failing_random_source_writes_nothing() {
     let store = as_store(&fake());
-    let dir = scratch("norandom").join("s");
+    let root = scratch("norandom");
+    let dir = root.join("s");
     let reg = open_now(Arc::clone(&store), &dir, Arc::new(NoRandom)).unwrap();
     let err = reg.put_connection(&name("cold"), &put("x")).unwrap_err();
     assert!(matches!(err, RegistryError::Secret(_)), "{err}");
