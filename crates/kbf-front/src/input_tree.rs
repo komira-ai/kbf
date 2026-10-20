@@ -344,6 +344,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Ok(Walked {
             absent,
             dirs_read: walk.dirs_read.load(Ordering::Relaxed),
+            ..Walked::default()
         })
     }
 }
@@ -359,12 +360,25 @@ pub(crate) struct Horizon {
 }
 
 /// What one walk of an input tree found.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct Walked {
     /// What [`Cache::missing_inputs`] returns.
     pub(crate) absent: Vec<Digest>,
     /// Directory blobs read from the store.
     pub(crate) dirs_read: u64,
+    /// Directories skipped with everything under them, because an earlier walk verified
+    /// them (the walk over a store; the in-process cache counts its own).
+    pub(crate) dirs_skipped: u64,
+    /// Files whose presence was asked about, and the FindMissing calls that took
+    /// (the walk over a store).
+    pub(crate) files_checked: u64,
+    pub(crate) file_asks: u64,
+    /// The time reading Directories, and the time asking about files, of a walk over a
+    /// store; the two phases run one after the other.
+    pub(crate) dirs_time: std::time::Duration,
+    /// Whether the two times above were measured (a walk over a store).
+    pub(crate) phased: bool,
+    pub(crate) files_time: std::time::Duration,
 }
 
 /// The check of `digest` for this request: the request's own earlier start of it, a
