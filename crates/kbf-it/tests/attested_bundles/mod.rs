@@ -13,6 +13,10 @@
 //!   `subject-path` exactly `dist/<tarball>` (not a glob or a list, which would make
 //!   one bundle for several tarballs). A step for a tarball no job of that group
 //!   packages is named too.
+//! - **The installer's package.** The `kbf-installer` deb that `cargo xtask pkg-asset`
+//!   lists as an asset ([`attested_assets::packaged_debs`]) is held to the same two
+//!   rules, as `dist/kbf-installer-<commit>-<platform>.deb` and its
+//!   `.deb.sigstore.json`.
 //! - **Its bundle's name.** The step after it sets `BUNDLE` to that step's
 //!   `bundle-path` output and copies it to `dist/<tarball>.sigstore.json` (the action
 //!   leaves it in a temporary directory under a name that is the same for every
@@ -91,7 +95,12 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
     if packaged.is_empty() {
         return Err("no `cargo xtask package` line in any `run:` step".to_owned());
     }
-    let groups: BTreeSet<&str> = packaged.iter().map(|(_, p)| group(p)).collect();
+    let debs = attested_assets::packaged_debs(artifacts)?;
+    let groups: BTreeSet<&str> = packaged
+        .iter()
+        .map(|(_, p)| group(p))
+        .chain(debs.iter().map(|p| group(p)))
+        .collect();
     let mut out = Vec::new();
     for g in &groups {
         let attest_job = format!("attest-{g}");
@@ -106,8 +115,13 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
             .filter(|(_, p)| group(p) == *g)
             .map(|(n, p)| (n.as_str(), p.as_str()))
             .collect();
+        let my_debs: Vec<&str> = debs
+            .iter()
+            .filter(|p| group(p) == *g)
+            .map(String::as_str)
+            .collect();
         let steps = workflows::job_steps(artifacts, &attest_job)?;
-        attested_alone(&attest_job, &steps, &mine, &mut out);
+        attested_alone(&attest_job, &steps, &mine, &my_debs, &mut out);
         uploaded(&attest_job, g, &steps, &mut out);
         let verify_job = format!("verify-{g}");
         let verify = workflows::job_steps(artifacts, &verify_job)?;
@@ -141,18 +155,36 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
 }
 
 /// The provenance and bundle-naming steps of every tarball of `mine` (name and platform)
-/// in the attest job `job`, the steps that attest anything else, and any `run:` step
-/// that is not the naming of a bundle.
+/// and every installer package of `debs` (platform) in the attest job `job`, the steps
+/// that attest anything else, and any `run:` step that is not the naming of a bundle.
 fn attested_alone(
     job: &str,
     steps: &[workflows::Step],
     mine: &[(&str, &str)],
+    debs: &[&str],
     out: &mut Vec<String>,
 ) {
     let mut expected = Vec::new();
+    // (what it is, the file it attests, the file its bundle is copied to)
+    let mut targets: Vec<(String, String, String)> = Vec::new();
     for (name, platform) in mine {
-        let stem = attested_assets::stem(name, platform);
-        let subject = format!("dist/{stem}.tar.gz");
+        targets.push((
+            format!("{name} for {platform}"),
+            format!("dist/{}.tar.gz", attested_assets::stem(name, platform)),
+            format!("dist/{name}-${{GITHUB_SHA}}-{platform}.tar.gz.sigstore.json"),
+        ));
+    }
+    for platform in debs {
+        targets.push((
+            format!("kbf-installer package (deb) for {platform}"),
+            format!(
+                "dist/{}.deb",
+                attested_assets::stem("kbf-installer", platform)
+            ),
+            format!("dist/kbf-installer-${{GITHUB_SHA}}-{platform}.deb.sigstore.json"),
+        ));
+    }
+    for (what, subject, bundle) in targets {
         expected.push(subject.clone());
         let found = steps
             .iter()
@@ -160,22 +192,21 @@ fn attested_alone(
             .find(|(_, s)| uses(s, PROVENANCE) && input(s, "subject-path") == Some(&subject));
         let Some((at, step)) = found else {
             out.push(format!(
-                "{name} for {platform} is packaged, but `{job}` has no actions/attest-build-provenance step with subject-path {subject}: it is not attested as its own subject, so it has no bundle of its own"
+                "{what} is packaged, but `{job}` has no actions/attest-build-provenance step with subject-path {subject}: it is not attested as its own subject, so it has no bundle of its own"
             ));
             continue;
         };
         if step.conditional {
             out.push(format!(
-                "the provenance step for {name} for {platform} in `{job}` is under `if:` or `continue-on-error:`"
+                "the provenance step for {what} in `{job}` is under `if:` or `continue-on-error:`"
             ));
         }
         let Some(id) = step.id.as_deref() else {
             out.push(format!(
-                "the provenance step for {name} for {platform} in `{job}` has no `id:`, so its `bundle-path` cannot be named"
+                "the provenance step for {what} in `{job}` has no `id:`, so its `bundle-path` cannot be named"
             ));
             continue;
         };
-        let bundle = format!("dist/{name}-${{GITHUB_SHA}}-{platform}.tar.gz.sigstore.json");
         let want_run = format!("cp \"$BUNDLE\" \"{bundle}\"");
         let want_env = bundle_path(id);
         let named = steps.get(at + 1).is_some_and(|s| {
@@ -185,7 +216,7 @@ fn attested_alone(
         });
         if !named {
             out.push(format!(
-                "the step after the provenance step for {name} for {platform} in `{job}` does not name its bundle: it is to be an unconditional step with `env: BUNDLE: {want_env}` and `run: {want_run}`"
+                "the step after the provenance step for {what} in `{job}` does not name its bundle: it is to be an unconditional step with `env: BUNDLE: {want_env}` and `run: {want_run}`"
             ));
         }
     }

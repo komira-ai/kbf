@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use kbf_tls::{CertEntry, SniCerts};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::Buck2Auth;
@@ -24,6 +25,9 @@ pub enum ConfigError {
     /// A rule between keys is broken.
     #[error("{0}")]
     Invalid(&'static str),
+    /// The server certificate list breaks a rule of [`kbf_tls::SniCerts::check_entries`].
+    #[error("server_cert: {0}")]
+    ServerCerts(String),
 }
 
 /// Ports of the children: slot `A` starts at `base_port`, slot `B` at `base_port + 10`; in a
@@ -126,6 +130,23 @@ impl Limits {
     }
 }
 
+/// One `[[server_cert]]` table.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerCert {
+    /// The DNS names this certificate is served for; each must be in its subject alternative
+    /// names. May be empty only on the default.
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// The PEM certificate chain, leaf first.
+    pub cert_file: PathBuf,
+    /// The PEM private key of the leaf.
+    pub key_file: PathBuf,
+    /// Whether this is the certificate for a client that names no host or an unknown one.
+    #[serde(default)]
+    pub default: bool,
+}
+
 /// The `[proxy]` table.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -144,10 +165,17 @@ pub struct ProxyConfig {
     pub buck2_token_file: Option<PathBuf>,
     /// The operator token file (`/etc/kbf/operator.token`), read by the proxy itself at start.
     pub operator_token_file: PathBuf,
-    /// The server certificate chain and key, reloaded on SIGHUP together with `client_ca`.
-    pub server_cert_file: PathBuf,
+    /// The server certificate chain and key, reloaded on SIGHUP together with `client_ca`:
+    /// the single-certificate form, served for every name. It is the same as one
+    /// `[[server_cert]]` with no names; give this pair or `server_cert`, not both.
+    pub server_cert_file: Option<PathBuf>,
     /// See `server_cert_file`.
-    pub server_key_file: PathBuf,
+    pub server_key_file: Option<PathBuf>,
+    /// The server certificates chosen by SNI: `[[server_cert]]` tables, each with the `names`
+    /// it is served for, its `cert_file` and `key_file`, and `default = true` on exactly one
+    /// when there are two or more (the one a handshake with no name or an unknown name gets).
+    #[serde(default)]
+    pub server_cert: Vec<ServerCert>,
     /// The farm CA bundle that verifies client certificates.
     pub client_ca_file: PathBuf,
     /// The secret file (default `/run/kbf-proxy/proxy-auth`).
@@ -211,6 +239,31 @@ impl ProxyConfig {
         Ok(config)
     }
 
+    /// The server certificates as the TLS layer takes them: the single pair as one default
+    /// entry with no names, or the `[[server_cert]]` list (a checked table has only one of
+    /// the two).
+    #[must_use]
+    pub fn cert_entries(&self) -> Vec<CertEntry> {
+        match (&self.server_cert_file, &self.server_key_file) {
+            (Some(cert), Some(key)) => vec![CertEntry {
+                names: Vec::new(),
+                cert: cert.clone(),
+                key: key.clone(),
+                default: true,
+            }],
+            _ => self
+                .server_cert
+                .iter()
+                .map(|c| CertEntry {
+                    names: c.names.clone(),
+                    cert: c.cert_file.clone(),
+                    key: c.key_file.clone(),
+                    default: c.default,
+                })
+                .collect(),
+        }
+    }
+
     /// Reads and checks the `[proxy]` table of a larger file (`installer.toml`) that the caller
     /// has already parsed: the same table, the same refusals as [`ProxyConfig::from_toml_str`].
     ///
@@ -225,6 +278,27 @@ impl ProxyConfig {
     }
 
     fn check(&self) -> Result<(), ConfigError> {
+        let pair = (&self.server_cert_file, &self.server_key_file);
+        match pair {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ConfigError::Invalid(
+                    "server_cert_file and server_key_file go together",
+                ));
+            }
+            (Some(_), Some(_)) if !self.server_cert.is_empty() => {
+                return Err(ConfigError::Invalid(
+                    "give server_cert_file/server_key_file or [[server_cert]], not both",
+                ));
+            }
+            (None, None) if self.server_cert.is_empty() => {
+                return Err(ConfigError::Invalid(
+                    "a server certificate is needed: server_cert_file and server_key_file, or [[server_cert]]",
+                ));
+            }
+            _ => {}
+        }
+        SniCerts::check_entries(&self.cert_entries())
+            .map_err(|e| ConfigError::ServerCerts(e.to_string()))?;
         if !(1024..=MAX_BASE_PORT).contains(&self.upstream.base_port) {
             return Err(ConfigError::Invalid(
                 "upstream.base_port must be 1024 to 65521 so both slots fit",
@@ -286,6 +360,99 @@ base_port = 18000
             PathBuf::from("/run/kbf-proxy/proxy-auth")
         );
         assert_eq!(c.state_dir, PathBuf::from("/var/lib/kbf-proxy"));
+    }
+
+    const HEAD: &str = r#"
+operator_token_file = "/etc/kbf/operator.token"
+client_ca_file = "/etc/kbf/tls/ca.pem"
+"#;
+    const UPSTREAM: &str = "[upstream]\nbase_port = 18000\n";
+
+    fn two_certs(extra: &str) -> String {
+        format!(
+            r#"{extra}
+{HEAD}
+[[server_cert]]
+names = ["reapi.example.com"]
+cert_file = "/etc/kbf/tls/reapi.pem"
+key_file = "/etc/kbf/tls/reapi.key"
+default = true
+[[server_cert]]
+names = ["farm.internal.example"]
+cert_file = "/etc/kbf/tls/worker.pem"
+key_file = "/etc/kbf/tls/worker.key"
+{UPSTREAM}"#
+        )
+    }
+
+    /// The single-pair form is one default entry with no names, so a config written before
+    /// SNI keeps serving one certificate for every name.
+    ///
+    /// Kills: the old form refused, or read as a named entry.
+    #[test]
+    fn the_single_certificate_form_is_a_one_entry_list() {
+        let c = ProxyConfig::from_toml_str(MIN).expect("valid");
+        assert_eq!(
+            c.cert_entries(),
+            [CertEntry {
+                names: Vec::new(),
+                cert: "/etc/kbf/tls/server.pem".into(),
+                key: "/etc/kbf/tls/server.key".into(),
+                default: true,
+            }]
+        );
+    }
+
+    /// A list of two with one marked default reads in file order with its names.
+    ///
+    /// Kills: names or the default flag dropped between the table and the TLS layer.
+    #[test]
+    fn a_server_cert_list_is_read_with_names_and_the_default() {
+        let c = ProxyConfig::from_toml_str(&two_certs("")).expect("valid");
+        let entries = c.cert_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].names, ["reapi.example.com"]);
+        assert!(entries[0].default);
+        assert!(!entries[1].default);
+        assert_eq!(entries[1].key, PathBuf::from("/etc/kbf/tls/worker.key"));
+    }
+
+    /// The forms do not mix, a half pair is refused, a list needs its default, and one
+    /// certificate is required.
+    ///
+    /// Kills: both forms accepted with one silently winning; a start with no certificate; a
+    /// list with no explicit default.
+    #[test]
+    fn the_certificate_forms_are_exclusive_and_the_default_is_explicit() {
+        let pair = "server_cert_file = \"/c\"\nserver_key_file = \"/k\"\n";
+        assert!(matches!(
+            ProxyConfig::from_toml_str(&two_certs(pair)),
+            Err(ConfigError::Invalid(_))
+        ));
+        let half = format!("server_cert_file = \"/c\"\n{HEAD}{UPSTREAM}");
+        assert!(matches!(
+            ProxyConfig::from_toml_str(&half),
+            Err(ConfigError::Invalid(_))
+        ));
+        assert!(matches!(
+            ProxyConfig::from_toml_str(&format!("{HEAD}{UPSTREAM}")),
+            Err(ConfigError::Invalid(_))
+        ));
+        let no_default = two_certs("").replacen("default = true", "", 1);
+        assert!(matches!(
+            ProxyConfig::from_toml_str(&no_default),
+            Err(ConfigError::ServerCerts(_))
+        ));
+        let twice = two_certs("").replace("names = [\"farm", "default = true\nnames = [\"farm");
+        assert!(matches!(
+            ProxyConfig::from_toml_str(&twice),
+            Err(ConfigError::ServerCerts(_))
+        ));
+        let dup = two_certs("").replace("farm.internal.example", "REAPI.example.com");
+        assert!(matches!(
+            ProxyConfig::from_toml_str(&dup),
+            Err(ConfigError::ServerCerts(_))
+        ));
     }
 
     #[test]
@@ -361,6 +528,16 @@ base_port = 18000
             "listen = \"192.0.2.10:8443\"\nbuck2_auth = \"bearer\"\nbuck2_token_file = \"/k\"\n{MIN}\n[limits]\nmax_streams = 100\n"
         );
         let config = ProxyConfig::from_toml_str(&text).expect("valid");
+        let again = toml::to_string(&config).expect("serializes");
+        assert_eq!(ProxyConfig::from_toml_str(&again).expect("valid"), config);
+    }
+
+    /// Catches `setup`'s rewrite dropping or reshaping the `[[server_cert]]` list: names,
+    /// files and the default flag come back equal.
+    #[test]
+    fn a_table_with_server_certs_serializes_back_to_itself() {
+        let config = ProxyConfig::from_toml_str(&two_certs("")).expect("valid");
+        assert_eq!(config.server_cert.len(), 2);
         let again = toml::to_string(&config).expect("serializes");
         assert_eq!(ProxyConfig::from_toml_str(&again).expect("valid"), config);
     }

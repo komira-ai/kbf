@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  kbf-installer's service (`kbf-installer serve`). The package installs this file and
+  kbf-installer's service (`kbf-installer run --launchd-label com.komira.kbf-daemon`: it kickstarts the node's daemon
+  job after a swap). The package installs this file and
   does not load it, and the job does not run until /usr/local/etc/kbf/installer.toml
   exists, which `kbf-installer setup` writes: RunAtLoad is false and KeepAlive holds the
   job only while that path exists (launchd's form of ConditionPathExists, which
@@ -17,7 +18,9 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/usr/local/kbf-installer/bin/kbf-installer</string>
-		<string>serve</string>
+		<string>run</string>
+		<string>--launchd-label</string>
+		<string>com.komira.kbf-daemon</string>
 	</array>
 	<key>RunAtLoad</key>
 	<false/>

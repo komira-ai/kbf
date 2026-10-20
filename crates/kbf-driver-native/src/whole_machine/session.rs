@@ -330,9 +330,7 @@ mod tests {
     /// refusal or a reply the verb does not expect passed off as success.
     #[test]
     fn each_verb_reaches_the_helper_as_itself() {
-        let dir = std::env::temp_dir().join(format!("kbf-wm-session-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-wm-session");
         let socket = dir.join("socket");
         let refused = |reason: &str| Reply::Refused {
             reason: reason.to_owned(),
@@ -437,7 +435,6 @@ mod tests {
         assert_eq!(asked[7], Request::KillUid { lease: lease() });
         assert_eq!(asked[8], Request::SessionIdle);
         assert_eq!(asked[9], Request::UserDelete { lease: lease() });
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Catches access control entries `chmod +a` does not take (the first whole-machine
@@ -448,9 +445,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_shared_directory_carries_both_entries_to_what_is_made_in_it() {
-        let dir = std::env::temp_dir().join(format!("kbf-wm-acl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-wm-acl");
         let me = std::process::Command::new("/usr/bin/id")
             .arg("-un")
             .output()
@@ -477,7 +472,6 @@ mod tests {
         );
         let error = share_with("no-such-user-kbf", &me, &dir).unwrap_err();
         assert!(error.contains("chmod +a"), "{error}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Catches a lease directory shared off macOS as if it had worked: there is no

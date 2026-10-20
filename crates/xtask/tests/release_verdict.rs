@@ -2,6 +2,7 @@
 //! tags are made by `git tag`, so a lightweight tag is a ref to a commit and an
 //! annotated one a tag object, as GitHub would hold them.
 
+use kbf_testkit::dir::TestDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -30,6 +31,8 @@ struct Fx {
     first: String,
     /// A commit on a side branch, not on main.
     side: String,
+    /// Last field: the directory is removed with the fixture.
+    _own: TestDir,
 }
 
 impl Fx {
@@ -91,12 +94,11 @@ fn git(dir: &Path, args: &[&str], stdin: Option<&str>) -> String {
 /// A repository: main holds `first` and `release commit` (hash [`RELEASE`]); the branch
 /// `side` holds `side` on top of `first`. Release files: `dist/SHA256SUMS`.
 fn fx(name: &str) -> Fx {
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("release-verdict")
-        .join(name);
-    if root.exists() {
-        std::fs::remove_dir_all(&root).unwrap();
-    }
+    let own = TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("release-verdict"),
+        name,
+    );
+    let root = own.to_path_buf();
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::create_dir_all(root.join("dist")).unwrap();
@@ -130,7 +132,12 @@ fn fx(name: &str) -> Fx {
     );
     let side = git(&repo, &["rev-parse", "HEAD"], None);
     git(&repo, &["switch", "-q", "main"], None);
-    Fx { root, first, side }
+    Fx {
+        root,
+        first,
+        side,
+        _own: own,
+    }
 }
 
 /// A verdict that passes for [`TAG`], [`RELEASE`] and [`SET`].

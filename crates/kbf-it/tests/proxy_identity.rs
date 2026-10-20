@@ -29,6 +29,7 @@ use kbf_state::ManualClock;
 use kbf_state::Store;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_storage::service::Admission;
+use kbf_testkit::dir::TestDir;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, SanType, SigningKey,
@@ -183,11 +184,11 @@ fn leaf_under(
     }
 }
 
-fn dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("proxy-identity-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a directory");
-    dir
+fn dir(name: &str) -> TestDir {
+    TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("proxy-identity-{name}"),
+    )
 }
 
 fn private(path: &Path, content: &[u8]) {
@@ -291,10 +292,13 @@ struct Rig {
     child: SocketAddr,
     incoming: TcpIncoming,
     secret: ProxySecret,
+    /// Held so the directory outlives the proxy.
+    _dir: TestDir,
 }
 
 async fn rig(name: &str) -> Rig {
     let dir = dir(name);
+    let started = dir.path().to_path_buf();
     let pki = Arc::new(Pki::new());
     let for_proxy = Arc::clone(&pki);
     // The child's port is the worker listener of slot A: base + 1.
@@ -303,7 +307,7 @@ async fn rig(name: &str) -> Rig {
     let base = child.port() - 1;
     // The proxy builds its own runtime, which must not be built or dropped inside this one.
     let (handle, proxy, secret_file) =
-        tokio::task::spawn_blocking(move || start_proxy(&dir, &for_proxy, base))
+        tokio::task::spawn_blocking(move || start_proxy(&started, &for_proxy, base))
             .await
             .expect("the proxy starts");
     let secret = ProxySecret::from_file(&secret_file)
@@ -315,6 +319,7 @@ async fn rig(name: &str) -> Rig {
         child,
         incoming,
         secret,
+        _dir: dir,
     }
 }
 
@@ -333,6 +338,7 @@ async fn child_accepts_proxy_headers() {
         child,
         incoming,
         secret,
+        _dir,
     } = rig("accepts").await;
     let layer = ProxyAuthLayer::new(Some(Arc::new(secret)));
     tokio::spawn(
@@ -404,6 +410,7 @@ async fn the_proxy_forwards_the_leafs_ips_and_no_others() {
         proxy,
         incoming,
         secret,
+        _dir,
         ..
     } = rig("ips").await;
     tokio::spawn(
@@ -460,6 +467,7 @@ async fn a_storage_node_registers_by_its_ip_through_the_proxy() {
         proxy,
         incoming,
         secret,
+        _dir,
         ..
     } = rig("register").await;
     let clock = Arc::new(ManualClock::default());
