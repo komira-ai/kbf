@@ -200,12 +200,13 @@ impl<M: MetaLog, O: ObjectStore> BlobRead<M, O> {
             return Ok(first);
         }
         // The caller bounds the blob's size: a decoded blob, or a batch read's.
+        let held = kbf_storage::in_flight::hold(self.range_len());
         let mut whole = BytesMut::with_capacity(usize::try_from(self.range_len()).unwrap_or(0));
         whole.extend_from_slice(&first);
         while let Some(window) = self.next().await.transpose()? {
             whole.extend_from_slice(&window);
         }
-        Ok(whole.freeze())
+        Ok(kbf_storage::in_flight::counted_with(whole.freeze(), held))
     }
 
     /// The bytes the read hands over in all: the range asked for.
@@ -234,6 +235,9 @@ impl<M: MetaLog, O: ObjectStore> BlobRead<M, O> {
                     return Some(Err(e));
                 }
             };
+            // Held (`kbf_bytes_in_flight`) until the window and every piece cut from it
+            // is dropped.
+            let window = kbf_storage::in_flight::counted(window);
             self.hasher.update(&window);
             self.at += len;
             if self.at == self.digest.size_bytes {

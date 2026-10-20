@@ -34,6 +34,8 @@ use kbf_types::{
 use tokio::sync::mpsc;
 use tonic::{Code, Status};
 
+#[path = "state_store/ack_reasons.rs"]
+mod ack_reasons;
 #[path = "state_store/budgets.rs"]
 mod budgets;
 #[path = "state_store/fate.rs"]
@@ -42,6 +44,8 @@ mod fate;
 mod floors;
 #[path = "state_store/handover.rs"]
 mod handover;
+#[path = "state_store/result_ack.rs"]
+mod result_ack;
 #[path = "state_store/subject.rs"]
 mod subject;
 mod thread_log;
@@ -121,22 +125,14 @@ impl Inner {
 }
 
 /// A directory removed when dropped.
-struct Scratch(std::path::PathBuf);
+struct Scratch(kbf_testkit::dir::TestDir);
 
 impl Scratch {
     fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("kbf-state-store-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        Self(dir)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        Self(kbf_testkit::dir::TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            "kbf-state-store",
+        ))
     }
 }
 
@@ -438,13 +434,18 @@ fn node() -> WorkerId {
 
 /// Registers `node-a` with room for four actions, as a daemon opening a stream does.
 fn register(farm: &TestFarm) -> (StreamId, Inbox) {
+    register_as(farm, &node())
+}
+
+/// Registers `worker` the same way.
+fn register_as(farm: &TestFarm, worker: &WorkerId) -> (StreamId, Inbox) {
     let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
         .expect("caps")
         .with_drivers(["container"]);
     let reported = Reported::serving(Resources::new(4_000, 8 * GIB), caps);
     let (outbound, inbox) = mpsc::unbounded_channel();
     let stream = farm.register(
-        &node(),
+        worker,
         DaemonInstance::new("daemon"),
         DaemonInstance::new(""),
         reported,
@@ -485,9 +486,12 @@ fn invalid(lease: LeaseId) -> worker::Result {
     }
 }
 
+/// Whether the farm answers a result of `lease` with an ack that says accepted. A result
+/// the store has not taken is not acknowledged at all (`Farm::report` is `None`), which is
+/// not accepted either.
 async fn accepted(farm: &TestFarm, lease: LeaseId) -> bool {
     let ack = farm.report(&node(), invalid(lease)).await;
-    ack.expect("an acknowledgement").accepted
+    ack.is_some_and(|ack| ack.accepted)
 }
 
 /// Catches: a farm that forgets a claim it acknowledged (the daemon runs a lease the

@@ -2,6 +2,8 @@
 //! (I10) and resource arithmetic. The arithmetic is written here, not taken from
 //! `kbf-types`, so that a defect planted in `Resources` is not shared by the reference.
 
+use std::cmp::Ordering;
+
 use kbf_caps::NodeCaps;
 use kbf_types::{ControlRecord, Effect, Resources};
 
@@ -36,6 +38,30 @@ pub fn room(
         && request.vms <= capacity.vms.saturating_sub(booked.vms)
         && request.memory_bytes <= capacity.memory_bytes
         && (!exclusive(capacity, request) || leases == 0)
+}
+
+/// The larger of the CPU and memory shares of `capacity` that `booked` is, as a fraction
+/// `(numerator, denominator)`; an axis with no capacity counts as 0. Integers, written
+/// here and not taken from the scheduler, so a defect in its ranking is not shared.
+fn dominant(capacity: Resources, booked: Resources) -> (u128, u128) {
+    let mut best = (0, 1);
+    for (b, c) in [
+        (booked.cpu_millis, capacity.cpu_millis),
+        (booked.memory_bytes, capacity.memory_bytes),
+    ] {
+        if c > 0 && u128::from(b) * best.1 > best.0 * u128::from(c) {
+            best = (u128::from(b), u128::from(c));
+        }
+    }
+    best
+}
+
+/// How placement ranks two workers, each as its capacity, what its holdings book and how
+/// many leases they are: the lesser share first, then the fewer leases. `Less` is the
+/// better place. A tie is left to the caller: the first by name.
+pub fn by_load(a: (Resources, Resources, usize), b: (Resources, Resources, usize)) -> Ordering {
+    let (x, y) = (dominant(a.0, a.1), dominant(b.0, b.1));
+    (x.0 * y.1).cmp(&(y.0 * x.1)).then(a.2.cmp(&b.2))
 }
 
 /// Whether `booked` is within `capacity` on every axis but memory, which is not booked

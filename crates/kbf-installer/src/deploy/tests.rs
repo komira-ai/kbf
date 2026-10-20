@@ -595,6 +595,7 @@ fn run_with(
         clock: &clock,
         smoke: &smoke,
         check: &check,
+        probe: &NoProbe,
     };
     deploy(&env, o, bundle)
 }
@@ -608,6 +609,7 @@ fn farm(nodes: Vec<NodeScript>) -> Farm {
 }
 
 mod gaps;
+mod offer;
 mod tls;
 mod update_api;
 
@@ -926,6 +928,7 @@ fn a_failed_installer_check_refuses_and_an_unavailable_one_is_recorded() {
         clock: &clock,
         smoke: &smoke,
         check: &bad,
+        probe: &NoProbe,
     };
     let s = deploy(&env, &opts(true), None);
     assert_eq!((s.exit, s.reason.as_str()), (3, "check_failed"));
@@ -939,6 +942,7 @@ fn a_failed_installer_check_refuses_and_an_unavailable_one_is_recorded() {
         clock: &clock,
         smoke: &smoke,
         check: &none,
+        probe: &NoProbe,
     };
     let s = deploy(&env, &opts(true), None);
     assert!(s.check_skipped && s.exit == 0);
@@ -1144,6 +1148,7 @@ fn with_step_back(farm: &Farm, at: u64) -> Summary {
         clock: &clock,
         smoke: &smoke,
         check: &check,
+        probe: &NoProbe,
     };
     deploy(&env, &opts(true), None)
 }
@@ -1279,6 +1284,10 @@ mod cli_tests {
             ("--lock", "/var/tmp/x/lock"),
             ("--platform", "linux-x86_64"),
             ("--cas", "http://127.0.0.1:1"),
+            // The stage binds an offer to this host; the age limit and the waiver loosen it.
+            ("--stage", "gamma"),
+            ("--no-offer", "x"),
+            ("--offer-max-age-h", "99999"),
         ] {
             let list = args(&["--commit", &commit, flag, value]);
             let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -1420,13 +1429,15 @@ mod cli_tests {
             ("--cas", "https://127.0.0.1:1"),
             ("--cas-ca", ca.to_str().unwrap()),
             ("--cas-server-name", "farm.example"),
+            ("--stage", "gamma"),
         ];
         let without = |left_out: Option<&str>| {
-            let flags: Vec<&str> = all
+            let mut flags: Vec<&str> = all
                 .iter()
                 .filter(|(flag, _)| Some(*flag) != left_out)
                 .flat_map(|(flag, value)| [*flag, *value])
                 .collect();
+            flags.push("--no-offer");
             go(argv(&flags))
         };
         assert_eq!(without(None).0, 1);

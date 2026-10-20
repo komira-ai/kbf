@@ -313,7 +313,9 @@ async fn both_kinds_answer_the_scheduler_calls_alike() {
         assert_eq!(hit, ActionResult::default());
 
         assert!(backend.leadership().is_none());
-        assert!(backend.render_metrics().contains("kbf_"), "{remote}");
+        let text = backend.render_metrics();
+        assert!(text.contains("kbf_"), "{remote}");
+        assert_in_flight_families(&text);
         assert_eq!(format!("{backend:?}"), "Backend(..)");
     }
 }
@@ -605,7 +607,9 @@ async fn scheduler_calls(backend: &Backend, held: (Digest, Bytes), root: (Digest
     assert_eq!(hit, ActionResult::default());
 
     assert!(backend.leadership().is_none());
-    assert!(backend.render_metrics().contains("kbf_"));
+    let text = backend.render_metrics();
+    assert!(text.contains("kbf_"));
+    assert_in_flight_families(&text);
     assert_eq!(format!("{backend:?}"), "Backend(..)");
 }
 
@@ -715,6 +719,19 @@ async fn the_routed_kind_uses_the_storage_node_until_the_map_has_two_members() {
         first.put(stored.1.clone()).await.expect("stored");
     }
     scheduler_calls(&backend, held, root).await;
+}
+
+/// Catches: a frontend backend whose `/metrics` text leaves out `kbf_bytes_in_flight` or
+/// `kbf_bytes_in_flight_peak` (the proxy kinds once rendered only their own counters).
+///
+/// Mutant: `Remote::render_metrics` returning `self.metrics.render()` alone.
+fn assert_in_flight_families(text: &str) {
+    for family in ["kbf_bytes_in_flight", "kbf_bytes_in_flight_peak"] {
+        assert!(
+            text.contains(&format!("# TYPE {family} gauge\n{family} ")),
+            "{family} missing from\n{text}"
+        );
+    }
 }
 
 /// A tree of a root over three directories of ten files each, every blob stored on the node

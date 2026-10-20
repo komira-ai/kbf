@@ -6,20 +6,21 @@ Mutating verbs only say what they would do unless --apply is given. Exit codes: 
 Usage: kbf-installer [OPTIONS] <COMMAND>
 
 Commands:
-  setup       First install: accounts, directories, installer.toml, the first release
-  status      What is installed, staged and pending, and the last refusal
-  run         Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap
-  update      Order an update of this host's own frontend (root, inline)
-  confirm     Keep the pending swap, naming its activation
-  revert      Undo the pending swap, naming its activation
-  rollback    Point `current` at `previous`, with no confirm window
-  gc          Remove the releases nothing needs: current, previous, staged, the swap on trial and any a process executes from stay, and so do the newest `--keep` others
-  boot-check  Run before each start of a release on trial; counts the start
-  migrate     Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's tree, or put it back with `--rollback`. A dry run without `--apply`
-  quiesce     For maintainer scripts: take the lock; exit 5 while a swap is pending
-  check       Validate the installer's configuration, trust files and path chain
-  proxy       Serve the frontend host's public port: route each stream to the active child frontend
-  help        Print this message or the help of the given subcommand(s)
+  setup           First install: accounts, directories, installer.toml, the first release
+  status          What is installed, staged and pending, and the last refusal
+  run             Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap
+  update          Order an update of this host's own frontend (root, inline)
+  confirm         Keep the pending swap, naming its activation
+  revert          Undo the pending swap, naming its activation
+  rollback        Point `current` at `previous`, with no confirm window
+  record-release  Record a release placed on the host by hand as its first
+  gc              Remove the releases nothing needs: current, previous, staged, the swap on trial and any a process executes from stay, and so do the newest `--keep` others
+  boot-check      Run before each start of a release on trial; counts the start
+  migrate         Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's tree, or put it back with `--rollback`. A dry run without `--apply`
+  quiesce         For maintainer scripts: take the lock; exit 5 while a swap is pending
+  check           Validate the installer's configuration, trust files and path chain
+  proxy           Serve the frontend host's public port: route each stream to the active child frontend
+  help            Print this message or the help of the given subcommand(s)
 
 Options:
       --json
@@ -158,6 +159,26 @@ Options:
       --launchd-label <LAUNCHD_LABEL>  The launchd label to kickstart after a swap (macOS)
   -h, --help                           Print help
 
+=== kbf-installer record-release --help ===
+Record a release placed on the host by hand as its first
+
+Checks its files, writes its `VERIFIED` marker and makes it current, so the frontend proxy can start it. The operator vouches for the commit; nothing is fetched or attested.
+
+Usage: kbf-installer record-release [OPTIONS] --commit <COMMIT>
+
+Options:
+      --commit <COMMIT>
+          The release to record (40 hex characters): `releases/<commit>/kbf` must be there
+
+      --json
+          Print the result as one JSON object on standard output
+
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+
+  -h, --help
+          Print help (see a summary with '-h')
+
 === kbf-installer gc --help ===
 Remove the releases nothing needs: current, previous, staged, the swap on trial and any a process executes from stay, and so do the newest `--keep` others
 
@@ -206,9 +227,10 @@ Serve the frontend host's public port: route each stream to the active child fro
 Usage: kbf-installer proxy [OPTIONS]
 
 Options:
-      --config <CONFIG>  The installer.toml whose `[proxy]` table configures the proxy (default: the platform's, `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac)
-      --json             Print the result as one JSON object on standard output
-      --apply            Do what the verb says. Without it a mutating verb is a dry run
-      --check            Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing
-  -h, --help             Print help
+      --config <CONFIG>          The installer.toml whose `[proxy]` table configures the proxy (default: the platform's, `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac)
+      --json                     Print the result as one JSON object on standard output
+      --apply                    Do what the verb says. Without it a mutating verb is a dry run
+      --check                    Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing
+      --update-dir <UPDATE_DIR>  Root's directory: the proxy reads `status.json` here, to start the installed release when no frontend child is running [default: /var/lib/kbf-installer]
+  -h, --help                     Print help
 

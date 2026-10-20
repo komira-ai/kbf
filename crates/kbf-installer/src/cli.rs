@@ -52,6 +52,11 @@ pub enum Verb {
     Revert(ActivationArgs),
     /// Point `current` at `previous`, with no confirm window.
     Rollback(ServiceArgs),
+    /// Record a release placed on the host by hand as its first
+    ///
+    /// Checks its files, writes its `VERIFIED` marker and makes it current, so the frontend
+    /// proxy can start it. The operator vouches for the commit; nothing is fetched or attested.
+    RecordRelease(RecordReleaseArgs),
     /// Remove the releases nothing needs: current, previous, staged, the swap on trial and any a
     /// process executes from stay, and so do the newest `--keep` others.
     Gc(GcArgs),
@@ -157,6 +162,13 @@ pub struct ActivationArgs {
     pub id: ActivationId,
     #[command(flatten)]
     pub service: ServiceArgs,
+}
+
+#[derive(Args)]
+pub struct RecordReleaseArgs {
+    /// The release to record (40 hex characters): `releases/<commit>/kbf` must be there.
+    #[arg(long)]
+    pub commit: CommitId,
 }
 
 /// The service a swap restarts, by its own flag (never from an order).
@@ -292,6 +304,10 @@ pub struct ProxyArgs {
     /// Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing.
     #[arg(long)]
     pub check: bool,
+    /// Root's directory: the proxy reads `status.json` here, to start the installed release
+    /// when no frontend child is running.
+    #[arg(long, default_value = "/var/lib/kbf-installer")]
+    pub update_dir: std::path::PathBuf,
 }
 
 #[derive(Args)]
@@ -311,6 +327,7 @@ impl Verb {
             Verb::Confirm(_) => "confirm",
             Verb::Revert(_) => "revert",
             Verb::Rollback(_) => "rollback",
+            Verb::RecordRelease(_) => "record-release",
             Verb::Gc(_) => "gc",
             Verb::BootCheck(_) => "boot-check",
             Verb::Migrate(_) => "migrate",
@@ -345,6 +362,7 @@ impl Verb {
             | Verb::Confirm(_)
             | Verb::Revert(_)
             | Verb::Rollback(_)
+            | Verb::RecordRelease(_)
             | Verb::Gc(_)
             | Verb::Stage
             | Verb::Activate => true,
@@ -369,6 +387,7 @@ impl Verb {
             | Verb::Confirm(_)
             | Verb::Revert(_)
             | Verb::Rollback(_)
+            | Verb::RecordRelease(_)
             | Verb::Gc(_)
             | Verb::Migrate(_)
             | Verb::Quiesce
