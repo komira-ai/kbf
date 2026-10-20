@@ -87,6 +87,8 @@ cd infra/site && npm ci --ignore-scripts
    delegation is live (the deploy waits for it).
 3. **Site**: `npm run held -- site --account <id> --profile <profile> --repo <owner>/<name>` (diff), then `--apply`.
    Refuses without the OIDC provider or the zone.
+3b. **Extra deployment policies (by hand)**: before running `vars`, delete any extra deployment policy on environment `prod`
+   yourself (Settings > Environments > prod); `github` warns about extras and never removes them, and `vars` refuses while one exists.
 4. **Variables**: `npm run held -- vars --account <id> --profile <profile> --repo <owner>/<name>`. It first verifies the
    GitHub side read-only (environment `prod` exists with custom branch policies, its policies are exactly the branch `main`
    and the tag `v*`, it has a required reviewer, self-review is allowed, administrators cannot bypass, the sub template

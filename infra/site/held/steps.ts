@@ -118,12 +118,19 @@ export const OIDC_KEYS = ['repo', 'context', 'job_workflow_ref'];
 /** The deployment policies environment `prod` must have, and no others: the existing job runs on main, publish on a v* tag. */
 export const POLICIES: [string, string][] = [['main', 'branch'], ['v*', 'tag']];
 
-/** Read-only GET of a GitHub API path under the repo; undefined when it fails (404 for an environment not yet created). */
+/** True when a failed `gh api` call was an HTTP 404 (gh prints "(HTTP 404)" on stderr, which execFileSync puts in the message). */
+function isNotFound(e: unknown): boolean {
+  const err = e as { message?: unknown; stderr?: unknown };
+  return /\(HTTP 404\)/.test(`${String(err?.message ?? '')}\n${String(err?.stderr ?? '')}`);
+}
+
+/** Read-only GET of a GitHub API path under the repo; undefined only for HTTP 404 (an environment not yet created). Any other failure aborts. */
 function ghGet(t: Tools, repo: string, path: string): any {
   try {
     return JSON.parse(t.capture('gh', ['api', `repos/${repo}/${path}`]));
-  } catch {
-    return undefined;
+  } catch (e) {
+    if (isNotFound(e)) return undefined;
+    throw new Refused(`gh api repos/${repo}/${path} failed, and not with a 404 (permission or network?): ${String((e as Error)?.message ?? e).split('\n')[0]} (nothing was changed)`);
   }
 }
 

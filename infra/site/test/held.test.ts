@@ -92,7 +92,8 @@ describe('account guard', () => {
 
 describe('dry run', () => {
   const GH = ['github', '--repo', REPO, '--reviewer', REVIEWER];
-  const NOTHING = { 'environments/prod/deployment-branch-policies': new Error('404'), 'environments/prod': new Error('404') };
+  const NOT_FOUND = new Error('gh: Not Found (HTTP 404)');
+  const NOTHING = { 'environments/prod/deployment-branch-policies': NOT_FOUND, 'environments/prod': NOT_FOUND };
   test('github prints the gh commands and executes none', () => {
     const f = fake(answers(NOTHING));
     main(GH, f.t);
@@ -158,6 +159,34 @@ describe('dry run', () => {
     const puts = f.calls.filter((c) => c.kind === 'stream' && c.args.includes('repos/' + REPO + '/environments/prod'));
     expect(puts).toHaveLength(1);
     expect(JSON.parse(puts[0].input!).reviewers).toEqual([{ type: 'User', id: REVIEWER_ID }]);
+  });
+  test('github creates the right policy when only a same-named policy of the wrong type exists, and warns about the wrong one', () => {
+    type P = [string, string];
+    const cases: [P[], P, string][] = [
+      [[['main', 'tag'], ['v*', 'tag']], ['main', 'tag'], 'name=main -f type=branch'],
+      [[['main', 'branch'], ['v*', 'branch']], ['v*', 'branch'], 'name=v* -f type=tag'],
+    ];
+    for (const [have, wrong, create] of cases) {
+      const f = fake(answers({ 'environments/prod/deployment-branch-policies': polsJson(...have) }));
+      main([...GH, '--apply'], f.t);
+      const posts = f.calls.filter((c) => c.kind === 'stream' && c.args.includes('POST'));
+      expect(posts).toHaveLength(1);
+      expect(posts[0].args.join(' ')).toContain(create);
+      expect(f.text()).toContain(`WARNING: extra policy ${wrong[0]}/${wrong[1]}`);
+      expect(f.calls.some((c) => c.args.includes('DELETE'))).toBe(false);
+    }
+  });
+  test.each(['environments/prod', 'environments/prod/deployment-branch-policies'])('github aborts, before any write, when reading %s fails with something other than a 404', (path) => {
+    for (const msg of ['gh: Resource not accessible by personal access token (HTTP 403)', 'error connecting to api.github.com', 'gh: Server Error (HTTP 500)']) {
+      const f = fake(answers({ [path]: new Error(msg) }));
+      expect(() => main([...GH, '--apply'], f.t)).toThrow(/not with a 404/);
+      expect(f.calls.some((c) => c.kind === 'stream')).toBe(false);
+    }
+  });
+  test('github treats a 404 on the environment and its policies as absent and creates everything', () => {
+    const f = fake(answers({ 'environments/prod/deployment-branch-policies': NOT_FOUND, 'environments/prod': NOT_FOUND }));
+    main([...GH, '--apply'], f.t);
+    expect(f.calls.filter((c) => c.kind === 'stream' && c.args.includes('POST'))).toHaveLength(2);
   });
   test('github warns about an extra policy and does not delete it', () => {
     const f = fake(answers({ 'environments/prod/deployment-branch-policies': polsJson(['main', 'branch'], ['v*', 'tag'], ['dev', 'branch']) }));
