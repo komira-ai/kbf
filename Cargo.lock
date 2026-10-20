@@ -1346,6 +1346,7 @@ dependencies = [
  "kbf-daemon",
  "kbf-driver-container",
  "kbf-front",
+ "kbf-harness",
  "kbf-meta",
  "kbf-node",
  "kbf-objstore",
@@ -1486,6 +1487,7 @@ dependencies = [
  "kbf-driver-container",
  "kbf-enroll",
  "kbf-front",
+ "kbf-harness",
  "kbf-installer",
  "kbf-node",
  "kbf-peer",
@@ -1755,6 +1757,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-harness"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "flate2",
+ "kbf-deploy",
+ "kbf-it",
+ "kbf-testkit",
+ "kbf-transfer",
+ "libc",
+ "rcgen",
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "kbf-history"
 version = "0.1.0"
 dependencies = [
@@ -1812,12 +1833,16 @@ dependencies = [
  "clap",
  "flate2",
  "futures",
+ "h2",
  "hex",
+ "http",
  "httparse",
  "hyper",
+ "kbf-cli",
  "kbf-host",
  "kbf-installer",
  "kbf-proto",
+ "kbf-proxy",
  "kbf-state",
  "kbf-testkit",
  "kbf-update",
@@ -1834,6 +1859,7 @@ dependencies = [
  "tar",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tonic",
  "tracing",
@@ -1856,11 +1882,13 @@ dependencies = [
 name = "kbf-it"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "futures",
  "h2",
  "hex",
  "http",
+ "kbf-cli",
  "kbf-daemon",
  "kbf-deploy",
  "kbf-front",
