@@ -125,10 +125,11 @@ fn members(tgz: &[u8]) -> Result<Vec<Member>, String> {
             continue;
         }
         let path = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
-        let mode = entry.header().mode().map_err(|e| format!("{path}: {e}"))?;
         let mut bytes = Vec::new();
-        entry
-            .read_to_end(&mut bytes)
+        let mode = entry
+            .header()
+            .mode()
+            .and_then(|mode| entry.read_to_end(&mut bytes).map(|_| mode))
             .map_err(|e| format!("{path}: {e}"))?;
         let path = path
             .trim_start_matches("./")

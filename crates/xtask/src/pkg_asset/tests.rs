@@ -547,7 +547,13 @@ fn the_version_is_what_the_installer_says_after_its_name_and_nothing_else() {
 /// An `ar` header of 60 bytes with `size` as its size field and `end` as its terminator.
 fn raw_ar(size: &str, end: &str) -> Vec<u8> {
     let mut out = b"!<arch>\n".to_vec();
-    out.extend(format!("{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}{end}", "x/", 0, 0, 0, "100644", size).as_bytes());
+    out.extend(
+        format!(
+            "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}{end}",
+            "x/", 0, 0, 0, "100644", size
+        )
+        .as_bytes(),
+    );
     out
 }
 
@@ -592,7 +598,10 @@ fn a_damaged_archive_is_named_not_taken_for_a_package() {
     let junk_data = ar(&[("control.tar.gz", &good), ("data.tar.gz", b"not gzip")]);
     let got = problems_of("junk-data", &junk_data);
     assert_eq!(got.len(), 1, "{got:?}");
-    assert!(got[0].starts_with("data.tar.gz: not a gzip stream"), "{got:?}");
+    assert!(
+        got[0].starts_with("data.tar.gz: not a gzip stream"),
+        "{got:?}"
+    );
     // A gzip stream of bytes that are no tar header.
     let not_tar = {
         use std::io::Write;
@@ -600,29 +609,56 @@ fn a_damaged_archive_is_named_not_taken_for_a_package() {
         gz.write_all(&[7u8; 1024]).expect("write");
         gz.finish().expect("gzip")
     };
-    let got = problems_of("not-tar", &ar(&[("control.tar.gz", &not_tar), ("data.tar.gz", &not_tar)]));
+    let got = problems_of(
+        "not-tar",
+        &ar(&[("control.tar.gz", &not_tar), ("data.tar.gz", &not_tar)]),
+    );
     assert!(got[0].starts_with("control.tar.gz: not a tar"), "{got:?}");
-    assert!(got.iter().any(|p| p.starts_with("data.tar.gz: not a tar")), "{got:?}");
-    // A file whose bytes end before its header says.
-    let cut = {
+    assert!(
+        got.iter().any(|p| p.starts_with("data.tar.gz: not a tar")),
+        "{got:?}"
+    );
+    // A file whose header says a mode that is no number, and one cut short.
+    let tar_of = |bad_mode: bool, body: &[u8], keep: usize| {
         use std::io::Write;
-        let mut tar = tar::Builder::new(Vec::new());
         let mut h = tar::Header::new_ustar();
         h.set_path("./usr/bin/kbf-installer").expect("path");
         h.set_entry_type(tar::EntryType::Regular);
-        h.set_size(1000);
+        h.set_size(body.len() as u64);
         h.set_mode(0o755);
+        if bad_mode {
+            h.as_old_mut().mode = *b"zzzzzzz\0";
+        }
         h.set_cksum();
-        tar.append(&h, &[1u8; 1000][..]).expect("append");
+        let mut tar = tar::Builder::new(Vec::new());
+        tar.append(&h, body).expect("append");
         let mut raw = tar.into_inner().expect("tar");
-        raw.truncate(512 + 10);
+        raw.truncate(keep);
         let mut gz = flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::fast());
         gz.write_all(&raw).expect("write");
         gz.finish().expect("gzip")
     };
-    let got = problems_of("cut", &ar(&[("control.tar.gz", &good), ("data.tar.gz", &cut)]));
+    let got = problems_of(
+        "bad-mode",
+        &ar(&[
+            ("control.tar.gz", &good),
+            ("data.tar.gz", &tar_of(true, b"x", 1024)),
+        ]),
+    );
     assert_eq!(got.len(), 1, "{got:?}");
-    assert!(got[0].starts_with("data.tar.gz: usr/bin/kbf-installer: "), "{got:?}");
+    assert!(
+        got[0].starts_with("data.tar.gz: usr/bin/kbf-installer: "),
+        "{got:?}"
+    );
+    let got = problems_of(
+        "cut",
+        &ar(&[
+            ("control.tar.gz", &good),
+            ("data.tar.gz", &tar_of(false, &[1u8; 1000], 522)),
+        ]),
+    );
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].starts_with("data.tar.gz: "), "{got:?}");
 }
 
 #[test]

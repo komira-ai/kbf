@@ -395,7 +395,10 @@ fn pkg_trust_writes_the_trust_directory_and_refuses_a_ref_no_host_would_load() {
         "SOURCE_REFS=refs/heads/feature/arch-v2\n"
     );
     assert_eq!(std::fs::read(out.join("gh")).expect("gh"), b"the pinned gh");
-    let mode = std::fs::metadata(out.join("gh")).expect("meta").permissions().mode();
+    let mode = std::fs::metadata(out.join("gh"))
+        .expect("meta")
+        .permissions()
+        .mode();
     assert_eq!(mode & 0o777, 0o755);
 }
 
@@ -411,7 +414,11 @@ fn pkg_asset_adds_the_package_as_the_asset_or_only_verifies_it() {
     std::fs::write(&tarball, tgz(&[("kbf-installer", 0o755, binary)])).expect("tarball");
     let pkgs = dir.join("pkgs");
     std::fs::create_dir_all(&pkgs).expect("pkgs");
-    std::fs::write(pkgs.join("kbf-installer_0.1.0_amd64.deb"), deb_of(binary, MAIN)).expect("deb");
+    std::fs::write(
+        pkgs.join("kbf-installer_0.1.0_amd64.deb"),
+        deb_of(binary, MAIN),
+    )
+    .expect("deb");
     let out = dir.join("dist");
     let run = |package: &Path, mode: &[&str]| {
         let mut args = vec![
@@ -438,8 +445,17 @@ fn pkg_asset_adds_the_package_as_the_asset_or_only_verifies_it() {
     assert!(sums.trim_end().ends_with(&format!("  {name}")), "{sums}");
     let before = std::fs::read_dir(&out).expect("dist").count();
     let verified = run(&out.join(&name), &["--verify-only"]);
-    assert_eq!(verified.status.code(), Some(0), "{}", text(&verified.stderr));
-    assert!(text(&verified.stdout).contains(&name), "{}", text(&verified.stdout));
+    assert_eq!(
+        verified.status.code(),
+        Some(0),
+        "{}",
+        text(&verified.stderr)
+    );
+    assert!(
+        text(&verified.stdout).contains(&name),
+        "{}",
+        text(&verified.stdout)
+    );
     assert_eq!(std::fs::read_dir(&out).expect("dist").count(), before);
     // A package of another binary: refused by either mode, and nothing is written.
     let other = dir.join("other");
@@ -448,7 +464,11 @@ fn pkg_asset_adds_the_package_as_the_asset_or_only_verifies_it() {
     let fresh = dir.join("fresh");
     let refused = run(&other, &["--out", s(&fresh)]);
     assert_eq!(refused.status.code(), Some(1), "{}", text(&refused.stderr));
-    assert!(text(&refused.stderr).contains("is not the binary of"), "{}", text(&refused.stderr));
+    assert!(
+        text(&refused.stderr).contains("is not the binary of"),
+        "{}",
+        text(&refused.stderr)
+    );
     assert!(!fresh.exists());
     let refused = run(&other.join("p.deb"), &["--verify-only"]);
     assert_eq!(refused.status.code(), Some(1), "{}", text(&refused.stderr));
