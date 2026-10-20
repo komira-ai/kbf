@@ -143,6 +143,28 @@ pub trait RootOrders {
     fn revert(&self, commit: &CommitId) -> Result<(), PortError>;
 }
 
+/// The two facts of the root half's `status.json` that the migration reads, and nothing
+/// that writes an order. Every [`RootOrders`] has them; the proxy's start has no order spool
+/// (that is the update API's), so it reads them through
+/// [`super::root_orders::StatusFile`] alone.
+pub trait StatusFacts {
+    /// As [`RootOrders::staged`].
+    fn staged(&self) -> Result<Option<StagedFacts>, PortError>;
+
+    /// As [`RootOrders::installed`].
+    fn installed(&self) -> Result<Option<CommitId>, PortError>;
+}
+
+impl<T: RootOrders> StatusFacts for T {
+    fn staged(&self) -> Result<Option<StagedFacts>, PortError> {
+        RootOrders::staged(self)
+    }
+
+    fn installed(&self) -> Result<Option<CommitId>, PortError> {
+        RootOrders::installed(self)
+    }
+}
+
 /// Time. `now` is the wall clock as a duration since the Unix epoch, so a bake start
 /// recorded in `update.json` still means something after a restart.
 pub trait Clock {

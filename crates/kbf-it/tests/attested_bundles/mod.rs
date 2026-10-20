@@ -14,9 +14,10 @@
 //!   one bundle for several tarballs). A step for a tarball no job of that group
 //!   packages is named too.
 //! - **The installer's package.** The `kbf-installer` deb that `cargo xtask pkg-asset`
-//!   lists as an asset ([`attested_assets::packaged_debs`]) is held to the same two
-//!   rules, as `dist/kbf-installer-<commit>-<platform>.deb` and its
-//!   `.deb.sigstore.json`.
+//!   lists as an asset ([`attested_assets::packaged_debs`]) and the Mac `.pkg` that
+//!   `cargo xtask pkg-macos-asset` lists ([`attested_assets::packaged_macos_pkgs`]) are
+//!   held to the same two rules, as `dist/kbf-installer-<commit>-<platform>.deb` (`.pkg`)
+//!   and its `.deb.sigstore.json` (`.pkg.sigstore.json`).
 //! - **Its bundle's name.** The step after it sets `BUNDLE` to that step's
 //!   `bundle-path` output and copies it to `dist/<tarball>.sigstore.json` (the action
 //!   leaves it in a temporary directory under a name that is the same for every
@@ -95,11 +96,21 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
     if packaged.is_empty() {
         return Err("no `cargo xtask package` line in any `run:` step".to_owned());
     }
-    let debs = attested_assets::packaged_debs(artifacts)?;
+    // The installer packages: (platform, extension), the deb of a Linux job and the `.pkg`
+    // of the macOS one.
+    let packages: Vec<(String, &str)> = attested_assets::packaged_debs(artifacts)?
+        .into_iter()
+        .map(|p| (p, "deb"))
+        .chain(
+            attested_assets::packaged_macos_pkgs(artifacts)?
+                .into_iter()
+                .map(|p| (p, "pkg")),
+        )
+        .collect();
     let groups: BTreeSet<&str> = packaged
         .iter()
         .map(|(_, p)| group(p))
-        .chain(debs.iter().map(|p| group(p)))
+        .chain(packages.iter().map(|(p, _)| group(p)))
         .collect();
     let mut out = Vec::new();
     for g in &groups {
@@ -115,13 +126,13 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
             .filter(|(_, p)| group(p) == *g)
             .map(|(n, p)| (n.as_str(), p.as_str()))
             .collect();
-        let my_debs: Vec<&str> = debs
+        let my_packages: Vec<(&str, &str)> = packages
             .iter()
-            .filter(|p| group(p) == *g)
-            .map(String::as_str)
+            .filter(|(p, _)| group(p) == *g)
+            .map(|(p, ext)| (p.as_str(), *ext))
             .collect();
         let steps = workflows::job_steps(artifacts, &attest_job)?;
-        attested_alone(&attest_job, &steps, &mine, &my_debs, &mut out);
+        attested_alone(&attest_job, &steps, &mine, &my_packages, &mut out);
         uploaded(&attest_job, g, &steps, &mut out);
         let verify_job = format!("verify-{g}");
         let verify = workflows::job_steps(artifacts, &verify_job)?;
@@ -155,13 +166,13 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
 }
 
 /// The provenance and bundle-naming steps of every tarball of `mine` (name and platform)
-/// and every installer package of `debs` (platform) in the attest job `job`, the steps
+/// and every installer package of `packages` (platform, extension) in the attest job `job`, the steps
 /// that attest anything else, and any `run:` step that is not the naming of a bundle.
 fn attested_alone(
     job: &str,
     steps: &[workflows::Step],
     mine: &[(&str, &str)],
-    debs: &[&str],
+    packages: &[(&str, &str)],
     out: &mut Vec<String>,
 ) {
     let mut expected = Vec::new();
@@ -174,14 +185,14 @@ fn attested_alone(
             format!("dist/{name}-${{GITHUB_SHA}}-{platform}.tar.gz.sigstore.json"),
         ));
     }
-    for platform in debs {
+    for (platform, ext) in packages {
         targets.push((
-            format!("kbf-installer package (deb) for {platform}"),
+            format!("kbf-installer package ({ext}) for {platform}"),
             format!(
-                "dist/{}.deb",
+                "dist/{}.{ext}",
                 attested_assets::stem("kbf-installer", platform)
             ),
-            format!("dist/kbf-installer-${{GITHUB_SHA}}-{platform}.deb.sigstore.json"),
+            format!("dist/kbf-installer-${{GITHUB_SHA}}-{platform}.{ext}.sigstore.json"),
         ));
     }
     for (what, subject, bundle) in targets {

@@ -6,6 +6,9 @@
 //! rollback path. The test-farm hosts that run the dev installer have no `VERIFIED`
 //! markers and no attestations; this is how they come over.
 //!
+//! A Mac the Mac kit installed has no state at all ([`kit`]): its links and its LaunchDaemon
+//! are the old layout, read as such, and the steps below are the same for it.
+//!
 //! The steps, each safe to run again (the re-run rule is stated at each):
 //!
 //! 1. **Read** the old state, memory and links. A swap on trial refuses the migration
@@ -41,6 +44,13 @@
 //!    units started. The state comes before the links because a link with no state beside
 //!    it reads as a host whose state is lost. Re-run: links and units are compared and only
 //!    what differs is done; a unit stopped by an earlier run is started by this one.
+//!    Last of step 5, **the installer's unit** is enabled (`--installer-unit`), after the old helper is
+//!    disabled, the new layout is in place and the stopped units are started: `systemctl
+//!    enable --now` when `is-enabled` does not say `enabled` (`launchctl bootstrap` when the
+//!    job is not loaded), the question and the command `setup` uses, so a migrated host takes
+//!    orders without a `setup` run. It is before the journal says done: a unit that will not
+//!    come up ends the run ([`MigrateError::InstallerUnit`]) and a run again finishes it.
+//!    Nothing else is started: not the frontend, not the proxy. Re-run after `done`: a no-op.
 //! 6. **Journal** `migration.json` says `done`. From then on `migrate` is a no-op and
 //!    [`guard`] lets `setup` through.
 //!
@@ -60,9 +70,11 @@
 //! [`crate::helper::status`] for `status.json`.
 
 mod apply;
+mod daemon_dirs;
 pub mod error;
 pub mod floor;
 pub mod journal;
+mod kit;
 mod newtree;
 mod old;
 mod probe;
@@ -79,7 +91,7 @@ use kbf_host::Mode;
 pub use apply::migrate;
 pub use error::MigrateError;
 pub use floor::{FrontendFloor, NoFrontend, Seed, Source};
-pub use rollback::rollback;
+pub use rollback::{rollback, rollback_at};
 pub use roots::Roots;
 pub use units::{Unit, retired_name};
 
@@ -124,6 +136,10 @@ pub struct Migration {
     /// installer and the old helper never both run.
     pub installer_unit: Option<Unit>,
     pub seed: Seed,
+    /// The user a node's unit runs as (Linux), who owns the order spool the migration makes
+    /// for a node it adds `update-dir` to; `None` when there is no such user (a Mac's daemon
+    /// is root's, and needs none).
+    pub node_user: Option<kbf_host::RunUser>,
     /// How long each of the two locks (the old tools', the installer's) is waited for before
     /// the verb ends busy (exit 4): a verb of the old tools can hold theirs for a long time,
     /// and a migration queued behind it holds up whatever else wants the installer's.
@@ -212,16 +228,20 @@ pub fn guard(layout: &Layout, owner_uid: u32) -> Result<(), MigrateError> {
 pub fn standing(layout: &Layout, owner_uid: u32) -> Result<Vec<Unit>, MigrateError> {
     let rules = tree::Rules::release(owner_uid);
     let roots = Roots::new(layout.platform());
-    let done = newtree::StateDir::open(layout, &rules)?
+    let journal = newtree::StateDir::open(layout, &rules)?
         .map(|t| t.journal())
         .transpose()?
-        .flatten()
-        .filter(|j| j.phase == journal::Phase::Done);
-    if let Some(journal) = done {
-        return Ok(journal.units);
+        .flatten();
+    if let Some(journal) = journal.as_ref().filter(|j| j.phase == journal::Phase::Done) {
+        return Ok(journal.units.clone());
     }
-    match old::read(layout, &roots, &rules)? {
+    if let Some(journal) = &journal {
+        rollback::refuse_if_installer_moved_aside(layout, journal)?;
+    }
+    let resume = journal.as_ref().is_some_and(journal::Journal::kit_begun);
+    match old::read(layout, &roots, &rules, resume)? {
         None => Ok(Vec::new()),
+        Some(old) if old.kit.is_some() => Err(MigrateError::Unmigrated(roots.old_tree.to_string())),
         Some(_) => Err(MigrateError::Unmigrated(roots.old_state.to_string())),
     }
 }
@@ -230,6 +250,16 @@ pub fn standing(layout: &Layout, owner_uid: u32) -> Result<Vec<Unit>, MigrateErr
 mod coverage_tests;
 #[cfg(test)]
 mod floor_tests;
+#[cfg(test)]
+mod installer_unit_tests;
+#[cfg(test)]
+mod kit_adopt_tests;
+#[cfg(test)]
+mod kit_host;
+#[cfg(test)]
+mod kit_host_tests;
+#[cfg(test)]
+mod kit_marker_tests;
 #[cfg(test)]
 mod lock_tests;
 #[cfg(test)]

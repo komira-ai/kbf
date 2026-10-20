@@ -152,6 +152,7 @@ fn services_stop_before_the_links_move_and_start_after_everything_is_written() {
             "disable kbf-helper.service links=false",
             "daemon-reload links=true",
             "start kbf-daemon.service links=true",
+            "enable --now kbf-installer.service links=true",
         ]
     );
     let active = rig.active.borrow();
@@ -444,7 +445,7 @@ fn each_unit_is_rewritten_left_alone_or_skipped_and_the_report_says_which() {
 
 /// Catches the macOS path using Linux's: a Mac host's plist is rewritten to the Mac tree
 /// (`/usr/local/kbf-installer`), the state goes to `/var/db/kbf-installer`, the probe asks
-/// `kbf-daemon`, launchd is stopped with `bootout`, restarted with `bootstrap`, and the
+/// `kbf` (a macOS release holds only that), launchd is stopped with `bootout`, restarted with `bootstrap`, and the
 /// helper is disabled in the system domain.
 ///
 /// Mutants seen red: the Linux roots used on macOS; `bootstrap` given the label, not the plist.
@@ -456,7 +457,7 @@ fn a_mac_host_comes_over_through_launchd() {
     assert!(
         seen.calls()[0]
             .program
-            .ends_with("releases/".to_owned() + A + "/kbf-daemon")
+            .ends_with("releases/".to_owned() + A + "/kbf")
     );
     let tree = rig.new_tree();
     assert_eq!(tree, rig.at("usr/local/kbf-installer"));
@@ -482,6 +483,7 @@ fn a_mac_host_comes_over_through_launchd() {
             "stop com.komira.kbf-daemon.plist links=false",
             "disable com.komira.kbf-helper.plist links=false",
             "start com.komira.kbf-daemon.plist links=true",
+            "start com.komira.kbf-installer.plist links=true",
         ]
     );
     let bootstraps: Vec<_> = rig
@@ -491,7 +493,7 @@ fn a_mac_host_comes_over_through_launchd() {
         .map(ToString::to_string)
         .filter(|l| l.contains("bootstrap"))
         .collect();
-    assert_eq!(bootstraps.len(), 1);
+    assert_eq!(bootstraps.len(), 2);
     assert!(
         bootstraps[0]
             .ends_with("bootstrap system /Library/LaunchDaemons/com.komira.kbf-daemon.plist"),

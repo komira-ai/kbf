@@ -16,7 +16,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use kbf_host::{HostExec, HostPath, Root};
 
 use crate::activate;
-use crate::cli::{BootArgs, Cli, MigrateArgs, ReleaseSource, RunArgs, ServiceArgs, Verb};
+use crate::backup;
+use crate::cli::{
+    BackupArgs, BootArgs, Cli, MigrateArgs, ReleaseSource, RestoreArgs, RunArgs, ServiceArgs, Verb,
+};
 use crate::database::Database;
 use crate::exit::Exit;
 use crate::helper::cycle::{Config, Helper, HelperError};
@@ -327,6 +330,14 @@ fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String
     let rehearsal = root != Path::new("/");
     let (layout, mut exec) = host(root)?;
     let user = probe_user(&exec, &args.fetch_user, rehearsal)?;
+    // A node that is not on a host with the user simply has no owner for its spool: the
+    // migration says so and leaves the node's `kbf.toml` as it is.
+    let node_user = kbf_host::user::lookup(
+        &exec,
+        crate::setup::plan::service_user_name(crate::cli::Mode::Daemon),
+    )
+    .ok()
+    .flatten();
     let m = migrate::Migration {
         roots: migrate::Roots::new(layout.platform()),
         layout,
@@ -345,6 +356,7 @@ fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String
             },
             min_generation: args.min_generation,
         },
+        node_user,
         lock_wait: operator::LOCK_WAIT,
     };
     let mode = if apply {
@@ -441,6 +453,91 @@ fn quiesce(root: PathBuf) -> Result<(), Failure> {
     operator::quiesce(&layout, operator::LOCK_WAIT).map_err(Failure::from)
 }
 
+/// What `backup` and `restore` say when they work, on the error stream (standard output is
+/// for `--json`).
+fn progress(err: &mut dyn Write, text: &str) {
+    // A closed pipe is the reader's business; the exit code still tells.
+    let _ = writeln!(err, "kbf-installer: {text}");
+}
+
+/// `kbf-installer backup`: without `--apply` it says what it would do and touches nothing.
+fn run_backup(
+    tool: &dyn backup::Tool,
+    root: PathBuf,
+    apply: bool,
+    args: &BackupArgs,
+    err: &mut dyn Write,
+) -> Result<(), Failure> {
+    let settings = backup::Settings::read(&under(&root, &args.installer_config)?)?;
+    let dir = under(&root, &args.dir)?;
+    if !apply {
+        progress(
+            err,
+            &format!(
+                "backup: dry run: would dump the state database into {}, keeping the newest {}",
+                dir.display(),
+                settings.keep
+            ),
+        );
+        return Ok(());
+    }
+    let spec = backup::Spec {
+        dir: &dir,
+        url: &settings.url,
+        keep: settings.keep,
+        pg_dump: &args.pg_dump,
+        pg_restore: &args.pg_restore,
+    };
+    let done = backup::backup(tool, &spec, now())?;
+    progress(
+        err,
+        &format!(
+            "backup: wrote {} ({} bytes); removed {} old",
+            done.file.display(),
+            done.bytes,
+            done.removed.len()
+        ),
+    );
+    Ok(())
+}
+
+/// `kbf-installer restore`: without `--apply` it says what it would do and touches nothing.
+fn run_restore(
+    tool: &dyn backup::Tool,
+    root: PathBuf,
+    apply: bool,
+    args: &RestoreArgs,
+    err: &mut dyn Write,
+) -> Result<(), Failure> {
+    let url = match &args.database {
+        // A bare name: a scratch database on the configured server, for the configured role.
+        Some(name) if !name.contains(['/', ':']) => {
+            let settings = backup::Settings::read(&under(&root, &args.installer_config)?)?;
+            settings.target.url_for(name)?
+        }
+        Some(url) => {
+            crate::database::check_url("the --database flag", url)
+                .map_err(|e| Failure::from(e.to_string()))?;
+            url.clone()
+        }
+        None => backup::Settings::read(&under(&root, &args.installer_config)?)?.url,
+    };
+    let file = under(&root, &args.file)?;
+    if !apply {
+        progress(
+            err,
+            &format!(
+                "restore: dry run: would restore {} into the state database",
+                file.display()
+            ),
+        );
+        return Ok(());
+    }
+    backup::restore(tool, &args.pg_restore, &url, &file)?;
+    progress(err, &format!("restore: restored {}", file.display()));
+    Ok(())
+}
+
 /// The directory the host's paths are under: `/`, except in a build with the sandbox flag.
 fn root_of(cli: &Cli) -> PathBuf {
     #[cfg(feature = "test-sandbox")]
@@ -481,6 +578,38 @@ fn finish_setup(
     e.exit()
 }
 
+/// Whether the caller came through `sudo` from another account: sudo sets `SUDO_UID` to the
+/// caller's uid and a caller cannot unset it for the command (the test `deploy` makes).
+fn sudo_caller() -> bool {
+    is_sudo_uid(std::env::var_os("SUDO_UID").as_deref())
+}
+
+/// [`sudo_caller`] for a `SUDO_UID` that is `uid`: set, and not root's own.
+fn is_sudo_uid(uid: Option<&std::ffi::OsStr>) -> bool {
+    uid.is_some_and(|u| u != "0")
+}
+
+/// `update`, refused through `sudo`. The verb takes `--api`, `--api-ca`, `--api-server-name`
+/// and `--token-file` from its caller, and `--api` is required, so through sudo root would
+/// read a file the caller chose and send it to an address the caller chose (a local TLS
+/// server with the caller's own CA reads the token from the bearer header). It needs no root:
+/// run it as the account that may read the token file.
+fn update_verb(
+    args: &crate::cli::UpdateArgs,
+    via_sudo: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Exit {
+    if via_sudo {
+        let _ = writeln!(
+            err,
+            "kbf-installer: update: not accepted through sudo; it needs no root, run it as the account that reads the token file"
+        );
+        return Exit::Usage;
+    }
+    crate::deploy::update::run(args, out, err)
+}
+
 /// How a `migrate` that went through ends: its report on `out`, as text, or with `--json` as
 /// one object. (A failure is said like every other verb's, by `dispatch`.)
 fn finish_migrate(json: bool, apply: bool, report: &str, out: &mut dyn Write) -> Exit {
@@ -498,6 +627,10 @@ fn finish_migrate(json: bool, apply: bool, report: &str, out: &mut dyn Write) ->
 /// `err`, or with `--json` as one object on `out`. A verb that succeeds prints nothing here,
 /// except `setup` (its steps) and `migrate` (its report).
 pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) -> Exit {
+    // `update` prints its own summary line and needs no root: it is a client of the update API.
+    if let Verb::Update(args) = &cli.verb {
+        return update_verb(args, sudo_caller(), out, err);
+    }
     let name = cli.verb.name();
     let mut say = |code: Exit, text: String, json: serde_json::Value| {
         // A closed pipe is the reader's business; the exit code still tells.
@@ -518,6 +651,8 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
             serde_json::json!({"verb": name, "error": "needs_root", "euid": euid}),
         );
     }
+    // What `backup` and `restore` report when they work; written once `say` is done with `err`.
+    let mut said = Vec::new();
     // The old helper and the installer never both manage one host: while the old layout's
     // state is the host's and no migration finished, the verbs that manage it wait.
     // (A verb that is not built yet only says so; the PR that builds it calls this first.)
@@ -532,7 +667,7 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         );
     }
     if let Verb::Proxy(args) = &cli.verb {
-        return match proxy_verb::run(args) {
+        return match proxy_verb::run(args, &root_of(cli)) {
             Ok(()) => Exit::Ok,
             Err(e) => say(
                 e.exit(),
@@ -566,6 +701,28 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         Verb::RecordRelease(a) => record_release(root_of(cli), euid, cli.apply, &a.commit),
         Verb::Gc(g) => gc(root_of(cli), cli.apply, g.keep),
         Verb::Quiesce => quiesce(root_of(cli)),
+        // The fetch child writes the component to `out` (standard output, a pipe the root
+        // parent reads) and says why it could not on `err`, one line. It runs as the fetch
+        // user, so no root check applies, and it prints no JSON: its output is the bytes.
+        Verb::FetchChild(args) => {
+            let written = crate::fetch::child::fetch(args, out).and_then(|n| {
+                out.flush().map_err(crate::fetch::child::ChildFault::Out)?;
+                Ok(n)
+            });
+            return match written {
+                Ok(_) => Exit::Ok,
+                Err(why) => {
+                    let _ = writeln!(err, "fetch-child: {why}");
+                    Exit::Failed
+                }
+            };
+        }
+        Verb::Backup(args) => {
+            run_backup(&backup::Process, root_of(cli), cli.apply, args, &mut said)
+        }
+        Verb::Restore(args) => {
+            run_restore(&backup::Process, root_of(cli), cli.apply, args, &mut said)
+        }
         other => {
             let phase = other.built_by().unwrap_or("?");
             return say(
@@ -581,7 +738,10 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         }
     };
     match result {
-        Ok(()) => Exit::Ok,
+        Ok(()) => {
+            let _ = err.write_all(&said);
+            Exit::Ok
+        }
         Err(Failure { exit, why }) => say(
             exit,
             format!("kbf-installer: {why}"),

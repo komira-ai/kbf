@@ -19,6 +19,21 @@ pub struct MapView {
     /// The generation before it, while a join or a drain is settling: a blob written
     /// before the change is found where it was. `None` once the change has settled.
     pub previous: Option<Arc<Map>>,
+    /// The generations before `previous`, newest first: a blob written before several quick
+    /// changes is found where it was. Empty when the process kept none.
+    pub earlier: Vec<Arc<Map>>,
+}
+
+impl MapView {
+    /// The retained maps before the newest, newest first: `previous`, then `earlier`.
+    #[must_use]
+    pub fn history(&self) -> Vec<&Map> {
+        self.previous
+            .iter()
+            .chain(&self.earlier)
+            .map(|m| &**m)
+            .collect()
+    }
 }
 
 /// Why a newer map could not be fetched.

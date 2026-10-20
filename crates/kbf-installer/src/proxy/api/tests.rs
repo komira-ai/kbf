@@ -8,13 +8,14 @@ use hyper::StatusCode;
 
 use super::core::{ApiError, Core, Crash, CrashHook, CrashPoint, Fault, NoCrash, Reply};
 use super::fakes::{COMMIT_C, Rig, facts, idle, req, staged};
+use super::idempotency::Idempotency;
 use super::model::{OldChild, RollbackBlocked, StatusBody, UpdateId, abortable};
 use super::refusal;
 use super::traits::{
     Compat, CompatGate, InstallerState, InstallerStatus, JsonFileStatus, StatusReader, StubGate,
     SupervisorError,
 };
-use crate::proxy::model::{Phase, Step, Verb};
+use crate::proxy::model::{Phase, Slot, Step, Verb};
 use crate::testkit::{A, B, c};
 
 fn accepted(r: Result<Reply, Fault>) -> (UpdateId, Phase) {
@@ -78,6 +79,37 @@ fn post_accepts_and_writes_one_locator_order_and_starts_nothing() {
     assert_eq!(s.from, Some(c(A)));
     assert_eq!(s.to, Some(c(B)));
     assert_eq!(s.phase, Some(Phase::Accepted));
+}
+
+/// Catches a `POST` that spends the installer's work on an update nothing can take over: a
+/// supervisor that says it cannot start refuses the POST with 503 and its own words before
+/// the request id is saved or an order written; the status read still answers; and once the
+/// supervisor can start, the same request id is a fresh request (it was never consumed).
+#[test]
+fn a_supervisor_that_cannot_start_refuses_the_post_before_anything_is_saved_or_written() {
+    let rig = Rig::new("u8b6-blocked");
+    rig.sup.block(Some("handover driver not wired"));
+    let mut core = rig.core();
+    let e = refused(core.post(req(B, "r1")));
+    assert_eq!(
+        (e.status, e.code, e.message.as_str()),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "handover_unavailable",
+            "handover driver not wired"
+        )
+    );
+    assert!(written(&rig).is_empty(), "an order was written");
+    assert!(
+        Idempotency::open(&rig.dir).get("r1").is_none(),
+        "the request id was saved"
+    );
+    assert_eq!(body(&mut core).update_id, None);
+
+    rig.sup.block(None);
+    let (_, phase) = accepted(core.post(req(B, "r1")));
+    assert_eq!(phase, Phase::Accepted);
+    assert_eq!(written(&rig).len(), 1);
 }
 
 #[test]
@@ -994,4 +1026,38 @@ fn a_revived_request_is_checked_again_like_a_new_one() {
             "{name}: no order for a refused revival"
         );
     }
+}
+
+/// Proves `active_slot` is the SERVING slot at every phase: the old child's (A) until the
+/// switch, the new child's (B) from `switched` on, and the old child's again after a rollback
+/// or an abort. Catches a status that reports the candidate's slot while it starts (a deploy
+/// would read a child that is not serving yet) or still reports the new child after a
+/// rollback (it would read a child that was stood down).
+///
+/// Mutants planted: the fake supervisor's rollback leaving the new child's slot.
+#[test]
+fn active_slot_is_the_serving_slot_through_switch_and_rollback() {
+    let rig = Rig::new("active-slot");
+    let mut core = rig.core();
+    for (phase, want) in [
+        (Phase::Preflight, Slot::A),
+        (Phase::Starting, Slot::A),
+        (Phase::Holding, Slot::A),
+        (Phase::Switching, Slot::A),
+        (Phase::Switched, Slot::B),
+        (Phase::Baking, Slot::B),
+        (Phase::Done, Slot::B),
+    ] {
+        rig.sup.set(phase, Some(old()), 0);
+        assert_eq!(body(&mut core).active_slot, Some(want), "{phase:?}");
+    }
+    rig.sup.set(Phase::Baking, Some(old()), 0);
+    let _ = core.rollback();
+    let s = body(&mut core);
+    assert_eq!(s.phase, Some(Phase::RolledBack));
+    assert_eq!(s.active_slot, Some(Slot::A), "the old child serves again");
+
+    rig.sup.set(Phase::Holding, Some(old()), 0);
+    let _ = core.abort();
+    assert_eq!(body(&mut core).active_slot, Some(Slot::A));
 }

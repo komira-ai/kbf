@@ -592,3 +592,267 @@ fn a_result_object_waits_for_the_staged_objects_of_its_closure() {
         "an object never staged waits for none"
     );
 }
+
+// ---- ReseatStaged (write-path.md, section 6.4). ----
+
+fn reseat(m: &mut MetaState, from: u64, to: StagedPut, stored: bool) -> Result<(), TierError> {
+    reseat_on(m, TIER, from, to, stored)
+}
+
+fn reseat_on(
+    m: &mut MetaState,
+    tier: TierId,
+    from: u64,
+    to: StagedPut,
+    stored: bool,
+) -> Result<(), TierError> {
+    let command = Command::ReseatStaged {
+        tier,
+        from: object(from),
+        to,
+        stored,
+    };
+    tier_cmd(m, command)
+}
+
+/// Objects 1 (digests 1, 2) sealed and 2 (digest 3) sealed, on [`TIER`].
+fn two_sealed() -> MetaState {
+    let mut m = tiered();
+    stage(&mut m, sealed(part(1, 300, &[(1, 0), (2, 100)]))).expect("staged");
+    stage(&mut m, sealed(part(2, 200, &[(3, 0)]))).expect("staged");
+    m
+}
+
+/// Catches: a reseat that moves an entry only some of the time, leaves the old object
+/// staged, or reports the moved blobs as lost or unavailable. The records must answer
+/// `Present` at the new object at every point the log can show, with no loss counted
+/// (a bake gate reads `blob_losses`, which never falls), and no mark on the old object.
+#[test]
+fn a_reseat_moves_the_entries_and_counts_nothing_as_lost() {
+    let mut m = two_sealed();
+    let new = sealed(part(5, 150, &[(2, 50), (1, 0)]));
+    assert_eq!(reseat(&mut m, 1, new, false), Ok(()));
+    assert_eq!(m.blob(&digest(1)), staged_at(5, 0));
+    assert_eq!(m.blob(&digest(2)), staged_at(5, 50));
+    assert_eq!(m.blob(&digest(3)), staged_at(2, 0), "another object's");
+    assert_eq!(state(&m, 1), None);
+    assert_eq!(state(&m, 5), Some(StagedState::Sealed));
+    assert_eq!(listed(&m, 5), [(digest(1), 0), (digest(2), 50)]);
+    assert_eq!(m.staged(object(5)).expect("staged").committed_len(), 150);
+    assert_eq!((m.lost_blobs(), m.blob_losses(), m.losses()), (0, 0, 0));
+    assert_eq!(m.unreachable(object(1)), None);
+    // The old object left the table for good: nothing stages into it again.
+    assert_eq!(
+        stage(&mut m, part(1, 300, &[(1, 0)])),
+        Err(TierError::Left(object(1)))
+    );
+}
+
+/// Catches: a reseat of an object in `Conflict` (the state earlier builds left) refused.
+#[test]
+fn a_reseat_takes_an_object_in_conflict() {
+    let mut m = two_sealed();
+    assert_eq!(conflict(&mut m, 1), Ok(()));
+    let new = sealed(part(5, 150, &[(1, 0), (2, 50)]));
+    assert_eq!(reseat(&mut m, 1, new, false), Ok(()));
+    assert_eq!(state(&m, 1), None);
+    assert_eq!(m.blob(&digest(1)), staged_at(5, 0));
+}
+
+/// Catches: the flush order lost with the object. An object that waited for the moved
+/// one must wait for the new one (or it flushes first), and the new one must wait for
+/// whatever the old one did.
+#[test]
+fn a_reseat_carries_the_flush_order_over() {
+    let mut m = tiered();
+    // 1: output (digest 3); 2: result (digest 1) of an entry that needs 3; 3: output of
+    // 2's entry (digest 5).
+    stage(&mut m, sealed(part(1, 100, &[(3, 0)]))).expect("staged");
+    stage(&mut m, sealed(part(2, 100, &[(1, 0)]))).expect("staged");
+    stage(&mut m, sealed(part(3, 100, &[(5, 0)]))).expect("staged");
+    let record = ActionRecord {
+        result: digest(1),
+        closure: Closure::from_iter([digest(3), digest(5)]),
+    };
+    put_action(&mut m, Role::Daemon, digest(40), record).expect("written");
+    assert_eq!(
+        m.flush_waits(object(2)),
+        BTreeSet::from([object(1), object(3)])
+    );
+
+    // The object it waits for moves: it waits for the new one.
+    assert_eq!(
+        reseat(&mut m, 1, sealed(part(7, 100, &[(3, 0)])), false),
+        Ok(())
+    );
+    assert_eq!(
+        m.flush_waits(object(2)),
+        BTreeSet::from([object(3), object(7)])
+    );
+
+    // The waiting object moves: the new one waits for the same objects.
+    assert_eq!(
+        reseat(&mut m, 2, sealed(part(8, 100, &[(1, 0)])), false),
+        Ok(())
+    );
+    assert_eq!(
+        m.flush_waits(object(8)),
+        BTreeSet::from([object(3), object(7)])
+    );
+    assert_eq!(m.flush_waits(object(2)), BTreeSet::new());
+}
+
+/// Catches: a reseat into the store that keeps a wait for an object it no longer is, or
+/// stages the stored object; and a stored object whose blobs are not moved to it.
+#[test]
+fn a_reseat_into_the_store_indexes_there_and_stages_nothing() {
+    let mut m = two_sealed();
+    let record = ActionRecord {
+        result: digest(3),
+        closure: Closure::from_iter([digest(1), digest(2)]),
+    };
+    put_action(&mut m, Role::Daemon, digest(40), record).expect("written");
+    assert_eq!(m.flush_waits(object(2)), BTreeSet::from([object(1)]));
+    let stored = sealed(part(9, 300, &[(1, 0), (2, 100)]));
+    assert_eq!(reseat(&mut m, 1, stored, true), Ok(()));
+    assert_eq!(state(&m, 9), None);
+    assert_eq!(state(&m, 1), None);
+    assert_eq!(m.blob(&digest(1)), stored_at(in_segment(9, 0)));
+    assert_eq!(m.blob(&digest(2)), stored_at(in_segment(9, 1)));
+    assert_eq!(m.flush_waits(object(2)), BTreeSet::new());
+    assert_eq!((m.lost_blobs(), m.blob_losses()), (0, 0));
+}
+
+/// Catches: a refusal that changes something first. Each refusal leaves the state as it
+/// was: an open object, another tier's object, a blob indexed at the old object that the
+/// new one does not list, a new object that is staged already or is the old one.
+#[test]
+fn a_refused_reseat_changes_nothing() {
+    let mut m = two_sealed();
+    stage(&mut m, part(3, 100, &[(4, 0)])).expect("an open object");
+    let before = m.clone();
+    let good = || sealed(part(5, 150, &[(1, 0), (2, 50)]));
+    assert_eq!(
+        reseat(&mut m, 3, sealed(part(6, 100, &[(4, 0)])), false),
+        Err(TierError::NotSealed(object(3)))
+    );
+    assert_eq!(
+        reseat_on(&mut m, TierId::new(8), 1, good(), false),
+        Err(TierError::OtherTier {
+            object: object(1),
+            tier: TIER
+        })
+    );
+    assert_eq!(
+        reseat(&mut m, 1, sealed(part(5, 100, &[(1, 0)])), false),
+        Err(TierError::Unlisted(object(1)))
+    );
+    assert_eq!(
+        reseat(&mut m, 1, sealed(part(2, 300, &[(1, 0), (2, 100)])), false),
+        Err(TierError::Repeated(object(2)))
+    );
+    assert_eq!(
+        reseat(&mut m, 1, sealed(part(1, 300, &[(1, 0), (2, 100)])), false),
+        Err(TierError::Repeated(object(1)))
+    );
+    assert_eq!(
+        reseat(&mut m, 1, sealed(part(5, 50, &[(1, 0)])), false),
+        Err(TierError::Unlisted(object(1)))
+    );
+    assert_eq!(
+        reseat(&mut m, 9, good(), false),
+        Err(TierError::NotStaged(object(9)))
+    );
+    assert_eq!(m, before);
+}
+
+/// Catches: a retry of a reseat that applied (the log applied it and lost the answer)
+/// refused, or applied twice. It is a no-op; and the same command against an object that
+/// left another way is still refused.
+#[test]
+fn a_reseat_retried_after_it_applied_is_a_no_op() {
+    let mut m = two_sealed();
+    let new = sealed(part(5, 150, &[(1, 0), (2, 50)]));
+    assert_eq!(reseat(&mut m, 1, new.clone(), false), Ok(()));
+    let once = m.clone();
+    assert_eq!(reseat(&mut m, 1, new, false), Ok(()));
+    assert_eq!(m, once);
+
+    let mut s = two_sealed();
+    let stored = sealed(part(9, 300, &[(1, 0), (2, 100)]));
+    assert_eq!(reseat(&mut s, 1, stored.clone(), true), Ok(()));
+    let once = s.clone();
+    assert_eq!(reseat(&mut s, 1, stored.clone(), true), Ok(()));
+    assert_eq!(s, once);
+
+    // Flushed instead of moved: the same command is refused.
+    let mut f = two_sealed();
+    assert_eq!(flushed(&mut f, 1), Ok(()));
+    assert_eq!(
+        reseat(&mut f, 1, sealed(part(5, 150, &[(1, 0), (2, 50)])), false),
+        Err(TierError::Left(object(1)))
+    );
+}
+
+/// Catches: an object with no records left in the table by a reseat to nothing, so a
+/// round never ends its flush.
+#[test]
+fn a_reseat_with_no_records_only_takes_the_object_out() {
+    let mut m = tiered();
+    stage(&mut m, sealed(part(1, 0, &[]))).expect("staged");
+    assert_eq!(reseat(&mut m, 1, sealed(part(5, 0, &[])), true), Ok(()));
+    assert_eq!(state(&m, 1), None);
+    assert_eq!(state(&m, 5), None);
+}
+
+/// Catches: a record of the new object that is not indexed at the old one treated as one
+/// that is. A digest not indexed at all is stored at the new object; one indexed at
+/// another object keeps that entry (the new copy is redundant, as for a `PutStaged`).
+#[test]
+fn a_reseat_indexes_the_records_that_were_not_at_the_old_object_as_a_put_does() {
+    let mut m = two_sealed();
+    let new = sealed(part(5, 250, &[(1, 0), (2, 50), (3, 100), (9, 150)]));
+    assert_eq!(reseat(&mut m, 1, new, false), Ok(()));
+    assert_eq!(m.blob(&digest(1)), staged_at(5, 0));
+    assert_eq!(m.blob(&digest(3)), staged_at(2, 0), "kept where it was");
+    assert_eq!(m.blob(&digest(9)), staged_at(5, 150), "indexed by the move");
+    assert_eq!(state(&m, 1), None);
+}
+
+/// Catches: the new object forced sealed whatever the command says (a move whose records
+/// are still being added to would be closed), and a record listed by the old object but
+/// indexed at another object (it was a duplicate when staged) counted as one the move
+/// must carry: it stays where it is.
+#[test]
+fn a_reseat_keeps_the_seal_it_names_and_leaves_a_duplicate_where_it_is() {
+    let mut m = tiered();
+    stage(&mut m, sealed(part(2, 100, &[(1, 0)]))).expect("staged");
+    stage(&mut m, sealed(part(1, 300, &[(1, 0), (2, 100)]))).expect("staged");
+    assert_eq!(m.blob(&digest(1)), staged_at(2, 0), "a duplicate");
+    assert_eq!(reseat(&mut m, 1, part(5, 100, &[(2, 0)]), false), Ok(()));
+    assert_eq!(state(&m, 5), Some(StagedState::Open));
+    assert_eq!(m.blob(&digest(1)), staged_at(2, 0));
+    assert_eq!(m.blob(&digest(2)), staged_at(5, 0));
+}
+
+/// Catches: a retry accepted on half the evidence. `from` having left is not enough (it
+/// may have been flushed): the new object must be held too, in the table or, for a store
+/// object, as every record's location; and a new object that is held while `from` never
+/// left is refused as the repeat it is.
+#[test]
+fn a_reseat_retry_needs_both_the_old_object_gone_and_the_new_one_held() {
+    let mut m = two_sealed();
+    stage(&mut m, sealed(part(5, 100, &[(7, 0)]))).expect("staged");
+    assert_eq!(
+        reseat(&mut m, 9, sealed(part(5, 100, &[(7, 0)])), false),
+        Err(TierError::NotStaged(object(9)))
+    );
+
+    let mut f = two_sealed();
+    assert_eq!(flushed(&mut f, 1), Ok(()));
+    let stored = sealed(part(9, 300, &[(1, 0), (2, 100)]));
+    assert_eq!(
+        reseat(&mut f, 1, stored, true),
+        Err(TierError::Left(object(1)))
+    );
+}

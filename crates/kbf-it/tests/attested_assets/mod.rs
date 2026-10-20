@@ -79,6 +79,24 @@ pub fn packaged_debs(workflow: &str) -> Result<Vec<String>, String> {
     Ok(found)
 }
 
+/// The platform (always `darwin-arm64`) of every `cargo xtask pkg-macos-asset` line in the
+/// workflow's `run:` steps that makes the Mac `kbf-installer` `.pkg` an asset (it has no
+/// `--verify-only`: that one only checks the file the attest job signed), in file order.
+pub fn packaged_macos_pkgs(workflow: &str) -> Result<Vec<String>, String> {
+    let mut found = Vec::new();
+    for step in workflows::run_steps(workflow)? {
+        for line in step.script.lines().map(str::trim_start) {
+            let Some(args) = line.strip_prefix("cargo xtask pkg-macos-asset ") else {
+                continue;
+            };
+            if !args.split_whitespace().any(|w| w == "--verify-only") {
+                found.push("darwin-arm64".to_owned());
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// The (subject-path, sbom-path) of every `actions/attest-sbom` step of `job`. An error
 /// for such a step that lacks either path, or that is under `if:` or
 /// `continue-on-error:` (it could be skipped while the job passes).

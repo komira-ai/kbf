@@ -22,31 +22,41 @@ pub mod bundle;
 pub mod cli;
 #[cfg(test)]
 mod cli_flag_tests;
+#[cfg(test)]
+mod cli_observe_tests;
 mod frontend;
 mod frontend_addr;
 #[cfg(test)]
 mod frontend_addr_tests;
+mod gates;
+mod interrupt;
 mod nodes;
+pub mod observe;
 pub mod offer;
 mod post;
+mod record;
 pub mod smoke;
 #[cfg(test)]
 pub(super) mod smoke_tests;
 mod summary;
 #[cfg(test)]
 mod tests;
+pub mod update;
+#[cfg(test)]
+mod update_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::CommitId;
 use api::{Operator, Reply, Request};
+use gates::Gates;
 pub use offer::{Attest, GhAttest, HostProbe, NoProbe, OfferPolicy, Probe, ProbeFault, Stage};
 pub use summary::{Exit, NodeResult, OfferRecord, PostResult, Previous, Step, Summary};
 
@@ -120,6 +130,9 @@ pub struct Options {
     pub request_id: String,
     /// Without it: read-only steps, then print the plan.
     pub apply: bool,
+    /// Ask the new frontend to update the nodes once it has baked (the update API's `nodes`).
+    /// `deploy` does; `update` leaves it to the caller.
+    pub nodes: bool,
     pub node_timeout: Duration,
     /// The whole frontend step: the POST (and its retries) and the wait for `done`. It
     /// includes the new frontend's bake.
@@ -132,6 +145,13 @@ pub struct Options {
     pub poll: Duration,
     /// How long members have to become active after the roll.
     pub members_timeout: Duration,
+    /// Gate E: how long after a node step the farm has to be fully replicated again.
+    pub settle: Duration,
+    /// Where the result document is written; with `None` none is (a unit test of the logic).
+    pub result: Option<PathBuf>,
+    /// The hash of the release set (`SHA256SUMS`) when the caller has it; else the document
+    /// carries one derived from what the store holds.
+    pub set_hash: Option<kbf_gate::SetHash>,
     /// What the deploy requires of an offer (docs/design/gamma-deploy.md, "The offer").
     pub offer: OfferPolicy,
 }
@@ -142,6 +162,7 @@ impl Options {
             commit,
             request_id,
             apply: false,
+            nodes: true,
             node_timeout: Duration::from_secs(1800),
             handover_timeout: Duration::from_secs(3600),
             smoke_timeout: Duration::from_secs(60),
@@ -149,6 +170,9 @@ impl Options {
             host_platform: host_platform.to_owned(),
             poll: Duration::from_secs(5),
             members_timeout: Duration::from_secs(120),
+            settle: Duration::from_secs(600),
+            result: None,
+            set_hash: None,
             offer: OfferPolicy::Unchecked,
         }
     }
@@ -156,7 +180,13 @@ impl Options {
 
 /// What a deploy talks to.
 pub struct Env<'a> {
+    /// The update API: every call that reads or changes the release (`--api`).
     pub api: &'a dyn Operator,
+    /// Finds the frontend the gates observe (`--observe`, `--observe-base-port`):
+    /// `/metrics` and `/v1/invocations`. A different listener from `api` on a real host (the
+    /// public proxy answers its own `/metrics`, and the update routes are not the child's), so
+    /// a gate never reads `api`. Asked again after every frontend step.
+    pub observe: &'a dyn observe::Observe,
     pub clock: &'a dyn Clock,
     pub smoke: &'a dyn Smoke,
     pub check: &'a dyn Check,
@@ -233,6 +263,9 @@ pub(crate) struct Run<'a> {
     pub env: &'a Env<'a>,
     pub opts: &'a Options,
     pub sum: Summary,
+    pub gates: Gates,
+    /// The frontend the gates read now; set by [`Run::resolve_observed`].
+    pub observed: Option<observe::Observed<'a>>,
     /// Every node the preflight saw (id to platform): the nodes the roll is waited for on.
     /// The new frontend lists only the nodes that have reconnected to it, so a list that
     /// lacks one of these is not a roll that finished.
@@ -257,6 +290,28 @@ impl Run<'_> {
             .ok_or_else(|| format!("GET {path}: the body is not JSON"))
     }
 
+    /// GET `path` from the observed frontend and parse the JSON body.
+    pub fn observe_json(&self, path: &str) -> Result<Value, String> {
+        let reply = self
+            .observe_send(&Request::get(path))
+            .map_err(|e| format!("GET {path}: {e}"))?;
+        if reply.status != 200 {
+            return Err(format!("GET {path}: status {}", reply.status));
+        }
+        reply
+            .json()
+            .ok_or_else(|| format!("GET {path}: the body is not JSON"))
+    }
+
+    /// Send `request` to the observed frontend (never to the update API).
+    pub fn observe_send(&self, request: &Request) -> Result<Reply, String> {
+        let observed = self
+            .observed
+            .as_ref()
+            .ok_or("no frontend to observe was resolved")?;
+        observed.api.send(request).map_err(|e| e.to_string())
+    }
+
     /// Run `body` as the step `name` and record it. A skipped step is `Ok(false)`.
     fn step<T>(
         &mut self,
@@ -276,20 +331,66 @@ impl Run<'_> {
 
 /// Run a deploy to its end and return the summary. `bundle` is the tar on standard input,
 /// if there is one.
+///
+/// An applied deploy also writes its result document (`opts.result`): `RUNNING` before the
+/// first request and `FINISHED` before this function returns, whatever the end, so the caller
+/// may `exit` at once. The one-line summary stays beside it until the exit codes 0 to 5 are
+/// mapped to the document's statuses by the callers; it is removed on 2026-12-01 (the
+/// document is the only format after that).
 pub fn deploy(env: &Env, opts: &Options, bundle: Option<&mut dyn Read>) -> Summary {
+    let began = env.clock.now();
+    let mut run = Run {
+        env,
+        opts,
+        sum: Summary::new(&opts.commit, began),
+        gates: Gates::new(opts.apply),
+        observed: None,
+        expected: BTreeMap::new(),
+    };
+    let record = match record::open(&run) {
+        Ok(record) => record,
+        Err(f) => {
+            run.sum.ended = summary::utc(env.clock.now());
+            run.sum.end(f.exit, f.reason, &f.detail);
+            return run.sum;
+        }
+    };
+    let mut outcome = run.go(bundle);
+    // The end of the gates runs after a failed deploy too, so the document is whole.
+    let ended = run.gate_finish();
+    if outcome.is_ok() {
+        outcome = ended;
+    }
+    run.sum.ended = summary::utc(env.clock.now());
+    match outcome {
+        Ok(()) => {}
+        Err(f) => run.sum.end(f.exit, f.reason, &f.detail),
+    }
+    if let Some(record) = record {
+        record::seal(&mut run, record, began);
+    }
+    run.sum
+}
+
+/// The frontend step of a deploy, alone: ask the update API to swap the frontend and wait for
+/// the update to end. `kbf-installer update --frontend` is this. No bundle, no preflight, no
+/// node watch and no smoke: the summary holds the one step. The exit is the summary's own
+/// (`Ok` for an update that is `done`, or already runs the commit).
+pub fn update_frontend(env: &Env, opts: &Options) -> (Summary, Exit) {
     let mut run = Run {
         env,
         opts,
         sum: Summary::new(&opts.commit, env.clock.now()),
         expected: BTreeMap::new(),
     };
-    let outcome = run.go(bundle);
+    let outcome = run.step("frontend", |r| r.update_frontend());
     run.sum.ended = summary::utc(env.clock.now());
-    match outcome {
-        Ok(()) => {}
-        Err(f) => run.sum.end(f.exit, f.reason, &f.detail),
-    }
-    run.sum
+    let (exit, reason, detail) = match outcome {
+        Ok(()) => (Exit::Ok, "", String::new()),
+        Err(f) => (f.exit, f.reason, f.detail),
+    };
+    run.sum.end(exit, reason, &detail);
+    (run.sum, exit)
 }
 
 impl Run<'_> {
@@ -484,6 +585,14 @@ impl Run<'_> {
                 "a frontend update is in flight",
             ));
         }
+        self.gates.derived_set_hash = nodes::set_hash(&releases, self.opts.commit.as_str());
+        // The gates start from a farm that is healthy now: storage fully replicated, no lost
+        // blob, nothing untraced. Nothing has been changed yet, so a red is a refusal.
+        self.gate_step("preflight");
+        self.resolve_observed("preflight", Exit::Refused)?;
+        let under = self.gate_scrape(Exit::Refused)?;
+        self.gate_preflight_storage(under)?;
+        self.gate_snapshot(Exit::Refused)?;
         Ok(())
     }
 

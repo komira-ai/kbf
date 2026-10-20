@@ -29,18 +29,11 @@ fn run_as(euid: u32, args: &[&str]) -> (Exit, String, String) {
 /// Every verb of the contract's table and the pull request that builds it. The verbs that
 /// are not built say so with the phase; the ones that are built (`run`, `setup` and the operator's) are not here.
 fn stubs() -> Vec<(Vec<&'static str>, &'static str, &'static str)> {
-    let commit: &'static str = B;
     vec![
         (vec!["status"], "status", "P4"),
-        (
-            vec!["update", "--commit", commit, "--frontend"],
-            "update",
-            "P13",
-        ),
         (vec!["check"], "check", "P10"),
         (vec!["stage"], "stage", "P8"),
         (vec!["activate"], "activate", "P5"),
-        (vec!["fetch-child"], "fetch-child", "P7"),
     ]
 }
 
@@ -79,6 +72,77 @@ fn only_status_and_check_run_without_root() {
     }
 }
 
+/// The fetch child is built (P7) and runs as the fetch user, not as root: it is not gated on
+/// root, it prints nothing on standard output but the component's bytes (never JSON, whatever
+/// the global flag), and it says why it fetched nothing in one line on standard error.
+///
+/// Catches the child inheriting the "needs root" gate (it would never start as `kbf-fetch`) and
+/// a child that prints prose where the parent counts bytes.
+#[test]
+fn the_fetch_child_is_no_root_verb_and_reports_in_one_line() {
+    let digest = "a".repeat(64);
+    for json in [false, true] {
+        let mut args = vec!["fetch-child"];
+        if json {
+            args.insert(0, "--json");
+        }
+        args.extend([
+            "--kind",
+            "url",
+            "--url",
+            "http://h.example",
+            "--sha256",
+            &digest,
+            "--limit",
+            "10",
+        ]);
+        let (exit, out, err) = run_as(1000, &args);
+        assert_eq!(exit, Exit::Failed, "{err}");
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(err.starts_with("fetch-child: "), "{err}");
+    }
+}
+
+/// The fetch child is asked for a blob (`--sha256`) or for what a release holds (`--describe`),
+/// one of the two; `--platform` belongs to a description.
+///
+/// Catches a child started with both (it would not know which to do), with neither, or with a
+/// platform and nothing to apply it to: all refused by the parser, before the child's own
+/// check of its flags. (A platform with a blob passes the parser, which drops a requirement a
+/// conflict rules out; the child refuses it itself.)
+#[test]
+fn the_fetch_child_takes_a_blob_or_a_release() {
+    let digest = "a".repeat(64);
+    let base = [
+        "fetch-child",
+        "--kind",
+        "url",
+        "--url",
+        "https://h.example",
+        "--limit",
+        "10",
+    ];
+    let with = |extra: &[&str]| {
+        let mut full = vec!["kbf-installer"];
+        full.extend(base);
+        full.extend_from_slice(extra);
+        Cli::try_parse_from(full)
+    };
+    assert!(with(&["--sha256", &digest]).is_ok());
+    assert!(with(&["--describe", A]).is_ok());
+    assert!(with(&["--describe", A, "--platform", "linux-x86_64"]).is_ok());
+    assert!(with(&[]).is_err(), "neither");
+    assert!(
+        with(&["--sha256", &digest, "--describe", A]).is_err(),
+        "both"
+    );
+    assert!(
+        with(&["--platform", "linux-x86_64"]).is_err(),
+        "a platform alone"
+    );
+}
+
 /// Catches the proxy verb asking for root (it runs as the service user), a refused table
 /// leaving as anything but a usage error with its path, and `--json` losing the reason.
 #[test]
@@ -109,7 +173,7 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
 
     fs::write(
         &file,
-        "[proxy]\noperator_token_file = \"/a\"\nserver_cert_file = \"/b\"\nserver_key_file = \"/c\"\nclient_ca_file = \"/d\"\n[proxy.upstream]\nbase_port = 18000\n",
+        "database = \"postgres:///kbf?host=/nonexistent\"\n[proxy]\noperator_token_file = \"/a\"\nserver_cert_file = \"/b\"\nserver_key_file = \"/c\"\nclient_ca_file = \"/d\"\n[proxy.upstream]\nbase_port = 18000\n",
     )
     .expect("write");
     let (exit, out, err) = run_as(1000, &["proxy", "--check", "--config", &path]);
@@ -120,6 +184,7 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
             config: Some(file),
             check: true,
             update_dir: "/var/lib/kbf-installer".into(),
+            orders_dir: "/var/lib/kbf-installer/orders".into(),
         })
         .needs_root()
     );
@@ -246,7 +311,8 @@ fn no_command_takes_a_positional_argument() {
     assert!(found.is_empty(), "{found:?}");
 }
 
-/// Catches the public verb list drifting from the contract's table (section 2): the visible
+/// Catches the public verb list drifting from the contract's table (section 2) plus the
+/// state database's `backup` and `restore` (frontend-proxy.md section 11): the visible
 /// verbs, and that the three internal ones stay out of the help.
 #[test]
 fn the_visible_verbs_are_the_contracts() {
@@ -272,6 +338,8 @@ fn the_visible_verbs_are_the_contracts() {
             "migrate",
             "quiesce",
             "check",
+            "backup",
+            "restore",
             "proxy"
         ]
     );
@@ -778,6 +846,65 @@ fn run_with_an_installer_config_refuses_a_relative_host_root() {
     assert!(refused.is_some_and(|f| !f.why.is_empty()));
 }
 
+/// Catches `update` being gated on root (it is a client of the update API and runs as
+/// whoever can read the token file) or not reaching its own code: a bad address is its own
+/// usage error, as an ordinary user, and prints no summary.
+#[test]
+fn update_runs_without_root_and_reports_its_own_usage_errors() {
+    let args = ["update", "--commit", B, "--frontend", "--api", "nowhere"];
+    let (exit, out, err) = run_as(1000, &args);
+    assert_eq!(exit, Exit::Usage);
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.contains("update: --api") && err.contains("host:port"),
+        "{err}"
+    );
+    assert!(!parse(&args).verb.needs_root());
+    assert_eq!(parse(&args).verb.name(), "update");
+}
+
+/// Catches `update` taking a caller-chosen API address and token file as root: through sudo
+/// (`SUDO_UID` of another account) it is refused as a usage error before the token file is
+/// read or any address is dialed, and says why. Fails without the refusal: the run would go to
+/// the address and report the unreadable token file instead.
+#[test]
+fn update_is_refused_through_sudo_before_it_reads_anything() {
+    let Verb::Update(args) = parse(&[
+        "update",
+        "--commit",
+        B,
+        "--frontend",
+        "--api",
+        "127.0.0.1:1",
+        "--token-file",
+        "/nonexistent/token",
+    ])
+    .verb
+    else {
+        panic!("an update");
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(update_verb(&args, true, &mut out, &mut err), Exit::Usage);
+    let err = String::from_utf8(err).expect("text");
+    assert!(out.is_empty());
+    assert!(err.contains("not accepted through sudo"), "{err}");
+    assert!(!err.contains("/nonexistent"), "{err}");
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    update_verb(&args, false, &mut out, &mut err);
+    let err = String::from_utf8(err).expect("text");
+    assert!(!err.contains("through sudo"), "{err}");
+}
+
+/// Catches a sudo test that takes root's own `SUDO_UID` or an unset one for another account
+/// (an operator running as root would be refused), or a caller's uid for none.
+#[test]
+fn only_a_sudo_uid_of_another_account_is_a_sudo_caller() {
+    use std::ffi::OsStr;
+    assert!(!is_sudo_uid(None));
+    assert!(!is_sudo_uid(Some(OsStr::new("0"))));
+    assert!(is_sudo_uid(Some(OsStr::new("1000"))));
+}
+
 /// Writes `mode = "<mode>"` as the host's `kbf.toml` under `root`.
 fn write_kbf_toml(root: &Path, text: &str) {
     fs::create_dir_all(root.join("etc/kbf")).expect("etc");
@@ -996,10 +1123,21 @@ fn the_verbs_that_manage_a_host_wait_for_its_migration() {
 /// Mutants to plant: `Verb::FetchChild` or `Verb::Migrate(_)` moved to the `true` arm; `Verb::Setup(_)` to the `false` one.
 #[test]
 fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
-    let held: [&[&str]; 10] = [
+    let digest = "a".repeat(64);
+    let fetch_child = [
+        "fetch-child",
+        "--kind",
+        "url",
+        "--url",
+        "http://h.example",
+        "--sha256",
+        digest.as_str(),
+        "--limit",
+        "10",
+    ];
+    let held: [&[&str]; 9] = [
         &["setup", "--mode=frontend"],
         &RUN,
-        &["update", "--commit", B, "--frontend"],
         &["confirm", "--id=1-5", "--unit", "kbf.service"],
         &["revert", "--id=1-5", "--unit", "kbf.service"],
         &["rollback", "--unit", "kbf.service"],
@@ -1008,13 +1146,23 @@ fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
         &["stage"],
         &["activate"],
     ];
-    let free: [&[&str]; 6] = [
+    let free: [&[&str]; 7] = [
+        // `update` is an unprivileged client of the proxy's API (new-layout hosts only); the
+        // root half it asks for, `run`, is held.
+        &[
+            "update",
+            "--commit",
+            B,
+            "--frontend",
+            "--api",
+            "127.0.0.1:1",
+        ],
         &["status"],
         &["check"],
         &["boot-check"],
         &["quiesce"],
         &["migrate"],
-        &["fetch-child"],
+        &fetch_child,
     ];
     for args in held {
         assert!(parse(args).verb.manages_host(), "{args:?} is held");
@@ -1247,3 +1395,6 @@ fn a_path_is_not_joined_to_a_relative_root() {
         PathBuf::from("/srv/root/etc/kbf/installer.toml")
     );
 }
+
+#[path = "app_backup_tests.rs"]
+mod backup_cli;

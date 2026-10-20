@@ -1,0 +1,9 @@
+# Written by `kbf-installer setup`; run setup again to change these keys. Another setting
+# goes into the table it belongs to (add the key there, never a second table of the same name).
+mode = "storage"
+
+[frontend]
+url = "https://farm.example:8443"
+
+[enroll]
+token_file = "/etc/kbf/enroll.token"

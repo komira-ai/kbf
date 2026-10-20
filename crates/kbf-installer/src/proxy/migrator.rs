@@ -6,8 +6,12 @@
 //! transaction per migration and the expand-only lint; `kbf-installer setup` and the root
 //! half's `activate` use the same. What is here is the swap's side of it:
 //!
-//! - **Which schema.** The `state_schema` of the staged release, read from `status.json`
-//!   through [`RootOrders::staged`], and only when the staged commit is the one asked for.
+//! - **Which schema.** The `state_schema` of the release asked for, and only when it is a
+//!   release whose facts are known. The staged release's are in `status.json`
+//!   ([`StatusFacts::staged`]); that is the swap's. The installed release (a cold start,
+//!   after a reboot) has none there once the root half has restarted, so it is asked: its own
+//!   `--version --json` ([`installed_schema`]), as the unprivileged user the proxy runs as.
+//!   Any other commit is `not_staged`: a guess could migrate past what the release runs on.
 //! - **A bounded wait.** The swap calls this with the old child serving (and, for an
 //!   all-in-one host, its streams held), so every lock wait ends after
 //!   [`DbMigrator::LOCK_WAIT`]: a second installer holding the schema lock, or a long read
@@ -26,21 +30,27 @@
 //!   `database_error: ... (SQLSTATE 28000)`. Server text about a migration's own
 //!   statements (a table that does not exist) is kept: it names the migration's objects.
 
+use std::path::Path;
 use std::time::Duration;
 
 use kbf_state::postgres::schema::{Outcome, SchemaError};
 
 use crate::CommitId;
+use crate::binary::Version;
 use crate::database::Database;
+use crate::run::{Runner, Spawn};
 
 use super::model::PortError;
-use super::ports::{Migrator, RootOrders};
+use super::ports::{Migrator, StatusFacts};
 
 /// Why a migration was refused. Each has a stable [`word`](Refusal::word).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// The release is not the staged one (or `status.json` cannot say).
     NotStaged,
+    /// The installed release did not say which schema it needs (its `--version --json`
+    /// failed, or is not that release's).
+    SchemaUnknown,
     /// The release needs a schema this installer does not embed, or the database is ahead of
     /// it: update the kbf-installer package first.
     InstallerTooOld,
@@ -63,6 +73,7 @@ impl Refusal {
     pub const fn word(self) -> &'static str {
         match self {
             Refusal::NotStaged => "not_staged",
+            Refusal::SchemaUnknown => "schema_unknown",
             Refusal::InstallerTooOld => "installer_too_old",
             Refusal::NotAdditive => "not_additive",
             Refusal::SchemaInvalid => "schema_invalid",
@@ -103,10 +114,14 @@ impl Refusal {
 /// The swap's [`Migrator`] over the state database.
 pub struct DbMigrator<'a> {
     db: Database,
-    orders: &'a dyn RootOrders,
+    facts: &'a dyn StatusFacts,
+    installed: Option<Asked<'a>>,
     lock_wait: Duration,
     apply: Apply<'a>,
 }
+
+/// How the `state_schema` of the installed release is learnt: from the release itself.
+type Asked<'a> = Box<dyn Fn(&CommitId) -> Result<u32, PortError> + 'a>;
 
 /// What runs the migrations: the database, the schema wanted and the lock wait. A seam so
 /// that a test sees which bounds are handed over.
@@ -117,19 +132,31 @@ impl<'a> DbMigrator<'a> {
     /// swap in this step has nothing started yet.
     pub const LOCK_WAIT: Duration = Duration::from_secs(30);
 
-    /// Migrates `db`, learning the schema a release needs from `orders`.
+    /// Migrates `db`, learning the schema a staged release needs from `facts`. A release
+    /// that is not the staged one is refused until [`knowing_installed`](Self::knowing_installed).
     #[must_use]
-    pub fn new(db: Database, orders: &'a dyn RootOrders) -> DbMigrator<'a> {
+    pub fn new(db: Database, facts: &'a dyn StatusFacts) -> DbMigrator<'a> {
         DbMigrator {
             db,
-            orders,
+            facts,
+            installed: None,
             lock_wait: Self::LOCK_WAIT,
             apply: Box::new(Database::migrate_within),
         }
     }
 
+    /// Also migrates for the installed release (the cold start's), asking `ask` which
+    /// schema it needs when `status.json` does not say.
+    #[must_use]
+    pub fn knowing_installed(
+        mut self,
+        ask: impl Fn(&CommitId) -> Result<u32, PortError> + 'a,
+    ) -> DbMigrator<'a> {
+        self.installed = Some(Box::new(ask));
+        self
+    }
+
     /// Runs `apply` instead of the database, to see what it is handed.
-    #[cfg(test)]
     pub(super) fn with_apply(mut self, apply: Apply<'a>) -> DbMigrator<'a> {
         self.apply = apply;
         self
@@ -142,14 +169,59 @@ impl<'a> DbMigrator<'a> {
         self
     }
 
-    /// The `state_schema` of `release`, if it is the staged one.
+    /// The `state_schema` of `release`: the staged one's from `status.json`, else the
+    /// installed one's from itself.
     fn needs(&self, release: &CommitId) -> Result<u32, PortError> {
-        match self.orders.staged() {
-            Ok(Some(facts)) if facts.commit == *release => Ok(facts.state_schema),
-            Ok(_) => Err(Refusal::NotStaged.because("the staged release is not this update's")),
-            Err(e) => Err(Refusal::NotStaged.because(format!("status.json: {e}"))),
+        match self.facts.staged() {
+            Ok(Some(facts)) if facts.commit == *release => return Ok(facts.state_schema),
+            Ok(_) => {}
+            Err(e) => return Err(Refusal::NotStaged.because(format!("status.json: {e}"))),
+        }
+        let installed = self.facts.installed().ok().flatten().as_ref() == Some(release);
+        match (&self.installed, installed) {
+            (Some(ask), true) => ask(release),
+            _ => Err(Refusal::NotStaged.because("the staged release is not this update's")),
         }
     }
+}
+
+/// How long a release gets to print its version: the installer's own probe bound.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The `state_schema` the release at `program` (the executable of `release`) declares:
+/// `<program> --version --json`, run as the caller with an empty environment in `/`, read as
+/// strictly as the installer read it when it installed the release, and required to be
+/// `release`'s own build.
+///
+/// # Errors
+/// [`Refusal::SchemaUnknown`]: the program cannot run, runs past [`PROBE_TIMEOUT`], exits
+/// non-zero, prints something else than a version object, or names another commit.
+pub fn installed_schema(
+    runner: &dyn Runner,
+    program: &Path,
+    release: &CommitId,
+) -> Result<u32, PortError> {
+    let unknown = |why: String| Refusal::SchemaUnknown.because(why);
+    let ran = runner
+        .run(&Spawn {
+            program: program.to_owned(),
+            args: vec!["--version".into(), "--json".into()],
+            env: Vec::new(),
+            cwd: "/".into(),
+            run_as: None,
+            timeout: PROBE_TIMEOUT,
+        })
+        .map_err(|e| unknown(format!("the release did not run: {}", e.kind())))?;
+    if ran.timed_out || ran.code != Some(0) {
+        return Err(unknown(format!(
+            "--version --json did not finish cleanly (exit {:?}, timed out: {})",
+            ran.code, ran.timed_out
+        )));
+    }
+    let version = Version::parse(&ran.stdout)
+        .and_then(|version| version.check(release).map(|()| version))
+        .map_err(|fault| unknown(fault.to_string()))?;
+    u32::try_from(version.state_schema).map_err(|_| unknown("state_schema is too large".into()))
 }
 
 impl Migrator for DbMigrator<'_> {

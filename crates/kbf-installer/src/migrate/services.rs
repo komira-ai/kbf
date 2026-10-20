@@ -87,6 +87,37 @@ impl<E: Exec> Services<'_, E> {
         self.exec.apply(&Step::Run(cmd))
     }
 
+    /// Whether `unit` is set to start on its own: enabled for systemd (what `setup` asks
+    /// before it enables a unit), loaded into the system domain for launchd (what `setup`
+    /// asks before it bootstraps a job).
+    pub fn is_enabled(&self, unit: &Unit) -> io::Result<bool> {
+        match unit.kind() {
+            Kind::Systemd => {
+                let out = self
+                    .exec
+                    .query(&systemctl(&["is-enabled", "--", unit.as_str()]))?;
+                Ok(
+                    out.status.success()
+                        && String::from_utf8_lossy(&out.stdout).trim() == "enabled",
+                )
+            }
+            Kind::Launchd => self.is_active(unit),
+        }
+    }
+
+    /// Enable `unit` and start it now, as `setup` does for the installer's own unit
+    /// (`enable --now`; launchd has no enabled-but-stopped job, so a bootstrap).
+    pub fn enable_now(&mut self, unit: &Unit) -> io::Result<()> {
+        let cmd = match unit.kind() {
+            Kind::Systemd => systemctl(&["enable", "--now", "--", unit.as_str()]),
+            Kind::Launchd => {
+                let plist = format!("{}/{unit}", self.roots.unit_dir);
+                launchctl(&["bootstrap", "system", &plist])
+            }
+        };
+        self.exec.apply(&Step::Run(cmd))
+    }
+
     /// Make the unit manager read the unit files again (a no-op for launchd, which reads a
     /// plist when it is bootstrapped).
     pub fn reload(&mut self) -> io::Result<()> {

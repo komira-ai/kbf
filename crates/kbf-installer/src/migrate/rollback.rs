@@ -5,9 +5,13 @@
 //! as the migration (the old tools', then the installer's): a live installer can activate a
 //! release up to the moment it holds the lock, so only what is read under it is true.
 
+use std::os::fd::OwnedFd;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use kbf_host::{Exec, Mode};
 
 use super::apply::{remove_note, rules};
+use super::daemon_dirs;
 use super::error::MigrateError;
 use super::journal::{Journal, Phase};
 use super::newtree::StateDir;
@@ -15,7 +19,10 @@ use super::old::OldLock;
 use super::services::Services;
 use super::tree::{self, Rules};
 use super::units;
+use super::units::Unit;
 use super::{Migration, Outcome, Report};
+use crate::backup::utc_stamp;
+use crate::layout::Layout;
 use crate::state::{self, Locked, State, StateError};
 
 /// What a look at the journal and the installer's state came to.
@@ -94,8 +101,74 @@ fn look(
     })))
 }
 
+/// A kit host that was rolled back has no installer tree: it was moved aside, and the
+/// kit manages the Mac. Whatever the installer is asked on such a host (`migrate`, `setup`)
+/// is refused with the way back, which is the package. A tree that is there again (the
+/// package was reinstalled) is not refused.
+pub(super) fn refuse_if_installer_moved_aside(
+    layout: &Layout,
+    journal: &Journal,
+) -> Result<(), MigrateError> {
+    if journal.kit && journal.phase == Phase::RolledBack {
+        let root = layout.join(&layout.install_root());
+        if tree::absent(tree::open_root(&root))
+            .map_err(MigrateError::io(root.display().to_string()))?
+            .is_none()
+        {
+            return Err(MigrateError::KitRolledBack);
+        }
+    }
+    Ok(())
+}
+
+/// The two things a kit host's rollback moves aside, each as the directory it is in and its
+/// name: `installer.toml` (the installer job's `KeepAlive` is gated on it, so it goes first)
+/// and the installer's tree.
+fn aside_names(layout: &Layout) -> [(String, String); 2] {
+    let toml = layout.installer_toml();
+    let (config_dir, toml_name) = toml.as_str().rsplit_once('/').expect("an absolute path");
+    let tree = layout.install_root();
+    let (tree_dir, tree_name) = tree.as_str().rsplit_once('/').expect("an absolute path");
+    [
+        (config_dir.to_owned(), toml_name.to_owned()),
+        (tree_dir.to_owned(), tree_name.to_owned()),
+    ]
+}
+
+/// Move `installer.toml` and the installer's tree aside under `suffix`. Both targets are
+/// looked at before either move, so a name taken already refuses the lot with nothing moved;
+/// what is not there to move is taken to have been moved by an earlier run of this rollback.
+fn move_aside(layout: &Layout, suffix: &str) -> Result<Vec<String>, MigrateError> {
+    let mut plan = Vec::new();
+    for (dir, name) in aside_names(layout) {
+        let fd: OwnedFd = tree::open_root(&layout.join(&host_dir(&dir)))
+            .map_err(MigrateError::io(dir.clone()))?;
+        let target = format!("{name}{suffix}");
+        let path = format!("{dir}/{name}");
+        if tree::holds(&fd, &name).map_err(MigrateError::io(path.clone()))? {
+            if tree::holds(&fd, &target).map_err(MigrateError::io(path.clone()))? {
+                return Err(MigrateError::Conflict(format!(
+                    "{dir}/{target} is there already: the rollback will not replace it; move it \
+                     away and run the rollback again"
+                )));
+            }
+            plan.push((fd, path, name, target));
+        }
+    }
+    let mut moved = Vec::new();
+    for (fd, path, name, target) in plan {
+        tree::rename_within(&fd, &name, &target).map_err(MigrateError::io(path.clone()))?;
+        moved.push(format!("{path} is now {path}{suffix}"));
+    }
+    Ok(moved)
+}
+
+fn host_dir(dir: &str) -> kbf_host::path::HostPath {
+    kbf_host::path::HostPath::new(dir).expect("a directory of the layout")
+}
+
 /// What the rollback says it does.
-fn plan(mode: Mode, unknown_state: Option<String>) -> Report {
+fn plan(mode: Mode, kit: bool, unknown_state: Option<String>) -> Report {
     let mut report = Report::new(match mode {
         Mode::DryRun => Outcome::Planned,
         Mode::Apply => Outcome::RolledBack,
@@ -110,11 +183,36 @@ fn plan(mode: Mode, unknown_state: Option<String>) -> Report {
         mode,
         "restore the units' originals, enable the old helper, start what ran before",
     );
+    if kit {
+        report.line(
+            mode,
+            "then boot out and disable the installer's own job and move installer.toml and the \
+             installer's tree aside, so the kit alone manages this Mac",
+        );
+    }
     report
 }
 
 /// Put the host back on the old layout, or (in a dry run) say what would be done.
+/// The package's installer job on a Mac (`packaging/macos`), stopped by a kit-host rollback
+/// when `--installer-unit` names none.
+const KIT_INSTALLER_JOB: &str = "com.komira.kbf-installer.plist";
+
 pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Report, MigrateError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    rollback_at(m, exec, mode, now)
+}
+
+/// [`rollback`] at `now_secs` since the epoch: the time a kit host's moved-aside files are
+/// named for.
+pub fn rollback_at<E: Exec>(
+    m: &Migration,
+    exec: &mut E,
+    mode: Mode,
+    now_secs: u64,
+) -> Result<Report, MigrateError> {
     let rules = rules(m);
     // The first look takes no lock. It is all of a dry run, and an apply's chance to refuse
     // before it waits for anything.
@@ -123,7 +221,7 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
         Look::Go(go) => go,
     };
     if mode == Mode::DryRun {
-        return Ok(plan(mode, first.unknown_state));
+        return Ok(plan(mode, first.journal.kit, first.unknown_state));
     }
     if exec.euid() != m.owner_uid {
         return Err(MigrateError::NotRoot {
@@ -135,7 +233,10 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
     // no longer (busy, exit 4), and held to the end: the installer is stopped below with
     // its lock held, so it writes no state while the old layout comes back, and no verb of
     // the old tools runs while its units start.
-    let _old_lock = OldLock::take(&m.layout, &m.roots, m.lock_wait)?;
+    // A kit host's migration took no old lock, so a rollback takes none.
+    let _old_lock = (!first.journal.kit)
+        .then(|| OldLock::take(&m.layout, &m.roots, m.lock_wait))
+        .transpose()?;
     state::make_lock_dir(&m.layout)?;
     let lock = Locked::acquire_within(&m.layout, m.lock_wait)?;
     // What was read before the locks may be stale: the installer may have activated a
@@ -149,12 +250,13 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
         Look::Settled(report) => return Ok(report),
         Look::Go(go) => *go,
     };
-    let mut report = plan(mode, unknown_state);
+    let mut report = plan(mode, journal.kit, unknown_state);
     let mut svc = Services {
         exec,
         roots: &m.roots,
     };
-    if let Some(installer) = &m.installer_unit
+    // A kit host's installer job is booted out after the kit's own is back (below).
+    if let Some(installer) = m.installer_unit.as_ref().filter(|_| !journal.kit)
         && svc
             .is_active(installer)
             .map_err(MigrateError::io(installer.as_str()))?
@@ -191,6 +293,7 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
             );
         }
     }
+    daemon_dirs::restore(m, svc.exec, mode, &mut report)?;
     svc.reload().map_err(MigrateError::io("daemon-reload"))?;
     if let Some(helper) = &journal.helper_unit {
         svc.enable(helper)
@@ -201,14 +304,61 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
         svc.start(&unit).map_err(MigrateError::io(unit.as_str()))?;
         report.line(mode, format!("started {unit}"));
     }
+    if journal.kit {
+        // The kit refuses to manage a Mac while the installer's tree is there, so from here
+        // nothing of the installer may be able to act. The job goes first, then the file its
+        // `KeepAlive` waits on, then the tree it would run; a run that died between them
+        // finds the same suffix in the journal and finishes with it.
+        // A kit host's installer job is always the package's, named or not: its `KeepAlive`
+        // waits on the `installer.toml` moved aside below, so it is stopped first in every
+        // case, and the order of the two moves cannot let it start.
+        let installer = match &m.installer_unit {
+            Some(named) => named.clone(),
+            None => Unit::new(KIT_INSTALLER_JOB).expect("a plist name"),
+        };
+        if svc
+            .is_active(&installer)
+            .map_err(MigrateError::io(installer.as_str()))?
+        {
+            svc.stop(&installer)
+                .map_err(MigrateError::io(installer.as_str()))?;
+            report.line(mode, format!("booted out {installer}"));
+        }
+        svc.disable(&installer)
+            .map_err(MigrateError::io(installer.as_str()))?;
+        report.line(mode, format!("disabled {installer}"));
+        let suffix = match journal.aside.clone() {
+            Some(suffix) => suffix,
+            None => {
+                let suffix = format!(".rolled-back-{}", utc_stamp(now_secs));
+                journal.aside = Some(suffix.clone());
+                state_dir.put_journal(&journal)?;
+                suffix
+            }
+        };
+        for line in move_aside(&m.layout, &suffix)? {
+            report.line(mode, line);
+        }
+    }
     journal.phase = Phase::RolledBack;
     journal.stopped.clear();
     state_dir.put_journal(&journal)?;
-    remove_note(m)?;
-    report.warnings.push(
-        "rolled back: the old layout runs again. The new tree is kept; `kbf-installer migrate --apply` \
-         moves the host over again."
-            .to_owned(),
-    );
+    if journal.kit {
+        report.warnings.push(
+            "rolled back: the Mac kit runs again and nothing of the installer can act on this \
+             Mac. Its job is booted out and disabled, and installer.toml and the installer's \
+             tree were moved aside (the `.rolled-back-...` names above); /var/db/kbf-installer, \
+             the journal, is kept. To hand the host to the installer again, reinstall the \
+             kbf-installer .pkg and run `kbf-installer migrate --apply`."
+                .to_owned(),
+        );
+    } else {
+        remove_note(m)?;
+        report.warnings.push(
+            "rolled back: the old layout runs again. The new tree is kept; `kbf-installer migrate --apply` \
+             moves the host over again."
+                .to_owned(),
+        );
+    }
     Ok(report)
 }

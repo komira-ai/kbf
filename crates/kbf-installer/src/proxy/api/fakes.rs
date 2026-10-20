@@ -171,6 +171,8 @@ pub struct SupState {
     pub starts: Vec<UpdateSpec>,
     pub calls: Vec<&'static str>,
     pub start_fails: bool,
+    /// What `start_blocked` answers.
+    pub blocked: Option<String>,
     /// The error the next abort, rollback or force-retire answers with.
     pub fail: Option<SupervisorError>,
 }
@@ -184,6 +186,8 @@ impl SupState {
         }
         for u in self.status.update.iter_mut() {
             u.phase = Phase::RolledBack;
+            // The new child is stood down: the old one serves again.
+            u.active_slot = Slot::A;
         }
         Ok(Phase::RolledBack)
     }
@@ -201,7 +205,15 @@ impl FakeSupervisor {
             to: c(B),
             phase,
             since_s: 1_800_000_000,
-            active_slot: Slot::B,
+            // The serving child: the old one (A) until the switch, the new one (B) after.
+            active_slot: if matches!(
+                phase,
+                Phase::Switched | Phase::Baking | Phase::Nodes | Phase::Draining | Phase::Done
+            ) {
+                Slot::B
+            } else {
+                Slot::A
+            },
             old,
             new: NewChild { open_streams: 3 },
             nodes_updated,
@@ -216,9 +228,18 @@ impl FakeSupervisor {
     pub fn starts(&self) -> usize {
         self.0.lock().unwrap().starts.len()
     }
+
+    /// From now on the supervisor says it cannot start (`None` says it can again).
+    pub fn block(&self, why: Option<&str>) {
+        self.0.lock().unwrap().blocked = why.map(str::to_owned);
+    }
 }
 
 impl Supervisor for FakeSupervisor {
+    fn start_blocked(&self) -> Option<String> {
+        self.0.lock().unwrap().blocked.clone()
+    }
+
     fn start(&mut self, spec: &UpdateSpec) -> Result<(), SupervisorError> {
         let mut s = self.0.lock().unwrap();
         s.calls.push("start");

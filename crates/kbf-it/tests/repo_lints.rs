@@ -45,6 +45,9 @@
 //!   (module `coverage_wiring`);
 //! - the bake evaluator named anywhere under `.github/` (a workflow, a local action or any
 //!   other file): it runs on the operator's side, never in Actions (module `bake_operator_side`);
+//! - a test scratch directory made by joining a name onto the system temporary directory
+//!   instead of with `kbf_testkit::dir::TestDir`, outside a short list that says why each
+//!   does not leak (module `scratch_dirs`, whose docs say what it misses);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
 //!   scanned or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
@@ -58,6 +61,7 @@ mod interpreters;
 mod kbf_spawns;
 mod release_artifacts;
 mod release_workflow;
+mod scratch_dirs;
 mod test_spawns;
 mod workflows;
 
