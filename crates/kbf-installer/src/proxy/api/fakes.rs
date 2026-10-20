@@ -186,6 +186,8 @@ impl SupState {
         }
         for u in self.status.update.iter_mut() {
             u.phase = Phase::RolledBack;
+            // The new child is stood down: the old one serves again.
+            u.active_slot = Slot::A;
         }
         Ok(Phase::RolledBack)
     }
@@ -203,7 +205,15 @@ impl FakeSupervisor {
             to: c(B),
             phase,
             since_s: 1_800_000_000,
-            active_slot: Slot::B,
+            // The serving child: the old one (A) until the switch, the new one (B) after.
+            active_slot: if matches!(
+                phase,
+                Phase::Switched | Phase::Baking | Phase::Nodes | Phase::Draining | Phase::Done
+            ) {
+                Slot::B
+            } else {
+                Slot::A
+            },
             old,
             new: NewChild { open_streams: 3 },
             nodes_updated,
