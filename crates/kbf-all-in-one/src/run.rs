@@ -166,6 +166,7 @@ pub(crate) fn with_draining_daemon(
     serving: Serving,
     stop: tokio::sync::oneshot::Sender<()>,
     start: Starter,
+    signals: kbf_node::Signals,
     daemon: &kbf_node::Cli,
 ) -> Result<(), Failed> {
     let (ended, other_ended) = tokio::sync::oneshot::channel::<()>();
@@ -175,7 +176,7 @@ pub(crate) fn with_draining_daemon(
     });
     let node = start(daemon).map_err(Failed::Daemon)?;
     drain_then_stop(tokio, serving, stop, || {
-        node.serve_alongside(async move {
+        node.serve_alongside(signals, async move {
             let _ = other_ended.await;
         })
     })
@@ -397,12 +398,13 @@ mod tests {
         ])
         .expect("the daemon's flags");
         let tokio = Runtime::new().expect("runtime");
-        // The process handles SIGTERM from here on, whoever else is running in it.
-        let _handled = {
+        // Installed before the signal is sent: one that arrives before the daemon half
+        // serves is kept, as in the deployed mode where the storage half starts first.
+        let install = || {
             let _context = tokio.enter();
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("SIGTERM handler")
+            kbf_node::Signals::install().expect("handlers")
         };
+        let signals = install();
         let stopped_at = Arc::new(std::sync::Mutex::new(None));
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let serving = {
@@ -415,21 +417,9 @@ mod tests {
         };
         let start: Starter =
             Box::new(|cli| kbf_node::start_with::<LocalDataPlane>(cli, |_| Err("no plane".into())));
-        // Until the daemon half is serving its handler is not there to get the signal.
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let sender = {
-            let done = Arc::clone(&done);
-            std::thread::spawn(move || {
-                while !done.load(std::sync::atomic::Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    // SAFETY: raise(3) on this process, which handles SIGTERM above.
-                    assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
-                }
-            })
-        };
-        let served = with_draining_daemon(&tokio, serving, stop, start, &cli);
-        done.store(true, std::sync::atomic::Ordering::SeqCst);
-        sender.join().expect("sender");
+        // SAFETY: raise(3) on this process, which handles SIGTERM above.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        let served = with_draining_daemon(&tokio, serving, stop, start, signals, &cli);
         assert!(served.is_ok(), "drained and stopped");
         assert!(
             stopped_at.lock().expect("flag").is_some(),
@@ -442,7 +432,7 @@ mod tests {
             Ok(())
         });
         let refused: Starter = Box::new(|_| Err("no scratch".into()));
-        let failed = with_draining_daemon(&tokio, serving, stop, refused, &cli);
+        let failed = with_draining_daemon(&tokio, serving, stop, refused, install(), &cli);
         assert_eq!(
             failed.expect_err("refused").said("storage"),
             "daemon: no scratch"

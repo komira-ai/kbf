@@ -510,29 +510,30 @@ impl NodeHandle {
     /// The signal handlers cannot be installed, or no storage member is reachable from
     /// this host ([`kbf_daemon::reach`]).
     pub fn serve(self) -> Result<(), Error> {
-        self.serve_alongside(std::future::pending())
+        let signals = {
+            let _context = self.tokio.enter();
+            Signals::install()?
+        };
+        self.serve_alongside(signals, std::future::pending())
     }
 
-    /// [`Self::serve`] for a daemon beside another half in the same process: the first
-    /// signal drains as `serve` does (the half beside it is not told until the drain is
-    /// over, so a running lease still reaches its blobs through it), and `other` completing
-    /// (that half stopped on its own) stops the daemon at once, abandoning the leases
-    /// still running.
+    /// [`Self::serve`] for a daemon beside another half in the same process, on `signals`
+    /// the caller installed earlier ([`Signals::install`]: one that arrived since then is
+    /// the first, so a stop during the other half's start is not lost). The first signal
+    /// drains as `serve` does (the half beside it is not told until the drain is over, so
+    /// a running lease still reaches its blobs through it), and `other` completing (that
+    /// half stopped on its own) stops the daemon at once, abandoning the leases still
+    /// running.
     ///
     /// # Errors
-    /// As [`Self::serve`].
-    pub fn serve_alongside(self, other: impl Future<Output = ()>) -> Result<(), Error> {
-        // A signal handler is registered with the runtime's reactor, so the runtime's
-        // context is entered while it is made.
-        let (term, int) = {
-            let _context = self.tokio.enter();
-            (
-                signal(SignalKind::terminate())?,
-                signal(SignalKind::interrupt())?,
-            )
-        };
-        let (signals, received) = tokio::sync::mpsc::unbounded_channel();
-        self.tokio.spawn(forward(term, int, signals));
+    /// As [`Self::serve`], less the handlers.
+    pub fn serve_alongside(
+        self,
+        signals: Signals,
+        other: impl Future<Output = ()>,
+    ) -> Result<(), Error> {
+        let (sender, received) = tokio::sync::mpsc::unbounded_channel();
+        self.tokio.spawn(forward(signals, sender));
         self.drain_on(received, other)
     }
 
@@ -999,19 +1000,41 @@ fn native_runtime<C: Cas>(
 /// What the native driver's surveys send the daemon, merged.
 type Reports = tokio::sync::watch::Receiver<kbf_daemon::DriverReport>;
 
+/// The SIGTERM and SIGINT handlers of a process.
+pub struct Signals {
+    term: Signal,
+    int: Signal,
+}
+
+impl Signals {
+    /// Installs the handlers now, in the context of the tokio runtime that is entered:
+    /// from here on a signal is kept until [`Self::recv`] takes it, not given its default
+    /// action (which ends the process).
+    ///
+    /// # Errors
+    /// The handlers cannot be installed.
+    pub fn install() -> std::io::Result<Self> {
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// The next SIGTERM or SIGINT (two that arrived before it count as one), by name.
+    pub async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.term.recv() => "SIGTERM",
+            _ = self.int.recv() => "SIGINT",
+        }
+    }
+}
+
 /// Sends a `()` on `signals` for every SIGTERM or SIGINT, until the receiver is gone.
-async fn forward(
-    mut term: Signal,
-    mut int: Signal,
-    signals: tokio::sync::mpsc::UnboundedSender<()>,
-) {
+async fn forward(mut signals: Signals, sender: tokio::sync::mpsc::UnboundedSender<()>) {
     loop {
-        let name = tokio::select! {
-            _ = term.recv() => "SIGTERM",
-            _ = int.recv() => "SIGINT",
-        };
+        let name = signals.recv().await;
         tracing::info!("{name}: shutting down");
-        if signals.send(()).is_err() {
+        if sender.send(()).is_err() {
             return;
         }
     }
@@ -2230,13 +2253,27 @@ mod tests {
 mod signal_tests {
     use std::time::Duration;
 
-    use tokio::signal::unix::{SignalKind, signal};
-
-    use super::forward;
+    use super::{Signals, forward};
 
     fn raise(signal: libc::c_int) {
         // SAFETY: raise(3) on this process, whose handler for `signal` the test installed.
         assert_eq!(unsafe { libc::raise(signal) }, 0);
+    }
+
+    /// Catches handlers that do not keep a signal sent before they are read (the start of
+    /// the other half of `kbf storage-and-daemon` takes long, and a SIGTERM in it must
+    /// still be the first signal): one sent after `install` and before `recv` is
+    /// received, by its name, and is not the default action that ends this test.
+    #[tokio::test]
+    async fn a_signal_sent_before_it_is_read_is_kept() {
+        let mut signals = Signals::install().expect("handlers");
+        raise(libc::SIGTERM);
+        let within = Duration::from_secs(10);
+        let name = tokio::time::timeout(within, signals.recv()).await;
+        assert_eq!(name.expect("kept"), "SIGTERM");
+        raise(libc::SIGINT);
+        let name = tokio::time::timeout(within, signals.recv()).await;
+        assert_eq!(name.expect("kept"), "SIGINT");
     }
 
     /// Catches a forwarder that drops a signal (the daemon would never drain), one that
@@ -2245,10 +2282,9 @@ mod signal_tests {
     /// nobody listens.
     #[tokio::test]
     async fn each_sigterm_and_sigint_is_one_signal_and_the_task_ends_with_its_receiver() {
-        let term = signal(SignalKind::terminate()).expect("SIGTERM handler");
-        let int = signal(SignalKind::interrupt()).expect("SIGINT handler");
+        let signals = Signals::install().expect("handlers");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let task = tokio::spawn(forward(term, int, tx));
+        let task = tokio::spawn(forward(signals, tx));
         let within = Duration::from_secs(10);
         raise(libc::SIGTERM);
         tokio::time::timeout(within, rx.recv())
