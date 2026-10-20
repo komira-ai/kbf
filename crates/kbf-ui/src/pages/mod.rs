@@ -11,6 +11,7 @@ use crate::{Answer, PREFIX, Source};
 
 mod action;
 mod build;
+mod storage;
 mod updates;
 
 pub(crate) use action::action;
@@ -19,6 +20,10 @@ pub(crate) use action::{ACTION, LOG_SHOWN_MAX_BYTES};
 #[cfg(test)]
 pub(crate) use build::BUILD;
 pub(crate) use build::build;
+#[cfg(test)]
+pub(crate) use storage::STORAGE;
+use storage::STORAGE_PATH;
+pub(crate) use storage::storage;
 #[cfg(test)]
 pub(crate) use updates::UPDATES;
 use updates::UPDATES_PATH;
@@ -42,7 +47,7 @@ pub(crate) const BUILDS: Page = Page {
 
 /// Every page, for the contract test.
 #[cfg(test)]
-pub(crate) const PAGES: [&Page; 5] = [&OVERVIEW, &BUILDS, &BUILD, &ACTION, &UPDATES];
+pub(crate) const PAGES: [&Page; 6] = [&OVERVIEW, &BUILDS, &BUILD, &ACTION, &UPDATES, &STORAGE];
 
 /// What a path segment keeps unencoded: RFC 3986's unreserved characters.
 const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
@@ -131,7 +136,11 @@ pub(crate) fn overview() -> Answer {
             );
         });
         h.el("ul", &[], |h| {
-            for (path, label) in [(BUILDS_PATH, "Builds"), (UPDATES_PATH, "Updates")] {
+            for (path, label) in [
+                (BUILDS_PATH, "Builds"),
+                (UPDATES_PATH, "Updates"),
+                (STORAGE_PATH, "Storage"),
+            ] {
                 let href = Href::root_relative(path).expect("a page's path is root-relative");
                 h.el("li", &[], |h| {
                     h.link(&href, label);
