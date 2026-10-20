@@ -243,16 +243,37 @@ async fn a_flag_that_is_not_known_exits_2() {
 }
 
 /// Catches the mode parser's refusal of what the start built being printed as something
-/// else, or exiting other than 2: a start given `--label`, which the daemon no longer has,
-/// prints clap's message, exits 2 and enrolls nothing.
+/// else, or exiting other than 2: an enrolled node whose `kbf.toml` has a value the daemon
+/// cannot read as a number prints clap's message naming the setting and exits 2, the node's
+/// files made all the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_flag_the_mode_refuses_exits_2_with_its_message() {
+async fn a_setting_the_mode_refuses_exits_2_with_its_message() {
     let run = fake::start();
     let root = scratch("process-mode-refusal");
+    let path = config(
+        &root,
+        run.enroll_addr.port(),
+        "[daemon]\nreconnect-ms = \"soon\"\n",
+    );
+    token(&root, &run.fake.mint(1, 1).to_line());
+    let out = kbf(args(&["--mode=daemon"], &path)).await;
+
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    assert!(out.stderr.contains("reconnect"), "{}", out.stderr);
+    assert!(
+        root.join("state/pki/node.json").exists(),
+        "enrolled all the same"
+    );
+}
+
+/// Catches `--label`, which the daemon no longer has, accepted or dropped: a start that
+/// still passes it exits 2 with clap's message naming it, before the token is spent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_with_a_label_flag_exits_2_naming_it_and_enrolls_nothing() {
+    let run = fake::start();
+    let root = scratch("process-label-refusal");
     let path = config(&root, run.enroll_addr.port(), "");
     token(&root, &run.fake.mint(1, 1).to_line());
-    // `--label` is not a flag of the daemon (node labels are removed): a unit that still
-    // passes it is refused at once, naming it, before the token is spent.
     let mut words = args(&["--mode=daemon"], &path);
     words.push("--label=pool=mac".to_owned());
     let out = kbf(words).await;
