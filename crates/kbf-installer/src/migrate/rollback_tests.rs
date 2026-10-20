@@ -205,6 +205,8 @@ fn a_mac_rollback_uses_launchd() {
     assert_eq!(
         *rig.events.borrow(),
         [
+            "stop com.komira.kbf-installer.plist links=true",
+            "disable com.komira.kbf-installer.plist links=true",
             "stop com.komira.kbf-daemon.plist links=true",
             "enable com.komira.kbf-helper.plist links=true",
             "enable com.komira.kbf-helper.plist links=true",

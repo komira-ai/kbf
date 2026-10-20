@@ -22,6 +22,7 @@ struct Played {
 }
 
 fn played(loaded: bool, lag: u32) -> Played {
+    let loaded = Cell::new(loaded);
     let seen = Rc::new(RefCell::new(Vec::new()));
     let lag = Cell::new(lag);
     let mut exec = FakeExec::new(0);
@@ -30,11 +31,16 @@ fn played(loaded: bool, lag: u32) -> Played {
         move |cmd| {
             let line = format!("{} {}", cmd.program, cmd.args.join(" "));
             let print = line.starts_with("/bin/launchctl print");
+            if line.starts_with("/bin/launchctl bootstrap") {
+                loaded.set(true);
+            } else if line.starts_with("/bin/launchctl bootout") {
+                loaded.set(false);
+            }
             seen.borrow_mut().push(line);
             if !print {
                 return Ok(reply(0, "", ""));
             }
-            if !loaded {
+            if !loaded.get() {
                 return Ok(reply(113, "", "Could not find service"));
             }
             if lag.get() > 0 {
@@ -76,9 +82,23 @@ const PAUSE: &str = "/bin/sleep 1";
 /// Mutants seen red: `enable` dropped; `enable` after `bootstrap`; the wait dropped.
 #[test]
 fn a_launchd_start_enables_bootstraps_and_looks_for_the_pid() {
+    let mut host = played(false, 0);
+    with(&mut host, Platform::MacOs, |s| s.start(&job())).expect("start");
+    assert_eq!(*host.seen.borrow(), [PRINT, ENABLE, BOOTSTRAP, PRINT]);
+}
+
+/// Catches a start of a loaded job that bootstraps it as it is (a real launchd refuses): the
+/// job is booted out first, then started as an unloaded one is.
+///
+/// Mutant seen red: the stop before the start dropped.
+#[test]
+fn a_launchd_start_boots_a_loaded_job_out_first() {
     let mut host = played(true, 0);
     with(&mut host, Platform::MacOs, |s| s.start(&job())).expect("start");
-    assert_eq!(*host.seen.borrow(), [ENABLE, BOOTSTRAP, PRINT]);
+    assert_eq!(
+        *host.seen.borrow(),
+        [PRINT, BOOTOUT, ENABLE, BOOTSTRAP, PRINT]
+    );
 }
 
 /// Catches a stop that asks `bootout` of a job launchd does not have (an error there), and
@@ -102,12 +122,12 @@ fn a_launchd_stop_boots_out_only_a_loaded_job() {
 /// Mutants seen red: the pause dropped; the loop ending after one look.
 #[test]
 fn the_start_waits_until_the_job_has_a_pid() {
-    let mut host = played(true, 3);
+    let mut host = played(false, 3);
     with(&mut host, Platform::MacOs, |s| s.start(&job())).expect("start");
     assert_eq!(
         *host.seen.borrow(),
         [
-            ENABLE, BOOTSTRAP, PRINT, PAUSE, PRINT, PAUSE, PRINT, PAUSE, PRINT
+            PRINT, ENABLE, BOOTSTRAP, PRINT, PAUSE, PRINT, PAUSE, PRINT, PAUSE, PRINT
         ]
     );
 }
@@ -119,7 +139,7 @@ fn the_start_waits_until_the_job_has_a_pid() {
 /// message.
 #[test]
 fn a_job_that_never_runs_times_out_naming_the_unit() {
-    let mut host = played(true, 1000);
+    let mut host = played(false, 1000);
     let error = with(&mut host, Platform::MacOs, |s| s.start(&job())).expect_err("times out");
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert!(error.to_string().contains(JOB), "{error}");
@@ -129,7 +149,7 @@ fn a_job_that_never_runs_times_out_naming_the_unit() {
     );
     let seen = host.seen.borrow();
     assert_eq!(seen.iter().filter(|l| *l == PAUSE).count(), 29);
-    assert_eq!(seen.iter().filter(|l| *l == PRINT).count(), 30);
+    assert_eq!(seen.iter().filter(|l| *l == PRINT).count(), 31);
 }
 
 /// Catches the systemd arms picking up launchd's steps: start and stop are one command each,

@@ -277,7 +277,13 @@ impl ProxyConfig {
         Ok(config)
     }
 
-    fn check(&self) -> Result<(), ConfigError> {
+    /// The rules between keys that a parse cannot see: the same checks
+    /// [`ProxyConfig::from_toml_str`] makes, for a caller (`kbf-installer setup`) that builds
+    /// a table from flags and must refuse what the proxy would refuse at start.
+    ///
+    /// # Errors
+    /// [`ConfigError::Invalid`].
+    pub fn check(&self) -> Result<(), ConfigError> {
         let pair = (&self.server_cert_file, &self.server_key_file);
         match pair {
             (Some(_), None) | (None, Some(_)) => {

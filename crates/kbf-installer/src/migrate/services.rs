@@ -81,7 +81,9 @@ impl<E: Exec> Services<'_, E> {
         self.exec.apply(&Step::Run(cmd))
     }
 
-    /// Start `unit`. A launchd job is enabled (an earlier `disable` would make `bootstrap`
+    /// Start `unit`. A launchd job is booted out first if it is loaded (`bootstrap` of a loaded
+    /// job is an error, and a resumed rollback meets one: a job its first run bootstrapped
+    /// and then found not running), enabled (an earlier `disable` would make `bootstrap`
     /// refuse it), bootstrapped, and waited for until it runs.
     pub fn start(&mut self, unit: &Unit) -> io::Result<()> {
         match unit.kind() {
@@ -90,6 +92,7 @@ impl<E: Exec> Services<'_, E> {
                     .apply(&Step::Run(systemctl(&["start", "--", unit.as_str()])))
             }
             Kind::Launchd => {
+                self.stop(unit)?;
                 self.enable(unit)?;
                 let plist = format!("{}/{unit}", self.roots.unit_dir);
                 self.exec
@@ -137,6 +140,38 @@ impl<E: Exec> Services<'_, E> {
             Kind::Launchd => launchctl(&["enable", &Self::domain(unit)]),
         };
         self.exec.apply(&Step::Run(cmd))
+    }
+
+    /// Whether `unit` is set to start on its own: enabled for systemd (what `setup` asks
+    /// before it enables a unit), loaded into the system domain for launchd (what `setup`
+    /// asks before it bootstraps a job).
+    pub fn is_enabled(&self, unit: &Unit) -> io::Result<bool> {
+        match unit.kind() {
+            Kind::Systemd => {
+                let out = self
+                    .exec
+                    .query(&systemctl(&["is-enabled", "--", unit.as_str()]))?;
+                Ok(
+                    out.status.success()
+                        && String::from_utf8_lossy(&out.stdout).trim() == "enabled",
+                )
+            }
+            Kind::Launchd => self.is_active(unit),
+        }
+    }
+
+    /// Enable `unit` and start it now, as `setup` does for the installer's own unit
+    /// (`enable --now`; launchd has no enabled-but-stopped job, so [`Self::start`]).
+    pub fn enable_now(&mut self, unit: &Unit) -> io::Result<()> {
+        match unit.kind() {
+            Kind::Systemd => self.exec.apply(&Step::Run(systemctl(&[
+                "enable",
+                "--now",
+                "--",
+                unit.as_str(),
+            ]))),
+            Kind::Launchd => self.start(unit),
+        }
     }
 
     /// Make the unit manager read the unit files again (a no-op for launchd, which reads a

@@ -192,9 +192,42 @@ says to run `systemctl daemon-reload` and then `systemctl restart kbf-proxy.sock
 operator does when the public port may drop the connections waiting in it. A bad `listen`
 stops `setup` with exit 5 and names the key, never the value.
 
-**Proxy units.** The bundled proxy's units (`kbf-proxy.service` and `.socket`) are not on
-`feature/arch-v2` yet (kbf#1153), so a frontend or all-in-one host enables the units that exist
-(`mode_units` in `src/setup/plan.rs` is the one place to change when they land).
+**Proxy units.** The bundled proxy's units (`kbf-proxy.socket` and `kbf-proxy.service`) are
+the ones a `--proxy` host enables (next section); `mode_units` in `src/setup/plan.rs` is the one
+place that names them.
+
+### A frontend behind the proxy: `--proxy`
+
+`--mode=frontend --proxy` sets the host up for `kbf-installer proxy`, which owns the public port
+(the socket unit's), starts the frontend children itself on loopback ports and terminates TLS.
+The proxy starts `kbf --mode=frontend` children, so `--proxy` is refused for every other mode
+(an `all-in-one` process cannot sit behind it), and it is never implied: a re-run on a host
+that has the table but not the flag keeps the table, enables `kbf-frontend.service` as before
+and says so.
+
+| flag | written as |
+|---|---|
+| `--reapi-tls-cert`, `--reapi-tls-key` (required) | `[proxy] server_cert_file`, `server_key_file`: the certificate clients see |
+| `--worker-client-ca` (required) | `[proxy] client_ca_file`: verifies client certificates |
+| `--proxy-base-port` (default 18000, 1024 to 65521) | `[proxy.upstream] base_port`: slot A uses it and the four after, slot B ten above |
+| `--buck2-auth none\|bearer\|mtls`, `--buck2-token-file` | `[proxy] buck2_auth`, `buck2_token_file` (a key file only with `bearer`) |
+| (none) | `[proxy] operator_token_file`: the operator token `setup` makes |
+
+`setup` enables `kbf-proxy.socket` and `kbf-proxy.service` instead of `kbf-frontend.service`
+(enabled, not started), writes none of those three TLS files into `kbf.toml` (the children
+speak plain h2c behind the proxy), and refuses `--listen`, `--worker-listen`, `--api-listen`,
+`--worker-tls-cert` and `--worker-tls-key`: the proxy gives each child its loopback ports on
+its command line and nothing would read them. It refuses a base port whose ranges cover 8980
+or 8982, the public socket's and the operator API's defaults. The table is checked by the
+proxy's own `ProxyConfig::check`, so `setup` cannot write one the proxy would refuse at start.
+If `kbf-frontend.service` is already enabled `setup` names it and leaves it: stop and disable
+it before starting the proxy, since the two never run together.
+
+Every other key of `[proxy]` (the secret file, the state directory, the hold bound, the limits)
+is the proxy's default and is written out in full, so a hand edit survives a rerun. A `[proxy]`
+table that is there is treated as `kbf.toml` is: the keys `setup` owns equal to the flags, it
+is kept as it is; different over a table of defaults, rewritten; different over a table with
+other settings, refused (exit 5) with the key names and no values.
 
 ## The state database
 

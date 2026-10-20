@@ -157,6 +157,9 @@ pub struct SetupArgs {
     /// storage): each sets the kbf flag of its name.
     #[command(flatten)]
     pub kbf: crate::setup::kbf_settings::KbfFlags,
+    /// A frontend host behind `kbf-installer proxy`: the `[proxy]` table of installer.toml.
+    #[command(flatten)]
+    pub proxy: crate::setup::proxy::ProxyFlags,
     /// The installer.toml `setup` writes (and reads, to keep what it does not set), under the
     /// host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which
     /// is the only value setup accepts. The same flag, with the same meaning, as on `run`.
@@ -298,7 +301,8 @@ pub struct MigrateArgs {
     /// The old helper's unit: stopped and disabled, so the installer is the only manager.
     #[arg(long, value_parser = crate::migrate::Unit::new)]
     pub helper_unit: Option<crate::migrate::Unit>,
-    /// The installer's own unit, which a rollback stops and disables first.
+    /// The installer's own unit: enabled and started as the last step of a migration, stopped
+    /// and disabled first by a rollback.
     #[arg(long, value_parser = crate::migrate::Unit::new)]
     pub installer_unit: Option<crate::migrate::Unit>,
     /// Where the host gets its releases: decides where the replay floor is seeded from.
@@ -356,11 +360,16 @@ pub struct ProxyArgs {
     /// `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac).
     #[arg(long)]
     pub config: Option<std::path::PathBuf>,
+    /// The order spool the update API writes and the root half reads: owned by the service
+    /// user. As `run --orders-dir`.
+    #[arg(long, default_value = "/var/lib/kbf-installer/orders")]
+    pub orders_dir: std::path::PathBuf,
     /// Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing.
     #[arg(long)]
     pub check: bool,
     /// Root's directory: the proxy reads `status.json` here, to start the installed release
-    /// when no frontend child is running.
+    /// when no frontend child is running, and the update API reads its status. As
+    /// `run --update-dir`.
     #[arg(long, default_value = "/var/lib/kbf-installer")]
     pub update_dir: std::path::PathBuf,
 }

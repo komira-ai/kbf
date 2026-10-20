@@ -152,6 +152,7 @@ fn services_stop_before_the_links_move_and_start_after_everything_is_written() {
             "disable kbf-helper.service links=false",
             "daemon-reload links=true",
             "start kbf-daemon.service links=true",
+            "enable --now kbf-installer.service links=true",
         ]
     );
     let active = rig.active.borrow();
@@ -483,6 +484,8 @@ fn a_mac_host_comes_over_through_launchd() {
             "disable com.komira.kbf-helper.plist links=false",
             "enable com.komira.kbf-daemon.plist links=true",
             "start com.komira.kbf-daemon.plist links=true",
+            "enable com.komira.kbf-installer.plist links=true",
+            "start com.komira.kbf-installer.plist links=true",
         ]
     );
     let bootstraps: Vec<_> = rig
@@ -492,11 +495,37 @@ fn a_mac_host_comes_over_through_launchd() {
         .map(ToString::to_string)
         .filter(|l| l.contains("bootstrap"))
         .collect();
-    assert_eq!(bootstraps.len(), 1);
+    assert_eq!(bootstraps.len(), 2);
     assert!(
         bootstraps[0]
             .ends_with("bootstrap system /Library/LaunchDaemons/com.komira.kbf-daemon.plist"),
         "{bootstraps:?}"
+    );
+}
+
+/// Catches a launchd start that bootstraps a loaded job, which a real launchd refuses (the
+/// rig refuses it too): the start boots the job out first.
+///
+/// Mutant seen red: the stop before the bootstrap dropped.
+#[test]
+fn a_start_of_a_loaded_job_boots_it_out_first() {
+    let mut rig = Rig::mac("mac-loaded");
+    let roots = super::roots::Roots::new(crate::layout::Platform::MacOs);
+    let daemon = super::units::Unit::new("com.komira.kbf-daemon.plist").expect("unit");
+    rig.active.borrow_mut().insert(daemon.as_str().to_owned());
+    let mut svc = super::services::Services {
+        exec: &mut rig.host,
+        roots: &roots,
+    };
+    svc.start(&daemon)
+        .expect("a loaded job is booted out, then started");
+    assert_eq!(
+        *rig.events.borrow(),
+        [
+            "stop com.komira.kbf-daemon.plist links=false",
+            "enable com.komira.kbf-daemon.plist links=false",
+            "start com.komira.kbf-daemon.plist links=false",
+        ]
     );
 }
 
@@ -517,7 +546,10 @@ fn a_mac_migration_waits_for_the_job_and_can_be_run_again() {
         .iter()
         .filter(|e| e.starts_with("wait"))
         .count();
-    assert_eq!(waits, 2);
+    assert_eq!(
+        waits, 4,
+        "two looks for the daemon's job, two for the installer's"
+    );
 
     let mut stuck = Rig::mac("mac-stuck");
     stuck.start_lag.set(1000);

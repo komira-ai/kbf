@@ -1,7 +1,8 @@
 //! `kbf-installer proxy` as a service manager runs it: a process with one activated socket.
 //! Nothing here needs root or a child frontend; the proxy has no active child, so every
 //! backend path is `UNAVAILABLE` and `/readyz` is 503, which is what the supervisor-less verb
-//! promises.
+//! promises. The update route (`/v1/update/frontend`) is the update API with no handover driver
+//! behind it: it answers its status and refuses a `POST`, and the tests at the end say how.
 
 #![cfg(target_os = "linux")]
 
@@ -44,12 +45,14 @@ fn served_config(name: &str) -> (PathBuf, PathBuf) {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
         path
     };
-    let token = private("operator.token", "operator-token-0123456789-abcdefghijkl");
+    let token = private("operator.token", TOKEN);
     let (cert, key) = (dir.join("server.pem"), dir.join("server.key"));
+    let state = dir.join("state");
+    fs::create_dir_all(&state).expect("state dir");
     let text = format!(
         "{DATABASE}[proxy]\noperator_token_file = {token:?}\nserver_cert_file = {cert:?}\n\
          server_key_file = {key:?}\nclient_ca_file = {ca_file:?}\n\
-         proxy_auth_file = {:?}\n[proxy.upstream]\nbase_port = 18000\n",
+         proxy_auth_file = {:?}\nstate_dir = {state:?}\n[proxy.upstream]\nbase_port = 18000\n",
         dir.join("proxy-auth"),
     );
     // Not `config`: it makes the directory again, and the files above are in it.
@@ -87,6 +90,26 @@ fn issue(dir: &Path, prefix: &str) -> PathBuf {
     private("server.pem", &cert.pem());
     private("server.key", &key.serialize_pem());
     private("ca.pem", &ca.pem())
+}
+
+/// The operator token `served_config` writes: the bearer the update route is called with.
+const TOKEN: &str = "operator-token-0123456789-abcdefghijkl";
+
+/// The proxy's state directory (`orders.json`, `requests.json`, `children/`), next to the
+/// config `served_config` wrote.
+fn state_of(config: &Path) -> PathBuf {
+    config.with_file_name("state")
+}
+
+/// The directory the verb is told holds the root half's `status.json`: next to the config, so
+/// every test has its own.
+fn update_dir_of(config: &Path) -> PathBuf {
+    config.with_file_name("update")
+}
+
+/// The order spool the verb is told to use: next to the config.
+fn orders_dir_of(config: &Path) -> PathBuf {
+    config.with_file_name("orders")
 }
 
 fn config(name: &str, text: &str) -> PathBuf {
@@ -233,10 +256,19 @@ fn start_args(
     command
         .args(["proxy", "--config"])
         .arg(path)
+        .arg("--orders-dir")
+        .arg(orders_dir_of(path))
         .args(flags)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr);
+    // A test that passes its own `--update-dir` (a `status.json` it wrote) is not given a second.
+    if !flags
+        .iter()
+        .any(|flag| flag.to_str() == Some("--update-dir"))
+    {
+        command.arg("--update-dir").arg(update_dir_of(path));
+    }
     // SAFETY: async-signal-safe calls (`sigprocmask` family, `fcntl`, `dup2`, `getpid`) and
     // `setenv`, which is not: if another thread of this test binary held the environment or
     // allocator lock at `fork`, the child would block before `exec` (the start then fails
@@ -314,19 +346,40 @@ async fn try_tls(
 
 /// One `GET` over TLS and h2 to `addr`: the status and the body.
 async fn get(addr: SocketAddr, ca: &Path, path: &str) -> (u16, String) {
+    call(addr, ca, "GET", path, None, b"").await
+}
+
+/// One request over TLS and h2 to `addr`: the status and the body. `bearer` is the token sent
+/// as `Authorization: Bearer`, if any; `body` is the request body (none when empty).
+async fn call(
+    addr: SocketAddr,
+    ca: &Path,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    body: &[u8],
+) -> (u16, String) {
     let tcp = tls(addr, ca).await;
     let (send, connection) = h2::client::handshake(tcp).await.expect("h2 handshake");
     tokio::spawn(connection);
-    let request = http::Request::builder()
-        .uri(format!("http://proxy.test{path}"))
-        .body(())
-        .expect("a request");
-    let (response, _) = send
+    let mut request = http::Request::builder()
+        .method(method)
+        .uri(format!("http://proxy.test{path}"));
+    if let Some(token) = bearer {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let request = request.body(()).expect("a request");
+    let (response, mut sending) = send
         .ready()
         .await
         .expect("capacity")
-        .send_request(request, true)
+        .send_request(request, body.is_empty())
         .expect("send");
+    if !body.is_empty() {
+        sending
+            .send_data(bytes::Bytes::copy_from_slice(body), true)
+            .expect("send the body");
+    }
     let response = response.await.expect("a response");
     let status = response.status().as_u16();
     let mut body = response.into_body();
@@ -551,8 +604,8 @@ async fn a_closed_standard_error_does_not_stop_the_verb_serving() {
 async fn a_recorded_frontend_is_adopted_and_outlives_the_proxy_that_stops() {
     use kbf_installer::proxy::child_real::{Recorded, ident_of};
 
-    let state = kbf_host::testkit::scratch("proxy-bin-adopt-state");
-    let children = state.join("children");
+    let (path, ca) = served_config("adopt");
+    let children = state_of(&path).join("children");
     fs::create_dir_all(&children).expect("children dir");
     let mut frontend = Command::new("sleep");
     frontend.arg("600").stdin(Stdio::null());
@@ -587,18 +640,10 @@ async fn a_recorded_frontend_is_adopted_and_outlives_the_proxy_that_stops() {
             let _ = std::io::Write::write_all(&mut stream, reply.as_bytes());
         }
     });
-    let (path, ca) = served_config("adopt");
-    let table = fs::read_to_string(&path)
-        .expect("config text")
-        .replacen(
-            "[proxy]\n",
-            &format!("[proxy]\nstate_dir = \"{}\"\n", state.display()),
-            1,
-        )
-        .replace(
-            "base_port = 18000",
-            &format!("base_port = {}", admin_port - 3),
-        );
+    let table = fs::read_to_string(&path).expect("config text").replace(
+        "base_port = 18000",
+        &format!("base_port = {}", admin_port - 3),
+    );
     fs::write(&path, table).expect("write");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -634,16 +679,10 @@ async fn a_recorded_frontend_is_adopted_and_outlives_the_proxy_that_stops() {
 /// error with the detail, and a stop during the wait between tries ends it cleanly.
 #[tokio::test(flavor = "current_thread")]
 async fn a_cold_start_that_cannot_read_status_reports_each_try_and_stops_cleanly() {
-    let state = kbf_host::testkit::scratch("proxy-bin-cold-state");
     let update = kbf_host::testkit::scratch("proxy-bin-cold-update");
     fs::write(update.join("status.json"), b"{not json").expect("status.json");
     let (path, _ca) = served_config("cold");
-    let table = fs::read_to_string(&path).expect("config text").replacen(
-        "[proxy]\n",
-        &format!("[proxy]\nstate_dir = \"{}\"\n", state.display()),
-        1,
-    );
-    fs::write(&path, table).expect("write");
+    let state = state_of(&path);
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let flags = [std::ffi::OsStr::new("--update-dir"), update.as_os_str()];
     let mut proxy = start_args(&path, &listener, Stdio::piped(), false, &flags);
@@ -1129,4 +1168,109 @@ async fn a_sighup_during_the_stop_does_not_cancel_it() {
     let status = status.unwrap_or_else(|| panic!("still running {took:?} after the SIGTERM"));
     assert!(status.code().is_some(), "ended by a signal: {status:?}");
     assert!(took < Duration::from_secs(10), "after {took:?}");
+}
+
+const UPDATE: &str = "/v1/update/frontend";
+const COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+/// The body of a `POST` that asks for an update to `COMMIT`.
+fn post_body(request_id: &str) -> String {
+    format!(r#"{{"commit":"{COMMIT}","request_id":"{request_id}","nodes":false}}"#)
+}
+
+fn json(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
+}
+
+/// The names in `dir`.
+fn names_in(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+/// A verb serving on a port of its own that answers `/healthz`: its guard, its address, the CA
+/// a client trusts and the config it was started with (the directories it was told to use are
+/// next to it).
+async fn serving(name: &str) -> (Reaped, SocketAddr, PathBuf, PathBuf) {
+    let (config, ca) = served_config(name);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let proxy = start(&config, &listener);
+    drop(listener);
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca, "/healthz"))
+        .await
+        .expect("the proxy answers");
+    assert_eq!(status, 200);
+    (proxy, addr, ca, config)
+}
+
+/// Catches an update route that is still the proxy's 503 `updates are not wired`, or that
+/// reaches something other than the update API: with the operator token a `GET` is the API's
+/// status of "no update" (200, no update id, no phase) although the root half has written no
+/// `status.json` yet, and the verb opened the order spool and its counter where it was told.
+#[tokio::test(flavor = "current_thread")]
+async fn the_update_route_is_the_update_api() {
+    let (_proxy, addr, ca, config) = serving("update-status").await;
+    let (status, text) = call(addr, &ca, "GET", UPDATE, Some(TOKEN), b"").await;
+    assert_eq!(status, 200, "{text}");
+    let body = json(&text);
+    assert_eq!(body["update_id"], serde_json::Value::Null, "{text}");
+    assert_eq!(body["phase"], serde_json::Value::Null, "{text}");
+    assert!(body["restart_pending"].is_boolean(), "{text}");
+    assert!(orders_dir_of(&config).is_dir());
+    assert!(state_of(&config).join("orders.json").is_file());
+}
+
+/// Catches a `POST` that goes as far as an order while nothing can take the update over
+/// (the swap is not wired into the verb): the API refuses with 503 and its reason, no order
+/// is in the spool, and no request id was saved, so the same request is a fresh one when the
+/// driver is there.
+#[tokio::test(flavor = "current_thread")]
+async fn a_post_is_refused_while_no_handover_driver_is_wired_and_writes_nothing() {
+    let (_proxy, addr, ca, config) = serving("update-post").await;
+    let body = post_body("r1");
+    let (status, text) = call(addr, &ca, "POST", UPDATE, Some(TOKEN), body.as_bytes()).await;
+    assert_eq!(status, 503, "{text}");
+    let answer = json(&text);
+    assert_eq!(answer["error"], "handover_unavailable", "{text}");
+    assert_eq!(answer["message"], "handover driver not wired", "{text}");
+    assert_eq!(names_in(&orders_dir_of(&config)), Vec::<String>::new());
+    assert!(!state_of(&config).join("requests.json").exists());
+}
+
+/// Catches an update route open to a caller the proxy should have refused. The API behind the
+/// route authenticates nothing (the proxy checked the caller before it called), so this is
+/// the one test that holds the property in the shipped binary: no token and a wrong token are
+/// 401 on `GET` and on `POST`, a body over the proxy's 4096 bytes is 413, and none of them
+/// reaches the API (no order, no saved request), while the same `POST` with the token does.
+#[tokio::test(flavor = "current_thread")]
+async fn the_proxy_refuses_before_the_update_api_is_called() {
+    let (_proxy, addr, ca, config) = serving("update-auth").await;
+    let body = post_body("r1");
+    let wrong = Some("not-the-operator-token-0123456789-abcdef");
+    for (method, bearer, payload) in [
+        ("GET", None, ""),
+        ("GET", wrong, ""),
+        ("POST", None, body.as_str()),
+        ("POST", wrong, body.as_str()),
+    ] {
+        let (status, text) = call(addr, &ca, method, UPDATE, bearer, payload.as_bytes()).await;
+        assert_eq!(status, 401, "{method} with {bearer:?}: {text}");
+    }
+    let huge = vec![b' '; 4097];
+    let (status, text) = call(addr, &ca, "POST", UPDATE, Some(TOKEN), &huge).await;
+    assert_eq!(status, 413, "{text}");
+    assert_eq!(names_in(&orders_dir_of(&config)), Vec::<String>::new());
+    assert!(!state_of(&config).join("requests.json").exists());
+
+    let (status, text) = call(addr, &ca, "POST", UPDATE, Some(TOKEN), body.as_bytes()).await;
+    assert_eq!(status, 503, "with the token the API is reached: {text}");
 }

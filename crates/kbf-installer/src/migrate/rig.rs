@@ -72,6 +72,10 @@ pub struct Rig {
     /// How many `launchctl print` answers a job gives after its start without a pid (loaded,
     /// not yet running); each start sets the count again.
     pub start_lag: Rc<Cell<u32>>,
+    /// The systemd units that are enabled, by file name (none to begin with).
+    pub enabled: Rc<RefCell<BTreeSet<String>>>,
+    /// Make `enable --now` fail.
+    pub fail_enable: Rc<Cell<bool>>,
     /// Called with the verb and the unit file of every service command before it is answered
     /// (`stop`, `start`, `is-active`, `daemon-reload` with no unit): what a test plays as
     /// the host doing something while the migration is in that call.
@@ -128,12 +132,16 @@ impl Rig {
         let fail_start = Rc::new(Cell::new(false));
         let start_lag = Rc::new(Cell::new(0));
         let lag_left = Rc::new(Cell::new(0));
+        let enabled = Rc::new(RefCell::new(BTreeSet::new()));
+        let fail_enable = Rc::new(Cell::new(false));
         let on_command: Rc<RefCell<Option<CommandHook>>> = Rc::new(RefCell::new(None));
         host.answer = Box::new({
-            let (active, events, fail_start, root, on_command) = (
+            let (active, events, fail_start, enabled, fail_enable, root, on_command) = (
                 active.clone(),
                 events.clone(),
                 fail_start.clone(),
+                enabled.clone(),
+                fail_enable.clone(),
                 root.clone(),
                 on_command.clone(),
             );
@@ -152,6 +160,9 @@ impl Rig {
                     ("/usr/bin/systemctl", ["daemon-reload"]) => ("daemon-reload", String::new()),
                     ("/usr/bin/systemctl", ["is-active", "--quiet", "--", u]) => {
                         ("is-active", (*u).to_owned())
+                    }
+                    ("/usr/bin/systemctl", ["enable", "--now", "--", u]) => {
+                        ("enable --now", (*u).to_owned())
                     }
                     ("/usr/bin/systemctl", [verb, "--", u]) => (verb, (*u).to_owned()),
                     ("/bin/sleep", ["1"]) => ("wait", String::new()),
@@ -188,10 +199,38 @@ impl Rig {
                         };
                         Ok(reply(i32::from(!running) * 3, out, ""))
                     }
+                    "is-enabled" if enabled.borrow().contains(&unit) => {
+                        Ok(reply(0, "enabled\n", ""))
+                    }
+                    "is-enabled" => Ok(reply(1, "disabled\n", "")),
+                    "enable --now" if fail_enable.get() => {
+                        Err(io::Error::other("planted: enable failed"))
+                    }
+                    "enable --now" => {
+                        enabled.borrow_mut().insert(unit.clone());
+                        active.borrow_mut().insert(unit.clone());
+                        record(format!("enable --now {unit}"));
+                        Ok(reply(0, "", ""))
+                    }
+                    "enable" | "disable" => {
+                        if verb == "enable" {
+                            enabled.borrow_mut().insert(unit.clone());
+                        } else {
+                            enabled.borrow_mut().remove(&unit);
+                        }
+                        record(format!("{verb} {unit}"));
+                        Ok(reply(0, "", ""))
+                    }
                     "stop" => {
                         active.borrow_mut().remove(&unit);
                         record(format!("stop {unit}"));
                         Ok(reply(0, "", ""))
+                    }
+                    // launchd refuses to bootstrap a job that is loaded (the rig's "active").
+                    "start" if platform == Platform::MacOs && active.borrow().contains(&unit) => {
+                        Err(io::Error::other(format!(
+                            "Bootstrap failed: 5: Input/output error ({unit} is loaded)"
+                        )))
                     }
                     "start" if fail_start.get() => Err(io::Error::other("planted: start failed")),
                     "start" => {
@@ -218,6 +257,8 @@ impl Rig {
             events,
             fail_start,
             start_lag,
+            enabled,
+            fail_enable,
             on_command,
             lock_wait: Duration::from_secs(20),
             kit: false,

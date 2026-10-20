@@ -9,6 +9,7 @@
 
 use super::kbf_settings::{KbfFlags, Setting};
 use super::paths;
+use super::proxy::{ProxyFlags, ProxyPlan};
 use crate::CommitId;
 use crate::cli::{Mode, ReleaseSource};
 use crate::installer_toml::{Source, https_base_named};
@@ -29,6 +30,8 @@ pub struct Raw {
     pub database: Option<String>,
     /// The listener, certificate and storage-client flags of a frontend or all-in-one host.
     pub kbf: KbfFlags,
+    /// `--proxy` and what goes with it.
+    pub proxy: ProxyFlags,
     /// `--create-local-database`.
     pub create_local_database: bool,
     /// `--installer-config`, as the host path it names; `None` is the platform's default.
@@ -53,6 +56,8 @@ pub struct Valid {
     pub database: Option<String>,
     /// The `kbf.toml` settings the listener, certificate and storage flags give.
     pub kbf: Vec<Setting>,
+    /// The proxy host's settings: `Some` for `--proxy`. The files it names are not in `kbf`.
+    pub proxy: Option<ProxyPlan>,
     /// With `--create-local-database`: what to create, from the URL.
     pub local_database: Option<LocalDatabase>,
 }
@@ -121,7 +126,12 @@ impl Raw {
         };
 
         let (database, local_database) = self.database(&mut problems);
-        let kbf = self.kbf.validate(self.mode, &mut problems);
+        let mut kbf = self
+            .kbf
+            .validate(self.mode, self.proxy.proxy, &mut problems);
+        let proxy = self
+            .proxy
+            .validate(platform, self.mode, &self.kbf, &mut kbf, &mut problems);
         let installer_toml = paths::installer_toml(platform);
         if self
             .installer_config
@@ -153,6 +163,7 @@ impl Raw {
                 commit: self.commit.clone(),
                 database,
                 kbf,
+                proxy,
                 local_database,
             }),
             _ => Err(problems),
