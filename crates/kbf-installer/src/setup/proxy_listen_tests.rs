@@ -5,7 +5,7 @@
 use super::*;
 use crate::setup::paths::{PROXY_LISTEN_DROPIN, PROXY_SOCKET_DIR};
 
-const UNITS: &[&str] = &["kbf-frontend@a.service"];
+const UNITS: &[&str] = &["kbf-frontend.service"];
 
 /// The operator's `[proxy]` table, with `extra` on top of it.
 fn table(extra: &str) -> String {

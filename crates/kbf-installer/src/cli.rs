@@ -179,12 +179,13 @@ pub struct ServiceArgs {
 
 impl ServiceArgs {
     /// Whether the service this installer restarts is the unit of a mode that keeps its state
-    /// in the database (`kbf-frontend@<instance>.service`, `kbf-all-in-one.service` or its
+    /// in the database (`kbf-frontend.service`, `kbf-frontend@<instance>.service`, `kbf-all-in-one.service` or its
     /// template `kbf-all-in-one@<instance>.service`): the installer is not told the host's
     /// mode, the unit it restarts is the one place that names it. A launchd label names no mode.
     pub fn runs_database_mode(&self) -> bool {
         self.unit.as_deref().is_some_and(|u| {
             u == "kbf-all-in-one.service"
+                || u == "kbf-frontend.service"
                 || (["kbf-frontend@", "kbf-all-in-one@"]
                     .iter()
                     .any(|p| u.starts_with(p))
