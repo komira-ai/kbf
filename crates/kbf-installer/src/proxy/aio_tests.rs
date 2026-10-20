@@ -180,3 +180,27 @@ fn a_restart_after_the_old_process_was_told_to_stop_goes_forward() {
         &["terminate pid 100", "migrate", "spawn B", "release_into B"],
     );
 }
+
+/// Catches an all-in-one swap that starts the new process waiting for a takeover: nothing
+/// calls `takeover` on this host (the old process is gone), so a process started with
+/// `--await-takeover` would serve nothing for ever. Both the new release and the old one put
+/// back after a failed start are started to serve.
+#[test]
+fn the_all_in_one_processes_are_started_to_serve_not_to_wait() {
+    let (w, old) = World::with_old();
+    assert_eq!(go(&w, old).0, Ok(Phase::Done));
+    assert_eq!(w.st.borrow().starts, vec![(Slot::B, Start::Active)]);
+    assert_eq!(w.count("admin:takeover"), 0);
+
+    let (w, old) = World::with_old();
+    w.script(Script {
+        ready_after: None,
+        exit_after: None,
+    });
+    assert_eq!(go(&w, old).0, Ok(Phase::Failed));
+    assert_eq!(
+        w.st.borrow().starts,
+        vec![(Slot::B, Start::Active), (Slot::A, Start::Active)],
+        "the new release, then the old one again"
+    );
+}
