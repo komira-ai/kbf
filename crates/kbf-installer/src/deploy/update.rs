@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use super::api::{Https, Trust};
 use super::cli::{CALL_TIMEOUT, host_platform, read_token};
+use super::observe::{Observe, Observed, Slot};
 use super::smoke::random;
 use super::summary;
 use super::{Check, Env, NoCheck, NoProbe, NoSmoke, Options, SystemClock, update_frontend};
@@ -54,12 +55,22 @@ pub fn run(args: &UpdateArgs, out: &mut dyn Write, err: &mut dyn Write) -> Exit 
     let (clock, check) = (SystemClock, NoCheck);
     let env = Env {
         api: &api,
+        observe: &NoObserve,
         clock: &clock,
         smoke: &NoSmoke,
         check: &check as &dyn Check,
         probe: &NoProbe,
     };
     finish(&env, &options, out)
+}
+
+/// `update --frontend` runs no gate, so there is no frontend to observe.
+pub(super) struct NoObserve;
+
+impl Observe for NoObserve {
+    fn resolve(&self, _: Option<Slot>) -> Result<Observed<'_>, String> {
+        Err("update --frontend observes no frontend".into())
+    }
 }
 
 /// The client and the options for `args`, or what is wrong with them. `rng` is the random
