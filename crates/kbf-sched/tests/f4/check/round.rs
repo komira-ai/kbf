@@ -33,10 +33,6 @@ impl Checker {
         let mut grants: Vec<(OperationId, WorkerId)> = Vec::new();
         let mut notes: Vec<(OperationId, Verdict)> = Vec::new();
         let mut room_short = false;
-        // The workers held this round for an operation that runs alone: nothing after it
-        // in the queue is placed there. And which operation holds which.
-        let mut held_back: BTreeSet<usize> = BTreeSet::new();
-        let mut holds: BTreeMap<OperationId, WorkerId> = BTreeMap::new();
         for &(_, id) in &self.queue {
             let op = &self.ops[usize::try_from(id.0).expect("ids fit")];
             let class = (op.needs, op.request.resources);
@@ -73,15 +69,13 @@ impl Checker {
                     .copied()
                     .filter(|&i| {
                         let (booked, leases, whole) = held_on(&extra, i);
-                        !held_back.contains(&i)
-                            && room(
-                                self.workers[live[i]].capacity,
-                                booked,
-                                whole,
-                                leases,
-                                op.request.resources,
-                            )
-                            && !(elsewhere && avoided(i))
+                        room(
+                            self.workers[live[i]].capacity,
+                            booked,
+                            whole,
+                            leases,
+                            op.request.resources,
+                        ) && !(elsewhere && avoided(i))
                     })
                     .min_by(|&a, &b| {
                         let load = |i: usize| {
@@ -116,46 +110,6 @@ impl Checker {
             if op.wait.is_some() || verdict != Verdict::Servable {
                 notes.push((id, verdict));
             }
-            // A servable operation that fits nowhere now and would run alone on some
-            // worker (an action at the whole memory of a worker that could run it) holds
-            // one worker it would run alone on, so that it empties: the one it held last
-            // round while that could still run it, else the one with the fewest leases,
-            // then the least booked, then the first by name. A worker with less memory
-            // than the action asks for, or with more, is not one.
-            let alone_on = |i: usize| {
-                let capacity = self.workers[live[i]].capacity;
-                fits(capacity, op.request.resources) && exclusive(capacity, op.request.resources)
-            };
-            let alone = m.iter().any(|&i| alone_on(i));
-            if !placed && verdict == Verdict::Servable && alone {
-                let could: Vec<usize> = m
-                    .iter()
-                    .copied()
-                    .filter(|&i| {
-                        let skipped = held_back.contains(&i) || (elsewhere && avoided(i));
-                        !skipped && alone_on(i)
-                    })
-                    .collect();
-                let kept = self
-                    .holds
-                    .get(&id)
-                    .and_then(|w| could.iter().copied().find(|&i| live[i] == w));
-                let emptiest = || {
-                    could.iter().copied().min_by_key(|&i| {
-                        let (b, leases, _) = held_on(&extra, i);
-                        (leases, b.cpu_millis, b.memory_bytes, b.gpus, b.vms)
-                    })
-                };
-                if let Some(i) = kept.or_else(emptiest) {
-                    held_back.insert(i);
-                    holds.insert(id, live[i].clone());
-                }
-            }
-        }
-        let held = holds.len();
-        self.holds = holds;
-        if held > 0 {
-            self.hit("an action that runs alone holds a worker");
         }
         if room_short {
             self.hit("servable work waits for room");

@@ -92,6 +92,17 @@ kbf-mac-provision revert                                # root: put back the rec
   | `--node-id` | `hostname` | `[identity]` | `node-id` |
   | `--data-dir` | `kbf_data_dir` | `[daemon]` | `data-dir` |
   | `--label` (the node label, then each of `kbf_labels`) | `kbf_labels` | `[identity]` | `label = [...]` |
+  | `--update-dir` (always `/var/db/kbf-installer`) | | `[daemon]` | `update-dir` |
+
+  `update-dir` turns on the node's update client: it takes the frontend's offers and orders
+  and writes the orders to `orders/` beneath it, which the root `kbf-installer` reads. The
+  directory is the installer's state directory on macOS, so `tests/node_config.rs` compares
+  it with kbf-installer's layout. `launchd_label` also checks and makes the state directory
+  (root's, mode 755) and `orders/` (the daemon account's, mode 700, root's for a root
+  daemon): the daemon account writes the orders and no other account may. kbf-installer
+  does not check who owns the spool; it opens it without following a link, reads only
+  regular files with one link, and acts on an order only after its own fetch and
+  verification of the commit it names.
 
   The profile has no size key, so `--data-max-bytes` (`[daemon]`, `data-max-bytes`) is not
   rendered; the daemon sizes the data directory from the filesystem.
@@ -128,7 +139,7 @@ letters and `_` only.
 | `default_developer_dir` | a pinned Xcode's path | `xcode-select -p` | `xcode-select -s` |
 | `probe` (`expect_probe`) | `KEY:/PATH:SHA256`; `KEY:XCODE_BUILD=VALUE` | each probe script's SHA-256 | check only. `expect_probe` lines are validated (a known probe, a pinned Xcode, once each) and printed |
 | `simulator_runtimes` | none | `/Library/Developer/CoreSimulator`: `Images/*.dmg`, `Profiles/Runtimes/*.simruntime`, `Volumes/*` | check only: runtimes live in VM images |
-| `launchd_label` (`kbf_labels`, `role_user`, and the profile's own SHA-256 in the node label) | label | `/usr/local/etc/kbf/kbf.toml` equals the one the profile renders, root-owned, mode 644, in a root's 755 directory; `/Library/LaunchDaemons/<label>.plist` equals the one the profile renders (section 5.3: `UserName`/`GroupName` the role account, `ProcessType` `Interactive`, `ExitTimeOut` 30, `kbf --mode=daemon --config <kbf.toml>` and nothing else), root-owned, mode 644; `/Library/Logs/kbf` root's, mode 755; the error log in it a regular file with one link, the role account's, mode 644; the job loaded | writes `kbf.toml` (and its directory, root's, mode 755), makes the log directory root's, replaces anything else at the error log's path (unlinked, never followed) with a new file of the role account, writes the plist, then restarts the job: `launchctl bootout`, the error log truncated while it is stopped, `launchctl bootstrap`. `restart` refuses, before it stops anything, when the error log is not such a file, so a link the role account plants is never emptied as root |
+| `launchd_label` (`kbf_labels`, `role_user`, and the profile's own SHA-256 in the node label) | label | `/usr/local/etc/kbf/kbf.toml` equals the one the profile renders, root-owned, mode 644, in a root's 755 directory; `/Library/LaunchDaemons/<label>.plist` equals the one the profile renders (section 5.3: `UserName`/`GroupName` the role account, `ProcessType` `Interactive`, `ExitTimeOut` 30, `kbf --mode=daemon --config <kbf.toml>` and nothing else), root-owned, mode 644; `/var/db/kbf-installer` root's, mode 755 and `/var/db/kbf-installer/orders` the daemon account's, mode 700; `/Library/Logs/kbf` root's, mode 755; the error log in it a regular file with one link, the role account's, mode 644; the job loaded | writes `kbf.toml` (and its directory, root's, mode 755), makes the two directories above (a link at either is removed, never followed), makes the log directory root's, replaces anything else at the error log's path (unlinked, never followed) with a new file of the role account, writes the plist, then restarts the job: `launchctl bootout`, the error log truncated while it is stopped, `launchctl bootstrap`. `restart` refuses, before it stops anything, when the error log is not such a file, so a link the role account plants is never emptied as root |
 
 ## Tests
 

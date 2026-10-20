@@ -76,6 +76,7 @@ impl Owners {
         let view = MapView {
             map: Arc::new(map),
             previous: None,
+            earlier: Vec::new(),
         };
         let hook = Arc::new(Hook::default());
         let many = NonZeroU32::new(1000).expect("not zero");

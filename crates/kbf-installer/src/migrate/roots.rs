@@ -42,11 +42,16 @@ impl Roots {
         }
     }
 
-    /// The binary a release's version is asked of.
-    pub fn binary(&self) -> &'static str {
-        match self.platform {
-            Platform::Linux => layout::RELEASE_BINARY,
-            Platform::MacOs => layout::RELEASE_DAEMON,
+    /// The binary a release's version is asked of. `kbf` on Linux and on a host the Mac kit
+    /// installed (a kit release holds only `kbf`, and a Linux release's `kbf` is the one the
+    /// old units run). An old-host Mac, the pilot or dev installer's, ran `kbf-daemon`: the
+    /// old `state.json` (schema 1) names no binary, so what the release holds decides, and
+    /// `kbf` when it holds no `kbf-daemon`. `holds_daemon` is whether the release holds one.
+    pub fn binary(&self, kit: bool, holds_daemon: bool) -> &'static str {
+        if self.platform == Platform::MacOs && !kit && holds_daemon {
+            layout::RELEASE_DAEMON
+        } else {
+            layout::RELEASE_BINARY
         }
     }
 }

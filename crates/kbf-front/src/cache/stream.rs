@@ -33,7 +33,7 @@ use std::sync::Arc;
 use futures::StreamExt as _;
 use kbf_objstore::{BodyStream, ObjectStore};
 use kbf_segments::{Crc32c, RecordHasher};
-use kbf_tier::{Reservation, TierError};
+use kbf_tier::{Reservation, Synced, TierError};
 
 use kbf_types::Digest;
 
@@ -104,6 +104,24 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         range: TierRange,
         blobs: Vec<(Digest, u64)>,
     ) -> Result<(), CacheError> {
+        let (staging, synced) = self.sync_range(range).await?;
+        let at = synced.offset();
+        let blobs = blobs
+            .into_iter()
+            .map(|(d, offset)| (d, at + offset))
+            .collect();
+        self.writer.put_staged(&staging, synced, blobs, true).await
+    }
+
+    /// Makes `range` durable: its block synced. Nothing is indexed yet; dropped, the
+    /// synced range is answered as failed and its block removed.
+    ///
+    /// # Errors
+    /// The sync failed.
+    pub(super) async fn sync_range(
+        &self,
+        range: TierRange,
+    ) -> Result<(Arc<Staging>, Synced), CacheError> {
         let TierRange {
             staging,
             reservation,
@@ -114,12 +132,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             Box::new(move || tier.sync(reservation).map_err(|unsynced| unsynced.error)),
         )
         .await?;
-        let at = synced.offset();
-        let blobs = blobs
-            .into_iter()
-            .map(|(d, offset)| (d, at + offset))
-            .collect();
-        self.writer.put_staged(&staging, synced, blobs, true).await
+        Ok((staging, synced))
     }
 
     /// A place in the write pool for a blob of `size` bytes ([`super::pool`]): the blob is

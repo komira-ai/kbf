@@ -105,6 +105,16 @@ impl Log {
         *lock(&self.0.blind).entry(command).or_default() += 1;
     }
 
+    /// The next state read through the cache's [`MetaLog::query`] fails, as a log that
+    /// cannot answer would.
+    #[allow(
+        dead_code,
+        reason = "write_tier_flusher.rs uses it; the other tests do not"
+    )]
+    pub fn fail_next_read(&self) {
+        *lock(&self.0.fail_reads) += 1;
+    }
+
     /// How many of the cache's state reads the test failed.
     #[allow(
         dead_code,
@@ -153,6 +163,13 @@ impl Log {
 
     pub fn staged_state(&self, object: ObjectId) -> Option<StagedState> {
         self.state(|s| s.staged(object).map(kbf_meta::StagedObject::state))
+    }
+
+    /// The blobs lost now and ever (`kbf_cache_blob_losses_total`'s source): both must
+    /// stay at zero for anything but a real loss.
+    #[allow(dead_code, reason = "the tests of the flusher use it; others do not")]
+    pub fn losses(&self) -> (u64, u64) {
+        self.state(|s| (s.lost_blobs(), s.blob_losses()))
     }
 
     pub fn unreachable(&self, object: ObjectId) -> Option<UnreachableReason> {

@@ -12,7 +12,7 @@ sudo kbf-installer setup --mode=daemon \
 sudo kbf-installer --apply setup ...                                                    # do it
 
 sudo kbf-installer setup --mode=frontend --release-url=https://releases.example/kbf \
-    --database='postgres:///kbf?host=/run/postgresql'
+    --database='postgres:///kbf?host=/run/postgresql&user=kbf' --create-local-database
 ```
 
 Without `--apply` it prints each step as `DRY-RUN: <step>` and changes nothing. With it, it
@@ -27,8 +27,10 @@ prints `+ <step>` and does the step. It never prints a token.
 
 The modes in the first row enroll with a frontend when they start, so they need its URL and
 an enrollment token. The other two do not enroll; they keep their state in Postgres. The
-server, the database and the role exist before `setup` runs (the operator provides them);
-`--database` says where, as `postgres:///NAME?host=SOCKET_DIR`. A URL with a password is
+server exists before `setup` runs (the operator provides it); the role and the database
+exist too, or `--create-local-database` makes them (see "The state database" below).
+`--database` says where, as `postgres:///NAME?host=SOCKET_DIR&user=ROLE`; the role is
+required, because `setup` runs as root and the service as its own account. A URL with a password is
 refused (`installer.toml` is world-readable), and no message quotes a URL. `--commit` installs
 the first release before the host has enrolled, so it needs `--release-source=url`.
 `--min-generation` is the operator floor for orders; a re-run may raise it and never lowers it.
@@ -80,11 +82,13 @@ installer's unit reads it, and refuses another path. A Mac is a node only (`--mo
    The operator's `[proxy]` table is kept (written back whole, defaults filled in). Its `listen`
    key is read here, as below.
 7. Frontend and all-in-one: the state database's schema is created, or brought forward, by the
-   installer's own migrations; a dry run asks the server and says what it would do. `setup`
-   connects as the user running it (root) unless the URL names a role with `user=`, so the
-   server must let that role in from root (peer authentication through a `pg_ident` map, or a
-   local `trust` rule). A server that cannot be reached stops `setup` here (exit 1), with
-   `installer.toml` written and no release, `kbf.toml` or unit; running it again finishes.
+   installer's own migrations; a dry run asks the server and says what it would do. With
+   `--create-local-database` the role and the database are made first. `setup` then logs in
+   as root with the URL's role and, when the service account exists, as that account, so a
+   server that would admit one and not the other is refused here and not at the first start.
+   A server that cannot be reached, or that refuses a login, stops `setup` here (exit 1)
+   with the recipe below, `installer.toml` written and no release, `kbf.toml` or unit;
+   running it again finishes.
 8. `--commit`: the first release, through the installer's `Fetcher` (the fetch child and the
    verify pipeline) and nothing else, then made `releases/current` with no trial. This build
    has no fetcher wired in, so it stops here with exit 1, before `kbf.toml` and the units.
@@ -97,9 +101,12 @@ installer's unit reads it, and refuses another path. A Mac is a node only (`--mo
 10. The units, last: the mode's unit and `kbf-installer.service`, `systemctl enable`, with
    `--now` for a node's unit when a release is installed and `--no-start` is not given (the
    installer's own service does not wait for either). A unit that makes a frontend
-   (`kbf-frontend@a.service`, `kbf-all-in-one.service`) is enabled and never started by
+   (`kbf-frontend.service`, `kbf-all-in-one.service`) is enabled and never started by
    `setup`: starting it takes the database, the TLS files and the port. A unit already
-   enabled is left alone. Nothing is restarted.
+   enabled is left alone. Nothing is restarted. Those two modes also get `kbf-backup.timer`,
+   enabled and started (the schema it dumps was made in step 7), and a drop-in that gives
+   `kbf-backup.service` its `User=`: the mode's service user, the one the frontend unit runs as
+   (see "Backup and restore").
 
 Every step is planned only where the host differs, so the same flags again is "nothing to do"
 (the database step reports the schema as current). A run that stopped part way is finished by
@@ -132,6 +139,168 @@ stops `setup` with exit 5 and names the key, never the value.
 **Proxy units.** The bundled proxy's units (`kbf-proxy.service` and `.socket`) are not on
 `feature/arch-v2` yet (kbf#1153), so a frontend or all-in-one host enables the units that exist
 (`mode_units` in `src/setup/plan.rs` is the one place to change when they land).
+
+## The state database
+
+`frontend` and `all-in-one` keep their state in one Postgres database on the host. The
+package only suggests the server (`Suggests: postgresql`, rpm `postgresql-server`): the
+package is shared by node hosts, which use none, and apt installs `Recommends` by default,
+which would start a database on every node. `setup` for these two modes refuses clearly when
+no server answers at the URL's socket, and says what to install.
+
+Install the server, then one of these.
+
+**Local server, setup makes the role and database (`--create-local-database`).** `setup` asks
+the server as its superuser, by running `/usr/bin/psql` as the operating-system user
+`postgres` over the Unix socket the URL names: peer authentication, no password anywhere. It
+creates, if missing, a login role (no password, not a superuser, no CREATEDB, CREATEROLE or
+REPLICATION) and a database owned by it, both named by the URL. A re-run creates only what is
+missing. It alters nothing that exists: a role that cannot log in or holds any privilege
+(superuser, CREATEROLE, CREATEDB, REPLICATION, BYPASSRLS), and a database another role owns,
+are refused (exit 1) and left as they are. The names must be
+letters, digits, `_` and `-` (at most 63), the role neither `postgres` nor `pg_`-prefixed,
+and the host a Linux host with a `postgres` account. The server's socket directory comes from
+`host=` and must be absolute; a remote server is never reached this way. `--database` names
+one server: a URL with several hosts or ports is refused, so that the role is never made on
+one server and the login tried on another.
+
+**`setup` never edits `pg_hba.conf` or `pg_ident.conf`.** It logs in the way kbf will and,
+when the server refuses, prints the rules to add. For a role `<role>` in database
+`<database>` and a service account `<service>` (`kbf-server` for `frontend` and `all-in-one`),
+above the first `local` line of `pg_hba.conf`:
+
+```text
+local  <database>  <role>  peer map=kbf
+```
+
+and in `pg_ident.conf`:
+
+```text
+kbf  root       <role>
+kbf  <service>  <role>
+```
+
+then reload the server (`pg_ctl reload`, or `systemctl reload postgresql`; a restart is not
+needed) and run `setup` again. If the role is named like the service account, the first
+`pg_ident` line alone is the missing part for root.
+
+`kbf` is the name of the map and any name works, as long as the `pg_hba.conf` line and the
+`pg_ident.conf` lines use the same one (a host that already has a map, `kbfmap` say, keeps
+it): `setup` never reads either file, it only tries the logins, so it does not know the name.
+
+**Remote or managed server, or a role and database the operator makes.** `setup` does not
+reach a remote server's superuser and holds no password. Create the role (login, no
+superuser) and a database it owns, make the server admit the logins above (with a server over
+TCP, client certificates are out of scope, see `docs/design/frontend-proxy.md` section 11),
+and run `setup` without `--create-local-database`: it only checks that it can log in, then
+creates or brings forward the schema.
+
+No refusal quotes the URL, the role, the database or the socket directory; the server's own
+words, which do, stay in its log.
+
+## Backup and restore
+
+A frontend or all-in-one host keeps all of kbf's state in its Postgres database, so that
+database is backed up. `kbf-backup.timer` starts `kbf-backup.service` every day (a host that
+was down then runs it when it starts, and each run is delayed by up to an hour), and the
+service runs `kbf-installer --apply backup` as the host's service user (`kbf-server` on a
+frontend, `kbf` on an all-in-one host). The package's `kbf-backup.service` carries no `User=`:
+`setup` writes it into `/etc/systemd/system/kbf-backup.service.d/10-service-user.conf` (root,
+0644) from the service user of the host's mode, together with the mode's state directory
+(`StateDirectory=` and the verb's `--dir`: `kbf-server` on a frontend, `kbf` on all-in-one, the
+ones of the mode's own unit). The unit asserts that file, so where `setup` has not written it
+(or it was deleted) the unit fails, rather than run as root or be skipped as a success. When
+the drop-in changes under a timer that is enabled already (a mode change), `setup` runs
+`systemctl daemon-reload` so the next run uses it. `setup` enables the timer on
+the two modes; the units are in the package like the others (`packaging/linux/units`). The
+backup runs as the role and in the database that "The state database" above provisions: both
+come from the `database` URL of `installer.toml`, whether `setup` made them
+(`--create-local-database`) or the operator did.
+
+**What the backup is.** `pg_dump` in custom format of the database `installer.toml` names, in
+`/var/lib/<state directory>/backups/kbf-<UTC time>.dump` (for example
+`/var/lib/kbf-server/backups/kbf-20270115T080000Z.dump` on a frontend; on an all-in-one host
+`/var/lib/kbf/backups/...`).
+The directory is 0700 and each file 0600, owned by the service user that runs the unit (the
+verb refuses a directory owned by anyone else): a dump holds the whole state, tokens and
+member map included. Nothing about the database is assumed. The role, the database name and
+the socket directory are the `database` URL of `installer.toml`, the one `setup` and the
+frontend read (on the farm
+`postgres:///kbf?host=/run/postgresql&user=kbf-server`: role `kbf-server`, database `kbf`).
+With peer authentication the service user connects as that role, directly when the names are
+the same or through the `pg_ident.conf` map `setup` tells you to add; no password exists
+anywhere. A URL without `user=` leaves the role to libpq, which uses the OS user's name.
+
+**What one run does, in order.** It makes (or checks) the directory and closes it to other
+users; removes the temp file of an earlier run that crashed; has `pg_dump` write a temp file
+whose name is not a backup's; checks that the file is not empty and that `pg_restore --list`
+can read it; syncs it and renames it to its name (a backup is a whole file or it is not
+there); and only then removes the oldest backups beyond the newest `backup_keep`. Any failure
+ends the run with exit 1, removes its temp file, leaves every older backup alone, and the
+unit is `failed`: `systemctl status kbf-backup.service`, `journalctl -u kbf-backup.service`.
+A second run in the same second refuses rather than replace a backup. Without `--apply` the
+verb only says what it would do.
+
+**How many.** `backup_keep` in `/etc/kbf/installer.toml`, 1 to 365, default 7 when the key is
+not there (one a day is a week). `setup` keeps the key when it rewrites the file; the file is
+closed, so a value out of range is refused by `check`, `run` and `backup` alike. The backups
+are on the host's own disk, next to the database they protect: a copy to another machine is
+the operator's (kbf does not push anywhere), and a disk lost takes both.
+
+**Prerequisites.** `pg_dump` and `pg_restore` of the same major version as the server, or a
+newer one (the `postgresql-client` package; a client older than the server refuses to dump).
+The package does not depend on it: it only suggests the Postgres server (see "The state
+database"), and the server package brings its client on most distributions. Both are found by name in `PATH`; `--pg-dump` and
+`--pg-restore` name other paths.
+
+**The first backup, and its restore test.** The design requires both before the farm depends
+on the database. On a new host, after `setup`, run one backup now and restore it into a
+scratch database, which touches nothing live:
+
+```text
+sudo systemctl start kbf-backup.service        # a oneshot: returns when the backup is done
+sudo ls -l /var/lib/<state directory>/backups   # kbf-<time>.dump, mode -rw-------
+sudo -u postgres createdb --owner=<role in the database URL> kbf_restore_test
+sudo -u <service user> kbf-installer --apply restore \
+    --file /var/lib/<state directory>/backups/kbf-<time>.dump \
+    --database kbf_restore_test
+sudo -u <service user> psql 'postgres:///kbf_restore_test?host=<socket dir>&user=<role>' \
+    -c '\dt kbf_state.*'
+sudo -u postgres dropdb kbf_restore_test
+```
+
+`restore` runs `pg_restore` in one transaction that stops at the first error, taking no owner
+or privilege from the dump (the connecting role owns what it makes, as `setup` made it). The
+database must hold no kbf schema: a restore into one that does fails and changes nothing.
+Without `--database` it restores into the database `installer.toml` names. `--database` takes
+a bare name (as above: a database on the same server and socket, for the same role as
+`installer.toml`'s URL) or a full URL with no password; the URL's `port=` (or the port of its
+authority) is kept. On a frontend the user, role, socket and state directory are `kbf-server`,
+`kbf-server`, `/run/postgresql` and `kbf-server`.
+
+**Restoring the real state** (the database is lost or damaged). The state is what the backup
+held: builds in flight are gone, and nodes register again.
+
+```text
+sudo systemctl stop kbf-frontend.service     # waits for open builds; nothing may write
+sudo -u postgres dropdb <database in the URL>
+sudo -u postgres createdb --owner=<role in the URL> <database in the URL>
+sudo -u <service user> kbf-installer --apply restore --file /var/lib/<state directory>/backups/kbf-<time>.dump
+sudo systemctl start kbf-frontend.service    # opens the store: its schema check must accept it
+```
+
+The tests: `src/backup_tests.rs` (retention, atomicity, modes and the arguments, reading the
+role, database and socket from the URL, without a server), `src/setup/backup_dropin_tests.rs`
+(the drop-in's `User=` and state directory are the mode's, and a reload follows a changed
+drop-in under an enabled timer), `package_units.rs` (the unit carries no `User=` and asserts
+the drop-in). They run in the PR's `test` job. `real_server_round_trip` needs a server and
+`pg_dump` 17: it is `#[ignore]` and no job selects it yet (the `state-postgres` job of
+`beta.yml` runs only the filters `database::` and `setup_creates_the_schema`, and its runner
+has no PostgreSQL 17 client): it runs by hand, with `KBF_TEST_POSTGRES_URL` set
+(`cargo test -p kbf-installer --lib -- --ignored backup::tests::real_server_round_trip`), until
+a change to `beta.yml` adds the filter and the client. It makes the schema as `setup`
+makes it, rows written through the state store, a backup, a restore into a second database as
+a role that is not a superuser, and the store opened on it reading every row back.
 
 ## Exit codes
 

@@ -147,6 +147,11 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
         fenced(Keys::Exactly("member-id"), "members (counter)", "member-id"),
         fenced(Keys::Under("boot/"), "members (counter)", "boot/1"),
         fenced(Keys::Under("instance/"), "members", "instance/node-a"),
+        fenced(
+            Keys::Under("member-owner/"),
+            "members (id claim)",
+            "member-owner/1",
+        ),
         fenced(Keys::Under("down/"), "members", "down/1"),
         fenced(
             Keys::Exactly("meta/members_formed"),
@@ -162,6 +167,12 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
             Keys::Under("unfilled/"),
             "members (joiner mark)",
             "unfilled/3",
+        ),
+        // The maps the last bumps replaced (`members/pins.rs`).
+        fenced(
+            Keys::Under("handoff/pin/"),
+            "members (map pins)",
+            "handoff/pin/00000000000000000001",
         ),
         fenced(
             Keys::Under("deny/"),
