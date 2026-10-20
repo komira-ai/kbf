@@ -276,3 +276,35 @@ fn the_fixtures_are_public_safe() {
     assert_eq!(CURRENT, "b".repeat(40));
     assert!(KIT_CONF.contains("FRONTEND_NAME=frontend.example.invalid"));
 }
+
+/// A manifest line of an unknown kind is a broken fixture, never a silently skipped entry.
+#[test]
+#[should_panic(expected = "manifest kind \"pipe\"")]
+fn an_unknown_manifest_kind_is_a_broken_fixture() {
+    parse("pipe 0644 root:wheel /usr/local/kbf/x\n");
+}
+
+/// Comments and blank lines are not entries; the kinds parse with their modes and targets.
+#[test]
+fn the_manifest_parser_reads_each_kind() {
+    let got = parse(
+        "# c\n\ndir 0755 root:wheel /a\nfile - _kbf:staff /a/f @kbf.toml\nlink - root:wheel /a/l releases/x\n",
+    );
+    assert_eq!(got.len(), 3);
+    assert_eq!((got[0].kind, got[0].mode), (Kind::Dir, Some(0o755)));
+    assert_eq!(
+        (got[1].kind, got[1].mode, got[1].source.as_deref()),
+        (Kind::File, None, Some("kbf.toml"))
+    );
+    assert_eq!(
+        (got[2].kind, got[2].target.as_deref()),
+        (Kind::Link, Some("releases/x"))
+    );
+}
+
+/// A file that names a fixture the loader does not carry is a broken fixture.
+#[test]
+#[should_panic(expected = "no fixture file \"missing.toml\"")]
+fn a_missing_fixture_file_is_a_broken_fixture() {
+    super::kit_host::source("missing.toml");
+}
