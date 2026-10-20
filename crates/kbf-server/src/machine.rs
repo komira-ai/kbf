@@ -73,6 +73,39 @@ pub struct Waiter {
     /// What the server's `action usage:` line says the action is; the first caller's
     /// names the operation.
     pub usage: Subject,
+    /// The OS family and ISA the action asked for, for the lease lines.
+    pub platform: Platform,
+}
+
+/// The operating system and architecture an action asked for, as kbf parsed them from
+/// its platform (`kbf_caps::Request::from_platform`), for the `lease granted` line. A
+/// part the action names none of is `-`. Only parsed values are kept, so a platform
+/// property's raw text never reaches the log.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Platform {
+    /// `linux` or `macos` (a daemon runs on no other); `-` for none, and for a value
+    /// that is neither.
+    pub os_family: &'static str,
+    /// The architecture's report name (`x86_64`, `arm64`); `-` for none.
+    pub isa: String,
+}
+
+impl Platform {
+    /// What `needs` asks for.
+    #[must_use]
+    pub fn of(needs: &kbf_caps::Request) -> Self {
+        let os_family = needs
+            .exact("os")
+            .and_then(|os| kbf_caps::DAEMON_OSES.iter().find(|known| **known == os))
+            .copied()
+            .unwrap_or("-");
+        let isa = needs
+            .properties()
+            .into_iter()
+            .find_map(|(key, value)| (key == "arch").then_some(value))
+            .unwrap_or_else(|| "-".to_owned());
+        Self { os_family, isa }
+    }
 }
 
 /// A lease whose `Start` was sent.
@@ -281,6 +314,24 @@ mod tests {
         }
     }
 
+    /// Catches: a platform line that logs the request's raw text (an `os` that is not
+    /// one a daemon runs on is `-`), or a part the request does not name that is not `-`.
+    #[test]
+    fn a_platform_is_the_parsed_os_family_and_isa_or_dashes() {
+        let of = |properties: &[(&str, &str)]| {
+            let request = kbf_caps::Request::parse(properties.iter().copied()).expect("parses");
+            let platform = Platform::of(&request);
+            (platform.os_family, platform.isa)
+        };
+        assert_eq!(of(&[]), ("-", "-".to_owned()));
+        assert_eq!(
+            of(&[("os", "macos"), ("arch", "arm64")]),
+            ("macos", "arm64".to_owned())
+        );
+        assert_eq!(of(&[("os", "linux")]), ("linux", "-".to_owned()));
+        assert_eq!(of(&[("os", "x\nINFO forged")]), ("-", "-".to_owned()));
+    }
+
     fn waiter(n: u8) -> Waiter {
         Waiter {
             key: ActionKey {
@@ -295,6 +346,7 @@ mod tests {
             do_not_cache: n.is_multiple_of(5),
             queued: at(u64::from(n)),
             usage: Subject::of(kbf_front::Described::default()).0,
+            platform: Platform::of(&kbf_caps::Request::default()),
         }
     }
 
