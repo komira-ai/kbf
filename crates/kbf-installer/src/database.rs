@@ -6,7 +6,8 @@
 //! Where the database is: the `database` key of `installer.toml`, a `postgres://` URL
 //! (`postgres:///kbf?host=/run/postgresql`). The file is world-readable, so a URL that
 //! carries a password is refused; peer authentication needs none. This module reads that
-//! one key and leaves the others to their own readers. No message here quotes the URL.
+//! one key and leaves the others to their own readers. No message here quotes the URL, and a server's refusal of
+//! the connection is reduced to its SQLSTATE (the server's text quotes role and database).
 //!
 //! The migrations are the ones embedded in this installer build. An update needs schema
 //! `state_schema` (what the staged release's `--version --json` says); the installer runs
@@ -16,6 +17,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use kbf_state::postgres::schema::{self, Migration, Outcome, SchemaError};
 use kbf_state::postgres::{ConfigError, PostgresConfig};
@@ -48,6 +50,22 @@ pub enum DatabaseError {
     /// The URL carries a password, in a world-readable file.
     #[error("the `database` URL in {0} carries a password; use peer authentication")]
     Password(String),
+}
+
+/// The `database` URL of the file `shown`, parsed and refused when it carries a password. The
+/// one place the rule lives: `setup`, `run` and `backup` all hold the file's URL to it.
+///
+/// # Errors
+/// [`DatabaseError::BadUrl`] or [`DatabaseError::Password`]; neither quotes the URL.
+pub(crate) fn check_url(shown: &str, url: &str) -> Result<PostgresConfig, DatabaseError> {
+    let config = PostgresConfig::parse(url).map_err(|why| DatabaseError::BadUrl {
+        path: shown.to_owned(),
+        why,
+    })?;
+    if config.has_password() {
+        return Err(DatabaseError::Password(shown.to_owned()));
+    }
+    Ok(config)
 }
 
 /// What runs before a release starts, so the installer's helper can be tested without a
@@ -86,13 +104,7 @@ impl Database {
         let Some(url) = table.get("database").and_then(toml::Value::as_str) else {
             return Err(DatabaseError::NoDatabase(shown));
         };
-        let config = PostgresConfig::parse(url).map_err(|why| DatabaseError::BadUrl {
-            path: shown.clone(),
-            why,
-        })?;
-        if config.has_password() {
-            return Err(DatabaseError::Password(shown));
-        }
+        let config = check_url(&shown, url)?;
         Ok(Database::new(config, schema::embedded()))
     }
 
@@ -110,6 +122,22 @@ impl Database {
     pub fn setup(&self) -> Result<Outcome, SchemaError> {
         let newest = self.migrations.last().map_or(0, Migration::version);
         schema::apply(&self.config, &self.migrations, newest)
+    }
+
+    /// Brings the database to schema `state_schema` (what a staged release reports) with
+    /// this build's migrations, waiting at most `lock_wait` for any lock and failing as
+    /// [`SchemaError::Busy`] after it. The proxy's swap calls this with its candidate
+    /// not yet started, so it must not wait for ever.
+    ///
+    /// # Errors
+    /// [`SchemaError`]: the installer embeds fewer migrations than the release needs, a
+    /// pending one is a contract step, the server is busy or refuses a migration.
+    pub fn migrate_within(
+        &self,
+        state_schema: u32,
+        lock_wait: Duration,
+    ) -> Result<Outcome, SchemaError> {
+        schema::apply_within(&self.config, &self.migrations, state_schema, lock_wait)
     }
 
     /// What `setup` would do, changing nothing: the database's version (`None` before the

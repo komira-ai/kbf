@@ -26,6 +26,16 @@ pub const KBF_BIN: &str = "/usr/local/kbf-installer/releases/current/kbf";
 pub const NODE_CONFIG: &str = "/usr/local/etc/kbf/kbf.toml";
 /// The directory of [`NODE_CONFIG`]: root's, so the daemon account cannot replace it.
 const CONFIG_DIR: &str = "/usr/local/etc/kbf";
+/// The directory the node's update client is given (`[daemon] update-dir`): the
+/// installer's state directory on macOS (`Layout::state_dir` of kbf-installer's
+/// `layout.rs`, which `kbf-installer setup` makes), where the installer writes
+/// `status.json` for the node to read. `tests/node_config.rs` compares it with that
+/// layout, so the two cannot drift apart.
+pub const UPDATE_DIR: &str = "/var/db/kbf-installer";
+/// The order spool: `orders/` beneath [`UPDATE_DIR`], where the node's update client
+/// writes the frontend's orders (`kbf_update::Config::new`) and the root installer reads
+/// them (its `--orders-dir`; `setup` makes the same directory).
+pub const ORDERS_DIR: &str = "/var/db/kbf-installer/orders";
 pub const LOG_DIR: &str = "/Library/Logs/kbf";
 pub const ERR_LOG: &str = "/Library/Logs/kbf/kbf-daemon.err.log";
 const ROOT_FILE: &str = "-rw-r--r-- 0 0";
@@ -85,6 +95,9 @@ pub fn render_config(profile: &Profile) -> String {
     out.push_str("\n[daemon]\n");
     out.push_str(&format!("driver = {}\n", strings(&["native"])));
     out.push_str(&format!("data-dir = \"{}\"\n", profile.get("kbf_data_dir")));
+    // The node's update client: it spools the frontend's orders under `update-dir` for the
+    // root installer. `orders-dir` is left to its default, `<update-dir>/orders`.
+    out.push_str(&format!("update-dir = \"{UPDATE_DIR}\"\n"));
     out
 }
 
@@ -138,6 +151,54 @@ pub fn render_plist(profile: &Profile) -> String {
     out
 }
 
+/// What `ls -ldn` shows for the order spool: the daemon account's alone, because the
+/// daemon writes the orders and the installer, as root, reads them. Root reads whatever
+/// the mode, so the spool is mode 700 to keep every other account out of it. The installer
+/// opens the spool without following a link and reads only regular files with one link, but
+/// does not check who owns the directory or the records, so who may write orders is
+/// decided here: the daemon account, and no other. A forged record from that account can
+/// name only a commit, which the installer fetches and verifies itself.
+fn spool_want(profile: &Profile) -> String {
+    let (_, id) = daemon_account(profile);
+    format!("drwx------ {id} {id}")
+}
+
+/// Whether the installer's state directory is root's, mode 755, and the order spool is
+/// [`spool_want`]: the problems found, each as the text of a FAIL.
+fn update_dir_problems(c: &Ctx<'_>) -> Vec<String> {
+    let mut problems = Vec::new();
+    let found = c.mac.ls(UPDATE_DIR);
+    if found != ROOT_DIR {
+        problems.push(format!("{UPDATE_DIR} is {found}, want {ROOT_DIR}"));
+    }
+    let (found, want) = (c.mac.ls(ORDERS_DIR), spool_want(c.profile));
+    if found != want {
+        problems.push(format!("{ORDERS_DIR} is {found}, want {want}"));
+    }
+    problems
+}
+
+/// Makes the installer's state directory root's, mode 755, and the order spool the
+/// daemon account's, mode 700, each only if it is not so now. What is at a path and is not
+/// a directory (a link included) is removed first, never followed.
+fn fix_update_dirs(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    let (account, id) = daemon_account(c.profile);
+    for (path, owner, who, mode, want) in [
+        (UPDATE_DIR, 0, "root", 0o755, ROOT_DIR.to_owned()),
+        (ORDERS_DIR, id, account, 0o700, spool_want(c.profile)),
+    ] {
+        if c.mac.ls(path) == want {
+            continue;
+        }
+        if c.mac.lstat(path).is_some_and(|s| s.kind != 'd') {
+            c.mac.remove(path)?;
+        }
+        c.mac.dir(path, owner, owner, mode)?;
+        out.change(c.key, format!("{path} {who}'s, mode {mode:o}"));
+    }
+    Ok(())
+}
+
 /// Whether the error log is a regular file with one link, the daemon account's: the
 /// only file `restart` may empty as root. Its directory is root's, so no link replaces
 /// it.
@@ -149,7 +210,8 @@ fn err_log_safe(c: &Ctx<'_>) -> bool {
 }
 
 /// The installed property list is the one the profile renders, root's, mode 644; the
-/// log directory root's, mode 755; the error log safe and the daemon account's, mode
+/// installer's state directory root's, mode 755, and the order spool in it the daemon
+/// account's, mode 700; the log directory root's, mode 755; the error log safe and the daemon account's, mode
 /// 644; and the job loaded.
 pub(crate) fn launchd_label(c: &Ctx<'_>) -> Outcome {
     let label = c.value();
@@ -171,6 +233,8 @@ pub(crate) fn launchd_label(c: &Ctx<'_>) -> Outcome {
         fail(format!(
             "{CONFIG_DIR} is {config_dir_owner}, want {ROOT_DIR}"
         ))
+    } else if let Some(problem) = update_dir_problems(c).into_iter().next() {
+        fail(problem)
     } else if c.mac.read(&plist).as_deref() != Some(render_plist(c.profile).as_bytes()) {
         fail(format!("{plist} is missing or differs from the profile"))
     } else if plist_owner != ROOT_FILE {
@@ -273,6 +337,7 @@ pub(crate) fn fix_launchd_label(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> 
         )?;
         out.change(c.key, format!("wrote {NODE_CONFIG}, root's, mode 644"));
     }
+    fix_update_dirs(c, out)?;
     let plist = plist_path(c.profile);
     c.mac.mkdir(LAUNCH_DAEMONS)?;
     c.mac

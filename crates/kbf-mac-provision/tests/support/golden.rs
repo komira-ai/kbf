@@ -75,6 +75,7 @@ label = ["profile=mac-arm64-test@{sha12}", "pool=mac", "rack=r2"]
 [daemon]
 driver = ["native"]
 data-dir = "/Volumes/kbf/data"
+update-dir = "/var/db/kbf-installer"
 "#
     )
 }

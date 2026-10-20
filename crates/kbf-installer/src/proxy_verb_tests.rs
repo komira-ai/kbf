@@ -340,6 +340,20 @@ fn the_production_stop_bound_is_ten_seconds() {
     assert_eq!(STOP_BOUND, Duration::from_secs(10));
 }
 
+/// Catches `Stop::production` carrying another bound or another exit than the verb's: its
+/// fields are pinned here. It does not see which `Stop` `serve` builds (a literal `Stop` in
+/// `serve` would pass); `serve` takes its stop from `Stop::production` and reads as such.
+#[test]
+fn the_production_stop_ends_the_process_after_the_bound() {
+    let stop = Stop::production();
+    assert_eq!(stop.bound, STOP_BOUND);
+    assert_eq!(
+        stop.exit as usize,
+        std::process::exit as fn(i32) -> ! as usize
+    );
+    assert!(!stop.seen.load(Ordering::SeqCst));
+}
+
 /// Catches a start that reads as served when it did not: the log line says which slot serves an
 /// adopted child, and that new streams stay held, with the reason, for a held start and for a
 /// supervisor that could not even build its admin client.

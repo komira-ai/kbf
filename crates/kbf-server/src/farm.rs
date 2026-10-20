@@ -44,7 +44,8 @@ use kbf_proto::google::rpc;
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::update::{UpdateOrder, UpdateStatus};
 use kbf_proto::worker::{
-    self, LeaseOffer, NodeStatus, ResultAck, ServerMessage, Start, server_message,
+    self, LeaseOffer, NodeStatus, ResultAck, ResultAckReason as Reason, ServerMessage, Start,
+    server_message,
 };
 use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{
@@ -59,6 +60,7 @@ use kbf_types::{
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
+mod ack;
 mod beat;
 mod durable;
 mod handover;
@@ -69,6 +71,7 @@ pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
 pub use handover::UNTRACED_LOOKS;
 pub use phase::Reported;
 
+use self::ack::{Verdict, refusal};
 use self::durable::Durable;
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
@@ -160,8 +163,8 @@ struct Link {
     /// The `os` and `arch` its newest `Hello` reported (empty if it named none).
     os: String,
     arch: &'static str,
-    /// The version its first `Hello` named, the one `Welcome` answered (`None` if it
-    /// named none). Like the link, it is the newest stream's: a daemon that returns on
+    /// The version `Welcome` named for its first `Hello`: the lesser of the `Hello`'s and
+    /// the server's newest (`None` if the `Hello` named none). Like the link, it is the newest stream's: a daemon that returns on
     /// another version replaces it, and a `Hello` resent on the stream does not.
     protocol: Option<u32>,
 }
@@ -280,6 +283,15 @@ struct State {
     /// `done/` row is made from it when the store is written, and the answer is settled
     /// with it once the store has taken the rows.
     parked: BTreeMap<LeaseId, Detail>,
+    /// The `Result`s the farm took but has not acknowledged, by lease, with the worker
+    /// that sent each: their finish waits in `unwritten` for the state store. The
+    /// acknowledgement goes out when that finish is settled ([`State::settle`]), and never
+    /// if it is dropped instead ([`State::forget_details`]).
+    owed: BTreeMap<LeaseId, WorkerId>,
+    /// The operation of each lease whose answer was settled, while the scheduler keeps
+    /// the operation: a copy of its `Result` is a duplicate, not an unknown lease
+    /// ([`State::standing`]).
+    answered: BTreeMap<LeaseId, OperationId>,
     /// The held effect whose last try was refused as unreachable: a "row is gone" for
     /// this effect and no other may be its own applied work
     /// ([`State::release_unwritten`]).
@@ -313,6 +325,34 @@ struct Settled {
     finished: Finished,
     write: Option<(Digest, ActionRecord)>,
     stages: Vec<watch::Sender<Stage>>,
+    /// The acknowledgement a `Result` was owed until this finish was written, and the
+    /// stream to send it on ([`State::owed`]).
+    ack: Option<(Outbound, ResultAck)>,
+}
+
+/// What a `Result` the scheduler was fed is acknowledged with ([`State::take_report`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Taken {
+    /// It became the operation's result, or a memory kill or lost run the scheduler took.
+    Accepted,
+    /// The scheduler did not take it, for this reason.
+    Refused(Reason),
+    /// The scheduler took it, but its finish is not written yet: acknowledged once it is.
+    Held,
+    /// The scheduler took it, and the record was dropped unwritten: never acknowledged.
+    Dropped,
+}
+
+impl Taken {
+    /// The `accepted` and `reason` of the `ResultAck` this is answered with; `None` for no
+    /// ack at all.
+    const fn ack(self) -> Option<(bool, Reason)> {
+        match self {
+            Self::Accepted => Some((true, Reason::Accepted)),
+            Self::Refused(reason) => Some((false, reason)),
+            Self::Held | Self::Dropped => None,
+        }
+    }
 }
 
 impl Farm {
@@ -363,6 +403,8 @@ impl Farm {
                 durable: None,
                 unsettled: Vec::new(),
                 unwritten: VecDeque::new(),
+                owed: BTreeMap::new(),
+                answered: BTreeMap::new(),
                 parked: BTreeMap::new(),
                 retrying: None,
                 write_drops: 0,
@@ -849,26 +891,40 @@ impl Farm {
     /// (unless the action is `do_not_cache` or exited non-zero) before its callers are
     /// answered. Before it is checked, its `ActionResult` gets the node id and the
     /// server's times ([`Stamp::apply`]), so callers and the cache see them. Returns
-    /// the acknowledgement, or `None` for a `Result` without a lease id.
+    /// the acknowledgement, or `None` for a `Result` without a lease id, and for one the
+    /// state store has not taken yet or the farm dropped over its cap: a daemon forgets a
+    /// `Result` on its ack, so none is sent for a record that is not durable. A held
+    /// result is acknowledged when its record is written ([`State::settle`]); the daemon
+    /// resends what it is not acknowledged for, and a copy of a held result gets no ack
+    /// either.
     pub async fn report(&self, worker: &WorkerId, result: worker::Result) -> Option<ResultAck> {
         let wire_lease = result.lease_id?;
         let _taking = self.in_flight();
         let lease = LeaseId::new(wire_lease.term, wire_lease.seq);
-        let refused = ResultAck {
-            lease_id: Some(wire_lease),
-            accepted: false,
-        };
-        let (holding, recorded) = {
-            let state = self.lock();
-            let holding = state.holder(lease, worker);
-            let recorded = holding
+        let (standing, recorded) = {
+            let mut state = self.lock();
+            let standing = state.standing(lease, worker);
+            let recorded = standing
                 .as_ref()
-                .is_some_and(|(operation, ..)| state.is_recorded(*operation));
-            (holding, recorded)
+                .is_ok_and(|(operation, ..)| state.is_recorded(*operation));
+            // A copy of a result the scheduler took whose finish waits for the store is
+            // acknowledged with the first, to the node that sent the first: a copy from
+            // another node, which never held the lease, is owed nothing.
+            if matches!(standing, Err(Verdict::Held)) {
+                state.owed.entry(lease).or_insert(worker.clone());
+            }
+            (standing, recorded)
         };
-        let Some((operation, action, stamp)) = holding else {
-            tracing::warn!(%worker, %lease, "result refused: not the holder of the current lease");
-            return Some(refused);
+        let (operation, action, stamp) = match standing {
+            Ok(holding) => holding,
+            Err(Verdict::Held) => {
+                tracing::info!(%worker, %lease, "result held: its record is not written yet; no ack");
+                return None;
+            }
+            Err(Verdict::Refused(reason)) => {
+                ack::log_refusal(worker, lease, reason);
+                return Some(refusal(wire_lease, reason));
+            }
         };
         // The lease id is this process's, so the run it reports was started for this
         // operation; a daemon that says it ran another action is refused all the same
@@ -876,8 +932,8 @@ impl Farm {
         if let Some(named) = &result.action_digest
             && *named != kbf_front::digest_to_proto(&action)
         {
-            tracing::warn!(%worker, %lease, %action, "result refused: it names another action");
-            return Some(refused);
+            ack::log_refusal(worker, lease, Reason::Mismatch);
+            return Some(refusal(wire_lease, Reason::Mismatch));
         }
         let ran_on = (worker, stamp);
         // Read before `outcome`, which drops a failed run's result.
@@ -890,7 +946,7 @@ impl Farm {
         let (outcome, detail) = self.outcome(lease, ran_on, result).await;
 
         let now = self.now();
-        let (answers, accepted) = {
+        let (answers, taken) = {
             let mut state = self.lock();
             let report = Report {
                 lease,
@@ -905,18 +961,24 @@ impl Farm {
             if let Some(detail) = detail {
                 state.park(lease, detail);
             }
-            let (answers, accepted) = state.take_report(now, worker, operation, report);
+            let (answers, taken) = state.take_report(now, worker, operation, report);
+            if taken == Taken::Held {
+                state.owed.insert(lease, worker.clone());
+            }
             let settled: Vec<Settled> = answers.iter().map(|a| state.settle(a)).collect();
             // What no answer used waits only if its answer does.
             state.forget_parked();
-            (settled, accepted)
+            (settled, taken)
         };
         for settled in answers {
             self.deliver(settled).await;
         }
+        // None: the ack is sent when the store has taken the record, or never.
+        let (accepted, reason) = taken.ack()?;
         Some(ResultAck {
             lease_id: Some(wire_lease),
             accepted,
+            reason: reason as i32,
         })
     }
 
@@ -1012,6 +1074,13 @@ impl Farm {
         }
         for stage in settled.stages {
             stage.send_replace(Stage::Done(settled.finished.clone()));
+        }
+        if let Some((outbound, ack)) = settled.ack {
+            // A stream that has just ended drops it; the daemon sends the result again.
+            let message = server_message::Message::ResultAck(ack);
+            let _ = outbound.send(Ok(ServerMessage {
+                message: Some(message),
+            }));
         }
     }
 }
@@ -1115,7 +1184,7 @@ impl State {
         worker: &WorkerId,
         operation: OperationId,
         report: Report,
-    ) -> (Vec<Answer>, bool) {
+    ) -> (Vec<Answer>, Taken) {
         let Report {
             lease,
             outcome,
@@ -1138,6 +1207,24 @@ impl State {
         let answers = self.feed(now, event);
         let rerun = self.runs_recorded(operation) > recorded_before;
         let accepted = rerun || answers.iter().any(|a| a.lease == lease);
+        // Not answered: refused, or finished by this lease with the finish waiting for the
+        // store, or with its record dropped unwritten (a finish neither held nor answered).
+        let taken = if accepted {
+            Taken::Accepted
+        } else {
+            let verdict = self
+                .standing(lease, worker)
+                .err()
+                .unwrap_or(Verdict::Refused(Reason::Stale));
+            match verdict {
+                Verdict::Held => Taken::Held,
+                Verdict::Refused(Reason::Duplicate) => Taken::Dropped,
+                Verdict::Refused(reason) => {
+                    ack::log_refusal(worker, lease, reason);
+                    Taken::Refused(reason)
+                }
+            }
+        };
         if accepted && let Some((subject, measured)) = &usage {
             action_usage::log(operation, subject, measured, outcome, lease, worker);
         }
@@ -1172,7 +1259,7 @@ impl State {
         if accepted && outcome == Outcome::Failed(Failure::NodeMemoryPressure) {
             memory::pressure(worker, self.sched.memory_pressure(worker));
         }
-        (answers, accepted)
+        (answers, taken)
     }
 
     fn is_current(&self, worker: &WorkerId, stream: StreamId) -> bool {
@@ -1187,28 +1274,6 @@ impl State {
                 self.machine.disconnect(worker);
             }
         }
-    }
-
-    /// The operation whose current lease is `lease`, the action its `Start` named,
-    /// and the server's times for the run, if `worker` holds it. Only this process's
-    /// leases are in the machine's started table, so a lease of an earlier process
-    /// (another term) is never one.
-    fn holder(&self, lease: LeaseId, worker: &WorkerId) -> Option<(OperationId, Digest, Stamp)> {
-        let sent = self.machine.sent(lease)?;
-        let operation = sent.operation;
-        let current = match self.sched.state(operation)? {
-            OpState::Leased {
-                lease: held,
-                worker: holder,
-                committed: true,
-            }
-            | OpState::Running {
-                lease: held,
-                worker: holder,
-            } => *held == lease && holder == worker,
-            _ => false,
-        };
-        current.then_some((operation, sent.action, sent.stamp))
     }
 
     /// Feeds an input that cannot lead to an answer: only a `Report`, a heartbeat (a
@@ -1349,6 +1414,8 @@ impl State {
         let forgotten = self
             .machine
             .forget_dropped(|operation| sched.state(operation).is_some());
+        self.answered
+            .retain(|_, operation| sched.state(*operation).is_some());
         for id in forgotten {
             self.stages.remove(&id);
         }
@@ -1509,6 +1576,7 @@ impl State {
     /// answer's lease ([`State::park`]), the one its `done/` row was made from.
     fn settle(&mut self, answer: &Answer) -> Settled {
         let detail = self.parked.remove(&answer.lease);
+        self.answered.insert(answer.lease, answer.operation);
         self.machine.forget_leases(answer.operation);
         let waiters: Vec<&Waiter> = answer
             .waiters
@@ -1538,10 +1606,25 @@ impl State {
         };
         self.record_finished(answer, &finished, stored, reason);
         self.keep_finished(answer.operation, answer.waiters.clone());
+        // A result whose finish waited for the store is acknowledged to its sender's
+        // newest stream: the store has taken the row.
+        let ack = self
+            .owed
+            .remove(&answer.lease)
+            .and_then(|worker| self.links.get(&worker))
+            .map(|link| {
+                let ack = ResultAck {
+                    lease_id: Some(wire_lease(answer.lease)),
+                    accepted: true,
+                    reason: Reason::Accepted as i32,
+                };
+                (link.outbound.clone(), ack)
+            });
         Settled {
             finished,
             write,
             stages,
+            ack,
         }
     }
 }

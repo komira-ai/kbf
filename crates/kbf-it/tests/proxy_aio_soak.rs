@@ -533,6 +533,7 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
         (client, driver)
     });
     let swap_over = AtomicBool::new(false);
+    let checks_over = AtomicBool::new(false);
     let (end, notes) = std::thread::scope(|scope| {
         // The deadline: a swap still running at SWAP_BOUND is stopped (its next sleep fails).
         scope.spawn(|| {
@@ -561,6 +562,11 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
             let mut swap = Swap::begin(ports, plan.clone(), Some(old.clone())).expect("begin");
             let end = swap.run();
             swap_over.store(true, Ordering::SeqCst);
+            // The new child was forked on this thread, and the kernel's death signal ends it
+            // when this thread does (`reaped::spawn`): stay until the checks on it are done.
+            while !checks_over.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             (end, swap.notes().to_vec())
         });
         // A failed check in the body stops the swap before the scope joins it.
@@ -691,6 +697,7 @@ child ready, or a hold that ran out, shows here)"
             until("B's executions end", || open_executions(&api_b) == 0).await;
             });
         }));
+        checks_over.store(true, Ordering::SeqCst);
         if let Err(panic) = body {
             clock.stop.store(true, Ordering::SeqCst);
             swap_over.store(true, Ordering::SeqCst);

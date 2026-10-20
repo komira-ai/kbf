@@ -59,6 +59,19 @@ fn naming_deb(platform: &str) -> String {
     )
 }
 
+/// The provenance step of the Mac installer `.pkg`.
+fn provenance_pkg() -> String {
+    format!(
+        "      - id: provenance-kbf-installer-pkg-darwin-arm64\n        uses: actions/attest-build-provenance@{ATTEST_PIN}\n        with:\n          subject-path: dist/{}.pkg\n",
+        attested_assets::stem("kbf-installer", "darwin-arm64")
+    )
+}
+
+/// The step after it, which names its bundle.
+fn naming_pkg() -> String {
+    "      - name: Name the bundle of the package for darwin-arm64\n        env:\n          BUNDLE: ${{ steps.provenance-kbf-installer-pkg-darwin-arm64.outputs.bundle-path }}\n        run: cp \"$BUNDLE\" \"dist/kbf-installer-${GITHUB_SHA}-darwin-arm64.pkg.sigstore.json\"\n".to_owned()
+}
+
 /// The upload of the bundles of the group `g`.
 fn upload(g: &str) -> String {
     format!(
@@ -88,6 +101,7 @@ fn good_artifacts() -> String {
             "      - name: Package {platform}\n        run: cargo xtask pkg-asset --package p.deb --platform {platform} --commit \"$GITHUB_SHA\" --binary-tarball t.tar.gz --expect-ref \"$PKG_SOURCE_REF\" --gh gh --out dist\n      - name: Check {platform}\n        run: cargo xtask pkg-asset --verify-only --package p.deb --platform {platform} --commit \"$GITHUB_SHA\" --binary-tarball t.tar.gz --expect-ref \"$GITHUB_REF\"\n"
         ));
     }
+    w.push_str("      - name: Package macos\n        run: cargo xtask pkg-macos-asset --package p.pkg --commit \"$GITHUB_SHA\" --binary-tarball t.tar.gz --expect-ref \"$PKG_SOURCE_REF\" --gh gh --out dist\n      - name: Check macos\n        run: cargo xtask pkg-macos-asset --verify-only --package p.pkg --commit \"$GITHUB_SHA\" --binary-tarball t.tar.gz --expect-ref \"$GITHUB_REF\"\n");
     for g in ["linux", "darwin-arm64"] {
         w.push_str(&format!(
             "  attest-{g}:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/attest-build-provenance@{ATTEST_PIN}\n        with:\n          subject-checksums: dist/SHA256SUMS\n"
@@ -99,6 +113,10 @@ fn good_artifacts() -> String {
         for platform in DEBS.iter().filter(|p| group(p) == g) {
             w.push_str(&provenance_deb(platform));
             w.push_str(&naming_deb(platform));
+        }
+        if g == "darwin-arm64" {
+            w.push_str(&provenance_pkg());
+            w.push_str(&naming_pkg());
         }
         w.push_str(&upload(g));
         w.push_str(&format!(
@@ -673,6 +691,80 @@ fn a_package_without_its_own_provenance_step_or_bundle_name_is_named() {
     ] {
         cases.artifacts(what, &broken(&from, &to), wanted, false);
     }
+    cases.done();
+}
+
+#[test]
+fn the_mac_package_without_its_own_provenance_step_or_bundle_name_is_named() {
+    // Catches: the Mac `.pkg` made an asset (and so listed in the macOS SHA256SUMS and
+    // released) with no attestation of its own, so a Mac has no bundle to verify it with
+    // offline; its bundle named as a tarball's or a deb's, a glob subject, the step
+    // skippable or without an id, and the `.pkg` attested in the Linux group.
+    let mut cases = Cases::default();
+    let w = good_artifacts();
+    let planted = w
+        .replacen(&provenance_pkg(), "", 1)
+        .replacen(&naming_pkg(), "", 1);
+    assert_ne!(planted, w);
+    cases.artifacts(
+        "pkg",
+        &planted,
+        &format!(
+            "kbf-installer package (pkg) for darwin-arm64 is packaged, but `attest-darwin-arm64` has no actions/attest-build-provenance step with subject-path dist/{}.pkg",
+            attested_assets::stem("kbf-installer", "darwin-arm64")
+        ),
+        true,
+    );
+    let bundle = "kbf-installer-${GITHUB_SHA}-darwin-arm64.pkg.sigstore.json";
+    for (what, from, to, wanted) in [
+        (
+            "the bundle named as a tarball's",
+            bundle.to_owned(),
+            "kbf-installer-${GITHUB_SHA}-darwin-arm64.tar.gz.sigstore.json".to_owned(),
+            "the step after the provenance step for kbf-installer package (pkg) for darwin-arm64 in `attest-darwin-arm64` does not name its bundle",
+        ),
+        (
+            "the bundle named as a deb's",
+            bundle.to_owned(),
+            "kbf-installer-${GITHUB_SHA}-darwin-arm64.deb.sigstore.json".to_owned(),
+            "does not name its bundle",
+        ),
+        (
+            "a glob subject",
+            format!(
+                "subject-path: dist/{}.pkg",
+                attested_assets::stem("kbf-installer", "darwin-arm64")
+            ),
+            "subject-path: dist/*.pkg".to_owned(),
+            "kbf-installer package (pkg) for darwin-arm64 is packaged, but",
+        ),
+        (
+            "the step skippable",
+            "      - id: provenance-kbf-installer-pkg-darwin-arm64\n".to_owned(),
+            "      - id: provenance-kbf-installer-pkg-darwin-arm64\n        if: always()\n"
+                .to_owned(),
+            "the provenance step for kbf-installer package (pkg) for darwin-arm64 in `attest-darwin-arm64` is under `if:`",
+        ),
+        (
+            "no id",
+            "      - id: provenance-kbf-installer-pkg-darwin-arm64\n".to_owned(),
+            String::new(),
+            "has no `id:`",
+        ),
+    ] {
+        cases.artifacts(what, &broken(&from, &to), wanted, false);
+    }
+    cases.artifacts(
+        "the pkg-macos-asset line removed",
+        &broken("cargo xtask pkg-macos-asset --package p.pkg", "echo p.pkg"),
+        "`attest-darwin-arm64` attests dist/kbf-installer-${{ github.sha }}-darwin-arm64.pkg with a provenance step of its own",
+        true,
+    );
+    assert_eq!(
+        attested_assets::packaged_macos_pkgs(&good_artifacts()).expect("readable"),
+        ["darwin-arm64"],
+        "the verify-only line is not a package made an asset"
+    );
     cases.done();
 }
 

@@ -9,6 +9,7 @@ use kbf_state::{
     Changes, Commit, CommitStats, Cond, Conflict, Revision, ScanPage, ScanRange, Store, StoreError,
     StoreTime, Txn, Versioned,
 };
+use kbf_testkit::dir::TestDir;
 use kbf_types::object_store_api::BindingRole;
 use prost::Message as _;
 
@@ -17,10 +18,13 @@ use crate::object_store::registry::cold_store_view;
 use crate::object_store::rows::{BindRow, ConnRow, conn_key};
 use crate::object_store::{ColdStoreView, Registry, RegistryError};
 
-fn bound(store: &Arc<dyn Store>, label: &str) -> Registry {
-    let reg = open(store, &scratch(label).join("s"));
+/// The registry and the directory of its secret files, which the caller holds as long as
+/// it uses the registry.
+fn bound(store: &Arc<dyn Store>, label: &str) -> (Registry, TestDir) {
+    let dir = scratch(label);
+    let reg = open(store, &dir.join("s"));
     reg.put_connection(&name("cold"), &put(SENTINEL)).unwrap();
-    reg
+    (reg, dir)
 }
 
 fn view(store: &Arc<dyn Store>) -> ColdStoreView {
@@ -39,7 +43,7 @@ fn no_binding_is_no_uri_at_the_registry_generation() {
             uri: None
         }
     );
-    let reg = bound(&store, "view-none");
+    let (reg, _dir) = bound(&store, "view-none");
     assert_eq!(
         view(&store),
         ColdStoreView {
@@ -60,7 +64,7 @@ fn no_binding_is_no_uri_at_the_registry_generation() {
 #[test]
 fn the_uri_is_the_bucket_prefix_endpoint_and_settings_and_nothing_else() {
     let store = as_store(&fake());
-    let reg = bound(&store, "view-uri");
+    let (reg, _dir) = bound(&store, "view-uri");
     let mut binding = bind("cold", "farm-cold");
     binding.prefix = String::new();
     reg.put_binding(BindingRole::Cold, &binding).unwrap();
@@ -80,7 +84,8 @@ fn the_uri_is_the_bucket_prefix_endpoint_and_settings_and_nothing_else() {
 #[test]
 fn the_registered_settings_are_in_the_uri() {
     let store = as_store(&fake());
-    let reg = open(&store, &scratch("view-set").join("s"));
+    let dir = scratch("view-set");
+    let reg = open(&store, &dir.join("s"));
     let mut conn = put(SENTINEL);
     conn.region = Some("eu-1".to_owned());
     conn.conditional_put = Some(true);
@@ -104,7 +109,7 @@ fn the_registered_settings_are_in_the_uri() {
 #[test]
 fn rows_that_do_not_make_a_store_are_corrupt_not_absent() {
     let store = as_store(&fake());
-    let reg = bound(&store, "view-bad");
+    let (reg, _dir) = bound(&store, "view-bad");
     reg.put_binding(BindingRole::Cold, &bind("cold", "b?x"))
         .unwrap();
     let err = cold_store_view(&*store).unwrap_err();
@@ -138,7 +143,7 @@ fn rows_that_do_not_make_a_store_are_corrupt_not_absent() {
 #[test]
 fn a_connection_row_with_userinfo_is_corrupt_and_makes_no_uri() {
     let store = as_store(&fake());
-    let reg = bound(&store, "view-userinfo");
+    let (reg, _dir) = bound(&store, "view-userinfo");
     reg.put_binding(BindingRole::Cold, &bind("cold", "b"))
         .unwrap();
     view(&store);
@@ -170,6 +175,8 @@ struct Changing {
     writer: Registry,
     times: usize,
     done: AtomicUsize,
+    /// Last: the writer's secret files outlive every use of it.
+    _dir: TestDir,
 }
 
 impl Store for Changing {
@@ -210,7 +217,7 @@ impl Store for Changing {
 
 fn changing(label: &str, times: usize) -> Changing {
     let inner = as_store(&fake());
-    let writer = bound(&inner, label);
+    let (writer, dir) = bound(&inner, label);
     writer
         .put_binding(BindingRole::Cold, &bind("cold", "b"))
         .unwrap();
@@ -219,6 +226,7 @@ fn changing(label: &str, times: usize) -> Changing {
         writer,
         times,
         done: AtomicUsize::new(0),
+        _dir: dir,
     }
 }
 
