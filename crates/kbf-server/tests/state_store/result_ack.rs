@@ -129,6 +129,47 @@ async fn a_result_resent_after_the_stream_dropped_is_recorded_once() {
     assert_eq!(disk.rows("done/"), 1);
 }
 
+/// Catches: a farm that hands the ack of a held result to a node that never held the
+/// lease. While the store is down, node-a's result is held; node-b, which was not granted
+/// the lease, names it too. When the store takes the record the one ack goes to node-a's
+/// stream, `accepted`, and node-b is sent none.
+#[tokio::test(start_paused = true)]
+async fn a_copy_of_a_held_result_from_another_node_is_not_acknowledged() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (stream_a, mut inbox) = register(&farm);
+    let other = WorkerId::new("node-b");
+    let (stream_b, mut other_inbox) = register_as(&farm, &other);
+    let _ticket = submit_ticket(&farm, 1);
+    let mut starts_a = starts(&mut inbox);
+    let mut starts_b = starts(&mut other_inbox);
+    let (holder, stream, holder_inbox, lease) = match (starts_a.pop(), starts_b.pop()) {
+        (Some(lease), None) => (node(), stream_a, &mut inbox, lease),
+        (None, Some(lease)) => (other.clone(), stream_b, &mut other_inbox, lease),
+        both => panic!("one node is granted the lease: {both:?}"),
+    };
+    let stranger = if holder == node() { other } else { node() };
+
+    disk.store.set_down(true);
+    assert_eq!(farm.report(&holder, invalid(lease)).await, None);
+    assert_eq!(farm.report(&stranger, invalid(lease)).await, None);
+
+    disk.store.set_down(false);
+    assert!(farm.heartbeat(&holder, stream, 1, vec![lease]).await);
+    let sent = acks(holder_inbox);
+    assert_eq!(sent.len(), 1, "the holder is acknowledged: {sent:?}");
+    assert!(sent[0].accepted);
+    let stray = if holder == node() {
+        &mut other_inbox
+    } else {
+        &mut inbox
+    };
+    assert!(
+        acks(stray).is_empty(),
+        "a node that never held the lease was acknowledged"
+    );
+}
+
 /// Catches: a farm that drops a committed record over its cap and still acknowledges the
 /// `Result` (the daemon forgets a result nothing holds). With room for one held record,
 /// the second result is dropped and the farm logs and counts it: no ack for it, while the
