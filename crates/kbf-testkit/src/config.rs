@@ -7,7 +7,6 @@
 //! Every test that starts a `kbf` gives it the flag [`flag`] returns.
 
 use std::fs::OpenOptions;
-use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
@@ -23,13 +22,12 @@ pub const FILE: &str = "kbf.toml";
 #[must_use]
 pub fn flag(dir: &Path) -> String {
     let path = dir.join(FILE);
-    let mut file = OpenOptions::new()
+    OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(&path)
-        .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-    file.flush().expect("flush");
+        .expect("write the empty kbf.toml");
     format!("--config={}", path.display())
 }
