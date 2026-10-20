@@ -17,7 +17,9 @@
 //!   capability set and the node's architecture the way containers/common resolves it:
 //!   an entry with `includes.caps` applies only if the container holds all of them, one
 //!   with `excludes.caps` only if it holds none, and one with `arches` only on those
-//!   architectures. The result is a plain OCI `linux.seccomp` section.
+//!   architectures. The result is a plain OCI `linux.seccomp` section. One edit differs
+//!   from upstream: four `personality` entries that also allow `ADDR_NO_RANDOMIZE`
+//!   (see their `comment` in the profile).
 //! - **Also set:** `noNewPrivileges`, `oom_score_adj` 0, a private cgroup namespace, and
 //!   `/sys/fs/cgroup` read-only (`spec`).
 //!
@@ -92,7 +94,7 @@ const PROFILE: &str = include_str!("seccomp.json");
 /// change, which is what a reviewer reads.
 #[cfg(test)]
 pub(crate) const PROFILE_SHA256: &str =
-    "cc374cf23846ce1f62f4dc807a8e2b8673c783c6f56cb475467621035d281e6c";
+    "ade1fa9f5ea569f899c8e3ff4b1d94032d72de6cd1888c012240b87c571594d8";
 
 /// The architecture name containers/common filters on (Go's `GOARCH`) for Rust's
 /// `std::env::consts::ARCH`; `None` for one the profile has no filter for.
