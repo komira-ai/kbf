@@ -178,11 +178,8 @@ impl Running {
     pub fn wait(&self) -> io::Result<Reaped> {
         // Without WNOHANG, `wait4` returns only once the leader is reaped, or fails.
         // This process installs no signal handler, so it is never interrupted.
-        loop {
-            if let Some(reaped) = self.reap(0)? {
-                return Ok(reaped);
-            }
-        }
+        self.reap(0)?
+            .ok_or_else(|| io::Error::other("wait4 without WNOHANG returned no child"))
     }
 
     fn reap(&self, flags: libc::c_int) -> io::Result<Option<Reaped>> {
@@ -355,9 +352,10 @@ mod tests {
         // Linux counts a zombie as a member of its group; whether macOS does is not
         // relied on, so there the drain only has to kill.
         let drained = running.drain(Duration::from_millis(50));
-        if cfg!(target_os = "linux") {
-            assert!(!drained, "the unreaped leader is a member");
-        }
+        #[cfg(target_os = "linux")]
+        assert!(!drained, "the unreaped leader is a member");
+        #[cfg(not(target_os = "linux"))]
+        let _ = drained;
         let reaped = running.wait().expect("reaped");
         assert_eq!(reaped.status, Err(libc::SIGKILL));
         assert!(
