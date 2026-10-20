@@ -404,6 +404,12 @@ pub fn migrate<E: Exec>(
         svc.start(&unit).map_err(MigrateError::io(unit.as_str()))?;
         report.line(mode, format!("started {unit}"));
     }
+    // Last, with the old helper disabled and the new layout in place: the installer's own
+    // unit, so the migrated host takes orders without a separate `setup`. Before the journal
+    // says done, so a failure here is a run again, not a host that looks finished.
+    if let Some(installer) = &m.installer_unit {
+        enable_installer(&mut svc, installer, mode, &mut report)?;
+    }
     journal.phase = Phase::Done;
     tree.state.put_journal(&journal)?;
     // A kit host has no old state directory to leave a note in, and none is made.
@@ -411,6 +417,31 @@ pub fn migrate<E: Exec>(
         note_old_state(m)?;
     }
     Ok(report)
+}
+
+/// Enable the installer's unit and start it unless it is enabled already: the same question
+/// and the same command `setup` uses, and nothing run when the answer is yes. The frontend
+/// and the proxy are not touched.
+fn enable_installer<E: Exec>(
+    svc: &mut Services<'_, E>,
+    installer: &Unit,
+    mode: Mode,
+    report: &mut Report,
+) -> Result<(), MigrateError> {
+    let refused = |e: std::io::Error| MigrateError::InstallerUnit {
+        unit: installer.to_string(),
+        why: e.to_string(),
+    };
+    if svc.is_enabled(installer).map_err(refused)? {
+        report.line(mode, format!("{installer}: already enabled"));
+        return Ok(());
+    }
+    svc.enable_now(installer).map_err(refused)?;
+    report.line(
+        mode,
+        format!("enabled and started {installer}: the host takes orders"),
+    );
+    Ok(())
 }
 
 fn describe(outcome: UnitOutcome) -> &'static str {
@@ -497,6 +528,17 @@ fn plan<E: Exec>(m: &Migration, exec: &mut E, report: &mut Report) -> Result<(),
             "it is not running: leave it stopped"
         };
         report.line(Mode::DryRun, format!("{unit}: {what}"));
+    }
+    if let Some(installer) = &m.installer_unit {
+        let enabled = svc
+            .is_enabled(installer)
+            .map_err(MigrateError::io(installer.as_str()))?;
+        let what = if enabled {
+            "it is enabled already: leave it"
+        } else {
+            "enable it and start it, last"
+        };
+        report.line(Mode::DryRun, format!("{installer}: {what}"));
     }
     report.line(
         Mode::DryRun,

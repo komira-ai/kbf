@@ -69,6 +69,13 @@ pub enum MigrateError {
          reinstall the kbf-installer .pkg to hand the host to the installer again"
     )]
     KitRolledBack,
+    /// The migration is written but the installer's own unit would not come up: without it
+    /// the host takes no orders. The journal is not `done`, so a run again finishes it.
+    #[error(
+        "{unit} could not be enabled and started ({why}): the host is moved but takes no orders; \
+         fix the unit, then run `kbf-installer migrate --apply` again"
+    )]
+    InstallerUnit { unit: String, why: String },
     /// A rollback that would throw away what the installer did since.
     #[error("cannot roll back: {0}")]
     MovedOn(String),
@@ -111,6 +118,7 @@ impl MigrateError {
             | MigrateError::Unmigrated(_)
             | MigrateError::KitRolledBack
             | MigrateError::MovedOn(_)
+            | MigrateError::InstallerUnit { .. }
             | MigrateError::NoJournal => Exit::NeedsOperator,
             // The old tools' lock or the installer's, held past the wait: ask again.
             MigrateError::State(StateError::Busy { .. }) => Exit::Busy,

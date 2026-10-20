@@ -39,7 +39,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Verb {
     /// First install: accounts, directories, installer.toml, the first release.
-    Setup(SetupArgs),
+    Setup(Box<SetupArgs>),
     /// What is installed, staged and pending, and the last refusal.
     Status,
     /// Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap.
@@ -153,6 +153,13 @@ pub struct SetupArgs {
     /// Enable the units without starting them.
     #[arg(long)]
     pub no_start: bool,
+    /// The kbf.toml settings of a frontend or all-in-one host (listeners, certificates,
+    /// storage): each sets the kbf flag of its name.
+    #[command(flatten)]
+    pub kbf: crate::setup::kbf_settings::KbfFlags,
+    /// A frontend host behind `kbf-installer proxy`: the `[proxy]` table of installer.toml.
+    #[command(flatten)]
+    pub proxy: crate::setup::proxy::ProxyFlags,
     /// The installer.toml `setup` writes (and reads, to keep what it does not set), under the
     /// host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which
     /// is the only value setup accepts. The same flag, with the same meaning, as on `run`.
@@ -294,7 +301,8 @@ pub struct MigrateArgs {
     /// The old helper's unit: stopped and disabled, so the installer is the only manager.
     #[arg(long, value_parser = crate::migrate::Unit::new)]
     pub helper_unit: Option<crate::migrate::Unit>,
-    /// The installer's own unit, which a rollback stops and disables first.
+    /// The installer's own unit: enabled and started as the last step of a migration, stopped
+    /// and disabled first by a rollback.
     #[arg(long, value_parser = crate::migrate::Unit::new)]
     pub installer_unit: Option<crate::migrate::Unit>,
     /// Where the host gets its releases: decides where the replay floor is seeded from.
