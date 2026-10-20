@@ -96,8 +96,10 @@ pub fn render_config(profile: &Profile) -> String {
     out.push_str(&format!("driver = {}\n", strings(&["native"])));
     out.push_str(&format!("data-dir = \"{}\"\n", profile.get("kbf_data_dir")));
     // The node's update client: it spools the frontend's orders under `update-dir` for the
-    // root installer. `orders-dir` is left to its default, `<update-dir>/orders`.
+    // root installer. Both keys are written, so nothing relies on the daemon's derived
+    // default for `orders-dir`; `setup` and `migrate` check them against the installer's layout.
     out.push_str(&format!("update-dir = \"{UPDATE_DIR}\"\n"));
+    out.push_str(&format!("orders-dir = \"{ORDERS_DIR}\"\n"));
     out
 }
 
