@@ -418,25 +418,36 @@ impl GhAttest {
     }
 }
 
-impl Attest for GhAttest {
-    fn verify(&self, commit: &CommitId, tarball: &[u8], attestation: &[u8]) -> Result<(), String> {
-        let io = |e: std::io::Error| format!("attestation: {e}");
-        let owner = self.switch_user.then_some(self.gh.run_as);
+impl GhAttest {
+    /// The scratch directory with `gh`'s home and the two files, for `owner` to read.
+    fn prepare(
+        &self,
+        owner: Option<RunAs>,
+        tarball: &[u8],
+        attestation: &[u8],
+    ) -> std::io::Result<(Scratch, [PathBuf; 3])> {
         let dir = scratch_in(&self.work, "deploy-attest", owner)?;
         let home = dir.0.join("gh");
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&home)
-            .map_err(io)?;
+        fs::DirBuilder::new().mode(0o700).create(&home)?;
         if let Some(user) = owner {
-            std::os::unix::fs::chown(&home, Some(user.uid), Some(user.gid)).map_err(io)?;
+            std::os::unix::fs::chown(&home, Some(user.uid), Some(user.gid))?;
         }
         let packed = dir.0.join("kbf.tar.gz");
         let bundle = dir.0.join("kbf.bundle.jsonl");
         for (path, bytes) in [(&packed, tarball), (&bundle, attestation)] {
-            fs::write(path, bytes).map_err(io)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o644)).map_err(io)?;
+            fs::write(path, bytes)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644))?;
         }
+        Ok((dir, [home, packed, bundle]))
+    }
+}
+
+impl Attest for GhAttest {
+    fn verify(&self, commit: &CommitId, tarball: &[u8], attestation: &[u8]) -> Result<(), String> {
+        let owner = self.switch_user.then_some(self.gh.run_as);
+        let (_dir, [home, packed, bundle]) = self
+            .prepare(owner, tarball, attestation)
+            .map_err(|e| format!("attestation: {e}"))?;
         let tools = Tools {
             trust: self.trust.as_ref(),
             runner: self.runner.as_ref(),
@@ -449,17 +460,16 @@ impl Attest for GhAttest {
 }
 
 /// A fresh scratch directory under `work`, handed to `owner` when there is one.
-fn scratch_in(work: &Path, prefix: &str, owner: Option<RunAs>) -> Result<Scratch, String> {
-    let io = |e: std::io::Error| format!("probe: {e}");
-    fs::create_dir_all(work).map_err(io)?;
-    let name = format!("{prefix}-{}", hex::encode(smoke::random(8)?));
+fn scratch_in(work: &Path, prefix: &str, owner: Option<RunAs>) -> std::io::Result<Scratch> {
+    fs::create_dir_all(work)?;
+    let name = format!(
+        "{prefix}-{}",
+        hex::encode(smoke::random(8).map_err(std::io::Error::other)?)
+    );
     let dir = Scratch(work.join(name));
-    fs::DirBuilder::new()
-        .mode(0o755)
-        .create(&dir.0)
-        .map_err(io)?;
+    fs::DirBuilder::new().mode(0o755).create(&dir.0)?;
     if let Some(user) = owner {
-        std::os::unix::fs::chown(&dir.0, Some(user.uid), Some(user.gid)).map_err(io)?;
+        std::os::unix::fs::chown(&dir.0, Some(user.uid), Some(user.gid))?;
     }
     Ok(dir)
 }
@@ -537,7 +547,7 @@ impl HostProbe {
     /// Unpack the (attested) tarball and run it.
     fn run(&self, commit: &CommitId, tarball: &[u8]) -> Result<Option<u64>, String> {
         let io = |e: std::io::Error| format!("probe: {e}");
-        let dir = scratch_in(&self.work, "deploy-probe", self.run_as)?;
+        let dir = scratch_in(&self.work, "deploy-probe", self.run_as).map_err(io)?;
         let packed = dir.0.join("kbf.tar.gz");
         fs::write(&packed, tarball).map_err(io)?;
         let binary = dir.0.join("kbf");
