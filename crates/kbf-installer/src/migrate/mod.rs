@@ -81,7 +81,7 @@ pub use error::MigrateError;
 pub use floor::{FrontendFloor, NoFrontend, Seed, Source};
 pub use rollback::rollback;
 pub use roots::Roots;
-pub use units::Unit;
+pub use units::{Unit, retired_name};
 
 use crate::CommitId;
 use crate::binary::Version;
@@ -195,24 +195,34 @@ impl std::fmt::Display for Report {
     }
 }
 
-/// The check `setup` and every verb that changes releases makes first: while the old
-/// layout's state is the host's (it exists and no migration finished), they refuse, so
-/// the old helper and the installer never both manage one host.
+/// The check every verb that changes releases makes first: while the old layout's state is
+/// the host's (it exists and no migration finished), they refuse, so the old helper and the
+/// installer never both manage one host. `setup` asks [`standing`], which is this check and
+/// the units a finished migration repointed.
 pub fn guard(layout: &Layout, owner_uid: u32) -> Result<(), MigrateError> {
+    standing(layout, owner_uid).map(drop)
+}
+
+/// What the migration left on this host, for `setup`. The units a finished migration
+/// (journal phase `Done`) repointed; they are the ones `setup` may retire where they shadow
+/// the packaged unit of the same name. A host with no old layout and no finished migration
+/// has none. A host with the old layout's state and no finished migration (never begun,
+/// begun, or rolled back) is refused with [`MigrateError::Unmigrated`]. The old layout's
+/// paths are not the test: a migrated host keeps them on purpose, as its rollback path.
+pub fn standing(layout: &Layout, owner_uid: u32) -> Result<Vec<Unit>, MigrateError> {
     let rules = tree::Rules::release(owner_uid);
     let roots = Roots::new(layout.platform());
-    if old::read(layout, &roots, &rules)?.is_none() {
-        return Ok(());
-    }
     let done = newtree::StateDir::open(layout, &rules)?
         .map(|t| t.journal())
         .transpose()?
         .flatten()
-        .is_some_and(|j| j.phase == journal::Phase::Done);
-    if done {
-        Ok(())
-    } else {
-        Err(MigrateError::Unmigrated(roots.old_state.to_string()))
+        .filter(|j| j.phase == journal::Phase::Done);
+    if let Some(journal) = done {
+        return Ok(journal.units);
+    }
+    match old::read(layout, &roots, &rules)? {
+        None => Ok(Vec::new()),
+        Some(_) => Err(MigrateError::Unmigrated(roots.old_state.to_string())),
     }
 }
 

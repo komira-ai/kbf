@@ -75,8 +75,9 @@ Every step can be run again: a finished migration is a no-op; one that stopped h
 the next run (the journal `migration.json` remembers what was stopped); a floor only goes up; a copy
 with the source's digest is kept, any other leftover is replaced, scratch is swept. While the old
 state exists and no migration finished, `run`, the operator's verbs (`confirm`, `revert`,
-`rollback`, `gc`) and `setup` of a mode with a database refuse (exit 5) and name this verb; the
-rest of `setup` calls the same check when it is built. `status.json` names `unverified` releases
+`rollback`, `gc`) and `setup` refuse (exit 5) and name this verb. `setup` also retires, on a
+finished migration, a journalled unit file that shadows the packaged unit of its name (the
+bytes are kept in `migration-units/<unit>.retired`); `--rollback` puts it back. `status.json` names `unverified` releases
 until the helper's first pass rewrites it (the helper does not carry the list yet; the journal
 `migration.json` and the missing `VERIFIED` marker do).
 
