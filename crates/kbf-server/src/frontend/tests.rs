@@ -423,3 +423,86 @@ async fn a_frontend_binds_its_three_listeners_on_their_own_ports() {
         "{ports:?}"
     );
 }
+
+/// Catches: `--auto-promote` on by default (a joiner would then be promoted without an
+/// operator on the first release, which the design says must behave as before), its
+/// companions turning it on or being refused without it (the config template writes them
+/// as live lines, so a refusal would break every frontend started from the template), the
+/// flag taken where no membership is kept (it needs the state store), and the values lost
+/// between the flags and the setting: the settle time in seconds and the degraded switch.
+#[test]
+fn auto_promote_is_off_by_default_and_its_companions_need_it() {
+    use crate::members::Handoff;
+    use std::time::Duration;
+
+    const STORE: &str = "--state-store=sqlite:///x.db";
+    assert_eq!(parsed(&[STORE]).expect("parses").handoff, None);
+    assert_eq!(parsed(&[]).expect("parses").handoff, None);
+    let on = parsed(&[STORE, "--auto-promote"]).expect("parses").handoff;
+    assert_eq!(on, Some(Handoff::default()));
+    let set = parsed(&[
+        STORE,
+        "--auto-promote",
+        "--handoff-settle-secs=5",
+        "--handoff-allow-degraded",
+    ])
+    .expect("parses")
+    .handoff;
+    assert_eq!(
+        set,
+        Some(Handoff {
+            settle: Duration::from_secs(5),
+            allow_degraded: true,
+        })
+    );
+    let zero = parsed(&[STORE, "--auto-promote", "--handoff-settle-secs=0"]).expect("parses");
+    assert_eq!(zero.handoff.map(|h| h.settle), Some(Duration::ZERO));
+    // The companions have a live line in the config template (with their defaults), so they
+    // must not need the switch: without it they change nothing.
+    for alone in [
+        vec![STORE, "--handoff-settle-secs=5"],
+        vec![STORE, "--handoff-allow-degraded"],
+        vec!["--handoff-settle-secs=30"],
+    ] {
+        assert_eq!(parsed(&alone).expect("parses").handoff, None, "{alone:?}");
+    }
+    let e = parsed(&["--auto-promote"]).expect_err("no state store");
+    assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    let help = super::command().render_long_help().to_string();
+    for flag in [
+        "--auto-promote",
+        "--handoff-settle-secs",
+        "--handoff-allow-degraded",
+    ] {
+        assert!(help.contains(flag), "{flag}");
+    }
+}
+
+/// Catches: the setting parsed and dropped before the members that use it (the frontend
+/// would take the flag and never promote), or given to members when none is asked for.
+#[test]
+fn the_members_of_a_frontend_carry_the_setting_it_was_given() {
+    use crate::members::Handoff;
+    use crate::serve::members_of;
+
+    let state = StateStore {
+        store: Arc::new(Fake::with_flaw(
+            Arc::new(ManualClock::default()),
+            Flaw::None,
+        )),
+        epoch: EpochPolicy::Keep,
+        members: crate::members::MembershipConfig::default(),
+        history: None,
+    };
+    let setting = Handoff {
+        settle: std::time::Duration::from_secs(9),
+        allow_degraded: true,
+    };
+    let given = members_of(Some(&state), Some(setting)).expect("members");
+    assert_eq!(given.handoff(), Some(setting));
+    assert_eq!(
+        members_of(Some(&state), None).expect("members").handoff(),
+        None
+    );
+    assert!(members_of(None, Some(setting)).is_none());
+}
