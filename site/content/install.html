@@ -1,2 +1,222 @@
 <h1>Install</h1>
-<div class="notice notice-warn"><p>This page is written after the design review of the home page and the quick start.</p></div>
+<p class="lede">What you install, on which machine, how to check the files before you run them, and what <code>kbf-installer</code> sets up. Each part is tagged: <span class="tag tag-ok">works today</span> is in the code, <span class="tag tag-planned">specified</span> is designed and not built.</p>
+
+<div class="notice notice-warn">
+  <p><strong>Where installing stands.</strong> CI builds, signs and attests every file below, and the <code>kbf-installer</code> package installs. Two steps of the one-command path are not built: <code>kbf-installer setup</code> cannot download the first <code>kbf</code> release yet, and the hosted <code>install.sh</code> has no release payload to fetch. Until they land, you place a verified <code>kbf</code> yourself. <a href="#path">The shortest path</a> says how.</p>
+</div>
+
+<p class="toc">On this page: <a href="#what">what you install</a> <a href="#modes">modes</a> <a href="#hosts">host requirements</a> <a href="#files">release files</a> <a href="#verify">verify</a> <a href="#installer">kbf-installer</a> <a href="#enroll">enrollment</a> <a href="#path">shortest path</a></p>
+
+<h2 id="what">What you install</h2>
+<p>kbf is Rust. A release has one runtime binary, <code>kbf</code>, and the tools around it. Nothing is built on your machines: the files come from CI.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Program</th><th>What it is</th><th>Platforms</th></tr></thead>
+<tbody>
+<tr><td><code>kbf</code></td><td>The runtime, with five modes chosen by <code>--mode</code>. It runs a role; it never installs, downloads or restarts anything.</td><td>Linux x86_64, Linux arm64, macOS arm64</td></tr>
+<tr><td><code>kbf-installer</code></td><td>The one root tool of a host: it sets the host up, verifies a <code>kbf</code> release, swaps releases and reverts a bad one. It never updates itself; the package manager replaces it.</td><td>Linux x86_64, Linux arm64, macOS arm64</td></tr>
+<tr><td><code>kbf-server</code>, <code>kbf-daemon</code></td><td>The earlier separate programs. <code>kbf-daemon</code> is the worker that <code>kbf --mode=daemon</code> runs; <code>kbf-server</code> is the older single server that holds the cache and the scheduler in one process. A new host uses <code>kbf</code>.</td><td>Linux x86_64, Linux arm64</td></tr>
+<tr><td><code>kbf-deploy</code></td><td>The manual path: renders and checks the systemd units of a mode (<code>render-units</code>, <code>check-units</code>, <code>install-units</code>) and checks a node certificate (<code>verify-cert</code>).</td><td>Linux x86_64, Linux arm64, macOS arm64</td></tr>
+</tbody></table></div>
+
+<h2 id="modes">Which machine runs what</h2>
+<p>A host's role is the flag <code>--mode=</code>, or <code>mode = "..."</code> in <code>/etc/kbf/kbf.toml</code>; a flag overrides the file. It is never a subcommand. <a href="architecture.html">The architecture page</a> says what each role does.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Mode</th><th>Runs</th><th>Put it on</th></tr></thead>
+<tbody>
+<tr><td><code>frontend</code></td><td>The REAPI listener your build tool dials, the scheduler, the listener daemons and storage nodes connect to, and the operator API. It keeps no blobs. Its scheduler state is in a state store: <code>setup</code> configures a Postgres database you provide, and <code>kbf</code> also accepts a SQLite file for one process.</td><td>One Linux host. Clients, daemons and storage nodes know only its name.</td></tr>
+<tr><td><code>storage</code></td><td>The content-addressable store and action cache: a fast local tier, a metadata log, and a cold store (a directory or an S3-compatible bucket).</td><td>Linux hosts with an SSD. Two or more for replication.</td></tr>
+<tr><td><code>daemon</code></td><td>The worker. It dials the frontend, fetches inputs, runs each action in isolation and uploads outputs. It listens on no port.</td><td>Linux (rootless containers through <code>crun</code>) or a Mac (plain processes, <code>--driver native</code>).</td></tr>
+<tr><td><code>storage-and-daemon</code></td><td>A storage node and a daemon in one process, sharing one cache on the node's disk.</td><td>Linux build hosts that also hold data.</td></tr>
+<tr><td><code>all-in-one</code></td><td>Frontend, storage and daemon in one process.</td><td>A single Linux machine, or a first try. The container driver only; kbf documents it for a trusted machine, because actions run beside the farm's state.</td></tr>
+</tbody></table></div>
+
+<h2 id="hosts">What a host needs</h2>
+<h3>Linux, x86_64 or arm64</h3>
+<ul>
+  <li>The binaries link glibc and need the glibc of Ubuntu 24.04 or newer.</li>
+  <li>A node that runs actions needs cgroup v2 with the memory controller, <code>crun</code> at <code>/usr/bin/crun</code>, <code>newuidmap</code> and <code>newgidmap</code> (the <code>uidmap</code> package), and a subordinate uid and gid range of at least 65,536 for the <code>kbf</code> user. The daemon checks the id range, <code>crun</code>, the two id tools and directory permissions at start and names the one that is wrong. <a href="https://github.com/komira-ai/kbf/blob/feature/arch-v2/docs/deploy/linux-build-host.md">The build-host guide</a> lists the rest, including the kernel it was tested on.</li>
+  <li>Actions name their image by digest (<code>docker://repo@sha256:...</code>); the node fetches it from the registry, so it needs egress to the registries your actions use.</li>
+  <li>A frontend or all-in-one host needs a running Postgres server on the host (socket authentication, no password in any flag). <code>kbf-installer setup</code> creates the schema and, with <code>--create-local-database</code>, the role and database.</li>
+</ul>
+<h3>macOS, arm64</h3>
+<ul>
+  <li>The Mac is a daemon host: <code>kbf --mode=daemon</code>, native driver, run by a LaunchDaemon. The binary targets macOS 14.0 and later.</li>
+  <li>The binaries are signed ad hoc (<code>codesign</code> with no certificate and the <code>runtime</code> option) and are not notarized. The <code>.pkg</code> is not signed, so Gatekeeper does not open it by double click; install it with <code>installer</code> from a shell after you verify it.</li>
+  <li><code>all-in-one</code> is Linux only. The installer sets a Mac up as a daemon only.</li>
+  <li><code>kbf-installer</code> on a Mac cannot yet activate a new release: it has no way to read that Mac's leases, so it refuses the order. <a href="updates.html">Updates</a> has the detail.</li>
+</ul>
+
+<h2 id="files">The release files</h2>
+<p>A release is the set of files one push run of the artifacts workflow on <code>main</code> built and attested for one commit, attached unchanged to a GitHub release. Nothing is rebuilt. <code>&lt;commit&gt;</code> below is the full 40-character commit; <code>&lt;platform&gt;</code> is <code>linux-x86_64</code>, <code>linux-arm64</code> or <code>darwin-arm64</code>.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>File</th><th>What it is</th></tr></thead>
+<tbody>
+<tr><td><code>kbf-&lt;commit&gt;-&lt;platform&gt;.tar.gz</code></td><td>The <code>kbf</code> binary and nothing else. The same pattern holds for <code>kbf-installer</code>, <code>kbf-deploy</code>, and on Linux <code>kbf-server</code> and <code>kbf-daemon</code>. The tarball is reproducible: one binary always packs to the same bytes.</td></tr>
+<tr><td><code>&lt;tarball&gt;.cdx.json</code></td><td>The CycloneDX SBOM of that binary, made from <code>Cargo.lock</code>.</td></tr>
+<tr><td><code>&lt;tarball&gt;.sigstore.json</code></td><td>The Sigstore bundle of the tarball's build provenance. It lets a host verify the tarball with no network.</td></tr>
+<tr><td><code>kbf-installer-&lt;commit&gt;-linux-x86_64.deb</code>, <code>...-linux-arm64.deb</code></td><td>The Debian package of <code>kbf-installer</code>: the binary, the systemd units (installed disabled), the pinned <code>gh</code>, a Sigstore trusted root and the trust settings. Each has its own <code>.sigstore.json</code>.</td></tr>
+<tr><td><code>kbf-installer-&lt;commit&gt;-darwin-arm64.pkg</code></td><td>The macOS package of <code>kbf-installer</code>: the binary, its LaunchDaemon property list (not loaded), the pinned <code>gh</code> and the trust directory. It has its own <code>.sigstore.json</code>.</td></tr>
+<tr><td><code>SHA256SUMS</code></td><td>The SHA-256 of every tarball, SBOM and package of the commit, sorted by name. It is a check for a damaged download; the attestation is the proof.</td></tr>
+</tbody></table></div>
+<p>The trust settings inside a package name the branch the package was attested on: a package built on <code>main</code> trusts releases of <code>main</code> and no other branch. A tag push cuts a release, and only a commit on <code>main</code> with a green verdict and a successful artifacts run can be released.</p>
+
+<h2 id="verify">Verify before you run</h2>
+<p>Every file is attested by the artifacts workflow with GitHub's build provenance. You need <code>gh</code> and the file. Name the repository, the workflow and the branch, or an attestation from any workflow of any branch would pass.</p>
+<ol class="steps">
+  <li>
+    <h3>Check the download <span class="tag tag-ok">works today</span></h3>
+    <div class="code"><pre><span class="p">$</span> sha256sum --check --strict --ignore-missing SHA256SUMS</pre></div>
+    <p>On a Mac, use <code>shasum -a 256 --check --strict --ignore-missing SHA256SUMS</code>.</p>
+  </li>
+  <li>
+    <h3>Verify the attestation <span class="tag tag-ok">works today</span></h3>
+    <div class="code"><pre><span class="p">$</span> gh attestation verify kbf-&lt;commit&gt;-linux-x86_64.tar.gz \
+    --repo komira-ai/kbf \
+    --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
+    --source-ref refs/heads/main \
+    --deny-self-hosted-runners</pre></div>
+    <p>For a file built from the development branch, <code>feature/arch-v2</code>, the ref is <code>refs/heads/feature/arch-v2</code>; a file attested there does not verify as <code>main</code>.</p>
+  </li>
+  <li>
+    <h3>Or verify offline, with the bundle <span class="tag tag-ok">works today</span></h3>
+    <p>This is what <code>kbf-installer</code> does. Fetch the trusted root once on a machine with a network, then verify with no network at all. <code>--source-digest</code> pins the commit, so a bundle for another commit of the same branch fails.</p>
+    <div class="code"><pre><span class="p">$</span> gh attestation trusted-root &gt; trusted_root.jsonl
+<span class="p">$</span> gh attestation verify kbf-&lt;commit&gt;-linux-x86_64.tar.gz \
+    --bundle kbf-&lt;commit&gt;-linux-x86_64.tar.gz.sigstore.json \
+    --custom-trusted-root trusted_root.jsonl \
+    --repo komira-ai/kbf \
+    --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
+    --cert-oidc-issuer https://token.actions.githubusercontent.com \
+    --source-ref refs/heads/main \
+    --source-digest &lt;commit&gt; \
+    --predicate-type https://slsa.dev/provenance/v1 \
+    --deny-self-hosted-runners</pre></div>
+  </li>
+  <li>
+    <h3>Ask the binary what it is <span class="tag tag-ok">works today</span></h3>
+    <p>Unpack the tarball and read the build identity. The commit is the first 12 digits of the one in the file name.</p>
+    <div class="code"><pre><span class="p">$</span> tar -xzf kbf-&lt;commit&gt;-linux-x86_64.tar.gz
+<span class="p">$</span> ./kbf --version --json
+<span class="c"># one line: admin_protocol, commit, meta_log, min_protocol, profile, protocol, state_schema, version</span></pre></div>
+    <p>The same line is what an update compares across two releases; see <a href="updates.html#skew">version skew</a>.</p>
+  </li>
+</ol>
+
+<h2 id="installer">kbf-installer</h2>
+<h3>Install the package <span class="tag tag-ok">works today</span></h3>
+<p>Installing places files and starts nothing. Verify the package first (the same flags as above, with the package and its bundle), then:</p>
+<div class="code"><pre><span class="c"># Debian and Ubuntu</span>
+<span class="p">$</span> sudo dpkg -i kbf-installer-&lt;commit&gt;-linux-x86_64.deb
+<span class="c"># macOS</span>
+<span class="p">$</span> sudo installer -pkg kbf-installer-&lt;commit&gt;-darwin-arm64.pkg -target /</pre></div>
+<p>A package manager checks no Sigstore attestation of its own, so the verification above is your step. The packages are not signed with a key and there is no apt repository yet.</p>
+<div class="notice">
+  <p><strong>Other channels, <span class="tag tag-planned">specified</span>.</strong> A hosted <code>curl ... | sh</code> script, a signed apt repository, rpm and apk packages, a Homebrew cask and a frontend container image are designed in <a href="https://github.com/komira-ai/kbf/blob/feature/arch-v2/docs/design/distribution.md">the distribution design</a>. The script is in the repository (<code>packaging/install.sh</code>) and is tested, but CI does not yet publish the payload it downloads, so none of these installs anything today.</p>
+</div>
+
+<h3>What it does</h3>
+<p>Every verb that changes a host is a dry run until you add <code>--apply</code> (before the verb: <code>kbf-installer --apply setup ...</code>). <code>--json</code> prints one JSON object. Exit codes: 0 ok, 1 failed, 2 usage or a missing prerequisite, 3 refused by verification or policy, 4 busy, 5 needs an operator.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Verb</th><th>What it does</th><th>State</th></tr></thead>
+<tbody>
+<tr><td><code>setup</code></td><td>First configuration of a host for a mode: accounts, directories, <code>installer.toml</code>, <code>kbf.toml</code>, the enrollment token, the database schema, and the units. Safe to run again.</td><td><span class="tag tag-ok">works today</span> except <code>--commit</code>, which stops with exit 1 because no downloader is wired in</td></tr>
+<tr><td><code>record-release --commit SHA</code></td><td>Makes a release you placed by hand the first one: checks <code>releases/&lt;sha&gt;</code>, writes the <code>VERIFIED</code> marker and makes it <code>current</code>. You vouch for it; nothing is fetched or attested.</td><td><span class="tag tag-ok">works today</span></td></tr>
+<tr><td><code>run</code></td><td>The service loop: acts on the order records kbf writes, reverts a swap that was not confirmed, writes <code>status.json</code>.</td><td><span class="tag tag-ok">works today</span>; it refuses an activation of a release that is not installed</td></tr>
+<tr><td><code>confirm</code>, <code>revert</code>, <code>rollback</code>, <code>gc</code>, <code>boot-check</code>, <code>quiesce</code></td><td>Swap, keep, undo and clean up releases. <a href="updates.html">Updates</a> explains each.</td><td><span class="tag tag-ok">works today</span></td></tr>
+<tr><td><code>update --commit SHA --frontend</code></td><td>Asks the frontend host's proxy to swap its frontend and waits.</td><td><span class="tag tag-ok">built</span>, with gaps listed on <a href="updates.html#frontend">Updates</a></td></tr>
+<tr><td><code>migrate</code></td><td>Adopts a host laid out by the earlier deploy tool into the installer's layout, or puts it back with <code>--rollback</code>.</td><td><span class="tag tag-ok">works today</span></td></tr>
+<tr><td><code>backup</code>, <code>restore</code></td><td>Dump the state database to a directory and keep the newest seven; restore one into an empty database. A timer runs <code>backup</code> daily on frontend and all-in-one hosts.</td><td><span class="tag tag-ok">works today</span></td></tr>
+<tr><td><code>proxy</code></td><td>Serves a frontend host's public port and starts the frontend processes (<code>kbf-proxy.service</code>).</td><td><span class="tag tag-ok">works today</span></td></tr>
+<tr><td><code>status</code>, <code>check</code></td><td>Read the installer's state; validate its configuration.</td><td><span class="tag tag-planned">specified</span>: both exit 1, "not implemented". Read <code>status.json</code> instead.</td></tr>
+</tbody></table></div>
+
+<h3>Setup, by mode <span class="tag tag-ok">works today</span></h3>
+<div class="code"><pre><span class="c"># a daemon host: dry run first, then --apply</span>
+<span class="p">$</span> sudo kbf-installer setup --mode=daemon \
+    --frontend-url=https://frontend.example.internal:ENROLL_PORT \
+    --token-file=/root/kbf.token
+<span class="p">$</span> sudo kbf-installer --apply setup --mode=daemon \
+    --frontend-url=https://frontend.example.internal:ENROLL_PORT \
+    --token-file=/root/kbf.token
+
+<span class="c"># a single machine</span>
+<span class="p">$</span> sudo kbf-installer setup --mode=all-in-one --release-url=https://releases.example.internal/kbf \
+    --database='postgres:///kbf?host=/run/postgresql' --create-local-database</pre></div>
+<p><code>--frontend-url</code> is the frontend's enrollment address, the one it serves with <code>--enroll-listen</code>. The flags each mode takes:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Mode</th><th><code>--frontend-url</code></th><th><code>--token-file</code></th><th><code>--database</code></th><th>Release source</th></tr></thead>
+<tbody>
+<tr><td><code>storage</code>, <code>daemon</code>, <code>storage-and-daemon</code></td><td>required</td><td>required</td><td>refused</td><td><code>frontend</code> (default) or <code>url</code></td></tr>
+<tr><td><code>frontend</code>, <code>all-in-one</code></td><td>refused</td><td>refused</td><td>required</td><td><code>url</code> only, so <code>--release-url</code> is required</td></tr>
+</tbody></table></div>
+<p>The rest: <code>--release-source url|frontend</code>, <code>--release-url</code> (https, no credentials in it), <code>--min-generation</code> (a floor for orders that only goes up), <code>--commit</code> (40 hex, needs the <code>url</code> source), <code>--no-start</code>, and for frontend and all-in-one hosts the listener, certificate and store flags that become <code>kbf.toml</code> keys (<code>--listen</code>, <code>--worker-listen</code>, <code>--reapi-tls-cert</code>, <code>--worker-tls-cert</code>, <code>--storage-url</code>, <code>--cold-store</code>, <code>--meta-dir</code>, and so on). A frontend can sit behind the bundled proxy with <code>--proxy</code>. Every key is on <a href="config.html">the configuration page</a>; the verb's exact behaviour is in <a href="https://github.com/komira-ai/kbf/blob/feature/arch-v2/docs/deploy/kbf-installer-setup.md">the setup guide</a>.</p>
+<p>A flag with a bad value stops <code>setup</code> before it touches the host, naming the flag and the rule and never the value. A key or certificate must exist and be owned correctly; <code>setup</code> checks that a key file is a regular file owned by the service user with no group or other bits.</p>
+
+<h3>What setup writes, and where</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Path (Linux)</th><th>What</th></tr></thead>
+<tbody>
+<tr><td><code>/etc/kbf/kbf.toml</code></td><td>The runtime's settings: <code>mode</code>, the frontend URL, the enrollment token path, and the flags above. Readable by the service group, mode 0640. A file with settings of your own is kept; one whose keys differ from the flags is refused with the key names.</td></tr>
+<tr><td><code>/etc/kbf/installer.toml</code></td><td>The installer's settings: release source and URL, the floors, the database URL (no password), the proxy table. The release source is read only from this file, never from an order.</td></tr>
+<tr><td><code>/etc/kbf/enroll.token</code></td><td>A node's enrollment token, mode 0600, owned by the service user.</td></tr>
+<tr><td><code>/etc/kbf/api-token</code></td><td>On a frontend or all-in-one host, the first operator token: 32 random bytes as hex, mode 0600, made once. <code>setup</code> prints the path and never the secret.</td></tr>
+<tr><td><code>/var/lib/kbf-installer/</code></td><td>The installer's tree, owned by root: <code>releases/&lt;commit&gt;/</code> with <code>current</code> and <code>previous</code> links, <code>state.json</code>, <code>status.json</code>, and <code>orders/</code>, the one directory kbf can write.</td></tr>
+<tr><td><code>/usr/share/kbf-installer/trust/</code></td><td>From the package: the pinned <code>gh</code>, <code>trusted_root.jsonl</code> and <code>installer.conf</code> with the branch it trusts.</td></tr>
+<tr><td>systemd units</td><td><code>kbf-&lt;mode&gt;.service</code> and <code>kbf-installer.service</code>, enabled. A node's unit starts when a release is installed; a frontend's unit is enabled and never started by <code>setup</code>.</td></tr>
+</tbody></table></div>
+<p>On a Mac the configuration directory is <code>/usr/local/etc/kbf</code>, the installer is under <code>/usr/local/kbf-installer</code> and its state under <code>/var/db/kbf-installer</code>. The package creates the accounts <code>kbf</code> (the runtime), <code>kbf-server</code> (frontend and storage units), <code>kbf-fetch</code> (the release download, which owns no file) and <code>kbf-verify</code> (created, not used by the installer yet). The units run <code>/var/lib/kbf-installer/releases/current/kbf --mode=&lt;mode&gt;</code> and first run <code>kbf --mode=&lt;mode&gt; --check</code>, which prints every missing prerequisite and exits 2 without starting.</p>
+
+<h2 id="enroll">Enrollment</h2>
+<p>A storage or daemon node gets its certificates by enrolling with the frontend when it starts; there is no <code>kbf enroll</code> command. The operator makes a token through the operator API, the node presents it once, and later starts renew without it.</p>
+<ol class="steps">
+  <li>
+    <h3>Make a token on the frontend <span class="tag tag-ok">works today</span></h3>
+    <p>Tokens are a route of the operator API, which takes writes only from loopback with the bearer token <code>setup</code> made. The answer is the only place the token string appears.</p>
+    <div class="code"><pre><span class="p">$</span> T=$(cat /etc/kbf/api-token)
+<span class="p">$</span> curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+    -d '{"roles": ["daemon"], "max_uses": 3, "expires_in": 86400, "label": "rack 4"}' \
+    http://localhost:API_PORT/v1/enroll/tokens</pre></div>
+    <p><code>roles</code> is <code>daemon</code>, <code>storage</code> or both. <code>expires_in</code> is seconds, at most 30 days. The token <code>kbft1.&lt;id&gt;.&lt;secret&gt;.&lt;pin&gt;</code> carries the SHA-256 of the farm's root CA, which the node pins at first contact. A token can be listed (<code>GET</code>, never the secret) and revoked (<code>DELETE /v1/enroll/tokens/{id}</code>); revoking a node (<code>POST /v1/enroll/nodes/{id}/revoke</code>) burns its id.</p>
+  </li>
+  <li>
+    <h3>Give it to the node <span class="tag tag-ok">works today</span></h3>
+    <p>Put the token in a file and pass it to <code>setup</code> as <code>--token-file</code>. At its first start the node makes one key per role, sends the token and a certificate request, and writes the certificates and <code>node.json</code> under its state directory. Certificates are ECDSA P-256 and live seven days by default; a node renews at half of that, with no token. A token that lacks a role the mode needs, or a <code>node.json</code> that does not cover the mode, exits 2 and the node is never enrolled again by itself.</p>
+  </li>
+  <li>
+    <h3>The frontend's enrollment listener <span class="tag tag-ok">works today</span>, with a limit</h3>
+    <p>A frontend serves enrollment only when started with <code>--enroll-listen</code>, <code>--ca-dir</code> (an empty directory gets a new CA once; an existing CA is loaded and never overwritten), <code>--frontend-name</code> and a signer. The production signer is a separate <code>kbf-signer</code> process that holds the CA key; it is not among the released files yet. The other choice is <code>--ca-dev-file-signer</code>, which keeps the CA key as a file in the frontend process and is meant for development. Revoking a node refuses its renewal at once, but storage does not yet refuse a revoked node's current certificate, so <code>--enroll-listen</code> also needs <code>--enroll-allow-unenforced-deny</code>.</p>
+  </li>
+</ol>
+<p>You can also bring your own certificates and skip enrollment: every listener takes its certificate, key and client CA as files. Each certificate names exactly one role in a URI subject alternative name (<code>urn:kbf:role:frontend</code>, <code>storage</code> or <code>daemon</code>), and a daemon certificate has exactly one DNS name, the node id. <code>kbf-deploy linux verify-cert --row ROW --cert FILE --ca-cert FILE</code> checks a certificate against its row before you point a unit at it.</p>
+
+<h2 id="path">The shortest path to a working farm</h2>
+<p>One Linux machine runs a whole farm in one process. <a href="quickstart.html">The quick start</a> takes it from there to a first remote build and has the <code>.buckconfig</code>; this section is the install half.</p>
+<ol class="steps">
+  <li>
+    <h3>Get and verify <code>kbf</code> <span class="tag tag-ok">works today</span></h3>
+    <p>Download <code>kbf-&lt;commit&gt;-linux-x86_64.tar.gz</code> (or <code>linux-arm64</code>), its <code>.sigstore.json</code> and <code>SHA256SUMS</code> from the release, run the checks above, unpack it and put <code>kbf</code> on the host, for example at <code>/usr/local/bin/kbf</code>.</p>
+  </li>
+  <li>
+    <h3>Prepare the host <span class="tag tag-ok">works today</span></h3>
+    <p>Install <code>crun</code> and <code>uidmap</code>, give the <code>kbf</code> user its subordinate ids, and have a Postgres server on the host (<a href="#hosts">requirements</a>). Make a CA, a worker listener certificate, and a daemon certificate for the node id <code>node1</code>, and check them with <code>kbf-deploy linux verify-cert</code>.</p>
+  </li>
+  <li>
+    <h3>Check, then start <span class="tag tag-ok">works today</span></h3>
+    <p>These are the flags <code>kbf --mode=all-in-one --help</code> requires, plus the stores. <code>--server</code> is the process's own worker listener (port 8981 by default, on loopback), so the worker certificate must carry the name you give there, or you set <code>--tls-server-name</code>.</p>
+    <div class="code"><pre><span class="p">$</span> kbf --mode=all-in-one --check \
+    --worker-tls-cert /etc/kbf/worker.pem --worker-tls-key /etc/kbf/worker.key \
+    --worker-client-ca /etc/kbf/ca.pem \
+    --server https://localhost:8981 \
+    --ca-cert /etc/kbf/ca.pem --cert /etc/kbf/node1.pem --key /etc/kbf/node1.key \
+    --node-id node1 --driver container --data-dir /var/lib/kbf/data \
+    --cold-store file:///var/lib/kbf/cold --meta-dir /var/lib/kbf/meta</pre></div>
+    <p><code>--check</code> prints each missing prerequisite and exits 2, or 75 if a restart may help, without starting. Drop it to run. The scheduler state defaults to the local Postgres socket (<code>postgres:///kbf?host=/run/postgresql</code>). Put the same settings in <code>/etc/kbf/kbf.toml</code> (see <a href="config.html">configuration</a>) to run it under a unit.</p>
+  </li>
+  <li>
+    <h3>Point your build tool at it <span class="tag tag-ok">works today</span></h3>
+    <p>Send actions, cache reads and blobs to the REAPI address, port 8980 by default. <a href="quickstart.html">The quick start</a> has the <code>.buckconfig</code> and the first build.</p>
+  </li>
+</ol>
+<div class="notice">
+  <p><strong>With the installer, <span class="tag tag-planned">specified</span>.</strong> The intended path is <code>curl -fsSL https://kbf.dev/install.sh | sudo sh</code>, then <code>sudo kbf-installer setup --mode=all-in-one ...</code>, which downloads, verifies and starts the first release by itself. Today you can use the installer for everything but the download: install the package, run <code>setup</code> without <code>--commit</code>, place the verified release at <code>/var/lib/kbf-installer/releases/&lt;commit&gt;/kbf</code> (owned by root, mode 0755), and run <code>sudo kbf-installer --apply record-release --commit &lt;commit&gt;</code>. Then start the unit. For a farm of several hosts, <a href="architecture.html">the architecture</a> says which mode goes where and <a href="updates.html">Updates</a> says how the farm moves to a new release.</p>
+</div>

@@ -1,2 +1,155 @@
 <h1>Updates</h1>
-<div class="notice notice-warn"><p>This page is written after the design review of the home page and the quick start.</p></div>
+<p class="lede">A farm is updated one host at a time, frontend first, and a new release is kept only if it comes up and says so. This page is the order of events on a host, how nodes and the frontend are rolled, and the rules that decide whether you can go back. Each part is tagged <span class="tag tag-ok">works today</span> or <span class="tag tag-planned">specified</span>. <a href="design.html#updates">The design page</a> has the reasoning.</p>
+
+<div class="notice notice-warn">
+  <p><strong>Read this first.</strong> The pieces of an update are built and tested one by one, but they do not yet run end to end. <code>kbf-installer</code> has no release downloader wired in at this commit, so <code>kbf-installer run</code> refuses every activation order with "this installer has no release fetcher wired in", and <code>kbf-installer update --frontend</code> cannot stage a release. A Mac cannot activate at all yet, because the installer has no way to read that Mac's leases. What you can do today on a host is place a verified release yourself and use the swap, confirm, revert and rollback verbs below. <a href="#status">The table at the end</a> lists every piece and its state.</p>
+</div>
+
+<p class="toc">On this page: <a href="#releases">releases on a host</a> <a href="#swap">swap and confirm</a> <a href="#nodes">rolling the nodes</a> <a href="#frontend">the frontend</a> <a href="#skew">version skew</a> <a href="#oneway">one-way changes</a> <a href="#status">what is built</a></p>
+
+<h2 id="releases">Releases on a host</h2>
+<p><code>kbf-installer</code> is the only writer of release files. It installs each <code>kbf</code> release into its own directory and never changes one afterwards; an update moves two links.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Path</th><th>What</th></tr></thead>
+<tbody>
+<tr><td><code>/var/lib/kbf-installer/releases/&lt;commit&gt;/kbf</code></td><td>One release. A <code>VERIFIED</code> marker is written into the directory before it is renamed into place; a release without it is not trusted.</td></tr>
+<tr><td><code>releases/current</code>, <code>releases/previous</code></td><td>Relative links to a <code>&lt;commit&gt;</code> directory. Every unit runs <code>releases/current/kbf --mode=&lt;mode&gt;</code>. <code>previous</code> is only ever a release that was confirmed.</td></tr>
+<tr><td><code>state.json</code>, <code>state.json.bak</code></td><td>The truth about <code>current</code>, <code>previous</code> and a swap on trial. A missing or corrupt file is never treated as empty: the installer uses the backup, or writes nothing and stops for an operator.</td></tr>
+<tr><td><code>status.json</code></td><td>What kbf reads: the installed and staged commits, the state (<code>idle</code>, <code>fetching</code>, <code>staged</code>, <code>activated_unconfirmed</code>, <code>confirmed</code>, <code>reverted</code>, <code>refused</code>) and the last refusal. It is world-readable. The <code>status</code> verb is not built; read this file.</td></tr>
+<tr><td><code>orders/</code></td><td>The one directory kbf can write. kbf writes one record per order; the installer reads each once and removes it.</td></tr>
+</tbody></table></div>
+<p><code>kbf-installer gc</code> removes releases nothing needs. It keeps <code>current</code>, <code>previous</code>, a staged one, a swap on trial, any release a running process executes from, and the newest one more (<code>--keep</code>, default 1).</p>
+
+<h2 id="swap">Swapping a release, and the confirm window</h2>
+<p>An order names a release by its 40-digit commit. Orders come from kbf, which can only drop, delay or burn an order id; it cannot make the installer run something unverified. The order is a locator and a set of claims. Every claim is checked again by root.</p>
+<ol class="steps">
+  <li>
+    <h3>Refuse early, change nothing <span class="tag tag-ok">works today</span></h3>
+    <p>Before any fetch the installer refuses: a replay or an older (epoch, generation) than it has acted on, a commit not in 40 lowercase hex, a size over the limit, a trial already pending, a generation below the floor in <code>installer.toml</code>, and a live lease. It reads leases itself, from the cgroup of the unit it restarts; the order's claim is never used. On a frontend unit an <code>activate</code> is refused as <code>denied</code>, since a frontend holds no leases and moves by its own path (below). At least 60 seconds must pass between activations.</p>
+  </li>
+  <li>
+    <h3>Fetch and verify <span class="tag tag-planned">not wired</span></h3>
+    <p>An unprivileged <code>kbf-fetch</code> user pulls the tarball from the one configured source, over a pipe, so it can create no file. Root then checks, in order: the byte count, the SHA-256 against the order and against the attestation bundle's subject, the attestation offline with the pinned <code>gh</code> (repository, workflow, branch, and the order's commit as <code>--source-digest</code>), the archive shape (exactly one regular file, no links), and finally the binary names itself: <code>kbf --version --json</code>, run as <code>kbf-fetch</code>, must report the ordered commit and the same protocol and schema facts the order expected. The code and its tests exist; the installer binary does not build a fetcher yet, so this step refuses today.</p>
+  </li>
+  <li>
+    <h3>Flip, state first <span class="tag tag-ok">works today</span></h3>
+    <p>The installer writes the whole new target to <code>state.json</code> with a pending-confirm record, then moves <code>previous</code> and then <code>current</code> by atomic renames, then restarts the unit. A crash at any point is repaired at the next start: the state file is the truth and the links are made to match.</p>
+  </li>
+  <li>
+    <h3>The window <span class="tag tag-ok">works today</span></h3>
+    <p>Before each start of the unit, <code>kbf-installer boot-check</code> counts the start. The window to confirm opens at the first start after the flip, 900 seconds by default (120 to 1800 with <code>run --window-secs</code>), and a release that has started 3 times without a confirm (<code>--starts</code>) is reverted before it starts a fourth time, so a crash loop ends in seconds.</p>
+  </li>
+  <li>
+    <h3>Confirm or revert <span class="tag tag-ok">works today</span></h3>
+    <p>The new kbf reports <code>activated_unconfirmed</code> and the frontend sends a confirm. A confirm is accepted only if it names the pending activation, the unit is active and the running process is the new release. With no confirm by the deadline, the installer reverts: state first, then the links, then a restart, and reports <code>reverted</code>. A new release that is itself compromised can confirm itself; the only defences are the attestation and the branch the package trusts.</p>
+  </li>
+</ol>
+<p>The verbs an operator uses. Each is a dry run until <code>--apply</code>, and each names the service to restart by its own flag, never from an order:</p>
+<div class="code"><pre><span class="c"># keep the swap on trial; the id is the activation, "&lt;epoch&gt;-&lt;order id&gt;"</span>
+<span class="p">$</span> sudo kbf-installer --apply confirm --id 1-7 --unit kbf-daemon.service
+<span class="c"># undo it now</span>
+<span class="p">$</span> sudo kbf-installer --apply revert --id 1-7 --unit kbf-daemon.service
+<span class="c"># point current at previous, with no window; refused while a swap is pending</span>
+<span class="p">$</span> sudo kbf-installer --apply rollback --unit kbf-daemon.service
+<span class="c"># adopt a release you placed by hand as the first one</span>
+<span class="p">$</span> sudo kbf-installer --apply record-release --commit &lt;commit&gt;</pre></div>
+<p>A rollback makes the previous confirmed release current again and restarts the unit. There is no window to confirm it.</p>
+
+<h2 id="nodes">Rolling the nodes</h2>
+<p>Storage and daemon hosts are updated by the frontend, one at a time. You offer a release; the frontend's controller does the rest.</p>
+<h3>Offering a release <span class="tag tag-ok">works today</span></h3>
+<ul>
+  <li>A frontend started with <code>--releases-dir</code> (it needs <code>--api-listen</code> and a state store) keeps a release store: the tarballs and their attestation bundles, uploaded with <code>PUT /v1/releases/{commit}/{platform}/{name}</code> and listed by <code>GET /v1/releases</code>. A platform counts as complete only when every tarball it needs is stored with its bundle.</li>
+  <li><code>POST /v1/update/desired</code> with <code>{"commit": "&lt;40 hex&gt;"}</code> offers a release. It answers 409 unless the store holds some platform of it complete. The generation moves only when the commit differs, so a repeated click is not a new run. A rollback is the older commit offered the same way, under a higher generation. <code>GET /v1/update</code> shows the desired release and the policy; <code>POST /v1/update/pause</code> and <code>resume</code> stop and start new hosts.</li>
+  <li>The controller runs where the frontend starts. By default it starts hosts for the desired release as soon as one is offered; an operator turns that off with <code>auto_nodes: false</code> in the <code>update/policy</code> row, or pauses it.</li>
+</ul>
+<h3>What happens to one node <span class="tag tag-ok">works today</span></h3>
+<p>The controller writes each step to the state store before it acts, so a restart resumes from the rows. At most one storage node is out at a time, because every blob has two copies. Daemon-only hosts and Macs have no storage coupling and go up to <code>max_hosts_out</code> at a time, 1 by default, beside it.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Step</th><th>What it does</th><th>If it fails</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Claim</td><td>Takes the one place in <code>update/slot</code> for this host.</td><td>Nothing changed.</td></tr>
+<tr><td>2</td><td>Cordon</td><td>Placement stops offering the node new leases (<code>POST /v1/nodes/{node}:cordon</code>). A node with no leases is cordoned in the step it is picked.</td><td>Give the host back.</td></tr>
+<tr><td>3</td><td>Wait for leases</td><td>The node's running leases end by themselves. Limit: 15 minutes on Linux, 60 on a Mac.</td><td>Uncordon and try later: capacity beats the update.</td></tr>
+<tr><td>4</td><td>Planned down</td><td>Storage hosts only. The member is marked <code>planned_down</code>, so writes skip it and reads fail over, and the controller waits until it reports no open writes (60 seconds).</td><td>Undo the mark, uncordon.</td></tr>
+<tr><td>5</td><td>Gate</td><td>Storage hosts only. With this node out, every other member must be <code>active</code> and fresh, no copy may be owed anywhere, and none may be catching up or planned down.</td><td>Undo and give the host back.</td></tr>
+<tr><td>6</td><td>Activate</td><td>The order to the host: flip and restart, as in <a href="#swap">above</a>. Wait up to 5 minutes for <code>activated_unconfirmed</code>.</td><td>The host reverts itself.</td></tr>
+<tr><td>7</td><td>Rejoin storage</td><td>Storage hosts only. The new process registers: <code>active</code> at once if its index is whole, <code>catching_up</code> while it rebuilds. An intact node that is not <code>active</code> in 120 seconds is reverted; a rebuilding one is waited for.</td><td>Revert, or wait.</td></tr>
+<tr><td>8</td><td>Repaired</td><td>Storage hosts only. The copies owed during the downtime are settled, up to 5 minutes.</td><td>Hold the run; the binary is healthy, so no revert.</td></tr>
+<tr><td>9</td><td>Confirm</td><td>The order to keep the release.</td><td>The installer's own timer reverts.</td></tr>
+<tr><td>10</td><td>Rejoin work</td><td>Uncordon. Done when the node gets a lease, or one heartbeat with nothing waiting for it.</td><td>The node stays cordoned and an alert is sent.</td></tr>
+</tbody></table></div>
+<p>So a node is <strong>cordoned</strong> (draining new work, finishing what it has) from step 2 to step 10, and a storage node is also <strong>planned down</strong> from step 4 until it re-registers. Planned down is not <code>draining</code>: <code>draining</code> starts moving the node's blobs to other owners, which a one-minute restart must not. The mark lasts at most the dwell, 300 seconds, and the controller alerts before it runs out. Daemon-only hosts skip steps 4, 5, 7 and 8.</p>
+<ul>
+  <li>Any failure up to the gate gives the host back. From the activate order on, nothing uncordons the host until step 10, and a failure <strong>holds the run for a person</strong>. It is not retried and the host is not skipped.</li>
+  <li>With no idle node after 2 minutes, the controller cordons the node with the fewest leases, so a farm that is never idle still drains one node at a time. A Mac that is busy is deferred and picked again when it goes idle.</li>
+  <li>An unknown count never reads as zero: a missing metric fails the gate.</li>
+  <li>A rollback is another release offered under a higher generation; hosts past the activate order finish their step, finished hosts are walked back by the same code.</li>
+</ul>
+<p>A frontend that is stopped, as in a restart, drains too: on <code>SIGTERM</code> it refuses new <code>Execute</code> calls with <code>UNAVAILABLE</code>, which Buck2 retries, and keeps every open stream until its action is done, with no deadline by default. The packaged units set <code>TimeoutStopSec=infinity</code> for the frontend, storage and all-in-one modes, because a stop that ends the drain fails every build in flight. A daemon drains for up to 600 seconds (<code>--drain-deadline-secs</code>) and its unit allows 660.</p>
+
+<h2 id="frontend">The frontend</h2>
+<p>A frontend cannot be restarted in place without failing builds: in our reading of Buck2, it does not recover an <code>Execute</code> stream that breaks after it started. The frontend host therefore runs <code>kbf-installer proxy</code> on its one public port, and the frontend is swapped behind it.</p>
+<h3>How the swap works <span class="tag tag-ok">built</span></h3>
+<ul>
+  <li>The proxy terminates TLS and forwards each HTTP/2 stream to the active <code>kbf --mode=frontend</code> process on loopback. A stream stays with the process that was active when its headers arrived, until it closes. The proxy never sends <code>GOAWAY</code> to a client.</li>
+  <li>The new release starts in the idle slot as a candidate (<code>--await-takeover</code>): it opens the state store and checks the schema, and takes no generation, bumps no epoch and schedules nothing. Two processes side by side need Postgres.</li>
+  <li><strong>Hold, quiesce, takeover.</strong> The proxy holds new streams for at most 15 seconds, the old process stops scheduling and flushes (3 seconds), the candidate takes the store's generation (10 seconds) and keeps the epoch, and the proxy releases the held streams to it. Every write is fenced by the generation, so the old process cannot write scheduler rows after the takeover. If takeover fails the proxy kills the candidate and resumes the old process from the store.</li>
+  <li>Daemons and storage nodes redial: the old process ends their streams with <code>UNAVAILABLE</code> and the redial is routed to the new one. A result a daemon has not seen acknowledged is sent again.</li>
+  <li>The old process keeps answering the <code>Execute</code> and <code>WaitExecution</code> streams it holds, from the results the new one writes, with no timeout. It is sent <code>SIGTERM</code> only when it holds no stream and no worker session, and never <code>SIGKILL</code>.</li>
+  <li><strong>Bake and confirm.</strong> The proxy watches the new process for 5 minutes by default, then sends a confirm order for the staged release. There is no automatic rollback while the proxy runs: you roll back with the API. A restart of the proxy that finds a failed switch before the confirm rolls back by itself.</li>
+</ul>
+<div class="code"><pre><span class="c"># from the frontend host, no root: swap the frontend, then have it update the nodes</span>
+<span class="p">$</span> kbf-installer update --commit &lt;commit&gt; --frontend --api LOOPBACK_ADDRESS:PORT --nodes</pre></div>
+<p><code>update</code> is a client of the proxy's update API; <code>--api</code> is the loopback address and port of the proxy's public socket. It needs the operator token (<code>--token-file</code>, default <code>/etc/kbf/api-token</code>), is refused under <code>sudo</code>, writes no order itself and waits up to <code>--handover-timeout-s</code> (3600) for the update to end. The API is <code>POST /v1/update/frontend</code> with <code>{commit, request_id, nodes, rollback}</code>, <code>GET /v1/update/frontend</code> for the phase, and <code>abort</code>, <code>rollback</code> and <code>force-retire</code> under it. It answers 409 while another update is open or an old process still drains. The phases are accepted, fetching, verifying, staged, preflight, starting, ready, holding, quiescing, switching, switched, baking, nodes, draining and done, plus failed and rolled_back. With <code>nodes</code>, the new frontend sets the desired release itself once it has baked.</p>
+<h3>Gaps <span class="tag tag-planned">specified</span></h3>
+<ul>
+  <li>The proxy's readiness check for a candidate asks for <code>/readyz</code>, a health-service call and a <code>GetCapabilities</code>; the last two probes are not built, so a swap on a real process stops at <code>ready</code>. The proxy's own cold start waits on <code>/readyz</code> alone.</li>
+  <li>The compatibility gate that reads the new release's <code>protocol</code>, <code>min_protocol</code> and <code>state_schema</code> and refuses a swap before anything starts is not built. Run <code>kbf --version --json</code> on both releases yourself; see <a href="#skew">version skew</a>.</li>
+  <li>Staging a release for the swap needs the installer's downloader, which is not wired.</li>
+  <li>An all-in-one host cannot run two processes. Its swap is stop then start, with the proxy holding new streams, 300 seconds at most.</li>
+  <li>The proxy itself is updated with its package, not by this path: <code>GET /v1/update/frontend</code> shows <code>restart_pending</code> while the running proxy is not the installed binary. A restart of the proxy cuts every stream through it.</li>
+  <li>The older <code>--handover-socket</code> and Envoy path still exist in <code>kbf --mode=frontend</code> for a frontend on SQLite. A Postgres frontend refuses it and is updated through the proxy.</li>
+</ul>
+
+<h2 id="skew">Version skew</h2>
+<p>During an update the farm runs two releases at once, for seconds on the frontend and for hours across the nodes. Every release says what it speaks in <code>kbf --version --json</code>:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Field</th><th>What it governs</th></tr></thead>
+<tbody>
+<tr><td><code>protocol</code>, <code>min_protocol</code></td><td>The <code>kbf.worker.v1</code> versions the binary speaks. A frontend accepts daemons from <code>min_protocol</code> through <code>protocol</code>; a daemon speaks exactly its <code>protocol</code>. Both are 1 in this build. A storage node's registration is refused below the map's floor, and the floor never falls.</td></tr>
+<tr><td><code>state_schema</code></td><td>The newest Postgres schema version the binary has a migration for. <code>kbf-installer</code> migrates the database to it before the release starts, and refuses with <code>installer_too_old</code> if the installer embeds fewer migrations than the release needs.</td></tr>
+<tr><td><code>meta_log</code></td><td>The highest metadata-log machine version the binary runs. See <a href="#oneway">one-way changes</a>.</td></tr>
+<tr><td><code>admin_protocol</code></td><td>The calls between the proxy and the frontend processes it starts.</td></tr>
+<tr><td><code>profile</code>, <code>commit</code>, <code>version</code></td><td><code>profile</code> must be <code>release</code>; the installer checks the commit against the order.</td></tr>
+</tbody></table></div>
+<ul>
+  <li><strong>Order.</strong> Upgrade the frontend first: it accepts old nodes as long as its <code>min_protocol</code> is at or below the oldest protocol a node runs, and a new <code>protocol</code> is fine. To downgrade across a protocol difference, do the nodes first, so no node dials a frontend that no longer accepts it. If no order satisfies both, the change is a flag day: stop the nodes, move the frontend, start them. A release that introduces new behaviour does not raise <code>min_protocol</code> in the same release. <span class="tag tag-planned">specified</span> The check that applies these rules and prints the numbers is not built; <code>GET /v1/nodes</code> and <code>GET /v1/members</code> report <code>oldest_protocol</code> to read by hand.</li>
+  <li><strong>Pairs of releases.</strong> A pair of storage nodes spans an update, so the storage calls (<code>ByteStream</code>, the copy leg of a write, the action store) are meant to work between a release and the one before it, in both directions. No cross-version test exists yet.</li>
+  <li><strong>Schema.</strong> An update runs only <em>expand</em> migrations: additive steps that an older binary ignores. A <em>contract</em> step (a drop or a rename) is refused by an update and nothing applies one yet; it would ship a release after the one that stopped using what it removes. A release that was reverted after its successor migrated still starts, because kbf accepts a schema newer than its own while every row above its range is an expand.</li>
+  <li><strong>The installer.</strong> The installer is not part of a release and does not update itself. Operator floors, <code>min_generation</code> and <code>min_protocol</code> in <code>installer.toml</code>, only go up, and only <code>rollback</code> may go below them.</li>
+</ul>
+
+<h2 id="oneway">One-way changes: what rollback needs</h2>
+<p>A rollback is safe as long as the release you go back to can read what the newer one wrote. Three things can say it cannot.</p>
+<ul>
+  <li><strong>The metadata log.</strong> A storage node raises its log's machine version at start, once, and a lower binary cannot open a raised log: it refuses at start. Going from release N to N-1 is reversible only if <code>meta_log(N) &lt;= meta_log(N-1)</code>; a build that prints no <code>meta_log</code> is unknown, and unknown is not reversible. If you have to go back past a raise, the log has to be restored: stop the node and put back a copy of its <code>--meta-dir</code> taken before the update. Without a copy, a node can rebuild its index from the footers of the segments in the object store and registers as <code>catching_up</code> while it does; the action cache is not rebuilt, so the actions whose entries only that node's log held run again. Treat that as recovery, not rollback.</li>
+  <li><strong>A contract schema step.</strong> Once one exists and has run, the older release cannot read the database. Back up before an update that carries one.</li>
+  <li><strong>The protocol floor.</strong> A frontend rolled back to a build with a lower oldest protocol keeps the stored floor. Rolling back across a protocol bump after the nodes updated is a flag day.</li>
+</ul>
+<p>The state database is backed up daily on frontend and all-in-one hosts by <code>kbf-backup.timer</code>; start <code>kbf-backup.service</code> by hand before an update you may want to undo. <code>kbf-installer restore --file FILE</code> restores a dump into an empty database.</p>
+
+<h2 id="status">What is built</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Piece</th><th>State</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>Releases, swap, confirm window, revert, rollback, gc, boot-check, <code>record-release</code></td><td><span class="tag tag-ok">works today</span></td><td>On Linux. Crash repair and the start budget are tested.</td></tr>
+<tr><td>Offline verification of a release (digest, attestation, shape, self-report)</td><td><span class="tag tag-ok">built</span></td><td>Library and tests; not reached from the binary, see the next row.</td></tr>
+<tr><td>The installer's downloader (<code>fetch-child</code>, release source)</td><td><span class="tag tag-planned">not wired</span></td><td><code>run</code> and <code>update --frontend</code> cannot stage a release; <code>setup --commit</code> exits 1.</td></tr>
+<tr><td>Frontend release store and desired release</td><td><span class="tag tag-ok">works today</span></td><td>Needs <code>--releases-dir</code>, <code>--api-listen</code> and a state store.</td></tr>
+<tr><td>Node-rolling controller</td><td><span class="tag tag-ok">works today</span></td><td>Gives the orders; the host side stops at the downloader.</td></tr>
+<tr><td>Planned-down members, node cordon and drain</td><td><span class="tag tag-ok">works today</span></td><td>Operator API routes.</td></tr>
+<tr><td>Frontend swap behind the proxy</td><td><span class="tag tag-planned">partly built</span></td><td>Swap, fencing, bake, rollback and crash recovery are built; the readiness probes, the compatibility gate and staging are not.</td></tr>
+<tr><td>Updating a Mac</td><td><span class="tag tag-planned">specified</span></td><td>The installer refuses an activation there until it can read leases.</td></tr>
+<tr><td>An update screen, a button, polling for releases</td><td><span class="tag tag-planned">specified</span></td><td>kbf never updates itself and shows no button; something outside it calls the API.</td></tr>
+</tbody></table></div>

@@ -2,7 +2,7 @@
 // names an id on the page it points to. The router serves '/x/' as '/x/index.html' and nothing else is rewritten, so
 // a link must be spelled the way the router resolves it ('/x' without a slash is a 404).
 
-import { readFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { join, posix } from 'path';
 import { decodeAttr, isExternalUrl, listFiles, readTags } from './check-dist';
 
@@ -45,6 +45,32 @@ export function checkLinks(dir: string): string[] {
           problems.push(`${p}: <${tag} ${name}="${v}"> names no id #${frag} on ${target}`);
         }
       }
+    }
+  }
+  return problems.sort();
+}
+
+const BLOB = /^https:\/\/github\.com\/komira-ai\/kbf\/(?:blob|tree)\/(?:main|feature\/arch-v2)\/([^#?]*)/;
+
+/**
+ * The links of dist to files of the repository (a doc's relative link to code becomes a GitHub blob URL) whose path is
+ * not in the repository: a renamed or deleted file. The router cannot see these, so the check reads the repo.
+ */
+export function checkRepoLinks(dir: string, repoRoot: string): string[] {
+  const problems: string[] = [];
+  for (const p of listFiles(dir).filter((f) => f.endsWith('.html'))) {
+    for (const [tag, attrs] of readTags(readFileSync(join(dir, p), 'utf8')).tags) {
+      const raw = tag === 'a' ? attrs.find(([k]) => k === 'href')?.[1] : undefined;
+      const href = raw === undefined ? null : decodeAttr(raw);
+      const m = href === null ? null : BLOB.exec(href);
+      if (!m) continue;
+      let path = m[1].replace(/\/$/, '');
+      try {
+        path = decodeURIComponent(path);
+      } catch {
+        // keep the raw text
+      }
+      if (path !== '' && !existsSync(join(repoRoot, path))) problems.push(`${p}: <a href="${href}"> names ${path}, which is not in the repository`);
     }
   }
   return problems.sort();

@@ -2,7 +2,12 @@
 // which scripts it loads. The content files are the page copy as written for the site (content/*.html: the inside of
 // <main>); the document around them is layout.ts.
 
-export type NavKey = 'install' | 'quickstart' | 'config' | 'updates' | 'architecture';
+import type { Status } from './docs-table';
+
+export type NavKey = 'install' | 'quickstart' | 'docs' | 'config' | 'updates' | 'architecture';
+
+/** Pages made by the build from something other than content/<source>.html. */
+export type Generated = 'config' | 'docs-index';
 
 export interface Page {
   /** The URL path: '/' or '/name/' or '/404.html'. */
@@ -19,6 +24,12 @@ export interface Page {
   /** The home and the story run in bands that each carry their own .wrap; every other page sits in one. */
   bands: boolean;
   noindex?: boolean;
+  /** Loads docs.css: the pages of the docs layout (the docs index and every page of the docs table). */
+  docs?: boolean;
+  /** Not read from content/: the build generates the page (config.ts, docs.ts). */
+  generated?: Generated;
+  /** A hand-written page of /docs/ lists itself on the docs index with this status. */
+  indexed?: Status;
 }
 
 export const SITE_NAME = 'kbf';
@@ -28,6 +39,7 @@ export const REPO_URL = 'https://github.com/komira-ai/kbf';
 export const NAV: readonly { key: NavKey; label: string; route: string }[] = [
   { key: 'install', label: 'Install', route: '/install/' },
   { key: 'quickstart', label: 'Quick start', route: '/quickstart/' },
+  { key: 'docs', label: 'Docs', route: '/docs/' },
   { key: 'config', label: 'Configuration', route: '/docs/config/' },
   { key: 'updates', label: 'Updates', route: '/docs/updates/' },
   { key: 'architecture', label: 'Architecture', route: '/docs/architecture/' },
@@ -42,7 +54,15 @@ export const PAGES: readonly Page[] = [
     scripts: ['copy.js', 'demo.js'],
     bands: true,
   },
-  { route: '/install/', source: 'install', title: 'Install', description: 'Install of kbf.', nav: 'install', scripts: ['copy.js'], bands: false },
+  {
+    route: '/install/',
+    source: 'install',
+    title: 'Install',
+    description: 'What to install for kbf, on which machines, how to verify the release files, and what kbf-installer sets up.',
+    nav: 'install',
+    scripts: ['copy.js'],
+    bands: false,
+  },
   {
     route: '/quickstart/',
     source: 'quickstart',
@@ -68,18 +88,49 @@ export const PAGES: readonly Page[] = [
     nav: 'config',
     scripts: ['copy.js'],
     bands: false,
+    generated: 'config',
+    indexed: 'works',
+  },
+  {
+    route: '/docs/',
+    source: 'docs-index',
+    title: 'Documentation',
+    description: 'Guides, reference and design documents of kbf, rendered from the repository.',
+    nav: 'docs',
+    scripts: ['copy.js'],
+    bands: false,
+    docs: true,
+    generated: 'docs-index',
   },
   {
     route: '/docs/architecture/',
     source: 'architecture',
     title: 'Architecture',
-    description: 'Architecture of kbf.',
+    description: 'The three roles of a kbf farm, the path of a remote execution, storage and its logs, and how the parts talk.',
     nav: 'architecture',
     scripts: ['copy.js'],
     bands: false,
+    indexed: 'partial',
   },
-  { route: '/docs/design/', source: 'design', title: 'Design', description: 'How kbf is built.', scripts: ['copy.js'], bands: false },
-  { route: '/docs/updates/', source: 'updates', title: 'Updates', description: 'Updates of kbf.', nav: 'updates', scripts: ['copy.js'], bands: false },
+  {
+    route: '/docs/design/',
+    source: 'design',
+    title: 'Design',
+    description: 'Why kbf has three roles, how it admits, queues and refuses work, how it places leases, and how it updates without failing builds.',
+    scripts: ['copy.js'],
+    bands: false,
+    indexed: 'partial',
+  },
+  {
+    route: '/docs/updates/',
+    source: 'updates',
+    title: 'Updates',
+    description: 'How a kbf farm moves to a new release: releases on a host, the confirm window, rolling nodes, the frontend swap, version skew and one-way changes.',
+    nav: 'updates',
+    scripts: ['copy.js'],
+    bands: false,
+    indexed: 'partial',
+  },
   {
     route: '/404.html',
     source: '404',
@@ -99,10 +150,13 @@ export function outPath(route: string): string {
 
 /**
  * The pages of the page copy name each other as '<source>.html' (the copy was written for a flat directory). Writes
- * those as the routes they are served at; an internal '.html' link that names no page is an error.
+ * those as the routes they are served at; an internal '.html' link that names no page is an error. A link to a file of
+ * the repository on the branch the copy was written against (feature/arch-v2, since merged) names main: the copy stays
+ * as written and the build says where the file is now.
  */
 export function rewriteLinks(html: string, pages: readonly Page[]): string {
   const bySource = new Map(pages.map((p) => [p.source, p.route]));
+  html = html.replaceAll(`${REPO_URL}/blob/feature/arch-v2/`, `${REPO_URL}/blob/main/`);
   return html.replace(/(\bhref=")([a-z0-9-]+)\.html(#[^"]*)?"/g, (_m, pre: string, name: string, frag: string | undefined) => {
     const route = bySource.get(name);
     if (route === undefined) throw new Error(`pages: a link to ${name}.html, which is no page`);

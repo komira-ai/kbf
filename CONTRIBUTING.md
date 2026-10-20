@@ -65,7 +65,27 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all --check
 ```
 
-There is no other build system in this repository.
+The one other build is the kbf.dev site in `site/` (TypeScript, Node at the exact
+version in `site/.node-version`; see `site/README.md`). It is self-contained: no crate
+depends on it.
+
+## Documentation
+
+Every Markdown file under `docs/` is published on kbf.dev. The table in
+`site/tools/docs-table.ts` gives each one its route, its section and its status
+(works today, built in part, design, planned), and the site's tests fail when a
+file under `docs/` is missing from it. So a pull request that adds, renames or
+removes a document also:
+
+1. adds, renames or removes its row in `site/tools/docs-table.ts` (or lists the
+   file in `EXCLUDE` there, if it must not be published), with the status the
+   code supports at that commit, not the status the document claims;
+2. runs `npm ci --ignore-scripts && npm run golden` in `site/` and commits the
+   changed `site/test/golden.manifest` (the navigation is on every page, so one
+   new document changes them all).
+
+Documents describe what the code at a named commit does. Anything not built goes
+in a paragraph that starts "Planned:".
 
 ## No new shell or Python
 

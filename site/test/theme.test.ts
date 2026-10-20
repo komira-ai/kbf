@@ -11,7 +11,8 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { readTags } from '../tools/check-dist';
+import { listFiles, readTags } from '../tools/check-dist';
+import { DOCS, docRoute } from '../tools/docs-table';
 import { outPath, PAGES } from '../tools/pages';
 import { assetDir, buildReal, copyTree, plant, SITE } from './support';
 
@@ -29,14 +30,15 @@ test('a one byte edit of the theme changes the digest (the pin can fail)', () =>
   assert.notEqual(sha256(bytes), THEME_SHA256);
 });
 
-test('the built site ships the pinned theme, and every page loads it before site.css', () => {
+test('the built site ships the pinned theme, and every page loads it before site.css (and docs.css only on the docs pages)', () => {
   const dist = buildReal('theme');
   assert.equal(sha256(readFileSync(join(dist, assetDir(dist), 'theme.css'))), THEME_SHA256);
-  for (const page of PAGES.map((p) => outPath(p.route))) {
+  const docsPages = new Set([...PAGES.filter((p) => p.docs), ...DOCS.map((d) => ({ route: docRoute(d) }))].map((p) => outPath(p.route)));
+  for (const page of listFiles(dist).filter((f) => f.endsWith('.html'))) {
     const sheets = readTags(readFileSync(join(dist, page), 'utf8'))
       .tags.filter(([t, a]) => t === 'link' && a.some(([k, v]) => k === 'rel' && v === 'stylesheet'))
       .map(([, a]) => (a.find(([k]) => k === 'href') as [string, string])[1].replace(/^.*\//, ''));
-    assert.deepEqual(sheets, ['theme.css', 'site.css'], page);
+    assert.deepEqual(sheets, docsPages.has(page) ? ['theme.css', 'site.css', 'docs.css'] : ['theme.css', 'site.css'], page);
   }
   const edited = copyTree(dist, 'theme-edited');
   plant(edited, `${assetDir(edited)}/theme.css`, /^/, ' ');
