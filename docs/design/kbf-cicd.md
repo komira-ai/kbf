@@ -117,7 +117,7 @@ result = "beta-result.json"
 [[stage]]
 name = "gamma"
 runs = "actions"          # gamma.yml: the offer and the deploy; the bake and the verdict run outside Actions
-after = ["beta"]
+after = ["beta"]          # the design; release/stages.yml has ["build"] until the beta result is attested
 result = "gamma-verdict.json"
 
 [[stage]]
@@ -427,12 +427,15 @@ beta scenario in the same change that fixes it (section 11).
   pull request trigger, and a re-run of a run derives everything again from its commit. Each job runs only for a run that
   succeeded, was a `push` to `main` and is of this repository (not a fork's, a pull request's or a dispatch's). The
   workflow lint allows `workflow_run` only in this file, the workflow named `gamma`, and holds it to this shape: the exact
-  trigger and `if:` of each job, the exact permission sets, `secrets.` in one step, a checkout of no ref, no event field in
-  a script, and the paths of what it uploads.
+  trigger and `if:` of each job, the exact permission sets, the word `secrets` in one step, the host and user variables in
+  one step, the `concurrency` group on the `deploy` job and nowhere else, a checkout of no ref, no event field in a
+  script, and the names and paths of what it uploads (each with `overwrite: true`). Every `cargo xtask` line of the file
+  is also given to xtask's own argument parser, so a misspelt flag fails a test and not the first release.
 - **`offer`** has read scopes (`actions`, `attestations`, `contents`), no environment and no credentials.
   `cargo xtask gamma evidence` asks GitHub whether the run was the `release` workflow's file, a push to `main` that
   succeeded at exactly the event's commit, and whether its `publish` job succeeded; a push that cut nothing (docs only)
-  gives `released=false` and the run ends green. Then `cargo xtask release stage-offer` downloads the release, verifies every
+  gives `released=false` and the run ends green. A job list that is missing, not whole or without a job named `publish`
+  (a renamed job) is an error, not a skip: a skip is a green run that deploys nothing. Then `cargo xtask release stage-offer` downloads the release, verifies every
   attestation before it runs anything of it, makes the offer for gamma with the fixed waiver of beta (for gamma only, never
   for prod, until the beta result is attested), and writes `offer.json` and the release's files into one tar, uploaded for
   three days. It writes nothing to any farm.
@@ -448,13 +451,21 @@ beta scenario in the same change that fixes it (section 11).
 - **What is public.** This repository's logs and artifacts are. The installer's summary names nodes, so the table and the
   uploaded `summary.json` hold only an allow-list of it (the commit, the result, the exit status and reason code, the step
   names, the platform, state and seconds of each node, the post checks and the offer's numbers), never a node, a free text or
-  a field the code does not know. The host and the user are masked in the log. GitHub prints a repository variable in the
-  log of every step that has it in its environment, so only the deploy step has them: use the short tailnet name of the
-  host, never an address.
-- **Rulings.** An irreversible release is not held: it deploys to gamma, and the notes carry the line (section 8.3). The
+  a field the code does not know. The host and the user are public names: GitHub prints a repository variable in the log
+  of every step that has it in its environment, so only the deploy step has them, and its header shows them (the verb masks
+  them in what it prints afterwards, and drops what `tailscale ssh` writes to its standard error). Use the short tailnet
+  name of the host, never an address. Hiding them would take secrets scoped to that step and a quiet `cargo`; that is the
+  repository owner's choice and is not built.
+- **Re-runs and a failed release run.** Both uploads overwrite, so re-running the jobs of `gamma.yml` (all of them, or
+  the failed ones) does not fail on the artifact name. `gamma.yml` follows only a release run that succeeded: a failed
+  `site` or `bump` job after a published release leaves the run failed, and gamma stays silent until the failed jobs are
+  re-run and the run is green.
+- **Rulings.** An irreversible release is not held: it deploys to gamma. The release notes are meant to carry the line
+  (section 8.3); that line belongs to the notes verb and is not built by `gamma.yml` or `cargo xtask gamma`. The
   Tailscale identity may reach the one gamma host and nothing else, and never prod. A deploy can hold the `gamma`
-  concurrency group for four hours; a queued run for a commit that is no longer the highest release is refused before
-  anything reaches the farm.
+  concurrency group for four hours. The group is the `deploy` job's, not the workflow's: GitHub cancels a pending run
+  when a newer one queues, so a workflow-level group would let a push that cut nothing cancel a pending release. A queued
+  deploy for a commit that is no longer the highest release is refused before anything reaches the farm.
 - **Held, for the operator.** The environment and its policy, the variables and secrets, the Tailscale OAuth client and
   policy, and the host's account, sudoers line and setup are settings, not code. `cargo xtask gamma held-steps` prints them
   for the repository, host and account given, and applies nothing (`docs/deploy/gamma.md`).

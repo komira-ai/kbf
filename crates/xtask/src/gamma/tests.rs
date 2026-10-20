@@ -334,9 +334,12 @@ fn the_table_names_no_node() {
     lacks(&md, "canary");
     has(&table("not json"), "no summary was printed");
     has(&table(""), "no summary was printed");
-    has(&table("{}"), "result: ? (exit ?) ?");
+    has(&table("{}"), "result: ? (exit ?)\n");
     let md = table(r#"{"nodes":[{"platform":"p","state":"s"}]}"#);
     has(&md, "| p | s | ? |");
+    // A deploy that succeeded has no reason code: the line says so by saying nothing.
+    let ok = table(&redact(r#"{"result":"ok","exit":0,"reason":""}"#));
+    has(&ok, "result: ok (exit 0)\n\n");
 }
 
 #[test]
@@ -352,15 +355,23 @@ fn summary_appends_and_survives_a_missing_file() {
 }
 
 /// Proves the bundle reaches the program's standard input and its standard output is the
-/// raw file, and that its exit status is returned. `cat` plays `tailscale`.
+/// raw file, that its exit status is returned, and that what it writes to its standard error
+/// is counted and not kept (`cat` of a file that is not there writes a message and exits 1).
+/// `cat` plays `tailscale`.
 #[test]
 fn pipe_sends_the_bundle_in_and_keeps_the_output_and_the_status() {
     let dir = scratch("pipe");
     let (bundle, raw) = (dir.join("b.tar"), dir.join("raw"));
     fs::write(&bundle, "the bundle").unwrap();
-    assert_eq!(pipe(Path::new("cat"), &[], &bundle, &raw).unwrap(), 0);
+    let ran = |program: &str| pipe(Path::new(program), &[], &bundle, &raw).unwrap();
+    assert_eq!(ran("cat"), (0, 0));
     assert_eq!(fs::read_to_string(&raw).unwrap(), "the bundle");
-    assert_eq!(pipe(Path::new("false"), &[], &bundle, &raw).unwrap(), 1);
+    assert_eq!(ran("false"), (1, 0));
+    let absent = [dir.join("absent").display().to_string()];
+    let (status, unseen) = pipe(Path::new("cat"), &absent, &bundle, &raw).unwrap();
+    assert_eq!(status, 1);
+    assert!(unseen > 0);
+    assert_eq!(fs::read_to_string(&raw).unwrap(), "");
     let missing = Path::new("no-such-program-for-gamma");
     assert!(pipe(missing, &[], &bundle, &raw).is_err());
     assert!(pipe(Path::new("cat"), &[], &dir.join("absent"), &raw).is_err());
@@ -372,7 +383,15 @@ fn pipe_sends_the_bundle_in_and_keeps_the_output_and_the_status() {
 #[test]
 fn held_steps_check_every_name_and_fill_every_placeholder() {
     let lines = held_steps(REPO, HOST, USER, TAG).unwrap();
-    for placeholder in ["{repo}", "{host}", "{user}", "{tag}", "{sudoers}"] {
+    let placeholders = [
+        "{repo}",
+        "{host}",
+        "{user}",
+        "{tag}",
+        "{host_tag}",
+        "{sudoers}",
+    ];
+    for placeholder in placeholders {
         let left = lines.iter().any(|l| l.contains(placeholder));
         assert!(!left, "{placeholder}");
     }
@@ -384,4 +403,17 @@ fn held_steps_check_every_name_and_fill_every_placeholder() {
     has(&refused(REPO, "198.51.100.7", USER, TAG), "--host");
     has(&refused(REPO, HOST, "root", TAG), "--user");
     has(&refused(REPO, HOST, USER, "x"), "--tag");
+    has(&refused(REPO, HOST, USER, HOST_TAG), "--tag");
+}
+
+/// Catches: the SSH rule's destination written as the device name (Tailscale accepts a tag,
+/// the user's own devices or `autogroup:self` there, so the printed policy would be refused),
+/// and the host not told to carry the tag the rules name.
+#[test]
+fn the_policy_names_the_host_by_its_tag_and_says_to_tag_it() {
+    let text = held_steps(REPO, HOST, USER, TAG).unwrap().join("\n");
+    has(&text, &format!("\"dst\": [\"{HOST_TAG}\"]"));
+    lacks(&text, &format!("\"dst\": [\"{HOST}\"]"));
+    has(&text, &format!("\"{HOST_TAG}\": [\"autogroup:admin\"]"));
+    has(&text, &format!("tailscale set --advertise-tags={HOST_TAG}"));
 }

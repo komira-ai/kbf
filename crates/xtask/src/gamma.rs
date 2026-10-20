@@ -5,17 +5,21 @@
 //! - `gamma evidence --repo <owner/repo> --sha <sha> --run-id <id> --output <file> [--gh
 //!   <program>]` ([`evidence`]): the run `<id>` of the `release` workflow is a push to `main`
 //!   that succeeded, at exactly `<sha>`, on the right file, and its `publish` job succeeded.
-//!   Prints `released=true`, or `released=false` when the job was skipped or absent (a push
-//!   that cut nothing, such as one that changed only docs), and appends it to `--output`.
-//!   A fact of the run that contradicts the event is an error, not a skip.
+//!   Prints `released=true`, or `released=false` when the job was skipped or did not succeed
+//!   (a push that cut nothing, such as one that changed only docs), and appends it to
+//!   `--output`. A fact of the run that contradicts the event is an error, not a skip; so is
+//!   a job list that is missing, not whole (its `total_count` is not the number listed) or
+//!   has no job named `publish`: those would end the pipeline green with nothing deployed.
 //! - `gamma deploy --repo <owner/repo> --sha <sha> --host <h> --user <u> --bundle <tar> --raw
 //!   <file> --summary <file> [--tailscale <program>] [--gh <program>]` ([`deploy`]): masks the
 //!   host and user in the log, refuses unless `<sha>` is the commit of the highest release tag
 //!   (Rule S, [`tags::superseded`], before anything reaches the farm), then runs
 //!   [`COMMAND`] on the host through `tailscale ssh` and `sudo` with `<tar>` on its standard
 //!   input. The installer's one-line summary goes to `--raw`, which names nodes, and
-//!   [`redact`] writes what a public log may show to `--summary`. Fails when the installer's
-//!   status is not 0; no message names the host.
+//!   [`redact`] writes what a public log may show to `--summary`. What `tailscale ssh` writes
+//!   to its standard error (`sudo`'s and the installer's messages name the host and its
+//!   paths) is dropped and only its size is printed. Fails when the installer's status is
+//!   not 0; no message names the host.
 //! - `gamma summary --file <summary.json> --output <file>` ([`summary`]): a table of the
 //!   redacted summary, appended to `<file>` (on Actions, `GITHUB_STEP_SUMMARY`). A missing or
 //!   unreadable summary is said so; it is not an error, so it never hides the deploy's own
@@ -47,9 +51,9 @@ pub const RELEASE_PATH: &str = ".github/workflows/release.yml";
 /// The job of that workflow that publishes: a run released a commit only if it succeeded.
 pub const PUBLISH_JOB: &str = "publish";
 
-/// The installer on the frontend host: the package's path, the one program the deploy account
-/// may run as root.
-pub const INSTALLER: &str = "/usr/bin/kbf-installer";
+/// The installer on the frontend host: the path the Linux package installs it at, the one
+/// program the deploy account may run as root.
+pub const INSTALLER: &str = crate::pkg_linux::BINARY_PATH;
 
 /// Where the commit goes in [`COMMAND`].
 const COMMIT_SLOT: &str = "<commit>";
@@ -146,7 +150,9 @@ fn repo_name(repo: &str) -> Result<(), Error> {
     };
     match repo.split_once('/') {
         Some((owner, name)) if part(owner) && part(name) => Ok(()),
-        _ => Err(Error::Usage(format!("--repo {repo:?} is not <owner>/<name>"))),
+        _ => Err(Error::Usage(format!(
+            "--repo {repo:?} is not <owner>/<name>"
+        ))),
     }
 }
 
@@ -207,35 +213,52 @@ pub fn evidence(
     repo_name(repo)?;
     let path = format!("repos/{repo}/actions/runs/{run_id}");
     let Some(run) = release::api(gh, &path)? else {
-        return Err(Error::Failed(format!("run {run_id} of {repo} does not exist")));
+        return Err(Error::Failed(format!(
+            "run {run_id} of {repo} does not exist"
+        )));
     };
     let wrong = contradictions(&run, sha);
     if !wrong.is_empty() {
         return Err(Error::Refused(wrong));
     }
-    let listing = release::api(gh, &format!("{path}/jobs?per_page=100"))?;
-    let jobs = listing.as_ref().and_then(|v| v["jobs"].as_array());
-    let published = |j: &Value| j["name"] == PUBLISH_JOB && j["conclusion"] == "success";
-    let released = jobs.into_iter().flatten().any(published);
+    // A run that succeeded lists its `publish` job, skipped when the push cut nothing. A job
+    // that is not there (renamed, or past the first page), a listing that is not whole or no
+    // listing is an error and not a skip: a skip is a green run that deploys nothing.
+    let Some(listing) = release::api(gh, &format!("{path}/jobs?per_page=100"))? else {
+        return Err(Error::Failed(format!("the jobs of run {run_id} are gone")));
+    };
+    let array = listing["jobs"].as_array();
+    let jobs = array.map(Vec::as_slice).unwrap_or_default();
+    if listing["total_count"] != jobs.len() {
+        let why = format!("run {run_id}: the list of its jobs is not whole");
+        return Err(Error::Failed(why));
+    }
+    let Some(job) = jobs.iter().find(|j| j["name"] == PUBLISH_JOB) else {
+        let why = format!("run {run_id} has no job named {PUBLISH_JOB}");
+        return Err(Error::Failed(why));
+    };
+    let released = job["conclusion"] == "success";
     let line = format!("released={released}");
     append(output, &format!("{line}\n"))?;
     Ok(vec![line])
 }
 
-/// Runs `program args` with the file `bundle` as its standard input and its standard output
-/// in `raw`. Returns its exit status (-1 when a signal ended it).
-fn pipe(program: &Path, args: &[String], bundle: &Path, raw: &Path) -> Result<i32, Error> {
-    let what = format!("open {}", bundle.display());
-    let input = fs::File::open(bundle).map_err(Error::spawn(what))?;
+/// Runs `program args` with the file `tar` as its standard input and its standard output in
+/// `raw`. Returns its exit status (-1 when a signal ended it) and how many bytes it wrote to
+/// its standard error, which is dropped: the remote side's messages (`sudo`'s, the
+/// installer's usage errors) name the host and its paths, and the log is public.
+fn pipe(program: &Path, args: &[String], tar: &Path, raw: &Path) -> Result<(i32, usize), Error> {
+    let what = format!("open {}", tar.display());
+    let input = fs::File::open(tar).map_err(Error::spawn(what))?;
     let what = format!("create {}", raw.display());
     let output = fs::File::create(raw).map_err(Error::spawn(what))?;
-    let status = Command::new(program)
+    let out = Command::new(program)
         .args(args)
         .stdin(Stdio::from(input))
         .stdout(Stdio::from(output))
-        .status()
+        .output()
         .map_err(Error::spawn("tailscale".to_owned()))?;
-    Ok(status.code().unwrap_or(-1))
+    Ok((out.status.code().unwrap_or(-1), out.stderr.len()))
 }
 
 /// What `gamma deploy` is given.
@@ -266,8 +289,9 @@ pub fn deploy(d: &Deploy<'_>) -> Result<Vec<String>, Error> {
     repo_name(d.repo)?;
     host_name(d.host)?;
     account(d.user)?;
-    // Workflow commands, printed before anything can show them: this repository's log is
-    // public.
+    // Workflow commands: from here on the log shows neither name. It cannot undo what GitHub
+    // and cargo printed of this step before (its environment, the command line), and the log
+    // is public.
     println!("::add-mask::{}", d.host);
     println!("::add-mask::{}", d.user);
     // Rule S for the one write to the farm: only the commit of the highest release tag.
@@ -276,19 +300,22 @@ pub fn deploy(d: &Deploy<'_>) -> Result<Vec<String>, Error> {
         let why = format!("{} is not the highest release ({standing:?})", d.sha);
         return Err(Error::Refused(vec![format!("not deployed: {why}")]));
     }
-    let status = pipe(
+    let (status, unseen) = pipe(
         d.tailscale,
         &ssh_args(d.sha, d.host, d.user),
         d.bundle,
         d.raw,
     )?;
+    if unseen > 0 {
+        eprintln!("tailscale: {unseen} bytes of standard error are not shown");
+    }
     // The installer's summary names nodes; only what `redact` keeps leaves this step.
     let raw = fs::read(d.raw).unwrap_or_default();
     let redacted = redact(&String::from_utf8_lossy(&raw));
     let what = format!("write {}", d.summary.display());
     fs::write(d.summary, redacted).map_err(Error::spawn(what))?;
     if status != 0 {
-        let why = format!("kbf-installer deploy exited {status} (see the summary)");
+        let why = format!("kbf-installer deploy exited {status}");
         return Err(Error::Failed(why));
     }
     Ok(vec![format!("{}: kbf-installer deploy exited 0", d.sha)])
@@ -375,12 +402,14 @@ pub fn table(json: &str) -> String {
     let Ok(v) = serde_json::from_str::<Value>(json) else {
         return "### gamma deploy\n\nno summary was printed\n".to_owned();
     };
+    // A deploy that succeeded has no reason code: say nothing, not a question mark.
+    let reason = v["reason"].as_str();
+    let reason = reason.map_or_else(String::new, |r| format!(" {r}"));
     let mut out = format!(
-        "### gamma deploy of `{}`\n\nresult: {} (exit {}) {}\n\n",
+        "### gamma deploy of `{}`\n\nresult: {} (exit {}){reason}\n\n",
         show(&v["commit"]),
         show(&v["result"]),
-        show(&v["exit"]),
-        show(&v["reason"])
+        show(&v["exit"])
     );
     out.push_str("| platform | state | seconds |\n|---|---|---|\n");
     for n in v["nodes"].as_array().into_iter().flatten() {
@@ -407,8 +436,12 @@ pub fn summary(file: &Path, output: &Path) -> Result<Vec<String>, Error> {
     Ok(vec![format!("wrote {} bytes", md.len())])
 }
 
-/// What a person does once, as lines to print. `{repo}`, `{host}`, `{user}`, `{tag}` and
-/// `{sudoers}` are replaced by [`held_steps`].
+/// The tag the gamma host carries: a Tailscale SSH rule's destination is a tag (or the
+/// user's own devices), not a device name.
+pub const HOST_TAG: &str = "tag:kbf-gamma-host";
+
+/// What a person does once, as lines to print. `{repo}`, `{host}`, `{user}`, `{tag}`,
+/// `{host_tag}` and `{sudoers}` are replaced by [`held_steps`].
 const HELD: &[&str] = &[
     "# gamma: what a person runs, once. This command prints the steps and changes nothing.",
     "# Each GitHub step needs admin on {repo}. Every name below comes from the flags.",
@@ -426,18 +459,19 @@ const HELD: &[&str] = &[
     "# GitHub prints a variable's value in the log of any step that has it in its environment, and this repository's logs are public: use the short tailnet name for the host, never an address.",
     "",
     r#"# 2. Tailscale: an OAuth client with the scope "Auth Keys: Write" only, restricted to {tag}; its id and secret are the two secrets of step 1."#,
-    r#"# Add to the policy file (merge, do not replace); "dst" names the host as your policy names devices:"#,
+    r#"# Add to the policy file (merge, do not replace). An SSH rule's "dst" is a tag, not a device name, so the host carries {host_tag} (step 3b):"#,
     "{",
-    r#"  "tagOwners": { "{tag}": ["autogroup:admin"] },"#,
-    r#"  "grants": [{ "src": ["{tag}"], "dst": ["{host}"], "ip": ["22"] }],"#,
-    r#"  "ssh": [{ "action": "accept", "src": ["{tag}"], "dst": ["{host}"], "users": ["{user}"] }]"#,
+    r#"  "tagOwners": { "{tag}": ["autogroup:admin"], "{host_tag}": ["autogroup:admin"] },"#,
+    r#"  "grants": [{ "src": ["{tag}"], "dst": ["{host_tag}"], "ip": ["22"] }],"#,
+    r#"  "ssh": [{ "action": "accept", "src": ["{tag}"], "dst": ["{host_tag}"], "users": ["{user}"] }]"#,
     "}",
     "",
     "# 3. The frontend host, as root there",
     "# a. The account {user} exists. It has no password: it only receives the ssh command.",
-    "# b. Run: visudo -f /etc/sudoers.d/kbf-gamma, and put this one line in it. It has no wildcard; only the commit varies, as forty hex digits.",
+    "# b. Give the host its tag, which the rules of step 2 name: tailscale set --advertise-tags={host_tag}",
+    "# c. Run: visudo -f /etc/sudoers.d/kbf-gamma, and put this one line in it. It has no wildcard; only the commit varies, as forty hex digits.",
     "{sudoers}",
-    "# c. kbf-installer is set up with --deploy-stage gamma, which writes /etc/kbf-installer/deploy.json (the API address, the token file and the stage): the workflow names none of them.",
+    "# d. kbf-installer is set up with --deploy-stage gamma, which writes /etc/kbf-installer/deploy.json (the API address, the token file and the stage): the workflow names none of them.",
     "",
     "# 4. Repository settings: the Actions policy allows tailscale/github-action.",
 ];
@@ -449,12 +483,17 @@ pub fn held_steps(repo: &str, host: &str, user: &str, tag: &str) -> Result<Vec<S
     host_name(host)?;
     account(user)?;
     tag_name(tag)?;
+    if tag == HOST_TAG {
+        let why = format!("--tag is the host's own tag {HOST_TAG}");
+        return Err(Error::Usage(why));
+    }
     let sudoers = rule(user);
     let names = [
         ("{repo}", repo),
         ("{host}", host),
         ("{user}", user),
         ("{tag}", tag),
+        ("{host_tag}", HOST_TAG),
         ("{sudoers}", sudoers.as_str()),
     ];
     let fill = |line: &str| {

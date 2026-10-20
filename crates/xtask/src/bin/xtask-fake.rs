@@ -53,8 +53,9 @@
 //! - Run as `tailscale` (`gamma deploy`'s `tailscale ssh <user>@<host> sudo ...`), it appends
 //!   its arguments as one line to `tailscale-args` next to it, writes its standard input to
 //!   `tailscale-stdin`, prints the file `tailscale-stdout` (when there is one: the
-//!   installer's summary, as a test wrote it) and exits with the number in `tailscale-exit`
-//!   (0 when there is no such file).
+//!   installer's summary, as a test wrote it), writes the file `tailscale-stderr` (when there
+//!   is one: what the remote side says, which a public log must not show) to its standard
+//!   error and exits with the number in `tailscale-exit` (0 when there is no such file).
 //! - Run as `uname` (by name, from PATH, or by path), it is a host that is no platform of
 //!   ours: `-s` prints `Linux` and `-m` prints `riscv64` (or `XTASK_FAKE_MACHINE` when set). Run as `id`, `-u` prints 1000
 //!   (a user that is not root).
@@ -485,6 +486,8 @@ fn tailscale(argv0: &str, args: &[String]) -> ExitCode {
     std::fs::write(dir.join("tailscale-stdin"), input).expect("tailscale-stdin");
     let answer = std::fs::read_to_string(dir.join("tailscale-stdout")).unwrap_or_default();
     print!("{answer}");
+    let noise = std::fs::read_to_string(dir.join("tailscale-stderr")).unwrap_or_default();
+    eprint!("{noise}");
     let code = std::fs::read_to_string(dir.join("tailscale-exit"))
         .ok()
         .and_then(|text| text.trim().parse::<u8>().ok());

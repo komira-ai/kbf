@@ -55,6 +55,8 @@ The sudoers line is generated, not written by hand: `cargo xtask gamma sudoers-l
 argument list, with the commit as forty `[0-9a-f]` classes and no wildcard. A test holds the two together: the pattern
 allows the command sent for a real commit and no other, and none of the flags sent is one this verb refuses through
 `sudo`. The account may not be `root` (a root caller is not "through sudo", so the flags above would not be refused).
+The generated line pins `--offer -`, not a path: the offer arrives on standard input with the files, so the rule names no
+path of the host. Where the paragraph above says the rule pins the offer's path, this is the form that is built.
 
 A farm whose `/v1/nodes` lists no node (an empty list, or no `nodes` array) is refused in
 preflight (exit 3, `no_nodes`); the wait for nodes and the post check each need at least one

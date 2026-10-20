@@ -19,8 +19,10 @@ What it prints, in order:
    secrets `TS_OAUTH_CLIENT_ID` and `TS_OAUTH_SECRET` of that environment, which `gh` asks for on the terminal (no value is
    on a command line). The OAuth client is the only credential in the workflow.
 2. **Tailscale.** An OAuth client with the scope "Auth Keys: Write" only, restricted to the tag, and the policy block: the
-   tag owner, a grant to the host's SSH port and an SSH rule that lets the tag log in to the host as the deploy account.
-3. **The frontend host, as root.** The deploy account (no password: it only receives the ssh command), the sudoers line from
+   tag owners, a grant to the host's SSH port and an SSH rule that lets the tag log in to the host as the deploy account.
+   An SSH rule's destination is a tag, not a device name, so the host carries its own tag (`tag:kbf-gamma-host`).
+3. **The frontend host, as root.** The deploy account (no password: it only receives the ssh command), the host's tag
+   (`tailscale set --advertise-tags`), the sudoers line from
    `cargo xtask gamma sudoers-line --user <account>` in `/etc/sudoers.d` (edit it with `visudo`), and `kbf-installer setup`
    with `--deploy-stage gamma`, which writes `/etc/kbf-installer/deploy.json`, so the workflow names no API address, token or
    stage.
@@ -35,9 +37,13 @@ name no path of the host, and the installer refuses its host flags (`--api`, `--
 
 This repository's logs and artifacts are public. The installer's summary names nodes, so the workflow shows only the
 allow-list `cargo xtask gamma deploy` writes (the commit, the result, the exit status and reason code, the step names, the
-platform, state and seconds of each node, the post checks and the offer's numbers). The host and the user are masked in the
-log, but GitHub prints a repository variable in the log of any step that has it in its environment, and the deploy step has
-two: give `GAMMA_HOST` the short tailnet name, never an address, and an account whose name you are willing to show.
+platform, state and seconds of each node, the post checks and the offer's numbers). **The host name and the account name
+are public.** GitHub prints a repository variable in the log of any step that has it in its environment, and the deploy
+step has two, so the step's header shows them and masking cannot hide what is already printed (the deploy verb masks them
+in what it prints after, and drops what `tailscale ssh` writes to its standard error, which can name the machine and its
+paths). Give `GAMMA_HOST` the short tailnet name, never an address, and use an account whose name you are willing to
+show. Keeping them out of the log needs secrets scoped to that one step and a quiet `cargo` (it prints its command line);
+that is a choice for the repository owner and is not built.
 
 ## Order
 
@@ -46,6 +52,12 @@ follows runs of the `release` workflow, which cuts a release on a push to `main`
 then set the three variables last. The first deploy is a person's to watch: what `gamma-deploy.md` lists under "What is not
 built" decides whether it can end `0`.
 
-A deploy can hold the `gamma` concurrency group for up to four hours. A run for a commit that is no longer the highest
+A release run in which any job failed, a `site` or `bump` job after a published release included, ends as a failed run,
+and `gamma.yml` follows only a run that succeeded: gamma stays silent until the failed jobs are re-run and the run turns
+green. The jobs of `gamma.yml` can be re-run; its uploads
+overwrite what the first attempt uploaded.
+
+A deploy can hold the `gamma` concurrency group (the `deploy` job's own, not the workflow's) for up to four hours; GitHub
+keeps one pending deploy per group, so a newer release replaces an older pending one. A run for a commit that is no longer the highest
 release tag is refused before anything is sent to the host; a run whose offer is more than 72 hours old is refused by the
 host (`offer_stale`) before it changes the farm.

@@ -12,11 +12,17 @@
 //!   the staged offer and the three repository variables, so an unset one is a green skip);
 //! - the permissions are exactly the read scopes of [`PERMISSIONS`], and no `id-token`
 //!   anywhere; `offer` has no environment and `deploy` has `gamma` and needs `offer`;
-//! - `secrets.` appears only in the `with:` of the Tailscale step of `deploy`, which comes
-//!   after the step that builds `cargo xtask`, and no other job joins the tailnet;
+//! - the word `secrets` appears only in the `with:` of the Tailscale step of `deploy`, which
+//!   comes after the step that builds `cargo xtask`, and no other job joins the tailnet;
+//! - the host and the user (`GAMMA_HOST`, `GAMMA_USER`) are named by the step that runs
+//!   `gamma deploy` alone: GitHub prints a variable in the log of a step that has it;
+//! - one deploy at a time is the `concurrency` of the `deploy` job, none of `offer` or of
+//!   the workflow (a pending run of the workflow would be cancelled by a newer run whose
+//!   deploy is skipped);
 //! - a checkout names no `ref` and no `repository`, no `run:` script holds an event field
 //!   (it goes through `env:`), and the artifacts uploaded are exactly those of [`UPLOADS`]:
-//!   the offer's tar, and the redacted summary, never the installer's own.
+//!   the offer's tar, and the redacted summary, never the installer's own; each upload
+//!   overwrites, so a re-run of its job does not fail on the name.
 
 use super::*;
 
@@ -51,6 +57,16 @@ const UPLOADS: [(&str, &str, &str); 2] = [
 
 /// The step that builds `cargo xtask`, which comes before any step that holds a credential.
 const BUILD: &str = "cargo build -p xtask --locked";
+
+/// The word every way of reaching the repository's secrets has: `secrets.X`, `secrets['X']`,
+/// `toJSON(secrets)` and `secrets: inherit`. Counting the bare word misses none of them.
+const SECRETS: &str = "secrets";
+
+/// The variables that name the host and the account: only the deploy step may have them.
+const HOST_VARS: [&str; 2] = ["GAMMA_HOST", "GAMMA_USER"];
+
+/// The script of the one step that may have [`HOST_VARS`]: the one that runs `gamma deploy`.
+const DEPLOY_VERB: &str = "gamma deploy";
 
 /// The problems found, one message each.
 #[derive(Default)]
@@ -91,18 +107,23 @@ fn is_tailscale(step: &Step) -> bool {
     uses.starts_with("tailscale/github-action@")
 }
 
+/// Whether `text` names a variable of [`HOST_VARS`].
+fn names_host(text: &str) -> bool {
+    HOST_VARS.iter().any(|var| text.contains(*var))
+}
+
 /// The value the step passes under `with:` as `key`.
 fn input<'a>(step: &'a Step, key: &str) -> Option<&'a str> {
     let found = step.with.iter().find(|(k, _)| k == key);
     found.map(|(_, value)| value.as_str())
 }
 
-/// How many `secrets.` the Tailscale step of `deploy` passes under `with:`.
+/// How many times the Tailscale step of `deploy` passes the word `secrets` under `with:`.
 fn secrets_held(text: &str) -> usize {
     let steps = job_steps(text, "deploy").unwrap_or_default();
     let tailscale = steps.iter().filter(|s| is_tailscale(s));
     let values = tailscale.flat_map(|s| s.with.iter().map(|(_, v)| v));
-    values.map(|v| v.matches("secrets.").count()).sum()
+    values.map(|v| v.matches(SECRETS).count()).sum()
 }
 
 /// The problems with the steps of the job `job`.
@@ -127,11 +148,17 @@ fn step_problems(p: &mut Problems, job: &str, steps: &[Step]) {
         if script.contains("github.event") {
             p.add(&format!("{who} puts an event field in a script"));
         }
-        let secret = |value: &String| value.contains("secrets.");
+        let secret = |value: &String| value.contains(SECRETS);
         let passed = step.with.iter().any(|(_, v)| secret(v));
-        let held = step.env.iter().any(|(_, v)| secret(v)) || script.contains("secrets.");
+        let held = step.env.iter().any(|(_, v)| secret(v)) || script.contains(SECRETS);
         if held || (passed && !(job == "deploy" && is_tailscale(step))) {
             p.add(&format!("{who} holds a credential"));
+        }
+        let named = |(k, v): &(String, String)| names_host(k) || names_host(v);
+        let in_vars = step.env.iter().chain(&step.with).any(named);
+        let deploy_step = job == "deploy" && script.contains(DEPLOY_VERB);
+        if (in_vars || names_host(script)) && !deploy_step {
+            p.add(&format!("{who} names the host or the user"));
         }
         if uses.starts_with("actions/upload-artifact@") {
             let pair = (input(step, "name"), input(step, "path"));
@@ -140,6 +167,9 @@ fn step_problems(p: &mut Problems, job: &str, steps: &[Step]) {
                 .any(|(j, name, path)| *j == job && pair == (Some(*name), Some(*path)));
             if !pinned {
                 p.add(&format!("{who} uploads {pair:?}, which it may not"));
+            }
+            if input(step, "overwrite") != Some("true") {
+                p.add(&format!("{who} uploads without `overwrite: true`"));
             }
         }
     }
@@ -203,9 +233,21 @@ pub(super) fn rules(text: &str) -> Vec<String> {
             Ok(steps) => step_problems(&mut p, job, &steps),
             Err(e) => p.add(&format!("the steps of `{job}`: {e}")),
         }
+        let env = job_env(text, job).unwrap_or_default();
+        if env.iter().any(|(k, v)| names_host(k) || names_host(v)) {
+            p.add(&format!("the `env` of `{job}` has the host or the user"));
+        }
     }
-    if text.matches("secrets.").count() != secrets_held(text) {
-        p.add("`secrets.` appears outside the Tailscale step's `with:`");
+    // One deploy at a time is the deploy job's own `concurrency`: a workflow-level group
+    // would let a run whose deploy is skipped cancel a pending release.
+    let top = workflow_has_key(text, "concurrency");
+    p.same("a workflow-level `concurrency`", top, false);
+    for (job, want) in [("offer", false), ("deploy", true)] {
+        let what = format!("a `concurrency` in `{job}`");
+        p.same(&what, job_has_key(text, job, "concurrency"), want);
+    }
+    if text.matches(SECRETS).count() != secrets_held(text) {
+        p.add("`secrets` appears outside the Tailscale step's `with:`");
     }
     if text.contains("id-token") {
         p.add("`id-token` appears: no job here signs or assumes a role");

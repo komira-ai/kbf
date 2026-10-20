@@ -672,10 +672,11 @@ enum GammaVerb {
         /// The released commit, a full SHA.
         #[arg(long)]
         sha: String,
-        /// The gamma host's tailnet name (masked in the log).
+        /// The gamma host's tailnet name: a short name, never an address. Masked in what
+        /// this prints, but a variable is shown by GitHub in the step's own header.
         #[arg(long)]
         host: String,
-        /// The deploy account on it (masked in the log).
+        /// The deploy account on it (masked the same way).
         #[arg(long)]
         user: String,
         /// The tar `release stage-offer` wrote, sent on standard input.
@@ -718,7 +719,7 @@ enum GammaVerb {
         /// The deploy account on it.
         #[arg(long)]
         user: String,
-        /// The Tailscale tag the runner joins as.
+        /// The Tailscale tag the runner joins as (never the host's own tag).
         #[arg(long, default_value = "tag:kbf-gamma-ci")]
         tag: String,
     },
@@ -1198,6 +1199,14 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             verified
         }
     }
+}
+
+/// Whether `args` (what follows `cargo xtask`) are a command line this program takes; the
+/// error is the parser's message. Nothing is run: a test of the lines a workflow runs uses it.
+pub fn check_args(args: &[&str]) -> Result<(), String> {
+    let argv = std::iter::once("xtask").chain(args.iter().copied());
+    let parsed = Cli::try_parse_from(argv);
+    parsed.map(drop).map_err(|e| e.to_string())
 }
 
 /// The program: parses the arguments, runs the verb and prints its result.

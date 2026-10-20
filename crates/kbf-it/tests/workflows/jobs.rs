@@ -164,6 +164,18 @@ pub fn job_env(text: &str, job: &str) -> Result<Vec<(String, String)>, String> {
     }
 }
 
+/// Whether the workflow has the top-level key `key` (matched ignoring ASCII case).
+pub fn workflow_has_key(text: &str, key: &str) -> Result<bool, String> {
+    let root = yaml::load(text)?;
+    Ok(get(top_of(&root)?, key).is_some())
+}
+
+/// Whether the job `job` has the key `key` (matched ignoring ASCII case).
+pub fn job_has_key(text: &str, job: &str, key: &str) -> Result<bool, String> {
+    let root = yaml::load(text)?;
+    Ok(get(job_of(&root, job)?, key).is_some())
+}
+
 /// The inputs of the `workflow_dispatch` trigger as `(name, required)`. An error when
 /// `on:` has no `workflow_dispatch` mapping with an `inputs:` mapping of mappings.
 pub fn dispatch_inputs(text: &str) -> Result<Vec<(String, bool)>, String> {

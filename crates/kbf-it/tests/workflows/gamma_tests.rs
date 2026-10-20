@@ -4,8 +4,6 @@
 
 use super::*;
 
-const SHA40: &str = "0123456789abcdef0123456789abcdef01234567";
-
 /// The lines of `gamma.yml` the plants work on.
 const BUILD: &str = "      - run: cargo build -p xtask --locked\n";
 const TOOLCHAIN: &str = "      - run: rustup toolchain install\n";
@@ -70,6 +68,13 @@ fn the_names_gamma_follows_are_the_names_release_yml_has() {
     assert!(jobs.contains(&publish), "{jobs:?}");
     let path = crate::repo_root().join(xtask::gamma::RELEASE_PATH);
     assert!(path.is_file(), "{}", path.display());
+    // The API reports a job by its display name, which is its id only while the job has no
+    // `name:`, is not a matrix and does not call a reusable workflow: any of the three would
+    // make `gamma evidence` fail (it refuses a run with no job of that name).
+    for key in ["name", "strategy", "uses"] {
+        let has = job_has_key(&release, xtask::gamma::PUBLISH_JOB, key);
+        assert_eq!(has, Ok(false), "the publish job has `{key}`");
+    }
 }
 
 /// Catches: a `workflow_run` in a workflow that is not `gamma`, which would run with the
@@ -183,7 +188,15 @@ fn the_oauth_client_reaches_one_step_after_the_build() {
     let run_id = "      RUN_ID: ${{ github.event.workflow_run.id }}\n";
     let leak = "      LEAK: ${{ secrets.TS_OAUTH_SECRET }}\n";
     let leaked = plant(run_id, &format!("{run_id}{leak}"));
-    refused(&leaked, "`secrets.` appears outside");
+    refused(&leaked, "`secrets` appears outside");
+    // Every other way to reach the repository's secrets has the word too.
+    for other in ["secrets['TS_OAUTH_SECRET']", "toJSON(secrets)"] {
+        let leak = format!("      LEAK: ${{{{ {other} }}}}\n");
+        let leaked = plant(run_id, &format!("{run_id}{leak}"));
+        refused(&leaked, "`secrets` appears outside");
+    }
+    let inherit = plant("  offer:\n", "  offer:\n    secrets: inherit\n");
+    refused(&inherit, "`secrets` appears outside");
     let token = "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}";
     let in_env = plant("GH_TOKEN: ${{ github.token }}", token);
     refused(&in_env, "holds a credential");
@@ -231,6 +244,43 @@ fn only_the_pinned_artifacts_are_uploaded_and_never_the_raw_summary() {
     refused(&plant(old, "path: dist\n          retention"), "uploads");
 }
 
+/// Catches: an upload without `overwrite: true`. `upload-artifact` refuses a name the run
+/// already has, so "Re-run all jobs" would fail in `offer`, and "Re-run failed jobs" after a
+/// failed deploy would end red in the summary upload even when the redeploy succeeded.
+#[test]
+fn every_upload_overwrites_so_a_rerun_does_not_fail_on_the_name() {
+    let without = "uploads without `overwrite: true`";
+    let offer = "          if-no-files-found: error\n          overwrite: true\n";
+    let planted = plant(offer, "          if-no-files-found: error\n");
+    refused(&planted, without);
+    let summary = "          retention-days: 30\n          overwrite: true\n";
+    let planted = plant(summary, "          retention-days: 30\n");
+    refused(&planted, without);
+    let off = "          overwrite: false\n";
+    let planted = plant_all("          overwrite: true\n", off);
+    refused(&planted, without);
+}
+
+/// Catches: the host or the user in a step that does not run the deploy, in a job's `env:`,
+/// or in a `with:` (GitHub prints a variable in the log of every step whose environment has
+/// it, and these logs are public).
+#[test]
+fn the_host_and_the_user_are_named_by_the_deploy_step_alone() {
+    let named = "names the host or the user";
+    let table = "        if: ${{ always() }}\n        run: cargo xtask gamma summary";
+    let env = "        if: ${{ always() }}\n        env:\n          GAMMA_HOST: ${{ vars.GAMMA_HOST }}\n        run: cargo xtask gamma summary";
+    refused(&plant(table, env), named);
+    let last = "          use-cache: true\n";
+    let with = format!("{last}          note: ${{{{ vars.GAMMA_USER }}}}\n");
+    refused(&plant(last, &with), named);
+    let script = "run: echo $GAMMA_HOST && cargo xtask gamma evidence";
+    refused(&plant("run: cargo xtask gamma evidence", script), named);
+    let run_id = "      RUN_ID: ${{ github.event.workflow_run.id }}\n";
+    let with_host = format!("{run_id}      GAMMA_HOST: ${{{{ vars.GAMMA_HOST }}}}\n");
+    let planted = plant(run_id, &with_host);
+    refused(&planted, "the `env` of `offer` has the host");
+}
+
 /// Catches: a deploy that does not wait for the offer, runs outside the `gamma` environment
 /// (whose branch policy and credentials it relies on), or an offer job in an environment.
 #[test]
@@ -265,7 +315,7 @@ fn env_names(step: &Step) -> Vec<String> {
 /// variable is printed in the log of a step that has it), and the artifact paths are those
 /// the verb is told.
 #[test]
-fn the_table_and_the_summary_are_made_after_a_failed_deploy() {
+fn the_table_and_the_summary_upload_run_whatever_the_deploy_did() {
     let text = real_gamma();
     let steps = job_steps(&text, "deploy").expect("steps");
     let ran = |word: &str| {
@@ -296,14 +346,83 @@ fn the_table_and_the_summary_are_made_after_a_failed_deploy() {
     assert!(table_run.contains(" --file summary.json"), "{table_run}");
 }
 
-/// Proves the file is arranged as designed: one deploy at a time and none cancelled
-/// mid-roll, nothing on a pull request, and no commit named in it.
+/// Proves one deploy at a time with none cancelled mid-roll, as the `deploy` job's own
+/// group, and catches the group moved to the workflow or put on `offer`. GitHub cancels a
+/// pending run when a newer one queues; at workflow level a docs-only push (whose `deploy` is
+/// skipped) would cancel a pending release and nothing would go red.
 #[test]
-fn the_deploys_queue_and_nothing_names_a_commit_or_a_pull_request() {
+fn the_deploys_queue_in_the_deploy_job_and_not_in_the_workflow() {
     let text = real_gamma();
-    assert!(text.contains("group: gamma\n  cancel-in-progress: false"));
-    assert!(!text.contains("pull_request"));
-    assert!(!text.contains(SHA40));
+    let group = "    concurrency:\n      group: gamma\n      cancel-in-progress: false\n";
+    assert!(text.contains(group));
+    let top = "concurrency:\n  group: gamma\n  cancel-in-progress: false\n\nenv:\n";
+    let new = format!("{top}  CARGO_TERM_COLOR");
+    let moved = plant("env:\n  CARGO_TERM_COLOR", &new);
+    refused(&moved, "a workflow-level `concurrency`");
+    let timeout = "    timeout-minutes: 30\n";
+    let planted = plant(timeout, &format!("{timeout}    concurrency: g\n"));
+    refused(&planted, "a `concurrency` in `offer`");
+    refused(&plant(group, ""), "a `concurrency` in `deploy`");
+}
+
+/// Proves nothing in the file runs on a pull request.
+#[test]
+fn nothing_in_the_file_runs_on_a_pull_request() {
+    assert!(!real_gamma().contains("pull_request"));
+}
+
+/// The environment references of the workflow's `cargo xtask` lines.
+const REFERENCES: [&str; 8] = [
+    "$GITHUB_REPOSITORY",
+    "$GITHUB_OUTPUT",
+    "$GITHUB_STEP_SUMMARY",
+    "$RUNNER_TEMP",
+    "$RUN_ID",
+    "$SHA",
+    "$GAMMA_HOST",
+    "$GAMMA_USER",
+];
+
+/// A word of a `run:` line without its quotes, each environment reference replaced by `1`.
+fn word(raw: &str) -> String {
+    let plain = raw.trim_matches('"').to_owned();
+    REFERENCES.iter().fold(plain, |w, var| w.replace(var, "1"))
+}
+
+fn split(line: &str) -> Vec<String> {
+    line.split(' ').map(word).collect()
+}
+
+/// The words of every `cargo xtask` line of the job `job`, `cargo xtask` cut off.
+fn xtask_words(text: &str, job: &str) -> Vec<Vec<String>> {
+    let steps = job_steps(text, job).expect("steps");
+    let lines = steps.iter().filter_map(|s| s.run.as_deref());
+    let lines = lines.filter_map(|line| line.strip_prefix("cargo xtask "));
+    lines.map(split).collect()
+}
+
+/// Catches: a flag of the workflow's `run:` lines that xtask does not take (`--run-id` spelled
+/// `--run_id`, a required flag left out, a verb renamed). `offer` runs on every release whether
+/// or not the repository variables are set, so without this the first real release would be the
+/// first parse of its lines. Each line is given to xtask's own argument parser.
+#[test]
+fn every_xtask_line_of_the_workflow_is_a_command_line_xtask_accepts() {
+    let text = real_gamma();
+    let mut seen = 0;
+    for job in ["offer", "deploy"] {
+        for words in xtask_words(&text, job) {
+            let args: Vec<&str> = words.iter().map(String::as_str).collect();
+            assert!(!words.iter().any(|w| w.contains('$')), "{args:?}");
+            assert_eq!(xtask::check_args(&args), Ok(()), "{args:?}");
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 4);
+    // The check is not blind: a misspelt flag and a missing one are refused.
+    let check = |line: &str| xtask::check_args(&line.split(' ').collect::<Vec<_>>());
+    assert!(check("gamma sudoers-line --user x").is_ok());
+    assert!(check("gamma evidence --repo 1 --sha 1 --run_id 1").is_err());
+    assert!(check("gamma evidence --repo 1").is_err());
 }
 
 /// Every workflow file of the repository, `(file name, text)`.

@@ -14,17 +14,18 @@ gh secret set TS_OAUTH_SECRET --env gamma --repo komira-ai/kbf
 # GitHub prints a variable's value in the log of any step that has it in its environment, and this repository's logs are public: use the short tailnet name for the host, never an address.
 
 # 2. Tailscale: an OAuth client with the scope "Auth Keys: Write" only, restricted to tag:kbf-gamma-ci; its id and secret are the two secrets of step 1.
-# Add to the policy file (merge, do not replace); "dst" names the host as your policy names devices:
+# Add to the policy file (merge, do not replace). An SSH rule's "dst" is a tag, not a device name, so the host carries tag:kbf-gamma-host (step 3b):
 {
-  "tagOwners": { "tag:kbf-gamma-ci": ["autogroup:admin"] },
-  "grants": [{ "src": ["tag:kbf-gamma-ci"], "dst": ["farm-front"], "ip": ["22"] }],
-  "ssh": [{ "action": "accept", "src": ["tag:kbf-gamma-ci"], "dst": ["farm-front"], "users": ["kbf-deploy"] }]
+  "tagOwners": { "tag:kbf-gamma-ci": ["autogroup:admin"], "tag:kbf-gamma-host": ["autogroup:admin"] },
+  "grants": [{ "src": ["tag:kbf-gamma-ci"], "dst": ["tag:kbf-gamma-host"], "ip": ["22"] }],
+  "ssh": [{ "action": "accept", "src": ["tag:kbf-gamma-ci"], "dst": ["tag:kbf-gamma-host"], "users": ["kbf-deploy"] }]
 }
 
 # 3. The frontend host, as root there
 # a. The account kbf-deploy exists. It has no password: it only receives the ssh command.
-# b. Run: visudo -f /etc/sudoers.d/kbf-gamma, and put this one line in it. It has no wildcard; only the commit varies, as forty hex digits.
+# b. Give the host its tag, which the rules of step 2 name: tailscale set --advertise-tags=tag:kbf-gamma-host
+# c. Run: visudo -f /etc/sudoers.d/kbf-gamma, and put this one line in it. It has no wildcard; only the commit varies, as forty hex digits.
 kbf-deploy ALL=(root) NOPASSWD: /usr/bin/kbf-installer deploy --apply --json --commit [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f] --offer - --bundle -
-# c. kbf-installer is set up with --deploy-stage gamma, which writes /etc/kbf-installer/deploy.json (the API address, the token file and the stage): the workflow names none of them.
+# d. kbf-installer is set up with --deploy-stage gamma, which writes /etc/kbf-installer/deploy.json (the API address, the token file and the stage): the workflow names none of them.
 
 # 4. Repository settings: the Actions policy allows tailscale/github-action.

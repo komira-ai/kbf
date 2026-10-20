@@ -23,9 +23,10 @@
 # Inert until configured: with any of the repository variables GAMMA_HOST, GAMMA_USER and
 # TS_TAG unset, `deploy` is skipped, which is a green run. Deleting one is the stop switch.
 # The OAuth client is the only credential, a secret of the `gamma` environment, which allows
-# deployments from main only, and it reaches one step, after `cargo xtask` is built. Nothing
-# here names a host or a user. The workflow lint (crates/kbf-it/tests/workflows/workflow_run.rs)
-# holds this file to all of that.
+# deployments from main only, and it reaches one step, after `cargo xtask` is built. No
+# host or user is written in this file (they are repository variables, and public once a step
+# has them). Re-running the jobs replaces the uploaded files. The workflow lint
+# (crates/kbf-it/tests/workflows/workflow_run.rs) holds this file to all of that.
 name: gamma
 
 on:
@@ -35,13 +36,6 @@ on:
     branches: [main]
 
 permissions: {}
-
-# One deploy at a time. A newer run queues behind a running deploy, which is never cancelled
-# mid-roll; a queued run for a commit that is no longer the highest release is refused before
-# anything reaches the farm.
-concurrency:
-  group: gamma
-  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -90,12 +84,23 @@ jobs:
           path: ${{ runner.temp }}/offer
           retention-days: 3
           if-no-files-found: error
+          overwrite: true
 
   deploy:
     needs: [offer]
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.offer.outputs.staged == 'true' && vars.GAMMA_HOST != '' && vars.GAMMA_USER != '' && vars.TS_TAG != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 240
+    # One deploy at a time. The group is the job's, not the workflow's: GitHub cancels a
+    # pending run when a newer one queues, and a run whose `deploy` is skipped (a push that cut
+    # nothing) must not cancel a pending release. A newer deploy queues behind a running one,
+    # which is never cancelled mid-roll; a queued deploy of a commit that is no longer the
+    # highest release is refused before anything reaches the farm. GitHub keeps one pending
+    # deploy per group, so a newer release replaces an older pending one, which Rule S would
+    # have refused anyway.
+    concurrency:
+      group: gamma
+      cancel-in-progress: false
     environment: gamma
     permissions:
       contents: read
@@ -118,8 +123,10 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: ${{ vars.TS_TAG }}
           use-cache: true
-      # GitHub prints a variable in the log of a step whose environment has it, so only this
-      # step has these two; `gamma deploy` masks them before it prints anything else.
+      # GitHub prints a variable in the log of a step whose environment has it, and this
+      # repository's logs are public: the host and the user are public names (use a short
+      # tailnet name, never an address), and only this step has them. `gamma deploy` masks them
+      # in what it prints after, and shows nothing of what `tailscale ssh` writes to stderr.
       - name: Deploy on the gamma host
         env:
           GH_TOKEN: ${{ github.token }}
@@ -136,3 +143,4 @@ jobs:
           path: summary.json
           if-no-files-found: warn
           retention-days: 30
+          overwrite: true

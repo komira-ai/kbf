@@ -107,13 +107,13 @@ fn run_with(key: &str, value: Value) -> Value {
     changed
 }
 
-/// GitHub's list of the run's jobs, `(name, conclusion)`.
+/// GitHub's list of the run's jobs, `(name, conclusion)`: all of them, with their count.
 fn jobs(list: &[(&str, &str)]) -> Value {
-    let list: Vec<Value> = list
+    let rows: Vec<Value> = list
         .iter()
         .map(|(name, conclusion)| json!({ "name": name, "conclusion": conclusion }))
         .collect();
-    json!({ "jobs": list })
+    json!({ "total_count": rows.len(), "jobs": rows })
 }
 
 /// `gamma evidence` for `repo` and `sha`, its output going to `output`, with the fake gh
@@ -169,28 +169,50 @@ fn evidence_says_released_for_a_successful_push_run_that_published() {
     }
 }
 
-/// Catches: a push that cut nothing (docs only: the publish job skipped), a publish job that
-/// failed or is not there, or a run with no jobs listed, offering a release that was not made.
-/// Each is a green run with `released=false`, not an error.
+/// Catches: a push that cut nothing (docs only: the publish job skipped) or a publish job
+/// that failed offering a release that was not made. Each is a green run with
+/// `released=false`, not an error.
 #[test]
 fn evidence_says_not_released_when_the_publish_job_did_not_succeed() {
     let verify = ("verify", "success");
     let cases = [
-        Some(jobs(&[verify, ("publish", "skipped")])),
-        Some(jobs(&[verify, ("publish", "failure")])),
-        Some(jobs(&[verify])),
-        Some(json!({})),
-        None,
+        jobs(&[verify, ("publish", "skipped")]),
+        jobs(&[verify, ("publish", "failure")]),
     ];
     for listing in cases {
         let root = world("evidence-not-released");
-        let mut known = vec![(run_path(), run())];
-        known.extend(listing.map(|jobs| (jobs_path(), jobs)));
-        answers(&root, &known);
+        answers(&root, &[(run_path(), run()), (jobs_path(), listing)]);
         let (code, out, err) = evidence(&root);
         assert_eq!(code, Some(0), "{err}");
         assert_eq!(out, "released=false\n");
         assert_eq!(read(&root.join("github-output")), "released=false\n");
+    }
+}
+
+/// Catches: a rename of the publish job, a job list that is not whole (more jobs than the
+/// first page, or no count) and no job list at all ending as `released=false`, which is a green
+/// run that deploys nothing and looks the same as a push that cut nothing. Each is an error and
+/// nothing is written.
+#[test]
+fn evidence_refuses_a_job_list_it_cannot_trust() {
+    let verify = ("verify", "success");
+    let rows = jobs(&[verify, ("publish", "success")])["jobs"].clone();
+    let cases = [
+        (Some(jobs(&[verify, ("deliver", "success")])), "no job named publish"),
+        (Some(json!({ "total_count": 150, "jobs": rows })), "not whole"),
+        (Some(json!({ "jobs": rows })), "not whole"),
+        (Some(json!({})), "not whole"),
+        (None, "are gone"),
+    ];
+    for (listing, message) in cases {
+        let root = world("evidence-untrusted-jobs");
+        let mut known = vec![(run_path(), run())];
+        known.extend(listing.map(|jobs| (jobs_path(), jobs)));
+        answers(&root, &known);
+        let (code, _, err) = evidence(&root);
+        assert_eq!(code, Some(1), "{message}: {err}");
+        has(&err, message);
+        assert!(!root.join("github-output").exists(), "{message}");
     }
 }
 
@@ -419,6 +441,24 @@ fn deploy_fails_with_the_installers_status_and_still_writes_the_summary() {
     assert_eq!(kept["result"], "failed");
 }
 
+/// Catches: what `tailscale ssh` writes to its standard error (a `sudo` message, an
+/// installer's usage error: they name the machine and its paths) reaching the public log
+/// through xtask's own output. Only its size is said, and the step still passes.
+#[test]
+fn deploy_shows_nothing_of_what_tailscale_ssh_writes_to_stderr() {
+    let root = released("deploy-stderr");
+    let noise = "sudo: unable to resolve host canary-machine";
+    std::fs::write(root.join("ts/tailscale-stderr"), noise).expect("stderr");
+    let (code, out, err) = deploy(&root, &call(&root, |_| {}));
+    assert_eq!(code, Some(0), "{err}");
+    for log in [&out, &err] {
+        lacks(log, "canary-machine");
+    }
+    let size = noise.len();
+    let shown = format!("tailscale: {size} bytes of standard error are not shown");
+    has(&err, &shown);
+}
+
 /// Proves Rule S for the farm write: the deploy asks nothing of the host unless the commit is
 /// the commit of the highest release tag. Catches a deploy of a commit that is only ahead of
 /// the highest tag (nothing was released at it), of one with no release at all, and of an old
@@ -491,6 +531,16 @@ fn deploy_reports_a_missing_bundle_program_or_output() {
         assert_eq!(code, Some(1), "{needle}: {err}");
         has(&err, needle);
     }
+}
+
+/// Proves `check_args` takes what a workflow runs and names the flag it refuses; the
+/// workflow lint feeds it every `cargo xtask` line of `gamma.yml`.
+#[test]
+fn check_args_takes_a_command_line_and_names_the_flag_it_refuses() {
+    let args = ["gamma", "sudoers-line", "--user", "kbf-deploy"];
+    assert_eq!(xtask::check_args(&args), Ok(()));
+    let args = ["gamma", "sudoers-line", "--usr", "kbf-deploy"];
+    has(&xtask::check_args(&args).unwrap_err(), "--usr");
 }
 
 #[test]

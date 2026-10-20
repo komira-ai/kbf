@@ -86,8 +86,8 @@ mod yaml;
 
 mod jobs;
 pub use jobs::{
-    dispatch_inputs, job_env, job_environment, job_needs, job_outputs, job_permission_levels,
-    push_filters, workflow_name, workflow_run_filters,
+    dispatch_inputs, job_env, job_environment, job_has_key, job_needs, job_outputs,
+    job_permission_levels, push_filters, workflow_has_key, workflow_name, workflow_run_filters,
 };
 
 use yaml::{Node, Value};
