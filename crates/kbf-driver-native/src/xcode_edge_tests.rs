@@ -12,8 +12,12 @@ use super::*;
 fn only_xcode_apps_are_found_and_in_name_order() {
     let dir = scratch("edge-found");
     for name in [
+        "Xcode_9.app",
         "Xcode_beta.app",
+        "Xcode_5.app",
+        "Xcode_7.app",
         "Xcode.app",
+        "Xcode_3.app",
         "Xcode_notes.txt",
         "Xcode.dmg",
         "Safari.app",
@@ -26,11 +30,19 @@ fn only_xcode_apps_are_found_and_in_name_order() {
         .iter()
         .map(|p| p.strip_prefix(&*dir).expect("inside"))
         .collect();
-    assert_eq!(names, [Path::new("Xcode.app"), Path::new("Xcode_beta.app")]);
+    let want = [
+        "Xcode.app",
+        "Xcode_3.app",
+        "Xcode_5.app",
+        "Xcode_7.app",
+        "Xcode_9.app",
+        "Xcode_beta.app",
+    ];
+    assert_eq!(names, want.map(Path::new));
     let unasked = not_surveyed(&dir);
     assert_eq!(
         unasked.iter().map(|x| x.state).collect::<Vec<_>>(),
-        [State::NotSurveyed, State::NotSurveyed]
+        [State::NotSurveyed; 6]
     );
 }
 

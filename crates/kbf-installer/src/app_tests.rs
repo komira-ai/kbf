@@ -143,6 +143,36 @@ fn the_fetch_child_takes_a_blob_or_a_release() {
     );
 }
 
+/// Catches `run` watching the Linux state directory on a Mac: without `--update-dir` and
+/// `--orders-dir` the directories are the layout's, the ones `setup` and the Mac provisioner
+/// write, for each platform; the flags still win.
+#[test]
+fn run_defaults_its_directories_to_the_layouts_on_every_platform() {
+    for platform in [Platform::Linux, Platform::MacOs] {
+        let (layout, _) = crate::testkit::host_root_on("run-dirs", platform);
+        let Verb::Run(args) = parse(&["run"]).verb else {
+            panic!("run");
+        };
+        assert_eq!(
+            args.update_dir_in(&layout),
+            layout.update_dir(),
+            "{platform:?}"
+        );
+        assert_eq!(
+            args.orders_dir_in(&layout),
+            layout.orders_dir(),
+            "{platform:?}"
+        );
+    }
+    let Verb::Run(args) = parse(&["run", "--update-dir", "/srv/u", "--orders-dir", "/srv/o"]).verb
+    else {
+        panic!("run");
+    };
+    let (layout, _) = crate::testkit::host_root_on("run-dirs-flags", Platform::MacOs);
+    assert_eq!(args.update_dir_in(&layout).as_str(), "/srv/u");
+    assert_eq!(args.orders_dir_in(&layout).as_str(), "/srv/o");
+}
+
 /// Catches the proxy verb asking for root (it runs as the service user), a refused table
 /// leaving as anything but a usage error with its path, and `--json` losing the reason.
 #[test]
@@ -1198,13 +1228,15 @@ fn the_probe_user_is_looked_up_with_the_exit_codes_of_the_contract() {
         })
     });
     assert_eq!(
-        probe_user(&exec, "kbf-fetch", false).expect("found").uid,
+        probe_user(&exec, "kbf-fetch", false, Platform::Linux)
+            .expect("found")
+            .uid,
         991
     );
-    let missing = probe_user(&exec, "nobody-here", false).expect_err("unknown");
+    let missing = probe_user(&exec, "nobody-here", false, Platform::Linux).expect_err("unknown");
     assert_eq!(missing.exit, Exit::Usage);
     assert!(missing.why.contains("nobody-here"), "{}", missing.why);
-    let broken = probe_user(&exec, "broken", false).expect_err("broken");
+    let broken = probe_user(&exec, "broken", false, Platform::Linux).expect_err("broken");
     assert_eq!(broken.exit, Exit::Failed);
     assert!(broken.why.contains("getent"), "{}", broken.why);
 }
@@ -1239,7 +1271,7 @@ fn the_version_probe_never_runs_as_root_on_a_host() {
         })
     });
     for name in ["root", "uid-zero", "gid-zero"] {
-        let error = probe_user(&exec, name, false).expect_err(name);
+        let error = probe_user(&exec, name, false, Platform::Linux).expect_err(name);
         assert_eq!(error.exit, Exit::Usage, "{name}");
         assert!(
             error.why.contains(name) && error.why.contains("root"),
@@ -1248,10 +1280,17 @@ fn the_version_probe_never_runs_as_root_on_a_host() {
         );
     }
     assert_eq!(
-        probe_user(&exec, "kbf-fetch", false).expect("found").uid,
+        probe_user(&exec, "kbf-fetch", false, Platform::Linux)
+            .expect("found")
+            .uid,
         991
     );
-    assert_eq!(probe_user(&exec, "root", true).expect("a rehearsal").uid, 0);
+    assert_eq!(
+        probe_user(&exec, "root", true, Platform::Linux)
+            .expect("a rehearsal")
+            .uid,
+        0
+    );
 }
 
 /// Catches `migrate` missing from the command line or from the dispatcher: its flags parse

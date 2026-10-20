@@ -203,8 +203,8 @@ fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failu
     let (layout, exec) = host(root)?;
     let platform = layout.platform();
     let cfg = Config {
-        update_dir: args.update_dir.clone(),
-        orders_dir: args.orders_dir.clone(),
+        update_dir: args.update_dir_in(&layout),
+        orders_dir: args.orders_dir_in(&layout),
         restart: target.service.restart(),
         window_secs: args.window_secs,
         starts: args.starts,
@@ -295,8 +295,12 @@ fn probe_user<E: kbf_host::Exec>(
     exec: &E,
     name: &str,
     rehearsal: bool,
+    platform: Platform,
 ) -> Result<kbf_host::RunUser, Failure> {
-    let user = user_found(kbf_host::user::lookup(exec, name), name)?;
+    let user = user_found(
+        kbf_host::user::lookup_on(exec, name, platform.user_db()),
+        name,
+    )?;
     // The probe runs a binary nobody has trusted yet, and who it runs as is the whole of what
     // it is confined by (settings refuse root for the same reason). A rehearsal runs on the
     // caller's own tree as the caller, whoever that is.
@@ -333,9 +337,10 @@ fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String
     let (user, made) = probe_account(&mut exec, &layout, args, apply, rehearsal, owner)?;
     // A node that is not on a host with the user simply has no owner for its spool: the
     // migration says so and leaves the node's `kbf.toml` as it is.
-    let node_user = kbf_host::user::lookup(
+    let node_user = kbf_host::user::lookup_on(
         &exec,
         crate::setup::plan::service_user_name(crate::cli::Mode::Daemon),
+        layout.platform().user_db(),
     )
     .ok()
     .flatten();
@@ -416,7 +421,7 @@ fn probe_account<E: kbf_host::Exec>(
     {
         made = make_fetch_user(exec, platform)?;
     }
-    let user = probe_user(&*exec, name, rehearsal).map_err(|f| {
+    let user = probe_user(&*exec, name, rehearsal, platform).map_err(|f| {
         if !apply && name == standard && platform == Platform::MacOs {
             Failure {
                 why: format!(
