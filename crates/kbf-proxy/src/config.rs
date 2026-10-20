@@ -340,10 +340,9 @@ base_port = 18000
             // source line to a parse error, which is the reader of a bare table's to decide.
             let table: toml::Value =
                 toml::from_str(&format!("listen = {bad}\n{MIN}")).expect("toml");
-            let why = match ProxyConfig::from_value(table) {
-                Err(ConfigError::Parse(why)) => why,
-                other => format!("{bad} was not a parse error: {other:?}"),
-            };
+            let refused = ProxyConfig::from_value(table).expect_err("a bad listen is refused");
+            assert!(matches!(refused, ConfigError::Parse(_)), "{bad}: {refused:?}");
+            let why = refused.to_string();
             assert!(why.contains("listen"), "{why}");
             for piece in ["farm.example", "192.0.2.10", "2001:db8"] {
                 assert!(!why.contains(piece), "{why} echoes the value");
