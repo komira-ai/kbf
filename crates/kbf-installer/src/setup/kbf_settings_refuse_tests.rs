@@ -43,7 +43,7 @@ fn base(mode: Mode) -> KbfFlags {
 /// untouched (exit 2).
 #[test]
 fn every_invalid_setting_is_refused_by_flag_and_without_its_value() {
-    let cases: [(Mode, &str, Mutate, &str); 33] = [
+    let cases: [(Mode, &str, Mutate, &str); 34] = [
         (
             Mode::Frontend,
             "listen",
@@ -241,6 +241,12 @@ fn every_invalid_setting_is_refused_by_flag_and_without_its_value() {
             "storage-url",
             |k, v| k.storage_url = some(v),
             "https://storage.example:8983/",
+        ),
+        (
+            Mode::Frontend,
+            "storage-url",
+            |k, v| k.storage_url = some(v),
+            "https://storage.example/SECRET/",
         ),
     ];
     for (mode, flag, set, value) in cases {
