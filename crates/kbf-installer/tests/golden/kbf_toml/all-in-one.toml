@@ -30,4 +30,4 @@ node-id = "farm-1"
 driver = "container"
 
 [scheduler]
-state-store = "postgres:///kbf?host=/run/postgresql"
+state-store = "postgres:///kbf?host=/run/postgresql&user=kbf-server"

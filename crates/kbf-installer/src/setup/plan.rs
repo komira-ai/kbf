@@ -82,7 +82,7 @@ pub fn mode_units(mode: Mode) -> &'static [&'static str] {
 }
 
 /// The user a mode's unit runs as on Linux (`User=` of the package's units).
-fn service_user_name(mode: Mode) -> &'static str {
+pub(super) fn service_user_name(mode: Mode) -> &'static str {
     match mode {
         Mode::Frontend | Mode::Storage => "kbf-server",
         Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne => "kbf",

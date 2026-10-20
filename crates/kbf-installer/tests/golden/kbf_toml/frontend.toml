@@ -22,4 +22,4 @@ storage-client-cert = "/etc/kbf/worker.pem"
 storage-client-key = "/etc/kbf/worker.key"
 
 [scheduler]
-state-store = "postgres:///kbf?host=/run/postgresql"
+state-store = "postgres:///kbf?host=/run/postgresql&user=kbf-server"

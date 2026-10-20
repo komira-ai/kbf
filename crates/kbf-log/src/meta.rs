@@ -50,6 +50,7 @@ pub(crate) fn since_v4(command: &Command) -> bool {
         | Command::FlushConflict { object } => node(object),
         Command::EvictObjects { objects } => objects.iter().any(node),
         Command::Tick(_)
+        | Command::ReseatStaged { .. }
         | Command::AllocEpoch
         | Command::PutAction { .. }
         | Command::Touch(_)
@@ -58,11 +59,18 @@ pub(crate) fn since_v4(command: &Command) -> bool {
     }
 }
 
+/// Whether `command` joined the log in [`Format::V5`](crate::Format::V5).
+pub(crate) const fn since_v5(command: &Command) -> bool {
+    matches!(command, Command::ReseatStaged { .. })
+}
+
 /// Whether `format` takes `command`: format 1 takes neither the format-2 nor the
 /// format-3 commands, format 2 takes no format-3 command, and no format before 4 takes
 /// a format-4 one (`SetWriter`, or a node writer's object in any command).
 pub(crate) fn takes(format: Format, command: &Command) -> bool {
-    if since_v4(command) {
+    if since_v5(command) {
+        format.get() >= Format::V5.get()
+    } else if since_v4(command) {
         format.get() >= Format::V4.get()
     } else if since_v3(command) {
         format.get() >= Format::V3.get()
@@ -139,6 +147,17 @@ pub(crate) fn to_proto(command: &Command) -> Result<proto::MetaCommand, EncodeEr
         }),
         Command::FlushConflict { object } => P::FlushConflict(proto::FlushConflict {
             object: Some(object_id(*object)),
+        }),
+        Command::ReseatStaged {
+            tier,
+            from,
+            to,
+            stored,
+        } => P::ReseatStaged(proto::ReseatStaged {
+            tier: tier.get(),
+            from: Some(object_id(*from)),
+            to: Some(staged_object(to)?),
+            stored: *stored,
         }),
         Command::EvictObjects { objects } => P::EvictObjects(proto::EvictObjects {
             objects: objects.iter().copied().map(object_id).collect(),
@@ -311,6 +330,12 @@ pub(crate) fn from_proto(command: proto::MetaCommand) -> Result<Command, DecodeE
             },
             P::FlushConflict(c) => Command::FlushConflict {
                 object: required_object(c.object, "FlushConflict.object")?,
+            },
+            P::ReseatStaged(r) => Command::ReseatStaged {
+                tier: TierId::new(r.tier),
+                from: required_object(r.from, "ReseatStaged.from")?,
+                to: from_staged_object(r.to.ok_or(DecodeError::Missing("ReseatStaged.to"))?)?,
+                stored: r.stored,
             },
             P::EvictObjects(e) => Command::EvictObjects {
                 objects: object_set(e.objects, "EvictObjects.objects")?,
