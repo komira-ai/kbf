@@ -44,6 +44,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use kbf_daemon::Capacity;
 
@@ -58,9 +59,15 @@ const CPU_PERIOD_US: u64 = 100_000;
 pub const SUPERVISOR: &str = "supervisor";
 /// The cgroup every lease cgroup is made under.
 pub const ACTIONS: &str = "actions";
-/// How many times the processes are listed and moved again when one appeared after the
-/// listing (enabling controllers then fails with EBUSY).
-const MOVE_TRIES: u32 = 20;
+/// The first pause before the processes are listed and moved again when enabling
+/// controllers fails with EBUSY (a process appeared after the listing, or a thread
+/// that has begun to exit still counts as in the cgroup); each pause doubles up to
+/// [`MOVE_PAUSE_MAX`].
+const MOVE_PAUSE_FIRST: Duration = Duration::from_millis(1);
+/// The longest pause between two tries.
+const MOVE_PAUSE_MAX: Duration = Duration::from_millis(50);
+/// How long, in pauses, the set-up lists and moves again before it gives up.
+const MOVE_PAUSE_TOTAL: Duration = Duration::from_secs(5);
 /// Where the kernel names the cgroups of this process.
 pub const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
 
@@ -146,6 +153,8 @@ pub(crate) trait CgroupFs {
     fn writable(&self, cgroup: &str) -> io::Result<()>;
     /// The path of `file` in `cgroup`, for messages.
     fn path(&self, cgroup: &str, file: &str) -> PathBuf;
+    /// Waits `how_long` (the tests record it instead).
+    fn pause(&self, how_long: Duration);
 }
 
 /// The cgroup v2 filesystem mounted at a directory.
@@ -167,6 +176,10 @@ impl CgroupFs for Mount<'_> {
     fn writable(&self, cgroup: &str) -> io::Result<()> {
         rustix::fs::access(self.path(cgroup, ""), rustix::fs::Access::WRITE_OK)
             .map_err(io::Error::from)
+    }
+
+    fn pause(&self, how_long: Duration) {
+        std::thread::sleep(how_long);
     }
 
     fn path(&self, cgroup: &str, file: &str) -> PathBuf {
@@ -337,7 +350,8 @@ pub(crate) fn delegate_in(
 
     let supervisor = child(root, SUPERVISOR);
     make(fs, &supervisor)?;
-    let mut tries = 0;
+    let mut pause = MOVE_PAUSE_FIRST;
+    let mut waited = Duration::ZERO;
     loop {
         for pid in read(fs, root, "cgroup.procs")?.split_whitespace() {
             match fs.write(&supervisor, "cgroup.procs", pid) {
@@ -352,9 +366,14 @@ pub(crate) fn delegate_in(
             }
         }
         match enable(fs, root) {
-            // A process appeared in `root` after the listing.
-            Err(e) if e.kind() == io::ErrorKind::ResourceBusy && tries + 1 < MOVE_TRIES => {
-                tries += 1;
+            // A process appeared in `root` after the listing, or a thread that has
+            // begun to exit is still counted there: the kernel skips it when it moves
+            // a process and `cgroup.procs` does not list it, but `root` stays populated
+            // until the exit ends. Wait, then list and move again.
+            Err(e) if e.kind() == io::ErrorKind::ResourceBusy && waited < MOVE_PAUSE_TOTAL => {
+                fs.pause(pause);
+                waited += pause;
+                pause = (pause * 2).min(MOVE_PAUSE_MAX);
             }
             other => {
                 break other.map_err(io_err(
