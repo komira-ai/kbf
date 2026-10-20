@@ -907,7 +907,7 @@ impl Farm {
             // another node, which never held the lease, is owed nothing.
             let held = holding.is_none() && state.finish_held_of(lease);
             if held {
-                state.owed.entry(lease).or_insert_with(|| worker.clone());
+                state.owed.entry(lease).or_insert(worker.clone());
             }
             (holding, recorded, held)
         };
