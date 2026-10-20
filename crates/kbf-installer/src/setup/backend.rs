@@ -1,5 +1,5 @@
-//! What `setup` does through the rest of the installer: the first release and the state
-//! database. Each is a trait with one real implementation here, so the tests of `run` play the
+//! What `setup` does through the rest of the installer: the first release, the state
+//! database and the migration's journal. Each is a trait with one real implementation here, so the tests of `run` play the
 //! host and the server and the implementations are tested on their own.
 
 use std::cell::RefCell;
@@ -14,6 +14,7 @@ use crate::activate;
 use crate::database::{Database, SchemaOps};
 use crate::helper::fetcher::{Fetcher, ReleaseLocator};
 use crate::layout::Layout;
+use crate::migrate::{self, MigrateError, Unit};
 
 /// The installer's one downloader, as `setup` uses it: fetch the release for `commit` from the
 /// source `installer.toml` names (setup has written it by then), verify it as an update is
@@ -87,8 +88,40 @@ impl Schemas for Postgres {
     }
 }
 
-/// The two, as `run` takes them.
+/// What the migration left on the host, as `setup` asks it: the old layout's paths are not
+/// the test (a migrated host keeps them as its rollback path), the migration's journal is.
+pub trait Migrations {
+    /// The units a finished migration repointed, which `setup` may retire where one shadows
+    /// the packaged unit of its name; none on a host with no old layout.
+    ///
+    /// # Errors
+    /// [`MigrateError::Unmigrated`] when the old layout's state is the host's and no
+    /// migration finished; any other error is a journal or tree that cannot be read.
+    fn units(&self) -> Result<Vec<Unit>, MigrateError>;
+}
+
+/// The host's own migration journal, read through [`migrate::standing`].
+pub struct Journaled {
+    layout: Layout,
+    owner_uid: u32,
+}
+
+impl Journaled {
+    /// `owner_uid` is the user that must own the files read (root on a host).
+    pub fn new(layout: Layout, owner_uid: u32) -> Journaled {
+        Journaled { layout, owner_uid }
+    }
+}
+
+impl Migrations for Journaled {
+    fn units(&self) -> Result<Vec<Unit>, MigrateError> {
+        migrate::standing(&self.layout, self.owner_uid)
+    }
+}
+
+/// The three, as `run` takes them.
 pub struct Backend<'a> {
     pub releases: &'a dyn Releases,
     pub schemas: &'a dyn Schemas,
+    pub migrations: &'a dyn Migrations,
 }

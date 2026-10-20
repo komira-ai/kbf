@@ -6,6 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use kbf_testkit::dir::TestDir;
 use kbf_testkit::forked::ForkedChild;
 
 use super::guard::{
@@ -21,11 +22,10 @@ fn clock() -> Arc<dyn Clock> {
     Arc::new(SystemClock::default())
 }
 
-/// An empty directory of its own under the system's temporary directory.
-fn unit_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-state-unit-{}-{name}", std::process::id()));
-    fs::create_dir_all(&dir).expect("create the directory");
-    dir
+/// An empty directory of its own under the system's temporary directory (a unit test
+/// gets no `CARGO_TARGET_TMPDIR`), removed when the returned value is dropped.
+fn unit_dir(name: &str) -> TestDir {
+    TestDir::under(std::env::temp_dir(), &format!("kbf-state-unit-{name}"))
 }
 
 // Catches a state file on NFS being opened: its locks and syncs are not reliable there.
@@ -200,7 +200,8 @@ fn a_files_one_name_resolves_links_and_refuses_what_it_cannot_resolve() {
         here.join("kbf-state-unit-no-such.db"),
         "a bare name is in the working directory"
     );
-    let dir = unit_dir("canonical").canonicalize().expect("resolve");
+    let owned = unit_dir("canonical");
+    let dir = owned.canonicalize().expect("resolve");
     std::os::unix::fs::symlink("b.db", dir.join("a.db")).expect("link");
     std::os::unix::fs::symlink("a.db", dir.join("b.db")).expect("link");
     let looped = canonical_db(&dir.join("a.db")).expect_err("a loop");
@@ -321,7 +322,6 @@ fn a_file_connection_is_wal_with_full_sync() {
         .expect("synchronous");
     assert_eq!(sync, 2, "2 is FULL; 1 (NORMAL) would not sync each commit");
     drop(conn);
-    fs::remove_dir_all(&dir).expect("remove the directory");
 }
 
 // Catches a feed page read without one snapshot for the head and the rows: a group
@@ -361,5 +361,4 @@ fn a_page_is_read_from_one_snapshot() {
     );
     assert_eq!(next.cursor, Revision(3));
     drop(store);
-    fs::remove_dir_all(&dir).expect("remove the directory");
 }
