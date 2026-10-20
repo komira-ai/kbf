@@ -1488,7 +1488,6 @@ dependencies = [
  "kbf-enroll",
  "kbf-front",
  "kbf-harness",
- "kbf-host",
  "kbf-installer",
  "kbf-node",
  "kbf-peer",

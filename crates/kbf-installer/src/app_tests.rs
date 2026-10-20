@@ -267,6 +267,7 @@ fn the_visible_verbs_are_the_contracts() {
             "rollback",
             "gc",
             "boot-check",
+            "migrate",
             "quiesce",
             "check",
             "proxy"
@@ -885,5 +886,317 @@ fn a_derived_database_unit_reads_the_default_installer_toml_and_others_none() {
     assert_eq!(
         config("all-in-one", &["--installer-config", "/etc/kbf/other.toml"]),
         other
+    );
+}
+
+/// Catches the old helper and the installer both managing one host: while the old layout's
+/// state is the host's and no migration finished, every verb that manages the host (`setup`,
+/// `run`, the operator's verbs) refuses with exit 5 and names `migrate`, and does nothing
+/// else; the verbs that change no release (`quiesce`, `boot-check`) and `migrate` itself are
+/// not held. A host with no old state is not held at all.
+///
+/// Mutants planted: the guard not called; the guard called for `quiesce` too.
+#[test]
+fn the_verbs_that_manage_a_host_wait_for_its_migration() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_, root) = seeded("unmigrated");
+    // The installer's directory as a host has it (the guard judges it like every file).
+    fs::set_permissions(
+        root.join("var/lib/kbf-installer"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .expect("mode");
+    let old = root.join("var/lib/kbf-deploy");
+    fs::create_dir_all(&old).expect("old state dir");
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).expect("mode");
+    let state = old.join("state.json");
+    fs::write(
+        &state,
+        r#"{"schema":1,"current":null,"previous":null,"staged":null,"pending_confirm":null,"order_floor":0}"#,
+    )
+    .expect("old state");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).expect("mode");
+
+    let held: [&[&str]; 5] = [
+        &RUN,
+        &["setup", "--mode=frontend"],
+        &["gc"],
+        &["confirm", "--id=1-5", "--unit", "kbf.service"],
+        &["rollback", "--unit", "kbf.service"],
+    ];
+    for args in held {
+        let (exit, err) = on(&root, args);
+        assert_eq!(exit, Exit::NeedsOperator, "{args:?}: {err}");
+        assert!(
+            err.contains("kbf-installer migrate --apply"),
+            "{args:?}: {err}"
+        );
+    }
+    for args in [&["quiesce"][..], &["boot-check"]] {
+        let (exit, err) = on(&root, args);
+        assert_ne!(exit, Exit::NeedsOperator, "{args:?}: {err}");
+    }
+
+    fs::remove_file(&state).expect("rm");
+    let (exit, err) = on(&root, &RUN);
+    assert_eq!(exit, Exit::Ok, "{err}");
+}
+
+/// Catches the migration guard's table drifting: a verb that manages the host (`setup`
+/// included, now that all of it is built) left out of it, or one that changes no release put
+/// in it. `fetch-child`, the unprivileged process a verb starts, manages nothing and is never
+/// held. (The compiler makes every new verb say which it is; this pins what it says.)
+///
+/// Mutants to plant: `Verb::FetchChild` or `Verb::Migrate(_)` moved to the `true` arm; `Verb::Setup(_)` to the `false` one.
+#[test]
+fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
+    let held: [&[&str]; 9] = [
+        &["setup", "--mode=frontend"],
+        &RUN,
+        &["update", "--commit", B, "--frontend"],
+        &["confirm", "--id=1-5", "--unit", "kbf.service"],
+        &["revert", "--id=1-5", "--unit", "kbf.service"],
+        &["rollback", "--unit", "kbf.service"],
+        &["gc"],
+        &["stage"],
+        &["activate"],
+    ];
+    let free: [&[&str]; 6] = [
+        &["status"],
+        &["check"],
+        &["boot-check"],
+        &["quiesce"],
+        &["migrate"],
+        &["fetch-child"],
+    ];
+    for args in held {
+        assert!(parse(args).verb.manages_host(), "{args:?} is held");
+    }
+    for args in free {
+        assert!(!parse(args).verb.manages_host(), "{args:?} is not held");
+    }
+}
+
+/// Catches the owner a migration trusts being root's only by accident: on a host it is
+/// uid 0 whoever runs the verb; under `--root` it is the caller, who owns the rehearsal.
+#[test]
+fn the_owner_is_root_on_a_host_and_the_caller_in_a_rehearsal() {
+    assert_eq!(owner_uid(false, 1000), 0);
+    assert_eq!(owner_uid(true, 1000), 1000);
+}
+
+/// Catches the probe user's lookup failing quietly: a host that cannot answer is exit 1
+/// with the reason, an unknown user exit 2 naming the user, a known one its ids.
+#[test]
+fn the_probe_user_is_looked_up_with_the_exit_codes_of_the_contract() {
+    use kbf_host::testkit::{FakeExec, reply};
+    let mut exec = FakeExec::new(0);
+    exec.answer = Box::new(|cmd| {
+        let who = cmd.args.last().map(String::as_str);
+        Ok(match (cmd.program.as_str().ends_with("getent"), who) {
+            (true, Some("kbf-fetch")) => {
+                reply(0, "kbf-fetch:x:991:991::/nonexistent:/sbin/nologin\n", "")
+            }
+            (true, Some("broken")) => reply(1, "", "getent: no such service"),
+            (true, _) => reply(2, "", ""),
+            (false, _) => reply(0, "991\n", ""),
+        })
+    });
+    assert_eq!(
+        probe_user(&exec, "kbf-fetch", false).expect("found").uid,
+        991
+    );
+    let missing = probe_user(&exec, "nobody-here", false).expect_err("unknown");
+    assert_eq!(missing.exit, Exit::Usage);
+    assert!(missing.why.contains("nobody-here"), "{}", missing.why);
+    let broken = probe_user(&exec, "broken", false).expect_err("broken");
+    assert_eq!(broken.exit, Exit::Failed);
+    assert!(broken.why.contains("getent"), "{}", broken.why);
+}
+
+/// Catches a version probe that runs as root: on a host `--fetch-user root`, or any user
+/// whose uid or gid is 0, is a usage error (exit 2) naming the user, for the probe runs a
+/// binary nobody has trusted yet and `run_as` is the whole of what it is run with. A
+/// rehearsal (`--root`, a tree of the caller's own) runs as whoever the caller is.
+///
+/// Mutants seen red: only the uid checked; only the gid checked; the rehearsal not excepted.
+#[test]
+fn the_version_probe_never_runs_as_root_on_a_host() {
+    use kbf_host::testkit::{FakeExec, reply};
+    let mut exec = FakeExec::new(0);
+    exec.answer = Box::new(|cmd| {
+        let who = cmd.args.last().map(String::as_str);
+        Ok(match (cmd.program.as_str().ends_with("getent"), who) {
+            (true, Some("root")) => reply(0, "root:x:0:0:root:/root:/bin/bash\n", ""),
+            (true, Some("uid-zero")) => {
+                reply(0, "uid-zero:x:0:991::/nonexistent:/sbin/nologin\n", "")
+            }
+            (true, Some("gid-zero")) => {
+                reply(0, "gid-zero:x:991:0::/nonexistent:/sbin/nologin\n", "")
+            }
+            (true, Some("kbf-fetch")) => {
+                reply(0, "kbf-fetch:x:991:991::/nonexistent:/sbin/nologin\n", "")
+            }
+            (true, _) => reply(2, "", ""),
+            // `id -G`: the groups, which hold the primary one.
+            (false, Some("root" | "gid-zero")) => reply(0, "0\n", ""),
+            (false, _) => reply(0, "991\n", ""),
+        })
+    });
+    for name in ["root", "uid-zero", "gid-zero"] {
+        let error = probe_user(&exec, name, false).expect_err(name);
+        assert_eq!(error.exit, Exit::Usage, "{name}");
+        assert!(
+            error.why.contains(name) && error.why.contains("root"),
+            "{name}: {}",
+            error.why
+        );
+    }
+    assert_eq!(
+        probe_user(&exec, "kbf-fetch", false).expect("found").uid,
+        991
+    );
+    assert_eq!(probe_user(&exec, "root", true).expect("a rehearsal").uid, 0);
+}
+
+/// Catches `migrate` missing from the command line or from the dispatcher: its flags parse
+/// into the verb (every unit flag takes a unit name, and a name that is a path or has no
+/// suffix is a usage error of the parser), the verb runs through `dispatch` on a host with
+/// no old layout, says so on standard output and exits 0, and `--json` makes that one object.
+///
+/// Mutants planted: the `Verb::Migrate` arm of the dispatcher removed (the verb said "not
+/// implemented"); a unit name taken unchecked.
+#[test]
+fn migrate_parses_its_flags_and_runs_through_the_dispatcher() {
+    let cli = parse(&[
+        "migrate",
+        "--unit",
+        "kbf-daemon.service",
+        "--unit",
+        "kbf-other.service",
+        "--helper-unit",
+        "kbf-helper.service",
+        "--installer-unit",
+        "kbf-installer.service",
+        "--min-generation",
+        "5",
+        "--release-source",
+        "frontend",
+        "--rollback",
+    ]);
+    let Verb::Migrate(args) = &cli.verb else {
+        panic!("not the migrate verb");
+    };
+    assert_eq!(args.units.len(), 2);
+    assert!(args.helper_unit.is_some() && args.installer_unit.is_some() && args.rollback);
+    assert_eq!(args.min_generation, Some(5));
+    for bad in ["../x.service", "kbf", "A.service"] {
+        for flag in ["--unit", "--helper-unit", "--installer-unit"] {
+            let tried = Cli::try_parse_from(["kbf-installer", "migrate", flag, bad]);
+            assert!(tried.is_err(), "{flag} {bad}");
+        }
+    }
+
+    // A host with nothing on it: not `host_root_on`, which makes the installer's directories.
+    let root = kbf_host::testkit::scratch("app-migrate");
+    let id = std::process::Command::new("/usr/bin/id")
+        .arg("-un")
+        .output()
+        .expect("id");
+    let me = String::from_utf8(id.stdout)
+        .expect("text")
+        .trim()
+        .to_owned();
+    let root = root.to_str().expect("text");
+    for json in [false, true] {
+        let mut args = vec!["--root", root, "migrate", "--fetch-user", &me];
+        if json {
+            args.push("--json");
+        }
+        let (exit, out, err) = run_as(1000, &args);
+        assert_eq!(exit, Exit::Ok, "{err}");
+        assert!(out.contains("nothing to migrate"), "{out}");
+        assert_eq!(out.trim_start().starts_with('{'), json, "{out}");
+    }
+}
+
+/// Catches the report of `migrate` going to the wrong stream or in the wrong shape: it is the
+/// result of the verb, so it is on standard output, as the text or, with `--json`, as the one
+/// object (`verb`, `apply`, `message`), whatever the lines it holds.
+///
+/// Mutants to plant: the report written to `err`; `apply` or `message` dropped from the object.
+#[test]
+fn the_migrate_report_is_on_standard_output_as_text_or_one_object() {
+    let mut out = Vec::new();
+    assert_eq!(
+        finish_migrate(false, true, "adopted 2 releases\nunits repointed", &mut out),
+        Exit::Ok
+    );
+    assert_eq!(
+        String::from_utf8(out).expect("text"),
+        "adopted 2 releases\nunits repointed\n"
+    );
+    let mut out = Vec::new();
+    assert_eq!(
+        finish_migrate(true, false, "adopted 2 releases\nunits repointed", &mut out),
+        Exit::Ok
+    );
+    let v: Value = serde_json::from_slice(&out).expect("one object");
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "verb": "migrate",
+            "apply": false,
+            "message": "adopted 2 releases\nunits repointed",
+        })
+    );
+}
+
+/// Catches a failed `migrate` (here: a probe user the host does not have) not being said the
+/// way every other verb's failure is: exit 2 for the usage error, the reason after the
+/// program's name on standard error, or with `--json` the object `error: failed` on standard
+/// output; nothing of a report.
+///
+/// Mutants to plant: the failure of the `Migrate` arm printed as a report (exit 0).
+#[test]
+fn a_migrate_that_fails_says_so_like_the_other_verbs() {
+    let root = kbf_host::testkit::scratch("app-migrate-fails");
+    let root = root.to_str().expect("text");
+    let user = "no-such-user-for-kbf-migrate";
+    let (exit, out, err) = run_as(1000, &["--root", root, "migrate", "--fetch-user", user]);
+    assert_eq!(exit, Exit::Usage, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.starts_with("kbf-installer: ") && err.contains(user),
+        "{err}"
+    );
+    let (exit, out, err) = run_as(
+        1000,
+        &["--json", "--root", root, "migrate", "--fetch-user", user],
+    );
+    assert_eq!((exit, err.as_str()), (Exit::Usage, ""));
+    let v: Value = serde_json::from_str(out.trim_end()).expect("one json object");
+    assert_eq!(
+        (v["verb"].as_str(), v["error"].as_str()),
+        (Some("migrate"), Some("failed"))
+    );
+    assert!(
+        v["message"].as_str().is_some_and(|m| m.contains(user)),
+        "{v}"
+    );
+}
+
+/// Catches a host path joined to a root that is not absolute: `under` refuses it with the
+/// reason. The dispatcher's migration guard looks at the root first, so it is this test, not
+/// a verb's, that reaches the refusal.
+#[test]
+fn a_path_is_not_joined_to_a_relative_root() {
+    let path = HostPath::new("/etc/kbf/installer.toml").expect("a host path");
+    let failure = under(Path::new("relative/root"), &path).expect_err("refused");
+    assert_eq!(failure.exit, Exit::Failed);
+    assert!(!failure.why.is_empty());
+    assert_eq!(
+        under(Path::new("/srv/root"), &path).expect("joined"),
+        PathBuf::from("/srv/root/etc/kbf/installer.toml")
     );
 }
