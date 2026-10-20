@@ -34,6 +34,8 @@ use kbf_types::{
 use tokio::sync::mpsc;
 use tonic::{Code, Status};
 
+#[path = "state_store/ack_reasons.rs"]
+mod ack_reasons;
 #[path = "state_store/budgets.rs"]
 mod budgets;
 #[path = "state_store/fate.rs"]
