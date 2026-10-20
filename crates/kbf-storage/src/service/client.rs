@@ -273,10 +273,9 @@ impl Storage for RemoteStorage {
             while let Some(chunk) = chunks.try_next().await? {
                 let chunk = in_flight::counted(chunk);
                 blob.extend_from_slice(&chunk);
-                let capacity = blob.capacity() as u64;
-                if capacity > held.bytes() {
-                    held.add(capacity - held.bytes());
-                }
+                // The capacity only grows: what it grew by (nothing, for a blob up to the
+                // preallocation) is counted too.
+                held.add(blob.capacity() as u64 - held.bytes());
             }
             if blob.len() as u64 != digest.size_bytes {
                 return Err(StorageError::Internal(format!(
