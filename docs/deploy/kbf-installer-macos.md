@@ -107,9 +107,12 @@ has the flags, the dry run and the exit codes.
 
 ### The first release
 
-This build of the installer has no release fetcher wired in, so `setup --commit` stops with exit 1
-and a node does not fetch its first release itself. Until it does, place the first release by hand
-and record it: put the `kbf` binary in `/usr/local/kbf-installer/releases/<commit>/kbf` (root-owned,
+`setup --commit <40 hex>` fetches and verifies the first release with the installer's own fetcher,
+but only from the `url` source (`--release-source=url --release-url=https://...`). The `frontend`
+source, which the example above uses and which is the default for a node, has no address or CA key
+in `installer.toml` yet, so a fetch from it is refused and `setup --commit` stops with exit 1.
+Whether a Mac's directories and the `_kbf-fetch` account pass the fetcher's trust checks has not
+been tested. Without a working `url` source, place the first release by hand and record it: put the `kbf` binary in `/usr/local/kbf-installer/releases/<commit>/kbf` (root-owned,
 not writable by group or others, executable by others, a Mach-O file), then run
 
 ```text
@@ -157,7 +160,8 @@ there. Reinstalling the package hands the host back to the installer.
 - Running `kbf-mac-provision` with a profile, and everything in it that is check-only: the
   administrator account, FileVault, macOS and Xcode installs, the APFS volume for the lease users.
 - Creating the enrollment token on the frontend and putting the token file on the Mac.
-- Placing and recording the first release (above) while the installer has no fetcher.
-- Updating: a Mac takes the frontend's update orders through `kbf-installer run` once it has a
-  release; see [updating a host](update-a-host.md).
+- Placing and recording the first release (above) when the host has no `url` source to fetch it from.
+- Updating: a Mac takes no update order yet. `kbf-installer run` activates a release only after it
+  has counted the live leases, and for a launchd job it has no lease source, so it refuses the
+  order (`cannot tell whether leases are live`). Update by hand, see [updating a host](update-a-host.md).
 - A signature: nothing in the package is signed with a Developer ID.

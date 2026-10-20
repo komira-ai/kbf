@@ -6,7 +6,7 @@ or [`migrate`](kbf-installer-migrate.md). There are three ways to move it to a n
 | way | state in this build |
 |---|---|
 | by hand, with `kbf-deploy host install` and a restart | works |
-| `kbf-installer update --frontend`, through the proxy's update API | built, but the host cannot fetch a release yet |
+| `kbf-installer update --frontend`, through the proxy's update API | the host fetches from its `url` source; a refused order is reported late (see below) |
 | pull updates, where the frontend offers and the host fetches | planned |
 
 All three use the same layout: each release in `releases/<commit>/` of the installer tree, the links
@@ -118,11 +118,18 @@ The API refuses a new update with `503` (`handover_unavailable`) when `update.js
 when the host has no `releases/` directory, when no frontend child was adopted (the proxy's start-up
 hold is in force), or when the other slot is still running a process.
 
-**What does not work yet.** The API writes a `frontend_update` order, and the root half
-(`kbf-installer run`) is the part that fetches and stages the release. This build has no release
-fetcher wired in, so the root half refuses the order with `fetch` and stages nothing. The root half
-does not yet name which order it refused, so the update waits out the API's staging deadline and
-ends failed with reason `timeout`. Until the fetcher is wired in, a frontend moves by hand: (a).
+**What works, and what does not yet.** The API writes a `frontend_update` order, and the root half
+(`kbf-installer run`) fetches, verifies and stages the release. The root half now has a release
+fetcher: it reads `installer.toml` and `installer.conf` at each fetch and fetches from the `url`
+source, the only source a frontend or all-in-one host can be set up with. Two things are missing:
+
+- The root half does not name which order it refused (`status.json` carries a `refusal` but no
+  `refused_order_id`). A refused order (a failed fetch, a failed check) therefore leaves the update
+  waiting out the API's staging deadline (15 minutes by default), and it ends failed with reason
+  `timeout` and not with the refusal's own word. The cause is in the `refusal` of `status.json`.
+- No test drives a fetch through the fetch child from `installer.toml`, so the first update on a
+  host is the first proof that its `url` source, its trust files and its fetch user work. Keep the
+  by-hand path (a) as the way back.
 
 ## (c) Planned: pull updates
 
@@ -139,5 +146,9 @@ Planned: the frontend offers a release and each host pulls it. The design is
   it. `setup --min-generation N` raises it (it never lowers it), and `migrate` prints the value to
   use.
 
-Planned: the host side of this, where the installer fetches and verifies a release from its
-configured source, is not wired in this build, so no host pulls an update yet.
+Planned: a host pulling an update on its own. The host's release fetcher is wired into `run` (a
+fetch from the `url` source works, as under (b)), but nothing yet asks the frontend what the
+desired release is: the installer carries the desired generation in an order and applies no rule to
+it. A host whose release source is `frontend` (the default for the node modes) cannot fetch at all,
+because `installer.toml` has no key for the frontend's address or its pinned CA, and the fetch
+refuses with that reason.
