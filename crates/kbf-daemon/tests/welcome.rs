@@ -54,10 +54,17 @@ async fn a_first_message_that_is_not_a_welcome_is_refused() {
 }
 
 /// Catches a daemon that does not compare the protocol version of the Welcome with its
-/// own: it would speak this version to a server that speaks another.
+/// own: it would speak this version to a server that speaks another. A version above the
+/// Hello's (2) and one below the oldest the daemon speaks (0) are both refused; the
+/// versions between are `src/welcome.rs`'s test, since this daemon speaks only 1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_welcome_of_another_protocol_version_is_refused() {
     refuses("welcome-version", welcome(2, Duration::from_millis(100))).await;
+    refuses(
+        "welcome-version-low",
+        welcome(0, Duration::from_millis(100)),
+    )
+    .await;
 }
 
 /// Catches a daemon that takes a heartbeat interval of zero (it would heartbeat in a
