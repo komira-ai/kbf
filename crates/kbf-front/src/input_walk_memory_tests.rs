@@ -17,6 +17,13 @@ use super::*;
 
 const EPOCH: u64 = 7;
 
+/// The memory of verified subtrees alone, as the walk was before the content cache of
+/// decoded Directories: what these tests measure is that memory, and a cache that
+/// answers without reading would change what they count.
+fn verified_only() -> Trees {
+    Trees::default().with_dir_cache(0)
+}
+
 /// A chain tree under a root with `width` heads of `depth`, all files held, in a store
 /// that answers an epoch.
 fn remembering(width: usize, depth: usize, delay: Duration) -> (Store, Digest) {
@@ -31,7 +38,7 @@ fn remembering(width: usize, depth: usize, delay: Duration) -> (Store, Digest) {
 #[tokio::test(start_paused = true)]
 async fn a_verified_tree_is_not_read_or_asked_again() {
     let (store, root) = remembering(20, 6, READ);
-    let trees = Trees::default();
+    let trees = verified_only();
     let first = walk(&store, root, &trees).await.expect("walk");
     assert_eq!((first.dirs_read, first.dirs_skipped), (121, 0));
     assert_eq!(first.files_checked, 120);
@@ -63,7 +70,7 @@ async fn a_subtree_shared_by_two_roots_is_read_and_asked_once() {
     );
     tree.held.extend([file("one"), file("two")]);
     let store = Store::fixed(tree, READ).at_epoch(EPOCH);
-    let trees = Trees::default();
+    let trees = verified_only();
     walk(&store, a, &trees).await.expect("a");
     let asked = store.total_asked();
     let second = walk(&store, b, &trees).await.expect("b");
@@ -82,7 +89,7 @@ async fn a_subtree_shared_by_two_roots_is_read_and_asked_once() {
 #[tokio::test(start_paused = true)]
 async fn a_lost_blob_is_found_when_the_time_to_live_ends() {
     let (store, root) = remembering(3, 3, READ);
-    let trees = Trees::default();
+    let trees = verified_only();
     walk(&store, root, &trees).await.expect("walk");
     let gone = file("chain 1 level 2");
     store.lose(gone);
@@ -108,7 +115,7 @@ async fn a_lost_blob_is_found_when_the_time_to_live_ends() {
 #[tokio::test(start_paused = true)]
 async fn a_new_epoch_forgets_everything() {
     let (store, root) = remembering(3, 3, READ);
-    let trees = Trees::default();
+    let trees = verified_only();
     walk(&store, root, &trees).await.expect("walk");
     let gone = file("chain 0 level 0");
     store.lose(gone);
@@ -133,7 +140,7 @@ async fn a_new_epoch_forgets_everything() {
 async fn nothing_is_remembered_without_an_epoch() {
     let (store, root) = remembering(3, 3, READ);
     store.set_epoch(None);
-    let trees = Trees::default();
+    let trees = verified_only();
     walk(&store, root, &trees).await.expect("walk");
     let again = walk(&store, root, &trees).await.expect("walk");
     assert_eq!((again.dirs_read, again.dirs_skipped), (10, 0));
@@ -147,7 +154,7 @@ async fn nothing_is_remembered_without_an_epoch() {
 async fn a_walk_that_straddles_an_epoch_change_remembers_nothing() {
     let (tree, root) = chains(3, 3);
     let store = Store::new(tree, |_| READ).at_epoch(EPOCH);
-    let trees = Trees::default();
+    let trees = verified_only();
     let moving = async {
         sleep(READ).await;
         store.set_epoch(Some(EPOCH + 1));
@@ -170,7 +177,7 @@ async fn finding_something_absent_distrusts_what_was_verified_before() {
     let hole = tree.add(dir(&[file("never uploaded")], &[]));
     tree.held.extend([good, victim]);
     let store = Store::fixed(tree, READ).at_epoch(EPOCH);
-    let trees = Trees::default();
+    let trees = verified_only();
     walk(&store, first, &trees).await.expect("walk");
     store.lose(victim);
     assert!(
@@ -205,7 +212,7 @@ async fn a_walk_that_began_before_a_loss_was_seen_is_not_kept() {
         }
     })
     .at_epoch(EPOCH);
-    let trees = Trees::default();
+    let trees = verified_only();
     let (slow, quick) = tokio::join!(walk(&store, slow_root, &trees), async {
         sleep(Duration::from_secs(1)).await;
         walk(&store, hole, &trees).await
@@ -232,7 +239,7 @@ async fn only_a_clean_walk_is_remembered() {
         let root = tree.add(dir(&[], &[ok, bad]));
         tree.held.extend([file("ok"), file("bad")]);
         let store = Store::fixed(tree, READ).at_epoch(EPOCH);
-        let trees = Trees::default();
+        let trees = verified_only();
         let _ = walk(&store, root, &trees).await;
         assert_eq!(trees.len(), 0, "{failing:?}");
         let _ = walk(&store, root, &trees).await;
@@ -242,7 +249,7 @@ async fn only_a_clean_walk_is_remembered() {
     let mut tree = Tree::default();
     let root = tree.add(dir(&[file("not held")], &[]));
     let store = Store::fixed(tree, READ).at_epoch(EPOCH);
-    let trees = Trees::default();
+    let trees = verified_only();
     assert_eq!(
         walk(&store, root, &trees).await.expect("walk").absent.len(),
         1
@@ -263,7 +270,7 @@ async fn a_root_is_no_fresher_than_the_oldest_subtree_it_skipped() {
     tree.held.insert(file("own"));
     let root = tree.add(dir(&[], &[toolchain, own]));
     let store = Store::fixed(tree, READ).at_epoch(EPOCH);
-    let trees = Trees::default();
+    let trees = verified_only();
     walk(&store, toolchain, &trees).await.expect("toolchain");
     tokio::time::advance(Duration::from_secs(30)).await;
     let w = walk(&store, root, &trees).await.expect("root");
@@ -357,7 +364,7 @@ async fn the_memory_never_changes_an_answer() {
             Duration::from_millis(u64::from(d.hash_hex().as_bytes()[0]) % 13)
         })
         .at_epoch(EPOCH);
-        let trees = Trees::default();
+        let trees = verified_only();
         let mut reads = Vec::new();
         for round in 0..3 {
             let before = store.total_reads();
@@ -401,7 +408,7 @@ async fn the_memory_never_changes_an_answer() {
 
 /// A komira-like action set: `actions` roots over one toolchain tree of about 1050
 /// Directories (`thousand_dirs`) plus a private source subtree of 13 Directories each.
-fn action_set(actions: usize) -> (Tree, Vec<Digest>) {
+pub(super) fn action_set(actions: usize) -> (Tree, Vec<Digest>) {
     let (mut tree, toolchain) = thousand_dirs();
     let roots = (0..actions)
         .map(|n| {
@@ -449,7 +456,7 @@ async fn presubmit(
         .with_asks(read)
         .with_flights()
         .at_epoch(EPOCH);
-    let trees = Trees::default();
+    let trees = verified_only();
     let waits = futures::future::join_all(roots.iter().enumerate().map(|(n, root)| {
         let (store, trees) = (&store, &trees);
         async move {
@@ -511,7 +518,7 @@ async fn presubmit_of_the_measured_build() {
 /// for the adopted epoch is kept.
 #[tokio::test(start_paused = true)]
 async fn a_finding_for_another_epoch_is_refused() {
-    let trees = Trees::default();
+    let trees = verified_only();
     let (now, dir) = (Instant::now(), file("some directory"));
     assert!(trees.fresh(EPOCH, &dir, now).is_none(), "adopts the epoch");
     trees.record(EPOCH + 1, &[dir], now);

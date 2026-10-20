@@ -780,7 +780,17 @@ async fn the_routed_walk_skips_a_tree_it_found_held() {
     let (routed, _) = unknown.backends();
     routed.walk_inputs(root).await.expect("first walk");
     let again = routed.walk_inputs(root).await.expect("second walk");
-    assert_eq!((again.dirs_read, again.dirs_skipped), (dirs as u64, 0));
+    // Nothing is believed verified: every Directory is taken again (from the content
+    // cache, so none is read, and each is asked about) and every file is asked about.
+    assert_eq!((again.dirs_skipped, again.files_checked), (0, 30));
+    assert_eq!(
+        (
+            again.dirs_read,
+            again.dir_cache_hits,
+            again.dirs_present_checked
+        ),
+        (0, dirs as u64, dirs as u64)
+    );
 }
 
 /// Catches: a single storage node's walk remembering what it found held. Nothing about
@@ -799,9 +809,17 @@ async fn a_walk_over_one_storage_node_never_skips() {
     for round in 0..3 {
         let walked = remote.walk_inputs(root.0).await.expect("walk");
         assert!(walked.absent.is_empty(), "round {round}");
+        // The first walk reads both Directories; the later ones take them from the
+        // content cache and ask the node about them, but skip nothing as verified.
+        let (read, cached) = if round == 0 { (2, 0) } else { (0, 2) };
         assert_eq!(
             (walked.dirs_read, walked.dirs_skipped, walked.files_checked),
-            (2, 0, 1),
+            (read, 0, 1),
+            "round {round}"
+        );
+        assert_eq!(
+            (walked.dir_cache_hits, walked.dirs_present_checked),
+            (cached, cached),
             "round {round}"
         );
     }

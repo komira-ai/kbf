@@ -429,6 +429,20 @@ pub struct CacheMetrics {
     pub execute_walk_dirs_skipped: Counter,
     pub execute_walk_file_asks: Counter,
     pub execute_walk_files_checked: Counter,
+    /// One Directory read of an input-tree check over a store, as the walk saw it
+    /// (`kbf_execute_walk_dir_read_seconds`): failed reads included, reads another
+    /// check shared and Directories taken from the content cache not.
+    pub execute_walk_dir_read: Histogram,
+    /// Of the content cache of decoded Directories behind those checks: Directories
+    /// taken without a read (from the cache, or from a read another check had open);
+    /// reads led; of the hits, those another check's read supplied; Directories
+    /// pushed out for room; cached Directories put to FindMissing; bytes held.
+    pub execute_dir_cache_hits: Counter,
+    pub execute_dir_cache_misses: Counter,
+    pub execute_dir_cache_merged: Counter,
+    pub execute_dir_cache_evictions: Counter,
+    pub execute_dir_cache_present_checked: Counter,
+    pub execute_dir_cache_bytes: Level,
     /// One call of the scheduler's submit from an Execute, the wait for its lock
     /// included.
     pub execute_submit: Histogram,
@@ -506,6 +520,13 @@ impl Default for CacheMetrics {
             execute_walk_dirs_skipped: Counter::default(),
             execute_walk_file_asks: Counter::default(),
             execute_walk_files_checked: Counter::default(),
+            execute_walk_dir_read: Histogram::new(Unit::Seconds),
+            execute_dir_cache_hits: Counter::default(),
+            execute_dir_cache_misses: Counter::default(),
+            execute_dir_cache_merged: Counter::default(),
+            execute_dir_cache_evictions: Counter::default(),
+            execute_dir_cache_present_checked: Counter::default(),
+            execute_dir_cache_bytes: Level::default(),
             execute_submit: Histogram::new(Unit::Seconds),
             sched_lock_wait: Histogram::new(Unit::Seconds),
             sched_queued: Level::default(),
@@ -638,6 +659,12 @@ impl CacheMetrics {
                 &self.execute_walk_files,
             ),
             (
+                "kbf_execute_walk_dir_read_seconds",
+                "One Directory read from the store by an Execute input-tree check: the \
+                 store's latency per read, failed reads included",
+                &self.execute_walk_dir_read,
+            ),
+            (
                 "kbf_execute_submit_seconds",
                 "The scheduler's submit called from one Execute, the wait for its lock included",
                 &self.execute_submit,
@@ -695,6 +722,37 @@ impl CacheMetrics {
                 &self.execute_walk_files_checked,
             ),
             (
+                "kbf_execute_dir_cache_hits_total",
+                "Directories an Execute input check took without reading them: from the \
+                 content cache of decoded Directories (and then asked about, never trusted \
+                 unasked), or from a read another check had open",
+                &self.execute_dir_cache_hits,
+            ),
+            (
+                "kbf_execute_dir_cache_misses_total",
+                "Directories an Execute input check found neither cached nor being read, \
+                 and so read",
+                &self.execute_dir_cache_misses,
+            ),
+            (
+                "kbf_execute_dir_cache_merged_total",
+                "Of the content cache hits, the Directories another check's read supplied \
+                 while this one waited",
+                &self.execute_dir_cache_merged,
+            ),
+            (
+                "kbf_execute_dir_cache_evictions_total",
+                "Decoded Directories pushed out of the content cache to stay within its \
+                 byte bound",
+                &self.execute_dir_cache_evictions,
+            ),
+            (
+                "kbf_execute_dir_cache_present_checked_total",
+                "Cached Directories whose digests an Execute input check put to FindMissing \
+                 to confirm the store still holds them",
+                &self.execute_dir_cache_present_checked,
+            ),
+            (
                 "kbf_input_directories_cached_total",
                 "Directories an input check took from the decoded-directory cache, touching \
                  the blob and reading nothing",
@@ -715,6 +773,12 @@ impl CacheMetrics {
         ] {
             out.counter(name, help, counter.get());
         }
+        out.gauge(
+            "kbf_execute_dir_cache_bytes",
+            "Bytes of decoded Directories the Execute input checks' content cache holds, as \
+             of the end of the last check",
+            self.execute_dir_cache_bytes.get(),
+        );
         out.gauge(
             "kbf_sched_queued",
             "Operations waiting for a lease, as of the last scheduler input",
