@@ -164,10 +164,9 @@ impl Members {
         if before.phase == FLUSHING {
             if before.generation == 0 {
                 next.generation = map.generation();
-            } else if !downs
-                && self
-                    .flush_blocks(map, rows, now, before.generation)
-                    .is_empty()
+            } else if self
+                .flush_blocks(map, rows, now, before.generation)
+                .is_empty()
             {
                 next.phase = ADOPTING;
                 next.epoch = epoch + 1;

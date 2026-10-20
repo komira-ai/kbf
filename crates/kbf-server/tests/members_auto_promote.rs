@@ -671,6 +671,43 @@ fn a_member_that_went_down_during_the_fill_withholds_promotion_unless_allowed() 
     }
 }
 
+/// Catches: a change of placement that no member's boot shows (a member goes `Down`: it keeps
+/// its slot and its boot) leaving the fence as it was: a report made under the old placement
+/// would then be taken for the new. The sweeper must open a newer epoch for the fingerprint
+/// alone; the joiner acknowledges it and, the degraded setting being on, is promoted.
+/// Mutant seen red: the fingerprint left out of the test that reopens the fence.
+#[test]
+fn a_member_going_down_reopens_the_fence_for_the_new_placement() {
+    let s = scene_with(
+        2,
+        Some(Handoff {
+            settle: SETTLE,
+            allow_degraded: true,
+        }),
+    );
+    let epoch = s.open_fence();
+    let plain = members(&s.store, 2, None);
+    for _ in 0..3 {
+        s.store.clock.advance(Duration::from_secs(1800));
+        for who in [&s.b, &s.c] {
+            s.beat(&plain, who, Progress::CaughtUp, s.done(epoch));
+        }
+        plain.refresh().expect("refresh");
+    }
+    assert_eq!(state_of(&s.map(), s.a.id), Some(MemberState::Down));
+    assert_eq!(
+        s.m.tail_epoch().expect("epoch"),
+        epoch,
+        "nothing reopened it yet"
+    );
+    s.m.refresh().expect("refresh");
+    let newer = s.m.tail_epoch().expect("epoch");
+    assert_eq!(newer, epoch + 1);
+    s.beat_joiner(Progress::CaughtUp, s.done(newer));
+    s.joiner_after(SETTLE, s.done(newer));
+    assert_eq!(s.state(), Some(MemberState::Active));
+}
+
 /// Catches: a member going `Down` after the fence opened, noticed by a frontend that does not
 /// advance marks (so the mark does not say degraded yet), not holding the joiner back: the
 /// beat itself must see the `Down` member in the map. Then it returns (registers again,
