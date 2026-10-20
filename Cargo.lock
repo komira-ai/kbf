@@ -2247,6 +2247,7 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "hex",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",

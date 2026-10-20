@@ -519,6 +519,12 @@ Options:
       --pool-users <POOL_USERS>
           How many lease users the pool has (native, macOS, a daemon run as root): every action runs as one of `kbf-pool-0` .. `kbf-pool-<N-1>`, one lease per user at a time, as kbf-mac-provision makes them (`pool_users`). Required of a root daemon, which runs no action as root; refused for any other
 
+      --ui[=<BOOL>]
+          Serves the web UI on the operator API (`--api-listen`): read-only pages under `/ui` (`docs/design/kbf-ui-v1.md`). On by default; `--ui=false` turns it off, and `/ui` is then a `404`. The UI is open: it asks for no login or certificate, and it shows everything unredacted, the logs of builds and the arguments of failed commands, to whoever reaches the operator API's port, whatever the REAPI policy says of `--invocations-open`. Only `GET` and `HEAD` are served; the operator API's write routes and their token are unchanged. Keep the operator API on loopback, or behind the proxy and a network you trust
+          
+          [default: true]
+          [possible values: true, false]
+
       --pool-first-uid <POOL_FIRST_UID>
           The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid` in kbf-mac-provision's profile); at least 600
 
