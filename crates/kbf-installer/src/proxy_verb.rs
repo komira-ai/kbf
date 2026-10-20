@@ -411,6 +411,7 @@ fn serve(
     config: ProxyConfig,
     handover: &HandoverConfig,
     listener: OwnedFd,
+    root: &kbf_host::Root,
 ) -> Result<(), VerbError> {
     #[cfg(target_os = "linux")]
     let (state_dir, proxy_auth_file, upstream) = (
@@ -456,6 +457,7 @@ fn serve(
         };
         supervise(
             &handle,
+            root,
             &state_dir,
             &proxy_auth_file,
             upstream,
@@ -477,6 +479,7 @@ fn serve(
 #[cfg(target_os = "linux")]
 fn supervise(
     handle: &kbf_proxy::ProxyHandle,
+    root: &kbf_host::Root,
     state_dir: &Path,
     proxy_auth_file: &Path,
     upstream: kbf_proxy::config::UpstreamTable,
@@ -488,7 +491,7 @@ fn supervise(
     use crate::proxy::supervisor::{Startup, adopt_children, children_dir, frontend_argv};
 
     let gate = Arc::new(crate::proxy::gate_real::ProxyGate::new(handle.clone()));
-    let layout = Layout::linux(kbf_host::Root::host());
+    let layout = Layout::linux(root.clone());
     let releases_dir = layout.join(&layout.releases());
     let child = Arc::new(ProcChild::new(
         layout,
@@ -531,11 +534,12 @@ fn handover_died(why: &str, stop: &Arc<Stop>, died: &AtomicBool, drain: impl FnO
 }
 
 /// The verb. With `--check`, the table is loaded and nothing is bound.
-pub fn run(args: &ProxyArgs) -> Result<(), VerbError> {
+pub fn run(args: &ProxyArgs, root: &Path) -> Result<(), VerbError> {
     let loaded = load(&args.config)?;
     if args.check {
         return Ok(());
     }
+    let root = kbf_host::Root::new(root).map_err(|e| VerbError::Usage(format!("--root: {e}")))?;
     let listen_pid = std::env::var("LISTEN_PID").ok();
     let listen_fds = std::env::var("LISTEN_FDS").ok();
     let listener = activated(
@@ -545,7 +549,7 @@ pub fn run(args: &ProxyArgs) -> Result<(), VerbError> {
         FIRST_FD,
     )?;
     let handover = handover_config(args, &loaded);
-    serve(loaded.proxy, &handover, listener)
+    serve(loaded.proxy, &handover, listener, &root)
 }
 
 #[cfg(test)]
