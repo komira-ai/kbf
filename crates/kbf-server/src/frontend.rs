@@ -113,7 +113,7 @@ use crate::handover::{
 };
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
 use crate::listen::{Binder, Socket};
-use crate::members::Members;
+use crate::members::{Handoff, Members};
 use crate::object_store::delivery::{Delivery, RegistrySource, Reports};
 use crate::proxy_auth::ProxyAuthLayer;
 use crate::serve::{
@@ -230,6 +230,10 @@ pub struct FrontendFlags {
     /// frontend that has none. Its history writer is named by it, so the history rows
     /// the process writes carry its id and no other process writes them.
     pub instance_id: Option<String>,
+    /// `--auto-promote` and its companions: a joiner is promoted by its own beat when it is
+    /// filled ([`crate::members::Members::with_handoff`]); `None` without the flag, where only
+    /// an operator promotes one.
+    pub handoff: Option<Handoff>,
 }
 
 /// The long names of the flags of [`Args`] that `kbf frontend` hides and refuses by name
@@ -361,6 +365,7 @@ pub fn command() -> Command {
     )
     .args(crate::enroll::flags::args())
     .args(crate::managed::flags::args())
+    .args(handoff::args())
     .arg(
         Arg::new(SECRETS_DIR)
             .long("object-store-secrets-dir")
@@ -447,6 +452,7 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         admin,
         object_store_secrets_dir: m.get_one::<PathBuf>(SECRETS_DIR).cloned(),
         instance_id: None,
+        handoff: handoff::from_matches(m),
     })
 }
 
@@ -980,7 +986,7 @@ impl<'a> Prepared<'a> {
         let writer = (flags.instance_id.as_deref()).map(kbf_history::WriterId::from_instance);
         let state = crate::history::with_history_as(state, &args.history, writer)?;
         let (state, history) = crate::history::take(state);
-        let members = members_of(state.as_ref());
+        let members = members_of(state.as_ref(), flags.handoff);
         let map = map_of(None, members.as_ref())?;
         let readiness = Arc::new(Readiness::default());
         let timeout = listeners.store_probe_timeout;
@@ -1527,6 +1533,8 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
         Ok(frontend.serve().await?)
     })
 }
+
+mod handoff;
 
 #[cfg(test)]
 mod tests;

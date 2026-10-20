@@ -131,6 +131,12 @@ unservable-wait-secs = 300
 # storage-client-key = "PATH"
 
 [storage-node]
+# Promote a storage node that joined a farm holding data from joining to active by its own heartbeat once it is filled: every member has flushed what it staged before the join, the joiner has indexed every object in the cold store under the frontend's tail epoch, its placement fingerprint matches, no member is down, and the settle time has passed. Off by default: an operator promotes a joiner (`POST /v1/members/{id}`, state active), which stays the override. Frontends first, then nodes, then this flag.
+auto-promote = false
+# Let --auto-promote promote a joiner although a member was down during its fill. A member that is down and inside its dwell still holds the first phase back. Off by default: a down member may hold the only copy of a blob. Used only with --auto-promote.
+handoff-allow-degraded = false
+# How long, in seconds, all the conditions of --auto-promote must keep holding at the joiner's beats before it is promoted. Used only with --auto-promote.
+handoff-settle-secs = 30
 # How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
 member-dwell-secs = 300
 # How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
