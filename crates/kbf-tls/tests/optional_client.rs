@@ -252,4 +252,6 @@ fn an_expired_leaf_is_refused_only_on_request() {
         Err(TlsError::Expired { .. })
     ));
     assert!(config(&expired, &ca, false).is_ok());
+    let fresh = server_leaf(&ca);
+    assert!(config(&fresh, &ca, true).is_ok());
 }

@@ -79,7 +79,7 @@ fn io(path: &Path) -> impl Fn(std::io::Error) -> StoreError + '_ {
 /// The part of the frontend's `NodeConfig` the node keeps in `node.json`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredConfig {
-    /// Strictly increases at every change.
+    /// The frontend's digest of the config; it differs when the config does (not ordered).
     pub generation: u64,
     /// The roles granted.
     pub roles: Vec<String>,

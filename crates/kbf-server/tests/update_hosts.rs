@@ -531,7 +531,18 @@ async fn a_state_store_that_fails_is_a_500_on_the_detail_and_no_verdict_on_the_l
 /// total more, and an injection armed after the wait would be met by one of them and not by
 /// its request; a read fewer makes a count less, and the wait never ends.
 ///
-/// Mutants seen red: `START_LOOKS` of `(1, 1)` and of `(2, 0)` (the counts after the wait).
+/// The wait of `Looks::done` is not the end of the start: the controller's look reads
+/// `update/desired` for its pass and again first among the farm's facts, and then the members
+/// (`map`, `member/`) and the registry (`enroll/node/`, the look's last read), so the sweeper's
+/// `deny/` can be read while the controller is yet to make those three. The test waits for the
+/// registry read as well, before it takes the count it compares; taken at the wait alone it was
+/// 21 on a slow run and 24 on a quick one.
+///
+/// Mutants seen red: `START_LOOKS` of `(1, 1)` and of `(2, 0)` (the counts after the wait), and
+/// a read of `map` made by the sweeper's task a tenth of a second after it starts (a read that
+/// comes by itself after the start). The start made slow (a sleep in `FarmFacts::look` before the
+/// members are read) was red on the count taken at the wait alone (`left: 24, right: 21`), and
+/// is green with the registry read waited for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_server_reads_the_rows_by_itself_only_at_start() {
     let hooked = hooked::Hooked::new();
@@ -540,8 +551,16 @@ async fn the_server_reads_the_rows_by_itself_only_at_start() {
         .expect("offer");
     let looks = looks::Looks::count(&hooked);
     let every_read = hooked.count("");
+    let registry_reads = hooked.count("enroll/node/");
     let running = start(farm_open(), Some(state_over(hooked.clone())));
     looks.done(START_LOOKS).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while registry_reads.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the controller's look reads the registry at start");
     let at_start = every_read.load(Ordering::SeqCst);
     let daemon = FakeDaemon::connect(running.worker, hello("node-a", 1, 1))
         .await

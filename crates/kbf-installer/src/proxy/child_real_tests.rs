@@ -681,3 +681,47 @@ fn the_identity_decision_covers_found_gone_and_other_errors() {
     assert_eq!(decide(Err(denied), ask), Err(text));
     assert!(!asked.get(), "another error never asks for a zombie");
 }
+
+/// Catches a child that is exiting when its identity is read being a spawn failure. Between
+/// the kernel dropping the process's address space (its `exe` link then reads ENOENT) and
+/// marking it a zombie (state `Z`) the process is neither readable as live nor a zombie;
+/// `identify_started` must wait for the exit then, not report the missing link. Nothing
+/// reaps these children but the test, so every failure here is that window.
+#[test]
+fn a_child_caught_while_exiting_is_identified_not_refused() {
+    let program = Path::new("/bin/true").canonicalize().expect("true");
+    let failures = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                for _ in 0..250 {
+                    let mut child = std::process::Command::new(&program).spawn().expect("spawn");
+                    // Look again and again until the child has exited, so one of the
+                    // reads lands in the window.
+                    loop {
+                        if let Err(e) = identify_started(child.id(), &program) {
+                            assert!(e.contains("No such file"), "the missing link: {e}");
+                            failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                        let zombie = fs::read_to_string(format!("/proc/{}/stat", child.id()))
+                            .is_ok_and(|s| {
+                                s.rsplit(')')
+                                    .next()
+                                    .is_some_and(|r| r.trim_start().starts_with('Z'))
+                            });
+                        if zombie {
+                            break;
+                        }
+                    }
+                    child.wait().expect("reaped");
+                }
+            });
+        }
+    });
+    assert_eq!(
+        failures.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "children refused while exiting, of 2000"
+    );
+}

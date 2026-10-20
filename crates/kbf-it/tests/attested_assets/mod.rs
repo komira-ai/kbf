@@ -48,6 +48,37 @@ pub fn packaged(workflow: &str) -> Result<Vec<(String, String)>, String> {
     Ok(found)
 }
 
+/// The platform of every `cargo xtask pkg-asset` line in the workflow's `run:` steps that
+/// makes the `kbf-installer` deb an asset (it has no `--verify-only`: that one only checks
+/// the file the attest job signed), in file order. An error names a line without
+/// `--platform`.
+pub fn packaged_debs(workflow: &str) -> Result<Vec<String>, String> {
+    let mut found = Vec::new();
+    for step in workflows::run_steps(workflow)? {
+        for line in step.script.lines().map(str::trim_start) {
+            let Some(args) = line.strip_prefix("cargo xtask pkg-asset ") else {
+                continue;
+            };
+            let words: Vec<&str> = args.split_whitespace().collect();
+            if words.contains(&"--verify-only") {
+                continue;
+            }
+            let platform = words
+                .iter()
+                .position(|w| *w == "--platform")
+                .and_then(|i| words.get(i + 1));
+            let Some(platform) = platform else {
+                return Err(format!(
+                    "{}/{}: a pkg-asset line without --platform: {line}",
+                    step.job, step.step
+                ));
+            };
+            found.push((*platform).trim_matches('"').to_owned());
+        }
+    }
+    Ok(found)
+}
+
 /// The (subject-path, sbom-path) of every `actions/attest-sbom` step of `job`. An error
 /// for such a step that lacks either path, or that is under `if:` or
 /// `continue-on-error:` (it could be skipped while the job passes).
