@@ -1,0 +1,45 @@
+# Build and tests of the website (site/): TypeScript compiled by tsc, a build program that prerenders the pages, and
+# node:test tests over the built tree (golden output, links, the Content-Security-Policy rules, the pinned theme, a
+# public-repo scan). Runs only when site/ (or this file, or the policy it is checked against) changes. The Node version
+# is exactly the one in site/.node-version. The network is touched by `npm ci` alone, with install scripts off.
+# GitHub-hosted runner, commit-pinned actions, no token rights beyond reading the checkout.
+name: site
+
+on:
+  pull_request:
+    paths:
+      - site/**
+      - infra/site/lib/site-stack.ts
+      - .github/workflows/site.yml
+  push:
+    branches: [main, feature/arch-v2]
+    paths:
+      - site/**
+      - infra/site/lib/site-stack.ts
+      - .github/workflows/site.yml
+
+permissions: {}
+
+concurrency:
+  group: site-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  site:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: site/.node-version
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build

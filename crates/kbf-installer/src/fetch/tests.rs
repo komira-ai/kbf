@@ -563,3 +563,25 @@ fn a_description_needs_the_nodes_identity_before_a_child_exists() {
     assert!(matches!(got, Err(FetchError::Identity(_))), "{got:?}");
     assert_eq!(got.unwrap_err().word(), "fetch");
 }
+
+/// The bounds of a fetch are the file's component cap and fetch timeout, each from its own
+/// key (the two differ here, and differ from the defaults).
+///
+/// Catches a cap read from the timeout's key or the timeout in the wrong unit.
+///
+/// Mutants planted: the timeout in milliseconds; the cap from `fetch_timeout_s`.
+#[test]
+fn limits_are_the_installer_tomls_cap_and_timeout() {
+    let toml = InstallerToml {
+        max_component_bytes: 7_000_001,
+        fetch_timeout_s: 1234,
+        ..InstallerToml::default()
+    };
+    assert_eq!(
+        Limits::of(&toml),
+        Limits {
+            max_component_bytes: 7_000_001,
+            fetch_timeout: Duration::from_secs(1234),
+        }
+    );
+}

@@ -68,7 +68,8 @@ use xtask::crun_tests::host_report;
 
 use crate::cell::{
     CellError, LEASE_WAIT, OrBroken as _, POLL, Process, absolute, copy_tree, ensure,
-    leases_started, plain, print_tails, random_hex, read, status, to_log, wait_for_line,
+    leases_started, plain, poll_until, print_tails, random_hex, read, status, to_log,
+    wait_for_line,
 };
 use crate::pki::PkiFiles;
 use crate::summary::{Tool, check_logs, parse};
@@ -341,20 +342,16 @@ impl Cell {
         let started = status(&mut start)?;
         self.units.push(unit.to_owned());
         ensure(started, format!("sudo -n systemd-run --unit={unit} failed"))?;
-        let deadline = Instant::now() + JOIN_WAIT;
-        loop {
+        let (text, welcome) = poll_until(JOIN_WAIT, POLL, || {
             let text = plain(&read(&log)?);
             let welcome = welcomed(&text) > before;
-            let late = Instant::now() >= deadline;
-            if welcome | late {
-                let last = text.lines().next_back().unwrap_or_default();
-                let why = format!("the daemon did not join; the last line of its log: {last}");
-                ensure(welcome, why)?;
-                println!("daemon joined ({unit})");
-                return Ok(());
-            }
-            std::thread::sleep(POLL);
-        }
+            Ok(((text, welcome), welcome))
+        })?;
+        let last = text.lines().next_back().unwrap_or_default();
+        let why = format!("the daemon did not join; the last line of its log: {last}");
+        ensure(welcome, why)?;
+        println!("daemon joined ({unit})");
+        Ok(())
     }
 
     /// The `systemd-run` arguments that start the daemon as `unit`: in
@@ -586,16 +583,12 @@ impl Cell {
     /// Nothing left behind (a few seconds allowed for the clean step to end) but the
     /// daemon's claim on the scratch directory.
     fn nothing_left(&self) -> Result<(), CellError> {
-        let deadline = Instant::now() + LEFT_WAIT;
-        let (left, dirs) = loop {
+        let (left, dirs) = poll_until(LEFT_WAIT, POLL, || {
             let left = self.containers();
             let dirs = names(&self.leases, LEASE_PREFIX);
             let clean = left.is_empty() & dirs.is_empty();
-            if clean | (Instant::now() >= deadline) {
-                break (left, dirs);
-            }
-            std::thread::sleep(POLL);
-        };
+            Ok(((left, dirs), clean))
+        })?;
         let why = format!(
             "{} crun containers are left: {}",
             left.len(),
@@ -632,13 +625,10 @@ impl Cell {
         self.start_daemon(&format!("{UNIT}-2"), pki)?;
         let welcomed = Instant::now();
         let server_log = self.logs.join("server.err");
-        let restarts = loop {
+        let restarts = poll_until(REQUEUE_WAIT, POLL, || {
             let restarts = plain(&read(&server_log)?).matches(RESTARTED).count();
-            if (restarts > 0) | (welcomed.elapsed() >= REQUEUE_WAIT) {
-                break restarts;
-            }
-            std::thread::sleep(POLL);
-        };
+            Ok((restarts, restarts > 0))
+        })?;
         let after = welcomed.elapsed();
         let why = format!("the server logged {restarts} restart requeues, not one");
         ensure(restarts == 1, why)?;

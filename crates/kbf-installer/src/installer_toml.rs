@@ -12,8 +12,13 @@
 
 use std::path::PathBuf;
 
+use kbf_host::exec::{Entry, Exec, Kind};
+use kbf_host::path::HostPath;
 use kbf_proxy::config::ProxyConfig;
 use serde::Deserialize;
+
+use crate::refusal::{Refusal, TrustFault};
+use crate::trust::trusted_chain;
 
 /// The largest file read.
 pub const MAX_FILE_BYTES: usize = 64 * 1024;
@@ -23,11 +28,6 @@ pub const FETCH_TIMEOUT_S: std::ops::RangeInclusive<u32> = 60..=3600;
 pub const MAX_COMPONENT_BYTES_CEILING: u64 = 1 << 30;
 /// A day: the longest minimum gap between two activations.
 pub const MIN_ACTIVATION_INTERVAL_CEILING_S: u32 = 86_400;
-/// The backups `kbf-installer backup` keeps (`backup_keep`): at least the newest one, at most a
-/// year of daily dumps.
-pub const BACKUP_KEEP: std::ops::RangeInclusive<u32> = 1..=365;
-/// What `backup_keep` is when the file does not say.
-pub const DEFAULT_BACKUP_KEEP: u32 = 7;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,7 +48,6 @@ struct Raw {
     /// keys are closed the same way.
     proxy: Option<toml::Value>,
     database: Option<String>,
-    backup_keep: Option<u32>,
 }
 
 /// Where releases are fetched from.
@@ -84,10 +83,6 @@ pub struct InstallerToml {
     /// leniently (only this key, and it refuses a password); this field exists so that the
     /// closed reader here does not reject the key, and it has no other consumer.
     pub database: Option<String>,
-    /// How many backups of the state database `kbf-installer backup` keeps; `None` is
-    /// [`DEFAULT_BACKUP_KEEP`]. Read by `crate::backup`, which refuses a file this reader
-    /// refuses.
-    pub backup_keep: Option<u32>,
 }
 
 impl Default for InstallerToml {
@@ -106,7 +101,6 @@ impl Default for InstallerToml {
             node_key: None,
             proxy: None,
             database: None,
-            backup_keep: None,
         }
     }
 }
@@ -120,6 +114,17 @@ pub enum ConfigError {
     Syntax(String),
     #[error("installer.toml:\n{}", .0.join("\n"))]
     Invalid(Vec<String>),
+}
+
+/// Why the file at a path could not be taken as the installer's settings.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError {
+    /// It is missing, not a plain file, owned by someone but root, writable by group or
+    /// others, or in a directory that is ([`trusted_chain`]).
+    #[error("{0}")]
+    Untrusted(Refusal),
+    #[error("{0}")]
+    Invalid(ConfigError),
 }
 
 fn absolute(key: &str, value: &Option<String>, problems: &mut Vec<String>) -> Option<PathBuf> {
@@ -254,6 +259,39 @@ fn syntax_line(text: &str, error: &toml::de::Error) -> String {
 }
 
 impl InstallerToml {
+    /// The settings in `file`, read through `trust` (the host's own executor, or a test's).
+    ///
+    /// The file decides where a release comes from and which versions the host refuses, so
+    /// it is held to the rule of the trust files ([`trusted_chain`]): a plain file of root's
+    /// that group and others cannot write, in directories of root's that they cannot write.
+    /// `setup` leaves it so (root:root 0644 in a root-owned 0755 directory).
+    ///
+    /// # Errors
+    /// [`ReadError::Untrusted`] when the rule is not met (or the file cannot be read),
+    /// [`ReadError::Invalid`] when its content is not an `installer.toml`.
+    pub fn read(trust: &dyn Exec, file: &HostPath) -> Result<InstallerToml, ReadError> {
+        let untrusted = |fault| {
+            ReadError::Untrusted(Refusal::Untrusted {
+                path: file.as_str().into(),
+                fault,
+            })
+        };
+        let read = trust
+            .inspect(file)
+            .map_err(|e| untrusted(TrustFault::Unreadable(e)))?;
+        let Some(entry) = read else {
+            return Err(untrusted(TrustFault::Missing));
+        };
+        // A link, a directory or a device where the file should be.
+        let Entry::File { bytes, .. } = entry else {
+            return Err(untrusted(TrustFault::Link));
+        };
+        trusted_chain(trust, file, Kind::File).map_err(ReadError::Untrusted)?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| ReadError::Invalid(ConfigError::Syntax("it is not UTF-8".to_owned())))?;
+        InstallerToml::parse(&text).map_err(ReadError::Invalid)
+    }
+
     pub fn parse(text: &str) -> Result<InstallerToml, ConfigError> {
         if text.len() > MAX_FILE_BYTES {
             return Err(ConfigError::TooLarge(text.len()));
@@ -334,15 +372,6 @@ impl InstallerToml {
             MIN_ACTIVATION_INTERVAL_CEILING_S,
             &mut problems,
         );
-        if let Some(n) = raw.backup_keep
-            && !BACKUP_KEEP.contains(&n)
-        {
-            problems.push(format!(
-                "backup_keep = {n}: must be {} to {}",
-                BACKUP_KEEP.start(),
-                BACKUP_KEEP.end()
-            ));
-        }
         let node_cert = absolute("node_cert", &raw.node_cert, &mut problems);
         let node_key = absolute("node_key", &raw.node_key, &mut problems);
         if node_cert.is_some() != node_key.is_some() && problems.is_empty() {
@@ -374,7 +403,6 @@ impl InstallerToml {
                 node_key,
                 proxy,
                 database: raw.database,
-                backup_keep: raw.backup_keep,
             }),
             _ => Err(ConfigError::Invalid(problems)),
         }
@@ -424,9 +452,6 @@ impl InstallerToml {
         if let Some(url) = &self.database {
             out.push_str(&format!("database = {}\n", toml_string(url)));
         }
-        if let Some(n) = self.backup_keep {
-            out.push_str(&format!("backup_keep = {n}\n"));
-        }
         if let Some(proxy) = &self.proxy {
             render_proxy(proxy, &mut out);
         }
@@ -460,6 +485,7 @@ fn render_proxy(p: &ProxyConfig, out: &mut String) {
     out.push_str(&format!("proxy_auth_file = {}\n", path(&p.proxy_auth_file)));
     out.push_str(&format!("state_dir = {}\n", path(&p.state_dir)));
     out.push_str(&format!("hold_max_s = {}\n", p.hold_max_s));
+    out.push_str(&format!("ui = {}\n", p.ui));
     for cert in &p.server_cert {
         out.push_str("\n[[proxy.server_cert]]\n");
         let names: Vec<String> = cert.names.iter().map(|n| toml_string(n)).collect();

@@ -93,6 +93,7 @@ kbf-mac-provision revert                                # root: put back the rec
   | `--data-dir` | `kbf_data_dir` | `[daemon]` | `data-dir` |
   | `--label` (the node label, then each of `kbf_labels`) | `kbf_labels` | `[identity]` | `label = [...]` |
   | `--update-dir` (always `/var/db/kbf-installer`) | | `[daemon]` | `update-dir` |
+  | `--orders-dir` (always `/var/db/kbf-installer/orders`) | | `[daemon]` | `orders-dir` |
 
   `update-dir` turns on the node's update client: it takes the frontend's offers and orders
   and writes the orders to `orders/` beneath it, which the root `kbf-installer` reads. The
