@@ -402,11 +402,26 @@ fn a_dated_name_that_is_taken_is_refused_and_a_rerun_finishes() {
         assert_eq!(error.exit(), Exit::NeedsOperator);
         assert!(rig.at("usr/local/kbf-installer").is_dir());
         assert!(rig.at(INSTALLER_TOML_PATH).is_file());
+        // Nothing moved and nothing replaced. The one change before the refusal is the
+        // revert of the two lines migrate added to the kit's kbf.toml (update-dir and
+        // orders-dir, #1321): the kit's own job is back by then and runs from that file.
+        let after = rig.snapshot("usr/local");
+        let toml = "etc/kbf/kbf.toml";
+        let without_added = |text: &str| {
+            text.lines()
+                .filter(|l| !l.starts_with("update-dir = ") && !l.starts_with("orders-dir = "))
+                .map(|l| format!("{l}\n"))
+                .collect::<String>()
+        };
         assert_eq!(
-            rig.snapshot("usr/local"),
-            before,
-            "nothing moved, nothing replaced"
+            after[toml],
+            without_added(&before[toml]),
+            "only migrate's two lines go"
         );
+        let (mut after_rest, mut before_rest) = (after.clone(), before.clone());
+        after_rest.remove(toml);
+        before_rest.remove(toml);
+        assert_eq!(after_rest, before_rest, "nothing moved, nothing replaced");
         assert!(
             !rig.active.borrow().contains(INSTALLER_JOB),
             "booted out first"
