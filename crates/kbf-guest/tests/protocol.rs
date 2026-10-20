@@ -546,3 +546,31 @@ fn a_failing_accept_ends_serving_with_its_error() {
     assert_eq!(err.to_string(), "accept broke");
     assert!(!agent.has_run());
 }
+
+/// Catches a run accepted when the inputs share is not there (mutant: the share's
+/// canonicalisation error ignored, so the command starts in a directory that does not
+/// exist): the request is refused as a bad request, the boot's run is not used, and a
+/// later connection is served.
+#[test]
+fn a_run_without_an_inputs_share_is_refused_without_using_the_run() {
+    let shares = Shares::new("no-inputs");
+    let config = kbf_guest::server::Config {
+        inputs: shares.inputs.join("missing"),
+        ..shares.config()
+    };
+    let served = Served::start(config);
+    let mut client = served.connect();
+    let err = client.run(&act("exit 0", &[])).expect_err("refused");
+    assert!(
+        matches!(
+            &err,
+            ClientError::Refused {
+                reason: Refusal::BadRequest,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    drop(client);
+    assert!(!served.join().has_run());
+}
