@@ -787,6 +787,7 @@ fn check_refuses_a_file_without_a_database() {
         config: Some(path),
         check: true,
         update_dir: "/nonexistent".into(),
+        orders_dir: "/nonexistent/orders".into(),
     };
     assert!(usage_of(run(&args)).contains("state database"));
 }
