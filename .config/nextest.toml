@@ -22,13 +22,15 @@ test-group = 'mac-provision-scratch'
 
 # The pull-request profile (`cargo nextest run --profile pr`, and `cargo llvm-cov nextest
 # --profile pr`): the fast gate. A pull request runs every test except the slow ones named
-# below; the push to feature/arch-v2 and main runs them all, with the default profile
+# below; the push to main runs them all, with the default profile
 # (.github/workflows/beta.yml, job test-x86).
 #
 # The slow set is every test that took 10 seconds or more in the full run on a hosted x86
 # runner: 77 of 8960 tests, 70 percent of the run's test time (the 5 GiB blob test alone
 # is 898 s). A test that needs a service (Postgres, S3, crun, root, macOS) is `#[ignore]`d
 # and so is in neither run; the other jobs of beta.yml run those.
+# The black-box crate kbf-blackbox (T009, crates/kbf-blackbox/README.md) is excluded whole by
+# `package(kbf-blackbox)` below: it is a beta suite, and runs in the full run only.
 #
 # To regenerate: take the `nextest-junit` artifact of a beta.yml run (junit.xml, written by
 # `[profile.default.junit]` below), list the `testcase`s with a `time` of 10 or more, and
@@ -43,6 +45,7 @@ not (
   (binary_id(=kbf-all-in-one) & test(=plane::tests::put_chunks_streams_a_large_blob_and_stores_a_small_one))
   | (binary_id(=kbf-all-in-one::memory) & (test(=a_2_gib_output_streams_onto_the_tier_in_bounded_memory) | test(=a_2_gib_remote_upload_is_written_through_to_the_tier_in_bounded_memory) | test(=without_a_tier_a_256_mib_output_streams_to_the_store_in_bounded_memory)))
   | (binary_id(=kbf-all-in-one::one_read) & (test(=with_a_tier_a_file_over_1_gib_is_read_once) | test(=without_a_tier_a_file_over_1_gib_is_read_once) | test(=a_blob_over_5_gib_is_not_refused_for_its_size)))
+  | package(kbf-blackbox)
   | (binary_id(=kbf-cli::all_in_one) & test(=an_input_is_on_the_nodes_disk_once))
   | (binary_id(=kbf-cli::rehearsal_in_a_box) & (test(=a_killed_storage_node_loses_no_blob) | test(=a_loaded_node_restarts_planned_down_and_loses_no_action) | test(=three_storage_nodes_run_an_action)))
   | (binary_id(=kbf-cli::storage_and_daemon) & test(=storage_and_daemon_runs_an_action_over_its_own_storage))

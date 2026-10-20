@@ -260,6 +260,45 @@ fn a_takeover_that_fails_ends_the_process_with_sigterm_not_sigkill() {
     assert_eq!(w.count("release_into"), 0);
 }
 
+/// Catches the next try starting while the SIGTERM'd process of the last one is still
+/// exiting: it takes three seconds to exit, longer than the two-second wait between the
+/// tries, and the second try must still find its slot free (not "spawn-failed"). The
+/// process is stopped for the boot's purposes when it is gone, not when it is told to go.
+#[test]
+fn a_try_does_not_start_before_the_process_of_the_last_one_is_gone() {
+    let run = Run::new();
+    {
+        let mut st = run.world.st.borrow_mut();
+        st.takeover = Takeover::Err;
+        st.term_takes = secs(3);
+    }
+    assert_eq!(run.boot(retry(3)), Booted::GaveUp(Reason::TakeoverFailed));
+    let w = &run.world;
+    assert_eq!(w.count("spawn A refused"), 0, "{:?}", w.log());
+    assert_eq!(w.count("spawn A "), 3, "{:?}", w.log());
+    let at = |prefix: &str| {
+        w.pos(prefix)
+            .unwrap_or_else(|| panic!("no {prefix}: {:?}", w.log()))
+    };
+    assert!(at("terminate") < at("await_exit"), "{:?}", w.log());
+}
+
+/// Catches a process that ignores SIGTERM stalling the boot for good: the wait for it ends
+/// at its limit and the try after it is refused for the slot, with its own word.
+#[test]
+fn a_process_that_does_not_exit_is_waited_for_a_while_and_then_the_try_fails() {
+    let run = Run::new();
+    {
+        let mut st = run.world.st.borrow_mut();
+        st.takeover = Takeover::Err;
+        st.term_takes = secs(3600);
+    }
+    assert_eq!(run.boot(retry(2)), Booted::GaveUp(Reason::SpawnFailed));
+    let w = &run.world;
+    assert_eq!(w.count("await_exit"), 1, "{:?}", w.log());
+    assert_eq!(w.count("spawn A refused: live child"), 1, "{:?}", w.log());
+}
+
 /// Catches a gate that cannot route after the takeover landed: its reason is its own.
 #[test]
 fn a_gate_that_refuses_the_release_is_a_failed_attempt_with_its_own_word() {

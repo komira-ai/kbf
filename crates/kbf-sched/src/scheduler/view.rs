@@ -79,6 +79,12 @@ impl Scheduler {
         self.ops.get(&operation).map(|op| &op.request.qos)
     }
 
+    /// The leader term this scheduler grants leases under.
+    #[must_use]
+    pub const fn term(&self) -> u64 {
+        self.term
+    }
+
     /// How many operations wait for a lease.
     #[must_use]
     pub fn queued_len(&self) -> usize {
@@ -138,6 +144,13 @@ impl Scheduler {
     #[must_use]
     pub fn booked(&self, worker: &WorkerId) -> Option<Resources> {
         self.workers.get(worker).map(|w| w.booked)
+    }
+
+    /// What `worker` reported it can run at once, if it is registered: its newest
+    /// `Hello`'s capacity. [`Scheduler::booked`] is what its leases hold of it.
+    #[must_use]
+    pub fn capacity(&self, worker: &WorkerId) -> Option<Resources> {
+        self.workers.get(worker).map(|w| w.capacity)
     }
 
     /// The leases in `running` (a heartbeat's running set) that this scheduler granted

@@ -54,6 +54,33 @@ A farm whose `/v1/nodes` lists no node (an empty list, or no `nodes` array) is r
 preflight (exit 3, `no_nodes`); the wait for nodes and the post check each need at least one
 node, so an empty list never reads as "every node confirmed".
 
+## The host's config: who writes it, and the sudoers rule
+
+`kbf-installer setup` (frontend and all-in-one) writes `/etc/kbf-installer/deploy.json` from
+`--deploy-stage gamma|prod` and, only where the defaults are wrong, `--deploy-api`,
+`--deploy-api-ca`, `--deploy-server-name` and `--deploy-token-file`
+(`docs/deploy/kbf-installer-setup.md`). The file is the type `deploy` reads
+(`deploy::host_config::HostConfig`), so what `setup` writes is what `deploy` gets back. It
+holds the token and the CA by path only; both files are the operator's, and `setup` refuses
+(exit 5, the command that fixes it in the message) when one is missing or unsafe. It never
+creates or copies the token.
+
+The sudoers rule is a held step for the person who owns the host's accounts; no code writes
+it. Install it with `visudo -f /etc/sudoers.d/kbf-deploy` (mode 0440, root:root), as one line
+with no wildcard, where `ACCOUNT` is the deploy account, `OFFER` the absolute path of the
+`offer.json` the pipeline copies to the host, and `[0-9a-f]` is repeated forty times for the
+commit:
+
+```
+ACCOUNT ALL=(root) NOPASSWD: /usr/bin/kbf-installer deploy --apply --json --commit [0-9a-f]...[0-9a-f] --offer OFFER --bundle -
+Defaults!/usr/bin/kbf-installer env_reset
+```
+
+Nothing else is allowed through `sudo`: the flags `deploy` refuses there (`--api`, `--token-file`,
+`--config`, `--stage`, `--no-offer`, ...) are exactly the ones that would let the caller choose
+where root sends the token, and the rule does not list `SSL_CERT_FILE` or `SSL_CERT_DIR` in
+`env_keep`.
+
 ## The offer
 
 `--offer offer.json` is the document `cargo xtask release offer` writes (`kbf_gate::OfferDoc`).
