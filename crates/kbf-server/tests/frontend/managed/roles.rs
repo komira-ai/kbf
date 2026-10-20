@@ -38,6 +38,10 @@ async fn a_candidate_takes_nothing_schedules_nothing_and_answers_readiness() {
     assert!(Child::worker_of(&view).is_none());
     let configured = flags.server.worker_listen;
     assert!(
+        kbf_testkit::port::is_taken(configured),
+        "the configured worker port is free for any socket to take: a refusal on it proves nothing"
+    );
+    assert!(
         refused(configured).await,
         "a candidate has a worker listener"
     );
