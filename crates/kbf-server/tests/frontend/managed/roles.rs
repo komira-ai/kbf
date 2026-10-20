@@ -16,7 +16,10 @@ async fn a_candidate_takes_nothing_schedules_nothing_and_answers_readiness() {
     let (held, version) = generation(&store);
     let commits = store.commit_stats();
 
-    let worker = format!("--worker-listen=127.0.0.1:{}", free_port());
+    // Held to the end of the test: a port freed and probed later can be bound by another
+    // test process in between, and then "refused" connects to that process.
+    let reserved = kbf_testkit::port::Reserved::new();
+    let worker = format!("--worker-listen={}", reserved.addr());
     let flags = managed_flags(&node, &["--await-takeover", &worker]);
     let b = Child::start(&flags, &store).await;
     meanwhile().await;
