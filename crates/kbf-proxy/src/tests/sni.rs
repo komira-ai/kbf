@@ -128,27 +128,63 @@ async fn no_name_and_an_unknown_name_are_served_the_default() {
     let tls = connect_tls_as(&s.rig, quiet, PUBLIC).await.expect("no SNI");
     assert_eq!(served(&tls), s.public_der);
 
-    // An unknown name: the certificate is the default's, so only a client that does not check
-    // names (the public root has no other name to offer) sees which one; it fails to verify
-    // here, which is the right answer for a name the certificate does not carry, and the
-    // failure is the client's, after the proxy sent the default.
-    let other = connect_tls_as(
-        &s.rig,
-        client_config(&s.public_ca.ca_pem, None, &["h2"]),
-        "unknown.example.com",
-    )
-    .await;
-    assert!(other.is_err());
-    let farm_client = connect_tls_as(
-        &s.rig,
-        client_config(&s.farm_ca.ca_pem, None, &["h2"]),
-        "unknown.example.com",
-    )
-    .await;
-    assert!(
-        farm_client.is_err(),
-        "the default is not the farm certificate"
-    );
+    // An unknown name: a client that verifies fails on it whatever the proxy served, so this
+    // one accepts any certificate and the test compares what the proxy actually sent: the
+    // handshake completes (the proxy did not refuse it), and the certificate is the default's,
+    // not the farm's.
+    let mut open = client_config(&s.public_ca.ca_pem, None, &["h2"]);
+    Arc::get_mut(&mut open)
+        .expect("unshared")
+        .dangerous()
+        .set_certificate_verifier(Arc::new(AcceptAny));
+    let tls = connect_tls_as(&s.rig, open, "unknown.example.com")
+        .await
+        .expect("an unknown name still completes the handshake");
+    let got = served(&tls);
+    assert_eq!(got, s.public_der, "an unknown name is served the default");
+    assert_ne!(got, s.farm_der, "the default is not the farm certificate");
+}
+
+/// Test only: a server-certificate verifier that accepts everything, so a test can look at
+/// which certificate the proxy chose without the client's name check getting in the way.
+#[derive(Debug)]
+struct AcceptAny;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 /// A name in another case is the same name.
@@ -196,7 +232,11 @@ async fn client_certificates_are_required_where_they_were_on_both_names() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let _ = tls.write_all(b"x").await;
         let mut buf = [0_u8; 64];
-        assert!(matches!(tls.read(&mut buf).await, Err(_) | Ok(0)), "{host}");
+        let read = tls.read(&mut buf).await;
+        assert!(
+            read.is_err(),
+            "{host}: the server's rejection is an alert, not a plain close: {read:?}"
+        );
     }
     assert_eq!(s.rig.a.state.dispatches(), 2);
 }
