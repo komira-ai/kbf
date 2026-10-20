@@ -407,6 +407,23 @@ fn operator_token(
     Ok(())
 }
 
+/// Take the unit files `shadows` out of `/etc/systemd/system`, each after a copy of its
+/// bytes is in the migration's backup directory (root's 0700, where the originals of the
+/// migration are): a crash between the two leaves the file in place and the copy made, and a
+/// run again finishes. Nothing is deleted that was not first kept.
+pub fn retire(exec: &dyn Exec, ctx: &Ctx, shadows: &[super::Shadow]) -> Result<Plan, SetupError> {
+    let view = View(exec);
+    let mut p = Planner::new(&view);
+    let backup = format!("{}/migration-units", ctx.layout.state_dir());
+    dir(&mut p, &backup, 0o700, ctx.root)?;
+    for shadow in shadows {
+        let kept = format!("{backup}/{}", crate::migrate::retired_name(shadow.unit));
+        file(&mut p, &kept, 0o600, ctx.root, shadow.bytes.clone())?;
+        p.absent(hp(&shadow.path)?)?;
+    }
+    Ok(p.finish())
+}
+
 /// The part after the first release: `kbf.toml`, then the units. `released` says whether a
 /// release is installed (or, in a dry run, would be). Reads the host, changes nothing.
 pub fn after_release(
@@ -416,6 +433,7 @@ pub fn after_release(
     ctx: &Ctx,
     released: bool,
     no_start: bool,
+    retired: &[&str],
 ) -> Result<Outcome, SetupError> {
     let view = View(exec);
     let mut p = Planner::new(&view);
@@ -462,7 +480,7 @@ pub fn after_release(
         Decision::Refuse(why) => return Err(SetupError::NeedsOperator(why)),
     }
 
-    units(&mut p, os, v, ctx.platform, released, no_start, &mut notes)?;
+    notes.extend(units(&mut p, os, v, ctx, released, no_start, retired)?);
     Ok(Outcome {
         plan: p.finish(),
         notes,
@@ -473,11 +491,13 @@ fn units(
     p: &mut Pl<'_, '_>,
     os: &dyn Os,
     v: &Valid,
-    platform: Platform,
+    ctx: &Ctx,
     released: bool,
     no_start: bool,
-    notes: &mut Vec<String>,
-) -> Result<(), SetupError> {
+    retired: &[&str],
+) -> Result<Vec<String>, SetupError> {
+    let platform = ctx.platform;
+    let mut notes = Vec::new();
     // The mode's units are started when the operator did not forbid it and a release is
     // there to run. The installer's own service has nothing to wait for. A unit that makes a
     // frontend is never started here: starting one takes the state database and the public
@@ -522,8 +542,14 @@ fn units(
                 .iter()
                 .map(|u| (*u, start_mode))
                 .chain([(INSTALLER_UNIT, !no_start)]);
+            // A unit file was taken out of `/etc/systemd/system`: systemd reads the packaged
+            // unit of that name from the next reload, and it is enabled whatever was said of
+            // the old file (the enable symlink of the old file named the same unit).
+            if !retired.is_empty() {
+                p.run(Cmd::new(hp(SYSTEMCTL)?).arg("daemon-reload"));
+            }
             for (unit, now) in wanted {
-                if !os.unit_enabled(unit)? {
+                if retired.contains(&unit) || !os.unit_enabled(unit)? {
                     let mut cmd = Cmd::new(hp(SYSTEMCTL)?).arg("enable");
                     if now {
                         cmd = cmd.arg("--now");
@@ -533,5 +559,5 @@ fn units(
             }
         }
     }
-    Ok(())
+    Ok(notes)
 }
