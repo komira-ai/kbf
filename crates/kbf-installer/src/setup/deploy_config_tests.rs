@@ -544,7 +544,7 @@ fn a_rerun_is_idempotent_and_a_changed_flag_rewrites_keeping_other_keys() {
         CONFIG,
         0o644,
         ROOT,
-        "{\"cas\": \"http://127.0.0.1:8980\", \"extra\": [1, 2], \"stage\": \"prod\", \"api_ca\": \"/old\"}",
+        "{\"cas\": \"http://127.0.0.1:8980\", \"extra\": [1, 2], \"stage\": \"prod\", \"api_ca\": \"/old\", \"observe_base_port\": \"19000\"}",
     );
     let flags = DeployFlags {
         deploy_api_ca: None,
@@ -555,6 +555,8 @@ fn a_rerun_is_idempotent_and_a_changed_flag_rewrites_keeping_other_keys() {
     let config = HostConfig::parse(&text(&exec, CONFIG)).expect("parses");
     assert_eq!(config.stage.as_deref(), Some("gamma"));
     assert_eq!(config.api_ca, None);
+    // No proxy table here, so setup derives no observe port and the operator's stays.
+    assert_eq!(config.observe_base_port.as_deref(), Some("19000"));
     assert_eq!(config.cas.as_deref(), Some("http://127.0.0.1:8980"));
     assert_eq!(config.other.get("extra"), Some(&serde_json::json!([1, 2])));
 }
