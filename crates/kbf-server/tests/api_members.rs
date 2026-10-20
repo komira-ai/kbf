@@ -17,7 +17,7 @@ use kbf_front::{Cache, MemoryMetaLog};
 use kbf_map::{MemberId, MemberState};
 use kbf_objstore::MemoryStore;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
-use kbf_server::storage_health::Debts;
+use kbf_server::storage_health::Reported;
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{Cond, ManualClock, Store, Txn};
@@ -265,10 +265,16 @@ async fn a_draining_or_expired_member_shows_its_state_until_it_leaves() {
     // Only `a` and `b` keep beating: `c` lapses, and is Down in the map.
     clock.advance(TTL - Duration::from_secs(1));
     frontend
-        .heartbeat(a.id, a.boot, Progress::CatchingUp, Debts::Unknown, None)
+        .heartbeat(
+            a.id,
+            a.boot,
+            Progress::CatchingUp,
+            Reported::default(),
+            None,
+        )
         .expect("beat a");
     frontend
-        .heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
+        .heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("beat b");
     clock.advance(Duration::from_secs(2));
     frontend.refresh().expect("refreshed");
@@ -320,7 +326,7 @@ async fn a_member_lists_the_protocol_it_registered_naming() {
 
     // A heartbeat and an administrator's state change rewrite the row, and keep it.
     frontend
-        .heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
+        .heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("beat");
     frontend.set_state(b.id, MemberState::Draining).expect("b");
     let view = members(server.api).await;
@@ -406,6 +412,50 @@ fn the_protocol_is_field_four_of_the_stored_row_as_a_plain_varint() {
     assert_eq!(read.get(&b.id), Some(&Some(5)), "{read:?}");
 }
 
+/// Catches: the end of an operator's planned restart moved to another tag of the stored
+/// row. A plan lives only in the row (`planned_until_nanos`), so a build that reads it from
+/// another tag than the build that wrote it loses every plan across a frontend restart,
+/// and the node is then judged as not planned down. Bytes spelled out by hand, for the
+/// reason of the test above: the planned end is field 5 as a plain varint, key byte
+/// `5 << 3 | 0`, 0x28, after the fields of the old layout and the protocol (field 4, 0x20).
+#[test]
+fn the_planned_end_is_field_five_of_the_stored_row_as_a_plain_varint() {
+    let (_clock, fake, _state) = store();
+    let frontend = other_frontend(&fake);
+    frontend.register(&speaking(1, 3)).expect("a");
+    let b = frontend.register(&speaking(2, 2)).expect("b");
+    let key = format!("member/{}", b.id.0);
+    let t0 = fake.now().as_duration().as_nanos();
+    frontend
+        .plan_down(b.id, Duration::from_secs(600))
+        .expect("plan");
+    let t1 = fake.now().as_duration().as_nanos();
+
+    let row = fake.get(&key).expect("store").expect("a live row");
+    let decoded = RowBeforeProtocol::decode(row.value.as_slice()).expect("a row");
+    // The fields before the plan (the member, now Down) as the old layout reads them, then
+    // the protocol (field 4) and the key byte of field 5, written by hand.
+    let mut prefix = decoded.encode_to_vec();
+    prefix.extend_from_slice(&[0x20, 2, 0x28]);
+    assert!(
+        row.value.starts_with(&prefix),
+        "the planned end is not field 5 of the row: {:?}",
+        row.value
+    );
+    // The rest is exactly one plain varint: the end, 600 s after the clock at the call.
+    let tail = &row.value[prefix.len()..];
+    let (last, init) = tail.split_last().expect("a varint");
+    assert!(*last < 0x80 && init.iter().all(|b| *b >= 0x80), "{tail:?}");
+    let end = tail
+        .iter()
+        .rev()
+        .fold(0u128, |n, b| (n << 7) | u128::from(b & 0x7f));
+    assert!(
+        (t0 + 600_000_000_000..=t1 + 600_000_000_000).contains(&end),
+        "{end} is not 600 s after {t0}..{t1}"
+    );
+}
+
 /// Catches: a stored member row that does not decode skipped by the view, which would
 /// list the members and name every version it could read as if the farm were whole. A
 /// row the other readers of the rows fail on is wrong content in a store that is up:
@@ -466,7 +516,7 @@ async fn a_member_whose_row_lapsed_names_no_protocol() {
                 registered.id,
                 registered.boot,
                 Progress::CaughtUp,
-                Debts::Unknown,
+                Reported::default(),
                 None,
             )
             .expect("beat");

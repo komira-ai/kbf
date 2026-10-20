@@ -145,6 +145,7 @@ async fn a_failed_heartbeat_waits_the_jittered_backoff() {
         boot: 1,
         interval: Duration::from_secs(2),
         generation: 1,
+        objstore_generation: 0,
     };
     let mut asks = joiner.node.maps().asks();
     let beating = tokio::spawn(async move { joiner.beat_until_lapse(&this, &mut asks).await });

@@ -1233,9 +1233,20 @@ fn each_failure_has_its_exit_code_and_word() {
             "fetch",
         ),
         (
-            SetupError::OldLayout("/x".into()),
+            SetupError::OldLayout {
+                path: "/x".into(),
+                fetch_user: "kbf-fetch",
+            },
             Exit::NeedsOperator,
             "old_layout",
+        ),
+        (
+            SetupError::ShadowUnit {
+                path: "/x".into(),
+                unit: "u",
+            },
+            Exit::NeedsOperator,
+            "unit_shadow",
         ),
         (
             SetupError::Release(crate::release::ReleaseError::NoPrevious),
@@ -1448,8 +1459,18 @@ fn every_failure_reads_as_a_sentence() {
             "no release fetcher",
         ),
         (
-            SetupError::OldLayout("/usr/local/kbf".into()),
+            SetupError::OldLayout {
+                path: "/usr/local/kbf".into(),
+                fetch_user: "kbf-fetch",
+            },
             "/usr/local/kbf",
+        ),
+        (
+            SetupError::ShadowUnit {
+                path: "/etc/systemd/system/a.service".into(),
+                unit: "a.service",
+            },
+            "shadows the packaged unit a.service",
         ),
         (
             SetupError::Release(crate::release::ReleaseError::NoPrevious),
