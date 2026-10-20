@@ -915,3 +915,23 @@ fn every_test_that_starts_kbf_gives_it_a_config_of_its_own_or_is_a_listed_allowa
         "the allowance only shrinks"
     );
 }
+
+#[test]
+fn no_test_uses_the_hosts_real_kbf_directories() {
+    // Catches: a test or harness file that opens, lists or runs a path under the host's
+    // `/etc/kbf` or `/var/lib/kbf-installer`, so it passes or fails by what the box it runs
+    // on has installed (rules, allowance and planted trees in `kbf_spawns/mod.rs`). The
+    // allowance is pinned at its count, so it cannot grow without this line changing.
+    let root = repo_root();
+    let files = listed_files(&root);
+    let read = |f: &str| {
+        read_bytes(&root.join(f)).map(|b| String::from_utf8(b).expect("UTF-8 Rust source"))
+    };
+    let problems = kbf_spawns::scan_host_paths(&files, read, kbf_spawns::HOST_PATH_ALLOWANCE);
+    assert!(problems.is_empty(), "host paths:\n{}", problems.join("\n"));
+    assert_eq!(
+        kbf_spawns::HOST_PATH_ALLOWANCE.len(),
+        1,
+        "the allowance only shrinks"
+    );
+}

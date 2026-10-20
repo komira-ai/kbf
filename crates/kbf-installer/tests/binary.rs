@@ -16,7 +16,7 @@ fn root(name: &str) -> PathBuf {
     // The platform the binary was built for, as the binary lays the host out.
     let (_, dir) =
         kbf_installer::testkit::host_root_on(&format!("helper-bin-{name}"), Platform::current());
-    fs::create_dir_all(dir.join("var/lib/kbf-installer/orders")).expect("order spool");
+    kbf_installer::testkit::mkdirs(&dir, &dir.join("var/lib/kbf-installer/orders"), 0o755);
     dir
 }
 
@@ -67,7 +67,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
         })
         .expect("state");
     let release = host.join(&host.release_dir(&c(A)));
-    fs::create_dir_all(&release).expect("release");
+    kbf_installer::testkit::mkdirs(&root, &release, 0o755);
     fs::write(release.join("kbf"), b"x").expect("binary");
 
     let run = ["run", "--passes", "1", "--unit", "kbf-daemon.service"];
@@ -156,7 +156,7 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
     let host = layout(&root);
     for commit in [A, B] {
         let dir = host.join(&host.release_dir(&c(commit)));
-        fs::create_dir_all(&dir).expect("release");
+        kbf_installer::testkit::mkdirs(&root, &dir, 0o755);
         fs::write(dir.join("kbf"), b"x").expect("binary");
     }
     let lock = Locked::acquire(&host).expect("lock");
@@ -319,7 +319,7 @@ fn the_operator_verbs_exit_by_the_contract() {
         .expect("state");
     for dir in [A, B] {
         let d = root.join("var/lib/kbf-installer/releases").join(dir);
-        fs::create_dir_all(&d).expect("release");
+        kbf_installer::testkit::mkdirs(&root, &d, 0o755);
         fs::write(d.join("kbf"), b"x").expect("binary");
     }
     let code = |verb: &[&str]| helper(&root, verb).status.code();
