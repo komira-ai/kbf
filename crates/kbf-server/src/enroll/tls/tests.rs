@@ -90,16 +90,17 @@ const HALF: u64 = 86_400 / 2;
 
 /// A renewal loop over a fresh certificate, watched from the test.
 ///
-/// Every attempt reports itself from its blocking thread before it renews, and the test
-/// reads those reports and nothing else. The paused clock moves only when the runtime has
-/// nothing to run and a timer is waiting (tokio also holds it still while a blocking task
-/// runs), so the loop's one pending sleep is all that ever moves it, and it jumps there
-/// when the loop arms it. The test has no `advance`, no sleep and no timeout while an
-/// attempt is out: how long the blocking pool takes changes how long the test runs, never
-/// what it sees.
+/// Every attempt reports itself from its blocking thread before it renews, with the paused
+/// clock's reading at that moment, and the test reads those reports and nothing else. The
+/// paused clock moves only when the runtime has nothing to run and a timer is waiting
+/// (tokio also holds it still while a blocking task runs), so the loop's one pending sleep
+/// is all that ever moves it, and it jumps there when the loop arms it. The test has no
+/// `advance`, no sleep and no timeout while an attempt is out: how long the blocking pool
+/// takes changes how long the test runs, never what it sees.
 struct Watched {
-    /// How many certificates the earlier attempts had installed, as each attempt began.
-    seen: UnboundedReceiver<u64>,
+    /// How many certificates the earlier attempts had installed, and the paused clock, as
+    /// each attempt began.
+    seen: UnboundedReceiver<(u64, Instant)>,
     looping: JoinHandle<()>,
     /// When the loop was started, on the paused clock.
     start: Instant,
@@ -119,7 +120,7 @@ impl Watched {
         let calls = AtomicU32::new(0);
         let clock: Arc<dyn Fn() -> i64 + Send + Sync> = Arc::new(move || {
             // A test that has gone away does not stop the attempt.
-            let _ = told.send(served.reloads().applied);
+            let _ = told.send((served.reloads().applied, Instant::now()));
             reading(calls.fetch_add(1, Ordering::SeqCst))
         });
         let start = Instant::now();
@@ -132,14 +133,14 @@ impl Watched {
     }
 
     /// The next attempt's report: when it began, in whole seconds of the paused clock since
-    /// the loop was started, and how many certificates the attempts before it had
-    /// installed.
+    /// the loop was started (read on the attempt's own thread), and how many certificates
+    /// the attempts before it had installed.
     ///
     /// # Panics
     /// If the loop ended: its clock, and with it the sending end, was dropped.
     async fn next(&mut self) -> (u64, u64) {
-        let applied = self.seen.recv().await.expect("the loop ended");
-        (self.start.elapsed().as_secs(), applied)
+        let (applied, at) = self.seen.recv().await.expect("the loop ended");
+        (at.duration_since(self.start).as_secs(), applied)
     }
 }
 
@@ -207,10 +208,9 @@ async fn the_certificate_is_renewed_at_half_life_and_a_failure_is_retried_in_a_m
 /// A retry is due a minute after the failed attempt ended, not a minute after it began.
 ///
 /// The first attempt is held at a gate while the clock moves 59 seconds, and is then
-/// released. This is the interleaving that the first version of the test above lost to a
-/// slow runner (it moved the clock by hand and waited, in real time, for the loop to
-/// notice that an attempt had ended): here the test decides it, so it is the same every
-/// run, and the retry is 59 + 60 seconds after the attempt began.
+/// released. A slow attempt is the interleaving a host's load decides in an ordinary run;
+/// here the test decides it, so it is the same every run, and the retry is 59 + 60 seconds
+/// after the attempt began.
 ///
 /// Catches: a retry on a fixed rhythm from the start of the attempt (a slow CA would be
 /// asked again while it is still working), and a retry timed before the attempt has ended.

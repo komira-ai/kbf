@@ -7,9 +7,9 @@
 //! it; the test then does what a renewal does and sees the next connection succeed.
 //!
 //! The tests that run a whole daemon wait for what the daemon does, never for the clock:
-//! they see an attempt fail (so it tried, with the expired certificate), replace the
-//! certificate, and wait for the session. The server is dialled by its address, so no
-//! name lookup and no listener of another test can answer in its place.
+//! they see an attempt fail, replace the certificate, and wait for the session. The
+//! server is dialled by its address, so no name lookup and no listener of another test
+//! can answer in its place.
 
 mod support;
 
@@ -116,9 +116,10 @@ impl Authority {
 /// (10 s) to give up.
 const HANG: Duration = Duration::from_secs(60);
 
-/// A daemon for the server at `server` over `files`, built and not yet running (building
-/// reads the TLS files, as starting does), and the events it will report. The server is
-/// dialled by its address; the name its certificate must carry is the one in `files`.
+/// A daemon for the server at `server` over `files`, built and not yet running, and the
+/// events it will report. Building reads the TLS files once, to fail early; each attempt
+/// reads them again. The server is dialled by its address; the name its certificate must
+/// carry is the one in `files`.
 fn built(files: &TlsFiles, server: SocketAddr) -> (Daemon, UnboundedReceiver<Event>) {
     let url = format!("https://{server}");
     let mut config = DaemonConfig::new(url, files.clone(), "node-1".to_owned());
@@ -158,13 +159,22 @@ impl Running {
     /// Why the daemon's next attempt to connect failed.
     ///
     /// # Panics
-    /// If no attempt fails within `HANG`, or the daemon stops.
-    async fn next_refusal(&mut self) -> String {
+    /// If the server takes a session first (it accepted a certificate it must refuse), if
+    /// no attempt fails within `HANG`, or if the daemon or the server stops.
+    async fn next_refusal(&mut self, sessions: &mut UnboundedReceiver<Peer>) -> String {
         let waiting = async {
             loop {
-                let event = self.events.recv().await.expect("the daemon stopped");
-                if let Event::ConnectFailed { reason, .. } = event {
-                    return reason;
+                tokio::select! {
+                    peer = sessions.recv() => {
+                        peer.expect("server running");
+                        panic!("the server took a session from a daemon with a bad certificate");
+                    }
+                    event = self.events.recv() => {
+                        let event = event.expect("the daemon stopped");
+                        if let Event::ConnectFailed { reason, .. } = event {
+                            return reason;
+                        }
+                    }
                 }
             }
         };
@@ -232,11 +242,10 @@ async fn worker(pki: &Pki) -> (UnboundedReceiver<Peer>, JoinHandle<()>, SocketAd
 /// certificate, which the server refuses; the certificate file is replaced as a renewal
 /// replaces it; the daemon's next attempt connects.
 ///
-/// The test sees an attempt fail before it replaces the file, so the daemon did try with
-/// the expired certificate, and it allows one more failure after (the attempt that had
-/// read the file before): the attempts after that must connect, however long the one in
-/// flight takes. Earlier versions waited a fixed 600 ms for no session and then `PROMPT`
-/// for one, and failed when a dial outlasted that.
+/// The test sees an attempt fail before it replaces the file, and that the failure is the
+/// server's refusal, not an unreadable identity. It allows one more failure after (the
+/// attempt that had read the file before): the attempts after that must connect, however
+/// long the one in flight takes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_renewed_certificate_is_presented_by_the_next_connection() {
     let authority = Authority::new();
@@ -245,10 +254,10 @@ async fn a_renewed_certificate_is_presented_by_the_next_connection() {
     let (daemon, events) = built(&pki.client, addr);
     let mut daemon = Running::start(daemon, events);
 
-    daemon.next_refusal().await;
+    let reason = daemon.next_refusal(&mut sessions).await;
     assert!(
-        sessions.try_recv().is_err(),
-        "the server took a session from a daemon with an expired certificate"
+        !reason.starts_with("client identity"),
+        "the first attempt failed before it presented a certificate: {reason}"
     );
     authority.renew(&pki.client);
     daemon.forget();
@@ -271,14 +280,10 @@ async fn a_certificate_that_cannot_be_read_fails_the_attempt_not_the_daemon() {
     std::fs::remove_file(&pki.client.cert).expect("remove the certificate");
     let mut daemon = Running::start(daemon, events);
 
-    let reason = daemon.next_refusal().await;
+    let reason = daemon.next_refusal(&mut sessions).await;
     assert!(
         reason.starts_with("client identity"),
         "the attempt failed for another reason: {reason}"
-    );
-    assert!(
-        sessions.try_recv().is_err(),
-        "a daemon connected without a certificate"
     );
     assert!(!daemon.task.is_finished(), "the daemon stopped");
     authority.renew(&pki.client);
@@ -301,10 +306,9 @@ impl Resolve for Listed {
 /// attempts after it. The one in flight keeps the identity it read (a handshake that has
 /// begun is not redone); the next attempt, to the next address of the same round, reads
 /// the files again and presents the new certificate, with no refusal to learn from first.
-/// This is the interleaving in which the old waits of
-/// `a_renewed_certificate_is_presented_by_the_next_connection` failed in a CI run (an
-/// attempt in flight for longer than `PROMPT` when the certificate was replaced), held
-/// open here by the test instead of left to the host: it ends the stall itself.
+/// An attempt can be in flight for longer than `PROMPT` when the certificate is replaced;
+/// here the test holds one open and ends the stall itself, so the interleaving is the same
+/// every run.
 ///
 /// The server is named by two addresses. The first accepts the connection and says
 /// nothing, so the daemon waits there with the (expired) identity it read for that
@@ -330,6 +334,7 @@ async fn the_attempt_after_a_stalled_one_presents_the_renewed_certificate() {
     drop(held);
     let failed = daemon.connected_after_renewal(&mut sessions).await;
     let marker = format!("({stalled})");
+    assert_eq!(failed.len(), 1, "the stalled attempt fails once: {failed:?}");
     assert!(
         failed.iter().all(|attempt| attempt.contains(&marker)),
         "an attempt that began after the renewal failed: {failed:?}"
