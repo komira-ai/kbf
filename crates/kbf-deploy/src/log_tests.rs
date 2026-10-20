@@ -1,14 +1,11 @@
+use kbf_testkit::dir::TestDir;
 use std::fs;
-use std::path::PathBuf;
 
 use super::*;
 
 /// A fresh directory for `name`.
-fn fresh(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-deploy-log-{name}.{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("dir");
-    dir
+fn fresh(name: &str) -> TestDir {
+    TestDir::under(std::env::temp_dir(), &format!("kbf-deploy-log-{name}"))
 }
 
 fn lines(dir: &Path, count: usize) -> Vec<String> {
