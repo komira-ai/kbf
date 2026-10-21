@@ -181,7 +181,10 @@ impl<E: Exec> Operator<'_, E> {
         if self.fetcher.source() != Some("bundled") {
             return Ok(());
         }
-        let relays = self.fetcher.probe(to).is_ok_and(|version| binary::relays(&version));
+        let relays = self
+            .fetcher
+            .probe(to)
+            .is_ok_and(|version| binary::relays(&version));
         if relays {
             return Ok(());
         }
