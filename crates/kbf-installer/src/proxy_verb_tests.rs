@@ -207,7 +207,7 @@ fn a_file_that_is_not_a_proxy_config_is_refused_with_its_path_and_reason() {
 /// are closed (they must understand the whole file); the proxy takes three things from it (the
 /// `[proxy]` table and the update API's two numbers) and a package downgrade must not take the
 /// public port down over a source key a later build wrote. The keys it does read are still
-/// checked, and the table is still closed; the parser's quote of a key it met is not repeated.
+/// checked, and the table is still closed; a value typed into a key it reads is not repeated.
 ///
 /// Mutants to plant: `loaded_from` back on the closed `InstallerToml::parse` (red: a usage error
 /// at line 1); the tolerant reader keeping the unread keys (the same); the bounds of

@@ -353,7 +353,8 @@ pub struct MigrateArgs {
     /// and disabled first by a rollback.
     #[arg(long, value_parser = crate::migrate::Unit::new)]
     pub installer_unit: Option<crate::migrate::Unit>,
-    /// Where the host gets its releases: decides where the replay floor is seeded from.
+    /// Where the host gets its releases: decides where the replay floor is seeded from. Only a
+    /// `frontend` host has a frontend to ask; a `url` or `bundled` one does not.
     #[arg(long, value_enum, default_value = "url")]
     pub release_source: ReleaseSource,
     /// The lowest generation an order may carry: the floor when there is no frontend to ask.
