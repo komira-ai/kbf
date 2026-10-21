@@ -19,14 +19,18 @@
 //!   with state planted and without, after the start (`Slots::start`) that resolves and
 //!   cleans each once.
 //!
-//! Then it removes every user, home and `/var/folders` entry it made. It does so when
-//! the test ends, when it panics (a drop guard), and at the start of the next run, which
-//! finds its own leftovers by name, uid, real name and home and refuses to run, touching
-//! nothing, if anything else holds a name or id of the block (`block.rs`; the rules are
-//! tested against a fake Mac on every platform, `block/tests.rs`).
+//! Then it removes every user, home and `/var/folders` entry it made, and what a reset's
+//! recreate moved aside of them (`.kbf-recreated-kbf-scale-<i>-*`, root's, beside the home
+//! and in `/var/folders/<xx>/`). It does so when the test ends, when it panics (a drop
+//! guard), and at the start of the next run, which finds its own leftovers by name, uid,
+//! real name and home and refuses to run, touching nothing, if anything else holds a name
+//! or id of the block, or if the directory of the homes is a symbolic link (`block.rs`;
+//! the rules are tested against a fake Mac on every platform, `block/tests.rs`). Every
+//! program it starts (`dscl` first) is killed, and the phase fails, if it has not exited
+//! within a minute (`spawn.rs`).
 //!
-//! Run by hand on a branch (`workflow_dispatch` of spike-pool-scale.yml), or as root with
-//! `cargo xtask sudo-test -p kbf-driver-native --test pool_scale_spike -- --nocapture`.
+//! Run by hand on a branch (`workflow_dispatch` of spike-slot-reach.yml, job
+//! `pool-scale`), or as root with `cargo xtask sudo-test -p kbf-driver-native --test pool_scale_spike -- --nocapture`.
 //! The test lives with `slot_clean.rs` because the reset it times is `Slots`, which only
 //! this crate reaches.
 
@@ -36,6 +40,7 @@ mod block;
 mod dscl;
 #[cfg(target_os = "macos")]
 mod mac;
+mod spawn;
 #[cfg(target_os = "macos")]
 mod spike;
 mod stats;

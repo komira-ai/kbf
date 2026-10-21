@@ -4,14 +4,17 @@
 use std::ffi::CString;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kbf_daemon::uid;
 
-use crate::block::{self, BLOCK, FIRST_UID, HOMES, Home, Mac, in_block, index_of};
+use crate::block::{
+    self, ASIDE, BLOCK, FIRST_UID, HOMES, Home, Mac, aside_index, in_block, index_of,
+};
 use crate::dscl;
+use crate::spawn;
 
 pub const DSCL: &str = "/usr/bin/dscl";
 const DSCACHEUTIL: &str = "/usr/bin/dscacheutil";
@@ -36,20 +39,19 @@ impl RealMac {
         self.spawns.load(Ordering::Relaxed)
     }
 
-    pub fn run(&self, program: &str, args: &[&str]) -> std::io::Result<Output> {
+    /// `program args` with standard input closed; killed, and an error, if it has not
+    /// exited within [`spawn::WITHIN`] (a hung `dscl` fails its phase).
+    pub fn run(&self, program: &str, args: &[&str]) -> Result<Output, String> {
         self.spawns.fetch_add(1, Ordering::Relaxed);
-        Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        spawn::output(cmd, None, spawn::WITHIN)
     }
 
     /// `program args`, timed from before the spawn to after the output is read.
     pub fn timed(&self, program: &str, args: &[&str]) -> Result<Timed, String> {
         let started = Instant::now();
-        let out = self
-            .run(program, args)
-            .map_err(|e| format!("{program}: {e}"))?;
+        let out = self.run(program, args)?;
         Ok(Timed {
             took: started.elapsed(),
             stdout: out.stdout.len(),
@@ -58,9 +60,7 @@ impl RealMac {
 
     /// stdout of a program that must exit 0.
     fn text(&self, program: &str, args: &[&str]) -> Result<String, String> {
-        let out = self
-            .run(program, args)
-            .map_err(|e| format!("{program}: {e}"))?;
+        let out = self.run(program, args)?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {
@@ -93,26 +93,14 @@ impl RealMac {
     /// Writes the records of users `indices` through one `dscl .` process that reads its
     /// commands from standard input ([`block::batch_script`]), after making their homes.
     pub fn create_users_in_one_process(&self, indices: &[u32]) -> Result<(), String> {
-        use std::io::Write as _;
         for &i in indices {
             self.make_home(&block::user_name(i), block::uid_of(i), FIRST_UID)?;
         }
         self.spawns.fetch_add(1, Ordering::Relaxed);
-        let mut child = Command::new(DSCL)
-            .arg(".")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("{DSCL}: {e}"))?;
-        let script = block::batch_script(indices);
-        let mut stdin = child.stdin.take().ok_or("no stdin")?;
-        // From a thread of its own: dscl may answer before it has read everything.
-        let writer = std::thread::spawn(move || stdin.write_all(script.as_bytes()));
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("{DSCL}: {e}"))?;
-        let _ = writer.join();
+        let mut cmd = Command::new(DSCL);
+        cmd.arg(".");
+        let script = block::batch_script(indices).into_bytes();
+        let out = spawn::output(cmd, Some(script), spawn::WITHIN)?;
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
@@ -194,6 +182,16 @@ fn check_name(name: &str) -> Result<u32, String> {
     index_of(name).ok_or_else(|| format!("{name:?} is not a test user's name"))
 }
 
+/// An entry of [`HOMES`] the spike may remove: a test user's name, or what a recreate
+/// moved aside of one.
+fn check_home_name(name: &str) -> Result<(), String> {
+    if index_of(name).is_some() || aside_index(name).is_some() {
+        Ok(())
+    } else {
+        Err(format!("{name:?} is not a test home"))
+    }
+}
+
 impl Mac for RealMac {
     fn users(&self) -> Result<Vec<(String, Option<u32>)>, String> {
         let users = self.listed("/Users", "UniqueID")?;
@@ -222,7 +220,7 @@ impl Mac for RealMac {
     fn attrs(&self, record: &str, wanted: &[&str]) -> Result<Vec<(String, String)>, String> {
         let mut args = vec![".", "-read", record];
         args.extend(wanted);
-        let out = self.run(DSCL, &args).map_err(|e| format!("{DSCL}: {e}"))?;
+        let out = self.run(DSCL, &args)?;
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
@@ -257,6 +255,14 @@ impl Mac for RealMac {
             ));
         }
         self.text(DSCL, &[".", "-delete", record]).map(drop)
+    }
+
+    fn homes_dir_is_link(&self) -> Result<bool, String> {
+        match std::fs::symlink_metadata(HOMES) {
+            Ok(meta) => Ok(meta.file_type().is_symlink()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("{HOMES}: {e}")),
+        }
     }
 
     fn homes(&self) -> Result<Vec<Home>, String> {
@@ -303,12 +309,18 @@ impl Mac for RealMac {
     }
 
     fn remove_home(&self, name: &str) -> Result<(), String> {
-        check_name(name)?;
+        check_home_name(name)?;
         let home = Path::new(HOMES).join(name);
         let meta =
             std::fs::symlink_metadata(&home).map_err(|e| format!("{}: {e}", home.display()))?;
         if !meta.is_dir() {
             return Err(format!("{} is not a directory", home.display()));
+        }
+        if index_of(name).is_none() && meta.uid() != 0 {
+            return Err(format!(
+                "{} was moved aside but is not root's",
+                home.display()
+            ));
         }
         if kbf_outputs::remove_tree(&home).is_err() {
             // A flag a lease left (uchg) stops the removal; clear them and try again.
@@ -344,7 +356,9 @@ impl Mac for RealMac {
                 let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
                     continue;
                 };
-                if meta.is_dir() && in_block(meta.uid()) {
+                let aside =
+                    meta.uid() == 0 && entry.file_name().to_string_lossy().starts_with(ASIDE);
+                if meta.is_dir() && (in_block(meta.uid()) || aside) {
                     found.push((entry.path().to_string_lossy().into_owned(), meta.uid()));
                 }
             }
@@ -358,9 +372,12 @@ impl Mac for RealMac {
             .strip_prefix(FOLDERS)
             .is_ok_and(|rest| rest.components().count() == 2);
         let meta = std::fs::symlink_metadata(p).map_err(|e| format!("{path}: {e}"))?;
-        if !shape || !meta.is_dir() || !in_block(meta.uid()) {
+        let aside = meta.uid() == 0
+            && p.file_name()
+                .is_some_and(|n| aside_index(&n.to_string_lossy()).is_some());
+        if !shape || !meta.is_dir() || !(in_block(meta.uid()) || aside) {
             return Err(format!(
-                "refusing to remove {path}: not a directory of a test uid"
+                "refusing to remove {path}: not a directory of a test uid, or moved aside from one"
             ));
         }
         kbf_outputs::remove_tree(p).map_err(|e| format!("{path}: {e}"))

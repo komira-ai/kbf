@@ -8,6 +8,16 @@
 //! a uid or gid of the block, or is named like a test user but disagrees, is "foreign":
 //! never changed, never removed, and a reason for [`start`] to refuse to run.
 //!
+//! The reset the spike times (`Slot::release`) may recreate a user, and then moves its
+//! home and its `/var/folders` entry aside, renamed `.kbf-recreated-<user>-<secs>.<nanos>`
+//! beside them, root's, mode 0700 (`kbf-driver-native` `slots/macos/host.rs`, `ASIDE`;
+//! nothing there removes them). Those of a test user (`<user>` is `kbf-scale-<i>`, the
+//! stamp in that shape) are the spike's too: [`aside_index`] names them, in [`HOMES`] and
+//! in `/var/folders/<xx>/`, and the sweep removes them with the user's own.
+//!
+//! [`HOMES`] itself must be a real directory or absent: a link there is refused before
+//! anything is made, changed or listed through it.
+//!
 //! The Mac is behind [`Mac`] so that every one of these rules is tested on Linux against a
 //! fake; `mac.rs` is the real one.
 
@@ -55,6 +65,26 @@ pub fn index_of(name: &str) -> Option<u32> {
     (i < BLOCK && i.to_string() == digits).then_some(i)
 }
 
+/// The prefix of the name a recreate moves a home or `/var/folders` entry aside to
+/// (`host.rs` `ASIDE` in `kbf-driver-native`, which this must equal).
+pub const ASIDE: &str = ".kbf-recreated-";
+
+/// `i` for `.kbf-recreated-kbf-scale-<i>-<secs>.<nanos>`: the name a recreate gives what
+/// it moves aside of test user `i` (the stamp is whole seconds, a dot, nine digits).
+pub fn aside_index(name: &str) -> Option<u32> {
+    let (user, stamp) = name.strip_prefix(ASIDE)?.rsplit_once('-')?;
+    let (secs, nanos) = stamp.split_once('.')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    (digits(secs) && digits(nanos) && nanos.len() == 9)
+        .then(|| index_of(user))
+        .flatten()
+}
+
+/// `i` for a name in [`HOMES`] that is test user `i`'s home or what a recreate moved aside.
+fn home_index(name: &str) -> Option<u32> {
+    index_of(name).or_else(|| aside_index(name))
+}
+
 /// An entry of [`HOMES`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Home {
@@ -78,6 +108,9 @@ pub trait Mac {
     fn create(&self, record: &str, attr: Option<(&str, &str)>) -> Result<(), String>;
     /// `dscl . -delete record`.
     fn delete(&self, record: &str) -> Result<(), String>;
+    /// Whether [`HOMES`] is a symbolic link (`symlink_metadata`; false when it is not
+    /// there).
+    fn homes_dir_is_link(&self) -> Result<bool, String>;
     /// The entries of [`HOMES`] (none when it is not there).
     fn homes(&self) -> Result<Vec<Home>, String>;
     /// Makes [`HOMES`] (root's, mode 0755) if it is not there.
@@ -90,7 +123,9 @@ pub trait Mac {
     fn remove_homes_dir(&self);
     /// Whether [`HOMES`] is there.
     fn homes_dir_left(&self) -> bool;
-    /// The entries of `/var/folders` (`<xx>/<hash>`) owned by a uid of the block.
+    /// The directories of `/var/folders/<xx>/` with the uid that owns them, when that is a
+    /// uid of the block, or root with a name that starts with [`ASIDE`]: [`survey`] says
+    /// whose they are.
     fn folders(&self) -> Result<Vec<(String, u32)>, String>;
     /// Removes one entry [`Mac::folders`] named.
     fn remove_folder(&self, path: &str) -> Result<(), String>;
@@ -107,9 +142,10 @@ pub struct Survey {
     pub users: Vec<u32>,
     /// The test group exists.
     pub group: bool,
-    /// Names in [`HOMES`] that are test homes.
+    /// Names in [`HOMES`] that are test homes, or what a recreate moved aside of one.
     pub homes: Vec<String>,
-    /// `/var/folders` entries of test uids, with the uid.
+    /// `/var/folders` entries of test uids, or what a recreate moved aside of one, with
+    /// the test user's uid.
     pub folders: Vec<(String, u32)>,
     /// What holds the block's ids or the spike's names and is not the spike's.
     pub foreign: Vec<String>,
@@ -120,6 +156,7 @@ pub struct Survey {
 /// # Errors
 /// A directory or file listing could not be read: nothing can be called ours then.
 pub fn survey(mac: &dyn Mac) -> Result<Survey, String> {
+    refuse_link(mac)?;
     let mut s = Survey::default();
     // Uids the rest of the Mac holds (or may hold) in the block: what is owned by them is
     // not the spike's.
@@ -139,7 +176,9 @@ pub fn survey(mac: &dyn Mac) -> Result<Survey, String> {
             s.foreign.push(format!(
                 "user {name} is named like a test user but has uid {u}, not {want}"
             ));
+            // Its name is the test user's, so what is the test user's by name is not ours.
             foreign_uids.extend(held);
+            foreign_uids.insert(want);
             continue;
         }
         let attrs = mac.attrs(&format!("/Users/{name}"), &["RealName", "NFSHomeDirectory"])?;
@@ -171,13 +210,18 @@ pub fn survey(mac: &dyn Mac) -> Result<Survey, String> {
         }
     }
     for h in mac.homes()? {
-        let Some(i) = index_of(&h.name) else {
+        let Some(i) = home_index(&h.name) else {
             s.foreign
                 .push(format!("{HOMES}/{} is not a test home", h.name));
             continue;
         };
         let want = uid_of(i);
-        let mine = h.is_dir && (h.uid == want || (h.uid == 0 && h.empty));
+        // What was moved aside is root's and has what the user left in it.
+        let mine = if index_of(&h.name).is_some() {
+            h.is_dir && (h.uid == want || (h.uid == 0 && h.empty))
+        } else {
+            h.is_dir && h.uid == 0
+        };
         if mine && !foreign_uids.contains(&want) {
             s.homes.push(h.name);
         } else {
@@ -187,15 +231,42 @@ pub fn survey(mac: &dyn Mac) -> Result<Survey, String> {
             ));
         }
     }
-    for (path, uid) in mac.folders()? {
-        if foreign_uids.contains(&uid) {
-            s.foreign
-                .push(format!("{path} is owned by foreign uid {uid}"));
+    for (path, owner) in mac.folders()? {
+        if in_block(owner) {
+            if foreign_uids.contains(&owner) {
+                s.foreign
+                    .push(format!("{path} is owned by foreign uid {owner}"));
+            } else {
+                s.folders.push((path, owner));
+            }
+            continue;
+        }
+        // Not owned by a test uid: only root's, moved aside from a test user's, is ours.
+        let name = path.rsplit('/').next().unwrap_or_default();
+        let Some(i) = aside_index(name).filter(|_| owner == 0) else {
+            continue;
+        };
+        if foreign_uids.contains(&uid_of(i)) {
+            s.foreign.push(format!(
+                "{path} was moved aside from foreign uid {}",
+                uid_of(i)
+            ));
         } else {
-            s.folders.push((path, uid));
+            s.folders.push((path, uid_of(i)));
         }
     }
     Ok(s)
+}
+
+/// Refuses when [`HOMES`] is a link: what is made, changed and listed there would be made,
+/// changed and listed wherever the link points.
+fn refuse_link(mac: &dyn Mac) -> Result<(), String> {
+    if mac.homes_dir_is_link()? {
+        return Err(format!(
+            "{HOMES} is a symbolic link; refusing to make, change or list anything through it"
+        ));
+    }
+    Ok(())
 }
 
 /// What a [`sweep`] did.
@@ -237,17 +308,18 @@ pub fn sweep(mac: &dyn Mac) -> Result<Sweep, String> {
             out.users += 1;
         }
     }
-    for name in s.homes.iter().filter(|n| !kept.contains(*n)) {
-        match mac.remove_home(name) {
-            Ok(()) => out.homes += 1,
-            Err(why) => out.errors.push(format!("remove home {name}: {why}")),
-        }
-    }
     let kept_uids: BTreeSet<u32> = kept
         .iter()
         .filter_map(|n| index_of(n))
         .map(uid_of)
         .collect();
+    let stays = |name: &str| home_index(name).is_some_and(|i| kept_uids.contains(&uid_of(i)));
+    for name in s.homes.iter().filter(|n| !stays(n)) {
+        match mac.remove_home(name) {
+            Ok(()) => out.homes += 1,
+            Err(why) => out.errors.push(format!("remove home {name}: {why}")),
+        }
+    }
     for (path, uid) in s.folders.iter().filter(|(_, u)| !kept_uids.contains(u)) {
         match mac.remove_folder(path) {
             Ok(()) => out.folders += 1,
@@ -307,6 +379,7 @@ pub fn leftovers(mac: &dyn Mac) -> Vec<String> {
 /// # Errors
 /// A record or directory could not be made.
 pub fn prepare(mac: &dyn Mac) -> Result<(), String> {
+    refuse_link(mac)?;
     mac.make_homes_dir()?;
     let record = format!("/Groups/{GROUP}");
     mac.create(&record, None)?;

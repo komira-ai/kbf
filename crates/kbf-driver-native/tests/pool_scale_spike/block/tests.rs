@@ -20,6 +20,10 @@ struct State {
     ended: Vec<u32>,
     /// Everything `delete`, `remove_home`, `remove_folder` was asked to remove.
     removed: Vec<String>,
+    /// [`HOMES`] is a symbolic link.
+    homes_link: bool,
+    /// How often the entries of [`HOMES`] were listed.
+    homes_listed: u32,
 }
 
 #[derive(Default)]
@@ -41,6 +45,32 @@ impl Fake {
     fn removed(&self) -> Vec<String> {
         self.0.borrow().removed.clone()
     }
+
+    /// An entry of [`HOMES`] that is not the spike's own name for a home.
+    fn home_entry(&self, name: &str, uid: u32, is_dir: bool) {
+        self.0.borrow_mut().homes.insert(
+            name.to_owned(),
+            Home {
+                name: name.to_owned(),
+                uid,
+                is_dir,
+                empty: false,
+            },
+        );
+    }
+
+    /// A `/var/folders/zz/<name>` directory owned by `owner`.
+    fn folder(&self, name: &str, owner: u32) -> String {
+        let path = format!("/private/var/folders/zz/{name}");
+        self.0.borrow_mut().folders.insert(path.clone(), owner);
+        path
+    }
+}
+
+/// What a recreate of test user `i` names the home and the folder it moves aside
+/// (`host.rs`: `.kbf-recreated-<user>-<secs>.<nanos, nine digits>`).
+fn aside(i: u32) -> String {
+    format!(".kbf-recreated-{}-1760000000.000000042", user_name(i))
 }
 
 impl Mac for Fake {
@@ -105,7 +135,12 @@ impl Mac for Fake {
             .ok_or_else(|| "no such record".to_owned())
     }
 
+    fn homes_dir_is_link(&self) -> Result<bool, String> {
+        Ok(self.0.borrow().homes_link)
+    }
+
     fn homes(&self) -> Result<Vec<Home>, String> {
+        self.0.borrow_mut().homes_listed += 1;
         Ok(self.0.borrow().homes.values().cloned().collect())
     }
 
@@ -479,4 +514,204 @@ fn the_batch_script_is_the_same_commands_in_the_same_order_as_one_dscl_each() {
     for (attr, value) in user_attrs(3) {
         assert_eq!(attrs.get(attr), Some(&value), "{attr}");
     }
+}
+
+#[test]
+fn the_name_a_recreate_gives_is_read_back_only_in_its_exact_shape() {
+    assert_eq!(aside_index(&aside(0)), Some(0));
+    assert_eq!(aside_index(&aside(1023)), Some(1023));
+    for name in [
+        // Not a test user, or not a canonical index of the block.
+        ".kbf-recreated-kbf-pool-3-1760000000.000000042",
+        ".kbf-recreated-kbf-scale-1024-1760000000.000000042",
+        ".kbf-recreated-kbf-scale-007-1760000000.000000042",
+        ".kbf-recreated-kbf-scale--1760000000.000000042",
+        ".kbf-recreated-someone-kbf-scale-3-1760000000.000000042",
+        // Not the prefix, or no stamp, or a stamp of another shape.
+        "kbf-recreated-kbf-scale-3-1760000000.000000042",
+        "kbf-scale-3-1760000000.000000042",
+        ".kbf-recreated-kbf-scale-3",
+        ".kbf-recreated-kbf-scale-3-1760000000",
+        ".kbf-recreated-kbf-scale-3-1760000000.42",
+        ".kbf-recreated-kbf-scale-3-1760000000.0000000421",
+        ".kbf-recreated-kbf-scale-3-.000000042",
+        ".kbf-recreated-kbf-scale-3-17x0000000.000000042",
+        ".kbf-recreated-kbf-scale-3-+760000000.000000042",
+        ".kbf-recreated-kbf-scale-3-1760000000.00000004x",
+    ] {
+        assert_eq!(aside_index(name), None, "{name}");
+    }
+}
+
+#[test]
+fn what_a_recreate_moved_aside_is_the_spikes_and_a_sweep_removes_it() {
+    let mac = made(3);
+    // Root's, with what the user left in it, beside the home (HOMES) and the folder.
+    mac.home_entry(&aside(1), 0, true);
+    let folder = mac.folder(&aside(2), 0);
+    // The user's own entry, as `made` and a reset leave it.
+    let own = mac.folder("hash", uid_of(0));
+    let s = survey(&mac).expect("survey");
+    assert!(s.foreign.is_empty(), "{:?}", s.foreign);
+    assert!(s.homes.contains(&aside(1)), "{:?}", s.homes);
+    assert!(
+        s.folders.contains(&(folder.clone(), uid_of(2))),
+        "{:?}",
+        s.folders
+    );
+    let swept = sweep(&mac).expect("sweep");
+    assert_eq!(
+        (swept.homes, swept.folders, swept.users),
+        (4, 2, 3),
+        "{swept:?}"
+    );
+    assert!(swept.errors.is_empty() && swept.foreign.is_empty());
+    let removed = mac.removed();
+    assert!(
+        removed.contains(&format!("home {}", aside(1))),
+        "{removed:?}"
+    );
+    assert!(removed.contains(&format!("folder {folder}")), "{removed:?}");
+    assert!(removed.contains(&format!("folder {own}")), "{removed:?}");
+    assert_eq!(leftovers(&mac), Vec::<String>::new());
+    assert!(mac.0.borrow().homes.is_empty() && mac.0.borrow().folders.is_empty());
+}
+
+#[test]
+fn a_start_after_a_run_that_recreated_users_removes_the_asides_and_does_not_refuse() {
+    let mac = made(2);
+    mac.home_entry(&aside(0), 0, true);
+    mac.folder(&aside(0), 0);
+    start(&mac).expect("a recreate's leftovers are not a reason to refuse");
+    assert_eq!(leftovers(&mac), Vec::<String>::new());
+}
+
+#[test]
+fn a_leftover_aside_is_reported_by_the_check_after_a_sweep_that_missed_it() {
+    // `leftovers` is what the test asserts empty: an aside it cannot see would hide.
+    let mac = Fake::default();
+    mac.home_entry(&aside(5), 0, true);
+    mac.folder(&aside(6), 0);
+    let left = leftovers(&mac);
+    assert!(
+        left.iter().any(|l| l == &format!("home {}", aside(5))),
+        "{left:?}"
+    );
+    assert!(
+        left.iter()
+            .any(|l| l.starts_with("folder ") && l.contains(&aside(6))),
+        "{left:?}"
+    );
+}
+
+#[test]
+fn an_aside_of_a_user_with_a_process_that_will_not_end_stays_with_the_user() {
+    let mac = made(2);
+    mac.0.borrow_mut().stuck.insert(uid_of(1));
+    mac.home_entry(&aside(1), 0, true);
+    let kept = mac.folder(&aside(1), 0);
+    mac.home_entry(&aside(0), 0, true);
+    let swept = sweep(&mac).expect("sweep");
+    assert_eq!(swept.errors.len(), 1, "{:?}", swept.errors);
+    let removed = mac.removed();
+    assert!(
+        removed.contains(&format!("home {}", aside(0))),
+        "{removed:?}"
+    );
+    assert!(
+        !removed.contains(&format!("home {}", aside(1))),
+        "{removed:?}"
+    );
+    assert!(!removed.contains(&format!("folder {kept}")), "{removed:?}");
+}
+
+#[test]
+fn an_aside_of_a_user_a_foreign_record_holds_is_refused_and_untouched() {
+    let mac = Fake::default();
+    mac.foreign_user("kbf-scale-5", Some(1234), &[]);
+    mac.home_entry(&aside(5), 0, true);
+    let folder = mac.folder(&aside(5), 0);
+    // A foreign record in the block with the name of another test user's aside.
+    mac.foreign_user("someone", Some(uid_of(6)), &[]);
+    mac.home_entry(&aside(6), 0, true);
+    let other = mac.folder(&aside(6), 0);
+    let err = start(&mac).expect_err("must refuse");
+    assert!(
+        err.contains("kbf-scale-5") && err.contains("someone"),
+        "{err}"
+    );
+    assert!(mac.removed().is_empty(), "{:?}", mac.removed());
+    assert!(mac.0.borrow().folders.contains_key(&folder));
+    assert!(mac.0.borrow().folders.contains_key(&other));
+}
+
+#[test]
+fn an_aside_that_is_not_a_test_users_or_not_root_s_is_not_removed() {
+    let mac = Fake::default();
+    // In /var/folders: another user's aside (a pool user's), a test user's aside owned by
+    // someone else, a plain root directory, a stamp of another shape: not the spike's,
+    // and not a reason to refuse either.
+    mac.folder(".kbf-recreated-kbf-pool-3-1760000000.000000042", 0);
+    mac.folder(&aside(3), 501);
+    mac.folder("hash", 0);
+    mac.folder(".kbf-recreated-kbf-scale-3-1760000000", 0);
+    start(&mac).expect("none of it is the spike's");
+    assert!(mac.removed().is_empty(), "{:?}", mac.removed());
+    // In HOMES everything unknown is foreign: a pool user's aside, a test user's aside
+    // that is not root's, or not a directory.
+    for (name, uid, is_dir) in [
+        (
+            ".kbf-recreated-kbf-pool-3-1760000000.000000042".to_owned(),
+            0,
+            true,
+        ),
+        (aside(3), 501, true),
+        (aside(4), 0, false),
+    ] {
+        let mac = Fake::default();
+        mac.home_entry(&name, uid, is_dir);
+        let err = start(&mac).expect_err("foreign home");
+        assert!(err.contains(&name), "{err}");
+        assert!(mac.removed().is_empty(), "{name}: {:?}", mac.removed());
+    }
+}
+
+#[test]
+fn a_homes_directory_that_is_a_link_is_refused_before_anything_is_made_changed_or_listed() {
+    let mac = made(2);
+    mac.0.borrow_mut().homes_link = true;
+    mac.0.borrow_mut().homes_dir = false;
+    mac.0.borrow_mut().homes_listed = 0;
+    // The start, the survey and the sweep read nothing and remove nothing, not even a
+    // user: nothing may be called ours while the directory of the homes is not a directory.
+    for err in [
+        start(&mac).expect_err("start"),
+        sweep(&mac).map(drop).expect_err("sweep"),
+        survey(&mac).map(drop).expect_err("survey"),
+    ] {
+        assert!(err.contains("symbolic link"), "{err}");
+    }
+    assert!(mac.removed().is_empty(), "{:?}", mac.removed());
+    assert_eq!(mac.0.borrow().homes_listed, 0, "listed through the link");
+    // Preparing makes no directory and no record through it.
+    let fresh = Fake::default();
+    fresh.0.borrow_mut().homes_link = true;
+    let err = prepare(&fresh).expect_err("prepare");
+    assert!(err.contains("symbolic link"), "{err}");
+    assert!(!fresh.homes_dir_left(), "made the directory through a link");
+    assert!(fresh.0.borrow().groups.is_empty(), "made the group");
+    // And what the post-run check says.
+    assert!(leftovers(&mac).iter().any(|l| l.contains("symbolic link")));
+    // A guard that unwinds over a link removes nothing either.
+    drop(Guard::new(&mac));
+    assert!(mac.removed().is_empty(), "{:?}", mac.removed());
+}
+
+#[test]
+fn a_homes_directory_that_is_not_a_link_is_listed_and_made_as_before() {
+    let mac = Fake::default();
+    prepare(&mac).expect("prepare");
+    assert!(mac.homes_dir_left());
+    survey(&mac).expect("survey");
+    assert_eq!(mac.0.borrow().homes_listed, 1);
 }
