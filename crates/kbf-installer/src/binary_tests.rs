@@ -135,6 +135,25 @@ fn the_version_object_is_read_by_its_fields() {
     }
 }
 
+/// Catches the `seq` that `kbf --version --json` prints (the number of commits behind the
+/// build) refused as a field the contract does not list, which would refuse every release
+/// built from the day the field was added, and a `seq` that is read as something else than
+/// the number: 0 ("could not count") is a value, not an absent field.
+///
+/// Mutant seen red: the `seq` field dropped from `Version` (the object is then refused).
+#[test]
+fn the_version_object_may_carry_seq() {
+    let said = version_json(COMMIT, "release").replace('}', ",\"seq\":812}");
+    let v = Version::parse(said.as_bytes()).expect("a build with a seq parses");
+    assert!(format!("{v:?}").contains("seq: Some(812)"), "{v:?}");
+    let zero = version_json(COMMIT, "release").replace('}', ",\"seq\":0}");
+    let v = Version::parse(zero.as_bytes()).expect("a build that could not count parses");
+    assert!(format!("{v:?}").contains("seq: Some(0)"), "{v:?}");
+    let text = version_json(COMMIT, "release").replace('}', ",\"seq\":\"812\"}");
+    let err = Version::parse(text.as_bytes()).expect_err("a seq that is text");
+    assert_eq!(err.code(), "version-unreadable");
+}
+
 /// Catches an unbounded read of what a not yet trusted binary prints: more than 4 KiB is
 /// refused whatever it holds, and exactly 4 KiB of valid JSON (padded with spaces) is read.
 ///

@@ -78,3 +78,7 @@ pub fn identity() -> Value {
 pub fn line() -> String {
     format!("{}\n", identity())
 }
+
+#[cfg(test)]
+#[path = "version_tests.rs"]
+mod tests;
