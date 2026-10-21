@@ -66,6 +66,8 @@ kbf-host = { workspace = true, features = ["testkit"] }
 # node's heartbeat; the S3 service the nodes and the frontend's probe talk to is the fake.
 kbf-map.workspace = true
 kbf-objstore = { workspace = true, features = ["testkit"] }
+# `tests/remote_ci_through_proxy.rs`: the fake issuer and keys a CI job's OIDC token is minted from.
+kbf-oidc = { workspace = true, features = ["testkit"] }
 kbf-state = { workspace = true, features = ["test-support"] }
 kbf-storage.workspace = true
 kbf-types.workspace = true

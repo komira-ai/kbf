@@ -264,6 +264,7 @@ buck2_token_file = "/etc/kbf/buck2.token"   # required for bearer
 proxy_auth_file = "/run/kbf-proxy/proxy-auth"
 state_dir = "/var/lib/kbf-proxy"     # update.json and the swap state machine are U7a's
 hold_max_s = 20                      # a frontend swap's hold; all-in-one is fixed at 300
+remote_operator_file = "/etc/kbf/remote-ci.toml"   # optional, off when absent: a CI job's GitHub OIDC token for POST /v1/update/desired and POST /v1/update/frontend (frontend-proxy.md section 4a)
 ui = true                            # the read-only web UI at /ui: open (no certificate, no token), GET and HEAD only; false makes /ui a 404 at the proxy
 [proxy.upstream]
 base_port = 18000
@@ -321,7 +322,7 @@ Handshake, h2 preface and h1 request-head timeouts: 10 s each (`pre_stream_timeo
 | C6 | Fenced = trailers-only, `grpc-status: 14`, one `x-kbf-fenced: nothing-committed` | a client that sees it retries correctly; strict shape cannot be forged by a body |
 | C7 | Idle is chosen by full method path of Execute and WaitExecution | generic routing needs no per-stream state |
 | C8 | Modes do not combine; wrong-role certificate is `PERMISSION_DENIED`; wrong token never falls back to a certificate | no downgrade to a weaker mechanism |
-| C9 | The proxy reads `operator_token_file` itself; update credential = the same `Token`; U8 swaps the `UpdateHandler`, `decide` is the OIDC seam | design section 4 says "same token"; one function to replace |
+| C9 | The proxy reads `operator_token_file` itself; update credential = the same `Token`; U8 swaps the `UpdateHandler`; the OIDC credential is `Security::authorize_call` (`remote_operator_file`), `decide` stays pure | design section 4 says "same token"; one function to replace |
 | C10 | Static table is `base_port` plus fixed offsets; one readiness writer: `/readyz` is 200 when an active child's last poll (every 1 s, 3 s timeout) passed within 5 s; readiness never touches routing or open streams | design: a health failure does not touch open streams |
 | C11 | `/metrics` is the proxy's own series (Prometheus text, operator token) followed by the active child's operator `/metrics` body, fetched as one bound operator stream (caller's `Authorization` and the proxy identity headers), at most 4 MiB and 2 s, with every `kbf_proxy_*` sample and `# HELP`/`# TYPE`/`# UNIT` line and any `# EOF` line of the child's body dropped; with no active child, a hold (the scrape never waits on it), an error status, an oversize body, a body that is not UTF-8 or a timeout the proxy's series are served alone and `kbf_proxy_child_metrics_failed_total` counts it | a scrape of the public port must see the child's series too, and the proxy must count its own streams; the `kbf_proxy_` prefix keeps the series apart, and the proxy is its only author, so a child cannot duplicate, contradict or terminate them |
 | C12 | SIGHUP reloads cert, key and CA as one unit; a failed reload keeps the old one and counts | a half-applied reload would break handshakes |
