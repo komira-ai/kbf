@@ -671,4 +671,15 @@ mod tests {
         joined.extend(&Kept::of(&bytes[RUN..]));
         assert_eq!(joined.read(1, joined.len), bytes[1..]);
     }
+
+    /// Catches: consecutive zero runs kept separately (a 5 GiB object of zeros would
+    /// keep tens of thousands of entries), or merged with a wrong total.
+    #[test]
+    fn consecutive_zero_runs_are_kept_as_one_run() {
+        let kept = Kept::of(&vec![0u8; 3 * RUN + 1]);
+        assert_eq!(kept.runs.len(), 1);
+        assert_eq!(kept.runs[0].as_ref().err(), Some(&(3 * RUN as u64 + 1)));
+        assert_eq!(kept.len, 3 * RUN as u64 + 1);
+        assert_eq!(kept.read(RUN as u64 - 1, RUN as u64 + 1), [0, 0]);
+    }
 }

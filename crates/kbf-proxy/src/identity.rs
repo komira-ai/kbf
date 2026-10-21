@@ -25,6 +25,11 @@ pub const PROXY_AUTH: &str = "x-kbf-proxy-auth";
 /// The IP addresses of the verified leaf certificate, `x-kbf-node-ips`: canonical text,
 /// sorted, comma separated, at most [`kbf_peer::NODE_IPS_MAX`]; absent when it names none.
 pub const NODE_IPS: &str = "x-kbf-node-ips";
+/// The address the client connected from, `x-kbf-client-addr`: canonical IP text, no port.
+/// It tells the child which browser is which, so a per-caller bound does not see every
+/// browser as the proxy. The child reads it only on a call that presented the secret
+/// (`kbf-server/src/proxy_auth.rs` defines the same name; a test in each crate pins it).
+pub const CLIENT_ADDR: &str = "x-kbf-client-addr";
 /// The reserved prefix: no header of a client or of a child's answer passes with it.
 pub const RESERVED_PREFIX: &str = "x-kbf-";
 /// The bytes of the secret.
@@ -175,8 +180,9 @@ fn remove_reserved(headers: &mut HeaderMap) {
 }
 
 /// Prepares a request's headers for the child: strips every inbound `x-kbf-*` header, then
-/// sets `x-kbf-proxy-auth` and, with a verified certificate, `x-kbf-node-id`,
-/// `x-kbf-role` and, if the leaf names IP addresses, `x-kbf-node-ips`. Each header has exactly one value afterwards.
+/// sets `x-kbf-proxy-auth`, with a verified certificate `x-kbf-node-id`, `x-kbf-role` and,
+/// if the leaf names IP addresses, `x-kbf-node-ips`, and, when the caller's address is
+/// known (`client`), `x-kbf-client-addr`. Each header has exactly one value afterwards.
 ///
 /// # Errors
 /// [`IdentityError::HeaderValue`]: the node id is not a legal header value;
@@ -185,9 +191,13 @@ fn remove_reserved(headers: &mut HeaderMap) {
 pub fn forward_headers(
     headers: &mut HeaderMap,
     identity: Option<&Identity>,
+    client: Option<IpAddr>,
     secret: &ProxySecret,
 ) -> Result<(), IdentityError> {
     remove_reserved(headers);
+    if let Some(ip) = client {
+        headers.insert(CLIENT_ADDR, value(&ip.to_canonical().to_string())?);
+    }
     if let Some(id) = identity {
         headers.insert(NODE_ID, value(&id.node_id)?);
         headers.insert(ROLE, value(id.role.name())?);
@@ -207,7 +217,7 @@ pub fn forward_headers(
 /// [`IdentityError::HeaderValue`] (never, for a 32-byte secret).
 pub fn admin_headers(secret: &ProxySecret) -> Result<HeaderMap, IdentityError> {
     let mut headers = HeaderMap::new();
-    forward_headers(&mut headers, None, secret)?;
+    forward_headers(&mut headers, None, None, secret)?;
     Ok(headers)
 }
 
@@ -323,7 +333,7 @@ mod tests {
         h.insert("x-kbf-other", HeaderValue::from_static("1"));
         h.insert("x-other", HeaderValue::from_static("kept"));
         // No certificate: both identity headers are absent, the secret is the proxy's.
-        forward_headers(&mut h, None, &secret()).expect("forward");
+        forward_headers(&mut h, None, None, &secret()).expect("forward");
         assert!(h.get(NODE_ID).is_none());
         assert!(h.get(ROLE).is_none());
         assert!(h.get("x-kbf-other").is_none());
@@ -341,7 +351,7 @@ mod tests {
         };
         let mut h = HeaderMap::new();
         h.append(NODE_ID, HeaderValue::from_static("forged"));
-        forward_headers(&mut h, Some(&id), &secret()).expect("forward");
+        forward_headers(&mut h, Some(&id), None, &secret()).expect("forward");
         assert_eq!(h.get_all(NODE_ID).iter().count(), 1);
         assert_eq!(h.get(NODE_ID).expect("node"), "node-1.farm");
         assert_eq!(h.get(ROLE).expect("role"), "storage");
@@ -372,7 +382,7 @@ mod tests {
         );
         let mut h = HeaderMap::new();
         h.append(NODE_IPS, HeaderValue::from_static("198.51.100.9"));
-        forward_headers(&mut h, Some(&id), &secret()).expect("forward");
+        forward_headers(&mut h, Some(&id), None, &secret()).expect("forward");
         assert_eq!(h.get_all(NODE_IPS).iter().count(), 1);
         assert_eq!(
             h.get(NODE_IPS).expect("ips"),
@@ -382,7 +392,7 @@ mod tests {
         let none = identity_of(&cert(&["spoolr-node-01"], Some("storage"))).expect("identity");
         let mut h = HeaderMap::new();
         h.append(NODE_IPS, HeaderValue::from_static("198.51.100.9"));
-        forward_headers(&mut h, Some(&none), &secret()).expect("forward");
+        forward_headers(&mut h, Some(&none), None, &secret()).expect("forward");
         assert!(
             h.get(NODE_IPS).is_none(),
             "no IP name, no header, no forged one"
@@ -390,8 +400,43 @@ mod tests {
         // No certificate: none either.
         let mut h = HeaderMap::new();
         h.append(NODE_IPS, HeaderValue::from_static("198.51.100.9"));
-        forward_headers(&mut h, None, &secret()).expect("forward");
+        forward_headers(&mut h, None, None, &secret()).expect("forward");
         assert!(h.get(NODE_IPS).is_none());
+    }
+
+    /// The client's address is the proxy's own reading of the connection: it is set from
+    /// `client`, whatever the client sent under the name, once, as canonical text with no
+    /// port, and not at all when it is unknown (a forged copy is still stripped).
+    ///
+    /// Kills: the header never set; a client's own value passed through (the strip skipped or
+    /// the insert made `append`); an IPv4-mapped IPv6 address left unmapped; a port in the
+    /// value; a forged value surviving a call with no known address; the name changed.
+    #[test]
+    fn the_clients_address_is_the_proxys_reading_never_the_clients() {
+        assert_eq!(
+            CLIENT_ADDR, "x-kbf-client-addr",
+            "the child reads this name"
+        );
+        let mut h = HeaderMap::new();
+        h.append(CLIENT_ADDR, HeaderValue::from_static("203.0.113.66"));
+        h.append(CLIENT_ADDR, HeaderValue::from_static("203.0.113.67"));
+        let ip: IpAddr = "192.0.2.7".parse().expect("an address");
+        forward_headers(&mut h, None, Some(ip), &secret()).expect("forward");
+        assert_eq!(h.get_all(CLIENT_ADDR).iter().count(), 1);
+        assert_eq!(h.get(CLIENT_ADDR).expect("addr"), "192.0.2.7");
+
+        let mut h = HeaderMap::new();
+        let mapped: IpAddr = "::ffff:192.0.2.8".parse().expect("an address");
+        forward_headers(&mut h, None, Some(mapped), &secret()).expect("forward");
+        assert_eq!(h.get(CLIENT_ADDR).expect("addr"), "192.0.2.8");
+        let v6: IpAddr = "2001:db8::1".parse().expect("an address");
+        forward_headers(&mut h, None, Some(v6), &secret()).expect("forward");
+        assert_eq!(h.get(CLIENT_ADDR).expect("addr"), "2001:db8::1");
+
+        let mut h = HeaderMap::new();
+        h.insert(CLIENT_ADDR, HeaderValue::from_static("203.0.113.66"));
+        forward_headers(&mut h, None, None, &secret()).expect("forward");
+        assert!(h.get(CLIENT_ADDR).is_none());
     }
 
     /// A leaf that names more addresses than the header holds is refused like one with two
@@ -423,7 +468,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(ROLE, HeaderValue::from_static("storage"));
         assert_eq!(
-            forward_headers(&mut h, Some(&id), &secret()),
+            forward_headers(&mut h, Some(&id), None, &secret()),
             Err(IdentityError::HeaderValue)
         );
         assert!(h.get(ROLE).is_none());

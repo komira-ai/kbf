@@ -397,6 +397,23 @@ impl Child for ProcChild {
         }
     }
 
+    fn await_exit(&self, ident: &ProcIdent, limit: Duration) -> bool {
+        // The wait is on a copy of the descriptor, outside the lock.
+        let Some(Ok(pidfd)) = self.lookup(ident, |h| h.pidfd.try_clone()) else {
+            return true;
+        };
+        let limit = Timespec {
+            tv_sec: i64::try_from(limit.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: i64::from(limit.subsec_nanos()),
+        };
+        let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
+        // An interrupted wait or a failed one is looked at below like a timeout: the
+        // process is either gone by now or not.
+        let _ = poll(&mut fds, Some(&limit));
+        // `exited` reaps a child of ours and clears its record.
+        self.exited(ident).is_some()
+    }
+
     fn terminate(&self, ident: &ProcIdent) -> Result<(), PortError> {
         self.signal(ident, Signal::TERM).map(drop)
     }

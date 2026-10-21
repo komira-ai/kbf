@@ -152,7 +152,7 @@ pub struct FileNeed {
     pub exact_len: Option<usize>,
 }
 
-/// A row of the farm's certificate table (docs/deploy/kbf-modes.md, "A node's
+/// A row of the farm's certificate table (docs/deploy/kbf-units.md, "A node's
 /// certificate").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Row {

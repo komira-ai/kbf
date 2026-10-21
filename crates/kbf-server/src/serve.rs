@@ -34,8 +34,7 @@ use crate::drain::Drain;
 use crate::farm::{Farm, StateError};
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::Readiness;
-use crate::http_blobs::{BlobReaders, ReadBudget};
-use crate::http_invocations::InvocationReaders;
+use crate::http_blobs::ReadBudget;
 use crate::identity::{DenyList, Peers};
 use crate::listen::Binder;
 use crate::members::{Members, MembershipError};
@@ -46,6 +45,7 @@ use crate::state_store::StateStore;
 use crate::store_config::service::ColdStoreService;
 use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
+use crate::ui_mount::bind_server_with_options;
 use crate::worker::WorkerService;
 use crate::worker_roles::WorkerRolesLayer;
 use kbf_mapsync::MapSource;
@@ -178,6 +178,8 @@ pub struct Api {
     /// The release store (`--releases-dir`), whose upload route is mounted here and whose
     /// `ReleaseService` the worker listener serves. `None`: the update endpoints answer 503.
     pub releases: Option<Arc<crate::release::ReleaseStore>>,
+    /// The release poller (`--release-poll-every-secs`); `None` turns it off.
+    pub poll: Option<crate::release::poll::Config>,
 }
 
 /// Why the server could not start or stopped.
@@ -399,14 +401,19 @@ pub(crate) fn keepalive(server: Server, timing: StreamTiming) -> Server {
 const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, drain, lease or \
     operation of an earlier server process is restored, and the server keeps no rollout record";
 
-/// The members a frontend with a state store keeps. Not generic, for the same reason as
+/// The members a frontend with a state store keeps, promoting joiners by their own beats
+/// when `handoff` is given (`--auto-promote`). Not generic, for the same reason as
 /// [`sweeping`].
-pub(crate) fn members_of(state: Option<&crate::StateStore>) -> Option<Arc<Members>> {
+pub(crate) fn members_of(
+    state: Option<&crate::StateStore>,
+    handoff: Option<crate::members::Handoff>,
+) -> Option<Arc<Members>> {
     let state = state?;
-    Some(Arc::new(Members::new(
-        Arc::clone(&state.store),
-        state.members,
-    )))
+    let members = Members::new(Arc::clone(&state.store), state.members);
+    Some(Arc::new(match handoff {
+        Some(handoff) => members.with_handoff(handoff),
+        None => members,
+    }))
 }
 
 /// The storage map daemons are sent: `explicit` if a caller gave one, else the members'
@@ -691,7 +698,9 @@ where
 /// action-cache calls proxied to a `storage` node ([`bind_server_with_storage`]), and
 /// the storage map `map` sent to daemons ([`bind_server_with_map`]), and a TLS-terminating
 /// `proxy` in front of every listener (`--proxy-auth-file`, [`crate::proxy_auth`]; `None`:
-/// the server is reached directly).
+/// the server is reached directly), and the web UI under `/ui` on the operator API
+/// ([`crate::ui_mount`]) when `ui` is given and the operator API listens
+/// ([`crate::ui_mount::bind_server_with_options`] is this with the UI on).
 ///
 /// # Errors
 /// As [`bind_server_with_state`].
@@ -699,7 +708,7 @@ where
     clippy::too_many_arguments,
     reason = "every option the bind functions delegate"
 )]
-pub fn bind_server_with_options<M, O>(
+pub fn bind_server_with_ui<M, O>(
     cache: Arc<Cache<M, O>>,
     listeners: Listeners,
     api: Option<Api>,
@@ -708,6 +717,7 @@ pub fn bind_server_with_options<M, O>(
     storage: Option<tonic::transport::Endpoint>,
     map: Option<Arc<dyn MapSource>>,
     proxy: Option<Behind>,
+    ui: bool,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
 where
@@ -737,7 +747,7 @@ where
     .recording(recorder.clone());
     let durable = state.is_some();
     // Storage nodes register with a frontend that has a state store to keep them in.
-    let members = members_of(state.as_ref());
+    let members = members_of(state.as_ref(), None);
     let map = map_of(map, members.as_ref())?;
     // The update rows live in the same store, whose handle is shared.
     let update_rows = state
@@ -767,31 +777,35 @@ where
     let reapi_incoming = Incoming::new(reapi_incoming, listeners.reapi_tls);
     let worker_incoming = Incoming::new(worker_incoming, worker_tls);
     let probe_timeout = listeners.store_probe_timeout;
-    let (api_listen, token, local, releases) = api.map_or((None, None, None, None), |api| {
-        (Some(api.listen), api.token, api.local_cache, api.releases)
-    });
+    let (api_listen, token, local, releases, poll) =
+        api.map_or((None, None, None, None, None), |api| {
+            (
+                Some(api.listen),
+                api.token,
+                api.local_cache,
+                api.releases,
+                api.poll,
+            )
+        });
     // One line: a `?` alone on its own line is a never-taken error region, a missed
     // line in the coverage ratchet (it counts lines per generic copy, best copy wins).
     let api_listener = api_listen.map(|l| bind_api(l, &binder)).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
+    let poll_stats = poll.as_ref().map(|_| Arc::default());
     let readiness = Arc::new(Readiness::default());
     let (closer, closing) = kbf_front::closing();
     let (drain, goaway) = Drain::new(closer, Arc::clone(&readiness));
     let drain = Arc::new(drain);
-    let health_routes =
-        crate::health::router(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
-    let blob_routes = crate::http_blobs::router(
-        Arc::clone(&cache),
-        BlobReaders::from_policy(&policy),
-        budget.clone(),
-    );
-    let page_routes = crate::http_invocations::router(
-        recorder.clone(),
-        Arc::clone(&cache),
-        InvocationReaders::from_policy(&policy),
-        history.as_ref().map(crate::history::History::reads),
+    let checks =
+        crate::health::cache_checks(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
+    let reads = crate::ui_mount::Reads {
+        cache: Arc::clone(&cache),
+        recorder: recorder.clone(),
+        history: history.as_ref().map(crate::history::History::reads),
         budget,
-    );
+        farm: Arc::clone(&farm),
+        rows: update_rows.clone(),
+    };
     let offers =
         crate::release::offers::offers_of(releases.clone(), update_rows.clone(), listeners.tick);
     let api_routes = crate::api::router(
@@ -805,31 +819,27 @@ where
     )
     .merge(crate::verbs::routes(token.clone(), members.clone()))
     .merge(crate::release::router(releases.clone(), token.clone()))
-    .merge(crate::update_hosts::router(
-        Arc::clone(&farm),
-        update_rows.clone(),
-        crate::update_hosts::FarmReaders::from_policy(&policy),
-    ))
     .merge(crate::release::desired::router(
         releases.clone(),
         update_rows,
         token,
         Arc::clone(&farm),
     ))
-    .merge(health_routes)
+    .merge(crate::health::routes(&checks, &farm, members.as_ref()))
     .merge(crate::metrics::router(
         Arc::clone(&cache),
         local,
         history.as_ref().map(crate::history::History::stats),
+        poll_stats.clone(),
         members.clone(),
         tls_sources,
-    ))
-    .merge(blob_routes)
-    .merge(page_routes);
+    ));
     // The storage health, if there are members: no branch in this generic function.
     let api_routes = members.iter().fold(api_routes, |routes, members| {
         routes.merge(crate::storage_health::router(Arc::clone(members)))
     });
+    // The gated reads (blobs, builds, runs, host updates) under the policy, and `/ui`.
+    let api_routes = crate::ui_mount::mount(api_routes, &reads, &policy, ui);
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);
@@ -928,6 +938,12 @@ where
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
         // The rolling-update controller; it starts hosts for the desired release unless the
         // operator wrote `auto_nodes` false or paused it.
+        let _poller = poll_stats
+            .clone()
+            .and_then(|stats| {
+                crate::release::poll::spawn(Arc::clone(&farm), update_store.clone(), poll, stats)
+            })
+            .map(AbortOnDrop);
         let _updates = crate::update::spawn_controller(
             Arc::clone(&farm),
             update_store,

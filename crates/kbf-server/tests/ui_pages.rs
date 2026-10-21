@@ -1,7 +1,7 @@
 //! The pages of `kbf-ui` over this server's real read API, through a listener: the
 //! documents the `/v1` routes answer are the ones the pages parse
 //! (`docs/design/ui-data.md` 6.1), and what a build printed reaches the page as text
-//! (section 8). The pages are not mounted on the server yet; the source here asks
+//! (section 8). The pages are mounted on the server (`tests/ui_mount.rs`); the source here asks
 //! the operator API over TCP as a browser's request would reach it.
 
 mod pages;
@@ -67,7 +67,11 @@ async fn the_pages_render_from_the_real_routes() {
     };
     let action_page = format!("/ui/builds/b1/actions/{}", text(&action));
     let mut bodies = Vec::new();
-    for (path, query) in [("/ui", "id=b1"), ("/ui/builds/b1", ""), (&action_page, "")] {
+    for (path, query) in [
+        ("/ui/builds", "id=b1"),
+        ("/ui/builds/b1", ""),
+        (&action_page, ""),
+    ] {
         let answer = kbf_ui::respond(&api, path, query).await;
         let html = String::from_utf8(answer.body().to_vec()).expect("UTF-8");
         assert_eq!(answer.status(), 200, "{path}: {html}");
@@ -80,11 +84,19 @@ async fn the_pages_render_from_the_real_routes() {
         bodies.push(html);
     }
     let answered = api.answered.lock().expect("not poisoned").clone();
-    assert_eq!(answered.len(), 5, "{answered:?}");
+    // The lookup; the Build page's summary, failures and actions; the Action page's row
+    // and the failures list that holds its log tail (so the blob route is not read).
+    assert_eq!(answered.len(), 6, "{answered:?}");
     for (url, code) in &answered {
         assert_eq!(*code, 200, "{url}");
     }
-    assert!(answered[4].0.starts_with("/v1/blobs/"), "{answered:?}");
+    assert!(answered[5].0.ends_with("/failures"), "{answered:?}");
+    assert!(
+        !answered
+            .iter()
+            .any(|(url, _)| url.starts_with("/v1/blobs/")),
+        "{answered:?}"
+    );
 
     let build = &bodies[1];
     assert!(build.contains("//app:&lt;b&gt;lib&lt;/b&gt;"), "{build}");

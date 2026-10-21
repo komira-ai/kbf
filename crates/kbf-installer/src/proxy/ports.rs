@@ -34,6 +34,12 @@ pub trait Child {
     /// no SIGKILL for it and no timeout behind it.
     fn terminate(&self, ident: &ProcIdent) -> Result<(), PortError>;
 
+    /// Block until the process is gone, for `limit` at most; `true` when it is (an identity
+    /// this port does not hold counts as gone). The one wait that is not [`Clock::sleep`]: it
+    /// ends the moment the process exits, so a caller that must not start the next process
+    /// before this one is gone does not guess how long an exit takes.
+    fn await_exit(&self, ident: &ProcIdent, limit: Duration) -> bool;
+
     /// SIGKILL a candidate that never served (FP section 5 steps 4 and 6). The swap calls
     /// it only on the process it spawned (or adopted) as the candidate, never on the old child.
     fn kill_unserved(&self, ident: &ProcIdent) -> Result<(), PortError>;

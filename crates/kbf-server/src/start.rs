@@ -34,7 +34,7 @@ use crate::local::LocalStore;
 use crate::startup_pass::StartPass;
 use crate::stores::{COLD_FILE_FLOOR, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
-use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_options, s3_store};
+use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_ui, s3_store};
 
 /// The server's thread sizes on a given machine shape: every CPU, then the overrides.
 pub fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
@@ -313,8 +313,8 @@ where
     let api = args.api()?;
     let storage = args.storage()?;
     let proxy = args.proxy()?;
-    let bound = bind_server_with_options(
-        cache, listeners, api, policy, state, storage, None, proxy, shutdown,
+    let bound = bind_server_with_ui(
+        cache, listeners, api, policy, state, storage, None, proxy, args.ui, shutdown,
     )?;
     let plain = args.plain_text_off_loopback();
     Ok(ServerHandle {

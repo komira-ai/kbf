@@ -45,6 +45,8 @@ use kbf_types::{Digest, DigestFunction};
 use serde::Serialize;
 
 use crate::api::JSON;
+use crate::farm::Farm;
+use crate::members::Members;
 use crate::{BUILD_COMMIT, SERVER_VERSION};
 
 /// The name, under the cache's key prefix, of the key the store probe reads. Nothing
@@ -382,7 +384,30 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    router_of(Arc::new(Checks::of_cache(cache, readiness, timeout)))
+    router_of(cache_checks(cache, readiness, timeout))
+}
+
+/// The checks of a server over `cache` ([`Checks::of_cache`]), shared by the routes that
+/// report them.
+pub fn cache_checks<M, O>(
+    cache: Arc<Cache<M, O>>,
+    readiness: Arc<Readiness>,
+    timeout: Duration,
+) -> Arc<Checks>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    Arc::new(Checks::of_cache(cache, readiness, timeout))
+}
+
+/// The health routes over `checks`: `/healthz`, `/readyz` and `GET /v1/health`, which
+/// composes `checks`, `farm`'s nodes and queue, and the storage health of `members` (none:
+/// this server keeps no storage members) ([`crate::health_summary`]).
+pub fn routes(checks: &Arc<Checks>, farm: &Arc<Farm>, members: Option<&Arc<Members>>) -> Router {
+    let summary =
+        crate::health_summary::route(Arc::clone(checks), Arc::clone(farm), members.cloned());
+    router_of(Arc::clone(checks)).merge(summary)
 }
 
 /// The `/healthz` and `/readyz` routes over `checks`.

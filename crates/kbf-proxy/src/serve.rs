@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -28,8 +29,8 @@ use crate::core::{Core, now};
 use crate::limits::h2_server_builder;
 use crate::metrics::Metrics;
 use crate::pool::BoxIo;
-use crate::reply::{from_update, is_grpc, refused, text, unknown};
-use crate::route::{Route, auth_class, route_of};
+use crate::reply::{from_update, is_grpc, method_not_allowed, refused, text, unknown};
+use crate::route::{Route, Target, auth_class, route_of, ui_method_allowed};
 use crate::stream::proxy_child;
 use crate::tls::{Acceptor, Peer, Proto};
 
@@ -113,7 +114,15 @@ impl<U: UpdateHandler + 'static> Service<U> {
             request
         };
         let grpc = is_grpc(request.headers());
-        let route = route_of(request.uri().path());
+        let route = match route_of(request.uri().path()) {
+            // Switched off: as unknown as a path outside the table.
+            Route::Ui if !self.core.ui.load(Ordering::Acquire) => Route::Unknown,
+            route => route,
+        };
+        // The UI is read-only: the proxy turns a write away before the child is asked.
+        if route == Route::Ui && !ui_method_allowed(request.method()) {
+            return method_not_allowed();
+        }
         // Who may call it, before the call is counted or held or forwarded.
         let refusal = auth_class(route).and_then(|class| {
             let headers = request.headers();
@@ -132,7 +141,14 @@ impl<U: UpdateHandler + 'static> Service<U> {
         match route {
             Route::Child(target) => {
                 let core = Arc::clone(&self.core);
-                proxy_child(core, pending, target, request, peer.identity.clone()).await
+                let identity = peer.identity.clone();
+                proxy_child(core, pending, target, request, identity, peer.ip).await
+            }
+            Route::Ui => {
+                let core = Arc::clone(&self.core);
+                let target = Target::Operator;
+                let identity = peer.identity.clone();
+                proxy_child(core, pending, target, request, identity, peer.ip).await
             }
             Route::Update => self.update(request).await,
             Route::Health => text(StatusCode::OK, "ok"),

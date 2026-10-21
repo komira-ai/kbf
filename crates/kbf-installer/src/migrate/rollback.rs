@@ -21,9 +21,9 @@ use super::tree::{self, Rules};
 use super::units;
 use super::units::Unit;
 use super::{Migration, Outcome, Report};
-use crate::backup::utc_stamp;
 use crate::layout::Layout;
 use crate::state::{self, Locked, State, StateError};
+use crate::utc_stamp::utc_stamp;
 
 /// What a look at the journal and the installer's state came to.
 enum Look {
@@ -39,6 +39,22 @@ struct Go {
     /// Why the installer's state could not be read, when it could not: whether it moved the
     /// host on is then unknown, and the report says so.
     unknown_state: Option<String>,
+}
+
+/// Whether the installer's `state` is no longer what the migration adopted: another
+/// `current` or `previous`, or a release staged or waiting for its confirm.
+pub(super) fn moved_on(journal: &Journal, state: &State) -> bool {
+    let adopted = |role: &str| {
+        journal
+            .adopted
+            .iter()
+            .find(|a| a.role == role)
+            .map(|a| a.commit.clone())
+    };
+    state.current != adopted("current")
+        || state.previous != adopted("previous")
+        || state.staged.is_some()
+        || state.pending_confirm.is_some()
 }
 
 /// Look at the journal and at the installer's state (as `read_state` reads it) and judge
@@ -75,17 +91,7 @@ fn look(
         read => read?,
     };
     if let Some(state) = state {
-        let adopted = |role: &str| {
-            journal
-                .adopted
-                .iter()
-                .find(|a| a.role == role)
-                .map(|a| a.commit.clone())
-        };
-        let moved = state.current != adopted("current")
-            || state.previous != adopted("previous")
-            || state.staged.is_some()
-            || state.pending_confirm.is_some();
+        let moved = moved_on(&journal, &state);
         if journal.phase == Phase::Done && moved {
             return Err(MigrateError::MovedOn(
                 "the installer has activated or staged a release since the migration; \
@@ -121,10 +127,13 @@ pub(super) fn refuse_if_installer_moved_aside(
     Ok(())
 }
 
+/// What a kit host's rollback appends to the names it moves aside, before the UTC time.
+pub(super) const ASIDE_PREFIX: &str = ".rolled-back-";
+
 /// The two things a kit host's rollback moves aside, each as the directory it is in and its
 /// name: `installer.toml` (the installer job's `KeepAlive` is gated on it, so it goes first)
 /// and the installer's tree.
-fn aside_names(layout: &Layout) -> [(String, String); 2] {
+pub(super) fn aside_names(layout: &Layout) -> [(String, String); 2] {
     let toml = layout.installer_toml();
     let (config_dir, toml_name) = toml.as_str().rsplit_once('/').expect("an absolute path");
     let tree = layout.install_root();
@@ -326,7 +335,7 @@ pub fn rollback_at<E: Exec>(
         let suffix = match journal.aside.clone() {
             Some(suffix) => suffix,
             None => {
-                let suffix = format!(".rolled-back-{}", utc_stamp(now_secs));
+                let suffix = format!("{ASIDE_PREFIX}{}", utc_stamp(now_secs));
                 journal.aside = Some(suffix.clone());
                 state_dir.put_journal(&journal)?;
                 suffix

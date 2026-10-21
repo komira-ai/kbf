@@ -14,6 +14,16 @@ clap.workspace = true
 form_urlencoded.workspace = true
 hex.workspace = true
 futures.workspace = true
+# The release poller's one request to the GitHub API (release/poll/github.rs): hyper's
+# connection API over rustls on the ring provider tonic's `tls-ring` builds, trusting the
+# system's roots; no HTTP client crate.
+http-body.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+rustls.workspace = true
+rustls-native-certs.workspace = true
+tokio-rustls.workspace = true
 kbf-auth.workspace = true
 kbf-ca.workspace = true
 kbf-front.workspace = true
@@ -42,6 +52,8 @@ kbf-threads.workspace = true
 kbf-tier.workspace = true
 kbf-tls.workspace = true
 kbf-types.workspace = true
+# The pages mounted under /ui (src/ui_mount.rs).
+kbf-ui.workspace = true
 percent-encoding.workspace = true
 prost.workspace = true
 prost-types.workspace = true
@@ -55,6 +67,9 @@ time.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tonic = { workspace = true, features = ["tls-ring"] }
 tower-layer.workspace = true
+# The in-process source of the pages calls a router as a service (src/ui_mount.rs; also
+# tests/object_store_api.rs, which calls one with a chosen peer address).
+tower-service.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 # The wipe of a secret file's bytes after they are read or written (object_store/secrets.rs).
@@ -82,10 +97,6 @@ kbf-installer.workspace = true
 kbf-sim.workspace = true
 # The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/).
 kbf-state = { workspace = true, features = ["test-support"] }
-# A router called as a service with a chosen peer address (tests/object_store_api.rs).
-tower-service.workspace = true
-# The pages, rendered over this server's real routes (tests/ui_pages.rs).
-kbf-ui.workspace = true
 # fcntl and kill for the test that holds the server at its start line (tests/binary.rs).
 libc.workspace = true
 # Makes and drops a database for each Postgres flag test (tests/state_store_postgres.rs).

@@ -80,6 +80,8 @@ use crate::release::desired::blocking;
 use crate::token::ApiToken;
 use crate::update::Rows;
 
+mod node_detail;
+
 /// The media type of every body this API returns, and of every write it accepts.
 pub const JSON: &str = "application/json";
 
@@ -148,10 +150,11 @@ pub fn router(
     enroll: Option<Arc<EnrollApi>>,
 ) -> Router {
     let enrollment = crate::enroll::api::routes(token.clone(), enroll);
+    let scheduler = crate::http_sched::router(Arc::clone(&farm));
     Router::new()
         .route(NODES, get(nodes))
         .route(MEMBERS, get(members_view))
-        .route("/v1/nodes/{target}", post(act))
+        .route("/v1/nodes/{target}", get(node_detail::one).post(act))
         .route("/v1/members/{id}", post(set_member_state))
         .route(DENIED, post(deny_entry).delete(allow_entry))
         .route(FRONTEND_DRAIN, get(drain_status).post(begin_drain))
@@ -163,6 +166,7 @@ pub fn router(
             update,
         }))
         .merge(enrollment)
+        .merge(scheduler)
 }
 
 /// The drain as it is now.
@@ -236,6 +240,10 @@ struct MemberView {
     weight: u32,
     /// What its registration named; `None` if its row names none or has lapsed.
     protocol: Option<u32>,
+    /// Why a joiner is not promoted yet, when `--auto-promote` is on and it is one
+    /// (`docs/design/rebalance-handoff.md`); absent otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    blocked_on: Vec<String>,
 }
 
 /// The storage members of the current map.
@@ -268,9 +276,9 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
     // whose row lapses between the two is listed without a version.
     let read = tokio::task::spawn_blocking(move || {
         let map = members.current_map()?;
-        Ok::<_, MembershipError>((map, members.protocols()?))
+        Ok::<_, MembershipError>((map, members.protocols()?, members.blocked_joiners()?))
     });
-    let (map, protocols) = match read.await {
+    let (map, protocols, blocked) = match read.await {
         Ok(Ok(read)) => read,
         Ok(Err(e)) => {
             let code = match e {
@@ -302,6 +310,9 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
                     state: state_name(m.state),
                     weight: m.weight,
                     protocol: protocols.get(&m.id).copied().flatten(),
+                    blocked_on: blocked
+                        .get(&m.id)
+                        .map_or_else(Vec::new, |b| b.iter().map(ToString::to_string).collect()),
                 })
                 .collect();
             MembersView {
@@ -981,3 +992,7 @@ mod tests {
         assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
+
+#[cfg(test)]
+#[path = "api_members_tests.rs"]
+mod members_tests;

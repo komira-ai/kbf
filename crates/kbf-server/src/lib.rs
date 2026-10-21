@@ -22,7 +22,9 @@
 //!   over the invocation records kept in memory ([`http_invocations`]), off unless
 //!   the REAPI policy names `invocations.getAuthorizer` (or `--invocations-open` is
 //!   given); and `GET /v1/blobs/{digest}`, a CAS blob's bytes for a browser
-//!   ([`http_blobs`]), off unless the policy also names `blobs.getAuthorizer`.
+//!   ([`http_blobs`]), off unless the policy also names `blobs.getAuthorizer`. Also on the
+//!   same listener, on by default (`--ui=false` turns it off), the read-only, open web UI under
+//!   `/ui` ([`ui_mount`]), whose reads are bounded per caller ([`read_limit`]).
 //! - A drain of the frontend ([`drain`]) that a stop signal or `POST /v1/frontend/drain`
 //!   begins, a second signal escalates, and `kbf cluster` calls through [`api_client`].
 //! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
@@ -80,6 +82,7 @@ pub mod drain;
 pub mod enroll;
 pub mod farm;
 mod fault;
+pub mod fill;
 mod flag_set;
 pub mod fleet;
 pub mod front_maps;
@@ -87,10 +90,12 @@ pub mod frontend;
 pub mod grpc_health;
 pub mod handover;
 pub mod health;
+mod health_summary;
 pub mod history;
 pub mod http_blobs;
 mod http_history;
 pub mod http_invocations;
+pub mod http_sched;
 pub mod identity;
 pub mod join;
 mod listen;
@@ -109,6 +114,7 @@ pub mod node_map;
 pub mod object_store;
 pub mod proxy_auth;
 pub mod raft_log;
+pub mod read_limit;
 mod rebuild;
 pub mod release;
 pub mod replication;
@@ -132,10 +138,12 @@ pub mod streams;
 mod test_dir;
 mod timeout;
 pub mod token;
+pub mod ui_mount;
 pub mod update;
 pub mod update_hosts;
 pub mod update_status;
 pub mod verbs;
+pub mod vitals;
 pub mod worker;
 pub mod worker_roles;
 pub mod write_rules;
@@ -153,8 +161,8 @@ pub use node_map::NodeMap;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
     Api, Behind, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming,
-    WorkerTls, bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_options,
-    bind_server_with_policy, bind_server_with_state, bind_server_with_storage, bind_service,
+    WorkerTls, bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_policy,
+    bind_server_with_state, bind_server_with_storage, bind_server_with_ui, bind_service,
     bind_storage,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
@@ -163,6 +171,7 @@ pub use start_exit::{
 };
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
 pub use streams::{StreamArgs, StreamLimits};
+pub use ui_mount::bind_server_with_options;
 pub use worker::WorkerService;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build

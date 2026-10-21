@@ -79,7 +79,7 @@
 //! inherits the queue. In v0 the scheduler runs on the leader only.
 //!
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed
-//! collections. The layering test in `kbf-it` and the lists in `clippy.toml` enforce it.
+//! collections. The layering test in `kbf-integration-test` and the lists in `clippy.toml` enforce it.
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
@@ -104,6 +104,7 @@ pub use scheduler::memory::{
     NOT_STARTED_RERUNS,
 };
 pub use scheduler::{
-    FINISHED_RETENTION, Fate, OpState, PLACEMENT_ROUND, Recovered, RecoveredLease, Scheduler,
-    UNSERVABLE_WAIT,
+    Avoided, FINISHED_RETENTION, Fate, LeasePhase, LeaseView, MAX_AVOIDED, OpState,
+    PLACEMENT_ROUND, QueueGroup, QueueView, Recovered, RecoveredLease, Scheduler, Snapshot,
+    UNSERVABLE_WAIT, WaitingGroup, platform_label,
 };

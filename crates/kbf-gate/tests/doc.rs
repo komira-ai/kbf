@@ -231,6 +231,55 @@ fn the_status_is_green_only_with_gates_and_none_red() {
     }
 }
 
+const FORGED: &str = "\n### Not reversible\nNothing";
+
+/// Catches a verdict forging a heading in the release notes through a free-text field: each
+/// field kind must be refused, by name.
+#[test]
+fn control_characters_in_free_text_are_refused_naming_the_field() {
+    let waiver = |what: &str, by: &str, reason: &str| Waiver {
+        what: what.to_owned(),
+        by: by.to_owned(),
+        reason: reason.to_owned(),
+    };
+    let forged = format!("x{FORGED}");
+    let cases = [
+        ("waiver reason", full_with_waiver(waiver("a", "b", &forged))),
+        ("waiver by", full_with_waiver(waiver("a", "b\t", "c"))),
+        ("waiver what", full_with_waiver(waiver("a\r", "b", "c"))),
+        ("escapes", {
+            let mut d = full();
+            d.escapes = vec![forged.clone()];
+            d
+        }),
+        ("withdrawn", {
+            let mut d = full();
+            d.withdrawn = vec!["v1\u{7f}".to_owned()];
+            d
+        }),
+    ];
+    for (field, d) in cases {
+        match ResultDoc::from_bytes(&d.to_bytes().unwrap()) {
+            Err(DocError::ControlChar(f)) => assert_eq!(f, field),
+            other => panic!("{field}: expected a refusal, got {other:?}"),
+        }
+    }
+}
+
+fn full_with_waiver(w: Waiver) -> ResultDoc {
+    let mut d = full();
+    d.waivers = vec![w];
+    d
+}
+
+#[test]
+fn a_normal_verdict_still_parses() {
+    assert_eq!(
+        ResultDoc::from_bytes(&full().to_bytes().unwrap()).unwrap(),
+        full()
+    );
+}
+
 /// Proves `observed` survives a write and a read, and that a document without it reads as
 /// before (the golden file has none). Catches a field that is dropped on write or required
 /// on read.

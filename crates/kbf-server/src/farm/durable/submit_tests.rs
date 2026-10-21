@@ -703,6 +703,20 @@ fn a_request_for_an_operation_the_scheduler_finished_is_refused_until_the_rows_g
 /// `finish_held` looks at, in this crate's own test binary.
 #[test]
 fn a_request_is_refused_while_the_finish_of_a_retired_operation_is_held() {
+    refused_while_the_finish_of_a_retired_operation_is_held(0);
+}
+
+/// Catches: the test above reading the retirement time off a clock of its own. The
+/// scheduler takes the later of its own time and an input's, and the farm stamps its
+/// submits with real elapsed milliseconds, so a slow `submit` moves the scheduler past the
+/// time the refusal is applied at and the finish is stamped later than the test assumed.
+/// Here the scheduler is 1 s in by the refusal, as after a submit that stalled.
+#[test]
+fn a_finish_stamped_after_a_slow_submit_is_retired_after_its_retention() {
+    refused_while_the_finish_of_a_retired_operation_is_held(1000);
+}
+
+fn refused_while_the_finish_of_a_retired_operation_is_held(lag_millis: u64) {
     let store = LostAck::new();
     let farm = farm_over(&store);
     assert!(submit(&farm, 1).is_ok());
@@ -713,13 +727,23 @@ fn a_request_is_refused_while_the_finish_of_a_retired_operation_is_held() {
     let at = |millis, event| kbf_sched::Input::new(kbf_types::FarmTime::from_millis(millis), event);
     let effects = {
         let mut state = farm.lock();
+        if lag_millis > 0 {
+            kbf_types::StateMachine::apply(
+                &mut state.sched,
+                at(lag_millis, kbf_sched::Event::Tick),
+            );
+        }
         kbf_types::StateMachine::apply(
             &mut state.sched,
             at(0, kbf_sched::Event::Committed(refusal)),
         )
     };
     assert_eq!(effects.len(), 1);
-    let past = u64::try_from(kbf_sched::FINISHED_RETENTION.as_millis()).expect("millis") + 1;
+    // The finish is stamped with the scheduler's own time: the later of the farm's clock
+    // at the submits above and the lag. The farm clock only moves on, so a tick this far
+    // past both retires it however long the submits took.
+    let retention = u64::try_from(kbf_sched::FINISHED_RETENTION.as_millis()).expect("millis");
+    let past = farm.now().as_millis().max(lag_millis) + retention;
     {
         let mut state = farm.lock();
         state.unwritten.push_back(

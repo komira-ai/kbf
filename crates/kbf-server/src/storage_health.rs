@@ -47,6 +47,7 @@ use serde::Serialize;
 
 use crate::api::{error, json};
 use crate::members::Members;
+use crate::vitals::Vitals;
 
 /// The path of `GET /v1/storage`.
 pub const STORAGE: &str = "/v1/storage";
@@ -123,6 +124,8 @@ pub struct Reported {
     pub writes: Writes,
     /// The map generation it held.
     pub generation: u64,
+    /// The write tier's health.
+    pub vitals: Vitals,
 }
 
 impl Default for Reported {
@@ -132,6 +135,7 @@ impl Default for Reported {
             debts: Debts::Unknown,
             writes: Writes::Unknown,
             generation: 0,
+            vitals: Vitals::NONE,
         }
     }
 }
@@ -144,6 +148,7 @@ impl Reported {
             debts,
             writes: Writes::Unknown,
             generation: 0,
+            vitals: Vitals::NONE,
         }
     }
 
@@ -247,6 +252,9 @@ pub struct NodeHealth {
     pub open_writes: Option<u64>,
     /// The generation of the map it held when it reported.
     pub generation: Option<u64>,
+    /// The write tier's health it reported; every value unknown when the report is
+    /// not fresh or the node does not say.
+    pub vitals: Vitals,
 }
 
 /// Why a storage node must not be taken down yet.
@@ -349,6 +357,7 @@ fn node_health(member: &MemberReport, now: StoreTime, freshness: Duration) -> No
             Writes::Unknown => None,
         }),
         generation: said.map(|said| said.generation),
+        vitals: said.map_or_else(Vitals::default, |said| said.vitals),
     }
 }
 
@@ -647,6 +656,8 @@ struct NodeView {
     repair_debts: Option<u64>,
     open_writes: Option<u64>,
     generation: Option<u64>,
+    #[serde(flatten)]
+    vitals: Vitals,
 }
 
 impl From<&StorageHealth> for View {
@@ -671,6 +682,7 @@ impl From<&StorageHealth> for View {
                     repair_debts: node.repair_debts,
                     open_writes: node.open_writes,
                     generation: node.generation,
+                    vitals: node.vitals,
                 })
                 .collect(),
         }
