@@ -444,6 +444,9 @@ fn linux_kit<E: Exec>(
             let done = SwapConfig::load(&config)
                 .map_err(HostError::from)
                 .and_then(|config| {
+                    if let Some(warning) = config.retired_warning() {
+                        let _ = writeln!(err, "{warning}");
+                    }
                     let a = swap::Swap {
                         config,
                         kubelet_allows_swap,

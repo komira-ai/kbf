@@ -17,8 +17,8 @@
 //! ([`verify_cert`], over kbf-ca's checks) checks, read only, that a certificate is its
 //! row of the farm's certificate table: its one role, its extended key usage, its chain to the CA.
 //!
-//! `swap`'s settings are a closed set of `KEY=VALUE` lines ([`config::KEYS`],
-//! `templates/linux/swap.example`). [`host`] holds what `swap` and the `mdm` kit share of
+//! `swap` reads two keys of a `KEY=VALUE` file (`templates/linux/swap.example`); the keys of
+//! the retired unit verbs' node settings file are ignored with a warning ([`config::KEYS`]). [`host`] holds what `swap` and the `mdm` kit share of
 //! the host.
 
 pub mod config;

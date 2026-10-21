@@ -379,6 +379,25 @@ fn the_retired_units_verbs_are_usage_errors() {
     }
 }
 
+/// Catches `linux swap` refusing an existing node.conf, or taking it without a word:
+/// the retired keys are ignored with one warning on stderr naming them.
+#[test]
+fn swap_ignores_the_retired_keys_of_an_old_node_conf_and_says_so() {
+    let dir = kbf_host::testkit::scratch("cli-swap-old-conf");
+    let file = dir.join("node.conf");
+    std::fs::write(&file, include_str!("linux/testdata/node.conf")).expect("write");
+    let mut exec = FakeExec::new(501);
+    let args = ["linux", "swap", "--config", file.to_str().expect("utf-8")];
+    let (_, _, err) = cli(&mut exec, &no_env, &args);
+    assert!(!err.contains("unknown key"), "{err}");
+    assert_eq!(err.matches("no longer read").count(), 1, "{err}");
+    assert!(
+        err.contains("KBF_HOST_NAME") && err.contains("docs/deploy/kbf-units.md"),
+        "{err}"
+    );
+    assert!(!err.contains("KBF_SWAP_FILE,"), "{err}");
+}
+
 /// The kit's settings in a file, with a LAN address filled in.
 fn mdm_config(name: &str) -> String {
     let dir = kbf_host::testkit::scratch(name);

@@ -1,6 +1,7 @@
 # kbf-deploy linux swap settings (docs/deploy/linux-build-host.md, "Swap: 128 GB").
 # Copy it and pass the copy as --config. KEY=VALUE lines; a value may be "quoted". An
-# unknown or repeated key is refused, and an empty value means the default. Every value
+# never-valid or repeated key is refused (keys of the retired unit verbs are ignored with a
+# warning), and an empty value means the default. Every value
 # here is the default.
 
 # The swapfile, an absolute path.

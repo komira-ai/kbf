@@ -524,8 +524,10 @@ disable --now`) before it installs a mode's unit: both would hold the same direc
 lines and changes nothing; `--apply` carries the plan out, stopping at the first step
 that fails. A re-run after an apply plans nothing. Exit codes: 0 done (or nothing to do),
 1 a step failed, 2 refused (`REFUSED:` on stderr, with the fix). It takes a
-`--config` file of two keys, `KBF_SWAP_FILE` and `KBF_SWAP_SIZE`
-(`crates/kbf-deploy/templates/linux/swap.example`); any other key is refused.
+`--config` file that reads two keys, `KBF_SWAP_FILE` and `KBF_SWAP_SIZE`
+(`crates/kbf-deploy/templates/linux/swap.example`). An existing node.conf still works: the
+other keys it sets, those of the retired unit verbs, are ignored (not refused) with one
+warning on stderr naming them; a key that was never valid is refused.
 
 ```text
 sudo kbf-deploy linux swap --config swap.conf [--kubelet-allows-swap] [--remove] [--apply]

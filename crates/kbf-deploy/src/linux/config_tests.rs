@@ -16,8 +16,8 @@ fn bad_settings_are_refused() {
     let cases = [
         (format!("{EXAMPLE}KBF_SWAP=1\n"), "unknown key KBF_SWAP"),
         (
-            format!("{EXAMPLE}KBF_RAM_GIB=256\n"),
-            "unknown key KBF_RAM_GIB",
+            format!("{EXAMPLE}KBF_RAM_GIB=1\nKBF_RAM_GIB=2\n"),
+            "KBF_RAM_GIB is already set",
         ),
         (
             format!("{EXAMPLE}KBF_SWAP_SIZE=1G\n"),
@@ -50,5 +50,43 @@ fn an_unset_or_empty_key_takes_the_default_the_example_shows() {
     assert_eq!(
         SwapConfig::parse("KBF_SWAP_FILE=\nKBF_SWAP_SIZE=\"\"\n").expect("empty values"),
         example
+    );
+}
+
+const OLD_NODE_CONF: &str = include_str!("testdata/node.conf");
+
+/// Catches a node.conf written for the retired unit verbs refused by `linux swap` (an
+/// operator's existing file must keep working), and its swap keys not read from it.
+#[test]
+fn an_old_full_node_conf_is_accepted_and_its_swap_keys_are_read() {
+    let old = OLD_NODE_CONF.replace("KBF_SWAP_SIZE=128G", "KBF_SWAP_SIZE=64G");
+    let c = SwapConfig::parse(&old).expect("accepted");
+    assert_eq!(c.swap_file.as_str(), "/swapfile");
+    assert_eq!(c.swap_size, "64G");
+}
+
+/// Catches a key that was never valid being swallowed with the retired ones.
+#[test]
+fn a_key_that_was_never_valid_is_still_refused() {
+    let text = format!("{OLD_NODE_CONF}KBF_RAM=1\n");
+    assert!(
+        refusal(&text).contains("unknown key KBF_RAM"),
+        "{}",
+        refusal(&text)
+    );
+}
+
+/// Catches the warning naming a swap key (they are read, not retired), and a file with
+/// no retired key warning.
+#[test]
+fn only_retired_keys_are_named_in_the_warning() {
+    let c = SwapConfig::parse(OLD_NODE_CONF).expect("accepted");
+    assert!(c.retired.contains(&"KBF_HOST_NAME") && !c.retired.contains(&"KBF_SWAP_FILE"));
+    assert_eq!(c.retired.len(), 32);
+    assert!(
+        SwapConfig::parse(EXAMPLE)
+            .expect("ok")
+            .retired_warning()
+            .is_none()
     );
 }
