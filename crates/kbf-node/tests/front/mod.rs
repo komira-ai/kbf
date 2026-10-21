@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -35,9 +36,19 @@ use tonic::{Request, Response, Status, Streaming};
 pub struct Session {
     from_daemon: mpsc::Receiver<DaemonMessage>,
     to_daemon: tokio_mpsc::UnboundedSender<Result<ServerMessage, Status>>,
+    ack_heartbeats: Arc<AtomicBool>,
 }
 
 impl Session {
+    /// From now on the stream's reader task answers each `Heartbeat` with a
+    /// `HeartbeatAck` as it arrives, whatever the test thread is doing (waiting for a
+    /// lease result, sleeping). Without it the test acknowledges nothing and the daemon
+    /// self-fences after its fence time. The heartbeat is still passed to [`Self::next`].
+    #[allow(dead_code)]
+    pub fn keep_acknowledging(&self) {
+        self.ack_heartbeats.store(true, Ordering::SeqCst);
+    }
+
     /// The next daemon message, or `None` once `within` has passed or the stream ended.
     pub fn next(&self, within: Duration) -> Option<daemon_message::Message> {
         let deadline = Instant::now() + within;
@@ -114,8 +125,19 @@ impl Worker for FakeWorker {
         let (to_daemon, outbound) = tokio_mpsc::unbounded_channel();
         let (seen, from_daemon) = mpsc::channel();
         let mut inbound = request.into_inner();
+        let ack_heartbeats = Arc::new(AtomicBool::new(false));
+        let (ack_flag, ack_to) = (Arc::clone(&ack_heartbeats), to_daemon.clone());
         tokio::spawn(async move {
             while let Ok(Some(message)) = inbound.message().await {
+                if let Some(daemon_message::Message::Heartbeat(beat)) = &message.message
+                    && ack_flag.load(Ordering::SeqCst)
+                {
+                    let _ = ack_to.send(Ok(ServerMessage {
+                        message: Some(server_message::Message::HeartbeatAck(
+                            kbf_proto::worker::HeartbeatAck { seq: beat.seq },
+                        )),
+                    }));
+                }
                 if seen.send(message).is_err() {
                     break;
                 }
@@ -124,6 +146,7 @@ impl Worker for FakeWorker {
         let _ = self.sessions.send(Session {
             from_daemon,
             to_daemon,
+            ack_heartbeats,
         });
         let stream = futures::stream::unfold(outbound, |mut rx| async move {
             rx.recv().await.map(|m| (m, rx))
@@ -241,20 +264,21 @@ impl Front {
     /// its digest. Only for the tests of how the daemon ends a user's shell command and
     /// the background job it starts (the shell's `$$` and `$!` name the processes).
     pub fn user_shell(&self, script: &str) -> Digest {
+        self.action(&["/bin/sh", "-c", script])
+    }
+
+    /// Stores an action that runs `arguments` (the program first, run as given: no
+    /// shell) with `PATH=/usr/bin:/bin`, in an empty input root; returns its digest.
+    pub fn action(&self, arguments: &[&str]) -> Digest {
         self.runtime.block_on(async {
-            let channel = Endpoint::from_shared(format!("http://{}", self.cas))
-                .expect("endpoint")
-                .connect()
-                .await
-                .expect("connect to the CAS");
-            let cas = Transfers::over(channel, TransferConfig::default());
+            let cas = self.transfers().await;
             let put = |bytes: Vec<u8>| {
                 let cas = &cas;
                 async move { cas.put(bytes).await.expect("upload") }
             };
             let root = put(Directory::default().encode_to_vec()).await;
             let command = Command {
-                arguments: ["/bin/sh", "-c", script].map(str::to_owned).to_vec(),
+                arguments: arguments.iter().map(|a| (*a).to_owned()).collect(),
                 environment_variables: vec![EnvironmentVariable {
                     name: "PATH".to_owned(),
                     value: "/usr/bin:/bin".to_owned(),
@@ -269,5 +293,28 @@ impl Front {
             };
             put(action.encode_to_vec()).await
         })
+    }
+
+    /// The bytes of the blob `digest` names in the CAS, such as the stdout of a lease
+    /// that has ended; empty when the digest is absent (an action that wrote nothing).
+    #[allow(dead_code)]
+    pub fn blob(&self, digest: Option<&Digest>) -> Vec<u8> {
+        let Some(digest) = digest.filter(|d| d.size_bytes > 0) else {
+            return Vec::new();
+        };
+        self.runtime.block_on(async {
+            let cas = self.transfers().await;
+            cas.get(digest).await.expect("the blob is in the CAS")
+        })
+    }
+
+    /// A client of the plain-text CAS.
+    async fn transfers(&self) -> Transfers {
+        let channel = Endpoint::from_shared(format!("http://{}", self.cas))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect to the CAS");
+        Transfers::over(channel, TransferConfig::default())
     }
 }
