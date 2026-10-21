@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use kbf_state::postgres::schema::{self, Migration, Outcome, SchemaError};
 use kbf_state::postgres::{PostgresConfig, PostgresStore, Unreached};
@@ -218,6 +219,37 @@ fn the_update_step_migrates_to_what_the_release_needs_while_the_old_child_serves
     assert_eq!(schema::current(&s.config()), Ok(2));
 }
 
+/// Catches the bounded step waiting behind another installer for ever: while a second session
+/// holds the schema lock, the step for a release that needs the next schema ends with the
+/// busy refusal after its wait (200 ms here) and applies nothing; once the lock is let go the
+/// same step migrates.
+///
+/// Mutant to plant: `Bounded::before_start` calling `schema::apply` (the unbounded one): the
+/// first call then waits on the held lock and the test does not end.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn the_bounded_step_gives_up_on_a_held_schema_lock() {
+    let s = Scratch::new();
+    Database::new(s.config(), schema::embedded())
+        .setup()
+        .expect("installed");
+    let mut other = postgres::Client::connect(&url(), postgres::NoTls).expect("connects");
+    let mut held = other.transaction().expect("begins");
+    let lock = "SELECT pg_advisory_xact_lock(hashtext('kbf-state-schema'))";
+    held.batch_execute(lock).expect("holds the lock");
+    let mut db = Database::new(s.config(), next_release()).bounded(Duration::from_millis(200));
+    assert_eq!(
+        db.before_start(2).unwrap_err(),
+        SchemaError::Busy.to_string()
+    );
+    assert_eq!(schema::current(&s.config()), Ok(1));
+    held.commit().expect("lock let go");
+    assert_eq!(
+        db.before_start(2).expect("migrates"),
+        "migrated the schema from 1 to 2"
+    );
+}
+
 /// Catches the plan and the update-step line mishandling what the server said, without a
 /// server: no schema yet is a plan (`None`), any other fault stays an error, and the step's
 /// line is the outcome's text or the error's one line.
@@ -254,6 +286,25 @@ fn setup_plan_and_the_update_step_report_an_unreachable_server() {
     assert!(db.setup().is_err());
     assert!(db.plan().is_err());
     assert!(!db.before_start(1).unwrap_err().is_empty());
+}
+
+/// Catches the bounded step hiding why it failed, or asking the database for something other
+/// than what the release needs, without a server: with no server behind the socket it
+/// returns the database's reason, and a release that needs a schema the installer does not
+/// embed is refused with the installer's one line before any connection is made.
+///
+/// Mutants to plant: the error swallowed into an `Ok` line; the release's schema replaced by
+/// the installer's newest (the second call then reaches for the socket and says something
+/// else).
+#[test]
+fn the_bounded_step_reports_an_unreachable_server_and_a_release_it_does_not_embed() {
+    let file = toml_file("database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n");
+    let mut db = Database::from_installer_toml(&file)
+        .expect("a usable url")
+        .bounded(Duration::from_secs(1));
+    assert!(!db.before_start(1).unwrap_err().is_empty());
+    let err = db.before_start(99).unwrap_err();
+    assert!(err.contains("needs state schema 99"), "{err}");
 }
 
 /// Catches the database step's three dry-run lines and its apply line going wrong: a fresh

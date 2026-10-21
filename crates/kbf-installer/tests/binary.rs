@@ -258,6 +258,53 @@ fn the_service_must_be_named_exactly_once() {
     assert_eq!(out.status.code(), Some(1));
 }
 
+/// Catches a bundled unit's `boot-check` taking one of its two flags without the other, or a
+/// mode the binary does not have: each is a usage error (exit 2, the flag named on standard
+/// error, nothing on standard output) before anything is read. With both, the shipped binary
+/// runs the bundled path: a daemon passes (exit 0) over a state both of whose files are
+/// ruined, which the connected host's check refuses with exit 5.
+///
+/// Mutants it catches: either `requires` dropped from the flags (the lone flag runs the
+/// connected check); the bundled path falling through to `activate::boot_check`.
+#[test]
+fn boot_check_takes_kbf_and_mode_together_or_not_at_all() {
+    let root = root("bundled-flags");
+    let lone = [
+        (&["--kbf", "/usr/bin/kbf"][..], "--mode"),
+        (&["--mode", "frontend"][..], "--kbf"),
+        (&["--kbf", "/usr/bin/kbf", "--mode", "node"][..], "node"),
+    ];
+    for (flags, named) in lone {
+        let mut args = vec!["boot-check"];
+        args.extend(flags);
+        let out = helper(&root, &args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(named), "{args:?}: {err}");
+    }
+
+    Locked::acquire(&layout(&root))
+        .expect("lock")
+        .write(&State {
+            current: Some(c(A)),
+            ..State::default()
+        })
+        .expect("state");
+    for name in ["state.json", "state.json.bak"] {
+        fs::write(in_state_dir(&root, name), b"not json").expect("ruin");
+    }
+    assert_eq!(helper(&root, &["boot-check"]).status.code(), Some(5));
+    let bundled = ["boot-check", "--kbf=/usr/bin/kbf", "--mode=daemon"];
+    let out = helper(&root, &bundled);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Catches a loop that does not loop or does not stop: two passes with a launchd label
 /// (the label is taken, and no unit is needed) end on their own; a helper.json the helper
 /// cannot read ends the run with an exit of 1 and a message, not a guess.
