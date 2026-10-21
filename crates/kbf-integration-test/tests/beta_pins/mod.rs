@@ -93,6 +93,86 @@ fn the_beta_workflow_copies_the_pins_of_ci() {
     assert_eq!(mismatches(&read(BETA), &read(BETA)), Ok(Vec::new()));
 }
 
+/// The job of the cross-version cell, which builds release N from a pinned commit.
+const CROSS_VERSION: &str = "cross-version";
+
+/// Why the commit the cross-version job builds release N from is not a pin, or `None` when
+/// it is one: `OLD_COMMIT` must be set in the job, as the 40 lower-case hex digits of a
+/// commit (a branch or a tag would move under the job, and a short name could be ambiguous
+/// or, once it is, fetch other bytes; a pin that is not a commit fails only when the
+/// workflow runs on a push to main). An error when the workflow does not parse or has no
+/// such job.
+fn old_commit_problem(beta: &str) -> Result<Option<String>, String> {
+    let env = workflows::job_env(beta, CROSS_VERSION)?;
+    let Some((_, commit)) = env.iter().find(|(k, _)| k == "OLD_COMMIT") else {
+        return Ok(Some(format!(
+            "{BETA}: the {CROSS_VERSION} job does not set OLD_COMMIT"
+        )));
+    };
+    let pinned = commit.len() == 40
+        && commit
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    Ok((!pinned).then(|| {
+        format!("{BETA}: OLD_COMMIT is {commit:?}, not the 40 lower-case hex digits of a commit")
+    }))
+}
+
+#[test]
+fn the_cross_version_job_builds_release_n_from_a_full_commit() {
+    // Catches: the pin of release N written as a branch, a tag or an abbreviation, or lost.
+    let root = super::repo_root();
+    let beta = std::fs::read_to_string(root.join(BETA)).expect(BETA);
+    assert_eq!(old_commit_problem(&beta), Ok(None));
+}
+
+/// The rule [`old_commit_problem`] reads the pin by, on planted workflows.
+mod pin_rules {
+    use super::*;
+
+    fn workflow(env: &str) -> String {
+        format!(
+            "on: push\npermissions: {{}}\njobs:\n  cross-version:\n    runs-on: ubuntu-24.04\n    env:\n{env}    steps:\n      - run: true\n"
+        )
+    }
+
+    #[test]
+    fn only_a_full_lower_case_commit_is_a_pin() {
+        // Catches: a pin accepted that is a branch, a tag, an abbreviation, upper case, one
+        // digit short or long, or not hex; and the full commit refused.
+        let full = "dfe8ceef77f9d63b9378cf2862de7e759624c0e9";
+        let pinned = workflow(&format!("      OLD_COMMIT: {full}\n"));
+        assert_eq!(old_commit_problem(&pinned), Ok(None));
+        for bad in [
+            "main",
+            "v0.1.0",
+            "dfe8ceef77f9",
+            "DFE8CEEF77F9D63B9378CF2862DE7E759624C0E9",
+            &full[..39],
+            &format!("{full}0"),
+            "gfe8ceef77f9d63b9378cf2862de7e759624c0e9",
+        ] {
+            let found = old_commit_problem(&workflow(&format!("      OLD_COMMIT: {bad}\n")));
+            let found = found.expect("parses").expect("not a pin");
+            assert!(found.contains("OLD_COMMIT is"), "{bad}: {found}");
+        }
+    }
+
+    #[test]
+    fn a_missing_pin_or_job_is_named_not_passed() {
+        // Catches: a lint that passes because it read nothing.
+        let found = old_commit_problem(&workflow("      OTHER: 1\n")).expect("parses");
+        assert!(
+            found
+                .expect("a problem")
+                .contains("does not set OLD_COMMIT")
+        );
+        assert!(old_commit_problem("jobs: [").is_err());
+        let no_job = "on: push\npermissions: {}\njobs:\n  smoke:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: true\n";
+        assert!(old_commit_problem(no_job).is_err(), "no such job");
+    }
+}
+
 /// The rules [`mismatches`] reads the two workflows by, on planted ones.
 mod rules {
     use super::*;
