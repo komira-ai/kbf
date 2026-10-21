@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use kbf_host::testkit::{ScratchHost, reply};
 use kbf_host::{Root, Step};
 use kbf_update::record::file_name;
-use kbf_update::{Facts, Locator, OrderRecord, Verb};
+use kbf_update::{Facts, Locator, OrderRecord, Source, Verb};
 
 use crate::activate;
 use crate::layout::{Layout, Platform};
@@ -84,6 +84,7 @@ fn record(
             state_schema: 3,
             profile: "release".to_owned(),
         }),
+        source: Source::Fetch,
     }
 }
 
@@ -1754,6 +1755,7 @@ fn plain_order(verb: OrderVerb) -> Order {
         commit: c(B),
         window_s: 600,
         claims: None,
+        source: Source::Fetch,
     }
 }
 
@@ -1844,6 +1846,7 @@ fn a_swap_that_fails_is_refused_and_moves_nothing() {
     let loc = ReleaseLocator {
         commit: c(B),
         components: Vec::new(),
+        source: Source::Fetch,
     };
     assert!(matches!(NotWired.fetch(&loc), Err(FetchError::NotWired)));
 }
@@ -1894,4 +1897,5 @@ fn the_same_activation_again_while_on_trial_is_a_repeat() {
 mod frontend_tests;
 mod pipeline_fetcher_tests;
 mod scratch_sweep_tests;
+mod seed_order_tests;
 mod staged_tests;

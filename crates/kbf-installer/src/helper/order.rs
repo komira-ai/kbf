@@ -7,9 +7,11 @@
 //! record is untrusted: the name must be the pair inside, the verb one of four words, the
 //! commit a full commit, an activation's claims complete, the other three verbs carry no
 //! claims (a `frontend_update` is a locator and nothing else), and no other or repeated key
-//! is accepted.
+//! is accepted. A record may name its source ([`Source`]): the installer's configured one
+//! (the default, and what every record meant before the key) or the release its package
+//! carries; any other word is not a record.
 
-use kbf_update::{Facts, Locator, OrderRecord, RecordError, Verb as RecordVerb};
+use kbf_update::{Facts, Locator, OrderRecord, RecordError, Source, Verb as RecordVerb};
 
 use crate::CommitId;
 
@@ -70,8 +72,11 @@ pub struct Order {
     pub commit: CommitId,
     /// The confirm window the frontend asks for; the helper clamps it.
     pub window_s: u32,
-    /// For an activation.
+    /// For an activation that fetches: what it claims the release is. A staged order has none:
+    /// the package's manifest is what the release is held to.
     pub claims: Option<Claims>,
+    /// Where the release comes from. Only an activation and a `frontend_update` can be staged.
+    pub source: Source,
 }
 
 /// Why a file is not an order.
@@ -132,5 +137,6 @@ pub fn parse(epoch: u64, id: u64, bytes: &[u8]) -> Result<Order, OrderFault> {
         commit,
         window_s: record.window_s,
         claims,
+        source: record.source,
     })
 }

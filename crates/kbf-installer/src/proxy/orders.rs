@@ -352,6 +352,8 @@ pub(super) fn record(locator: &Locator, verb: RecordVerb) -> Result<OrderRecord,
         window_s: locator.window_s,
         components: Vec::new(),
         expected: None,
+        // The proxy's records name no source: they fetch.
+        source: kbf_update::Source::Fetch,
     };
     record.check().map_err(SpoolError::Record)?;
     Ok(record)

@@ -36,6 +36,7 @@ use crate::refusal::Refusal;
 use crate::run::SystemRunner;
 use crate::settings::{NoCommonRef, Settings};
 use crate::stage::Policy;
+use crate::version;
 
 /// Pulls and installs a release the way the host is configured to, as of the moment it is
 /// asked. See the module documentation.
@@ -45,6 +46,9 @@ pub struct HostFetcher {
     installer_toml: HostPath,
     /// What the host supplies, made for each fetch.
     parts: Box<dyn Fn() -> Result<Parts, String>>,
+    /// The first 12 hex digits of the commit this installer was built from: the name of the
+    /// seed directory it reads.
+    build: String,
 }
 
 impl HostFetcher {
@@ -60,7 +64,17 @@ impl HostFetcher {
             host,
             installer_toml,
             parts: Box::new(parts),
+            build: version::BUILD_COMMIT.to_owned(),
         }
+    }
+
+    /// The same fetcher for an installer built from the commit whose first 12 hex digits are
+    /// `build` (the name of the seed directory it reads). A fetcher is made for the program
+    /// that runs; a test is not built from a commit that has a seed.
+    #[must_use]
+    pub fn with_build(mut self, build: &str) -> HostFetcher {
+        build.clone_into(&mut self.build);
+        self
     }
 
     /// The fetcher of the host `host` itself: the real executor and runner, the owner of this

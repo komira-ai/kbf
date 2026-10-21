@@ -975,6 +975,7 @@ fn run_builds_its_helper_with_the_host_fetcher_not_the_unwired_one() {
     let rec = crate::helper::fetcher::ReleaseLocator {
         commit: c(B),
         components: Vec::new(),
+        source: kbf_update::Source::Fetch,
     };
     let got = helper.fetcher().fetch(&rec);
     assert!(

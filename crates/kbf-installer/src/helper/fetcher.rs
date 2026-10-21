@@ -8,19 +8,28 @@
 //! The real fetcher is [`fetcher_real::RealFetcher`](super::fetcher_real::RealFetcher): the
 //! unprivileged fetch child and the verify pipeline behind this trait, which the binary has
 //! built for each fetch by [`fetcher_host::HostFetcher`](super::fetcher_host::HostFetcher).
-//! [`NotWired`] is the fetcher of a build that has none: it refuses, and nothing is fetched.
+//! The other is [`fetcher_seed::SeedFetcher`](super::fetcher_seed::SeedFetcher): it brings in
+//! no bytes, it hands the release the installer's package carries to the same verify
+//! pipeline. The locator says which one an order wants ([`ReleaseLocator::source`]), and the
+//! host fetcher decides whether the host's configuration allows it. [`NotWired`] is the
+//! fetcher of a build that has none: it refuses, and nothing is fetched.
 
-use kbf_update::{Facts, Locator};
+use kbf_update::{Facts, Locator, Source};
 
 use crate::CommitId;
+use crate::seed::SeedFacts;
 
 /// Where the release for an order can be fetched. Locators and claims, not trust: the
 /// fetcher re-derives every one that matters. Where the bytes come from is the installer's
-/// own configuration, never anything in here.
+/// own configuration, never anything in here: [`source`](ReleaseLocator::source) only chooses
+/// between that configuration and the release the package carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleaseLocator {
     pub commit: CommitId,
     pub components: Vec<Locator>,
+    /// Whether to fetch the release from the configured source or to use the one the package
+    /// carries (which has no components to name: its manifest is the locator).
+    pub source: Source,
 }
 
 /// A release that is installed and verified in `releases/<commit>/`, and what its own
@@ -51,6 +60,11 @@ pub enum FetchError {
     /// This build has no fetcher.
     #[error("fetch: this installer has no release fetcher wired in")]
     NotWired,
+    /// The order itself is refused, before a byte is fetched or read: this host's
+    /// configuration does not allow its source, or it names a release this host does not
+    /// stage. `word` is the contract's refusal word it is reported under.
+    #[error("{word}: {why}")]
+    Order { word: &'static str, why: String },
 }
 
 /// Pulls and installs a release.
@@ -88,6 +102,16 @@ pub trait Fetcher {
         rec: &ReleaseLocator,
         expected: &Facts,
     ) -> Result<InstalledRelease, FetchError>;
+
+    /// What the release the host's package carries is, by the package's own manifest: its
+    /// commit, its `seq` and the facts it declares. An order whose source is
+    /// [`Source::Staged`] carries no facts, so the cycle takes them from here and passes them
+    /// to [`Fetcher::fetch_activation`], which holds the release to them; `setup` asks for the
+    /// commit it has no `--commit` to name. It reads the manifest and decides nothing about an
+    /// order. A fetcher that has no package says so.
+    fn seed(&self) -> Result<SeedFacts, FetchError> {
+        Err(FetchError::NotWired)
+    }
 }
 
 /// The fetcher of a build that has none: every fetch is refused.
@@ -119,6 +143,7 @@ pub(crate) mod fake {
 
     use super::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
     use crate::layout::Layout;
+    use crate::seed::SeedFacts;
 
     /// A change a test makes to the report of the release it installs.
     pub type Tamper = fn(&mut InstalledRelease);
@@ -133,6 +158,8 @@ pub(crate) mod fake {
         pub fail: Arc<Mutex<Option<FetchError>>>,
         /// Changes the report of the installed release (a binary that says other things).
         pub tamper: Arc<Mutex<Option<Tamper>>>,
+        /// The release this fetcher's package carries; `None` for a host with no package.
+        pub seed: Arc<Mutex<Option<SeedFacts>>>,
     }
 
     impl FakeFetcher {
@@ -143,6 +170,7 @@ pub(crate) mod fake {
                 expected: Arc::default(),
                 fail: Arc::default(),
                 tamper: Arc::default(),
+                seed: Arc::default(),
             }
         }
 
@@ -189,6 +217,11 @@ pub(crate) mod fake {
         ) -> Result<InstalledRelease, FetchError> {
             self.expected.lock().expect("lock").push(expected.clone());
             self.fetch(rec)
+        }
+
+        fn seed(&self) -> Result<SeedFacts, FetchError> {
+            let carried = self.seed.lock().expect("lock").clone();
+            carried.ok_or(FetchError::NotWired)
         }
     }
 }

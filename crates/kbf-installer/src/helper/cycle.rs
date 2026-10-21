@@ -21,6 +21,7 @@ use crate::stage;
 use crate::state::{self, Locked, State, StateError};
 use kbf_host::plan::Mode;
 use kbf_host::{Exec, HostPath, Perms, Step};
+use kbf_update::Source;
 
 mod frontend;
 
@@ -636,6 +637,7 @@ impl<E: Exec> Helper<E> {
         let rec = ReleaseLocator {
             commit: order.commit.clone(),
             components: claims.components.clone(),
+            source: Source::Fetch,
         };
         // The node is told a fetch is under way; it may take minutes.
         memory.fetching = true;

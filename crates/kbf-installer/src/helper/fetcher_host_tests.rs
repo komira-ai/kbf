@@ -11,11 +11,14 @@ use std::time::Duration;
 use kbf_host::exec::Entry;
 use kbf_host::step::Perms;
 use kbf_host::testkit::FakeExec;
+use kbf_update::Source as OrderSource;
 
 use super::*;
 use crate::fixtures::{FakeRunner, SETTINGS_PATH, me, ran, trusted_host};
 use crate::helper::leases::fake::FakeLeases;
 use crate::layout::path;
+use crate::seed::SeedFacts;
+use crate::seed_fixture::{SEQ, Seeded};
 use crate::testkit::{A, c, host_root};
 
 const FILE: &str = "/etc/kbf/installer.toml";
@@ -140,6 +143,15 @@ fn locator() -> ReleaseLocator {
     ReleaseLocator {
         commit: c(A),
         components: Vec::new(),
+        source: OrderSource::Fetch,
+    }
+}
+
+/// The locator of an order that asks for the release the package carries.
+fn staged() -> ReleaseLocator {
+    ReleaseLocator {
+        source: OrderSource::Staged,
+        ..locator()
     }
 }
 
@@ -283,23 +295,113 @@ fn the_frontend_source_is_refused_until_the_fetcher_uses_the_snapshot() {
     }
 }
 
-/// A bundled host fetches nothing, and this build has no fetcher for the release the package
-/// carries (a later change), so every fetch under `bundled` is refused naming the source, and
-/// not read as a `url` or a `frontend` source.
+/// A bundled host fetches nothing: an order that fetches is denied by the fetcher itself,
+/// whoever calls it and whichever form (so a caller that did not look at the configuration, or
+/// looked at one the file no longer says, cannot make it fetch), with the word `denied` and
+/// the reason, and not read as a `url` or a `frontend` source.
 ///
 /// Catches `bundled` falling through to a source that fetches (the network where the host is
-/// air-gapped), and a refusal that does not say why.
+/// air-gapped), the denial left to the callers that ask, and a refusal that does not say why.
 ///
-/// Mutants to plant: the `bundled` arm returning the `frontend` refusal (red: the message);
-/// returning a `url` source built from nothing (red: no refusal).
+/// Mutants to plant: the gate only in the callers (the direct calls here fetch); the `bundled`
+/// arm returning the `frontend` refusal (red: the message); returning a `url` source built from
+/// nothing (red: no refusal).
 #[test]
-fn a_bundled_host_is_refused_by_a_build_without_the_bundled_fetcher() {
+fn a_bundled_host_denies_every_fetch_by_the_fetcher_itself() {
     let rig = Rig::new("host-fetcher-bundled");
     rig.write("release_source = \"bundled\"\n");
-    let why = rig.refused();
+    let why = "release_source is bundled; source=fetch is refused (use source=staged)";
+    assert_eq!(rig.refused(), why);
+    let denied = || FetchError::Order {
+        word: "denied",
+        why: why.to_owned(),
+    };
+    assert_eq!(rig.fetcher.fetch(&locator()), Err(denied()));
+    assert_eq!(
+        rig.fetcher.fetch_activation(&locator(), &facts()),
+        Err(denied())
+    );
+}
+
+/// An order for the release the package carries is carried out on every kind of host, a
+/// `bundled` one, a `url` one with or without a CA of its own, the default (a frontend) and a
+/// frontend with its snapshot, by the seed fetcher and not by the fetch child: the seed's
+/// bundle is one `gh` does not accept, so what answers is the pipeline (`attestation`), not a
+/// refusal of the source, not a denial and not the child that cannot start.
+///
+/// Catches a staged order read as a fetch (the frontend source is not buildable, and a `url`
+/// host would start the child), and `staged` allowed on a `bundled` host only.
+///
+/// Mutants planted: the staged form building the real fetcher (every case but `url`, which
+/// starts the child, is red); the staged form refused unless the file says `bundled`.
+#[test]
+fn a_staged_order_takes_the_package_on_every_kind_of_host_and_never_starts_the_child() {
+    let mut seeded = Seeded::scratch("host-fetcher-staged");
+    seeded.attested = b"the bundle of another release\n".to_vec();
+    let ca = format!("{URL_FILE}release_ca = \"/var/lib/kbf-installer/release-ca.pem\"\n");
+    let frontend = format!("release_source = \"frontend\"\n{SNAPSHOT}");
+    let files = [
+        "release_source = \"bundled\"\n",
+        URL_FILE,
+        ca.as_str(),
+        "",
+        frontend.as_str(),
+    ];
+    for file in files {
+        let fetcher = seeded.host_fetcher(file);
+        let locator = ReleaseLocator {
+            commit: seeded.commit.clone(),
+            ..staged()
+        };
+        for got in [
+            fetcher.fetch(&locator),
+            fetcher.fetch_activation(&locator, &seeded.facts()),
+        ] {
+            let why = got.expect_err(file).to_string();
+            assert!(
+                why.starts_with("fetch: rejected: attestation: "),
+                "{file:?}: {why}"
+            );
+        }
+    }
+    assert!(!seeded.installed());
+}
+
+/// The hook reports the package's manifest through the host fetcher, whatever the source
+/// file says, and a host whose installer was built from another commit than the package's, or
+/// that cannot supply its parts, reports why it has no seed.
+///
+/// Catches the hook answered from the configuration, and a missing seed taken for a seed.
+///
+/// Mutant planted: the hook delegating to the fetch-source fetcher (a `url` host without a
+/// child refuses).
+#[test]
+fn the_host_fetcher_reports_the_seed_of_its_package_or_why_it_has_none() {
+    let seeded = Seeded::scratch("host-fetcher-seed");
+    let want = SeedFacts {
+        commit: seeded.commit.clone(),
+        seq: SEQ,
+        facts: seeded.facts(),
+    };
+    for file in ["release_source = \"bundled\"\n", URL_FILE] {
+        assert_eq!(seeded.host_fetcher(file).seed(), Ok(want.clone()), "{file:?}");
+    }
+    let other = seeded.host_fetcher(URL_FILE).with_build("ffffffffffff");
+    let got = other.seed();
     assert!(
-        why.contains("release_source = \"bundled\"") && why.contains("no bundled fetcher"),
-        "{why}"
+        matches!(&got, Err(FetchError::Unavailable(why)) if why.starts_with("seed_missing: ")),
+        "{got:?}"
+    );
+
+    let (layout, _) = host_root("host-fetcher-seed-no-parts");
+    let reason = "the fetch user: there is no user \"kbf-fetch\"";
+    let fetcher = HostFetcher::new(layout, path(FILE), || Err(reason.to_owned()));
+    let unavailable = || FetchError::Unavailable(reason.to_owned());
+    assert_eq!(fetcher.seed(), Err(unavailable()));
+    assert_eq!(fetcher.fetch(&staged()), Err(unavailable()));
+    assert_eq!(
+        fetcher.fetch_activation(&staged(), &facts()),
+        Err(unavailable())
     );
 }
 

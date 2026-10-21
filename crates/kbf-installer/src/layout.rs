@@ -10,17 +10,21 @@
 //!   releases/current.new, previous.new     a link being replaced (renamed over its name)
 //!   releases/previous                      link to <commit>, the one before it
 //!   state.json, state.json.bak             the state (crate::state) and the last good one
+//!   seq_floor                              the lowest seq a staged release must exceed
 //!   work/                                  scratch of a stage in progress (crate::stage)
 //! /run/kbf-installer/lock                  the lock the state is read and written under
 //! /usr/share/kbf-installer/trust/          what offline verification trusts (package-owned)
 //!   gh, trusted_root.jsonl, installer.conf
+//! /usr/share/kbf-installer/seed/<commit12>/  the release the package carries (package-owned)
+//!   manifest.json, kbf-<commit>-<platform>.tar.gz, and that file with .sigstore.json
 //! ```
 //!
 //! macOS differs in these paths ([`Platform`]): the configuration directory is
 //! `/usr/local/etc/kbf` (`kbf.toml`, `installer.toml`, the tokens), the installer tree is root's
 //! `/usr/local/kbf-installer` (never a user-owned Homebrew prefix), the state is in
 //! `/var/db/kbf-installer` (with `work/`), the lock is `/var/run/kbf-installer/lock`, and the
-//! trust directory is `/usr/local/kbf-installer/trust` (the pkg's PREFIX/trust).
+//! trust directory is `/usr/local/kbf-installer/trust` (the pkg's PREFIX/trust) and the seed
+//! directory `/usr/local/kbf-installer/seed/<commit12>` (PREFIX/seed).
 //!
 //! Nothing else is named anywhere else: `kbf-deploy host ...`, the helper and the tests ask a
 //! [`Layout`]. The kbf runtime's own state, `/var/lib/kbf`, is not here and is never touched.
@@ -44,6 +48,10 @@ const LINUX_LOCK: &str = "/run/kbf-installer/lock";
 const MACOS_LOCK: &str = "/var/run/kbf-installer/lock";
 const LINUX_TRUST: &str = "/usr/share/kbf-installer/trust";
 const MACOS_TRUST: &str = "/usr/local/kbf-installer/trust";
+/// What the package installs: the trust directory and the seed directory are in it. The
+/// Mac pkg installs into the installer's own tree.
+const LINUX_PACKAGE: &str = "/usr/share/kbf-installer";
+const MACOS_PACKAGE: &str = MACOS_ROOT;
 /// The configuration directory, and the files `setup` keeps in it: `/etc/kbf` on Linux,
 /// `/usr/local/etc/kbf` on macOS (the launchd gate of the installer's job waits on the
 /// `installer.toml` there).
@@ -57,6 +65,13 @@ const LINUX_ENROLL_TOKEN: &str = "/etc/kbf/enroll.token";
 const MACOS_ENROLL_TOKEN: &str = "/usr/local/etc/kbf/enroll.token";
 const LINUX_API_TOKEN: &str = "/etc/kbf/api-token";
 const MACOS_API_TOKEN: &str = "/usr/local/etc/kbf/api-token";
+
+/// The directory of the packaged releases, one per build of the installer, in the package's
+/// directory.
+pub const SEED: &str = "seed";
+/// The root-owned file beside `state.json` that holds the lowest `seq` a staged release must
+/// exceed: decimal text, one number.
+pub const SEQ_FLOOR: &str = "seq_floor";
 
 /// The files of the trust directory.
 pub const GH: &str = "gh";
@@ -194,6 +209,13 @@ impl Platform {
         match self {
             Platform::Linux => LINUX_TRUST,
             Platform::MacOs => MACOS_TRUST,
+        }
+    }
+
+    fn package(self) -> &'static str {
+        match self {
+            Platform::Linux => LINUX_PACKAGE,
+            Platform::MacOs => MACOS_PACKAGE,
         }
     }
 }
@@ -370,6 +392,23 @@ impl Layout {
     /// The host's settings (`installer.conf`), optional.
     pub fn settings(&self) -> HostPath {
         path_in(self.platform.trust(), SETTINGS)
+    }
+
+    /// `seed/<build>`, beside the trust directory: the release the package carries. `build`
+    /// is the first 12 hex digits of the commit this installer was built from, a plain name
+    /// (the caller checks that it is one).
+    pub fn seed_dir(&self, build: &str) -> HostPath {
+        path_in(&format!("{}/{SEED}", self.platform.package()), build)
+    }
+
+    /// A file of the seed directory of `build`, by its plain `name`.
+    pub fn seed_file(&self, build: &str, name: &str) -> HostPath {
+        path_in(self.seed_dir(build).as_str(), name)
+    }
+
+    /// `seq_floor`, beside the state: the lowest `seq` a staged release must exceed.
+    pub fn seq_floor(&self) -> HostPath {
+        path_in(self.platform.state_dir(), SEQ_FLOOR)
     }
 }
 

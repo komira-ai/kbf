@@ -75,6 +75,13 @@ impl From<Sha256Hex> for String {
     }
 }
 
+impl Sha256Hex {
+    /// The digest as text: 64 lowercase hex characters.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// An activation: the order that started a swap, `<epoch>-<order id>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]

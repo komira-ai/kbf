@@ -76,6 +76,9 @@ pub mod record_release;
 pub mod refusal;
 pub mod release;
 pub mod run;
+pub mod seed;
+#[cfg(test)]
+mod seed_fixture;
 pub mod settings;
 pub mod setup;
 pub mod spool;

@@ -31,7 +31,9 @@
 //!   `kbf-proxy.socket.d/listen.conf` on Linux, and no key removes the drop-in. Setup never
 //!   reloads systemd or restarts the socket: it says that is needed.
 //! - `--release-source bundled` writes `release_source = "bundled"` and fetches nothing: it
-//!   takes no `--release-url` and no `--commit`. The keys a source has of its own
+//!   takes no `--release-url` and no `--commit`. The first release is the one the package
+//!   carries ([`backend::Releases::install_seed`]), verified as a fetched one is; a host with a
+//!   release already installs nothing. The keys a source has of its own
 //!   (`--release-ca`, the frontend snapshot flags) are checked and written, never read
 //!   ([`release_keys`]); the flags decide them, so a run for another source leaves none behind.
 //! - `kbf.toml` is written after every file a unit needs, and the units after it.
@@ -438,6 +440,21 @@ pub fn run(
         (Some(commit), true) => notes.push(format!(
             "a release is installed already: --commit {commit} is not fetched (setup installs the first release only; use update)"
         )),
+        // A bundled host fetches nothing and names no commit: the first release is the one the
+        // package carries, through the same verify pipeline as a fetched one.
+        (None, false) if valid.source == Source::Bundled => {
+            steps += 1;
+            if options.apply {
+                writeln!(out, "+ install and verify the release the package carries")?;
+                backend.releases.install_seed()?;
+            } else {
+                writeln!(
+                    out,
+                    "DRY-RUN: install and verify the release the package carries"
+                )?;
+            }
+            have_release = true;
+        }
         (None, _) => {}
     }
 

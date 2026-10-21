@@ -17,6 +17,7 @@
 //! fetcher's `fetch_timeout_s`.
 
 use kbf_host::Exec;
+use kbf_update::Source;
 
 use super::{Done, FrontendStep, Helper, Memory, Order, facts, platform_prefix, refuse};
 use crate::activate::{self, Confirmed};
@@ -52,13 +53,18 @@ impl From<ReleaseError> for Refused {
     }
 }
 
-impl From<FetchError> for Refused {
-    fn from(e: FetchError) -> Refused {
+impl Refused {
+    /// The refusal of order `id` whose fetch said `e`. A refusal of the order itself carries
+    /// its own word (`denied`, `commit_or_ref`) and is said with the order it is for.
+    fn of_fetch(e: FetchError, id: u64) -> Refused {
         // `stage` is the word of a failure the installer cannot place; the real fetcher's
         // rejections become the verify words when it is wired.
         let word = match e {
             FetchError::Unavailable(_) | FetchError::NotWired => "fetch",
             FetchError::Rejected(_) => "stage",
+            FetchError::Order { word, why } => {
+                return Refused::new(word, format!("order {id}: {why}"));
+            }
         };
         Refused::new(word, e.to_string())
     }
@@ -91,11 +97,15 @@ impl<E: Exec> Helper<E> {
         let rec = ReleaseLocator {
             commit: order.commit.clone(),
             components: Vec::new(),
+            source: Source::Fetch,
         };
         memory.fetching = true;
         let told = self.report(memory);
         let fetched = match told {
-            Ok(()) => self.fetcher.fetch(&rec).map_err(Refused::from),
+            Ok(()) => {
+                let pulled = self.fetcher.fetch(&rec);
+                pulled.map_err(|e| Refused::of_fetch(e, order.id))
+            }
             Err(e) => Err(Refused::new("stage", e.to_string())),
         };
         memory.fetching = false;

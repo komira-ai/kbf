@@ -399,7 +399,7 @@ fn fetch_error(e: fetch::FetchError) -> FetchError {
 /// A pipeline refusal as the trait reports it: a refusal with a contract word is a verdict
 /// on the release (`Rejected`, the word first); one without is the host failing to do the
 /// work (a scratch directory, a tool that would not start), which says nothing of the release.
-fn refused(r: Refusal) -> FetchError {
+pub(super) fn refused(r: Refusal) -> FetchError {
     match r.word() {
         Some(word) => FetchError::Rejected(with_word(word, &r)),
         None => FetchError::Unavailable(r.to_string()),

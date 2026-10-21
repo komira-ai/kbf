@@ -81,6 +81,7 @@ fn rec(components: Vec<Locator>) -> ReleaseLocator {
     ReleaseLocator {
         commit: commit(),
         components,
+        source: kbf_update::Source::Fetch,
     }
 }
 
