@@ -67,7 +67,7 @@ pub use controller::Controller;
 pub use facts::{
     AvailableFact, DaemonLoad, Facts, Generation, HelperReport, HelperStatus, HostFacts, HostKind,
     HostRecord, MemberFacts, Observations, OrderId, Platform, PlatformClass, Release, SlotView,
-    Work,
+    Source, Work,
 };
 pub use gate::{GateFail, GateMode, storage_gate};
 pub use node_step::{HostPhase, Transition, step};

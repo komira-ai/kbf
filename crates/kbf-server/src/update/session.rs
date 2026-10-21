@@ -69,8 +69,8 @@ use kbf_types::{FarmTime, WorkerId};
 use super::command::{Alert, Severity};
 use super::facts::MemberFacts;
 use super::facts::{
-    AvailableFact, DaemonLoad, HelperReport, HelperStatus, HostFacts, HostKind, HostRecord, OrderId,
-    Platform, PlatformClass, Release, Work,
+    AvailableFact, DaemonLoad, HelperReport, HelperStatus, HostFacts, HostKind, HostRecord,
+    OrderId, Platform, PlatformClass, Release, Work,
 };
 use super::ports::{FactsSource, FarmView, SourceError, Transport, TransportError};
 use super::rows::Rows;

@@ -6,6 +6,12 @@
 # to main; this workflow runs it by hand on a branch first, so a probe change is measured
 # before it merges. A pull request does not run it (a pull request runs the fast gate of
 # ci.yml only; the macOS pool is small).
+#
+# The second job, `pool-spike`, is M0 of the Mac legs of the isolation suites (T018,
+# crates/kbf-daemon-test/tests/mac_pool_spike): the real daemon with a pool of two users as
+# root behind a fake front, and what the runner does for them (`launchctl asuser`, the
+# `user/<uid>` domain without a login, `security`, `pbcopy`, the lease directory), each fact a
+# `SPIKE` line. Also in beta.yml's native-macos job; here it runs by hand on a branch first.
 name: spike-slot-reach
 
 on:
@@ -32,3 +38,20 @@ jobs:
       - run: rustup toolchain install
       - name: Cross-slot reach of a pool action, sandboxed and not (root, real users)
         run: cargo xtask sudo-test -p kbf-driver-native --test slot_reach -- --test-threads=1 --nocapture
+
+  pool-spike:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      # The daemon the test starts is found beside the test binary.
+      - run: cargo build -p kbf-cli --bin kbf --locked
+      - name: What the runner does for a root daemon with a pool of two users (root, real users)
+        run: cargo xtask sudo-test -p kbf-daemon-test --test mac_pool_spike -- --test-threads=1 --nocapture

@@ -97,7 +97,7 @@ mod tests {
     use super::*;
     use crate::fixtures::{COMMIT, scratch};
     use crate::record::Locator;
-    use crate::types::{Order, Verb};
+    use crate::types::{Order, Source, Verb};
 
     fn confirm(order_id: u64) -> OrderRecord {
         let order = Order {
@@ -107,6 +107,7 @@ mod tests {
             verb: Some(Verb::Confirm),
             commit: COMMIT.to_owned(),
             window_s: 600,
+            source: Some(Source::Fetch),
         };
         OrderRecord::for_order(&order, Verb::Confirm, None).expect("record")
     }

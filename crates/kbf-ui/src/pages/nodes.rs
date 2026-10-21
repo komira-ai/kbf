@@ -8,6 +8,7 @@
 
 use serde::Deserialize;
 
+use super::started::{self, HEALTH};
 use super::{bytes, failed, pill, refresh, segment};
 use crate::html::{Href, Html, attr};
 use crate::layout;
@@ -20,13 +21,13 @@ pub(crate) const NODES_PATH: &str = "/ui/nodes";
 /// Nodes: the list.
 pub(crate) const NODES: Page = Page {
     name: "Nodes",
-    reads: &["/v1/nodes"],
+    reads: &["/v1/nodes", HEALTH],
 };
 
 /// Node: one node.
 pub(crate) const NODE: Page = Page {
     name: "Node",
-    reads: &["/v1/nodes/{id}"],
+    reads: &["/v1/nodes/{id}", HEALTH],
 };
 
 /// What a restart does to what these pages show.
@@ -110,6 +111,7 @@ pub(crate) async fn nodes<S: Source>(source: &S, query: &str) -> Answer {
         Ok(doc) => doc,
         Err(e) => return failed(&NODES, NODES_PATH, r.asked(), &e),
     };
+    let started = started::read(&mut r).await;
     let body = layout::page_refreshing(NODES.name, NODES_PATH, r.asked(), refresh, |h| {
         h.el("h1", &[], |h| {
             h.text("Nodes");
@@ -118,6 +120,7 @@ pub(crate) async fn nodes<S: Source>(source: &S, query: &str) -> Answer {
         h.el("p", &[attr("class", "hint")], |h| {
             h.text(IN_MEMORY);
         });
+        started::note(h, &started);
         if doc.nodes.is_empty() {
             h.el("p", &[], |h| {
                 h.text("No node has registered with this server.");
@@ -199,6 +202,7 @@ pub(crate) async fn node<S: Source>(source: &S, id: &str, query: &str) -> Answer
         Ok(doc) => doc,
         Err(e) => return failed(&NODE, &here, r.asked(), &e),
     };
+    let started = started::read(&mut r).await;
     let body = layout::page_refreshing(NODE.name, &here, r.asked(), refresh, |h| {
         let all = Href::root_relative(NODES_PATH).expect("the Nodes path is root-relative");
         h.el("p", &[attr("class", "crumbs")], |h| {
@@ -213,6 +217,7 @@ pub(crate) async fn node<S: Source>(source: &S, id: &str, query: &str) -> Answer
         h.el("p", &[attr("class", "hint")], |h| {
             h.text(IN_MEMORY);
         });
+        started::note(h, &started);
         summary(h, &doc.node);
         h.el("h2", &[], |h| {
             h.text("Capacity");

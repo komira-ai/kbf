@@ -111,7 +111,23 @@ pub(super) fn order(id: u64, verb: Verb, commit: &str) -> Order {
         verb: Some(verb),
         commit: commit.to_owned(),
         window_s: 600,
+        source: Some(Source::Fetch),
     }
+}
+
+/// An activation of `commit` from the release the host's package carries.
+pub(super) fn staged_order(id: u64, commit: &str) -> Order {
+    Order {
+        source: Some(Source::Staged),
+        ..order(id, Verb::Activate, commit)
+    }
+}
+
+/// `status` with one more key, as the installer writes them.
+pub(super) fn with_key(status: &str, key_and_value: &str) -> String {
+    let mut text = status.to_owned();
+    text.pop();
+    format!("{text},{key_and_value}}}")
 }
 
 pub(super) const NO_LEASES: &dyn Fn() -> usize = &|| 0;

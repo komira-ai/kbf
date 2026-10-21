@@ -14,7 +14,7 @@
 //!   `DaemonMessage`, 8 and 9 of `ServerMessage`;
 //! - an enum value renumbered, or a service renamed (the path a client dials).
 
-use kbf_proto::update::update_order::Verb;
+use kbf_proto::update::update_order::{Source as OrderSource, Verb};
 use kbf_proto::update::update_status::{Available, ReleaseSource, State};
 use kbf_proto::update::{
     Component, DescribeRequest, FetchChunk, FetchRequest, ReleaseComponent, ReleaseDescription,
@@ -205,6 +205,7 @@ fn order() -> UpdateOrder {
         commit: COMMIT.to_owned(),
         window_s: 900,
         generation: 11,
+        source: 0,
     }
 }
 
@@ -245,6 +246,25 @@ fn offer_bytes() {
 #[test]
 fn order_bytes() {
     golden(&order(), &bytes(ORDER));
+}
+
+/// Catches `source` renumbered off field 7 (tag `0x38`), `FETCH` and `STAGED` swapped, and a
+/// number the node does not know refused at decode instead of by the node (it must survive as
+/// the number it is). An unset source writing nothing is pinned by `order_bytes`.
+#[test]
+fn a_staged_order_is_field_7_and_an_explicit_fetch_is_1() {
+    let staged = UpdateOrder {
+        source: OrderSource::Staged.into(),
+        ..order()
+    };
+    golden(&staged, &bytes(&[ORDER, &["3802"][..]].concat()));
+    let fetch = UpdateOrder {
+        source: OrderSource::Fetch.into(),
+        ..UpdateOrder::default()
+    };
+    golden(&fetch, &bytes(&["3801"]));
+    let unknown = UpdateOrder::decode(&bytes(&["3809"])[..]).expect("decodes");
+    assert_eq!(unknown.source, 9);
 }
 
 #[test]
@@ -404,8 +424,16 @@ fn enum_numbers_are_pinned() {
     ] {
         assert_eq!(state as i32, n);
     }
+    for (source, n) in [
+        (OrderSource::Unspecified, 0),
+        (OrderSource::Fetch, 1),
+        (OrderSource::Staged, 2),
+    ] {
+        assert_eq!(source as i32, n);
+    }
     assert!(State::try_from(9).is_err());
     assert!(Verb::try_from(4).is_err());
+    assert!(OrderSource::try_from(3).is_err());
 }
 
 /// Catches a service renamed: the name is the path every host dials.

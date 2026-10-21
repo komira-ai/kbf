@@ -1,7 +1,7 @@
 # Everything the pull-request gate (ci.yml: lint, and test on the fast set) leaves out, run
 # on a push to main and never on a pull request: the whole nextest run
 # with its slow tests, the Arm run, the jobs that need a service or a root or a Mac
-# (Postgres, S3 stores, crun, the M1 and M2 cells, macOS), the Linux packages, and the beta
+# (Postgres, S3 stores, crun, the M1, M2 and cross-version cells, macOS), the Linux packages, and the beta
 # smoke below. The stage lint (crates/kbf-integration-test/tests/workflows/stages.rs) allows `push` only.
 #
 # The beta smoke is a whole farm of real kbf processes (a frontend, three storage nodes, two
@@ -554,6 +554,14 @@ jobs:
       # sockets, the process table), measured and printed, not asserted, with and without
       # the sandbox (crates/kbf-driver-native/tests/slot_reach.rs).
       - run: cargo xtask sudo-test -p kbf-driver-native --test slot_reach -- --test-threads=1 --nocapture
+      # What this runner can do for the Mac legs of the isolation suites (T018, M0; a spike that
+      # asserts nothing about isolation): two pool users made with dscl, the real `kbf daemon
+      # --driver native --pool-users 2` as root behind a fake front, one action per question
+      # (`launchctl asuser`, the `user/<uid>` domain, `security`, `pbcopy`, `defaults`, the lease
+      # directory), each fact a `SPIKE` line in this log (crates/kbf-daemon-test/tests/mac_pool_spike).
+      # The daemon is the `kbf` binary built beside the test.
+      - run: cargo build -p kbf-cli --bin kbf --locked
+      - run: cargo xtask sudo-test -p kbf-daemon-test --test mac_pool_spike -- --test-threads=1 --nocapture
       # The per-binary entitlement allow list (tools/ci/darwin-entitlements.txt): the
       # kbf-vmm stub signed by `cargo xtask sign-darwin` with the virtualization
       # entitlement, kbf with none, both accepted by `darwin-asset`, and every
@@ -722,3 +730,75 @@ jobs:
           name: m1-cell-logs
           path: ${{ runner.temp }}/m1/logs
           if-no-files-found: warn
+
+  # The cross-version cell (`kbf-cell cross-version`, crates/kbf-integration-test/src/cross_version.rs;
+  # docs/design/frontend-proxy.md, section 9): a frontend and a daemon of two different builds over
+  # the real worker protocol on loopback, both ways, with the installer of the newer build on the
+  # hosts first. "Release N" is the commit OLD_COMMIT below, built from a second checkout in `old/`
+  # (no release is published to fetch, and a build of a pinned commit needs no network beyond the
+  # crates it already pulls); the tip is the "N+1" side. Move OLD_COMMIT to the commit of the newest
+  # release when one is cut, and again whenever the protocol or the installer's numbers move: with
+  # both sides declaring the same numbers the cell passes and says its order check was not exercised.
+  # Not a pull-request job and not a required one: it costs a second cold build of the workspace
+  # (a few minutes more than the other cells; the two target directories are cached), and the
+  # pull-request gate keeps its two jobs. The cell's own logic runs in the pull request's `test`
+  # job against fakes (crates/kbf-integration-test/tests/cross_version.rs). x86_64 only.
+  cross-version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      # Release N: a commit of this repository that has the worker handshake of
+      # `negotiate` (a Hello newer than the server is welcomed at the server's newest).
+      OLD_COMMIT: dfe8ceef77f9d63b9378cf2862de7e759624c0e9
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ env.OLD_COMMIT }}
+          path: old
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            old/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ env.OLD_COMMIT }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      - name: Build the tip (release N+1) and the cell
+        run: cargo build -p kbf-server -p kbf-node -p kbf-cli -p kbf-integration-test --bin kbf-server --bin kbf-daemon --bin kbf --bin kbf-cell --locked
+      # Release N has its own toolchain file and lock file: both steps run in its checkout.
+      - name: Install the toolchain release N pins
+        working-directory: old
+        run: rustup toolchain install
+      - name: Build release N from its commit
+        working-directory: old
+        run: cargo build -p kbf-server -p kbf-node -p kbf-cli --bin kbf-server --bin kbf-daemon --bin kbf --locked
+      - name: N+1 frontend, N daemon, N+1 installer first
+        run: target/debug/kbf-cell cross-version --server-dir target/debug --daemon-dir old/target/debug --installer-dir target/debug --work "$RUNNER_TEMP/cross-version/n1-server"
+      - name: N frontend, N+1 daemon, N+1 installer first
+        run: target/debug/kbf-cell cross-version --server-dir old/target/debug --daemon-dir target/debug --installer-dir target/debug --work "$RUNNER_TEMP/cross-version/n-server"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: cross-version-logs
+          path: |
+            ${{ runner.temp }}/cross-version/n1-server/logs
+            ${{ runner.temp }}/cross-version/n-server/logs
+          if-no-files-found: warn
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            old/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}

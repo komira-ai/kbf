@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use kbf_map::{MemberId, MemberState};
 use kbf_types::{FarmTime, WorkerId};
+use serde::{Deserialize, Serialize};
 
 use super::command::Command;
 use super::gate::{GateFail, GateMode, storage_gate};
@@ -44,6 +45,19 @@ impl Release {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Where the release of a run comes from. The same two words as `kbf_update::Source`, which
+/// this crate's library does not depend on. The default is [`Source::Fetch`], what every run
+/// has meant so far, so a row that names no source is a fetch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    /// The hosts pull the release from the source their installer is configured with.
+    #[default]
+    Fetch,
+    /// The hosts use the release their installer's package carries.
+    Staged,
 }
 
 /// The generation of a run (`update/desired`): it grows with every change of the desired

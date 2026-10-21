@@ -88,6 +88,8 @@ pub enum RecordError {
     Commit(String),
     #[error("a node never writes a frontend_update record")]
     NotForNodes,
+    #[error("the order names a source this build does not know")]
+    NoSource,
     #[error("an activation names no release component")]
     NoComponents,
     #[error("a {0} order carries components, expected facts or a source it does not take")]
@@ -126,13 +128,15 @@ pub fn parse_file_name(name: &str) -> Option<(u64, u64)> {
 }
 
 impl OrderRecord {
-    /// The record for `order` with `verb`. An activation takes its locators and expected
-    /// facts from `offer`, which must be the offer this node holds for the order's commit.
+    /// The record for `order` with `verb`. An activation that fetches takes its locators and
+    /// expected facts from `offer`, which must be the offer this node holds for the order's
+    /// commit; a staged activation takes no offer and is written as a locator.
     ///
     /// # Errors
     /// An activation without an offer, with an offer that carries no expected facts or an
     /// attestation that is not text, or a record that would be too large; any record
-    /// that fails [`check`](Self::check). A frontend update, which a node never writes.
+    /// that fails [`check`](Self::check). A frontend update, which a node never writes. An
+    /// order whose source is none ([`RecordError::NoSource`]).
     pub fn for_order(
         order: &Order,
         verb: Verb,
@@ -141,8 +145,11 @@ impl OrderRecord {
         if verb == Verb::FrontendUpdate {
             return Err(RecordError::NotForNodes);
         }
-        let (components, expected) = match (verb, offer) {
-            (Verb::Activate, Some(offer)) => {
+        let source = order.source.ok_or(RecordError::NoSource)?;
+        // A staged activation is a locator, so it never takes the offer, whatever the caller
+        // passes.
+        let (components, expected) = match (verb, offer, source) {
+            (Verb::Activate, Some(offer), Source::Fetch) => {
                 let components = offer
                     .components
                     .iter()
@@ -177,8 +184,7 @@ impl OrderRecord {
             window_s: order.window_s,
             components,
             expected,
-            // A node's order says nothing of a source yet: it is the default.
-            source: Source::Fetch,
+            source,
         };
         record.check()?;
         record.to_bytes()?;
@@ -300,7 +306,47 @@ mod tests {
             verb: Some(Verb::Activate),
             commit: commit.to_owned(),
             window_s: 600,
+            source: Some(Source::Fetch),
         }
+    }
+
+    /// Catches a staged activation written with the offer's locators and facts (a staged
+    /// record is a locator, whatever offer the caller holds), the source written as another
+    /// word or left out, a confirm that names a source reaching the file, and an order whose
+    /// source this build does not know written as a fetch.
+    ///
+    /// Mutants planted: the source hard-coded to fetch; the offer consumed for a staged
+    /// order; a source of none defaulted to fetch.
+    #[test]
+    fn a_staged_order_is_written_as_a_locator_and_an_unknown_source_is_not_written() {
+        let staged = Order {
+            source: Some(Source::Staged),
+            ..order(COMMIT)
+        };
+        let want = [
+            r#"{"order_id":5,"epoch":2,"generation":9,"verb":"activate","commit":""#,
+            COMMIT,
+            r#"","window_s":600,"source":"staged"}"#,
+        ]
+        .concat();
+        let held = good_offer();
+        for offer in [Some(&held), None] {
+            let record = OrderRecord::for_order(&staged, Verb::Activate, offer).expect("record");
+            let text = String::from_utf8(record.to_bytes().expect("bytes")).expect("text");
+            assert_eq!(text, want);
+        }
+        assert_eq!(
+            OrderRecord::for_order(&staged, Verb::Confirm, None),
+            Err(RecordError::Unexpected("confirm"))
+        );
+        let unknown = Order {
+            source: None,
+            ..order(COMMIT)
+        };
+        assert_eq!(
+            OrderRecord::for_order(&unknown, Verb::Activate, Some(&held)),
+            Err(RecordError::NoSource)
+        );
     }
 
     /// Catches a record that does not survive its own bytes (the writer and reader

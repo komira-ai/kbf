@@ -22,6 +22,7 @@ mod overview;
 mod queue;
 mod refresh;
 mod sched;
+mod started;
 mod storage;
 mod strip;
 mod target;

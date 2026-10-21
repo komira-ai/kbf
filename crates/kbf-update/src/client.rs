@@ -10,9 +10,13 @@
 //!   and the record carries the offer's components for it. Nothing is fetched here.
 //! - **Orders** are accepted only from the epoch of the current session, above every
 //!   order id accepted before, and an activation only for a commit whose offer this node
-//!   holds and with no lease live. Confirm and revert are for a commit the installer
-//!   reports as held. An accepted order is written to the order spool as a record and
-//!   nothing else is done with it. An accepted activation closes the update gate.
+//!   holds and with no lease live. A staged activation (its source is the release the
+//!   host's package carries) takes no offer: it is accepted only for the commit the
+//!   installer reports as available, and a fetching one is refused on a host whose
+//!   installer fetches nothing. Confirm and revert are for a commit the installer
+//!   reports as held, and name no staged source. An accepted order is written to the order
+//!   spool as a record and nothing else is done with it. An accepted activation closes the
+//!   update gate.
 //! - **Status** is derived from what the client and the installer's status file say, and
 //!   published on a watch channel after every change.
 
@@ -26,7 +30,7 @@ use crate::floors::{Floors, FloorsError, FloorsFile};
 use crate::helper::{self, Helper, HelperState, Report};
 use crate::record::OrderRecord;
 use crate::spool::Spool;
-use crate::types::{Offer, Order, ReleaseSource, State, Status, Verb};
+use crate::types::{Offer, Order, ReleaseSource, Source, State, Status, Verb};
 
 /// How many offers are remembered, oldest generation first out.
 const KEEP_OFFERS: usize = 4;
@@ -101,6 +105,25 @@ impl Decision {
 struct Gate {
     order_id: u64,
     commit: String,
+}
+
+/// Why this host's installer cannot carry out an activation from `source`, if it cannot.
+fn source_refusal(report: &Report, source: Source, commit: &str) -> Option<String> {
+    let bundled = report.release_source == ReleaseSource::Bundled;
+    match (source, bundled, &report.available) {
+        (Source::Fetch, true, _) => Some(format!(
+            "order names source fetch, but this host's installer fetches nothing (release_source bundled); use source=staged for {commit}"
+        )),
+        (Source::Fetch, false, _) => None,
+        (Source::Staged, _, Some(seed)) if seed.commit == commit => None,
+        (Source::Staged, _, Some(seed)) => Some(format!(
+            "commit {commit} is not staged by this host's package: it carries {}",
+            seed.commit
+        )),
+        (Source::Staged, _, None) => Some(format!(
+            "commit {commit} is not staged by this host's package: it reports none"
+        )),
+    }
 }
 
 /// What the client knows, under one lock.
@@ -273,6 +296,9 @@ impl Shared {
         decision
     }
 
+    /// Decides `order`. Every refusal comes before the order id is recorded, so a refused
+    /// order moves no floor. A staged activation skips the offer: it is a locator for the
+    /// release the installer's package carries.
     fn decide(
         &self,
         core: &mut Core,
@@ -319,6 +345,14 @@ impl Shared {
                 "order {id} is a frontend update, which a node does not take from the session"
             ));
         }
+        let Some(source) = order.source else {
+            let why = format!("order {id} names a source this node does not know");
+            return Decision::Refused(why);
+        };
+        if !source.is_fetch() && verb != Verb::Activate {
+            let word = verb.name();
+            return Decision::Refused(format!("order {id}: a {word} order takes no source"));
+        }
         let Some(report) = core.report() else {
             return Decision::Refused(
                 "no update installer reports on this host, so it cannot take an order".to_owned(),
@@ -333,8 +367,12 @@ impl Shared {
                 order.commit
             ));
         }
+        if activate && let Some(why) = source_refusal(report, source, &order.commit) {
+            return Decision::Refused(why);
+        }
+        // A staged activation is a locator and takes no offer; only a fetch needs one.
         let offer = core.offers.iter().find(|o| o.commit == order.commit);
-        if activate && offer.is_none() {
+        if activate && source.is_fetch() && offer.is_none() {
             return Decision::Refused(format!(
                 "no offer for commit {} is held; not activating",
                 order.commit
