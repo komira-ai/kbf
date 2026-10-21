@@ -2,9 +2,9 @@
 //! (issue #155).
 //!
 //! A daemon killed by SIGKILL, the kernel's OOM killer or a panic that aborts cannot
-//! end its containers: each runs under conmon, outside the daemon's process tree. The
-//! start-up sweep removes them only when a daemon is started again on the node. Until
-//! then the action would run, for as long as the work takes, beside the copy the
+//! end its containers: nothing kills a `crun run` or the container it started when the
+//! daemon dies, so they keep running. The start-up sweep removes them only when a daemon
+//! is started again on the node. Until then the action would run, for as long as the work takes, beside the copy the
 //! scheduler starts elsewhere once the handover grace has passed. So each lease gets a
 //! keeper once its cgroup is made: the daemon's own binary in its keeper mode
 //! ([`kbf_daemon::keeper`], `cgroup`), whose stdin is a pipe only the daemon holds the
