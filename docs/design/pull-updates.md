@@ -277,8 +277,13 @@ that document. **A platform stored without it is accepted and held, and is never
 and `GET /v1/releases` say `no version facts (kbf-<commit>-<platform>.version.json): nodes will not be offered this platform; rebuild
 the release to include it`. That is how a commit built before the pipeline wrote the file, a rollback target included, stays
 deployable on the paths that need no offer. The document is a hint, not trust: the installer still runs the staged binary and
-requires its own report to equal the offer's facts (section 7.2). The store does not check an attestation for any file, the document
-included; the build attests the document with the tarball and the host verifies what it fetches.
+requires its own report to equal the offer's facts (section 7.2). The store does not check an attestation for any file, and the document has no
+attestation of its own: it is unattested, and what makes it safe is the node's probe of the attested binary. A document that is
+well formed but wrong (right shape, wrong numbers) is pinned like a tarball (a different body is a 409), and every node then refuses
+the activation with facts-differ; the repair is a new commit. The platform check applies only if the document names a platform, and
+`kbf --version --json` does not today, so it is the node's probe, not the store, that catches a report uploaded under another platform.
+A stored document that later becomes unreadable fails the offer look and keeps the previous offers for every platform until repaired.
+The deploy summary carries the same no-facts text in `notes` for each platform its bundle has no document for.
 The release pipeline writing the file is a separate change from the store accepting it.
 
 **Who supplies what the host verifies.** The attestation bundles an offer carries are **stored by the frontend's release store** (the

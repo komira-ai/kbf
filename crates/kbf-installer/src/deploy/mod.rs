@@ -554,6 +554,27 @@ impl Run<'_> {
         self.read_bundle_offer(&bundle)?;
         self.check_offer_bundle(&bundle)?;
         let entries = bundle.entries;
+        // The store keeps a platform without a version facts file but never offers it; say
+        // so here too, with the words of the store's own listing.
+        let with_facts: BTreeSet<&str> = entries
+            .iter()
+            .filter(|e| e.name == bundle::FACTS)
+            .map(|e| e.platform.as_str())
+            .collect();
+        let mut without: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.name != bundle::FACTS && !with_facts.contains(e.platform.as_str()))
+            .map(|e| e.platform.as_str())
+            .collect();
+        without.sort_unstable();
+        without.dedup();
+        for platform in without {
+            self.sum.notes.push(format!(
+                "no version facts (kbf-{}-{platform}.version.json): nodes will not be offered \
+                 this platform; rebuild the release to include it",
+                self.opts.commit
+            ));
+        }
         if !self.opts.apply {
             return Ok(());
         }

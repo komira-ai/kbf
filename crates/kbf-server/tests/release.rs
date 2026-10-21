@@ -517,6 +517,7 @@ async fn unconfigured_answers_503_everywhere() {
 async fn a_put_needs_the_operator_token() {
     let served = serve().await;
     let path = path_of(COMMIT, "linux-x86_64", "kbf");
+    let facts = path_of(COMMIT, "linux-x86_64", "version.json");
     let wrong = vec![(
         "Authorization",
         "Bearer not-the-token-not-the-token-not-the-token".to_owned(),
@@ -526,16 +527,22 @@ async fn a_put_needs_the_operator_token() {
         ("Origin", "http://evil.example".to_owned()),
     ];
     for (headers, want) in [(Vec::new(), 401), (wrong, 401), (page, 403)] {
-        let reply = http(served.addr, "PUT", &path, &headers, b"payload").await;
-        assert_eq!(reply.status, want, "{}", reply.body);
+        for path in [&path, &facts] {
+            let reply = http(served.addr, "PUT", path, &headers, b"payload").await;
+            assert_eq!(reply.status, want, "{path}: {}", reply.body);
+        }
     }
     assert!(tree(&served.dir.store().join("files")).is_empty());
+    assert!(tree(&served.dir.store().join("index")).is_empty());
     assert_eq!(get_list(&served).await.status, 200);
 
     let off = serve_with(SMALL, true, None).await;
-    let reply = http(off.addr, "PUT", &path, &authorized(), b"payload").await;
-    assert_eq!(reply.status, 403, "{}", reply.body);
+    for path in [&path, &facts] {
+        let reply = http(off.addr, "PUT", path, &authorized(), b"payload").await;
+        assert_eq!(reply.status, 403, "{path}: {}", reply.body);
+    }
     assert!(tree(&off.dir.store().join("files")).is_empty());
+    assert!(tree(&off.dir.store().join("index")).is_empty());
 
     // The token lets the same request through.
     assert_eq!(put(&served, "kbf", b"payload").await.status, 201);

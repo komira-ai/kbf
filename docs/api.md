@@ -1880,6 +1880,11 @@ release and their build attestations, kept as uploaded. Mounted by `--releases-d
   be offered this platform; rebuild the release to include it"`, and `GET /v1/releases` lists the
   platform with `"version_facts": false` and the same `note` (`true` and no `note` when stored).
   A commit stored before this field existed lists as `false` and is not offered either.
+  The document is unattested (the store attests no file) and is only a hint: the node runs the staged,
+  attested binary and refuses the activation unless its own report equals the offer's facts. The platform
+  check applies only if the document names a platform, which `kbf --version --json` does not today. A
+  well-formed document with wrong numbers is pinned (a different body is a `409`) and every node then
+  refuses that release with facts-differ; the repair is a new commit.
 - `GET` is open and lists `{"releases": [{"commit", "platforms": [{"platform", "complete",
   "version_facts", "note"?, "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
   order above, a platform `complete` when it holds, with their attestations, the tarballs its

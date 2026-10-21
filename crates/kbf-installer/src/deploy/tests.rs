@@ -1218,6 +1218,32 @@ fn a_version_facts_file_is_uploaded_first_and_a_refusal_of_it_says_why() {
     assert!(read(&[(&facts, &big)]).is_err(), "past the store's cap");
 }
 
+/// Proves a deploy that uploads a platform with no version facts file says so in its summary
+/// (the platform is stored and never offered), naming the file, once per platform, and says
+/// nothing for a platform that carries its facts.
+///
+/// Mutant seen red: the note pushed for every platform; the note dropped.
+#[test]
+fn a_platform_uploaded_without_version_facts_is_noted_in_the_summary() {
+    let f = farm(two_nodes());
+    let bundle = tarball(&[
+        (&format!("kbf-{TARGET}-linux-x86_64.tar.gz"), b"t"),
+        (&format!("kbf-{TARGET}-linux-x86_64.version.json"), b"{}"),
+        (&format!("kbf-{TARGET}-linux-arm64.tar.gz"), b"t"),
+        (&format!("kbf-daemon-{TARGET}-linux-arm64.tar.gz"), b"t"),
+    ]);
+    let mut input: &[u8] = &bundle;
+    let s = run_with(&f, &opts(true), SmokeResult::Pass, Some(&mut input));
+    assert_eq!(s.exit, 0, "{}", s.line());
+    assert_eq!(
+        s.notes,
+        [format!(
+            "no version facts (kbf-{TARGET}-linux-arm64.version.json): nodes will not be \
+             offered this platform; rebuild the release to include it"
+        )]
+    );
+}
+
 /// Proves a mistake in the bundle is a usage error before any byte is uploaded.
 #[test]
 fn a_bundle_with_a_file_the_store_would_not_take_uploads_nothing() {
