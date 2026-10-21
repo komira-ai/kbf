@@ -179,8 +179,10 @@ async fn a_good_platform_still_runs_and_still_hits_the_cache() {
 /// Catches: a cache hit that fails because the action it is for cannot be checked: the
 /// action not in the CAS, not decoding, naming no Command, a Command not held, or a
 /// Command that does not decode, are answered from the cache (an Execute that runs says
-/// what is wrong with them); an action the store cannot read is UNAVAILABLE, as it is
-/// when the action is run.
+/// what is wrong with them). The closing UNAVAILABLE for an unreadable action only pins
+/// the behaviour: the cache lookup before `refuse_platform_of` already fails on it, so
+/// that read error in `held` is unreachable apart from the lookup, and the Command-side
+/// one is covered by `a_commands_read_error_on_a_cache_hit_is_unavailable`.
 #[tokio::test]
 async fn a_cached_result_for_an_action_that_cannot_be_checked_is_served() {
     let script = Arc::new(Script::default());
@@ -242,4 +244,27 @@ async fn a_cached_result_for_an_action_that_cannot_be_checked_is_served() {
         .expect("write");
     let status = start(&farm, &held_garbage).await.expect_err("unreadable");
     assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+}
+
+/// Catches: a store error while the Command of a cached action is read to check its
+/// platform swallowed (`.ok().flatten()`), serving the cached result. The Action is
+/// valid and has no platform, so only the Command can carry one; the Command is held
+/// but its object is gone. Nothing before `refuse_platform_of` reads the Command, so
+/// only that read can make this UNAVAILABLE.
+#[tokio::test]
+async fn a_commands_read_error_on_a_cache_hit_is_unavailable() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let (action, command, root, input) = placed("unreadable command", &[], false);
+    farm.upload(&[&action]).await;
+    farm.upload(&[&command]).await;
+    farm.upload(&[&root, &input]).await;
+    farm.delete_object_of(&command).await;
+    farm.cache
+        .write_action_result(Role::Daemon, action.digest, &ActionResult::default())
+        .await
+        .expect("write");
+    let status = start(&farm, &action).await.expect_err("unreadable Command");
+    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+    assert!(script.submitted().is_empty());
 }
