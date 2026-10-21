@@ -15,7 +15,7 @@
 use std::io::ErrorKind;
 
 use super::super::host::Kind;
-use super::super::tests::{DAEMON, Fake, needs_from};
+use super::super::tests::{DAEMON, Fake, needs_from, needs_from_in};
 use super::super::{Class, Report};
 use super::check;
 
@@ -249,7 +249,75 @@ fn the_key_beside_builds_is_roots_alone() {
 /// reads none.
 #[test]
 fn the_key_file_is_beside_kbf_toml() {
-    assert_eq!(super::super::key_file(), std::path::PathBuf::from(KEY));
+    let default = std::path::Path::new("/etc/kbf/kbf.toml");
+    assert_eq!(
+        super::super::key_file(default),
+        std::path::PathBuf::from(KEY)
+    );
     let bad = key_file(Fake::empty(), 0o666, 1000);
     assert_eq!(daemon(&bad), Report::default());
+}
+
+/// Catches the key file looked for at the default place whatever settings file kbf loaded:
+/// with `--config` elsewhere, the lax `s3.env` beside that file is the one refused, and the
+/// default place is not read.
+#[test]
+fn the_key_file_is_beside_the_config_kbf_loaded() {
+    let lax = Fake::empty().running_as(SVC, SVC, &[SVC]).put(
+        "/srv/farm/s3.env",
+        Kind::File,
+        SVC,
+        0o644,
+        b"",
+    );
+    let mut flags = vec!["storage"];
+    flags.extend(STORAGE);
+    let mut report = Report::default();
+    check(
+        &needs_from_in(&flags, "/srv/farm/kbf.toml"),
+        &lax,
+        &mut report,
+    );
+    let what = whats(&report);
+    assert_eq!(what.len(), 1, "{report:#?}");
+    assert!(
+        what[0].contains("/srv/farm/s3.env is mode 0644"),
+        "{what:?}"
+    );
+    let mut report = Report::default();
+    check(
+        &needs_from_in(&flags, "/etc/kbf/kbf.toml"),
+        &lax,
+        &mut report,
+    );
+    assert_eq!(report, Report::default());
+}
+
+/// Catches the rule refusing on any `AWS_` name (an ambient `AWS_REGION` or
+/// `AWS_EC2_METADATA_DISABLED` carries no credential and must not stop a daemon), and
+/// missing one of the variables that carry or locate one.
+#[test]
+fn only_the_variables_that_carry_or_locate_a_credential_are_refused() {
+    for name in [
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_EC2_METADATA_DISABLED",
+        "AWS_EXECUTION_ENV",
+    ] {
+        assert_eq!(
+            daemon(&Fake::empty().var(name, "x")),
+            Report::default(),
+            "{name}"
+        );
+    }
+    for name in super::CREDENTIAL_VARS {
+        let report = daemon(&Fake::empty().var(name, "x").var("AWS_REGION", "r"));
+        let what = whats(&report);
+        assert_eq!(what.len(), 1, "{name}: {report:#?}");
+        assert!(
+            what[0].ends_with(&format!("sets {name}")),
+            "{name}: {what:?}"
+        );
+    }
+    assert!(super::CREDENTIAL_VARS.len() >= 14);
 }

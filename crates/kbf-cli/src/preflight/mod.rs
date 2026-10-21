@@ -26,7 +26,7 @@
 //!   has its copies until it is retired): the directories above a `file://` `--hot-store`
 //!   can be entered by the user kbf runs as ([`traverse`]); the cgroup kbf runs in keeps
 //!   every CPU and NUMA node of the node, for a daemon on the container driver
-//!   ([`cpuset`]); a mode with no storage half has no `AWS_*` variable in its environment,
+//!   ([`cpuset`]); a mode with no storage half has no AWS credential variable in its environment,
 //!   and the cold store's key file beside `kbf.toml`, if there is one, is owned and moded as
 //!   its mode needs ([`credential`]).
 //!
@@ -58,7 +58,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 pub use host::{Host, System};
-pub use needs::needs;
+pub use needs::{needs, needs_in};
 
 use crate::Invocation;
 
@@ -223,10 +223,10 @@ pub struct Needs {
     pub key: KeyRule,
 }
 
-/// Where the legacy cold store key file is: `s3.env` beside `kbf.toml`.
+/// Where the legacy cold store key file is: `s3.env` beside the `kbf.toml` kbf loads.
 #[must_use]
-pub fn key_file() -> PathBuf {
-    Path::new(crate::config::DEFAULT_PATH).with_file_name("s3.env")
+pub fn key_file(config: &Path) -> PathBuf {
+    config.with_file_name("s3.env")
 }
 
 /// What a mode's rule `credential` asks of the host ([`credential`]).
@@ -235,7 +235,7 @@ pub enum KeyRule {
     /// Nothing (the frontend).
     #[default]
     None,
-    /// A mode with no storage half: no `AWS_*` variable in the environment.
+    /// A mode with no storage half: no AWS credential variable in the environment.
     Absent,
     /// The storage node, which holds the key as a user of its own: the key file, if
     /// there is one, is root's or that user's and no one else can read it.
@@ -261,8 +261,8 @@ pub fn check(needs: &Needs, host: &dyn Host) -> Report {
 /// The refusal of `invocation`, printed to standard error, if its host does not meet
 /// what it needs; `None` to go on and start.
 #[must_use]
-pub fn refusal(invocation: &Invocation) -> Option<ExitCode> {
-    let needs = needs(invocation);
+pub fn refusal(invocation: &Invocation, config: &Path) -> Option<ExitCode> {
+    let needs = needs_in(invocation, config);
     let report = check(&needs, &System);
     eprint!("{}", report.render(needs.mode));
     report.exit_status().map(ExitCode::from)
@@ -273,8 +273,8 @@ pub fn refusal(invocation: &Invocation) -> Option<ExitCode> {
 /// error, as a start prints them); the exit status is the one a start would exit with:
 /// 0, [`REFUSED`] or [`NOT_READY`].
 #[must_use]
-pub fn check_only(invocation: &Invocation) -> ExitCode {
-    let needs = needs(invocation);
+pub fn check_only(invocation: &Invocation, config: &Path) -> ExitCode {
+    let needs = needs_in(invocation, config);
     let report = check(&needs, &System);
     eprint!("{}", report.render(needs.mode));
     match report.exit_status() {

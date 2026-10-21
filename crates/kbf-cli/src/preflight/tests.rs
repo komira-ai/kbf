@@ -260,6 +260,15 @@ pub(super) const DAEMON: [&str; 8] = [
     "--data-dir=/var/lib/kbf",
 ];
 
+/// [`needs_from`] for a start that loads the settings file `config`.
+pub(super) fn needs_from_in(args: &[&str], config: &str) -> Needs {
+    let argv = std::iter::once("kbf").chain(args.iter().copied());
+    super::needs_in(
+        &crate::parse_from(argv).expect("flags parse"),
+        Path::new(config),
+    )
+}
+
 /// The needs of `kbf` run with `args`: from the flags to the checks, as a start goes.
 pub(super) fn needs_from(args: &[&str]) -> Needs {
     let argv = std::iter::once("kbf").chain(args.iter().copied());
@@ -1223,10 +1232,16 @@ mod wiring {
         let s3 = "--cold-store=s3://bucket/p?endpoint=http://127.0.0.1:9000";
         let storage = with("storage", &[s3, "--meta-dir=/m"], &hot);
         assert_eq!(storage.hot_store, Some(PathBuf::from("/srv/hot")));
-        assert_eq!(storage.key, KeyRule::Holder(key_file()));
+        assert_eq!(
+            storage.key,
+            KeyRule::Holder(key_file(std::path::Path::new("/etc/kbf/kbf.toml")))
+        );
         assert!(!storage.cpuset);
         let both = with("storage-and-daemon", &DAEMON, &[s3, "--meta-dir=/m"]);
-        assert_eq!(both.key, KeyRule::RootAlone(key_file()));
+        assert_eq!(
+            both.key,
+            KeyRule::RootAlone(key_file(std::path::Path::new("/etc/kbf/kbf.toml")))
+        );
         assert!(both.cpuset && both.hot_store.is_none());
         let s3_hot = ["--hot-store=s3://bucket/p?endpoint=http://127.0.0.1:9000"];
         assert_eq!(

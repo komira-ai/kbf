@@ -9,7 +9,9 @@
 //! or a parent cgroup can narrow them as well, so kbf reads what they cause: the
 //! `cpuset.cpus.effective` and `cpuset.mems.effective` of its own cgroup (`/proc/self/cgroup`,
 //! cgroup v2), from the nearest ancestor that has them, against the node's own sets, the
-//! kernel's `/sys/devices/system/cpu/online` and `/sys/devices/system/node/online`. Where
+//! kernel's `/sys/devices/system/cpu/online` and `/sys/devices/system/node/has_memory` (the
+//! nodes with memory, which is what `cpuset.mems.effective` follows; a memory-less node is
+//! online but never in it). Where
 //! one cannot be read (another system, a container without `/sys`), the list is not
 //! compared and a warning says so. Only the container driver places leases, so only a
 //! daemon on it is checked.
@@ -35,7 +37,7 @@ const KEYS: [(&str, &str, &str, &str); 2] = [
     (
         "AllowedMemoryNodes",
         "NUMA nodes",
-        "/sys/devices/system/node/online",
+        "/sys/devices/system/node/has_memory",
         "cpuset.mems.effective",
     ),
 ];

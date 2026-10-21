@@ -13,6 +13,13 @@ use crate::Invocation;
 /// The needs of `invocation`.
 #[must_use]
 pub fn needs(invocation: &Invocation) -> Needs {
+    needs_in(invocation, Path::new(crate::config::DEFAULT_PATH))
+}
+
+/// The needs of `invocation` started with the settings file `config`: the legacy key file
+/// is the `s3.env` in its directory.
+#[must_use]
+pub fn needs_in(invocation: &Invocation, config: &Path) -> Needs {
     match invocation {
         // The flags of a start that enrolls are made after it has: the start checks them
         // then (`node::run`).
@@ -26,7 +33,7 @@ pub fn needs(invocation: &Invocation) -> Needs {
         Invocation::Storage(flags) => {
             let mut n = Needs::new("storage");
             storage(&mut n, flags);
-            n.key = KeyRule::Holder(key_file());
+            n.key = KeyRule::Holder(key_file(config));
             n
         }
         Invocation::Frontend(flags) => {
@@ -49,7 +56,7 @@ pub fn needs(invocation: &Invocation) -> Needs {
             let mut n = Needs::new("storage-and-daemon");
             storage(&mut n, &flags.storage);
             daemon(&mut n, &flags.daemon);
-            n.key = KeyRule::RootAlone(key_file());
+            n.key = KeyRule::RootAlone(key_file(config));
             n
         }
         Invocation::AllInOne(flags) => {

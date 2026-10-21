@@ -14,7 +14,9 @@ const CGROUP: &str = "0::/system.slice/kbf-daemon.service\n";
 const UNIT: &str = "/sys/fs/cgroup/system.slice/kbf-daemon.service";
 const SLICE: &str = "/sys/fs/cgroup/system.slice";
 const CPUS: &str = "/sys/devices/system/cpu/online";
-const NODES: &str = "/sys/devices/system/node/online";
+/// The nodes with memory, which `cpuset.mems.effective` follows (not the online ones).
+const NODES: &str = "/sys/devices/system/node/has_memory";
+const ONLINE_NODES: &str = "/sys/devices/system/node/online";
 
 /// A node with CPUs 0-7 and NUMA nodes 0-1, and kbf in `kbf-daemon.service` with `cpus`
 /// and `mems` as its cgroup's effective sets.
@@ -23,6 +25,7 @@ fn node(cpus: &str, mems: &str) -> Fake {
         .file("/proc/self/cgroup", 0o444, CGROUP.as_bytes())
         .file(CPUS, 0o444, b"0-7\n")
         .file(NODES, 0o444, b"0-1\n")
+        .file(ONLINE_NODES, 0o444, b"0-1\n")
         .file(
             &format!("{UNIT}/cpuset.cpus.effective"),
             0o444,
@@ -200,4 +203,22 @@ fn only_the_container_driver_places_leases() {
         &mut report,
     );
     assert_eq!(report, Report::default());
+}
+
+/// Catches the NUMA nodes compared with the online ones: `cpuset.mems.effective` holds
+/// only nodes with memory, so a host with a memory-less node (online 0-1, memory on 0) would
+/// refuse every daemon start. A real narrowing (the cgroup misses a node that has memory)
+/// still fails.
+#[test]
+fn a_numa_node_without_memory_is_not_a_narrowing() {
+    let memoryless = node("0-7\n", "0\n").file(NODES, 0o444, b"0\n");
+    assert_eq!(run(&memoryless), Report::default());
+    let narrowed = node("0-7\n", "1\n").file(NODES, 0o444, b"0-1\n");
+    let report = run(&narrowed);
+    assert_eq!(report.problems.len(), 1, "{report:#?}");
+    assert!(
+        report.problems[0]
+            .what
+            .contains("narrower than the node's NUMA nodes 0-1")
+    );
 }

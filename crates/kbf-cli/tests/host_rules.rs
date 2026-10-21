@@ -101,3 +101,31 @@ fn a_hot_store_below_a_directory_the_user_cannot_enter_is_refused() {
         "{err}"
     );
 }
+
+/// Catches the key file looked for only at the default place: a storage node started with
+/// `--config` in another directory, beside which `s3.env` is readable by everyone, is
+/// refused at start, naming that file.
+#[test]
+fn a_lax_key_file_beside_the_loaded_config_is_refused() {
+    let dir = scratch("keyfile");
+    let key = dir.join("s3.env");
+    std::fs::write(&key, "AWS_ACCESS_KEY_ID=a\n").expect("write");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("mode");
+    let out = kbf(
+        &dir,
+        "storage",
+        &[
+            "--storage-listen=127.0.0.1:0".to_owned(),
+            format!("--cold-store=file://{}", dir.join("cold").display()),
+            format!("--meta-dir={}", dir.join("meta").display()),
+        ],
+    )
+    .output()
+    .expect("run kbf");
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(
+        err.contains(&format!("{} is mode 0644", key.display())),
+        "{err}"
+    );
+}

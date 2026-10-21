@@ -7,7 +7,7 @@
 //! static now and name none, so kbf reads what the process has:
 //!
 //! - a mode with no storage half (`daemon`, and `all-in-one` with a file cold store) has no
-//!   `AWS_*` variable in its environment, from whatever file or unit line it came
+//!   [`CREDENTIAL_VARS`] variable in its environment, from whatever file or unit line it came
 //!   ([`KeyRule::Absent`]): a build node talks to no AWS-style store, and its builds run as
 //!   its user;
 //! - the key file, `s3.env` beside `kbf.toml` ([`super::key_file`], where a node still on a
@@ -28,8 +28,26 @@ use std::path::Path;
 use super::host::Kind;
 use super::{Host, KeyRule, Needs, Report};
 
-/// The prefix of the variables an AWS SDK or CLI reads.
-const AWS_PREFIX: &str = "AWS_";
+/// The variables that carry or locate an AWS credential, as the SDK's provider chain reads
+/// them (keys, session token, profile and credential files, web identity, container
+/// credentials). Other `AWS_*` variables (`AWS_REGION`, the metadata switches) hold none.
+const CREDENTIAL_VARS: [&str; 15] = [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_CONFIG_FILE",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+];
 
 pub(super) fn check(needs: &Needs, host: &dyn Host, report: &mut Report) {
     match &needs.key {
@@ -40,13 +58,13 @@ pub(super) fn check(needs: &Needs, host: &dyn Host, report: &mut Report) {
     }
 }
 
-/// A build node holds no credential: no `AWS_*` variable, which would be a copy of the key
+/// A build node holds no credential: none of [`CREDENTIAL_VARS`], which would be a copy of the key
 /// or point an SDK at one.
 fn aws_variables(host: &dyn Host, report: &mut Report) {
     let mut names: Vec<String> = host
         .var_names()
         .into_iter()
-        .filter(|n| n.starts_with(AWS_PREFIX))
+        .filter(|n| CREDENTIAL_VARS.contains(&n.as_str()))
         .collect();
     if names.is_empty() {
         return;
