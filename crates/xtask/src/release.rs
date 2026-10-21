@@ -139,7 +139,7 @@ pub const ARTIFACTS: [&str; 6] = [
 ];
 
 /// `gh api <path>`: the JSON it printed, or `None` when GitHub answered 404.
-fn api(gh: &Path, path: &str) -> Result<Option<Value>, Error> {
+pub(crate) fn api(gh: &Path, path: &str) -> Result<Option<Value>, Error> {
     let out = Command::new(gh)
         .args(["api", path])
         .output()
