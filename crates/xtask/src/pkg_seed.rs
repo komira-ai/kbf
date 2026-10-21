@@ -4,9 +4,10 @@
 //!
 //! A seed is one signed `kbf` release of the commit the installer is built from. The verb
 //! makes `<out>`, which must not exist, from the three files the release already has in
-//! `<dist>`, and puts four files in it. Every name derives from `--commit` and `--platform`
-//! alone, never from what a file holds, so the seed is the release of that commit or it is
-//! refused (a `<dist>` of another commit's files lacks the names this commit's seed has):
+//! `<dist>`, and puts three files in it, the three the installer's seed reader opens. Every
+//! name derives from `--commit` and `--platform` alone, never from what a file holds, so the
+//! seed is the release of that commit or it is refused (a `<dist>` of another commit's files
+//! lacks the names this commit's seed has):
 //!
 //! - `manifest.json` ([`MANIFEST`]): what `kbf_installer::seed::Manifest` says, filled in from
 //!   the files below and the digests of the trust directory, as `serde_json` pretty-prints it
@@ -15,26 +16,27 @@
 //!   attestation binds those bytes); it must hold the one regular file `kbf`, as the
 //!   installer's shape check requires;
 //! - `kbf-<commit>-<platform>.tar.gz.sigstore.json`: its attestation bundle, byte for byte; it
-//!   must be a JSON object;
-//! - `kbf-<commit>-<platform>.version.json` ([`crate::version_facts::name`]): what `kbf
-//!   --version --json` printed for the build of that commit and platform, as the release's
-//!   `version-facts` step kept it, byte for byte. Nothing here ties its bytes to the
-//!   tarball's binary beyond the shared name; the installer's own probe of the staged binary
-//!   (`kbf_installer::stage::Pipeline`) does. The installer does not read this file, and the
-//!   manifest has no key for it. It is held here to the release the seed carries (the
-//!   release build of the commit, a counted `seq` above 0, this platform), the manifest
-//!   takes its numbers from it, and [`check`] refuses a seed whose facts and manifest
-//!   disagree.
+//!   must be a JSON object.
+//!
+//! The manifest's `seq`, protocol numbers, state schema and profile are read from a fourth
+//! file, an input only and never part of the seed: what `kbf --version --json` printed for
+//! the build of that commit and platform, as the release's `version-facts` step kept it
+//! under [`crate::version_facts::name`] in `<dist>`. No other source in the inputs states
+//! those numbers, and the verb does not run the binary. Nothing here ties its bytes to the
+//! tarball's binary beyond the shared name; the installer's own probe of the staged binary
+//! against the manifest (`kbf_installer::stage::Pipeline`) does. It is held to the release
+//! the seed carries (the release build of the commit, a counted `seq` above 0, this
+//! platform).
 //!
 //! [`build`] accumulates every problem of the inputs into one [`Error::Refused`] and writes
 //! nothing. It reads the manifest it made with the installer's own parser and requires the
 //! file names the installer derives from that manifest to be the names written, so a rename
 //! on either side is caught here and not on a host. [`check`] judges a directory that
 //! exists, for the package builder and the asset check to ask of what they are handed:
-//! exactly the four names, each a regular file (a link is refused), the manifest this
-//! module's reader accepts, the facts as `build` judges them, the tarball's and the bundle's
-//! digests as the manifest says, and the manifest's commit, platform and trust digests as
-//! [`Expect`] says. It does not open the tarball or parse the bundle.
+//! exactly the three names, each a regular file (a link is refused), the manifest this
+//! module's reader accepts, the tarball's and the bundle's digests as the manifest says, and
+//! the manifest's commit, platform and trust digests as [`Expect`] says. It does not open the
+//! tarball or parse the bundle.
 //!
 //! No package carries the seed yet.
 
@@ -87,7 +89,8 @@ impl TrustDigests {
 #[derive(Clone, Copy, Debug)]
 pub struct Inputs<'a> {
     /// The directory holding the release tarball, its attestation bundle and its version
-    /// facts, each under the name the seed has it by.
+    /// facts (an input only: the seed does not carry them), each under the name the release
+    /// has it by.
     pub dist: &'a Path,
     /// The commit the release was built from, a full SHA.
     pub commit: &'a str,
@@ -113,7 +116,7 @@ pub struct Expect<'a> {
 pub struct Seed {
     /// The first 12 digits of the commit: the name of the seed's directory in a package.
     pub commit12: String,
-    /// Each file's name and bytes: `manifest.json` first, then the other three by name.
+    /// Each file's name and bytes: `manifest.json` first, then the other two by name.
     pub files: Vec<(String, Vec<u8>)>,
 }
 
@@ -139,7 +142,8 @@ pub struct Args {
     pub out: PathBuf,
 }
 
-/// The names of the four files of the seed of a commit on a platform.
+/// The names of the files of the release of a commit on a platform: the seed's tarball and
+/// bundle, and the version facts the manifest's numbers are read from.
 struct Names {
     tarball: String,
     bundle: String,
@@ -157,9 +161,9 @@ impl Names {
         }
     }
 
-    /// All four names, the manifest's first.
-    fn all(&self) -> [&str; 4] {
-        [MANIFEST, &self.tarball, &self.bundle, &self.facts]
+    /// The three names of the seed, the manifest's first.
+    fn all(&self) -> [&str; 3] {
+        [MANIFEST, &self.tarball, &self.bundle]
     }
 }
 
@@ -268,16 +272,14 @@ fn judge_facts(bytes: &[u8], commit: &str, platform: Platform) -> Result<Stated,
     })
 }
 
-/// The facts file `name` in `dir`, whole, and what it states.
+/// What the facts file `name` in `dir` states.
 fn facts_read(
     dir: &Path,
     name: &str,
     commit: &str,
     platform: Platform,
-) -> Result<(Vec<u8>, Stated), Vec<String>> {
-    let bytes = take(dir, name)?;
-    let stated = judge_facts(&bytes, commit, platform)?;
-    Ok((bytes, stated))
+) -> Result<Stated, Vec<String>> {
+    judge_facts(&take(dir, name)?, commit, platform)
 }
 
 /// The manifest in `bytes`, by the installer's reader.
@@ -366,24 +368,7 @@ fn bundle_unequal(m: &Manifest, bytes: &[u8]) -> Vec<String> {
     digest.into_iter().collect()
 }
 
-/// What the facts file states against the manifest's `seq`, numbers and profile.
-fn facts_unequal(m: &Manifest, s: &Stated) -> Vec<String> {
-    let rows = [
-        ("seq", s.seq, m.seq),
-        ("protocol", s.protocol, m.protocol.into()),
-        ("min_protocol", s.min_protocol, m.min_protocol.into()),
-        ("state_schema", s.state_schema, m.state_schema.into()),
-    ];
-    let mut problems = Vec::new();
-    for (name, found, expected) in rows {
-        let what = format!("version facts {name}");
-        problems.extend(unequal(&what, &found.to_string(), &expected.to_string()));
-    }
-    problems.extend(unequal("version facts profile", &s.profile, &m.profile));
-    problems
-}
-
-/// The entries of `dir` that are none of the four files of a seed.
+/// The entries of `dir` that are none of the three files of a seed.
 fn unexpected(dir: &Path, names: &Names) -> Result<Vec<String>, Error> {
     let what = format!("read {}", dir.display());
     let listed = std::fs::read_dir(dir).map_err(Error::spawn(what))?;
@@ -412,7 +397,7 @@ pub fn build(i: &Inputs) -> Result<Seed, Error> {
     let bundle = settle(bundle, &mut problems);
     let facts = facts_read(i.dist, &names.facts, i.commit, i.platform);
     let facts = settle(facts, &mut problems);
-    let (Some(tarball), Some(bundle), Some((facts, stated))) = (tarball, bundle, facts) else {
+    let (Some(tarball), Some(bundle), Some(stated)) = (tarball, bundle, facts) else {
         return Err(Error::Refused(problems));
     };
     let manifest = Manifest {
@@ -438,11 +423,7 @@ pub fn build(i: &Inputs) -> Result<Seed, Error> {
     if !problems.is_empty() {
         return Err(Error::Refused(problems));
     }
-    let mut rest = vec![
-        (names.tarball, tarball),
-        (names.bundle, bundle),
-        (names.facts, facts),
-    ];
+    let mut rest = vec![(names.tarball, tarball), (names.bundle, bundle)];
     rest.sort();
     let mut files = vec![(MANIFEST.to_owned(), json)];
     files.extend(rest);
@@ -452,7 +433,7 @@ pub fn build(i: &Inputs) -> Result<Seed, Error> {
     })
 }
 
-/// The `pkg-seed` verb on `i`: [`build`], then the four files in the new directory `out`
+/// The `pkg-seed` verb on `i`: [`build`], then the three files in the new directory `out`
 /// (its parents are made when missing). The lines to print: where, and each file's sha256.
 /// A file that cannot be written leaves the files before it, and the directory then exists:
 /// the rerun needs another `out`.
@@ -488,13 +469,10 @@ pub fn check(dir: &Path, want: &Expect) -> Result<Vec<String>, Error> {
     let manifest = settle(manifest_in(dir), &mut problems);
     let tarball = settle(take(dir, &names.tarball), &mut problems);
     let bundle = settle(take(dir, &names.bundle), &mut problems);
-    let facts = facts_read(dir, &names.facts, want.commit, want.platform);
-    let facts = settle(facts, &mut problems);
     if let Some(m) = &manifest {
         problems.extend(manifest_unequal(m, want));
         problems.extend(tarball.iter().flat_map(|t| tarball_unequal(m, t)));
         problems.extend(bundle.iter().flat_map(|b| bundle_unequal(m, b)));
-        problems.extend(facts.iter().flat_map(|(_, s)| facts_unequal(m, s)));
     }
     Ok(problems)
 }

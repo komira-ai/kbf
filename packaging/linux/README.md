@@ -120,11 +120,13 @@ configuration).
 
 `cargo xtask pkg-seed --dist <dir> --commit <sha> --platform <platform> --trust <dir> --out <dir>`
 builds the seed directory the installer reads (`crates/kbf-installer/src/seed.rs`): a
-`manifest.json`, the `kbf` release tarball, its attestation bundle and the release's version
-facts, the last three named for the commit and the platform, and refuses a release that is
-not whole. `--trust` is the directory `pkg-trust` wrote; the digests of its three files go in
-the manifest. `xtask::pkg_seed::check` holds an existing directory to the same names,
-digests, commit, platform and trust digests (it does not open the tarball). No package
+`manifest.json`, the `kbf` release tarball and its attestation bundle, the last two named
+for the commit and the platform, and refuses a release that is not whole. The manifest's
+`seq`, protocol numbers, state schema and profile are read from the build's
+`kbf-<commit>-<platform>.version.json` in `--dist`, which is an input only and is not
+copied into the seed. `--trust` is the directory `pkg-trust` wrote; the digests of its three
+files go in the manifest. `xtask::pkg_seed::check` holds an existing directory to the same
+names, digests, commit, platform and trust digests (it does not open the tarball). No package
 carries a seed yet: `pkg-config` and `pkg-build` do not take one, so the packages above are
 unchanged.
 

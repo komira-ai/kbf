@@ -196,22 +196,24 @@ impl Fixture {
     }
 }
 
-/// A good seed is four files, named for the commit and the platform and nothing else, that
-/// `check` accepts: the tarball, the bundle and the facts byte for byte as the release has
-/// them, and a manifest the installer's own reader parses to the values of the inputs, whose
-/// file names (as the reader derives them) are the names written. Two builds are the same
-/// bytes, and `write` makes the directory of exactly those files.
+/// A good seed is three files, named for the commit and the platform and nothing else, that
+/// `check` accepts: the tarball and the bundle byte for byte as the release has them, and a
+/// manifest the installer's own reader parses to the values of the inputs (the numbers
+/// being the facts file's, which the seed does not carry), whose file names (as the reader
+/// derives them) are the names written. Two builds are the same bytes, and `write` makes
+/// the directory of exactly those files.
 ///
 /// Catches: a file name taken from an input (any name in `dist`), a file changed on its way
 /// in (a re-compressed tarball no attestation covers), a manifest with a time or an order
 /// that varies, a manifest field read from the wrong input, a builder and a reader that
-/// name the files differently, and a directory with a file more or less than the four.
+/// name the files differently, and a directory with a file more or less than the three
+/// (the version facts copied into it).
 ///
-/// Mutants it catches: the facts file copied with a changed byte; `seq` or `protocol`
-/// read from the wrong field; the bundle digest taken of the tarball; the `.version.json`
-/// suffix changed; the manifest not first; a trust digest swapped for another's.
+/// Mutants it catches: the facts file copied into the seed; `seq` or `protocol` read from
+/// the wrong field; the bundle digest taken of the tarball; the `.version.json` suffix
+/// changed; the manifest not first; a trust digest swapped for another's.
 #[test]
-fn a_good_seed_is_four_named_files_that_check_accepts_and_build_the_same_bytes() {
+fn a_good_seed_is_three_named_files_that_check_accepts_and_build_the_same_bytes() {
     let f = Fixture::new("good", A, X86);
     let seed = build(&f.inputs()).expect("build");
     let again = build(&f.inputs()).expect("again");
@@ -269,7 +271,7 @@ fn a_good_seed_is_four_named_files_that_check_accepts_and_build_the_same_bytes()
         assert_eq!(&kept, bytes, "{name}");
     }
     let lines = write(&f.inputs(), &f.dir.join("again")).expect("write");
-    assert_eq!(lines.len(), 5, "{lines:?}");
+    assert_eq!(lines.len(), 4, "{lines:?}");
     assert!(lines[0].starts_with("wrote "), "{lines:?}");
     let first = Sha256::of(&seed.files[0].1);
     assert_eq!(lines[1], format!("{first}  {MANIFEST}"));
@@ -430,9 +432,9 @@ fn another_commits_files_do_not_make_this_commits_seed() {
     };
     let problems = problems_of(build(&for_a));
     let wanted = Names::of(A, X86);
-    let all = wanted.all();
+    let missing = [&wanted.tarball, &wanted.bundle, &wanted.facts];
     assert_eq!(problems.len(), 3, "{problems:?}");
-    for (problem, name) in problems.iter().zip(&all[1..]) {
+    for (problem, name) in problems.iter().zip(missing) {
         assert!(problem.contains(name), "{problem}");
         assert!(problem.ends_with(NOT_REGULAR), "{problem}");
     }
@@ -579,50 +581,10 @@ fn facts_that_are_not_a_counted_release_build_for_the_platform_are_refused() {
     }
 }
 
-/// A facts file in a seed directory that no longer agrees with the manifest is refused, field
-/// by field: the `seq`, each of the three numbers, and the profile (a manifest that says
-/// `debug` against facts that say `release`). Facts that are themselves refused are
-/// reported, and the comparison with the manifest is not made against them.
-///
-/// Catches: a manifest and a facts file that drifted (one rewritten), and any one field left
-/// out of the comparison.
-///
-/// Mutants it catches: any of the five comparisons in `facts_unequal` dropped; the numbers
-/// compared as text with a different spelling.
-#[test]
-fn a_facts_file_that_disagrees_with_the_manifest_is_refused_field_by_field() {
-    let f = Fixture::new("disagree", A, X86);
-    let out = f.written();
-    let facts_file = out.join(f.names().facts);
-    let changes: [(&str, u64, u64); 4] = [
-        ("seq", SEQ, SEQ + 1),
-        ("protocol", 4, 5),
-        ("min_protocol", 3, 2),
-        ("state_schema", 7, 8),
-    ];
-    for (key, was, now) in changes {
-        let mut value = facts(A, X86);
-        value[key] = json!(now);
-        rewrite(&facts_file, &value);
-        let want = format!("version facts {key} is {now}, not {was}");
-        assert_eq!(f.problems_in(&out), vec![want]);
-    }
-    rewrite(&facts_file, &facts(A, X86));
-    edit_manifest(&out, |m| m["profile"] = json!("debug"));
-    let want = "version facts profile is release, not debug".to_owned();
-    assert_eq!(f.problems_in(&out), vec![want]);
-
-    let mut value = facts(A, X86);
-    value["seq"] = json!(0);
-    rewrite(&facts_file, &value);
-    let problem = only(f.problems_in(&out));
-    assert!(problem.contains("have no seq, or seq 0"), "{problem}");
-}
-
-/// A directory of the wrong shape is refused: files more (named, in order), a link in place
-/// of a file even when its target is the right bytes, a directory where a file belongs, a
-/// file less, a manifest less (nothing else is judged against it), and a directory that
-/// cannot be listed (an error, not a clean check).
+/// A directory of the wrong shape is refused: files more (named, in order, the build's
+/// version facts among them), a link in place of a file even when its target is the right
+/// bytes, a directory where a file belongs, a file less, a manifest less (nothing else is
+/// judged against it), and a directory that cannot be listed (an error, not a clean check).
 ///
 /// Catches: a seed that carries a file the package builder did not make (a second tarball,
 /// a script), a link followed out of the directory, and a missing file passed over.
@@ -636,11 +598,13 @@ fn a_seed_directory_of_the_wrong_shape_is_refused() {
     let out = f.written();
     put(&out, "b.txt", b"extra");
     put(&out, "a.txt", b"extra");
+    let facts = names.facts.as_str();
+    put(&out, facts, b"the build's version facts");
     std::fs::create_dir(out.join("zzz")).expect("dir");
-    let extras = ["a.txt", "b.txt", "zzz"];
+    let extras = ["a.txt", "b.txt", facts, "zzz"];
     let want = extras.map(|n| format!("unexpected file {n}"));
     assert_eq!(f.problems_in(&out), want);
-    for extra in ["a.txt", "b.txt"] {
+    for extra in ["a.txt", "b.txt", facts] {
         std::fs::remove_file(out.join(extra)).expect("remove");
     }
     std::fs::remove_dir(out.join("zzz")).expect("remove");
@@ -788,7 +752,7 @@ fn the_verb_makes_the_seed_from_a_trust_directory_or_fails_before_it_makes_any()
         out: f.seed_dir(),
     };
     let lines = run(&args).expect("run");
-    assert_eq!(lines.len(), 5, "{lines:?}");
+    assert_eq!(lines.len(), 4, "{lines:?}");
     assert_eq!(f.problems_in(&f.seed_dir()), Vec::<String>::new());
     let failing = Args {
         trust: f.dir.join("no-trust"),

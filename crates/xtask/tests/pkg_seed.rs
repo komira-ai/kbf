@@ -101,10 +101,11 @@ fn listing(dir: &Path) -> Vec<String> {
 }
 
 #[test]
-fn pkg_seed_writes_the_four_files_and_does_not_write_over_them() {
-    // Catches: the verb not wired to its writer (no directory, or one that is not the four
-    // files), a manifest the installer's own reader refuses, a file written executable, and
-    // a second run that writes into the directory the first made.
+fn pkg_seed_writes_the_three_files_and_does_not_write_over_them() {
+    // Catches: the verb not wired to its writer (no directory, or one that is not the three
+    // files, the build's version facts among them), a manifest the installer's own reader
+    // refuses, a file written executable, and a second run that writes into the directory
+    // the first made.
     let dir = scratch("happy");
     release(&dir);
     let out = dir.join("seed");
@@ -114,7 +115,6 @@ fn pkg_seed_writes_the_four_files_and_does_not_write_over_them() {
     let want = [
         format!("{stem}.tar.gz"),
         format!("{stem}.tar.gz.sigstore.json"),
-        format!("{stem}.version.json"),
         "manifest.json".to_owned(),
     ];
     assert_eq!(listing(&out), want);
