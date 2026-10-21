@@ -29,12 +29,23 @@ pub enum DocError {
     /// A waiver without who or why.
     #[error("waiver for `{0}` names no operator or no reason")]
     Waiver(String),
+    /// Free text with a control character (a newline could forge a line of the release notes).
+    #[error("`{0}` holds a control character")]
+    ControlChar(&'static str),
     /// An offer document a reader refuses.
     #[error("offer document: {0}")]
     Offer(String),
     /// A hash that is not lower-case hex of the right length.
     #[error("`{0}` is not a lower-case hex string of {1} characters")]
     Hex(String, &'static str),
+}
+
+/// Refuse U+0000..=U+001F and U+007F in `s`, naming `field`.
+fn plain_text(field: &'static str, s: &str) -> Result<(), DocError> {
+    if s.chars().any(|c| c.is_ascii_control()) {
+        return Err(DocError::ControlChar(field));
+    }
+    Ok(())
 }
 
 fn hex_of(s: &str, lens: &[usize], what: &'static str) -> Result<String, DocError> {
@@ -202,6 +213,9 @@ impl Waiver {
         if by.trim().is_empty() || reason.trim().is_empty() {
             return Err(DocError::Waiver(what.to_owned()));
         }
+        plain_text("waiver what", what)?;
+        plain_text("waiver by", by)?;
+        plain_text("waiver reason", reason)?;
         Ok(Self {
             what: what.to_owned(),
             by: by.to_owned(),
@@ -268,7 +282,8 @@ pub struct ResultDoc {
     pub observed: Vec<String>,
     /// The release tag a gamma verdict is for; `release verdict` refuses another.
     pub tag: Option<String>,
-    /// What makes the release not reversible (section 8.3), one line each; the notes carry it.
+    /// What the run author thought not reversible, one line each. Informational: the release
+    /// notes do not read it (verify computes the irreversible list).
     pub not_reversible: Vec<String>,
     /// The scenarios only gamma found (section 10), one line each; the notes count them.
     pub escapes: Vec<String>,
@@ -340,6 +355,11 @@ impl ResultDoc {
         }
         for w in &doc.waivers {
             Waiver::new(&w.what, &w.by, &w.reason)?;
+        }
+        for (field, lines) in [("escapes", &doc.escapes), ("withdrawn", &doc.withdrawn)] {
+            for l in lines {
+                plain_text(field, l)?;
+            }
         }
         if doc.status == Status::Green {
             if doc.gates.is_empty() {
