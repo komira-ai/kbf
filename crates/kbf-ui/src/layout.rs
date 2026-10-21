@@ -10,10 +10,12 @@ use crate::{PREFIX, STYLESHEET};
 const NAV: &[(&str, &str)] = &[
     ("Overview", PREFIX),
     ("Builds", "/ui/builds"),
+    ("Targets", "/ui/targets"),
     ("Nodes", "/ui/nodes"),
     ("Updates", "/ui/updates"),
     ("Leases", "/ui/leases"),
     ("Queue", "/ui/queue"),
+    ("Storage", "/ui/storage"),
 ];
 
 /// A URL the page asked for, as the page lists it.

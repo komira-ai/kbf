@@ -13,12 +13,18 @@ mod action;
 mod build;
 mod builds;
 mod failures;
+#[cfg(test)]
+pub(crate) mod history_fixtures;
 mod leases;
 mod nodes;
 mod overview;
 mod queue;
 mod refresh;
 mod sched;
+mod storage;
+mod strip;
+mod target;
+mod targets;
 mod updates;
 
 #[cfg(test)]
@@ -46,6 +52,15 @@ pub(crate) use queue::queue;
 #[cfg(test)]
 pub(crate) use sched::fixtures::sched_farm;
 #[cfg(test)]
+pub(crate) use storage::STORAGE;
+pub(crate) use storage::storage;
+#[cfg(test)]
+pub(crate) use target::TARGET;
+pub(crate) use target::target;
+#[cfg(test)]
+pub(crate) use targets::TARGETS;
+pub(crate) use targets::targets;
+#[cfg(test)]
 pub(crate) use updates::UPDATES;
 use updates::UPDATES_PATH;
 pub(crate) use updates::updates;
@@ -55,8 +70,9 @@ pub(crate) const BUILDS_PATH: &str = "/ui/builds";
 
 /// Every page, for the contract test.
 #[cfg(test)]
-pub(crate) const PAGES: [&Page; 9] = [
-    &OVERVIEW, &BUILDS, &BUILD, &ACTION, &NODES, &NODE, &UPDATES, &LEASES, &QUEUE,
+pub(crate) const PAGES: [&Page; 12] = [
+    &OVERVIEW, &BUILDS, &BUILD, &ACTION, &NODES, &NODE, &UPDATES, &LEASES, &QUEUE, &TARGETS,
+    &TARGET, &STORAGE,
 ];
 
 /// What a path segment keeps unencoded: RFC 3986's unreserved characters.

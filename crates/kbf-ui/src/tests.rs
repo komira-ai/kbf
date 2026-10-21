@@ -11,7 +11,8 @@ use futures::executor::block_on;
 use serde_json::{Value, json};
 
 use crate::pages::{
-    ACTION, BUILD, BUILDS, LEASES, NODE, NODES, OVERVIEW, PAGES, QUEUE, UPDATES, sched_farm,
+    ACTION, BUILD, BUILDS, LEASES, NODE, NODES, OVERVIEW, PAGES, QUEUE, STORAGE, TARGET, TARGETS,
+    UPDATES, sched_farm,
 };
 use crate::read::Page;
 use crate::{Answer, CONTENT_SECURITY_POLICY, Fetched, Source, SourceError, respond};
@@ -373,6 +374,52 @@ pub(crate) fn updates_farm() -> Fake {
         .json(HOSTS_URL, &hosts_doc())
 }
 
+/// One storage member of `GET /v1/storage`, every report value known.
+pub(crate) fn storage_node(id: u64, state: &str) -> Value {
+    json!({
+        "id": id, "state": state, "planned_down": false, "repair_debts": 3,
+        "open_writes": 0, "generation": 12,
+        "unflushed_bytes": 1_048_576, "unflushed_blocks": 2, "oldest_unflushed_ms": 4200,
+        "budget_bytes": 107_374_182_400_u64, "used_bytes": 2_097_152,
+        "flush_failures": 0, "flush_conflicts": 5,
+    })
+}
+
+/// A member whose report says nothing: every value is `null`.
+pub(crate) fn storage_node_unknown(id: u64, state: &str) -> Value {
+    let mut node = storage_node(id, state);
+    for key in [
+        "repair_debts",
+        "open_writes",
+        "generation",
+        "unflushed_bytes",
+        "unflushed_blocks",
+        "oldest_unflushed_ms",
+        "budget_bytes",
+        "used_bytes",
+        "flush_failures",
+        "flush_conflicts",
+    ] {
+        node[key] = Value::Null;
+    }
+    node
+}
+
+/// `GET /v1/storage` with one known member and one that is silent.
+pub(crate) fn storage_doc() -> Value {
+    json!({
+        "members_total": 2, "members_active": 2, "not_active": [], "silent": [2],
+        "unreported": [], "debts_total": 3, "under_replicated_blobs": null,
+        "reasons": ["member 2 silent", "3 blobs owed"],
+        "nodes": [storage_node(1, "active"), storage_node_unknown(2, "active")],
+    })
+}
+
+/// A read API that answers the Storage page's route.
+pub(crate) fn storage_farm() -> Fake {
+    Fake::default().json("/v1/storage", &storage_doc())
+}
+
 /// The markup a hostile node or build would send in every string the pages show.
 pub(crate) const HOSTILE: &str = "<script>alert(1)</script>\"'&<img src=x onerror=alert(2)>";
 
@@ -462,8 +509,12 @@ pub(crate) fn fleet_farm() -> Fake {
 fn fake_for(page: &Page) -> Fake {
     if page.name == UPDATES.name {
         updates_farm()
+    } else if page.name == TARGETS.name || page.name == TARGET.name {
+        crate::pages::history_fixtures::farm()
     } else if page.name == LEASES.name || page.name == QUEUE.name {
         sched_farm()
+    } else if page.name == STORAGE.name {
+        storage_farm()
     } else if [OVERVIEW.name, NODES.name, NODE.name].contains(&page.name) {
         fleet_farm()
     } else {
@@ -647,6 +698,15 @@ fn contract_table() -> Vec<(&'static Page, Vec<String>)> {
             vec!["/ui/leases".to_owned(), "/ui/leases?node=node-a".to_owned()],
         ),
         (&QUEUE, vec!["/ui/queue".to_owned()]),
+        (&TARGETS, vec!["/ui/targets".to_owned()]),
+        (
+            &TARGET,
+            vec![
+                "/ui/targets/1111111111111111?instance=main&cfg=cfgA".to_owned(),
+                "/ui/targets/1111111111111111".to_owned(),
+            ],
+        ),
+        (&STORAGE, vec!["/ui/storage".to_owned()]),
     ]
 }
 
