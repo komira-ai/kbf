@@ -54,6 +54,9 @@ futures.workspace = true
 h2.workspace = true
 hex.workspace = true
 http.workspace = true
+# `tests/planned_restart.rs`: the farm of real `kbf` processes it drives and the REAPI
+# client of its frontend (`kbf_harness::reapi`).
+kbf-harness.workspace = true
 # `tests/ui_through_proxy.rs`: the real server's policy, and the scheduler's timings its
 # listeners are given.
 kbf-auth.workspace = true
