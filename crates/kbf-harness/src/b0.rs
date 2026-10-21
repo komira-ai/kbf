@@ -57,7 +57,7 @@ pub struct B0 {
     /// `kbf-m2-act`, the program the sample project's actions run.
     pub act: PathBuf,
     pub buck2: PathBuf,
-    /// The sample project (`crates/kbf-it/beta/buck2`).
+    /// The sample project (`crates/kbf-integration-test/beta/buck2`).
     pub project: PathBuf,
     /// The run's directory: the farm, the project's copy, `logs/` and the result.
     pub work: PathBuf,

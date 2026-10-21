@@ -10,16 +10,16 @@ inputs, and `crates/xtask/src/pkg_linux.rs` is the one place that says what goes
 
 | path | what |
 |---|---|
-| `sysusers.d/kbf-installer.conf` | the users `kbf`, `kbf-server`, `kbf-fetch`, `kbf-verify` (no login); installed to `/usr/lib/sysusers.d` |
+| `sysusers.d/kbf-installer.conf` | the users `kbf`, `kbf-server`, `kbf-fetch`, `kbf-signer` (no login); installed to `/usr/lib/sysusers.d` |
 | `tmpfiles.d/kbf-installer.conf` | `/run/kbf-installer` (0755), `/var/cache/kbf-fetch` (0711); the units author's file, packaged unchanged; installed to `/usr/lib/tmpfiles.d` |
-| `units/` | the unit files (`kbf-*.service`, `kbf-*.timer`, `kbf.slice`), installed to `/usr/lib/systemd/system`; `testdata/units` is the fixture for the unit tests only |
+| `units/` | the unit files (`kbf-*.service`, `kbf-*.socket`, `kbf.slice`), installed to `/usr/lib/systemd/system`; `testdata/units` is the fixture for the unit tests only |
 | `testdata/` | fixtures for the install test only: two gated units and three stand-in trust files |
 | `test/ubuntu`, `test/fedora` | the fresh systems the install test uses, systemd as PID 1, pinned by digest |
 
 ## What the package holds
 
 - `/usr/bin/kbf-installer` (0755);
-- every file of `packaging/linux/units` (the `kbf-*.service` and `kbf-*.timer` files and `kbf.slice`; the
+- every file of `packaging/linux/units` (the `kbf-*.service` and `kbf-*.socket` files and `kbf.slice`; the
   unit files are packaging's input from the units author, packaged unchanged) in
   `/usr/lib/systemd/system` (0644);
 - `/usr/share/kbf-installer/trust/`: `gh` (0755), `trusted_root.jsonl`, `installer.conf` (0644);
@@ -41,7 +41,7 @@ A frontend host enables exactly one of two units; they bind the same ports.
   slot per instance). It is kept until the proxy work removes it (frontend-proxy units U7c);
   `kbf-installer setup` enables `kbf-frontend.service`, never the template.
 
-It refuses anything else (a unit named none of `kbf-*.service`, `kbf-*.socket`, `kbf-*.timer` and `kbf.slice`, a fourth trust file, no unit).
+It refuses anything else (a unit named none of `kbf-*.service`, `kbf-*.socket` and `kbf.slice`, a fourth trust file, no unit).
 
 Dependencies: deb `crun, uidmap, systemd, ca-certificates`; rpm the same with Fedora's name
 for `uidmap`, `shadow-utils`. Never Podman, never Envoy (a test pins it): Envoy
@@ -96,7 +96,7 @@ Two call sites, one way to build: both go through `pkg-config` and `pkg-build`.
 - Each mode unit runs `/var/lib/kbf-installer/releases/current/kbf`, the link the installer
   creates and flips (`layout.rs`), after `kbf-installer boot-check`. The frontend template
   runs its `slots/%i` link.
-- `crates/kbf-it/tests/package_installer_verbs.rs` parses every `kbf-installer` command line of
+- `crates/kbf-integration-test/tests/package_installer_verbs.rs` parses every `kbf-installer` command line of
   these units, and of the macOS property list, with the binary's own parser and refuses a verb that
   is not built; it also holds the exec path to the layout's.
 

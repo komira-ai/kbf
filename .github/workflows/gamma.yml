@@ -32,7 +32,7 @@
 # deployments from main only, and it reaches one step, after `cargo xtask` is built. No
 # host or user is written in this file (they are repository variables, and public once a step
 # has them). Re-running the jobs replaces the uploaded files. The workflow lint
-# (crates/kbf-it/tests/workflows/workflow_run.rs) holds this file to all of that.
+# (crates/kbf-integration-test/tests/workflows/workflow_run.rs) holds this file to all of that.
 name: gamma
 
 on:

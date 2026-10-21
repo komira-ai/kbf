@@ -397,6 +397,15 @@ mod tests {
         (dir, cli)
     }
 
+    /// The daemon half's starter over a plane on an in-memory cache, as the modes give it
+    /// theirs. The fake driver the tests use never asks for the plane.
+    fn starter(tokio: &Runtime) -> Starter {
+        let _context = tokio.enter();
+        let cache = Arc::new(kbf_front::Cache::memory());
+        let store = kbf_server::LocalStore::new(cache, kbf_front::SegmentsConfig::DEFAULT);
+        in_process(Arc::new(LocalDataPlane::new(store, tokio.handle().clone())))
+    }
+
     /// Catches `with_draining_daemon` not draining on a signal or not stopping the half
     /// beside the daemon after it: a daemon half started as `kbf storage-and-daemon`
     /// starts it, with a SIGTERM sent to this process, returns `Ok` and the half beside it
@@ -423,8 +432,7 @@ mod tests {
                 Ok(())
             })
         };
-        let start: Starter =
-            Box::new(|cli| kbf_node::start_with::<LocalDataPlane>(cli, |_| Err("no plane".into())));
+        let start = starter(&tokio);
         // SAFETY: raise(3) on this process, which handles SIGTERM above.
         assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
         let served = with_draining_daemon(&tokio, serving, stop, start, signals, &cli);
@@ -469,9 +477,7 @@ mod tests {
                     source: std::io::Error::other("in use"),
                 })
             });
-            let start: Starter = Box::new(|cli| {
-                kbf_node::start_with::<LocalDataPlane>(cli, |_| Err("no plane".into()))
-            });
+            let start = starter(&tokio);
             let served = with_draining_daemon(&tokio, serving, stop, start, signals, &cli);
             ended
                 .send(served.expect_err("the half failed").said("storage"))

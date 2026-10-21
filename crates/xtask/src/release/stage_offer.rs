@@ -63,7 +63,7 @@ use kbf_gate::{Target, system_clock};
 use kbf_types::ReleasePlatform;
 
 use super::offer::{self, Attester, Evidence, Gh, IDENTITY_CAP, Request, incomplete, render};
-use super::previous::{self, PreviousArgs, tag_commit};
+use super::fetch_previous::{self, FetchPreviousArgs, tag_commit};
 use super::tags::{self, Standing};
 use crate::Error;
 use crate::build_commit::{full_commit, write_executable};
@@ -381,7 +381,7 @@ fn trusted_root(gh: &Path, scratch: &Path) -> Result<PathBuf, Error> {
     Ok(path)
 }
 
-/// The release before `--sha`, as `release previous` finds it: its commit, and the file its
+/// The release before `--sha`, as `release fetch-previous` finds it: its commit, and the file its
 /// `kbf --version --json` wrote. `None` when there is no release before.
 struct Before {
     sha: String,
@@ -396,7 +396,7 @@ fn previous_build(
     scratch: &Path,
 ) -> Result<Option<Before>, Error> {
     let unpacked = scratch.join("previous");
-    let lines = previous::run(&PreviousArgs {
+    let lines = fetch_previous::run(&FetchPreviousArgs {
         repo: a.repo.clone(),
         sha: a.sha.clone(),
         platform,

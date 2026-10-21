@@ -675,7 +675,7 @@ only if the `ibtool`/`actool` probe passes.
 | `kbf-driver-vm` (new) | section 6 | ~3,000 with tests |
 | `kbf-vmm`, `kbf-guest` (new) | the VM helper, run as a dedicated non-admin uid (needs `kbf-mac-session run`, [fleet-updates.md](fleet-updates.md) phase P1), and the guest agent | ~1,000 |
 | `kbf-segments`, `kbf-front` | chunked upload, if images ship through the CAS | ~400 |
-| `kbf-it` | the freshness test on VMs | ~150 |
+| `kbf-integration-test` | the freshness test on VMs | ~150 |
 
 Exit: two XCUITest actions run at once on one Mac beside bare-metal builds; a third
 waits; each VM is gone afterwards; measured boot time, idle guest memory and a real

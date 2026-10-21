@@ -46,7 +46,7 @@
 //! placement be if this member were `Active`", for checking a joiner's fill before promotion.
 //!
 //! This is a pure crate: no I/O, async runtime, clock or randomness. The layering test in
-//! `kbf-it` and the lists in `clippy.toml` enforce it.
+//! `kbf-integration-test` and the lists in `clippy.toml` enforce it.
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 

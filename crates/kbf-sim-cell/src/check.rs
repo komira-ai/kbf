@@ -642,8 +642,9 @@ mod tests {
         assert!(all_accepted(&reported, &seen.accepted).is_ok());
         // An action-cache entry for an action with no accepted result.
         let mut cached = MetaState::new(Retention::default());
-        let Applied::Epoch(epoch) = cached.execute(1, Command::AllocEpoch) else {
-            panic!("an epoch")
+        let epoch = match cached.execute(1, Command::AllocEpoch) {
+            Applied::Epoch(epoch) => epoch,
+            other => panic!("an epoch, got {other:?}"),
         };
         let result = input_of(&action(0));
         let location = Location {

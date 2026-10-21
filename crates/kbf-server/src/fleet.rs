@@ -28,6 +28,7 @@
 
 use kbf_proto::worker::{NodeStatus, XcodeState, XcodeStatus};
 use kbf_sched::NodePhase;
+use kbf_types::Resources;
 use serde::Serialize;
 
 use crate::update_status::UpdateSummary;
@@ -57,6 +58,51 @@ pub struct NodeView {
     pub placement: PlacementView,
     /// What its newest `Hello` says it is doing besides running leases.
     pub phase: PhaseView,
+    /// How many leases it holds (granted or running) now.
+    pub lease_count: u32,
+    /// What those leases book of its capacity.
+    pub booked: ResourcesView,
+}
+
+/// A resource vector (`kbf_types::Resources`) as the operator API writes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ResourcesView {
+    /// CPU in thousandths of a core.
+    pub cpu_millis: u64,
+    /// Memory in bytes.
+    pub memory_bytes: u64,
+    /// Whole GPUs.
+    pub gpus: u64,
+    /// VM slots.
+    pub vms: u64,
+}
+
+impl ResourcesView {
+    /// The view of `r`.
+    #[must_use]
+    pub const fn of(r: Resources) -> Self {
+        Self {
+            cpu_millis: r.cpu_millis,
+            memory_bytes: r.memory_bytes,
+            gpus: r.gpus,
+            vms: r.vms,
+        }
+    }
+}
+
+/// One node as `GET /v1/nodes/{id}` answers: its entry of the list, and what the list
+/// leaves out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NodeDetail {
+    /// Every field of the list entry.
+    #[serde(flatten)]
+    pub node: NodeView,
+    /// What its newest `Hello` says it can run at once.
+    pub capacity: ResourcesView,
+    /// What is left of `capacity` after `booked`, never below zero.
+    pub free: ResourcesView,
+    /// The leases it holds, as `term.seq`, in lease order.
+    pub leases: Vec<String>,
 }
 
 /// A node's phase (`kbf_sched::NodePhase`). Serialized with its `state` as a tag.

@@ -40,10 +40,13 @@ clap.workspace = true
 flate2.workspace = true
 kbf-deploy.workspace = true
 # The Buck2 summary line parser (`Commands: N (cached: N, remote: N, local: N)`).
-kbf-it.workspace = true
+kbf-integration-test.workspace = true
+kbf-proto.workspace = true
 kbf-testkit.workspace = true
 kbf-transfer.workspace = true
 libc.workspace = true
+prost.workspace = true
+prost-types.workspace = true
 rcgen = { workspace = true, features = ["x509-parser"] }
 rustix = { workspace = true, features = ["fs", "process"] }
 serde.workspace = true
@@ -51,6 +54,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 # RFC 3339 timestamps of the gates' windows.
 time.workspace = true
+# The REAPI client of `reapi` (the channel under the farm CA).
+tonic = { workspace = true, features = ["tls-ring"] }
+
+[dev-dependencies]
+futures.workspace = true
+kbf-types.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
 
 [lints]
 workspace = true

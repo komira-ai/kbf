@@ -53,6 +53,17 @@
 //! - Run as `gh api <path>`, it prints the value under the key `<path>` of the JSON
 //!   object in `gh-api.json` next to it, or `gh: Not Found (HTTP 404)` on stderr and
 //!   exits 1 when there is none: the GitHub API, as a test wrote it.
+//! - Run as `gh api <path> -X POST --input -`, it reads a JSON body on stdin. For
+//!   `repos/<repo>/git/tags` it stores a tag object under `repos/<repo>/git/tags/<id>` (its
+//!   tagger is `komira-release-bot[bot]`) and answers `{"sha": <id>}`. For
+//!   `repos/<repo>/git/refs` it stores the ref under `repos/<repo>/git/ref/tags/<name>`, or
+//!   fails with HTTP 422 `Reference already exists` when that key is there. No call updates
+//!   a ref. `gh-fault` next to it plants one fault: `fail-post:<code>[:<times>]` (the next
+//!   POSTs fail with HTTP `<code>`), `no-sha` (a tag object is answered with no id),
+//!   `garbage` (a reply that is not JSON), `refuse-ref` (a ref is refused with HTTP 422
+//!   `Validation Failed`), `race` (another run made the ref first, with another message),
+//!   `lose-ref-502` / `lose-ref-422` (the next ref is stored, and its reply is lost as that
+//!   HTTP status), or `fail-get:<code>` (every GET of a ref fails with that status).
 //! - Run as `gh release create|upload <tag> <files> --repo <repo> ...`, it copies each
 //!   file into `releases/<tag>/` next to it (create makes that directory and fails if
 //!   it exists; a file already there fails the command, as GitHub refuses an asset
@@ -307,6 +318,7 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
         .expect("gh-args");
     writeln!(log, "{}", args.join(" ")).expect("gh-args");
     match args[0].as_str() {
+        "api" if args.iter().any(|a| a == "--input") => return api_write(dir, args),
         "api" => return api(dir, &args[1]),
         "release" => return release(dir, args),
         "attestation" if args[1] == "trusted-root" => return trusted_root(),
@@ -456,6 +468,14 @@ fn api(dir: &Path, path: &str) -> ExitCode {
         println!("<html>");
         return ExitCode::SUCCESS;
     }
+    let fault = std::fs::read_to_string(dir.join("gh-fault")).unwrap_or_default();
+    if let Some(code) = fault
+        .strip_prefix("fail-get:")
+        .filter(|_| path.contains("/git/ref/"))
+    {
+        eprintln!("gh: Error (HTTP {code})");
+        return ExitCode::FAILURE;
+    }
     match api_store(dir).get(path) {
         Some(answer) => {
             println!("{answer}");
@@ -466,6 +486,120 @@ fn api(dir: &Path, path: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// A tag object as the API stores it: the id is the hash of its parts.
+fn tag_object(
+    tag: &serde_json::Value,
+    message: &serde_json::Value,
+    object: &serde_json::Value,
+    kind: &serde_json::Value,
+) -> (String, serde_json::Value) {
+    let id = hex::encode(sha2::Sha256::digest(format!(
+        "{tag}{message}{object}{kind}"
+    )))[..40]
+        .to_owned();
+    let stored = serde_json::json!({
+        "tag": tag,
+        "sha": id,
+        "message": message,
+        "object": { "type": kind, "sha": object },
+        "tagger": { "name": "komira-release-bot[bot]" },
+    });
+    (id, stored)
+}
+
+/// A `gh api <path> -X POST --input -` call: the writes of the tag API, `git/tags` and
+/// `git/refs`. Nothing updates a ref: GitHub's rulesets would refuse it, and so does this.
+fn api_write(dir: &Path, args: &[String]) -> ExitCode {
+    let path = args[1].as_str();
+    let body: serde_json::Value = serde_json::from_reader(std::io::stdin()).expect("a JSON body");
+    let fault_file = dir.join("gh-fault");
+    let fault = std::fs::read_to_string(&fault_file).unwrap_or_default();
+    if let Some(spec) = fault.strip_prefix("fail-post:") {
+        let (code, times) = spec.split_once(':').unwrap_or((spec, "1"));
+        let left = times.parse::<u32>().expect("a count") - 1;
+        if left == 0 {
+            std::fs::remove_file(&fault_file).expect("gh-fault");
+        } else {
+            std::fs::write(&fault_file, format!("fail-post:{code}:{left}")).expect("gh-fault");
+        }
+        eprintln!("gh: Error (HTTP {code})");
+        return ExitCode::FAILURE;
+    }
+    if fault == "garbage" {
+        println!("<html>");
+        return ExitCode::SUCCESS;
+    }
+    let mut answers = api_store(dir);
+    let repo = path.split("/git/").next().expect("repos/<repo>");
+    let reply = if path.ends_with("/git/tags") && fault == "no-sha" {
+        serde_json::json!({})
+    } else if path.ends_with("/git/tags") {
+        let (id, stored) = tag_object(
+            &body["tag"],
+            &body["message"],
+            &body["object"],
+            &body["type"],
+        );
+        answers.insert(format!("{repo}/git/tags/{id}"), stored);
+        serde_json::json!({ "sha": id })
+    } else {
+        let name = body["ref"]
+            .as_str()
+            .and_then(|r| r.strip_prefix("refs/tags/"))
+            .expect("a tag ref");
+        let key = format!("{repo}/git/ref/tags/{name}");
+        if fault == "refuse-ref" {
+            eprintln!("gh: Validation Failed (HTTP 422)");
+            return ExitCode::FAILURE;
+        }
+        if fault == "race" {
+            // Another run made this tag first, with another message.
+            std::fs::remove_file(&fault_file).expect("gh-fault");
+            let (id, stored) = tag_object(
+                &body["ref"],
+                &serde_json::json!("other\n"),
+                &body["sha"],
+                &serde_json::json!("commit"),
+            );
+            answers.insert(format!("{repo}/git/tags/{id}"), stored);
+            answers.insert(
+                key.clone(),
+                serde_json::json!({ "object": { "type": "tag", "sha": id } }),
+            );
+        }
+        if answers.contains_key(&key) {
+            write_answers(dir, answers);
+            eprintln!("gh: Reference already exists (HTTP 422)");
+            return ExitCode::FAILURE;
+        }
+        answers.insert(
+            key,
+            serde_json::json!({ "object": { "type": "tag", "sha": body["sha"] } }),
+        );
+        if let Some(status) = fault.strip_prefix("lose-ref-") {
+            std::fs::remove_file(&fault_file).expect("gh-fault");
+            write_answers(dir, answers);
+            eprintln!("gh: Error (HTTP {status})");
+            if status == "422" {
+                eprintln!("Reference already exists");
+            }
+            return ExitCode::FAILURE;
+        }
+        serde_json::json!({})
+    };
+    write_answers(dir, answers);
+    println!("{reply}");
+    ExitCode::SUCCESS
+}
+
+fn write_answers(dir: &Path, answers: serde_json::Map<String, serde_json::Value>) {
+    std::fs::write(
+        dir.join("gh-api.json"),
+        serde_json::Value::Object(answers).to_string(),
+    )
+    .expect("gh-api.json");
 }
 
 fn release(dir: &Path, args: &[String]) -> ExitCode {

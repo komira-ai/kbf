@@ -359,6 +359,10 @@ fn the_freeze_refuses_before_anything_is_asked_of_github() {
         "{err}"
     );
     assert_eq!(fx.gh_args(), "");
+    // Catches: a freeze trimmed before the test, so a variable of spaces lets it through.
+    let (code, _, err) = fx.plan(&sha, ZERO, &["--freeze", " "]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("frozen: RELEASE_FREEZE is \" \""), "{err}");
     let (code, _, err) = fx.plan(&sha, ZERO, &["--freeze", ""]);
     assert_eq!(code, Some(0), "{err}");
     let (code, _, err) = fx.plan(&sha, ZERO, &[]);
@@ -468,14 +472,32 @@ fn the_push_is_classified_by_the_files_it_changed() {
     // (files written; [code, site, pipeline])
     let cases: &[Case] = &[
         (&[("README.md", "x")], [false, false, false]),
-        (&[("crates/a/README.md", "x")], [false, false, false]),
+        (&[("crates/a/README.md", "x")], [true, false, false]),
+        (&[("crates/a/docs/x.md", "x")], [true, false, false]),
         (&[("docs/a.txt", "x")], [false, true, false]),
         (&[("docs/b.md", "x")], [false, true, false]),
         (&[("site/index.html", "x")], [false, true, false]),
-        (&[(".github/CODEOWNERS", "x")], [false, false, false]),
+        (&[(".github/CODEOWNERS", "x")], [false, false, true]),
+        (
+            &[(".github/actions/a/action.yml", "x")],
+            [false, false, true],
+        ),
+        (&[(".github/dependabot.yml", "x")], [false, false, true]),
         (&[(".github/workflows/ci.yml", "x")], [false, false, true]),
         (&[("infra/site/main.ts", "x")], [false, false, true]),
-        (&[("infra/other/main.ts", "x")], [false, false, false]),
+        (&[("infra/other/main.ts", "x")], [false, false, true]),
+        (&[("crates/xtask/Cargo.toml", "x")], [true, false, true]),
+        (
+            &[("crates/xtask/tests/golden/a.txt", "x")],
+            [true, false, true],
+        ),
+        (&[("crates/kbf-gate/src/lib.rs", "x")], [true, false, true]),
+        (&[(".config/nextest.toml", "x")], [true, false, true]),
+        (&[("rust-toolchain.toml", "x")], [true, false, true]),
+        (&[("deny.toml", "x")], [true, false, true]),
+        (&[("Cargo.lock", "x")], [true, false, true]),
+        (&[(".cargo/config.toml", "x")], [true, false, true]),
+        (&[("crates/a/Cargo.toml", "x")], [true, false, false]),
         (&[("crates/a/src/lib.rs", "x")], [true, false, false]),
         (&[("src/docs/x.rs", "x")], [true, false, false]),
         (&[("src/site/x.rs", "x")], [true, false, false]),
@@ -485,10 +507,10 @@ fn the_push_is_classified_by_the_files_it_changed() {
             &[("crates/xtask/src/release/plan.rs", "x")],
             [true, false, true],
         ),
-        (&[("crates/xtask/src/lib.rs", "x")], [true, false, false]),
+        (&[("crates/xtask/src/lib.rs", "x")], [true, false, true]),
         (
             &[("crates/xtask/tests/release.rs", "x")],
-            [true, false, false],
+            [true, false, true],
         ),
         (&[("notes.md.txt", "x")], [true, false, false]),
         (

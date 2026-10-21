@@ -170,10 +170,13 @@ fn lines_of(e: Error) -> Vec<String> {
     }
 }
 
-/// The `meta_log` the identity file `path` states for the build of `commit`: `None` when
-/// the file lacks the field (a build before it). A file that is not the build's identity
-/// is a problem, not an unknown.
-fn meta_log_of(path: &Path, commit: &str, flag: &str) -> Result<Option<u64>, String> {
+/// The identity (`kbf --version --json`) the file `path` holds for the build of `commit`.
+/// A file that is not the build's identity is a problem, not an unknown.
+pub(super) fn identity_of(
+    path: &Path,
+    commit: &str,
+    flag: &str,
+) -> Result<serde_json::Value, String> {
     let at = |e: &dyn std::fmt::Display| format!("{flag} {}: {e}", path.display());
     let file = std::fs::File::open(path).map_err(|e| at(&e))?;
     let mut text = String::new();
@@ -189,13 +192,26 @@ fn meta_log_of(path: &Path, commit: &str, flag: &str) -> Result<Option<u64>, Str
     if stamp != Some(short) {
         return Err(at(&format!("names commit {stamp:?}, not {short}")));
     }
-    match value.get("meta_log") {
+    Ok(value)
+}
+
+/// The whole number the identity `value` states under `key`: `None` when it lacks the
+/// field (a build before it), an error when the field is not a whole number.
+pub(super) fn whole_field(value: &serde_json::Value, key: &str) -> Result<Option<u64>, String> {
+    match value.get(key) {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(v) => v
             .as_u64()
             .map(Some)
-            .ok_or_else(|| at(&format!("meta_log {v} is not a whole number"))),
+            .ok_or_else(|| format!("{key} {v} is not a whole number")),
     }
+}
+
+/// The `meta_log` the identity file `path` states for the build of `commit`: `None` when
+/// the file lacks the field (a build before it).
+fn meta_log_of(path: &Path, commit: &str, flag: &str) -> Result<Option<u64>, String> {
+    let value = identity_of(path, commit, flag)?;
+    whole_field(&value, "meta_log").map_err(|e| format!("{flag} {}: {e}", path.display()))
 }
 
 /// What is wrong with a beta result for this commit and set. A gate counts only when
