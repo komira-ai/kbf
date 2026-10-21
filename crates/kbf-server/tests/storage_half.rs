@@ -145,6 +145,14 @@ impl kbf_storage::Storage for Watched {
         }
         self.inner.find_missing(digests)
     }
+    /// Forwards: the inner storage decides what is durable.
+    fn find_durable<'a>(
+        &'a self,
+        digests: &'a [kbf_types::Digest],
+    ) -> kbf_storage::Answer<'a, Vec<kbf_types::Digest>> {
+        self.inner.find_durable(digests)
+    }
+
     fn read_blob<'a>(&'a self, digest: &'a kbf_types::Digest) -> kbf_storage::Answer<'a, Bytes> {
         self.inner.read_blob(digest)
     }

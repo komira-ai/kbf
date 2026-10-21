@@ -91,6 +91,11 @@ impl Storage for Spy {
         self.inner.find_missing(digests)
     }
 
+    /// Forwards: the inner storage decides what is durable.
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        self.inner.find_durable(digests)
+    }
+
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes> {
         self.inner.read_blob(digest)
     }

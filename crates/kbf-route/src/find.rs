@@ -11,6 +11,15 @@ use kbf_types::Digest;
 use crate::router::{Router, unavailable, write_order};
 use crate::source::MapView;
 
+/// Which question a FindMissing round asks of a node.
+#[derive(Clone, Copy)]
+enum Ask {
+    /// Blobs it can serve, RAM-held ones included ([`kbf_storage::Storage::find_missing`]).
+    Servable,
+    /// Blobs on its disk only ([`kbf_storage::Storage::find_durable`]).
+    Durable,
+}
+
 impl Router {
     /// The digests among `digests` the farm does not hold, in the order asked (a digest
     /// asked twice is answered twice): each digest is asked of its primary owner, one
@@ -43,12 +52,41 @@ impl Router {
             .collect())
     }
 
+    /// [`Router::find_missing`] counting only blobs durable on the owner asked: one held
+    /// in RAM and not yet on its disk is missing (`kbf-durable: only`,
+    /// [`kbf_storage::Storage::find_durable`]). Asked of the same owners in the same order,
+    /// so a digest is answered by its primary, or by the next owner when the primary
+    /// cannot answer. The question rule 2 asks before a durable record names a blob.
+    ///
+    /// # Errors
+    /// As [`Router::find_missing`].
+    pub async fn find_durable(&self, digests: &[Digest]) -> Result<Vec<Digest>, StorageError> {
+        let missing = self
+            .routed(|view| async move { self.find_in_as(&view, digests, Ask::Durable).await })
+            .await?;
+        Ok(digests
+            .iter()
+            .filter(|d| missing.contains_key(d))
+            .copied()
+            .collect())
+    }
+
     /// The digests missing, as the map `view` places them, each with the owner that said
     /// it lacks it.
     pub(crate) async fn find_in(
         &self,
         view: &MapView,
         digests: &[Digest],
+    ) -> Result<BTreeMap<Digest, MemberId>, StorageError> {
+        self.find_in_as(view, digests, Ask::Servable).await
+    }
+
+    /// [`Router::find_in`], asking the question `ask` names.
+    async fn find_in_as(
+        &self,
+        view: &MapView,
+        digests: &[Digest],
+        ask: Ask,
     ) -> Result<BTreeMap<Digest, MemberId>, StorageError> {
         let generation = view.map.generation();
         let mut missing = BTreeMap::new();
@@ -78,7 +116,10 @@ impl Router {
                 // A node bounds the digests of one call, so a long list is several.
                 let mut lacking = Vec::new();
                 for chunk in asked.chunks(MAX_FIND_MISSING_DIGESTS) {
-                    lacking.extend(node.find_missing(chunk).await?);
+                    lacking.extend(match ask {
+                        Ask::Servable => node.find_missing(chunk).await?,
+                        Ask::Durable => node.find_durable(chunk).await?,
+                    });
                 }
                 Ok(lacking)
             }))

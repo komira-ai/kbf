@@ -46,6 +46,12 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
         Box::pin(async move { Ok(self.cache.find_missing(digests).await?) })
     }
 
+    /// The cache's durable answer ([`Cache::durable`]): the index alone, so a blob held in
+    /// RAM is missing.
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(async move { Ok(self.cache.durable(digests).await?) })
+    }
+
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes> {
         Box::pin(async move { Ok(self.cache.read_blob(digest).await?) })
     }
