@@ -143,9 +143,7 @@ fn node_lines() -> String {
 /// The `installer.toml` of a LAN-pull host whose CA copy has the sha256 `ca_digest`.
 fn pull_file(ca_digest: &str) -> String {
     let nodes = node_lines();
-    let ca = format!(
-        "frontend_ca = \"{CA_PATH}\"\nfrontend_ca_sha256 = \"{ca_digest}\"\n"
-    );
+    let ca = format!("frontend_ca = \"{CA_PATH}\"\nfrontend_ca_sha256 = \"{ca_digest}\"\n");
     format!("release_source = \"frontend\"\n{nodes}{URL_LINE}{ca}")
 }
 

@@ -340,8 +340,7 @@ fn frontend_source(toml: &InstallerToml, trust: &dyn Exec) -> Result<FrontendSou
     };
     let ca = HostPath::new(&pull.ca.to_string_lossy())
         .map_err(|e| NotBuilt::Pull(format!("frontend_ca: {e}")))?;
-    trusted_chain(trust, &ca, Kind::File)
-        .map_err(|e| NotBuilt::Pull(e.to_string()))?;
+    trusted_chain(trust, &ca, Kind::File).map_err(|e| NotBuilt::Pull(e.to_string()))?;
     let cap = crate::fetch::identity::MAX_PEM_BYTES;
     let len = trust.stat(&ca).ok().flatten().map_or(0, |m| m.len);
     if !(1..=cap).contains(&len) {
@@ -351,7 +350,7 @@ fn frontend_source(toml: &InstallerToml, trust: &dyn Exec) -> Result<FrontendSou
     let Ok(Some(Entry::File { bytes, .. })) = trust.inspect(&ca) else {
         return Err(NotBuilt::Source("frontend_ca could not be read"));
     };
-    if hex::encode(Sha256::digest(bytes)) !=pull.ca_sha256.as_str() {
+    if hex::encode(Sha256::digest(bytes)) != pull.ca_sha256.as_str() {
         return Err(NotBuilt::Source(
             "frontend_ca does not have the sha256 frontend_ca_sha256 names",
         ));
