@@ -164,8 +164,17 @@ async fn health_is_what_readyz_and_the_source_routes_report() {
     );
     // The age is the scheduler's, the one `GET /v1/queue` shows: bracketed by two reads
     // of that route around the health read (the oldest operation is the same one).
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    let (_, before) = get(api, "/v1/queue").await;
+    // Wait until that route shows the job has waited a while (the farm's clock is not
+    // the test's), so a health age of zero or a constant cannot pass.
+    let mut before = Value::Null;
+    for _ in 0..250 {
+        before = get(api, "/v1/queue").await.1;
+        let age = before["oldest_age_ms"].as_u64();
+        if age.is_some_and(|age| age >= 30) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let (health, ..) = read().await;
     let (_, after) = get(api, "/v1/queue").await;
     let (low, mid, high) = (
@@ -173,7 +182,7 @@ async fn health_is_what_readyz_and_the_source_routes_report() {
         health["queue"]["oldest_age_ms"].as_u64().expect("an age"),
         after["oldest_age_ms"].as_u64().expect("an age"),
     );
-    assert!(low >= 60, "the job has waited at least the sleep: {before}");
+    assert!(low >= 30, "the job never showed a waited age: {before}");
     assert!(low <= mid && mid <= high, "{low} <= {mid} <= {high}");
 
     // The frontend drains: `/readyz` fails with its reason, and so does the summary.
