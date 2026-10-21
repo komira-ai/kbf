@@ -17,20 +17,23 @@
 //!    `reason=no-release` and succeeds. A release newer than `--sha`, and any call that
 //!    fails, is an error, never "no release";
 //! 3. the release's assets are downloaded into a directory of this process alone;
-//! 4. they are verified as `release offer` verifies them: `release check`, then the
-//!    attestations of every file, the bundles offline against the trusted root. Nothing of
-//!    the release is run before this;
+//! 4. they are verified as `release offer` verifies them: `release check` (each `kbf` tarball
+//!    has its version facts listed), then the attestations of every file, the bundles offline
+//!    against the trusted root. Nothing of the release is run before this;
 //! 5. only then the `kbf` of `--runner-platform` is taken out of its tarball and run
-//!    ([`version_json`]);
-//! 6. the release before it ([`previous`]) is fetched and verified the same way and its `kbf`
-//!    run too. Its commit is the offer's `previous`: the offer says whether going back to
+//!    ([`version_json`]). What it prints must be, byte for byte, the version facts the
+//!    release holds for that platform (`kbf-<sha>-<p>.version.json`): the bundle carries
+//!    the facts, the offer's `meta_log` is read from the run, and a release whose two
+//!    disagree is refused;
+//! 6. the release before it ([`previous`]) is fetched and verified the same way, except that
+//!    its version facts are not required (it may predate them), and its `kbf` run too. Its commit is the offer's `previous`: the offer says whether going back to
 //!    that release is reversible, and the host compares its own running build when it
 //!    applies it. With no earlier release the offer is not reversible; any error is an error;
 //! 7. the platforms the release completes ([`farm_platforms`]): those with every tarball a
 //!    host of the platform needs ([`ReleasePlatform::components`]), each with its SBOM and
-//!    bundle. A platform that lacks one is left out and printed (`platform-skipped=<p>`), not
-//!    an error: the host refuses an offer only when a node of a left-out platform exists. If
-//!    no platform is complete the verb refuses;
+//!    bundle, and the version facts of its `kbf`. A platform that lacks one is left out and
+//!    printed (`platform-skipped=<p>`), not an error: the host refuses an offer only when a
+//!    node of a left-out platform exists. If no platform is complete the verb refuses;
 //! 8. [`offer::plan`] makes the offer, for gamma, with beta waived. It checks the release
 //!    again, hashes and attestations of every file, now that both `kbf` have run (both run
 //!    as the user that can write the downloaded files): a file a run changed is refused,
@@ -40,9 +43,12 @@
 //! 10. `--output` gets the lines, last: if it cannot be written the run fails with `--out`
 //!     already made.
 //!
-//! `bundle.tar` is what the installer's bundle reader takes: `SHA256SUMS` (the release's, byte
-//! for byte), `offer.json`, then for each complete platform, in [`ReleasePlatform::ALL`] order,
-//! and each of its components, `<c>-<sha>-<p>.tar.gz` and `<c>-<sha>-<p>.tar.gz.attestation`:
+//! `bundle.tar` is what the installer's bundle reader takes (`kbf-installer deploy --offer -
+//! --bundle -`, which reads the offer back from it): `SHA256SUMS` (the release's, byte for
+//! byte), `offer.json`, then for each complete platform, in [`ReleasePlatform::ALL`] order,
+//! its version facts `kbf-<sha>-<p>.version.json` (the release's, byte for byte, which the
+//! installer uploads to the release store and the store's offer to a node is made from), and
+//! for each of its components `<c>-<sha>-<p>.tar.gz` and `<c>-<sha>-<p>.tar.gz.attestation`:
 //! the release's `<c>-<sha>-<p>.tar.gz.sigstore.json` under the name the installer wants. No
 //! SBOM and no other file goes in. Every entry is mode 0644, owner and group 0, time 0, so the
 //! same release and offer give the same bytes.
@@ -71,6 +77,7 @@ use crate::bundles;
 use crate::darwin::packaged_binary;
 use crate::package::{Platform, read, write_new};
 use crate::sums::{self, SUMS};
+use crate::version_facts::{self, Pairing};
 
 /// Who the beta waiver of every staged offer is recorded under.
 pub const WAIVER_OPERATOR: &str = "gamma-pipeline";
@@ -94,6 +101,10 @@ pub const MAX_TARBALL: u64 = 512 * 1024 * 1024;
 
 /// The most an attestation in the bundle may be: the installer's cap.
 pub const MAX_ATTESTATION: u64 = 256 * 1024;
+
+/// The most a platform's version facts in the bundle may be: the installer's cap, which is
+/// the most a `kbf --version --json` may print.
+pub const MAX_FACTS: u64 = kbf_types::VERSION_CAP as u64;
 
 /// The most `SHA256SUMS` in the bundle may be: the installer's cap.
 pub const MAX_SUMS: u64 = 1024 * 1024;
@@ -264,10 +275,10 @@ fn platform_of(platform: ReleasePlatform) -> Platform {
 
 /// The platforms a deploy of this release can serve, and the ones it cannot with what each
 /// lacks. A platform is complete when [`incomplete`] finds nothing missing (a tarball, its
-/// SBOM, its bundle) and every tarball a host of it needs
-/// ([`ReleasePlatform::components`]) is one of `listed` (the names in `SHA256SUMS`): the
-/// release holds a `kbf-daemon` for no Mac, so a Mac is not served, and a tarball of
-/// another binary does not make a platform complete.
+/// SBOM, its bundle, the version facts of its `kbf`) and every tarball a host of it needs
+/// ([`ReleasePlatform::components`]) is one of `listed` (the names in `SHA256SUMS`): a
+/// tarball of another binary (a `kbf-daemon` with no `kbf`) does not make a platform
+/// complete.
 fn farm_platforms(
     dir: &Path,
     listed: &[String],
@@ -441,11 +452,13 @@ fn stage_release(a: &StageOfferArgs, tag: &str, scratch: &Path) -> Result<Staged
             "release", "download", tag, "--repo", &a.repo, "--dir", &download,
         ],
     )?;
-    // 4. Verified, before any of it is run.
-    super::check(&assets, &a.sha)?;
+    // 4. Verified, before any of it is run. A release made since the build jobs record version
+    // facts has them for every `kbf` tarball.
+    super::check(&assets, &a.sha, Pairing::Required)?;
     attester(a, &root, &flipped).artifacts(&assets, &a.sha)?;
     // 5. The runner's own `kbf`, out of the verified tarball.
-    let tarball = assets.join(format!("kbf-{}-{}.tar.gz", a.sha, platform.name()));
+    let tarball_name = format!("kbf-{}-{}.tar.gz", a.sha, platform.name());
+    let tarball = assets.join(&tarball_name);
     let bytes = packaged_binary(&tarball, &read(&tarball)?, "kbf")?;
     let run_dir = scratch.join("run");
     make_dir(&run_dir)?;
@@ -453,6 +466,15 @@ fn stage_release(a: &StageOfferArgs, tag: &str, scratch: &Path) -> Result<Staged
     write_executable(&kbf, &bytes)?;
     let version = scratch.join("version.json");
     version_json(&kbf, &version, RUN_TIMEOUT)?;
+    // The facts the build job kept for this platform are what its `kbf` prints: they go in the
+    // bundle and a node's offer is made from them, while the offer's `meta_log` is read from
+    // the run. Both come from the one build, or the release is refused.
+    let facts_file = version_facts::name(&a.sha, platform);
+    if read(&assets.join(&facts_file))? != read(&version)? {
+        return Err(Error::Failed(format!(
+            "{facts_file} is not what the kbf in {tarball_name} printed for --version --json"
+        )));
+    }
     // 6. The release before it.
     let before = previous_build(a, platform, &root, scratch)?;
     // 7. The platforms the release completes.
@@ -581,9 +603,9 @@ fn append(tar: &mut tar::Builder<Vec<u8>>, name: &str, bytes: &[u8]) {
 }
 
 /// The bundle of the release in `dir` for `sha`: `SHA256SUMS`, `offer` as `offer.json`, then
-/// for each of `platforms` and each of its components the tarball and its attestation (the
-/// release's bundle of it, renamed). Entries are in that order, with fixed headers, so the
-/// same inputs give the same bytes.
+/// for each of `platforms` its version facts, and for each of its components the tarball and
+/// its attestation (the release's bundle of it, renamed). Entries are in that order, with fixed
+/// headers, so the same inputs give the same bytes.
 ///
 /// # Errors
 /// A file is missing, or is larger than the installer takes (`MAX_*`).
@@ -604,6 +626,9 @@ pub fn build_bundle(
     append(&mut tar, SUMS, &sums);
     append(&mut tar, OFFER_FILE, offer);
     for platform in platforms {
+        let facts = version_facts::name(sha, platform_of(*platform));
+        let held = read_capped(&dir.join(&facts), MAX_FACTS)?;
+        append(&mut tar, &facts, &held);
         for component in platform.components() {
             let name = format!("{component}-{sha}-{platform}.tar.gz");
             let tarball = read_capped(&dir.join(&name), MAX_TARBALL)?;

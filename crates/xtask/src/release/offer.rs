@@ -13,7 +13,8 @@
 //! and runs only when the first found nothing):
 //!
 //! 1. `<dir>` passes `release check` for `--commit` (sums, names, one bundle per tarball);
-//! 2. every `--platform` is complete: a tarball, its SBOM and its bundle;
+//! 2. every `--platform` is complete: a tarball, its SBOM, its bundle and the version facts
+//!    of its `kbf`;
 //! 3. beta: `--beta-result` is a green beta document for this commit and set whose gates
 //!    are all green and within their limits, or `--waive-beta <reason> --operator <name>`
 //!    is recorded in the offer (never for `--target prod`, never with a result given);
