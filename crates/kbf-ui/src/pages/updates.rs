@@ -434,7 +434,7 @@ fn command(h: &mut Html, desired: Option<&Desired>) {
 }
 
 /// `ms` since the Unix epoch as an RFC 3339 UTC time.
-fn rfc3339(ms: u64) -> String {
+pub(super) fn rfc3339(ms: u64) -> String {
     let secs = ms / 1000;
     let (days, rem) = (secs / 86_400, secs % 86_400);
     // Civil date from days since 1970-01-01 (proleptic Gregorian; Hinnant's algorithm).

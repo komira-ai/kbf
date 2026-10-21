@@ -1788,7 +1788,6 @@ dependencies = [
  "flate2",
  "futures",
  "kbf-ca",
- "kbf-deploy",
  "kbf-integration-test",
  "kbf-proto",
  "kbf-testkit",
@@ -1805,6 +1804,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "toml",
  "tonic",
 ]
 
@@ -1939,6 +1939,7 @@ dependencies = [
  "kbf-transfer",
  "kbf-types",
  "kbf-unitfile",
+ "libc",
  "proc-macro2",
  "prost",
  "rcgen",

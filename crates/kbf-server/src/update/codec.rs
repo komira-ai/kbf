@@ -12,7 +12,8 @@
 //! were first written, and a few beyond them, each said where it is declared:
 //! `update/host.reason` (the reason of a `Held` phase), `update/host.order_epoch` (the epoch
 //! an order id was drawn under) and `update/host.commit` (the release the host's run drives
-//! it to), and the node step's limits in `update/policy`, each optional and absent when it is
+//! it to), `update/desired.source` and `update/host.source` (where the run's release comes
+//! from), and the node step's limits in `update/policy`, each optional and absent when it is
 //! the default, so that a writer that knows only the agreed fields leaves them at the default
 //! instead of at zero. `paused` is an agreed field of `update/policy` (it was once
 //! `update/desired`'s); it took the next free number there, 18, because no field changes its
@@ -22,6 +23,12 @@
 //! no phase and no reason, and a row that holds one is [`Corrupt`], never read as the first
 //! variant. A reader that meets a number it does not know refuses the row: every unknown
 //! fails closed.
+//!
+//! **`source` is the one enum where zero is valid.** A row written before the field existed
+//! has no tag for it, and that row is a fetch, what every run meant then: 0 (or an absent tag)
+//! reads [`Source::Fetch`], 1 reads [`Source::Staged`], and a fetch is not written, so the
+//! bytes of every row that exists are unchanged. A number above 1 is [`Corrupt`], as any
+//! unknown enum number is.
 
 use std::time::Duration;
 
@@ -29,7 +36,7 @@ use kbf_types::{FarmTime, WorkerId};
 use prost::Message as _;
 
 use super::command::HoldReason;
-use super::facts::{Generation, HostRecord, OrderId, Release};
+use super::facts::{Generation, HostRecord, OrderId, Release, Source};
 use super::node_step::HostPhase;
 use super::policy::Policy;
 use super::slot::{Holder, Slot};
@@ -53,12 +60,15 @@ pub struct Desired {
     pub commit: Release,
     /// When the release was set: where the idle wait counts from until a host finishes.
     pub set_at: FarmTime,
+    /// Where the release comes from. It is part of the run: the same commit under another
+    /// source is a new generation.
+    pub source: Source,
 }
 
 /// `update/host/<id>`: a host's record, and the commit its run drives it to. A host started
 /// under an earlier generation finishes that step once it is past the activate order (a
 /// rollback walks it back afterwards), so the commit is kept with the row and not read from
-/// `update/desired`. `commit` is beyond the agreed fields.
+/// `update/desired`. `commit` and `source` are beyond the agreed fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostRow {
     /// Where the host is, as the pure step reads it.
@@ -66,6 +76,10 @@ pub struct HostRow {
     /// The release the run that started the host drives to; unread while the host is not in
     /// a step.
     pub commit: Release,
+    /// The source of the run that started the host, kept while the host is in a step: a run
+    /// that is offered again under another source does not change what a host past the
+    /// activate order is doing. Unread while the host is not in a step.
+    pub source: Source,
 }
 
 impl HostRow {
@@ -75,12 +89,14 @@ impl HostRow {
         Self {
             record: HostRecord::unstarted(),
             commit: Release::new(""),
+            source: Source::Fetch,
         }
     }
 }
 
 /// Tag 4 was `paused` in an earlier draft of this row, which no release wrote (the pause is
-/// `update/policy`'s); the number is not reused.
+/// `update/policy`'s); the number is not reused. `source` is 0 (fetch, not written) or 1
+/// (staged).
 #[derive(Clone, PartialEq, prost::Message)]
 struct DesiredMsg {
     #[prost(uint64, tag = "1")]
@@ -89,11 +105,14 @@ struct DesiredMsg {
     commit: String,
     #[prost(uint64, tag = "3")]
     set_at_ms: u64,
+    #[prost(uint32, tag = "5")]
+    source: u32,
 }
 
 /// The agreed fields are `phase`, `order_id`, `generation`, `since` and `boot_before`;
 /// `reason` is the hold reason of a `Held` phase, `order_epoch` the epoch the order id was
-/// drawn under (an order id is the pair), and `commit` the run's release.
+/// drawn under (an order id is the pair), `commit` the run's release and `source` where it
+/// comes from (0 fetch, not written; 1 staged).
 #[derive(Clone, PartialEq, prost::Message)]
 struct HostMsg {
     #[prost(uint32, tag = "1")]
@@ -112,6 +131,8 @@ struct HostMsg {
     order_epoch: u64,
     #[prost(string, tag = "8")]
     commit: String,
+    #[prost(uint32, tag = "9")]
+    source: u32,
 }
 
 /// One holder of a place: the agreed `{host, order_id, epoch}`.
@@ -265,6 +286,24 @@ fn phase_from(code: u32, reason: u32) -> Result<HostPhase, Corrupt> {
     }
 }
 
+/// The number a source is written as: a fetch is 0, which the row leaves out.
+const fn source_code(source: Source) -> u32 {
+    match source {
+        Source::Fetch => 0,
+        Source::Staged => 1,
+    }
+}
+
+/// The source a row names. Unlike the other enums, 0 is valid: it is the fetch of a row that
+/// has no `source`.
+fn source_from(code: u32) -> Result<Source, Corrupt> {
+    match code {
+        0 => Ok(Source::Fetch),
+        1 => Ok(Source::Staged),
+        other => corrupt(format!("source {other} is not one this build knows")),
+    }
+}
+
 fn ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -288,12 +327,14 @@ pub(super) fn encode_desired(desired: &Desired) -> Vec<u8> {
         generation: desired.generation.0,
         commit: desired.commit.as_str().to_owned(),
         set_at_ms: desired.set_at.as_millis(),
+        source: source_code(desired.source),
     }
     .encode_to_vec()
 }
 
 /// # Errors
-/// [`Corrupt`]: the bytes are not a message, the commit is empty, or the generation is 0.
+/// [`Corrupt`]: the bytes are not a message, the commit is empty, the generation is 0, or the
+/// source is not one this build knows.
 pub(super) fn decode_desired(bytes: &[u8]) -> Result<Desired, Corrupt> {
     let msg = DesiredMsg::decode(bytes).map_err(|e| Corrupt(e.to_string()))?;
     if msg.commit.is_empty() {
@@ -308,6 +349,7 @@ pub(super) fn decode_desired(bytes: &[u8]) -> Result<Desired, Corrupt> {
         generation: Generation(msg.generation),
         commit: Release::new(msg.commit),
         set_at: FarmTime::from_millis(msg.set_at_ms),
+        source: source_from(msg.source)?,
     })
 }
 
@@ -324,13 +366,14 @@ pub(super) fn encode_host(row: &HostRow) -> Vec<u8> {
         reason,
         order_epoch: row.record.order.epoch,
         commit: row.commit.as_str().to_owned(),
+        source: source_code(row.source),
     }
     .encode_to_vec()
 }
 
 /// # Errors
-/// [`Corrupt`]: the bytes are not a message, or name a phase or reason this build does not
-/// know.
+/// [`Corrupt`]: the bytes are not a message, or name a phase, reason or source this build
+/// does not know.
 pub(super) fn decode_host(bytes: &[u8]) -> Result<HostRow, Corrupt> {
     let msg = HostMsg::decode(bytes).map_err(|e| Corrupt(e.to_string()))?;
     Ok(HostRow {
@@ -342,6 +385,7 @@ pub(super) fn decode_host(bytes: &[u8]) -> Result<HostRow, Corrupt> {
             boot_before: msg.boot_before,
         },
         commit: Release::new(msg.commit),
+        source: source_from(msg.source)?,
     })
 }
 

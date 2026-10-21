@@ -97,6 +97,40 @@ pub trait Source {
     /// `GET url`, a root-relative path with its query.
     fn get(&self, url: &str) -> impl Future<Output = Result<Fetched, SourceError>> + Send;
 
+    /// `GET url` with `Range: bytes=-n`: the last `n` bytes, as the log and blob routes
+    /// read a suffix range: `206` with a `Content-Range` that names the whole, `416` for
+    /// an empty object (or an `n` of zero), or `200` with the whole body when the range is
+    /// ignored. The default reads the whole answer and cuts it as the server would, as
+    /// [`Source::get_range`]'s does.
+    fn get_suffix(
+        &self,
+        url: &str,
+        n: u64,
+    ) -> impl Future<Output = Result<Fetched, SourceError>> + Send {
+        let whole = self.get(url);
+        async move {
+            let mut fetched = whole.await?;
+            if fetched.status != 200 || fetched.body.is_empty() {
+                return Ok(fetched);
+            }
+            let total = fetched.body.len() as u64;
+            if n == 0 {
+                fetched.status = 416;
+                fetched.body = Vec::new();
+                fetched.headers = vec![("content-range".to_owned(), format!("bytes */{total}"))];
+                return Ok(fetched);
+            }
+            let first = total - n.min(total);
+            fetched.status = 206;
+            fetched.body = fetched.body[first as usize..].to_vec();
+            fetched.headers = vec![(
+                "content-range".to_owned(),
+                format!("bytes {first}-{}/{total}", total - 1),
+            )];
+            Ok(fetched)
+        }
+    }
+
     /// `GET url` with `Range: bytes=first-last` (both inclusive), as the API's log and
     /// blob routes read it: `206` with a `Content-Range`, `416` for a start past the
     /// end, or `200` with the whole body when the range is ignored. A source that
@@ -235,7 +269,7 @@ pub async fn respond<S: Source + Sync>(source: &S, path: &str, query: &str) -> A
         ["runs", run_id, "logs", stream]
             if !run_id.is_empty() && pages::STREAMS.contains(&stream) =>
         {
-            pages::run_log(source, run_id, stream).await
+            pages::run_log(source, run_id, stream, query).await
         }
         ["updates"] => pages::updates(source).await,
         ["leases"] => pages::leases(source, query).await,

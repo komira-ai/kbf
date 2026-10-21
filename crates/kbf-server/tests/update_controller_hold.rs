@@ -23,7 +23,7 @@ use kbf_map::{MemberId, MemberState};
 use kbf_server::update::{
     Alert, Controller, ControllerError, Generation, GiveBack, HelperReport, HelperStatus,
     HoldReason, HostPhase, HostRecord, HostRow, OrderId, Policy, Release, RowError, SlotClass,
-    Stored, Tick, Transport, TransportError,
+    Source, Stored, Tick, Transport, TransportError,
 };
 use kbf_state::{Fenced, Store, StoreError};
 use kbf_types::WorkerId;
@@ -321,6 +321,7 @@ fn held_row(rig: &Rig, generation: Generation, reason: HoldReason) -> HostRow {
             boot_before: None,
         },
         commit: Release::new(NEW),
+        source: Source::Fetch,
     }
 }
 
