@@ -155,9 +155,10 @@ pub struct Loaded {
     pub fetch_timeout_s: u32,
 }
 
-/// Reads `path` and returns what the verb takes from it, checked: every refusal of
-/// `installer.toml` and of the `[proxy]` table itself, and a file with no `[proxy]` table at
-/// all.
+/// Reads `path` and returns what the verb takes from it, checked: the keys it reads
+/// ([`InstallerToml::parse_tolerant`]: any other key, a source a later build wrote for one, is
+/// ignored, so a package downgrade does not take the public port down), the `[proxy]` table
+/// itself, and a file with no `[proxy]` table at all.
 pub fn load(path: &Path) -> Result<Loaded, VerbError> {
     loaded_from(path, &read_config(path)?)
 }
@@ -178,7 +179,7 @@ fn read_config(path: &Path) -> Result<String, VerbError> {
 /// What the verb takes from `text`, the configuration read from `path`.
 fn loaded_from(path: &Path, text: &str) -> Result<Loaded, VerbError> {
     let usage = |why: String| VerbError::Usage(format!("{}: {why}", path.display()));
-    let installer = InstallerToml::parse(text).map_err(|e| usage(e.to_string()))?;
+    let installer = InstallerToml::parse_tolerant(text).map_err(|e| usage(e.to_string()))?;
     let proxy = installer
         .proxy
         .ok_or_else(|| usage("has no [proxy] table".to_owned()))?;

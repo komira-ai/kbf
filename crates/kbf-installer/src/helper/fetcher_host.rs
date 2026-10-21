@@ -161,17 +161,26 @@ pub fn host_parts(host: &Layout, leases: Box<dyn LeaseSource>, child: ChildProgr
 
 /// Where `installer.toml` says the bytes come from.
 ///
-/// The `url` source is a base the file validated, with the system's roots (no key sets a
-/// private CA). The `frontend` source needs the frontend's address and the CA enrollment
-/// pinned, and `installer.toml` has no key for either, so it cannot be built.
+/// The `url` source is a base the file validated, with the system's roots. `installer.toml`
+/// can now hold the keys of the other sources (`release_ca`, the frontend snapshot, `bundled`),
+/// and this build reads them without using them, so a source that needs one is refused, with
+/// the reason, rather than built without it: a `url` host with a `release_ca` would otherwise
+/// trust the system's roots where the operator named a CA, the `frontend` has no fetch of its
+/// own yet, and a `bundled` host has no fetcher for the release the package carries.
 fn source_of(toml: &InstallerToml) -> Result<Source, NotBuilt> {
-    match &toml.source {
-        Configured::Url(base) => Ok(Source::Url {
+    match (&toml.source, &toml.release_ca) {
+        (Configured::Url(base), None) => Ok(Source::Url {
             base: base.clone(),
             ca_file: None,
         }),
-        Configured::Frontend => Err(NotBuilt::Source(
-            "release_source = \"frontend\": installer.toml has no key for the frontend's address or its pinned CA yet, so the frontend cannot be fetched from; use release_source = \"url\"",
+        (Configured::Url(_), Some(_)) => Err(NotBuilt::Source(
+            "release_ca is set and this build does not use it yet: a fetch would trust the system's roots instead of the CA named; remove release_ca",
+        )),
+        (Configured::Frontend, _) => Err(NotBuilt::Source(
+            "release_source = \"frontend\": this build cannot fetch from the frontend yet, even with frontend_url, frontend_ca and frontend_ca_sha256 set; use release_source = \"url\"",
+        )),
+        (Configured::Bundled, _) => Err(NotBuilt::Source(
+            "release_source = \"bundled\": this build has no bundled fetcher yet, and nothing else is fetched under bundled",
         )),
     }
 }

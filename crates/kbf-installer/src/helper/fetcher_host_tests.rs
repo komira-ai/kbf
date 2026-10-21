@@ -290,8 +290,8 @@ fn the_frontend_source_is_refused_until_the_fetcher_uses_the_snapshot() {
 /// Catches `bundled` falling through to a source that fetches (the network where the host is
 /// air-gapped), and a refusal that does not say why.
 ///
-/// Mutants planted: the `bundled` arm returning the `frontend` refusal; returning a `url`
-/// source built from nothing.
+/// Mutants to plant: the `bundled` arm returning the `frontend` refusal (red: the message);
+/// returning a `url` source built from nothing (red: no refusal).
 #[test]
 fn a_bundled_host_is_refused_by_a_build_without_the_bundled_fetcher() {
     let rig = Rig::new("host-fetcher-bundled");
@@ -310,7 +310,7 @@ fn a_bundled_host_is_refused_by_a_build_without_the_bundled_fetcher() {
 ///
 /// Catches a key that is parsed and silently dropped on the way to the fetch child.
 ///
-/// Mutants planted: the `release_ca` arm removed (the key ignored).
+/// Mutants to plant: the `release_ca` arm removed (the key ignored: red, no refusal).
 #[test]
 fn a_url_host_with_a_release_ca_is_refused_not_fetched_with_the_system_roots() {
     let rig = Rig::new("host-fetcher-release-ca");

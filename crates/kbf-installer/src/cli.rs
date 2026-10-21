@@ -107,6 +107,7 @@ impl Mode {
 pub enum ReleaseSource {
     Url,
     Frontend,
+    Bundled,
 }
 
 #[derive(Args)]
@@ -115,12 +116,17 @@ pub struct SetupArgs {
     #[arg(long, value_enum)]
     pub mode: Mode,
     /// Where releases are fetched from. Default: the frontend for the modes that enroll,
-    /// a file server (`url`) for `frontend` and `all-in-one`.
+    /// a file server (`url`) for `frontend` and `all-in-one`. `bundled` fetches nothing: it
+    /// takes no --release-url and no --commit.
     #[arg(long, value_enum)]
     pub release_source: Option<ReleaseSource>,
     /// The https base URL of the file server, for --release-source url.
     #[arg(long)]
     pub release_url: Option<String>,
+    /// The keys of the release source that go with it in installer.toml: the file server's CA
+    /// (`url`) and the frontend's worker listener with its CA (`frontend`).
+    #[command(flatten)]
+    pub release: crate::setup::release_keys::ReleaseFlags,
     /// Refuse orders below this generation. A floor only goes up.
     #[arg(long)]
     pub min_generation: Option<u64>,

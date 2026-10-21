@@ -1,8 +1,8 @@
-//! Tests of the release keys the air-gapped design added to `installer.toml` (T023, sections 3
-//! and 6): `release_source = "bundled"`, the frontend snapshot (`frontend_url`, `frontend_ca`,
-//! `frontend_ca_sha256`), `release_ca`, and the tolerant reader. The older keys' tests are
-//! `installer_toml_tests.rs`'s. Each test says the defect it catches and the mutants to plant
-//! to see it go red.
+//! Tests of the release keys added to `installer.toml` for hosts with no route to the internet
+//! (docs/design/kbf-installer.md section 3): `release_source = "bundled"`, the frontend
+//! snapshot (`frontend_url`, `frontend_ca`, `frontend_ca_sha256`), `release_ca`, and the
+//! tolerant reader. The older keys' tests are `installer_toml_tests.rs`'s. Each test says the
+//! defect it catches and the mutants to plant to see it go red.
 
 use std::path::PathBuf;
 

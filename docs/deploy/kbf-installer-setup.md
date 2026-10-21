@@ -38,8 +38,8 @@ holds a token.
 
 | mode | `--frontend-url` | `--token-file` | `--database` | release source |
 |---|---|---|---|---|
-| `storage`, `daemon`, `storage-and-daemon` | required | required | refused | `frontend` (default) or `url` |
-| `frontend`, `all-in-one` | refused | refused | required | `url` only (`--release-url` required) |
+| `storage`, `daemon`, `storage-and-daemon` | required | required | refused | `frontend` (default), `url` or `bundled` |
+| `frontend`, `all-in-one` | refused | refused | required | `url` (default; `--release-url` required) or `bundled` |
 
 The modes in the first row enroll with a frontend when they start, so they need its URL
 (`https://host[:port]`, nothing after it) and an enrollment token file (an absolute path, one
@@ -49,7 +49,9 @@ accepts only `--mode=daemon`.
 
 | flag | meaning |
 |---|---|
-| `--release-source url\|frontend`, `--release-url` | where releases come from; `url` needs an `https` `--release-url`, `frontend` refuses one |
+| `--release-source url\|frontend\|bundled`, `--release-url` | where releases come from; `url` needs an `https` `--release-url`, `frontend` and `bundled` refuse one. `bundled` fetches nothing and takes no `--commit`: it writes `release_source = "bundled"`, and installing the release the package carries is a later change |
+| `--release-ca` | for `url`: a PEM file of the CAs the file server's certificate is checked against instead of the system's (an absolute path, a copy owned by root); written as `release_ca`, not read |
+| `--frontend-worker-url`, `--frontend-ca`, `--frontend-ca-sha256` | for `frontend`, all three together: the frontend's worker listener (`https://host[:port]`), a copy of the CA that authenticates it and that copy's sha256; written as `frontend_url`, `frontend_ca`, `frontend_ca_sha256`, not read |
 | `--commit` | the first release (40 hex); needs `--release-source url` |
 | `--min-generation N` | the floor for orders; it only goes up, `0` is refused, and a lower value than `installer.toml` holds is refused (exit 5) |
 | `--database`, `--create-local-database` | the state database, see below |

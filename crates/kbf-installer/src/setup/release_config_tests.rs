@@ -1,5 +1,5 @@
-//! Tests of the release keys `setup` writes into `installer.toml` (T023, section 3):
-//! `--release-source bundled`, `--release-ca` and the frontend snapshot flags
+//! Tests of the release keys `setup` writes into `installer.toml` (docs/design/kbf-installer.md
+//! section 3): `--release-source bundled`, `--release-ca` and the frontend snapshot flags
 //! (`--frontend-worker-url`, `--frontend-ca`, `--frontend-ca-sha256`). `setup` checks and
 //! writes the values; it does not install the release a bundled host carries (a later change)
 //! and does not read the CA files. The helpers are `tests.rs`'s. Each test says the defect it
