@@ -21,7 +21,7 @@ publish.workspace = true
 # `mdm verify` and `mdm tls --check-godaddy`; rustls loads the push certificate's key
 # to match it to the certificate, and checks `pilot server-install`'s server
 # certificate and key; sha2 checks the archives against their pins; zip, tar and flate2 unpack the archives;
-# x509-parser reads the certificates `mdm` checks; plist writes the enrollment profile;
+# x509-parser reads the certificates `mdm` checks; kbf-ca holds the checks `linux verify-cert` runs; plist writes the enrollment profile;
 # base64 encodes the Basic auth of the MDM services' APIs.
 # `mdm erase-request` writes and checks the request with kbf-mdm's own parser and
 # signature check, and reads the security key's public half with ssh-key.
@@ -38,6 +38,7 @@ clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
 httparse.workspace = true
+kbf-ca.workspace = true
 kbf-host.workspace = true
 kbf-installer.workspace = true
 kbf-mdm.workspace = true

@@ -246,7 +246,7 @@ fn the_all_in_one_unit_names_its_sqlite_state_file_in_the_data_directory() {
 /// certificate verify-cert passes but storage reads as another role or none.
 #[test]
 fn each_rows_certificate_names_its_role_as_storage_reads_it() {
-    use kbf_deploy::linux::verify_cert::{CLIENT_AUTH, ROLE_URI_PREFIX, Row, verify};
+    use kbf_ca::verify_cert::{CLIENT_AUTH, ROLE_URI_PREFIX, Row, verify};
     use kbf_storage::service::{PeerRole, role_of};
     use rcgen::{ExtendedKeyUsagePurpose as Eku, KeyUsagePurpose, SanType};
 
