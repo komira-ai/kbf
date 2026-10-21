@@ -1565,6 +1565,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-daemon-test"
+version = "0.1.0"
+dependencies = [
+ "kbf-harness",
+ "kbf-proto",
+ "kbf-testkit",
+ "kbf-transfer",
+ "rustix",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "kbf-deploy"
 version = "0.1.0"
 dependencies = [
