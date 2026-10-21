@@ -1337,10 +1337,7 @@ async fn serving_remote(
     .await;
     let (config, ca) = served_config(name);
     let dir = config.parent().expect("the directory").to_owned();
-    let kbf_oidc::Roots::Given(roots) = &issuer.roots else {
-        panic!("a fake issuer has roots of its own");
-    };
-    let b64 = base64::engine::general_purpose::STANDARD.encode(roots[0].as_ref());
+    let b64 = base64::engine::general_purpose::STANDARD.encode(issuer.root.as_ref());
     let pem = format!(
         "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
         b64.as_bytes()

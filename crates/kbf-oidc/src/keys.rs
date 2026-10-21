@@ -1,7 +1,7 @@
 //! The issuer's signing keys: a JWKS, kept in memory.
 //!
 //! A key is looked up by `kid`. An unknown `kid` makes one refetch, at most once per
-//! [`KeyCache::refetch_interval`], and is then refused. A failed fetch with keys already
+//! `refetch_interval`, and is then refused. A failed fetch with keys already
 //! held keeps verifying with them; a failed first fetch fails closed.
 
 use std::collections::BTreeMap;
@@ -96,12 +96,6 @@ impl KeyCache {
             }),
             refetch_interval,
         }
-    }
-
-    /// The minimum time between two fetches.
-    #[must_use]
-    pub const fn refetch_interval(&self) -> Duration {
-        self.refetch_interval
     }
 
     /// The key `kid` names, fetching if it is unknown and the interval allows.

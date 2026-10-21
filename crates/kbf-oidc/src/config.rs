@@ -118,11 +118,7 @@ impl OidcConfig {
             .remote_operator
             .ok_or_else(|| ConfigError::Invalid("the [remote_operator] table is absent".into()))?;
         let issuer = need(raw.issuer, "issuer")?;
-        if !issuer.starts_with("https://")
-            || issuer.ends_with('/')
-            || issuer.contains(['?', '#'])
-            || issuer.len() <= "https://".len()
-        {
+        if !issuer.starts_with("https://") || issuer.ends_with('/') || issuer.contains(['?', '#']) {
             return Err(ConfigError::Invalid(
                 "issuer must be an https:// URL with no trailing slash, query or fragment".into(),
             ));

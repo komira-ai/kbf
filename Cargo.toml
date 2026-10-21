@@ -269,3 +269,11 @@ incremental = false
 [profile.test]
 debug = "line-tables-only"
 incremental = false
+
+# The RSA test keys of kbf-oidc's `testkit` are generated in each test process (nextest runs a
+# process per test, three 2048-bit keys each): the prime search is minutes in an unoptimized,
+# instrumented build and seconds optimized. Only these two crates, only in test builds.
+[profile.dev.package.rsa]
+opt-level = 3
+[profile.dev.package.num-bigint-dig]
+opt-level = 3

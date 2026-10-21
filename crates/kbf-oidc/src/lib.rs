@@ -207,12 +207,6 @@ impl Verifier {
         }
     }
 
-    /// The allow-list.
-    #[must_use]
-    pub const fn config(&self) -> &OidcConfig {
-        &self.config
-    }
-
     /// Checks `token`. On success the `jti` is spent: the same token is refused next time.
     ///
     /// # Errors
@@ -325,6 +319,8 @@ fn audience_is(claims: &Map<String, Value>, want: &str) -> Result<bool, Refusal>
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_edges;
 
 #[cfg(any(test, feature = "testkit"))]
 #[allow(clippy::missing_panics_doc, clippy::missing_errors_doc)]

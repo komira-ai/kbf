@@ -93,9 +93,21 @@ struct Case {
     rig: Rig,
     child: ChildLog,
     handler: HandlerLog,
+    /// Held so the `tracing` macros of the code under test run their fields (a subscriber that
+    /// writes nowhere): a test's coverage must not rest on another test's subscriber.
+    _log: tracing::subscriber::DefaultGuard,
+}
+
+fn logging() -> tracing::subscriber::DefaultGuard {
+    tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .finish(),
+    )
 }
 
 async fn case(remote: Option<Arc<Verifier>>) -> Case {
+    let log = logging();
     let (child, handler): (ChildLog, HandlerLog) = Default::default();
     let slots = ActiveSlot::new();
     slots.open(Slot::A);
@@ -118,6 +130,7 @@ async fn case(remote: Option<Arc<Verifier>>) -> Case {
         rig,
         child,
         handler,
+        _log: log,
     }
 }
 
@@ -510,4 +523,165 @@ fn the_allow_list_is_off_by_default_and_a_bad_one_stops_the_start() {
             "no secret was made for a start that failed"
         );
     }
+}
+
+/// The refusal for keys that cannot be had has its own codes on both kinds of route.
+///
+/// Kills: `Unavailable` answered as an authentication failure (a retrying pipeline reads 401
+/// as a wrong credential and stops).
+#[test]
+fn an_unavailable_credential_is_a_503_and_a_grpc_14() {
+    use crate::auth::Refusal;
+    assert_eq!(Refusal::Unavailable.http_status(), 503);
+    assert_eq!(Refusal::Unavailable.grpc_status(), 14);
+    let plain = crate::reply::refused(false, Refusal::Unavailable);
+    assert_eq!(plain.status(), 503);
+    let grpc = crate::reply::refused(true, Refusal::Unavailable);
+    assert_eq!(
+        grpc.headers().get("grpc-status").map(|v| v.as_bytes()),
+        Some(&b"14"[..])
+    );
+}
+
+fn jws_shaped_operator_token() -> &'static str {
+    "aGVhZGVy.Ym9keQ.c2lnbmF0dXJl-0123456789abcdef"
+}
+
+/// An operator token that happens to look like a JWS is still the operator token: it is
+/// admitted as the credential of the class, the verifier is not asked, and it costs the
+/// address nothing.
+///
+/// Kills: the OIDC path tried before the operator token (a hand-made token with two dots
+/// refused as a bad OIDC token).
+#[tokio::test(start_paused = true)]
+async fn an_operator_token_that_looks_like_a_jws_is_the_operator_token() {
+    use crate::auth::{Token, Tokens};
+    use crate::identity::ProxySecret;
+    use crate::route::AuthClass;
+    use crate::security::{Admitted, Security};
+
+    let tokens = Tokens {
+        buck2: None,
+        operator: Some(Token::new(jws_shaped_operator_token().as_bytes())),
+    };
+    let (verifier, _) = static_verifier();
+    let security = Security::new(
+        Buck2Auth::None,
+        tokens,
+        ProxySecret::from_slice(&super::kit::SECRET).expect("32 bytes"),
+    )
+    .with_remote(RemoteCi::new(verifier));
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_str(&format!("Bearer {}", jws_shaped_operator_token()))
+            .expect("value"),
+    );
+    let ip = "192.0.2.9".parse().expect("an ip");
+    let call = (
+        &http::Method::POST,
+        &"/v1/update/frontend".parse::<http::Uri>().expect("uri"),
+    );
+    let admitted = security
+        .authorize_call(
+            AuthClass::Update,
+            call,
+            &headers,
+            None,
+            ip,
+            std::time::Instant::now(),
+        )
+        .await;
+    assert!(matches!(admitted, Ok(Admitted::Credential)), "{admitted:?}");
+    assert_eq!(security.failures.tracked(), 0);
+}
+
+/// A proxy that holds no operator token cannot put one on a call for the child, so an OIDC
+/// token it admits for `desired` is refused (403) and nothing reaches the child; the update
+/// API, which is the proxy's own and needs no token to the child, is still reached.
+///
+/// Kills: the call forwarded with the OIDC token (or none) when there is no operator token.
+#[tokio::test(start_paused = true)]
+async fn without_an_operator_token_to_forward_desired_is_refused() {
+    use crate::auth::Tokens;
+    use crate::identity::ProxySecret;
+    use crate::security::Security;
+
+    let _log = logging();
+    let (verifier, _) = static_verifier();
+    let (child, handler): (ChildLog, HandlerLog) = Default::default();
+    let slots = ActiveSlot::new();
+    slots.open(Slot::A);
+    slots.set_active(Slot::A).expect("A is open");
+    let secured = Security::new(
+        Buck2Auth::None,
+        Tokens::default(),
+        ProxySecret::from_slice(&super::kit::SECRET).expect("32 bytes"),
+    )
+    .with_remote(RemoteCi::new(verifier));
+    let rig = Rig::build_with(
+        recording_child(&child),
+        tagged("b"),
+        Handler(Arc::clone(&handler)),
+        Limits::default(),
+        slots,
+        secured,
+        Access::Plain(None),
+    )
+    .await;
+    let case = Case {
+        rig,
+        child,
+        handler,
+        _log: logging(),
+    };
+    assert_eq!(case.call("POST", DESIRED, DESIRED_BODY, &good()).await, 403);
+    assert!(case.reached().0.is_empty());
+    assert_eq!(
+        case.call("POST", FRONTEND, FRONTEND_BODY, &good()).await,
+        202
+    );
+    assert_eq!(case.reached().1.len(), 1);
+}
+
+/// `Proxy::bind_with_remote` takes the gate it is given, `RemoteCi::from_file` reads the file
+/// (it needs the host's root certificates to trust the issuer, so on a host with none it
+/// refuses for that and says so), and a token that is not text is `Malformed`.
+#[tokio::test]
+async fn a_given_gate_is_installed_and_a_file_is_read() {
+    use super::bypass::files;
+    use crate::scratch::write_file;
+    use std::os::fd::OwnedFd;
+
+    let (verifier, _) = static_verifier();
+    let gate = RemoteCi::new(verifier);
+    let not_text = gate.verify(b"\xff\xfe").await.expect_err("not text");
+    assert!(matches!(not_text, kbf_oidc::Refusal::Malformed(_)));
+
+    let on = files("remote-given", 20_000, "");
+    let socket = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    let bound = tokio::task::spawn_blocking(move || {
+        crate::Proxy::bind_with_remote(
+            on.config.clone(),
+            OwnedFd::from(socket),
+            Some(RemoteCi::new(static_verifier().0)),
+        )
+        .map(|_| ())
+    })
+    .await
+    .expect("the bind finishes");
+    assert!(bound.is_ok(), "{bound:?}");
+
+    let dir = crate::scratch::scratch("remote-from-file");
+    let file = dir.join("ci.toml");
+    write_file(
+        &file,
+        config_text("https://token.example").as_bytes(),
+        0o600,
+    );
+    assert_eq!(RemoteCi::check_file(&file), Ok(()));
+    // Ok on a host with root certificates, a refusal for want of them on one without: the
+    // body runs either way.
+    let _ = RemoteCi::from_file(&file);
+    assert!(RemoteCi::from_file(&dir.join("missing.toml")).is_err());
 }

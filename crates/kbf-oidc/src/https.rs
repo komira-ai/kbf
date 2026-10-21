@@ -75,54 +75,43 @@ impl HttpsKeys {
     }
 
     async fn get(&self, url: &str) -> Result<Vec<u8>, String> {
-        tokio::time::timeout(self.timeout, self.get_inner(url))
-            .await
-            .map_err(|_| format!("{url}: timed out"))?
+        match tokio::time::timeout(self.timeout, self.fetch(url)).await {
+            Ok(Ok(body)) => Ok(body),
+            Ok(Err(e)) => Err(format!("{url}: {e}")),
+            Err(_) => Err(format!("{url}: timed out")),
+        }
     }
 
-    async fn get_inner(&self, url: &str) -> Result<Vec<u8>, String> {
-        let uri: Uri = url.parse().map_err(|e| format!("{url}: {e}"))?;
+    async fn fetch(&self, url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        let uri: Uri = url.parse()?;
         if uri.scheme_str() != Some("https") {
-            return Err(format!("{url}: not https"));
+            return Err("not https".into());
         }
         let authority = uri.authority().map_or("", Authority::as_str);
         let host = uri.host().unwrap_or_default();
         let port = uri.port_u16().unwrap_or(443);
-        let name = ServerName::try_from(host.to_owned()).map_err(|e| format!("{url}: {e}"))?;
-        let tcp = TcpStream::connect((host, port))
-            .await
-            .map_err(|e| format!("{url}: connect: {e}"))?;
-        let tls = self
-            .connector
-            .connect(name, tcp)
-            .await
-            .map_err(|e| format!("{url}: TLS: {e}"))?;
+        let name = ServerName::try_from(host.to_owned())?;
+        let tcp = TcpStream::connect((host, port)).await?;
+        let tls = self.connector.connect(name, tcp).await?;
         let (mut sender, connection) =
-            hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(TokioIo::new(tls))
-                .await
-                .map_err(|e| format!("{url}: {e}"))?;
+            hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(TokioIo::new(tls)).await?;
         let driver = tokio::spawn(async move {
             let _ = connection.await;
         });
         let request = Request::get(uri.path_and_query().map_or("/", |p| p.as_str()))
             .header(HOST, authority)
-            .header(USER_AGENT, "kbf-server")
+            .header(USER_AGENT, "kbf-oidc")
             .header(CONNECTION, "close")
-            .body(Empty::<Bytes>::new())
-            .map_err(|e| format!("{url}: {e}"))?;
-        let response = sender
-            .send_request(request)
-            .await
-            .map_err(|e| format!("{url}: {e}"))?;
+            .body(Empty::<Bytes>::new())?;
+        let response = sender.send_request(request).await?;
         let status = response.status();
         if !status.is_success() {
             driver.abort();
-            return Err(format!("{url}: status {status}"));
+            return Err(format!("status {status}").into());
         }
         let body = Limited::new(response.into_body(), MAX_DOCUMENT_BYTES)
             .collect()
-            .await
-            .map_err(|e| format!("{url}: {e}"))?
+            .await?
             .to_bytes();
         driver.abort();
         Ok(body.to_vec())
@@ -138,25 +127,32 @@ fn origin(url: &str) -> Option<(String, String)> {
     ))
 }
 
+impl HttpsKeys {
+    /// The `jwks_uri` of the discovery document `doc`, if the document is the issuer's own
+    /// and the URI is on the issuer's origin.
+    fn jwks_uri(&self, doc: &[u8]) -> Result<String, String> {
+        let doc: serde_json::Value = serde_json::from_slice(doc).map_err(|e| e.to_string())?;
+        let field = |name| doc.get(name).and_then(|v| v.as_str());
+        if field("issuer") != Some(self.issuer.as_str()) {
+            return Err(format!("its issuer is not {}", self.issuer));
+        }
+        match field("jwks_uri") {
+            Some(uri) if origin(uri) == origin(&self.issuer) => Ok(uri.to_owned()),
+            Some(_) => Err("jwks_uri is not on the issuer's origin".to_owned()),
+            None => Err("no jwks_uri".to_owned()),
+        }
+    }
+}
+
 impl KeySource for HttpsKeys {
     fn jwks(&self) -> BoxFuture<'_, Result<String, String>> {
         Box::pin(async move {
             let discovery = format!("{}/.well-known/openid-configuration", self.issuer);
-            let doc: serde_json::Value = serde_json::from_slice(&self.get(&discovery).await?)
-                .map_err(|e| format!("{discovery}: {e}"))?;
-            if doc.get("issuer").and_then(|v| v.as_str()) != Some(self.issuer.as_str()) {
-                return Err(format!("{discovery}: its issuer is not {}", self.issuer));
-            }
-            let uri = doc
-                .get("jwks_uri")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("{discovery}: no jwks_uri"))?;
-            if origin(uri) != origin(&self.issuer) {
-                return Err(format!(
-                    "{discovery}: jwks_uri is not on the issuer's origin"
-                ));
-            }
-            String::from_utf8(self.get(uri).await?).map_err(|e| format!("{uri}: {e}"))
+            let doc = self.get(&discovery).await?;
+            let uri = self
+                .jwks_uri(&doc)
+                .map_err(|why| format!("{discovery}: {why}"))?;
+            String::from_utf8(self.get(&uri).await?).map_err(|e| format!("{uri}: {e}"))
         })
     }
 }

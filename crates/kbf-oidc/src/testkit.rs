@@ -98,11 +98,17 @@ pub struct Served {
     pub jwks_uri: Option<String>,
     /// How many times the JWKS was requested.
     pub jwks_requests: usize,
+    /// The discovery document, if not the issuer's own.
+    pub discovery: Option<String>,
+    /// Read the request and never answer it.
+    pub hang: bool,
 }
 
 /// A TLS server on loopback acting as `token.actions.githubusercontent.com`.
 pub struct FakeIssuer {
     pub url: String,
+    /// The certificate the issuer serves, which is the one root that trusts it.
+    pub root: rustls::pki_types::CertificateDer<'static>,
     pub roots: Roots,
     pub served: Arc<Mutex<Served>>,
 }
@@ -133,13 +139,13 @@ impl FakeIssuer {
             fail: false,
             jwks_uri: None,
             jwks_requests: 0,
+            discovery: None,
+            hang: false,
         }));
         let (state, issuer) = (Arc::clone(&served), url.clone());
         tokio::spawn(async move {
             loop {
-                let Ok((tcp, _)) = listener.accept().await else {
-                    return;
-                };
+                let (tcp, _) = listener.accept().await.expect("accept");
                 let (acceptor, state, issuer) =
                     (acceptor.clone(), Arc::clone(&state), issuer.clone());
                 tokio::spawn(async move {
@@ -154,12 +160,19 @@ impl FakeIssuer {
                             Ok(n) => head.extend_from_slice(&buf[..n]),
                         }
                     }
+                    if state.lock().expect("state").hang {
+                        std::future::pending::<()>().await;
+                    }
                     let head = String::from_utf8_lossy(&head);
                     let path = head.split_whitespace().nth(1).unwrap_or("/").to_owned();
                     let (status, body) = {
                         let mut s = state.lock().expect("state");
                         if s.fail {
                             ("503 Service Unavailable", String::new())
+                        } else if path == "/.well-known/openid-configuration"
+                            && s.discovery.is_some()
+                        {
+                            ("200 OK", s.discovery.clone().unwrap_or_default())
                         } else if path == "/.well-known/openid-configuration" {
                             let uri = s
                                 .jwks_uri
@@ -188,6 +201,7 @@ impl FakeIssuer {
         });
         Self {
             url,
+            root: der.clone(),
             roots: Roots::Given(vec![der]),
             served,
         }
@@ -195,6 +209,14 @@ impl FakeIssuer {
 
     pub fn set_jwks(&self, jwks: String) {
         self.served.lock().expect("state").jwks = jwks;
+    }
+
+    pub fn set_discovery(&self, document: &str) {
+        self.served.lock().expect("state").discovery = Some(document.to_owned());
+    }
+
+    pub fn set_hang(&self) {
+        self.served.lock().expect("state").hang = true;
     }
 
     pub fn set_fail(&self, fail: bool) {
