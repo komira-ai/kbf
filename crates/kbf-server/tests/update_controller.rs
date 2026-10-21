@@ -935,16 +935,17 @@ impl Transport for Flaky {
         host: &WorkerId,
         order: OrderId,
         release: &Release,
+        source: Source,
     ) -> Result<(), TransportError> {
         self.calls.lock().unwrap().push(order);
         if self.failures > 0 {
             self.failures -= 1;
             if self.deliver_first {
-                self.inner.activate(host, order, release)?;
+                self.inner.activate(host, order, release, source)?;
             }
             return Err(TransportError::new("the answer did not come"));
         }
-        self.inner.activate(host, order, release)
+        self.inner.activate(host, order, release, source)
     }
 
     fn confirm(
