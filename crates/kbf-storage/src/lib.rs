@@ -23,7 +23,7 @@
 //!   needs is held.
 //!
 //! This crate depends on no frontend crate: not the scheduler (`kbf-sched`) and not
-//! authorization (`kbf-auth`). `crates/kbf-it/tests/layering.rs` checks it.
+//! authorization (`kbf-auth`). `crates/kbf-integration-test/tests/layering.rs` checks it.
 
 pub mod flush;
 pub mod in_flight;

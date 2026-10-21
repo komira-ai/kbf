@@ -50,7 +50,7 @@ pub const DEFAULT_STREAM_IDLE: Duration = Duration::from_secs(300);
 pub const DEFAULT_ROUTE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The names kbf-server's grpc.health.v1 service answers (`kbf_server::grpc_health::
-/// SERVICES`, which a kbf-it test compares with this list); any other name is
+/// SERVICES`, which a kbf-integration-test test compares with this list); any other name is
 /// NOT_FOUND, so the server is never healthy.
 pub const HEALTH_SERVICES: [&str; 6] = [
     "",

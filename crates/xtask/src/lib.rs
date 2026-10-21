@@ -5,7 +5,8 @@
 //!   <commit>` and `build-commit stamps <commit>` ([`build_commit`]): kbf-server names the
 //!   commit it was built from, and `kbf` does in the tarball that ships.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
-//!   row the working tree's budget file has and `<rev>`'s does not is refused. CI runs
+//!   row the working tree's budget file has and `<rev>`'s does not is refused, unless
+//!   git sees the row's path renamed from a path `<rev>` has a row for. CI runs
 //!   it on pull requests, with the base branch as `<rev>`.
 //! - `sign-darwin <binary> --minos <version> [--summary <file>]` and `darwin-asset
 //!   <tarball> <name>` ([`darwin`]): the macOS binary signed ad hoc with the hardened
@@ -30,6 +31,10 @@
 //!   attested on, and the built deb as the release asset
 //!   `kbf-installer-<commit>-<platform>.deb`, refused unless it holds the binary of the
 //!   attested tarball and trusts the branch it is attested for.
+//! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf-installer` package
+//!   carries, in the one form a deb and an rpm put in the same order, and the most a package
+//!   that carries a kbf release may weigh. `pkg-config` and `pkg-asset` take them up with
+//!   the release.
 //! - `pkg-macos-asset` and `pkg-macos-install-test` ([`pkg_macos_asset`],
 //!   [`pkg_macos_install`]): the Mac `.pkg` as the release asset
 //!   `kbf-installer-<commit>-darwin-arm64.pkg`, refused unless it holds the attested
@@ -63,6 +68,7 @@
 //! Exit status: 0 when the check passed, 1 when it failed (one reason per line on
 //! stderr), 2 on a usage error.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -85,7 +91,9 @@ pub mod pkg_linux;
 pub mod pkg_macos_asset;
 #[cfg(target_os = "macos")]
 pub mod pkg_macos_install;
+pub mod pkg_size;
 pub mod pkg_trust;
+pub mod pkg_version;
 pub mod proxy_loom;
 pub mod release;
 pub mod sudo_test;
@@ -706,30 +714,45 @@ fn default_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The budget file as `rev` holds it, read with `git show` in `root`.
-fn budget_at(root: &Path, rev: &str) -> Result<String, Error> {
-    let spec = format!("{rev}:{}", budget::BUDGET);
+/// What `git <args>` prints in `root`.
+fn git_stdout(root: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["show", &spec])
+        .args(args)
         .output()
         .map_err(Error::spawn("git".to_owned()))?;
     if !out.status.success() {
         return Err(Error::Failed(format!(
-            "git show {spec}: {}",
+            "git {}: {}",
+            args.join(" "),
             String::from_utf8_lossy(&out.stderr).trim_end()
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(out.stdout)
 }
 
-/// `budget-diff --base <rev>`: the line it prints when nothing was added.
+/// The budget file as `rev` holds it, read with `git show` in `root`.
+fn budget_at(root: &Path, rev: &str) -> Result<String, Error> {
+    let spec = format!("{rev}:{}", budget::BUDGET);
+    let out = git_stdout(root, &["show", &spec])?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// The paths git sees renamed between `rev` and `HEAD` in `root`: new path to old.
+fn renames_since(root: &Path, rev: &str) -> Result<BTreeMap<String, String>, Error> {
+    let args = ["diff", "--find-renames", "--name-status", "-z", rev, "HEAD"];
+    Ok(budget::parse_renames(&git_stdout(root, &args)?))
+}
+
+/// `budget-diff --base <rev>`: the line it prints when nothing was added. A path git
+/// renamed since `rev` keeps its row.
 fn budget_diff(root: &Path, rev: &str) -> Result<String, Error> {
     let base = budget_at(root, rev)?;
+    let renames = renames_since(root, rev)?;
     let path = root.join(budget::BUDGET);
     let head = std::fs::read_to_string(&path).map_err(Error::spawn(path.display().to_string()))?;
-    let added = budget::new_rows(&base, &head).map_err(Error::Refused)?;
+    let added = budget::new_rows_renamed(&base, &head, &renames).map_err(Error::Refused)?;
     if added.is_empty() {
         return Ok(format!("ok: {} adds no row to {rev}'s", budget::BUDGET));
     }

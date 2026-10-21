@@ -382,7 +382,7 @@ All from `feature/arch-v2`.
   Single-box modes use `file://` (`docs/deploy/kbf-units.md`, "all-in-one is for a trusted box"; `docs/deploy/storage-node.md:272`);
   `file://` is one process per directory: `FsStore::open` takes an exclusive `flock` on `LOCK` with `try_lock` (`fs_store.rs:294-302`, doc `:7-8`), and a second opener gets `FsStoreError::Locked` instead of sharing the directory. No doc describes a multi-node `file://` farm. The test-farm unit uses an `s3://` store
   that is loopback unless `MINIO_S3_ENDPOINT` is remote; the rehearsal harness defaults to a
-  directory (`docs/design/kbf-cicd.md:232,241`). No doc says "every node shares one store".
+  directory (`docs/design/kbf-cicd.md` section 4.3, the harness). No doc says "every node shares one store".
 
 **Index and `put_unowned`**
 - `MetaState.blobs` is private (`crates/kbf-meta/src/state.rs:320`); public readers are

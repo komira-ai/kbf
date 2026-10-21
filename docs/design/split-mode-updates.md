@@ -748,7 +748,7 @@ may not start the frontend phase or change policy.
 
 ## 7. Test plan
 
-End-to-end tests in `kbf-it` (a new cell, `kbf-cell upd`, beside `m1` and `m2`): real `kbf` processes, the pinned buck2,
+End-to-end tests in `kbf-integration-test` (a new cell, `kbf-cell upd`, beside `m1` and `m2`): real `kbf` processes, the pinned buck2,
 `//:pause`-style actions, a `file://` cold store, 3 storage-and-daemon nodes at R=2, one daemon-only process, the frontend as
 `@a`/`@b` processes with the control socket (the unit text is covered by the existing unit lints). A second cell runs the base
 binary and a test-only "N+1" built from the next commit for the mixed-version tests. Each test names the defect and the mutant to plant.

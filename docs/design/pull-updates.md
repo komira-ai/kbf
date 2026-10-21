@@ -225,9 +225,9 @@ URL or a unit.
 
 ### 6.1 Flags and failure
 
-`--releases-dir DIR` names the content-addressed release store (files named by their SHA-256). Every update
-endpoint needs it **and** a state store (`--state-store`). Without either, every update endpoint answers **503**
-saying which is missing; nothing answers an empty 200.
+`--releases-dir DIR` names the content-addressed release store (files named by their SHA-256). `GET /v1/update` and
+`POST /v1/update/desired` need `--releases-dir` and `--state-store`; pause and resume need only `--state-store`. Without what an endpoint
+needs it answers **503** saying which flag is missing; nothing answers an empty 200.
 
 ### 6.2 State store rows
 
@@ -239,7 +239,33 @@ saying which is missing; nothing answers an empty 200.
 | `update/slot` | the rollout slot: one storage holder plus up to `max_hosts_out` host holders, each `{host, order_id, epoch}`, with the run state; no time to live (section 8) |
 | `update/host/<id>` | the controller's per-host phase `{phase, order_id, generation, since, boot_before}`: what a restarted controller resumes from (split-mode-updates.md 2.6) |
 | `update/available/<commit>` | the release source's proposal and its preflight result; metadata only (split-mode-updates.md 6.2) |
-| `update/policy` | `{paused (bool), idle_wait, min_serving, max_hosts_out (default 1), mac_force_after, new_work_only_to_updated, accept_failing_builds}`; the older `update/auto {enabled}` row is removed |
+| `update/policy` | the policy fields listed below; the older `update/auto {enabled}` row is removed |
+
+**The `update/policy` fields.** The row stores durations in milliseconds (`idle_wait_ms`, `ttl_ms`, and so on) and omits a field that
+equals its default; `GET /v1/update` shows the policy with durations in seconds (key `<name>_secs`) and leaves out `ttl` and `dwell`. Defaults are those of `Policy::default`.
+
+| key | value |
+|---|---|
+| `paused` | bool, default false: while set no host is started |
+| `auto_nodes` | bool, default true: the controller starts hosts for the desired release (read by the frontend runner) |
+| `auto_frontend` | bool, default false: as `auto_nodes` for the frontend's own update; carried, not acted on |
+| `new_work_only_to_updated` | bool, default false; carried, not acted on |
+| `accept_failing_builds` | bool, default false; carried, not acted on |
+| `idle_wait` | how long the picker waits for a node to go idle before it cordons the least-loaded one, default 120 s (`idle_wait_secs` in GET) |
+| `min_serving` | count of other hosts of the platform that must stay connected and uncordoned, default 0 (no floor) |
+| `max_hosts_out` | daemon-only hosts and Macs in a step at once, default 1, must be at least 1 |
+| `mac_force_after` | optional: after this long without an idle Mac the least-loaded Mac is cordoned, default null (never) (`mac_force_after_secs`) |
+| `ttl` | member row time to live, default 15 s; in the row, not shown by GET /v1/update |
+| `dwell` | how long a Down member stays in the map, default 300 s; in the row, not shown by GET; must exceed 2 x `ttl` |
+| `lease_limit` | step 3 on Linux, wait for leases to end, default 900 s (`lease_limit_secs` in GET) |
+| `mac_lease_limit` | step 3 on a Mac, default 3600 s (`mac_lease_limit_secs`) |
+| `write_limit` | steps 4 and 5, wait for write sessions to reach zero, default 60 s (`write_limit_secs`); 2 x it must be below `dwell` - 2 x `ttl` |
+| `activate_limit` | step 6, wait for ACTIVATED_UNCONFIRMED, default 300 s (`activate_limit_secs`) |
+| `health_limit` | claim, cordon, return and confirm wait, default 120 s (`health_limit_secs`) |
+| `rebuild_limit` | step 7, optional (null = no bound), default null (`rebuild_limit_secs`) |
+| `repair_wait` | step 8, default 300 s (`repair_wait_secs`) |
+
+The first nine keys are the operator-facing fields; the rest are limits of the node step. A writer that knows only the nine leaves the others at their defaults.
 
 **A release upload triggers its preflight.** The `PUT` of a release's last needed component starts the preflight for the commit and
 writes the `update/available/<commit>` row (metadata, the declared `protocol`, `min_protocol`, `state_schema`, `profile`, and the
@@ -269,11 +295,15 @@ the disk index, never the reverse. The desired release, the slot, the per-host p
 - `GET /v1/releases`: commits with, per platform, which components are present and whether the platform is complete.
 - `GET /v1/releases/{commit}`: the description `ReleaseService.Describe` gives for every complete platform, as JSON (section 5): the
   files of the release by digest, and the `releases/<commit>.json` of a `url` source.
+- **Write gates.** Writes are accepted only from the server's own host, need `Authorization: Bearer <token from --api-token-file>`, and
+  refuse an `Origin` header (403 or 401). `POST /v1/update/desired` wants `Content-Type: application/json` exactly (else 415).
 - `POST /v1/update/desired {commit}`: the commit needs at least one complete platform (else 409). Compare-and-set
   on `update/desired`; the counter gives the new generation only when the commit differs from the current one.
-- `GET /v1/update`: `{desired, releases}`. The policy fields are set through `POST /v1/update/policy` (admin). There is no auto-update endpoint.
-- `GET /v1/nodes` gains, per node, an `update` object: state, the three commits, offered generation, refusal,
-  `helper_present`, `up_to_date` (true, false or null) and `availability` (`ok`, `unavailable`, `unsupported`).
+- `GET /v1/update` (open): `{desired, paused, policy, proposals, releases}`. `desired` is `null` or `{generation, commit, set_at_ms}`; `paused` is the policy row's flag (false when no policy row exists); `policy` is the `update/policy` row, or `null` when the operator never wrote one; `proposals` are the releases the release poller found (a proposal starts nothing); `releases` is the body of `GET /v1/releases`. Without `--state-store` or `--releases-dir` it is 503.
+- `POST /v1/update/desired {commit, expect_generation?}` (write gates, JSON body, no other key): without `expect_generation` the write is as above. With it, the write happens only if the desired release is at that generation (0 before any offer); otherwise it is 409 with a message naming both generations and nothing is written. The answer is the desired release. The 409 has two causes, told apart only by the error text: the commit has no complete platform, or `expect_generation` is not the current generation. The stale check runs before the same-commit shortcut, so a stale `expect_generation` with the commit already desired is 409, not a 200 no-op; a missing or null `expect_generation` skips the check. A negative or non-integer value is 400. A malformed body or commit is 400; contended retries are 503 with `Retry-After: 1`.
+- `POST /v1/update/pause` and `POST /v1/update/resume` (write gates, no body) set `paused` in the policy row by compare-and-set of that field alone, need no run, and answer `{paused}` whatever the current value. The first pause or resume creates the policy row with the defaults, so `policy` in `GET /v1/update` is non-null from then on. While `paused` is set no host is started. An offer leaves the flag as it is. These two need only `--state-store`.
+- Updates are triggered externally: the deployment that rolls out a release calls `POST /v1/update/desired`. There is no auto-update endpoint. Planned: `POST /v1/update/policy` (admin), to set the other policy fields, and `GET /v1/update/plan?commit=`, a read that computes the plan (hosts and blockers) and stores nothing; neither route exists yet.
+- `GET /v1/nodes` gains, per node, `update: {state, up_to_date, availability}` (`up_to_date` is true, false or null; `availability` is `ok`, `unavailable` or `unsupported`). The three commits, the offered generation, the refusal (capped at 512 bytes) and `helper_present` are on `GET /v1/update/hosts` (off unless the policy names `farm.getAuthorizer`).
 
 ### 6.4 Sessions
 
@@ -341,7 +371,7 @@ still run unprivileged there, so a fault in them is not root.
 
 | Command | Does |
 |---|---|
-| `kbf-installer run` | every 5 seconds (a fixed constant, not a key), each pass: finish a restart it owes; revert a swap whose confirm window ran out; sweep leftover scratch (7.3); act on order records from `orders/` in (epoch, id) order, once each. For `activate`: refuse it while a trial is pending (a release activated and not yet confirmed or reverted: there is one confirm window at a time, never two timers), check the order (below), **fetch, verify and install the release for the commit (7.1, 7.2)**, write `pending_confirm`, flip `previous` then `current`, restart the one configured service; `confirm`: keep it; `revert`: flip back and restart; write `status.json` |
+| `kbf-installer run` | at start, once, under the lock: remove the `work/*.partial` and `work/*.check` a killed stage left (7.3). Then every 5 seconds (a fixed constant, not a key), each pass: finish a restart it owes; revert a swap whose confirm window ran out; act on order records from `orders/` in (epoch, id) order, once each. For `activate`: refuse it while a trial is pending (a release activated and not yet confirmed or reverted: there is one confirm window at a time, never two timers), check the order (below), **fetch, verify and install the release for the commit (7.1, 7.2)**, write `pending_confirm`, flip `previous` then `current`, restart the one configured service; `confirm`: keep it; `revert`: flip back and restart; write `status.json` |
 | `kbf-installer confirm`, `revert`, `rollback` | the operator verbs: **inline root CLI runs under the installer's lock** (exit 4 while a `run` pass holds it); no socket, and `kbf` cannot run them. `confirm` and `revert` name the activation; `rollback` is the only verb below the floor. `update --commit SHA --frontend` is not among them: it needs no root, is refused through `sudo`, and is a client of the proxy's update API (`--api`, `--token-file`, `--api-ca`) that waits for the swap; the API writes the `frontend_update` order (section 6.5) |
 | `kbf-installer boot-check` | `ExecStartPre` on Linux: count the starts of a release on trial and revert one that keeps failing before it starts again; start the confirm window at the first start |
 
@@ -516,8 +546,9 @@ test-farm switch (§2, attestation off) never carry the marker and so never coun
   sets `STATE_REFUSED` with the reason (`fetch: short read`, `fetch: timeout`, `fetch: source unreachable`) and does **not**
   retry. Nothing but scratch has changed. The frontend's controller treats it as a failure before the swap: the host is
   uncordoned, the run goes `held`, and a person re-issues the update (a new order id).
-- **Parent or host dies during the fetch**: `work/*.partial` is left. The installer deletes every
-  entry under `work/` and every unreferenced `releases/` directory without `VERIFIED` at the start of each run; **the sweep never removes
+- **Parent or host dies during the fetch**: `work/*.partial` is left. At the start of each run, under the lock
+  and before its first pass, the installer deletes every `work/*.partial` and `work/*.check` (nothing else in `work/`; a link is removed, never followed), and the operator's verbs
+  sweep the `releases/.stage-*` directories; neither sweep removes a `releases/` directory that has a name of its own. **The sweep never removes
 the target of `current` or `previous`**, whatever its marker: a referenced directory without `VERIFIED` stays and `status.json`
 flags it "unverified: rollback to it refused"; a partial file is never resumed or trusted, since its bytes were not verified. The child
   has `PDEATHSIG` (Linux) or is killed by process group (macOS), and a closed pipe, so it does not outlive the parent. A

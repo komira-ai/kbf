@@ -19,6 +19,7 @@ pub mod floors;
 pub mod gate;
 pub mod lcov;
 pub mod raise;
+pub mod renames;
 
 use std::fmt;
 

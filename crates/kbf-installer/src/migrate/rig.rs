@@ -69,10 +69,18 @@ pub struct Rig {
     pub events: Rc<RefCell<Vec<String>>>,
     /// Make the next `start` fail.
     pub fail_start: Rc<Cell<bool>>,
+    /// How many `launchctl print` answers a job gives after its start without a pid (loaded,
+    /// not yet running); each start sets the count again.
+    pub start_lag: Rc<Cell<u32>>,
     /// The systemd units that are enabled, by file name (none to begin with).
     pub enabled: Rc<RefCell<BTreeSet<String>>>,
     /// Make `enable --now` fail.
     pub fail_enable: Rc<Cell<bool>>,
+    /// The package receipts `pkgutil` knows, by identifier (none to begin with).
+    pub receipts: Rc<RefCell<BTreeSet<String>>>,
+    /// Make every command of this verb fail (`bootout` is `stop`; `pkgutil --forget` is
+    /// `forget`; `launchctl enable` is `enable`), until it is `None` again.
+    pub fail_verb: Rc<RefCell<Option<String>>>,
     /// Called with the verb and the unit file of every service command before it is answered
     /// (`stop`, `start`, `is-active`, `daemon-reload` with no unit): what a test plays as
     /// the host doing something while the migration is in that call.
@@ -118,7 +126,7 @@ impl Rig {
     }
 
     /// A scratch host with the services played and nothing on it but `run/`.
-    fn bare(name: &str, platform: Platform) -> Rig {
+    pub fn bare(name: &str, platform: Platform) -> Rig {
         root_umask();
         let mut host = ScratchHost::new(&format!("migrate-{name}"));
         host.euid = me();
@@ -127,8 +135,12 @@ impl Rig {
         let active = Rc::new(RefCell::new(BTreeSet::new()));
         let events = Rc::new(RefCell::new(Vec::new()));
         let fail_start = Rc::new(Cell::new(false));
+        let start_lag = Rc::new(Cell::new(0));
+        let lag_left = Rc::new(Cell::new(0));
         let enabled = Rc::new(RefCell::new(BTreeSet::new()));
         let fail_enable = Rc::new(Cell::new(false));
+        let receipts = Rc::new(RefCell::new(BTreeSet::new()));
+        let fail_verb: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let on_command: Rc<RefCell<Option<CommandHook>>> = Rc::new(RefCell::new(None));
         host.answer = Box::new({
             let (active, events, fail_start, enabled, fail_enable, root, on_command) = (
@@ -140,6 +152,8 @@ impl Rig {
                 root.clone(),
                 on_command.clone(),
             );
+            let (receipts, fail_verb) = (receipts.clone(), fail_verb.clone());
+            let (start_lag, lag_left) = (start_lag.clone(), lag_left.clone());
             move |cmd| {
                 let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
                 let current = root.join(match platform {
@@ -159,6 +173,9 @@ impl Rig {
                         ("enable --now", (*u).to_owned())
                     }
                     ("/usr/bin/systemctl", [verb, "--", u]) => (verb, (*u).to_owned()),
+                    ("/usr/sbin/pkgutil", ["--pkg-info", id]) => ("pkg-info", (*id).to_owned()),
+                    ("/usr/sbin/pkgutil", ["--forget", id]) => ("forget", (*id).to_owned()),
+                    ("/bin/sleep", ["1"]) => ("wait", String::new()),
                     ("/bin/launchctl", ["bootstrap", "system", plist]) => (
                         "start",
                         plist.rsplit('/').next().expect("a name").to_owned(),
@@ -176,12 +193,31 @@ impl Rig {
                 if let Some(hook) = on_command.borrow().as_ref() {
                     hook(verb, &unit);
                 }
+                if fail_verb.borrow().as_deref() == Some(verb) {
+                    return Err(io::Error::other(format!("planted: {verb} failed")));
+                }
                 match verb {
-                    "is-active" => Ok(reply(
-                        i32::from(!active.borrow().contains(&unit)) * 3,
-                        "",
-                        "",
-                    )),
+                    "pkg-info" => Ok(reply(i32::from(!receipts.borrow().contains(&unit)), "", "")),
+                    "forget" => {
+                        receipts.borrow_mut().remove(&unit);
+                        record(format!("forget {unit}"));
+                        Ok(reply(0, "", ""))
+                    }
+                    "is-active" => {
+                        let running = active.borrow().contains(&unit);
+                        // `launchctl print`: a running job shows its pid, a job just started
+                        // may not have one yet.
+                        let lagging = running && lag_left.get() > 0;
+                        if lagging {
+                            lag_left.set(lag_left.get() - 1);
+                        }
+                        let out = if running && !lagging {
+                            "\tpid = 812\n"
+                        } else {
+                            ""
+                        };
+                        Ok(reply(i32::from(!running) * 3, out, ""))
+                    }
                     "is-enabled" if enabled.borrow().contains(&unit) => {
                         Ok(reply(0, "enabled\n", ""))
                     }
@@ -209,9 +245,16 @@ impl Rig {
                         record(format!("stop {unit}"));
                         Ok(reply(0, "", ""))
                     }
+                    // launchd refuses to bootstrap a job that is loaded (the rig's "active").
+                    "start" if platform == Platform::MacOs && active.borrow().contains(&unit) => {
+                        Err(io::Error::other(format!(
+                            "Bootstrap failed: 5: Input/output error ({unit} is loaded)"
+                        )))
+                    }
                     "start" if fail_start.get() => Err(io::Error::other("planted: start failed")),
                     "start" => {
                         active.borrow_mut().insert(unit.clone());
+                        lag_left.set(start_lag.get());
                         record(format!("start {unit}"));
                         Ok(reply(0, "", ""))
                     }
@@ -232,8 +275,11 @@ impl Rig {
             active,
             events,
             fail_start,
+            start_lag,
             enabled,
             fail_enable,
+            receipts,
+            fail_verb,
             on_command,
             lock_wait: Duration::from_secs(20),
             kit: false,

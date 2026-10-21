@@ -14,7 +14,7 @@
 //! - [`config`]: `--config FILE`, `KEY=VALUE` lines over a closed key set; an unknown
 //!   or repeated key is refused.
 //! - [`unit`]: a systemd unit file read as systemd reads it (sections, `\` continuations,
-//!   the last assignment wins), shared with the docs check in `kbf-it`.
+//!   the last assignment wins), shared with the docs check in `kbf-integration-test`.
 //! - [`template`]: strict `@KEY@` substitution; a placeholder with no value is refused.
 //! - [`cli`]: the `kbf-deploy` command line, one subcommand per kit.
 //!

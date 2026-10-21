@@ -60,6 +60,10 @@
 //! the same two locks and decides from what it reads under them, so a release the installer
 //! activated while it waited is seen.
 //!
+//! [`uninstall`] is what comes after a rollback: the package's own leftovers (its plist, receipt,
+//! logs, disable override and the files a rollback moved aside) are removed from a host that is
+//! rolled back or was never adopted, and the journal is archived, never deleted.
+//!
 //! Stand-ins that remain: [`Verifier`], which asks for a release to be fetched from the
 //! configured source and verified from its commit alone (the migration holds no order, so no
 //! locator: the fetcher of [`crate::helper::fetcher`] takes one), by the verify pipeline
@@ -82,6 +86,7 @@ mod rollback;
 pub mod roots;
 mod services;
 pub mod tree;
+mod uninstall;
 pub mod units;
 
 use std::time::Duration;
@@ -93,6 +98,7 @@ pub use error::MigrateError;
 pub use floor::{FrontendFloor, NoFrontend, Seed, Source};
 pub use rollback::{rollback, rollback_at};
 pub use roots::Roots;
+pub use uninstall::{Uninstall, uninstall, uninstall_at};
 pub use units::{Unit, retired_name};
 
 use crate::CommitId;
@@ -164,6 +170,8 @@ pub enum Outcome {
     Planned,
     Migrated,
     RolledBack,
+    /// `uninstall` removed what the package left.
+    Uninstalled,
 }
 
 /// What was done (or, in a dry run, would be), for the operator.
@@ -285,6 +293,10 @@ pub(crate) mod rig;
 #[cfg(test)]
 mod rollback_tests;
 #[cfg(test)]
+mod services_tests;
+#[cfg(test)]
 mod testfarm_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod uninstall_tests;

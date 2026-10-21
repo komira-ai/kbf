@@ -15,7 +15,7 @@ const TAGS: &[&str] = &[
     "a", "body", "code", "dd", "details", "div", "dl", "dt", "footer", "form", "h1", "h2", "head",
     "header", "html", "input", "label", "li", "link", "main", "meta", "nav", "ol", "p", "pre",
     "section", "small", "span", "summary", "table", "tbody", "td", "th", "thead", "time", "title",
-    "tr", "ul",
+    "tr", "ul", "h3", "option", "select",
 ];
 
 /// Elements written without a closing tag.
@@ -39,6 +39,7 @@ const TEXT_ATTRS: &[&str] = &[
     "rel",
     "required",
     "scope",
+    "selected",
     "spellcheck",
     "title",
     "type",
@@ -162,6 +163,16 @@ impl Html {
         self.el("a", &[url("href", href)], |h| {
             h.text(label);
         })
+    }
+
+    /// `<meta http-equiv="refresh" content="N">`: reload the page's own URL after
+    /// `seconds`. Only an integer is ever written (no `url=` part), so the browser
+    /// can only come back to the page it is on; `http-equiv` is in no attribute
+    /// allowlist, this is the one place it is written.
+    pub(crate) fn refresh(&mut self, seconds: u32) -> &mut Self {
+        self.raw("<meta http-equiv=\"refresh\" content=\"")
+            .raw(&seconds.to_string())
+            .raw("\">")
     }
 
     /// The document written.
