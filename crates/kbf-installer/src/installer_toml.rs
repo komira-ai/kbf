@@ -532,3 +532,7 @@ pub(crate) fn toml_string(text: &str) -> String {
 #[cfg(test)]
 #[path = "installer_toml_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "installer_toml_release_tests.rs"]
+mod release_tests;

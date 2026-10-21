@@ -1804,3 +1804,6 @@ fn the_journals_kit_flag_picks_the_kbf_toml_decision() {
 
 #[path = "update_dirs_tests.rs"]
 mod update_dirs;
+
+#[path = "release_config_tests.rs"]
+mod release_config;
