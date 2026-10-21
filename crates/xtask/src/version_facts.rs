@@ -27,8 +27,12 @@
 //!
 //! The release set holds the file because [`facts_of`] names it: `verify-assets sums`
 //! (and so `release check`, `release publish` and `release offer`) refuses a listed `kbf`
-//! tarball whose facts are not listed, and `verify-assets attestations` checks the facts
-//! for build provenance, as an SBOM is (they have no bundle).
+//! tarball whose facts are not listed ([`Pairing::Required`]; `release check
+//! --without-version-facts` is [`Pairing::Waived`], for the release made before the build
+//! jobs recorded them) and a listed facts file whose tarball is not ([`tarball_of`]),
+//! `release offer` calls a platform incomplete without them, and `verify-assets
+//! attestations` checks the facts for build provenance, as an SBOM is (they have no
+//! bundle).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -85,6 +89,26 @@ pub fn facts_of(asset: &str) -> Option<String> {
     let (commit, platform) = rest.split_once('-')?;
     let is_kbf = build_commit::is_commit(commit) && Platform::named(platform).is_some();
     is_kbf.then(|| format!("{stem}{SUFFIX}"))
+}
+
+/// The `kbf` tarball `file` states the facts of, when `file` is a facts file
+/// (`kbf-<commit>-<platform>.version.json`): the inverse of [`facts_of`].
+pub fn tarball_of(file: &str) -> Option<String> {
+    let stem = file.strip_suffix(SUFFIX)?;
+    let tarball = format!("{stem}.tar.gz");
+    facts_of(&tarball).map(|_| tarball)
+}
+
+/// Whether `verify-assets sums` holds each listed `kbf` tarball to listing its facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pairing {
+    /// A `kbf` tarball without its facts is refused: every release made since the build
+    /// jobs record them.
+    Required,
+    /// A `kbf` tarball may go without facts: the release before the build jobs recorded
+    /// them, which `release check previous` reads. Facts without their tarball are
+    /// refused either way.
+    Waived,
 }
 
 /// Whether `file` is the facts file of the `kbf` built from `commit` for one of the

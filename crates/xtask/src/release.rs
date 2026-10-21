@@ -13,8 +13,10 @@
 //!   pass and `--off-main` must be refused. CI runs it on pull requests into `main`
 //!   with the base commit and the pull request's merge commit, so a check that accepts
 //!   every commit (or none) fails there instead of at a release.
-//! - `release check <dir> --commit <sha>` ([`check`]): `<dir>` passes `verify-assets
-//!   sums` (so each `kbf` tarball has its version facts listed), every file `SHA256SUMS`
+//! - `release check <dir> --commit <sha> [--without-version-facts]` ([`check`]): `<dir>`
+//!   passes `verify-assets sums` (so each `kbf` tarball has its version facts listed; the
+//!   flag, for the release before the build jobs recorded them, waives that and nothing
+//!   else: [`Pairing::Waived`]), every file `SHA256SUMS`
 //!   lists is `<binary>-<sha>-<platform>.tar.gz` or `.cdx.json`, or `kbf`'s
 //!   `kbf-<sha>-<platform>.version.json` ([`crate::version_facts`]): the assets of that
 //!   commit and no other, and each tarball has exactly
@@ -88,7 +90,7 @@ use crate::bundles;
 use crate::fetch::Sha256;
 use crate::package::{Platform, read};
 use crate::sums::{self, SUMS};
-use crate::version_facts;
+use crate::version_facts::{self, Pairing};
 
 /// The branch a released commit must be on.
 pub const MAIN: &str = "main";
@@ -260,9 +262,13 @@ fn is_asset_of(name: &str, commit: &str) -> bool {
 
 /// The `release check` verb: the lines to print, then every file name of `dir`
 /// (`SHA256SUMS` first, then the listed files, then the bundles).
-fn checked(dir: &Path, commit: &str) -> Result<(Vec<String>, Vec<String>), Error> {
+fn checked(
+    dir: &Path,
+    commit: &str,
+    pairing: Pairing,
+) -> Result<(Vec<String>, Vec<String>), Error> {
     full_commit("--commit", commit)?;
-    let sums_line = sums::verify_sums(dir, Sha256::of)?;
+    let sums_line = sums::verify_sums_with(dir, Sha256::of, pairing)?;
     let lines = sums::read_sums(&dir.join(SUMS))?;
     let foreign: Vec<String> = lines
         .iter()
@@ -310,9 +316,10 @@ fn checked(dir: &Path, commit: &str) -> Result<(Vec<String>, Vec<String>), Error
     Ok((printed, names))
 }
 
-/// The `release check` verb: the lines to print.
-pub fn check(dir: &Path, commit: &str) -> Result<Vec<String>, Error> {
-    Ok(checked(dir, commit)?.0)
+/// The `release check` verb: the lines to print. `pairing` is [`Pairing::Waived`] only for
+/// the release before the build jobs recorded version facts (`--without-version-facts`).
+pub fn check(dir: &Path, commit: &str, pairing: Pairing) -> Result<Vec<String>, Error> {
+    Ok(checked(dir, commit, pairing)?.0)
 }
 
 /// The most characters GitHub takes in a release body.
@@ -417,7 +424,7 @@ fn tag_is_current(tag: &str, standing: &tags::Standing) -> Result<(), Error> {
 
 /// The `release publish` verb: the lines to print.
 pub fn publish(dir: &Path, r: &Release) -> Result<Vec<String>, Error> {
-    let (mut printed, names) = checked(dir, r.commit)?;
+    let (mut printed, names) = checked(dir, r.commit, Pairing::Required)?;
     let held_set = verdict::set_hash_of(dir)?;
     if &held_set != r.set_hash {
         return Err(Error::Refused(vec![format!(

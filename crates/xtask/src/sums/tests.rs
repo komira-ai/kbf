@@ -94,6 +94,42 @@ fn verify_sums_passes_when_listed_is_present_and_each_matches() {
 }
 
 #[test]
+fn a_kbf_tarball_and_its_version_facts_are_listed_together() {
+    // Catches: the pairing in one direction only, the waiver skipping more than the facts
+    // of a tarball, and a waiver that is ignored. Rows: a `kbf` tarball without facts is
+    // refused, and passes when the pairing is waived; facts without their tarball are
+    // refused either way; both listed pass either way. Mutants: either `if` dropped.
+    let tarball = "kbf-c0ffee012345-linux-x86_64.tar.gz";
+    let facts = "kbf-c0ffee012345-linux-x86_64.version.json";
+    let no_facts = format!(
+        "{tarball}: its version facts {facts} are not listed in {SUMS}"
+    );
+    let no_tarball = format!(
+        "{facts}: the tarball it states the facts of, {tarball}, is not listed in {SUMS}"
+    );
+    let (no_facts, no_tarball) = (no_facts.as_str(), no_tarball.as_str());
+    let rows: [(&str, &[&str], Option<&str>, Option<&str>); 3] = [
+        ("tarball", &[tarball], Some(no_facts), None),
+        ("facts", &[facts], Some(no_tarball), Some(no_tarball)),
+        ("both", &[tarball, facts], None, None),
+    ];
+    let bytes: &[u8] = b"bytes";
+    for (what, listed, required, waived) in rows {
+        let dir = scratch(&format!("verify-pairing-{what}"));
+        let files: Vec<(&str, &[u8])> = listed.iter().map(|n| (*n, bytes)).collect();
+        let sums: String = listed.iter().map(|n| line(n, bytes)).collect();
+        assets(&dir, &files, &sums);
+        for (pairing, wanted) in [(Pairing::Required, required), (Pairing::Waived, waived)] {
+            let got = verify_sums_with(&dir, Sha256::of, pairing);
+            match wanted {
+                Some(problem) => assert_eq!(refused(got), [problem], "{what} {pairing:?}"),
+                None => assert!(got.is_ok(), "{what} {pairing:?}: {got:?}"),
+            }
+        }
+    }
+}
+
+#[test]
 fn verify_sums_refuses_listed_not_equal_to_present() {
     // Catches: a file in the directory that SHA256SUMS does not list (it would be
     // shipped unsigned; a leftover SHA256SUMS.<platform> part included), a listed file that is missing, a line listed twice, and a

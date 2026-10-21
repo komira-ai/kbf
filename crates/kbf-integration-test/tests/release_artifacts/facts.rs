@@ -13,7 +13,10 @@
 //! - runs it under `if:` or `continue-on-error:`;
 //! - runs it before `cargo xtask build-commit check --json` of the `kbf` (so before the
 //!   build is known to name this commit and be a release build; on macOS that check is of
-//!   the signed bytes), or at or after the step that packages the `kbf`.
+//!   the signed bytes; a job with no check at all is the identity rule's to name), or at or
+//!   after the step that packages the `kbf`;
+//! - records another `--binary` path than the one it packages (another build's `kbf` has
+//!   the same file name).
 
 use super::*;
 
@@ -74,24 +77,36 @@ pub fn rules(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
             args(l, "cargo xtask build-commit check --json ")
                 .is_some_and(|a| a.first().is_some_and(|b| base(b) == "kbf"))
         };
-        let packages = |l: &str| {
-            args(l, "cargo xtask package ")
-                .is_some_and(|a| flag(&a, "--binary").is_some_and(|b| base(b) == "kbf"))
-        };
-        let checked = first(&steps, 0, checks).is_some_and(|(c, _)| c < *at);
-        if !checked {
+        // A job with no check at all is the identity rule's to name (one problem, not two).
+        if first(&steps, 0, checks).is_some_and(|(c, _)| c >= *at) {
             out.push(format!(
-                "`{job}` records the facts of kbf before `build-commit check --json` of it, or without one: only a build that names this commit and is a release build is recorded"
+                "`{job}` records the facts of kbf before `build-commit check --json` of it: only a build that names this commit and is a release build is recorded"
             ));
         }
-        let before_package = first(&steps, 0, packages).is_some_and(|(p, _)| *at < p);
+        let packaged = first(&steps, 0, |l| packaged_kbf(l).is_some());
+        let before_package = packaged.is_some_and(|(p, _)| *at < p);
         if !before_package {
             out.push(format!(
                 "`{job}` records the facts of kbf at or after the step that packages it, or packages none: they are the facts of the binary that ships"
             ));
         }
+        // The same path, not the same file name: another build's `kbf` has one too.
+        let shipped = packaged.and_then(|(_, s)| lines(s).find_map(packaged_kbf));
+        if let (Some(shipped), Some(recorded)) = (shipped, flag(words, "--binary"))
+            && shipped != recorded
+        {
+            out.push(format!(
+                "`{job}` records the facts of {recorded} but packages {shipped}: they are the facts of the binary that ships"
+            ));
+        }
     }
     Ok(())
+}
+
+/// The `--binary` of a line that packages the `kbf`.
+fn packaged_kbf(line: &str) -> Option<&str> {
+    let words = args(line, "cargo xtask package ")?;
+    flag(&words, "--binary").filter(|b| base(b) == "kbf")
 }
 
 #[cfg(test)]
@@ -198,6 +213,18 @@ mod tests {
     }
 
     #[test]
+    fn a_job_that_records_another_build_of_kbf_than_it_packages_is_named() {
+        // Catches: the facts of a `kbf` of another build directory (a debug build, an
+        // older target) that has the file name of the one that ships; the facts would be
+        // true of a binary nobody installs. Mutant: the comparison dropped from `rules`.
+        let w = workflow(|job| {
+            let other = record(job).replace("target/$TARGET/release", "other/release");
+            vec![run(CHECK), run(&other), run(PACKAGE)]
+        });
+        names(&w, "but packages target/$TARGET/release/kbf");
+    }
+
+    #[test]
     fn a_job_that_may_skip_the_step_is_named() {
         // Catches: the step under `if:` (or `continue-on-error:`), skipped while the job
         // passes.
@@ -213,11 +240,13 @@ mod tests {
     #[test]
     fn a_job_that_records_out_of_order_is_named() {
         // Catches: the facts taken before the build is known to name the commit and be a
-        // release build (or with no such check), and after the tarball is made or with none.
+        // release build, and after the tarball is made or with none. A job with no check
+        // at all is not named here: the identity rule names it, and one defect is one
+        // problem (the test of that rule counts them).
         let before = workflow(|job| vec![run(&record(job)), run(CHECK), run(PACKAGE)]);
         names(&before, "before `build-commit check --json`");
         let unchecked = workflow(|job| vec![run(&record(job)), run(PACKAGE)]);
-        names(&unchecked, "before `build-commit check --json`");
+        assert_eq!(found(&unchecked), Vec::<String>::new());
         let after = workflow(|job| vec![run(CHECK), run(PACKAGE), run(&record(job))]);
         names(&after, "at or after the step that packages it");
         let unpackaged = workflow(|job| vec![run(CHECK), run(&record(job))]);

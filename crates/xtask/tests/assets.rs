@@ -704,12 +704,31 @@ fn a_kbf_tarball_without_its_version_facts_fails_the_sums_check() {
 }
 
 #[test]
+fn version_facts_without_their_kbf_tarball_fail_the_sums_check() {
+    // Catches: facts in the release set of a platform that has no `kbf` there (a stray
+    // file, or another build's, would be attested and carried as if it stated something of
+    // a binary that ships), and a message that does not name both files. The control is
+    // the pairing of the test above, with the tarball listed. Mutant: the reverse pairing
+    // taken out of `verify_sums`.
+    let names: &[&str] = &["kbf-daemon"];
+    let r = Release::build_with("facts-orphan", &[("linux-x86_64", names)]);
+    let facts = r.add_facts("linux-x86_64");
+    let (code, out, err) = xtask(&["verify-assets", "sums", s(&r.dist)], &r.tmp, None);
+    assert_eq!(code, Some(1), "{out}");
+    let want = format!(
+        "xtask: {facts}: the tarball it states the facts of, \
+         kbf-{COMMIT}-linux-x86_64.tar.gz, is not listed in SHA256SUMS\n"
+    );
+    assert_eq!(err, want);
+}
+
+#[test]
 fn version_facts_are_verified_for_build_provenance_and_nothing_else() {
     // Catches: facts the attest job signs that the verify job refuses as neither a tarball,
     // a package nor an SBOM; facts held to what only a tarball has (an SBOM attestation, a
     // bundle: neither exists, and the release check names a bundle of anything else); and
     // facts whose provenance is not checked, or whose missing attestation is passed over.
-    let names: &[&str] = &["kbf-daemon"];
+    let names: &[&str] = &["kbf", "kbf-daemon"];
     let r = Release::build_with("facts-attested", &[("linux-x86_64", names)]);
     let facts = r.add_facts("linux-x86_64");
     r.attest(None);

@@ -25,8 +25,8 @@
 //!   run as on stderr. What a test asks of it by an environment variable, the empty
 //!   environment of `release version-facts` does not carry, so two more files beside it
 //!   do: `kbf.env` (when it exists, the fake overwrites it with `ran` and one `NAME=value`
-//!   line per variable it was given) and `kbf.mode` (`fail`: exit 1 before printing;
-//!   `hang`: never answer).
+//!   line per variable it was given) and `kbf.mode` (`fail`: print the answer, then exit 1;
+//!   `hang`: never answer, for two minutes).
 //! - Run as `kbf-installer`, it is the STUB of the real kbf-installer, which the package
 //!   build and its macOS install test ship until the real tool is built there (one path
 //!   change in `crates/xtask/tests/pkg_macos.rs`): it prints `kbf-installer-stub` and
@@ -148,9 +148,15 @@ fn kbf_asked(argv0: &str) -> Option<ExitCode> {
         std::fs::write(&env_log, seen).expect("env log");
     }
     match std::fs::read_to_string(format!("{argv0}.mode")).as_deref() {
-        Ok("fail") => Some(ExitCode::FAILURE),
+        // It answers as it should and then fails: only its status can refuse it.
+        Ok("fail") => {
+            print!("{}", kbf_says(argv0).1);
+            Some(ExitCode::FAILURE)
+        }
+        // Long enough for any limit a test sets, short enough that a limit which is broken
+        // fails the test's own time assertion instead of hanging the suite.
         Ok("hang") => {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
+            std::thread::sleep(std::time::Duration::from_secs(120));
             Some(ExitCode::FAILURE)
         }
         _ => None,

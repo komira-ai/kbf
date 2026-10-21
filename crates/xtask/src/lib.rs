@@ -570,6 +570,11 @@ enum ReleaseVerb {
         /// The commit the assets were built from, a full SHA.
         #[arg(long)]
         commit: String,
+        /// Do not require the version facts of each `kbf` tarball: for the release made
+        /// before the build jobs recorded them (the previous release, read by the first
+        /// release that has them). Facts without their tarball are still refused.
+        #[arg(long)]
+        without_version_facts: bool,
     },
     /// Create release `--tag` with every file of `<dir>`, or add the files it lacks;
     /// an asset it holds must be one of them, byte for byte.
@@ -1057,7 +1062,18 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         }) => Ok(vec![release::main_control(
             &gh, &repo, &on_main, &off_main,
         )?]),
-        Verb::Release(ReleaseVerb::Check { dir, commit }) => release::check(&dir, &commit),
+        Verb::Release(ReleaseVerb::Check {
+            dir,
+            commit,
+            without_version_facts,
+        }) => {
+            let pairing = if without_version_facts {
+                version_facts::Pairing::Waived
+            } else {
+                version_facts::Pairing::Required
+            };
+            release::check(&dir, &commit, pairing)
+        }
         Verb::Release(ReleaseVerb::Verdict { subject, output }) => {
             let verified = release::verdict::verify(&subject.subject())?;
             let line = format!("set-hash={}", verified.set_hash.as_str());

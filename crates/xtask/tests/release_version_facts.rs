@@ -67,11 +67,7 @@ fn fx(name: &str, says: &str) -> Fx {
     std::fs::write(bin.join("kbf.stamp"), &COMMIT[..12]).expect("stamp");
     std::fs::write(bin.join("kbf.json"), says).expect("json");
     let out = root.join("dist");
-    Fx {
-        kbf,
-        out,
-        root,
-    }
+    Fx { kbf, out, root }
 }
 
 /// `release version-facts` on the fixture's `kbf`, run as the job runs it, from a
@@ -197,8 +193,9 @@ fn it_refuses_what_is_no_release_build_of_the_commit_and_writes_nothing() {
 
 #[test]
 fn a_binary_that_exits_with_an_error_is_refused_whatever_it_printed() {
-    // Catches: the exit status ignored because the output reads as facts. Mutant: the
-    // status check dropped.
+    // Catches: the exit status ignored because the output reads as facts. The fake prints
+    // valid facts of the commit and then exits 1, so only the status can refuse it. Mutant:
+    // the status check dropped.
     let f = fx("fails", &says(COMMIT, "release"));
     std::fs::write(f.kbf.with_file_name("kbf.mode"), "fail").expect("mode");
     let (code, out, err) = run(&f, COMMIT, PLATFORM);
@@ -210,7 +207,7 @@ fn a_binary_that_exits_with_an_error_is_refused_whatever_it_printed() {
 #[test]
 fn a_binary_that_does_not_answer_is_killed_when_the_time_is_up() {
     // Catches: no time limit (the job would wait for the runner's limit), and a limit
-    // that waits for the binary to end on its own. The fake sleeps for an hour. Mutant:
+    // that waits for the binary to end on its own. The fake sleeps for two minutes. Mutant:
     // the timeout flag of the run ignored.
     let f = fx("hangs", &says(COMMIT, "release"));
     std::fs::write(f.kbf.with_file_name("kbf.mode"), "hang").expect("mode");

@@ -115,10 +115,22 @@ read and written again. The file is listed in the job's `SHA256SUMS.<platform>` 
 tarball, so the one `SHA256SUMS`, the build provenance, the verification and the release
 carry it. It has no SBOM and no bundle of its own. The set is closed over it:
 `verify-assets sums` (so `release check`, `release publish` and `release offer`) refuses a
-listed `kbf` tarball whose `kbf-<commit>-<platform>.version.json` is not listed, and
-`release check` takes that name and no other `.version.json`. The workflow lint
+listed `kbf` tarball whose `kbf-<commit>-<platform>.version.json` is not listed, and a
+listed facts file whose `kbf` tarball is not; `release check` takes that name and no other
+`.version.json`, and `release offer` calls a platform incomplete without its facts, whatever
+other tarballs it lists. The release made before the build jobs recorded the facts has none:
+`release check --without-version-facts` waives the first rule (and nothing else), and
+`release.yml` gives it to the check of the previous release only (the lint holds that); remove
+the flag once the release before the one being made was made with the facts. The workflow lint
 (`crates/kbf-integration-test/tests/release_artifacts`) names a build job that does not run
-the verb once, for its own platform, between the identity check of `kbf` and its package.
+the verb once, for its own platform, between the identity check of `kbf` and its package,
+for the same `--binary` path the job packages.
+
+The build jobs check out at the default shallow depth, so until that changes the facts say
+`seq: 0` (unknown; see `seq` below). The bundle `kbf-installer deploy --bundle` reads holds
+`kbf` and `kbf-daemon` tarballs and their attestations and refuses any other entry: the
+facts file is not packed into a bundle, and a packer that adds it needs a reader that accepts
+it installed first (the deploy order of `seq`, below).
 
 `kbf-server`, `kbf` and `kbf-installer` embed the first 12 characters of the commit they
 were built from (`kbf` through the server library it links), and `--version` prints
