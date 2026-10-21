@@ -486,6 +486,10 @@ impl Controller {
         commands: &[Command],
         row: &HostRow,
     ) -> Result<bool, ControllerError> {
+        // The activate order says where the release comes from by the run that started the
+        // host, as the steps read it: not by `update/desired`, which a later offer may have
+        // changed under a host that is already in its step.
+        let source = row.source;
         for command in commands {
             let given = match command {
                 Command::CasSlot(SlotOp::Claim) => self.claim(pass, id).map(|()| Ok(()))?,
@@ -503,7 +507,9 @@ impl Controller {
                     Some(member) => self.transport.undown(id, member),
                     None => Err(no_member(id)),
                 },
-                Command::Activate { order } => self.transport.activate(id, *order, &row.commit),
+                Command::Activate { order } => {
+                    self.transport.activate(id, *order, &row.commit, source)
+                }
                 Command::Confirm { order } => self.transport.confirm(id, *order, &row.commit),
                 Command::Alert(alert) => self.tell(id, alert),
             };
