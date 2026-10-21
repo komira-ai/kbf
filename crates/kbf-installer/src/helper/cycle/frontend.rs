@@ -84,6 +84,9 @@ impl<E: Exec> Helper<E> {
                 memory.event = done.event;
                 memory.refusal = done.note;
                 self.gc_due |= done.kept;
+                if done.kept {
+                    self.raise_floor();
+                }
             }
             Err(r) => refuse(memory, &format!("{}: {}", r.word, r.why)),
         }

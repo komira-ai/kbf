@@ -26,7 +26,7 @@ use crate::floors::{Floors, FloorsError, FloorsFile};
 use crate::helper::{self, Helper, HelperState, Report};
 use crate::record::OrderRecord;
 use crate::spool::Spool;
-use crate::types::{Offer, Order, State, Status, Verb};
+use crate::types::{Offer, Order, ReleaseSource, State, Status, Verb};
 
 /// How many offers are remembered, oldest generation first out.
 const KEEP_OFFERS: usize = 4;
@@ -206,6 +206,8 @@ impl Core {
             offered_generation: self.seen,
             helper_present: self.helper != Helper::Missing,
             staged: report.and_then(|r| r.staged_facts),
+            available: report.and_then(|r| r.available.clone()),
+            release_source: report.map_or(ReleaseSource::Unreported, |r| r.release_source),
             gated: self.gate.is_some(),
         }
     }

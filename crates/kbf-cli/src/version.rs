@@ -20,6 +20,9 @@
 //!   version this binary speaks ([`kbf_server::worker`]); the daemon half speaks exactly
 //!   `protocol` (a test pins the two halves equal);
 //! - `profile`: the Cargo profile, `release` or `debug` ([`PROFILE`]);
+//! - `relay`: how far this build carries what its host's installer reports to the frontend
+//!   ([`RELAY`]); the installer reads it before it takes `release_source = "bundled"`, which
+//!   only a `kbf` that relays can be run beside. A build before this field prints none;
 //! - `seq`: the number of commits behind the commit built (`git rev-list --count HEAD`,
 //!   [`build_seq`]), so two builds of one branch are put in order by it: a later commit has
 //!   the larger number. It is 0 when the build could not count them (a shallow checkout,
@@ -39,6 +42,13 @@ use serde_json::{Map, Value};
 
 /// The Cargo profile this binary was built with: `release` or `debug`.
 pub const PROFILE: &str = env!("KBF_BUILD_PROFILE");
+
+/// How far this build relays what its host's installer reports to the frontend: at level 1 it
+/// reads `available` and `release_source` from the installer's `status.json` and sends them in
+/// its `UpdateStatus`. The installer will not take `release_source = "bundled"` beside a `kbf`
+/// that declares less (`kbf_installer::binary::RELAY_NEEDED`; a test pins that this build
+/// meets it). Raised when a later change relays more.
+pub const RELAY: u64 = 1;
 
 /// Whether `args` (the program's name first) are exactly `--version --json` or
 /// `--json --version`.
@@ -77,6 +87,7 @@ pub fn identity() -> Value {
         "protocol".to_owned(),
         kbf_server::worker::PROTOCOL_VERSION.into(),
     );
+    fields.insert("relay".to_owned(), RELAY.into());
     fields.insert("seq".to_owned(), build_seq().into());
     fields.insert(
         "state_schema".to_owned(),

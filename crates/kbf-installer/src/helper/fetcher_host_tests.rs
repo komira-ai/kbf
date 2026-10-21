@@ -18,7 +18,7 @@ use crate::fixtures::{FakeRunner, SETTINGS_PATH, me, ran, trusted_host};
 use crate::helper::leases::fake::FakeLeases;
 use crate::layout::path;
 use crate::seed::SeedFacts;
-use crate::seed_fixture::{SEQ, Seeded};
+use crate::seed_fixture::{EARLIER_SEQ, SEQ, Seeded};
 use crate::testkit::{A, c, host_root};
 
 const FILE: &str = "/etc/kbf/installer.toml";
@@ -404,6 +404,106 @@ fn the_host_fetcher_reports_the_seed_of_its_package_or_why_it_has_none() {
         fetcher.fetch_activation(&staged(), &facts()),
         Err(unavailable())
     );
+}
+
+/// The look the run loop takes reports the word `installer.toml` holds for the source (whatever
+/// that source can or cannot fetch, and whether the package carries a seed) beside what it
+/// finds of the package: the seed found whole on every kind of host, nothing when the package
+/// has none, and why not when the host cannot say (a file the closed reader refuses, a host
+/// without its parts).
+///
+/// Catches the source reported from the fetch (a `bundled` host unable to say so), a package
+/// looked at only on a host that fetches nothing, and a file that cannot be read taken for a
+/// default source.
+///
+/// Mutants to plant: the word taken from the order's source; the look delegating to the
+/// fetch-source fetcher (a `url` host without a child cannot look); the source reported as
+/// `None` when no seed is found.
+#[test]
+fn the_host_fetcher_looks_at_the_package_and_reports_the_source_the_file_names() {
+    let seeded = Seeded::scratch("host-fetcher-look");
+    let want = SeedFacts {
+        commit: seeded.commit.clone(),
+        seq: SEQ,
+        facts: seeded.facts(),
+    };
+    let frontend = format!("release_source = \"frontend\"\n{SNAPSHOT}");
+    let files = [
+        ("release_source = \"bundled\"\n", "bundled"),
+        (URL_FILE, "url"),
+        ("", "frontend"),
+        (frontend.as_str(), "frontend"),
+    ];
+    for (file, word) in files {
+        let noticed = seeded.host_fetcher(file).look(None);
+        assert_eq!(noticed.source, Some(word), "{file:?}");
+        let found = noticed.seed.expect("looks").expect("a seed");
+        assert_eq!(found.seed, want, "{file:?}");
+    }
+
+    // A package without a seed for this installer's build: nothing found, the source still told.
+    let other = seeded.host_fetcher(URL_FILE).with_build("ffffffffffff");
+    let noticed = other.look(None);
+    assert_eq!((noticed.source, noticed.seed), (Some("url"), Ok(None)));
+
+    // A file the closed reader refuses: no source, and the reason. The reader never echoes the
+    // file's text, so the reason names the kind of fault, not the key.
+    let noticed = seeded.host_fetcher("surprise = 1\n").look(None);
+    assert_eq!(noticed.source, None);
+    let why = noticed.seed.expect_err("refused").to_string();
+    assert!(why.contains("unknown field"), "{why}");
+    assert!(!why.contains("surprise"), "{why}");
+
+    // A host that cannot supply its parts.
+    let (layout, _) = host_root("host-fetcher-look-no-parts");
+    let reason = "the fetch user: there is no user \"kbf-fetch\"";
+    let fetcher = HostFetcher::new(layout, path(FILE), || Err(reason.to_owned()));
+    let noticed = fetcher.look(None);
+    assert_eq!(noticed.source, None);
+    let unavailable = FetchError::Unavailable(reason.to_owned());
+    assert_eq!(noticed.seed, Err(unavailable));
+}
+
+/// The host fetcher tells the word `installer.toml` holds for the source, for the operator's
+/// `rollback`; a file the closed reader refuses, or a host without its parts, has no word.
+///
+/// Catches the word taken for a default when the file cannot be read (a bundled host that no
+/// longer says so), and the trait's default left in place.
+///
+/// Mutants to plant: `source` left at the trait's default (`None`); `unwrap_or("url")` on it.
+#[test]
+fn the_host_fetcher_tells_the_source_word_and_nothing_when_it_cannot() {
+    let seeded = Seeded::scratch("host-fetcher-source");
+    let files = [
+        ("release_source = \"bundled\"\n", "bundled"),
+        (URL_FILE, "url"),
+    ];
+    for (file, word) in files {
+        assert_eq!(seeded.host_fetcher(file).source(), Some(word), "{file:?}");
+    }
+    assert_eq!(seeded.host_fetcher("surprise = 1\n").source(), None);
+    let (layout, _) = host_root("host-fetcher-source-no-parts");
+    let fetcher = HostFetcher::new(layout, path(FILE), || Err("no parts".to_owned()));
+    assert_eq!(fetcher.source(), None);
+}
+
+/// An installed release is asked its version through the host fetcher on every kind of host,
+/// and a host that cannot supply its parts says why it cannot ask.
+///
+/// Catches the question answered only where a source can fetch.
+///
+/// Mutant to plant: the probe delegating to the fetch-source fetcher.
+#[test]
+fn the_host_fetcher_asks_an_installed_release_for_its_version() {
+    let seeded = Seeded::scratch("host-fetcher-probe");
+    for file in ["release_source = \"bundled\"\n", URL_FILE] {
+        let said = seeded.host_fetcher(file).probe(&c(A)).expect("asked");
+        assert_eq!(said.seq, Some(EARLIER_SEQ), "{file:?}");
+    }
+    let (layout, _) = host_root("host-fetcher-probe-no-parts");
+    let fetcher = HostFetcher::new(layout, path(FILE), || Err("no parts".to_owned()));
+    let got = fetcher.probe(&c(A));
+    assert_eq!(got, Err(FetchError::Unavailable("no parts".to_owned())));
 }
 
 /// `release_ca` names the roots a `url` source is checked against instead of the system's, and

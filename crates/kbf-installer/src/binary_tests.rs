@@ -85,3 +85,25 @@ fn the_kinds_print_for_an_operator() {
         "neither an ELF nor a thin Mach-O binary"
     );
 }
+
+/// Catches a build that predates `relay` taken for one that relays, a level below the one
+/// `bundled` needs taken for it, and a comparison off by one at the boundary. (That the field
+/// is read at all is `kbf-types`'s test.)
+///
+/// Mutants to plant: `relays` true for any declared level; `>=` made `>`.
+#[test]
+fn bundled_needs_a_build_that_relays_far_enough() {
+    let shape = |relay: &str| {
+        format!(
+            "{{\"commit\":\"0123456789ab\",\"min_protocol\":3,\"profile\":\"release\",\
+             \"protocol\":4,\"state_schema\":7,\"version\":\"0.1.0\"{relay}}}"
+        )
+    };
+    let before = Version::parse(shape("").as_bytes()).expect("a pre-relay build parses");
+    assert!(!relays(&before));
+    for (level, expected) in [(0, false), (RELAY_NEEDED, true), (RELAY_NEEDED + 1, true)] {
+        let said = shape(&format!(",\"relay\":{level}"));
+        let v = Version::parse(said.as_bytes()).expect("a build with a relay level parses");
+        assert_eq!(relays(&v), expected, "{level}");
+    }
+}
