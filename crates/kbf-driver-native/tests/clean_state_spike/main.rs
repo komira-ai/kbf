@@ -250,6 +250,7 @@ struct Cs {
     rules_c: String,
     stats: Mutex<Stats>,
     job: String,
+    last_marker: Mutex<String>,
 }
 
 fn say(line: impl AsRef<str>) {
@@ -356,6 +357,7 @@ impl Cs {
                 quarantined: 0,
             }),
             job: job.to_owned(),
+            last_marker: Mutex::new(String::new()),
         }
     }
 
@@ -458,6 +460,7 @@ impl Cs {
         env.row = row.to_owned();
         env.marker = format!("kbf{n:08x}");
         env.mk = format!("{WORK}/mk.{}", env.marker);
+        *self.last_marker.lock().unwrap() = env.marker.clone();
         env.mode = match clean {
             Clean::P(m) => m.to_owned(),
             _ => "P".to_owned(),
@@ -499,11 +502,14 @@ impl Cs {
         self.rt.block_on(slot.hand_over(&lease)).expect("hand over");
 
         let fixture = env.root(
-            "hasfn fixture_$ROW && fixture_$ROW; touch \"$MK\"; echo fixture-done",
+            "cs_skel; hasfn fixture_$ROW && fixture_$ROW; touch \"$MK\"; echo fixture-done",
             120,
         );
+        for line in fixture.text.lines().filter(|l| !l.is_empty() && *l != "fixture-done") {
+            say(format!("INFO {tag} fixture {}", short(line, 200)));
+        }
         if !fixture.text.contains("fixture-done") {
-            say(format!("INFO {tag} fixture: {}", short(&fixture.text, 200)));
+            say(format!("INFO {tag} fixture did not finish"));
         }
         let snaps = clean != Clean::None;
         let base = format!("{WORK}/snap.{}.base", env.marker);
@@ -537,11 +543,11 @@ impl Cs {
             env.root(&format!("snap > '{leased_snap}' 2>&1"), 180);
             self.diff(&tag, "leased", &env, &base, &leased_snap);
         }
-        // The driver's end of a lease: the lease directory goes before the slot is cleaned.
-        env.root(
-            "chflags -R nouchg,nouappnd \"$L\" 2>/dev/null; chmod -RN \"$L\" 2>/dev/null; chmod -R u+rwx \"$L\" 2>/dev/null; rm -rf \"$L\"",
-            120,
-        );
+        // The driver's end of a lease: the lease directory goes (no mount crossed) before the slot is cleaned.
+        let le = env.root("cs_lease_end", 120);
+        if le.text.contains("LEASE-DIR-LEFT") {
+            say(format!("INFO {tag} {}", short(&le.text, 160)));
+        }
 
         // The clean.
         env.stage = "clean".into();
@@ -730,11 +736,20 @@ impl Cs {
     fn diff(&self, tag: &str, stage: &str, env: &Env, a: &str, b: &str) -> usize {
         let o = env.root(&format!("sdiff_ '{a}' '{b}'"), 60);
         let lines: Vec<&str> = o.text.lines().filter(|l| !l.is_empty()).collect();
-        say(format!("SNAPDIFF {tag} {stage} lines={}", lines.len()));
-        for l in lines.iter().take(10) {
+        // The launchd-own agents of the uid (distnoted, cfprefsd): the shipped clean's check
+        // tolerates them too, so they are counted apart.
+        let is_agent = |l: &&str| {
+            l.contains("distnoted") || l.contains("cfprefsd") || l.contains("com.apple.rootless")
+        };
+        let agents = lines.iter().filter(|l| is_agent(*l)).count();
+        let others = lines.len() - agents;
+        say(format!(
+            "SNAPDIFF {tag} {stage} lines={others} agent_lines={agents}"
+        ));
+        for l in lines.iter().take(12) {
             say(format!("  | {}", short(l, 190)));
         }
-        lines.len()
+        others
     }
 
     /// The cells of one channel row.
@@ -868,9 +883,24 @@ fn wipe_3() {
 fn baseline_and_builds() {
     let cs = Cs::new("baseline_and_builds");
     let env0 = base_env(&user_of(CELL_USER));
+    let dirs = "find /private/var /private/tmp /Library /Users /usr/local /opt -xdev -newer";
+    let top = "2>/dev/null | cut -d/ -f1-5 | sort | uniq -c | sort -rn";
+
+    // B2 first, while nothing of the spike runs: the idle window (users exist, nobody uses them).
+    let o = env0.root(
+        &format!(
+            "touch \"$W/mk.idle\"; sleep 60; {dirs} \"$W/mk.idle\" {top} | head -60 > \"$W/drift.idle\"; sed -E 's/^ *[0-9]+ //' \"$W/drift.idle\" > \"$W/drift.idle.dirs\"; head -25 \"$W/drift.idle\""
+        ),
+        400,
+    );
+    for l in o.text.lines() {
+        say(format!("DRIFT idle {}", short(l, 160)));
+    }
+    env0.root("touch \"$W/mk.active\"", 10);
 
     // B0: users 5, 6, 7 were made and never used. Their snapshots must match once
-    // the names, uids and homes are normalised (the noise test).
+    // the names, uids and homes are normalised (the noise test); the dscl hash is left
+    // out (it holds the GeneratedUID) and the folders entry does not exist yet.
     let mut snaps = Vec::new();
     for i in [5u32, 6, 7] {
         let u = user_of(i);
@@ -881,7 +911,7 @@ fn baseline_and_builds() {
         let path = format!("{WORK}/snap.b0.{i}");
         let o = e.root(
             &format!(
-                "touch \"$MK\"; snap | sed -e \"s#$H#<H>#g\" -e \"s#$U#<U>#g\" -e \"s/$ID/<ID>/g\" > '{path}' 2>&1; wc -l < '{path}'"
+                "touch \"$MK\"; snap | awk '/^== /{{s=$2}} s!=\"ds\" && s!=\"folders\"{{print}}' | sed -e \"s#$H#<H>#g\" -e \"s#$U#<U>#g\" -e \"s/$ID/<ID>/g\" > '{path}' 2>&1; wc -l < '{path}'"
             ),
             180,
         );
@@ -891,24 +921,33 @@ fn baseline_and_builds() {
     for pair in [(0usize, 1usize), (1, 2)] {
         let o = env0.root(&format!("sdiff_ '{}' '{}'", snaps[pair.0], snaps[pair.1]), 30);
         let n = o.text.lines().filter(|l| !l.is_empty()).count();
-        say(format!("NOISE B0 f{} vs f{}: {}", pair.0, pair.1, if n == 0 { "identical".to_owned() } else { format!("DIFFERENT lines={n}") }));
+        say(format!(
+            "NOISE B0 f{} vs f{}: {}",
+            pair.0,
+            pair.1,
+            if n == 0 { "identical".to_owned() } else { format!("DIFFERENT lines={n}") }
+        ));
         for l in o.text.lines().take(10) {
             say(format!("  | {}", short(l, 190)));
         }
     }
 
-    // B1: user 1 ran `true` once under arm A and was cleaned by S and then P: what merely
-    // using a pool user leaves, against B0.
+    // B1: user 0 ran `true` once under arm A and was cleaned by S: what merely using a
+    // pool user leaves (its snapshot after the clean against the never-used B0).
     let cell = cs.cell("B1", Arm::A, Clean::S, &[]);
-    say(format!("INFO B1 cell verdict {cell:?} (the diff of its snapshots is the SNAPDIFF above)"));
-
-    // B2: global drift, an idle window against a window with a lease in it.
+    say(format!("INFO B1 cell verdict {cell:?}"));
+    let m = cs.last_marker.lock().unwrap().clone();
     let o = env0.root(
-        "touch \"$W/mk.idle\"; sleep 60; find /private/var /private/tmp /Library /Users /usr/local /opt -xdev -newer \"$W/mk.idle\" 2>/dev/null | cut -d/ -f1-5 | sort | uniq -c | sort -rn | head -25",
-        400,
+        &format!(
+            "awk '/^== /{{s=$2}} s!=\"ds\" && s!=\"folders\"{{print}}' '{WORK}/snap.{m}.after' | sed -e 's#{HOMES}/kbf-cs-0#<H>#g' -e 's/kbf-cs-0/<U>/g' -e 's/61000/<ID>/g' > '{WORK}/b1.norm'; sdiff_ '{}' '{WORK}/b1.norm'",
+            snaps[0]
+        ),
+        60,
     );
-    for l in o.text.lines() {
-        say(format!("DRIFT idle {}", short(l, 160)));
+    let n = o.text.lines().filter(|l| !l.is_empty()).count();
+    say(format!("B1DIFF B0 (never used) vs B1 (used once, cleaned by S): lines={n}"));
+    for l in o.text.lines().take(15) {
+        say(format!("  | {}", short(l, 190)));
     }
 
     // B3: positive controls for the probes.
@@ -918,11 +957,24 @@ fn baseline_and_builds() {
     }
 
     // B4: real builds as a pool user under arm A, with the driver's environment and a hostile one.
-    env0.root("cs_prepare_rust", 120);
+    let o = env0.root("cs_prepare_rust", 120);
+    say(format!("INFO prepare-rust {}", short(&o.text, 200)));
     for row in ["BR1", "BR2", "BR3", "BR4", "BR5"] {
         for benv in ["driver", "hostile"] {
             cs.cell(row, Arm::A, Clean::S, &[("BENV", benv)]);
         }
+    }
+
+    // B2, the active window (B1, the builds): what moved on the machine beyond the idle set
+    // and the runner's own home.
+    let o = env0.root(
+        &format!(
+            "{dirs} \"$W/mk.active\" {top} | grep -v '/Users/runner/' | head -60 | while read -r n d; do grep -qxF \"$d\" \"$W/drift.idle.dirs\" || echo \"$n $d\"; done | head -30"
+        ),
+        400,
+    );
+    for l in o.text.lines() {
+        say(format!("DRIFT active-minus-idle {}", short(l, 160)));
     }
     let o = env0.root("cs_inventory", 400);
     for l in o.text.lines() {

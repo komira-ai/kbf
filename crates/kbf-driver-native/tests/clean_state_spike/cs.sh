@@ -57,7 +57,7 @@ cs_rmuser() { # name uid home
   done
   crontab -r -u "$_n" >/dev/null 2>&1; rm -f "/var/at/tabs/$_n"
   # hdiutil images and mounts under the home go first
-  mount | awk -v h="$_h" '{ i=index($0," on "); r=substr($0,i+4); j=index(r," ("); mp=substr(r,1,j-1); if (index(mp,h)==1) print mp }' |
+  mount | awk -v h="$_h" -v l="/private/var/kbf-cs-leases.noindex" '{ i=index($0," on "); r=substr($0,i+4); j=index(r," ("); mp=substr(r,1,j-1); if (index(mp,h)==1||index(mp,l)==1) print mp }' |
     while IFS= read -r mp; do hdiutil detach -force "$mp" >/dev/null 2>&1 || umount -f "$mp" 2>/dev/null; done
   dscl . -delete "/Users/$_n" >/dev/null 2>&1
   chflags -R nouchg,nouappnd,noschg,nosappnd "$_h" >/dev/null 2>&1
@@ -94,7 +94,7 @@ snap() { # a passive, root-only reading of everything the uid can own or leave
   echo "== ipcs";    ipcs -a 2>/dev/null | awk -v u="$U" -v id="$ID" '($1=="m"||$1=="q"||$1=="s") && ($5==u||$5==id||$7==u||$7==id){print $1,$3,$4}' | sort
   echo "== mounts";  mount | grep -E "$H|$F|$LEASES" ; hdiutil info 2>/dev/null | grep image-path | grep -E "$H|$F|$LEASES"
   echo "== cron";    ls /var/at/tabs 2>/dev/null | grep -x "$U"; find /var/at/jobs -user "$ID" 2>/dev/null
-  echo "== crash";   ls "$H/Library/Logs/DiagnosticReports" /Library/Logs/DiagnosticReports /cores 2>/dev/null | grep -v '^$' | sort
+  echo "== crash";   ls "$H/Library/Logs/DiagnosticReports" 2>/dev/null | sort; find /Library/Logs/DiagnosticReports /cores -newer "$MK" -name 'canary*' 2>/dev/null | sort
   echo "== ds";      dscl . -read "/Users/$U" 2>&1 | shasum
   echo "== tcc";     sqlite3 -readonly "$H/Library/Application Support/com.apple.TCC/TCC.db" 'select count(*) from access' 2>&1 | head -1
   case " $SNAPX " in *" lsof "*) echo "== lsof"; lsof -nP -a -u "$ID" 2>/dev/null | sed 1d | awk '{print $1,$5,$9,$10}' | sort ;; esac
@@ -160,7 +160,7 @@ p_ipc() {
     while read -r t i; do case $t in m) ipcrm -m "$i";; q) ipcrm -q "$i";; s) ipcrm -s "$i";; esac; done
 }
 p_flags() {
-  [ "$MODE" = P-noflags ] || chflags -R nouchg,nouappnd,nodump,noopaque,nohidden "$H" "$F" 2>/dev/null
+  [ "$MODE" = P-noflags ] || chflags -R nouchg,nouappnd,dump,noopaque,nohidden "$H" "$F" 2>/dev/null
   chmod -RN "$H" "$F" 2>/dev/null
   chmod -R u+rwx "$H" "$F" 2>/dev/null
 }
@@ -171,8 +171,9 @@ p_delete() {
   else
     find -x "$H" -mindepth 1 -depth -delete 2>"$W/de.$ROW"
   fi
-  for _d in 0 C T; do find -x "$F/$_d" -mindepth 1 -depth -delete 2>>"$W/de.$ROW"; done
-  find -x "$F" -mindepth 1 -maxdepth 1 ! -name 0 ! -name C ! -name T -exec rm -rf {} + 2>>"$W/de.$ROW"
+  # the entry's skeleton (its directories as the system made them, listed before the lease) stays, emptied
+  for _d in $(cat "$W/skel.$M" 2>/dev/null || echo "0 C T"); do [ -d "$F/$_d" ] && find -x "$F/$_d" -mindepth 1 -depth -delete 2>>"$W/de.$ROW"; done
+  ls -A "$F" 2>/dev/null | while IFS= read -r _e; do case " $(cat "$W/skel.$M" 2>/dev/null || echo "0 C T") " in *" $_e "*) ;; *) rm -rf "$F/$_e" 2>>"$W/de.$ROW";; esac; done
   DE=$(wc -l <"$W/de.$ROW" | tr -d ' ')
 }
 p_shared() {
@@ -212,7 +213,15 @@ cs_clean_p_daemon() {
   [ -e "$W/daemon.done" ] || echo "PINFO daemon-clean-timeout"
 }
 
-cs_cell_end() { rm -rf /private/tmp/*"$M"* /private/var/tmp/*"$M"* "$W"/*"$M"* 2>/dev/null; hasfn "teardown_$ROW" && "teardown_$ROW"; }
+cs_cell_end() { hasfn "teardown_$ROW" && "teardown_$ROW"; rm -rf /private/tmp/*"$M"* /private/var/tmp/*"$M"* "$W"/*"$M"* 2>/dev/null; }
+
+# the driver's end of a lease: the lease directory goes (no mount crossed), before the slot is cleaned
+cs_lease_end() {
+  chflags -R nouchg,nouappnd "$L" 2>/dev/null; chmod -RN "$L" 2>/dev/null; chmod -R u+rwx "$L" 2>/dev/null
+  find -x "$L" -mindepth 1 -depth -delete 2>/dev/null; rmdir "$L" 2>/dev/null
+  [ -e "$L" ] && echo "LEASE-DIR-LEFT $(ls -A "$L" | head -3 | tr '\n' ' ')"
+}
+cs_skel() { ls -A "$F" 2>/dev/null | tr '\n' ' ' >"$W/skel.$M"; }
 
 # ================================================================ CHANNEL ROWS (table 1)
 
@@ -244,7 +253,7 @@ probe_CH06() { pr '[ -e "$H/f" ]'; }
 do_CH07a() { hdiutil create -quiet -size 2m -fs HFS+ -volname "$M" "$L/a.dmg" && mkdir -p "$H/mnt" && hdiutil attach -quiet -mountpoint "$H/mnt" "$L/a.dmg"; }
 do_CH07b() { mkdir "$L/dev" && mount_devfs devfs "$L/dev"; }
 plant_CH07() { p CH07a do_CH07a; p CH07b do_CH07b; }
-probe_CH07() { pr 'mount | grep -E -q "$H/mnt|$L/dev"'; }
+probe_CH07() { echo "INFO CH07 mounts: $(mount | grep -E "$H|$L" | sed -E 's/\(.*//' | tr '\n' ';' | cut -c1-200)"; pr 'mount | grep -E -q "$H/mnt|$L/dev"'; }
 
 plant_CH08() { p CH08 "$K" sysv-sem; }
 probe_CH08() { pr 'ipcs_has s'; }
@@ -384,10 +393,10 @@ probe_CH32() {
   pr 'log show --last 5m --style compact --predicate "eventMessage contains \"kbf-spike-$M\"" 2>/dev/null | grep -q "kbf-spike-$M"'
 }
 
-do_CH33() { "$K" crash-segv; "$K" crash-abort; sleep 25; true; }
+do_CH33() { "$K" crash-segv; "$K" crash-abort; sleep 40; echo "reports-dir-entries: $(ls /Library/Logs/DiagnosticReports 2>/dev/null | wc -l | tr -d ' ') home-dir: $(ls "$H/Library/Logs/DiagnosticReports" 2>&1 | head -3 | tr '\n' ' ')"; true; }
 plant_CH33() { p CH33 do_CH33; }
 probe_CH33() {
-  echo "INFO CH33 reports: $(find /Library/Logs/DiagnosticReports "$H/Library/Logs/DiagnosticReports" /cores -newer "$MK" -type f 2>/dev/null | head -4 | tr '\n' ';')"
+  echo "INFO CH33 reports: $(find /Library/Logs/DiagnosticReports "$H/Library/Logs/DiagnosticReports" /cores -newer "$MK" -type f 2>/dev/null | head -4 | tr '\n' ';') newest-in-system-dir: $(ls -t /Library/Logs/DiagnosticReports 2>/dev/null | head -2 | tr '\n' ';')"
   pr '[ -n "$(find /Library/Logs/DiagnosticReports "$H/Library/Logs/DiagnosticReports" /cores -newer "$MK" -type f \( -name "canary*" -o -name "*.ips" -o -name "*.crash" \) 2>/dev/null | head -1)" ]'
 }
 
@@ -400,7 +409,7 @@ do_CH34() {
 plant_CH34() { p CH34 do_CH34; }
 probe_CH34() { pr 'asu xcrun simctl list devices 2>/dev/null | grep -q "$M"'; }
 
-do_CH35() { for _b in crontab at sudo su login; do alarm_run 5 /usr/bin/$_b </dev/null >/dev/null 2>&1; echo "setuid-exec $_b rc=$?"; done; }
+do_CH35() { for _b in crontab at sudo su login; do _o=$(alarm_run 5 /usr/bin/$_b </dev/null 2>&1 | head -c 70 | tr '\n' ' '); echo "setuid-exec $_b first-output: $_o"; done; }
 plant_CH35() { p CH35 do_CH35; }
 probe_CH35() { pr 'false'; }
 
@@ -441,14 +450,27 @@ do_W03() { mkdir -p "$H/z/y" "$H/go/a/b" && touch "$H/z/y/f" "$H/go/a/b/f" && ch
 plant_W03() { p W03 do_W03; }
 probe_W03() { pr 'home_nonempty'; }
 
-plant_W04() { p W04 do_CH17; }
+# a respawning job in the user's launchd domain, put there by root (a pool user cannot bootstrap one itself on a
+# runner: see CH17), stands for any job launchd keeps alive for the uid
+fixture_W04() {
+  cat >"$W/$M.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>$M</string><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>1</integer><key>UserName</key><string>$U</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>echo x >>"$H/respawn-$M"; sleep 2</string></array></dict></plist>
+EOF
+  chmod 644 "$W/$M.plist"
+  echo "W04 fixture bootstrap: $(launchctl bootstrap "user/$ID" "$W/$M.plist" 2>&1 | head -2 | tr '\n' ' ')"
+  sleep 3
+}
+do_W04() { launchctl submit -l "kbf.w4.$M" -- /bin/sh -c "echo x >>$H/submit-$M; sleep 2"; echo "submit rc=$?"; sleep 2; }
+plant_W04() { p W04 do_W04; }
 probe_W04() {
   _any=0
   for _s in 0 2 3; do
     sleep "$_s"
-    procs_of | grep -q "sleep" && _any=1
+    [ "$(wc -l <"$H/respawn-$M" 2>/dev/null | tr -d ' ')" -gt 1 ] 2>/dev/null && _any=1
     launchctl print "user/$ID" 2>/dev/null | grep -q "$M" && _any=1
   done
+  echo "INFO W04 respawn-lines: $(wc -l <"$H/respawn-$M" 2>/dev/null | tr -d ' ') job-listed: $(launchctl print "user/$ID" 2>/dev/null | grep -c "$M")"
   [ "$_any" = 1 ] && echo "PROBE $ROW present" || echo "PROBE $ROW absent"
 }
 
@@ -457,7 +479,7 @@ plant_W05() { p W05 do_W05; }
 probe_W05() { echo "INFO W05 canaries: $(procs_of | grep -c canary) maxprocperuid: $(sysctl -n kern.maxprocperuid)"; pr 'procs_of | grep -q canary'; }
 
 plant_W06a() { p W06a bg_ok hd "$K" hold-deleted "$L/big" 128; }
-probe_W06a() { pr 'lsof +L1 -u "$ID" 2>/dev/null | sed 1d | grep -q .'; }
+probe_W06a() { pr 'lsof -a +L1 -u "$ID" 2>/dev/null | sed 1d | grep -q .'; }
 plant_W06() { plant_W06a; }
 probe_W06() { probe_W06a; }
 
@@ -529,15 +551,21 @@ probe_W09() { pr 'home_nonempty'; }
 
 do_W10() { touch "$H/x"; chflags uchg "$H" && chmod 000 "$H" && chflags uchg "$L"; chflags hidden "$F"; true; }
 plant_W10() { p W10 do_W10; }
-probe_W10() { pr 'home_attr_bad || [ "$(stat -f %Sf "$F" 2>/dev/null)" != "-" ] || home_nonempty'; }
+probe_W10() { echo "INFO W10 home: $(stat -f '%Sp %Sf' "$H") entry: $(stat -f '%Sf' "$F")"; pr 'home_attr_bad || case "$(stat -f %Sf "$F" 2>/dev/null)" in *uchg*|*hidden*|*uappnd*) true;; *) false;; esac || home_nonempty'; }
 
-do_W11() {
-  printf '* * * * * touch %s/cron-%s\n' "$H" "$M" >"$L/ct"; crontab "$L/ct" 2>&1
-  write_plist "$M" "touch $H/si-$M" '<key>StartInterval</key><integer>5</integer>' && boot_plist "$M"
+fixture_W11() {
+  cat >"$W/$M.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>$M</string><key>StartInterval</key><integer>5</integer><key>UserName</key><string>$U</string><key>ProgramArguments</key><array><string>/usr/bin/touch</string><string>$H/si-$M</string></array></dict></plist>
+EOF
+  chmod 644 "$W/$M.plist"
+  echo "W11 fixture bootstrap: $(launchctl bootstrap "user/$ID" "$W/$M.plist" 2>&1 | head -2 | tr '\n' ' ')"
 }
-plant_W11() { p W11 do_W11; }
+do_W11a() { printf '* * * * * touch %s/cron-%s\n' "$H" "$M" >"$L/ct" && crontab "$L/ct"; }
+plant_W11() { p W11a do_W11a; }
 probe_W11() {
   [ "$STAGE" = reset ] || sleep 75
+  echo "INFO W11 home: $(ls "$H" 2>/dev/null | tr '\n' ' ') crontab: $(ls /var/at/tabs 2>/dev/null | grep -c -x "$U")"
   pr 'ls "$H" 2>/dev/null | grep -q -E "cron-|si-"'
 }
 
