@@ -128,3 +128,22 @@ async fn a_link_carries_lines_and_says_how_a_read_ended() {
     let io = WireError::from(io::Error::other("broken"));
     assert_eq!(io.to_string(), "control socket: broken");
 }
+
+/// Catches: a hello of another protocol version (protocol 2 has five fields, not six)
+/// parsing to nothing, so the holder drops the connection instead of refusing by name.
+/// Mutant: all six fields required before the version is read.
+#[test]
+fn a_hello_of_another_protocol_parses_to_its_version_alone() {
+    for line in [
+        "hello 2 a 127.0.0.1:1 00",
+        "hello 1",
+        "hello 4 whatever fields follow",
+    ] {
+        let version = match Message::parse(line) {
+            Some(Message::Hello { version, .. }) => version,
+            other => panic!("{line:?} parsed to {other:?}"),
+        };
+        assert_ne!(version, PROTOCOL, "{line:?}");
+    }
+    assert_eq!(Message::parse("hello x"), None);
+}

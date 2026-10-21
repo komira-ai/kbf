@@ -107,7 +107,18 @@ fn one_line(text: &str) -> String {
 
 fn hello(rest: &str) -> Option<Message> {
     let mut fields = rest.split(' ');
-    let version = fields.next()?.parse().ok()?;
+    let version: u32 = fields.next()?.parse().ok()?;
+    if version != PROTOCOL {
+        // Another protocol's hello has other fields (protocol 2 has no enroll field): the
+        // holder only needs the version, to refuse it by name. The rest is not read.
+        return Some(Message::Hello {
+            version,
+            instance: None,
+            reapi: SocketAddr::from(([0, 0, 0, 0], 0)),
+            state: PathBuf::new(),
+            enroll: None,
+        });
+    }
     let instance = match fields.next()? {
         "-" => None,
         letter => Some(letter.parse().ok()?),

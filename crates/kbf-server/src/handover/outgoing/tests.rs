@@ -571,3 +571,28 @@ async fn a_holder_whose_store_cannot_be_read_goes_on_looking() {
     );
     task.abort();
 }
+
+/// Catches: a holder that drops the connection of a protocol-2 successor, whose hello has
+/// no enroll field, so that it only sees "the other process closed the control
+/// connection". The holder answers with the refusal that names both protocols, changes
+/// nothing, and a good successor still takes over. Mutant: the hello requires all six
+/// fields before the version is read (the old successor then hears a close).
+#[tokio::test]
+async fn a_protocol_2_successor_is_refused_by_name_and_nothing_changes() {
+    let rig = Rig::new();
+    let (served, _departed) = serve(rig.holder(Rig::uid(), LONG));
+    let mut link = connect(&rig).await;
+    link.say_raw(b"hello 2 b 127.0.0.1:18990 2f7661722f7374617465\n")
+        .await;
+    match link.hear().await.expect("an answer, not a close") {
+        Message::Refused(said) => {
+            assert!(said.contains("protocol 3, not 2"), "{said}");
+        }
+        other => panic!("answered {other:?}"),
+    }
+    assert!(untouched(&rig));
+    let (mut link, released) = take_over(&rig).await.expect("a good successor");
+    assert_eq!(released, Message::Released);
+    link.say(&Message::Serving).await.expect("serving");
+    served.await.expect("the holder");
+}
