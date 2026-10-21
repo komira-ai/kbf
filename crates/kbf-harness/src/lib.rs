@@ -55,6 +55,7 @@ pub mod scrape;
 pub mod stand_in;
 pub mod topology;
 pub mod units;
+pub mod units_rendered;
 
 /// A fresh directory for one unit test, under the temporary directory, named for the test
 /// (`CARGO_TARGET_TMPDIR` is for integration tests only).

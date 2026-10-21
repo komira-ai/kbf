@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::*;
+use crate::units::Mode;
 
 /// A fresh directory for one test.
 fn dir(name: &str) -> PathBuf {
@@ -654,36 +655,59 @@ fn a_farm_reaps_its_processes_before_it_removes_the_scratch() {
     );
 }
 
+/// The unit of `mode` for a made-up process under `root`.
+fn unit_under(root: &Path, mode: Mode) -> Unit {
+    let wiring = Wiring {
+        reapi: 1,
+        worker: 2,
+        api: 3,
+        storage_url: "https://127.0.0.2:4".to_owned(),
+    };
+    let settings = Settings {
+        root,
+        host: "127.0.0.9",
+        node_id: "n-1",
+        storage_port: 5,
+        wiring: &wiring,
+        image: "",
+    };
+    Unit::new(mode, &settings, 1000)
+}
+
 #[test]
 fn a_launched_kbf_child_is_given_a_settings_file_of_the_harnesss_own() {
     // Catches: a child started with no `--config`, which reads the host's
     // /etc/kbf/kbf.toml when there is one (and dies on it when the test's user cannot read
-    // it), so a harness test passes on a host without kbf installed and fails on one with it.
+    // it), so a harness test passes on a host without kbf installed and fails on one with
+    // it; a file that is not the unit's settings, or one group or other can write (kbf
+    // refuses it); a command line that is not the packaged unit's `--mode=<name>`.
     let d = dir("own-config");
     let root = d.join("root");
     std::fs::create_dir_all(&root).expect("root");
     let mut farm = Farm::supervise(&d, Vec::new());
-    let unit = Rendered {
-        mode: Mode::Storage,
-        argv: vec!["storage".to_owned(), "--x=1".to_owned()],
-        env: Vec::new(),
-    };
+    let unit = unit_under(&root, Mode::Storage);
+    let text = unit.toml();
+    let flags = unit.flags();
     farm.launch(Path::new("true"), Role::Node(1), &root, unit, None);
     let file = root.join("kbf.toml");
-    let flags: Vec<_> = farm
-        .spec(Role::Node(1))
-        .argv
-        .iter()
-        .filter(|a| a.starts_with("--config"))
-        .collect();
-    assert_eq!(flags, [&format!("--config={}", file.display())]);
-    assert_eq!(std::fs::read(&file).expect("the file"), b"");
+    assert_eq!(
+        farm.spec(Role::Node(1)).argv,
+        [
+            "--mode=storage".to_owned(),
+            format!("--config={}", file.display())
+        ]
+    );
+    assert_eq!(std::fs::read_to_string(&file).expect("the file"), text);
+    assert_eq!(farm.flags(Role::Node(1)), flags);
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(&file).expect("meta").permissions().mode();
+    assert_eq!(mode & 0o022, 0, "{mode:o}");
 }
 
 #[test]
 fn a_container_driver_child_is_given_the_settings_file_of_its_root_not_of_its_bin() {
     // Catches: the `Some(bin)` branch of `launch` (the container driver's, whose child
-    // runs in `bin`) building its flags without `--config`, or putting the file under
+    // runs in `bin`) building its command line without `--config`, or putting the file under
     // `bin` (shared by every child) instead of the child's own root; the `None` test
     // above pins the other branch only.
     let d = dir("own-config-bin");
@@ -692,21 +716,21 @@ fn a_container_driver_child_is_given_the_settings_file_of_its_root_not_of_its_bi
         std::fs::create_dir_all(p).expect("dir");
     }
     let mut farm = Farm::supervise(&d, Vec::new());
-    let unit = Rendered {
-        mode: Mode::Daemon,
-        argv: vec![
-            "daemon".to_owned(),
-            "--oci-runtime=/usr/bin/crun".to_owned(),
-        ],
-        env: Vec::new(),
-    };
+    let unit = unit_under(&root, Mode::Daemon);
+    let text = unit.toml();
     farm.launch(Path::new("true"), Role::Node(1), &root, unit, Some(&bin));
     let file = root.join("kbf.toml");
     let argv = &farm.spec(Role::Node(1)).argv;
-    let flags: Vec<_> = argv.iter().filter(|a| a.starts_with("--config")).collect();
-    assert_eq!(flags, [&format!("--config={}", file.display())], "{argv:?}");
-    assert_eq!(std::fs::read(&file).expect("the file"), b"");
+    assert_eq!(
+        argv,
+        &[
+            "--mode=daemon".to_owned(),
+            format!("--config={}", file.display())
+        ]
+    );
+    assert_eq!(std::fs::read_to_string(&file).expect("the file"), text);
     assert!(!bin.join("kbf.toml").exists());
+    assert_eq!(farm.spec(Role::Node(1)).cwd, bin);
 }
 
 #[test]
