@@ -151,16 +151,6 @@ pub fn absolute_path(s: &str) -> bool {
     c.literal("/") && c.many(|b| alnum(b) || b"._/-".contains(&b)) > 0 && c.done()
 }
 
-/// `[A-Za-z0-9._-]+=[A-Za-z0-9._:/@+,=-]+`: one of the daemon's `--label`s.
-pub fn daemon_label(s: &str) -> bool {
-    s.split_once('=').is_some_and(|(k, v)| {
-        !k.is_empty()
-            && k.bytes().all(|b| alnum(b) || b"._-".contains(&b))
-            && !v.is_empty()
-            && v.bytes().all(|b| alnum(b) || b"._:/@+,=-".contains(&b))
-    })
-}
-
 /// `[0-9a-f]{64}`
 pub fn sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| digit(b) || (b'a'..=b'f').contains(&b))
@@ -262,13 +252,6 @@ mod tests {
             (absolute_path, "/", false),
             (absolute_path, "node.pem", false),
             (absolute_path, "/a b", false),
-            (daemon_label, "pool=mac", true),
-            (daemon_label, "a=b=c", true),
-            (daemon_label, "rack", false),
-            (daemon_label, "=mac", false),
-            (daemon_label, "pool=", false),
-            (daemon_label, "po ol=mac", false),
-            (daemon_label, "pool=m*c", false),
             (sha256, &"ab".repeat(32), true),
             (sha256, &"AB".repeat(32), false),
             (sha256, &"a".repeat(63), false),

@@ -237,6 +237,26 @@ fn a_macos_test_farm_host_migrates_and_its_node_starts() {
     assert_eq!(state["current"], FARM_X);
 }
 
+/// Catches: the test-farm Mac's plist (the migration's input, and the node it starts
+/// from it) passing `--label` again. Node labels are removed, and a daemon that refuses
+/// the flag would stop on the fixture before the migration's check reached any other
+/// argument.
+///
+/// Mutant seen red: the three `--label` pairs put back in the plist.
+#[test]
+fn the_test_farm_mac_plist_passes_no_label() {
+    let arguments = program_arguments(FARM_PLIST);
+    assert!(arguments.len() > 10, "{arguments:?}");
+    for argument in &arguments {
+        assert!(
+            argument != "--label"
+                && !argument.starts_with("--label=")
+                && !argument.starts_with("pool="),
+            "{argument} in {arguments:?}"
+        );
+    }
+}
+
 /// The programs a migration's probes ran, as file names.
 fn probed(runner: &crate::fixtures::FakeRunner) -> Vec<String> {
     runner
