@@ -163,7 +163,7 @@ words, in either order): one JSON object on one line of stdout, exit 0, the fiel
 sorted by name.
 
 ```text
-{"admin_protocol":1,"commit":"0123456789ab","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"seq":812,"state_schema":1,"version":"0.1.0"}
+{"admin_protocol":1,"commit":"0123456789ab","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"relay":1,"seq":812,"state_schema":1,"version":"0.1.0"}
 ```
 
 - `admin_protocol`: the version of the admin calls of `kbf --mode frontend` (`GET role`,
@@ -180,6 +180,13 @@ sorted by name.
 - `protocol` and `min_protocol`: the newest and the oldest `kbf.worker.v1` version the
   binary speaks. The daemon half speaks exactly `protocol`; the server half accepts
   `min_protocol` through `protocol`.
+- `relay`: how far the build carries what its host's installer reports to the frontend. At
+  `1` it reads `available` and `release_source` from the installer's `status.json` and sends
+  them in its `UpdateStatus`. `kbf-installer setup` takes `release_source = "bundled"` on a
+  host that has a release only beside a `kbf` that declares at least the level the installer
+  needs (`kbf_installer::binary::RELAY_NEEDED`); a build before this field prints none. An
+  installer whose reader refuses keys it does not know refuses to stage a `kbf` that prints
+  it, so the installers ship first.
 - `seq`: the number of commits behind the commit built (`git rev-list --count HEAD`), so
   two builds of one branch are put in order by it: a later commit has the larger number.
   It is `0` when the build could not count them (a shallow checkout, which holds only part

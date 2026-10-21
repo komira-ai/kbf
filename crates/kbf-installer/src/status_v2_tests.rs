@@ -3,8 +3,12 @@ use serde_json::{Value, json};
 use super::*;
 use crate::golden::{STATUS, status};
 
-/// Catches a change to `status.json` that `kbf-update` would misread and that did not move
-/// the golden file.
+/// Catches a change to `status.json` that did not move the golden file or this type: the
+/// golden bytes are the writer's (`helper/status_tests.rs`), and here they decode strictly to the
+/// host they describe and encode back to the same bytes, key for key and in the same order.
+///
+/// Mutants to plant: a key of the type renamed or moved; a key the writer writes missing from the
+/// type (the strict decode refuses the golden).
 #[test]
 fn the_golden_status_decodes_and_encodes_to_itself() {
     assert_eq!(
@@ -15,6 +19,26 @@ fn the_golden_status_decodes_and_encodes_to_itself() {
         String::from_utf8(status().render().expect("encodes")).expect("text"),
         STATUS
     );
+}
+
+/// Catches a host with no seed and no source encoded with the two keys as `null`, and a
+/// status written before they existed refused: both are left out, and a file without them reads.
+///
+/// Mutants to plant: the `skip_serializing_if` of either key removed; the `default` of either
+/// removed.
+#[test]
+fn a_status_without_a_seed_or_a_source_has_neither_key_and_still_reads() {
+    let bare = StatusV2 {
+        release_source: None,
+        available: None,
+        ..status()
+    };
+    let bytes = bare.render().expect("encodes");
+    let json: Value = serde_json::from_slice(&bytes).expect("json");
+    for key in ["release_source", "available", "unverified"] {
+        assert!(json.get(key).is_none(), "{key}");
+    }
+    assert_eq!(StatusV2::parse(&bytes).expect("parses"), bare);
 }
 
 /// Catches a renamed, added or dropped refusal word: scripts and the frontend branch on them
@@ -73,8 +97,8 @@ fn the_state_words_are_fixed() {
     }
 }
 
-/// Catches a status reader that takes a schema 1 file, an unknown key, or a word that is not
-/// a refusal.
+/// Catches a status reader that takes a schema 1 file, an unknown key (also inside a nested
+/// object), or a state word that is not one.
 #[test]
 fn a_foreign_status_is_refused() {
     let edit = |f: &dyn Fn(&mut Value)| {
@@ -84,6 +108,6 @@ fn a_foreign_status_is_refused() {
     };
     assert!(StatusV2::parse(&edit(&|v| v["schema"] = json!(1))).is_err());
     assert!(StatusV2::parse(&edit(&|v| v["note"] = json!("x"))).is_err());
-    assert!(StatusV2::parse(&edit(&|v| v["refusal"]["word"] = json!("busy"))).is_err());
+    assert!(StatusV2::parse(&edit(&|v| v["available"]["facts"] = json!(1))).is_err());
     assert!(StatusV2::parse(&edit(&|v| v["state"] = json!("rebooting"))).is_err());
 }
