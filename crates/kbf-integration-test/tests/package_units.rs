@@ -915,15 +915,12 @@ fn modes_in<'a>(files: &[&'a str]) -> Vec<&'a str> {
     m
 }
 
-/// Catches the units drifting from the mode table of kbf-deploy: the modes the package
+/// Catches the units drifting from the mode table of kbf-cli (`names::MODES`): the modes the package
 /// ships are exactly the five `kbf --mode=` takes (there is no `node` mode), each as
 /// `kbf-<mode>.service`; an extra or a missing mode unit is not that set.
 #[test]
 fn the_kbf_modes_are_exactly_the_five() {
-    let mut want: Vec<&str> = kbf_deploy::linux::Mode::ALL
-        .iter()
-        .map(|m| m.name())
-        .collect();
+    let mut want: Vec<&str> = kbf_cli::names::MODES.iter().map(|m| m.name).collect();
     want.sort_unstable();
     assert_eq!(want.len(), 5);
     assert_eq!(modes_in(&FILES), want);
@@ -940,10 +937,10 @@ fn the_kbf_modes_are_exactly_the_five() {
 }
 
 /// Catches the per-instance block of the frontend going missing from the template: the
-/// two instances of kbf-deploy's `FRONTEND_INSTANCES` run the same line through `%i`.
+/// two instances of `kbf frontend handover` (`kbf_cli::handover::INSTANCES`) run the same line through `%i`.
 #[test]
 fn the_frontend_template_serves_both_instances_through_the_specifier() {
-    assert_eq!(kbf_deploy::linux::modes::FRONTEND_INSTANCES, ["a", "b"]);
+    assert_eq!(kbf_cli::handover::INSTANCES, ["a", "b"]);
     let text = read("kbf-frontend@.service");
     let unit = UnitFile::parse(&text).expect("parses");
     assert_eq!(unit.get_in("Install", "DefaultInstance"), Some("a"));

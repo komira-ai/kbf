@@ -466,7 +466,7 @@ fn the_node_step_obeys_its_table_over_random_observations() {
     }
 }
 
-const REASONS: [HoldReason; 11] = [
+const REASONS: [HoldReason; 12] = [
     HoldReason::SecondMemberDown,
     HoldReason::RestartDeadline,
     HoldReason::MemberGone,
@@ -478,6 +478,7 @@ const REASONS: [HoldReason; 11] = [
     HoldReason::Reverted,
     HoldReason::RevertRefused,
     HoldReason::StillCordoned,
+    HoldReason::ActivateRefused,
 ];
 
 /// The name of a command, for counting.

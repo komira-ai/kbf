@@ -641,7 +641,7 @@ held and the run goes `held`; a broken host never lets another take its place.
    inside the drained step**, so the host is out of service for the download as well as the swap; the time cap of 7.1 bounds it.
    Pre-fetching a release while the host still serves is deferred (section 12).
 3. **Failure**: an error after the swap rolls back, never retries. A fetch or verification that fails before the swap changes
-   nothing on the host (section 7.3): it reports `REFUSED` with the reason, is uncordoned, and the run goes `held`. A host
+   nothing on the host (section 7.3): it reports `REFUSED` with the reason, stays cordoned, and the run goes `held`. A host
    reverted by its own timer reports `REVERTED`; the run goes `held` and stays held until a person acts.
 4. **Pause** stops granting between hosts, never mid-host. **Rollback** (a fleet walk-back) sets an older commit as the
    desired release. That write gets a **new, higher generation** from the store counter, so the installer accepts it: generation orders the

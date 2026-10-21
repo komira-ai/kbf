@@ -50,12 +50,17 @@ fn the_helpers_report_moves_a_storage_host_on_to_rejoin() {
 }
 
 /// Catches: a helper that reverted or refused being waited on for ever. "The helper
-/// reverts itself": the controller issues no revert, no uncordon, and holds.
+/// reverts itself": the controller issues no revert, no uncordon, and holds. A refusal of
+/// the activate order itself is `ActivateRefused`: the helper flipped nothing, so it is not
+/// the page that a revert that could not run is.
+///
+/// Mutants: step 6 reporting a refusal as `RevertRefused`; a refusal left waiting for the
+/// activate limit.
 #[test]
 fn a_reverted_or_refused_helper_holds_the_run_and_touches_nothing() {
     for (status, reason) in [
         (HelperStatus::Reverted, HoldReason::Reverted),
-        (HelperStatus::Refused, HoldReason::RevertRefused),
+        (HelperStatus::Refused, HoldReason::ActivateRefused),
     ] {
         let mut f = activating_fleet();
         host_mut(&mut f, "s1").helper = report(status);
@@ -63,7 +68,68 @@ fn a_reverted_or_refused_helper_holds_the_run_and_touches_nothing() {
         assert_eq!(moved.next, HostPhase::Held { reason });
         assert_eq!(moved.commands, vec![Command::Alert(Alert::Held(reason))]);
     }
+    assert_eq!(HoldReason::ActivateRefused.severity(), Severity::Warn);
+}
+
+/// Catches: the split of the refusal going too far. After the flip (steps 7 to 9) a refused
+/// helper is a revert that could not run, because the previous release is missing: it stays
+/// `RevertRefused` and pages. Each of the three steps reads it before anything else.
+///
+/// Mutants: `helper_failed` mapping a refusal to `ActivateRefused`; a step that does not
+/// read the refusal.
+#[test]
+fn a_refusal_after_the_flip_is_a_revert_that_could_not_run() {
+    for phase in [
+        HostPhase::RejoiningStorage,
+        HostPhase::Repairing,
+        HostPhase::Confirming,
+    ] {
+        let mut f = waiting_in(&phase);
+        host_mut(&mut f, "s1").helper = report(HelperStatus::Refused);
+        let moved = run(&f, "s1", &phase, 5);
+        let reason = HoldReason::RevertRefused;
+        assert_eq!(moved.next, HostPhase::Held { reason }, "{phase:?}");
+        assert_eq!(
+            moved.commands,
+            vec![Command::Alert(Alert::Held(reason))],
+            "{phase:?}"
+        );
+    }
     assert_eq!(HoldReason::RevertRefused.severity(), Severity::Page);
+}
+
+/// Catches: a refusal of an earlier order holding the host this order is being given to. A
+/// host is updated many times, and the helper's status of the last update can be a
+/// `REFUSED`: it names an order the row does not hold, so the activation waits as if nothing
+/// had come, and is held for the stall at the limit, not for a refusal. The refusal of the
+/// row's own order holds it at once.
+///
+/// Mutant: the order not compared (a refusal of any order is read).
+#[test]
+fn a_refusal_of_an_earlier_order_does_not_hold_the_activation() {
+    for older in [
+        support::order(ORDER.seq - 1),
+        OrderId::new(ORDER.epoch - 1, ORDER.seq),
+    ] {
+        let mut f = activating_fleet();
+        host_mut(&mut f, "s1").helper = report_of(older, HelperStatus::Refused);
+        let waiting = run(&f, "s1", &HostPhase::Activating, 5);
+        assert_eq!(waiting.next, HostPhase::Activating, "{older:?}");
+        assert_eq!(waiting.commands, Vec::new(), "{older:?}");
+
+        let at = run(&f, "s1", &HostPhase::Activating, 5 * MIN);
+        let stalled = HostPhase::Held {
+            reason: HoldReason::ActivateStalled,
+        };
+        assert_eq!(at.next, stalled, "{older:?}");
+
+        host_mut(&mut f, "s1").helper = report(HelperStatus::Refused);
+        let own = run(&f, "s1", &HostPhase::Activating, 5);
+        let refused = HostPhase::Held {
+            reason: HoldReason::ActivateRefused,
+        };
+        assert_eq!(own.next, refused, "{older:?}");
+    }
 }
 
 /// Catches: a status left over from an earlier update read as the answer to this one. A
@@ -560,6 +626,7 @@ fn a_held_node_keeps_its_cordon_except_when_the_hold_put_it_back() {
         HoldReason::Reverted,
         HoldReason::RevertRefused,
         HoldReason::StillCordoned,
+        HoldReason::ActivateRefused,
     ];
     for reason in reasons {
         let phase = HostPhase::Held { reason };
