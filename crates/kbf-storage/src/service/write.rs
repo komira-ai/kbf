@@ -69,7 +69,17 @@ impl StorageService {
             Err(StorageError::Invalid(_)) if unowned => (Plan::Local, None),
             planned => (planned?, view),
         };
-        if self.storage.find_missing(&[digest]).await?.is_empty() {
+        // A blob this node already holds is acknowledged at once. A copy a peer sends (a
+        // chain's leg, the repair worker's) is a request for a durable copy, so a blob held
+        // only in RAM does not answer it: it is written (rule 2,
+        // `docs/design/storage-ram-ack.md`). A client's write is answered by what can be
+        // served.
+        let held = if leg_from.is_some() {
+            self.storage.find_durable(&[digest]).await?
+        } else {
+            self.storage.find_missing(&[digest]).await?
+        };
+        if held.is_empty() {
             return Ok(size);
         }
         self.write_blob(digest, first, messages, view.as_ref(), leg_from, plan)

@@ -88,12 +88,19 @@ pub const MAP_GENERATION_HEADER: &str = "kbf-map-generation";
 
 /// The metadata entry on `FindMissingBlobs` that asks a durable question: `only` answers
 /// from the index alone, so a blob held in RAM and not yet written to disk is missing
-/// ([`crate::Storage::find_durable`]). Without it a held blob is present, as it can be
-/// served. Any other value is INVALID_ARGUMENT.
+/// ([`crate::Storage::find_durable`]); `wait` first waits for the held ones to be written
+/// ([`crate::Storage::find_durable_waiting`]). Without it a held blob is present, as it can
+/// be served. Any other value is INVALID_ARGUMENT.
 pub const DURABLE_HEADER: &str = "kbf-durable";
 
 /// The value of [`DURABLE_HEADER`] that asks for the index alone.
 pub const DURABLE_ONLY: &str = "only";
+
+/// The value of [`DURABLE_HEADER`] that asks for the index alone after the node has waited,
+/// for at most its `--durable-wait`, for the held blobs among the digests to be written
+/// ([`crate::Storage::find_durable_waiting`]): the question a caller asks before it writes
+/// something durable that names a blob, and can wait for the write-behind to catch up.
+pub const DURABLE_WAIT: &str = "wait";
 
 /// The metadata entry that marks a `Write` as a copy the caller needs on this node
 /// although the map does not place the blob here ([`crate::Storage::put_unowned`]).

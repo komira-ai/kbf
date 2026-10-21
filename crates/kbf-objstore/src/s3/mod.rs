@@ -197,9 +197,7 @@ impl S3Store {
         if !valid_bucket(&config.bucket) {
             return Err(S3ConfigError::Bucket(config.bucket));
         }
-        let client = reqwest::Client::builder()
-            .connect_timeout(config.connect_timeout)
-            .timeout(config.request_timeout)
+        let client = store_client_builder(config.connect_timeout, config.request_timeout)
             .build()
             .map_err(S3ConfigError::Client)?;
         let conn = Conn {
@@ -217,6 +215,39 @@ impl S3Store {
             conn: Arc::new(conn),
         })
     }
+}
+
+/// How long an unused pooled connection is kept before the client drops it. reqwest's
+/// default is 90 s, longer than many servers and proxies keep an idle connection; a
+/// request sent on a connection the peer has already closed fails with "connection
+/// closed before message completed". Dropping idle connections after 30 s keeps the
+/// client's side shorter than common load-balancer and server idle closes (often 60 s;
+/// some paths close at about 20 s).
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The HTTP client builder every `S3Store` uses: the configured limits plus
+/// `POOL_IDLE_TIMEOUT`. `S3Store::new` goes through this one function.
+///
+/// Test gap: reqwest cannot read the idle timeout back from a builder, so no test
+/// proves `S3Store::new` uses this function; the tests prove the constant and that
+/// `client_builder` applies the timeout it is given.
+fn store_client_builder(
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> reqwest::ClientBuilder {
+    client_builder(connect_timeout, request_timeout, POOL_IDLE_TIMEOUT)
+}
+
+/// A client builder with the given limits and idle pool timeout.
+fn client_builder(
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    pool_idle_timeout: Duration,
+) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .pool_idle_timeout(pool_idle_timeout)
 }
 
 impl Conn {
@@ -640,6 +671,70 @@ mod tests {
         let slowest = S3Store::new(c).unwrap();
         let saturated = Duration::from_secs(60) + Duration::from_nanos(u64::MAX);
         assert_eq!(slowest.conn.timeout_for(usize::MAX), saturated);
+    }
+
+    /// Catches: the idle pool timeout reverting to reqwest's 90 s default, which lets a
+    /// request reuse a connection the server has already closed.
+    #[test]
+    fn pool_idle_timeout_is_30s() {
+        assert_eq!(POOL_IDLE_TIMEOUT, Duration::from_secs(30));
+    }
+
+    /// Catches: the builder not applying the idle timeout it is given (the default is
+    /// 90 s, so a connection idle past the limit would be reused, not replaced).
+    #[tokio::test]
+    async fn idle_connection_is_dropped_after_the_timeout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0
+                            || sock
+                                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                                .await
+                                .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let limit = Duration::from_secs(5);
+        // Reuse: a long idle timeout keeps the connection across two requests.
+        let keeping = client_builder(limit, limit, Duration::from_secs(60))
+            .build()
+            .unwrap();
+        keeping.get(&url).send().await.unwrap();
+        keeping.get(&url).send().await.unwrap();
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "a fresh connection is reused"
+        );
+        // Expiry: a short idle timeout and a wait far above it replace the connection.
+        let dropping = client_builder(limit, limit, Duration::from_millis(100))
+            .build()
+            .unwrap();
+        dropping.get(&url).send().await.unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        dropping.get(&url).send().await.unwrap();
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            3,
+            "an idle connection was kept"
+        );
     }
 
     fn config(endpoint: &str, bucket: &str) -> S3Config {

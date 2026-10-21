@@ -186,12 +186,13 @@ impl Transport for Counting {
         host: &WorkerId,
         order: OrderId,
         release: &Release,
+        source: Source,
     ) -> Result<(), TransportError> {
         self.one();
         if self.refuse_activate.load(Ordering::SeqCst) {
             return Err(TransportError::new("the farm is not answering"));
         }
-        self.inner.activate(host, order, release)
+        self.inner.activate(host, order, release, source)
     }
 
     fn confirm(

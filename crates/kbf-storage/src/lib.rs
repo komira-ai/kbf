@@ -84,11 +84,30 @@ pub trait Storage: Send + Sync {
     /// wire). There is no default: a storage that holds nothing in RAM answers with
     /// [`Storage::find_missing`] explicitly, and one that does (or wraps one) decides, so
     /// no wrapper answers a durable question with the held-inclusive answer by omission.
-    /// Touches nothing.
+    /// The digests it reports present are touched, as [`Storage::find_missing`] touches
+    /// them, so a closure check or a copy's dedup that asks keeps the blobs it finds; a
+    /// digest reported missing (absent, or held in RAM only) is not touched.
     ///
     /// # Errors
     /// The store could not answer; never a partial answer.
     fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>>;
+
+    /// [`Storage::find_durable`] after first waiting, for at most the node's own bound
+    /// (`--durable-wait`), for the held digests among `digests` to be written to the
+    /// disk (`kbf-durable: wait` on the wire). A digest still held when the bound ends is
+    /// missing, as a durable answer says. What a caller asks before it writes something
+    /// durable that names a blob and can afford to wait for the write-behind to catch up.
+    ///
+    /// The default asks [`Storage::find_durable`] without waiting: a storage that holds
+    /// nothing in RAM has nothing to wait for, and one that does and does not override
+    /// this refuses a held blob at once instead of reporting it durable, which is the safe
+    /// side. What it reports present is touched, as in [`Storage::find_durable`].
+    ///
+    /// # Errors
+    /// The store could not answer; never a partial answer.
+    fn find_durable_waiting<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        self.find_durable(digests)
+    }
 
     /// A whole blob, checked against its digest, after touching it: for a blob the
     /// caller decodes. A blob of any size is read with [`Storage::read_range`], a window

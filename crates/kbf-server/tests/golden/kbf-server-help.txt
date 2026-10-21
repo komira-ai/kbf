@@ -215,6 +215,16 @@ Options:
           
           [default: 30]
 
+      --durable-wait <DURABLE_WAIT>
+          How long, in seconds, a storage node waits for blobs it holds in RAM to be written to its disk when a caller asks for a durable answer that waits (`kbf-durable: wait`): an action-cache entry is committed only once every blob it names is on an owner's disk, and the writer of the entry asks each owner with this wait; the action's owner waits the same for its own copies. A blob still in RAM when it ends is reported missing and the write fails UNAVAILABLE, for the caller to try again. Nothing holds a blob in RAM yet, so no call waits. At least 1, and under half of the 120 seconds a chain's replica may take to commit a blob (`kbf_storage::replicate::ChainConfig`): a start with more is refused
+          
+          [default: 10]
+
+      --ram-peer-grace <RAM_PEER_GRACE>
+          How long, in seconds, after its own write of a blob it acknowledged from RAM a storage node waits before it asks the blob's other owner whether the blob is on its disk too, and journals a repair debt if it is not. Long enough that the usual answer is yes and nothing is journalled. Nothing acknowledges from RAM yet, so no node asks. At least 1
+          
+          [default: 5]
+
       --store-put-attempts <STORE_PUT_ATTEMPTS>
           How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
           

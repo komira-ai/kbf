@@ -159,6 +159,18 @@ impl Storage for Called {
         })
     }
 
+    fn find_durable_waiting<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(async move {
+            let service = self.judged().await?;
+            let catching_up = service.catching_up();
+            let missing = service.storage.find_durable_waiting(digests).await?;
+            match catch_up::missing_gap(catching_up, missing.len(), digests.len()) {
+                Some(status) => Err(lift(&status, None)),
+                None => Ok(missing),
+            }
+        })
+    }
+
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes> {
         Box::pin(async move {
             let service = self.judged().await?;

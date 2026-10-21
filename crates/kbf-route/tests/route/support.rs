@@ -163,6 +163,8 @@ pub struct Node {
     ram_only: Mutex<BTreeSet<Digest>>,
     /// The digests of each `find_durable` call.
     durable_finds: Mutex<Vec<Vec<Digest>>>,
+    /// The digests of each `find_durable_waiting` call.
+    waiting_finds: Mutex<Vec<Vec<Digest>>>,
     pub puts: Mutex<Vec<Digest>>,
     pub commits: Mutex<Vec<Digest>>,
     pub action_gets: AtomicUsize,
@@ -194,6 +196,7 @@ impl Node {
             finds: Mutex::default(),
             ram_only: Mutex::default(),
             durable_finds: Mutex::default(),
+            waiting_finds: Mutex::default(),
             puts: Mutex::default(),
             commits: Mutex::default(),
             action_gets: AtomicUsize::new(0),
@@ -215,6 +218,16 @@ impl Node {
     /// Makes the held `digest` RAM-only, as a blob a write acknowledged from RAM is until it is on disk: the node serves it and says it is present, but not durable ([`Storage::find_durable`]).
     pub fn make_ram_only(&self, digest: &Digest) {
         self.ram_only.lock().expect("lock").insert(*digest);
+    }
+
+    /// Writes the RAM-only `digest` to the disk: durable from now on.
+    pub fn make_durable(&self, digest: &Digest) {
+        self.ram_only.lock().expect("lock").remove(digest);
+    }
+
+    /// The digests of each `find_durable_waiting` call (the question `kbf-durable: wait` is).
+    pub fn waiting_log(&self) -> Vec<Vec<Digest>> {
+        self.waiting_finds.lock().expect("lock").clone()
     }
 
     /// The digests of each `find_durable` call.
@@ -411,6 +424,24 @@ impl Storage for Node {
     fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
         Box::pin(async move {
             self.durable_finds
+                .lock()
+                .expect("lock")
+                .push(digests.to_vec());
+            self.check()?;
+            let blobs = self.blobs.lock().expect("lock");
+            let ram_only = self.ram_only.lock().expect("lock");
+            Ok(digests
+                .iter()
+                .filter(|d| d.size_bytes != 0 && (!blobs.contains_key(d) || ram_only.contains(d)))
+                .copied()
+                .collect())
+        })
+    }
+
+    /// As `find_durable`, and noted as a waiting question.
+    fn find_durable_waiting<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(async move {
+            self.waiting_finds
                 .lock()
                 .expect("lock")
                 .push(digests.to_vec());

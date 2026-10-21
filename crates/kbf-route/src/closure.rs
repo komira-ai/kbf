@@ -351,7 +351,10 @@ impl Router {
                 // A node bounds the digests of one call, so a long list is several.
                 for chunk in asked.chunks(MAX_FIND_MISSING_DIGESTS) {
                     verified.counters.rpcs.fetch_add(1, Ordering::Relaxed);
-                    lacking.extend(node.find_missing(chunk).await?);
+                    // Durable only: a blob a node holds in RAM and has not written is not
+                    // one an entry may rest on, and a positive that is never remembered is
+                    // never wrong after the node restarts (rule 2, `kbf-durable: only`).
+                    lacking.extend(node.find_durable(chunk).await?);
                 }
                 Ok::<_, StorageError>(lacking)
             }))

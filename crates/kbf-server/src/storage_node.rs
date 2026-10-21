@@ -105,6 +105,8 @@ pub const ALLOWED: &[&str] = &[
     "write_pool_writers",
     "write_pool_queue",
     "write_pool_stream_idle",
+    "durable_wait",
+    "ram_peer_grace",
     "store_put_attempts",
 ];
 
@@ -300,6 +302,7 @@ pub fn parse(m: &ArgMatches) -> Result<StorageFlags, clap::Error> {
             return Err(command().error(clap::error::ErrorKind::InvalidValue, refusal));
         }
     }
+    let repair = server.repair_config();
     Ok(StorageFlags {
         server,
         listen,
@@ -309,7 +312,7 @@ pub fn parse(m: &ArgMatches) -> Result<StorageFlags, clap::Error> {
         advertise,
         zone: text(REGISTRATION[2]).unwrap_or_default(),
         weight: m.get_one::<u32>(REGISTRATION[3]).copied().unwrap_or(1),
-        repair: RepairConfig::default(),
+        repair,
         env: process_env,
     })
 }
@@ -324,6 +327,7 @@ impl StorageFlags {
     /// every call, so it is for one machine only).
     pub fn listener(&self) -> Result<StorageListener, ConfigError> {
         self.server.segment_upload_fits_write_bound()?;
+        self.server.durable_wait_fits_commit_bound()?;
         let tls = match &self.tls {
             Some([cert, key, ca]) => Some(TlsSource::files(
                 "storage",
@@ -666,7 +670,8 @@ where
     let (cache, registered) = open_cache(flags, socket, (meta, cold, prefix, log)).await?;
     let cache = cache
         .with_writes(flags.server.write_config())
-        .with_write_pool(flags.server.write_pool_config());
+        .with_write_pool(flags.server.write_pool_config())
+        .with_durable_wait(flags.server.durable_wait());
     // A registered node dates what it stages by the map it holds, so it can say what it has
     // flushed ([`crate::fill`]); it flushes everything, as without the gate.
     let cache = if registered.joiner.is_some() {

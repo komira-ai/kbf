@@ -21,7 +21,7 @@ use kbf_map::MemberId;
 use kbf_types::{FarmTime, WorkerId};
 
 use super::command::Alert;
-use super::facts::{HostFacts, MemberFacts, OrderId, PlatformClass, Release};
+use super::facts::{HostFacts, MemberFacts, OrderId, PlatformClass, Release, Source};
 
 /// An order the farm did not take, or a call that did not come back. The controller does
 /// not know whether it was applied, so it gives it again.
@@ -82,6 +82,12 @@ pub trait Transport: Send {
     /// equal to the highest it has acted on, and refuse a lower one (section 6.1); a
     /// transport that cannot promise that is not safe to give this order.
     ///
+    /// `source` is where the release comes from, the source of the run that started the host
+    /// ([`super::HostRow::source`]), not of the run that is desired now. A staged run's order
+    /// tells the installer to use the release its package carries; the order of a fetch run
+    /// says nothing of the source, as every order did before the field. A confirmation has no
+    /// source: it is about a release the host has installed.
+    ///
     /// # Errors
     /// As [`Transport::cordon`].
     fn activate(
@@ -89,6 +95,7 @@ pub trait Transport: Send {
         host: &WorkerId,
         order: OrderId,
         release: &Release,
+        source: Source,
     ) -> Result<(), TransportError>;
 
     /// Orders `CONFIRM` of the activation `order`: the helper cancels its revert timer.

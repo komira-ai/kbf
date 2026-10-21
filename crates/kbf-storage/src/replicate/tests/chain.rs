@@ -831,3 +831,66 @@ async fn a_store_whose_stream_call_fails_fails_the_write() {
     assert_eq!(status.code(), Code::Internal, "{status:?}");
     assert!(!held(&farm, 0, &digest) && !held(&farm, 1, &digest));
 }
+
+/// Catches a copy's dedup that keeps no blob alive : the replica already holds the
+/// blob on its disk, so the copy the primary sends is answered "held" at once (nothing is
+/// written), and the replica must have been asked the durable question about it, which is
+/// what refreshes the blob's retention there (the node's cache touches what it reports
+/// present). The primary's own client check is plain and runs on the primary, so a touch
+/// on the replica can only be the copy's. Mutants: the dedup asks nothing and writes always
+/// (the blob is written again and nothing is touched).
+#[tokio::test]
+async fn a_copy_of_a_blob_the_replica_holds_on_disk_touches_it() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    let map = farm.map(1, 2, &[]);
+    let bytes = farm.blob(&map, 0, 1, 4096, 41);
+    let digest = sha(&bytes);
+    farm.nodes[1]
+        .mem
+        .blobs
+        .lock()
+        .expect("lock")
+        .insert(digest, Bytes::from(bytes.clone()));
+
+    let written = within(farm.client(0, 1).put(Bytes::from(bytes))).await;
+    assert_eq!(written.expect("answered"), digest);
+    assert_eq!(
+        *farm.nodes[1].mem.touched.lock().expect("lock"),
+        [digest],
+        "the replica touched the blob it held when the copy arrived"
+    );
+    assert_eq!(
+        farm.nodes[1].mem.knobs.begun.load(Ordering::SeqCst),
+        0,
+        "a durable copy is not written again"
+    );
+}
+
+/// The other side of the touch: the replica holds the blob in RAM only, so the copy's
+/// durable question reports it missing, nothing is touched on that answer, and the copy
+/// is written. Mutant: the dedup answers on RAM copies (nothing written, blob still
+/// RAM-only).
+#[tokio::test]
+async fn a_copy_of_a_blob_the_replica_holds_in_ram_is_written_not_touched() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    let map = farm.map(1, 2, &[]);
+    let bytes = farm.blob(&map, 0, 1, 4096, 42);
+    let digest = sha(&bytes);
+    farm.nodes[1]
+        .mem
+        .blobs
+        .lock()
+        .expect("lock")
+        .insert(digest, Bytes::from(bytes.clone()));
+    farm.nodes[1]
+        .mem
+        .ram_only
+        .lock()
+        .expect("lock")
+        .insert(digest);
+
+    let written = within(farm.client(0, 1).put(Bytes::from(bytes))).await;
+    assert_eq!(written.expect("answered"), digest);
+    assert!(farm.nodes[1].mem.touched.lock().expect("lock").is_empty());
+    assert_eq!(farm.nodes[1].mem.knobs.begun.load(Ordering::SeqCst), 1);
+}

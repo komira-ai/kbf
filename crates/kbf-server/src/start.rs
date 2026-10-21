@@ -298,6 +298,7 @@ where
         .await?
         .with_writes(args.write_config())
         .with_write_pool(args.write_pool_config())
+        .with_durable_wait(args.durable_wait())
         .with_input_trees(args.input_tree_config());
     let local = args.local_cache.as_ref();
     let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;

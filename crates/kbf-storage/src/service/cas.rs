@@ -10,6 +10,7 @@ use kbf_proto::reapi::{
 };
 use tonic::{Request, Response, Status, Streaming};
 
+use super::generation::Durability;
 use super::{Endpoint, MAX_FIND_MISSING_DIGESTS, StorageService, catch_up, generation, wire};
 
 /// What every call but FindMissingBlobs answers.
@@ -31,7 +32,7 @@ impl ContentAddressableStorage for StorageService {
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
         self.guard(&request, Endpoint::FindMissing)?;
         self.check_map(generation::requested(&request)?).await?;
-        let durable = generation::durable_only(&request)?;
+        let durability = generation::durability(&request)?;
         let request = request.into_inner();
         if request.blob_digests.len() > MAX_FIND_MISSING_DIGESTS {
             return Err(Status::invalid_argument(format!(
@@ -47,10 +48,10 @@ impl ContentAddressableStorage for StorageService {
             .map(|d| wire::digest(Some(d)))
             .collect::<Result<Vec<_>, _>>()?;
         let catching_up = self.catching_up();
-        let missing = if durable {
-            self.storage.find_durable(&digests).await?
-        } else {
-            self.storage.find_missing(&digests).await?
+        let missing = match durability {
+            Durability::Servable => self.storage.find_missing(&digests).await?,
+            Durability::Only => self.storage.find_durable(&digests).await?,
+            Durability::Wait => self.storage.find_durable_waiting(&digests).await?,
         };
         if let Some(status) = catch_up::missing_gap(catching_up, missing.len(), digests.len()) {
             return Err(status);

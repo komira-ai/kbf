@@ -1483,7 +1483,6 @@ dependencies = [
  "kbf-ca",
  "kbf-cas-conformance",
  "kbf-daemon",
- "kbf-deploy",
  "kbf-driver-container",
  "kbf-enroll",
  "kbf-front",

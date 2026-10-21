@@ -125,6 +125,23 @@ impl<C: Cas> NativeRuntime<C> {
         Self::with_remover(config, cas, &crate::mounts::remove_lease_dir)
     }
 
+    /// [`NativeRuntime::new`] with the clean of every pool slot made wrong on purpose
+    /// ([`clean::Mutant`](crate::slots::clean::Mutant): one step skipped, the check
+    /// honest or blind): for the mutant tests of `tests/slot_clean.rs` alone, which run
+    /// the freshness scenario over it and see the skipped step's residue.
+    ///
+    /// # Errors
+    /// As [`NativeRuntime::new`].
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    pub fn with_clean_mutant(
+        config: NativeConfig,
+        cas: Arc<C>,
+        mutant: crate::slots::clean::Mutant,
+    ) -> std::io::Result<Self> {
+        Self::build(config, cas, &crate::mounts::remove_lease_dir, Some(mutant))
+    }
+
     /// [`NativeRuntime::new`], sweeping the scratch root with `remove`: a test hands
     /// it a remover that fails, as a directory an action locked would.
     fn with_remover(
@@ -132,14 +149,28 @@ impl<C: Cas> NativeRuntime<C> {
         cas: Arc<C>,
         remove: &dyn Fn(&Path) -> std::io::Result<()>,
     ) -> std::io::Result<Self> {
+        Self::build(config, cas, remove, None)
+    }
+
+    /// [`NativeRuntime::with_remover`], with the pool's clean mutated when `mutant` is
+    /// given.
+    fn build(
+        config: NativeConfig,
+        cas: Arc<C>,
+        remove: &dyn Fn(&Path) -> std::io::Result<()>,
+        mutant: Option<crate::slots::clean::Mutant>,
+    ) -> std::io::Result<Self> {
         let root = rustix::process::geteuid().is_root();
         crate::slots::check_daemon_user(root, config.pool.as_ref())
             .map_err(std::io::Error::other)?;
+        // Only a Mac has slots to clean.
+        #[cfg(not(target_os = "macos"))]
+        let _ = mutant;
         // Before the sweep: the keepers of a killed daemon's slots have ended them, and
         // this ends what is left, as every lease's end does.
         #[cfg(target_os = "macos")]
         let slots = (config.pool.as_ref())
-            .map(|pool| crate::slots::macos::Slots::start(pool, config.kill_wait))
+            .map(|pool| crate::slots::macos::Slots::start_mutated(pool, config.kill_wait, mutant))
             .transpose()?;
         std::fs::create_dir_all(&config.scratch)?;
         let rules = config

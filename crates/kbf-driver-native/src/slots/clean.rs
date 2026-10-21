@@ -100,6 +100,70 @@ pub trait Os {
     fn recreate(&self) -> Result<(), String>;
 }
 
+/// How the check of a [`Mutant`] answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verify {
+    /// The inner [`Os::left`] answers: what the skipped step left is found, so the clean
+    /// fails, is retried and ends recreated or quarantined, never clean.
+    Honest,
+    /// [`Os::left`] answers nothing is left, whatever the inner one finds (all of it,
+    /// not only the skipped step's: a skipped step can leave work for another's look,
+    /// such as a job launchd starts again after the kill). What the skipped step should
+    /// have removed reaches the next lease: the residue rows of a freshness test turn
+    /// red.
+    Blind,
+}
+
+/// A clean made wrong on purpose: one [`Step`] skipped, and the check honest or blind.
+/// For the mutant tests (`tests/slot_mutants.rs` on every platform, `tests/slot_clean.rs`
+/// on a Mac), which show that each step's residue is seen by the tests that claim to
+/// guard it. Nothing in the daemon builds one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mutant {
+    pub skip: Step,
+    pub verify: Verify,
+}
+
+/// An [`Os`] that is `inner` except as its [`Mutant`] says: [`Os::run`] of the skipped
+/// step does nothing and succeeds, [`Os::left`] is empty when the check is blind. The
+/// order, the pause and the recreate are `inner`'s.
+pub struct Mutated<'a> {
+    inner: &'a dyn Os,
+    mutant: Mutant,
+}
+
+impl<'a> Mutated<'a> {
+    #[must_use]
+    pub fn new(inner: &'a dyn Os, mutant: Mutant) -> Self {
+        Self { inner, mutant }
+    }
+}
+
+impl Os for Mutated<'_> {
+    fn run(&self, step: Step) -> Result<(), String> {
+        if step == self.mutant.skip {
+            return Ok(());
+        }
+        self.inner.run(step)
+    }
+
+    fn left(&self) -> Vec<Left> {
+        let left = self.inner.left();
+        match self.mutant.verify {
+            Verify::Honest => left,
+            Verify::Blind => Vec::new(),
+        }
+    }
+
+    fn pause(&self) {
+        self.inner.pause();
+    }
+
+    fn recreate(&self) -> Result<(), String> {
+        self.inner.recreate()
+    }
+}
+
 /// How a clean ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -423,5 +487,77 @@ mod tests {
             .filter(|c| **c == Call::Recreate)
             .count();
         assert_eq!(recreates, 1);
+    }
+
+    /// Catches a mutant that skips more or less than the one step it names (the mutant
+    /// tests would then blame the wrong step), or that reorders, drops or doubles the
+    /// rest: for every step, the inner [`Os`] is asked the other seven in [`STEPS`]'
+    /// order and never the skipped one, and the clean is whole.
+    #[test]
+    fn a_mutant_skips_exactly_its_step_and_nothing_else() {
+        for skip in STEPS {
+            let fake = Fake::default();
+            let mutated = Mutated::new(
+                &fake,
+                Mutant {
+                    skip,
+                    verify: Verify::Blind,
+                },
+            );
+            assert_eq!(clean(&mutated), Outcome::Clean, "skipping {skip}");
+            let mut want = whole_attempt();
+            want.retain(|c| *c != Call::Run(skip));
+            assert_eq!(fake.calls(), want, "skipping {skip}");
+        }
+    }
+
+    /// Catches a blind check that lets the inner look through, and an honest one that
+    /// blinds: what the inner look finds is hidden from the clean when blind (clean
+    /// although something is left, the mutant's whole point) and seen when honest (the
+    /// retry runs and the user is made again).
+    #[test]
+    fn a_blind_check_hides_what_the_inner_look_finds_and_an_honest_one_does_not() {
+        let looks = || vec![vec![left(Step::Home, "a file")]; 8];
+        let blind = Fake::looking(looks());
+        let mutant = Mutant {
+            skip: Step::Home,
+            verify: Verify::Blind,
+        };
+        assert_eq!(clean(&Mutated::new(&blind, mutant)), Outcome::Clean);
+        let mut want = whole_attempt();
+        want.retain(|c| *c != Call::Run(Step::Home));
+        assert_eq!(blind.calls(), want);
+
+        let honest = Fake::looking(looks());
+        let mutant = Mutant {
+            verify: Verify::Honest,
+            ..mutant
+        };
+        let outcome = clean(&Mutated::new(&honest, mutant));
+        assert!(
+            matches!(outcome, Outcome::Quarantined { .. }),
+            "{outcome:?}"
+        );
+        assert!(honest.calls().contains(&Call::Recreate));
+    }
+
+    /// Catches a mutant that does not hand the recreate to the inner [`Os`] (the user
+    /// would not be made again, and the quarantine reason would be lost): the inner's
+    /// failure is the clean's.
+    #[test]
+    fn a_mutant_hands_the_recreate_to_the_inner_os() {
+        let mut fake = Fake::failing(Step::Home, 2);
+        fake.recreate = Some("rename: Operation not permitted".to_owned());
+        let mutant = Mutant {
+            skip: Step::Shared,
+            verify: Verify::Honest,
+        };
+        assert_eq!(
+            clean(&Mutated::new(&fake, mutant)),
+            quarantined(
+                "home: home failed; making the user again: rename: Operation not permitted"
+            )
+        );
+        assert_eq!(fake.calls().last(), Some(&Call::Recreate));
     }
 }

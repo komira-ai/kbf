@@ -426,46 +426,56 @@ Options:
           
           [default: 30]
 
+      --durable-wait <DURABLE_WAIT>
+          How long, in seconds, a storage node waits for blobs it holds in RAM to be written to its disk when a caller asks for a durable answer that waits (`kbf-durable: wait`): an action-cache entry is committed only once every blob it names is on an owner's disk, and the writer of the entry asks each owner with this wait; the action's owner waits the same for its own copies. A blob still in RAM when it ends is reported missing and the write fails UNAVAILABLE, for the caller to try again. Nothing holds a blob in RAM yet, so no call waits. At least 1, and under half of the 120 seconds a chain's replica may take to commit a blob (`kbf_storage::replicate::ChainConfig`): a start with more is refused
+          
+          [default: 10]
+
       --memory-poll-ms <MEMORY_POLL_MS>
           How often a lease's memory is measured, in milliseconds (native)
           
           [default: 250]
 
-      --store-put-attempts <STORE_PUT_ATTEMPTS>
-          How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
+      --ram-peer-grace <RAM_PEER_GRACE>
+          How long, in seconds, after its own write of a blob it acknowledged from RAM a storage node waits before it asks the blob's other owner whether the blob is on its disk too, and journals a repair debt if it is not. Long enough that the usual answer is yes and nothing is journalled. Nothing acknowledges from RAM yet, so no node asks. At least 1
           
-          [default: 3]
-
-      --input-tree-cache-entries <INPUT_TREE_CACHE_ENTRIES>
-          The most decoded Directories an Execute's input check keeps in memory (`docs/design/storage.md#input-tree-check`). Least recently used go first
-          
-          [default: 1048576]
+          [default: 5]
 
       --xcode-apps <XCODE_APPS>
           The directory searched for `Xcode*.app` (native). Each Xcode whose own `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`, and for which `xcrun --find clang` does (each within a minute, under the actions' sandbox), is ready: it is reported as an `xcode` entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed in the node's status with why and the command that fixes it, and logged at WARN. The daemon says Hello without waiting for its first survey, which runs in the background: until it ends, each Xcode is listed as not surveyed yet and none is reported
           
           [default: /Applications]
 
-      --input-tree-cache-bytes <INPUT_TREE_CACHE_BYTES>
-          The most bytes of decoded Directories the input check keeps (each costs its digests, 40 bytes apiece, and 160 bytes)
+      --store-put-attempts <STORE_PUT_ATTEMPTS>
+          How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
           
-          [default: 268435456]
+          [default: 3]
 
       --xcode-recheck-secs <XCODE_RECHECK_SECS>
           How often, in seconds, the Xcodes are asked again (native), so one fixed while the daemon runs becomes ready without a restart
           
           [default: 180]
 
-      --input-tree-reads-in-flight <INPUT_TREE_READS_IN_FLIGHT>
-          The most Directory blobs the input check reads from the store at once, across all Executes
+      --input-tree-cache-entries <INPUT_TREE_CACHE_ENTRIES>
+          The most decoded Directories an Execute's input check keeps in memory (`docs/design/storage.md#input-tree-check`). Least recently used go first
           
-          [default: 64]
+          [default: 1048576]
 
       --require-metal-toolchain
           This node's actions use Metal (native): an Xcode whose Metal toolchain is not installed (`xcodebuild -showComponent MetalToolchain`) is not ready
 
       --image <IMAGE>
           A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
+
+      --input-tree-cache-bytes <INPUT_TREE_CACHE_BYTES>
+          The most bytes of decoded Directories the input check keeps (each costs its digests, 40 bytes apiece, and 160 bytes)
+          
+          [default: 268435456]
+
+      --input-tree-reads-in-flight <INPUT_TREE_READS_IN_FLIGHT>
+          The most Directory blobs the input check reads from the store at once, across all Executes
+          
+          [default: 64]
 
       --lease-placement <none|numa-node>
           Where each lease runs among the node's CPUs (container, Linux): `none`, the default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with the least CPU booked by running leases (the lowest id on a tie). `--reserve-cpus` is a quota on all leases together, so it still applies; it removes no CPU from a node. Needs the `cpuset` controller delegated to the daemon (the start fails and says how when it is not); a host with fewer than two NUMA nodes that hold CPUs runs as `none`, which the start logs. Refused with a driver other than `container` (macOS has no such driver)
@@ -478,46 +488,46 @@ Options:
           
           [default: 15]
 
-      --member-dwell-secs <SECONDS>
-          How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
-          
-          [default: 300]
-
       --oci-runtime <OCI_RUNTIME>
           The OCI runtime that runs each action's container (container): `crun`, run directly. Each action gets a fresh rootless sandbox. It needs the daemon user's subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on `PATH`, and every directory down to `--data-dir` searchable by others
           
           [default: /usr/bin/crun]
+
+      --member-dwell-secs <SECONDS>
+          How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
+          
+          [default: 300]
 
       --mac-session-socket <MAC_SESSION_SOCKET>
           The socket `kbf-mac-session` serves (native-whole-machine)
           
           [default: /var/run/kbf-mac-session/socket]
 
+      --daemon-user <DAEMON_USER>
+          This daemon's own user, which keeps read and remove access to what a whole-machine lease's user writes in its lease directory (native-whole-machine)
+          
+          [default: _kbf]
+
+      --pool-users <POOL_USERS>
+          How many lease users the pool has (native, macOS, a daemon run as root): every action runs as one of `kbf-pool-0` .. `kbf-pool-<N-1>`, one lease per user at a time, as kbf-mac-provision makes them (`pool_users`). Required of a root daemon, which runs no action as root; refused for any other
+
       --release-poll-every-secs <SECONDS>
           How often, in seconds, the active frontend asks GitHub for new releases of `--release-poll-repo` and records the newest one the farm could run as a proposal (`proposals` of `GET /v1/update`). A proposal starts nothing: only an operator's `POST /v1/update/desired` does. The question is one conditional request with no credential, so an unchanged feed costs nothing. 0 turns the poller off. Only the newest 30 releases are read (no further pages), so a `v*` release buried under more than 30 newer releases of other tags is not seen. It needs `--state-store`, which holds the proposals
           
           [default: 300]
 
-      --daemon-user <DAEMON_USER>
-          This daemon's own user, which keeps read and remove access to what a whole-machine lease's user writes in its lease directory (native-whole-machine)
-          
-          [default: _kbf]
+      --pool-first-uid <POOL_FIRST_UID>
+          The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid` in kbf-mac-provision's profile); at least 600
 
       --release-poll-repo <OWNER/NAME>
           The GitHub repository, `owner/name`, whose releases of `v*` tags are polled
           
           [default: komira-ai/kbf]
 
-      --pool-users <POOL_USERS>
-          How many lease users the pool has (native, macOS, a daemon run as root): every action runs as one of `kbf-pool-0` .. `kbf-pool-<N-1>`, one lease per user at a time, as kbf-mac-provision makes them (`pool_users`). Required of a root daemon, which runs no action as root; refused for any other
-
       --release-poll-refs <REF>
           The refs a polled release may have been built from, as its notes say, separated by commas; a release built from another is ignored and counted
           
           [default: main]
-
-      --pool-first-uid <POOL_FIRST_UID>
-          The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid` in kbf-mac-provision's profile); at least 600
 
       --ui[=<BOOL>]
           Serves the web UI on the operator API (`--api-listen`): read-only pages under `/ui` (`docs/design/kbf-ui-v1.md`). On by default; `--ui=false` turns it off, and `/ui` is then a `404`. The UI is open: it asks for no login or certificate, and it shows everything unredacted, the logs of builds and the arguments of failed commands, to whoever reaches the operator API's port, whatever the REAPI policy says of `--invocations-open`. Only `GET` and `HEAD` are served; the operator API's write routes and their token are unchanged. Keep the operator API on loopback, or behind the proxy and a network you trust

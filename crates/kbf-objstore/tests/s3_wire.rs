@@ -1063,3 +1063,62 @@ async fn a_ranged_read_that_timed_out_is_not_sent_again() {
     assert!(err.to_string().contains("timed out"), "{err}");
     assert_eq!(*accepted.lock().unwrap(), 1);
 }
+
+/// Serves forever: the first connection reads one whole request and is closed with no
+/// answer; every later connection is answered `200`. Counts the requests it read.
+async fn cut_then_ok() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&reads);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let counted = Arc::clone(&counted);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // The head and the three body bytes of the PUT.
+                while !buf.ends_with(b"abc") {
+                    match sock.read(&mut chunk).await {
+                        Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                        _ => return,
+                    }
+                }
+                if counted.fetch_add(1, Ordering::SeqCst) > 0 {
+                    let _ = sock.write_all(answer("200 OK", &[], "").as_bytes()).await;
+                }
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    (endpoint, reads)
+}
+
+/// Catches: a PUT sent again by the client after its connection closed before the
+/// answer. The first PUT may have landed; a resend would meet its own object (or write
+/// over a changed one on a store without conditional writes), so the caller, who knows
+/// the key and can read it back, is the only one who may try again. Exactly one PUT
+/// reaches the store and the transport error comes back.
+#[tokio::test]
+async fn a_put_cut_before_its_answer_is_sent_once_and_fails_as_transport() {
+    use std::sync::atomic::Ordering;
+    let (endpoint, reads) = cut_then_ok().await;
+    let s = store(endpoint, Capabilities::default());
+    let err = s
+        .put_new(&key(), Bytes::from("abc"), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
+    // A late resend would show here.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the PUT was sent again");
+    // Through put_stream too (the flusher's path for a small object).
+    let body: kbf_objstore::BodyStream =
+        futures::stream::iter(vec![Ok(Bytes::from("abc"))]).boxed();
+    s.put_stream(&key(), 3, body).await.unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+}

@@ -73,6 +73,7 @@
 
 mod anywhere;
 mod closure;
+mod durable;
 mod find;
 mod flights;
 mod nodes;

@@ -168,7 +168,10 @@ async fn a_durable_question_counts_a_blob_held_only_in_ram_as_missing() {
     cluster.node(1).hold_as(b, b"in ram");
     cluster.node(1).make_ram_only(&b);
 
-    let durable = router.find_durable(&[a, b, c]).await.expect("an answer");
+    let durable = router
+        .find_durable(&[a, b, c], false)
+        .await
+        .expect("an answer");
     assert_eq!(durable, [b, c]);
     assert_eq!(cluster.node(1).durable_log(), [sorted(vec![a, b, c])]);
     assert!(cluster.node(1).find_log().is_empty());
@@ -197,7 +200,7 @@ async fn a_durable_question_fails_over_as_a_durable_question() {
     cluster.node(2).hold_as(owned[1], b"on disk on the replica");
     cluster.node(1).fail_next(unavailable());
 
-    let missing = router.find_durable(&owned).await.expect("an answer");
+    let missing = router.find_durable(&owned, false).await.expect("an answer");
     assert_eq!(missing, [owned[0]]);
     assert_eq!(cluster.node(2).durable_log(), [sorted(owned.clone())]);
     assert!(cluster.node(2).find_log().is_empty());
@@ -205,8 +208,40 @@ async fn a_durable_question_fails_over_as_a_durable_question() {
     cluster.node(1).set_down(true);
     cluster.node(2).set_down(true);
     let error = router
-        .find_durable(&owned)
+        .find_durable(&owned, false)
         .await
         .expect_err("nobody answers");
     assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
+}
+
+/// Catches `Router::find_durable(.., true)` that does not carry the wait to the node
+/// (`kbf-durable: wait`), or that carries it when `wait` is false: with `wait` the primary
+/// is asked `find_durable_waiting` (and the RAM-only blob is still reported missing, as
+/// the node's answer after its bound), without it `find_durable`; on a failover the
+/// replica is asked the same waiting question. Mutant: `Ask::durable` ignores `wait`.
+#[tokio::test]
+async fn a_durable_question_carries_the_wait_to_the_node_it_asks() {
+    let map = map(1, 2, active(&[1, 2]));
+    let cluster = Cluster::of(2);
+    let (router, _) = router(&map, &cluster);
+    let owned = primary_is(&map, 1, 2);
+    cluster.node(1).hold_as(owned[0], b"on disk");
+    cluster.node(1).hold_as(owned[1], b"in ram");
+    cluster.node(1).make_ram_only(&owned[1]);
+
+    let missing = router.find_durable(&owned, true).await.expect("an answer");
+    assert_eq!(missing, [owned[1]]);
+    assert_eq!(cluster.node(1).waiting_log(), [sorted(owned.clone())]);
+    assert!(cluster.node(1).durable_log().is_empty());
+
+    router.find_durable(&owned, false).await.expect("an answer");
+    assert_eq!(cluster.node(1).waiting_log().len(), 1, "no wait asked");
+    assert_eq!(cluster.node(1).durable_log().len(), 1);
+
+    cluster.node(1).fail_next(unavailable());
+    cluster.node(2).hold_as(owned[0], b"on disk on the replica");
+    cluster.node(2).hold_as(owned[1], b"on disk on the replica");
+    router.find_durable(&owned, true).await.expect("an answer");
+    assert_eq!(cluster.node(2).waiting_log(), [sorted(owned)]);
+    assert!(cluster.node(2).durable_log().is_empty());
 }

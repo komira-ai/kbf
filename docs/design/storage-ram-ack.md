@@ -145,6 +145,42 @@ Every durable thing that names a blob, each barred or argued safe:
 | `loss/<operation>` records | Not a blob pointer: the scheduler's lost-lease record, keyed by operation. |
 | Result acknowledgement | Independent: the Result is accepted after `prepare` and the state store; the AC entry it leads to goes through the AC row. |
 
+### As built (PR 4 of the plan)
+
+The consumers of the durable question exist; nothing puts a blob in Held in a running
+node yet, so each of them answers as it did and the tests put a blob there through
+`Cache::hold_for_test`.
+
+- `kbf-durable: wait` is parsed by the node (`Storage::find_durable_waiting`, which a
+  storage that does not override answers as `find_durable`: no wait, a held blob missing)
+  and `--durable-wait` (default 10 s, at least 1 s) bounds it; a start with a wait of half
+  the 120 s chain commit bound or more is refused. `Cache::durable_waiting` and the AC
+  owner's barrier (b) wait on a notification the drain's removal sends, not on a poll.
+- Barrier (a) runs in `commit_closed_at` **after** the copies to the action's owner, so a
+  blob no owner holds still ends the commit with the read's error, as before. It asks
+  every blob's primary in one batched `wait` call, then the next owner for what the
+  primary lacks (a blob durable on the replica only is enough). A blob no owner holds
+  durably, and that some owner holds in RAM, is `UNAVAILABLE`; one that no owner holds at
+  all (the action's owner has a copy, no reader asks it) is `Absent`.
+- The closure check asks `kbf-durable: only` and so remembers only durable positives.
+- The durable questions (`only`, `wait`) touch exactly the digests they report present,
+  the indexed ones, as `find_missing` does (retention and touches in `storage.md`). The
+  closure check and a copy's dedup therefore still refresh the retention of an entry's
+  blobs on their owners; a digest that is only held in RAM is reported missing and is not
+  touched, and neither is an absent one.
+- The repair worker asks the owner `kbf-durable: only`. A node that receives a copy from a
+  peer (a chain leg or the worker) dedups on the durable question, so a copy sent to an
+  owner that holds the blob only in RAM is written. **PR 6** refines this with the leg
+  header that asks for a Held answer: only a leg that asks for it dedups on Held.
+- Not switched, on purpose: `settle_evicted` asks this node's own store the plain question
+  (a Held blob is not evicted, and the debt stays); read repair's probe and
+  `find_missing_anywhere` (the Execute input check) stay plain, as rule 1 and the table
+  above say.
+- Peer confirmation is `PeerConfirmer` (`kbf-storage/src/repair/confirm.rs`), run on the
+  repair worker's ticks. `--ram-peer-grace` is 5 s. A peer that is down in the map, does
+  not answer, or answers missing is owed a debt; a full set journals at once. Nothing calls
+  `track` until PR 6.
+
 ## Rule 3: budget, backpressure and metrics
 
 `--ram-ack-bytes` is per node. At hold time each node makes a **non-blocking**
