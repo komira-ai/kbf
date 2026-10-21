@@ -6,6 +6,7 @@
 use form_urlencoded::Serializer;
 
 use super::sched::{Lease, LeasesDoc, age, code, memory_note, node_link};
+use super::started::{self, HEALTH, Started};
 use super::{pill, problem};
 use crate::html::{Href, Html, attr, url};
 use crate::layout;
@@ -26,7 +27,7 @@ const FORWARDED: [&str; 3] = ["node", "page_size", "page_token"];
 /// Leases: `/v1/leases`.
 pub(crate) const LEASES: Page = Page {
     name: "Leases",
-    reads: &[ROUTE],
+    reads: &[ROUTE, HEALTH],
 };
 
 /// The forwarded pairs of `query`: the first value of each key of [`FORWARDED`], in
@@ -79,12 +80,18 @@ pub(crate) async fn leases<S: Source>(source: &S, query: &str) -> Answer {
         Ok(_) => (200, &[][..]),
         Err(e) => (e.status(), e.headers()),
     };
+    // The banner's start time is read only for a page that shows what it is a banner of.
+    let started = if doc.is_ok() {
+        started::read(&mut r).await
+    } else {
+        Started::Unsaid(String::new())
+    };
     let body = layout::page(LEASES.name, LEASES_PATH, r.asked(), |h| {
         h.el("h1", &[], |h| {
             h.text("Leases");
         });
         match &doc {
-            Ok(doc) => held(h, doc, node),
+            Ok(doc) => held(h, doc, node, &started),
             Err(e) => failure(h, node, e),
         }
     });
@@ -98,8 +105,8 @@ fn failure(h: &mut Html, node: Option<&str>, e: &ReadError) {
 }
 
 /// The filter, the summary, the table and the pager of a page that was read.
-fn held(h: &mut Html, doc: &LeasesDoc, node: Option<&str>) {
-    memory_note(h);
+fn held(h: &mut Html, doc: &LeasesDoc, node: Option<&str>, started: &Started) {
+    memory_note(h, started);
     filter(h, node);
     h.el("p", &[], |h| {
         h.text("Scheduler term ");

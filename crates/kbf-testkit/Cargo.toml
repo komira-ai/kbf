@@ -22,6 +22,11 @@ test = false
 [dependencies]
 libc.workspace = true
 rustix = { workspace = true, features = ["process", "net"] }
+# `switch`: the forwarder tokio runs on the caller's runtime.
+tokio = { workspace = true, features = ["io-util", "net", "rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
 
 [lints]
 workspace = true

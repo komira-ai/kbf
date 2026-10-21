@@ -49,7 +49,8 @@
 //!
 //! Every external step is bounded: `gh` 120 s, unpacking 120 s, the probe 10 s
 //! ([`Timeouts`]); a program is killed with its whole process group. The scratch
-//! directories (`work/<commit>.partial/` and `work/<commit>.check/`) are root's and go
+//! directories (`work/<commit>.partial/`, `work/<commit>.check/` and, for the run loop's look
+//! at the package, `work/<commit>.look/`) are root's and go
 //! whatever the outcome, unless the process is killed first (a crash, the OOM killer, a
 //! reboot): then `run` removes what is left when it starts ([`sweep_work`]).
 //!
@@ -170,9 +171,12 @@ impl Drop for Partial {
 }
 
 /// The suffixes of a stage's scratch directories in `work/`: `<commit>.partial` (the
-/// download, then the release being made) and `<commit>.check` (the checks' own).
+/// download, then the release being made), `<commit>.check` (a stage's checks) and
+/// `<commit>.look` (the checks of the run loop's look at the package's seed, which is not a
+/// stage and must not clear a stage's).
 const PARTIAL: &str = ".partial";
 const CHECK: &str = ".check";
+const LOOK: &str = ".look";
 
 /// `work/<commit><suffix>`, with `work/` made when it is missing.
 fn work_path(host: &Layout, commit: &CommitId, suffix: &str) -> Result<PathBuf, Refusal> {
@@ -183,8 +187,8 @@ fn work_path(host: &Layout, commit: &CommitId, suffix: &str) -> Result<PathBuf, 
     Ok(work.join(format!("{commit}{suffix}")))
 }
 
-/// Remove every `work/*.partial` and `work/*.check`: the scratch of a stage that was killed
-/// before it could remove it (a crash, the OOM killer, a reboot, `SIGKILL`), which
+/// Remove every `work/*.partial`, `work/*.check` and `work/*.look`: the scratch of a stage or
+/// a look that was killed before it could remove it (a crash, the OOM killer, a reboot, `SIGKILL`), which
 /// [`Partial::create`] refuses for ever. Nothing else in `work/` is touched, and a link is
 /// removed, never followed ([`sweep_dir`], the sweep the operator's verbs make of
 /// `releases/.stage-*`).
@@ -202,7 +206,7 @@ pub fn sweep_work(host: &Layout, _lock: &Locked) -> Result<(), ReleaseError> {
 
 /// Whether `name` is one of a stage's scratch directories.
 fn is_scratch(name: &str) -> bool {
-    name.ends_with(PARTIAL) || name.ends_with(CHECK)
+    name.ends_with(PARTIAL) || name.ends_with(CHECK) || name.ends_with(LOOK)
 }
 
 fn make_dir(dir: &Path, mode: u32, owner: Owner) -> Result<(), Refusal> {
@@ -260,6 +264,39 @@ pub fn supported() -> Supported {
         min_protocol: 1,
         state_schema: u64::from(kbf_state::postgres::schema::latest()),
     }
+}
+
+/// Whether an installer that understands `supported` may stage `component`, which declared
+/// `declared`: `Err(InstallerTooOld)` when any of its numbers is past what the installer
+/// understands (the last check of step 5, and the rule behind upgrading the installer
+/// before a kbf that raises one).
+pub fn understood(
+    supported: Supported,
+    component: &str,
+    declared: Supported,
+) -> Result<(), Refusal> {
+    let newer = [
+        ("protocol", declared.protocol, supported.protocol),
+        (
+            "min_protocol",
+            declared.min_protocol,
+            supported.min_protocol,
+        ),
+        (
+            "state_schema",
+            declared.state_schema,
+            supported.state_schema,
+        ),
+    ];
+    for (field, got, most) in newer {
+        if got > most {
+            return Err(Refusal::InstallerTooOld {
+                component: component.to_owned(),
+                what: format!("{field} {got}; this installer understands up to {most}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// What the host decides about how a release is verified.
@@ -358,7 +395,7 @@ impl Verifier for Pipeline<'_> {
         for (locator, received) in &files {
             self.count_and_digest(locator, received)?;
         }
-        let scratch = Scratch::make(self.host, order.commit, self.settings, self.owner)?;
+        let scratch = Scratch::make(self.host, order.commit, CHECK, self.settings, self.owner)?;
         let mut source_ref = None;
         for (locator, received) in &files {
             let verified = self.attest(&gh, &scratch, locator, received, order.commit)?;
@@ -446,9 +483,11 @@ fn pair<'a>(
     Ok(pairs)
 }
 
-/// The scratch directory of the checks: `work/<commit>.check/`, root's, with `gh/` (the
-/// unprivileged user's home for `gh`, 0700) and `empty/` (the directory the probe runs
-/// in), and the links and bundles the unprivileged user reads. Removed when dropped.
+/// The scratch directory of the checks: `work/<commit>.check/` for a stage, `work/<commit>.look/`
+/// for the run loop's look at a seed (each its owner's alone, so that neither clears the
+/// other's), root's, with `gh/` (the unprivileged user's home for `gh`, 0700) and `empty/` (the
+/// directory the probe runs in), and the links and bundles the unprivileged user reads.
+/// Removed when dropped.
 struct Scratch {
     dir: PathBuf,
 }
@@ -457,11 +496,12 @@ impl Scratch {
     fn make(
         host: &Layout,
         commit: &CommitId,
+        suffix: &str,
         settings: &Settings,
         owner: Owner,
     ) -> Result<Scratch, Refusal> {
-        let dir = work_path(host, commit, CHECK)?;
-        // A check directory left by a crash is ours alone to remove.
+        let dir = work_path(host, commit, suffix)?;
+        // A check directory of this kind left by a crash is ours alone to remove.
         let _ = fs::remove_dir_all(&dir);
         let made = Scratch { dir };
         make_dir(&made.dir, 0o755, owner)?;
@@ -486,6 +526,30 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+/// The attestation bundle `text` of the component `name`, written into the checks' scratch
+/// directory (where the unprivileged user can read it, 0644); its path. A bundle over
+/// [`BUNDLE_CAP`] is refused.
+fn put_bundle(scratch: &Scratch, name: &str, text: &str) -> Result<PathBuf, Refusal> {
+    let bytes = text.as_bytes();
+    if bytes.len() as u64 > BUNDLE_CAP {
+        return Err(Refusal::Size {
+            name: format!("{name} attestation"),
+            want: BUNDLE_CAP,
+            got: bytes.len() as u64,
+            max: BUNDLE_CAP,
+        });
+    }
+    let bundle = scratch.dir.join(format!("{name}.bundle.jsonl"));
+    let mut out = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&bundle)
+        .map_err(work_err(&bundle))?;
+    out.write_all(bytes).map_err(work_err(&bundle))?;
+    Ok(bundle)
 }
 
 impl Pipeline<'_> {
@@ -538,24 +602,7 @@ impl Pipeline<'_> {
         received: &Received,
         commit: &CommitId,
     ) -> Result<SourceRef, Refusal> {
-        let bundle_bytes = locator.attestation.as_bytes();
-        if bundle_bytes.len() as u64 > BUNDLE_CAP {
-            return Err(Refusal::Size {
-                name: format!("{} attestation", locator.name),
-                want: BUNDLE_CAP,
-                got: bundle_bytes.len() as u64,
-                max: BUNDLE_CAP,
-            });
-        }
-        let bundle = scratch.dir.join(format!("{}.bundle.jsonl", locator.name));
-        let mut out = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(&bundle)
-            .map_err(work_err(&bundle))?;
-        out.write_all(bundle_bytes).map_err(work_err(&bundle))?;
-        drop(out);
+        let bundle = put_bundle(scratch, &locator.name, &locator.attestation)?;
 
         let link = scratch.dir.join(format!("{}.tar.gz", locator.name));
         let file = open_owned(&received.tarball, self.owner)?;
@@ -568,6 +615,29 @@ impl Pipeline<'_> {
             runner: self.runner,
         };
         gh.verify(&tools, &scratch.gh(), &link, &bundle, commit)
+            .map(|verified| verified.source_ref)
+    }
+
+    /// Step 3 alone, for a tarball that is where the unprivileged user can read it already (the
+    /// package's own copy: nothing is copied, linked or changed) and a bundle given as text.
+    /// This is the run loop's look at a seed: it installs nothing and unpacks nothing. A scratch
+    /// directory is made for `gh` (`work/<commit>.look`, never a stage's `.check`, which a
+    /// stage in another process may be using), and gone when this returns.
+    pub(crate) fn attest_in_place(
+        &self,
+        commit: &CommitId,
+        name: &str,
+        tarball: &Path,
+        bundle: &str,
+    ) -> Result<SourceRef, Refusal> {
+        let gh = self.gh();
+        let scratch = Scratch::make(self.host, commit, LOOK, self.settings, self.owner)?;
+        let bundle = put_bundle(&scratch, name, bundle)?;
+        let tools = Tools {
+            trust: self.trust,
+            runner: self.runner,
+        };
+        gh.verify(&tools, &scratch.gh(), tarball, &bundle, commit)
             .map(|verified| verified.source_ref)
     }
 
@@ -629,7 +699,7 @@ impl Pipeline<'_> {
     }
 
     /// `<binary> --version --json`, as the unprivileged user, strictly read.
-    fn probe(&self, binary: &Path, name: &str, cwd: &Path) -> Result<Version, Refusal> {
+    pub(crate) fn probe(&self, binary: &Path, name: &str, cwd: &Path) -> Result<Version, Refusal> {
         let spawn = Spawn {
             program: binary.to_owned(),
             args: vec!["--version".into(), "--json".into()],
@@ -713,21 +783,12 @@ impl Pipeline<'_> {
                 ),
             });
         }
-        let s = self.policy.supported;
-        let newer = [
-            ("protocol", said.protocol, s.protocol),
-            ("min_protocol", said.min_protocol, s.min_protocol),
-            ("state_schema", said.state_schema, s.state_schema),
-        ];
-        for (field, got, most) in newer {
-            if got > most {
-                return Err(Refusal::InstallerTooOld {
-                    component: name.to_owned(),
-                    what: format!("{field} {got}; this installer understands up to {most}"),
-                });
-            }
-        }
-        Ok(())
+        let declared = Supported {
+            protocol: said.protocol,
+            min_protocol: said.min_protocol,
+            state_schema: said.state_schema,
+        };
+        understood(self.policy.supported, name, declared)
     }
 
     /// Step 7. Returns whether the same release was already in place.

@@ -33,6 +33,8 @@ tonic = { workspace = true, features = ["tls-ring"] }
 tracing.workspace = true
 
 [dev-dependencies]
+# The switch that cuts a node off (kbf_testkit::switch).
+kbf-testkit.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util", "time"] }
 

@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
+use kbf_ca::verify_cert::{CLIENT_AUTH, ROLE_URI_PREFIX, Row, verify};
 use kbf_daemon::keeper::{self, Mode};
-use kbf_deploy::linux::verify_cert::{CLIENT_AUTH, ROLE_URI_PREFIX, Row, verify};
 use kbf_testkit::dir::TestDir;
 use rcgen::{
     CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
@@ -151,10 +151,6 @@ fn unit_args(dir: &Path, data: &Path, port: u16) -> Vec<String> {
         &data.display().to_string(),
         "--data-max-bytes",
         "4294967296",
-        "--label",
-        "pool=darwin-sized",
-        "--label",
-        "os=macos",
     ]
     .map(str::to_owned)
     .to_vec()
@@ -337,7 +333,7 @@ fn rendered_config(dir: &Path, data: &Path, port: u16) -> PathBuf {
     let url = format!("https://localhost:{port}");
     let text = format!(
         "mode = \"daemon\"\n\n[identity]\nserver = \"{url}\"\ncas = \"{url}\"\nca-cert = \"{}\"\n\
-         cert = \"{}\"\nkey = \"{}\"\nnode-id = \"node-1\"\nlabel = [\"pool=darwin-sized\", \"os=macos\"]\n\n\
+         cert = \"{}\"\nkey = \"{}\"\nnode-id = \"node-1\"\n\n\
          [daemon]\ndriver = [\"native\"]\ndata-dir = \"{}\"\n",
         at("ca.pem"),
         at("node.pem"),

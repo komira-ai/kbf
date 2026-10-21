@@ -8,6 +8,7 @@
 
 mod catch_up;
 mod denied;
+mod durable;
 mod every_call;
 pub(crate) mod fake;
 mod generation;

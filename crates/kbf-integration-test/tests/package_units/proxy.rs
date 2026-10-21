@@ -5,7 +5,7 @@
 //! service that supervises children it leaves running. Each rule has a planted defect in
 //! `MUTANTS`, and `every_proxy_rule_has_a_mutant` fails when one has none.
 
-use kbf_deploy::unit::UnitFile;
+use kbf_unitfile::UnitFile;
 
 use super::{INSTALLER, INSTALLER_CONFIG, all, read, rules_of, trim, violations};
 

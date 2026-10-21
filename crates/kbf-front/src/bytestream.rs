@@ -179,7 +179,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
             })
         };
         // The cheapest upload is the one we skip.
-        if self.cache.is_durable(&digest).await? {
+        if self.cache.is_complete(&digest).await? {
             self.cache.metrics().write_present.add(1);
             timed.ok();
             return Ok(committed(size));
@@ -206,7 +206,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
             wire::write_resource(&request.into_inner().resource_name)?;
         let call = "/google.bytestream.ByteStream/QueryWriteStatus";
         authorize(&*self.authorizers.cas_put, &caller, call, &instance).await?;
-        let complete = self.cache.is_durable(&digest).await?;
+        let complete = self.cache.is_complete(&digest).await?;
         let committed_size = if complete {
             i64::try_from(digest.size_bytes).unwrap_or(i64::MAX)
         } else {

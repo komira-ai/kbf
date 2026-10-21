@@ -78,6 +78,18 @@ pub trait Storage: Send + Sync {
     /// The store could not answer; never a partial answer.
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>>;
 
+    /// [`Storage::find_missing`] counting only blobs that are durable: committed to the
+    /// index, not merely held in RAM awaiting their write to disk. What a caller asks
+    /// before it writes something durable that names a blob (`kbf-durable: only` on the
+    /// wire). There is no default: a storage that holds nothing in RAM answers with
+    /// [`Storage::find_missing`] explicitly, and one that does (or wraps one) decides, so
+    /// no wrapper answers a durable question with the held-inclusive answer by omission.
+    /// Touches nothing.
+    ///
+    /// # Errors
+    /// The store could not answer; never a partial answer.
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>>;
+
     /// A whole blob, checked against its digest, after touching it: for a blob the
     /// caller decodes. A blob of any size is read with [`Storage::read_range`], a window
     /// at a time.
@@ -266,13 +278,25 @@ pub trait PutStream: Send {
     ) -> Result<Box<dyn StreamedPut>, StorageError>;
 }
 
+/// What a [`StreamedPut::commit`] may answer on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CommitMode {
+    /// Answer once the blob is durable on this node's disk and present in its index.
+    #[default]
+    Durable,
+    /// Answer once the node holds the blob in memory, before its disk has it. No
+    /// implementation does that yet: every one commits as [`CommitMode::Durable`].
+    Held,
+}
+
 /// A streamed blob whose bytes are written and checked, not yet committed.
 pub trait StreamedPut: Send {
-    /// Makes the blob durable and present: present once this answers.
+    /// Makes the blob present, as `mode` asks: present once this answers. Every
+    /// implementation commits as [`CommitMode::Durable`] whatever `mode` is.
     ///
     /// # Errors
     /// The store's sync or its index commit failed.
-    fn commit(self: Box<Self>) -> Answer<'static, ()>;
+    fn commit(self: Box<Self>, mode: CommitMode) -> Answer<'static, ()>;
 }
 
 /// Why a [`Storage`] call failed. [`Status`] has a `From` for it, so a service answers

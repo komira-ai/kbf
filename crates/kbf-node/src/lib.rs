@@ -18,7 +18,7 @@
 //! ```text
 //! kbf-daemon --driver native --server https://kbf-server:8981 --cas https://kbf-server:8981 \
 //!   --ca-cert ca.pem --cert node.pem --key node.key --node-id mac-studio-1 \
-//!   --data-dir /var/kbf --label pool=darwin-sized
+//!   --data-dir /var/kbf
 //! ```
 //!
 //! Exits non-zero when the node cannot be detected or the configuration cannot be
@@ -843,7 +843,7 @@ impl<C: Cas> Node<C> {
 /// configuration `native` makes and the `xcrun` it surveys with and
 /// warms (a test names its own user folders and sandbox, and an `xcrun` of its own).
 /// Also returns what the native driver's Xcode watch sends the daemon, for a test to
-/// follow. Its node report is the detected entries, the labels and a `drivers` entry
+/// follow. Its node report is the detected entries and a `drivers` entry
 /// per runtime (which `Daemon::new` adds), its `cpus` and `mem_gib` no more than the
 /// container driver allows; the native driver adds its own with
 /// `Daemon::with_driver_report`. Its status lists every `--image`, which only the
@@ -899,10 +899,7 @@ fn node_over<C: Cas>(
     let leases = sizes(cli)?.lease_cpus() as u64;
     node.capacity.cpus = Some(node.capacity.cpus.map_or(leases, |cpus| cpus.min(leases)));
     // `Daemon::new` adds every runtime's driver.
-    let report = offered(
-        NodeReport::detect(&[])?.with_entries(cli.daemon.label_entries()),
-        node.capacity,
-    );
+    let report = offered(NodeReport::detect(&[])?, node.capacity);
     // A node without the whole-machine runtime is always serving: a phase that never
     // changes.
     let phase = node
@@ -1052,14 +1049,21 @@ fn data_dir(cli: &Cli) -> Result<Option<data_dir::Plan>, Error> {
     // The drivers that link or clone leases' inputs from the cache.
     let cached = cli.drivers.contains(&Driver::Container)
         || (cfg!(target_os = "macos") && cli.drivers.contains(&Driver::Native));
-    // The container ids are not the daemon's: `leases` must be searchable.
-    let oci = cli.drivers.contains(&Driver::Container);
-    let plan = data_dir::Plan::new(&cli.data, cached, &Statvfs)?.with_open_leases(oci);
+    let plan = data_dir::Plan::new(&cli.data, cached, &Statvfs)?.with_open_leases(leases_open(cli));
     plan.create()?;
     for line in plan.describe() {
         tracing::info!("{line}");
     }
     Ok(Some(plan))
+}
+
+/// Whether `<--data-dir>/leases` must be searchable by others (0711, not the daemon's
+/// 0700): the container ids of the container driver are not the daemon's, and neither
+/// are the pool users of the native driver (`--pool-users`), each of which must reach
+/// its own lease directory through it. A native daemon run as its own user keeps 0700.
+fn leases_open(cli: &Cli) -> bool {
+    cli.drivers.contains(&Driver::Container)
+        || (cli.pool_users.is_some() && cli.drivers.contains(&Driver::Native))
 }
 
 /// The lease directory root, `<--data-dir>/leases`, which the real drivers require.
@@ -1476,6 +1480,55 @@ mod tests {
         let root = pooled(&["--pool-users=1", "--pool-first-uid=0"]).expect("flags");
         let refused = native_config(&root).expect_err("a pool at uid 0");
         assert!(refused.to_string().contains("root"), "{refused}");
+    }
+
+    /// Catches a native daemon with a lease-user pool that makes `leases` 0700, which a
+    /// pool user cannot search: its first lease fails with "working directory:
+    /// Permission denied" (measured on a Mac with `--pool-users`). Starts the data
+    /// directory the way the daemon does: with a pool `leases` is
+    /// `kbf_driver_native::slots::LEASES_ROOT_MODE` (0711: searched, not listed, by the
+    /// slot users), and a leftover 0700 one from a start without the pool is opened;
+    /// without a pool the daemon's own user alone keeps it (0700); the container driver
+    /// keeps its 0711; the fake driver with a pool flag and no native driver does not
+    /// open it.
+    #[test]
+    fn leases_are_searchable_by_the_pool_users_of_a_native_daemon_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tests::scratch("leases-pool-mode");
+        let mode = |dir: &Path| {
+            std::fs::metadata(dir.join("leases"))
+                .expect("leases")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let start = |name: &str, extra: &[&str]| {
+            let dir = base.join(name);
+            let data = format!("--data-dir={}", dir.display());
+            let flags = [&["--driver=native", data.as_str()][..], extra].concat();
+            let cli = parse(&flags).expect("flags");
+            data_dir(&cli).expect("started").expect("a data dir");
+            dir
+        };
+        let pool = ["--pool-users=2", "--pool-first-uid=700"];
+        let pooled = start("pooled", &pool);
+        assert_eq!(mode(&pooled), kbf_driver_native::slots::LEASES_ROOT_MODE);
+        assert_eq!(mode(&pooled), 0o711, "traverse, no list, no write");
+        let alone = start("alone", &[]);
+        assert_eq!(mode(&alone), 0o700, "a daemon without a pool");
+        // The same data directory started again, now with a pool.
+        let again = start("alone", &pool);
+        assert_eq!(again, alone);
+        assert_eq!(mode(&alone), 0o711, "an existing 0700 is opened for a pool");
+        let flags = [format!("--data-dir={}", base.join("oci").display())];
+        let oci = parse(&["--driver=container", flags[0].as_str()]).expect("flags");
+        assert!(leases_open(&oci), "the container driver");
+        let no_native =
+            parse(&["--driver=fake", flags[0].as_str(), pool[0], pool[1]]).expect("flags");
+        assert!(
+            !leases_open(&no_native),
+            "a pool flag without the native driver"
+        );
     }
 
     /// Catches an upload deadline that defaults to anything but

@@ -150,3 +150,63 @@ async fn a_long_list_is_asked_in_calls_a_node_takes() {
         [MAX_FIND_MISSING_DIGESTS, 70_000 - MAX_FIND_MISSING_DIGESTS]
     );
 }
+
+/// Catches a durable question that is a plain one (a node's blob held only in RAM would
+/// be reported durable, so a durable record could name a blob a restart loses), and one
+/// that asks the wrong owners or tells the node the wrong thing: the primary holds `a` on
+/// disk and `b` in RAM only, and has not got `c`. `find_durable` answers `b` and `c`,
+/// calling only `find_durable`; `find_missing` answers `c` alone, calling only
+/// `find_missing`; the replica is asked neither time.
+#[tokio::test]
+async fn a_durable_question_counts_a_blob_held_only_in_ram_as_missing() {
+    let map = map(1, 2, active(&[1, 2]));
+    let cluster = Cluster::of(2);
+    let (router, _) = router(&map, &cluster);
+    let owned = primary_is(&map, 1, 3);
+    let (a, b, c) = (owned[0], owned[1], owned[2]);
+    cluster.node(1).hold_as(a, b"on disk");
+    cluster.node(1).hold_as(b, b"in ram");
+    cluster.node(1).make_ram_only(&b);
+
+    let durable = router.find_durable(&[a, b, c]).await.expect("an answer");
+    assert_eq!(durable, [b, c]);
+    assert_eq!(cluster.node(1).durable_log(), [sorted(vec![a, b, c])]);
+    assert!(cluster.node(1).find_log().is_empty());
+
+    let plain = router.find_missing(&[a, b, c]).await.expect("an answer");
+    assert_eq!(plain, [c]);
+    assert_eq!(cluster.node(1).find_log(), [sorted(vec![a, b, c])]);
+    assert_eq!(cluster.node(1).durable_log().len(), 1);
+    assert!(cluster.node(2).find_log().is_empty());
+    assert!(cluster.node(2).durable_log().is_empty());
+}
+
+/// Catches a durable question that falls back to the plain one when the primary fails
+/// (the replica would then report its RAM-held blob durable): the primary fails, so its
+/// digests go to the replica, which is asked `find_durable`, answers that the blob it
+/// holds in RAM is missing, and is never asked the plain question. A call that cannot be
+/// answered for a digest fails, as the plain one does.
+#[tokio::test]
+async fn a_durable_question_fails_over_as_a_durable_question() {
+    let map = map(1, 2, active(&[1, 2]));
+    let cluster = Cluster::of(2);
+    let (router, _) = router(&map, &cluster);
+    let owned = primary_is(&map, 1, 2);
+    cluster.node(2).hold_as(owned[0], b"in ram on the replica");
+    cluster.node(2).make_ram_only(&owned[0]);
+    cluster.node(2).hold_as(owned[1], b"on disk on the replica");
+    cluster.node(1).fail_next(unavailable());
+
+    let missing = router.find_durable(&owned).await.expect("an answer");
+    assert_eq!(missing, [owned[0]]);
+    assert_eq!(cluster.node(2).durable_log(), [sorted(owned.clone())]);
+    assert!(cluster.node(2).find_log().is_empty());
+
+    cluster.node(1).set_down(true);
+    cluster.node(2).set_down(true);
+    let error = router
+        .find_durable(&owned)
+        .await
+        .expect_err("nobody answers");
+    assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
+}

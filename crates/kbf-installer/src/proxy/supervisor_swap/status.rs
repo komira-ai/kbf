@@ -24,9 +24,9 @@ pub(super) fn active_after(intent: &Intent, new_holds: &dyn Fn() -> bool) -> Slo
         Phase::Done => true,
         Phase::RolledBack => false,
         Phase::Failed => match intent.failure.as_ref().map(|f| f.step) {
-            // A confirm that failed after the switch, or a rollback that did not land: the new
-            // child keeps serving.
-            Some(Step::Confirm | Step::Rollback) => true,
+            // A confirm that failed after the switch, a rollback that did not land, or an order
+            // for the nodes the new child would not take: the new child keeps serving.
+            Some(Step::Confirm | Step::Rollback | Step::Nodes) => true,
             Some(Step::Restart) => new_holds(),
             _ => false,
         },
@@ -95,6 +95,7 @@ pub(super) fn assemble(
         // The intent keeps `nodes_posted` as a flag; the API reads only whether it is zero.
         nodes_updated: u32::from(intent.nodes_posted),
         failure: intent.failure.clone(),
+        source: intent.source,
     };
     SupervisorStatus {
         update: Some(update),

@@ -16,11 +16,13 @@ mod failures;
 #[cfg(test)]
 pub(crate) mod history_fixtures;
 mod leases;
+mod log;
 mod nodes;
 mod overview;
 mod queue;
 mod refresh;
 mod sched;
+mod started;
 mod storage;
 mod strip;
 mod target;
@@ -47,6 +49,9 @@ pub(crate) use build::build;
 pub(crate) use leases::LEASES;
 pub(crate) use leases::leases;
 #[cfg(test)]
+pub(crate) use log::LOG;
+pub(crate) use log::{STREAMS, log_page, run_log};
+#[cfg(test)]
 pub(crate) use queue::QUEUE;
 pub(crate) use queue::queue;
 #[cfg(test)]
@@ -70,8 +75,8 @@ pub(crate) const BUILDS_PATH: &str = "/ui/builds";
 
 /// Every page, for the contract test.
 #[cfg(test)]
-pub(crate) const PAGES: [&Page; 12] = [
-    &OVERVIEW, &BUILDS, &BUILD, &ACTION, &NODES, &NODE, &UPDATES, &LEASES, &QUEUE, &TARGETS,
+pub(crate) const PAGES: [&Page; 13] = [
+    &OVERVIEW, &BUILDS, &BUILD, &ACTION, &LOG, &NODES, &NODE, &UPDATES, &LEASES, &QUEUE, &TARGETS,
     &TARGET, &STORAGE,
 ];
 
@@ -111,6 +116,15 @@ pub(crate) fn failed(
     asked: &[crate::read::Asked],
     e: &ReadError,
 ) -> Answer {
+    if e.is_history_off() {
+        let body = layout::page(page.name, here, asked, |h| {
+            h.el("h1", &[], |h| {
+                h.text(page.name);
+            });
+            history_off(h);
+        });
+        return Answer::html(200, body);
+    }
     let body = layout::page(page.name, here, asked, |h| {
         h.el("h1", &[], |h| {
             h.text(page.name);
@@ -118,6 +132,30 @@ pub(crate) fn failed(
         problem(h, e);
     });
     Answer::html(e.status(), body).passing_on(e.headers())
+}
+
+/// What a page that lists history says when the farm keeps none: an explanation and the
+/// flag that turns it on. The page is `200`: nothing is wrong, nothing was recorded.
+pub(crate) fn history_off(h: &mut Html) {
+    h.el("section", &[attr("class", "card")], |h| {
+        h.el("h2", &[], |h| {
+            h.text("History is off on this farm");
+        });
+        h.el("p", &[], |h| {
+            h.text(
+                "The farm records no builds, so there is nothing to list here. Start the \
+                 server with ",
+            )
+            .el("code", &[], |h| {
+                h.text("--history-objects=<URI>");
+            })
+            .text(" (it needs ")
+            .el("code", &[], |h| {
+                h.text("--state-store");
+            })
+            .text(") to keep them.");
+        });
+    });
 }
 
 /// A read's failure as a note on the page.
@@ -298,3 +336,5 @@ pub(crate) fn pill(h: &mut Html, words: &str, class: &'static str) {
 mod tests;
 #[cfg(test)]
 mod tests_failures;
+#[cfg(test)]
+mod tests_history_off;

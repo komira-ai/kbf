@@ -33,7 +33,7 @@ fn the_list_shows_each_node_with_its_state_leases_and_booking() {
     let fake = fleet_farm();
     let (status, html) = page(&fake, "/ui/nodes");
     assert_eq!(status, 200, "{html}");
-    assert_eq!(fake.seen(), ["/v1/nodes"]);
+    assert_eq!(fake.seen(), ["/v1/nodes", "/v1/health"]);
     assert!(html.contains("<title>Nodes - kbf</title>"), "{html}");
     assert!(html.contains("aria-current=\"page\">Nodes</a>"), "{html}");
     let row = html
@@ -95,7 +95,10 @@ fn hostile_node_strings_render_as_text() {
     let fake = Fake::default().json(&format!("/v1/nodes/{id}"), &detail);
     let (status, html) = page(&fake, &link);
     assert_eq!(status, 200, "{html}");
-    assert_eq!(fake.seen(), [format!("/v1/nodes/{id}")]);
+    assert_eq!(
+        fake.seen(),
+        [format!("/v1/nodes/{id}"), "/v1/health".to_owned()]
+    );
     for needle in ["<script", "<img", "onerror=alert(2)>"] {
         assert!(!html.contains(needle), "{needle}: {html}");
     }
@@ -154,7 +157,7 @@ fn the_node_shows_capacity_booked_free_and_its_leases_as_the_api_says() {
     let fake = fleet_farm();
     let (status, html) = page(&fake, "/ui/nodes/mac-1");
     assert_eq!(status, 200, "{html}");
-    assert_eq!(fake.seen(), ["/v1/nodes/mac-1"]);
+    assert_eq!(fake.seen(), ["/v1/nodes/mac-1", "/v1/health"]);
     assert!(html.contains("<title>Node - kbf</title>"), "{html}");
     for text in [
         "<h1>Node <code>mac-1</code></h1>",

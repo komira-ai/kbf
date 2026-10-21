@@ -107,7 +107,7 @@ pub enum Ended {
 /// of it is 1 MiB too (so a write soon takes the direct path to the cold store, which
 /// refuses it: with the hot tier at its default size, the flush to the cold store fails and
 /// is retried, with the blobs still readable from the hot tier, and no build sees it).
-fn shrunk() -> Vec<String> {
+pub fn shrunk() -> Vec<String> {
     vec![
         format!("--cold-store-size-bytes={}", 1 << 20),
         "--cold-store-floor-bytes=0".to_owned(),

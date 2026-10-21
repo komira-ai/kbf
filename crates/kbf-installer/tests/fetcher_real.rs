@@ -81,6 +81,7 @@ fn rec(components: Vec<Locator>) -> ReleaseLocator {
     ReleaseLocator {
         commit: commit(),
         components,
+        source: kbf_update::Source::Fetch,
     }
 }
 
@@ -761,6 +762,32 @@ fn an_activation_without_components_is_refused_and_makes_nothing() {
     let got = fetcher.fetch_activation(&rec(Vec::new()), &facts());
     assert!(matches!(got, Err(FetchError::Rejected(_))), "{got:?}");
     assert!(!rig.work().exists(), "not even the work directory");
+}
+
+/// A locator whose source is `staged` names the package's release, which the fetching fetcher
+/// does not bring in: both forms refuse it with the word `denied` before anything is asked or
+/// made, so a locator handed to the wrong fetcher cannot fetch what the package should supply.
+///
+/// Catches the routing resting on `HostFetcher` alone.
+///
+/// Mutant to plant: the source check removed from `RealFetcher::pull`.
+#[test]
+fn a_staged_locator_is_refused_by_the_fetching_fetcher_and_makes_nothing() {
+    let rig = Rig::new("staged-locator");
+    let fetcher = rig.fetcher(None, Answers::honest());
+    let mut staged = rec(vec![locator("kbf", &tarball())]);
+    staged.source = kbf_update::Source::Staged;
+    let forms = [
+        fetcher.fetch(&staged),
+        fetcher.fetch_activation(&staged, &facts()),
+    ];
+    for got in forms {
+        assert!(
+            matches!(&got, Err(FetchError::Order { word: "denied", .. })),
+            "{got:?}"
+        );
+    }
+    assert!(!rig.work().exists(), "nothing was made");
 }
 
 /// A frontend update that does carry its components is fetched and verified without facts to

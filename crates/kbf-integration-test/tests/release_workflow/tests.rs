@@ -27,57 +27,54 @@ fn red(found: &[String], want: &str) {
 
 #[test]
 fn the_real_release_workflow_meets_every_rule() {
-    // Catches: release.yml drifting from the prod stage (no verdict, no notes, no
+    // Catches: release.yml drifting from the prod stage (no tag check, no notes, no
     // approval, a write scope outside publish), and the control for every plant below.
     let found = problems(&real()).expect("release.yml is read");
     assert!(found.is_empty(), "{PATH}:\n{}", found.join("\n"));
 }
 
 #[test]
-fn a_verify_job_without_the_verdict_step_is_refused() {
-    // Catches: the verdict check dropped, so a tag with no verdict (or a red one) is
-    // released. Mutant: the step runs `release check` again instead of `release verdict`.
+fn a_verify_job_without_the_tag_check_step_is_refused() {
+    // Catches: the tag check dropped, so a tag naming another commit, or one not on main, is
+    // released. Mutant: the step runs `release check` again instead of `release verify`.
     let found = plant(
-        "cargo xtask release verdict dist",
+        "cargo xtask release verify dist",
         "cargo xtask release check dist",
     );
-    red(&found, "does not run `cargo xtask release verdict`");
+    red(&found, "does not run `cargo xtask release verify`");
 }
 
 #[test]
-fn a_verdict_that_cannot_stop_the_job_is_refused() {
-    // Catches: the verdict under `if:`, so the job passes without it. Mutant: an `if`.
+fn a_tag_check_that_cannot_stop_the_job_is_refused() {
+    // Catches: the tag check under `if:`, so the job passes without it. Mutant: an `if`.
     let found = plant(
-        "        id: verdict\n",
-        "        id: verdict\n        if: ${{ github.event_name == 'push' }}\n",
+        "        id: verify-tag\n",
+        "        id: verify-tag\n        if: ${{ github.event_name == 'push' }}\n",
     );
-    red(&found, "`release verdict` step of `verify` is under `if:`");
+    red(&found, "`release verify` step of `verify` is under `if:`");
 }
 
 #[test]
-fn a_verdict_not_given_this_tag_or_commit_is_refused() {
-    // Catches: a verdict checked for the wrong tag or commit (the check would pass for
+fn a_tag_check_not_given_this_tag_or_commit_is_refused() {
+    // Catches: a tag check run for the wrong tag or commit (the check would pass for
     // any release). Mutants: the tag, then the commit, dropped from the arguments.
     red(
-        &plant(
-            "release verdict dist --tag \"$TAG\"",
-            "release verdict dist",
-        ),
+        &plant("release verify dist --tag \"$TAG\"", "release verify dist"),
         "not given `--tag \"$TAG\"`",
     );
     red(
         &plant(
-            "release verdict dist --tag \"$TAG\" --commit \"$COMMIT\"",
-            "release verdict dist --tag \"$TAG\"",
+            "release verify dist --tag \"$TAG\" --commit \"$COMMIT\"",
+            "release verify dist --tag \"$TAG\"",
         ),
         "not given `--commit \"$COMMIT\"`",
     );
 }
 
 #[test]
-fn a_verdict_before_the_files_are_checked_is_refused() {
-    // Catches: the verdict naming a set no one has verified yet. Mutant: the check step
-    // renamed so that the verdict now comes first.
+fn a_tag_check_before_the_files_are_checked_is_refused() {
+    // Catches: the tag check naming a set no one has verified yet. Mutant: the check step
+    // renamed so that the tag check now comes first.
     let found = plant(
         "cargo xtask release check dist",
         "cargo xtask release checkdist dist",
@@ -86,7 +83,7 @@ fn a_verdict_before_the_files_are_checked_is_refused() {
 }
 
 #[test]
-fn a_verdict_against_another_main_is_refused() {
+fn a_tag_check_against_another_main_is_refused() {
     // Catches: main-only weakened by pointing the on-main test at another ref.
     let found = plant(
         "--output \"$GITHUB_OUTPUT\"\n      # What the release changes",
@@ -96,15 +93,15 @@ fn a_verdict_against_another_main_is_refused() {
 }
 
 #[test]
-fn the_set_hash_must_travel_from_the_verdict_to_publish() {
-    // Catches: publish releasing files the verdict does not name. Mutants: the job
+fn the_set_hash_must_travel_from_the_tag_check_to_publish() {
+    // Catches: publish releasing files `release verify` did not print. Mutants: the job
     // output dropped; publish not given `--set-hash`; publish's SET_HASH from nowhere.
     red(
         &plant(
-            "      set-hash: ${{ steps.verdict.outputs.set-hash }}\n",
+            "      set-hash: ${{ steps.verify-tag.outputs.set-hash }}\n",
             "",
         ),
-        "does not output `set-hash` from the verdict step",
+        "does not output `set-hash` from the verify step",
     );
     red(
         &plant(" --set-hash \"$SET_HASH\"", ""),
@@ -492,5 +489,27 @@ fn a_binary_runs_only_after_its_files_are_attested() {
             "run: dist/kbf --version --json > version.json",
         ),
         "not `release identity` on `dist` or `previous`",
+    );
+}
+
+#[test]
+fn only_the_previous_releases_check_waives_the_version_facts() {
+    // Catches: the first release with version facts failing on the release before it
+    // (which has none) so that nothing is published, and the other way round: a waiver on
+    // the check of the release being made, so a set without the facts of its kbf goes out.
+    // Mutants: the flag dropped from `previous`; the flag added to `dist`.
+    red(
+        &plant(
+            "release check previous --commit \"$PREVIOUS_COMMIT\" --without-version-facts",
+            "release check previous --commit \"$PREVIOUS_COMMIT\"",
+        ),
+        "`release check previous` is not given `--without-version-facts`",
+    );
+    red(
+        &plant(
+            "release check dist --commit \"$COMMIT\"",
+            "release check dist --commit \"$COMMIT\" --without-version-facts",
+        ),
+        "`release check dist` is given `--without-version-facts`",
     );
 }

@@ -180,6 +180,32 @@ fn the_temp_file_is_synced_before_the_rename_and_the_directory_after_it() {
     );
 }
 
+/// Catches the source of an update lost from `update.json` (a restarted proxy would then send
+/// the order for the nodes as for a fetch), and a record of an update that fetches that an
+/// older build cannot read: the key is there only for a source that is not `fetch`, and a
+/// record written before the key reads as `fetch`.
+///
+/// Mutants planted: `skip_serializing_if` removed; `default` removed.
+#[test]
+fn a_staged_update_keeps_its_source_in_the_record_and_a_fetching_one_leaves_it_out() {
+    let d = dir("source");
+    let r = FileRecorder::new(&d);
+    let mut staged = intent(Phase::Baking);
+    staged.source = Source::Staged;
+    r.record(&staged).expect("write");
+    let text = fs::read_to_string(d.join("update.json")).expect("read");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(json["source"], "staged");
+    assert_eq!(FileRecorder::load(&d).expect("read"), Some(staged));
+
+    r.record(&intent(Phase::Baking)).expect("write");
+    let text = fs::read_to_string(d.join("update.json")).expect("read");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("json");
+    assert!(json.get("source").is_none(), "{text}");
+    let loaded = FileRecorder::load(&d).expect("read").expect("present");
+    assert_eq!(loaded.source, Source::Fetch);
+}
+
 #[test]
 fn a_failed_file_sync_leaves_the_old_record_and_stops_the_swap() {
     let (r, calls, d) = spied("sync-fail", true);

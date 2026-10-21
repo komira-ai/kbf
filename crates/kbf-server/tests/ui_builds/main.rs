@@ -83,14 +83,20 @@ async fn the_builds_list_is_the_history_route_with_its_filters() {
 }
 
 /// Catches: the Builds list on a server with no history: it must say why it is empty
-/// (the route's own `404`), not show an empty list as a quiet farm.
+/// (history is off, naming the flag; the route is unknown to such a server, `404` with no
+/// body, and the page is `200`), not show an empty list as a quiet farm, and not pass the
+/// route's `404` on as a failure. A build looked up by id that is not held stays a `404`.
 #[tokio::test]
-async fn without_history_the_builds_list_says_the_route_is_off() {
+async fn without_history_the_builds_list_says_history_is_off() {
     let server = Server::with(OPEN);
     let (status, html) = page(&server, "/ui/builds").await;
-    assert_eq!(status, 404, "{html}");
-    assert!(html.contains("problem"), "{html}");
+    assert_eq!(status, 200, "{html}");
+    assert!(html.contains("History is off on this farm"), "{html}");
+    assert!(html.contains("--history-objects"), "{html}");
     assert!(!html.contains("No builds match."), "{html}");
+    let (status, html) = page(&server, "/ui/builds?id=missing").await;
+    assert_eq!(status, 404, "{html}");
+    assert!(!html.contains("History is off"), "{html}");
     server.stop().await;
 }
 

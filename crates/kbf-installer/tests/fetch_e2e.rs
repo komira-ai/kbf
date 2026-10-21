@@ -2353,6 +2353,7 @@ fn a_frontend_update_is_installed_from_a_url_source_end_to_end() {
     let locator = ReleaseLocator {
         commit: CommitId::new(COMMIT).expect("commit"),
         components: Vec::new(),
+        source: kbf_update::Source::Fetch,
     };
     let got = fetcher.fetch(&locator).map_err(|e: Refused| e.to_string());
     let got = got.expect("installed");

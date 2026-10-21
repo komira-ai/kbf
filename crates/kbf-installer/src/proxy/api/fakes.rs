@@ -8,6 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use hyper::{Request, Response};
+use kbf_update::Source;
 use tokio::sync::watch;
 
 use super::actor::{ActorTiming, Api, spawn};
@@ -140,12 +141,13 @@ pub struct FakeOrders {
     pub fail: Arc<Mutex<bool>>,
 }
 
-impl OrderWriter for FakeOrders {
-    fn write(
-        &mut self,
+impl FakeOrders {
+    fn record(
+        &self,
         verb: Verb,
         commit: &CommitId,
         window_s: u32,
+        source: Source,
     ) -> Result<Locator, OrderError> {
         if *self.fail.lock().unwrap() {
             return Err(OrderError("orders/ is not writable".to_owned()));
@@ -159,9 +161,30 @@ impl OrderWriter for FakeOrders {
             verb,
             commit: commit.clone(),
             window_s,
+            source,
         };
         written.push(loc.clone());
         Ok(loc)
+    }
+}
+
+impl OrderWriter for FakeOrders {
+    fn write(
+        &mut self,
+        verb: Verb,
+        commit: &CommitId,
+        window_s: u32,
+    ) -> Result<Locator, OrderError> {
+        self.record(verb, commit, window_s, Source::Fetch)
+    }
+
+    fn write_update(
+        &mut self,
+        commit: &CommitId,
+        window_s: u32,
+        source: Source,
+    ) -> Result<Locator, OrderError> {
+        self.record(Verb::FrontendUpdate, commit, window_s, source)
     }
 }
 
@@ -218,6 +241,7 @@ impl FakeSupervisor {
             new: NewChild { open_streams: 3 },
             nodes_updated,
             failure: None,
+            source: Source::Fetch,
         });
     }
 
@@ -258,6 +282,7 @@ impl Supervisor for FakeSupervisor {
             new: NewChild::default(),
             nodes_updated: 0,
             failure: None,
+            source: spec.source,
         });
         Ok(())
     }
@@ -440,6 +465,7 @@ pub fn req(commit: &str, request_id: &str) -> super::model::UpdateRequest {
         request_id: request_id.to_owned(),
         nodes: true,
         rollback: false,
+        source: Source::Fetch,
     }
 }
 

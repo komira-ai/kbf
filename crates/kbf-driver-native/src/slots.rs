@@ -14,7 +14,10 @@
 //!   temporary places), the clean is checked, the user is made again if the check
 //!   fails twice, and the slot is quarantined (the node reports one fewer) if that
 //!   fails too;
-//! - its lease directory is the slot user's, and its action is started through
+//! - its lease directory is the slot user's alone (mode 0700, from the moment it is made:
+//!   another pool user cannot read, list or connect into it, and the root of the leases is
+//!   searchable by others, `LEASES_ROOT_MODE`, so the slot user can reach it), and its
+//!   action is started through
 //!   `launchctl asuser <uid>`, then this binary's `__as-user` mode, which drops to the
 //!   slot's uid and group (no supplementary groups) and executes it: so it runs in
 //!   `user/<uid>`'s bootstrap namespace, with the per-user services (`cfprefsd`,
@@ -57,6 +60,18 @@ pub const MIN_UID: u32 = 600;
 
 /// The most users a pool may have, as in provisioning.
 pub const MAX_USERS: u32 = 64;
+
+/// The mode of the root of the lease directories (`--data-dir`'s `leases`) when a pool
+/// runs actions: the daemon's (root's), searchable but not listable by others, so that a
+/// slot user reaches its own lease directory through it and no other. A mode of 0700
+/// there stops the first lease ("working directory: Permission denied"). The node makes
+/// the directory; a test that runs a pool over a scratch directory makes the same mode.
+pub const LEASES_ROOT_MODE: u32 = 0o711;
+
+/// The mode of a slot's lease directory: its user's alone. The pool users share a
+/// primary group and a Mac's default is 0755, so any other mode lets another slot read
+/// the lease's files, list them and connect to a socket in them.
+pub const LEASE_DIR_MODE: u32 = 0o700;
 
 /// The node report entry that says how many actions run at once.
 pub const CAPABILITY: &str = "action_slots";
@@ -188,6 +203,37 @@ pub fn check_daemon_user(root: bool, pool: Option<&Pool>) -> Result<(), String> 
     }
 }
 
+/// Makes the lease directory `dir` ([`LEASE_DIR_MODE`] for a slot user's, otherwise the
+/// process's default for a directory) and nothing above it.
+///
+/// # Errors
+/// The directory exists, or its parent does not.
+pub(crate) async fn make_lease_dir(dir: &Path, private: bool) -> std::io::Result<()> {
+    let mut builder = tokio::fs::DirBuilder::new();
+    if private {
+        builder.mode(LEASE_DIR_MODE);
+    }
+    builder.create(dir).await
+}
+
+/// Gives `root` and everything under it to `uid`:`gid`, never following a link, then
+/// closes `root` itself to everyone else ([`LEASE_DIR_MODE`], whatever its mode was),
+/// which is what keeps another slot out of the tree.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn hand_tree(root: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut pending: Vec<PathBuf> = vec![root.to_owned()];
+    while let Some(path) = pending.pop() {
+        std::os::unix::fs::lchown(&path, Some(uid), Some(gid))?;
+        if std::fs::symlink_metadata(&path)?.is_dir() {
+            for entry in std::fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+        }
+    }
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(LEASE_DIR_MODE))
+}
+
 /// How a lease's action runs: as the daemon's own user, its processes followed by
 /// process group ([`crate::procs`]), or as the pool user of the slot it took (macOS).
 #[derive(Debug, Default)]
@@ -216,6 +262,16 @@ impl Runner {
             Self::Daemon => Ok(isolation.wrap(network, lease, rules, program, args)),
             #[cfg(target_os = "macos")]
             Self::Slot(slot) => slot.launch(isolation, network, lease, program, args),
+        }
+    }
+
+    /// Whether the lease directory is made closed to others at once (a slot user's, which
+    /// the pool's other users could otherwise list while its inputs are written).
+    pub fn private_lease(&self) -> bool {
+        match self {
+            Self::Daemon => false,
+            #[cfg(target_os = "macos")]
+            Self::Slot(_) => true,
         }
     }
 
@@ -427,5 +483,74 @@ mod tests {
     fn only_the_as_user_argument_selects_the_mode() {
         assert!(dispatch().is_none());
         hook();
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    /// Catches a slot's lease directory left readable by the other pool users (0755 is
+    /// what the daemon makes it and what a hand-over by `chown` alone keeps; the pool
+    /// users share a primary group, so 0770 would leak too): after the hand-over the
+    /// lease directory is 0700 and its user's, whatever its mode was; what is inside
+    /// keeps its own modes and is the user's too, a link is given and not followed, and
+    /// a tree that cannot be given (here, one that does not exist) fails and closes
+    /// nothing.
+    #[test]
+    fn handing_over_a_lease_directory_closes_it_to_everyone_else() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let base = crate::unit_dir("slots-hand-tree");
+        let lease = base.join("lease-1-1");
+        std::fs::create_dir_all(lease.join("root/sub")).expect("tree");
+        std::fs::write(lease.join("root/sub/file"), b"x").expect("file");
+        std::os::unix::fs::symlink("/", lease.join("root/link")).expect("link");
+        for (path, mode) in [
+            (lease.clone(), 0o775),
+            (lease.join("root"), 0o755),
+            (lease.join("root/sub/file"), 0o644),
+        ] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        }
+        let me = std::fs::metadata(&lease).expect("lease");
+        hand_tree(&lease, me.uid(), me.gid()).expect("handed over");
+        assert_eq!(mode_of(&lease), LEASE_DIR_MODE, "the lease directory");
+        assert_eq!(mode_of(&lease), 0o700, "the documented mode");
+        assert_eq!(mode_of(&lease.join("root")), 0o755, "inside keeps its mode");
+        assert_eq!(mode_of(&lease.join("root/sub/file")), 0o644);
+        assert!(
+            std::fs::symlink_metadata(lease.join("root/link"))
+                .expect("link")
+                .is_symlink(),
+            "the link was followed or replaced"
+        );
+        let missing = base.join("missing");
+        assert!(hand_tree(&missing, me.uid(), me.gid()).is_err());
+        assert!(!missing.exists(), "a failed hand-over made something");
+    }
+
+    /// Catches a slot's lease directory made with the process's default mode, which
+    /// the other pool users can list while its inputs are written (before the
+    /// hand-over): made for a slot it is 0700 at once; made for the daemon's own user
+    /// it is made as it always was; neither replaces a directory that exists.
+    #[tokio::test]
+    async fn a_slots_lease_directory_is_closed_when_it_is_made() {
+        let base = crate::unit_dir("slots-make-lease-dir");
+        let private = base.join("lease-1-1");
+        make_lease_dir(&private, true).await.expect("made");
+        assert_eq!(mode_of(&private), 0o700);
+        let plain = base.join("lease-1-2");
+        make_lease_dir(&plain, false).await.expect("made");
+        assert!(plain.is_dir());
+        assert!(make_lease_dir(&private, true).await.is_err(), "twice");
+        assert!(
+            make_lease_dir(&base.join("a/b"), true).await.is_err(),
+            "no parents made"
+        );
+        assert!(!Runner::Daemon.private_lease());
     }
 }

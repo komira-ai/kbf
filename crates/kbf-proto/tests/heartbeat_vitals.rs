@@ -60,7 +60,10 @@ fn each_field_is_a_varint_on_its_number() {
 
 #[test]
 fn a_set_zero_is_on_the_wire_and_an_unset_field_is_not() {
-    assert_eq!(pb::HeartbeatRequest::default().encode_to_vec(), []);
+    assert_eq!(
+        pb::HeartbeatRequest::default().encode_to_vec(),
+        Vec::<u8>::new()
+    );
     assert_eq!(with(17, 0).encode_to_vec(), [0x88, 0x01, 0]);
     let zero = pb::HeartbeatRequest::decode(&[0x88, 0x01, 0][..]).expect("decodes");
     assert_eq!(zero.unflushed_bytes, Some(0), "a real zero");

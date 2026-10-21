@@ -3,6 +3,7 @@
 //! kept there).
 
 use crate::CommitId;
+use crate::seed::Available;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -48,6 +49,13 @@ pub struct Memory {
     pub event: Event,
     /// Why the last order was refused, or what was reverted.
     pub refusal: String,
+    /// The id of the proxy's order `refusal` answers, when it answers one: what lets the
+    /// frontend proxy tell its own order's refusal from another's. A node's order names none
+    /// (its ids are another counter's). Never stored: `helper.json` is read by builds that
+    /// refuse a key they do not know, so the helper keeps the id from one pass to the next
+    /// itself (`Notice`), and a restarted helper has none.
+    #[serde(skip)]
+    pub refused_order_id: Option<u64>,
     /// When root first saw each record now in the spool, in seconds. A record expires by
     /// this, never by the file's modification time, which its writer sets.
     pub first_seen: BTreeMap<String, u64>,
@@ -66,4 +74,13 @@ pub struct Memory {
     /// leave it set).
     #[serde(skip)]
     pub fetching: bool,
+    /// The seed the host's package carries, when the run loop has found it whole and above the
+    /// floor of `seq`: what `status.json` tells the frontend it can order. Re-derived every
+    /// pass and never stored, so a crash cannot leave one that is no longer true.
+    #[serde(skip)]
+    pub available: Option<Available>,
+    /// The word `installer.toml` holds for `release_source` (`url`, `frontend`, `bundled`),
+    /// when it could be read. Never stored, for the same reason.
+    #[serde(skip)]
+    pub release_source: Option<&'static str>,
 }

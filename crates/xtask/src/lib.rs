@@ -4,6 +4,10 @@
 //! - `build-commit check <binary> <commit>`, `build-commit check-asset <tarball>
 //!   <commit>` and `build-commit stamps <commit>` ([`build_commit`]): kbf-server names the
 //!   commit it was built from, and `kbf` does in the tarball that ships.
+//! - `advisories --repo <owner>/<repo> [--commit <sha>]` ([`advisories`]): `cargo deny check
+//!   advisories`, kept in one GitHub issue (opened, updated, or commented on and closed when
+//!   none remain) instead of failing a pull request. Exit 0 whatever it found; 1 when
+//!   cargo-deny or `gh` failed. `advisories.yml` runs it daily and on every push to `main`.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
 //!   row the working tree's budget file has and `<rev>`'s does not is refused, unless
 //!   git sees the row's path renamed from a path `<rev>` has a row for. CI runs
@@ -52,10 +56,16 @@
 //!   attestations` and `release check` hold a directory to one bundle per tarball,
 //!   each that tarball's (its one subject is the tarball's digest); `verify-assets
 //!   attestations` also has `gh` verify each tarball against its bundle.
-//! - `release {locate,main-control,check,verdict,offer,notes,plan,identity,previous,fetch-previous,stage-offer,publish}` ([`release`]): a GitHub release of
+//! - `release {locate,main-control,check,verify,offer,notes,plan,identity,previous,fetch-previous,stage-offer,publish,bump-internal}` ([`release`]): a GitHub release of
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
+//! - `release version-facts --binary <kbf> --commit <sha> --platform <p> --out <dir>`
+//!   ([`version_facts`]): the `kbf` just built, run with `--version --json`, and what it
+//!   printed kept unchanged as the release asset `kbf-<commit>-<platform>.version.json`
+//!   with its line in `SHA256SUMS.<platform>`. The release set holds it for every `kbf`
+//!   tarball (`verify-assets sums`, `release check`), because only a runner of a platform
+//!   can run its binary.
 //! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
 //!   unit.
@@ -75,6 +85,7 @@ use std::process::{Command, ExitCode};
 
 use clap::{Parser, Subcommand};
 
+pub mod advisories;
 pub mod budget;
 pub mod build_commit;
 pub mod bundles;
@@ -98,6 +109,7 @@ pub mod proxy_loom;
 pub mod release;
 pub mod sudo_test;
 pub mod sums;
+pub mod version_facts;
 
 /// Why a verb failed.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -149,6 +161,8 @@ enum Verb {
     /// kbf-server's `--version` names the commit it was built from.
     #[command(subcommand)]
     BuildCommit(BuildCommit),
+    /// Keep the advisories `cargo deny` reports in one GitHub issue.
+    Advisories(advisories::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
         /// The revision to compare with (on a pull request, the base branch).
@@ -563,6 +577,11 @@ enum ReleaseVerb {
         /// The commit the assets were built from, a full SHA.
         #[arg(long)]
         commit: String,
+        /// Do not require the version facts of each `kbf` tarball: for the release made
+        /// before the build jobs recorded them (the previous release, read by the first
+        /// release that has them). Facts without their tarball are still refused.
+        #[arg(long)]
+        without_version_facts: bool,
     },
     /// Create release `--tag` with every file of `<dir>`, or add the files it lacks;
     /// an asset it holds must be one of them, byte for byte.
@@ -580,7 +599,7 @@ enum ReleaseVerb {
         /// The artifacts workflow run that built and attested the files.
         #[arg(long)]
         run_id: u64,
-        /// The set hash the gamma verdict names, as `release verdict` printed it.
+        /// The set hash of the verified files, as `release verify` printed it.
         #[arg(long)]
         set_hash: String,
         /// The release's notes (`release notes --out`): the release body, followed by how
@@ -591,9 +610,9 @@ enum ReleaseVerb {
         #[arg(long, default_value = "gh")]
         gh: PathBuf,
     },
-    /// The tag's message is a green gamma verdict for this tag, commit and set, after a bake
-    /// of 24 hours or more. Prints `set-hash=<hex>`.
-    Verdict {
+    /// The tag names this commit, which is on main. Reads no verdict: the tag's message is
+    /// an audit record nothing gates on. Prints `set-hash=<hex>` of the files.
+    Verify {
         #[command(flatten)]
         subject: SubjectArgs,
         /// Append `set-hash=<hex>` to this file (on Actions, `GITHUB_OUTPUT`).
@@ -603,6 +622,9 @@ enum ReleaseVerb {
     /// The checks that make a commit offerable to a farm; writes `offer.json`, sets
     /// nothing on any farm.
     Offer(release::offer::OfferArgs),
+    /// Wait for the push runs of ci, beta and artifacts for `--sha` on `--branch` and
+    /// require all three to succeed; print their run ids. Only reads.
+    Gates(release::gates::GatesArgs),
     /// What a push would release: the next version, the push's class, and the freeze and
     /// superseded refusals. Writes nothing but `--output`.
     Plan(release::plan::PlanArgs),
@@ -614,11 +636,18 @@ enum ReleaseVerb {
     /// handed: the release verified before any of it runs. A commit with no release is
     /// `staged=false`, not an error.
     StageOffer(release::stage_offer::StageOfferArgs),
+    /// Open the pull request in the internal repository that moves its submodule to the
+    /// released commit, with auto-merge on (the token is `GH_TOKEN`).
+    BumpInternal(release::bump::BumpArgs),
     /// Create the annotated release tag at `--sha` through the GitHub API: create-only,
     /// after the stale-run guards; a tag that exists is reused only when it is the same.
     Tag(release::tag::TagArgs),
-    /// Write the verdict document a release tag carries as its message.
+    /// Write the Beta record a release tag carries as its message (audit only).
     VerdictWrite(release::verdict_write::WriteArgs),
+    /// Run the `kbf` just built with `--version --json` and keep what it printed as the
+    /// release asset `kbf-<commit>-<platform>.version.json`, refused unless it is the
+    /// release build of `--commit`.
+    VersionFacts(version_facts::Args),
     /// The same checks, then write the release's notes.
     Notes {
         #[command(flatten)]
@@ -663,7 +692,7 @@ enum ReleaseVerb {
     },
 }
 
-/// What `release verdict` and `release notes` check a release against.
+/// What `release verify` and `release notes` check a release against.
 #[derive(clap::Args)]
 struct SubjectArgs {
     /// The verified release files (`SHA256SUMS` among them).
@@ -683,8 +712,8 @@ struct SubjectArgs {
 }
 
 impl SubjectArgs {
-    fn subject(&self) -> release::verdict::Subject<'_> {
-        release::verdict::Subject {
+    fn subject(&self) -> release::verify::Subject<'_> {
+        release::verify::Subject {
             repo_dir: &self.repo_dir,
             tag: &self.tag,
             commit: &self.commit,
@@ -822,6 +851,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             sudo: &sudo,
             root: &root,
         }),
+        Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::Fetch {
             url,
@@ -1054,9 +1084,20 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         }) => Ok(vec![release::main_control(
             &gh, &repo, &on_main, &off_main,
         )?]),
-        Verb::Release(ReleaseVerb::Check { dir, commit }) => release::check(&dir, &commit),
-        Verb::Release(ReleaseVerb::Verdict { subject, output }) => {
-            let verified = release::verdict::verify(&subject.subject())?;
+        Verb::Release(ReleaseVerb::Check {
+            dir,
+            commit,
+            without_version_facts,
+        }) => {
+            let pairing = if without_version_facts {
+                version_facts::Pairing::Waived
+            } else {
+                version_facts::Pairing::Required
+            };
+            release::check(&dir, &commit, pairing)
+        }
+        Verb::Release(ReleaseVerb::Verify { subject, output }) => {
+            let verified = release::verify::verify(&subject.subject())?;
             let line = format!("set-hash={}", verified.set_hash.as_str());
             if let Some(output) = output {
                 std::fs::OpenOptions::new()
@@ -1070,22 +1111,24 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             }
             Ok(vec![
                 format!(
-                    "tag {}: a green gamma verdict for {} and set {}",
+                    "tag {} names {} on {}; the files are set {}",
                     subject.tag,
                     subject.commit,
+                    subject.main_ref,
                     verified.set_hash.as_str()
                 ),
                 line,
             ])
         }
         Verb::Release(ReleaseVerb::Offer(args)) => release::offer::run(&args),
+        Verb::Release(ReleaseVerb::Gates(args)) => release::gates::run(&args),
         Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
         Verb::Release(ReleaseVerb::FetchPrevious(args)) => release::fetch_previous::run(&args),
         Verb::Release(ReleaseVerb::StageOffer(args)) => release::stage_offer::run(&args),
+        Verb::Release(ReleaseVerb::BumpInternal(args)) => release::bump::run(&args),
         Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
-        Verb::Release(ReleaseVerb::VerdictWrite(args)) => {
-            release::verdict_write::run(&args, release::verdict::GATE_STAGE)
-        }
+        Verb::Release(ReleaseVerb::VersionFacts(args)) => version_facts::run(&args),
+        Verb::Release(ReleaseVerb::VerdictWrite(args)) => release::verdict_write::run(&args),
         Verb::Release(ReleaseVerb::Identity { dir, commit, out }) => {
             // The binary's unpacking place, of this process alone.
             let scratch =

@@ -207,6 +207,11 @@ pub struct Cache<M, O> {
     /// The write pool, started with the first blob a tier takes; `None` inside if it
     /// cannot run (no runtime).
     pool: std::sync::OnceLock<Option<WritePool>>,
+    /// The blobs held in RAM, which every reader consults before the index.
+    held: Held,
+    /// A test's callback between a reader's Held step and its index step.
+    #[cfg(feature = "testkit")]
+    between: std::sync::OnceLock<held::BetweenCell>,
 }
 
 impl<M, O> Drop for Cache<M, O> {
@@ -268,6 +273,9 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             gate: None,
             pool_config: PoolConfig::DEFAULT,
             pool: std::sync::OnceLock::new(),
+            held: Held::default(),
+            #[cfg(feature = "testkit")]
+            between: std::sync::OnceLock::new(),
         }
     }
 
@@ -278,6 +286,19 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     #[must_use]
     pub fn with_write_pool(mut self, config: PoolConfig) -> Self {
         self.pool_config = config;
+        self
+    }
+
+    /// The same cache, calling `hook` from a write-pool writer after each batch's
+    /// `PutStaged` is applied to the index and before its blobs are answered, with the
+    /// batch's digests. The writer waits for `hook`, so a test can park it between the
+    /// two steps and read the cache there. Only with the `testkit` feature: a release
+    /// build has no hook. Set it before the cache stores anything; a second call keeps
+    /// the first hook.
+    #[cfg(feature = "testkit")]
+    #[must_use]
+    pub fn with_drain_hook(self, hook: DrainHook) -> Self {
+        let _ = self.writer.drain_hook.set(pool::HookCell(hook));
         self
     }
 
@@ -462,15 +483,19 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 
     /// Answers `FindMissingBlobs`: every requested digest that is not present and
-    /// reachable, in request order. The present blobs' touch is recorded, not
+    /// reachable, in request order. A blob held in RAM is present (the node can serve
+    /// it), whether or not it is durable yet ([`Cache::durable`] asks that); the set is
+    /// looked at before the index. The present blobs' touch is recorded, not
     /// committed: the answer waits for no metadata commit.
     ///
     /// # Errors
     /// The metadata log is unavailable; never a partial answer.
     pub async fn find_missing(&self, digests: &[Digest]) -> Result<Vec<Digest>, CacheError> {
+        let unheld = self.held.unheld(digests);
+        self.between_steps().await;
         let (missing, objects) = self
             .touched(|s| {
-                let found = s.find_missing(digests);
+                let found = s.find_missing(&unheld);
                 ((found.missing, found.objects), found.touch)
             })
             .await?;
@@ -479,32 +504,43 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 
     /// Whether each of `digests` is present and reachable, in order, as
-    /// FindMissingBlobs would answer, but without touching any: a page that lists a
-    /// blob does not keep it.
+    /// FindMissingBlobs would answer (a held blob is present), but without touching any:
+    /// a page that lists a blob does not keep it.
     ///
     /// # Errors
     /// The metadata log is unavailable.
     pub async fn present(&self, digests: &[Digest]) -> Result<Vec<bool>, CacheError> {
+        let held = self.held.which(digests);
+        self.between_steps().await;
         let found = self
             .writer
             .query(|s| {
-                let held = |d: &Digest| matches!(s.blob(d), BlobAnswer::Present { .. });
+                let indexed = |d: &Digest| matches!(s.blob(d), BlobAnswer::Present { .. });
                 digests
                     .iter()
-                    .map(|d| is_empty_blob(d) || held(d))
+                    .zip(&held)
+                    .map(|(d, held)| *held || is_empty_blob(d) || indexed(d))
                     .collect()
             })
             .await?;
         Ok(found)
     }
 
-    /// Whether `digest` is durable: committed to the index at a reachable object. What
-    /// `QueryWriteStatus` reports; bytes still arriving count for nothing.
+    /// Whether `digest` is complete on this node, what `QueryWriteStatus` reports: held
+    /// in RAM, or committed to the index at a reachable object. **Not a durability
+    /// barrier**: a held blob is complete and a restart loses it. A caller that writes
+    /// something durable naming the blob asks [`Cache::durable`]. Bytes still arriving
+    /// count for nothing.
     ///
     /// # Errors
     /// The metadata log is unavailable.
-    pub async fn is_durable(&self, digest: &Digest) -> Result<bool, CacheError> {
+    pub async fn is_complete(&self, digest: &Digest) -> Result<bool, CacheError> {
         if is_empty_blob(digest) {
+            return Ok(true);
+        }
+        let held = self.held.has(digest);
+        self.between_steps().await;
+        if held {
             return Ok(true);
         }
         self.touched(|s| match s.blob(digest) {
@@ -526,8 +562,9 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         self.store_admitted(blobs, Admitted::default()).await
     }
 
-    /// Which of `blobs` are present, each touched. A blob collected between the query
-    /// and the touch is left out, so it is stored again.
+    /// Which of `blobs` are in the index, each touched. A blob collected between the query
+    /// and the touch is left out, so it is stored again. The Held set is not looked at:
+    /// every caller stores for durability, and a blob only held in RAM is not durable.
     async fn held(&self, blobs: &[VerifiedBlob]) -> Result<BTreeSet<Digest>, CacheError> {
         let (mut held, touch) = self
             .writer
@@ -796,6 +833,7 @@ mod consistency;
 mod direct;
 mod evict;
 mod flush;
+mod held;
 mod losses;
 mod pool;
 mod read;
@@ -818,7 +856,12 @@ pub use evict::{EVICT_EVERY, EVICT_GRACE, EvictRound};
 pub use flush::{
     FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
 };
+#[cfg(feature = "testkit")]
+pub use held::BetweenHook;
+use held::Held;
 pub use losses::Losses;
+#[cfg(feature = "testkit")]
+pub use pool::DrainHook;
 use pool::WritePool;
 pub use pool::{BATCH_BLOBS, BATCH_BYTES, BUFFERED_BLOB_BYTES, PoolConfig};
 pub use read::{BlobRead, MAX_DECODED_BLOB_BYTES, READ_WINDOW_BYTES};

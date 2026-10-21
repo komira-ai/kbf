@@ -231,11 +231,13 @@ kbf-storage = { path = "crates/kbf-storage" }
 kbf-store = { path = "crates/kbf-store" }
 kbf-testkit = { path = "crates/kbf-testkit" }
 kbf-threads = { path = "crates/kbf-threads" }
+kbf-oidc = { path = "crates/kbf-oidc" }
 kbf-tls = { path = "crates/kbf-tls" }
 kbf-tier = { path = "crates/kbf-tier" }
 kbf-transfer = { path = "crates/kbf-transfer" }
 kbf-types = { path = "crates/kbf-types" }
 kbf-ui = { path = "crates/kbf-ui" }
+kbf-unitfile = { path = "crates/kbf-unitfile" }
 kbf-update = { path = "crates/kbf-update" }
 # The CI verbs (`cargo xtask`); kbf-integration-test reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
@@ -247,7 +249,7 @@ xtask = { path = "crates/xtask" }
 [workspace.lints.rust]
 # `kbf_loom` swaps kbf-proxy's atomics for loom's (`cargo xtask proxy-loom`). Not `loom`:
 # tokio reads `cfg(loom)` too and then needs a loom dependency of its own.
-# `coverage` is set by cargo-llvm-cov (crates/kbf-all-in-one-test compiles its tests out under it).
+# `coverage` is set by cargo-llvm-cov (crates/kbf-all-in-one-test and crates/kbf-daemon-test compile their tests out under it).
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kbf_loom)", "cfg(coverage)"] }
 
 [workspace.lints.clippy]

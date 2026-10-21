@@ -243,21 +243,27 @@ async fn a_flag_that_is_not_known_exits_2() {
 }
 
 /// Catches the mode parser's refusal of what the start built being printed as something
-/// else, or exiting other than 2: an enrolled node given a label the daemon refuses prints
-/// clap's message and exits 2.
+/// else, or exiting other than 2: an enrolled node whose `kbf.toml` holds a value the daemon
+/// refuses (`actions-memory-max-gib = 0`: a flag's range, checked by the mode's parser, not
+/// by the file's table check) prints clap's message and exits 2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_flag_the_mode_refuses_exits_2_with_its_message() {
     let run = fake::start();
     let root = scratch("process-mode-refusal");
     let path = config(&root, run.enroll_addr.port(), "");
+    let mut text = std::fs::read_to_string(&path).expect("kbf.toml");
+    text.push_str("[containers]\nactions-memory-max-gib = 0\n");
+    write_config(&path, &text);
     token(&root, &run.fake.mint(1, 1).to_line());
-    // Enrolled by a start that stops at its first refusal: the label has no `=`.
-    let mut words = args(&["--mode=daemon"], &path);
-    words.push("--label=no-equals-sign".to_owned());
-    let out = kbf(words).await;
+    // Enrolled by a start that stops at its first refusal: the flag's range starts at 1.
+    let out = kbf(args(&["--mode=daemon"], &path)).await;
 
     assert_eq!(out.code, Some(2), "{}", out.stderr);
-    assert!(out.stderr.contains("--label"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("--actions-memory-max-gib"),
+        "{}",
+        out.stderr
+    );
     assert!(
         root.join("state/pki/node.json").exists(),
         "enrolled all the same"

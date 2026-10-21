@@ -24,7 +24,7 @@ pub enum Driver {
     /// `--driver=native`: each action is a plain process in its lease directory. No
     /// container path is exercised; any argv a build sends runs as sent.
     Native,
-    /// `--driver=container` as rendered, over the stand-in `crun` (which runs one
+    /// `--driver=container` as the unit has it, over the stand-in `crun` (which runs one
     /// planted argv whatever the lease asks for), a planted cgroup tree and id files.
     StandInContainer,
 }
@@ -68,7 +68,7 @@ pub enum NodeMode {
 
 /// The ceilings that keep the farm small enough for a hosted runner (about 4 vCPU and
 /// 16 GB), as extra flags per kind of process, given to the unit's own flags with
-/// [`Rendered::set`] (so they replace a rendered value and are added when there is none).
+/// [`crate::units::Unit::set`] (so they replace the unit's value and are added when there is none).
 #[derive(Clone, Debug, Default)]
 pub struct Limits {
     pub frontend: Vec<String>,

@@ -41,6 +41,6 @@ pub use record::{
     Facts, Locator, MAX_AGE_SECS, MAX_RECORD_BYTES, MAX_RECORDS, OrderRecord, RecordError,
 };
 pub use types::{
-    COMPONENT_NAMES, Component, Expected, MAX_ATTESTATION_BYTES, MAX_COMPONENT_BYTES, Offer, Order,
-    Staged, State, Status, Verb,
+    Available, COMPONENT_NAMES, Component, Expected, MAX_ATTESTATION_BYTES, MAX_COMPONENT_BYTES,
+    Offer, Order, ReleaseSource, Source, Staged, State, Status, Verb,
 };

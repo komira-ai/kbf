@@ -81,8 +81,8 @@ impl Endpoint {
 
     /// The roles that call this endpoint (section 7: a client's calls come through a
     /// frontend; a daemon fetches inputs and uploads outputs directly; storage nodes
-    /// call each other to replicate). A daemon never reads the action cache, and only a
-    /// daemon uploads segments.
+    /// call each other to replicate). A daemon neither reads nor writes the action cache
+    /// (only the frontend does), and only a daemon uploads segments.
     #[must_use]
     pub const fn allowed(self) -> &'static [PeerRole] {
         use PeerRole::{Daemon, Frontend, Storage};
@@ -92,7 +92,7 @@ impl Endpoint {
             }
             Self::WriteLeg => &[Storage],
             Self::ActionGet => &[Frontend],
-            Self::ActionPrepare | Self::ActionCommit => &[Frontend, Daemon],
+            Self::ActionPrepare | Self::ActionCommit => &[Frontend],
             Self::Segments => &[Daemon],
         }
     }

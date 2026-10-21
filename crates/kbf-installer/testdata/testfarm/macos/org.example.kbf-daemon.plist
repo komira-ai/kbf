@@ -23,12 +23,6 @@
 		<string>kbf-mac-07</string>
 		<string>--data-dir</string>
 		<string>/Volumes/kbf/data</string>
-		<string>--label</string>
-		<string>profile=mac-arm64-test@0123456789ab</string>
-		<string>--label</string>
-		<string>pool=mac</string>
-		<string>--label</string>
-		<string>rack=r2</string>
 	</array>
 	<key>UserName</key>
 	<string>_kbf</string>

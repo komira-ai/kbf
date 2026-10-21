@@ -159,7 +159,7 @@ async fn concurrent_writes_stay_under_the_bytes_in_flight() {
         "{peak} bytes buffered over a {BOUND}-byte bound"
     );
     for d in &digests {
-        assert!(cache.is_durable(d).await.expect("durable"), "{d}");
+        assert!(cache.is_complete(d).await.expect("complete"), "{d}");
     }
 }
 

@@ -54,6 +54,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use kbf_gate::OfferDoc;
+use kbf_update::Source;
 use serde_json::Value;
 
 use crate::CommitId;
@@ -135,6 +136,13 @@ pub struct Options {
     /// Ask the new frontend to update the nodes once it has baked (the update API's `nodes`).
     /// `deploy` does; `update` leaves it to the caller.
     pub nodes: bool,
+    /// Where the frontend's release comes from: fetched from the installer's configured
+    /// source (what every update has meant so far), or the one this host's package carries.
+    /// The request names it only when it is `staged`; `deploy` always fetches.
+    pub source: Source,
+    /// This host fetches nothing: its `installer.toml` says `release_source = "bundled"`. A
+    /// `deploy` can only fetch, so on such a host it is refused before the bundle is read.
+    pub bundled: bool,
     pub node_timeout: Duration,
     /// The whole frontend step: the POST (and its retries) and the wait for `done`. It
     /// includes the new frontend's bake.
@@ -165,6 +173,8 @@ impl Options {
             request_id,
             apply: false,
             nodes: true,
+            source: Source::Fetch,
+            bundled: false,
             node_timeout: Duration::from_secs(1800),
             handover_timeout: Duration::from_secs(3600),
             smoke_timeout: Duration::from_secs(60),
@@ -427,6 +437,9 @@ pub fn update_frontend(env: &Env, opts: &Options) -> (Summary, Exit) {
 
 impl Run<'_> {
     fn go(&mut self, bundle: Option<&mut dyn Read>) -> Result<(), Fail> {
+        if self.opts.bundled {
+            self.step("source", |r| r.refuse_bundled())?;
+        }
         if !matches!(self.opts.offer, OfferPolicy::Unchecked) {
             self.step("offer", |r| r.check_offer())?;
         }
@@ -450,6 +463,18 @@ impl Run<'_> {
             self.sum.end(Exit::Ok, "", "");
         }
         Ok(())
+    }
+
+    /// A deploy can only fetch, which a host whose release is the one its package carries
+    /// refuses at the installer, after the bundle is uploaded and the proxy asked. The deploy
+    /// of such a host ends here, before either, with the reason the update verb uses.
+    fn refuse_bundled(&mut self) -> Result<(), Fail> {
+        Err(fail(
+            Exit::Refused,
+            "source_refused",
+            "this host's release_source is bundled: it fetches nothing, and a deploy can only \
+             fetch (update it with `update --source staged`)",
+        ))
     }
 
     /// Step 0, when a stage is named: the offer (or the `--no-offer`) the deploy runs under.
@@ -554,6 +579,27 @@ impl Run<'_> {
         self.read_bundle_offer(&bundle)?;
         self.check_offer_bundle(&bundle)?;
         let entries = bundle.entries;
+        // The store keeps a platform without a version facts file but never offers it; say
+        // so here too, with the words of the store's own listing.
+        let with_facts: BTreeSet<&str> = entries
+            .iter()
+            .filter(|e| e.name == bundle::FACTS)
+            .map(|e| e.platform.as_str())
+            .collect();
+        let mut without: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.name != bundle::FACTS && !with_facts.contains(e.platform.as_str()))
+            .map(|e| e.platform.as_str())
+            .collect();
+        without.sort_unstable();
+        without.dedup();
+        for platform in without {
+            self.sum.notes.push(format!(
+                "no version facts (kbf-{}-{platform}.version.json): nodes will not be offered \
+                 this platform; rebuild the release to include it",
+                self.opts.commit
+            ));
+        }
         if !self.opts.apply {
             return Ok(());
         }
@@ -575,10 +621,16 @@ impl Run<'_> {
                     ));
                 }
                 s => {
+                    // The store says why it refused a file (a version facts document that
+                    // contradicts the upload, naming it); no host path is in that text.
+                    let why = reply
+                        .json()
+                        .and_then(|j| j.get("error").and_then(|e| e.as_str().map(str::to_owned)))
+                        .map_or_else(String::new, |e| format!(": {e}"));
                     return Err(fail(
                         Exit::Failed,
                         "upload_failed",
-                        format!("PUT {path}: status {s}"),
+                        format!("PUT {path}: status {s}{why}"),
                     ));
                 }
             }

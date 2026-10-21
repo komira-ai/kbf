@@ -36,9 +36,33 @@ pub(crate) fn unavailable_trailers(message: &'static str) -> HeaderMap {
     trailers
 }
 
+/// The security headers on every answer the proxy makes itself (never on a forwarded child
+/// answer: the child sets its own). The policy is the strictest there is, because the proxy's
+/// own pages load nothing and embed nothing. No HSTS: a farm often serves a private-CA or
+/// self-signed certificate, and HSTS would stop a browser from going past its warning.
+pub(crate) const OWN_HEADERS: [(&str, &str); 5] = [
+    (
+        "content-security-policy",
+        "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+    ),
+    ("x-content-type-options", "nosniff"),
+    ("referrer-policy", "no-referrer"),
+    ("cache-control", "no-store"),
+    ("cross-origin-resource-policy", "same-origin"),
+];
+
+/// Sets [`OWN_HEADERS`] on an answer the proxy produced (`insert`: each exactly once).
+fn secured(mut response: Response<ProxyBody>) -> Response<ProxyBody> {
+    let headers = response.headers_mut();
+    for (name, value) in OWN_HEADERS {
+        headers.insert(name, HeaderValue::from_static(value));
+    }
+    response
+}
+
 /// A trailers-only gRPC answer: the status in the one headers frame, END_STREAM on it.
 fn grpc_only(status: &'static str, message: &'static str) -> Response<ProxyBody> {
-    let mut response = Response::new(ProxyBody::empty());
+    let mut response = secured(Response::new(ProxyBody::empty()));
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
@@ -51,7 +75,7 @@ fn grpc_only(status: &'static str, message: &'static str) -> Response<ProxyBody>
 
 /// A plain HTTP answer.
 pub(crate) fn text(status: StatusCode, message: impl Into<Bytes>) -> Response<ProxyBody> {
-    let mut response = Response::new(ProxyBody::bytes(message.into()));
+    let mut response = secured(Response::new(ProxyBody::bytes(message.into())));
     *response.status_mut() = status;
     response
         .headers_mut()
@@ -92,6 +116,11 @@ pub(crate) fn refused(grpc: bool, refusal: Refusal) -> Response<ProxyBody> {
             StatusCode::TOO_MANY_REQUESTS,
             GRPC_RESOURCE_EXHAUSTED,
             "too many wrong credentials from this address",
+        ),
+        Refusal::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            GRPC_UNAVAILABLE,
+            "the credential cannot be checked now: the issuer's keys are unavailable",
         ),
     };
     if grpc {
@@ -138,7 +167,7 @@ pub(crate) fn unknown(grpc: bool) -> Response<ProxyBody> {
 
 /// An update handler's reply as an HTTP answer.
 pub(crate) fn from_update(reply: UpdateReply) -> Response<ProxyBody> {
-    let mut response = Response::new(ProxyBody::bytes(Bytes::from(reply.body)));
+    let mut response = secured(Response::new(ProxyBody::bytes(Bytes::from(reply.body))));
     *response.status_mut() = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let headers = response.headers_mut();
     headers.insert(

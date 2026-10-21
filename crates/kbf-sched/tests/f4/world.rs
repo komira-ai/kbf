@@ -58,12 +58,12 @@ const PLATFORMS: [(&[(&str, &str)], u64); 13] = [
     (&[("OSFamily", "Darwin"), ("xcode", "15F31d")], 2),
     // No worker ever has these: always refused.
     (&[("OSFamily", "Darwin"), ("xcode", "99Z999")], 1),
-    (&[("label.pool", "nowhere")], 1),
+    (&[("os_image", "nowhere")], 1),
     (&[("ISA", "x86-64-v2")], 3),
     // Only the few release nodes, so a cordon or an outage can take them all.
-    (&[("label.pool", "release")], 2),
+    (&[("os_image", "release")], 2),
 ];
-/// How many nodes carry `label.pool=release`: the first ones in the storm set.
+/// How many nodes report `os_image=release`: the first ones in the storm set.
 const RELEASE_NODES: usize = 4;
 /// The plain `OSFamily=Darwin` platform, whose smallest requests book a VM slot.
 const DARWIN: usize = 6;
@@ -348,7 +348,7 @@ impl World {
         storm.truncate(workers.div_ceil(10));
         for &i in storm.iter().take(RELEASE_NODES) {
             let n = &mut nodes[i];
-            n.report.push(("label.pool", "release".to_owned()));
+            n.report.push(("os_image", "release".to_owned()));
             n.caps = caps_of(&n.report);
         }
         let by_name = nodes

@@ -15,7 +15,7 @@ use tonic::Status;
 use super::{STREAM_FROM_BYTES, StorageService};
 use crate::in_flight;
 use crate::replicate::{Plan, ReplicaLeg, Staging, View};
-use crate::{PutStream, StorageError, StreamedPut};
+use crate::{CommitMode, PutStream, StorageError, StreamedPut};
 
 /// What a streamed write takes from [`super::Config::write_bytes_in_flight`]: room for the
 /// few chunks it holds (the writer's queue, the replica's, and the one in hand), not for
@@ -138,7 +138,7 @@ impl StorageService {
                 owing = Some(chain.degrade(view, replica, &digest, &why).await?);
             }
         }
-        let committed = staged.commit().await;
+        let committed = staged.commit(CommitMode::Durable).await;
         drop(owing);
         committed?;
         Ok(())

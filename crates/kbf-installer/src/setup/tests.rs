@@ -150,6 +150,11 @@ impl Releases for Unwired {
     fn install_first(&self, _: &CommitId) -> Result<(), SetupError> {
         Err(SetupError::Fetch(FetchError::NotWired))
     }
+
+    /// The release that runs is taken to relay: these tests are about what `setup` writes.
+    fn running_relays(&self) -> Result<bool, SetupError> {
+        Ok(true)
+    }
 }
 
 /// What the migration journal says on the fake host.
@@ -1080,6 +1085,15 @@ impl Releases for Installs {
         self.0.borrow_mut().push(commit.to_string());
         Ok(())
     }
+
+    fn install_seed(&self) -> Result<CommitId, SetupError> {
+        self.0.borrow_mut().push("the package's release".to_owned());
+        Ok(COMMIT.parse().expect("a commit"))
+    }
+
+    fn running_relays(&self) -> Result<bool, SetupError> {
+        Ok(true)
+    }
 }
 
 fn first_release(mode: Mode) -> Raw {
@@ -1809,3 +1823,6 @@ mod update_dirs;
 
 #[path = "release_config_tests.rs"]
 mod release_config;
+
+#[path = "seed_tests.rs"]
+mod seed;

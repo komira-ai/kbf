@@ -91,6 +91,18 @@ pub enum Source {
     Bundled,
 }
 
+impl Source {
+    /// The word `release_source` holds for this source in the file, which `status.json` tells
+    /// the frontend.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Source::Frontend => "frontend",
+            Source::Url(_) => "url",
+            Source::Bundled => "bundled",
+        }
+    }
+}
+
 /// The frontend's worker listener and the CA that authenticates it, as `setup` saw them: a
 /// snapshot, taken once, because the root half cannot take its source from the service user's
 /// directory. The CA is meant to be a copy that root owns; whether it is, and whether it still
@@ -693,6 +705,9 @@ fn render_proxy(p: &ProxyConfig, out: &mut String) {
     out.push_str(&format!("buck2_auth = \"{}\"\n", p.buck2_auth.name()));
     if let Some(file) = &p.buck2_token_file {
         out.push_str(&format!("buck2_token_file = {}\n", path(file)));
+    }
+    if let Some(file) = &p.remote_operator_file {
+        out.push_str(&format!("remote_operator_file = {}\n", path(file)));
     }
     out.push_str(&format!("proxy_auth_file = {}\n", path(&p.proxy_auth_file)));
     out.push_str(&format!("state_dir = {}\n", path(&p.state_dir)));

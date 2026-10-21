@@ -547,12 +547,17 @@ fn operate(
 ) -> Result<(), Failure> {
     let (layout, mut exec) = host(root)?;
     let procs = HostProcs::new(layout.platform());
+    // The host's own `installer.toml`, read when `rollback` asks; the leases are never asked.
+    let fetcher = HostFetcher::on_host(layout.clone(), layout.installer_toml(), || {
+        Box::new(leases::NotWired)
+    });
     let mut err = std::io::stderr();
     verb(&mut Operator {
         host: &layout,
         exec: &mut exec,
         restart: &restart,
         procs: &procs,
+        fetcher: &fetcher,
         out: &mut err,
         apply,
         wait: operator::LOCK_WAIT,

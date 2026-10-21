@@ -130,6 +130,23 @@ fn the_sweep_removes_the_two_suffixes_and_nothing_else_and_follows_no_link() {
     assert!(holds(&rig, A, "kbf"), "the release is still there");
 }
 
+/// Catches the checks of a look that was killed (`<commit>.look`, which the run loop's look at
+/// the package makes) left in `work/` for ever: the start removes the directory, with what it
+/// holds, as it does a stage's two.
+///
+/// Red on the commit before: the sweep knows two suffixes, so `<B>.look` stays.
+///
+/// Mutant it is meant to catch (reasoned, not run): `.look` left out of the sweep's test.
+#[test]
+fn the_sweep_removes_the_scratch_of_a_look_that_was_killed() {
+    let mut rig = Rig::new("sweep-look");
+    let work = work_dir(&rig);
+    fs::create_dir_all(work.join(format!("{B}.look/gh"))).expect("a killed look's checks");
+    fs::write(work.join("notes.txt"), b"notes").expect("a file");
+    rig.helper.recover().expect("run's start");
+    assert_eq!(names(&work), vec!["notes.txt".to_owned()]);
+}
+
 /// Catches a start that dies, or says nothing, when `work/` cannot be listed (a file stands
 /// where the directory belongs). The start goes on, since the service must still take
 /// orders, and the failure is logged and is not a refusal: nothing was ordered that it

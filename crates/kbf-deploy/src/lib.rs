@@ -29,11 +29,6 @@
 //!   (`mdm fetch`), its services installed as root (`mdm install`), and read-only
 //!   checks of what runs (`mdm verify`); and, on an operator's own machine, an erase
 //!   request for one Mac signed with their security key (`mdm erase-request`).
-//! - [`envoy`]: a client front's Kubernetes objects and Envoy config, rendered from
-//!   the settings (`envoy render`), byte for byte the same for the same settings, and
-//!   a render checked for what the REAPI path through the front depends on
-//!   (`envoy check`), and the render applied to a cluster through kubectl after the
-//!   cluster's prerequisites and a server-side dry run pass (`envoy apply`).
 //! - [`log`]: the last lines of a kbf-server's durable log across its rotated files
 //!   (`log`; read-only).
 //! - [`pilot`]: a pilot kbf-server run as a systemd user service by the operator's own
@@ -42,7 +37,6 @@
 
 pub mod cli;
 pub mod config;
-pub mod envoy;
 pub mod host;
 pub mod https;
 pub mod linux;
@@ -51,7 +45,7 @@ pub mod mdm;
 pub mod minio;
 pub mod pilot;
 pub mod template;
-pub mod unit;
+pub use kbf_unitfile as unit;
 
 pub use config::{Config, ConfigError};
 

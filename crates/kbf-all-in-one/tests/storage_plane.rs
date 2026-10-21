@@ -96,6 +96,11 @@ macro_rules! passing {
                 self.inner.find_missing(digests)
             }
 
+            /// Forwards: the inner storage decides what is durable.
+            fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+                self.inner.find_durable(digests)
+            }
+
             fn put(&self, bytes: Bytes) -> Answer<'_, Digest> {
                 self.inner.put(bytes)
             }

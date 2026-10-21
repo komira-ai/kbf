@@ -102,6 +102,9 @@ enum FrontendFate {
     Failed,
     /// `rolled_back` twenty seconds after the POST, with no failure.
     RolledBack,
+    /// `failed` forty seconds after the POST, at step `nodes`: the new frontend, which has
+    /// served since the twentieth second, would not take the order for the nodes.
+    NodesRefused,
     /// Stays in `baking` for ever.
     Hang,
     /// Answers the POST with 409 `update_open`.
@@ -174,6 +177,8 @@ struct Farm {
     /// Every body POSTed to the frontend update route, as it was sent.
     raw: Mutex<Vec<Vec<u8>>>,
     upload_status: u16,
+    /// What the store says with a refused upload (an `error` member), if anything.
+    upload_error: &'static str,
     ready: bool,
     members_active_after: u64,
     /// `/v1/members` lists no member at all.
@@ -310,6 +315,7 @@ impl Farm {
             offered_at_start: false,
             raw: Mutex::new(Vec::new()),
             upload_status: 201,
+            upload_error: "",
             ready: true,
             members_active_after: 0,
             no_members: false,
@@ -486,6 +492,13 @@ impl Farm {
                 }),
             ),
             FrontendFate::RolledBack if e >= 20 => (Phase::RolledBack, None),
+            FrontendFate::NodesRefused if e >= 40 => (
+                Phase::Failed,
+                Some(Failure {
+                    step: FailedStep::Nodes,
+                    reason: "not_own: not the child's own release".to_owned(),
+                }),
+            ),
             FrontendFate::Hang => (by_time.min(Phase::Baking), None),
             FrontendFate::StuckInNodes => (by_time.min(Phase::Nodes), None),
             _ => (by_time, None),
@@ -523,6 +536,7 @@ impl Farm {
             old: None,
             new: None,
             failure,
+            source: kbf_update::Source::Fetch,
         }
     }
 
@@ -661,7 +675,13 @@ impl Farm {
     fn serve(&self, r: &Request) -> io::Result<Reply> {
         let now = self.now.get();
         match (r.method, r.path.as_str()) {
-            ("PUT", _) => Farm::reply(self.upload_status, json!({"sha256": "x", "size": 1})),
+            ("PUT", _) => {
+                let mut answer = json!({"sha256": "x", "size": 1});
+                if !self.upload_error.is_empty() {
+                    answer = json!({ "error": self.upload_error });
+                }
+                Farm::reply(self.upload_status, answer)
+            }
             ("GET", "/v1/nodes") => {
                 if self.nodes_key_missing {
                     return Farm::reply(200, json!({"server": {"commit": self.server_commit}}));
@@ -1053,6 +1073,7 @@ fn a_clean_deploy_updates_the_frontend_first_then_watches_the_nodes_and_checks_t
             request_id: REQUEST_ID.to_owned(),
             nodes: true,
             rollback: false,
+            source: kbf_update::Source::Fetch,
         }]
     );
     assert_eq!(f.requests("POST"), 1);
@@ -1110,9 +1131,9 @@ fn the_bundle_is_uploaded_to_the_store_paths() {
             &format!("kbf-{TARGET}-linux-x86_64.tar.gz.attestation"),
             b"a",
         ),
-        (&format!("kbf-daemon-{TARGET}-darwin-arm64.tar.gz"), b"t"),
+        (&format!("kbf-{TARGET}-darwin-arm64.tar.gz"), b"t"),
         (
-            &format!("kbf-daemon-{TARGET}-darwin-arm64.tar.gz.attestation"),
+            &format!("kbf-{TARGET}-darwin-arm64.tar.gz.attestation"),
             b"a",
         ),
     ]);
@@ -1123,8 +1144,8 @@ fn the_bundle_is_uploaded_to_the_store_paths() {
     for want in [
         format!("PUT /v1/releases/{TARGET}/linux-x86_64/kbf"),
         format!("PUT /v1/releases/{TARGET}/linux-x86_64/kbf.attestation"),
-        format!("PUT /v1/releases/{TARGET}/darwin-arm64/kbf-daemon"),
-        format!("PUT /v1/releases/{TARGET}/darwin-arm64/kbf-daemon.attestation"),
+        format!("PUT /v1/releases/{TARGET}/darwin-arm64/kbf"),
+        format!("PUT /v1/releases/{TARGET}/darwin-arm64/kbf.attestation"),
     ] {
         assert!(log.contains(&want), "{want} in {log:?}");
     }
@@ -1152,6 +1173,87 @@ fn an_upload_that_fails_is_a_failure() {
     let mut input: &[u8] = &bundle;
     let s = run_with(&f, &opts(true), SmokeResult::Pass, Some(&mut input));
     assert_eq!((s.exit, s.reason.as_str()), (1, "upload_failed"));
+}
+
+/// Proves a platform's version facts file is uploaded to its store path, before the tarballs
+/// of the bundle whatever its place in the tar (the store's answer to a tarball names a
+/// platform that has none), with the store's cap, and that a file the store refuses is
+/// refused with the store's reason (which names the file) in the detail.
+///
+/// Mutant seen red: the facts sorted after the tarballs.
+#[test]
+fn a_version_facts_file_is_uploaded_first_and_a_refusal_of_it_says_why() {
+    let f = farm(two_nodes());
+    let facts = format!("kbf-{TARGET}-linux-x86_64.version.json");
+    let bundle = tarball(&[
+        (&format!("kbf-{TARGET}-linux-x86_64.tar.gz"), b"t"),
+        (&facts, b"{}"),
+    ]);
+    let mut input: &[u8] = &bundle;
+    let s = run_with(&f, &opts(true), SmokeResult::Pass, Some(&mut input));
+    assert_eq!(s.exit, 0, "{}", s.line());
+    let log = f.log.lock().unwrap();
+    let puts: Vec<_> = log.iter().filter(|l| l.starts_with("PUT")).collect();
+    assert_eq!(
+        puts,
+        [
+            &format!("PUT /v1/releases/{TARGET}/linux-x86_64/version.json"),
+            &format!("PUT /v1/releases/{TARGET}/linux-x86_64/kbf"),
+        ]
+    );
+    drop(log);
+
+    let mut refused = farm(two_nodes());
+    refused.upload_status = 400;
+    refused.upload_error =
+        "kbf-x-linux-x86_64.version.json: it says commit a, and the release is b";
+    let mut input: &[u8] = &bundle;
+    let s = run_with(&refused, &opts(true), SmokeResult::Pass, Some(&mut input));
+    assert_eq!((s.exit, s.reason.as_str()), (1, "upload_failed"));
+    assert!(
+        s.detail
+            .contains(": kbf-x-linux-x86_64.version.json: it says commit a"),
+        "{}",
+        s.detail
+    );
+
+    let commit = c(TARGET);
+    let read = |files: &[(&str, &[u8])]| bundle::read(&tarball(files)[..], &commit);
+    let other = format!("kbf-{TARGET}-windows.version.json");
+    assert!(
+        read(&[(&other, b"{}")]).is_err(),
+        "a platform the store does not know"
+    );
+    let elsewhere = "kbf-0123456789abcdef0123456789abcdef01234567-linux-arm64.version.json";
+    assert!(read(&[(elsewhere, b"{}")]).is_err(), "another commit's");
+    let big = vec![b' '; (bundle::MAX_FACTS + 1) as usize];
+    assert!(read(&[(&facts, &big)]).is_err(), "past the store's cap");
+}
+
+/// Proves a deploy that uploads a platform with no version facts file says so in its summary
+/// (the platform is stored and never offered), naming the file, once per platform, and says
+/// nothing for a platform that carries its facts.
+///
+/// Mutant seen red: the note pushed for every platform; the note dropped.
+#[test]
+fn a_platform_uploaded_without_version_facts_is_noted_in_the_summary() {
+    let f = farm(two_nodes());
+    let bundle = tarball(&[
+        (&format!("kbf-{TARGET}-linux-x86_64.tar.gz"), b"t"),
+        (&format!("kbf-{TARGET}-linux-x86_64.version.json"), b"{}"),
+        (&format!("kbf-{TARGET}-linux-arm64.tar.gz"), b"t"),
+        (&format!("kbf-daemon-{TARGET}-linux-arm64.tar.gz"), b"t"),
+    ]);
+    let mut input: &[u8] = &bundle;
+    let s = run_with(&f, &opts(true), SmokeResult::Pass, Some(&mut input));
+    assert_eq!(s.exit, 0, "{}", s.line());
+    assert_eq!(
+        s.notes,
+        [format!(
+            "no version facts (kbf-{TARGET}-linux-arm64.version.json): nodes will not be \
+             offered this platform; rebuild the release to include it"
+        )]
+    );
 }
 
 /// Proves a mistake in the bundle is a usage error before any byte is uploaded.

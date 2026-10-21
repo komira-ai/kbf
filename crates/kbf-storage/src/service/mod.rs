@@ -86,6 +86,15 @@ pub use open_writes::{OpenWrite, OpenWrites};
 /// The metadata entry that carries the map generation on the standard calls.
 pub const MAP_GENERATION_HEADER: &str = "kbf-map-generation";
 
+/// The metadata entry on `FindMissingBlobs` that asks a durable question: `only` answers
+/// from the index alone, so a blob held in RAM and not yet written to disk is missing
+/// ([`crate::Storage::find_durable`]). Without it a held blob is present, as it can be
+/// served. Any other value is INVALID_ARGUMENT.
+pub const DURABLE_HEADER: &str = "kbf-durable";
+
+/// The value of [`DURABLE_HEADER`] that asks for the index alone.
+pub const DURABLE_ONLY: &str = "only";
+
 /// The metadata entry that marks a `Write` as a copy the caller needs on this node
 /// although the map does not place the blob here ([`crate::Storage::put_unowned`]).
 pub const UNOWNED_HEADER: &str = "kbf-unowned-copy";

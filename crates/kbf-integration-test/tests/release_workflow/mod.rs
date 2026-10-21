@@ -5,16 +5,16 @@
 //! - **Main only, tag push or dry run.** The triggers are exactly a `v*` tag push (no
 //!   branch filter) and `workflow_dispatch`: no `pull_request`, no schedule, no other
 //!   event. `verify` runs `cargo xtask release locate` (refuses a commit not on main) and
-//!   `cargo xtask release verdict` against `origin/main`, each in a step that cannot be
+//!   `cargo xtask release verify` against `origin/main`, each in a step that cannot be
 //!   skipped, after a checkout of the whole history so the annotated tag object and
 //!   `origin/main` are there.
-//! - **The verdict.** `verify` runs `release verdict` after the files are checked
+//! - **The tag check.** `verify` runs `release verify` after the files are checked
 //!   (`release check`), for the tag and commit it was triggered for, and passes the
 //!   `set-hash` it prints out of the job; `publish` hands it to `release publish
-//!   --set-hash`, so only the files the verdict names are released.
+//!   --set-hash`, so only the files `release verify` printed the set of are released. It reads no verdict.
 //! - **The notes.** `verify` writes the notes (`release notes --out <file>`) and uploads
 //!   that file as the artifact `release-notes` (`if-no-files-found: error`), so a dry run shows them;
-//!   the notes are for the same `--tag "$TAG"` and `--commit "$COMMIT"` as the verdict. The dispatch
+//!   the notes are for the same `--tag "$TAG"` and `--commit "$COMMIT"` as the tag check. The dispatch
 //!   declares required inputs `commit` and `tag`, and `verify` binds `COMMIT` and `TAG` to the
 //!   push (`github.sha`, `github.ref_name`) or dispatch (`inputs.*`) value.
 //! - **The release body is the notes.** `publish` downloads the artifact `release-notes` into the
@@ -213,7 +213,7 @@ fn publish_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
                 out.push(format!("the job `{PUBLISH}` does not download the artifact `{NOTES_ARTIFACT}` (into the working directory), in a step before `release publish`: there would be no notes to publish"));
             }
             if value(&words, "--set-hash") != Some("$SET_HASH") {
-                out.push("`release publish` is not given `--set-hash \"$SET_HASH\"`, so it would not refuse files the verdict does not name".to_owned());
+                out.push("`release publish` is not given `--set-hash \"$SET_HASH\"`, so it would not refuse files `release verify` did not print".to_owned());
             }
             let wanted = format!("${{{{ needs.{VERIFY}.outputs.set-hash }}}}");
             if !step
@@ -254,28 +254,28 @@ fn verify_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         }
     }
     let checked = command(&steps, "cargo xtask release check ").map(|(at, ..)| at);
-    match command(&steps, "cargo xtask release verdict ") {
-        None => out.push(format!("the job `{VERIFY}` does not run `cargo xtask release verdict`: a tag without a gamma verdict would release")),
+    match command(&steps, "cargo xtask release verify ") {
+        None => out.push(format!("the job `{VERIFY}` does not run `cargo xtask release verify`: a tag naming another commit, or one not on main, would release")),
         Some((at, step, words)) => {
             if step.conditional {
-                out.push(format!("the `release verdict` step of `{VERIFY}` is under `if:` or `continue-on-error:`"));
+                out.push(format!("the `release verify` step of `{VERIFY}` is under `if:` or `continue-on-error:`"));
             }
             if checked.is_none_or(|c| at <= c) {
-                out.push("`release verdict` does not come after `release check`, so it would name a set not yet verified".to_owned());
+                out.push("`release verify` does not come after `release check`, so it would name a set not yet verified".to_owned());
             }
             for (flag, var) in [("--tag", "$TAG"), ("--commit", "$COMMIT"), ("--output", "$GITHUB_OUTPUT")] {
                 if value(&words, flag) != Some(var) {
-                    out.push(format!("`release verdict` is not given `{flag} \"{var}\"`"));
+                    out.push(format!("`release verify` is not given `{flag} \"{var}\"`"));
                 }
             }
             if value(&words, "--main-ref").is_some_and(|r| r != "origin/main") {
-                out.push("`release verdict` checks against a main ref other than `origin/main`".to_owned());
+                out.push("`release verify` checks against a main ref other than `origin/main`".to_owned());
             }
             let id = step.id.as_deref().unwrap_or("");
             let wanted = format!("${{{{ steps.{id}.outputs.set-hash }}}}");
             let outputs = workflows::job_outputs(release, VERIFY)?;
             if id.is_empty() || !outputs.iter().any(|(k, v)| k == "set-hash" && *v == wanted) {
-                out.push(format!("the job `{VERIFY}` does not output `set-hash` from the verdict step (`{wanted}`)"));
+                out.push(format!("the job `{VERIFY}` does not output `set-hash` from the verify step (`{wanted}`)"));
             }
         }
     }
@@ -317,7 +317,30 @@ fn verify_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         }
     }
     identities(&steps, out);
+    version_facts(&steps, out);
     Ok(())
+}
+
+/// The flag that holds a `release check` to no version facts of its `kbf` tarballs.
+const WITHOUT_FACTS: &str = "--without-version-facts";
+
+/// The release being made is checked with the version facts of its `kbf` (`release check
+/// dist` has no waiver), and the previous release, made before the build jobs recorded
+/// them, is checked without (`release check previous` has it): else the first release
+/// with facts would fail on the one before it, or a set without them would go out.
+fn version_facts(steps: &[workflows::Step], out: &mut Vec<String>) {
+    for (dir, waived) in [(DIST, false), (PREVIOUS_DIR, true)] {
+        let prefix = format!("cargo xtask release check {dir} ");
+        let Some((_, _, words)) = command(steps, &prefix) else {
+            continue;
+        };
+        if waived && !words.contains(&WITHOUT_FACTS) {
+            out.push(format!("`release check {dir}` is not given `{WITHOUT_FACTS}`: the release before the version facts were recorded has none, so the first release with them would fail on it"));
+        }
+        if !waived && words.contains(&WITHOUT_FACTS) {
+            out.push(format!("`release check {dir}` is given `{WITHOUT_FACTS}`: the release being made must hold the version facts of its kbf"));
+        }
+    }
 }
 
 /// A binary runs in `verify` only to print `--version --json`, and only after the

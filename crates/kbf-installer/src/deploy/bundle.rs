@@ -2,7 +2,9 @@
 //! their build attestations, each entry named as the release store names it.
 //!
 //! `<name>-<commit>-<platform>.tar.gz` is a tarball; the same name plus `.attestation` is
-//! its build-attestation bundle. Beside them a bundle may carry the release set's
+//! its build-attestation bundle. `kbf-<commit>-<platform>.version.json` is a platform's version
+//! facts, the exact bytes of its `kbf --version --json` (a platform without one is stored and
+//! never offered; the store says so). Beside them a bundle may carry the release set's
 //! `SHA256SUMS` and, for `deploy --offer -`, the `offer.json` that is the offer. Nothing
 //! else is accepted: an entry the store would not take is a mistake in whoever packed the
 //! bundle, and is refused before anything is uploaded. This is bytes, not trust: the node
@@ -19,6 +21,11 @@ use crate::CommitId;
 pub const MAX_TARBALL: u64 = 512 * 1024 * 1024;
 /// The most an attestation bundle may be.
 pub const MAX_ATTESTATION: u64 = 256 * 1024;
+
+/// The most a version facts file may be (the store's cap).
+pub const MAX_FACTS: u64 = kbf_types::VERSION_CAP as u64;
+/// The store name of a platform's version facts (`PUT .../{platform}/version.json`).
+pub const FACTS: &str = "version.json";
 
 /// The release set's checksum file, which a bundle may carry beside the tarballs. It is not
 /// uploaded: the deploy hashes it to name the set (`SetHash`) and checks each file against it.
@@ -41,7 +48,8 @@ pub const COMPONENTS: [&str; 2] = ["kbf", "kbf-daemon"];
 #[derive(Debug, PartialEq, Eq)]
 pub struct Entry {
     pub platform: String,
-    /// `kbf` or `kbf-daemon`, with `.attestation` for the bundle.
+    /// `kbf` or `kbf-daemon`, with `.attestation` for the bundle; [`FACTS`] for the
+    /// platform's version facts.
     pub name: String,
     pub bytes: Vec<u8>,
 }
@@ -115,7 +123,9 @@ fn read_from(input: &mut dyn Read, commit: &CommitId) -> Result<Bundle, String> 
             }
             _ => {
                 let (platform, name) = classify(&file, commit)?;
-                let cap = if name.ends_with(".attestation") {
+                let cap = if name == FACTS {
+                    MAX_FACTS
+                } else if name.ends_with(".attestation") {
                     MAX_ATTESTATION
                 } else {
                     MAX_TARBALL
@@ -156,6 +166,9 @@ fn read_from(input: &mut dyn Read, commit: &CommitId) -> Result<Bundle, String> 
     if out.is_empty() {
         return Err("the bundle holds no file".to_owned());
     }
+    // A platform's facts first: the store's answer to a tarball names a platform that has
+    // none, so the facts must be there before the tarballs are put.
+    out.sort_by_key(|e| e.name != FACTS);
     Ok(Bundle {
         entries: out,
         sums,
@@ -165,6 +178,15 @@ fn read_from(input: &mut dyn Read, commit: &CommitId) -> Result<Bundle, String> 
 
 /// `(platform, store name)` for a file name, or why it is refused.
 fn classify(file: &str, commit: &CommitId) -> Result<(String, String), String> {
+    if let Some(platform) = file
+        .strip_prefix("kbf-")
+        .and_then(|r| r.strip_prefix(commit.as_str()))
+        .and_then(|r| r.strip_prefix('-'))
+        .and_then(|r| r.strip_suffix(".version.json"))
+        && PLATFORMS.contains(&platform)
+    {
+        return Ok((platform.to_owned(), FACTS.to_owned()));
+    }
     let (stem, attestation) = match file.strip_suffix(".attestation") {
         Some(stem) => (stem, true),
         None => (file, false),
@@ -195,6 +217,6 @@ fn classify(file: &str, commit: &CommitId) -> Result<(String, String), String> {
         }
     }
     Err(format!(
-        "{file}: not a kbf or kbf-daemon tarball of this commit on a known platform"
+        "{file}: not a kbf or kbf-daemon tarball, or a kbf-<commit>-<platform>.version.json, of this commit on a known platform"
     ))
 }

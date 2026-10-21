@@ -8,6 +8,7 @@
 
 use serde::Deserialize;
 
+use super::started::{self, Started};
 use super::{BUILDS_PATH, UPDATES_PATH, build_page, definitions, pill, refresh};
 use crate::html::{Href, Html, attr};
 use crate::layout;
@@ -35,6 +36,11 @@ struct Health {
     /// Why `storage` is `null`, when the membership could not be read.
     #[serde(default)]
     storage_unavailable: Option<String>,
+    /// When the server started; an older server does not send it.
+    #[serde(default)]
+    started_unix_ms: Option<u64>,
+    #[serde(default)]
+    uptime_ms: Option<u64>,
 }
 
 /// A readiness check that fails.
@@ -159,6 +165,7 @@ fn farm(h: &mut Html, health: &Health) {
              restart or a frontend swap they count only what has reconnected since.",
         );
     });
+    started::note(h, &Started::of(health.started_unix_ms, health.uptime_ms));
 
     h.el("h2", &[], |h| {
         h.text("Queue, leases and storage");
@@ -268,6 +275,18 @@ fn latest_builds(h: &mut Html, builds: &Result<Builds, crate::read::ReadError>) 
     });
     let all = Href::root_relative(BUILDS_PATH).expect("the Builds path is root-relative");
     match builds {
+        Err(e) if e.is_history_off() => {
+            h.el("p", &[attr("class", "hint")], |h| {
+                h.text("History is off on this farm, so no builds are listed (start the server ")
+                    .text("with ")
+                    .el("code", &[], |h| {
+                        h.text("--history-objects=<URI>");
+                    })
+                    .text("). A live build can still be looked up by its id on the ")
+                    .link(&all, "Builds page")
+                    .text(".");
+            });
+        }
         Err(e) => {
             h.el("p", &[attr("class", "hint")], |h| {
                 h.text("The list of builds is not available (")

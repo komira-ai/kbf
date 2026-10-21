@@ -8,10 +8,9 @@ use crate::installer_toml::{FrontendPull, InstallerToml, Source};
 use crate::record::{
     ActivationId, Component, Expected, OrderRecord, OrderVerb, Sha256Hex, TargetPlatform,
 };
+use crate::seed::Available;
 use crate::state_v2::{Floor, Instance, PendingConfirm, SCHEMA as STATE_SCHEMA, StateV2, Unacked};
-use crate::status_v2::{
-    Phase, ProbeFacts, Refusal, RefusalNote, SCHEMA as STATUS_SCHEMA, StagedFacts, StatusV2,
-};
+use crate::status_v2::{Envoy, Phase, SCHEMA as STATUS_SCHEMA, StagedFacts, StatusV2};
 use crate::testkit::{A, B, C, c};
 
 pub const ORDER_ACTIVATE: &str = include_str!("../testdata/golden/order_activate.json");
@@ -19,6 +18,8 @@ pub const ORDER_CONFIRM: &str = include_str!("../testdata/golden/order_confirm.j
 pub const ORDER_REVERT: &str = include_str!("../testdata/golden/order_revert.json");
 pub const ORDER_FRONTEND_UPDATE: &str =
     include_str!("../testdata/golden/order_frontend_update.json");
+pub const ORDER_FRONTEND_UPDATE_STAGED: &str =
+    include_str!("../testdata/golden/order_frontend_update_staged.json");
 pub const STATE: &str = include_str!("../testdata/golden/state.json");
 pub const STATUS: &str = include_str!("../testdata/golden/status.json");
 pub const INSTALLER_TOML_URL: &str = include_str!("../testdata/golden/installer.toml");
@@ -54,6 +55,7 @@ pub fn order_activate() -> OrderRecord {
             state_schema: 4,
             profile: "release".to_owned(),
         }),
+        source: kbf_update::Source::Fetch,
     }
 }
 
@@ -76,6 +78,15 @@ pub fn order_frontend_update() -> OrderRecord {
     }
 }
 
+/// The same update of the frontend, of the release the installer's package carries: the
+/// record names its source, which a record that fetches leaves out.
+pub fn order_frontend_update_staged() -> OrderRecord {
+    OrderRecord {
+        source: kbf_update::Source::Staged,
+        ..order_frontend_update()
+    }
+}
+
 pub fn order_confirm() -> OrderRecord {
     OrderRecord {
         order_id: 43,
@@ -86,6 +97,7 @@ pub fn order_confirm() -> OrderRecord {
         window_s: 900,
         components: Vec::new(),
         expected: None,
+        source: kbf_update::Source::Fetch,
     }
 }
 
@@ -120,33 +132,34 @@ pub fn state() -> StateV2 {
     }
 }
 
+/// The host the golden `status.json` describes: running A with C before it, B staged and
+/// refused, a source that fetches nothing and a package that carries a seed of B.
 pub fn status() -> StatusV2 {
     StatusV2 {
         schema: STATUS_SCHEMA,
         installed_commit: Some(commit(A)),
         previous_commit: Some(commit(C)),
         staged_commit: Some(commit(B)),
-        state: Phase::ActivatedUnconfirmed,
-        refusal: Some(RefusalNote {
-            word: Refusal::Attestation,
-            reason: "no valid attestation for kbf at commit 0123456789ab".to_owned(),
-        }),
+        state: Phase::Refused,
+        refusal: "attestation: no valid attestation for kbf at commit 0123456789ab".to_owned(),
         acked_order_id: 41,
+        refused_order_id: None,
         staged: Some(StagedFacts {
             protocol: 12,
             min_protocol: 11,
             state_schema: 4,
+            profile: Some("release".to_owned()),
         }),
-        probe: Some(ProbeFacts {
+        envoy: Envoy {
+            current: None,
+            previous: None,
+        },
+        release_source: Some("bundled".to_owned()),
+        available: Some(Available {
             commit: commit(B),
-            platform: "linux-x86_64".to_owned(),
-            protocol: 12,
-            min_protocol: 11,
-            state_schema: 4,
-            profile: "release".to_owned(),
+            seq: 812,
         }),
-        trust_days_left: Some(120),
-        unverified: vec![commit(C)],
+        unverified: Vec::new(),
     }
 }
 
