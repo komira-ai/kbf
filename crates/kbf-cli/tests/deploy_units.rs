@@ -14,6 +14,13 @@
 //! (`kbf-installer`'s `kbf_settings_tests`), and the preflight accepts a metadata log
 //! under the node's data root for a storage-and-daemon node
 //! (`preflight/tests.rs::a_storage_and_daemon_node_with_its_meta_dir_under_its_data_dir_passes`).
+//!
+//! The daemon, storage and storage-and-daemon units are a start that enrolls: their
+//! certificate files are the enrolled store's, by role, and the flags they run with are
+//! `node::plan`'s, held by `src/node_tests.rs`
+//! (`a_daemon_only_node_runs_kbf_daemon_with_the_frontends_endpoints`,
+//! `a_storage_only_node_runs_kbf_storage_registered_with_the_frontend` and
+//! `a_node_with_both_roles_runs_the_converged_mode`, which names each half's pair and CA).
 
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt as _;
@@ -429,11 +436,14 @@ fn the_handover_command_starts_the_instances_of_the_frontends_template() {
         Some(INSTANCES[0])
     );
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "packaged-handover");
-    // A Postgres store refuses a control socket, so the file stands for a frontend with
-    // the storage URL alone.
+    // The parse accepts a Postgres store beside a control socket, and the runtime refuses
+    // the pairing (`HandoverError::PostgresStore`, in kbf-server's `state_uri`), so this
+    // test does not say that the template and a Postgres store run together. It uses the
+    // SQLite store variant, which `StateStoreUri` still has, so the file stands for a
+    // frontend that hands over.
     let config = write_config(
         dir.path(),
-        "[storage-client]\nstorage = \"http://127.0.0.1:1\"\n\n[scheduler]\nstate-store = \"postgres:///kbf?host=/run/postgresql&user=kbf-server\"\n",
+        "[storage-client]\nstorage = \"http://127.0.0.1:1\"\n\n[scheduler]\nstate-store = \"sqlite:///var/lib/kbf-server/state.db\"\n",
     );
     for instance in INSTANCES {
         let argv = template.exec_start();
