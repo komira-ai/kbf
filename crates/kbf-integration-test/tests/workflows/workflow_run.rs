@@ -341,11 +341,7 @@ pub(super) fn rules(text: &str) -> Vec<String> {
         p.same(&what, job_needs(text, job), want);
     }
     let gamma = Some("gamma".to_owned());
-    let environments = [
-        ("offer", None),
-        ("deploy", gamma.clone()),
-        ("check", gamma),
-    ];
+    let environments = [("offer", None), ("deploy", gamma.clone()), ("check", gamma)];
     for (job, want) in environments {
         let what = format!("the environment of `{job}`");
         p.same(&what, job_environment(text, job), want);
