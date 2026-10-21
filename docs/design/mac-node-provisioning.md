@@ -245,7 +245,6 @@ expect_probe=host_identity:17A000=26.6-0123456789abcdef
 expect_probe=host_identity:18A000=27.0-fedcba9876543210
 kbf_server=https://farm.example.net:8981
 kbf_cas=https://farm.example.net:8981
-kbf_labels=pool=mac rack=r2
 ```
 
 ## 3. Host profile and worker profile
@@ -378,8 +377,12 @@ listed, and step 3 checks that they print it.
 >   a token that can sign.
 > - **The Linux binaries** (`kbf-daemon` and `kbf-server`, x86_64 and arm64) are built
 >   by their own jobs, not by the macOS job.
-> - **The darwin tarball holds `kbf-daemon` only:** `kbf-mac-provision` is built and
->   tested in CI but not packaged yet. Only `kbf-daemon` is signed; the fleet-updates helpers do not exist yet.
+> - **The darwin release holds `kbf` (and the deploy tool and installer), not `kbf-daemon`:**
+>   a Mac runs `kbf --mode=daemon` from `releases/current/kbf`, and no darwin `kbf-daemon` is
+>   built (`ReleasePlatform::components` names `kbf` for every platform). The text of this
+>   section that says `kbf-daemon-<commit>-darwin-arm64.tar.gz` is the design as first written.
+>   `kbf-mac-provision` is built and tested in CI but not packaged yet; the fleet-updates
+>   helpers do not exist yet.
 > - **The oldest macOS supported is 14.0** (`MACOSX_DEPLOYMENT_TARGET`), a choice of
 >   that workflow; this design names none.
 > - **Signing is ad hoc with the hardened runtime** (`--options runtime`). CI checks

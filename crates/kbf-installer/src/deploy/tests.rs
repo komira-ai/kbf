@@ -1110,9 +1110,9 @@ fn the_bundle_is_uploaded_to_the_store_paths() {
             &format!("kbf-{TARGET}-linux-x86_64.tar.gz.attestation"),
             b"a",
         ),
-        (&format!("kbf-daemon-{TARGET}-darwin-arm64.tar.gz"), b"t"),
+        (&format!("kbf-{TARGET}-darwin-arm64.tar.gz"), b"t"),
         (
-            &format!("kbf-daemon-{TARGET}-darwin-arm64.tar.gz.attestation"),
+            &format!("kbf-{TARGET}-darwin-arm64.tar.gz.attestation"),
             b"a",
         ),
     ]);
@@ -1123,8 +1123,8 @@ fn the_bundle_is_uploaded_to_the_store_paths() {
     for want in [
         format!("PUT /v1/releases/{TARGET}/linux-x86_64/kbf"),
         format!("PUT /v1/releases/{TARGET}/linux-x86_64/kbf.attestation"),
-        format!("PUT /v1/releases/{TARGET}/darwin-arm64/kbf-daemon"),
-        format!("PUT /v1/releases/{TARGET}/darwin-arm64/kbf-daemon.attestation"),
+        format!("PUT /v1/releases/{TARGET}/darwin-arm64/kbf"),
+        format!("PUT /v1/releases/{TARGET}/darwin-arm64/kbf.attestation"),
     ] {
         assert!(log.contains(&want), "{want} in {log:?}");
     }
