@@ -34,6 +34,11 @@
 //!   packaged (`dist/<binary>-$GITHUB_SHA-<platform>.tar.gz`), which opens that file and
 //!   makes the same check on the binary inside: the bytes that ship, not only the bytes
 //!   built.
+//! - **The `kbf` says what it is.** Every build job runs `cargo xtask release
+//!   version-facts` on the `kbf` it built, once, between that check and the package, and
+//!   `dist` gets `kbf-<commit>-<platform>.version.json` (the rules are `facts`'). Such a job
+//!   checks out with `fetch-depth: 0`: a shallow clone cannot count the commits, so `seq`
+//!   would be 0.
 //! - **The installer's package.** Each Linux job builds the `kbf-installer` deb and makes it
 //!   an asset (`cargo xtask pkg-asset`, [`PACKAGES`]), and no other job does. In that job
 //!   `pkg-trust` and `pkg-asset` both take the branch the package trusts and is attested
@@ -158,6 +163,7 @@ pub fn problems(workflow: &str) -> Result<Vec<String>, String> {
     release_set(workflow, &mut out)?;
     signing(workflow, &mut out)?;
     identity(workflow, &mut out)?;
+    facts::rules(workflow, &mut out)?;
     packages(workflow, &mut out)?;
     mac_package(workflow, &mut out)?;
     darwin(workflow, &mut out)?;
@@ -852,6 +858,7 @@ fn the_docs_describe_the_release_set() {
         "--source-digest <commit>",
         "sudo dpkg -i kbf-installer-<commit>-linux-x86_64.deb",
         "sudo installer -pkg kbf-installer-<commit>-darwin-arm64.pkg -target /",
+        "`kbf-<commit>-<platform>.version.json`",
         "**no SBOM attestation**",
         "**the branch the package is attested on**",
     ] {
@@ -907,6 +914,17 @@ mod rules {
         )
     }
 
+    /// The step that records the facts of the `kbf` built, after its identity is checked.
+    fn facts_step(platform: &str) -> String {
+        format!(
+            "      - name: Facts\n        run: cargo xtask release version-facts --binary \"target/$TARGET/release/kbf\" --commit \"$GITHUB_SHA\" --platform {platform} --out dist\n"
+        )
+    }
+
+    /// The checkout step of a build job: the whole history, so the build can count its `seq`.
+    const CHECKOUT: &str =
+        "      - uses: actions/checkout@abc\n        with:\n          fetch-depth: 0\n";
+
     /// A workflow of the shape the rules read, meeting every one.
     fn good() -> String {
         let mut w = String::from(
@@ -922,6 +940,7 @@ mod rules {
                 ));
             }
             w.push_str("    steps:\n");
+            w.push_str(CHECKOUT);
             let platform = *job;
             let mine: Vec<&str> = ASSETS
                 .iter()
@@ -951,6 +970,7 @@ mod rules {
                     w.push_str(&identity_step(name));
                 }
             }
+            w.push_str(&facts_step(platform));
             for name in &mine {
                 w.push_str(&format!(
                     "      - name: Package {name}\n        run: cargo xtask package --binary \"target/$TARGET/release/{name}\" --sbom s.json --platform {platform} --commit \"$GITHUB_SHA\" --out dist\n"
@@ -1754,9 +1774,9 @@ mod rules {
                 "no PKG_SOURCE_REF",
                 broken(
                     &format!(
-                        "    env:\n      {PKG_SOURCE_REF}: {PKG_SOURCE_REF_EXPR}\n    steps:\n      - name: Sign kbf\n"
+                        "    env:\n      {PKG_SOURCE_REF}: {PKG_SOURCE_REF_EXPR}\n    steps:\n{CHECKOUT}      - name: Sign kbf\n"
                     ),
-                    "    steps:\n      - name: Sign kbf\n",
+                    &format!("    steps:\n{CHECKOUT}      - name: Sign kbf\n"),
                 ),
                 "the job `darwin-arm64` has PKG_SOURCE_REF: (none)",
             ),
@@ -1877,5 +1897,6 @@ mod rules {
     }
 }
 
+mod facts;
 #[cfg(test)]
 mod installer;

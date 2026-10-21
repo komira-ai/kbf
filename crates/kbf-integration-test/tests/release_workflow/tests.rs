@@ -494,3 +494,25 @@ fn a_binary_runs_only_after_its_files_are_attested() {
         "not `release identity` on `dist` or `previous`",
     );
 }
+
+#[test]
+fn only_the_previous_releases_check_waives_the_version_facts() {
+    // Catches: the first release with version facts failing on the release before it
+    // (which has none) so that nothing is published, and the other way round: a waiver on
+    // the check of the release being made, so a set without the facts of its kbf goes out.
+    // Mutants: the flag dropped from `previous`; the flag added to `dist`.
+    red(
+        &plant(
+            "release check previous --commit \"$PREVIOUS_COMMIT\" --without-version-facts",
+            "release check previous --commit \"$PREVIOUS_COMMIT\"",
+        ),
+        "`release check previous` is not given `--without-version-facts`",
+    );
+    red(
+        &plant(
+            "release check dist --commit \"$COMMIT\"",
+            "release check dist --commit \"$COMMIT\" --without-version-facts",
+        ),
+        "`release check dist` is given `--without-version-facts`",
+    );
+}
