@@ -56,7 +56,7 @@
 //!   attestations` and `release check` hold a directory to one bundle per tarball,
 //!   each that tarball's (its one subject is the tarball's digest); `verify-assets
 //!   attestations` also has `gh` verify each tarball against its bundle.
-//! - `release {locate,main-control,check,verify,offer,notes,plan,identity,previous,publish,bump-internal}` ([`release`]): a GitHub release of
+//! - `release {locate,main-control,check,verify,offer,notes,plan,identity,previous,fetch-previous,publish,bump-internal}` ([`release`]): a GitHub release of
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
@@ -628,6 +628,10 @@ enum ReleaseVerb {
     /// What a push would release: the next version, the push's class, and the freeze and
     /// superseded refusals. Writes nothing but `--output`.
     Plan(release::plan::PlanArgs),
+    /// The release before `--sha`: the highest release tag that names a strict ancestor of it,
+    /// downloaded, verified as `release offer` verifies one, and its named binaries taken
+    /// out into `--out`. With no such tag, prints `previous-source=none`.
+    FetchPrevious(release::fetch_previous::FetchPreviousArgs),
     /// Open the pull request in the internal repository that moves its submodule to the
     /// released commit, with auto-merge on (the token is `GH_TOKEN`).
     BumpInternal(release::bump::BumpArgs),
@@ -1115,6 +1119,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::Release(ReleaseVerb::Offer(args)) => release::offer::run(&args),
         Verb::Release(ReleaseVerb::Gates(args)) => release::gates::run(&args),
         Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
+        Verb::Release(ReleaseVerb::FetchPrevious(args)) => release::fetch_previous::run(&args),
         Verb::Release(ReleaseVerb::BumpInternal(args)) => release::bump::run(&args),
         Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
         Verb::Release(ReleaseVerb::VersionFacts(args)) => version_facts::run(&args),
