@@ -233,7 +233,7 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     (
         "kbf-proxy.socket",
         "[Install]\n",
-        "[Socket]\nService=kbf-frontend@a.service\n[Install]\n",
+        "[Socket]\nService=kbf-frontend.service\n[Install]\n",
         "proxy-socket-pair",
     ),
     (

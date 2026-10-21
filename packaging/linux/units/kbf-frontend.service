@@ -12,8 +12,8 @@
 # binary is the release `releases/current` points at (docs/design/kbf-installer.md, section
 # 7): there are no slots. A host with the proxy runs the frontend as a child of kbf-proxy
 # instead and does not enable this unit; enable one of the two, never both (they bind the
-# same ports). The template kbf-frontend@.service is the handover model (two instances, a
-# control socket, a slot per instance) that the proxy replaces.
+# same ports). The socket handover between two instances (a template unit) is retired: the
+# proxy swaps frontend children instead.
 #
 # No --instance and no --handover-socket: kbf refuses --instance without --handover-socket,
 # and without either the process is a plain frontend. An update is a restart: a stop

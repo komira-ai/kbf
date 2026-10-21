@@ -37,11 +37,12 @@ A frontend host enables exactly one of two units; they bind the same ports.
   are `kbf.toml`'s. An update is a restart after `kbf-installer confirm` flips `current`.
 - `kbf-proxy` (the unprivileged proxy that starts the frontend as its child from
   `releases/<commit>/kbf`): a host **with** the proxy does not enable a frontend unit.
-- `kbf-frontend@.service`: the handover model (instances `a` and `b`, a control socket, a
-  slot per instance). It is kept until the proxy work removes it (frontend-proxy units U7c);
-  `kbf-installer setup` enables `kbf-frontend.service`, never the template.
 
 It refuses anything else (a unit named none of `kbf-*.service`, `kbf-*.socket` and `kbf.slice`, a fourth trust file, no unit).
+
+The socket-handover template (`kbf-frontend@.service`, instances `a` and `b`) is no longer
+packaged: the proxy swaps frontend children instead, and a frontend with a Postgres store
+refuses a control socket.
 
 Dependencies: deb `crun, uidmap, systemd, ca-certificates`; rpm the same with Fedora's name
 for `uidmap`, `shadow-utils`. Never Podman, never Envoy (a test pins it): Envoy

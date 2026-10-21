@@ -1,5 +1,13 @@
 # Updating the frontend without failing a build
 
+> **Retired.** The unit `kbf-frontend@.service` and the command `kbf frontend handover`
+> described below were removed by a maintainer decision: kbf-installer's proxy swaps frontend
+> children instead, and the state store is Postgres everywhere (a Postgres frontend refuses a
+> control socket, so the template could not start). The package ships `kbf-frontend.service`
+> (one process) and `kbf-proxy`. What stays of this page is the protocol in
+> `kbf_server::handover` (the test farm's frontend uses its control socket) and the history
+> below; nothing here is an instruction to enable the template.
+
 `kbf frontend handover` starts a new frontend beside the serving one, behind Envoy. The new
 one binds listeners of its own, takes the state store and the daemons over, and serves;
 Envoy sends new streams to it once it is ready; the old one goes not ready, forwards the

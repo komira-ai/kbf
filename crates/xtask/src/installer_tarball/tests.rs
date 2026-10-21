@@ -54,7 +54,7 @@ fn inputs(dir: &Path) -> Inputs {
         "units",
         &[
             ("kbf-installer.service", "[Unit]\n"),
-            ("kbf-frontend@.service", "[Unit]\n"),
+            ("kbf-frontend.service", "[Unit]\n"),
             ("kbf.slice", "[Slice]\n"),
         ],
     );
@@ -101,7 +101,7 @@ fn the_payload_is_the_packages_files_at_the_packages_paths_and_modes_sorted() {
         got,
         [
             ("usr/bin/kbf-installer", 0o755),
-            ("usr/lib/systemd/system/kbf-frontend@.service", 0o644),
+            ("usr/lib/systemd/system/kbf-frontend.service", 0o644),
             ("usr/lib/systemd/system/kbf-installer.service", 0o644),
             ("usr/lib/systemd/system/kbf.slice", 0o644),
             ("usr/lib/sysusers.d/kbf-installer.conf", 0o644),

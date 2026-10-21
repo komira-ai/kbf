@@ -126,7 +126,7 @@ written a configuration that passes the same check the daemon applies. The unit 
 section 7; its shape:
 
 ```ini
-# one unit per mode (frontend is a template, kbf-frontend@.service, with --instance %i)
+# one unit per mode (kbf-frontend.service for the frontend)
 [Unit]
 ConditionPathExists=/etc/kbf/kbf.toml
 [Service]
@@ -235,7 +235,7 @@ already deleted; the all-in-one tests run `kbf all-in-one`.
 
 - `kbf-helper` (folded into `kbf-installer`), and later the `kbf-server` and `kbf-daemon`
   binaries (after the farm and the Macs run `kbf --mode=<mode>`); the old subcommand forms, which are aliases until then;
-- `kbf frontend handover` and its unit rule, once the installer performs the baton in the frontend update;
+- `kbf frontend handover` and its unit rule (removed, with the packaged `kbf-frontend@.service`), once the installer performs the baton in the frontend update;
 - `kbf-deploy`, last: `host` becomes the installer, `linux render-units|install-units` become package units,
   `envoy` becomes the installer's config render, `log`, backups and image pull become API routes, and the MDM,
   object-store provisioning and pilot kits leave the product.
