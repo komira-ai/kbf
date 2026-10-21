@@ -24,8 +24,8 @@
 //! does not answer, 2 for a usage error, 3 when the release is incompatible or incomplete,
 //! when the host will not take the source (`--source`: a host that fetches nothing is not told to
 //! fetch, and a package is asked only for the release it carries) or when the new frontend
-//! would not take the order for the nodes, 4 when an update is open, an old child is draining or
-//! the installer is busy.
+//! refused the order for the nodes (one it never answered is exit 1, `nodes_unreached`), 4 when
+//! an update is open, an old child is draining or the installer is busy.
 //!
 //! `--source` is `fetch` (the default: the installer fetches from the source it is configured
 //! with) or `staged` (the release the host's package carries). The request names it only when it

@@ -94,7 +94,8 @@ and waits for the update to end.
 ```text
 kbf-installer update --frontend --commit <40 hex> \
     --api 127.0.0.1:8980 --api-ca /etc/kbf/ca.pem --api-server-name frontend.example.invalid \
-    [--token-file /etc/kbf/api-token] [--nodes] [--request-id ID] [--handover-timeout-s 3600]
+    [--token-file /etc/kbf/api-token] [--nodes] [--source fetch|staged] [--request-id ID] \
+    [--handover-timeout-s 3600]
 ```
 
 | flag | meaning |
@@ -105,14 +106,25 @@ kbf-installer update --frontend --commit <40 hex> \
 | `--api-ca`, `--api-server-name` | the CA the API's certificate is verified against, and the name it carries (the address's own IP when none is given) |
 | `--token-file` | the operator token, a file of mode 0600 or 0400 (default `/etc/kbf/api-token`, which `setup` writes) |
 | `--nodes` | have the new frontend update the nodes once it has baked; without it only the frontend is swapped |
+| `--source` | where the release comes from: `fetch` (the default) is the source the installer is configured with; `staged` is the release the host's package carries (`available` in `status.json`). A host whose `release_source` is `bundled` fetches nothing and refuses `fetch` (exit 3, `source_refused`); the proxy refuses `staged` with `--nodes` or a rollback (`source_refused`) and for a commit the package does not carry (`not_staged`), both exit 3 |
 | `--request-id` | names this update, so a run repeated after a lost connection is the same update; random when not given |
 | `--handover-timeout-s` | how long to wait for the update to end, the new frontend's bake included (default 3600) |
 
 It needs no root and is refused when it comes through `sudo` (exit 2): run it as the account that
 may read the token file. It prints one JSON summary line. The exit codes are 0 for done (and for a
 frontend that already runs the commit), 1 for failed, rolled back, a timeout or an API that does not
-answer, 2 for a usage error, 3 when the release is incompatible or incomplete, and 4 when an update
-is open, an old child is still draining, or the installer is busy.
+answer, 2 for a usage error (`--source staged` with `--nodes` is one), 3 when the release is
+incompatible or incomplete, when the host will not take the source (`source_refused`,
+`not_staged`), or when the new frontend refused the order to update the nodes (`nodes_refused`),
+and 4 when an update is open, an old child is still draining, or the installer is busy.
+
+An update that fails at the order for the nodes has swapped the frontend: the new one serves and
+the nodes were not told. If the new frontend refused the order it is exit 3 (`nodes_refused`,
+with the frontend's own word in the detail); if it never answered in the time the proxy allows it
+is exit 1 (`nodes_unreached`). The same command will not tell the nodes, because the frontend
+already runs the commit (it exits 0): fix what the detail names; the nodes are told by the next
+update to a new commit with `--nodes`. `kbf-installer deploy` is refused on a host whose `release_source` is `bundled`
+(exit 3, `source_refused`, before the bundle is read): it can only fetch.
 
 The API refuses a new update with `503` (`handover_unavailable`) when `update.json` is unreadable,
 when the host has no `releases/` directory, when no frontend child was adopted (the proxy's start-up
@@ -122,7 +134,7 @@ hold is in force), or when the other slot is still running a process.
 (`kbf-installer run`) fetches, verifies and stages the release. The root half now has a release
 fetcher: it reads `installer.toml` and `installer.conf` at each fetch and fetches from the `url`
 source, the only source a frontend or all-in-one host can be set up with. The root half names the
-order it refused (`status.json` carries `refused_order_id` beside the `refusal`), so an order that is
+proxy's order it refused (`status.json` carries `refused_order_id` beside the `refusal`), so an order that is
 refused (a failed fetch, a failed check) ends the update failed at once, with the refusal's own
 word as the reason. An installer from before that field names no order, and then the update waits out
 the API's staging deadline (15 minutes by default) and ends failed with reason `timeout`; the cause
