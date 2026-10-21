@@ -66,12 +66,12 @@ addition (storage and daemon).
 | the hot tier can be opened by a second process | **No.** Open deletes every block file no staged object names, so a second opener removes the first's active blocks. | `kbf-tier/src/open.rs` |
 | a write call is answered only when durable | Yes: a ByteStream `Write` or `BatchUpdateBlobs` buffers (admitted by bytes), is grouped into a segment, PUT, committed by one `PutBlobs`, and only then answered. | `kbf-front/src/cache/write_group.rs` |
 | `/readyz` and the gRPC health service agree | Yes: both evaluate `Checks::failing`; `Readiness::stop` flips both; `Readiness::set_leader(false)` exists for a process that is up but must not be picked. | `kbf-server/src/health.rs`, `grpc_health.rs` |
-| kbf-deploy renders an Envoy config | Yes, for a **Kubernetes client front**, not a box: one cleartext h2c listener behind a Tailscale ingress, one STRICT_DNS cluster of servers over TLS to the farm CA, route timeout 0, stream idle timeout 7200 s, no `max_stream_duration`, `healthy_panic_threshold` 0, gRPC health check (5 s interval), a checker that models those properties. It has no circuit breakers, no retry policy, no worker route, no hot restart, and refuses a route whose action has anything but a cluster and timeouts. Section 4 builds on it. | `crates/kbf-deploy/src/envoy/{render,check,config}.rs` |
+| kbf-deploy renders an Envoy config | Yes, for a **Kubernetes client front**, not a box: one cleartext h2c listener behind a Tailscale ingress, one STRICT_DNS cluster of servers over TLS to the farm CA, route timeout 0, stream idle timeout 7200 s, no `max_stream_duration`, `healthy_panic_threshold` 0, gRPC health check (5 s interval), a checker that models those properties. It has no circuit breakers, no retry policy, no worker route, no hot restart, and refuses a route whose action has anything but a cluster and timeouts. Section 4 builds on it. | `crates/kbf-deploy/src/envoy/{render,check,config}.rs` (retired: the kit is deleted, no Envoy since the no-Envoy ruling) |
 | `/readyz` is only the flags | **No.** `Checks::failing` also runs a store probe (a read of the probe digest through the cache, `STORE_PROBE_TIMEOUT` 2 s) besides the `stopping` and `leader` flags. After the cut that probe would run through `HandoverStorage` or a frozen store, so section 5.1 pins `p`'s readiness explicitly. | `kbf-server/src/health.rs` (`failing`, `StoreProbe`) |
 | a cordon is durable | **Yes for an operator's cordon.** `farm/durable.rs` keeps a `cordon/<worker>` row (written by `Durable::cordoned` on cordon, drain and uncordon) and recovery reads it back (`cordons`, `restore_cordons`), so a restarted process serves a node as the operator left it. The `kbf-sched/src/cordon.rs` module doc still says "gone after a server restart" and is stale. **Still new for this design**: the takeover writes the predecessor's cordon row, and deletes the successor's own node id's row, in the takeover's state-store transaction (section 6.2); today no takeover path writes a cordon. | `kbf-server/src/farm/durable.rs`, `kbf-server/src/farm/handover.rs`, `kbf-sched/src/cordon.rs` |
 | the Welcome epoch is the state store's | The Welcome carries `Farm::lease_epoch` ("this process's term, or the Raft log's id"); `SqliteStore::open` also bumps its own recorded epoch. Which one `Keep` must hold constant is checked in T-7 (section 6.2). | `kbf-server/src/worker.rs`, `kbf-state/src/sqlite/mod.rs` |
 | the REAPI listener advertises unlimited streams | **No.** `max_concurrent_streams` is `StreamTiming`'s `streams`, at most `MAX_STREAMS` (`i32::MAX / 65536`, 32767); the configured value is what Envoy sees. Section 3.1 derives the breaker from it. | `kbf-server/src/serve.rs`, `streams.rs` |
-| a real Envoy is available to tests | Yes: CI fetches a pinned Envoy and validates the kit's render with `--mode validate`. | `.github/workflows/beta.yml`, `crates/kbf-deploy/tests/envoy_validate.rs` |
+| a real Envoy is available to tests | Yes: CI fetches a pinned Envoy and validates the kit's render with `--mode validate`. | `.github/workflows/beta.yml`, `crates/kbf-deploy/tests/envoy_validate.rs` (retired with the kit; the installer's box render is still validated by `crates/kbf-integration-test/tests/envoy_validate.rs`) |
 
 ## 3. Topology on one box
 
@@ -119,7 +119,7 @@ that overlap it answers through the successor (section 5.2).
 
 - `kbf_reapi`: the kit's existing `grpc.health.v1` check on the REAPI port, empty service
   name. It is `/readyz`'s evaluation (`grpc_health.rs`); reusing it keeps the checker and the
-  kbf-it test that pins the service names (`crates/kbf-it/tests/envoy_check.rs`).
+  kbf-integration-test test that pins the service names (`crates/kbf-integration-test/tests/envoy_check.rs`).
 - `kbf_workers`: an HTTP check of `/readyz` on the instance's API port (`health_check_config.port_value`),
   plain loopback HTTP, since the worker cluster has no TLS of its own. `--api-listen` is already in
   the unit and is required here.
@@ -135,7 +135,7 @@ that overlap it answers through the successor (section 5.2).
   default, and is the fallback when no admin address is configured. `--envoy-admin` is a flag
   of `kbf frontend` and `kbf all-in-one`, loopback only.
 - The worker cluster's check is `/readyz` on the API port, which is a separate unauthenticated route
-  (`health.rs`); `check` and a kbf-it test pin that it answers without a token. It does not prove the
+  (`health.rs`); `check` and a kbf-integration-test test pin that it answers without a token. It does not prove the
   worker listener accepts mTLS, so the worker cluster also gets a TCP connect check on the worker
   port, and a worker listener that fails to bind folds into `Checks::failing` as a `worker` flag.
 - `interval` 1 s, `no_traffic_interval` 1 s, `timeout` 1 s, `unhealthy_threshold` 2, `healthy_threshold` 1.
@@ -1005,7 +1005,7 @@ it); container tests run in the crun container job (Podman is dropped; kbf runs 
 | T-16 | SIGKILL a detached old: the successor is unaffected, `precheck` refuses the restart, `--acknowledge-crash` clears | restart into takeover | write the marker after `released`, or after the meta demote (T-M15) |
 | T-17 | a load of writes, reads and `Execute` calls running across the whole cut: every call completes, none is refused by `p` (a daemon redial is not a call), the longest call is within `T_s` plus its normal latency, `kbf_handover_drain_refused_total` is zero | any hold, park or refusal in the sequence | add a sleep in the cut; refuse writes at the route flag; set `closed` before the drain (T-M17) |
 
-A kbf-it test pins that `/readyz` answers without a token on the API listener.
+A kbf-integration-test test pins that `/readyz` answers without a token on the API listener.
 
 Failpoints and the short-fence flag live behind a cargo feature with a gate test that fails when a release build enables
 it. No test pins a wrong answer.
@@ -1035,7 +1035,7 @@ this refresh. Sizes are estimated changed lines.
 | M4 | the handover storm: a two-process harness with failpoints at every demote stage and every `promote` step, SIGKILL and restart rules; T-M18 | 400 |
 | M5 | snapshot-aware follower, after the snapshot PRs of `metadata-snapshots.md` land; T-M9 | 300 |
 | 6-9 | all-in-one: `FsStore::demote`, the wiring of M1-M3 (flags `--meta-follow-interval-ms`, `--meta-follow-lag-max`, `--handover-drain-ms`, `--handover-prepare-ttl-secs`), the cut marker written first and removed on fail-closed (T-M15), the `p`-path guard in `HandoverStorage`, `meta-unhealthy` (T-M19), T-3, `Cache::seal`, read-only tier open and `HandoverStorage` (T-4, T-5, forwarded commits), the detached daemon with the remote data plane and per-instance data dir (T-8, T-11), the wiring, cordon reset and capacity (T-6, T-7, T-12..16) | about 3900 |
-| 10 | all-in-one `kbf-it` T-10, T-12, T-17, container CI placement | 500 |
+| 10 | all-in-one `kbf-integration-test` T-10, T-12, T-17, container CI placement | 500 |
 
 Sizes of M3, M4 and 6-9 grew with the review of 6.4 (the store guard, the drain, the marker order and the new tests). PRs 6 to 9 are inert until their flags are given. Everything from PR M1 and PR 6 on is gated on the spike's `T_s` answer, and the spike carries a throwaway follower (read-only scan, tail, open from a cursor) so the tail-only time of 6.4.2 is measured, not estimated. M5 waits on the snapshot PRs; until then the follower refuses a directory with a snapshot.
 

@@ -3,7 +3,9 @@ use std::io;
 
 use super::*;
 use crate::fixtures::{FakeRunner, ran, scratch_dir};
+use crate::layout::Platform;
 use crate::run::Ran;
+use kbf_host::path::Root;
 
 /// A lease cgroup directory under `actions` with the given `cgroup.events`.
 fn lease(actions: &std::path::Path, name: &str, events: Option<&str>) {
@@ -200,7 +202,7 @@ fn the_daemons_lease_source_reads_its_units_cgroup_and_a_missing_one_cannot_tell
         "kbf-lease-1-1",
         Some("populated 0\n"),
     );
-    let live = |unit: &str| for_restart(&systemd(unit), &root).live();
+    let live = |unit: &str| for_restart(&systemd(unit), &on(&root)).live();
     assert_eq!(live("kbf-daemon.service"), Ok(1));
     assert_eq!(live("kbf-all-in-one.service"), Ok(0));
     let err = live("kbf-storage-and-daemon.service").expect_err("no such cgroup");
@@ -226,12 +228,12 @@ fn every_unit_a_mode_can_name_is_classified_and_reads_its_own_cgroup() {
             let root = scratch_dir("leases-lockstep");
             busy(&root, unit);
             assert_eq!(
-                for_restart(&systemd(unit), &root).live(),
+                for_restart(&systemd(unit), &on(&root)).live(),
                 Ok(1),
                 "{mode:?}: {unit}"
             );
             let empty = scratch_dir("leases-lockstep-empty");
-            let err = for_restart(&systemd(unit), &empty)
+            let err = for_restart(&systemd(unit), &on(&empty))
                 .live()
                 .expect_err("fail closed without the cgroup");
             assert!(err.contains("no such cgroup"), "{unit}: {err}");
@@ -262,7 +264,7 @@ fn a_units_family_is_the_modes_and_any_other_unit_is_refused() {
         "kbf-all-in-one@1.service",
     ];
     // Every case is judged at once, so a defect shows each unit it gets wrong.
-    let live = |unit: &str| for_restart(&systemd(unit), &root).live();
+    let live = |unit: &str| for_restart(&systemd(unit), &on(&root)).live();
     let read: Vec<_> = family
         .iter()
         .map(|unit| {
@@ -309,18 +311,35 @@ fn a_units_family_is_the_modes_and_any_other_unit_is_refused() {
     assert_eq!(refused, naming_each);
 }
 
-/// Catches a launchd label given a lease source nothing configures: a Mac names no
-/// `first_uid` or pool size to the installer, so its source stays the one that cannot tell,
-/// and an activation there is refused (fail closed), with the reason.
+/// The lease sources' view of a host whose root (and cgroup mount) is `root`.
+fn on(root: &Path) -> LeaseHost {
+    LeaseHost {
+        cgroup_root: root.to_path_buf(),
+        layout: Layout::new(Root::new(root).expect("absolute"), Platform::MacOs),
+    }
+}
+
+/// Catches a launchd label given the wrong source: an empty label names no service and
+/// cannot tell (saying so), and a label gets the Mac source, which reads the host root it is
+/// given (here a root with no `sandbox-exec`: it cannot tell, naming the file) and never the
+/// cgroup source (a populated cgroup planted for the label is not a lease) or the
+/// not-wired one.
 ///
-/// Mutant seen red: a label given the cgroup source (the planted cgroup then reads as live).
+/// Mutants seen red: a label given `NotWired` (the message names no sandbox); an empty label
+/// given the Mac source (it names no label problem).
 #[test]
-fn a_launchd_label_has_no_lease_source_yet() {
+fn a_launchd_label_gets_the_mac_source_and_an_empty_one_cannot_tell() {
     let root = scratch_dir("leases-launchd");
     busy(&root, "com.komira.kbf-daemon");
-    let source = for_restart(&Restart::Launchd("com.komira.kbf-daemon".to_owned()), &root);
-    let err = source.live().expect_err("not wired");
-    assert!(err.contains("no lease source wired"), "{err}");
+    let source = for_restart(
+        &Restart::Launchd("com.komira.kbf-daemon".to_owned()),
+        &on(&root),
+    );
+    let err = source.live().expect_err("no sandbox-exec under the root");
+    assert!(err.contains("/usr/bin/sandbox-exec"), "{err}");
+    let empty = for_restart(&Restart::Launchd(String::new()), &on(&root));
+    let err = empty.live().expect_err("no label");
+    assert!(err.contains("no launchd label"), "{err}");
 }
 
 /// Catches a frontend's unit taken for another mode's, or another mode's for a frontend's:

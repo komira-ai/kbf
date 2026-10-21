@@ -46,6 +46,7 @@ fn raw(mode: Mode) -> Raw {
         token_file: node.then(|| SRC.to_owned()),
         release_source: None,
         release_url: (!node).then(|| "https://releases.example/kbf".to_owned()),
+        release: Default::default(),
         min_generation: None,
         commit: None,
         database: mode.keeps_state_in_database().then(|| DATABASE.to_owned()),
@@ -1079,6 +1080,11 @@ impl Releases for Installs {
         self.0.borrow_mut().push(commit.to_string());
         Ok(())
     }
+
+    fn install_seed(&self) -> Result<CommitId, SetupError> {
+        self.0.borrow_mut().push("the package's release".to_owned());
+        Ok(COMMIT.parse().expect("a commit"))
+    }
 }
 
 fn first_release(mode: Mode) -> Raw {
@@ -1205,6 +1211,7 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
         token_file: Some("rel/token".to_owned()),
         release_source: Some(ReleaseSource::Url),
         release_url: None,
+        release: Default::default(),
         min_generation: Some(0),
         commit: None,
         database: Some(DATABASE.to_owned()),
@@ -1412,7 +1419,7 @@ fn a_mac_node_gets_its_fetch_account_and_launchd_jobs() {
     let mut exec = released(host(), Platform::MacOs);
     go_ok(&os, &mut exec, &raw(Mode::Daemon));
     let c = cmds(&exec);
-    assert_eq!(c.len(), 8, "{c:?}");
+    assert_eq!(c.len(), 9, "{c:?}");
     assert_eq!(
         c[0],
         "run /usr/bin/dscl . -create /Groups/_kbf-fetch PrimaryGroupID 303"
@@ -1426,10 +1433,14 @@ fn a_mac_node_gets_its_fetch_account_and_launchd_jobs() {
     );
     assert_eq!(
         c[6],
-        "run /bin/launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-installer.plist"
+        "run /bin/launchctl enable system/com.komira.kbf-installer"
     );
     assert_eq!(
         c[7],
+        "run /bin/launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-installer.plist"
+    );
+    assert_eq!(
+        c[8],
         "run /bin/launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-daemon.plist"
     );
     assert_eq!(
@@ -1478,7 +1489,69 @@ fn a_mac_refuses_the_frontend_and_waits_for_a_release() {
     os.loaded.insert("com.komira.kbf-installer".to_owned());
     let mut exec = released(host(), Platform::MacOs);
     go_ok(&os, &mut exec, &raw(Mode::Daemon));
-    assert!(cmds(&exec).iter().all(|c| !c.contains("launchctl")));
+    // Both jobs are loaded: nothing is bootstrapped, and the installer's job is still enabled
+    // (a loaded job can carry a disable override).
+    let c = cmds(&exec);
+    let launchctl: Vec<_> = c.iter().filter(|c| c.contains("launchctl")).collect();
+    assert_eq!(
+        launchctl,
+        ["run /bin/launchctl enable system/com.komira.kbf-installer"]
+    );
+}
+
+/// Catches a Mac whose installer job is left disabled after a reinstall: a rollback of an
+/// adopted Mac disables `system/com.komira.kbf-installer` (`launchctl disable`) and the
+/// package's removal does not clear it, so `setup` must `launchctl enable` the job before it
+/// bootstraps it (the bootstrap of a disabled job fails, and a disabled job is not loaded at
+/// boot). The daemon's job is not the installer's to enable, a job that is loaded already is
+/// not bootstrapped again but is still enabled (it can carry an override while loaded), and
+/// `--no-start` still clears the override (without bootstrapping) so the next boot loads the job.
+///
+/// Mutants seen red: the `enable` removed (the order and the count); the `enable` dropped under
+/// `--no-start`; the `enable` skipped for a loaded job (red before the change that made it
+/// unconditional). Not run as mutants: the `enable` put after the bootstrap; the `enable` given
+/// to every label.
+#[test]
+fn a_mac_clears_the_installer_jobs_disable_before_it_bootstraps_it() {
+    let launchctl = |exec: &FakeExec| -> Vec<String> {
+        cmds(exec)
+            .into_iter()
+            .filter(|c| c.contains("launchctl"))
+            .collect()
+    };
+    let mut exec = released(host(), Platform::MacOs);
+    go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
+    assert_eq!(
+        launchctl(&exec),
+        [
+            "run /bin/launchctl enable system/com.komira.kbf-installer",
+            "run /bin/launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-installer.plist",
+            "run /bin/launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-daemon.plist",
+        ]
+    );
+
+    let mut exec = released(host(), Platform::MacOs);
+    let none = Options {
+        apply: true,
+        no_start: true,
+    };
+    go(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon), none).expect("setup");
+    assert_eq!(
+        launchctl(&exec),
+        ["run /bin/launchctl enable system/com.komira.kbf-installer"]
+    );
+
+    let mut os = FakeOs::mac();
+    os.loaded.insert("com.komira.kbf-installer".to_owned());
+    let mut exec = released(host(), Platform::MacOs);
+    go_ok(&os, &mut exec, &raw(Mode::Daemon));
+    assert_eq!(
+        launchctl(&exec),
+        [
+            "run /bin/launchctl enable system/com.komira.kbf-installer",
+            "run /bin/launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-daemon.plist"
+        ]
+    );
 }
 
 #[test]
@@ -1738,3 +1811,9 @@ fn the_journals_kit_flag_picks_the_kbf_toml_decision() {
 
 #[path = "update_dirs_tests.rs"]
 mod update_dirs;
+
+#[path = "release_config_tests.rs"]
+mod release_config;
+
+#[path = "seed_tests.rs"]
+mod seed;

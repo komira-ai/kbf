@@ -1,4 +1,4 @@
-//! The Buck2 load: builds of the sample project (`crates/kbf-it/beta/buck2`) in a loop,
+//! The Buck2 load: builds of the sample project (`crates/kbf-integration-test/beta/buck2`) in a loop,
 //! `concurrency` loops at once, each loop with a Buck2 daemon of its own (an isolation
 //! directory), through the frontend's REAPI port.
 //!
@@ -8,7 +8,7 @@
 //! from the action cache, and bounded by a time limit of its own.
 //!
 //! A build is judged by its exit status and by what it says it did: Buck2's console
-//! summary (`Commands: N (cached: N, remote: N, local: N)`, parsed with `kbf-it`'s
+//! summary (`Commands: N (cached: N, remote: N, local: N)`, parsed with `kbf-integration-test`'s
 //! reader) must show actions run on the farm and none anywhere else, and its event log
 //! ([`crate::eventlog`]) is counted for failed actions.
 
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use kbf_it::summary::{Spawns, Tool, parse};
+use kbf_integration_test::summary::{Spawns, Tool, parse};
 
 use crate::eventlog;
 use crate::procs::after;

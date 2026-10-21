@@ -1,6 +1,8 @@
 use super::*;
 use crate::golden::{
-    INSTALLER_TOML_FRONTEND, INSTALLER_TOML_URL, installer_toml_frontend, installer_toml_url,
+    INSTALLER_TOML_BUNDLED, INSTALLER_TOML_FRONTEND, INSTALLER_TOML_FRONTEND_PULL,
+    INSTALLER_TOML_URL, INSTALLER_TOML_URL_CA, installer_toml_bundled, installer_toml_frontend,
+    installer_toml_frontend_pull, installer_toml_url, installer_toml_url_ca,
 };
 
 fn problems(text: &str) -> String {
@@ -8,12 +10,20 @@ fn problems(text: &str) -> String {
 }
 
 /// Catches a change to the file's keys, defaults or spelling that does not move the golden
-/// files: both decode to the expected values and render back byte for byte.
+/// files: both decode to the expected values and render back byte for byte. The first two
+/// are files written before `bundled`, the snapshot and `release_ca` (they decode as they did);
+/// the other three carry the new keys, in the order `render` writes them.
+///
+/// Mutants to plant: `render` writing the snapshot before `node_cert`, or `release_ca` after
+/// the limits; a key dropped from `render`; `bundled` spelt otherwise.
 #[test]
 fn the_golden_files_decode_and_render_to_themselves() {
     for (text, want) in [
         (INSTALLER_TOML_URL, installer_toml_url()),
         (INSTALLER_TOML_FRONTEND, installer_toml_frontend()),
+        (INSTALLER_TOML_BUNDLED, installer_toml_bundled()),
+        (INSTALLER_TOML_FRONTEND_PULL, installer_toml_frontend_pull()),
+        (INSTALLER_TOML_URL_CA, installer_toml_url_ca()),
     ] {
         assert_eq!(InstallerToml::parse(text).expect("parses"), want);
         assert_eq!(want.render(), text);
@@ -608,6 +618,37 @@ fn the_proxy_table_is_rendered_and_read_back_with_every_key() {
     assert_eq!(back.proxy.as_ref().map(|p| p.ui), Some(false));
     assert_eq!(back.render(), odd);
     assert_eq!(InstallerToml::parse(&back.render()).expect("again"), back);
+}
+
+/// Catches `remote_operator_file` lost on a rewrite: `setup` parses `installer.toml` and renders
+/// it again, so a key that is read and not rendered switches the CI credential off silently on
+/// the next run. The key parses, survives `render`, and a table without it renders without it.
+#[test]
+fn the_remote_operator_file_survives_a_rewrite() {
+    let with = PROXY_HOST.replace(
+        "proxy_auth_file =",
+        "remote_operator_file = \"/etc/kbf/remote-ci.toml\"\nproxy_auth_file =",
+    );
+    assert_ne!(with, PROXY_HOST);
+    let parsed = InstallerToml::parse(&with).expect("parses");
+    assert_eq!(
+        parsed
+            .proxy
+            .as_ref()
+            .and_then(|p| p.remote_operator_file.as_deref()),
+        Some(std::path::Path::new("/etc/kbf/remote-ci.toml"))
+    );
+    assert_eq!(parsed.render(), with);
+    assert_eq!(
+        InstallerToml::parse(&parsed.render()).expect("again"),
+        parsed
+    );
+    assert!(
+        !InstallerToml::parse(PROXY_HOST)
+            .expect("parses")
+            .render()
+            .contains("remote_operator_file")
+    );
 }
 
 /// Catches a UI that is off unless asked for: the golden says `ui = true` and parses to it, and

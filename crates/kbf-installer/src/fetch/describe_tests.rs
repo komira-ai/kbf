@@ -68,7 +68,7 @@ fn the_form_is_the_documented_lines() {
 /// lost or added.
 #[test]
 fn a_description_survives_the_form() {
-    let mut zero = entry("kbf-daemon", "darwin-arm64");
+    let mut zero = entry("kbf", "darwin-arm64");
     zero.size = 0;
     for components in [
         Vec::new(),
@@ -380,7 +380,7 @@ fn the_hosts_components_are_chosen() {
     let all = description(vec![
         entry("kbf", "linux-arm64"),
         entry("kbf", "linux-x86_64"),
-        entry("kbf-daemon", "darwin-arm64"),
+        entry("kbf", "darwin-arm64"),
     ]);
     assert_eq!(
         all.select(&commit(), ReleasePlatform::LinuxX86_64, MAX),
@@ -388,7 +388,7 @@ fn the_hosts_components_are_chosen() {
     );
     assert_eq!(
         all.select(&commit(), ReleasePlatform::DarwinArm64, MAX),
-        Ok(vec![entry("kbf-daemon", "darwin-arm64")])
+        Ok(vec![entry("kbf", "darwin-arm64")])
     );
 }
 
@@ -460,10 +460,10 @@ fn a_platform_must_be_complete_and_exact() {
         fault_text(empty.select(&commit(), host, MAX)),
         "it has no kbf for linux-x86_64"
     );
-    let mac = description(vec![entry("kbf", "darwin-arm64")]);
+    let mac = description(vec![entry("kbf-daemon", "darwin-arm64")]);
     assert!(
         fault_text(mac.select(&commit(), ReleasePlatform::DarwinArm64, MAX))
-            .contains("\"kbf\" is not a component of darwin-arm64")
+            .contains("\"kbf-daemon\" is not a component of darwin-arm64")
     );
 }
 

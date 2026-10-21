@@ -18,7 +18,7 @@ These properties change how kbf schedules an action today:
 
 Any other value of `kbf-lease`, `gpu`, `kbf-book-cpus` or `kbf-book-mem-gib` is refused
 with `INVALID_ARGUMENT`. kbf's own
-capability keys (`os`, `arch`, `isa_level`, `cpu.feature`, `label.<k>`, ...; see
+capability keys (`os`, `arch`, `isa_level`, `cpu.feature`, ...; see
 [capabilities.md](design/capabilities.md#matching)) are matched too. Other properties
 (`container-image`, `Pool`, ...) are accepted and not acted on by the scheduler.
 
@@ -30,8 +30,8 @@ meant for kbf is never ignored because of how it is spelled: `osfamily=darwin`,
 names (`OSFamily`, `ISA`, `Arch`) and for every kbf key: the capability keys above
 (`OS` is `os`, `ISA_Level` is `isa_level`), `gpu` (`GPU=1` books a GPU), and the
 reserved `kbf-lease`, `kbf-cpu`, `kbf-mac-admin`, `kbf-book-cpus` and
-`kbf-book-mem-gib`. In `label.<k>` only `label.` is
-read in any case; the label's own name `<k>` is compared exactly, as its value is.
+`kbf-book-mem-gib`. A `label.<k>` is not one of them in any case: node labels were
+removed, so it is a name kbf does not read and is ignored like `Pool`.
 `arch` spelled exactly so is kbf's own `arch` key (values `x86_64`, `arm64`); in any
 other spelling (`Arch`, `ARCH`) it is REAPI's `Arch` and takes the values in the
 table. Values are compared as described for each key: `OSFamily`, `ISA` and `Arch`

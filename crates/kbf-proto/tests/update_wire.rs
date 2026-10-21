@@ -303,7 +303,7 @@ fn defaults_are_not_written() {
         verb: Verb::Unspecified.into(),
         ..UpdateOrder::default()
     };
-    assert_eq!(zero.encode_to_vec(), []);
+    assert_eq!(zero.encode_to_vec(), Vec::<u8>::new());
 }
 
 /// Catches `update_status` off field 7 of `DaemonMessage` (tag `0x3a`: 7 << 3 | 2), and

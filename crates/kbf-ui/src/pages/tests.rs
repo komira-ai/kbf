@@ -13,37 +13,19 @@ fn page(fake: &Fake, path: &str) -> (u16, String) {
     (a.status(), body(&a))
 }
 
-/// Catches: the Overview reading a route, missing a link to a page, or the lookup left
-/// at the prefix (the form of Builds moved to `/ui/builds`, so `/ui` has none).
+/// Catches: the lookup form missing, the list not read (an empty id is no id), the
+/// current section not marked.
 #[test]
-fn overview_links_the_pages_and_reads_nothing() {
-    let fake = farm();
-    for path in ["/ui", "/ui/"] {
-        let (status, html) = page(&fake, path);
-        assert_eq!(status, 200);
-        assert!(html.contains("<title>Overview - kbf</title>"), "{html}");
-        for link in ["/ui/builds", "/ui/updates"] {
-            assert!(html.contains(&format!("<a href=\"{link}\">")), "{html}");
-        }
-        assert!(!html.contains("<form"), "{html}");
-        assert!(html.contains("Nothing: this page read no route."), "{html}");
-    }
-    assert!(fake.seen().is_empty());
-}
-
-/// Catches: the lookup form missing, a read made without an id, the footer not
-/// saying nothing was read.
-#[test]
-fn builds_without_an_id_shows_the_form_and_reads_nothing() {
-    let fake = farm();
+fn builds_without_an_id_shows_the_form_and_the_list() {
     for path in ["/ui/builds", "/ui/builds?id="] {
+        let fake = farm();
         let (status, html) = page(&fake, path);
         assert_eq!(status, 200);
         assert!(
             html.contains("<form method=\"get\" action=\"/ui/builds\""),
             "{html}"
         );
-        assert!(html.contains("Nothing: this page read no route."), "{html}");
+        assert_eq!(fake.seen(), ["/v1/invocations"], "{path}");
         assert!(
             html.contains("aria-current=\"page\""),
             "Builds is the current section"
@@ -51,7 +33,145 @@ fn builds_without_an_id_shows_the_form_and_reads_nothing() {
         assert!(html.contains("<title>Builds - kbf</title>"), "{html}");
         assert!(html.contains("href=\"/ui/static/kbf.css\""), "{html}");
     }
-    assert!(fake.seen().is_empty());
+}
+
+/// Catches: a listed build not shown, not linked to its Build page, or its counters
+/// shown under another's name (the fixture gives ran, hits and failed each a value);
+/// a build with failures shown as ok, an open one as finished, or a result by colour
+/// alone (the pill carries the words); a build id of markup written as markup; the
+/// next page not carrying the token and the filters, or shown when there is none.
+#[test]
+fn builds_lists_the_builds_with_their_result() {
+    let filtered = "/v1/invocations?state=closed&instance=main%26x";
+    let list = json!({"invocations": [
+            crate::tests::listed(ID, "closed", 1), crate::tests::listed("<i>b2</i>", "open", 0)],
+        "next_page": format!("{filtered}&page_size=20&page_token=l%2B1")});
+    let fake = farm().json(filtered, &list);
+    let (status, html) = page(&fake, "/ui/builds?state=closed&instance=main%26x");
+    assert_eq!(status, 200, "{html}");
+    assert_eq!(
+        fake.seen(),
+        ["/v1/invocations?state=closed&instance=main%26x"]
+    );
+    assert!(
+        html.contains("<td><a href=\"/ui/builds/build-1\">build-1</a></td>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<td><span class=\"pill fail\">1 failed</span></td><td>main, edge</td>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<td>2</td><td>5</td><td>1</td></tr>"),
+        "ran, cache hits, failed: {html}"
+    );
+    // The open build is pending, not ok; its id is markup and is escaped.
+    assert!(
+        html.contains("<a href=\"/ui/builds/%3Ci%3Eb2%3C%2Fi%3E\">&lt;i&gt;b2&lt;/i&gt;</a>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<span class=\"pill pending\">open</span>"),
+        "{html}"
+    );
+    assert!(!html.contains("<i>"), "{html}");
+    assert!(
+        html.contains(
+            "<a href=\"/ui/builds?state=closed&amp;instance=main%26x&amp;page_token=l%2B1\">\
+             Next page</a>"
+        ),
+        "{html}"
+    );
+    // The filters are shown as chosen.
+    assert!(
+        html.contains("<option value=\"closed\" selected=\"selected\">"),
+        "{html}"
+    );
+    assert!(html.contains("value=\"main&amp;x\""), "{html}");
+
+    // The next page: the token goes to the API with the same filters; an empty page says
+    // so, and a partial list says it is partial.
+    let (status, html) = page(&fake, "/ui/builds?page_token=l%2B1");
+    assert_eq!(status, 200, "{html}");
+    assert_eq!(
+        fake.seen().last().map(String::as_str),
+        Some("/v1/invocations?page_token=l%2B1")
+    );
+    assert!(html.contains("No builds match."), "{html}");
+    assert!(
+        html.contains("Partial: the list of some instance"),
+        "{html}"
+    );
+    assert!(!html.contains("Next page"), "{html}");
+
+    // The last page of a list that has builds: no next link.
+    let last = json!({"invocations": [crate::tests::listed(ID, "closed", 0)]});
+    let fake = Fake::default().json("/v1/invocations", &last);
+    let (status, html) = page(&fake, "/ui/builds");
+    assert_eq!(status, 200, "{html}");
+    assert!(html.contains("<span class=\"pill ok\">ok</span>"), "{html}");
+    assert!(!html.contains("Next page"), "{html}");
+    assert!(!html.contains("Partial:"), "{html}");
+}
+
+/// Catches: a filter the page does not take, a duplicated one or a state that is not
+/// `open` or `closed` reaching the API (mutants: the unknown-key arm, the duplicate
+/// check or the state check dropped): each is a `400` page that reads nothing and shows
+/// why; an instance over the bound forwarded; an empty filter sent as a value.
+#[test]
+fn builds_refuses_a_query_it_does_not_take() {
+    let long = format!("/ui/builds?instance={}", "i".repeat(257));
+    let cases = [
+        (
+            "/ui/builds?limit=5".to_owned(),
+            "\"limit\" is not a parameter",
+        ),
+        (
+            "/ui/builds?state=open&state=closed".to_owned(),
+            "\"state\" is given twice",
+        ),
+        (
+            "/ui/builds?state=<script>".to_owned(),
+            "state=\"<script>\": open or closed",
+        ),
+        (long, "instance is over 256 bytes"),
+    ];
+    for (path, why) in cases {
+        let fake = farm();
+        let (status, html) = page(&fake, &path);
+        assert_eq!(status, 400, "{path}: {html}");
+        assert!(html.contains(&crate::html::escape(why)), "{path}: {html}");
+        assert!(!html.contains("<script"), "{html}");
+        assert!(fake.seen().is_empty(), "{path}");
+    }
+    let fake = farm();
+    let (status, _) = page(&fake, "/ui/builds?state=&instance=");
+    assert_eq!(status, 200);
+    assert_eq!(fake.seen(), ["/v1/invocations"]);
+}
+
+/// Catches: a list the API refuses shown as a list: history off (`404`) or busy (`503`
+/// with `Retry-After`) answered `200`, its status or header dropped, or the filters
+/// hidden behind the error.
+#[test]
+fn builds_list_answers_the_api_status() {
+    let fake = Fake::default().with_headers(
+        "/v1/invocations",
+        503,
+        &[("Retry-After", "3")],
+        r#"{"error": "build history cannot be read right now"}"#,
+    );
+    let a = crate::tests::render(&fake, "/ui/builds");
+    assert_eq!(a.status(), 503);
+    assert!(
+        a.headers().contains(&("retry-after", "3")),
+        "{:?}",
+        a.headers()
+    );
+    assert!(body(&a).contains("build history cannot be read right now"));
+    let fake = Fake::default().with("/v1/invocations", 200, r#"{"builds": []}"#);
+    let (status, html) = page(&fake, "/ui/builds");
+    assert_eq!(status, 502, "{html}");
 }
 
 /// Catches: the summary not shown, not linked to the Build page, or the id not kept
@@ -338,8 +458,15 @@ fn action_shows_its_answer_and_its_logs() {
         "stdout: {html}"
     );
     assert!(html.contains(&crate::html::escape(STDERR)), "{html}");
-    // The stdout blob is gone: never asked for.
-    assert_eq!(fake.seen().len(), 2, "{:?}", fake.seen());
+    // The stdout blob is gone: never asked for; the stderr tail came with the failures,
+    // so its blob was not read either.
+    assert_eq!(
+        fake.seen(),
+        [
+            format!("/v1/invocations/{ID}/actions/{}", action_digest()),
+            format!("/v1/invocations/{ID}/failures"),
+        ]
+    );
 
     // The same outputs, all of them kept: listed, with no note that the list is cut.
     let mut doc = action(&json!(null));
@@ -475,6 +602,7 @@ fn attempt_ends_in_words() {
         started: None,
         ended: None,
         end,
+        run_id: None,
     };
     let end = |result: Option<&str>,
                requeue: Option<&str>,
@@ -553,7 +681,8 @@ fn a_log_of_the_bound_is_shown_and_one_byte_more_is_a_link() {
         );
         let (status, html) = page(&fake, &path);
         assert_eq!(status, 200);
-        assert_eq!(fake.seen().len(), if read { 2 } else { 1 }, "{size}");
+        // The action, the failures list (not held by this fake), and the log if small.
+        assert_eq!(fake.seen().len(), if read { 3 } else { 2 }, "{size}");
         assert_eq!(html.contains("too large to show here"), !read, "{size}");
     }
 }

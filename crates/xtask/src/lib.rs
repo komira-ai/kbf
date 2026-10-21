@@ -4,8 +4,13 @@
 //! - `build-commit check <binary> <commit>`, `build-commit check-asset <tarball>
 //!   <commit>` and `build-commit stamps <commit>` ([`build_commit`]): kbf-server names the
 //!   commit it was built from, and `kbf` does in the tarball that ships.
+//! - `advisories --repo <owner>/<repo> [--commit <sha>]` ([`advisories`]): `cargo deny check
+//!   advisories`, kept in one GitHub issue (opened, updated, or commented on and closed when
+//!   none remain) instead of failing a pull request. Exit 0 whatever it found; 1 when
+//!   cargo-deny or `gh` failed. `advisories.yml` runs it daily and on every push to `main`.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
-//!   row the working tree's budget file has and `<rev>`'s does not is refused. CI runs
+//!   row the working tree's budget file has and `<rev>`'s does not is refused, unless
+//!   git sees the row's path renamed from a path `<rev>` has a row for. CI runs
 //!   it on pull requests, with the base branch as `<rev>`.
 //! - `sign-darwin <binary> --minos <version> [--summary <file>]` and `darwin-asset
 //!   <tarball> <name>` ([`darwin`]): the macOS binary signed ad hoc with the hardened
@@ -30,6 +35,10 @@
 //!   attested on, and the built deb as the release asset
 //!   `kbf-installer-<commit>-<platform>.deb`, refused unless it holds the binary of the
 //!   attested tarball and trusts the branch it is attested for.
+//! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf-installer` package
+//!   carries, in the one form a deb and an rpm put in the same order, and the most a package
+//!   that carries a kbf release may weigh. `pkg-config` and `pkg-asset` take them up with
+//!   the release.
 //! - `pkg-macos-asset` and `pkg-macos-install-test` ([`pkg_macos_asset`],
 //!   [`pkg_macos_install`]): the Mac `.pkg` as the release asset
 //!   `kbf-installer-<commit>-darwin-arm64.pkg`, refused unless it holds the attested
@@ -47,10 +56,16 @@
 //!   attestations` and `release check` hold a directory to one bundle per tarball,
 //!   each that tarball's (its one subject is the tarball's digest); `verify-assets
 //!   attestations` also has `gh` verify each tarball against its bundle.
-//! - `release {locate,main-control,check,verify,offer,notes,plan,identity,previous,publish}` ([`release`]): a GitHub release of
+//! - `release {locate,main-control,check,verify,offer,notes,plan,identity,previous,publish,bump-internal}` ([`release`]): a GitHub release of
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
+//! - `release version-facts --binary <kbf> --commit <sha> --platform <p> --out <dir>`
+//!   ([`version_facts`]): the `kbf` just built, run with `--version --json`, and what it
+//!   printed kept unchanged as the release asset `kbf-<commit>-<platform>.version.json`
+//!   with its line in `SHA256SUMS.<platform>`. The release set holds it for every `kbf`
+//!   tarball (`verify-assets sums`, `release check`), because only a runner of a platform
+//!   can run its binary.
 //! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
 //!   unit.
@@ -63,12 +78,14 @@
 //! Exit status: 0 when the check passed, 1 when it failed (one reason per line on
 //! stderr), 2 on a usage error.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use clap::{Parser, Subcommand};
 
+pub mod advisories;
 pub mod budget;
 pub mod build_commit;
 pub mod bundles;
@@ -85,11 +102,14 @@ pub mod pkg_linux;
 pub mod pkg_macos_asset;
 #[cfg(target_os = "macos")]
 pub mod pkg_macos_install;
+pub mod pkg_size;
 pub mod pkg_trust;
+pub mod pkg_version;
 pub mod proxy_loom;
 pub mod release;
 pub mod sudo_test;
 pub mod sums;
+pub mod version_facts;
 
 /// Why a verb failed.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -141,6 +161,8 @@ enum Verb {
     /// kbf-server's `--version` names the commit it was built from.
     #[command(subcommand)]
     BuildCommit(BuildCommit),
+    /// Keep the advisories `cargo deny` reports in one GitHub issue.
+    Advisories(advisories::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
         /// The revision to compare with (on a pull request, the base branch).
@@ -555,6 +577,11 @@ enum ReleaseVerb {
         /// The commit the assets were built from, a full SHA.
         #[arg(long)]
         commit: String,
+        /// Do not require the version facts of each `kbf` tarball: for the release made
+        /// before the build jobs recorded them (the previous release, read by the first
+        /// release that has them). Facts without their tarball are still refused.
+        #[arg(long)]
+        without_version_facts: bool,
     },
     /// Create release `--tag` with every file of `<dir>`, or add the files it lacks;
     /// an asset it holds must be one of them, byte for byte.
@@ -601,11 +628,18 @@ enum ReleaseVerb {
     /// What a push would release: the next version, the push's class, and the freeze and
     /// superseded refusals. Writes nothing but `--output`.
     Plan(release::plan::PlanArgs),
+    /// Open the pull request in the internal repository that moves its submodule to the
+    /// released commit, with auto-merge on (the token is `GH_TOKEN`).
+    BumpInternal(release::bump::BumpArgs),
     /// Create the annotated release tag at `--sha` through the GitHub API: create-only,
     /// after the stale-run guards; a tag that exists is reused only when it is the same.
     Tag(release::tag::TagArgs),
     /// Write the Beta record a release tag carries as its message (audit only).
     VerdictWrite(release::verdict_write::WriteArgs),
+    /// Run the `kbf` just built with `--version --json` and keep what it printed as the
+    /// release asset `kbf-<commit>-<platform>.version.json`, refused unless it is the
+    /// release build of `--commit`.
+    VersionFacts(version_facts::Args),
     /// The same checks, then write the release's notes.
     Notes {
         #[command(flatten)]
@@ -705,30 +739,45 @@ fn default_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The budget file as `rev` holds it, read with `git show` in `root`.
-fn budget_at(root: &Path, rev: &str) -> Result<String, Error> {
-    let spec = format!("{rev}:{}", budget::BUDGET);
+/// What `git <args>` prints in `root`.
+fn git_stdout(root: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["show", &spec])
+        .args(args)
         .output()
         .map_err(Error::spawn("git".to_owned()))?;
     if !out.status.success() {
         return Err(Error::Failed(format!(
-            "git show {spec}: {}",
+            "git {}: {}",
+            args.join(" "),
             String::from_utf8_lossy(&out.stderr).trim_end()
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(out.stdout)
 }
 
-/// `budget-diff --base <rev>`: the line it prints when nothing was added.
+/// The budget file as `rev` holds it, read with `git show` in `root`.
+fn budget_at(root: &Path, rev: &str) -> Result<String, Error> {
+    let spec = format!("{rev}:{}", budget::BUDGET);
+    let out = git_stdout(root, &["show", &spec])?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// The paths git sees renamed between `rev` and `HEAD` in `root`: new path to old.
+fn renames_since(root: &Path, rev: &str) -> Result<BTreeMap<String, String>, Error> {
+    let args = ["diff", "--find-renames", "--name-status", "-z", rev, "HEAD"];
+    Ok(budget::parse_renames(&git_stdout(root, &args)?))
+}
+
+/// `budget-diff --base <rev>`: the line it prints when nothing was added. A path git
+/// renamed since `rev` keeps its row.
 fn budget_diff(root: &Path, rev: &str) -> Result<String, Error> {
     let base = budget_at(root, rev)?;
+    let renames = renames_since(root, rev)?;
     let path = root.join(budget::BUDGET);
     let head = std::fs::read_to_string(&path).map_err(Error::spawn(path.display().to_string()))?;
-    let added = budget::new_rows(&base, &head).map_err(Error::Refused)?;
+    let added = budget::new_rows_renamed(&base, &head, &renames).map_err(Error::Refused)?;
     if added.is_empty() {
         return Ok(format!("ok: {} adds no row to {rev}'s", budget::BUDGET));
     }
@@ -794,6 +843,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             sudo: &sudo,
             root: &root,
         }),
+        Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::Fetch {
             url,
@@ -1026,7 +1076,18 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         }) => Ok(vec![release::main_control(
             &gh, &repo, &on_main, &off_main,
         )?]),
-        Verb::Release(ReleaseVerb::Check { dir, commit }) => release::check(&dir, &commit),
+        Verb::Release(ReleaseVerb::Check {
+            dir,
+            commit,
+            without_version_facts,
+        }) => {
+            let pairing = if without_version_facts {
+                version_facts::Pairing::Waived
+            } else {
+                version_facts::Pairing::Required
+            };
+            release::check(&dir, &commit, pairing)
+        }
         Verb::Release(ReleaseVerb::Verify { subject, output }) => {
             let verified = release::verify::verify(&subject.subject())?;
             let line = format!("set-hash={}", verified.set_hash.as_str());
@@ -1054,7 +1115,9 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::Release(ReleaseVerb::Offer(args)) => release::offer::run(&args),
         Verb::Release(ReleaseVerb::Gates(args)) => release::gates::run(&args),
         Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
+        Verb::Release(ReleaseVerb::BumpInternal(args)) => release::bump::run(&args),
         Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
+        Verb::Release(ReleaseVerb::VersionFacts(args)) => version_facts::run(&args),
         Verb::Release(ReleaseVerb::VerdictWrite(args)) => release::verdict_write::run(&args),
         Verb::Release(ReleaseVerb::Identity { dir, commit, out }) => {
             // The binary's unpacking place, of this process alone.

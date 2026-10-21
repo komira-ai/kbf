@@ -146,7 +146,6 @@ impl Harness {
             mode,
             config: self.config_path(),
             check: false,
-            labels: Vec::new(),
         }
     }
 
@@ -710,34 +709,40 @@ async fn a_setting_for_a_role_the_node_does_not_hold_is_a_warning_not_a_refusal(
     assert_eq!(launches.seen(), [names::DAEMON]);
 }
 
-/// Catches a mode that refuses the flags the start built (here a label the daemon does not
-/// accept) starting anyway, or being reported as anything but a usage error: the node is
-/// enrolled, the mode's own parser says what it refused, and nothing runs.
+/// Catches a `label` key left in `kbf.toml` (a node label, removed: placement uses what
+/// the node reports) starting the node, or being found only after the token is spent: the
+/// start is refused with the key and its replacement named, exit 2, before the token is
+/// sent, with nothing installed and the token file kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_label_the_mode_refuses_stops_the_start() {
+async fn a_label_in_kbf_toml_stops_the_start_before_enrolling() {
     let h = Harness::new("node-bad-label");
-    h.ready("[daemon]\n");
-    let launches = Arc::new(Launches::default());
-    let (node, env) = (
-        Start {
-            labels: vec!["no-equals-sign".to_owned()],
-            ..h.start_of(Some(names::DAEMON))
-        },
-        h.env(),
+    h.write_config_with(
+        h.run.enroll_addr.port(),
+        "",
+        "",
+        "[identity]\nlabel = [\"pool=mac\"]\n\n[daemon]\n",
     );
+    h.put_token(&h.fake().mint(1, 1));
+    let launches = Arc::new(Launches::default());
 
-    let failure = tokio::task::spawn_blocking(move || {
-        run_with(&node, &env, Driver::Container, &|_| ExitCode::SUCCESS)
-    })
-    .await
-    .expect("no panic")
-    .expect_err("refused");
+    let failure = start(&h, &launches, || {}).await.expect_err("refused");
 
-    assert!(matches!(failure, Failure::Mode(_)), "{failure:?}");
+    assert!(matches!(failure, Failure::Settings(_)), "{failure:?}");
     assert_eq!(failure.exit_code(), 2);
-    assert!(failure.to_string().contains("--label"), "{failure}");
+    let said = failure.to_string();
+    assert!(said.contains("`identity.label`"), "{said}");
+    assert!(
+        said.contains(&h.config_path().display().to_string()),
+        "{said}"
+    );
+    assert!(
+        said.contains("`label` was removed: placement uses what the node reports (OSFamily, ISA); delete the key"),
+        "{said}"
+    );
     assert!(launches.seen().is_empty());
-    assert!(h.node_json().contains("node-02"), "enrolled all the same");
+    assert!(h.fake().enrolls().is_empty(), "the token was not sent");
+    assert!(!h.state().join("pki/node.json").exists());
+    assert!(h.token_path().exists());
 }
 
 /// An enrolled node and a renewer for it, with the clock at the fake's.

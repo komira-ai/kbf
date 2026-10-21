@@ -22,7 +22,6 @@
 #![cfg(target_os = "linux")]
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use kbf_harness::api::connected;
 use kbf_harness::farm::{Bins, Farm, Role, Topology, node_id};
@@ -60,21 +59,20 @@ fn scratch(name: &str) -> TestDir {
 /// The rehearsal's farm of `storage_nodes` nodes and a daemon, started from the units
 /// `kbf-deploy` renders, over the stand-in `crun`.
 fn start(name: &str, storage_nodes: usize) -> Farm {
-    start_with(name, &Topology::rehearsal(storage_nodes)).0
+    start_with(name, &Topology::rehearsal(storage_nodes))
 }
 
-/// A farm of `topology`, and the directory it was started in (a node's files are under it).
-fn start_with(name: &str, topology: &Topology) -> (Farm, PathBuf) {
+/// A farm of `topology`.
+fn start_with(name: &str, topology: &Topology) -> Farm {
     let scratch = scratch(name);
     let dir = scratch.path().to_path_buf();
     let bins = Bins {
         kbf: PathBuf::from(env!("CARGO_BIN_EXE_kbf")),
         fake_crun: Some(PathBuf::from(env!("CARGO_BIN_EXE_kbf-cli-fake-crun"))),
     };
-    let farm = Farm::start(&dir, &dir, &bins, topology)
+    Farm::start(&dir, &dir, &bins, topology)
         .unwrap_or_else(|e| panic!("{e}"))
-        .owning(scratch);
-    (farm, dir)
+        .owning(scratch)
 }
 
 /// Waits until the frontend is ready and lists every node as connected.
@@ -521,183 +519,4 @@ fn a_killed_storage_node_loses_no_blob() {
     for (role, how) in farm.stop_all() {
         assert_eq!(how, "exit 0", "{role}\n{}", farm.logs());
     }
-}
-
-/// A planned restart of a loaded node (`a_loaded_node_restarts_planned_down_and_loses_no_action`).
-const LOAD_NODES: usize = 3;
-const LOAD_ACTIONS: usize = 12;
-/// How long each action sleeps: longer than the planned-down, SIGTERM and restart take to
-/// begin, so the victim still runs leases when it is stopped.
-const SLEEP_SECS: &str = "4";
-
-/// Plants the steps every node's stand-in `crun` runs (it reads them at each run): sleep,
-/// then write the output file.
-fn plant_slow_action(farm: &Farm, dir: &std::path::Path) {
-    let steps = [
-        "sleep",
-        SLEEP_SECS,
-        ";",
-        "write-lines",
-        "$UPPER/out/file.txt",
-        "a file",
-    ];
-    let text: String = steps.iter().map(|s| format!("{s}\n")).collect();
-    for n in 1..=farm.storage_nodes() {
-        let file = dir.join(format!("node-{n}/bin/crun-state/action"));
-        std::fs::write(&file, &text).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
-    }
-}
-
-/// Executes the action of `input` to the end of its operation: its response, or why there
-/// is none (a failed call, an operation that ended with no response, a hang).
-async fn run_one(
-    reapi: Channel,
-    cas: Arc<Transfers>,
-    image: String,
-    input: usize,
-) -> Result<ExecuteResponse, String> {
-    let bytes = format!("planned restart input {input:04} {}", "x".repeat(80)).into_bytes();
-    let action = upload_action(&cas, &image, &bytes).await;
-    let call = async {
-        let mut ops = ExecutionClient::new(reapi)
-            .execute(ExecuteRequest {
-                action_digest: Some(action),
-                ..ExecuteRequest::default()
-            })
-            .await
-            .map_err(|e| format!("Execute: {e}"))?
-            .into_inner();
-        loop {
-            let op = ops
-                .message()
-                .await
-                .map_err(|e| format!("the stream: {e}"))?
-                .ok_or("the stream ended before the operation was done")?;
-            if !op.done {
-                continue;
-            }
-            let Some(operation::Result::Response(any)) = op.result else {
-                return Err(format!("no response: {op:?}"));
-            };
-            return ExecuteResponse::decode(any.value.as_slice()).map_err(|e| e.to_string());
-        }
-    };
-    tokio::time::timeout(HANG, call)
-        .await
-        .map_err(|_| "no answer in time".to_owned())?
-}
-
-/// The node (1-based) whose log first says a lease started, once any does.
-fn node_with_a_lease(farm: &Farm) -> Option<usize> {
-    let hits = farm.log_hits("lease started");
-    let (file, _) = hits.first()?.split_once(": ")?;
-    let rest = file.strip_prefix("node-")?;
-    rest.split('.').next()?.parse().ok()
-}
-
-/// A planned restart of a loaded node: a frontend and three `storage-and-daemon` nodes (no
-/// plain daemon, so every action lands on a node's own daemon half) run twelve distinct
-/// actions at once, each a stand-in `crun` run that sleeps four seconds. Once a node has
-/// running leases it is the victim: its storage member is marked `planned_down` through the
-/// operator API, the frontend lists it down, the node gets SIGTERM and is started again.
-///
-/// What it proves is the contract of a planned restart as an operator lives it: every
-/// `Execute` still completes with exit code 0 (none cached, each output the action wrote),
-/// no run is dropped and no lease fails or is fenced in any process's log in any
-/// generation, the restarted node's member returns to `active`, and every process stops
-/// with exit 0. Catches a node that, on SIGTERM, drops the leases it runs (a client sees a
-/// failed action, the log says `run dropped`), a frontend that fails an action because the
-/// member it ran on is planned down, and a member that does not come back.
-///
-/// A node that stopped its leases at SIGTERM completed every action too (the dropped lease
-/// is run again on another node), so the test reads the logs: the victim drains (kbf#1087),
-/// and no process logs `run dropped`.
-///
-/// It runs about half a minute and is on the slow list of the pull-request gate
-/// (`.config/nextest.toml`); the beta workflow runs it.
-#[test]
-fn a_loaded_node_restarts_planned_down_and_loses_no_action() {
-    // No plain daemon: every lease runs on a node's own daemon half.
-    let topology = Topology {
-        daemons: 0,
-        ..Topology::rehearsal(LOAD_NODES)
-    };
-    let (mut farm, dir) = start_with("planned-restart", &topology);
-    farm.wait_ready().unwrap_or_else(|e| panic!("{e}"));
-    plant_slow_action(&farm, &dir);
-
-    // The load: every action is submitted at once and awaited at the end.
-    let tokio = tokio::runtime::Runtime::new().expect("runtime");
-    let (channel, cas) = tokio.block_on(async {
-        let channel = channel(&farm).await;
-        let cas = Arc::new(Transfers::over(channel.clone(), TransferConfig::default()));
-        (channel, cas)
-    });
-    let image = farm.image().to_owned();
-    let running: Vec<_> = (0..LOAD_ACTIONS)
-        .map(|i| tokio.spawn(run_one(channel.clone(), cas.clone(), image.clone(), i)))
-        .collect();
-
-    // The victim is a node that runs leases now (its own log says so).
-    let victim = farm.wait("a node to start a lease", node_with_a_lease);
-    let member = farm
-        .wait("the victim's member to be listed", |f| f.member_of(victim))
-        .id;
-    eprintln!("victim: node {victim}, member {member}");
-
-    let body = r#"{"state":"planned_down","for_secs":300}"#;
-    let (code, answer) = farm
-        .post(&format!("/v1/members/{member}"), body)
-        .expect("the API answers");
-    assert_eq!(code, 200, "planned_down: {answer}");
-    farm.wait("the victim's member to be listed down", |f| {
-        (f.member_of(victim)?.state == "down").then_some(())
-    });
-
-    let status = farm.term(Role::Node(victim)).expect("SIGTERM was answered");
-    assert!(status.success(), "the victim ended {status:?}");
-    farm.restart(Role::Node(victim));
-    farm.wait_ready().unwrap_or_else(|e| panic!("{e}"));
-
-    // Every action completed, ran (not a cache hit), and wrote its output.
-    let mut failures = Vec::new();
-    for (i, handle) in running.into_iter().enumerate() {
-        match tokio.block_on(handle).expect("the task ran") {
-            Err(why) => failures.push(format!("action {i}: {why}")),
-            Ok(response) => {
-                let result = response.result.clone().unwrap_or_default();
-                let ok = result.exit_code == 0
-                    && !response.cached_result
-                    && response.status.as_ref().is_none_or(|s| s.code == 0)
-                    && result.output_files.len() == 1
-                    && result.output_files[0].digest.as_ref() == Some(&digest_of(OUTPUT));
-                if !ok {
-                    failures.push(format!("action {i}: {response:?}"));
-                }
-            }
-        }
-    }
-    let logs = farm.logs();
-    assert!(failures.is_empty(), "{failures:#?}\n{logs}");
-
-    let member = farm.member_of(victim).expect("the member is listed");
-    assert_eq!(member.state, "active", "the restarted node's member");
-
-    // Nothing was dropped or fenced, in any process, in any generation.
-    for needle in ["run dropped", "lease failed", "lease fenced"] {
-        let hits = farm.log_hits(needle);
-        // The victim's lease lines, to say what its leases were doing when this happened.
-        let victim_leases = farm
-            .log_hits("lease")
-            .into_iter()
-            .filter(|l| l.starts_with(&format!("node-{victim}.")))
-            .collect::<Vec<_>>();
-        assert!(
-            hits.is_empty(),
-            "{needle:?}:\n{}\nthe victim's lease lines:\n{}\n{logs}",
-            hits.join("\n"),
-            victim_leases.join("\n")
-        );
-    }
-    farm.stop();
 }

@@ -41,6 +41,7 @@ use crate::Error;
 use crate::build_commit::not_full_commit;
 use crate::package::Platform;
 use crate::sums::{self, SUMS};
+use crate::version_facts::{self, Pairing};
 
 /// The workflow that is to attest the beta result (planned: the beta workflow signs
 /// nothing today, so [`Gh::beta`] refuses every result until it does).
@@ -264,7 +265,7 @@ fn describe(l: Limit) -> String {
 }
 
 /// What is missing for `platform` in the listed files of `dir`: its tarball, the SBOM
-/// beside it, the bundle beside it.
+/// beside it, the bundle beside it, and the version facts of its `kbf`.
 fn incomplete(dir: &Path, listed: &[String], commit: &str, platform: Platform) -> Vec<String> {
     let suffix = format!("-{commit}-{}.tar.gz", platform.name());
     let tarballs: Vec<&String> = listed.iter().filter(|n| n.ends_with(&suffix)).collect();
@@ -275,6 +276,15 @@ fn incomplete(dir: &Path, listed: &[String], commit: &str, platform: Platform) -
         )];
     }
     let mut missing = Vec::new();
+    // A tarball of another binary counts as the platform's above; the facts of the `kbf`
+    // are what a node's offer reads, so they are required whatever else is listed.
+    let facts = version_facts::name(commit, platform);
+    if !listed.contains(&facts) {
+        missing.push(format!(
+            "platform {}: no version facts {facts}",
+            platform.name()
+        ));
+    }
     for t in tarballs {
         let sbom = format!("{}.cdx.json", t.trim_end_matches(".tar.gz"));
         if !listed.contains(&sbom) {
@@ -315,7 +325,7 @@ pub fn plan(r: &Request, attester: &dyn Attester) -> Result<OfferDoc, Error> {
     let mut problems = Vec::new();
 
     // 1. The release.
-    if let Err(e) = super::check(r.dir, r.commit) {
+    if let Err(e) = super::check(r.dir, r.commit, Pairing::Required) {
         problems.extend(lines_of(e));
     }
     let set_hash = verify::set_hash_of(r.dir)?;

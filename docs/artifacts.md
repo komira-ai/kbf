@@ -31,7 +31,7 @@ macOS runner pool. Adding it to an open pull request starts a run.
 added to a pull request therefore starts a whole `artifacts` run, which replaces the pull
 request's earlier run: add labels together, before the run you want to keep. `native-macos`
 and `pkg-macos` run in `beta.yml` on every push and never on a pull request; that is pinned
-by `crates/kbf-it/tests/release_artifacts`.
+by `crates/kbf-integration-test/tests/release_artifacts`.
 
 ## What is built
 
@@ -68,7 +68,7 @@ The packages are the two Linux jobs' debs and the macOS job's `.pkg`:
 | `kbf-installer-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
 | `kbf-installer-<commit>-darwin-arm64.pkg` | the `darwin-arm64` job (`macos-15`, `cargo xtask pkg build`) | the `kbf-installer` of the tarball of the same name, its LaunchDaemon property list, the pinned darwin `gh` and a trust directory |
 
-The set above is pinned: `crates/kbf-it/tests/release_artifacts` fails a pull request
+The set above is pinned: `crates/kbf-integration-test/tests/release_artifacts` fails a pull request
 that drops one of these files from the workflow, packages one that is not listed, or
 leaves this table describing another set.
 
@@ -96,6 +96,42 @@ installed by `cargo xtask fetch`). One `SHA256SUMS` covers every tarball and SBO
 sums assemble`), and checks every file against it (`cargo xtask verify-assets sums`:
 every file listed once, each matching, and a copy of the first tarball with one byte
 flipped not matching).
+
+The `kbf` tarball of each platform has a third file beside it, `kbf-<commit>-<platform>.version.json`:
+the exact bytes `kbf --version --json` printed when the job that built the `kbf` ran it
+(below). A node's offer and the age check of a release need what the `kbf` of each platform
+says of itself (`meta_log`, the protocols, `seq`), nothing on the frontend records it, and
+only a runner of the platform can run its binary: a Linux runner cannot run the macOS
+`kbf`. Each build job therefore runs `cargo xtask release version-facts --binary
+target/<target>/release/kbf --commit "$GITHUB_SHA" --platform <platform> --out dist` after
+the `kbf` is built (on macOS, signed) and its identity is checked, and before it is
+packaged. The verb runs `kbf --version --json` as the installer runs a staged binary: by
+absolute path, with an empty environment (the runner's tokens are not passed to it), no
+standard input and a limit of 10 seconds, and reads what it printed with the installer's
+own strict reader (`kbf_installer::binary::Version`: at most 4096 bytes and exactly the
+fields below). It refuses, and writes nothing, unless the binary exited 0 and says it is
+the `release` build of `$GITHUB_SHA`; the file is those bytes unchanged, never a document
+read and written again. The file is listed in the job's `SHA256SUMS.<platform>` like a
+tarball, so the one `SHA256SUMS`, the build provenance, the verification and the release
+carry it. It has no SBOM and no bundle of its own. The set is closed over it:
+`verify-assets sums` (so `release check`, `release publish` and `release offer`) refuses a
+listed `kbf` tarball whose `kbf-<commit>-<platform>.version.json` is not listed, and a
+listed facts file whose `kbf` tarball is not; `release check` takes that name and no other
+`.version.json`, and `release offer` calls a platform incomplete without its facts, whatever
+other tarballs it lists. The release made before the build jobs recorded the facts has none:
+`release check --without-version-facts` waives the first rule (and nothing else), and
+`release.yml` gives it to the check of the previous release only (the lint holds that); remove
+the flag once the release before the one being made was made with the facts. The workflow lint
+(`crates/kbf-integration-test/tests/release_artifacts`) names a build job that does not run
+the verb once, for its own platform, between the identity check of `kbf` and its package,
+for the same `--binary` path the job packages.
+
+The build jobs check out the full history (`fetch-depth: 0`, which the workflow lint holds
+for every job that records the facts), so the facts carry the real `seq` (see `seq` below);
+a shallow local build still says `seq: 0`. The bundle `kbf-installer deploy --bundle` reads
+holds `kbf` and `kbf-daemon` tarballs and their attestations and refuses any other entry: the
+facts file is not packed into a bundle, and a packer that adds it needs a reader that accepts
+it installed first (the deploy order of `seq`, below).
 
 `kbf-server`, `kbf` and `kbf-installer` embed the first 12 characters of the commit they
 were built from (`kbf` through the server library it links), and `--version` prints
@@ -127,7 +163,7 @@ words, in either order): one JSON object on one line of stdout, exit 0, the fiel
 sorted by name.
 
 ```text
-{"admin_protocol":1,"commit":"0123456789ab","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"state_schema":1,"version":"0.1.0"}
+{"admin_protocol":1,"commit":"0123456789ab","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"seq":812,"state_schema":1,"version":"0.1.0"}
 ```
 
 - `admin_protocol`: the version of the admin calls of `kbf --mode frontend` (`GET role`,
@@ -144,6 +180,17 @@ sorted by name.
 - `protocol` and `min_protocol`: the newest and the oldest `kbf.worker.v1` version the
   binary speaks. The daemon half speaks exactly `protocol`; the server half accepts
   `min_protocol` through `protocol`.
+- `seq`: the number of commits behind the commit built (`git rev-list --count HEAD`), so
+  two builds of one branch are put in order by it: a later commit has the larger number.
+  It is `0` when the build could not count them (a shallow checkout, which holds only part
+  of the history, or a source archive with no git), and nothing is newer than `0`: a build
+  that cannot count is never ranked above another. A build before this field prints none.
+  The build jobs of `artifacts.yml` check out with `fetch-depth: 0`, so the assets they
+  build print the real count; a shallow local build still prints `seq: 0`. The strict
+  reader of this line in `kbf-installer` (`deny_unknown_fields`) accepts `seq` from this
+  change on: an installer older than that refuses a kbf that prints it
+  (`version-unreadable`), so the installer package that reads `seq` ships before the kbf
+  that prints it.
 - `state_schema`: the schema version of the SQLite state file the binary creates and
   reads.
 - `version`: the package version.
@@ -185,7 +232,7 @@ never released.
 Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write`, and only
 under the exact `if:` that limits it to a push to `main` (the
 `verify-*` jobs run under the same one). The workflow lint
-(`crates/kbf-it/tests/workflows`) refuses those scopes in any other job, and in one
+(`crates/kbf-integration-test/tests/workflows`) refuses those scopes in any other job, and in one
 whose `if:` is any other spelling, so no pull request or merge-queue run holds a token
 that can sign an attestation. No repository code runs in
 an `attest-*` job and nothing is built there: it holds those scopes for the pinned signing
@@ -194,10 +241,10 @@ SHA, and that lint refuses one that is not.
 
 The attest job of a platform group names each tarball of the group and its SBOM, one `actions/attest-sbom` step per
 tarball, and runs only on a push to one of those two branches. So that a binary added to a build job cannot reach
-`main` without its step, the repository lint (`crates/kbf-it/tests/attested_assets`)
+`main` without its step, the repository lint (`crates/kbf-integration-test/tests/attested_assets`)
 reads the workflow's `cargo xtask package` lines and its attest steps on every pull
 request, and refuses a packaged tarball with no step pairing it with its own SBOM, or a
-step for a tarball no job packages. The lint `crates/kbf-it/tests/attested_bundles` does
+step for a tarball no job packages. The lint `crates/kbf-integration-test/tests/attested_bundles` does
 the same for the bundles: a packaged tarball with no provenance step of its own, no step
 that names its bundle, or a bundle that is not uploaded, downloaded by the verify job and
 by the release workflow, and required by `release locate`, is named in the pull request. It
@@ -424,7 +471,8 @@ themselves do not expire with the artifacts.
 A release is the files a push run of `artifacts.yml` on `main` left for one commit,
 attached unchanged to a GitHub release
 ([`.github/workflows/release.yml`](../.github/workflows/release.yml)). Nothing is
-rebuilt. Its assets are every tarball and SBOM in the table above, for that commit, their
+rebuilt. Its assets are every tarball and SBOM in the table above, for that commit, the
+`kbf-<commit>-<platform>.version.json` of each platform, their
 `SHA256SUMS`, and the provenance bundle of each tarball, `<tarball>.sigstore.json`, beside
 it.
 
@@ -445,7 +493,8 @@ nothing is published) when:
   the bundles; they expire after 90 days, so a release is cut within 90 days of the
   commit);
 - a file does not match `SHA256SUMS` (`sha256sum --check --strict`), a file is not
-  listed in it, or a listed file is not `<binary>-<commit>-<platform>`;
+  listed in it, a `kbf` tarball's `kbf-<commit>-<platform>.version.json` is not listed,
+  or a listed file is not `<binary>-<commit>-<platform>` (or that version file);
 - a tarball has no bundle, or a bundle file belongs to no listed tarball, is not exactly
   one bundle of at most 256 KiB, or does not have its tarball's digest as its one subject
   (`cargo xtask release check`);
@@ -480,7 +529,7 @@ commit. The `publish` job runs in the `prod` environment, whose required reviewe
 The workflow can also be run by hand (`workflow_dispatch`) with a commit SHA and the
 annotated tag to check. Only `verify` runs then: every check above, and nothing is
 published (`publish` runs only for a pushed tag, and only `publish` holds a write scope).
-`crates/kbf-it/tests/release_workflow` holds the file to this: the tag-check step, the
+`crates/kbf-integration-test/tests/release_workflow` holds the file to this: the tag-check step, the
 `prod` environment, a `v*` tag push and a dispatch as the only triggers (no pull request),
 pinned actions and an empty top-level `permissions`. On every pull request
 into `main`, CI asks GitHub the same on-`main` question for the pull request's base

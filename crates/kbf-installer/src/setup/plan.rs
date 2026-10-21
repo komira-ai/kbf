@@ -704,7 +704,26 @@ fn units(
                 (MAC_DAEMON_LABEL, start_mode),
             ];
             for (label, now) in wanted {
-                if now && !os.launchd_loaded(label)? {
+                // The installer's job may carry a launchd disable override (the rollback of
+                // an adopted Mac sets one, and the package's removal does not clear it): a
+                // job that is disabled does not load at boot, and `bootstrap` of it fails.
+                // `enable` clears the override and is harmless without one, so it is run
+                // whether or not the job is loaded (a loaded job can carry an override too),
+                // before the bootstrap, and with `--no-start` too (the job is then enabled
+                // for the next boot, as a systemd unit is).
+                let installer = label == MAC_INSTALLER_LABEL;
+                if !(now || installer) {
+                    continue;
+                }
+                let loaded = os.launchd_loaded(label)?;
+                if installer {
+                    p.run(
+                        Cmd::new(hp(LAUNCHCTL)?)
+                            .arg("enable")
+                            .arg(format!("system/{label}")),
+                    );
+                }
+                if now && !loaded {
                     p.run(
                         Cmd::new(hp(LAUNCHCTL)?)
                             .arg("bootstrap")

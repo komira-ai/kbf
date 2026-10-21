@@ -281,6 +281,19 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         self
     }
 
+    /// The same cache, calling `hook` from a write-pool writer after each batch's
+    /// `PutStaged` is applied to the index and before its blobs are answered, with the
+    /// batch's digests. The writer waits for `hook`, so a test can park it between the
+    /// two steps and read the cache there. Only with the `testkit` feature: a release
+    /// build has no hook. Set it before the cache stores anything; a second call keeps
+    /// the first hook.
+    #[cfg(feature = "testkit")]
+    #[must_use]
+    pub fn with_drain_hook(self, hook: DrainHook) -> Self {
+        let _ = self.writer.drain_hook.set(pool::HookCell(hook));
+        self
+    }
+
     /// The same cache, flushing only the staged objects that hold a digest `gate` says
     /// this node flushes (one flusher per digest, `kbf_storage::flush`). A sealed object
     /// of digests the node does not flush stays staged, whole, off the flusher's queue.
@@ -819,6 +832,8 @@ pub use flush::{
     FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
 };
 pub use losses::Losses;
+#[cfg(feature = "testkit")]
+pub use pool::DrainHook;
 use pool::WritePool;
 pub use pool::{BATCH_BLOBS, BATCH_BYTES, BUFFERED_BLOB_BYTES, PoolConfig};
 pub use read::{BlobRead, MAX_DECODED_BLOB_BYTES, READ_WINDOW_BYTES};

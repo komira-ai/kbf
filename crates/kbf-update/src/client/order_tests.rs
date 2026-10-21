@@ -294,6 +294,58 @@ async fn an_activation_record_carries_the_locators_the_facts_and_the_orders_gene
     assert!(!order_file(&rig, 3).exists());
 }
 
+/// Catches the node taking an offer whose facts the frontend left out, or refusing one that
+/// is whole: an offer with every fact is activated and its record carries each fact, and
+/// an offer missing any one of `protocol`, `state_schema`, `profile` is held but its
+/// activation is refused naming the facts and writes no record (fail closed). A `min_protocol`
+/// of 0 is a real minimum (a build that speaks every version) and is accepted.
+///
+/// Mutant seen red: the refusal loosened (`protocol == 0 || state_schema == 0` made `&&`:
+/// a zero `state_schema` is accepted).
+#[tokio::test]
+async fn an_offer_with_every_fact_is_activated_and_one_missing_any_is_refused() {
+    let rig = rig_with_helper("facts-whole", "", &commit(9));
+    type Blank = fn(&mut crate::types::Expected);
+    let breaks: [(&str, Blank); 3] = [
+        ("protocol", |e| e.protocol = 0),
+        ("state_schema", |e| e.state_schema = 0),
+        ("profile", |e| e.profile.clear()),
+    ];
+    for (n, (fact, blank)) in breaks.into_iter().enumerate() {
+        let generation = 20 + n as u64;
+        let mut broken = crate::fixtures::offer_of(generation);
+        blank(&mut broken.expected);
+        rig.handle.offer(broken.clone());
+        let id = 10 + n as u64;
+        let decision = rig.ask(id, Verb::Activate, &broken.commit);
+        assert!(
+            why(&decision).contains("expected facts"),
+            "{fact}: {decision:?}"
+        );
+        assert!(!order_file(&rig, id).exists(), "{fact}: no record");
+    }
+
+    let mut open_minimum = crate::fixtures::offer_of(30);
+    open_minimum.expected.min_protocol = 0;
+    rig.handle.offer(open_minimum.clone());
+    assert_eq!(
+        rig.ask(40, Verb::Activate, &open_minimum.commit),
+        Decision::Accepted
+    );
+    let text = fs::read_to_string(order_file(&rig, 40)).expect("record");
+    let record = crate::OrderRecord::parse(text.as_bytes()).expect("parses");
+    let facts = record.expected.expect("facts");
+    assert_eq!(
+        (
+            facts.protocol,
+            facts.min_protocol,
+            facts.state_schema,
+            facts.profile.as_str()
+        ),
+        (7, 0, 3, "release")
+    );
+}
+
 /// Catches an order accepted when its id or file cannot be recorded: nothing the helper
 /// could act on is left behind without the id.
 #[tokio::test]

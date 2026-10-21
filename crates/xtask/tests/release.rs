@@ -73,6 +73,17 @@ fn check(dir: &Path, commit: &str) -> (Option<i32>, String, String) {
     (out.status.code(), text(&out.stdout), text(&out.stderr))
 }
 
+/// `cargo xtask release check --without-version-facts`, as the previous release is read.
+fn check_without_facts(dir: &Path, commit: &str) -> (Option<i32>, String, String) {
+    let out = Command::new(XTASK)
+        .args(["release", "check", s(dir), "--commit", commit])
+        .arg("--without-version-facts")
+        .output()
+        .expect("run xtask");
+    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    (out.status.code(), text(&out.stdout), text(&out.stderr))
+}
+
 /// Writes GitHub's answers, `(path, JSON)`, to the fake's `gh-api.json`.
 fn answers(root: &Path, answers: &[(String, serde_json::Value)]) {
     let map: serde_json::Map<String, serde_json::Value> = answers.iter().cloned().collect();
@@ -804,6 +815,113 @@ fn check_refuses_assets_of_another_commit_or_of_no_binary() {
         let line = format!("{}  {bad}\n", hex::encode(sha2::Sha256::digest(b"x")));
         std::fs::write(commit_dist.join("SHA256SUMS"), format!("{line}{sums}")).expect("sums");
         let (code, _, err) = check(&commit_dist, COMMIT);
+        assert_eq!(code, Some(1), "{bad}");
+        assert_eq!(err, format!("xtask: {bad}: not an asset of {COMMIT}\n"));
+    }
+}
+
+/// [`dist`] with one more listed file, `name`, holding `x`.
+fn dist_with(root: &Path, name: &str) -> PathBuf {
+    let d = dist(root, COMMIT);
+    let sums = std::fs::read_to_string(d.join("SHA256SUMS")).expect("sums");
+    std::fs::write(d.join(name), "x").expect("file");
+    let line = format!("{}  {name}\n", hex::encode(sha2::Sha256::digest(b"x")));
+    std::fs::write(d.join("SHA256SUMS"), format!("{sums}{line}")).expect("sums");
+    d
+}
+
+/// [`dist`] with the `kbf` tarball of `platform`, its bundle and, when `facts`, the
+/// version facts beside it.
+fn dist_with_kbf(root: &Path, platform: &str, facts: bool) -> PathBuf {
+    let d = dist(root, COMMIT);
+    let mut sums = std::fs::read_to_string(d.join("SHA256SUMS")).expect("sums");
+    let tarball = format!("kbf-{COMMIT}-{platform}.tar.gz");
+    let mut names = vec![tarball.clone()];
+    if facts {
+        names.push(format!("kbf-{COMMIT}-{platform}.version.json"));
+    }
+    for name in names {
+        let bytes = format!("{name} bytes");
+        std::fs::write(d.join(&name), &bytes).expect("file");
+        let sha = sha_of(&bytes);
+        sums.push_str(&format!("{sha}  {name}\n"));
+        if name == tarball {
+            let bundle = d.join(format!("{name}.sigstore.json"));
+            std::fs::write(bundle, bundle_text(&sha)).expect("bundle");
+        }
+    }
+    std::fs::write(d.join("SHA256SUMS"), sums).expect("sums");
+    d
+}
+
+#[test]
+fn check_takes_the_version_facts_of_kbf_for_the_commit() {
+    // Catches: the facts file the build jobs now list refused as no asset of the commit,
+    // which would stop every release. Control for the next tests: the name that passes is
+    // exactly `kbf-<commit>-<platform>.version.json`, beside its tarball.
+    let root = scratch("check-facts");
+    let d = dist_with_kbf(&root, "linux-arm64", true);
+    let (code, out, err) = check(&d, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("sums: 8 files match"), "{out}");
+    assert!(out.contains("is an asset of"), "{out}");
+    assert!(out.contains("each of the 4 tarballs"), "{out}");
+}
+
+#[test]
+fn check_waives_the_version_facts_of_a_release_made_before_them_and_only_that() {
+    // Catches: the first release after the facts were recorded failing at its check of the
+    // previous release (a `kbf` tarball and no facts: nothing is published), and a waiver
+    // that is a general pass: without the flag the same directory is refused, with it
+    // facts without their tarball are still refused, and so is a changed file. Mutants:
+    // the flag ignored; the flag skipping the whole pairing; the flag skipping the sums.
+    let root = scratch("check-waived");
+    let d = dist_with_kbf(&root, "linux-arm64", false);
+    let facts = format!("kbf-{COMMIT}-linux-arm64.version.json");
+    let tarball = format!("kbf-{COMMIT}-linux-arm64.tar.gz");
+    let (code, _, err) = check(&d, COMMIT);
+    assert_eq!(code, Some(1), "{err}");
+    let want =
+        format!("xtask: {tarball}: its version facts {facts} are not listed in SHA256SUMS\n");
+    assert_eq!(err, want);
+    let (code, out, err) = check_without_facts(&d, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("sums: 7 files match"), "{out}");
+    assert!(out.contains("each of the 4 tarballs"), "{out}");
+    // Facts with no tarball are refused whether or not the flag is given.
+    let orphan_root = scratch("check-orphan");
+    let orphan = dist_with(&orphan_root, &facts);
+    let want = format!(
+        "xtask: {facts}: the tarball it states the facts of, {tarball}, is not listed in \
+         SHA256SUMS\n"
+    );
+    for run in [check, check_without_facts] {
+        let (code, _, err) = run(&orphan, COMMIT);
+        assert_eq!(code, Some(1), "{err}");
+        assert_eq!(err, want);
+    }
+    // The sums are still read.
+    std::fs::write(d.join(&tarball), "other").expect("change");
+    let (code, _, err) = check_without_facts(&d, COMMIT);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("does not match its line"), "{err}");
+}
+
+#[test]
+fn check_refuses_version_facts_that_are_not_kbfs_for_the_commit() {
+    // Catches: any file ending `.version.json` taken as an asset (another binary's, an
+    // unknown platform's, a renamed copy), when the set holds one name per platform.
+    // Another commit's facts are refused earlier, by the sums (no tarball of it is listed);
+    // `is_facts_of` has a test of its own for that name. Mutant: the exact name replaced by
+    // the suffix.
+    for bad in [
+        format!("kbf-daemon-{COMMIT}-linux-arm64.version.json"),
+        format!("kbf-{COMMIT}-windows-x86_64.version.json"),
+        format!("kbf-{COMMIT}-linux-arm64.version.json.bak"),
+    ] {
+        let root = scratch("check-bad-facts");
+        let d = dist_with(&root, &bad);
+        let (code, _, err) = check(&d, COMMIT);
         assert_eq!(code, Some(1), "{bad}");
         assert_eq!(err, format!("xtask: {bad}: not an asset of {COMMIT}\n"));
     }

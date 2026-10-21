@@ -116,17 +116,18 @@ fn the_policy_flags_are_shown_by_name() {
     );
 }
 
-/// Catches: a platform complete or not without the component it needs named (linux
-/// `kbf`, darwin `kbf-daemon`); the desired release not marked; an empty store.
-/// Mutants: the two components swapped; every platform "complete".
+/// Catches: a platform complete or not without the component it needs named (`kbf` on linux
+/// and darwin; the Mac was shown `kbf-daemon`, which is not built for it); the desired
+/// release not marked; an empty store. Mutants: darwin's component back to `kbf-daemon`;
+/// every platform "complete".
 #[test]
 fn releases_name_the_component_each_platform_needs() {
     let (_, html) = page(&updates_farm());
     for text in [
         "linux-x86_64: complete (kbf)",
-        "darwin-arm64: incomplete, needs (kbf-daemon)",
+        "darwin-arm64: incomplete, needs (kbf)",
         "linux-arm64: complete (kbf)",
-        "darwin-arm64: complete (kbf-daemon)",
+        "darwin-arm64: complete (kbf)",
         &format!("<td><code>{COMMIT_B}</code></td><td>yes</td>"),
         &format!("<td><code>{COMMIT_A}</code></td><td></td>"),
     ] {
@@ -190,7 +191,7 @@ fn the_host_table_shows_each_host_with_its_detail() {
     assert_eq!(
         row("mac-1"),
         format!(
-            "<tr><td>mac-1</td><td>darwin (kbf-daemon)</td><td>-</td><td>aaaaaaaaaaaa</td>\
+            "<tr><td>mac-1</td><td>darwin (kbf)</td><td>-</td><td>aaaaaaaaaaaa</td>\
              <td>{COMMIT_B}</td><td>no</td><td>yes</td><td>refused</td>\
              <td><span class=\"pill ok\">ok</span></td><td>no helper installed</td>"
         )
@@ -279,7 +280,7 @@ fn a_refused_detail_route_removes_the_detail_columns_and_keeps_the_summary() {
         // The open summary of every host.
         assert!(
             html.contains(
-                "<tr><td>mac-1</td><td>darwin (kbf-daemon)</td><td>-</td><td>no</td>\
+                "<tr><td>mac-1</td><td>darwin (kbf)</td><td>-</td><td>no</td>\
                  <td>yes</td><td>refused</td><td><span class=\"pill ok\">ok</span></td></tr>"
             ),
             "{html}"
@@ -630,8 +631,5 @@ fn a_darwin_os_name_is_a_darwin_host() {
         .json("/v1/nodes", &nodes)
         .json(HOSTS_URL, &hosts_doc());
     let (_, html) = page(&fake);
-    assert!(
-        html.contains("<td>d-1</td><td>darwin (kbf-daemon)</td>"),
-        "{html}"
-    );
+    assert!(html.contains("<td>d-1</td><td>darwin (kbf)</td>"), "{html}");
 }

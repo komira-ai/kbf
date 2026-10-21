@@ -53,6 +53,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use kbf_gate::OfferDoc;
 use serde_json::Value;
 
 use crate::CommitId;
@@ -191,7 +192,8 @@ pub struct Env<'a> {
     pub clock: &'a dyn Clock,
     pub smoke: &'a dyn Smoke,
     pub check: &'a dyn Check,
-    /// Reads the `meta_log` of the staged `kbf` (only an offer asks).
+    /// Reads the `meta_log` of the staged `kbf` and of the one this host runs (only an offer
+    /// asks).
     pub probe: &'a dyn Probe,
 }
 
@@ -259,6 +261,11 @@ pub(crate) fn fail(exit: Exit, reason: &'static str, detail: impl Into<String>) 
     }
 }
 
+/// An offer's refusal as the deploy's failure: exit 3 with the offer's reason.
+fn refused((reason, detail): offer::Refused) -> Fail {
+    fail(Exit::Refused, reason, detail)
+}
+
 /// Everything one run builds up.
 pub(crate) struct Run<'a> {
     pub env: &'a Env<'a>,
@@ -271,9 +278,29 @@ pub(crate) struct Run<'a> {
     /// The new frontend lists only the nodes that have reconnected to it, so a list that
     /// lacks one of these is not a roll that finished.
     pub expected: BTreeMap<String, String>,
+    /// The offer read from the bundle (`--offer -`), once the bundle is read. A file's offer
+    /// is in the options; `offer_in_force()` is the one place that knows which is which.
+    pub offer_doc: Option<OfferDoc>,
 }
 
 impl Run<'_> {
+    /// The stage and the offer this deploy runs under: a file's from the start, the bundle's
+    /// once the bundle is read, none under the other policies. A policy that takes its offer
+    /// from the bundle, asked before that offer was read, is `offer_missing`: a gate that
+    /// cannot find its offer stops the run, it does not pass.
+    fn offer_in_force(&self) -> Result<Option<(Stage, &OfferDoc)>, Fail> {
+        match (&self.opts.offer, &self.offer_doc) {
+            (OfferPolicy::Offer { stage, doc, .. }, _) => Ok(Some((*stage, doc.as_ref()))),
+            (OfferPolicy::InBundle { stage, .. }, Some(doc)) => Ok(Some((*stage, doc))),
+            (OfferPolicy::InBundle { .. }, None) => Err(fail(
+                Exit::Refused,
+                "offer_missing",
+                "the bundle's offer was not read before it was needed",
+            )),
+            _ => Ok(None),
+        }
+    }
+
     pub fn send(&self, request: &Request) -> Result<Reply, String> {
         self.env
             .api
@@ -347,6 +374,7 @@ pub fn deploy(env: &Env, opts: &Options, bundle: Option<&mut dyn Read>) -> Summa
         gates: Gates::new(opts.apply),
         observed: None,
         expected: BTreeMap::new(),
+        offer_doc: None,
     };
     let record = match record::open(&run) {
         Ok(record) => record,
@@ -385,6 +413,7 @@ pub fn update_frontend(env: &Env, opts: &Options) -> (Summary, Exit) {
         gates: Gates::new(false),
         observed: None,
         expected: BTreeMap::new(),
+        offer_doc: None,
     };
     let outcome = run.step("frontend", |r| r.update_frontend());
     run.sum.ended = summary::utc(env.clock.now());
@@ -426,7 +455,6 @@ impl Run<'_> {
     /// Step 0, when a stage is named: the offer (or the `--no-offer`) the deploy runs under.
     /// What needs the bundle is checked in step 1, before a byte is uploaded.
     fn check_offer(&mut self) -> Result<(), Fail> {
-        let refused = |(reason, detail): offer::Refused| fail(Exit::Refused, reason, detail);
         self.sum.offer = self.opts.offer.record();
         match &self.opts.offer {
             OfferPolicy::Missing(stage) => Err(fail(
@@ -438,6 +466,8 @@ impl Run<'_> {
                 ),
             )),
             OfferPolicy::Unchecked | OfferPolicy::Waived(_) => Ok(()),
+            // The offer is the bundle's own, and is judged once the bundle is read.
+            OfferPolicy::InBundle { .. } => Ok(()),
             OfferPolicy::Offer {
                 stage,
                 doc,
@@ -453,6 +483,55 @@ impl Run<'_> {
         }
     }
 
+    /// `--offer -`: the offer is the bundle's own `offer.json`. Read it, record it in the
+    /// summary at once (so a refusal below carries it), and judge it as a file's is: the stage,
+    /// the commit and the age. Under any other policy the bundle must not carry an
+    /// `offer.json` at all: an offer that is there but not the one judged is a stray entry.
+    fn read_bundle_offer(&mut self, bundle: &bundle::Bundle) -> Result<(), Fail> {
+        let OfferPolicy::InBundle { stage, max_age } = &self.opts.offer else {
+            if bundle.offer.is_some() {
+                return Err(fail(
+                    Exit::Usage,
+                    "bad_bundle",
+                    "the bundle carries offer.json, which only --offer - reads",
+                ));
+            }
+            return Ok(());
+        };
+        let entry = bundle.offer.as_deref();
+        let doc = offer::from_bundle(entry).map_err(refused)?;
+        self.sum.offer = Some(OfferRecord::of(stage.word(), &doc));
+        let now = self.env.clock.now();
+        let judged = offer::check_header(*stage, &doc, &self.opts.commit, now, *max_age);
+        judged.map_err(refused)?;
+        self.offer_doc = Some(doc);
+        Ok(())
+    }
+
+    /// What the offer asks of the bundle and of this host, before a byte is uploaded: the
+    /// set, the files and the staged `kbf`'s `meta_log`, then a claim of `reversible` against
+    /// the build this host runs. With no offer there is nothing to ask.
+    fn check_offer_bundle(&mut self, bundle: &bundle::Bundle) -> Result<(), Fail> {
+        let Some((stage, doc)) = self.offer_in_force()? else {
+            return Ok(());
+        };
+        let probe = self.env.probe;
+        offer::check_bundle(
+            doc,
+            bundle,
+            &self.opts.commit,
+            &self.opts.host_platform,
+            probe,
+        )
+        .map_err(refused)?;
+        // The record the offer step made, with the host's own word on `reversible` added. It
+        // never stops the deploy: an irreversible release is deployed and recorded as one.
+        let mut record = OfferRecord::of(stage.word(), doc);
+        record.host_reversible = offer::check_reversible(doc, probe);
+        self.sum.offer = Some(record);
+        Ok(())
+    }
+
     /// Step 1: put the bundle's files in the store.
     fn upload(&mut self, bundle: Option<&mut dyn Read>) -> Result<(), Fail> {
         if matches!(self.opts.offer, OfferPolicy::Offer { .. }) && bundle.is_none() {
@@ -462,20 +541,40 @@ impl Run<'_> {
                 "with --offer the bundle (--bundle -) must carry the release and its SHA256SUMS",
             ));
         }
+        if matches!(self.opts.offer, OfferPolicy::InBundle { .. }) && bundle.is_none() {
+            return Err(fail(
+                Exit::Refused,
+                "offer_missing",
+                "with --offer - the offer is the bundle's own: --bundle - must carry offer.json",
+            ));
+        }
         let Some(input) = bundle else { return Ok(()) };
         let bundle = bundle::read_bundle(input, &self.opts.commit)
             .map_err(|e| fail(Exit::Usage, "bad_bundle", e))?;
-        if let OfferPolicy::Offer { doc, .. } = &self.opts.offer {
-            offer::check_bundle(
-                doc,
-                &bundle,
-                &self.opts.commit,
-                &self.opts.host_platform,
-                self.env.probe,
-            )
-            .map_err(|(reason, detail)| fail(Exit::Refused, reason, detail))?;
-        }
+        self.read_bundle_offer(&bundle)?;
+        self.check_offer_bundle(&bundle)?;
         let entries = bundle.entries;
+        // The store keeps a platform without a version facts file but never offers it; say
+        // so here too, with the words of the store's own listing.
+        let with_facts: BTreeSet<&str> = entries
+            .iter()
+            .filter(|e| e.name == bundle::FACTS)
+            .map(|e| e.platform.as_str())
+            .collect();
+        let mut without: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.name != bundle::FACTS && !with_facts.contains(e.platform.as_str()))
+            .map(|e| e.platform.as_str())
+            .collect();
+        without.sort_unstable();
+        without.dedup();
+        for platform in without {
+            self.sum.notes.push(format!(
+                "no version facts (kbf-{}-{platform}.version.json): nodes will not be offered \
+                 this platform; rebuild the release to include it",
+                self.opts.commit
+            ));
+        }
         if !self.opts.apply {
             return Ok(());
         }
@@ -497,10 +596,16 @@ impl Run<'_> {
                     ));
                 }
                 s => {
+                    // The store says why it refused a file (a version facts document that
+                    // contradicts the upload, naming it); no host path is in that text.
+                    let why = reply
+                        .json()
+                        .and_then(|j| j.get("error").and_then(|e| e.as_str().map(str::to_owned)))
+                        .map_or_else(String::new, |e| format!(": {e}"));
                     return Err(fail(
                         Exit::Failed,
                         "upload_failed",
-                        format!("PUT {path}: status {s}"),
+                        format!("PUT {path}: status {s}{why}"),
                     ));
                 }
             }
@@ -540,9 +645,8 @@ impl Run<'_> {
                 format!("no platform for {}", unknown.join(", ")),
             ));
         }
-        if let OfferPolicy::Offer { doc, .. } = &self.opts.offer {
-            offer::check_platforms(doc, &wanted)
-                .map_err(|(reason, detail)| fail(Exit::Refused, reason, detail))?;
+        if let Some((_, doc)) = self.offer_in_force()? {
+            offer::check_platforms(doc, &wanted).map_err(refused)?;
         }
         let releases = self.get_json("/v1/releases").map_err(io)?;
         let mut missing = Vec::new();

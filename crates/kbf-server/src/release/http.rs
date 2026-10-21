@@ -13,6 +13,14 @@
 //!   file. `201` when the key is new, `200` when it already held exactly these bytes, `409`
 //!   for other bytes, `413` past the limit, `400` for a segment that is not what it must be,
 //!   an empty body or a body cut short.
+//! - **Version facts.** `PUT /v1/releases/{commit}/{platform}/version.json` takes the exact
+//!   bytes of that platform's `kbf --version --json` (the file `kbf-<commit>-<platform>.version.json`,
+//!   at most 4 KiB), the same answers as above, and `400` naming the file for a document that
+//!   does not parse, names another commit or platform, or states numbers a node refuses. A
+//!   platform stored without it is accepted as ever and never offered: the answer of a `PUT`
+//!   of its tarball or attestation carries a `note` that says so and names the file, and
+//!   `GET /v1/releases` lists the platform with `"version_facts": false` and the same
+//!   `note`.
 //! - A `PUT` needs what the other `/v1` writes need ([`crate::api::operator_gate`]): a
 //!   loopback peer, no `Origin`, the bearer token. Its body is not JSON, so the JSON
 //!   content type rule of the others does not apply. `GET` is open like `GET /v1/nodes`.
@@ -32,7 +40,7 @@ use futures::StreamExt;
 use serde_json::json;
 
 use super::describe::{DescribeError, describe, view};
-use super::key::{Commit, Key, KeyError, Part};
+use super::key::{Commit, FACTS_SEGMENT, Key, KeyError, Part, no_facts_note};
 use super::store::{CommitListing, PutError, ReleaseStore, Stored};
 use crate::api::{error, json, operator_gate};
 use crate::proxy_auth::Caller;
@@ -85,6 +93,9 @@ async fn put_file(
     let Some(store) = releases.store.as_deref() else {
         return off();
     };
+    if name == FACTS_SEGMENT {
+        return put_facts(store, &commit, &platform, body).await;
+    }
     let (key, part) = match Key::parse(&commit, &platform, &name) {
         Ok(parsed) => parsed,
         Err(e) => return error(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -94,19 +105,42 @@ async fn put_file(
         Part::Tarball => store.put_tarball(&key, &mut chunks).await,
         Part::Attestation => store.put_attestation(&key, &mut chunks).await,
     };
-    match put {
-        Ok(stored) => stored_answer(&stored),
+    let stored = match put {
+        Ok(stored) => stored,
+        Err(e) => return put_refused(&e),
+    };
+    // Said at every put of a component, so whoever uploads sees it whichever file is last.
+    let note = match store.facts(&key.commit, key.platform).await {
+        Ok(None) => Some(no_facts_note(&key.commit, key.platform)),
+        Ok(Some(_)) => None,
+        Err(e) => return disk_failed("facts", &e),
+    };
+    stored_answer(&stored, note)
+}
+
+/// The `PUT` of a platform's version facts.
+async fn put_facts(store: &ReleaseStore, commit: &str, platform: &str, body: Body) -> Response {
+    let (commit, platform) = match Key::parse_platform(commit, platform) {
+        Ok(parsed) => parsed,
+        Err(e) => return error(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let mut chunks = body.into_data_stream().map(|c| c.map_err(io::Error::other));
+    match store.put_facts(&commit, platform, &mut chunks).await {
+        Ok(stored) => stored_answer(&stored, None),
         Err(e) => put_refused(&e),
     }
 }
 
-fn stored_answer(stored: &Stored) -> Response {
+fn stored_answer(stored: &Stored, note: Option<String>) -> Response {
     let code = if stored.created {
         StatusCode::CREATED
     } else {
         StatusCode::OK
     };
-    let answer = json!({ "sha256": stored.sha256.as_str(), "size": stored.size });
+    let mut answer = json!({ "sha256": stored.sha256.as_str(), "size": stored.size });
+    if let Some(note) = note {
+        answer["note"] = note.into();
+    }
     json(code, &answer)
 }
 
@@ -114,7 +148,7 @@ fn put_refused(e: &PutError) -> Response {
     let code = match e {
         PutError::Conflict(_) => StatusCode::CONFLICT,
         PutError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-        PutError::Empty | PutError::Body(_) => StatusCode::BAD_REQUEST,
+        PutError::Empty | PutError::Body(_) | PutError::Facts { .. } => StatusCode::BAD_REQUEST,
         PutError::Disk(e) => return disk_failed("put", e),
     };
     error(code, &e.to_string())
@@ -170,11 +204,16 @@ pub(super) fn listing_view(listing: &[CommitListing]) -> serde_json::Value {
                             })
                         })
                         .collect();
-                    json!({
+                    let mut platform = json!({
                         "platform": p.platform.as_str(),
                         "complete": p.complete,
+                        "version_facts": p.facts,
                         "components": components,
-                    })
+                    });
+                    if !p.facts {
+                        platform["note"] = no_facts_note(&commit.commit, p.platform).into();
+                    }
+                    platform
                 })
                 .collect();
             json!({ "commit": commit.commit.as_str(), "platforms": platforms })

@@ -12,7 +12,7 @@
 # offline for the commit as a host does (cargo xtask verify-assets attestations). Only
 # then does the publish job create the release with those files and the bundles, or add
 # the ones an existing release lacks. It is the one job that may write: `contents: write`, under the exact tag-push
-# `if:` the workflow lint (crates/kbf-it/tests/workflows) requires for that scope. A
+# `if:` the workflow lint (crates/kbf-integration-test/tests/workflows) requires for that scope. A
 # re-run creates no second release and replaces no asset: every asset the release
 # already holds must be one of the verified files, byte for byte, or the run fails and
 # changes nothing.
@@ -28,7 +28,7 @@
 # `prod` environment, whose required reviewer approves it.
 #
 # Run by hand (workflow_dispatch) with a commit and a tag, only the verify job runs: a dry run
-# of every check that publishes nothing. The workflow lint (crates/kbf-it/tests/release_workflow)
+# of every check that publishes nothing. The workflow lint (crates/kbf-integration-test/tests/release_workflow)
 # holds this file to all of that.
 name: release
 
@@ -48,9 +48,12 @@ on:
 
 permissions: {}
 
-# One run per tag (or per branch, for a dry run) at a time, none cancelled.
+# One release at a time across the repository, none cancelled: every tag push shares the one
+# group `release-push` (a second tag waits for the first; a third pending one replaces the
+# second while it waits, as GitHub keeps one pending run per group). A dry run by hand
+# (workflow_dispatch) publishes nothing, so each has its own group and never holds a release.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'push' && 'push' || github.run_id }}
   cancel-in-progress: false
 
 env:
@@ -149,11 +152,14 @@ jobs:
         if: ${{ steps.previous.outputs.previous != '' }}
         working-directory: previous
         run: sha256sum --check --strict SHA256SUMS
+      # The release before the build jobs recorded version facts has none, and this is the
+      # only check that waives them: the release being made (`release check dist`) never does.
+      # Remove the flag once the release before this one was made with the facts.
       - name: Every one is an asset of the previous release's commit, with its bundle
         if: ${{ steps.previous.outputs.previous != '' }}
         env:
           PREVIOUS_COMMIT: ${{ steps.previous.outputs.previous-commit }}
-        run: cargo xtask release check previous --commit "$PREVIOUS_COMMIT"
+        run: cargo xtask release check previous --commit "$PREVIOUS_COMMIT" --without-version-facts
       - name: Verify the previous release's attestations as these were
         if: ${{ steps.previous.outputs.previous != '' }}
         env:
@@ -219,5 +225,5 @@ jobs:
       # The kbf.dev upload (packages, attestations, checksums to the bucket, and the site
       # sync) goes here, after the release exists, through a GitHub OIDC deploy role. It is
       # a separate change: it adds its scope to WRITERS in
-      # crates/kbf-it/tests/release_workflow and settles how the workflow lint admits
+      # crates/kbf-integration-test/tests/release_workflow and settles how the workflow lint admits
       # `id-token: write` under a tag push.

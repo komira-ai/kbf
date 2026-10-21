@@ -79,6 +79,16 @@ pub enum MigrateError {
     /// A rollback that would throw away what the installer did since.
     #[error("cannot roll back: {0}")]
     MovedOn(String),
+    /// An uninstall of a host the installer manages: only a host that is rolled back or was
+    /// never adopted has nothing of the installer in use.
+    #[error("cannot uninstall: {0}")]
+    Adopted(String),
+    /// Applying an uninstall needs the user that owns the installer's files.
+    #[error("uninstalling changes root's files: run it as root (this is uid {have}, not {want})")]
+    NotRootToUninstall { have: u32, want: u32 },
+    /// The installer's unit is of the other platform's kind.
+    #[error("--installer-unit {unit}: this host's units are {want}")]
+    UnitKind { unit: String, want: &'static str },
     /// There is nothing to roll back.
     #[error("cannot roll back: this host was not migrated (no migration.json)")]
     NoJournal,
@@ -102,7 +112,9 @@ impl MigrateError {
     /// How the verb ends (docs/design/kbf-installer.md section 2).
     pub fn exit(&self) -> Exit {
         match self {
-            MigrateError::NotRoot { .. } => Exit::Usage,
+            MigrateError::NotRoot { .. }
+            | MigrateError::NotRootToUninstall { .. }
+            | MigrateError::UnitKind { .. } => Exit::Usage,
             MigrateError::BadLink { .. }
             | MigrateError::Mislabeled { .. }
             | MigrateError::HalfKit(_)
@@ -118,6 +130,7 @@ impl MigrateError {
             | MigrateError::Unmigrated(_)
             | MigrateError::KitRolledBack
             | MigrateError::MovedOn(_)
+            | MigrateError::Adopted(_)
             | MigrateError::InstallerUnit { .. }
             | MigrateError::NoJournal => Exit::NeedsOperator,
             // The old tools' lock or the installer's, held past the wait: ask again.

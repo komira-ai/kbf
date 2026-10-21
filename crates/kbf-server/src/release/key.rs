@@ -98,6 +98,28 @@ impl fmt::Display for Component {
     }
 }
 
+/// The last segment of the path a platform's version facts are put under:
+/// `PUT /v1/releases/{commit}/{platform}/version.json`.
+pub const FACTS_SEGMENT: &str = "version.json";
+
+/// The name the version facts of `platform` at `commit` are known by outside the store:
+/// `kbf-<commit>-<platform>.version.json`, exactly the bytes of that platform's
+/// `kbf --version --json`. Messages name this file, never a path.
+#[must_use]
+pub fn facts_file(commit: &Commit, platform: ReleasePlatform) -> String {
+    format!("kbf-{commit}-{platform}.version.json")
+}
+
+/// What a platform stored without version facts is told: it is held, and never offered.
+#[must_use]
+pub fn no_facts_note(commit: &Commit, platform: ReleasePlatform) -> String {
+    format!(
+        "no version facts ({}): nodes will not be offered this platform; rebuild the release \
+         to include it",
+        facts_file(commit, platform)
+    )
+}
+
 /// The file suffix of a component's attestation bundle in a request path.
 pub const ATTESTATION_SUFFIX: &str = ".attestation";
 
@@ -136,6 +158,21 @@ pub enum KeyError {
 }
 
 impl Key {
+    /// The commit and platform the first two segments name, for the files that belong to a
+    /// platform and not to a component (its version facts).
+    ///
+    /// # Errors
+    /// The first segment that is not exactly what it must be.
+    pub fn parse_platform(
+        commit: &str,
+        platform: &str,
+    ) -> Result<(Commit, ReleasePlatform), KeyError> {
+        let commit = Commit::parse(commit).ok_or_else(|| KeyError::Commit(commit.to_owned()))?;
+        let platform = ReleasePlatform::parse(platform)
+            .ok_or_else(|| KeyError::Platform(platform.to_owned()))?;
+        Ok((commit, platform))
+    }
+
     /// The key and part the three segments of `/v1/releases/{commit}/{platform}/{name}`
     /// name.
     ///
@@ -143,9 +180,7 @@ impl Key {
     /// The first segment that is not exactly what it must be. Case is not folded and
     /// nothing is trimmed.
     pub fn parse(commit: &str, platform: &str, name: &str) -> Result<(Self, Part), KeyError> {
-        let commit = Commit::parse(commit).ok_or_else(|| KeyError::Commit(commit.to_owned()))?;
-        let platform = ReleasePlatform::parse(platform)
-            .ok_or_else(|| KeyError::Platform(platform.to_owned()))?;
+        let (commit, platform) = Self::parse_platform(commit, platform)?;
         let (stem, part) = match name.strip_suffix(ATTESTATION_SUFFIX) {
             Some(stem) => (stem, Part::Attestation),
             None => (name, Part::Tarball),
@@ -250,5 +285,29 @@ mod tests {
         }
         assert_eq!(Commit::parse(COMMIT).expect("good").to_string(), COMMIT);
         assert_eq!(Component::Kbf.to_string(), "kbf");
+    }
+
+    /// Catches the facts file named wrongly (the pipeline, the client and the notes all use
+    /// this name), and the note not naming it.
+    #[test]
+    fn the_facts_file_and_its_note_name_the_commit_and_platform() {
+        let commit = Commit::parse(COMMIT).expect("good");
+        let file = facts_file(&commit, ReleasePlatform::DarwinArm64);
+        assert_eq!(file, format!("kbf-{COMMIT}-darwin-arm64.version.json"));
+        assert_eq!(
+            no_facts_note(&commit, ReleasePlatform::DarwinArm64),
+            format!(
+                "no version facts ({file}): nodes will not be offered this platform; rebuild \
+                 the release to include it"
+            )
+        );
+        assert_eq!(
+            Key::parse_platform(COMMIT, "linux-arm64"),
+            Ok((commit, ReleasePlatform::LinuxArm64))
+        );
+        assert_eq!(
+            Key::parse_platform(COMMIT, "linux"),
+            Err(KeyError::Platform("linux".to_owned()))
+        );
     }
 }
