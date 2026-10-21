@@ -1,7 +1,7 @@
 //! The pages of `kbf-ui` over this server's real read API, through a listener: the
 //! documents the `/v1` routes answer are the ones the pages parse
 //! (`docs/design/ui-data.md` 6.1), and what a build printed reaches the page as text
-//! (section 8). The pages are not mounted on the server yet; the source here asks
+//! (section 8). The pages are mounted on the server (`tests/ui_mount.rs`); the source here asks
 //! the operator API over TCP as a browser's request would reach it.
 
 mod pages;
@@ -67,7 +67,11 @@ async fn the_pages_render_from_the_real_routes() {
     };
     let action_page = format!("/ui/builds/b1/actions/{}", text(&action));
     let mut bodies = Vec::new();
-    for (path, query) in [("/ui", "id=b1"), ("/ui/builds/b1", ""), (&action_page, "")] {
+    for (path, query) in [
+        ("/ui/builds", "id=b1"),
+        ("/ui/builds/b1", ""),
+        (&action_page, ""),
+    ] {
         let answer = kbf_ui::respond(&api, path, query).await;
         let html = String::from_utf8(answer.body().to_vec()).expect("UTF-8");
         assert_eq!(answer.status(), 200, "{path}: {html}");

@@ -38,6 +38,8 @@ fn flags_of_the_profile(p: &Profile) -> Vec<OsString> {
         p.get("kbf_data_dir"),
         "--update-dir",
         "/var/db/kbf-installer",
+        "--orders-dir",
+        "/var/db/kbf-installer/orders",
         "--label",
     ]
     .into_iter()
@@ -138,7 +140,17 @@ fn the_update_directory_is_the_installers_state_directory() {
         text.contains(&format!("update_dir: Some(\"{}\")", state.as_str())),
         "{text}"
     );
-    assert!(text.contains("orders_dir: None"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "orders_dir: Some(\"{}\")",
+            layout.orders_dir().as_str()
+        )),
+        "{text}"
+    );
+    assert_eq!(
+        layout.orders_dir().as_str(),
+        kbf_mac_provision::launchd::ORDERS_DIR
+    );
     let client = kbf_update::Config::new(state.as_str().into(), "p".into(), "c".into());
     assert_eq!(
         client.orders_dir.to_str(),

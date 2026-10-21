@@ -18,6 +18,7 @@ buck2_auth = "none"
 proxy_auth_file = "/run/kbf-proxy/proxy-auth"
 state_dir = "/var/lib/kbf-proxy"
 hold_max_s = 20
+ui = true
 
 [proxy.upstream]
 base_port = 18000
