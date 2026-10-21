@@ -172,7 +172,8 @@ fn the_update_apis_places_default_to_the_layouts_on_every_platform() {
 
 /// Catches each way a file is refused being accepted, or refused without its path and its
 /// reason: unreadable, a directory, not text, no `[proxy]` table, an unknown key in the table,
-/// an unknown key outside it, a table whose own rules fail and a file over the size limit.
+/// a table whose own rules fail and a file over the size limit. (A key outside the table that
+/// this build does not know is not a refusal: the next test.)
 #[test]
 fn a_file_that_is_not_a_proxy_config_is_refused_with_its_path_and_reason() {
     let path = file("none", b"min_generation = 4\n");
@@ -192,16 +193,6 @@ fn a_file_that_is_not_a_proxy_config_is_refused_with_its_path_and_reason() {
         "unknown field",
     );
     refused(
-        &file("outside", format!("surprise = 1\n{PROXY}").as_bytes()),
-        "line 1: unknown field (the text is not shown)",
-    );
-    // The parser quotes the key it met; the message must not carry it.
-    let text = usage_of(load(&file(
-        "outside-redacted",
-        format!("surprise = 1\n{PROXY}").as_bytes(),
-    )));
-    assert!(!text.contains("surprise"), "{text}");
-    refused(
         &file("port", PROXY.replace("18000", "80").as_bytes()),
         "proxy: upstream.base_port must be 1024 to 65521 so both slots fit",
     );
@@ -209,6 +200,39 @@ fn a_file_that_is_not_a_proxy_config_is_refused_with_its_path_and_reason() {
         &file("big", &vec![b'#'; MAX_FILE_BYTES + 1]),
         "bytes; at most",
     );
+}
+
+/// Catches the proxy refusing to start because the file it shares with the installer holds a key
+/// or a value this build does not know. The file is also read by `setup` and the fetcher, which
+/// are closed (they must understand the whole file); the proxy checks three things in it (the
+/// `[proxy]` table and the update API's two numbers; `database` it reads on its own, leniently)
+/// and a package downgrade must not take the
+/// public port down over a source key a later build wrote. The keys it does read are still
+/// checked, and the table is still closed; a value typed into a key it reads is not repeated.
+///
+/// Mutants to plant: `loaded_from` back on the closed `InstallerToml::parse` (red: a usage error
+/// at line 1); the tolerant reader keeping the unread keys (the same); the bounds of
+/// `confirm_window_s` skipped.
+#[test]
+fn the_proxy_reads_the_keys_it_needs_and_ignores_the_rest_of_the_file() {
+    let future = "release_source = \"mirror-pull\"\nrelease_ca = 7\nfuture_key = true\n";
+    let text = format!("{future}confirm_window_s = 300\nfetch_timeout_s = 1200\n{PROXY}");
+    let loaded = load(&file("future-keys", text.as_bytes())).expect("valid");
+    assert_eq!(
+        (loaded.confirm_window_s, loaded.fetch_timeout_s),
+        (300, 1200)
+    );
+    assert_eq!(loaded.proxy.upstream.base_port, 18_000);
+    assert_eq!(loaded.proxy.hold_max_s, 15);
+    let low = format!("confirm_window_s = 10\n{PROXY}");
+    let refused = usage_of(load(&file("low-window", low.as_bytes())));
+    assert!(refused.contains("confirm_window_s"), "{refused}");
+    let typed = format!("confirm_window_s = \"surprise\"\n{PROXY}");
+    let refused = usage_of(load(&file("typed-window", typed.as_bytes())));
+    assert!(!refused.contains("surprise"), "{refused}");
+    let in_table = PROXY.replace("[proxy.upstream]", "[proxy.upstream]\nsurprise = 1");
+    let refused = usage_of(load(&file("typo-in-table", in_table.as_bytes())));
+    assert!(refused.contains("unknown field"), "{refused}");
 }
 
 /// Catches an activation rule loosened: the markers must name this process and exactly one

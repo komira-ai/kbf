@@ -4,7 +4,7 @@
 //!
 //! This RUNS a binary, so the caller has verified the directory first: `release check` and
 //! `verify-assets attestations` on it, in the same job and before this verb (the workflow
-//! lint, `crates/kbf-it/tests/release_workflow`, holds the order). The binary comes from the
+//! lint, `crates/kbf-integration-test/tests/release_workflow`, holds the order). The binary comes from the
 //! tarball `kbf-<commit>-linux-x86_64.tar.gz`, never from anywhere else, and runs with
 //! `--version --json` only.
 

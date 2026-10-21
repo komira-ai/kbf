@@ -30,6 +30,10 @@
 //! - `[proxy] listen` of `installer.toml` (the operator's key) becomes the drop-in
 //!   `kbf-proxy.socket.d/listen.conf` on Linux, and no key removes the drop-in. Setup never
 //!   reloads systemd or restarts the socket: it says that is needed.
+//! - `--release-source bundled` writes `release_source = "bundled"` and fetches nothing: it
+//!   takes no `--release-url` and no `--commit`. The keys a source has of its own
+//!   (`--release-ca`, the frontend snapshot flags) are checked and written, never read
+//!   ([`release_keys`]); the flags decide them, so a run for another source leaves none behind.
 //! - `kbf.toml` is written after every file a unit needs, and the units after it.
 
 pub mod backend;
@@ -41,6 +45,7 @@ pub mod paths;
 pub mod plan;
 pub mod provision;
 pub mod proxy;
+pub mod release_keys;
 pub mod validate;
 
 #[cfg(test)]
@@ -218,6 +223,10 @@ pub fn installer_settings(
         settings.min_generation = floor;
     }
     settings.source = v.source.clone();
+    // The flags decide the keys of the source: a key of a source the host no longer has is
+    // not kept, or the file would not read back.
+    settings.release_ca = v.release_ca.clone();
+    settings.frontend = v.frontend.clone();
     settings.database = v.database.clone();
     (settings.node_cert, settings.node_key) = match (&v.source, node_role(v.mode)) {
         (Source::Frontend, Some(role)) => {
@@ -492,6 +501,7 @@ pub fn cli(
         token_file: args.token_file.clone(),
         release_source: args.release_source,
         release_url: args.release_url.clone(),
+        release: args.release.clone(),
         min_generation: args.min_generation,
         commit: args.commit.clone(),
         database: args.database.clone(),

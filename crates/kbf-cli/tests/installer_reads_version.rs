@@ -30,6 +30,7 @@ fn the_installer_parses_what_kbf_prints() {
     assert_eq!(parsed.meta_log, Some(num("meta_log")));
     assert_eq!(parsed.min_protocol, num("min_protocol"));
     assert_eq!(parsed.protocol, num("protocol"));
+    assert_eq!(parsed.seq, Some(num("seq")));
     assert_eq!(parsed.state_schema, num("state_schema"));
     assert_eq!(parsed.commit, text("commit"));
     assert_eq!(parsed.profile, text("profile"));

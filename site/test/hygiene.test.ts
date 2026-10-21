@@ -4,7 +4,7 @@
 // that is not a public one this site links to, a cloud account's resource name, an internal repository name, or a date
 // from before the project went public. The site is built from page copy and recorded data (a terminal recording and a
 // memory trace), and recordings are where such things leak, so the scan reads every built file, data included.
-// The repository lints (crates/kbf-it/tests/repo_lints.rs) scan the sources; this scans what is deployed.
+// The repository lints (crates/kbf-integration-test/tests/repo_lints.rs) scan the sources; this scans what is deployed.
 
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';

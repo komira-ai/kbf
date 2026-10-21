@@ -64,7 +64,13 @@
 //! - `holds FILE WORDS...`: fails unless `FILE` holds exactly the words, joined by
 //!   spaces (no newline);
 //! - `inode-links OUT PATH...`: creates or truncates `OUT` and writes a line
-//!   `INODE LINKS` for each `PATH` (a link followed): its inode and link count.
+//!   `INODE LINKS` for each `PATH` (a link followed): its inode and link count;
+//! - the probes `try-read PATH`, `try-write PATH`, `try-list DIR`, `tcp-listen ADDR
+//!   PORTFILE SECS`, `tcp-connect ADDR`, `unix-listen PATH SECS`, `unix-connect PATH`,
+//!   `procargs PID`, `proc-sees PID` and `ps-sees MARKER`: each makes one attempt a
+//!   sandbox or the kernel may refuse, prints `PROBE <name> ok` or `PROBE <name>
+//!   errno=<n>`, and goes on whatever the attempt came to (what each does: the header of
+//!   `src/probe.rs`).
 //!
 //! [`main`] first looks at argv0: run through a link named for a tool of
 //! [`crate::fake`], it answers as that tool instead.
@@ -84,6 +90,7 @@ use std::time::{Duration, Instant};
 
 use rustix::process::Signal;
 
+use crate::probe::{self, Probe};
 use crate::{Error, create, failed, number, read, write_line};
 
 /// The base name a link to a test binary that expands
@@ -236,6 +243,8 @@ pub(crate) enum Step<'a> {
         out: &'a str,
         paths: Vec<&'a str>,
     },
+    /// One of the probes of [`crate::probe`].
+    Probe(Probe<'a>),
 }
 
 /// What `test` asks of a path.
@@ -367,7 +376,10 @@ fn step(words: &[String]) -> Result<Step<'_>, Error> {
             out,
             paths: paths.to_vec(),
         },
-        _ => return Err(Error::Usage(format!("bad step: {strs:?}"))),
+        _ => match probe::parse(&strs)? {
+            Some(probe) => Step::Probe(probe),
+            None => return Err(Error::Usage(format!("bad step: {strs:?}"))),
+        },
     })
 }
 
@@ -402,7 +414,7 @@ fn child<'a>(words: &[&'a str]) -> Result<Vec<&'a str>, Error> {
 }
 
 /// `text` as a non-negative, finite number of seconds.
-fn seconds(text: &str) -> Result<Duration, Error> {
+pub(crate) fn seconds(text: &str) -> Result<Duration, Error> {
     text.parse::<f64>()
         .ok()
         .and_then(|s| Duration::try_from_secs_f64(s).ok())
@@ -584,6 +596,7 @@ pub(crate) fn perform(steps: &[Step<'_>]) -> Result<Option<u8>, Error> {
                 }
                 create(out, text.as_bytes())?;
             }
+            Step::Probe(probe) => probe::perform(probe)?,
         }
     }
     drop(held);
@@ -683,7 +696,10 @@ mod tests {
              chmod 7777 q ; wait-for w 1.5 ; sleep-once o 0.5 ; mkdir m/n ; cat c ; mtime t 946684800 ; pgid ; \
              leads ; write-lines w ; write-lines w a b ; copy o i j ; remove r ; mkfifo p ; \
              truncate t 2048 ; zeros 3 ; zeros --stderr 4 ; ignore-signal 15 ; test -e e ; \
-             test ! -d d ; test -x x ; points-to l t ; holds h a b ; inode-links o a b",
+             test ! -d d ; test -x x ; points-to l t ; holds h a b ; inode-links o a b ; try-read r ; try-write w ; \
+             try-list d ; tcp-listen 127.0.0.1:0 pf 1.5 ; tcp-listen [::1]:8080 pf 0 ; \
+             tcp-connect 192.0.2.1:80 ; unix-listen s 30 ; unix-connect s ; procargs 1 ; \
+             proc-sees 4242 ; ps-sees m-1",
         );
         let want = [
             Step::Exit(7),
@@ -813,6 +829,28 @@ mod tests {
                 out: "o",
                 paths: vec!["a", "b"],
             },
+            Step::Probe(Probe::TryRead("r")),
+            Step::Probe(Probe::TryWrite("w")),
+            Step::Probe(Probe::TryList("d")),
+            Step::Probe(Probe::TcpListen {
+                addr: "127.0.0.1:0".parse().expect("address"),
+                portfile: "pf",
+                hold: Duration::from_millis(1500),
+            }),
+            Step::Probe(Probe::TcpListen {
+                addr: "[::1]:8080".parse().expect("address"),
+                portfile: "pf",
+                hold: Duration::ZERO,
+            }),
+            Step::Probe(Probe::TcpConnect("192.0.2.1:80".parse().expect("address"))),
+            Step::Probe(Probe::UnixListen {
+                path: "s",
+                hold: Duration::from_secs(30),
+            }),
+            Step::Probe(Probe::UnixConnect("s")),
+            Step::Probe(Probe::Procargs(1)),
+            Step::Probe(Probe::ProcSees(4242)),
+            Step::Probe(Probe::PsSees("m-1")),
         ];
         assert_eq!(parse(&all).expect("parses"), want);
         for bad in [
@@ -873,6 +911,31 @@ mod tests {
             "points-to l",
             "holds",
             "inode-links o",
+            "try-read",
+            "try-read a b",
+            "try-write",
+            "try-list",
+            "try-list a b",
+            "tcp-listen 127.0.0.1:0 pf",
+            "tcp-listen 127.0.0.1 pf 1",
+            "tcp-listen localhost:80 pf 1",
+            "tcp-listen 127.0.0.1:0 pf soon",
+            "tcp-listen 127.0.0.1:0 pf -1",
+            "tcp-connect",
+            "tcp-connect 127.0.0.1",
+            "tcp-connect 127.0.0.1:65536",
+            "unix-listen s",
+            "unix-listen s soon",
+            "unix-connect",
+            "procargs",
+            "procargs 0",
+            "procargs -1",
+            "procargs x",
+            "proc-sees",
+            "proc-sees 0",
+            "proc-sees 1.5",
+            "ps-sees",
+            "ps-sees a b",
             "echo a ; ; exit 0",
             "nope",
         ] {

@@ -169,14 +169,17 @@ mod tests {
             },
         );
         f.insert(
-            "kbf-it".into(),
+            "kbf-integration-test".into(),
             Floor {
                 lines: None,
                 branches: p("97.43"),
             },
         );
         let text = render(&f);
-        assert!(text.contains("kbf-it         -  97.43\n"), "{text}");
+        assert!(
+            text.contains("kbf-integration-test      -  97.43\n"),
+            "{text}"
+        );
         assert_eq!(parse(&text), Ok(f));
         assert_eq!(parse(&render(&Floors::new())), Ok(Floors::new()));
     }

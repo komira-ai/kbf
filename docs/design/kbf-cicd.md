@@ -77,7 +77,7 @@ What carries over, unchanged in meaning:
 | build once, promote by set hash | `artifacts.yml` already builds once per commit and writes `SHA256SUMS`; the set hash is the digest of that file |
 | validation never a skip, distinct exit code | each stage ends in a result document with a verdict; "not run" is not "passed" |
 | result document written RUNNING first, FINISHED on every exit | the same, one JSON per stage, uploaded as a workflow artifact |
-| workflow checked against the stage list | a lint in `crates/kbf-it/tests` beside the existing workflow lints (hosted runners only, SHA-pinned actions, `permissions: {}`) |
+| workflow checked against the stage list | a lint in `crates/kbf-integration-test/tests` beside the existing workflow lints (hosted runners only, SHA-pinned actions, `permissions: {}`) |
 | least privilege: the job with the publish token holds nothing else | `attest` is already the only job with `id-token: write`; the new jobs hold `contents: read` |
 | dry run by default | `release.yml` dispatch is already a dry run; gamma-offer and prod get the same switch |
 

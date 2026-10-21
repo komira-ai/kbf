@@ -84,11 +84,19 @@ async fn the_pages_render_from_the_real_routes() {
         bodies.push(html);
     }
     let answered = api.answered.lock().expect("not poisoned").clone();
-    assert_eq!(answered.len(), 5, "{answered:?}");
+    // The lookup; the Build page's summary, failures and actions; the Action page's row
+    // and the failures list that holds its log tail (so the blob route is not read).
+    assert_eq!(answered.len(), 6, "{answered:?}");
     for (url, code) in &answered {
         assert_eq!(*code, 200, "{url}");
     }
-    assert!(answered[4].0.starts_with("/v1/blobs/"), "{answered:?}");
+    assert!(answered[5].0.ends_with("/failures"), "{answered:?}");
+    assert!(
+        !answered
+            .iter()
+            .any(|(url, _)| url.starts_with("/v1/blobs/")),
+        "{answered:?}"
+    );
 
     let build = &bodies[1];
     assert!(build.contains("//app:&lt;b&gt;lib&lt;/b&gt;"), "{build}");

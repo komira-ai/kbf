@@ -12,7 +12,7 @@
 //!   a package built on `main` must never trust a feature branch (and one built on a
 //!   feature branch trusts that branch, not `main`). The generator writes no other key,
 //!   so it cannot drift from the keys the installer's settings parser accepts
-//!   (`crates/kbf-it` parses its output with the installer's own parser).
+//!   (`crates/kbf-integration-test` parses its output with the installer's own parser).
 //!
 //! A ref the installer would refuse ([`ref_ok`], the rule of its `SourceRef`) is refused
 //! here, before a package is built that no host could load.

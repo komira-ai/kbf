@@ -31,6 +31,10 @@
 //!   attested on, and the built deb as the release asset
 //!   `kbf-installer-<commit>-<platform>.deb`, refused unless it holds the binary of the
 //!   attested tarball and trusts the branch it is attested for.
+//! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf-installer` package
+//!   carries, in the one form a deb and an rpm put in the same order, and the most a package
+//!   that carries a kbf release may weigh. `pkg-config` and `pkg-asset` take them up with
+//!   the release.
 //! - `pkg-macos-asset` and `pkg-macos-install-test` ([`pkg_macos_asset`],
 //!   [`pkg_macos_install`]): the Mac `.pkg` as the release asset
 //!   `kbf-installer-<commit>-darwin-arm64.pkg`, refused unless it holds the attested
@@ -87,7 +91,9 @@ pub mod pkg_linux;
 pub mod pkg_macos_asset;
 #[cfg(target_os = "macos")]
 pub mod pkg_macos_install;
+pub mod pkg_size;
 pub mod pkg_trust;
+pub mod pkg_version;
 pub mod proxy_loom;
 pub mod release;
 pub mod sudo_test;
