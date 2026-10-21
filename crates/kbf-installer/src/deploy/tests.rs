@@ -1695,7 +1695,16 @@ mod cli_tests {
         }
         // The argv the workflow sends gets past the flag check (it stops later, for want of
         // a config on this machine, with a different message).
-        let list = args(&["--apply", "--json", "--commit", &commit, "--bundle", "-"]);
+        let list = args(&[
+            "--apply",
+            "--json",
+            "--commit",
+            commit.as_str(),
+            "--offer",
+            "-",
+            "--bundle",
+            "-",
+        ]);
         let (mut out, mut err) = (Vec::new(), Vec::new());
         cli::main_as(&list, &mut &b""[..], &mut out, &mut err, true);
         assert!(!String::from_utf8(err).unwrap().contains("through sudo"));

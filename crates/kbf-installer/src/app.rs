@@ -231,11 +231,15 @@ fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failu
     // fetcher reads `installer.toml` (the flag's, else the host's own) at each fetch.
     let cgroups = HostPath::new(leases::CGROUP_ROOT).expect("CGROUP_ROOT is an absolute path");
     let cgroup_root = layout.join(&cgroups);
-    let lease_source = leases::for_restart(&cfg.restart, &cgroup_root);
+    let lease_host = leases::LeaseHost {
+        cgroup_root,
+        layout: layout.clone(),
+    };
+    let lease_source = leases::for_restart(&cfg.restart, &lease_host);
     let restart = cfg.restart.clone();
     let installer_toml = installer_toml_of(args, &layout);
     let fetcher = HostFetcher::on_host(layout.clone(), installer_toml, move || {
-        leases::for_restart(&restart, &cgroup_root)
+        leases::for_restart(&restart, &lease_host)
     });
     let mut helper = Helper::new(
         layout,

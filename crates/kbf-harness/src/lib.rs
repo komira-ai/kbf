@@ -8,6 +8,8 @@
 //!   ([`units`]), on a loopback address of its own, under certificates of the right
 //!   rows ([`pki`]); a supervisor with `term`, `kill`, `restart`, a process table and a
 //!   report of every process's output for a hang ([`procs`]).
+//! - [`reapi`]: a client of a farm's frontend (the REAPI listener under the farm CA), and the
+//!   upload and `Execute` of one action, for the black-box test crates.
 //! - [`scrape`] and [`gates`]: the frontend's metrics read every second, and the gates a
 //!   scenario applies to what it measured.
 //! - [`load`] and [`eventlog`]: the Buck2 builds that load the farm, and what their event
@@ -47,6 +49,7 @@ pub mod pki;
 pub mod ports;
 pub mod procs;
 pub mod reap;
+pub mod reapi;
 pub mod result;
 pub mod scrape;
 pub mod stand_in;

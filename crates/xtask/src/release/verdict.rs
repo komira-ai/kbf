@@ -40,7 +40,7 @@ pub struct Verified {
 }
 
 /// The set hash of the release files in `dir`: [`SetHash::of_sums`] of its `SHA256SUMS`,
-/// the one definition the bake evaluator uses too.
+/// the one definition the gamma verdict's producer (Planned) will use too.
 pub fn set_hash_of(dir: &Path) -> Result<SetHash, Error> {
     Ok(SetHash::of_sums(&read(&dir.join(SUMS))?))
 }

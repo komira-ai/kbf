@@ -2,13 +2,16 @@
 //! their build attestations, each entry named as the release store names it.
 //!
 //! `<name>-<commit>-<platform>.tar.gz` is a tarball; the same name plus `.attestation` is
-//! its build-attestation bundle. Nothing else is accepted: an entry the store would not
-//! take is a mistake in whoever packed the bundle, and is refused before anything is
-//! uploaded. This is bytes, not trust: the node and the frontend's own update verify the
-//! attestation offline (docs/design/pull-updates.md, section 5).
+//! its build-attestation bundle. Beside them a bundle may carry the release set's
+//! `SHA256SUMS` and, for `deploy --offer -`, the `offer.json` that is the offer. Nothing
+//! else is accepted: an entry the store would not take is a mistake in whoever packed the
+//! bundle, and is refused before anything is uploaded. This is bytes, not trust: the node
+//! and the frontend's own update verify the attestation offline
+//! (docs/design/pull-updates.md, section 5).
 
 use std::io::Read;
 
+use super::offer::MAX_OFFER;
 use super::why;
 use crate::CommitId;
 
@@ -22,6 +25,12 @@ pub const MAX_ATTESTATION: u64 = 256 * 1024;
 pub const SUMS: &str = "SHA256SUMS";
 /// The most the checksum file may be.
 pub const MAX_SUMS: u64 = 1024 * 1024;
+
+/// The offer a bundle may carry for `deploy --offer -` (`kbf_gate::OfferDoc`), under exactly
+/// this name. Like the checksum file it is read, never uploaded, and capped at
+/// [`MAX_OFFER`]. A name that only resembles it (another case, a suffix) is no tarball
+/// either, so it is refused as any other stray entry is.
+pub const OFFER: &str = "offer.json";
 
 /// The platforms the store knows.
 pub const PLATFORMS: [&str; 3] = ["linux-x86_64", "linux-arm64", "darwin-arm64"];
@@ -44,12 +53,22 @@ impl Entry {
     }
 }
 
-/// What a bundle holds: the files to upload and, when it carries one, the set's checksum file.
+/// What a bundle holds: the files to upload and, when it carries them, the set's checksum
+/// file and the offer.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Bundle {
     pub entries: Vec<Entry>,
     /// The exact bytes of `SHA256SUMS`.
     pub sums: Option<Vec<u8>>,
+    /// The exact bytes of `offer.json`, unparsed.
+    pub offer: Option<Vec<u8>>,
+}
+
+/// What one entry of the tar is.
+enum Kind {
+    Sums,
+    Offer,
+    File { platform: String, name: String },
 }
 
 /// Read the whole bundle. Every entry must be for `commit`.
@@ -57,7 +76,7 @@ pub fn read(input: impl Read, commit: &CommitId) -> Result<Vec<Entry>, String> {
     read_bundle(input, commit).map(|b| b.entries)
 }
 
-/// [`read`], with the checksum file too.
+/// [`read`], with the checksum file and the offer too.
 pub fn read_bundle(mut input: impl Read, commit: &CommitId) -> Result<Bundle, String> {
     read_from(&mut input, commit)
 }
@@ -65,6 +84,7 @@ pub fn read_bundle(mut input: impl Read, commit: &CommitId) -> Result<Bundle, St
 /// [`read_bundle`], from one reader type whatever the caller's (so one copy of the code).
 fn read_from(input: &mut dyn Read, commit: &CommitId) -> Result<Bundle, String> {
     let mut sums: Option<Vec<u8>> = None;
+    let mut offer: Option<Vec<u8>> = None;
     let mut archive = tar::Archive::new(input);
     let mut out = Vec::new();
     let entries = archive.entries().map_err(why("not a tar"))?;
@@ -79,20 +99,29 @@ fn read_from(input: &mut dyn Read, commit: &CommitId) -> Result<Bundle, String> 
             .and_then(|n| n.to_str())
             .ok_or("an entry has no usable name")?
             .to_owned();
-        // The checksum file is read as the tarballs are: capped, and never empty.
-        let (kind, cap) = if file == SUMS {
-            if sums.is_some() {
-                return Err(format!("{file} appears twice"));
+        // The checksum file and the offer are read as the tarballs are: capped, never empty.
+        let (kind, cap) = match file.as_str() {
+            SUMS => {
+                if sums.is_some() {
+                    return Err(format!("{file} appears twice"));
+                }
+                (Kind::Sums, MAX_SUMS)
             }
-            (None, MAX_SUMS)
-        } else {
-            let (platform, name) = classify(&file, commit)?;
-            let cap = if name.ends_with(".attestation") {
-                MAX_ATTESTATION
-            } else {
-                MAX_TARBALL
-            };
-            (Some((platform, name)), cap)
+            OFFER => {
+                if offer.is_some() {
+                    return Err(format!("{file} appears twice"));
+                }
+                (Kind::Offer, MAX_OFFER)
+            }
+            _ => {
+                let (platform, name) = classify(&file, commit)?;
+                let cap = if name.ends_with(".attestation") {
+                    MAX_ATTESTATION
+                } else {
+                    MAX_TARBALL
+                };
+                (Kind::File { platform, name }, cap)
+            }
         };
         let mut bytes = Vec::new();
         entry
@@ -106,26 +135,32 @@ fn read_from(input: &mut dyn Read, commit: &CommitId) -> Result<Bundle, String> 
         if bytes.is_empty() {
             return Err(format!("{file} is empty"));
         }
-        let Some((platform, name)) = kind else {
-            sums = Some(bytes);
-            continue;
-        };
-        if out
-            .iter()
-            .any(|e: &Entry| e.platform == platform && e.name == name)
-        {
-            return Err(format!("{file} appears twice"));
+        match kind {
+            Kind::Sums => sums = Some(bytes),
+            Kind::Offer => offer = Some(bytes),
+            Kind::File { platform, name } => {
+                if out
+                    .iter()
+                    .any(|e: &Entry| e.platform == platform && e.name == name)
+                {
+                    return Err(format!("{file} appears twice"));
+                }
+                out.push(Entry {
+                    platform,
+                    name,
+                    bytes,
+                });
+            }
         }
-        out.push(Entry {
-            platform,
-            name,
-            bytes,
-        });
     }
     if out.is_empty() {
         return Err("the bundle holds no file".to_owned());
     }
-    Ok(Bundle { entries: out, sums })
+    Ok(Bundle {
+        entries: out,
+        sums,
+        offer,
+    })
 }
 
 /// `(platform, store name)` for a file name, or why it is refused.

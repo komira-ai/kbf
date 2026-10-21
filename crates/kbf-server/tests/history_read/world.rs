@@ -48,6 +48,8 @@ pub struct ObjectsInner {
     /// Reads that start at the first byte (a whole chunk) fail.
     fail_chunk_reads: AtomicBool,
     puts: AtomicU64,
+    /// Writes asked of the store, whatever they answered.
+    put_attempts: AtomicU64,
     gets: AtomicU64,
 }
 
@@ -62,6 +64,7 @@ impl Objects {
             fail_gets: AtomicBool::new(false),
             fail_chunk_reads: AtomicBool::new(false),
             puts: AtomicU64::new(0),
+            put_attempts: AtomicU64::new(0),
             gets: AtomicU64::new(0),
         }))
     }
@@ -83,6 +86,23 @@ impl Objects {
         self.0.puts.load(Ordering::SeqCst)
     }
 
+    /// Writes asked of the store, whatever they answered.
+    pub fn put_attempts(&self) -> u64 {
+        self.0.put_attempts.load(Ordering::SeqCst)
+    }
+
+    /// Waits until the writer has asked the store for a write: it has cut a chunk and
+    /// tried to put it, so what the server does next comes after the cut.
+    pub async fn put_attempted(&self) {
+        for _ in 0..500 {
+            if self.put_attempts() > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the writer never tried to write a chunk");
+    }
+
     /// Reads asked of the store, whatever they answered.
     pub fn gets(&self) -> u64 {
         self.0.gets.load(Ordering::SeqCst)
@@ -100,6 +120,7 @@ impl ObjectStore for Objects {
         body: Bytes,
         retain_until: Option<SystemTime>,
     ) -> Result<(), ObjectStoreError> {
+        self.0.put_attempts.fetch_add(1, Ordering::SeqCst);
         if self.0.fail_puts.load(Ordering::SeqCst) {
             return Err(ObjectStoreError::Protocol("planted failure".into()));
         }

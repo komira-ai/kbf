@@ -133,6 +133,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The merge commit and its first parent, the base branch (no-lowering --base-ref).
+          fetch-depth: 2
       # The restored target/, the instrumented workspace build and its profiles outgrew a
       # hosted runner's free disk (runs died with "No space left on device", or the runner
       # was lost mid-test). Remove toolchains the image preinstalls that this job never
@@ -235,7 +237,7 @@ jobs:
           persist-credentials: false
       - name: Floors are not lower than the base's
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
-        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base base/coverage-floors --floors coverage-floors
+        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base-ref HEAD^1 --base base/coverage-floors --floors coverage-floors
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:

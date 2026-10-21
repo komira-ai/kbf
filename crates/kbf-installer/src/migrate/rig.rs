@@ -69,6 +69,9 @@ pub struct Rig {
     pub events: Rc<RefCell<Vec<String>>>,
     /// Make the next `start` fail.
     pub fail_start: Rc<Cell<bool>>,
+    /// How many `launchctl print` answers a job gives after its start without a pid (loaded,
+    /// not yet running); each start sets the count again.
+    pub start_lag: Rc<Cell<u32>>,
     /// The systemd units that are enabled, by file name (none to begin with).
     pub enabled: Rc<RefCell<BTreeSet<String>>>,
     /// Make `enable --now` fail.
@@ -127,6 +130,8 @@ impl Rig {
         let active = Rc::new(RefCell::new(BTreeSet::new()));
         let events = Rc::new(RefCell::new(Vec::new()));
         let fail_start = Rc::new(Cell::new(false));
+        let start_lag = Rc::new(Cell::new(0));
+        let lag_left = Rc::new(Cell::new(0));
         let enabled = Rc::new(RefCell::new(BTreeSet::new()));
         let fail_enable = Rc::new(Cell::new(false));
         let on_command: Rc<RefCell<Option<CommandHook>>> = Rc::new(RefCell::new(None));
@@ -140,6 +145,7 @@ impl Rig {
                 root.clone(),
                 on_command.clone(),
             );
+            let (start_lag, lag_left) = (start_lag.clone(), lag_left.clone());
             move |cmd| {
                 let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
                 let current = root.join(match platform {
@@ -159,6 +165,7 @@ impl Rig {
                         ("enable --now", (*u).to_owned())
                     }
                     ("/usr/bin/systemctl", [verb, "--", u]) => (verb, (*u).to_owned()),
+                    ("/bin/sleep", ["1"]) => ("wait", String::new()),
                     ("/bin/launchctl", ["bootstrap", "system", plist]) => (
                         "start",
                         plist.rsplit('/').next().expect("a name").to_owned(),
@@ -177,11 +184,21 @@ impl Rig {
                     hook(verb, &unit);
                 }
                 match verb {
-                    "is-active" => Ok(reply(
-                        i32::from(!active.borrow().contains(&unit)) * 3,
-                        "",
-                        "",
-                    )),
+                    "is-active" => {
+                        let running = active.borrow().contains(&unit);
+                        // `launchctl print`: a running job shows its pid, a job just started
+                        // may not have one yet.
+                        let lagging = running && lag_left.get() > 0;
+                        if lagging {
+                            lag_left.set(lag_left.get() - 1);
+                        }
+                        let out = if running && !lagging {
+                            "\tpid = 812\n"
+                        } else {
+                            ""
+                        };
+                        Ok(reply(i32::from(!running) * 3, out, ""))
+                    }
                     "is-enabled" if enabled.borrow().contains(&unit) => {
                         Ok(reply(0, "enabled\n", ""))
                     }
@@ -209,9 +226,16 @@ impl Rig {
                         record(format!("stop {unit}"));
                         Ok(reply(0, "", ""))
                     }
+                    // launchd refuses to bootstrap a job that is loaded (the rig's "active").
+                    "start" if platform == Platform::MacOs && active.borrow().contains(&unit) => {
+                        Err(io::Error::other(format!(
+                            "Bootstrap failed: 5: Input/output error ({unit} is loaded)"
+                        )))
+                    }
                     "start" if fail_start.get() => Err(io::Error::other("planted: start failed")),
                     "start" => {
                         active.borrow_mut().insert(unit.clone());
+                        lag_left.set(start_lag.get());
                         record(format!("start {unit}"));
                         Ok(reply(0, "", ""))
                     }
@@ -232,6 +256,7 @@ impl Rig {
             active,
             events,
             fail_start,
+            start_lag,
             enabled,
             fail_enable,
             on_command,

@@ -38,6 +38,8 @@ pub mod fetcher_host;
 pub mod fetcher_real;
 pub mod host_mode;
 pub mod leases;
+pub mod mac_config;
+pub mod mac_leases;
 pub mod memory;
 pub mod operator;
 pub mod order;

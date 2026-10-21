@@ -482,7 +482,9 @@ fn a_mac_host_comes_over_through_launchd() {
             "stop com.komira.kbf-helper.plist links=false",
             "stop com.komira.kbf-daemon.plist links=false",
             "disable com.komira.kbf-helper.plist links=false",
+            "enable com.komira.kbf-daemon.plist links=true",
             "start com.komira.kbf-daemon.plist links=true",
+            "enable com.komira.kbf-installer.plist links=true",
             "start com.komira.kbf-installer.plist links=true",
         ]
     );
@@ -498,6 +500,101 @@ fn a_mac_host_comes_over_through_launchd() {
         bootstraps[0]
             .ends_with("bootstrap system /Library/LaunchDaemons/com.komira.kbf-daemon.plist"),
         "{bootstraps:?}"
+    );
+}
+
+/// Catches a rig that lets a job be bootstrapped twice: launchd refuses a loaded job, so the
+/// rig must too, or the test above would pass without the start booting the job out.
+///
+/// Mutant it catches (not run; the `expect_err` fails by construction): the rig's refusal
+/// dropped, so the bootstrap of a loaded job succeeds.
+#[test]
+fn the_rig_refuses_to_bootstrap_a_loaded_job() {
+    use kbf_host::{Cmd, Exec, Step, path::HostPath};
+    let mut rig = Rig::mac("mac-refuses");
+    let daemon = "com.komira.kbf-daemon.plist";
+    rig.active.borrow_mut().insert(daemon.to_owned());
+    let bootstrap = Cmd::new(HostPath::new("/bin/launchctl").expect("path"))
+        .arg("bootstrap")
+        .arg("system")
+        .arg("/Library/LaunchDaemons/com.komira.kbf-daemon.plist");
+    let error = rig
+        .host
+        .apply(&Step::Run(bootstrap))
+        .expect_err("a loaded job is refused");
+    assert!(error.to_string().contains("is loaded"), "{error}");
+    assert!(rig.events.borrow().is_empty());
+}
+
+/// Catches a launchd start that bootstraps a loaded job, which a real launchd refuses (the
+/// rig refuses it too): the start boots the job out first.
+///
+/// Mutant seen red: the stop before the bootstrap dropped.
+#[test]
+fn a_start_of_a_loaded_job_boots_it_out_first() {
+    let mut rig = Rig::mac("mac-loaded");
+    let roots = super::roots::Roots::new(crate::layout::Platform::MacOs);
+    let daemon = super::units::Unit::new("com.komira.kbf-daemon.plist").expect("unit");
+    rig.active.borrow_mut().insert(daemon.as_str().to_owned());
+    let mut svc = super::services::Services {
+        exec: &mut rig.host,
+        roots: &roots,
+    };
+    svc.start(&daemon)
+        .expect("a loaded job is booted out, then started");
+    assert_eq!(
+        *rig.events.borrow(),
+        [
+            "stop com.komira.kbf-daemon.plist links=false",
+            "enable com.komira.kbf-daemon.plist links=false",
+            "start com.komira.kbf-daemon.plist links=false",
+        ]
+    );
+}
+
+/// Catches a Mac migration that reports `started` for a job launchd has loaded and not run:
+/// the start waits for the pid (here after two looks without one), and a job that never runs
+/// fails the migration naming the unit, before the journal says done, so the same command
+/// finishes it once the job runs.
+///
+/// Mutants seen red: no wait after `bootstrap`; the wait given up after one look.
+#[test]
+fn a_mac_migration_waits_for_the_job_and_can_be_run_again() {
+    let mut rig = Rig::mac("mac-wait");
+    rig.start_lag.set(2);
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    let waits = rig
+        .events
+        .borrow()
+        .iter()
+        .filter(|e| e.starts_with("wait"))
+        .count();
+    assert_eq!(
+        waits, 4,
+        "two looks for the daemon's job, two for the installer's"
+    );
+
+    let mut stuck = Rig::mac("mac-stuck");
+    stuck.start_lag.set(1000);
+    let error = run_migrate(&mut stuck, &never(), Mode::Apply).expect_err("never runs");
+    assert!(
+        error.to_string().contains("com.komira.kbf-daemon.plist"),
+        "{error}"
+    );
+    let waits = stuck
+        .events
+        .borrow()
+        .iter()
+        .filter(|e| e.starts_with("wait"))
+        .count();
+    assert_eq!(waits, 29, "thirty looks, a pause between each");
+    stuck.start_lag.set(0);
+    run_migrate(&mut stuck, &never(), Mode::Apply).expect("the same command finishes it");
+    assert!(
+        stuck
+            .active
+            .borrow()
+            .contains("com.komira.kbf-daemon.plist")
     );
 }
 

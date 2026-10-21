@@ -509,6 +509,72 @@ fn budget_diff_refuses_a_new_row_and_passes_a_removal() {
     assert_eq!(budget_diff(&root, "HEAD").0, Some(0));
 }
 
+/// `git <args>` in `root`, with the identity the commits need.
+fn git(root: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .output()
+        .expect("git");
+    assert!(out.status.success(), "git {args:?}: {}", text(&out.stderr));
+}
+
+/// A repository whose base commit holds `a.sh` (listed in the budget) and `b.sh`, and
+/// whose next commit moves `a.sh` to `moved/a.sh` (the file's bytes unchanged) and
+/// writes `budget` as the budget file.
+fn repo_with_rename(name: &str, budget: &str) -> TestDir {
+    let root = repo(name, "[files]\na.sh\tto port\n[workflow]\n[src-sh-c]\n");
+    let body = "one\ntwo\nthree\nfour\nfive\n";
+    std::fs::write(root.join("a.sh"), body).expect("a.sh");
+    git(&root, &["add", "a.sh"]);
+    git(&root, &["commit", "-q", "-m", "add a.sh"]);
+    std::fs::create_dir_all(root.join("moved")).expect("moved");
+    git(&root, &["mv", "a.sh", "moved/a.sh"]);
+    std::fs::write(root.join("tools/interpreter_budget.tsv"), budget).expect("budget");
+    git(&root, &["add", "tools"]);
+    git(&root, &["commit", "-q", "-m", "move a.sh"]);
+    root
+}
+
+#[test]
+fn budget_diff_follows_a_git_rename_and_refuses_growth_with_it() {
+    // Catches (kbf#1401): a pure `git mv` of a listed file refused as a new row; a rename
+    // that excuses a second row added with it, or any new path.
+    let moved = "[files]\nmoved/a.sh\tto port\n[workflow]\n[src-sh-c]\n";
+    let root = repo_with_rename("budget-rename", moved);
+    let (code, out, err) = budget_diff(&root, "HEAD~1");
+    assert_eq!(
+        (code, err.as_str()),
+        (Some(0), ""),
+        "a pure rename adds no row"
+    );
+    assert_eq!(
+        out,
+        "ok: tools/interpreter_budget.tsv adds no row to HEAD~1's\n"
+    );
+    let grown = "[files]\nmoved/a.sh\tto port\nnew.sh\tnew\n[workflow]\n[src-sh-c]\n";
+    let root = repo_with_rename("budget-rename-grows", grown);
+    let (code, _, err) = budget_diff(&root, "HEAD~1");
+    assert_eq!(code, Some(1));
+    assert!(err.contains("a new [files] row for `new.sh`"), "{err}");
+    assert!(!err.contains("moved/a.sh"), "{err}");
+    let unrelated = "[files]\nother/z.sh\tx\n[workflow]\n[src-sh-c]\n";
+    let root = repo_with_rename("budget-rename-other", unrelated);
+    let (code, _, err) = budget_diff(&root, "HEAD~1");
+    assert_eq!(code, Some(1));
+    assert!(err.contains("a new [files] row for `other/z.sh`"), "{err}");
+    let gone = "[files]\n[workflow]\n[src-sh-c]\n";
+    let root = repo_with_rename("budget-rename-gone", gone);
+    assert_eq!(budget_diff(&root, "HEAD~1").0, Some(0));
+}
+
 #[test]
 fn budget_diff_refuses_what_it_cannot_compare() {
     // Catches: an unknown base, a missing budget file, a malformed one, or git not
