@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -37,12 +38,15 @@ const NO_PLATFORM: &str = "cccccccccccc0000000000000000000000000000";
 /// io error for `FAILS`.
 struct Recorded {
     answers: BTreeMap<&'static str, TargetSeq>,
+    /// How many times the store was asked.
+    calls: Arc<AtomicUsize>,
 }
 
 const FAILS: &str = "dddddddddddd0000000000000000000000000000";
 
 impl SeqLookup for Recorded {
     fn seq<'a>(&'a self, commit: &'a Commit) -> BoxFuture<'a, io::Result<TargetSeq>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         let answer = if commit.as_str() == FAILS {
             Err(io::Error::other("the disk went"))
         } else {
@@ -59,6 +63,8 @@ impl SeqLookup for Recorded {
 struct Rig {
     update: Arc<Update>,
     rows: Rows,
+    /// The asks made of the fake store.
+    calls: Arc<AtomicUsize>,
     _dir: kbf_testkit::dir::TestDir,
 }
 
@@ -97,9 +103,11 @@ async fn rig_of(
     for commit in [OWN_FULL, SIBLING, OTHER, FAILS] {
         put(&store, commit).await;
     }
+    let calls = Arc::new(AtomicUsize::new(0));
     let lookup: Arc<dyn SeqLookup> = match answers {
         Some(answers) => Arc::new(Recorded {
             answers: answers.iter().copied().collect(),
+            calls: Arc::clone(&calls),
         }),
         None => store.clone(),
     };
@@ -127,6 +135,7 @@ async fn rig_of(
     Rig {
         update,
         rows,
+        calls,
         _dir: dir,
     }
 }
@@ -273,6 +282,7 @@ async fn the_check_of_a_server_is_the_build_it_is() {
         answers: [(OTHER, TargetSeq::Seq(crate::BUILD_SEQ.saturating_sub(1)))]
             .into_iter()
             .collect(),
+        calls: Arc::default(),
     });
     let refused = AgeCheck::running(lookup)
         .check(&other)
@@ -423,6 +433,7 @@ async fn the_check_of_a_server_uses_its_full_commit_when_it_has_one() {
         )]
         .into_iter()
         .collect(),
+        calls: Arc::default(),
     });
     let sibling = Commit::parse(&sibling).expect("a commit");
     let refused = AgeCheck::running(lookup)
@@ -434,4 +445,42 @@ async fn the_check_of_a_server_uses_its_full_commit_when_it_has_one() {
         refused,
         !crate::BUILD_COMMIT_FULL.is_empty() && crate::BUILD_SEQ >= 1
     );
+}
+
+/// Catches: R4 applied to the running build's own commit (the proxy's step-9 post names it, so
+/// a release the store has no seq for would be refused), and the store asked about it. Under
+/// every answer the own commit is allowed with no look; a different commit with the same
+/// answer is looked up and refused where R4 says so.
+#[tokio::test]
+async fn the_running_commit_is_never_refused_and_never_looked_up() {
+    for answer in [
+        TargetSeq::Missing,
+        TargetSeq::NotRecorded,
+        TargetSeq::Seq(1),
+        TargetSeq::Seq(0),
+    ] {
+        let rig = rig_of(
+            OWN_SEQ,
+            OWN_FULL,
+            Some(&[(OWN_FULL, answer), (OTHER, answer)]),
+        )
+        .await;
+        let (code, body) = offer(&rig, &json!({"commit": OWN_FULL})).await;
+        assert_eq!(code, 200, "{answer:?}: {body}");
+        assert_eq!(
+            rig.calls.load(Ordering::SeqCst),
+            0,
+            "{answer:?}: no look at the own commit"
+        );
+    }
+    // A build that knows only its 12 digits names its own commit by them.
+    let rig = rig(OWN_SEQ, Some(&[(OWN_FULL, TargetSeq::Missing)])).await;
+    let (code, body) = offer(&rig, &json!({"commit": OWN_FULL})).await;
+    assert_eq!((code, rig.calls.load(Ordering::SeqCst)), (200, 0), "{body}");
+    // Another commit with the same answer is looked up, and refused.
+    let rig = rig_of(OWN_SEQ, OWN_FULL, Some(&[(OTHER, TargetSeq::Missing)])).await;
+    let (code, body) = offer(&rig, &json!({"commit": OTHER})).await;
+    assert_eq!(code, 409, "{body}");
+    assert!(body.contains("seq_unknown"), "{body}");
+    assert_eq!(rig.calls.load(Ordering::SeqCst), 1);
 }

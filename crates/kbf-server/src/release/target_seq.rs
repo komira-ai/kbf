@@ -103,11 +103,17 @@ impl AgeCheck {
         Self::new(crate::BUILD_SEQ, commit, lookup)
     }
 
-    /// Whether `commit` may be offered as the desired release.
+    /// Whether `commit` may be offered as the desired release. The running build's own commit
+    /// always may (the proxy's step-9 post names it); any other is compared by `seq`.
     ///
     /// # Errors
     /// The io error of the lookup; `Ok(Err(_))` is a refusal.
     pub async fn check(&self, commit: &Commit) -> io::Result<Result<(), Refused>> {
+        // The age check means something for another commit only: the running build's own is
+        // never refused, whatever the store knows of it, and the store is not asked.
+        if age::same_commit(&self.own_commit, commit.as_str()) {
+            return Ok(Ok(()));
+        }
         let target_seq = match self.lookup.seq(commit).await? {
             TargetSeq::NotRecorded => return Ok(Ok(())),
             TargetSeq::Seq(seq) => Some(seq),

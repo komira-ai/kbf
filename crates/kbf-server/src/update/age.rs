@@ -61,7 +61,8 @@ impl Refusal {
 /// running build is given its full commit when it has one: a 12-digit prefix may name two
 /// commits, and is only the best a build that does not know its full commit can say.
 /// `unknown` and the empty text name nothing.
-fn same_commit(a: &str, b: &str) -> bool {
+#[must_use]
+pub fn same_commit(a: &str, b: &str) -> bool {
     let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     short.len() >= 12 && long.starts_with(short)
 }
