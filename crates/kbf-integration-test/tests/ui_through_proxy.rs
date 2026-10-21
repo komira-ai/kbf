@@ -347,9 +347,9 @@ async fn the_ui_answers_without_credentials_with_the_security_headers() {
     for (method, path, status) in [
         ("GET", "/ui", 200),
         ("GET", "/ui/", 200),
-        // The list reads `/v1/invocations`, which this server has no history for: the page
-        // answers that route's `404`, with the headers.
-        ("GET", "/ui/builds", 404),
+        // The list reads `/v1/invocations`, which this server has no history for (it answers
+        // as an unknown route, `404`): the page says history is off, `200`, with the headers.
+        ("GET", "/ui/builds", 200),
         ("GET", "/ui/static/kbf.css", 200),
         ("HEAD", "/ui", 200),
         ("GET", "/ui/builds/no-such-build", 404),
@@ -376,6 +376,12 @@ async fn the_ui_answers_without_credentials_with_the_security_headers() {
     let page = String::from_utf8_lossy(&index.body);
     assert!(page.contains("<h1>Overview</h1>"), "{page}");
     assert!(!page.contains("<script"), "no script on a page");
+    // No history store on this farm: the list says so and names the flag, where a missing
+    // build (a record the farm does not hold) stays a `404`.
+    let builds = rig.anon("GET", "/ui/builds").await;
+    let page = String::from_utf8_lossy(&builds.body);
+    assert!(page.contains("History is off on this farm"), "{page}");
+    assert!(page.contains("--history-objects"), "{page}");
     rig.stop().await;
 }
 

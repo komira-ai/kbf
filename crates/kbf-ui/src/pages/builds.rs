@@ -3,7 +3,7 @@
 
 use serde::Deserialize;
 
-use super::{BUILDS_PATH, build_page, invocation_url, pill, problem, summary};
+use super::{BUILDS_PATH, build_page, history_off, invocation_url, pill, problem, summary};
 use crate::api::Invocation;
 use crate::html::{Href, Html, attr};
 use crate::layout;
@@ -151,20 +151,25 @@ pub(crate) async fn builds<S: Source>(source: &S, query: &str) -> Answer {
         (Some(Err(e)), _) | (_, Some(Err(e))) => Some(e),
         _ => None,
     };
-    let status = if let Some(e) = failed {
+    let off = failed.is_some_and(ReadError::is_history_off);
+    let status = if off {
+        200
+    } else if let Some(e) = failed {
         e.status()
     } else if dot {
         404
     } else {
         200
     };
-    let passed_on = failed.map_or(&[][..], ReadError::headers);
+    let passed_on = failed.filter(|_| !off).map_or(&[][..], ReadError::headers);
     let body = layout::page(BUILDS.name, BUILDS_PATH, r.asked(), |h| {
         h.el("h1", &[], |h| {
             h.text("Builds");
         });
         lookup(h, asked.id.as_deref().unwrap_or_default());
-        if let Some(e) = failed {
+        if off {
+            history_off(h);
+        } else if let Some(e) = failed {
             problem(h, e);
         } else if let Some(Ok(inv)) = &found {
             h.el("section", &[attr("class", "card")], |h| {

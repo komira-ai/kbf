@@ -38,7 +38,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY, RANGE, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderName, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -197,7 +197,24 @@ impl InProcess {
 
 impl Source for InProcess {
     async fn get(&self, url: &str) -> Result<Fetched, SourceError> {
-        let mut request = Request::get(url)
+        self.ask(url, None).await
+    }
+
+    /// The route asked with `Range: bytes=first-last`, so a log or a blob route reads
+    /// only those bytes.
+    async fn get_range(&self, url: &str, first: u64, last: u64) -> Result<Fetched, SourceError> {
+        self.ask(url, Some((first, last))).await
+    }
+}
+
+impl InProcess {
+    /// `GET url`, with a `Range` header for `range` (first and last byte, inclusive).
+    async fn ask(&self, url: &str, range: Option<(u64, u64)>) -> Result<Fetched, SourceError> {
+        let mut request = Request::get(url);
+        if let Some((first, last)) = range {
+            request = request.header(RANGE, format!("bytes={first}-{last}"));
+        }
+        let mut request = request
             .body(Body::empty())
             .map_err(|e| SourceError(format!("{url:?} is not a request target: {e}")))?;
         // The lowest trust: a handler that decides by who called never takes this for
