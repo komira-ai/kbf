@@ -65,7 +65,7 @@ pub fn daemon_args(_profile: &Profile) -> Vec<String> {
 /// tables are the ones of `GROUPS` in kbf-cli's `config.rs` (`identity` and `daemon`);
 /// `tests/node_config.rs` loads the file with that crate's loader. A flag that may repeat
 /// (`driver`) is an array. The file has no `label` key: node labels are removed, and the
-/// daemon that follows this tool refuses the key. No value needs TOML escaping: the profile's patterns
+/// next daemon release removes the key. No value needs TOML escaping: the profile's patterns
 /// admit no `"`, `\` or control character.
 pub fn render_config(profile: &Profile) -> String {
     let strings = |items: &[&str]| {

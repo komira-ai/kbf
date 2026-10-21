@@ -118,8 +118,8 @@ fn the_node_config_renders_as_the_golden_file() {
 }
 
 /// Catches: the node's `kbf.toml` carrying a node label again, from any profile: a
-/// `label` key in any table (the daemon that follows this tool refuses the key and the
-/// start fails), for the test profile, the example, a root daemon and a smaller pool.
+/// `label` key in any table (the next daemon release removes the key, and one that refuses
+/// it would then fail to start), for the test profile, the example, a root daemon and a smaller pool.
 /// Read as lines, not as the golden, so a label put back with a golden updated to match
 /// still fails here.
 #[test]
