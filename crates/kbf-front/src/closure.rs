@@ -175,6 +175,7 @@ mod tests {
             &d(b"tree"),
             Bytes::from_static(b"\xff\xff\xff"),
         );
-        assert!(matches!(junk, Err(CacheError::Invalid(m)) if m.contains("does not decode")));
+        let message = junk.expect_err("junk is not a Directory").to_string();
+        assert!(message.contains("does not decode"), "{message}");
     }
 }

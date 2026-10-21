@@ -20,7 +20,7 @@
 //!   cannot be skipped. (The scopes that sign are held to the same `if:` by the
 //!   workflow lint, `workflows/mod.rs`.)
 //! - **What the verify job checks.** It names the branch it is verifying: `--source-ref
-//!   "$GITHUB_REF"`, so the development branch's attestations verify as that branch's and
+//!   "$GITHUB_REF"`, so an attestation verifies as the branch that signed it and
 //!   a release (which verifies as `refs/heads/main`) never accepts them. It also names
 //!   the commit, `--commit "$GITHUB_SHA"`, and the trusted root it fetched first
 //!   (`--trusted-root`), so each tarball's bundle is verified offline for the commit it
@@ -85,10 +85,11 @@ pub const IDENTIFIED: &[&str] = &["kbf", "kbf-installer"];
 
 /// The branches whose pushes run the workflow: the ones a host's verification may name
 /// as `--source-ref` (`refs/heads/<branch>`).
-pub const PUSH_BRANCHES: &[&str] = &["main", "feature/arch-v2"];
+pub const PUSH_BRANCHES: &[&str] = &["main"];
 
 /// The one `if:` of the jobs that sign and verify: a push, to one of [`PUSH_BRANCHES`].
-pub const SIGNING_IF: &str = "${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}";
+pub const SIGNING_IF: &str =
+    "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
 
 /// The platforms whose job builds the `kbf-installer` deb and makes it an asset: the
 /// `cargo xtask pkg-asset` lines name exactly these.
@@ -181,7 +182,7 @@ fn pull_request_gate(workflow: &str, out: &mut Vec<String>) -> Result<(), String
 }
 
 /// The jobs of beta.yml that run on a Mac. A pull request never runs them (the macOS pool is
-/// small and a pull request runs the fast gate only); a push to main or feature/arch-v2
+/// small and a pull request runs the fast gate only); a push to main
 /// always does, so none may carry an `if:` that skips it.
 pub const MACOS_JOBS: [&str; 2] = ["native-macos", "pkg-macos"];
 
@@ -892,7 +893,7 @@ mod rules {
     /// A workflow of the shape the rules read, meeting every one.
     fn good() -> String {
         let mut w = String::from(
-            "on:\n  pull_request:\n  merge_group:\n  push:\n    branches: [main, feature/arch-v2]\npermissions: {}\nenv:\n  GH_SHA256_AARCH64_DARWIN: abababababababababababababababababababababababababababababababab\njobs:\n",
+            "on:\n  pull_request:\n  merge_group:\n  push:\n    branches: [main]\npermissions: {}\nenv:\n  GH_SHA256_AARCH64_DARWIN: abababababababababababababababababababababababababababababababab\njobs:\n",
         );
         for job in BUILD_JOBS {
             w.push_str(&format!(
@@ -1083,14 +1084,14 @@ mod rules {
     #[test]
     fn the_signing_jobs_run_only_for_a_push_to_a_listed_branch() {
         // Catches: attest or verify opened to every event or every push (a pull request
-        // would sign), narrowed to main (the development branch unattested), or left
-        // without an `if:`; and a push trigger of other branches than the pinned two.
+        // would sign), re-widened to the retired development branch `feature/arch-v2`, or left
+        // without an `if:`; and a push trigger of other branches than main.
         let line = format!("    if: {SIGNING_IF}\n");
         for (k, job) in ATTEST_JOBS.iter().chain(VERIFY_JOBS).enumerate() {
             for to in [
                 "if: ${{ github.event_name == 'push' }}",
                 "if: ${{ github.ref == 'refs/heads/main' }}",
-                "if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}",
+                "if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}",
                 "if: ${{ github.event_name != 'push' }}",
             ] {
                 // The k-th `if:` of the signing jobs, replaced.
@@ -1118,12 +1119,12 @@ mod rules {
         let none = broken(&line, "");
         names(&none, &["has `if: (none)`"]);
         for branches in [
-            "[main]",
-            "[main, feature/arch-v2, other]",
+            "[main, feature/arch-v2]",
+            "[main, other]",
             "[feature/arch-v2]",
         ] {
             names(
-                &broken("[main, feature/arch-v2]", branches),
+                &broken("[main]", branches),
                 &["`push` runs the workflow for"],
             );
         }

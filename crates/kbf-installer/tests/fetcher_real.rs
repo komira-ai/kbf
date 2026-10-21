@@ -808,9 +808,8 @@ fn a_component_named_by_a_path_is_refused_before_a_file_is_made() {
 }
 
 /// The pipeline asks the lease source again, after the download: a source that cannot tell
-/// (the binary's `leases::NotWired`) refuses with `lease`, nothing is installed and the
-/// directory is gone. This is why the binary does not build a `RealFetcher` while it has no
-/// real lease source: every activation would be downloaded and then refused.
+/// (`leases::NotWired`, or a cgroup that cannot be read) refuses with `lease`, nothing is
+/// installed and the directory is gone.
 ///
 /// Catches the lease step skipped on the real path (a host with work running would be swapped).
 ///

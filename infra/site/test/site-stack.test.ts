@@ -182,9 +182,13 @@ describe('publish role', () => {
 
   test('trust: one provider, aud, and sub exactly bound to repo ids, environment, reusable workflow file and main', () => {
     const expectedSub =
-      'repo:example-org@111/example-repo@222:environment:prod:job_workflow_ref:' +
+      'repo:example-org@111/example-repo@222:environment:prod-site:job_workflow_ref:' +
       'example-org/example-repo/.github/workflows/site-publish.yml@refs/heads/main';
     expect(c.oidcSubject(CONFIG)).toBe(expectedSub);
+    // the approved publish job runs in `prod` (contents: write): its sub must not satisfy the role
+    expect(expectedSub).not.toContain('environment:prod:');
+    expect(c.GITHUB_ENVIRONMENT).toBe('prod-site');
+    expect(c.APPROVAL_ENVIRONMENT).toBe('prod');
     const trust = role().Properties.AssumeRolePolicyDocument.Statement;
     expect(trust).toEqual([
       {

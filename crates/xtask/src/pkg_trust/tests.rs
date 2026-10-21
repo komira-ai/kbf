@@ -47,7 +47,7 @@ fn the_trust_directory_is_the_three_files_with_the_branch_in_the_conf() {
     // branch's), a conf with a key or comment beyond SOURCE_REFS, `gh` that is not
     // executable (a host's installer could not run it), the data files executable, a
     // file other than the three, and bytes not copied.
-    for source_ref in ["refs/heads/main", "refs/heads/feature/arch-v2"] {
+    for source_ref in ["refs/heads/main", "refs/heads/team/topic-2"] {
         let dir = scratch("good");
         let (gh, root) = inputs(&dir, b"\x7fELF gh", ROOT);
         let out = dir.join("trust");
@@ -173,7 +173,7 @@ fn conf_ref_reads_back_only_what_conf_writes() {
     // installer might read differently from the build.
     for r in [
         "refs/heads/main",
-        "refs/heads/feature/arch-v2",
+        "refs/heads/team/topic-2",
         "refs/heads/a.b_c-d",
     ] {
         assert_eq!(conf_ref(&conf(r)), Some(r));
