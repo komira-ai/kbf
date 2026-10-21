@@ -995,19 +995,19 @@ impl TierCounters {
 }
 
 /// The text of a scrape, one family at a time.
-struct Families(String);
+pub(crate) struct Families(pub(crate) String);
 
 impl Families {
-    fn head(&mut self, name: &str, kind: &str, help: &str) {
+    pub(crate) fn head(&mut self, name: &str, kind: &str, help: &str) {
         let _ = writeln!(self.0, "# HELP {name} {help}.\n# TYPE {name} {kind}");
     }
 
-    fn counter(&mut self, name: &str, help: &str, value: u64) {
+    pub(crate) fn counter(&mut self, name: &str, help: &str, value: u64) {
         self.head(name, "counter", help);
         let _ = writeln!(self.0, "{name} {value}");
     }
 
-    fn gauge(&mut self, name: &str, help: &str, value: u64) {
+    pub(crate) fn gauge(&mut self, name: &str, help: &str, value: u64) {
         self.head(name, "gauge", help);
         let _ = writeln!(self.0, "{name} {value}");
     }

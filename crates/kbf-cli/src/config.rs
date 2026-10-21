@@ -163,6 +163,8 @@ const GROUPS: &[(&str, &[&str])] = &[
             "hot-store-max-bytes",
             "meta-dir",
             "object-store-secrets-dir",
+            "ram-ack-bytes",
+            "ram-drain-deadline",
             "ram-peer-grace",
             "store-put-attempts",
             "write-bytes-in-flight",

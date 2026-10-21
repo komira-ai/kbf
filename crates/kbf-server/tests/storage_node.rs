@@ -118,6 +118,36 @@ async fn it_serves_until_the_shutdown_future_completes() {
     serving.await.expect("task").expect("serves to the end");
 }
 
+/// Catches a node with a RAM budget whose stop does not complete: with `--ram-ack-bytes`
+/// the node starts the drain task and drains once more when it stops; nothing is held, so
+/// the stop ends at once and serves to the end, as it does without the flag. The flags
+/// are accepted by `kbf storage` with their values.
+#[tokio::test]
+async fn a_node_with_a_ram_budget_starts_and_stops() {
+    let dir = dir("ram-budget");
+    let f = flags(
+        &dir,
+        &[
+            "--ram-ack-bytes=1048576".to_owned(),
+            "--ram-drain-deadline=2".to_owned(),
+        ],
+    )
+    .expect("flags");
+    assert_eq!(f.server.ram_ack_bytes(), 1 << 20);
+    assert_eq!(f.server.ram_drain_deadline(), Duration::from_secs(2));
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let node = start_storage(&f, || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .await
+    .expect("starts");
+    let serving = tokio::spawn(node.serve());
+    stop.send(()).expect("stop");
+    serving.await.expect("task").expect("serves to the end");
+}
+
 /// Catches flags that do not make a node: the three certificate flags must come
 /// together, a segment upload cap over the write bound is refused as the server refuses
 /// it, a certificate file that is not there is an error (not plain text), and a start

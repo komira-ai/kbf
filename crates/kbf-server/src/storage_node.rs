@@ -72,6 +72,7 @@ use crate::listen::Binder;
 use crate::members::LastBoot;
 use crate::metrics::bind_node_sockets;
 use crate::node_map::NodeMap;
+use crate::ram_drain::RamDrain;
 use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, Registered, bind_node};
 use crate::serve::{ServeError, StorageListener, StorageSocket};
@@ -107,6 +108,8 @@ pub const ALLOWED: &[&str] = &[
     "write_pool_stream_idle",
     "durable_wait",
     "ram_peer_grace",
+    "ram_ack_bytes",
+    "ram_drain_deadline",
     "store_put_attempts",
 ];
 
@@ -671,7 +674,8 @@ where
     let cache = cache
         .with_writes(flags.server.write_config())
         .with_write_pool(flags.server.write_pool_config())
-        .with_durable_wait(flags.server.durable_wait());
+        .with_durable_wait(flags.server.durable_wait())
+        .with_ram_ack_bytes(flags.server.ram_ack_bytes());
     // A registered node dates what it stages by the map it holds, so it can say what it has
     // flushed ([`crate::fill`]); it flushes everything, as without the gate.
     let cache = if registered.joiner.is_some() {
@@ -704,6 +708,11 @@ where
         );
         AbortOnDrop(tokio::spawn(fill))
     });
+    let ram = RamDrain::start(
+        Arc::clone(&cache),
+        flags.server.ram_ack_bytes(),
+        flags.server.ram_drain_deadline(),
+    );
     let storage = Arc::new(CacheStorage::new(cache, flags.segments()));
     let stop = Box::pin(shutdown()?);
     let node = bind_node(flags, listener, registered, storage, repair_dir, stop)?;
@@ -714,7 +723,7 @@ where
             "kbf-storage {SERVER_VERSION} storage={} log={log}",
             node.addr
         ),
-        serving: node.serving,
+        serving: Box::pin(ram.after(node.serving)),
         _flusher,
         _background,
         _fill,

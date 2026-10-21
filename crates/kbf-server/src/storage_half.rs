@@ -50,6 +50,7 @@ use kbf_threads::disk::Statvfs;
 use crate::cold_apply::{ColdPick, Fixed, Registrable};
 use crate::listen::Binder;
 use crate::metrics::bind_node_sockets;
+use crate::ram_drain::RamDrain;
 use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, bind_node};
 use crate::serve::{ServeError, StorageListener};
@@ -206,7 +207,8 @@ where
     let cache = cache
         .with_writes(args.write_config())
         .with_write_pool(args.write_pool_config())
-        .with_durable_wait(args.durable_wait());
+        .with_durable_wait(args.durable_wait())
+        .with_ram_ack_bytes(args.ram_ack_bytes());
     let local = args.local_cache.as_ref();
     let hot = stores.hot.as_ref();
     let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;
@@ -232,6 +234,11 @@ where
         max_bytes: args.segment_upload_max_bytes,
         idle: Duration::from_secs(args.segment_upload_idle_secs),
     };
+    let ram = RamDrain::start(
+        Arc::clone(&cache),
+        args.ram_ack_bytes(),
+        args.ram_drain_deadline(),
+    );
     let storage: Arc<dyn Storage> = Arc::new(CacheStorage::new(cache, segments));
     // After the log is open: it refuses a directory that holds files it did not write.
     let repair_dir = stores.meta_dir.join(REPAIR_DIR);
@@ -245,7 +252,7 @@ where
         storage,
         in_process: node.in_process,
         start_line: format!("kbf-storage {SERVER_VERSION} storage={addr} log={log}"),
-        serving: node.serving,
+        serving: Box::pin(ram.after(node.serving)),
         maps: node.maps,
         repairs: node.repairs,
         _flusher,
