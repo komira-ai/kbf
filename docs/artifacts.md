@@ -149,6 +149,12 @@ sorted by name.
   It is `0` when the build could not count them (a shallow checkout, which holds only part
   of the history, or a source archive with no git), and nothing is newer than `0`: a build
   that cannot count is never ranked above another. A build before this field prints none.
+  `artifacts.yml` checks out at the default shallow depth, so the assets it builds print
+  `seq: 0` until it checks out with `fetch-depth: 0`; no package is ranked by `seq` before
+  that. The strict reader of this line in `kbf-installer` (`deny_unknown_fields`) accepts
+  `seq` from this change on: an installer older than that refuses a kbf that prints it
+  (`version-unreadable`), so the installer package that reads `seq` ships before the kbf
+  that prints it.
 - `state_schema`: the schema version of the SQLite state file the binary creates and
   reads.
 - `version`: the package version.

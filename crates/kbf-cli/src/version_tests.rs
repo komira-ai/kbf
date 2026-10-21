@@ -30,6 +30,8 @@ fn seq_is_the_rule_applied_to_the_checkout_built() {
 /// Catches `seq` written as a literal: a literal equal to today's count passes the check above
 /// on a machine where the count is what was written, and is wrong on the next commit. The
 /// one place the number may come from is the build's, so the source of `identity` must read it.
+/// This reads the source text of `version.rs` itself, because in a shallow CI checkout the
+/// right answer and a literal 0 are the same number and no run of the binary tells them apart.
 #[test]
 fn seq_is_read_from_the_build_not_written_down() {
     let source = include_str!("version.rs");

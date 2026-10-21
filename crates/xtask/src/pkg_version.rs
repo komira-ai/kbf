@@ -16,8 +16,8 @@
 //! them, because a hyphen would end a deb's upstream version and an rpm takes none.
 //!
 //! A `seq` of 0 means the build could not count its commits (a shallow checkout, a source
-//! archive), so no version is made of it: `0.1.0+g...` could not be told from the old form,
-//! and a package of an unknown place in the history must not be ranked at all.
+//! archive), so no version is made of it: a package of an unknown place in the history must
+//! not be ranked at all, and `0.1.0+g...` would rank it, below every counted build of the series.
 //!
 //! This module only names the version. `pkg-config` and `pkg-asset` use it when the package
 //! carries a release; until then they keep the version of the installer binary.
@@ -91,6 +91,11 @@ pub struct PackageVersion {
 impl PackageVersion {
     /// The version of the build of `git_ref` (`GITHUB_REF`) at `commit`, whose `kbf --version
     /// --json` said `seq`, in CI run number `run`.
+    ///
+    /// `git_ref` must be the ref that was built, `GITHUB_REF` of a push or `github.ref`. Not
+    /// the base branch of a pull request (`artifacts.yml` calls that `PKG_SOURCE_REF`): it is
+    /// `refs/heads/main` for a pull request into `main`, and the build of a pull request
+    /// would be named as a build of `main`.
     ///
     /// # Errors
     /// [`Error::Refused`] with every reason the build cannot be put in order: a `seq` or `run`

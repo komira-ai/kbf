@@ -55,12 +55,17 @@ mod tests {
 
     use super::{UNKNOWN, choose, from_git};
 
-    /// `git args` in `dir`, run as a person with no git configuration of their own would.
+    /// `git args` in `dir`, run as a person with no git configuration of their own would, and
+    /// with no repository chosen by the caller's environment (a hook exports `GIT_DIR` and
+    /// `GIT_INDEX_FILE`, and a commit made under them would land in the caller's repository).
     fn git(dir: &Path, args: &[&str]) {
         let out = Command::new("git")
             .arg("-C")
             .arg(dir)
             .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", "t")
@@ -69,11 +74,8 @@ mod tests {
             .env("GIT_COMMITTER_EMAIL", "t@example.com")
             .output()
             .expect("git runs");
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "git {args:?}: {stderr}");
     }
 
     /// A repository of `commits` empty commits, in a directory of its own.
@@ -135,7 +137,9 @@ mod tests {
     }
 
     /// Catches: a directory with no repository, and a repository with no commit, counted as
-    /// something.
+    /// something. The first half assumes the system temp directory is not inside a git work
+    /// tree, as it is on every runner CI uses; `from_git` runs the production `git`, whose
+    /// environment a test cannot set.
     #[test]
     fn no_history_is_not_known() {
         let none = TestDir::under(std::env::temp_dir(), "build-seq-none");
