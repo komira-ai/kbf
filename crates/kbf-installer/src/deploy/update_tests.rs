@@ -470,6 +470,7 @@ fn an_update_that_failed_at_the_order_for_the_nodes_exits_three_with_the_childs_
     assert_eq!(line["reason"], "nodes_refused");
     let detail = line["detail"].as_str().expect("detail");
     assert!(detail.contains("not_own"), "{detail}");
+    assert!(detail.contains("nodes were not told"), "{detail}");
 
     let api = Api::new(vec![accepted()], vec![failed_at("confirm", "x")]);
     let (exit, line) = go_with(&api, &options(true));
@@ -477,6 +478,26 @@ fn an_update_that_failed_at_the_order_for_the_nodes_exits_three_with_the_childs_
         (exit, &line["reason"]),
         (Exit::Failed, &json!("frontend_failed"))
     );
+    let detail = line["detail"].as_str().expect("detail");
+    assert!(!detail.contains("nodes were not told"), "{detail}");
+}
+
+/// Catches a new frontend that never answered the order for the nodes being reported as one
+/// that refused it. Exit 3 means the same command fails the same way; a child that gave no
+/// answer in the time the proxy allows has refused nothing, so the update is exit 1 under a
+/// reason of its own, and says as well that the nodes were not told.
+///
+/// Mutant planted: the reason's start not looked at (exit 3, `nodes_refused`).
+#[test]
+fn an_update_whose_order_for_the_nodes_was_never_answered_exits_one() {
+    let reason = "timeout: no answer in 300 s (the last: connection refused)";
+    let api = Api::new(vec![accepted()], vec![failed_at("nodes", reason)]);
+    let (exit, line) = go_with(&api, &options(true));
+    assert_eq!(exit, Exit::Failed, "{line}");
+    assert_eq!(line["exit"], 1);
+    assert_eq!(line["reason"], "nodes_unreached");
+    let detail = line["detail"].as_str().expect("detail");
+    assert!(detail.contains("nodes were not told"), "{detail}");
 }
 
 /// Catches `--source` read as anything but the two words, or dropped on the way to the

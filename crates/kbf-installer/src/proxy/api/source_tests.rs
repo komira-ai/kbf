@@ -12,7 +12,7 @@ use super::core::{ApiError, Core, Fault, Reply};
 use super::fakes::{Rig, idle, req, staged};
 use super::idempotency::Idempotency;
 use super::model::{StatusBody, UpdateId, UpdateRequest};
-use super::traits::{AvailableWire, InstallerStatus};
+use super::traits::{AvailableWire, InstallerState, InstallerStatus};
 use crate::proxy::model::{Phase, Source, Verb};
 use crate::testkit::{A, B, C, c};
 
@@ -279,6 +279,69 @@ fn a_request_id_reused_with_another_source_is_refused_and_with_the_same_one_is_a
     let (again, _) = accepted(core.post(staged_req(B, "r1")));
     assert_eq!(first, again);
     assert_eq!(rig.orders.written.lock().unwrap().len(), 1);
+}
+
+/// Catches a retry judged by what it asks for before it is judged by its id: a request id used
+/// for an update that fetches and takes the nodes, asked again with source `staged` and the
+/// nodes, is a request id reused (409 `request_id_reused`, exit 1 in the CLI), not a staged
+/// update that cannot take nodes (409 `source_refused`, exit 3).
+///
+/// Mutant planted: the source and nodes check run before the request map is looked up.
+#[test]
+fn a_retry_with_another_source_and_nodes_is_a_reused_id_before_it_is_a_refused_source() {
+    let rig = Rig::new("pr5a-reuse-nodes");
+    rig.set_status(host(Some(B), None));
+    let mut core = rig.core();
+    let first = UpdateRequest {
+        nodes: true,
+        ..fetch_req(B, "r1")
+    };
+    accepted(core.post(first));
+    let again = UpdateRequest {
+        nodes: true,
+        ..staged_req(B, "r1")
+    };
+    let e = refused(core.post(again));
+    is_refusal(&e, StatusCode::CONFLICT, "request_id_reused");
+}
+
+/// Catches the source lost when an update ends: the installer refuses the order of a staged
+/// update, the update ends `failed`, and the status that is then read still says `staged`.
+///
+/// Mutant planted: the ended update built with source `fetch`.
+#[test]
+fn the_status_of_a_staged_update_that_ended_still_says_its_source() {
+    let rig = Rig::new("pr5a-ended-source");
+    rig.set_status(host(Some(B), Some("bundled")));
+    let mut core = rig.core();
+    accepted(core.post(staged_req(B, "r1")));
+    rig.set_status(InstallerStatus {
+        state: InstallerState::Refused,
+        refusal: "hash: the digest differs".to_owned(),
+        refused_order_id: Some(101),
+        ..host(Some(B), Some("bundled"))
+    });
+    let s = body(&mut core);
+    assert_eq!(s.phase, Some(Phase::Failed));
+    assert_eq!(s.source, Source::Staged);
+}
+
+/// Catches a refusal of a fetch on a bundled host that leaves the operator at a dead end: the
+/// text offers the staged source, and for a rollback (which a staged update cannot do) the
+/// installer's own `rollback` on the host.
+///
+/// Mutant planted: the text without the way to roll back.
+#[test]
+fn the_refusal_of_a_fetch_on_a_bundled_host_says_what_can_be_asked() {
+    let rig = Rig::new("pr5a-bundled-text");
+    rig.set_status(host(Some(B), Some("bundled")));
+    let e = refused(rig.core().post(fetch_req(B, "r1")));
+    assert!(e.message.contains("source staged"), "{}", e.message);
+    assert!(
+        e.message.contains("kbf-installer rollback"),
+        "{}",
+        e.message
+    );
 }
 
 /// Catches a request map written before `source` existed being refused or read as anything
