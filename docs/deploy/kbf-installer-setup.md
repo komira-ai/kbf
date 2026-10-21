@@ -192,8 +192,8 @@ named. The sudoers rule that lets the deploy account run `deploy` is a held step
 8. `--commit`: the first release, through the installer's fetcher (the fetch child and the verify
    pipeline), then made `releases/current` with no trial. The fetcher is the host's own: it reads
    `installer.toml` and `installer.conf` and looks up the fetch user when `--commit` asks, so the
-   files this run wrote count. A fetch that cannot be made (the `frontend` source, which has no
-   address or CA key in `installer.toml` yet; a missing fetch user) or that fails stops `setup`
+   files this run wrote count. A fetch that cannot be made (the `frontend` source, which this build
+   does not fetch from yet; a missing fetch user) or that fails stops `setup`
    here with exit 1, before `kbf.toml` and the units. The branches a release may be attested for
    are `SOURCE_REFS` of `installer.conf` (default `refs/heads/main`); `source_refs` of
    `installer.toml` can only narrow that list, and a list with no ref in common refuses the fetch.

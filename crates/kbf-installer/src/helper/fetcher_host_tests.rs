@@ -30,6 +30,16 @@ const URL_FILE: &str = "release_source = \"url\"\nrelease_url = \"https://mirror
 /// CA that authenticates it, and that copy's digest.
 const SNAPSHOT: &str = "frontend_url = \"https://frontend.lan:8443\"\nfrontend_ca = \"/var/lib/kbf-installer/frontend-ca.pem\"\nfrontend_ca_sha256 = \"d2a84f4b8b650937ec8f73cd8be2c74add5a911ba64df27458ed8229da804a26\"\n";
 
+/// Where a LAN-pull host keeps its root-owned copy of the frontend's CA.
+const CA_PATH: &str = "/var/lib/kbf-installer/frontend-ca.pem";
+
+/// The copy of the frontend's CA at [`CA_PATH`].
+struct CaCopy {
+    bytes: Vec<u8>,
+    uid: u32,
+    mode: u32,
+}
+
 /// What is on the fake host, changed by a test between two fetches.
 #[derive(Default)]
 struct Disk {
@@ -40,6 +50,8 @@ struct Disk {
     toml_mode: Option<u32>,
     /// The text of `installer.conf`; `None` for no file (the defaults).
     conf: Option<String>,
+    /// The CA copy at [`CA_PATH`], under root's directories; `None` for no file.
+    ca: Option<CaCopy>,
 }
 
 fn entry(text: &str, mode: u32, uid: u32) -> Entry {
@@ -50,10 +62,16 @@ fn entry(text: &str, mode: u32, uid: u32) -> Entry {
     }
 }
 
-/// The host as `disk` says, with the trust list and root's `/etc/kbf`.
+/// The host as `disk` says, with the trust list and root's `/etc/kbf` and the CA's directory.
 fn exec(disk: &Disk) -> FakeExec {
     let mut exec = trusted_host();
-    for at in ["/etc", "/etc/kbf"] {
+    for at in [
+        "/etc",
+        "/etc/kbf",
+        "/var",
+        "/var/lib",
+        "/var/lib/kbf-installer",
+    ] {
         let dir = Entry::Dir {
             perms: Perms::new(0o755),
             owner: ROOT,
@@ -68,6 +86,17 @@ fn exec(disk: &Disk) -> FakeExec {
     if let Some(text) = &disk.conf {
         exec.entries
             .insert(path(SETTINGS_PATH), entry(text, 0o644, 0));
+    }
+    if let Some(ca) = &disk.ca {
+        let file = Entry::File {
+            perms: Perms::new(ca.mode),
+            owner: Owner {
+                uid: ca.uid,
+                gid: 0,
+            },
+            bytes: ca.bytes.clone(),
+        };
+        exec.entries.insert(path(CA_PATH), file);
     }
     exec
 }
@@ -267,32 +296,6 @@ fn a_fetch_is_made_from_the_file_and_the_hosts_parts() {
     assert_eq!(real.child.program, nowhere().program);
     assert_eq!(real.leases.live(), Ok(3), "the host's lease source");
     assert_eq!(real.host.platform(), Platform::Linux);
-}
-
-/// The frontend source is not buildable yet: `installer.toml` can now hold the frontend's
-/// address and its pinned CA (`frontend_url`, `frontend_ca`, `frontend_ca_sha256`), and this
-/// build reads them without using them, so the fetch is refused with that said. The default
-/// file (which is a frontend source), the file that names the source, and the file with the
-/// whole snapshot are the cases.
-///
-/// Catches a frontend source built from nothing (a fetch to no address, or with the system's
-/// roots where the farm's CA is required), a message that still says the file has no key for
-/// them, and the snapshot read as a licence to fetch.
-///
-/// Mutants planted: the frontend arm returning a `url` source.
-#[test]
-fn the_frontend_source_is_refused_until_the_fetcher_uses_the_snapshot() {
-    let rig = Rig::new("host-fetcher-frontend");
-    let snapshot = format!("release_source = \"frontend\"\n{SNAPSHOT}");
-    for text in ["", "release_source = \"frontend\"\n", snapshot.as_str()] {
-        rig.write(text);
-        let why = rig.refused();
-        assert!(
-            why.contains("release_source = \"frontend\"")
-                && why.contains("cannot fetch from the frontend yet"),
-            "{text:?}: {why}"
-        );
-    }
 }
 
 /// A bundled host fetches nothing: an order that fetches is denied by the fetcher itself,
@@ -729,3 +732,6 @@ fn the_host_fetcher_of_a_host_without_the_fetch_user_names_it() {
         "{got:?}"
     );
 }
+
+#[path = "fetcher_host_frontend_tests.rs"]
+mod frontend;

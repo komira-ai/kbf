@@ -34,12 +34,13 @@
 //!   one with a source of its own alike, and starts no fetch child: the seed fetcher
 //!   ([`SeedFetcher`]) hands the package's files to the same verify pipeline.
 
-use kbf_host::{HostExec, HostPath, Owner};
+use kbf_host::{Entry, Exec, HostExec, HostPath, Kind, Owner};
 use kbf_update::{Facts, Source as OrderSource};
+use sha2::{Digest, Sha256};
 
 use crate::CommitId;
 use crate::binary::Version;
-use crate::fetch::{ChildProgram, Limits, ProgramFault, Source};
+use crate::fetch::{ChildProgram, FrontendSource, Limits, ProgramFault, Source};
 use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
 use crate::helper::fetcher_real::{Parts, RealFetcher};
 use crate::helper::fetcher_seed::SeedFetcher;
@@ -51,6 +52,7 @@ use crate::run::SystemRunner;
 use crate::seed::{Looked, Noticed, SeedFacts};
 use crate::settings::{NoCommonRef, Settings};
 use crate::stage::Policy;
+use crate::trust::trusted_chain;
 use crate::version;
 
 /// Pulls and installs a release the way the host is configured to, as of the moment it is
@@ -146,7 +148,7 @@ impl HostFetcher {
     /// and where `bundled` is denied.
     fn assemble(&self) -> Result<RealFetcher, NotBuilt> {
         let (parts, toml, settings) = self.read()?;
-        let source = source_of(&toml)?;
+        let source = source_of(&toml, &*parts.trust)?;
         Ok(RealFetcher::new(
             self.host.clone(),
             settings,
@@ -233,6 +235,10 @@ enum NotBuilt {
     Refs(#[from] NoCommonRef),
     #[error("{0}")]
     Source(&'static str),
+    /// The frontend source is set and a piece it needs is not there or is not trusted, said
+    /// without the bytes of any file.
+    #[error("{0}")]
+    Pull(String),
     /// The host's configuration does not allow what the order asks.
     #[error("{0}")]
     Denied(&'static str),
@@ -270,11 +276,17 @@ pub fn host_parts(host: &Layout, leases: Box<dyn LeaseSource>, child: ChildProgr
 ///
 /// The `url` source is a base the file validated, with the system's roots. `installer.toml`
 /// can now hold the keys of the other sources (`release_ca`, the frontend snapshot), and this
-/// build reads them without using them, so a source that needs one is refused, with the
-/// reason, rather than built without it: a `url` host with a `release_ca` would otherwise
-/// trust the system's roots where the operator named a CA, and the `frontend` has no fetch of
-/// its own yet. A `bundled` host fetches nothing: an order that fetches is denied.
-fn source_of(toml: &InstallerToml) -> Result<Source, NotBuilt> {
+/// build does not use `release_ca`, so a source that needs it is refused, with the reason,
+/// rather than built without it: a `url` host with a `release_ca` would otherwise trust the
+/// system's roots where the operator named a CA. A `bundled` host fetches nothing: an order
+/// that fetches is denied.
+///
+/// The `frontend` source is built and held to every guard ([`frontend_source`]), and is then
+/// refused all the same: this build does not fetch from the frontend yet, because LAN pull
+/// waits for a decision on lending the node key to the fetch child. The built source is
+/// dropped, so no node key is read or lent. Fetching is one change here: the arm returns
+/// `frontend_source(toml, trust).map(Source::Frontend)`.
+fn source_of(toml: &InstallerToml, trust: &dyn Exec) -> Result<Source, NotBuilt> {
     match (&toml.source, &toml.release_ca) {
         (Configured::Url(base), None) => Ok(Source::Url {
             base: base.clone(),
@@ -283,13 +295,73 @@ fn source_of(toml: &InstallerToml) -> Result<Source, NotBuilt> {
         (Configured::Url(_), Some(_)) => Err(NotBuilt::Source(
             "release_ca is set and this build does not use it yet: a fetch would trust the system's roots instead of the CA named; remove release_ca",
         )),
-        (Configured::Frontend, _) => Err(NotBuilt::Source(
-            "release_source = \"frontend\": this build cannot fetch from the frontend yet, even with frontend_url, frontend_ca and frontend_ca_sha256 set; use release_source = \"url\"",
-        )),
+        (Configured::Frontend, _) => {
+            frontend_source(toml, trust)?;
+            Err(NotBuilt::Source(
+                "release_source = \"frontend\": the snapshot, the node_cert and node_key names and frontend_ca check out, but this build does not fetch from the frontend yet (LAN pull waits for a decision on lending the node key to the fetch child); use release_source = \"url\"",
+            ))
+        }
         (Configured::Bundled, _) => Err(NotBuilt::Denied(
             "release_source is bundled; source=fetch is refused (use source=staged)",
         )),
     }
+}
+
+/// The frontend a fetch would use, built from `installer.toml` after every guard it has.
+/// Nothing here reads the node's certificate or key: they are paths, lent to the fetch child
+/// only when a fetch is made from the source built.
+///
+/// In this order, each refusal with its own reason and none holding a file's bytes:
+///
+/// 1. the snapshot (`frontend_url`, `frontend_ca`, `frontend_ca_sha256`) is in the file;
+/// 2. the node's certificate and key are named;
+/// 3. the CA copy is a file root alone can write, with no link on its way
+///    ([`trusted_chain`]), before any byte of it is asked for;
+/// 4. its size is within what the identity reader accepts (at least 1 byte, at most
+///    [`MAX_PEM_BYTES`](crate::fetch::identity::MAX_PEM_BYTES)), checked before it is read;
+/// 5. its sha256 is the `frontend_ca_sha256` of the file.
+///
+/// The executor `trust` is rooted at the host's root, and the fetch child opens the paths it
+/// is given as they are, so the two agree only when the root is `/`, which is the host's.
+///
+/// Known residual: the identity reader opens the CA again, a moment after step 5. Only root
+/// can write the path under step 3, so this is accepted; lending the bytes just checked would
+/// change [`FrontendSource`].
+fn frontend_source(toml: &InstallerToml, trust: &dyn Exec) -> Result<FrontendSource, NotBuilt> {
+    let Some(pull) = &toml.frontend else {
+        return Err(NotBuilt::Source(
+            "release_source = \"frontend\" needs frontend_url, frontend_ca and frontend_ca_sha256 (setup: --frontend-worker-url, --frontend-ca, --frontend-ca-sha256)",
+        ));
+    };
+    let (Some(node_cert), Some(node_key)) = (&toml.node_cert, &toml.node_key) else {
+        return Err(NotBuilt::Source(
+            "release_source = \"frontend\" needs node_cert and node_key: this host is not an enrolled daemon or storage node",
+        ));
+    };
+    let ca = HostPath::new(&pull.ca.to_string_lossy())
+        .map_err(|e| NotBuilt::Pull(format!("frontend_ca: {e}")))?;
+    trusted_chain(trust, &ca, Kind::File)
+        .map_err(|e| NotBuilt::Pull(e.to_string()))?;
+    let cap = crate::fetch::identity::MAX_PEM_BYTES;
+    let len = trust.stat(&ca).ok().flatten().map_or(0, |m| m.len);
+    if !(1..=cap).contains(&len) {
+        let why = format!("frontend_ca is empty or over {cap} bytes");
+        return Err(NotBuilt::Pull(why));
+    }
+    let Ok(Some(Entry::File { bytes, .. })) = trust.inspect(&ca) else {
+        return Err(NotBuilt::Source("frontend_ca could not be read"));
+    };
+    if hex::encode(Sha256::digest(bytes)) !=pull.ca_sha256.as_str() {
+        return Err(NotBuilt::Source(
+            "frontend_ca does not have the sha256 frontend_ca_sha256 names",
+        ));
+    }
+    Ok(FrontendSource {
+        url: pull.url.clone(),
+        ca_file: pull.ca.clone(),
+        node_cert: node_cert.clone(),
+        node_key: node_key.clone(),
+    })
 }
 
 #[cfg(test)]

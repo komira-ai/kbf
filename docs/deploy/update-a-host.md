@@ -172,6 +172,6 @@ Planned: the frontend offers a release and each host pulls it. The design is
 Planned: a host pulling an update on its own. The host's release fetcher is wired into `run` (a
 fetch from the `url` source works, as under (b)), but nothing yet asks the frontend what the
 desired release is: the installer carries the desired generation in an order and applies no rule to
-it. A host whose release source is `frontend` (the default for the node modes) cannot fetch at all,
-because `installer.toml` has no key for the frontend's address or its pinned CA, and the fetch
-refuses with that reason.
+it. A host whose release source is `frontend` (the default for the node modes) cannot fetch yet: the
+fetch checks the snapshot, the names of the node's certificate and key and the root-owned copy of
+the CA, and then refuses, saying this build does not fetch from the frontend.
