@@ -426,32 +426,9 @@ impl FactsFault {
     }
 }
 
-/// Why a staged binary's `--version --json` is refused.
-#[derive(Debug, thiserror::Error)]
-pub enum VersionFault {
-    #[error("it did not exit 0 (status {0:?})")]
-    Failed(Option<i32>),
-    #[error("it printed no JSON object of the fields a build reports: {0}")]
-    Unreadable(String),
-    #[error("it says commit {got}, and the release is {want}")]
-    Commit { want: String, got: String },
-    #[error("it says profile {0:?}, not \"release\"")]
-    Profile(String),
-    #[error("it printed more than {cap} bytes")]
-    Oversize { cap: usize },
-}
-
-impl VersionFault {
-    pub fn code(&self) -> &'static str {
-        match self {
-            VersionFault::Failed(_) => "version-failed",
-            VersionFault::Unreadable(_) => "version-unreadable",
-            VersionFault::Commit { .. } => "version-commit",
-            VersionFault::Profile(_) => "version-profile",
-            VersionFault::Oversize { .. } => "version-oversize",
-        }
-    }
-}
+/// Why a staged binary's `--version --json` is refused (the type is shared with the release
+/// store, which reads the same document).
+pub use kbf_types::VersionFault;
 
 #[cfg(test)]
 #[path = "refusal_tests.rs"]
