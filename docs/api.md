@@ -1795,7 +1795,10 @@ there is nothing to mount it on.
   `Cross-Origin-Opener-Policy: same-origin` and a `Permissions-Policy` denying every
   powerful feature (camera, microphone, geolocation, usb, serial, hid, bluetooth,
   payment, display capture, clipboard, midi, xr, and the rest of its list) with an
-  empty allowlist. No `Strict-Transport-Security`: TLS ends at the proxy.
+  empty allowlist. No `Strict-Transport-Security`, deliberately: a farm often serves a
+  private-CA or self-signed certificate, and HSTS would stop a browser from proceeding
+  past its warning. The proxy's own answers (503 handover page, 404, 405, 401) carry a
+  stricter set; see `docs/deploy/kbf-ui.md`.
 - **Bounds.** Each caller has at most 4 reads open at once on `/ui`, and 4 on the read
   routes the pages use (`/v1/blobs`, `/v1/invocations` and below, `/v1/runs` and the history
   routes, `/v1/update/hosts`): the fifth is `429` with `Retry-After: 1`, before its handler
