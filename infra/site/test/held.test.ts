@@ -8,8 +8,10 @@ const REVIEWER_ID = 4242;
 interface Call { cmd: string; args: string[]; kind: 'capture' | 'stream'; input?: string }
 
 /** A fake: `answers` maps "cmd arg arg..." prefixes to stdout; anything else answers "{}". */
-function fake(answers: Record<string, string | Error> = {}) {
+function fake(answers: Record<string, string | Error> = {}, failStream = '') {
   const calls: Call[] = [];
+  const written: Record<string, string> = {};
+  const removed: string[] = [];
   const lines: string[] = [];
   const t: Tools = {
     capture(cmd, args) {
@@ -23,10 +25,18 @@ function fake(answers: Record<string, string | Error> = {}) {
       }
       return '{}';
     },
-    stream(cmd, args, input) { calls.push({ cmd, args, kind: 'stream', input }); },
+    stream(cmd, args, opts) {
+      calls.push({ cmd, args, kind: 'stream', input: opts?.input });
+      if (failStream && [cmd, ...args].join(' ').includes(failStream)) throw new Error('failed');
+    },
     log: (l) => lines.push(l),
+    mkScratch: () => '/scratch/x',
+    removeScratch: (d) => { removed.push(d); },
+    readFile: () => '24.21.0\n',
+    writeFile: (p, d) => { written[p] = d; },
+    listFiles: () => ['404.html', 'assets/abc/app.js', 'assets/abc/site.css', 'index.html'],
   };
-  return { t, calls, lines, text: () => lines.join('\n'), ran: (s: string) => calls.some((c) => [c.cmd, ...c.args].join(' ').includes(s)) };
+  return { t, calls, lines, written, removed, text: () => lines.join('\n'), ran: (s: string) => calls.some((c) => [c.cmd, ...c.args].join(' ').includes(s)) };
 }
 
 const envJson = (over: Record<string, unknown> = {}, rule: Record<string, unknown> | null = {}) =>
@@ -47,8 +57,11 @@ const STACK = JSON.stringify([
   { OutputKey: 'DistributionId', OutputValue: 'EDIST123' },
   { OutputKey: 'PublishRoleArn', OutputValue: `arn:aws:iam::${ACCOUNT}:role/kbf-prod-publish` },
 ]);
+const SHA = 'a'.repeat(40);
 const answers = (over: Record<string, string | Error> = {}) => ({
   'sts get-caller-identity': ACCOUNT,
+  'cat-file -t': 'commit\n',
+  'node --version': 'v24.21.0\n',
   // prod-site first: a fake key matches by substring, and 'environments/prod' is a prefix of 'environments/prod-site'
   'environments/prod-site/deployment-branch-policies': SITE_POLS,
   'environments/prod-site': SITE_ENV,
@@ -268,6 +281,38 @@ describe('site', () => {
     expect(() => main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO], fake(answers({ 'get-open-id-connect-provider': new Error('NoSuchEntity') })).t)).toThrow(/OIDC provider/);
     expect(() => main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO], fake(answers({ 'list-hosted-zones-by-name': JSON.stringify({ HostedZones: [] }) })).t)).toThrow(/hosted zone/);
   });
+  test('--no-domain: no zone lookup, passes -c noDomain=true to cdk, and the default mode does not', () => {
+    const f = fake(answers({ 'list-hosted-zones-by-name': new Error('must not be called') }));
+    main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO, '--no-domain'], f.t);
+    expect(f.ran('route53')).toBe(false);
+    expect(f.ran('-c noDomain=true')).toBe(true);
+    expect(f.ran('cdk diff kbf-prod-site')).toBe(true);
+    expect(f.ran('cdk deploy')).toBe(false);
+    const g = fake(answers());
+    main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO], g.t);
+    expect(g.ran('noDomain')).toBe(false);
+    expect(g.ran('route53')).toBe(true);
+  });
+  test('--no-domain still refuses without the OIDC provider and on an account mismatch', () => {
+    const flags = ['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO, '--no-domain'];
+    expect(() => main(flags, fake(answers({ 'get-open-id-connect-provider': new Error('NoSuchEntity') })).t)).toThrow(/OIDC provider/);
+    const f = fake(answers({ 'sts get-caller-identity': '999999999999' }));
+    expect(() => main(flags, f.t)).toThrow(/not the --account/);
+    expect(f.calls).toHaveLength(1);
+  });
+  test('--no-domain is a flag of site only', () => {
+    expect(() => parse(['dns', '--account', ACCOUNT, '--profile', 'p', '--no-domain'])).toThrow(/unknown flag/);
+    expect(() => parse(['vars', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO, '--no-domain'])).toThrow(/unknown flag/);
+    expect(parse(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO, '--no-domain']).noDomain).toBe(true);
+  });
+  test('--no-domain --apply prints the distribution domain name from the stack outputs', () => {
+    const stack = JSON.stringify([{ OutputKey: 'DistributionDomainName', OutputValue: 'd111111abcdef8.cloudfront.net' }]);
+    const f = fake(answers({ 'describe-stacks': stack }));
+    main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO, '--no-domain', '--apply'], f.t);
+    expect(f.ran('cdk deploy kbf-prod-site')).toBe(true);
+    expect(f.ran('-c noDomain=true')).toBe(true);
+    expect(f.text()).toContain('https://d111111abcdef8.cloudfront.net/');
+  });
   test('never creates an OIDC provider', () => {
     const f = fake(answers());
     main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO, '--apply'], f.t);
@@ -318,6 +363,14 @@ describe('vars', () => {
     const go = () => main(['vars', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO], f.t);
     return { f, go };
   };
+  test('works for the no-domain stack: same three variables, and the cloudfront.net name is shown', () => {
+    const stack = JSON.stringify([...JSON.parse(STACK), { OutputKey: 'DistributionDomainName', OutputValue: 'd111111abcdef8.cloudfront.net' }]);
+    const { f, go } = run({ 'describe-stacks': stack });
+    go();
+    expect(f.lines.filter((l) => l.startsWith('gh variable set'))).toHaveLength(3);
+    expect(f.text()).toContain('https://d111111abcdef8.cloudfront.net/');
+    expect(f.ran('route53')).toBe(false);
+  });
   test('prints the three gh variable set commands when GitHub is as expected', () => {
     const { f, go } = run();
     go();
@@ -408,5 +461,118 @@ describe('oidc-provider', () => {
   });
   test('the site step still never creates one and now points at this step', () => {
     expect(() => main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO], fake(answers({ 'get-open-id-connect-provider': new Error('NoSuchEntity') })).t)).toThrow(/held -- oidc-provider --apply/);
+  });
+});
+
+// temporary: removed by site-publish.yml
+describe('upload', () => {
+  const flags = (...extra: string[]) => ['upload', '--account', ACCOUNT, '--profile', 'p', '--commit', SHA, ...extra];
+  const aws3 = (f: ReturnType<typeof fake>) => f.calls.filter((c) => c.cmd === 'aws' && c.args[0] === 's3');
+  const str = (c: Call) => [c.cmd, ...c.args].join(' ');
+
+  test('a dry run writes nothing: every s3 call is --dryrun, no invalidation, no version.txt upload', () => {
+    const f = fake(answers());
+    main(flags(), f.t);
+    expect(aws3(f).length).toBeGreaterThanOrEqual(5);
+    for (const c of aws3(f)) expect(c.args).toContain('--dryrun');
+    expect(f.ran('create-invalidation')).toBe(false);
+    expect(f.text()).toContain('DRY-RUN: aws cloudfront create-invalidation');
+    expect(f.text()).toContain('assets/abc/app.js');
+  });
+
+  test('--apply: sync passes, then version.txt, then the invalidation last', () => {
+    const f = fake(answers());
+    main(flags('--apply'), f.t);
+    const aws = f.calls.filter((c) => c.cmd === 'aws').map(str);
+    const lastSync = aws.map((l, i) => (l.includes('s3 sync') ? i : -1)).reduce((a, b) => Math.max(a, b));
+    const cp = aws.findIndex((l) => l.includes('s3 cp') && l.includes('version.txt'));
+    const inv = aws.findIndex((l) => l.includes('create-invalidation'));
+    expect(aws.some((l) => l.includes('--dryrun'))).toBe(false);
+    expect(aws.findIndex((l) => l.includes('s3 sync'))).toBeLessThan(cp);
+    expect(lastSync).toBeLessThan(cp);
+    expect(cp).toBeLessThan(inv);
+    expect(inv).toBe(aws.length - 1);
+    expect(aws[inv]).toContain('--paths /*');
+    expect(aws[inv]).toContain('--distribution-id EDIST123');
+    expect(f.written['/scratch/x/version.txt']).toBe(`${SHA}\n`);
+  });
+
+  test('every sync excludes releases/ last, deletes, and targets the bucket from the stack outputs', () => {
+    const f = fake(answers());
+    main(flags('--apply'), f.t);
+    const syncs = f.calls.filter((c) => c.cmd === 'aws' && c.args[1] === 'sync');
+    expect(syncs).toHaveLength(4);
+    for (const c of syncs) {
+      expect(c.args).toContain('--delete');
+      expect(c.args).toContain(`s3://kbf-prod-site-${ACCOUNT}/`);
+      const i = c.args.lastIndexOf('--exclude');
+      expect(c.args[i + 1] === 'releases/*' || c.args[i + 1] === 'version.txt').toBe(true);
+      expect(c.args.join(' ')).toContain("--exclude releases/*");
+      const inc = c.args.indexOf('--include');
+      if (inc >= 0) expect(c.args.indexOf('--exclude', inc)).toBeGreaterThan(inc); // releases exclusion follows every include
+    }
+    expect(f.calls.some((c) => c.args.includes('releases/latest.json') || c.args.some((a) => a.endsWith('/releases/')))).toBe(false);
+  });
+
+  test('the final catch-all sync keeps releases/ and the live version.txt out of its --delete', () => {
+    const f = fake(answers());
+    main(flags('--apply'), f.t);
+    const syncs = f.calls.filter((c) => c.cmd === 'aws' && c.args[1] === 'sync');
+    const last = syncs[syncs.length - 1].args.join(' ');
+    expect(last).not.toContain('--include');
+    expect(last).toContain('--exclude releases/*');
+    expect(last).toContain('--exclude version.txt');
+  });
+
+  test('content types and cache-control per class: assets immutable, pages short', () => {
+    const f = fake(answers());
+    main(flags('--apply'), f.t);
+    const line = (inc: string) => str(f.calls.find((c) => c.args.includes(inc))!);
+    expect(line('assets/*.js')).toContain('--content-type text/javascript --cache-control public, max-age=31536000, immutable');
+    expect(line('assets/*.css')).toContain('--content-type text/css --cache-control public, max-age=31536000, immutable');
+    expect(line('*.html')).toContain('--content-type text/html; charset=utf-8 --cache-control public, max-age=60, s-maxage=300');
+  });
+
+  test('refuses a sha that is not a commit before building, and removes nothing it did not make', () => {
+    const f = fake(answers({ 'cat-file -t': new Error('bad object') }));
+    expect(() => main(flags('--apply'), f.t)).toThrow(/not a commit/);
+    expect(f.ran('worktree add')).toBe(false);
+    const g = fake(answers({ 'cat-file -t': 'tree\n' }));
+    expect(() => main(flags(), g.t)).toThrow(/not a commit/);
+  });
+
+  test('refuses when node is not the version in site/.node-version, before npm ci', () => {
+    const f = fake(answers({ 'node --version': 'v20.19.4\n' }));
+    expect(() => main(flags('--apply'), f.t)).toThrow(/24\.21\.0.*20\.19\.4/);
+    expect(f.ran('npm ci')).toBe(false);
+    expect(f.ran('s3')).toBe(false);
+    expect(f.ran('worktree remove')).toBe(true); // the temporary worktree is removed even on refusal
+    expect(f.removed).toEqual(['/scratch/x']);
+  });
+
+  test('refuses when check-dist fails, before any s3 call', () => {
+    const f = fake(answers(), 'check-dist');
+    expect(() => main(flags('--apply'), f.t)).toThrow(/check-dist failed/);
+    expect(f.calls.some((c) => c.args[0] === 's3' || c.args[0] === 'cloudfront')).toBe(false);
+    expect(f.ran('worktree remove')).toBe(true);
+  });
+
+  test('builds in a detached worktree at the sha, with install scripts off, and removes it afterwards', () => {
+    const f = fake(answers());
+    main(flags(), f.t);
+    const order = f.calls.map(str);
+    expect(order.findIndex((l) => l.includes(`worktree add --detach /scratch/x/wt ${SHA}`))).toBeGreaterThanOrEqual(0);
+    expect(f.ran('npm ci --ignore-scripts --no-audit --no-fund')).toBe(true);
+    expect(f.ran('npm run build')).toBe(true);
+    expect(order.findIndex((l) => l.includes('check-dist'))).toBeLessThan(order.findIndex((l) => l.includes('s3 sync')));
+    expect(order[order.length - 1]).toContain('worktree remove --force /scratch/x/wt');
+  });
+
+  test('the account guard applies, and a short or non-hex commit is refused', () => {
+    const f = fake(answers({ 'sts get-caller-identity': '999999999999' }));
+    expect(() => main(flags(), f.t)).toThrow(/not the --account/);
+    expect(f.calls).toHaveLength(1);
+    expect(() => parse(['upload', '--account', ACCOUNT, '--profile', 'p', '--commit', 'main'])).toThrow(/40-hex/);
+    expect(() => parse(['upload', '--account', ACCOUNT, '--profile', 'p'])).toThrow(/--commit/);
   });
 });
