@@ -14,7 +14,10 @@ use std::time::Duration;
 use kbf_host::plan::Mode;
 use kbf_host::{Exec, Perms, Step};
 
+use crate::CommitId;
 use crate::activate::{self, Reverted};
+use crate::binary;
+use crate::helper::fetcher::Fetcher;
 use crate::helper::restart::{self, Restart};
 use crate::helper::service::{self, Procs};
 use crate::layout::Layout;
@@ -86,6 +89,8 @@ pub struct Operator<'a, E: Exec> {
     pub exec: &'a mut E,
     pub restart: &'a Restart,
     pub procs: &'a dyn Procs,
+    /// Says the host's source and what an installed release declares (`rollback` asks both).
+    pub fetcher: &'a dyn Fetcher,
     pub out: &'a mut dyn Write,
     pub apply: bool,
     /// How long to wait for the lock ([`LOCK_WAIT`]).
@@ -154,6 +159,7 @@ impl<E: Exec> Operator<'_, E> {
     pub fn rollback(&mut self) -> Result<(), Failure> {
         let (lock, state) = self.locked()?;
         let to = activate::rollback_target(&*self.exec, self.host, &state)?;
+        self.must_relay(&to)?;
         if !self.apply {
             self.say(&format!("would roll back to {to}"));
             return Ok(());
@@ -163,6 +169,30 @@ impl<E: Exec> Operator<'_, E> {
         })?;
         self.say(&format!("rolled back: {} is current", done.to));
         Ok(())
+    }
+
+    /// A host whose `release_source` is `bundled` fetches nothing: a new kbf reaches it only as
+    /// a staged order, which only a kbf that relays ([`crate::binary::RELAY_NEEDED`]) hands
+    /// on. Going back to a release whose kbf does not would leave no way to update, so it is
+    /// refused, before anything is written. What the release declares is asked of its own
+    /// binary, as the unprivileged user; a release that cannot be asked counts as not relaying.
+    /// A host of another source (or one whose `installer.toml` cannot be read) is not held to it.
+    fn must_relay(&self, to: &CommitId) -> Result<(), Failure> {
+        if self.fetcher.source() != Some("bundled") {
+            return Ok(());
+        }
+        let relays = self
+            .fetcher
+            .probe(to)
+            .is_ok_and(|version| binary::relays(&version));
+        if relays {
+            return Ok(());
+        }
+        Err(Failure::Refused(format!(
+            "the previous release's kbf cannot relay a staged order (no relay); on a bundled \
+             host that would leave no way to update; roll forward with `update --source \
+             staged`, or set release_source back to url first (the previous release is {to})"
+        )))
     }
 
     /// Run `change` (which moves the links) with the restart it owes marked first, then

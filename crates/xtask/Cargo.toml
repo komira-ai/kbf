@@ -30,7 +30,7 @@ base64.workspace = true
 clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
-# The result document a release's gamma verdict is, and the one definition of a set hash.
+# The result document the Beta record in a release tag is, and the one definition of a set hash.
 kbf-gate.workspace = true
 # `release version-facts` runs `kbf --version --json` as the installer runs a staged binary
 # and reads what it prints with the installer's own parser: one definition of the fields,

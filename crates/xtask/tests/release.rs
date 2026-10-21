@@ -945,7 +945,7 @@ fn check_refuses_a_changed_file() {
 }
 
 fn publish(root: &Path, defect: Option<&str>) -> (Option<i32>, String, String) {
-    // The set hash a verdict names for the files in `dist`: sha256 of its SHA256SUMS.
+    // The set hash `release verify` prints for the files in `dist`: sha256 of its SHA256SUMS.
     let sums = std::fs::read_to_string(root.join("dist/SHA256SUMS")).unwrap_or_default();
     publish_set(root, &sha_of(&sums), defect)
 }
@@ -1494,17 +1494,17 @@ fn a_failed_gh_release_fails_the_run() {
 }
 
 #[test]
-fn publish_refuses_files_whose_set_differs_from_the_verdicts_before_asking_github() {
+fn publish_refuses_files_whose_set_differs_from_the_verified_one_before_asking_github() {
     // Catches: a publish that trusts the verified files without comparing their set to
-    // the one gamma ran (kbf-cicd.md 8.1: "if anything is rebuilt, verify fails"). The
+    // the one `release verify` printed (kbf-cicd.md 8.1: "if anything is rebuilt, verify fails"). The
     // files pass `check` in every case, so only the set hash can refuse them.
     let root = scratch("publish-other-set");
     let dist = dist(&root, COMMIT);
-    // Gamma ran another set than these files.
-    let other = sha_of("what gamma ran");
+    // `release verify` printed another set than these files.
+    let other = sha_of("what verify printed");
     let (code, _, err) = publish_set(&root, &other, None);
     assert_eq!(code, Some(1), "{err}");
-    assert!(err.contains("the gate ran other bytes"), "{err}");
+    assert!(err.contains("other bytes than it verified"), "{err}");
     assert!(err.contains(&other), "{err}");
     assert!(released(&root).is_empty(), "nothing was released");
     assert!(

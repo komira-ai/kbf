@@ -1,0 +1,18 @@
+[package]
+name = "kbf-unitfile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The systemd unit-file reader the deploy docs check, the rendered-unit checks and the
+# packaged-unit tests share. Its own crate, not `kbf-testkit` (which has no kbf
+# dependency and is a dev-dependency only): `kbf-deploy`'s non-test code reads units
+# with it, and `kbf-integration-test` and `kbf-harness` take it as a normal dependency.
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

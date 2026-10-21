@@ -87,7 +87,7 @@ fn ships_nothing(path: &str) -> bool {
 }
 
 /// The release machinery and what it trusts: the workflows and every other file under
-/// `.github/` and `infra/`, all of `crates/xtask/` and `crates/kbf-gate/` (the verdict
+/// `.github/` and `infra/`, all of `crates/xtask/` and `crates/kbf-gate/` (the record
 /// and the notes use them), and the toolchain, dependency and policy files. Fail closed:
 /// a push that touches one never releases itself.
 fn is_pipeline(path: &str) -> bool {

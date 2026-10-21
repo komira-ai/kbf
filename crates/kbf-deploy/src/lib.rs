@@ -45,7 +45,7 @@ pub mod mdm;
 pub mod minio;
 pub mod pilot;
 pub mod template;
-pub mod unit;
+pub use kbf_unitfile as unit;
 
 pub use config::{Config, ConfigError};
 

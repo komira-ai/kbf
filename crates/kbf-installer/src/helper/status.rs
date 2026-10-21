@@ -3,6 +3,7 @@
 //! `kbf-update`'s client reads (`helper.rs`).
 
 use crate::CommitId;
+use crate::seed::Available;
 use crate::state::State;
 use serde::Serialize;
 
@@ -37,6 +38,14 @@ struct File<'a> {
     acked_order_id: u64,
     staged: Option<Staged>,
     envoy: Envoy,
+    /// The word `installer.toml` holds for `release_source`; left out when the file could not
+    /// be read, and so by an installer that never told it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_source: Option<&'static str>,
+    /// The seed the host's package carries, once the run loop found it whole and above the
+    /// floor of `seq`; left out when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    available: Option<&'a Available>,
     /// Releases a link names that carry no `VERIFIED` marker (adopted by `migrate`); left out
     /// when there are none, so a status of a host that has none reads as it always did.
     #[serde(skip_serializing_if = "<[CommitId]>::is_empty")]
@@ -97,9 +106,15 @@ pub fn render_with(state: &State, memory: &Memory, unverified: &[CommitId]) -> V
             current: None,
             previous: None,
         },
+        release_source: memory.release_source,
+        available: memory.available.as_ref(),
         unverified,
     };
     let mut bytes = serde_json::to_vec(&file).expect("plain fields serialize");
     bytes.push(b'\n');
     bytes
 }
+
+#[cfg(test)]
+#[path = "status_tests.rs"]
+mod tests;
