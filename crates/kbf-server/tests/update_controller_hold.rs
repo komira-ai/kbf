@@ -448,6 +448,7 @@ impl Transport for Refusing {
         host: &WorkerId,
         order: OrderId,
         release: &Release,
+        _source: Source,
     ) -> Result<(), TransportError> {
         let back = u64::from(self.stale);
         let named = OrderId::new(order.epoch, order.seq.saturating_sub(back));

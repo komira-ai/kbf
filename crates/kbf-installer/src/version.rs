@@ -30,6 +30,15 @@ pub const BUILD_COMMIT: &str = env!("KBF_BUILD_COMMIT");
 /// The Cargo profile this binary is built with: `release` or `debug` (`build.rs`).
 pub const PROFILE: &str = env!("KBF_BUILD_PROFILE");
 
+/// The level of this installer: a whole number that grows by one whenever a change to the
+/// installer means a host must be upgraded (by its package manager; the installer never
+/// updates itself) before it can take what newer releases bring, such as a field of the
+/// offer it would refuse. The package version is constant and the commit is not ordered, so
+/// neither can say "older"; this can. An offer's `min_installer` is the level of the tree it
+/// was made from, and `deploy --offer` refuses an offer above this number before it fetches
+/// anything. Level 1 is the first installer that understands the field.
+pub const LEVEL: u32 = 1;
+
 /// What `--version` prints after the program's name: the package version, `+`, and
 /// [`BUILD_COMMIT`].
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT"));

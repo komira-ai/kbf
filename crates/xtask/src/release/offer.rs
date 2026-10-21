@@ -429,6 +429,9 @@ pub fn plan(r: &Request, attester: &dyn Attester) -> Result<OfferDoc, Error> {
         previous,
         previous_meta_log,
         reversible: reversible(meta_log, previous_meta_log),
+        // The installer of this tree is the one that reads this offer's successors: a host
+        // below it is held, not half-applied.
+        min_installer: Some(kbf_installer::version::LEVEL),
     };
     doc.validate()
         .map_err(|e| Error::Refused(vec![e.to_string()]))?;

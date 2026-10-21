@@ -93,17 +93,31 @@ pub fn job_outputs(text: &str, job: &str) -> Result<Vec<(String, String)>, Strin
 /// (`tags`, `branches`, `paths`, ...) with its list of strings. An error when `on:` has
 /// no `push` mapping.
 pub fn push_filters(text: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    trigger_filters(text, "push")
+}
+
+/// The filters under the workflow's `workflow_run` trigger (`workflows`, `types`,
+/// `branches`), as [`push_filters`] reads those of `push`.
+pub fn workflow_run_filters(text: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    trigger_filters(text, "workflow_run")
+}
+
+fn trigger_filters(text: &str, trigger: &str) -> Result<Vec<(String, Vec<String>)>, String> {
     let root = yaml::load(text)?;
     let on = get(top_of(&root)?, "on").ok_or("the workflow has no `on:`")?;
     let Value::Map(on) = &on.value else {
         return Err("`on:` is not a mapping".to_owned());
     };
-    let Some(Value::Map(push)) = get(on, "push").map(|p| &p.value) else {
-        return Err("`on:` has no `push:` mapping".to_owned());
+    let Some(Value::Map(filters)) = get(on, trigger).map(|p| &p.value) else {
+        return Err(format!("`on:` has no `{trigger}:` mapping"));
     };
-    push.iter()
+    filters
+        .iter()
         .map(|(k, v)| {
-            let key = k.as_str().ok_or("a `push` key is not a string")?.to_owned();
+            let key = k
+                .as_str()
+                .ok_or_else(|| format!("a `{trigger}` key is not a string"))?
+                .to_owned();
             let values = match &v.value {
                 Value::Seq(items) => items
                     .iter()
@@ -111,10 +125,23 @@ pub fn push_filters(text: &str) -> Result<Vec<(String, Vec<String>)>, String> {
                     .collect::<Option<Vec<_>>>(),
                 _ => v.as_str().map(|s| vec![s.to_owned()]),
             };
-            let values = values.ok_or_else(|| format!("`push.{key}` is not strings"))?;
+            let values = values.ok_or_else(|| format!("`{trigger}.{key}` is not strings"))?;
             Ok((key, values))
         })
         .collect()
+}
+
+/// The workflow's own `name:` (its key matched ignoring ASCII case): `None` without one.
+/// An error when the text does not parse or the name is not a string.
+pub fn workflow_name(text: &str) -> Result<Option<String>, String> {
+    let root = yaml::load(text)?;
+    match get(top_of(&root)?, "name") {
+        None => Ok(None),
+        Some(name) => name
+            .as_str()
+            .map(|n| Some(n.to_owned()))
+            .ok_or_else(|| "the workflow's `name` is not a string".to_owned()),
+    }
 }
 
 /// The job `job`'s own `env:` as `(name, value)`; empty without one. An error when it is
@@ -135,6 +162,18 @@ pub fn job_env(text: &str, job: &str) -> Result<Vec<(String, String)>, String> {
             .collect(),
         Some(_) => Err(format!("the `env` of job `{job}` is not a mapping")),
     }
+}
+
+/// Whether the workflow has the top-level key `key` (matched ignoring ASCII case).
+pub fn workflow_has_key(text: &str, key: &str) -> Result<bool, String> {
+    let root = yaml::load(text)?;
+    Ok(get(top_of(&root)?, key).is_some())
+}
+
+/// Whether the job `job` has the key `key` (matched ignoring ASCII case).
+pub fn job_has_key(text: &str, job: &str, key: &str) -> Result<bool, String> {
+    let root = yaml::load(text)?;
+    Ok(get(job_of(&root, job)?, key).is_some())
 }
 
 /// The inputs of the `workflow_dispatch` trigger as `(name, required)`. An error when

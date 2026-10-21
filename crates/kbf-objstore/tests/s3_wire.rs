@@ -938,11 +938,10 @@ fn cut_short(status: &str, headers: &[&str]) -> String {
 /// and the listing fail `Transport`.
 #[tokio::test]
 async fn an_answer_cut_short_is_a_transport_error_for_reads_and_listings() {
-    let (endpoint, _) = script(vec![
-        cut_short("206 Partial Content", &["content-range: bytes 0-49/50"]),
-        cut_short("200 OK", &[]),
-    ])
-    .await;
+    // The read is sent three times (`READ_RETRIES`), every send cut short.
+    let mut cuts = vec![cut_short("206 Partial Content", &["content-range: bytes 0-49/50"]); 3];
+    cuts.push(cut_short("200 OK", &[]));
+    let (endpoint, _) = script(cuts).await;
     let s = store(endpoint, Capabilities::default());
     let err = s
         .get_range(&key(), ByteRange::new(0, 50).unwrap())
@@ -973,4 +972,153 @@ async fn a_small_streamed_write_with_a_failing_body_sends_nothing() {
         "{err}"
     );
     assert!(seen.lock().unwrap().is_empty());
+}
+
+/// Catches a ranged read that gives up on the first dropped connection: a store (or the
+/// path to it) that closes a pooled connection after the request went out answers
+/// nothing, the client reports "connection closed before message completed", and that
+/// failed a whole batch of reads though the next attempt would have succeeded. The first
+/// connection here is closed after its request is read; the second answers.
+#[tokio::test]
+async fn a_ranged_read_survives_a_connection_closed_before_its_answer() {
+    let (endpoint, seen) = script(vec![
+        String::new(),
+        answer(
+            "206 Partial Content",
+            &["content-range: bytes 2-5/10"],
+            "2345",
+        ),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let got = s
+        .get_range(&key(), ByteRange::new(2, 4).unwrap())
+        .await
+        .expect("one dropped connection must not fail the read");
+    assert_eq!(got, Bytes::from("2345"));
+    assert_eq!(seen.lock().unwrap().len(), 2, "the read was sent again");
+}
+
+/// Catches the same failure part way through the body: the head says 4 bytes, 2 arrive,
+/// the connection closes.
+#[tokio::test]
+async fn a_ranged_read_survives_a_body_cut_short() {
+    let cut = "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes 2-5/10\r\n\
+               content-length: 4\r\n\r\n23"
+        .to_owned();
+    let (endpoint, seen) = script(vec![
+        cut,
+        answer(
+            "206 Partial Content",
+            &["content-range: bytes 2-5/10"],
+            "2345",
+        ),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let got = s
+        .get_range(&key(), ByteRange::new(2, 4).unwrap())
+        .await
+        .expect("a body cut short must be read again");
+    assert_eq!(got, Bytes::from("2345"));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+/// Catches a retry with no bound: a store that closes every connection fails the read
+/// after a fixed number of sends (the first and two more), with the transport error.
+#[tokio::test]
+async fn a_ranged_read_gives_up_after_its_retries() {
+    let (endpoint, seen) = script(vec![String::new(); 3]).await;
+    let s = store(endpoint, Capabilities::default());
+    let err = s
+        .get_range(&key(), ByteRange::new(2, 4).unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
+    assert!(err.to_string().contains("connection closed"), "{err}");
+    assert_eq!(seen.lock().unwrap().len(), 3);
+}
+
+/// Catches a retry of a timeout: a store that never answers is already `request_timeout`
+/// slow, and sending again would triple the wait of a read that cannot succeed.
+#[tokio::test]
+async fn a_ranged_read_that_timed_out_is_not_sent_again() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = Arc::new(Mutex::new(0usize));
+    let count = Arc::clone(&accepted);
+    let held = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            *count.lock().unwrap() += 1;
+            held.push(sock);
+        }
+    });
+    let s = timed_store(endpoint, Duration::from_millis(300), None);
+    let err = s
+        .get_range(&key(), ByteRange::new(2, 4).unwrap())
+        .await
+        .unwrap_err();
+    held.abort();
+    assert!(err.to_string().contains("timed out"), "{err}");
+    assert_eq!(*accepted.lock().unwrap(), 1);
+}
+
+/// Serves forever: the first connection reads one whole request and is closed with no
+/// answer; every later connection is answered `200`. Counts the requests it read.
+async fn cut_then_ok() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&reads);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let counted = Arc::clone(&counted);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // The head and the three body bytes of the PUT.
+                while !buf.ends_with(b"abc") {
+                    match sock.read(&mut chunk).await {
+                        Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                        _ => return,
+                    }
+                }
+                if counted.fetch_add(1, Ordering::SeqCst) > 0 {
+                    let _ = sock.write_all(answer("200 OK", &[], "").as_bytes()).await;
+                }
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    (endpoint, reads)
+}
+
+/// Catches: a PUT sent again by the client after its connection closed before the
+/// answer. The first PUT may have landed; a resend would meet its own object (or write
+/// over a changed one on a store without conditional writes), so the caller, who knows
+/// the key and can read it back, is the only one who may try again. Exactly one PUT
+/// reaches the store and the transport error comes back.
+#[tokio::test]
+async fn a_put_cut_before_its_answer_is_sent_once_and_fails_as_transport() {
+    use std::sync::atomic::Ordering;
+    let (endpoint, reads) = cut_then_ok().await;
+    let s = store(endpoint, Capabilities::default());
+    let err = s
+        .put_new(&key(), Bytes::from("abc"), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
+    // A late resend would show here.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the PUT was sent again");
+    // Through put_stream too (the flusher's path for a small object).
+    let body: kbf_objstore::BodyStream =
+        futures::stream::iter(vec![Ok(Bytes::from("abc"))]).boxed();
+    s.put_stream(&key(), 3, body).await.unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
 }

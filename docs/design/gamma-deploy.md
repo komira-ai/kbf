@@ -51,6 +51,14 @@ The token in the token file is the operator token the proxy checks on every rout
 probes. Where `setup` puts that file is the proxy's design (`docs/design/frontend-proxy.md`,
 section 4, "Auth"), not this verb's.
 
+The sudoers line is generated, not written by hand: `cargo xtask gamma sudoers-line --user <account>` prints it, and
+`cargo xtask gamma deploy` (the step of `gamma.yml`, `docs/design/kbf-cicd.md` section 5.4) sends its command from the same
+argument list, with the commit as forty `[0-9a-f]` classes and no wildcard. A test holds the two together: the pattern
+allows the command sent for a real commit and no other, and none of the flags sent is one this verb refuses through
+`sudo`. The account may not be `root` (a root caller is not "through sudo", so the flags above would not be refused).
+The generated line pins `--offer -`, not a path: the offer arrives on standard input with the files, so the rule names no
+path of the host. Where the paragraph above says the rule pins the offer's path, this is the form that is built.
+
 A farm whose `/v1/nodes` lists no node (an empty list, or no `nodes` array) is refused in
 preflight (exit 3, `no_nodes`); the wait for nodes and the post check each need at least one
 node, so an empty list never reads as "every node confirmed".
@@ -113,6 +121,16 @@ release it is about to move is the one the offer is for. Nothing is taken from a
   `offer_required`) unless `--no-offer` says so. `--no-offer` is logged on standard error and
   recorded in the summary (`offer.kind: "waived"`); it is for a test farm.
 - **The commit**: the offer's `commit` is `--commit` (`offer_wrong_commit`).
+- **The installer**: the offer's optional `min_installer` is the lowest installer level
+  (`kbf_installer::version::LEVEL`, a whole number raised by one whenever a change means hosts
+  must be upgraded first; the package version is constant and commits are not ordered) that may
+  deploy it. An installer below it refuses first, before any other check, the bundle's files or
+  an upload (`offer_installer_too_old`, exit 3; the detail names both levels), so the node keeps
+  the release it serves and the update controller holds the order. An offer without the field
+  (made before it) is accepted by every level. `release offer` and `release stage-offer` write
+  the level of the tree they run from. An installer from before the field cannot read an offer
+  that has it (the document refuses unknown fields), so a host that old needs its package
+  installed once by hand.
 - **The set**: with an offer the bundle must carry `SHA256SUMS` (one entry, not uploaded). Its
   SHA-256 is the offer's `set_hash` (`offer_set_mismatch`), and every tarball in the bundle,
   and every platform's version facts (`kbf-<commit>-<platform>.version.json`, which the store
@@ -371,6 +389,50 @@ blob back and compares every byte, then asks the action cache for a random diges
 NOT_FOUND; a hit or another status fails). One bound for all of it, `--smoke-timeout-s`
 (default 60). An unreachable listener or any failed check is `postcheck_failed`, exit 1. The
 instance name is empty. The blob stays in the store until eviction.
+
+## The check after a deploy
+
+A deploy that exits 0 says the nodes confirmed the release. It does not say the farm still builds
+what it is for. The `check` job of `.github/workflows/gamma.yml` runs after a deploy that
+succeeded and builds komira's `main` against the farm just updated, with the farm's normal
+caching: `cargo xtask gamma check-build` runs `<komira checkout>/buck2 build --console simple
+--config-file <the farm's buckconfig> <targets>` in a checkout of `komira-ai/komira` at `main`.
+There is no stamp action, and the check has no way to pass `--no-remote-cache`: the verb builds the
+argument list itself, refuses a target that is a flag or an argument file, and the workflow lint
+refuses the flag's name anywhere in the file.
+
+It passes only when all three hold:
+
+- buck2 printed `BUILD SUCCEEDED` (the last `BUILD ...` line of the output wins);
+- the last `Commands: N (cached: N, remote: N, local: N)` line says `local: 0`, so every action ran
+  on the farm or was answered by its cache;
+- buck2 exited 0.
+
+A missing summary, a `BUILD FAILED`, a `Commands:` line that does not parse and a non-zero `local`
+are failures; nothing is a pass by default. buck2's whole output goes to a log file on the runner
+and is never printed or uploaded: it names the farm, and the repository's logs are public. What
+reaches the log of the step and the job summary is the `Commands:` line, rebuilt from the parsed
+text (a line holding anything but lowercase words, digits and `: , _` is not a Commands line), and
+the verdict, `PASS` or `FAIL (<reason>)`.
+
+The job is configured by two settings, both made once by the repository owner
+(`cargo xtask gamma held-steps` prints them). `GAMMA_CHECK_TARGETS` is a repository variable: the
+komira targets to build, separated by spaces. The farm's buckconfig is a secret of the `gamma`
+environment, `GAMMA_FARM_BUCKCONFIG`, and not a variable, because GitHub prints a variable in the log
+of the step that has it and the config names the farm; GitHub masks the secret line by line. The
+verb reads it from the environment (it is secret material) and writes it to a file for
+`--config-file`. The job is skipped, which is a green run, whenever `deploy` is, so unsetting
+`GAMMA_HOST`, `GAMMA_USER` or `TS_TAG` stops the check too. It joins the tailnet with the same
+step and identity as `deploy` and queues in the same concurrency group, so it never runs during a
+roll; it needs only `contents: read`.
+
+komira's text runs inside this job, so the lint holds the job to a shape: the checkout of komira is
+exactly `repository: komira-ai/komira`, `ref: main`, its own `path`, no credentials kept, once, after
+`cargo xtask` is built; the only script that touches it is the one `check-build` step, with nothing
+chained to it and exactly the two variables it is given. That step is the only one that holds
+the farm's config. The Tailscale policy must let the runner's tag reach the farm's build port; the
+held steps say so, and say to grant nothing more, because the identity is the one that may also ssh
+to the gamma host.
 
 ## What is not built
 

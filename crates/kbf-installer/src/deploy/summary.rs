@@ -163,6 +163,9 @@ pub struct OfferRecord {
     /// this, not `reversible`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_reversible: Option<bool>,
+    /// The offer's `min_installer`; absent when the offer names none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_installer: Option<u32>,
 }
 
 impl OfferRecord {
@@ -178,6 +181,7 @@ impl OfferRecord {
             meta_log: None,
             previous_meta_log: None,
             host_reversible: None,
+            min_installer: None,
         }
     }
 
@@ -191,6 +195,7 @@ impl OfferRecord {
             previous: doc.previous.as_ref().map(|c| c.as_str().to_owned()),
             meta_log: doc.meta_log,
             previous_meta_log: doc.previous_meta_log,
+            min_installer: doc.min_installer,
             ..OfferRecord::waived(stage)
         }
     }

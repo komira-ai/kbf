@@ -461,9 +461,10 @@ impl Transport for Spy {
         host: &WorkerId,
         order: OrderId,
         release: &Release,
+        source: Source,
     ) -> Result<(), TransportError> {
         self.look(host, Gave::Activate(order, release.as_str().to_owned()));
-        self.inner.activate(host, order, release)
+        self.inner.activate(host, order, release, source)
     }
 
     fn confirm(

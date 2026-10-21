@@ -1,7 +1,8 @@
 //! A rehearsal of a deployment in a box: a frontend, three `storage-and-daemon` nodes and
-//! one plain daemon, each a real `kbf` process started from the flags `kbf-deploy` renders
-//! into its unit (`kbf_deploy::linux::modes::render`, the `ExecStart=` line, nothing
-//! written by hand), on loopback addresses of their own, under certificates of the
+//! one plain daemon, each a real `kbf` process started as the packaged units start it
+//! (`kbf --mode=<mode>` on a generated `kbf.toml`, `kbf_harness::farm::Farm`; the flags the
+//! `kbf-deploy` units used to give are held by `harness_toml_equivalence.rs`), on loopback
+//! addresses of their own, under certificates of the
 //! rows the farm's certificate table has. A buck2-shaped client then drives the frontend:
 //! CAS writes and reads, an `Execute` of an action (inputs, `Command` and `Action`
 //! uploaded first), its outputs read back, and a repeat `Execute` answered from the
@@ -56,8 +57,8 @@ fn scratch(name: &str) -> TestDir {
     )
 }
 
-/// The rehearsal's farm of `storage_nodes` nodes and a daemon, started from the units
-/// `kbf-deploy` renders, over the stand-in `crun`.
+/// The rehearsal's farm of `storage_nodes` nodes and a daemon, started from a generated
+/// `kbf.toml`, over the stand-in `crun`.
 fn start(name: &str, storage_nodes: usize) -> Farm {
     start_with(name, &Topology::rehearsal(storage_nodes))
 }

@@ -249,8 +249,8 @@ fn config_with_advertise(c: &Case) -> Config {
 
 /// Catches both roles started as two processes, or as `kbf storage-and-daemon` without
 /// the storage flags or with the daemon's `--cas` (which that mode refuses: its daemon
-/// reads the node's storage in-process), and a reload interval the frontend turned off
-/// still passed.
+/// reads the node's storage in-process), a reload interval the frontend turned off
+/// still passed, and either half's certificate files being another role's.
 #[test]
 fn a_node_with_both_roles_runs_the_converged_mode() {
     let c = case("both");
@@ -269,7 +269,22 @@ fn a_node_with_both_roles_runs_the_converged_mode() {
     let text = strings(&argv);
     assert_eq!(text[1], "--mode=storage-and-daemon");
     assert!(text.iter().any(|a| a.starts_with("--storage-listen=")));
-    assert!(text.iter().any(|a| a.starts_with("--cert=")));
+    // The certificate files of each half are the enrolled node's own, by role: the storage
+    // half serves with the storage role's pair and the farm CA, the daemon half dials with
+    // the daemon role's.
+    for (flag, file) in [
+        ("--storage-tls-cert", "storage.pem"),
+        ("--storage-tls-key", "storage.key"),
+        ("--storage-client-ca", "ca.pem"),
+        ("--ca-cert", "ca.pem"),
+        ("--cert", "daemon.pem"),
+        ("--key", "daemon.key"),
+    ] {
+        assert!(
+            text.contains(&format!("{flag}={}", pki(&c, file))),
+            "{flag} is not {file}: {text:?}"
+        );
+    }
     assert!(!text.iter().any(|a| a.starts_with("--cas=")), "{text:?}");
     assert!(
         !text

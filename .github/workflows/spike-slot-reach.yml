@@ -55,3 +55,50 @@ jobs:
       - run: cargo build -p kbf-cli --bin kbf --locked
       - name: What the runner does for a root daemon with a pool of two users (root, real users)
         run: cargo xtask sudo-test -p kbf-daemon-test --test mac_pool_spike -- --test-threads=1 --nocapture
+
+  # How a Mac behaves with a pool of 100 and of 1000 users (a measurement spike for the pool
+  # and reset design): as root on a hosted Mac, make the users `kbf-scale-<i>` in the uid
+  # block 61000 to 62023, time their creation, the first `getpwnam` that sees each, the
+  # pool's per-user check and opendirectoryd lookups before and after, time one full reset
+  # (`Slot::release`) for a sample of 20, and remove every user, home and /var/folders entry
+  # made, whatever the result (crates/kbf-driver-native/tests/pool_scale_spike). The log
+  # carries `MEASURE` lines and a closing `SUMMARY`; the test asserts only that the harness
+  # ran and left nothing behind. It makes up to 1000 real users and takes most of an hour,
+  # so it has a limit of its own. This workflow's `cancel-in-progress: true` would cancel a
+  # run in its clean-up when a second dispatch starts on the branch; do not dispatch it
+  # twice.
+  pool-scale:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: Pool of 100 then 1000 hidden users, and one full reset for 20 (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test pool_scale_spike -- --test-threads=1 --nocapture
+
+  # M2 of the Mac legs (crates/kbf-driver-native/tests/slot_clean.rs): the freshness
+  # scenario of the slot clean, and the mutant tests that run it with one step of the
+  # clean skipped and print which rows turn red. By hand on a branch, so what the mutants
+  # show on a Mac (the bootout's and the image detach's rows are printed, not asserted) is
+  # measured before the branch merges. The same command as the native-macos job of
+  # beta.yml runs after a push to main.
+  slot-clean-mutants:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: The slot clean and its mutants, on real users (root)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture

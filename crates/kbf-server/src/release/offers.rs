@@ -19,6 +19,10 @@
 //!   one it has not sent ([`push`]): after `Welcome`, and again at each change of the
 //!   desired release or of a platform's completeness. A platform that stops being complete
 //!   is sent nothing (the node keeps the offer it holds).
+//! - **A staged run is offered to no node.** When the desired run's source is
+//!   [`Source::Staged`] the table is empty: the hosts use the release their package carries,
+//!   so there is nothing to fetch and no offer to name (the node keeps the offer it holds).
+//!   The next fetch run is offered as always.
 //! - **A look that fails changes nothing.** The row or the store could not be read: the
 //!   table stays as it was, and the first failure after a good look is logged.
 //!
@@ -40,7 +44,7 @@ use super::desired::blocking;
 use super::key::{Commit, Key};
 use super::store::ReleaseStore;
 use crate::farm::Outbound;
-use crate::update::{RowError, Rows};
+use crate::update::{RowError, Rows, Source};
 
 /// The offer of each platform that has a complete release.
 pub type Table = BTreeMap<ReleasePlatform, UpdateOffer>;
@@ -133,6 +137,11 @@ impl Offers {
         else {
             return Ok(Table::new());
         };
+        // A staged run is carried out with the release each host's package holds, so no node
+        // is told of a release to fetch; the offer a node holds stays with it.
+        if desired.source == Source::Staged {
+            return Ok(Table::new());
+        }
         let Some(listing) = self.store.commit(commit.clone()).await? else {
             return Ok(Table::new());
         };
@@ -501,6 +510,47 @@ mod tests {
             .await
             .expect_err("unreadable");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Catches a staged run offered to the nodes (each would be told to fetch a release its
+    /// package already holds), and a fetch run left unoffered after one. The release is
+    /// complete in the store throughout. The fetch run has its offer; the same commit offered
+    /// as a staged run is a new generation and the look gives an empty table (not the fetch
+    /// run's table kept); the commit offered as a fetch run once more brings the offer back
+    /// at that run's generation. The look is read directly, so the poll task's own first
+    /// look cannot publish into the check.
+    ///
+    /// Mutants it catches: the staged check removed (the table keeps an offer under the
+    /// staged run); the check made on the fetch source (the fetch runs are offered nothing).
+    #[tokio::test]
+    async fn a_staged_run_is_offered_to_no_node_and_a_fetch_run_is() {
+        let (_dir, store) = store("staged-run");
+        linux_release(&store).await;
+        let rows = rows();
+        let release = Release::new(COMMIT);
+        let at = FarmTime::from_millis(1);
+        let offers = Offers::start(store, rows.clone(), Duration::from_secs(3600));
+        async fn held(offers: &Offers) -> Vec<u64> {
+            let table = offers.look().await.expect("a look");
+            table.values().map(|o| o.generation).collect()
+        }
+
+        let fetch = rows.offer(&release, at).expect("a fetch run");
+        assert_eq!(held(&offers).await, [fetch.generation.0], "a fetch run");
+
+        let staged = rows
+            .offer_expecting(&release, Source::Staged, at, None)
+            .expect("a staged run");
+        assert!(staged.generation > fetch.generation);
+        assert!(held(&offers).await.is_empty(), "a staged run");
+
+        let again = rows.offer(&release, at).expect("a fetch run again");
+        assert!(again.generation > staged.generation);
+        assert_eq!(
+            held(&offers).await,
+            [again.generation.0],
+            "a fetch run again"
+        );
     }
 
     /// Catches a poll that never looks (the desired release is in the row and the store

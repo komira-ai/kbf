@@ -514,7 +514,7 @@ fn check(
         "kbf: --check: mode {} is configured and this node is enrolled as {}",
         want.mode, node.node_id
     );
-    Ok(preflight::check_only(&invocation))
+    Ok(preflight::check_only(&invocation, path))
 }
 
 /// Runs a start: resolves the mode, enrolls if needed, runs the mode through `launch`
@@ -585,8 +585,10 @@ pub fn run_with(
 #[must_use]
 pub fn run(args: &Start) -> ExitCode {
     // The checks of any start, on the flags the enrollment made.
-    run_with(args, &Env::system(), Driver::host(), &crate::start)
-        .unwrap_or_else(|failure| report(&failure))
+    run_with(args, &Env::system(), Driver::host(), &|invocation| {
+        crate::start(invocation, &args.config)
+    })
+    .unwrap_or_else(|failure| report(&failure))
 }
 
 #[cfg(test)]

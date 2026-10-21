@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use kbf_map::{MemberId, MemberState};
 use kbf_server::update::{
     Alert, AvailableFact, DaemonLoad, FactsSource, FarmView, HelperReport, HelperStatus, HostFacts,
-    HostKind, HostRecord, MemberFacts, OrderId, Platform, PlatformClass, Release, SourceError,
-    Transport, TransportError, Work,
+    HostKind, HostRecord, MemberFacts, OrderId, Platform, PlatformClass, Release, Source,
+    SourceError, Transport, TransportError, Work,
 };
 use kbf_server::update_status::ReleaseSource;
 use kbf_sim::{Chance, SimRng};
@@ -690,11 +690,15 @@ impl Transport for World {
         self.lock().mark(host, member, false)
     }
 
+    /// The model helper takes the same order whatever the source: what it was told is not
+    /// part of the farm's state. The tests that read it wrap the transport (`SourceSpy` in
+    /// `update_controller_source.rs`).
     fn activate(
         &mut self,
         host: &WorkerId,
         order: OrderId,
         release: &Release,
+        _source: Source,
     ) -> Result<(), TransportError> {
         self.lock().activate(host, order, release)
     }

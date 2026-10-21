@@ -18,6 +18,7 @@
 
 /// Helpers that start `kbf` with the test's own settings file. Key: the path.
 pub const FLAGGED: &[&str] = &[
+    "crates/kbf-cli/tests/host_rules.rs",
     "crates/kbf-cli/tests/storage_process.rs",
     "crates/kbf-harness/src/farm.rs",
     "crates/kbf-integration-test/tests/proxy_support/mod.rs",
