@@ -52,8 +52,9 @@
 //! one): the release it runs is the desired release when the 12 digits of its running commit
 //! begin the desired commit, else its own commit (none, if that is not 12 lowercase hex
 //! digits: the report keeps what a host sent); the helper's report is its state and the
-//! order it acted on. `Work` is read from the scheduler: a lease on the node, else an empty
-//! queue.
+//! order it acted on; the release its package carries is the one it reported if that is 40
+//! lowercase hex digits (else none), and its release source is the one it reported (else
+//! unreported). `Work` is read from the scheduler: a lease on the node, else an empty queue.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -68,14 +69,15 @@ use kbf_types::{FarmTime, WorkerId};
 use super::command::{Alert, Severity};
 use super::facts::MemberFacts;
 use super::facts::{
-    DaemonLoad, HelperReport, HelperStatus, HostFacts, HostKind, HostRecord, OrderId, Platform,
-    PlatformClass, Release, Work,
+    AvailableFact, DaemonLoad, HelperReport, HelperStatus, HostFacts, HostKind, HostRecord, OrderId,
+    Platform, PlatformClass, Release, Work,
 };
 use super::ports::{FactsSource, FarmView, SourceError, Transport, TransportError};
 use super::rows::Rows;
 use crate::farm::{Farm, NodeAction, NodeLook};
 use crate::members::{MemberLook, Members, MembersLook, MembershipError};
 use crate::storage_health::{Class, NotIdle};
+use crate::update_status::{ReleaseSource, UpdateReport};
 
 /// Which confirmation order id went to which host, for which activation.
 #[derive(Debug, Default)]
@@ -453,6 +455,22 @@ fn running(commit: &str, target: Option<&Release>) -> Option<Release> {
     }
 }
 
+/// The release a host's package carries, if its report names one. A commit that is not 40
+/// lowercase hex digits (the report keeps the bytes a host sent as data) names none, as a
+/// running commit that is not 12 does ([`running`]): the host reads as having nothing, which
+/// keeps it from being ordered to a release it may not hold. The report is kept either way.
+fn available(report: &UpdateReport) -> Option<AvailableFact> {
+    let have = report.available.as_ref()?;
+    let hex = have
+        .commit
+        .bytes()
+        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    (have.commit.len() == 40 && hex).then(|| AvailableFact {
+        commit: Release::new(have.commit.as_str()),
+        seq: have.seq,
+    })
+}
+
 fn helper_status(state: State) -> Option<HelperStatus> {
     match state {
         State::ActivatedUnconfirmed => Some(HelperStatus::ActivatedUnconfirmed),
@@ -526,6 +544,11 @@ impl FarmFacts {
                 .update
                 .as_ref()
                 .and_then(|u| running(&u.running_commit, target)),
+            available: look.update.as_ref().and_then(available),
+            release_source: look
+                .update
+                .as_ref()
+                .map_or(ReleaseSource::Unreported, |u| u.release_source),
             connected: look.connected,
             cordoned: Some(look.cordoned),
             load: Some(DaemonLoad {

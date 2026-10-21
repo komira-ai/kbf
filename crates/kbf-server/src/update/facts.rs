@@ -25,6 +25,7 @@ use super::gate::{GateFail, GateMode, storage_gate};
 use super::node_step::HostPhase;
 use super::policy::Policy;
 use super::slot::{Slot, SlotClass};
+use crate::update_status::ReleaseSource;
 
 /// A release, by whatever the controller compares: a commit or a software-set digest.
 /// Only equality is defined, so a rollback is another target and never "an older one".
@@ -290,6 +291,16 @@ impl MemberFacts {
     }
 }
 
+/// A release the host's package carries, which its installer has found whole.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AvailableFact {
+    /// The release: a full commit (40 lowercase hex digits), so it compares equal to a target
+    /// that is a full commit.
+    pub commit: Release,
+    /// The number of commits behind it: puts two builds of one branch in order.
+    pub seq: u64,
+}
+
 /// One host as the controller sees it now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostFacts {
@@ -305,6 +316,14 @@ pub struct HostFacts {
     pub member: Option<MemberId>,
     /// The release it runs, as it reported it; `None` if it has not.
     pub release: Option<Release>,
+    /// The release its package carries, when its installer has found it whole; `None` if it
+    /// reports none, if its installer predates the field, or if it reports a commit that is
+    /// not 40 lowercase hex digits.
+    pub available: Option<AvailableFact>,
+    /// Where its installer fetches releases from; [`ReleaseSource::Unreported`] if it does not
+    /// say or sent a number this build does not know (an installer that predates the field, or
+    /// no report at all).
+    pub release_source: ReleaseSource,
     /// Whether its daemon stream is open.
     pub connected: bool,
     /// Whether placement has it cordoned; `None` if unknown.

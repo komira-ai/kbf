@@ -27,6 +27,7 @@ use kbf_server::update::{
     HostRecord, MemberFacts, OrderId, Platform, PlatformClass, Release, SourceError, Transport,
     TransportError, Work,
 };
+use kbf_server::update_status::ReleaseSource;
 use kbf_sim::{Chance, SimRng};
 use kbf_types::{FarmTime, WorkerId};
 
@@ -604,6 +605,8 @@ impl Inner {
                 platform: h.platform.clone(),
                 member: h.member.map(MemberId),
                 release: Some(h.reported.clone()),
+                available: None,
+                release_source: ReleaseSource::Unreported,
                 connected: h.connected,
                 cordoned: Some(h.cordoned),
                 load: Some(DaemonLoad {

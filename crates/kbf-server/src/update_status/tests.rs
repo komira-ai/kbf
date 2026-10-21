@@ -1,3 +1,5 @@
+use kbf_proto::update::update_status::Available;
+
 use super::*;
 
 fn status(state: State) -> UpdateStatus {
@@ -297,4 +299,71 @@ fn the_detail_keeps_the_last_report_of_a_quiet_host_but_not_its_state() {
     ] {
         assert_eq!(value[key], serde_json::Value::Null, "{key}");
     }
+}
+
+/// The report of an idle host that sent `available` and `release_source` as given.
+fn package(available: Option<(&str, u64)>, release_source: i32) -> UpdateReport {
+    UpdateReport::new(
+        UpdateStatus {
+            available: available.map(|(commit, seq)| Available {
+                commit: commit.to_owned(),
+                seq,
+            }),
+            release_source,
+            ..status(State::Idle)
+        },
+        1,
+    )
+}
+
+/// Catches the package and the source a host reports being lost on the way in: with either
+/// field dropped every host would read as an installer too old to report packages, and the
+/// picker would skip all of them. A report that names no package has `None`, never an empty
+/// commit; one that names a package keeps its commit and its `seq`, and the source it came
+/// with. Each wire source has its own variant. Zero and a number this build does not know
+/// (above the last, or negative) read as unreported, never as one of the others.
+///
+/// Mutants: `available` or `release_source` set to its default; an absent package read as one
+/// with an empty commit; a wire number mapped to another variant; an unknown number mapped to
+/// `Url` or `Bundled`.
+#[test]
+fn the_package_and_the_source_a_host_reports_are_kept() {
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    let kept = package(Some((COMMIT, 812)), WireSource::Bundled as i32);
+    let have = kept.available.as_ref().expect("a package");
+    assert_eq!((have.commit.as_str(), have.seq), (COMMIT, 812));
+    assert_eq!(kept.release_source, ReleaseSource::Bundled);
+
+    let none = package(None, WireSource::Url as i32);
+    assert!(none.available.is_none());
+    assert_eq!(none.release_source, ReleaseSource::Url);
+
+    for (number, want) in [
+        (WireSource::Unspecified as i32, ReleaseSource::Unreported),
+        (WireSource::Url as i32, ReleaseSource::Url),
+        (WireSource::Frontend as i32, ReleaseSource::Frontend),
+        (WireSource::Bundled as i32, ReleaseSource::Bundled),
+        (4, ReleaseSource::Unreported),
+        (99, ReleaseSource::Unreported),
+        (-1, ReleaseSource::Unreported),
+    ] {
+        let got = package(None, number).release_source;
+        assert_eq!(got, want, "number {number}");
+    }
+}
+
+/// Catches a package commit kept as the host sent it: it is a string from a host, cut to the
+/// bound of every commit and with control characters replaced, as the other commits are.
+/// The report keeps a commit that is no commit; it is the facts that refuse it.
+///
+/// Mutants: the commit not cut; the commit not cleaned.
+#[test]
+fn the_commit_of_a_package_is_kept_as_data() {
+    let text = "a".repeat(1000);
+    let long = package(Some((text.as_str(), 1)), 0);
+    let have = long.available.as_ref().expect("a package");
+    assert_eq!(have.commit.len(), COMMIT_MAX_BYTES);
+    let odd = package(Some(("ab\ncd", 1)), 0);
+    let have = odd.available.as_ref().expect("a package");
+    assert_eq!(have.commit, "ab\u{fffd}cd");
 }
