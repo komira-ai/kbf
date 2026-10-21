@@ -10,17 +10,17 @@ use crate::linux::host::SYSTEMCTL;
 use kbf_host::step::Step;
 use kbf_host::testkit::{ScratchHost, reply};
 
-const EXAMPLE: &str = include_str!("../../templates/linux/config.example");
+const EXAMPLE: &str = include_str!("../../templates/linux/swap.example");
 const FILE: &str = "/srv/swap/kbf.swap";
 const OTHER_LINE: &str = "UUID=1 / ext4 defaults 0 1";
 /// 20 GiB in KiB: room for a 1G file and the 16 GiB spare.
 const ROOMY: u64 = 20 * 1024 * 1024;
 
-fn config(file: &str) -> LinuxConfig {
+fn config(file: &str) -> SwapConfig {
     let text = EXAMPLE
         .replace("KBF_SWAP_FILE=/swapfile", &format!("KBF_SWAP_FILE={file}"))
         .replace("KBF_SWAP_SIZE=128G", "KBF_SWAP_SIZE=1G");
-    LinuxConfig::parse(&text).expect("valid settings")
+    SwapConfig::parse(&text).expect("valid settings")
 }
 
 fn swap(file: &str) -> Swap {

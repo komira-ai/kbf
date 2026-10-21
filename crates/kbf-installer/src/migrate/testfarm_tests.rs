@@ -1,6 +1,7 @@
 //! The test farm's hosts, as they are today, through the migration: the files under
 //! `testdata/testfarm/` are what the dev installer, the old helper and the deploy kit left
-//! (the kit's own test keeps the units equal to what `render-units` writes). Each test
+//! (the kit's `render-units`, retired, wrote the units; they are kept as the old hosts'
+//! files). Each test
 //! migrates one and then does what the host does next: reads the unit file the migration
 //! wrote and checks that the node would start from it, with the command line it had.
 //!
@@ -9,7 +10,6 @@
 //! starts" is shown by what a start needs and the migration could break: the program the
 //! unit names is a regular, executable file in the installer's tree, root's, with the
 //! bytes of the release that ran, and the unit passes the arguments it passed before.
-//! (kbf-deploy's test of the same fixtures runs the kit's rules on the migrated unit.)
 
 use std::fs;
 use std::os::unix::fs::MetadataExt;

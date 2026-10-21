@@ -241,14 +241,29 @@ impl kbf_cli::preflight::Host for EverythingExists {
             mode: 0o600,
         })
     }
+    fn lstat(&self, path: &std::path::Path) -> std::io::Result<kbf_cli::preflight::host::Lstat> {
+        Ok(kbf_cli::preflight::host::Lstat {
+            stat: self.stat(path)?,
+            gid: 0,
+        })
+    }
     fn read(&self, _: &std::path::Path) -> std::io::Result<Vec<u8>> {
         Ok(Vec::new())
     }
     fn var(&self, _: &str) -> Option<String> {
         Some("x".to_owned())
     }
+    fn var_names(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn euid(&self) -> u32 {
         0
+    }
+    fn egid(&self) -> u32 {
+        0
+    }
+    fn groups(&self) -> Vec<u32> {
+        Vec::new()
     }
     fn nofile(&self) -> u64 {
         1 << 20

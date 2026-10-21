@@ -355,9 +355,8 @@ control socket's `RuntimeDirectoryPreserve`.
 **Dropped:** `SCM_RIGHTS` and the `Sockets` of `handover/`; the successor's adoption of listeners and its `local_addr` check; the
 requirement that both instances have identical addresses (they now differ by port, and the holder's refusal of a different
 listen address is removed, while a different state path is still refused); the latches that close the old listeners at once;
-"connections that arrived in the gap wait in the backlog" (replaced by hold and retry). **Changed:** the check-units rule
-`handover` (instances differ in ports); the successor must serve health and *hold* calls before it holds the store (today it
-answers nothing before `ready`); `install-units` writes a flags file per instance.
+"connections that arrived in the gap wait in the backlog" (replaced by hold and retry). **Changed:** the `handover` rule (once check-units', now the package test's) (instances differ in ports); the successor must serve health and *hold* calls before it holds the store (today it
+answers nothing before `ready`); the installer writes a flags file per instance (`install-units` is retired).
 
 **Other conflicts and what they need:**
 

@@ -187,8 +187,8 @@ cannot do:
   goes with it; a deploy of a new `kbf` is a restart of the whole farm.
 - **Builds run beside the farm's state.** The container driver runs each action as a
   subordinate id of the process's user, but no test yet proves an action cannot read what
-  that user holds. Use it on a trusted host, and see the warning `check-units` prints for
-  it in [kbf-units.md](kbf-units.md).
+  that user holds. Use it on a trusted host only, as
+  [kbf-units.md](kbf-units.md) says.
 
 ### Distributed: a farm
 
@@ -338,7 +338,7 @@ maintenance without stopping it, `kbf cluster drain <node>`.
 
 ## Related pages
 
-- [kbf-units.md](kbf-units.md): rendering and checking each mode's systemd units.
+- [kbf-units.md](kbf-units.md): each mode's packaged systemd unit and how it is checked.
 - [kbf-installer-setup.md](kbf-installer-setup.md): `kbf-installer setup`, the state database,
   the proxy host and backup.
 - [update-a-host.md](update-a-host.md): updating a host and swapping a frontend.

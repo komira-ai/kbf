@@ -508,30 +508,27 @@ At start the daemon logs the data directory, the leases directory, and the cache
 tree budgets it resolved; the server logs its cold store, hot store (with its budget) and
 metadata directory.
 
-## Rendering and installing a mode's units
+## A mode's units
 
-`kbf-deploy linux render-units --mode MODE`, `check-units --mode MODE` and, as root,
-`install-units --mode MODE` work on one mode of the one `kbf` binary: its unit and
-`kbf.slice`, from templates compiled into the binary
-(`crates/kbf-deploy/templates/linux/`) and a settings file (`config.example` documents
-each key; an unknown or repeated key is refused). They are described, with every rule
-`check-units` applies, in [kbf-units.md](kbf-units.md). The converged form of these
-verbs (no `--mode`: four files for MinIO, `kbf-server` and `kbf-daemon`, with
-`--restart-minio` and `--uninstall`) is gone; the units above remain the hand-written
-example of that layout. A node that still runs `kbf-server.service` and
-`kbf-daemon.service` stops and disables them (`systemctl disable --now`) before it
-installs a mode's unit: both would hold the same directories.
+Each mode of the one `kbf` binary has a packaged unit, installed by `kbf-installer` and
+configured by `/etc/kbf/kbf.toml`; they are described, with the rules they are held to, in
+[kbf-units.md](kbf-units.md). `kbf-deploy linux render-units`, `check-units` and
+`install-units` (and the converged form of them, with `--restart-minio` and `--uninstall`)
+are gone; the units above remain the hand-written example of that layout. A node that still
+runs `kbf-server.service` and `kbf-daemon.service` stops and disables them (`systemctl
+disable --now`) before it installs a mode's unit: both would hold the same directories.
 
 ## The build swapfile
 
 `kbf-deploy linux swap`, as root, reads the host first, prints its plan as `DRY-RUN:`
 lines and changes nothing; `--apply` carries the plan out, stopping at the first step
 that fails. A re-run after an apply plans nothing. Exit codes: 0 done (or nothing to do),
-1 a step failed, 2 refused (`REFUSED:` on stderr, with the fix). It takes the same
-`--config` file as `render-units`.
+1 a step failed, 2 refused (`REFUSED:` on stderr, with the fix). It takes a
+`--config` file of two keys, `KBF_SWAP_FILE` and `KBF_SWAP_SIZE`
+(`crates/kbf-deploy/templates/linux/swap.example`); any other key is refused.
 
 ```text
-sudo kbf-deploy linux swap --config node.conf [--kubelet-allows-swap] [--remove] [--apply]
+sudo kbf-deploy linux swap --config swap.conf [--kubelet-allows-swap] [--remove] [--apply]
 ```
 
 `swap` makes `KBF_SWAP_SIZE` at `KBF_SWAP_FILE` (`fallocate`, `chmod 600`, `mkswap`, on
@@ -625,9 +622,9 @@ backup.
   [priority](#priorities) order.
 - `kbf-node`'s tests (`src/deploy_doc_tests.rs`) run `kbf-daemon`'s flag parser over
   every daemon unit in `docs/deploy/`.
-- `kbf-deploy`'s tests (`src/linux/tests.rs`) refuse each bad setting and check that an
-  unset key takes the default `config.example` shows. The mode verbs' rules and host
-  verbs are tested as [kbf-units.md](kbf-units.md) says; the swap verb's tests
+- `kbf-deploy`'s tests (`src/linux/config_tests.rs`) refuse each bad swap setting and check
+  that an unset key takes the default `swap.example` shows. The units' rules are tested as
+  [kbf-units.md](kbf-units.md) says; the swap verb's tests
   (`src/linux/swap_tests.rs`) apply each plan into a scratch directory with the tools
   played by a fake, check what landed, and require a re-run to plan nothing; each
   missing prerequisite is a row that must be refused with its own refusal.

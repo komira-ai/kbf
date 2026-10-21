@@ -5,9 +5,6 @@
 //!                          --mc PATH [--key-file PATH [--key-owner USER]] [--remove] [--apply]
 //! kbf-deploy minio nodeport --kubectl PATH --kubeconfig PATH [--context NAME]
 //!                           --namespace NS --service NAME --node-port N [--remove] [--apply]
-//! kbf-deploy linux render-units --config FILE --out DIR --mode MODE [--kbf-uid UID]
-//! kbf-deploy linux check-units --config FILE --dir DIR --mode MODE [--installable]
-//! kbf-deploy linux install-units --config FILE --mode MODE [--bin-dir DIR] [--apply]
 //! kbf-deploy linux swap --config FILE [--kubelet-allows-swap] [--remove] [--apply]
 //! kbf-deploy linux meta-backup --meta-dir DIR [--hot-dir DIR] --out FILE [--metrics URL]
 //!                              [--unit NAME] [--ready-secs N] [--apply]
@@ -35,11 +32,8 @@
 //!
 //! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
 //! `--apply` they print their plan as `DRY-RUN:` lines and change nothing, and they exit
-//! 0 done (or nothing to do) or 1 refused or failed. `linux render-units` and
-//! `check-units` only write into or read the directory they are given, and exit 0 done,
-//! 1 a check found a broken rule, or 2 refused (a bad setting or file, printed as
-//! `REFUSED: ...` on stderr). `linux install-units` and `swap` change the
-//! host as root, plan by default as the `minio` subcommands do, and exit 0 done (or
+//! 0 done (or nothing to do) or 1 refused or failed. `linux swap` changes the
+//! host as root, plans by default as the `minio` subcommands do, and exits 0 done (or
 //! nothing to do), 1 a step or the check after an apply failed (`FAIL ...`), or 2
 //! refused (`REFUSED: ...` on stderr). `linux meta-backup` and `meta-verify` exit 0
 //! done, 1 a failure after the stop (the unit restarted) or an archive that does not
@@ -72,7 +66,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 
 use crate::https::Client;
-use crate::linux::{self, HostError, LinuxConfig, install_mode, meta, swap};
+use crate::linux::{self, HostError, SwapConfig, meta, swap};
 use crate::log;
 use crate::mdm::dep::{Dep, Serial};
 use crate::mdm::erase::{self, EraseArgs, Made};
@@ -110,7 +104,7 @@ enum Kit {
     /// A MinIO for kbf: its buckets and key, and a NodePort for its S3 port.
     #[command(subcommand)]
     Minio(Minio),
-    /// A Linux node: the systemd unit of one kbf mode, and the build swapfile.
+    /// A Linux node: the build swapfile, the metadata backup and the certificate check.
     #[command(subcommand)]
     Linux(Linux),
     /// An Apple MDM on one Linux host: NanoHUB, the SCEP server, NanoDEP and an HTTPS
@@ -128,53 +122,6 @@ enum Kit {
 
 #[derive(Subcommand)]
 enum Linux {
-    /// Render kbf.slice and the unit of one mode of the one kbf binary into a directory.
-    RenderUnits {
-        /// The kit's settings, KEY=VALUE lines.
-        #[arg(long)]
-        config: PathBuf,
-        /// Where to write the files, laid out as under /etc/systemd/system.
-        #[arg(long)]
-        out: PathBuf,
-        /// The kbf user's uid (the daemon's XDG_RUNTIME_DIR); without it a unit that
-        /// runs builds keeps `<kbf uid>`, which `check-units --installable` refuses.
-        #[arg(long)]
-        kbf_uid: Option<u32>,
-        /// The mode whose unit is rendered.
-        #[arg(long, value_enum)]
-        mode: linux::Mode,
-    },
-    /// Check rendered units against the host's priorities.
-    CheckUnits {
-        /// The settings the units were rendered with.
-        #[arg(long)]
-        config: PathBuf,
-        /// The directory render-units wrote.
-        #[arg(long)]
-        dir: PathBuf,
-        /// Also refuse a `<...>` placeholder.
-        #[arg(long)]
-        installable: bool,
-        /// The mode whose unit is checked.
-        #[arg(long, value_enum)]
-        mode: linux::Mode,
-    },
-    /// Install kbf.slice and the unit of one mode of the one kbf binary, and start it
-    /// (as root).
-    InstallUnits {
-        /// The kit's settings, KEY=VALUE lines.
-        #[arg(long)]
-        config: PathBuf,
-        /// Where the new kbf is; without it the installed one stays.
-        #[arg(long, value_parser = HostPath::new)]
-        bin_dir: Option<HostPath>,
-        /// The mode whose unit is installed.
-        #[arg(long, value_enum)]
-        mode: linux::Mode,
-        /// Carry the plan out.
-        #[arg(long)]
-        apply: bool,
-    },
     /// Back up kbf-server's metadata log in a brief stop (as root): one tar file with
     /// a sha256 manifest; prints the downtime.
     MetaBackup(meta::cli::BackupArgs),
@@ -477,62 +424,24 @@ pub fn run<E: Exec>(
     }
 }
 
-/// The `linux` kit: 0 done, 1 a check found a broken rule, 2 refused.
+/// The `linux` kit: 0 done, 1 a step failed, 2 refused.
 fn linux_kit<E: Exec>(
     l: Linux,
     exec: &mut E,
     mut out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let result = match l {
-        Linux::RenderUnits {
-            config,
-            out: dir,
-            kbf_uid,
-            mode,
-        } => linux::render_mode_unit(&config, &dir, kbf_uid, mode).map(|line| (vec![line], 0)),
-        Linux::CheckUnits {
-            config,
-            dir,
-            installable,
-            mode,
-        } => linux::check_mode_unit(exec, &config, &dir, mode, installable).map(|report| {
-            let code = u8::from(!report.failures.is_empty());
-            let mut lines: Vec<String> = report.failures.iter().map(ToString::to_string).collect();
-            lines.extend(report.notes);
-            lines.push(report.summary);
-            (lines, code)
-        }),
-        Linux::InstallUnits {
-            config,
-            bin_dir,
-            mode: unit_mode,
-            apply,
-        } => {
-            let done = LinuxConfig::load(&config)
-                .map_err(HostError::from)
-                .and_then(|config| {
-                    let a = install_mode::InstallMode {
-                        config,
-                        mode: unit_mode,
-                        bin_dir,
-                    };
-                    install_mode::run(exec, &a, mode(apply), &mut out)
-                });
-            return host_verb(done, err);
-        }
-        Linux::MetaBackup(a) => {
-            return meta::cli::backup(a, exec, &meta::metrics::http_get, out, err);
-        }
-        Linux::MetaVerify(a) => return meta::cli::verify(&a, out, err),
-        Linux::VerifyCert(a) => return linux::verify_cert::cli(&a, out, err),
+    match l {
+        Linux::MetaBackup(a) => meta::cli::backup(a, exec, &meta::metrics::http_get, out, err),
+        Linux::MetaVerify(a) => meta::cli::verify(&a, out, err),
+        Linux::VerifyCert(a) => linux::verify_cert::cli(&a, out, err),
         Linux::Swap {
             config,
             kubelet_allows_swap,
             remove,
             apply,
         } => {
-            let done = LinuxConfig::load(&config)
+            let done = SwapConfig::load(&config)
                 .map_err(HostError::from)
                 .and_then(|config| {
                     let a = swap::Swap {
@@ -542,20 +451,7 @@ fn linux_kit<E: Exec>(
                     };
                     swap::run(exec, &a, mode(apply), &mut out)
                 });
-            return host_verb(done, err);
-        }
-    };
-    match result {
-        Ok((lines, code)) => {
-            for line in lines {
-                // A closed stdout (`| head`) is not worth a panic; the exit code still says it.
-                let _ = writeln!(out, "{line}");
-            }
-            ExitCode::from(code)
-        }
-        Err(e) => {
-            let _ = writeln!(err, "REFUSED: {e}");
-            ExitCode::from(2)
+            host_verb(done, err)
         }
     }
 }

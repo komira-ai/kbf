@@ -8,9 +8,9 @@
 //! non-blank line above is `` `/etc/systemd/system/<file>`: ``. An `ini` block without
 //! that line is an error, so an example cannot escape the check by losing its name.
 //!
-//! Each unit body is read with `kbf_unitfile`, the parser `kbf-deploy linux
-//! check-units` reads rendered units with, so the docs and the deploy tool agree on
-//! what a unit says.
+//! Each unit body is read with `kbf_unitfile`, the parser the package test
+//! (`tests/package_units.rs`) reads the packaged units with, so the docs and the
+//! units agree on what a unit says.
 //!
 //! The examples write host-specific values as placeholders (`<node id>`); [`argv`]
 //! replaces each with a sample value from [`PLACEHOLDERS`], and a placeholder missing

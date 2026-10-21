@@ -56,13 +56,11 @@ pub trait Host {
     /// The error `stat` returned.
     fn stat(&self, path: &Path) -> io::Result<Stat>;
     /// `lstat(path)`: like [`Host::stat`], but a symbolic link is itself, [`Kind::Link`], and
-    /// the group is told. A host that cannot say (the default) answers `Unsupported`.
+    /// the group is told.
     ///
     /// # Errors
     /// The error `lstat` returned.
-    fn lstat(&self, _path: &Path) -> io::Result<Lstat> {
-        Err(io::ErrorKind::Unsupported.into())
-    }
+    fn lstat(&self, path: &Path) -> io::Result<Lstat>;
     /// The bytes of the file at `path`.
     ///
     /// # Errors
@@ -71,19 +69,13 @@ pub trait Host {
     /// An environment variable.
     fn var(&self, name: &str) -> Option<String>;
     /// The names of the environment variables the process has.
-    fn var_names(&self) -> Vec<String> {
-        Vec::new()
-    }
+    fn var_names(&self) -> Vec<String>;
     /// The user this process runs as.
     fn euid(&self) -> u32;
     /// The group this process runs as.
-    fn egid(&self) -> u32 {
-        self.euid()
-    }
+    fn egid(&self) -> u32;
     /// The supplementary groups of this process.
-    fn groups(&self) -> Vec<u32> {
-        Vec::new()
-    }
+    fn groups(&self) -> Vec<u32>;
     /// The soft open-file limit in force.
     fn nofile(&self) -> u64;
     /// Runs `program` with `args` and collects its output.
