@@ -9,7 +9,7 @@ use kbf_map::MemberState;
 use kbf_types::FarmTime;
 
 use super::command::{Alert, Command, GiveBack, HoldReason, SlotOp};
-use super::facts::{HelperStatus, HostRecord, MemberFacts, Observations, SlotView, Work};
+use super::facts::{HelperStatus, HostRecord, MemberFacts, Observations, SlotView, Source, Work};
 use super::gate::{GateFail, GateMode};
 use super::node_step::{HostPhase, Transition};
 use super::policy::Policy;
@@ -63,7 +63,9 @@ impl Ctx<'_> {
         }
     }
 
-    /// The helper reverted or refused: the run is held (steps 6 to 9).
+    /// The helper reverted or refused: the run is held (steps 6 to 9). A refusal here is a
+    /// revert that could not run; step 6 reads the refusal of its own order first
+    /// ([`activating`]).
     fn helper_failed(&self) -> Option<Transition> {
         match self.obs.report() {
             Some(HelperStatus::Reverted) => {
@@ -102,6 +104,18 @@ impl Ctx<'_> {
     /// A host that cannot be sent the activate order is given back (steps 2 to 5).
     fn disconnected(&self) -> Option<Transition> {
         (!self.obs.host().connected).then(|| self.back(GiveBack::Disconnected))
+    }
+
+    /// A staged run's host whose package no longer carries the run's release is given back
+    /// (steps 1 to 5): the run's release is not what its package carries, so the host is given
+    /// back before an activate order is minted. The steps that enter `Activating` read it
+    /// before they do, from the same observations. A fetch run reads nothing of the package.
+    fn unavailable(&self) -> Option<Transition> {
+        if self.obs.facts().source == Source::Fetch {
+            return None;
+        }
+        let carried = self.obs.host().carries(self.obs.target());
+        (!carried).then(|| self.back(GiveBack::NotAvailable))
     }
 
     /// Give the host back: undo the mark if it is written, uncordon if the cordon was
@@ -198,6 +212,9 @@ fn selected(ctx: &Ctx<'_>) -> Transition {
     if let Some(moved) = ctx.disconnected() {
         return moved;
     }
+    if let Some(moved) = ctx.unavailable() {
+        return moved;
+    }
     if let Err(fail) = ctx.gate(GateMode::Out { fresh_since: None }) {
         return ctx.back(GiveBack::GateClosed(fail));
     }
@@ -213,6 +230,9 @@ fn cordoned(ctx: &Ctx<'_>) -> Transition {
     if let Some(moved) = ctx.disconnected() {
         return moved;
     }
+    if let Some(moved) = ctx.unavailable() {
+        return moved;
+    }
     match ctx.cordoned() {
         Some(true) => ctx.enter(HostPhase::WaitingLeases),
         _ if ctx.waited >= ctx.policy.health_limit => ctx.back(GiveBack::CordonNotTaken),
@@ -225,6 +245,9 @@ fn cordoned(ctx: &Ctx<'_>) -> Transition {
 /// after the last look.
 fn waiting_leases(ctx: &Ctx<'_>) -> Transition {
     if let Some(moved) = ctx.disconnected() {
+        return moved;
+    }
+    if let Some(moved) = ctx.unavailable() {
         return moved;
     }
     let host = ctx.obs.host();
@@ -254,6 +277,9 @@ fn planned_down(ctx: &Ctx<'_>) -> Transition {
     if let Some(moved) = ctx.disconnected() {
         return moved;
     }
+    if let Some(moved) = ctx.unavailable() {
+        return moved;
+    }
     if let Err(fail) = ctx.gate(GateMode::Out { fresh_since: None })
         && fail.is_second_member_down()
     {
@@ -278,6 +304,9 @@ fn planned_down(ctx: &Ctx<'_>) -> Transition {
 /// Step 5: G_S with the node out, from reports newer than the mark.
 fn gated(ctx: &Ctx<'_>) -> Transition {
     if let Some(moved) = ctx.disconnected() {
+        return moved;
+    }
+    if let Some(moved) = ctx.unavailable() {
         return moved;
     }
     let mode = GateMode::Out {
@@ -314,6 +343,11 @@ fn gated(ctx: &Ctx<'_>) -> Transition {
 /// Step 6: the helper reports the flip, naming this update's order. A daemon-only host also
 /// waits for its daemon to be back at the target, which stands in for step 7.
 fn activating(ctx: &Ctx<'_>) -> Transition {
+    // The helper refused this step's order, so it flipped nothing: not a revert that could
+    // not run. A refusal that names another order is no report ([`Observations::report`]).
+    if ctx.obs.report() == Some(HelperStatus::Refused) {
+        return Transition::hold(HoldReason::ActivateRefused, Vec::new());
+    }
     if let Some(held) = ctx.helper_failed() {
         return held;
     }

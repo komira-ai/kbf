@@ -11,10 +11,11 @@ use std::collections::BTreeSet;
 
 use kbf_map::{MemberId, MemberState};
 use kbf_server::update::{
-    Alert, Command, DaemonLoad, Facts, Generation, GiveBack, HelperReport, HelperStatus, Holder,
-    HostFacts, HostKind, HostPhase, HostRecord, MemberFacts, OrderId, Platform, PlatformClass,
-    Policy, Release, Slot, SlotClass, SlotOp, Transition, step,
+    Alert, AvailableFact, Command, DaemonLoad, Facts, Generation, GiveBack, HelperReport,
+    HelperStatus, Holder, HostFacts, HostKind, HostPhase, HostRecord, MemberFacts, OrderId,
+    Platform, PlatformClass, Policy, Release, Slot, SlotClass, SlotOp, Source, Transition, step,
 };
+use kbf_server::update_status::ReleaseSource;
 use kbf_types::{FarmTime, WorkerId};
 
 pub mod harness;
@@ -99,6 +100,8 @@ fn host(name: &str, kind: HostKind, platform: Platform, member: Option<u64>) -> 
         platform,
         member: member.map(MemberId),
         release: Some(Release::new(OLD)),
+        available: None,
+        release_source: ReleaseSource::Unreported,
         connected: true,
         cordoned: Some(false),
         load: Some(IDLE),
@@ -160,6 +163,7 @@ pub fn members(n: u64) -> Vec<MemberFacts> {
 pub fn facts(hosts: Vec<HostFacts>, members: Vec<MemberFacts>) -> Facts {
     Facts {
         target: Release::new(NEW),
+        source: Source::Fetch,
         generation: GENERATION,
         next_order: NEXT_ORDER,
         hosts,
@@ -207,6 +211,18 @@ pub fn host_mut<'a>(facts: &'a mut Facts, name: &str) -> &'a mut HostFacts {
         .iter_mut()
         .find(|h| h.id == id(name))
         .expect("the host is in the facts")
+}
+
+/// Makes `name` the host of an installer that reports packages: its package carries `commit`,
+/// and its releases come from `release_source`. Without this a host carries no package and
+/// reports no source, as an installer that predates the report does.
+pub fn package(facts: &mut Facts, name: &str, commit: &str, release_source: ReleaseSource) {
+    let host = host_mut(facts, name);
+    host.available = Some(AvailableFact {
+        commit: Release::new(commit),
+        seq: 1,
+    });
+    host.release_source = release_source;
 }
 
 /// The defaults of the design.

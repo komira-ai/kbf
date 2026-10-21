@@ -268,7 +268,7 @@ fn farms_started_together_in_one_process_are_told_ports_of_their_own() {
             ports.all().iter().all(|p| block.contains(p)),
             "{ports:?} {block:?}"
         );
-        let frontend = farm.spec(Role::Frontend).argv.join(" ");
+        let frontend = farm.flags(Role::Frontend).join(" ");
         assert!(
             frontend.contains(&format!(":{}", ports.front.0)),
             "{frontend}"
@@ -288,7 +288,7 @@ fn farms_started_together_in_one_process_are_told_ports_of_their_own() {
             "{}",
             farm.reapi()
         );
-        let node = farm.spec(Role::Node(1)).argv.join(" ");
+        let node = farm.flags(Role::Node(1)).join(" ");
         assert!(
             node.contains(&format!("--metrics-listen=127.0.0.1:{}", ports.metrics[0])),
             "{node}"

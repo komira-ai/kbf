@@ -419,6 +419,94 @@ fn facts_come_from_the_current_stream_only() {
     assert!(seen.helper.is_some());
 }
 
+/// Catches the package and the release source a node reports never reaching the facts (every
+/// host would read as an installer too old to report packages), and one that sticks from an
+/// earlier report. A host that has reported nothing has no package and an unreported source;
+/// each wire source maps to its own variant, and a number this build does not know to
+/// unreported; a package keeps its commit and its `seq`; a commit that is not 40 lowercase hex
+/// digits (empty, short, capitals, a letter past `f`, one digit too many) is no package, its
+/// source is read all the same, and the next report with a good one is read again.
+///
+/// Mutants: either field left at its default when the facts are built; an unknown number
+/// read as `Bundled`; the length check or the hex check dropped; a package kept from an
+/// earlier report when the newest has none.
+#[test]
+fn the_package_and_the_source_a_host_reports_reach_its_facts() {
+    use kbf_proto::update::update_status::{Available, ReleaseSource as Wire};
+    use kbf_server::update::FactsSource as _;
+    use kbf_server::update_status::ReleaseSource;
+
+    fn package(commit: &str, seq: u64) -> Option<Available> {
+        Some(Available {
+            commit: commit.to_owned(),
+            seq,
+        })
+    }
+
+    let farm = farm();
+    let store = store();
+    let rows = Rows::new(Arc::clone(&store));
+    let (_transport, mut source) = ports(Arc::clone(&farm), rows, members(&store));
+    let (mac, _inbound) = register(&farm, "mac", "macos");
+    let look = |source: &mut kbf_server::update::FarmFacts| {
+        let hosts = source.look(FarmTime::from_millis(0)).expect("a look").hosts;
+        let [seen] = &hosts[..] else {
+            panic!("one host");
+        };
+        (seen.available.clone(), seen.release_source)
+    };
+    let report = |available: Option<Available>, release_source: i32| {
+        let status = UpdateStatus {
+            available,
+            release_source,
+            ..UpdateStatus::default()
+        };
+        farm.update_status(&WorkerId::new("mac"), mac, status);
+    };
+
+    assert_eq!(look(&mut source), (None, ReleaseSource::Unreported));
+
+    report(package(A, 812), Wire::Bundled as i32);
+    let (have, from) = look(&mut source);
+    let have = have.expect("a package");
+    assert_eq!((have.commit.as_str(), have.seq), (A, 812));
+    assert_eq!(from, ReleaseSource::Bundled);
+
+    for (number, want) in [
+        (Wire::Unspecified as i32, ReleaseSource::Unreported),
+        (Wire::Url as i32, ReleaseSource::Url),
+        (Wire::Frontend as i32, ReleaseSource::Frontend),
+        (Wire::Bundled as i32, ReleaseSource::Bundled),
+        (4, ReleaseSource::Unreported),
+        (-1, ReleaseSource::Unreported),
+    ] {
+        report(None, number);
+        let (have, from) = look(&mut source);
+        assert!(have.is_none(), "number {number}");
+        assert_eq!(from, want, "number {number}");
+    }
+
+    let bad = [
+        String::new(),
+        A[..12].to_owned(),
+        A.to_uppercase(),
+        format!("{A}0"),
+        "g".repeat(40),
+    ];
+    for commit in &bad {
+        report(package(commit, 3), Wire::Url as i32);
+        let (have, from) = look(&mut source);
+        assert!(have.is_none(), "{commit:?}");
+        assert_eq!(from, ReleaseSource::Url, "{commit:?}");
+    }
+
+    report(package(OLD, 9), 0);
+    let (have, from) = look(&mut source);
+    let have = have.expect("a package again");
+    assert_eq!((have.commit.as_str(), have.seq), (OLD, 9));
+    assert_eq!(from, ReleaseSource::Unreported);
+}
+
 /// Catches a state the controller reads wrong, a host class it mistakes, and a refusal that
 /// is a pretence: every helper state maps to its report (the states of an idle or fetching
 /// node to none), a Linux host is listed as a storage-and-daemon host linked to no member (so

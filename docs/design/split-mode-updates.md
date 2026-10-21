@@ -588,13 +588,14 @@ attempts; T1 measures it. An `Execute` queued because capacity is short keeps it
 | Node, step 3 leases do not end | uncordon at the limit, `Pending` | |
 | Step 4 or 5 gate fails | undo planned-down, uncordon, `Pending` or `Held` | |
 | Step 6 binary exits at once | boot counter reverts before the Nth start; `Held` | journal |
+| Step 6 the helper refuses the activate order | `Held` (`ActivateRefused`), node stays cordoned, warn-level alert; no restart was started | read the refusal in the helper's status |
 | Step 6/7 starts, never registers | window expires, helper reverts, `REVERTED`, `Held` | |
 | Step 7 stays `CatchingUp` | wait while rebuild progresses; a failed rebuild retries with back-off (**[F]** #860); past the rebuild limit `Held`, node stays cordoned, the other owner serves | decide |
 | Step 8 debt does not settle | `Held`, cordoned, no revert | look at the other owner |
 | A second member goes `Down` unplanned | the controller stops at once, restarts nothing; blobs owned by both are `UNAVAILABLE` until one returns | bring it back first |
 | Restart deadline passes | `Held`, alert; the dwell may start re-replication | |
 | Confirm lost | the timer fires; node returns to N; `Held` | |
-| Revert fails (previous missing) | node stays as is, cordoned, `REFUSED`, page-level alert | manual path |
+| Revert fails after the flip, steps 7 to 9 (previous missing) | node stays as is, cordoned, `REFUSED`, page-level alert | manual path |
 | Controller (frontend) dies mid-run | on start it reads `update/host/<id>` and resumes; the cordon row persists | |
 | Frontend host loses power | everything on it fails; cold start; running actions are re-sent after the epoch | accepted: one frontend is a scheduling single point of failure |
 

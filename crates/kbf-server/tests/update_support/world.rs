@@ -23,10 +23,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use kbf_map::{MemberId, MemberState};
 use kbf_server::update::{
-    Alert, DaemonLoad, FactsSource, FarmView, HelperReport, HelperStatus, HostFacts, HostKind,
-    HostRecord, MemberFacts, OrderId, Platform, PlatformClass, Release, SourceError, Transport,
-    TransportError, Work,
+    Alert, AvailableFact, DaemonLoad, FactsSource, FarmView, HelperReport, HelperStatus, HostFacts,
+    HostKind, HostRecord, MemberFacts, OrderId, Platform, PlatformClass, Release, SourceError,
+    Transport, TransportError, Work,
 };
+use kbf_server::update_status::ReleaseSource;
 use kbf_sim::{Chance, SimRng};
 use kbf_types::{FarmTime, WorkerId};
 
@@ -111,6 +112,11 @@ pub struct HostTruth {
     pub member: Option<u64>,
     /// The release its daemon last reported.
     pub reported: Release,
+    /// The release its package carries, as its installer reports it; none for a host whose
+    /// installer reports no package.
+    pub package: Option<Release>,
+    /// Where its installer says it fetches from; `Unreported` for an installer that does not say.
+    pub installer: ReleaseSource,
     pub connected: bool,
     pub cordoned: bool,
     /// The seconds at which each lease ends.
@@ -185,6 +191,14 @@ fn pct(rng: &mut SimRng, p: u32) -> bool {
     rng.chance(Chance::percent(p))
 }
 
+/// What an installer reports of a package that carries `commit`.
+fn carried(commit: &Release) -> AvailableFact {
+    AvailableFact {
+        commit: commit.clone(),
+        seq: 1,
+    }
+}
+
 /// A handle on a farm. Clones share it.
 #[derive(Clone)]
 pub struct World(Arc<Mutex<Inner>>);
@@ -201,6 +215,8 @@ impl World {
             platform,
             member,
             reported: Release::new(OLD),
+            package: None,
+            installer: ReleaseSource::Unreported,
             connected: true,
             cordoned: false,
             leases: Vec::new(),
@@ -293,6 +309,22 @@ impl World {
     /// One second passes.
     pub fn advance(&self) {
         self.lock().advance();
+    }
+
+    /// Every host's installer now reports a package that carries `commit`, and says it fetches
+    /// from `installer`. A farm starts with installers that report neither.
+    pub fn carry(&self, commit: &str, installer: ReleaseSource) {
+        for host in &mut self.lock().hosts {
+            host.package = Some(Release::new(commit));
+            host.installer = installer;
+        }
+    }
+
+    /// Every host's installer now reports no package.
+    pub fn drop_packages(&self) {
+        for host in &mut self.lock().hosts {
+            host.package = None;
+        }
     }
 
     /// A host that has a lease for `secs` seconds from now (a busy host).
@@ -604,6 +636,8 @@ impl Inner {
                 platform: h.platform.clone(),
                 member: h.member.map(MemberId),
                 release: Some(h.reported.clone()),
+                available: h.package.as_ref().map(carried),
+                release_source: h.installer,
                 connected: h.connected,
                 cordoned: Some(h.cordoned),
                 load: Some(DaemonLoad {

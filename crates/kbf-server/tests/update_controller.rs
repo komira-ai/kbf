@@ -19,6 +19,7 @@ use kbf_server::update::{
     HostRecord, HostRow, OrderId, Policy, PolicyError, Release, SlotClass, Source, SourceError,
     Stored, Transport, TransportError, WaitReason,
 };
+use kbf_server::update_status::ReleaseSource;
 use kbf_state::{Cond, Txn};
 use kbf_types::{FarmTime, WorkerId};
 use support::harness::{Backing, Rig, row_of, spied};
@@ -504,6 +505,8 @@ fn a_host_finishes_the_offer_that_began_it_and_is_then_walked_back() {
 #[test]
 fn a_host_keeps_its_runs_source_and_takes_the_next_runs_when_walked_back() {
     let mut rig = Rig::new(Backing::Fake, "source", &spec(2, 0, 0), Policy::default());
+    // A staged run starts only hosts whose package carries the release.
+    rig.world.carry(NEW, ReleaseSource::Url);
     rig.offer_from(NEW, Source::Staged);
     rig.until("the activate order", 200, |r| {
         r.phase("s1") == HostPhase::Activating
