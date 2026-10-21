@@ -4,8 +4,8 @@
 //!
 //! Nothing here judges a verdict. The annotated tag's message is the Beta record `release
 //! verdict-write` wrote; it is read for the notes ([`Verified::record`]) and is an audit
-//! record that nothing gates on: a tag without one, or with one that says it failed, verifies
-//! the same. What gates a release is `release gates` (the runs) and the checks of the
+//! record that nothing gates on: an annotated tag without one (empty or prose message), or with one that says it
+//! failed, verifies the same. A lightweight tag is refused. What gates a release is `release gates` (the runs) and the checks of the
 //! files themselves (`release check`, the attestations, the set hash).
 
 use std::path::Path;
@@ -52,16 +52,14 @@ pub fn verify(s: &Subject) -> Result<Verified, Error> {
     let set_hash = set_hash_of(s.dir)?;
     let mut problems = Vec::new();
     let record = match git::read_tag(s.repo_dir, s.tag)? {
-        // A bare ref to a commit: it has no message and no object of its own. `commit_of`
-        // peels it, and refuses a ref to a tree or a blob.
+        // A bare ref to a commit is refused: the release tag is made annotated (`release
+        // tag`), and the site-publish guard relies on the tag object naming the commit and
+        // being named as its ref. A ref that skips the tag object proves neither.
         Tag::Lightweight => {
-            let object = git::commit_of(s.repo_dir, s.tag)?;
-            if object != s.commit {
-                problems.push(format!(
-                    "tag {} names commit {object}, not commit {}",
-                    s.tag, s.commit
-                ));
-            }
+            problems.push(format!(
+                "tag {} is lightweight (a ref straight at a commit): a release tag is annotated",
+                s.tag
+            ));
             None
         }
         Tag::Annotated {

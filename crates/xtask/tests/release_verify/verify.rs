@@ -50,10 +50,10 @@ fn a_tag_whose_message_is_prose_verifies() {
 }
 
 #[test]
-fn a_lightweight_tag_has_no_record_and_verifies() {
-    // Catches: a lightweight tag refused for having no message to carry a record, or its
-    // commit taken for a tag object. The fixture is a real lightweight tag: git says its
-    // object is a commit.
+fn a_lightweight_tag_is_refused() {
+    // Catches (mutant: accept `Tag::Lightweight` again): a ref straight at the right commit
+    // verifying. The release tag is annotated; the fixture is a real lightweight tag, and
+    // git says its object is a commit.
     let fx = fx("lightweight");
     fx.git(&["tag", TAG, RELEASE]);
     assert_eq!(
@@ -61,8 +61,8 @@ fn a_lightweight_tag_has_no_record_and_verifies() {
         "commit"
     );
     let (code, out, err) = verify(&fx, TAG, RELEASE);
-    assert_eq!(code, Some(0), "{out}{err}");
-    assert!(out.ends_with(&format!("set-hash={SET}\n")), "{out}");
+    assert_eq!(code, Some(1), "{out}{err}");
+    assert!(err.contains("is lightweight"), "{err}");
 }
 
 #[test]
@@ -148,27 +148,6 @@ fn a_tag_naming_another_commit_than_the_release_fails() {
     let (code, _, err) = verify(&fx, TAG, &fx.first);
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("not commit"), "{err}");
-}
-
-#[test]
-fn a_lightweight_tag_naming_another_commit_fails() {
-    // Catches: a lightweight tag taken for the release's whatever it points at (it has no
-    // tag object to compare, so its commit is peeled).
-    let fx = fx("lightweight-elsewhere");
-    fx.git(&["tag", TAG, &fx.first]);
-    let (code, _, err) = verify(&fx, TAG, RELEASE);
-    assert_eq!(code, Some(1), "{err}");
-    assert!(err.contains("names commit"), "{err}");
-}
-
-#[test]
-fn a_lightweight_tag_on_a_tree_fails() {
-    // Catches: a ref to a tree read as a commit's tag; git says its object is a tree.
-    let fx = fx("lightweight-tree");
-    let tree = fx.git(&["rev-parse", &format!("{RELEASE}^{{tree}}")]);
-    fx.git(&["update-ref", &format!("refs/tags/{TAG}"), &tree]);
-    let (code, _, err) = verify(&fx, TAG, RELEASE);
-    assert_eq!(code, Some(1), "{err}");
 }
 
 #[test]

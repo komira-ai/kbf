@@ -573,10 +573,10 @@ fn notes_are_written_whatever_the_record_says() {
 }
 
 #[test]
-fn notes_of_a_lightweight_tag_say_there_is_no_record() {
-    // Catches: a lightweight tag refused by notes, or its (absent) message parsed.
-    let fx = fx("notes-lightweight");
-    fx.git(&["tag", TAG, RELEASE]);
+fn notes_of_a_tag_with_a_prose_message_say_there_is_no_record() {
+    // Catches: a tag with no readable record refused by notes, or its prose parsed.
+    let fx = fx("notes-prose");
+    fx.annotate(TAG, RELEASE, b"release 0.10.0\n\nlooks fine\n");
     let notes = notes_of(&fx);
     assert!(notes.contains("no readable Beta record"), "{notes}");
 }
