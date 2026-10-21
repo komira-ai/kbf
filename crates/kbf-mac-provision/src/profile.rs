@@ -49,7 +49,6 @@ pub const REQUIRED: &[&str] = &[
     "kbf_cert",
     "kbf_key",
     "kbf_data_dir",
-    "kbf_labels",
     "simulator_runtimes",
 ];
 
@@ -110,6 +109,22 @@ pub enum ProfileError {
 /// The old name of `kbf_data_dir`, accepted with a warning.
 const OLD_DATA_DIR: &str = "kbf_scratch";
 
+/// The key that set the daemon's extra `--label`s. Node labels are removed: this tool
+/// writes no `label` key to `kbf.toml` (the daemon that follows refuses one), so the
+/// profile has no use for the key.
+const RETIRED_LABELS: &str = "kbf_labels";
+
+/// What a profile line `kbf_labels=...` does, in this one place: today it is refused,
+/// naming the key and saying to delete the line, whatever the value (every profile
+/// written before the key went has the line, empty or not). A grace window is a change
+/// to this function alone: push a line onto `warnings` and return `Ok(())` (the line is
+/// then skipped, the value ignored).
+fn retired_labels(line: usize, _warnings: &mut Vec<String>) -> Result<(), ProfileError> {
+    Err(ProfileError::Invalid(format!(
+        "profile line {line}: {RETIRED_LABELS}: node labels are removed and this key has no effect; delete the line"
+    )))
+}
+
 /// A pinned Xcode: `BUILD:/Applications/Xcode*.app/Contents/Developer:SHA256`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Xcode {
@@ -156,8 +171,6 @@ pub struct Profile {
     /// `daemon_user`: the account kbf-daemon's job runs as.
     pub daemon_user: DaemonUser,
     pub time_max_offset_ms: u64,
-    /// The daemon's other `--label`s, from `kbf_labels`.
-    pub labels: Vec<String>,
     /// The SHA-256 of the file, in hex.
     pub sha256: String,
     /// Deprecation warnings, one line each: the profile is accepted, and `load` prints
@@ -213,6 +226,10 @@ impl Profile {
             };
             let (key, value) = (&line[..eq], &line[eq + 1..]);
             let key_text = String::from_utf8_lossy(key).into_owned();
+            if key_text == RETIRED_LABELS {
+                retired_labels(line_no, &mut warnings)?;
+                continue;
+            }
             if !value.iter().all(|&b| value_byte(b)) {
                 return Err(ProfileError::BadCharacter {
                     line: line_no,
@@ -287,13 +304,8 @@ impl Profile {
         &self.sha256[..12]
     }
 
-    /// The node label: `profile=<profile>@<first 12 hex digits of the SHA-256>`.
-    pub fn node_label(&self) -> String {
-        format!("profile={}@{}", self.get("profile"), self.short_sha())
-    }
-
     /// What `print` shows: each key set to a non-empty value (required, then optional),
-    /// the repeated keys, the SHA-256 and the node label.
+    /// the repeated keys and the SHA-256.
     pub fn print(&self) -> String {
         let mut out = String::new();
         for key in REQUIRED.iter().chain(OPTIONAL) {
@@ -314,11 +326,7 @@ impl Profile {
         for e in &self.expectations {
             out.push_str(&format!("expect_probe={e}\n"));
         }
-        out.push_str(&format!(
-            "profile_sha256={}\nnode_label={}\n",
-            self.sha256,
-            self.node_label()
-        ));
+        out.push_str(&format!("profile_sha256={}\n", self.sha256));
         out
     }
 
@@ -429,23 +437,6 @@ impl Profile {
         for key in ["kbf_ca_cert", "kbf_cert", "kbf_key", "kbf_data_dir"] {
             want(key, pattern::absolute_path, "an absolute path")?;
         }
-        let labels: Vec<String> = get("kbf_labels")
-            .split(' ')
-            .filter(|l| !l.is_empty())
-            .map(str::to_owned)
-            .collect();
-        for label in &labels {
-            if !pattern::daemon_label(label) {
-                return Err(ProfileError::Invalid(format!(
-                    "kbf_labels: {label} is not key=value"
-                )));
-            }
-            if label.starts_with("profile=") {
-                return Err(ProfileError::Invalid(
-                    "kbf_labels: the profile label is kbf-mac-provision's".into(),
-                ));
-            }
-        }
         if !get("xcode_disable_manifest_sandbox").is_empty() {
             want("xcode_disable_manifest_sandbox", pattern::bit, "0 or 1")?;
         }
@@ -468,7 +459,6 @@ impl Profile {
             volume,
             daemon_user,
             time_max_offset_ms,
-            labels,
             sha256,
             warnings: Vec::new(),
         })
