@@ -17,6 +17,13 @@
 //!   the notes are for the same `--tag "$TAG"` and `--commit "$COMMIT"` as the verdict. The dispatch
 //!   declares required inputs `commit` and `tag`, and `verify` binds `COMMIT` and `TAG` to the
 //!   push (`github.sha`, `github.ref_name`) or dispatch (`inputs.*`) value.
+//! - **The release body is the notes.** `publish` downloads the artifact `release-notes` into the
+//!   working directory (a step before `release publish`) and passes `--notes-file` with the file
+//!   `verify` wrote (`--out`); the generated notes are what the release says.
+//! - **Irreversible items are computed.** `verify` writes `kbf --version --json` of this release and
+//!   of the previous one (`release previous`, `release identity`) and gives both files to
+//!   `release notes`; a binary runs only through `release identity` on `dist` or `previous`,
+//!   after the step that verifies the attestations of that directory, under the same `if:`.
 //! - **Who may write.** Only `publish` holds a write scope (`contents`), under the exact
 //!   tag-push `if:`, so a dry run (a dispatch) publishes nothing; it also runs in the
 //!   `prod` environment and needs `verify`. The kbf.dev upload (an OIDC role step) is to
@@ -51,6 +58,10 @@ const TAG_EXPR: &str = "${{ github.event_name == 'push' && github.ref_name || in
 
 /// The artifact the notes are uploaded as.
 const NOTES_ARTIFACT: &str = "release-notes";
+const NAME: &str = "name";
+/// The directories of verified release files whose binaries `verify` may run.
+const DIST: &str = "dist";
+const PREVIOUS_DIR: &str = "previous";
 
 fn lines(step: &workflows::Step) -> impl Iterator<Item = &str> {
     step.run
@@ -151,6 +162,15 @@ fn writers(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// The file the verify job writes the notes to (its `release notes --out`).
+fn notes_out(release: &str) -> Result<String, String> {
+    let steps = workflows::job_steps(release, VERIFY)?;
+    let words = command(&steps, "cargo xtask release notes ").map(|(.., w)| w);
+    Ok(words
+        .and_then(|w| value(&w, "--out").map(str::to_owned))
+        .unwrap_or_default())
+}
+
 fn publish_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     let environment = workflows::job_environment(release, PUBLISH)?;
     if environment.as_deref() != Some(ENVIRONMENT) {
@@ -176,7 +196,22 @@ fn publish_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         None => out.push(format!(
             "the job `{PUBLISH}` does not run `cargo xtask release publish`"
         )),
-        Some((_, step, words)) => {
+        Some((at, step, words)) => {
+            let notes = notes_out(release)?;
+            if notes.is_empty() || value(&words, "--notes-file") != Some(notes.as_str()) {
+                out.push(format!("`release publish` is not given `--notes-file {notes}`, the file `verify` writes the notes to: the release body would not be the notes the approver read"));
+            }
+            let downloaded = steps.iter().take(at).any(|s| {
+                s.uses
+                    .as_deref()
+                    .is_some_and(|u| u.starts_with("actions/download-artifact@"))
+                    && s.with.iter().any(|(k, v)| k == NAME && v == NOTES_ARTIFACT)
+                    && s.with.iter().all(|(k, v)| k != "path" || v == ".")
+                    && !s.conditional
+            });
+            if !downloaded {
+                out.push(format!("the job `{PUBLISH}` does not download the artifact `{NOTES_ARTIFACT}` (into the working directory), in a step before `release publish`: there would be no notes to publish"));
+            }
             if value(&words, "--set-hash") != Some("$SET_HASH") {
                 out.push("`release publish` is not given `--set-hash \"$SET_HASH\"`, so it would not refuse files the verdict does not name".to_owned());
             }
@@ -254,6 +289,12 @@ fn verify_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
                     out.push(format!("`release notes` is not given `{flag} \"{var}\"`: the approver would read notes for another release"));
                 }
             }
+            if value(&words, "--version-json").is_none() {
+                out.push("`release notes` is not given `--version-json`: what is not reversible would not be computed from the build".to_owned());
+            }
+            if value(&words, "--previous-version-json") != Some("$PREVIOUS_IDENTITY") {
+                out.push("`release notes` is not given `--previous-version-json \"$PREVIOUS_IDENTITY\"`: going back would not be checked against the previous release".to_owned());
+            }
             let notes = value(&words, "--out").unwrap_or("");
             let uploaded = steps.iter().skip(at + 1).any(|s| {
                 s.uses
@@ -275,7 +316,35 @@ fn verify_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             }
         }
     }
+    identities(&steps, out);
     Ok(())
+}
+
+/// A binary runs in `verify` only to print `--version --json`, and only after the
+/// attestations of the directory it was unpacked from are verified, under the same `if:`.
+fn identities(steps: &[workflows::Step], out: &mut Vec<String>) {
+    let mut ran = 0;
+    for (at, step) in steps.iter().enumerate() {
+        let run = step.run.as_deref().unwrap_or_default();
+        if !run.contains("--version --json") && !run.starts_with("cargo xtask release identity ") {
+            continue;
+        }
+        ran += 1;
+        let words = command(&steps[at..=at], "cargo xtask release identity ");
+        let dir = words.as_ref().and_then(|(.., w)| w.first().copied());
+        let Some(dir) = dir.filter(|d| [DIST, PREVIOUS_DIR].contains(d)) else {
+            out.push(format!("step {at} of `{VERIFY}` runs a binary that is not `release identity` on `{DIST}` or `{PREVIOUS_DIR}`: an unattested binary would run"));
+            continue;
+        };
+        let prefix = format!("cargo xtask verify-assets attestations {dir} ");
+        match command(&steps[..at], &prefix) {
+            Some((_, check, _)) if check.condition == step.condition => {}
+            _ => out.push(format!("step {at} of `{VERIFY}` runs a binary unpacked from `{dir}/` without an earlier, equally conditioned `{prefix}...` step: an unattested binary would run")),
+        }
+    }
+    if ran == 0 {
+        out.push(format!("the job `{VERIFY}` never runs `release identity`: what is not reversible would not be computed from the builds"));
+    }
 }
 
 #[cfg(test)]

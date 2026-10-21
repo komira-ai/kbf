@@ -49,8 +49,8 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/xtask/src/lib.rs",
-        2,
-        "product code: the release and verify scratch, removed after the run whatever its result",
+        3,
+        "product code: the release, verify and identity scratch, each removed after its run whatever its result",
     ),
     (
         "crates/xtask/src/release/offer.rs",
