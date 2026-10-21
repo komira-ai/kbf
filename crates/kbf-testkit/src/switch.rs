@@ -26,9 +26,9 @@ impl Switch {
             let (up, connections) = (Arc::clone(&up), Arc::clone(&connections));
             tokio::spawn(async move {
                 loop {
-                    let Ok((mut inbound, _)) = listener.accept().await else {
-                        continue;
-                    };
+                    // A loopback listener's accept fails only when the process is out of
+                    // descriptors, which ends the test that hit it.
+                    let (mut inbound, _) = listener.accept().await.expect("accept");
                     if !up.load(Ordering::SeqCst) {
                         continue;
                     }
@@ -76,9 +76,7 @@ mod tests {
         let addr = listener.local_addr().expect("address");
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    continue;
-                };
+                let (mut stream, _) = listener.accept().await.expect("accept");
                 tokio::spawn(async move {
                     let (mut read, mut write) = stream.split();
                     let _ = tokio::io::copy(&mut read, &mut write).await;
@@ -107,8 +105,8 @@ mod tests {
         switch.cut();
         // The abort closes the forwarder's halves of the connection: a read ends.
         let mut rest = Vec::new();
-        let ended = open.read_to_end(&mut rest).await;
-        assert!(ended.is_err() || rest.is_empty(), "{ended:?} {rest:?}");
+        let _ = open.read_to_end(&mut rest).await;
+        assert!(rest.is_empty(), "{rest:?}");
 
         // A new connection is accepted and dropped at once: nothing comes back.
         let mut refused = TcpStream::connect(switch.addr).await.expect("connect");
@@ -117,5 +115,19 @@ mod tests {
         switch.restore();
         let mut again = TcpStream::connect(switch.addr).await.expect("connect");
         assert_eq!(&round_trip(&mut again).await.expect("through"), b"ping");
+    }
+
+    /// A server that is not there: the switch accepts, cannot reach it and drops the
+    /// connection, so nothing comes back. Catches a forwarder that panics or hangs the
+    /// caller when its target is down.
+    #[tokio::test]
+    async fn a_dead_target_drops_the_connection() {
+        let dead = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            listener.local_addr().expect("address")
+        };
+        let switch = Switch::start(dead).await;
+        let mut stream = TcpStream::connect(switch.addr).await.expect("connect");
+        assert!(round_trip(&mut stream).await.is_err());
     }
 }
