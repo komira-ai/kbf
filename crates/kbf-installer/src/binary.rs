@@ -121,8 +121,8 @@ pub const RELAY_NEEDED: u64 = 1;
 
 /// What `--version --json` prints. A field this type does not name is refused, and so is
 /// one named twice or a required one missing. `platform` (the installer derives it from
-/// the binary's header), `admin_protocol`, `meta_log` and `seq` (builds before them lack
-/// them) may be absent and are then `None`; `meta_log: None` means not reversible.
+/// the binary's header), `admin_protocol`, `meta_log`, `relay` and `seq` (builds before them
+/// lack them) may be absent and are then `None`; `meta_log: None` means not reversible.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Version {

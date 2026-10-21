@@ -254,7 +254,10 @@ impl<E: Exec> Helper<E> {
         self.orders(now, &mut memory)?;
         self.restart_if_owed(&mut memory)?;
         self.collect();
-        self.notice_package(&mut memory);
+        // What the orders came to is told before the look, which reads the package in full the
+        // first time and may run `gh`; the write is skipped when the second report is the same.
+        self.report(&memory)?;
+        self.notice_package(now, &mut memory);
         self.report(&memory)
     }
 

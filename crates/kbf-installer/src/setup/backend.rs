@@ -123,7 +123,8 @@ impl<E: Exec> Releases for Fetching<'_, E> {
 fn floor_not_kept(e: FloorError) -> SetupError {
     SetupError::NeedsOperator(format!(
         "the package's release is installed and current, but its floor on seq cannot be kept: \
-         {e}; once that is fixed `kbf-installer run` keeps it"
+         {e}; once that is fixed, run `setup` again (the release stands) and `kbf-installer run` \
+         then keeps it"
     ))
 }
 

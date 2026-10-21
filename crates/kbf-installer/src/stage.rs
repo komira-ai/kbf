@@ -49,7 +49,8 @@
 //!
 //! Every external step is bounded: `gh` 120 s, unpacking 120 s, the probe 10 s
 //! ([`Timeouts`]); a program is killed with its whole process group. The scratch
-//! directories (`work/<commit>.partial/` and `work/<commit>.check/`) are root's and go
+//! directories (`work/<commit>.partial/`, `work/<commit>.check/` and, for the run loop's look
+//! at the package, `work/<commit>.look/`) are root's and go
 //! whatever the outcome, unless the process is killed first (a crash, the OOM killer, a
 //! reboot): then `run` removes what is left when it starts ([`sweep_work`]).
 //!
@@ -170,9 +171,12 @@ impl Drop for Partial {
 }
 
 /// The suffixes of a stage's scratch directories in `work/`: `<commit>.partial` (the
-/// download, then the release being made) and `<commit>.check` (the checks' own).
+/// download, then the release being made), `<commit>.check` (a stage's checks) and
+/// `<commit>.look` (the checks of the run loop's look at the package's seed, which is not a
+/// stage and must not clear a stage's).
 const PARTIAL: &str = ".partial";
 const CHECK: &str = ".check";
+const LOOK: &str = ".look";
 
 /// `work/<commit><suffix>`, with `work/` made when it is missing.
 fn work_path(host: &Layout, commit: &CommitId, suffix: &str) -> Result<PathBuf, Refusal> {
@@ -183,8 +187,8 @@ fn work_path(host: &Layout, commit: &CommitId, suffix: &str) -> Result<PathBuf, 
     Ok(work.join(format!("{commit}{suffix}")))
 }
 
-/// Remove every `work/*.partial` and `work/*.check`: the scratch of a stage that was killed
-/// before it could remove it (a crash, the OOM killer, a reboot, `SIGKILL`), which
+/// Remove every `work/*.partial`, `work/*.check` and `work/*.look`: the scratch of a stage or
+/// a look that was killed before it could remove it (a crash, the OOM killer, a reboot, `SIGKILL`), which
 /// [`Partial::create`] refuses for ever. Nothing else in `work/` is touched, and a link is
 /// removed, never followed ([`sweep_dir`], the sweep the operator's verbs make of
 /// `releases/.stage-*`).
@@ -202,7 +206,7 @@ pub fn sweep_work(host: &Layout, _lock: &Locked) -> Result<(), ReleaseError> {
 
 /// Whether `name` is one of a stage's scratch directories.
 fn is_scratch(name: &str) -> bool {
-    name.ends_with(PARTIAL) || name.ends_with(CHECK)
+    name.ends_with(PARTIAL) || name.ends_with(CHECK) || name.ends_with(LOOK)
 }
 
 fn make_dir(dir: &Path, mode: u32, owner: Owner) -> Result<(), Refusal> {
@@ -358,7 +362,7 @@ impl Verifier for Pipeline<'_> {
         for (locator, received) in &files {
             self.count_and_digest(locator, received)?;
         }
-        let scratch = Scratch::make(self.host, order.commit, self.settings, self.owner)?;
+        let scratch = Scratch::make(self.host, order.commit, CHECK, self.settings, self.owner)?;
         let mut source_ref = None;
         for (locator, received) in &files {
             let verified = self.attest(&gh, &scratch, locator, received, order.commit)?;
@@ -446,9 +450,11 @@ fn pair<'a>(
     Ok(pairs)
 }
 
-/// The scratch directory of the checks: `work/<commit>.check/`, root's, with `gh/` (the
-/// unprivileged user's home for `gh`, 0700) and `empty/` (the directory the probe runs
-/// in), and the links and bundles the unprivileged user reads. Removed when dropped.
+/// The scratch directory of the checks: `work/<commit>.check/` for a stage, `work/<commit>.look/`
+/// for the run loop's look at a seed (each its owner's alone, so that neither clears the
+/// other's), root's, with `gh/` (the unprivileged user's home for `gh`, 0700) and `empty/` (the
+/// directory the probe runs in), and the links and bundles the unprivileged user reads.
+/// Removed when dropped.
 struct Scratch {
     dir: PathBuf,
 }
@@ -457,11 +463,12 @@ impl Scratch {
     fn make(
         host: &Layout,
         commit: &CommitId,
+        suffix: &str,
         settings: &Settings,
         owner: Owner,
     ) -> Result<Scratch, Refusal> {
-        let dir = work_path(host, commit, CHECK)?;
-        // A check directory left by a crash is ours alone to remove.
+        let dir = work_path(host, commit, suffix)?;
+        // A check directory of this kind left by a crash is ours alone to remove.
         let _ = fs::remove_dir_all(&dir);
         let made = Scratch { dir };
         make_dir(&made.dir, 0o755, owner)?;
@@ -581,7 +588,8 @@ impl Pipeline<'_> {
     /// Step 3 alone, for a tarball that is where the unprivileged user can read it already (the
     /// package's own copy: nothing is copied, linked or changed) and a bundle given as text.
     /// This is the run loop's look at a seed: it installs nothing and unpacks nothing. A scratch
-    /// directory is made for `gh`, and gone when this returns.
+    /// directory is made for `gh` (`work/<commit>.look`, never a stage's `.check`, which a
+    /// stage in another process may be using), and gone when this returns.
     pub(crate) fn attest_in_place(
         &self,
         commit: &CommitId,
@@ -590,7 +598,7 @@ impl Pipeline<'_> {
         bundle: &str,
     ) -> Result<SourceRef, Refusal> {
         let gh = self.gh();
-        let scratch = Scratch::make(self.host, commit, self.settings, self.owner)?;
+        let scratch = Scratch::make(self.host, commit, LOOK, self.settings, self.owner)?;
         let bundle = put_bundle(&scratch, name, bundle)?;
         let tools = Tools {
             trust: self.trust,

@@ -10,7 +10,8 @@
 //! writer's bytes too.
 //!
 //! `state` words map 1:1 to `UpdateStatus.State` on the wire. `refusal` is the last refusal as
-//! text, `<word>: <message>`, the word one of section 5's; lock contention is exit 4, not a
+//! text, usually leading `<word>: <message>` with the word one of section 5's (some are plain
+//! sentences, such as the number of leases that are live); lock contention is exit 4, not a
 //! refusal.
 
 use serde::{Deserialize, Serialize};

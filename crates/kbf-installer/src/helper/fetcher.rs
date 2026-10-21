@@ -114,8 +114,9 @@ pub trait Fetcher {
         Err(FetchError::NotWired)
     }
 
-    /// What the run loop learns once a pass without an order: the source `installer.toml`
-    /// names, and whether the package's seed is whole (see [`Noticed`]). `known` is the seed
+    /// What the run loop learns at the end of each pass (not again for a minute after a look
+    /// that failed): the source `installer.toml` names, and whether the package's seed is whole
+    /// (see [`Noticed`]). `known` is the seed
     /// found whole by an earlier look: while the package's manifest is the one it was found by,
     /// the package is not checked again, and `known` is the answer. It installs nothing, moves
     /// nothing and decides nothing about an order. A fetcher that has no package says so.

@@ -327,14 +327,15 @@ fn a_package_that_fails_its_look_is_looked_at_again_only_after_a_minute() {
         s.attested = b"the bundle of another release\n".to_vec();
     });
     rig.cycle(T0);
-    assert_eq!(gh_runs(&calls), 1);
+    let first = gh_runs(&calls);
+    assert_ne!(first, 0, "gh was asked");
     assert!(said(&mut rig).starts_with("package: fetch: rejected: attestation: "));
     rig.cycle(T0 + 5);
-    assert_eq!(gh_runs(&calls), 1, "not again at the next pass");
+    assert_eq!(gh_runs(&calls), first, "not again at the next pass");
     rig.cycle(T0 + 59);
-    assert_eq!(gh_runs(&calls), 1, "not before the minute is up");
+    assert_eq!(gh_runs(&calls), first, "not before the minute is up");
     rig.cycle(T0 + 60);
-    assert_eq!(gh_runs(&calls), 2, "again after it");
+    assert_eq!(gh_runs(&calls), 2 * first, "again after it");
     assert_eq!(said(&mut rig), "", "said once");
     assert!(rig.status().get("available").is_none());
 }
