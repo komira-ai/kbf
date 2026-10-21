@@ -22,7 +22,11 @@
 //!   no `kbf.stamp` next to it, it reads both from a trailer on its own file (`kbf_says`
 //!   below), so a copy packaged into a tarball and extracted elsewhere says what the
 //!   tarball's bytes say. With `XTASK_FAKE_ANNOUNCE` set, it also prints the path it was
-//!   run as on stderr.
+//!   run as on stderr. What a test asks of it by an environment variable, the empty
+//!   environment of `release version-facts` does not carry, so two more files beside it
+//!   do: `kbf.env` (when it exists, the fake overwrites it with `ran` and one `NAME=value`
+//!   line per variable it was given) and `kbf.mode` (`fail`: print the answer, then exit 1;
+//!   `hang`: never answer, for two minutes).
 //! - Run as `kbf-installer`, it is the STUB of the real kbf-installer, which the package
 //!   build and its macOS install test ship until the real tool is built there (one path
 //!   change in `crates/xtask/tests/pkg_macos.rs`): it prints `kbf-installer-stub` and
@@ -133,11 +137,42 @@ fn kbf_says(argv0: &str) -> (String, String) {
     (stamp.to_owned(), json.to_owned())
 }
 
+/// What a test asked of `kbf` in the files beside it (see the top of this file): the
+/// environment it was given is written to `<argv0>.env`, if that file exists, and
+/// `<argv0>.mode` makes it fail or hang. The exit code to leave with, if it is not to answer.
+fn kbf_asked(argv0: &str) -> Option<ExitCode> {
+    let env_log = format!("{argv0}.env");
+    if Path::new(&env_log).exists() {
+        let mut seen = String::from("ran\n");
+        for (name, value) in std::env::vars() {
+            seen.push_str(&format!("{name}={value}\n"));
+        }
+        std::fs::write(&env_log, seen).expect("env log");
+    }
+    match std::fs::read_to_string(format!("{argv0}.mode")).as_deref() {
+        // It answers as it should and then fails: only its status can refuse it.
+        Ok("fail") => {
+            print!("{}", kbf_says(argv0).1);
+            Some(ExitCode::FAILURE)
+        }
+        // Long enough for any limit a test sets, short enough that a limit which is broken
+        // fails the test's own time assertion instead of hanging the suite.
+        Ok("hang") => {
+            std::thread::sleep(std::time::Duration::from_secs(120));
+            Some(ExitCode::FAILURE)
+        }
+        _ => None,
+    }
+}
+
 /// `kbf --version` and `kbf --version --json`, as [`kbf_says`] has them.
 fn kbf(argv0: &str, args: &[String]) -> ExitCode {
     // Where a test sees which file was run.
     if std::env::var_os("XTASK_FAKE_ANNOUNCE").is_some() {
         eprintln!("xtask-fake: kbf runs as {argv0}");
+    }
+    if let Some(code) = kbf_asked(argv0) {
+        return code;
     }
     if args == ["--version", "--json"] {
         if defect("json-fails") {

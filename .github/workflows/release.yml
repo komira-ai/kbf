@@ -149,11 +149,14 @@ jobs:
         if: ${{ steps.previous.outputs.previous != '' }}
         working-directory: previous
         run: sha256sum --check --strict SHA256SUMS
+      # The release before the build jobs recorded version facts has none, and this is the
+      # only check that waives them: the release being made (`release check dist`) never does.
+      # Remove the flag once the release before this one was made with the facts.
       - name: Every one is an asset of the previous release's commit, with its bundle
         if: ${{ steps.previous.outputs.previous != '' }}
         env:
           PREVIOUS_COMMIT: ${{ steps.previous.outputs.previous-commit }}
-        run: cargo xtask release check previous --commit "$PREVIOUS_COMMIT"
+        run: cargo xtask release check previous --commit "$PREVIOUS_COMMIT" --without-version-facts
       - name: Verify the previous release's attestations as these were
         if: ${{ steps.previous.outputs.previous != '' }}
         env:
