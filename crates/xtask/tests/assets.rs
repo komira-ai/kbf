@@ -230,7 +230,23 @@ impl Release {
     fn add_package(&self, platform: &str, ext: &str) -> String {
         let name = format!("kbf-installer-{COMMIT}-{platform}.{ext}");
         let bytes = format!("the kbf-installer package for {platform}");
-        std::fs::write(self.dist.join(&name), &bytes).expect("deb");
+        self.add_listed(&name, &bytes);
+        name
+    }
+
+    /// Adds the version facts of `kbf` for `platform` as `release version-facts` leaves
+    /// them: a file in `dist` (distinct bytes), listed in `SHA256SUMS`.
+    fn add_facts(&self, platform: &str) -> String {
+        let name = format!("kbf-{COMMIT}-{platform}.version.json");
+        let bytes = format!("the version facts of kbf for {platform}\n");
+        self.add_listed(&name, &bytes);
+        name
+    }
+
+    /// Adds the file `name` holding `bytes` to `dist` and to `SHA256SUMS`, which stays
+    /// sorted by name as `sums assemble` leaves it.
+    fn add_listed(&self, name: &str, bytes: &str) {
+        std::fs::write(self.dist.join(name), bytes).expect("file");
         let mut lines: Vec<String> = std::fs::read_to_string(self.dist.join("SHA256SUMS"))
             .expect("SHA256SUMS")
             .lines()
@@ -238,11 +254,10 @@ impl Release {
             .collect();
         lines.push(format!(
             "{}  {name}",
-            hex::encode(sha2::Sha256::digest(&bytes))
+            hex::encode(sha2::Sha256::digest(bytes))
         ));
         lines.sort_by_key(|l| l.split_once("  ").map(|(_, n)| n.to_owned()));
         std::fs::write(self.dist.join("SHA256SUMS"), lines.join("\n") + "\n").expect("sums");
-        name
     }
 
     /// Writes next to each tarball and package the bundle the attest job leaves: one
@@ -658,8 +673,66 @@ fn attestations_refuse_a_foreign_workflow_an_unknown_file_and_a_missing_gh() {
     assert_eq!(code, Some(1));
     assert_eq!(
         err,
-        "xtask: SHA256SUMS lists notes.txt, neither a tarball, a package nor an SBOM\n"
+        "xtask: SHA256SUMS lists notes.txt, neither a tarball, a package, an SBOM \
+         nor version facts\n"
     );
+}
+
+#[test]
+fn a_kbf_tarball_without_its_version_facts_fails_the_sums_check() {
+    // Catches: a release set that does not need the facts of its `kbf` (a build job that
+    // lost the step would publish a platform with nothing for an offer to read), and the
+    // message not naming the tarball and the file missing. The second half is the control:
+    // with the facts listed and present the same set passes, so the refusal was for them
+    // and for nothing else, and `kbf-daemon`'s tarball (no facts) is not named. Mutant:
+    // the pairing taken out of `verify_sums`.
+    let names: &[&str] = &["kbf", "kbf-daemon"];
+    let r = Release::build_with("facts-missing", &[("linux-x86_64", names)]);
+    let tarball = format!("kbf-{COMMIT}-linux-x86_64.tar.gz");
+    let facts = format!("kbf-{COMMIT}-linux-x86_64.version.json");
+    let (code, out, err) = xtask(&["verify-assets", "sums", s(&r.dist)], &r.tmp, None);
+    assert_eq!(code, Some(1), "{out}");
+    let want = format!(
+        "xtask: {tarball}: its version facts {facts} are not listed in \
+         SHA256SUMS\n"
+    );
+    assert_eq!(err, want);
+    r.add_facts("linux-x86_64");
+    let (code, out, err) = xtask(&["verify-assets", "sums", s(&r.dist)], &r.tmp, None);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(out, "sums: 5 files match; the flipped copy does not\n");
+}
+
+#[test]
+fn version_facts_are_verified_for_build_provenance_and_nothing_else() {
+    // Catches: facts the attest job signs that the verify job refuses as neither a tarball,
+    // a package nor an SBOM; facts held to what only a tarball has (an SBOM attestation, a
+    // bundle: neither exists, and the release check names a bundle of anything else); and
+    // facts whose provenance is not checked, or whose missing attestation is passed over.
+    let names: &[&str] = &["kbf-daemon"];
+    let r = Release::build_with("facts-attested", &[("linux-x86_64", names)]);
+    let facts = r.add_facts("linux-x86_64");
+    r.attest(None);
+    let (code, out, err) = r.verify(&format!("{WORKFLOW}@refs/heads/main"), None);
+    assert_eq!(code, Some(0), "{err}");
+    let line = format!("verified: {facts} (provenance)\n");
+    assert!(out.contains(&line), "{out}");
+    let path = s(&r.dist.join(&facts)).to_owned();
+    let calls = r.gh_calls();
+    let mine: Vec<&String> = calls.iter().filter(|c| c.contains(&path)).collect();
+    assert_eq!(mine.len(), 1, "{mine:#?}");
+    assert_eq!(
+        *mine[0],
+        format!("attestation verify {path} {}", flags(WORKFLOW))
+    );
+    r.attest(Some((facts.as_str(), false)));
+    let (code, _, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(1), "{err}");
+    let want = format!(
+        "xtask: {path}: no build provenance attestation signed by \
+         {WORKFLOW} verifies\n"
+    );
+    assert_eq!(err, want);
 }
 
 #[test]

@@ -809,6 +809,49 @@ fn check_refuses_assets_of_another_commit_or_of_no_binary() {
     }
 }
 
+/// [`dist`] with one more listed file, `name`, holding `x`.
+fn dist_with(root: &Path, name: &str) -> PathBuf {
+    let d = dist(root, COMMIT);
+    let sums = std::fs::read_to_string(d.join("SHA256SUMS")).expect("sums");
+    std::fs::write(d.join(name), "x").expect("file");
+    let line = format!("{}  {name}\n", hex::encode(sha2::Sha256::digest(b"x")));
+    std::fs::write(d.join("SHA256SUMS"), format!("{sums}{line}")).expect("sums");
+    d
+}
+
+#[test]
+fn check_takes_the_version_facts_of_kbf_for_the_commit() {
+    // Catches: the facts file the build jobs now list refused as no asset of the commit,
+    // which would stop every release. Control for the next test: the name that passes is
+    // exactly `kbf-<commit>-<platform>.version.json`.
+    let root = scratch("check-facts");
+    let facts = format!("kbf-{COMMIT}-linux-arm64.version.json");
+    let d = dist_with(&root, &facts);
+    let (code, out, err) = check(&d, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("sums: 7 files match"), "{out}");
+    assert!(out.contains("is an asset of"), "{out}");
+}
+
+#[test]
+fn check_refuses_version_facts_that_are_not_kbfs_for_the_commit() {
+    // Catches: any file ending `.version.json` taken as an asset (another binary's, another
+    // commit's, an unknown platform's, a renamed copy), when the set holds one name per
+    // platform. Mutant: the exact name replaced by the suffix.
+    for bad in [
+        format!("kbf-daemon-{COMMIT}-linux-arm64.version.json"),
+        format!("kbf-{OTHER}-linux-arm64.version.json"),
+        format!("kbf-{COMMIT}-windows-x86_64.version.json"),
+        format!("kbf-{COMMIT}-linux-arm64.version.json.bak"),
+    ] {
+        let root = scratch("check-bad-facts");
+        let d = dist_with(&root, &bad);
+        let (code, _, err) = check(&d, COMMIT);
+        assert_eq!(code, Some(1), "{bad}");
+        assert_eq!(err, format!("xtask: {bad}: not an asset of {COMMIT}\n"));
+    }
+}
+
 #[test]
 fn check_refuses_a_changed_file() {
     // Catches: a check that reads names only (the `sha256sum --check` half dropped).

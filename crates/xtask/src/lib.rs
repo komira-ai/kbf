@@ -98,6 +98,7 @@ pub mod proxy_loom;
 pub mod release;
 pub mod sudo_test;
 pub mod sums;
+pub mod version_facts;
 
 /// Why a verb failed.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -611,6 +612,10 @@ enum ReleaseVerb {
     Tag(release::tag::TagArgs),
     /// Write the verdict document a release tag carries as its message.
     VerdictWrite(release::verdict_write::WriteArgs),
+    /// Run the `kbf` just built with `--version --json` and keep what it printed as the
+    /// release asset `kbf-<commit>-<platform>.version.json`, refused unless it is the
+    /// release build of `--commit`.
+    VersionFacts(version_facts::Args),
     /// The same checks, then write the release's notes.
     Notes {
         #[command(flatten)]
@@ -1073,6 +1078,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::Release(ReleaseVerb::Offer(args)) => release::offer::run(&args),
         Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
         Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
+        Verb::Release(ReleaseVerb::VersionFacts(args)) => version_facts::run(&args),
         Verb::Release(ReleaseVerb::VerdictWrite(args)) => {
             release::verdict_write::run(&args, release::verdict::GATE_STAGE)
         }

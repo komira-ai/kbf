@@ -34,6 +34,9 @@
 //!   packaged (`dist/<binary>-$GITHUB_SHA-<platform>.tar.gz`), which opens that file and
 //!   makes the same check on the binary inside: the bytes that ship, not only the bytes
 //!   built.
+//! - **The `kbf` says what it is.** Every build job runs `cargo xtask release
+//!   version-facts` on the `kbf` it built, once, between that check and the package, and
+//!   `dist` gets `kbf-<commit>-<platform>.version.json` (the rules are `facts`').
 //! - **The installer's package.** Each Linux job builds the `kbf-installer` deb and makes it
 //!   an asset (`cargo xtask pkg-asset`, [`PACKAGES`]), and no other job does. In that job
 //!   `pkg-trust` and `pkg-asset` both take the branch the package trusts and is attested
@@ -158,6 +161,7 @@ pub fn problems(workflow: &str) -> Result<Vec<String>, String> {
     release_set(workflow, &mut out)?;
     signing(workflow, &mut out)?;
     identity(workflow, &mut out)?;
+    facts::rules(workflow, &mut out)?;
     packages(workflow, &mut out)?;
     mac_package(workflow, &mut out)?;
     darwin(workflow, &mut out)?;
@@ -835,6 +839,7 @@ fn the_docs_describe_the_release_set() {
         "--source-digest <commit>",
         "sudo dpkg -i kbf-installer-<commit>-linux-x86_64.deb",
         "sudo installer -pkg kbf-installer-<commit>-darwin-arm64.pkg -target /",
+        "`kbf-<commit>-<platform>.version.json`",
         "**no SBOM attestation**",
         "**the branch the package is attested on**",
     ] {
@@ -890,6 +895,13 @@ mod rules {
         )
     }
 
+    /// The step that records the facts of the `kbf` built, after its identity is checked.
+    fn facts_step(platform: &str) -> String {
+        format!(
+            "      - name: Facts\n        run: cargo xtask release version-facts --binary \"target/$TARGET/release/kbf\" --commit \"$GITHUB_SHA\" --platform {platform} --out dist\n"
+        )
+    }
+
     /// A workflow of the shape the rules read, meeting every one.
     fn good() -> String {
         let mut w = String::from(
@@ -934,6 +946,7 @@ mod rules {
                     w.push_str(&identity_step(name));
                 }
             }
+            w.push_str(&facts_step(platform));
             for name in &mine {
                 w.push_str(&format!(
                     "      - name: Package {name}\n        run: cargo xtask package --binary \"target/$TARGET/release/{name}\" --sbom s.json --platform {platform} --commit \"$GITHUB_SHA\" --out dist\n"
@@ -1860,5 +1873,6 @@ mod rules {
     }
 }
 
+mod facts;
 #[cfg(test)]
 mod installer;
