@@ -446,11 +446,13 @@ fn the_host_fetcher_looks_at_the_package_and_reports_the_source_the_file_names()
     let noticed = other.look(None);
     assert_eq!((noticed.source, noticed.seed), (Some("url"), Ok(None)));
 
-    // A file the closed reader refuses: no source, and the reason.
+    // A file the closed reader refuses: no source, and the reason. The reader never echoes the
+    // file's text, so the reason names the kind of fault, not the key.
     let noticed = seeded.host_fetcher("surprise = 1\n").look(None);
     assert_eq!(noticed.source, None);
     let why = noticed.seed.expect_err("refused").to_string();
-    assert!(why.contains("surprise"), "{why}");
+    assert!(why.contains("unknown field"), "{why}");
+    assert!(!why.contains("surprise"), "{why}");
 
     // A host that cannot supply its parts.
     let (layout, _) = host_root("host-fetcher-look-no-parts");
