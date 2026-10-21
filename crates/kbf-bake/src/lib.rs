@@ -16,7 +16,7 @@
 //! - [`cli`]: `kbf-bake run`, `sample`, `baseline` and `tag-message`.
 //!
 //! **Operator side only.** The evaluator reads the farm's metrics and must not run on a
-//! hosted runner; `crates/kbf-it/tests/repo_lints.rs` refuses its name under `.github/`.
+//! hosted runner; `crates/kbf-integration-test/tests/repo_lints.rs` refuses its name under `.github/`.
 //!
 //! **A green bake is blocked** on #951 (failed actions by class) and #954 (a boot counter
 //! and a membership gauge): the gates that read them find the series absent, and an absent

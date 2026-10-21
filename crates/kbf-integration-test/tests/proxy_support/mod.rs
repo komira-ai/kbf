@@ -244,8 +244,12 @@ pub fn frontend_args(storage: &str, base: u16) -> Vec<String> {
 pub fn proxy_config(
     dir: &Path,
     base: u16,
-) -> (kbf_proxy::config::ProxyConfig, kbf_it::pki::PkiFiles) {
-    let pki = kbf_it::pki::write(&dir.join("pki"), "soak-client").expect("certificates");
+) -> (
+    kbf_proxy::config::ProxyConfig,
+    kbf_integration_test::pki::PkiFiles,
+) {
+    let pki =
+        kbf_integration_test::pki::write(&dir.join("pki"), "soak-client").expect("certificates");
     let token = dir.join("operator.token");
     std::fs::write(&token, OPERATOR_TOKEN).expect("token");
     std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))

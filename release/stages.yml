@@ -1,5 +1,5 @@
 # The release stages, and which workflow job belongs to which. The workflow lint
-# (crates/kbf-it/tests/workflows/stages.rs) reads this file and refuses:
+# (crates/kbf-integration-test/tests/workflows/stages.rs) reads this file and refuses:
 # - a job row that names a stage this file does not list, and an `after` that names a stage
 #   not listed before it;
 # - an `actions` stage with no job, and a stage marked `planned` that has one (delete

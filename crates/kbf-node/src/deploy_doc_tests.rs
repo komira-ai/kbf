@@ -1,11 +1,11 @@
 //! The daemon units in `docs/deploy/*.md` against `kbf-daemon`'s flag parser. The
-//! server's units are checked in `kbf-it` (`tests/deploy_units.rs`); this half lives
+//! server's units are checked in `kbf-integration-test` (`tests/deploy_units.rs`); this half lives
 //! here because the daemon's command line, [`Cli`], is private to this binary.
 
 use std::path::Path;
 
 use clap::Parser as _;
-use kbf_it::deploy_units::{Unit, units};
+use kbf_integration_test::deploy_units::{Unit, units};
 
 use super::Cli;
 

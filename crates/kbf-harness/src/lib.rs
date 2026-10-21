@@ -16,12 +16,12 @@
 //! - [`b0`]: scenario B0, `farm_under_build_load`, and [`cli`], the command line of the
 //!   `kbf-beta` binary that runs it.
 //!
-//! To run B0 by hand, with the binaries built (`cargo build -p kbf-cli -p kbf-harness -p kbf-it
+//! To run B0 by hand, with the binaries built (`cargo build -p kbf-cli -p kbf-harness -p kbf-integration-test
 //! --bins`), and a pinned `buck2` (the beta workflow
 //! fetches it by checksum):
 //!
 //! ```text
-//! kbf-beta b0 --bin-dir target/debug --buck2 <buck2> --project crates/kbf-it/beta/buck2 \
+//! kbf-beta b0 --bin-dir target/debug --buck2 <buck2> --project crates/kbf-integration-test/beta/buck2 \
 //!     --work <a directory that does not exist yet> --duration-secs 60 --concurrency 2
 //! ```
 //!

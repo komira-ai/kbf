@@ -95,7 +95,7 @@ fn problems(files: &[(String, Vec<u8>)], allowed: &[(&str, usize, &str)]) -> Vec
     for (path, bytes) in files {
         if !path.starts_with("crates/")
             || !path.ends_with(".rs")
-            || path.starts_with("crates/kbf-it/tests/scratch_dirs/")
+            || path.starts_with("crates/kbf-integration-test/tests/scratch_dirs/")
         {
             continue;
         }
@@ -195,7 +195,7 @@ fn the_scan_finds_a_planted_join() {
             "std::env::temp_dir().join(\"a\")",
         ),
         (
-            "crates/kbf-it/tests/scratch_dirs/mod.rs",
+            "crates/kbf-integration-test/tests/scratch_dirs/mod.rs",
             "std::env::temp_dir().join(\"a\")",
         ),
     ] {

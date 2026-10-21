@@ -1,5 +1,5 @@
 [package]
-name = "kbf-it"
+name = "kbf-integration-test"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

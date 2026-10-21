@@ -1,7 +1,7 @@
-//! The M1 exit rule over build summaries (`kbf_it::summary`): the parsers for Bazel's
+//! The M1 exit rule over build summaries (`kbf_integration_test::summary`): the parsers for Bazel's
 //! and buck2's end-of-build lines, and the rule a first build and its rebuild must meet.
 
-use kbf_it::summary::{Spawns, SummaryError, Tool, check, check_logs, parse};
+use kbf_integration_test::summary::{Spawns, SummaryError, Tool, check, check_logs, parse};
 
 fn spawns(remote: u64, cached: u64, other: &[(&str, u64)]) -> Spawns {
     Spawns {

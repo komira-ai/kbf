@@ -7,7 +7,7 @@
 //! in it now, and it is still read so that `budget-diff` can compare against a base
 //! list that has it.
 //!
-//! [`parse`] reads the file; the repository lints (`crates/kbf-it/tests/repo_lints.rs`)
+//! [`parse`] reads the file; the repository lints (`crates/kbf-integration-test/tests/repo_lints.rs`)
 //! hold it against what the tree contains. [`new_rows`] is `cargo xtask budget-diff`:
 //! the list may only shrink, so a row a change adds is refused, whatever its file is.
 //! One exception is a section the base list has no header for: the change that

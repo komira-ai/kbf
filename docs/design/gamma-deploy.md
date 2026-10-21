@@ -331,6 +331,6 @@ instance name is empty. The blob stays in the store until eviction.
   real run ends `postcheck_failed`, exit 1, and a gamma host stays inert.
 - A run of the whole deploy against the real proxy and the real children. The deploy's tests
   play the API (a fake that answers with the API's own types, served over TLS from a test CA).
-  The client's transport is proved against the real proxy by `crates/kbf-it/tests/deploy_through_proxy.rs`
+  The client's transport is proved against the real proxy by `crates/kbf-integration-test/tests/deploy_through_proxy.rs`
   (the update route, the forwarded `/v1/*` calls, a three MiB upload, a wrong token); the run
   of the steps with the real proxy waits for the update API to be served on the proxy's update route.

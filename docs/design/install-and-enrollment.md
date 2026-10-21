@@ -621,7 +621,7 @@ Each test names the defect it catches and the mutant that turns it red. The bar 
 | `kbf` CLI | no positional argument or subcommand is accepted on a new form; `--mode` overrides `mode` in the file; `--mode=node` is refused; the shipped units' `ExecStart` lines parse under `kbf --check` for every mode | a unit the binary rejects, a flag that does not override | let the file win over the flag |
 | repo lint | the package's maintainer scripts contain only calls to `kbf-installer quiesce` | logic creeping back into shell | add a `useradd` to a script |
 
-### 10.2 The hermetic enrollment test (B3 and B4 together, in `kbf-it`)
+### 10.2 The hermetic enrollment test (B3 and B4 together, in `kbf-integration-test`)
 
 In one process: SQLite state store on a temp file with a `ManualClock`; the real `Enroll` service on a loopback `--enroll-listen` with a `kbf-ca` CA; the real node client from `kbf-enroll` with a `kbf.toml` in a scratch root. It then:
 

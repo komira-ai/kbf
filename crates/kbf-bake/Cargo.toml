@@ -11,9 +11,9 @@ publish.workspace = true
 # scrapes the farm's metrics endpoint, keeps the bake's clock in a state file so a restart
 # does not restart it, decides the gates of the table (src/table.rs, which a test holds equal
 # to the page's table) and writes `gamma-verdict.json` in the shape kbf-gate defines. It
-# runs on the operator's side, never in a GitHub Actions job (crates/kbf-it/tests/
+# runs on the operator's side, never in a GitHub Actions job (crates/kbf-integration-test/tests/
 # repo_lints.rs refuses its name under .github/). Its only kbf dependency is kbf-gate, and
-# it links no async runtime (crates/kbf-it/tests/layering.rs).
+# it links no async runtime (crates/kbf-integration-test/tests/layering.rs).
 [[bin]]
 name = "kbf-bake"
 path = "src/main.rs"

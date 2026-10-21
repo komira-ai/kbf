@@ -40,7 +40,7 @@ clap.workspace = true
 flate2.workspace = true
 kbf-deploy.workspace = true
 # The Buck2 summary line parser (`Commands: N (cached: N, remote: N, local: N)`).
-kbf-it.workspace = true
+kbf-integration-test.workspace = true
 kbf-testkit.workspace = true
 kbf-transfer.workspace = true
 libc.workspace = true

@@ -1,5 +1,5 @@
 # The pull-request gate: two jobs, `lint` and `test`. GitHub-hosted runners only; the repository
-# lints in crates/kbf-it/tests/repo_lints.rs hold every workflow to that, to commit-SHA pinned
+# lints in crates/kbf-integration-test/tests/repo_lints.rs hold every workflow to that, to commit-SHA pinned
 # actions from the set the repository's Actions policy allows (actions/* and
 # tailscale/github-action), and to a top-level `permissions: {}`.
 #
@@ -83,7 +83,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: cargo xtask release main-control --repo "$GITHUB_REPOSITORY" --on-main "$BASE_SHA" --off-main "$GITHUB_SHA"
-      - run: cargo test -p kbf-it --locked --test repo_lints
+      - run: cargo test -p kbf-integration-test --locked --test repo_lints
         if: ${{ !cancelled() }}
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}

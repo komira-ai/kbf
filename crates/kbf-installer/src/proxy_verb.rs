@@ -36,7 +36,7 @@
 //! quoted, logged or passed in an argument vector.
 //!
 //! This module and the root helper (`helper/`, `run.rs`) share a binary and nothing else:
-//! `kbf-it`'s layering test fails if the root half ever names `kbf_proxy` or this module.
+//! `kbf-integration-test`'s layering test fails if the root half ever names `kbf_proxy` or this module.
 //!
 //! The only environment variables read are the service manager's socket-activation markers,
 //! `LISTEN_PID` and `LISTEN_FDS`; everything else is the `[proxy]` table.
