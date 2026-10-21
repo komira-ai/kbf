@@ -1,136 +1,226 @@
-//! The units `kbf-deploy linux render-units --mode` writes, against this binary's own
-//! parser, in-process: each mode's rendered `ExecStart=` is a command line `kbf` takes,
-//! for the mode the unit is named after, and kbf-deploy renders exactly kbf's modes;
-//! and a flag an operator adds to a unit that kbf refuses is refused by that parser.
+//! The units kbf ships (`packaging/linux/units/`, installed by kbf-installer) against this
+//! binary's own parser, in-process, with the `kbf.toml` each mode is started with: the
+//! package's unit is `kbf --mode=<mode>` and nothing else, every setting is the file's.
+//! The file is the one `kbf-installer setup` writes for the mode
+//! (`kbf-installer/tests/golden/kbf_toml`), or, for a storage node an operator wrote by
+//! hand, the stores and certificates in a file of its own.
+//!
+//! Where a defect class is already caught elsewhere, the test is named here, not
+//! repeated: the files of the package are exactly kbf's modes
+//! (`package_units.rs::the_package_has_a_unit_for_each_kbf_mode`), each unit's `--check`
+//! and start lines parse (`package_units.rs`), a key kbf refuses in `kbf.toml` is refused
+//! naming the key and the file (`config_file.rs::an_unknown_key_is_refused_naming_the_key_and_the_file`),
+//! every key `setup` writes is a real flag of its table
+//! (`kbf-installer`'s `kbf_settings_tests`), and the preflight accepts a metadata log
+//! under the node's data root for a storage-and-daemon node
+//! (`preflight/tests.rs::a_storage_and_daemon_node_with_its_meta_dir_under_its_data_dir_passes`).
 
-use kbf_cli::{Invocation, parse_from};
-use kbf_deploy::linux::modes::render;
-use kbf_deploy::linux::{LinuxConfig, Mode};
+use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+
+use kbf_cli::names::MODES;
+use kbf_cli::{Invocation, parse_with};
+use kbf_testkit::dir::TestDir;
 use kbf_unitfile::UnitFile;
 
-const EXAMPLE: &str = include_str!("../../kbf-deploy/templates/linux/config.example");
+/// The program every packaged unit runs: the release `kbf-installer` flipped to.
+const PROGRAM: &str = "/var/lib/kbf-installer/releases/current/kbf";
 
-/// The example settings with one pinned image, so the image flags render too.
-fn config() -> LinuxConfig {
-    let image = format!("docker.io/library/busybox@sha256:{}", "a".repeat(64));
-    let text = EXAMPLE.replace("KBF_IMAGES=\n", &format!("KBF_IMAGES={image}\n"));
-    assert_ne!(
-        text, EXAMPLE,
-        "config.example has no empty KBF_IMAGES= line"
-    );
-    LinuxConfig::parse(&text).expect("valid settings")
+/// The `kbf.toml` `kbf-installer setup` writes for `mode`.
+fn setup_file(mode: &str) -> &'static str {
+    match mode {
+        "all-in-one" => {
+            include_str!("../../kbf-installer/tests/golden/kbf_toml/all-in-one.toml")
+        }
+        "daemon" => include_str!("../../kbf-installer/tests/golden/kbf_toml/daemon.toml"),
+        "frontend" => include_str!("../../kbf-installer/tests/golden/kbf_toml/frontend.toml"),
+        "storage" => include_str!("../../kbf-installer/tests/golden/kbf_toml/storage.toml"),
+        "storage-and-daemon" => {
+            include_str!("../../kbf-installer/tests/golden/kbf_toml/storage-and-daemon.toml")
+        }
+        other => panic!("no setup file for the mode {other}"),
+    }
 }
 
-/// Catches a mode unit naming a flag `kbf <mode>` does not take or refuses as another
-/// mode's (a store flag in the daemon's unit, `--cas` in the all-in-one's), a value
-/// its parser refuses, and a unit that starts another mode than its name says.
+/// A `storage` node an operator configured by hand, without enrollment: its listener,
+/// certificates and stores are the file's, as the unit the package ships gives none.
+const STORAGE_BY_HAND: &str = "\
+[listener]
+storage-listen = \"192.0.2.10:8983\"
+
+[tls]
+storage-tls-cert = \"/etc/kbf/storage.pem\"
+storage-tls-key = \"/etc/kbf/storage.key\"
+storage-client-ca = \"/etc/kbf/ca.pem\"
+
+[stores]
+cold-store = \"file:///var/lib/kbf-server/cold\"
+hot-store = \"file:///var/lib/kbf-server/hot\"
+meta-dir = \"/var/lib/kbf-server/raft\"
+";
+
+/// The packaged unit file `name`, parsed.
+fn unit(name: &str) -> UnitFile {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../packaging/linux/units")
+        .join(name);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+    UnitFile::parse(&text).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// The words after the program of the unit's `ExecStart=`, asserting the program is the
+/// installer's current release. The plain frontend unit names the host's file
+/// (`--config /etc/kbf/kbf.toml`); that pair is dropped, as the test gives its own.
+fn start_words(unit: &UnitFile, name: &str) -> Vec<String> {
+    let argv = unit.exec_start();
+    assert_eq!(argv.first().copied(), Some(PROGRAM), "{name}: {argv:?}");
+    let mut words = Vec::new();
+    let mut rest = argv[1..].iter();
+    while let Some(w) = rest.next() {
+        if *w == "--config" {
+            assert_eq!(rest.next().copied(), Some("/etc/kbf/kbf.toml"), "{name}");
+        } else {
+            words.push((*w).to_owned());
+        }
+    }
+    words
+}
+
+/// `kbf`'s argv for these words and the file the host's `/etc/kbf/kbf.toml` stands for.
+fn argv(words: &[String], config: &Path) -> Vec<OsString> {
+    let mut out: Vec<OsString> = vec!["kbf".into()];
+    out.extend(words.iter().map(OsString::from));
+    out.extend(["--config".into(), config.into()]);
+    out
+}
+
+/// `text` as `kbf.toml` in `dir`, mode 0600 as `setup` leaves it.
+fn write_config(dir: &Path, text: &str) -> PathBuf {
+    let path = dir.join("kbf.toml");
+    std::fs::write(&path, text).expect("write");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    path
+}
+
+/// The database `setup` writes for a host that keeps its state in Postgres, as kbf's own
+/// URI parser reads it: the socket of the OS package, the role of the server user, no password.
+fn setup_state_store() -> kbf_server::StateStoreUri {
+    "postgres:///kbf?host=/run/postgresql&user=kbf-server"
+        .parse()
+        .expect("a store URI")
+}
+
+fn paths(p: [PathBuf; 3]) -> [String; 3] {
+    p.map(|p| p.display().to_string())
+}
+
+/// Catches a packaged unit that starts another mode than its file is named after (a
+/// `--mode=daemon` in `kbf-storage.service`), a unit that gives kbf a flag of its own (the
+/// settings are the file's), and a `kbf.toml` that `setup` writes whose values kbf reads
+/// as other settings than the ones written. Each mode's unit and its setup file are read
+/// by kbf's own parser: the frontend and the all-in-one resolve to their flags (listeners,
+/// certificates toward storage, token file and the Postgres state store as the file
+/// spells them, no handover flag, which a Postgres store refuses), and the three modes
+/// that enroll resolve to a start of the mode the unit names, on the file.
 #[test]
-fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
-    let c = config();
-    for mode in Mode::ALL {
-        let text = render(&c, Some(1500), mode).expect("renders");
-        let unit = UnitFile::parse(&text).expect("a unit");
-        let argv = unit.exec_start();
-        assert_eq!(argv[..2], ["/usr/local/bin/kbf", mode.name()], "{mode}");
-        let parsed = match parse_from(argv.iter().copied()) {
+fn each_packaged_mode_unit_starts_its_own_mode_on_the_kbf_toml_setup_writes() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "packaged-mode-units");
+    for mode in MODES {
+        let name = format!("kbf-{}.service", mode.name);
+        let words = start_words(&unit(&name), &name);
+        assert_eq!(words, [format!("--mode={}", mode.name)], "{name}");
+        let config = write_config(dir.path(), setup_file(mode.name));
+        let parsed = match parse_with(argv(&words, &config), None) {
             Ok(parsed) => parsed,
-            Err(e) => panic!("kbf {mode} refuses its rendered ExecStart= {argv:?}:\n{e}"),
+            Err(e) => panic!("kbf {} refuses {name} on its setup file:\n{e}", mode.name),
         };
-        match parsed {
-            Invocation::Daemon(_) => assert_eq!(mode, Mode::Daemon),
-            Invocation::AllInOne(flags) => {
-                assert_eq!(mode, Mode::AllInOne);
-                assert_eq!(
-                    flags.server.api_token_file.as_deref(),
-                    Some(std::path::Path::new("/etc/kbf/api-token"))
-                );
-            }
+        assert!(!parsed.check, "{name} is a start");
+        match parsed.invocation {
             Invocation::Frontend(flags) => {
-                assert_eq!(mode, Mode::Frontend);
-                // The unit's storage URL and the three flags toward it are read as the
-                // settings spell them: mutual TLS with the frontend's worker certificate.
-                assert_eq!(flags.storage.uri().to_string(), "https://192.0.2.20:8983/");
-                let paths = flags
-                    .tls
-                    .expect("the frontend unit turns on mutual TLS to storage");
+                assert_eq!(mode.name, "frontend");
                 assert_eq!(
-                    paths.map(|p| p.display().to_string()),
+                    flags.storage.uri().to_string(),
+                    "https://storage.example:8983/"
+                );
+                let tls = flags.tls.expect("mutual TLS toward storage");
+                assert_eq!(
+                    paths(tls),
                     [
                         "/etc/kbf/worker.pem",
                         "/etc/kbf/worker.key",
                         "/etc/kbf/ca.pem"
                     ]
                 );
-                assert_eq!(flags.server.listen.to_string(), "192.0.2.10:8980");
-                assert_eq!(flags.server.worker_listen.to_string(), "192.0.2.10:8981");
+                assert_eq!(flags.server.listen.to_string(), "0.0.0.0:8980");
+                assert_eq!(flags.server.worker_listen.to_string(), "0.0.0.0:8981");
                 assert_eq!(
                     flags.server.api_listen.map(|a| a.to_string()).as_deref(),
                     Some("127.0.0.1:8982")
                 );
-                // The operator API's token is the file the unit names, so a write is not 401.
+                // The operator API's token is the file the setup names, so a write is not 401.
                 assert_eq!(
                     flags.server.api_token_file.as_deref(),
-                    Some(std::path::Path::new("/etc/kbf/api-token"))
+                    Some(Path::new("/etc/kbf/api-token"))
                 );
-                // The state store is the Postgres of the settings (the example's is the
-                // host's socket), read by kbf's own URI parser: a password-free URI.
-                assert_eq!(
-                    flags.server.state_store,
-                    Some(kbf_server::StateStoreUri::local_postgres())
-                );
-                // `kbf frontend` refuses a Postgres store together with a control socket
-                // (a start would exit 2), so the unit gives none.
+                assert_eq!(flags.server.state_store, Some(setup_state_store()));
+                // `kbf frontend` refuses a Postgres store with a control socket.
                 assert!(
                     flags.handover.is_none(),
-                    "the postgres unit gives a handover flag"
+                    "the postgres file gives a handover"
                 );
             }
-            Invocation::Registered(_) => {
-                panic!("{mode}: a rendered unit gives flags, so it is not a start that enrolls")
-            }
-            Invocation::Storage(flags) => {
-                assert_eq!(mode, Mode::Storage);
-                // The unit's certificate flags are read as the paths they spell (not
-                // dropped, and not another flag's), so the node starts with mutual TLS.
-                let paths = flags.tls.expect("the storage unit turns on mutual TLS");
+            Invocation::AllInOne(flags) => {
+                assert_eq!(mode.name, "all-in-one");
                 assert_eq!(
-                    paths.map(|p| p.display().to_string()),
-                    [
-                        "/etc/kbf/storage.pem",
-                        "/etc/kbf/storage.key",
-                        "/etc/kbf/ca.pem"
-                    ]
+                    flags.server.api_token_file.as_deref(),
+                    Some(Path::new("/etc/kbf/api-token"))
                 );
-                // Its stores and listener are the settings', read as kbf reads them:
-                // the bucket, the hot store and the metadata log, on the pinned address.
-                assert_eq!(flags.listen.to_string(), "192.0.2.10:8983");
+                assert_eq!(flags.server.state_store, Some(setup_state_store()));
                 assert_eq!(
                     flags.server.meta_dir.as_deref(),
-                    Some(std::path::Path::new("/var/lib/kbf-server/raft"))
+                    Some(Path::new("/var/lib/kbf-meta"))
                 );
                 assert!(flags.server.cold_store.is_some(), "no cold store");
-                assert!(flags.server.hot_store.is_some(), "no hot store");
             }
-            Invocation::StorageAndDaemon(flags) => {
-                assert_eq!(mode, Mode::StorageAndDaemon);
-                // The storage half's certificate flags are read as the storage unit's
-                // are, and the daemon half's are its own.
-                let paths = flags
-                    .storage
-                    .tls
-                    .expect("the storage half turns on mutual TLS");
-                assert_eq!(
-                    paths.map(|p| p.display().to_string()),
-                    [
-                        "/etc/kbf/storage.pem",
-                        "/etc/kbf/storage.key",
-                        "/etc/kbf/ca.pem"
-                    ]
-                );
-                assert!(format!("{:?}", flags.daemon).contains("/etc/kbf/node.pem"));
+            Invocation::Registered(start) => {
+                assert_eq!(start.mode, Some(mode.name), "{name} starts another mode");
+                assert_eq!(start.config, config);
+                assert!(!start.check);
             }
+            other => panic!("{name} on its setup file is {other:?}"),
         }
     }
+}
+
+/// Catches the storage unit's settings read as others, or dropped, for a node an operator
+/// configured by hand: the certificate flags are read as the paths they spell (not
+/// dropped, and not another flag's), so the node serves with mutual TLS, and its
+/// listener, hot and cold stores and metadata log are the file's.
+#[test]
+fn the_storage_unit_reads_a_hand_written_kbf_toml_for_its_certificates_and_stores() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "packaged-storage-by-hand");
+    let words = start_words(&unit("kbf-storage.service"), "kbf-storage.service");
+    let config = write_config(dir.path(), STORAGE_BY_HAND);
+    let flags = match parse_with(argv(&words, &config), None).map(|p| p.invocation) {
+        Ok(Invocation::Storage(flags)) => flags,
+        other => panic!("not kbf storage: {other:?}"),
+    };
+    assert_eq!(
+        paths(flags.tls.expect("the file turns on mutual TLS")),
+        [
+            "/etc/kbf/storage.pem",
+            "/etc/kbf/storage.key",
+            "/etc/kbf/ca.pem"
+        ]
+    );
+    assert_eq!(flags.listen.to_string(), "192.0.2.10:8983");
+    assert_eq!(
+        flags.server.meta_dir.as_deref(),
+        Some(Path::new("/var/lib/kbf-server/raft"))
+    );
+    assert!(flags.server.cold_store.is_some(), "no cold store");
+    assert!(flags.server.hot_store.is_some(), "no hot store");
 }
 
 /// A host where every path exists as a file and a directory alike, empty and mode 0600.
@@ -171,24 +261,41 @@ impl kbf_cli::preflight::Host for EverythingExists {
     }
 }
 
-/// Catches a startup preflight rule refusing a layout `kbf-deploy` renders: every mode
-/// unit, with the settings' default metadata directory and with the test farm's (the
-/// metadata log under the node's own data root), is read by `kbf <mode>`'s own parser and
-/// checked against a host where every file exists. The files may still fail their own
-/// checks (these are empty); no problem may be about the two directories.
+/// Catches a startup preflight rule refusing a layout the package's files give: each
+/// packaged unit with its setup file (and the by-hand storage file), with the file's
+/// metadata directory and with the test farm's (the metadata log under the node's own data
+/// root), is read by `kbf`'s own parser and checked against a host where every file
+/// exists. The files may still fail their own checks (these are empty); no problem may be
+/// about the two directories.
 #[test]
-fn no_rendered_mode_unit_is_refused_over_where_its_directories_are() {
-    let farm = EXAMPLE.replace(
-        "KBF_META_DIR=/var/lib/kbf-server/raft",
-        "KBF_META_DIR=/var/lib/kbf/av2-meta",
-    );
-    assert_ne!(farm, EXAMPLE, "config.example moved KBF_META_DIR");
-    for text in [EXAMPLE.to_owned(), farm] {
-        let c = LinuxConfig::parse(&text).expect("valid settings");
-        for mode in Mode::ALL {
-            let unit = render(&c, Some(1500), mode).expect("renders");
-            let unit = UnitFile::parse(&unit).expect("a unit");
-            let invocation = parse_from(unit.exec_start().iter().copied()).expect("parses");
+fn no_packaged_unit_is_refused_over_where_its_directories_are() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "packaged-unit-preflight");
+    let mut cases: Vec<(&str, String)> = MODES
+        .iter()
+        .map(|m| (m.name, setup_file(m.name).to_owned()))
+        .collect();
+    cases.push(("storage", STORAGE_BY_HAND.to_owned()));
+    let mut moved = 0;
+    for (mode, text) in cases {
+        let farm = text
+            .lines()
+            .map(|l| {
+                if l.starts_with("meta-dir = ") {
+                    moved += 1;
+                    "meta-dir = \"/var/lib/kbf/av2-meta\""
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for text in [text.clone(), farm] {
+            let name = format!("kbf-{mode}.service");
+            let words = start_words(&unit(&name), &name);
+            let config = write_config(dir.path(), &text);
+            let invocation = parse_with(argv(&words, &config), None)
+                .unwrap_or_else(|e| panic!("{name}: {e}"))
+                .invocation;
             let needs = kbf_cli::preflight::needs(&invocation);
             let report = kbf_cli::preflight::check(&needs, &EverythingExists);
             let text = report.render(needs.mode);
@@ -198,42 +305,7 @@ fn no_rendered_mode_unit_is_refused_over_where_its_directories_are() {
             );
         }
     }
-}
-
-/// The all-in-one unit names the SQLite file `state.db` in its `--data-dir` as its
-/// `--state-store`, and kbf all-in-one, parsing the rendered command line, takes that file:
-/// kbf's own default is Postgres, so a unit that left the flag out would change store when
-/// its binary is replaced. One rule `state-store` passes. Catches the unit leaving the
-/// flag out (the farm would need Postgres at its next restart), or naming a file outside
-/// the data directory.
-#[test]
-fn the_all_in_one_unit_names_its_sqlite_state_file_in_the_data_directory() {
-    let text = render(&config(), Some(1500), Mode::AllInOne).expect("renders");
-    let unit = UnitFile::parse(&text).expect("a unit");
-    let argv = unit.exec_start();
-    let data_dir = argv
-        .iter()
-        .find_map(|a| a.strip_prefix("--data-dir="))
-        .expect("the all-in-one unit gives --data-dir");
-    let stores: Vec<&&str> = argv
-        .iter()
-        .filter(|a| a.starts_with("--state-store"))
-        .collect();
-    assert_eq!(
-        stores,
-        [&format!("--state-store=sqlite://{data_dir}/state.db").as_str()],
-        "{argv:?}"
-    );
-    match parse_from(argv.iter().copied()) {
-        Ok(Invocation::AllInOne(flags)) => assert_eq!(
-            flags.server.state_store,
-            Some(kbf_server::StateStoreUri::Sqlite(
-                std::path::Path::new(data_dir).join("state.db")
-            ))
-        ),
-        Ok(_) => panic!("not the all-in-one"),
-        Err(e) => panic!("kbf all-in-one refuses its rendered unit: {e}"),
-    }
+    assert!(moved >= 2, "no setup file names a metadata directory");
 }
 
 /// A certificate made for each row of the farm's certificate table, as the farm's
@@ -306,66 +378,34 @@ fn each_rows_certificate_names_its_role_as_storage_reads_it() {
     }
 }
 
-/// Catches kbf-deploy rendering a mode kbf does not have (a sixth, or an old name),
-/// missing one kbf has, and listing them in another order than `kbf --help`.
+/// Catches `kbf` taking a flag an operator added to a packaged unit's `ExecStart=` that it
+/// refuses: an unknown flag, a store flag in the daemon's unit (a build node holds no
+/// store), and another mode's flag in the storage unit. The words with that flag are
+/// refused by kbf's own parser, in-process, with the message `kbf --mode=<mode> --check`
+/// prints; the unedited words parse (above).
 #[test]
-fn kbf_deploy_renders_exactly_the_modes_kbf_takes() {
-    let kbf = kbf_cli::command();
-    let help: Vec<&str> = kbf.get_subcommands().map(clap::Command::get_name).collect();
-    let deploy: Vec<&str> = Mode::ALL.iter().map(|m| m.name()).collect();
-    assert_eq!(deploy, help);
-}
-
-/// Catches `kbf` taking a flag an operator added to a rendered unit that it refuses: an
-/// unknown flag, a store flag in the daemon's unit (a build node holds no store), and
-/// another mode's flag in the storage unit. The unit's `ExecStart=` words with that flag
-/// are refused by kbf's own parser, in-process, with the message `kbf <mode> --check`
-/// prints; the unedited words parse. `kbf-deploy linux check-units --mode` used to ask
-/// this of `kbf check-args` on the host.
-#[test]
-fn a_rendered_unit_edited_with_a_flag_kbf_refuses_is_refused_by_its_parser() {
-    let c = config();
-    let exec_start = |mode: Mode, edit: &dyn Fn(&str) -> String| -> Vec<String> {
-        let text = render(&c, Some(1500), mode).expect("renders");
-        let edited = edit(&text);
-        let unit = UnitFile::parse(&edited).expect("a unit");
-        unit.exec_start().iter().map(|w| (*w).to_owned()).collect()
+fn a_packaged_unit_edited_with_a_flag_kbf_refuses_is_refused_by_its_parser() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "packaged-unit-edited");
+    let refused = |mode: &str, flag: &str| {
+        let name = format!("kbf-{mode}.service");
+        let mut words = start_words(&unit(&name), &name);
+        words.push(flag.to_owned());
+        let config = write_config(dir.path(), setup_file(mode));
+        parse_with(argv(&words, &config), None).expect_err(flag)
     };
-    let same = |t: &str| t.to_owned();
-    for mode in Mode::ALL {
-        let argv = exec_start(mode, &same);
-        parse_from(&argv).unwrap_or_else(|e| panic!("{mode}: {e}"));
-    }
-    let daemon = |flag: &'static str| {
-        move |t: &str| {
-            let edited = t.replace("--driver=container", &format!("--driver=container {flag}"));
-            assert_ne!(edited, t);
-            edited
-        }
-    };
-    let e = parse_from(exec_start(Mode::Daemon, &daemon("--bogus-flag")))
-        .expect_err("an unknown flag is refused");
+    let e = refused("daemon", "--bogus-flag");
     assert!(
         e.to_string().contains("unexpected argument '--bogus-flag'"),
         "{e}"
     );
     assert_eq!(e.exit_code(), 2);
-    let e = parse_from(exec_start(Mode::Daemon, &daemon("--cold-store=file:///x")))
-        .expect_err("a build node holds no store");
+    let e = refused("daemon", "--cold-store=file:///x");
     assert!(
         e.to_string().contains("kbf daemon refuses --cold-store"),
         "{e}"
     );
     assert_eq!(e.exit_code(), 2);
-    let worker = |t: &str| {
-        let edited = t.replace(
-            "--meta-dir=",
-            "--worker-listen=192.0.2.10:8981 \\\n    --meta-dir=",
-        );
-        assert_ne!(edited, t);
-        edited
-    };
-    let e = parse_from(exec_start(Mode::Storage, &worker)).expect_err("refused by name");
+    let e = refused("storage", "--worker-listen=192.0.2.10:8981");
     assert!(
         e.to_string()
             .contains("kbf storage refuses --worker-listen"),
@@ -373,17 +413,41 @@ fn a_rendered_unit_edited_with_a_flag_kbf_refuses_is_refused_by_its_parser() {
     );
 }
 
-/// Catches `kbf frontend handover` starting instances the unit template does not have:
-/// kbf-cli spells the template's name and instances itself (kbf-deploy is a dev-dependency
-/// only), and the two must be the same words.
+/// Catches `kbf frontend handover` starting instances the packaged template does not
+/// have: kbf-cli spells the template's name and instances itself, and the package's must
+/// be the same words. The template file is `<TEMPLATE>@.service` and its name is the
+/// frontend mode's; its default instance is the first one a start with none up picks; its
+/// start line, for each instance, is a command line kbf's parser takes (the file, with
+/// the handover socket, stands for the frontend's settings).
 #[test]
 fn the_handover_command_starts_the_instances_of_the_frontends_template() {
     use kbf_cli::handover::{INSTANCES, TEMPLATE};
-    let instances: Vec<String> = INSTANCES
-        .iter()
-        .map(|i| format!("{TEMPLATE}@{i}.service"))
-        .collect();
-    assert_eq!(instances, Mode::Frontend.instances());
-    assert_eq!(Mode::Frontend.unit_name(), format!("{TEMPLATE}@.service"));
-    assert_eq!(TEMPLATE, format!("kbf-{}", Mode::Frontend.name()));
+    assert_eq!(TEMPLATE, "kbf-frontend");
+    let template = unit(&format!("{TEMPLATE}@.service"));
+    assert_eq!(
+        template.get_in("Install", "DefaultInstance"),
+        Some(INSTANCES[0])
+    );
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "packaged-handover");
+    // A Postgres store refuses a control socket, so the file stands for a frontend with
+    // the storage URL alone.
+    let config = write_config(
+        dir.path(),
+        "[storage-client]\nstorage = \"http://127.0.0.1:1\"\n\n[scheduler]\nstate-store = \"postgres:///kbf?host=/run/postgresql&user=kbf-server\"\n",
+    );
+    for instance in INSTANCES {
+        let argv = template.exec_start();
+        let words: Vec<String> = argv[1..]
+            .iter()
+            .map(|w| w.replace("%i", instance))
+            .collect();
+        assert!(
+            words.contains(&format!("--instance={instance}")),
+            "{instance}: {words:?}"
+        );
+        match parse_with(self::argv(&words, &config), None).map(|p| p.invocation) {
+            Ok(Invocation::Frontend(flags)) => assert!(flags.handover.is_some()),
+            other => panic!("{instance}: not the frontend: {other:?}"),
+        }
+    }
 }

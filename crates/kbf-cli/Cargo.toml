@@ -90,15 +90,14 @@ postgres.workspace = true
 # kbf-driver-container's, under the Linux-only section at the end.
 kbf-testkit.workspace = true
 prost.workspace = true
-# The units `kbf-deploy linux render-units --mode` writes, parsed with kbf's own
-# parser (tests/deploy_units.rs).
-kbf-deploy.workspace = true
-# The certificate checks (`kbf_ca::verify_cert`) those tests run.
+# The certificate checks (`kbf_ca::verify_cert`) of tests/deploy_units.rs.
 kbf-ca.workspace = true
+# The packaged units (`packaging/linux/units`) parsed with kbf's own parser
+# (tests/deploy_units.rs, tests/package_units.rs).
 kbf-unitfile.workspace = true
-# Certificates made as the farm's issuer makes them, checked by `kbf-deploy linux
-# verify-cert` and read back with the storage node's own role check
-# (tests/deploy_units.rs), and the node's certificates (tests/storage_and_daemon.rs).
+# Certificates made as the farm's issuer makes them, checked by `kbf_ca::verify_cert` and
+# read back with the storage node's own role check (tests/deploy_units.rs), and the node's
+# certificates (tests/storage_and_daemon.rs).
 rcgen = { workspace = true, features = ["x509-parser"] }
 # The in-process frontend of kbf-enroll's tests (tests/node.rs includes it): its
 # certificate authority (the role check of its worker listener is kbf-peer's, above).

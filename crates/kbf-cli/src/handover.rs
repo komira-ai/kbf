@@ -31,7 +31,7 @@ use std::time::Duration;
 use clap::Args;
 
 /// The instances of `kbf-frontend@.service`, in the order a start with none up picks
-/// (`kbf-deploy`'s `FRONTEND_INSTANCES`; its tests hold the two equal).
+/// (the packaged `kbf-frontend@.service`; `tests/deploy_units.rs` holds the two equal).
 pub const INSTANCES: [&str; 2] = ["a", "b"];
 
 /// The template's name before the `@`.
