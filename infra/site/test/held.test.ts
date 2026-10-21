@@ -168,6 +168,27 @@ describe('dry run', () => {
     for (const c of withBody) expect(c.args.slice(-2)).toEqual(['--input', '-']);
     for (const c of f.calls.filter((x) => x.kind === 'stream' && x.input === undefined)) expect(c.args).not.toContain('--input');
   });
+  // Catches: a re-run that leaves an environment the bodiless PUT created with GitHub's defaults (admins may bypass,
+  // no reviewer, no branch policy, so its policy list is a 404). That is the state the first real --apply left; the
+  // re-run must PUT prod again with the full body, and only then add its two branch policies.
+  test('github --apply repairs a prod that exists with GitHub defaults: full PUT first, then both branch policies', () => {
+    const DEFAULTS = JSON.stringify({ name: 'prod', can_admins_bypass: true, protection_rules: [], deployment_branch_policy: null });
+    const f = fake(answers({ 'environments/prod/deployment-branch-policies': NOT_FOUND, 'environments/prod': DEFAULTS }));
+    main([...GH, '--apply'], f.t);
+    const streamed = f.calls.filter((c) => c.kind === 'stream');
+    const put = streamed.findIndex((c) => c.args.includes(`repos/${REPO}/environments/prod`));
+    expect(put).toBeGreaterThanOrEqual(0);
+    expect(streamed[put].args.slice(-2)).toEqual(['--input', '-']);
+    expect(JSON.parse(streamed[put].input!)).toEqual({
+      reviewers: [{ type: 'User', id: REVIEWER_ID }],
+      prevent_self_review: false,
+      can_admins_bypass: false,
+      deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
+    });
+    const posts = streamed.map((c, i) => [i, c.args.join(' ')] as const).filter(([, a]) => a.includes('environments/prod/deployment-branch-policies'));
+    expect(posts.map(([, a]) => a.match(/name=(\S+) -f type=(\S+)/)!.slice(1).join('/'))).toEqual(['main/branch', 'v*/tag']);
+    for (const [i] of posts) expect(i).toBeGreaterThan(put);
+  });
   test('github --apply is idempotent: with everything present only the (idempotent) sub template is written', () => {
     const f = fake(answers());
     main([...GH, '--apply'], f.t);
