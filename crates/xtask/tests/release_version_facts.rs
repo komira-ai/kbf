@@ -90,7 +90,7 @@ fn run(f: &Fx, commit: &str, platform: &str) -> Ran {
 }
 
 /// `cargo xtask <args>`.
-fn xtask(args: &[&str]) -> Ran {
+fn cargo_xtask(args: &[&str]) -> Ran {
     let out = Command::new(XTASK)
         .args(args)
         .env_remove("XTASK_FAKE_DEFECT")
@@ -138,7 +138,7 @@ fn it_keeps_the_exact_bytes_under_the_name_of_the_tarball_and_lists_them() {
         "--out",
         s(&f.out),
     ];
-    let (code, _, err) = xtask(&package);
+    let (code, _, err) = cargo_xtask(&package);
     assert_eq!(code, Some(0), "{err}");
     let listed = names(&f.out);
     let tarball = listed.iter().find(|n| n.ends_with(".tar.gz"));
@@ -153,9 +153,9 @@ fn it_keeps_the_exact_bytes_under_the_name_of_the_tarball_and_lists_them() {
     let sums = f.out.join("SHA256SUMS.linux-x86_64");
     let part = std::fs::read_to_string(&sums).expect("the platform's sums");
     assert!(part.starts_with(&format!("{sha}  {facts}\n")), "{part}");
-    let (code, _, err) = xtask(&["sums", "assemble", s(&f.out)]);
+    let (code, _, err) = cargo_xtask(&["sums", "assemble", s(&f.out)]);
     assert_eq!(code, Some(0), "{err}");
-    let (code, checked, err) = xtask(&["verify-assets", "sums", s(&f.out)]);
+    let (code, checked, err) = cargo_xtask(&["verify-assets", "sums", s(&f.out)]);
     assert_eq!(code, Some(0), "{err}");
     let want = "sums: 3 files match; the flipped copy does not\n";
     assert_eq!(checked, want);
