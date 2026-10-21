@@ -58,11 +58,10 @@ pub fn asked(args: &[OsString]) -> bool {
 }
 
 /// The number of commits behind the commit this binary was built from, or 0 when the build
-/// could not count them: `build.rs` embeds it, by the rule in `src/build_seq.rs`.
+/// could not count them: [`kbf_server::BUILD_SEQ`], which the server's `build.rs` embeds.
 #[must_use]
 pub fn build_seq() -> u64 {
-    // `build.rs` embeds decimal digits; 0, "not known", if that ever fails to read.
-    env!("KBF_BUILD_SEQ").parse().unwrap_or(0)
+    kbf_server::BUILD_SEQ
 }
 
 /// The identity of this build.

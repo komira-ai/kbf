@@ -423,8 +423,14 @@ fn the_tail_epoch_fields_are_pinned() {
         ..Default::default()
     };
     assert_eq!(answer.encode_to_vec(), [0x28, 6], "field 5");
-    assert_eq!(pb::HeartbeatRequest::default().encode_to_vec(), []);
-    assert_eq!(pb::HeartbeatResponse::default().encode_to_vec(), []);
+    assert_eq!(
+        pb::HeartbeatRequest::default().encode_to_vec(),
+        Vec::<u8>::new()
+    );
+    assert_eq!(
+        pb::HeartbeatResponse::default().encode_to_vec(),
+        Vec::<u8>::new()
+    );
     let old = pb::HeartbeatRequest::decode(&[0x08, 1, 0x10, 2][..]).expect("decodes");
     assert_eq!(old.tail_epoch_done, 0);
     let older = pb::HeartbeatResponse::decode(&[0x18, 9][..]).expect("decodes");

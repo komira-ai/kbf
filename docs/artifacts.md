@@ -97,6 +97,42 @@ sums assemble`), and checks every file against it (`cargo xtask verify-assets su
 every file listed once, each matching, and a copy of the first tarball with one byte
 flipped not matching).
 
+The `kbf` tarball of each platform has a third file beside it, `kbf-<commit>-<platform>.version.json`:
+the exact bytes `kbf --version --json` printed when the job that built the `kbf` ran it
+(below). A node's offer and the age check of a release need what the `kbf` of each platform
+says of itself (`meta_log`, the protocols, `seq`), nothing on the frontend records it, and
+only a runner of the platform can run its binary: a Linux runner cannot run the macOS
+`kbf`. Each build job therefore runs `cargo xtask release version-facts --binary
+target/<target>/release/kbf --commit "$GITHUB_SHA" --platform <platform> --out dist` after
+the `kbf` is built (on macOS, signed) and its identity is checked, and before it is
+packaged. The verb runs `kbf --version --json` as the installer runs a staged binary: by
+absolute path, with an empty environment (the runner's tokens are not passed to it), no
+standard input and a limit of 10 seconds, and reads what it printed with the installer's
+own strict reader (`kbf_installer::binary::Version`: at most 4096 bytes and exactly the
+fields below). It refuses, and writes nothing, unless the binary exited 0 and says it is
+the `release` build of `$GITHUB_SHA`; the file is those bytes unchanged, never a document
+read and written again. The file is listed in the job's `SHA256SUMS.<platform>` like a
+tarball, so the one `SHA256SUMS`, the build provenance, the verification and the release
+carry it. It has no SBOM and no bundle of its own. The set is closed over it:
+`verify-assets sums` (so `release check`, `release publish` and `release offer`) refuses a
+listed `kbf` tarball whose `kbf-<commit>-<platform>.version.json` is not listed, and a
+listed facts file whose `kbf` tarball is not; `release check` takes that name and no other
+`.version.json`, and `release offer` calls a platform incomplete without its facts, whatever
+other tarballs it lists. The release made before the build jobs recorded the facts has none:
+`release check --without-version-facts` waives the first rule (and nothing else), and
+`release.yml` gives it to the check of the previous release only (the lint holds that); remove
+the flag once the release before the one being made was made with the facts. The workflow lint
+(`crates/kbf-integration-test/tests/release_artifacts`) names a build job that does not run
+the verb once, for its own platform, between the identity check of `kbf` and its package,
+for the same `--binary` path the job packages.
+
+The build jobs check out the full history (`fetch-depth: 0`, which the workflow lint holds
+for every job that records the facts), so the facts carry the real `seq` (see `seq` below);
+a shallow local build still says `seq: 0`. The bundle `kbf-installer deploy --bundle` reads
+holds `kbf` and `kbf-daemon` tarballs and their attestations and refuses any other entry: the
+facts file is not packed into a bundle, and a packer that adds it needs a reader that accepts
+it installed first (the deploy order of `seq`, below).
+
 `kbf-server`, `kbf` and `kbf-installer` embed the first 12 characters of the commit they
 were built from (`kbf` through the server library it links), and `--version` prints
 `<binary> <package version>+<commit>` (so do the server's start line and the `server`
@@ -156,10 +192,10 @@ sorted by name.
   It is `0` when the build could not count them (a shallow checkout, which holds only part
   of the history, or a source archive with no git), and nothing is newer than `0`: a build
   that cannot count is never ranked above another. A build before this field prints none.
-  `artifacts.yml` checks out at the default shallow depth, so the assets it builds print
-  `seq: 0` until it checks out with `fetch-depth: 0`; no package is ranked by `seq` before
-  that. The strict reader of this line in `kbf-installer` (`deny_unknown_fields`) accepts
-  `seq` from this change on: an installer older than that refuses a kbf that prints it
+  The build jobs of `artifacts.yml` check out with `fetch-depth: 0`, so the assets they
+  build print the real count; a shallow local build still prints `seq: 0`. The strict
+  reader of this line in `kbf-installer` (`deny_unknown_fields`) accepts `seq` from this
+  change on: an installer older than that refuses a kbf that prints it
   (`version-unreadable`), so the installer package that reads `seq` ships before the kbf
   that prints it.
 - `state_schema`: the schema version of the SQLite state file the binary creates and
@@ -442,7 +478,8 @@ themselves do not expire with the artifacts.
 A release is the files a push run of `artifacts.yml` on `main` left for one commit,
 attached unchanged to a GitHub release
 ([`.github/workflows/release.yml`](../.github/workflows/release.yml)). Nothing is
-rebuilt. Its assets are every tarball and SBOM in the table above, for that commit, their
+rebuilt. Its assets are every tarball and SBOM in the table above, for that commit, the
+`kbf-<commit>-<platform>.version.json` of each platform, their
 `SHA256SUMS`, and the provenance bundle of each tarball, `<tarball>.sigstore.json`, beside
 it.
 
@@ -463,7 +500,8 @@ nothing is published) when:
   the bundles; they expire after 90 days, so a release is cut within 90 days of the
   commit);
 - a file does not match `SHA256SUMS` (`sha256sum --check --strict`), a file is not
-  listed in it, or a listed file is not `<binary>-<commit>-<platform>`;
+  listed in it, a `kbf` tarball's `kbf-<commit>-<platform>.version.json` is not listed,
+  or a listed file is not `<binary>-<commit>-<platform>` (or that version file);
 - a tarball has no bundle, or a bundle file belongs to no listed tarball, is not exactly
   one bundle of at most 256 KiB, or does not have its tarball's digest as its one subject
   (`cargo xtask release check`);
@@ -479,13 +517,16 @@ release already holds must be one of the verified files, byte for byte, or the r
 fails and changes nothing; the files it lacks are uploaded (`cargo xtask release
 publish`).
 
-Two further verbs read the annotated `v*` tag, whose message is the gamma verdict
-(`docs/design/kbf-cicd.md`, section 8.1). `verify` runs both, on a checkout of the whole
+Two further verbs read the annotated `v*` tag, whose message is the verdict of the gate
+stage (`docs/design/kbf-cicd.md`, section 8.1; today Beta, written by `release
+verdict-write` after `release gates` saw the `ci`, `beta` and `artifacts` push runs of the
+commit succeed). `verify` runs both, on a checkout of the whole
 history (the tag object and `origin/main` must be there): `cargo xtask release verdict`
 refuses a lightweight tag, a commit not on main, a message
-that is not a green gamma verdict, a verdict that names another commit, tag or set (the
-set hash is the SHA-256 of `SHA256SUMS`, `kbf_gate::SetHash::of_sums`), a bake under 24
-hours, and a thin bake without a recorded `min-load` waiver; it prints `set-hash=<hex>`.
+that is not a green verdict of the gate stage, a verdict that names another commit, tag or
+set (the set hash is the SHA-256 of `SHA256SUMS`, `kbf_gate::SetHash::of_sums`), and, for
+Gamma, a bake under 24 hours and a thin bake without a recorded `min-load` waiver (a Beta
+verdict records no bake, and one that does is refused); it prints `set-hash=<hex>`.
 `cargo xtask release notes` runs the same checks and writes the notes, which `verify`
 uploads as the artifact `release-notes`, so a dry run shows them. `verify` passes the hash
 to `publish` as a job output, and `release publish` takes it as `--set-hash` and publishes

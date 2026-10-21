@@ -3,8 +3,8 @@
 
 use super::failures::{self, Failure, FailuresPage, LogTail};
 use super::{
-    action_label, attempt_end, build_page, bytes, definitions, failed, invocation_url, micros,
-    outcome, pill, problem, query_value, segment,
+    STREAMS, action_label, attempt_end, build_page, bytes, definitions, failed, invocation_url,
+    log_page, micros, outcome, pill, problem, query_value, segment,
 };
 use crate::api::{Action, Attempt, Blob, Outcome, Output};
 use crate::html::{Href, Html, attr};
@@ -179,6 +179,7 @@ pub(crate) async fn action<S: Source>(source: &S, id: &str, digest: &str, query:
         }
         definitions(h, &fields);
         attempts(h, &a.row.attempts);
+        run_logs(h, &a.row.attempts);
         why(h, &found);
         outputs(h, &a.outputs, a.outputs_truncated);
         show_log(h, "stdout", &stdout);
@@ -331,6 +332,37 @@ fn attempts(h: &mut Html, attempts: &[Attempt]) {
                 });
             }
         });
+    });
+}
+
+/// The whole logs history kept, one line of links for each attempt that has a run id
+/// (a farm without history sends none, and nothing is shown). A run keeps a copy only of
+/// a failure's logs: a link to one that was not kept is the Log page's own `404`.
+fn run_logs(h: &mut Html, attempts: &[Attempt]) {
+    let runs: Vec<(&Attempt, &str)> = attempts
+        .iter()
+        .filter_map(|a| Some((a, a.run_id.as_deref()?)))
+        .collect();
+    if runs.is_empty() {
+        return;
+    }
+    h.el("h2", &[], |h| {
+        h.text("Run logs");
+    });
+    h.el("ul", &[attr("class", "outputs")], |h| {
+        for (a, run_id) in runs {
+            h.el("li", &[], |h| {
+                h.text(&format!("Lease {}, run {run_id}: ", a.lease));
+                for (i, stream) in STREAMS.into_iter().enumerate() {
+                    if i > 0 {
+                        h.text(", ");
+                    }
+                    let href = Href::root_relative(&log_page(run_id, stream))
+                        .expect("a log page is root-relative");
+                    h.link(&href, stream);
+                }
+            });
+        }
     });
 }
 

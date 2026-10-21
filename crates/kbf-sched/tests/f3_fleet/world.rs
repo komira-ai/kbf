@@ -58,7 +58,7 @@ pub const SIZES: [(u64, u64); 3] = [(1_000, GIB), (2_000, 2 * GIB), (6_000, 4 * 
 pub const WORKERS: [&str; 4] = ["arm", "mac", "x86-a", "x86-b"];
 
 pub fn mac_caps(xcodes: &[&str]) -> NodeCaps {
-    let mut report = vec![("arch", "arm64"), ("os", "macos"), ("label.pool", "darwin")];
+    let mut report = vec![("arch", "arm64"), ("os", "macos")];
     report.extend(xcodes.iter().map(|x| ("xcode", *x)));
     NodeCaps::from_report(report)
         .expect("a valid report")

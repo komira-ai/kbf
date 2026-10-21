@@ -91,6 +91,8 @@ use tonic::service::Routes;
 pub use crate::action_cache::ActionCacheService;
 pub use crate::backend::Backend;
 pub use crate::bytestream::ByteStreamService;
+#[cfg(feature = "testkit")]
+pub use crate::cache::DrainHook;
 pub use crate::cache::HIT_CHECKS_IN_FLIGHT;
 pub use crate::cache::{
     ADOPT_RECORDS, Admitted, BATCH_BLOBS, BATCH_BYTES, BATCH_READS_IN_FLIGHT, BUFFERED_BLOB_BYTES,

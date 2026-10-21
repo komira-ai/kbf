@@ -15,13 +15,13 @@ fn git(args: &[&str]) -> Option<String> {
 /// Catches a `seq` that is not the rule applied to this checkout: the build script not run
 /// again when `HEAD` moves, a count taken of another directory, a number that is not
 /// embedded at all. The rule is `build_seq::choose`, tested on its own against real
-/// repositories (`src/build_seq.rs`); here it meets the live checkout, which is a full clone
+/// repositories (`kbf-server/src/build_seq.rs`); here it meets the live checkout, which is a full clone
 /// on a person's machine and a shallow one in CI, so each run proves one of its two answers.
 #[test]
 fn seq_is_the_rule_applied_to_the_checkout_built() {
     let shallow = git(&["rev-parse", "--is-shallow-repository"]);
     let count = git(&["rev-list", "--count", "HEAD"]);
-    let want = crate::build_seq::choose(shallow.as_deref(), count.as_deref());
+    let want = kbf_server::build_seq::choose(shallow.as_deref(), count.as_deref());
     let seq = identity()["seq"].clone();
     assert!(seq.is_u64(), "seq is a number: {seq}");
     assert_eq!(seq, want);

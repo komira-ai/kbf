@@ -26,6 +26,7 @@ mod release;
 mod rollout;
 mod state;
 mod time;
+mod version;
 mod work;
 
 pub use digest::{Digest, DigestFunction, ParseDigestError};
@@ -45,6 +46,7 @@ pub use rollout::{
 };
 pub use state::{Effect, StateMachine};
 pub use time::FarmTime;
+pub use version::{VERSION_CAP, Version, VersionFault};
 pub use work::{
     ActionKey, Answer, ControlRecord, Failure, FarmFault, FarmRun, FencePolicy, LeaseGrant,
     LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Refusal, RefusalRecord, Resources,

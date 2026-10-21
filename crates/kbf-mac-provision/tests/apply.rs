@@ -82,7 +82,7 @@ fn one_apply_converges_a_fresh_mac() {
     );
     assert_eq!(
         fs::read_to_string(mac.path(CONFIG)).unwrap(),
-        golden_config(&sha[..12])
+        golden_config()
     );
     for (path, want) in [
         (PLIST, "-rw-r--r-- 0 0"),

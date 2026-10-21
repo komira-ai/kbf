@@ -147,7 +147,8 @@ impl Router {
     /// changed: the map's generation, and the id and boot of every member in it. A caller
     /// that remembers an answer beside this number may trust it only while the number is
     /// the same: a new generation moves blobs between owners, and a restarted owner (a
-    /// new boot) may have lost what it held only in RAM.
+    /// new boot) is the one whose holdings are least certain (a disk replaced or wiped
+    /// while it was down, say).
     ///
     /// `None` when no map has arrived, or when any member's boot is 0 (unknown: a restart
     /// of that member could not be told), so that nothing is remembered.

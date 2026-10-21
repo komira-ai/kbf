@@ -26,10 +26,6 @@
 //! kbf-deploy mdm verify --config FILE [--via ADDR:PORT]
 //! kbf-deploy mdm erase-request --serial SERIAL --reason TEXT [--lease ID] --key KEY
 //!                           --out FILE [--valid-for MINUTES] [--ssh-keygen PATH] [--apply]
-//! kbf-deploy envoy render --config FILE --out DIR
-//! kbf-deploy envoy check --config FILE [--dir DIR]
-//! kbf-deploy envoy apply --config FILE --kubectl PATH --kubeconfig PATH
-//!                        [--refuse-example FILE] [--apply]
 //! kbf-deploy pilot server-install --config FILE --bin FILE [--bind ADDR] [--pki DIR]
 //!                                 [--s3-env-file FILE] [--apply]
 //! kbf-deploy pilot server-install --config FILE --uninstall [--apply]
@@ -47,14 +43,7 @@
 //! nothing to do), 1 a step or the check after an apply failed (`FAIL ...`), or 2
 //! refused (`REFUSED: ...` on stderr). `linux meta-backup` and `meta-verify` exit 0
 //! done, 1 a failure after the stop (the unit restarted) or an archive that does not
-//! verify (`FAIL ...` on stderr), or 2 refused ([`crate::linux::meta`]). `envoy render` only writes into the directory
-//! it is given, and exits 0 done or 2 refused (`REFUSED: ...` on stderr); `envoy check`
-//! only reads, and exits 0 every check passed, 1 a check failed (`FAIL <check>: ...` on
-//! stdout) or 2 refused. `envoy apply` reads the cluster and has it validate the render in
-//! a dry run as in an apply, changes it only with `--apply`, and exits 0 done (or
-//! planned), 1 a step or the check after an apply failed (`FAIL ...` on stderr), or 2
-//! refused before any step (`REFUSED: ...` on stderr; a render check's `FAIL` lines on
-//! stdout).
+//! verify (`FAIL ...` on stderr), or 2 refused ([`crate::linux::meta`]).
 //! The `mdm` verbs exit as the `linux` host verbs do; `mdm verify` exits 1 when a check
 //! fails, `mdm dep assign` when Apple did not assign every device, and `mdm tls
 //! --check-godaddy` when the account may not use the API ([`crate::mdm`]).
@@ -75,14 +64,13 @@ use std::fs::{self, DirBuilder};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::os::unix::fs::DirBuilderExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::envoy;
 use crate::https::Client;
 use crate::linux::{self, HostError, LinuxConfig, install_mode, meta, swap};
 use crate::log;
@@ -129,10 +117,6 @@ enum Kit {
     /// proxy.
     #[command(subcommand)]
     Mdm(Mdm),
-    /// A client front: a Tailscale operator Ingress in front of Envoy, which routes
-    /// REAPI calls to the kbf-servers.
-    #[command(subcommand)]
-    Envoy(Envoy),
     /// A pilot kbf-server as a systemd user service, and the buck2 overlay that points
     /// one worktree at it.
     #[command(subcommand)]
@@ -140,53 +124,6 @@ enum Kit {
     /// The last lines of a kbf-server's durable log, across its rotated files, oldest
     /// first. Only reads.
     Log(log::LogArgs),
-}
-
-#[derive(Subcommand)]
-enum Envoy {
-    /// Write manifests.json (the Kubernetes objects) and envoy.json (Envoy's config)
-    /// into a directory.
-    Render {
-        /// The kit's settings, KEY=VALUE lines.
-        #[arg(long)]
-        config: PathBuf,
-        /// Where to write the two files.
-        #[arg(long)]
-        out: PathBuf,
-    },
-    /// Check a render for what the REAPI path through the front depends on: every
-    /// client call routed with no bound on a stream's life, TLS to the CA naming
-    /// each server, health checks kbf-server answers, the Ingress and NetworkPolicy
-    /// reaching Envoy. One `FAIL <check>: <why>` line per failure.
-    Check {
-        /// The kit's settings, KEY=VALUE lines.
-        #[arg(long)]
-        config: PathBuf,
-        /// The directory render wrote; without it, the render of --config is checked.
-        #[arg(long)]
-        dir: Option<PathBuf>,
-    },
-    /// Check the render and what the cluster must already hold, have the API server
-    /// validate the render, and with --apply apply it (server-side, field manager
-    /// kbf-front) and wait for Envoy and the Ingress's address.
-    Apply {
-        /// The kit's settings, KEY=VALUE lines.
-        #[arg(long)]
-        config: PathBuf,
-        /// kubectl, by absolute path.
-        #[arg(long, value_parser = HostPath::new)]
-        kubectl: HostPath,
-        /// A kubeconfig with the config's KBF_FRONT_KUBE_CONTEXT.
-        #[arg(long, value_parser = HostPath::new)]
-        kubeconfig: HostPath,
-        /// Settings whose context, tailnet and servers --config must not share (the
-        /// kit's own config.example); kbf's example when not given.
-        #[arg(long)]
-        refuse_example: Option<PathBuf>,
-        /// Apply for real.
-        #[arg(long)]
-        apply: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -526,7 +463,6 @@ pub fn run<E: Exec>(
         Kit::Minio(Minio::Nodeport(a)) => minio_nodeport(a, exec, out),
         Kit::Linux(l) => return linux_kit(l, exec, out, err),
         Kit::Mdm(m) => return mdm_kit(m, exec, out, err),
-        Kit::Envoy(e) => return envoy_kit(e, exec, out, err),
         Kit::Log(a) => return log::run(&a, out, err),
         Kit::Pilot(p) => {
             return pilot::cli::run(p, exec, env, out, err, &pilot::cli::sleep_a_second);
@@ -755,92 +691,6 @@ fn mdm_kit<E: Exec>(m: Mdm, exec: &mut E, out: &mut dyn Write, err: &mut dyn Wri
             ExitCode::from(2)
         }
     }
-}
-
-/// The `envoy` kit: 0 done (or every check passed), 1 a check (or an apply's step)
-/// failed, 2 refused.
-fn envoy_kit<E: Exec>(
-    e: Envoy,
-    exec: &mut E,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> ExitCode {
-    let done = match e {
-        Envoy::Apply {
-            config,
-            kubectl,
-            kubeconfig,
-            refuse_example,
-            apply,
-        } => {
-            let example = refuse_example.as_deref();
-            let done = envoy_apply(
-                &config,
-                kubectl,
-                kubeconfig,
-                example,
-                mode(apply),
-                exec,
-                out,
-            );
-            return match done {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) if e.exit_code() == 1 => {
-                    let _ = writeln!(err, "FAIL {e}");
-                    ExitCode::FAILURE
-                }
-                Err(e) => {
-                    let _ = writeln!(err, "REFUSED: {e}");
-                    ExitCode::from(2)
-                }
-            };
-        }
-        Envoy::Render { config, out: dir } => envoy::render_files(&config, &dir),
-        Envoy::Check { config, dir } => match envoy::check_files(&config, dir.as_deref()) {
-            Ok(failures) if failures.is_empty() => Ok(envoy::check_passed()),
-            Ok(failures) => {
-                for f in &failures {
-                    let _ = writeln!(out, "{}", f.line());
-                }
-                return ExitCode::FAILURE;
-            }
-            Err(e) => Err(e),
-        },
-    };
-    match done {
-        Ok(line) => {
-            let _ = writeln!(out, "{line}");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            let _ = writeln!(err, "REFUSED: {e}");
-            ExitCode::from(2)
-        }
-    }
-}
-
-/// `envoy apply`, with a private kubectl cache directory.
-fn envoy_apply<E: Exec>(
-    config: &Path,
-    kubectl: HostPath,
-    kubeconfig: HostPath,
-    example: Option<&Path>,
-    mode: Mode,
-    exec: &mut E,
-    mut out: &mut dyn Write,
-) -> Result<(), envoy::apply::ApplyError> {
-    let config = envoy::EnvoyConfig::load(config)?;
-    let example = envoy::apply::example(example)?;
-    let scratch = Scratch::new().map_err(envoy::apply::ApplyError::Scratch)?;
-    let args = envoy::apply::Apply {
-        config,
-        example,
-        kubectl,
-        kubeconfig,
-        cache_dir: scratch.path(),
-        wait: envoy::apply::Wait::DEFAULT,
-    };
-    envoy::apply::run(exec, &args, mode, &mut out)
 }
 
 /// A host-changing `linux` verb's exit: 0 done, 1 a step failed, 2 refused.

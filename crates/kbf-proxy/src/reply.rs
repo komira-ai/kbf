@@ -93,6 +93,11 @@ pub(crate) fn refused(grpc: bool, refusal: Refusal) -> Response<ProxyBody> {
             GRPC_RESOURCE_EXHAUSTED,
             "too many wrong credentials from this address",
         ),
+        Refusal::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            GRPC_UNAVAILABLE,
+            "the credential cannot be checked now: the issuer's keys are unavailable",
+        ),
     };
     if grpc {
         return grpc_only(code, message);

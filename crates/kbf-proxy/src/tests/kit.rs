@@ -72,6 +72,8 @@ pub(super) struct Call {
     pub method: http::Method,
     /// The request's URI as the child received it: path and query.
     pub uri: http::Uri,
+    /// The request's headers as the child received them.
+    pub headers: http::HeaderMap,
     /// How many streams this child has accepted so far, this one included.
     pub nth: usize,
     /// Rung to make this stream's connection send a graceful GOAWAY.
@@ -617,6 +619,7 @@ async fn connection(
                     respond,
                     method: parts.method.clone(),
                     uri: parts.uri.clone(),
+                    headers: parts.headers.clone(),
                     nth,
                     goaway: Arc::clone(&goaway),
                 }));

@@ -34,7 +34,7 @@ message Component {
 
 // The desired release for one host, level-triggered: sent after `Welcome` and again at
 // every change of the desired release, so a host that connects later gets it too. A
-// host whose platform has no complete release gets no offer.
+// host whose platform has no complete release, or no version facts document, gets no offer.
 message UpdateOffer {
   // Strictly increases at each change of the desired release, and survives a frontend
   // restart. An offer with the generation a host already holds is a repeat (for example,
@@ -46,10 +46,12 @@ message UpdateOffer {
   string platform = 3;
   // The tarballs the host needs for that platform.
   repeated Component components = 4;
-  // What the frontend's preflight recorded about the release (what its `kbf --version
-  // --json` declares; the platform is field 3). They are claims: the installer runs the
-  // fetched binary and requires its own report to equal them. Zeros and "" (a frontend
-  // that predates the fields, or a release never preflighted) are refused: fail closed.
+  // What the release's version facts document states for this platform: the exact bytes
+  // of that platform's `kbf --version --json`, stored by the frontend with the release (the
+  // platform is field 3). They are a hint: the installer runs the fetched binary and
+  // requires its own report to equal them. The frontend sends no offer for a platform it
+  // holds no document for, so a real offer never carries zeros; the installer refuses zeros
+  // and "" all the same (an offer from a frontend that predates the fields): fail closed.
   uint32 protocol = 5;
   uint32 min_protocol = 6;
   uint32 state_schema = 7;
