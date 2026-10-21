@@ -4,12 +4,13 @@
 //! so the session never fails on one.
 
 use kbf_proto::update as wire;
+use kbf_proto::update::update_order::Source as WireOrderSource;
 use kbf_proto::update::update_order::Verb as WireVerb;
 use kbf_proto::update::update_status::ReleaseSource as WireSource;
 use kbf_proto::update::update_status::State as WireState;
 
 use crate::types::{
-    Available, Component, Expected, Offer, Order, ReleaseSource, State, Status, Verb,
+    Available, Component, Expected, Offer, Order, ReleaseSource, Source, State, Status, Verb,
 };
 
 impl From<wire::Component> for Component {
@@ -48,6 +49,14 @@ impl From<wire::UpdateOrder> for Order {
             Ok(WireVerb::Revert) => Some(Verb::Revert),
             Ok(WireVerb::Unspecified) | Err(_) => None,
         };
+        // The deliberate exception to the verb rule above: zero is a fetch, what every sender
+        // that predates the field means. A number this build does not know is refused by the
+        // client.
+        let source = match WireOrderSource::try_from(o.source) {
+            Ok(WireOrderSource::Unspecified | WireOrderSource::Fetch) => Some(Source::Fetch),
+            Ok(WireOrderSource::Staged) => Some(Source::Staged),
+            Err(_) => None,
+        };
         Self {
             order_id: o.order_id,
             epoch: o.epoch,
@@ -55,6 +64,7 @@ impl From<wire::UpdateOrder> for Order {
             verb,
             commit: o.commit,
             window_s: o.window_s,
+            source,
         }
     }
 }
@@ -118,7 +128,7 @@ impl From<&Status> for wire::UpdateStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Available, ReleaseSource, Staged};
+    use crate::types::{Available, ReleaseSource, Source, Staged};
 
     /// Catches a field of an offer lost or moved on the way in (every field is given a
     /// different value, so a swap shows).
@@ -175,6 +185,7 @@ mod tests {
                 verb,
                 commit: "e".repeat(40),
                 window_s: 600,
+                ..Default::default()
             })
         };
         assert_eq!(order(1).verb, Some(Verb::Activate));
@@ -186,6 +197,26 @@ mod tests {
         assert_eq!((o.order_id, o.epoch, o.window_s), (4, 5, 600));
         assert_eq!(o.generation, 6, "the generation is carried to the record");
         assert_eq!(o.commit, "e".repeat(40));
+    }
+
+    /// Catches a source mapped to another, an unset source taken for a refusal (what every
+    /// sender that predates the field writes is a fetch), and a number this build does not
+    /// know taken for one it does.
+    #[test]
+    fn an_order_maps_its_source() {
+        let source = |n: i32| {
+            let message = wire::UpdateOrder {
+                source: n,
+                ..Default::default()
+            };
+            Order::from(message).source
+        };
+        assert_eq!(source(0), Some(Source::Fetch));
+        assert_eq!(source(1), Some(Source::Fetch));
+        assert_eq!(source(2), Some(Source::Staged));
+        assert_eq!(source(3), None);
+        assert_eq!(source(99), None);
+        assert_eq!(source(-1), None);
     }
 
     /// Catches a state sent as another, a missing value sent as something but empty or 0,

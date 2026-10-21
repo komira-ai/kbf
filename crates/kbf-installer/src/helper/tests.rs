@@ -901,6 +901,7 @@ fn the_record_kbf_update_writes_is_the_order_this_side_reads() {
         verb: Some(Verb::Activate),
         commit: B.to_owned(),
         window_s: 600,
+        source: Some(Source::Fetch),
     };
     let r = OrderRecord::for_order(&order_in, Verb::Activate, Some(&offer)).expect("record");
     let bytes = r.to_bytes().expect("bytes");
@@ -918,6 +919,34 @@ fn the_record_kbf_update_writes_is_the_order_this_side_reads() {
     // The name must be the pair inside.
     assert!(order::parse(2, 6, &bytes).is_err());
     assert!(order::parse(3, 5, &bytes).is_err());
+}
+
+/// Catches the staged record `kbf-update` writes being read by this side as anything but a
+/// staged order: the source survives the file, and the record carries no claims although the
+/// caller handed the writer an offer.
+///
+/// Mutants planted: the writer ignoring the order's source; the writer consuming the offer
+/// for a staged order.
+#[test]
+fn the_staged_record_kbf_update_writes_is_the_staged_order_this_side_reads() {
+    use crate::helper::order::{self, Verb as OrderVerb};
+    let offer = kbf_update_offer();
+    let order_in = kbf_update::Order {
+        order_id: 5,
+        epoch: 2,
+        generation: 9,
+        verb: Some(Verb::Activate),
+        commit: B.to_owned(),
+        window_s: 600,
+        source: Some(Source::Staged),
+    };
+    let r = OrderRecord::for_order(&order_in, Verb::Activate, Some(&offer)).expect("record");
+    let bytes = r.to_bytes().expect("bytes");
+    let (epoch, id) = order::key_of(&r.file_name()).expect("name");
+    let read = order::parse(epoch, id, &bytes).expect("read");
+    assert_eq!(read.source, Source::Staged);
+    assert!(read.claims.is_none());
+    assert_eq!(read.verb, OrderVerb::Activate);
 }
 
 fn kbf_update_offer() -> kbf_update::Offer {

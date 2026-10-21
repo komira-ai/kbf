@@ -72,6 +72,15 @@ message UpdateOrder {
     // Go back to the previous release.
     VERB_REVERT = 3;
   }
+  // Where the release comes from. UNSPECIFIED (a frontend that predates the field) and FETCH
+  // both mean the installer fetches it, as every order has meant: unlike Verb, zero is valid.
+  // A sender writes the field only for STAGED (the release the host's package carries). A
+  // node refuses a number it does not know, and STAGED on CONFIRM or REVERT.
+  enum Source {
+    SOURCE_UNSPECIFIED = 0;
+    SOURCE_FETCH = 1;
+    SOURCE_STAGED = 2;
+  }
   // Strictly increasing; a host ignores an order it has already acknowledged.
   uint64 order_id = 1;
   // The epoch `Welcome` named, so an order from before a frontend restart is not replayed.
@@ -86,6 +95,7 @@ message UpdateOrder {
   // acted on, so a replayed or reordered order of an older desired state cannot undo a
   // newer one. 0 when a frontend predates the field.
   uint64 generation = 6;
+  Source source = 7;
 }
 
 // What a host reports about its update, resent on every change. Its own message of the
