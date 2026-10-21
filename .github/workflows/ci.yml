@@ -5,7 +5,7 @@
 #
 # A pull request runs only this. The rest of the suite (the slow tests, the Arm run, the
 # jobs that need a service, root, crun or a Mac, the packages and the beta smoke) runs on a
-# push to main or feature/arch-v2, in beta.yml. This workflow runs on those pushes too, so
+# push to main, in beta.yml. This workflow runs on those pushes too, so
 # the merged result meets the same gate and the Cargo cache below is saved.
 #
 # The Cargo cache (registry, git checkouts and target) is keyed on the runner, the job,
@@ -17,7 +17,7 @@ on:
   pull_request:
   merge_group:
   push:
-    branches: [main, feature/arch-v2]
+    branches: [main]
 
 permissions: {}
 
@@ -133,6 +133,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The restored target/, the instrumented workspace build and its profiles outgrew a
+      # hosted runner's free disk (runs died with "No space left on device", or the runner
+      # was lost mid-test). Remove toolchains the image preinstalls that this job never
+      # uses; the Postgres service container's image is not touched.
+      - name: Free disk before (report)
+        run: df -h /
+      - name: Remove preinstalled toolchains this job does not use
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+      - name: Free disk after (report)
+        run: df -h /
       - run: rustup toolchain install "$COVERAGE_TOOLCHAIN" --profile minimal --component llvm-tools-preview
       # xtask builds with the coverage nightly, the one toolchain this job installs.
       - name: Install cargo-llvm-cov (pinned version and checksum)

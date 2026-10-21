@@ -19,7 +19,7 @@
 //!   `contents` ([`RELEASE_SCOPES`]), which may be `write` only in a job whose `if:` is
 //!   exactly [`RELEASE_TAG_PUSH_ONLY`]. So no pull request or merge-queue run holds a
 //!   token that can sign an attestation, every attestation this repository signs names
-//!   `refs/heads/main` or `refs/heads/feature/arch-v2`, and only a pushed `v*` tag runs a job that can create a release
+//!   `refs/heads/main`, and only a pushed `v*` tag runs a job that can create a release
 //!   (or push to the repository);
 //! - a job calls a reusable workflow that is not one of this repository's linted
 //!   workflow files (its runners are not in a file this lint read);
@@ -140,15 +140,16 @@ const ALLOWED_OWNERS: &[&str] = &["actions"];
 /// Further `owner/repository` actions the repository's Actions policy allows.
 const ALLOWED_REPOSITORIES: &[&str] = &["tailscale/github-action"];
 
-/// Token scopes a job may set to `write` when it runs only for a push to `main` or to
-/// `feature/arch-v2`: the OIDC token and the attestations API, which together sign
+/// Token scopes a job may set to `write` when it runs only for a push to `main`:
+/// the OIDC token and the attestations API, which together sign
 /// build provenance.
 const SIGNING_SCOPES: &[&str] = &["id-token", "attestations"];
 
 /// The one `if:` spelling under which a job may hold [`SIGNING_SCOPES`] for writing: a
-/// push, to `main` or to the development branch. No pull request or merge-queue run
-/// satisfies it, and every attestation signed under it names one of those two refs.
-const SIGNING_PUSH_ONLY: &str = "${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}";
+/// push, to `main` only. No pull request or merge-queue run satisfies it, and every
+/// attestation signed under it names `refs/heads/main`.
+const SIGNING_PUSH_ONLY: &str =
+    "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
 
 /// Token scopes a job may set to `write` when it runs only for a pushed release tag:
 /// the repository's contents, which creating a release and uploading its assets need.

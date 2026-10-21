@@ -11,9 +11,7 @@
 # are unchanged.
 #
 # On a pull request or in the merge queue this is a build check: everything is built,
-# signed, packaged and summed, and nothing is attested (a pull request into
-# feature/arch-v2 skips darwin-arm64, and so the sums, to spare the macOS runners). On a push to main or to
-# feature/arch-v2, the attest jobs sign build provenance for every file and an SBOM
+# signed, packaged and summed, and nothing is attested. On a push to main, the attest jobs sign build provenance for every file and an SBOM
 # attestation for every tarball, per platform group (Linux does not wait for the macOS
 # runners), and the verify jobs then check them, for the branch
 # that was pushed, as the planned deployment job is to. Only attest may hold `id-token:
@@ -34,18 +32,14 @@ on:
     types: [opened, synchronize, reopened, labeled]
   merge_group:
   push:
-    branches: [main, feature/arch-v2]
+    branches: [main]
 
 permissions: {}
 
-# A pull request's newer run replaces its older one. Pushes to feature/arch-v2 share one
-# group but a RUNNING build is never cancelled: GitHub keeps one running and one pending
-# run per group, and a newer push replaces only the pending one. Under steady merges a
-# cancel-in-progress group never finished an attested release (every run was cancelled by
-# the next merge), and a host roll needs one; this way there is always a recent finished
-# release, and runs still never queue up behind each other for the few macOS runners.
-# Every commit on main still gets its own group, so no main commit's run is cancelled or
-# dropped while queued.
+# A pull request's newer run replaces its older one. A RUNNING build is never cancelled
+# (cancel-in-progress is for pull requests only), and every commit on main gets its own
+# group, so no main commit's run is cancelled or dropped while queued: under steady merges
+# a cancel-in-progress group never finished an attested release, and a host roll needs one.
 concurrency:
   group: artifacts-${{ github.event_name }}-${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -77,11 +71,9 @@ defaults:
 
 jobs:
   darwin-arm64:
-    # Not for pull requests into feature/arch-v2: nothing is attested from a pull request,
-    # macOS runners are the scarce ones, and the push to feature/arch-v2 builds and
-    # attests darwin-arm64 for its head. Pull requests into main still build it.
-    # With the label `needs-artifacts`, like every job here.
-    if: ${{ github.event_name != 'pull_request' || (github.base_ref != 'feature/arch-v2' && contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) }}
+    # A pull request builds it only with the label `needs-artifacts`, like every job here:
+    # nothing is attested from a pull request and the macOS runners are the scarce ones.
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
     runs-on: macos-15
     timeout-minutes: 45
     permissions:
@@ -106,7 +98,7 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-          # On a push (to main or feature/arch-v2: the build the attest job signs)
+          # On a push (to main: the build the attest job signs)
           # nothing is restored: the attested binary is built from a clean target/,
           # never on a cached one. The lookup still tells the save step below whether
           # this key exists.
@@ -213,7 +205,7 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-          # On a push (to main or feature/arch-v2: the build the attest job signs)
+          # On a push (to main: the build the attest job signs)
           # nothing is restored: the attested binary is built from a clean target/,
           # never on a cached one. The lookup still tells the save step below whether
           # this key exists.
@@ -309,7 +301,7 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-          # On a push (to main or feature/arch-v2: the build the attest job signs)
+          # On a push (to main: the build the attest job signs)
           # nothing is restored: the attested binary is built from a clean target/,
           # never on a cached one. The lookup still tells the save step below whether
           # this key exists.
@@ -473,7 +465,7 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-  # Push to main or feature/arch-v2 only: build provenance for every Linux file, an SBOM
+  # Push to main only: build provenance for every Linux file, an SBOM
   # attestation for every Linux tarball, and a provenance attestation (and its bundle) of each
   # tarball alone. This job signs and does nothing else: while it holds `id-token: write` no
   # repository code runs, and nothing is built, only the pinned actions below and a `cp` that
@@ -481,7 +473,7 @@ jobs:
   # verify job checks what it signs.
   attest-linux:
     needs: [sums-linux]
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -647,7 +639,7 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-  # Push to main or feature/arch-v2 only: build provenance for every macOS file, an SBOM
+  # Push to main only: build provenance for every macOS file, an SBOM
   # attestation for every macOS tarball, and a provenance attestation (and its bundle) of each
   # tarball alone. This job signs and does nothing else: while it holds `id-token: write` no
   # repository code runs, and nothing is built, only the pinned actions below and a `cp` that
@@ -655,7 +647,7 @@ jobs:
   # verify job checks what it signs.
   attest-darwin-arm64:
     needs: [sums-darwin-arm64]
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -727,7 +719,7 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-  # Push to main or feature/arch-v2 only, after attest-linux: the checks the planned deployment
+  # Push to main only, after attest-linux: the checks the planned deployment
   # job is to make (cargo xtask verify-assets, crates/xtask/src/sums.rs), for the branch
   # that was pushed (`--source-ref "$GITHUB_REF"`), with read-only scopes, on the Linux files.
   # The files are assembled again into a SHA256SUMS that must be byte for byte the one the
@@ -736,7 +728,7 @@ jobs:
   # (`--commit "$GITHUB_SHA"`), with the flags a host's installer uses.
   verify-linux:
     needs: [attest-linux]
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -779,7 +771,7 @@ jobs:
       - name: The signed linux-arm64 package holds the attested binary and trusts this branch
         run: cargo xtask pkg-asset --verify-only --package "dist/kbf-installer-$GITHUB_SHA-linux-arm64.deb" --platform linux-arm64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$GITHUB_REF"
 
-  # Push to main or feature/arch-v2 only, after attest-darwin-arm64: the checks the planned deployment
+  # Push to main only, after attest-darwin-arm64: the checks the planned deployment
   # job is to make (cargo xtask verify-assets, crates/xtask/src/sums.rs), for the branch
   # that was pushed (`--source-ref "$GITHUB_REF"`), with read-only scopes, on the macOS files.
   # The files are assembled again into a SHA256SUMS that must be byte for byte the one the
@@ -787,7 +779,7 @@ jobs:
   # Each tarball and the package is also verified against its own bundle; see verify-linux.
   verify-darwin-arm64:
     needs: [attest-darwin-arm64]
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
