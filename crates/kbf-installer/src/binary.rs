@@ -5,16 +5,12 @@
 //! file for another platform is refused before anything executes it. The version is what
 //! `kbf --version --json` prints (crates/kbf-cli/src/version.rs): `commit` (the first 12
 //! hex digits), `min_protocol`, `protocol`, `profile`, `state_schema` and `version`, and
-//! `admin_protocol` and `meta_log` when the build has them.
+//! `admin_protocol`, `meta_log` and `seq` when the build has them.
 //! It is a consistency check on a file the attestation already vouches for, not trust.
 
 use std::fmt;
 
-use serde::Deserialize;
-
-use crate::CommitId;
 use crate::layout::Platform;
-use crate::refusal::VersionFault;
 
 /// The CPU a binary is built for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,62 +107,9 @@ impl BinaryKind {
     }
 }
 
-/// The most a binary's `--version --json` may print.
-pub const VERSION_CAP: usize = 4096;
-
-/// What `--version --json` prints. A field this type does not name is refused, and so is
-/// one named twice or a required one missing. `platform` (the installer derives it from
-/// the binary's header), `admin_protocol` and `meta_log` (builds before them lack them)
-/// may be absent and are then `None`; `meta_log: None` means not reversible.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Version {
-    /// The version of the admin calls between a proxy and the frontend processes it
-    /// starts. `None` for a build that predates the field.
-    #[serde(default)]
-    pub admin_protocol: Option<u64>,
-    pub commit: String,
-    /// The highest metadata-log machine version the build runs. Going from release N to
-    /// N-1 is reversible only if `meta_log(N) <= meta_log(N-1)`; `None` (a build that
-    /// predates the field) is unknown, and unknown is not reversible.
-    #[serde(default)]
-    pub meta_log: Option<u64>,
-    pub min_protocol: u64,
-    pub protocol: u64,
-    pub profile: String,
-    pub state_schema: u64,
-    pub version: String,
-    /// `linux-x86_64`, `linux-arm64` or `darwin-arm64`, when the build says.
-    #[serde(default)]
-    pub platform: Option<String>,
-}
-
-impl Version {
-    /// The object a binary printed, strictly: at most [`VERSION_CAP`] bytes, one JSON
-    /// object of the fields above and nothing after it.
-    pub fn parse(stdout: &[u8]) -> Result<Version, VersionFault> {
-        if stdout.len() > VERSION_CAP {
-            return Err(VersionFault::Oversize { cap: VERSION_CAP });
-        }
-        serde_json::from_slice(stdout).map_err(|e| VersionFault::Unreadable(e.to_string()))
-    }
-
-    /// Whether this build is `commit`'s release build: it names the commit's first 12 hex
-    /// digits and is a `release` profile, not a debug build.
-    pub fn check(&self, commit: &CommitId) -> Result<(), VersionFault> {
-        let want = &commit.as_str()[..12];
-        if self.commit != want {
-            return Err(VersionFault::Commit {
-                want: want.to_owned(),
-                got: self.commit.clone(),
-            });
-        }
-        if self.profile != "release" {
-            return Err(VersionFault::Profile(self.profile.clone()));
-        }
-        Ok(())
-    }
-}
+// What `--version --json` prints is read by `kbf_types::Version`, the one parser the release
+// store reads its version facts with too.
+pub use kbf_types::{VERSION_CAP, Version};
 
 #[cfg(test)]
 #[path = "binary_tests.rs"]

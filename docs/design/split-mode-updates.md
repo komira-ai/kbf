@@ -1,6 +1,6 @@
 # Updating a split-mode farm without failing a build
 
-Status: design for the sequence. The pull updater it relies on is partly built: `kbf-installer` (merged), `kbf-update` (the node's client, #908) and
+Status: design for the sequence. (`kbf-deploy envoy render|check|apply`, named below, is retired: kbf runs no Envoy since the no-Envoy ruling, and the frontend is fronted by kbf-proxy.) The pull updater it relies on is partly built: `kbf-installer` (merged), `kbf-update` (the node's client, #908) and
 `kbf-installer run` (the root helper, #929) are built or in review; the controller, the node gates, the Envoy switch and the poller are not.
 Planned-down (#914) is built. It is read against `feature/arch-v2` and these pull requests, fetched
 when this was written: #857, #879 and #887 (the frontend handover, open, stacked), #803 (the rollout state machine, open), #886
@@ -674,7 +674,7 @@ That document owns `update/release/<commit>/<platform>/<name>`, `update/desired 
 - `update/host/<id> {phase, order_id, generation, since, boot_before}`: what the controller resumes from; `boot_before` is the node's boot counter before the step, which the rejoin check compares with the registered one;
 - `update/policy {auto_nodes (bool), auto_frontend (bool), paused (bool), idle_wait, min_serving, max_hosts_out (default 1), new_work_only_to_updated, mac_force_after, accept_failing_builds}`
   (`pull-updates.md`'s `update/auto {enabled}` is `auto_nodes`);
-- `update/available/<commit>` from the poller: proposals and preflight results, metadata only.
+- `update/available/<commit>` from the poller: proposals and preflight results, metadata only. Not built: the release facts an offer carries are the release store's per-platform version facts document (`pull-updates.md` 6.2).
 
 The release store on disk is the source of truth for bytes; the `update/release/...` rows are metadata over it and are rebuilt
 from the disk index if lost (`pull-updates.md` 6.2).
@@ -748,7 +748,7 @@ may not start the frontend phase or change policy.
 
 ## 7. Test plan
 
-End-to-end tests in `kbf-it` (a new cell, `kbf-cell upd`, beside `m1` and `m2`): real `kbf` processes, the pinned buck2,
+End-to-end tests in `kbf-integration-test` (a new cell, `kbf-cell upd`, beside `m1` and `m2`): real `kbf` processes, the pinned buck2,
 `//:pause`-style actions, a `file://` cold store, 3 storage-and-daemon nodes at R=2, one daemon-only process, the frontend as
 `@a`/`@b` processes with the control socket (the unit text is covered by the existing unit lints). A second cell runs the base
 binary and a test-only "N+1" built from the next commit for the mixed-version tests. Each test names the defect and the mutant to plant.

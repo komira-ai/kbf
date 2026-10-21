@@ -1,6 +1,7 @@
 //! The contract between `kbf --version --json` and the installer that reads it before it
-//! stages a release: the installer's strict parser (`deny_unknown_fields`) must accept
-//! every field kbf-cli emits, and keep each one.
+//! stages a release: the installer's parser (which ignores fields it does not know) must
+//! accept what kbf-cli emits, and keep each field it names: a field the parser does not
+//! hold would be dropped without notice.
 
 use kbf_installer::binary::Version;
 
@@ -30,6 +31,7 @@ fn the_installer_parses_what_kbf_prints() {
     assert_eq!(parsed.meta_log, Some(num("meta_log")));
     assert_eq!(parsed.min_protocol, num("min_protocol"));
     assert_eq!(parsed.protocol, num("protocol"));
+    assert_eq!(parsed.seq, Some(num("seq")));
     assert_eq!(parsed.state_schema, num("state_schema"));
     assert_eq!(parsed.commit, text("commit"));
     assert_eq!(parsed.profile, text("profile"));

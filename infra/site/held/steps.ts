@@ -6,15 +6,24 @@ import { APPROVAL_ENVIRONMENT, GITHUB_ENVIRONMENT, oidcSubject } from '../lib/co
 
 export interface Tools {
   /** Run a read-only command and return its stdout. Throws on a non-zero exit. */
-  capture(cmd: string, args: string[]): string;
-  /** Run a command with its output shown (diff, install, tests, deploy); `input` is written to its stdin. */
-  stream(cmd: string, args: string[], input?: string): void;
+  capture(cmd: string, args: string[], cwd?: string): string;
+  /** Run a command with its output shown (diff, install, tests, deploy); `cwd` defaults to the infra/site root, `input` is written to its stdin. */
+  stream(cmd: string, args: string[], opts?: { cwd?: string; input?: string }): void;
   log(line: string): void;
+  // The members below serve `upload` only (temporary: removed by site-publish.yml).
+  /** A new empty scratch directory outside the repository. */
+  mkScratch(): string;
+  /** Delete a directory made by mkScratch. */
+  removeScratch(dir: string): void;
+  readFile(path: string): string;
+  writeFile(path: string, data: string): void;
+  /** Relative paths ('/'-separated) of every file under dir, sorted. */
+  listFiles(dir: string): string[];
 }
 
 export class Refused extends Error {}
 
-export type Command = 'github' | 'oidc-provider' | 'dns' | 'site' | 'vars';
+export type Command = 'github' | 'oidc-provider' | 'dns' | 'site' | 'vars' | 'upload';
 
 export interface Options {
   command: Command;
@@ -25,14 +34,19 @@ export interface Options {
   reviewer?: string;
   domain: string;
   oidcProviderArn?: string;
+  /** `site` only: deploy without the domain (no certificate, alias or zone); see README "Before DNS". */
+  noDomain: boolean;
+  /** `upload` only: the 40-hex commit whose site/ is built and uploaded. */
+  commit?: string;
 }
 
 const ALLOWED: Record<Command, string[]> = {
   github: ['--repo', '--reviewer'],
   'oidc-provider': ['--account', '--profile'],
   dns: ['--account', '--profile', '--domain'],
-  site: ['--account', '--profile', '--repo', '--domain', '--oidc-provider-arn'],
+  site: ['--account', '--profile', '--repo', '--domain', '--oidc-provider-arn', '--no-domain'],
   vars: ['--account', '--profile', '--repo'],
+  upload: ['--account', '--profile', '--commit'], // temporary: removed by site-publish.yml
 };
 const REQUIRED: Record<Command, string[]> = {
   github: ['--repo', '--reviewer'],
@@ -40,26 +54,32 @@ const REQUIRED: Record<Command, string[]> = {
   dns: ['--account', '--profile'],
   site: ['--account', '--profile', '--repo'],
   vars: ['--account', '--profile', '--repo'],
+  upload: ['--account', '--profile', '--commit'],
 };
 
 export const USAGE = `usage: npm run held -- <command> [flags]
   github --repo <owner/name> --reviewer <github login of the approver> [--apply]
   oidc-provider --account <12 digits> --profile <aws profile> [--apply]   (creates the GitHub OIDC provider only if absent)
   dns    --account <12 digits> --profile <aws profile> [--domain <name>] [--apply]
-  site   --account <12 digits> --profile <aws profile> --repo <owner/name> [--domain <name>] [--oidc-provider-arn <arn>] [--apply]
+  site   --account <12 digits> --profile <aws profile> --repo <owner/name> [--domain <name>] [--oidc-provider-arn <arn>] [--no-domain] [--apply]
   vars   --account <12 digits> --profile <aws profile> --repo <owner/name>      (read-only; prints commands)
+  upload --account <12 digits> --profile <aws profile> --commit <40-hex sha> [--apply]   (temporary: builds site/ at that commit and uploads it)
 Dry run unless --apply. There is no --force.`;
 
 export function parse(argv: string[]): Options {
   const [command, ...rest] = argv;
   if (!command || !(command in ALLOWED)) throw new Refused(`unknown or missing command\n${USAGE}`);
   const cmd = command as Command;
-  const o: Options = { command: cmd, apply: false, domain: 'kbf.dev' };
+  const o: Options = { command: cmd, apply: false, domain: 'kbf.dev', noDomain: false };
   const seen = new Set<string>();
   for (let i = 0; i < rest.length; i++) {
     const f = rest[i];
     if (f === '--apply') {
       o.apply = true;
+      continue;
+    }
+    if (f === '--no-domain' && ALLOWED[cmd].includes(f)) {
+      o.noDomain = true;
       continue;
     }
     if (!ALLOWED[cmd].includes(f)) throw new Refused(`unknown flag for ${cmd}: ${f}\n${USAGE}`);
@@ -72,10 +92,12 @@ export function parse(argv: string[]): Options {
     if (f === '--reviewer') o.reviewer = v;
     if (f === '--domain') o.domain = v;
     if (f === '--oidc-provider-arn') o.oidcProviderArn = v;
+    if (f === '--commit') o.commit = v;
   }
   for (const r of REQUIRED[cmd]) if (!seen.has(r)) throw new Refused(`${r} is required`);
   if (o.account !== undefined && !/^\d{12}$/.test(o.account)) throw new Refused('--account must be 12 digits');
   if (o.repo !== undefined && !/^[\w.-]+\/[\w.-]+$/.test(o.repo)) throw new Refused('--repo must be <owner>/<name>');
+  if (o.commit !== undefined && !/^[0-9a-f]{40}$/.test(o.commit)) throw new Refused('--commit must be a full 40-hex commit sha');
   if (o.reviewer !== undefined && !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(o.reviewer)) throw new Refused('--reviewer must be a GitHub login');
   if (cmd === 'vars' && o.apply) throw new Refused('vars has no --apply: it only prints');
   return o;
@@ -171,10 +193,13 @@ export function github(t: Tools, o: Options): void {
   const ids = repoIds(t, repo); // read-only; refuses a --repo that is not the repository's exact name
   const reviewer = reviewerId(t, o.reviewer!);
   const act = (args: string[], input?: string) => {
-    const shown = input === undefined ? args : [...args, '--input', '-', `<<< ${shellQuote(input)}`];
+    // A body goes to gh's stdin, and gh reads stdin only when told to: `--input -` must be on the argv it runs with,
+    // not only on the line shown (without it gh sends no body and GitHub applies its defaults).
+    const run = input === undefined ? args : [...args, '--input', '-'];
+    const shown = input === undefined ? run : [...run, `<<< ${shellQuote(input)}`];
     if (o.apply) {
       t.log(`+ gh ${shown.join(' ')}`);
-      t.stream('gh', args, input);
+      t.stream('gh', run, { input });
     } else t.log(`DRY-RUN: gh ${shown.join(' ')}`);
   };
   if (!o.apply) t.log('# dry run: nothing is executed. Re-run with --apply to act.');
@@ -267,18 +292,28 @@ export function site(t: Tools, o: Options): void {
   } catch {
     throw new Refused(`no GitHub OIDC provider at ${arn}; run: npm run held -- oidc-provider --apply (with this account and profile) first (it is imported, never created here) or pass --oidc-provider-arn`);
   }
-  const zones = JSON.parse(
-    t.capture('aws', aws(o, 'route53', 'list-hosted-zones-by-name', '--dns-name', o.domain, '--max-items', '1', '--output', 'json')),
-  ).HostedZones as { Name: string }[];
-  if (!zones.some((z) => z.Name === `${o.domain}.`)) throw new Refused(`no ${o.domain} hosted zone in this account; run dns --apply first`);
+  if (o.noDomain) {
+    t.log('# no-domain mode: no certificate, alias or Route 53 records; the zone is not looked up');
+  } else {
+    const zones = JSON.parse(
+      t.capture('aws', aws(o, 'route53', 'list-hosted-zones-by-name', '--dns-name', o.domain, '--max-items', '1', '--output', 'json')),
+    ).HostedZones as { Name: string }[];
+    if (!zones.some((z) => z.Name === `${o.domain}.`)) throw new Refused(`no ${o.domain} hosted zone in this account; run dns --apply first`);
+  }
   const { repoId, ownerId, fullName } = repoIds(t, o.repo!);
   prepare(t);
   const ctx = [
     '-c', `account=${o.account}`, '-c', `domain=${o.domain}`, '-c', `githubRepo=${fullName}`, // GitHub's own spelling: the sub claim uses it
     '-c', `githubRepoId=${repoId}`, '-c', `githubOwnerId=${ownerId}`, '-c', `oidcProviderArn=${arn}`,
+    ...(o.noDomain ? ['-c', 'noDomain=true'] : []),
   ];
   if (o.apply) {
     t.stream('npx', ['cdk', 'deploy', 'kbf-prod-site', '--profile', o.profile!, '--require-approval', 'broadening', ...ctx]);
+    const outs = JSON.parse(
+      t.capture('aws', aws(o, 'cloudformation', 'describe-stacks', '--region', REGION, '--stack-name', 'kbf-prod-site', '--query', 'Stacks[0].Outputs', '--output', 'json')),
+    ) as { OutputKey: string; OutputValue: string }[];
+    const host = outs.find((x) => x.OutputKey === 'DistributionDomainName')?.OutputValue;
+    if (host) t.log(`# The site is served at https://${host}/`);
     t.log(`# Done. Next: npm run held -- vars --account ${o.account} --profile ${o.profile} --repo ${o.repo}`);
   } else {
     t.log('# dry run: cdk diff only. Re-run with --apply to deploy.');
@@ -344,9 +379,95 @@ export function vars(t: Tools, o: Options): void {
   for (const [k, v] of rows) t.log(`gh variable set ${k} --env ${GITHUB_ENVIRONMENT} --repo ${o.repo} --body ${shellQuote(v!)}`);
   t.log(`# Region is always ${REGION}. The role's trust must name environment ${GITHUB_ENVIRONMENT}; its sub is:`);
   t.log(`#   ${subFor(repoIds(t, o.repo!))}`);
+  const host = val('DistributionDomainName');
+  if (host) t.log(`# The distribution answers at https://${host}/`);
+}
+
+// temporary: removed by site-publish.yml
+// Uploads the website built from a COMMITTED sha, with the operator's own profile (never the CI role), until the publish
+// workflow exists. Order: build and check-dist, then the sync passes, then version.txt, then the invalidation.
+export const UPLOAD_CACHE = {
+  immutable: 'public, max-age=31536000, immutable',
+  page: 'public, max-age=60, s-maxage=300',
+  version: 'no-cache',
+};
+
+export function upload(t: Tools, o: Options): void {
+  checkCaller(t, o);
+  const sha = o.commit!;
+  let kind = '';
+  try {
+    kind = t.capture('git', ['cat-file', '-t', sha]).trim();
+  } catch {
+    /* not an object */
+  }
+  if (kind !== 'commit') throw new Refused(`${sha} is not a commit of this repository (fetch it first); nothing was built`);
+  const outs = JSON.parse(
+    t.capture('aws', aws(o, 'cloudformation', 'describe-stacks', '--region', REGION, '--stack-name', 'kbf-prod-site', '--query', 'Stacks[0].Outputs', '--output', 'json')),
+  ) as { OutputKey: string; OutputValue: string }[];
+  const bucket = outs.find((x) => x.OutputKey === 'BucketName')?.OutputValue;
+  const dist = outs.find((x) => x.OutputKey === 'DistributionId')?.OutputValue;
+  if (!bucket || !dist) throw new Refused('stack kbf-prod-site has no outputs; run site --apply first');
+
+  const scratch = t.mkScratch();
+  const wt = `${scratch}/wt`;
+  let added = false;
+  try {
+    t.stream('git', ['worktree', 'add', '--detach', wt, sha]);
+    added = true;
+    const site = `${wt}/site`;
+    const want = t.readFile(`${site}/.node-version`).trim();
+    const have = t.capture('node', ['--version'], site).trim().replace(/^v/, '');
+    if (have !== want) throw new Refused(`site/.node-version at ${sha} is ${want}, this node is ${have}; use exactly ${want} (nothing was built)`);
+    t.stream('npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: site });
+    t.stream('npm', ['run', 'build'], { cwd: site });
+    try {
+      t.stream('node', ['-e', "require('./build/tools/tools/check-dist.js').checkDist('dist')"], { cwd: site }); // check-dist: CSP, links, hygiene
+    } catch {
+      throw new Refused('check-dist failed on the built dist; nothing was uploaded');
+    }
+    const dir = `${site}/dist`;
+    const files = t.listFiles(dir);
+    t.writeFile(`${scratch}/version.txt`, `${sha}\n`);
+
+    const target = `s3://${bucket}/`;
+    const dry = o.apply ? [] : ['--dryrun'];
+    const notReleases = ['--exclude', 'releases/*']; // last, so it wins: the sync never touches releases/
+    const pass = (include: string, type: string, cache: string) => [
+      's3', 'sync', dir, target, '--delete', '--exclude', '*', '--include', include, ...notReleases,
+      '--content-type', type, '--cache-control', cache, ...dry,
+    ];
+    const syncs = [
+      pass('assets/*.js', 'text/javascript', UPLOAD_CACHE.immutable),
+      pass('assets/*.css', 'text/css', UPLOAD_CACHE.immutable),
+      pass('*.html', 'text/html; charset=utf-8', UPLOAD_CACHE.page),
+      // Anything else in the bucket that the build no longer has goes too; files already uploaded above are skipped.
+      ['s3', 'sync', dir, target, '--delete', ...notReleases, '--exclude', 'version.txt', ...dry],
+    ];
+    const cp = ['s3', 'cp', `${scratch}/version.txt`, `${target}version.txt`, '--content-type', 'text/plain', '--cache-control', UPLOAD_CACHE.version, ...dry];
+    const invalidate = ['cloudfront', 'create-invalidation', '--distribution-id', dist, '--paths', '/*'];
+
+    t.log(`# commit ${sha}: ${files.length} files built and checked; they go to s3://${bucket}/ (never releases/):`);
+    for (const f of files) t.log(`#   ${f}  ${f.startsWith('assets/') ? 'immutable' : 'page'}`);
+    t.log(`#   version.txt  (the commit sha)`);
+    if (!o.apply) t.log('# dry run: aws s3 --dryrun lists the uploads and deletes below; nothing is written. Re-run with --apply.');
+    for (const a of syncs) {
+      t.log(`${o.apply ? '+' : 'DRY-RUN:'} aws ${[...a, '--profile', o.profile!].join(' ')}`);
+      t.stream('aws', aws(o, ...a));
+    }
+    t.log(`${o.apply ? '+' : 'DRY-RUN:'} aws ${[...cp, '--profile', o.profile!].join(' ')}`);
+    t.stream('aws', aws(o, ...cp));
+    if (o.apply) {
+      t.log(`+ aws ${[...invalidate, '--profile', o.profile!].join(' ')}`);
+      t.stream('aws', aws(o, ...invalidate));
+    } else t.log(`DRY-RUN: aws ${[...invalidate, '--profile', o.profile!].join(' ')}`);
+  } finally {
+    if (added) t.stream('git', ['worktree', 'remove', '--force', wt]);
+    t.removeScratch(scratch);
+  }
 }
 
 export function main(argv: string[], t: Tools): void {
   const o = parse(argv);
-  ({ github, 'oidc-provider': oidcProvider, dns, site, vars })[o.command](t, o);
+  ({ github, 'oidc-provider': oidcProvider, dns, site, vars, upload })[o.command](t, o);
 }

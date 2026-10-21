@@ -4,7 +4,7 @@
 //! diff of `testdata/golden/` is the review of the format.
 
 use crate::CommitId;
-use crate::installer_toml::{InstallerToml, Source};
+use crate::installer_toml::{FrontendPull, InstallerToml, Source};
 use crate::record::{
     ActivationId, Component, Expected, OrderRecord, OrderVerb, Sha256Hex, TargetPlatform,
 };
@@ -19,11 +19,17 @@ pub const ORDER_CONFIRM: &str = include_str!("../testdata/golden/order_confirm.j
 pub const ORDER_REVERT: &str = include_str!("../testdata/golden/order_revert.json");
 pub const ORDER_FRONTEND_UPDATE: &str =
     include_str!("../testdata/golden/order_frontend_update.json");
+pub const ORDER_FRONTEND_UPDATE_STAGED: &str =
+    include_str!("../testdata/golden/order_frontend_update_staged.json");
 pub const STATE: &str = include_str!("../testdata/golden/state.json");
 pub const STATUS: &str = include_str!("../testdata/golden/status.json");
 pub const INSTALLER_TOML_URL: &str = include_str!("../testdata/golden/installer.toml");
 pub const INSTALLER_TOML_FRONTEND: &str =
     include_str!("../testdata/golden/installer_frontend.toml");
+pub const INSTALLER_TOML_BUNDLED: &str = include_str!("../testdata/golden/installer_bundled.toml");
+pub const INSTALLER_TOML_FRONTEND_PULL: &str =
+    include_str!("../testdata/golden/installer_frontend_pull.toml");
+pub const INSTALLER_TOML_URL_CA: &str = include_str!("../testdata/golden/installer_url_ca.toml");
 
 fn commit(id: &str) -> CommitId {
     c(id)
@@ -50,6 +56,7 @@ pub fn order_activate() -> OrderRecord {
             state_schema: 4,
             profile: "release".to_owned(),
         }),
+        source: kbf_update::Source::Fetch,
     }
 }
 
@@ -72,6 +79,15 @@ pub fn order_frontend_update() -> OrderRecord {
     }
 }
 
+/// The same update of the frontend, of the release the installer's package carries: the
+/// record names its source, which a record that fetches leaves out.
+pub fn order_frontend_update_staged() -> OrderRecord {
+    OrderRecord {
+        source: kbf_update::Source::Staged,
+        ..order_frontend_update()
+    }
+}
+
 pub fn order_confirm() -> OrderRecord {
     OrderRecord {
         order_id: 43,
@@ -82,6 +98,7 @@ pub fn order_confirm() -> OrderRecord {
         window_s: 900,
         components: Vec::new(),
         expected: None,
+        source: kbf_update::Source::Fetch,
     }
 }
 
@@ -159,6 +176,8 @@ pub fn installer_toml_url() -> InstallerToml {
         min_activation_interval_s: 120,
         node_cert: None,
         node_key: None,
+        release_ca: None,
+        frontend: None,
         proxy: None,
         database: None,
     }
@@ -168,6 +187,39 @@ pub fn installer_toml_frontend() -> InstallerToml {
     InstallerToml {
         node_cert: Some("/etc/kbf/node.crt".into()),
         node_key: Some("/etc/kbf/node.key".into()),
+        ..InstallerToml::default()
+    }
+}
+
+/// A host that fetches nothing: the defaults, with the release the package carries.
+pub fn installer_toml_bundled() -> InstallerToml {
+    InstallerToml {
+        source: Source::Bundled,
+        ..InstallerToml::default()
+    }
+}
+
+/// A node that pulls over the LAN: the frontend's node identity and the snapshot of its worker
+/// listener and CA.
+pub fn installer_toml_frontend_pull() -> InstallerToml {
+    InstallerToml {
+        frontend: Some(FrontendPull {
+            url: "https://frontend.lan:8443".to_owned(),
+            ca: "/var/lib/kbf-installer/frontend-ca.pem".into(),
+            ca_sha256: Sha256Hex::try_from(
+                "d2a84f4b8b650937ec8f73cd8be2c74add5a911ba64df27458ed8229da804a26".to_owned(),
+            )
+            .expect("a digest"),
+        }),
+        ..installer_toml_frontend()
+    }
+}
+
+/// A file server under a private CA.
+pub fn installer_toml_url_ca() -> InstallerToml {
+    InstallerToml {
+        source: Source::Url("https://releases.example.com/kbf".to_owned()),
+        release_ca: Some("/var/lib/kbf-installer/release-ca.pem".into()),
         ..InstallerToml::default()
     }
 }

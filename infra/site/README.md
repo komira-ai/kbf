@@ -14,7 +14,7 @@ deploy to) and their own `gh` login. Each step is a dry run unless `--apply` is 
 unless the AWS profile's account equals the `--account` you pass. Nothing here writes an account id, an organization
 name or a repository id to a file: they are flags and CDK context.
 
-Dry runs: `dns` and `site` make AWS read calls even without `--apply` (the caller identity, and `cdk diff` and its
+Dry runs: `dns`, `site` and `upload` make AWS read calls even without `--apply` (the caller identity, and `cdk diff` and its
 lookups); `github`'s dry run makes no AWS call and no change (it reads the repository from GitHub). `site` and `github`
 refuse a `--repo` whose GitHub `full_name` is not exactly the name given (case-insensitive), and print the repository
 name and the two numeric ids the role will trust before any write or `cdk` call.
@@ -60,6 +60,7 @@ stand there.
 | `--repo` / `-c githubRepo` | `github`, `site`, `vars` | `<owner>/<name>` of the repository that hosts the publish workflow |
 | `-c githubRepoId`, `-c githubOwnerId` | `cdk` (set by `site`) | immutable numeric ids; `site` reads them with read-only `gh api repos/<repo>` |
 | `--domain` / `-c domain` | `dns`, `site` | site name; default `kbf.dev` |
+| `--no-domain` / `-c noDomain=true` | `site` | no certificate, alias or zone; serve on the `*.cloudfront.net` name (see "Before DNS") |
 | `--oidc-provider-arn` / `-c oidcProviderArn` | `site` | the account's existing GitHub OIDC provider; default `arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com` |
 
 Names are fixed: bucket `kbf-prod-site-<account>`, headers policy `kbf-prod-site-headers`, function
@@ -158,6 +159,44 @@ no hand-written one and no waiver: it passes the checks every tag passes. Gamma 
 - Step 1: delete the stack; the zone is RETAINed, delete it in Route 53 by hand once nothing delegates to it.
 - Step 0b: delete the provider in IAM only if nothing else in the account uses it.
 - Step 0: delete the environments `prod` and `prod-site`; restore the sub template with `use_default=true`.
+
+## Before DNS: no-domain mode
+
+While the domain has no delegation yet, deploy the same stack without the domain: no ACM certificate, no alias, no
+Route 53 lookup or records. CloudFront serves the site on its own `*.cloudfront.net` name with the default certificate.
+`held site --no-domain` (context `-c noDomain=true`) does not look up or need the zone, still refuses without the OIDC
+provider or on an account mismatch, and prints the distribution's domain name (stack output `DistributionDomainName`).
+`dns` is not needed.
+
+```sh
+npm run held -- github --repo <owner>/<name>                      # dry run, then add --apply
+npm run held -- site --no-domain --account <id> --profile <profile> --repo <owner>/<name>   # dry run, then add --apply
+npm run held -- vars --account <id> --profile <profile> --repo <owner>/<name>              # prints the gh variable commands and the site URL
+npm run held -- upload --account <id> --profile <profile> --commit <40-hex sha>             # dry run, then add --apply
+```
+
+`upload` is TEMPORARY (marked `// temporary: removed by site-publish.yml` in `held/steps.ts`): it puts the website on the
+bucket until the publish workflow does. It runs with your own profile, never the CI role, and needs the stack from
+`site` (the bucket and distribution come from its outputs; it works for the no-domain stack). It
+1. refuses unless the sha is a commit of this repository and the `node` on PATH is exactly the one in `site/.node-version`
+   (both checked before anything is built);
+2. makes a temporary `git worktree add --detach` at the sha, runs `npm ci --ignore-scripts --no-audit --no-fund` and
+   `npm run build` in its `site/`, runs check-dist (CSP, links, hygiene) on the `dist/` and refuses if it fails, then
+   removes the worktree;
+3. syncs `dist/` with `aws s3 sync --delete` in passes per class, each excluding `releases/*` last (it never touches
+   `releases/`): `assets/*.js` and `assets/*.css` with `public, max-age=31536000, immutable`, pages (`*.html`,
+   `text/html; charset=utf-8`) with `public, max-age=60, s-maxage=300`, then a sweep that deletes what the build no
+   longer has (the sweep skips `releases/*` and `version.txt`);
+4. uploads `version.txt` (the sha, `text/plain`, `no-cache`), then invalidates `/*` last.
+
+The dry run builds and checks locally, prints the file list, and runs each `aws s3` call with `--dryrun` (S3 read
+calls, which list the uploads and deletes); it writes nothing and does not invalidate.
+
+Moving to the domain later: run `dns` (step 1), set the nameservers at the registrar (step 2), then run `site` again
+WITHOUT `--no-domain` (dry run first). The bucket and the distribution keep their logical ids (a test compares them
+between the two modes), so nothing is replaced. In place, the deploy adds the certificate (validated in the zone), the
+A and AAAA alias records, and the distribution's alias and certificate; the bucket, OAC, headers policy, router function
+and publish role do not change. The `*.cloudfront.net` name keeps working. The variables do not change.
 
 ## The publish workflow
 

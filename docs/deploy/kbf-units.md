@@ -27,8 +27,8 @@ lists the mode's flags. There is no `node` mode and no `enroll` word.
   and does not read the file. The units that `render-units` writes still run the old subcommand
   forms (`kbf storage ...`, `kbf daemon ...`): they are hidden aliases of the same modes, kept
   until the units move.
-- **`kbf.toml`.** `kbf --mode=storage|daemon|storage-and-daemon` with at most `--config FILE` and
-  `--label` reads the host's file. On the first start, with the token file `enroll.token_file`
+- **`kbf.toml`.** `kbf --mode=storage|daemon|storage-and-daemon` with at most `--config FILE`
+  reads the host's file. On the first start, with the token file `enroll.token_file`
   names, it makes its keys, sends the token and a request for the roles the mode needs
   (`storage` the storage role, `daemon` the daemon role, `storage-and-daemon` both) and writes
   `node.json`; later starts renew the certificates without the token. `[storage]` and `[daemon]`
@@ -455,7 +455,7 @@ names) as well as from the command line. The file is the mode's flags and nothin
   one key per flag, the key being the flag's long name without the dashes in front
   (`--storage-listen` is `storage-listen = "127.0.0.1:9982"` under `[listener]`);
 - a value is what the flag takes: a string or a number, `true` for a switch, an array
-  for a flag that may be given more than once (`label = ["a=b", "c=d"]`). Names,
+  for a flag that may be given more than once (`server = ["https://a:8981", "https://b:8981"]`). Names,
   validation and defaults are the flags' own, because the file is turned into the flags
   it stands for before clap parses the command line;
 - a flag on the command line replaces the file's key for it;

@@ -143,7 +143,7 @@ ssh-key = { version = "0.6.7", default-features = false, features = ["alloc", "e
 # Constant-time comparison of the operator API token (kbf-server). Already in the tree
 # through rustls.
 subtle = "2.6.1"
-# Parses Rust sources for the interpreter budget's shell scan (kbf-it, tests only).
+# Parses Rust sources for the interpreter budget's shell scan (kbf-integration-test, tests only).
 # Already in the tree through the derive macros.
 syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "visit"] }
 # The tar archives kbf-deploy installs (`mdm install`) and `cargo xtask fetch` unpacks;
@@ -204,7 +204,7 @@ kbf-image = { path = "crates/kbf-image" }
 kbf-host = { path = "crates/kbf-host" }
 kbf-installer = { path = "crates/kbf-installer" }
 kbf-invocation = { path = "crates/kbf-invocation" }
-kbf-it = { path = "crates/kbf-it" }
+kbf-integration-test = { path = "crates/kbf-integration-test" }
 kbf-log = { path = "crates/kbf-log" }
 kbf-map = { path = "crates/kbf-map" }
 kbf-mapsync = { path = "crates/kbf-mapsync" }
@@ -231,23 +231,24 @@ kbf-storage = { path = "crates/kbf-storage" }
 kbf-store = { path = "crates/kbf-store" }
 kbf-testkit = { path = "crates/kbf-testkit" }
 kbf-threads = { path = "crates/kbf-threads" }
+kbf-oidc = { path = "crates/kbf-oidc" }
 kbf-tls = { path = "crates/kbf-tls" }
 kbf-tier = { path = "crates/kbf-tier" }
 kbf-transfer = { path = "crates/kbf-transfer" }
 kbf-types = { path = "crates/kbf-types" }
 kbf-ui = { path = "crates/kbf-ui" }
 kbf-update = { path = "crates/kbf-update" }
-# The CI verbs (`cargo xtask`); kbf-it reads the interpreter budget with its parser.
+# The CI verbs (`cargo xtask`); kbf-integration-test reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
 
 # `clippy.toml` lists the clock, sleep, network and hashed-collection items that pure
 # crates must not use. They are allowed workspace-wide; each pure crate denies them in
 # its `lib.rs` (an in-source attribute overrides this table), and the layering test in
-# `kbf-it` checks that the deny is present.
+# `kbf-integration-test` checks that the deny is present.
 [workspace.lints.rust]
 # `kbf_loom` swaps kbf-proxy's atomics for loom's (`cargo xtask proxy-loom`). Not `loom`:
 # tokio reads `cfg(loom)` too and then needs a loom dependency of its own.
-# `coverage` is set by cargo-llvm-cov (crates/kbf-all-in-one-test compiles its tests out under it).
+# `coverage` is set by cargo-llvm-cov (crates/kbf-all-in-one-test and crates/kbf-daemon-test compile their tests out under it).
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kbf_loom)", "cfg(coverage)"] }
 
 [workspace.lints.clippy]

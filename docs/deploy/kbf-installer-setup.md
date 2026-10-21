@@ -38,8 +38,8 @@ holds a token.
 
 | mode | `--frontend-url` | `--token-file` | `--database` | release source |
 |---|---|---|---|---|
-| `storage`, `daemon`, `storage-and-daemon` | required | required | refused | `frontend` (default) or `url` |
-| `frontend`, `all-in-one` | refused | refused | required | `url` only (`--release-url` required) |
+| `storage`, `daemon`, `storage-and-daemon` | required | required | refused | `frontend` (default), `url` or `bundled` |
+| `frontend`, `all-in-one` | refused | refused | required | `url` (default; `--release-url` required) or `bundled` |
 
 The modes in the first row enroll with a frontend when they start, so they need its URL
 (`https://host[:port]`, nothing after it) and an enrollment token file (an absolute path, one
@@ -49,7 +49,9 @@ accepts only `--mode=daemon`.
 
 | flag | meaning |
 |---|---|
-| `--release-source url\|frontend`, `--release-url` | where releases come from; `url` needs an `https` `--release-url`, `frontend` refuses one |
+| `--release-source url\|frontend\|bundled`, `--release-url` | where releases come from; `url` needs an `https` `--release-url`, `frontend` and `bundled` refuse one. `bundled` fetches nothing and takes no `--commit`: it writes `release_source = "bundled"`, and on a host with no release installs the one the package carries (checked by the same verify pipeline as a fetched one) between `installer.toml` and `kbf.toml` |
+| `--release-ca` | for `url`: a PEM file of the CAs the file server's certificate is checked against instead of the system's (an absolute path, a copy owned by root); written as `release_ca`, not read by a fetch yet; `setup` does not check the file's owner, so keep it root-owned in a root-owned directory |
+| `--frontend-worker-url`, `--frontend-ca`, `--frontend-ca-sha256` | for `frontend`, all three together: the frontend's worker listener (`https://host[:port]`), a copy of the CA that authenticates it and that copy's sha256; written as `frontend_url`, `frontend_ca`, `frontend_ca_sha256`, not read by a fetch yet; the CA copy must be root-owned in a root-owned directory (not checked by `setup`) |
 | `--commit` | the first release (40 hex); needs `--release-source url` |
 | `--min-generation N` | the floor for orders; it only goes up, `0` is refused, and a lower value than `installer.toml` holds is refused (exit 5) |
 | `--database`, `--create-local-database` | the state database, see below |
@@ -268,6 +270,7 @@ keeps the table, enables `kbf-frontend.service` as before and says so.
 | `--proxy-base-port` (default 18000, 1024 to 65521) | `[proxy.upstream] base_port`: slot A uses it and the four after, slot B ten above |
 | `--buck2-auth none\|bearer\|mtls`, `--buck2-token-file` | `[proxy] buck2_auth`, `buck2_token_file` (a key file only with `bearer`) |
 | (none) | `[proxy] operator_token_file`: the operator token `setup` makes |
+| (none) | `[proxy] remote_operator_file`: optional, off when absent; a path to the allow-list of a CI job's GitHub OIDC token (`[remote_operator]` table; claims in `docs/design/frontend-proxy.md` section 4a). Written by hand; a rerun keeps it |
 | (none) | `[proxy] ui = true`: the proxy serves the read-only web UI at `/ui`, open (no certificate or token), `GET` and `HEAD` only; set `ui = false` in `installer.toml` to make `/ui` a 404 |
 
 `setup` enables `kbf-proxy.socket` and `kbf-proxy.service` instead of `kbf-frontend.service`,

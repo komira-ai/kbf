@@ -31,7 +31,7 @@ pub const USAGE: &str = "usage: kbf-installer deploy --commit <40hex> [--api <12
 [--cas http(s)://127.0.0.1:port] [--cas-ca <pem>] [--cas-server-name <dns>] [--apply] [--json] [--bundle -|DIR] \
 [--allow-offline <id>[,<id>...]] [--node-timeout-s N] [--handover-timeout-s N] [--smoke-timeout-s N] \
 [--lock <path>] [--platform linux-x86_64|linux-arm64|darwin-arm64] \
-[--stage gamma|prod] [--offer <offer.json> | --no-offer] [--offer-max-age-h N]";
+[--stage gamma|prod] [--offer <offer.json>|- | --no-offer] [--offer-max-age-h N]";
 
 /// How long one call to the API may take, a release upload included (each read and write
 /// of the connection is held to it).
@@ -76,7 +76,12 @@ pub(super) struct Args {
 /// that got here through `sudo` (a deploy account that may only run `deploy`) must not set
 /// them: root would read a file of the caller's choosing and send it to an address of the
 /// caller's choosing. Those values come from the root-owned config.
-const HOST_FLAGS: [&str; 17] = [
+///
+/// `--offer` is not listed: a caller through `sudo` may give it, but only as `-` (the offer
+/// in the bundle), and `parse` refuses any other value. Public so that whoever builds the
+/// argument list a `sudo` caller sends (the gamma workflow) can test that it holds none of
+/// these.
+pub const HOST_FLAGS: [&str; 17] = [
     "--api",
     "--api-ca",
     "--api-server-name",
@@ -164,7 +169,15 @@ pub(super) fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args,
                 settle = number("--settle-timeout-s", &value("--settle-timeout-s")?)?;
             }
             "--stage" => stage = Some(value("--stage")?),
-            "--offer" => offer_file = Some(PathBuf::from(value("--offer")?)),
+            "--offer" => {
+                let path = value("--offer")?;
+                // Through `sudo` the offer is the bundle's (`-`): a path would have root read a
+                // file of the caller's choosing.
+                if via_sudo && path != "-" {
+                    return Err("--offer is accepted through sudo only as -".to_owned());
+                }
+                offer_file = Some(PathBuf::from(path));
+            }
             "--no-offer" => no_offer = true,
             "--offer-max-age-h" => {
                 max_age_h = number("--offer-max-age-h", &value("--offer-max-age-h")?)?;
@@ -272,7 +285,14 @@ pub(super) fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args,
     // One id for the whole run: every retry of the frontend update carries it.
     let request_id = format!("deploy-{}", hex::encode(random(16)?));
     let mut options = Options::new(commit, &platform, request_id);
-    options.offer = policy(stage, offer_file.as_deref(), no_offer, max_age_h, apply)?;
+    options.offer = policy(
+        stage,
+        offer_file.as_deref(),
+        bundle.as_deref(),
+        no_offer,
+        max_age_h,
+        apply,
+    )?;
     options.apply = apply;
     options.allow_offline = allow;
     options.node_timeout = Duration::from_secs(secs[0]);
@@ -299,10 +319,12 @@ pub(super) fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args,
 
 /// What the flags make of the offer rules. A stage is what an offer is bound to, so an offer
 /// or a `--no-offer` without one is a usage error, and so is an apply that names none (it
-/// would skip the rule that a gamma or prod deploy has an offer).
+/// would skip the rule that a gamma or prod deploy has an offer). `--offer -` is the offer in
+/// the bundle, which must then be the one on standard input (`--bundle -`).
 fn policy(
     stage: Option<Stage>,
     file: Option<&Path>,
+    bundle: Option<&str>,
     no_offer: bool,
     max_age_h: u64,
     apply: bool,
@@ -319,11 +341,18 @@ fn policy(
         }
         return Ok(OfferPolicy::Unchecked);
     };
+    let max_age = Duration::from_secs(max_age_h.saturating_mul(3600));
     Ok(match (file, no_offer) {
+        (Some(path), _) if path == Path::new("-") => {
+            if bundle != Some("-") {
+                return Err("--offer - needs --bundle -".to_owned());
+            }
+            OfferPolicy::InBundle { stage, max_age }
+        }
         (Some(path), _) => OfferPolicy::Offer {
             stage,
             doc: Box::new(offer::read(path)?),
-            max_age: Duration::from_secs(max_age_h.saturating_mul(3600)),
+            max_age,
         },
         (None, true) => OfferPolicy::Waived(stage),
         (None, false) => OfferPolicy::Missing(stage),
@@ -601,10 +630,12 @@ pub(super) fn run(
         Box::new(NoSmoke)
     };
     let probe: Box<dyn Probe> = match &parsed.options.offer {
-        OfferPolicy::Offer { .. } => match HostProbe::at(&host.installer_root, host.root) {
-            Ok(p) => Box::new(p),
-            Err(why) => return usage(err, &why),
-        },
+        OfferPolicy::Offer { .. } | OfferPolicy::InBundle { .. } => {
+            match HostProbe::at(&host.installer_root, host.root) {
+                Ok(p) => Box::new(p),
+                Err(why) => return usage(err, &why),
+            }
+        }
         _ => Box::new(NoProbe),
     };
     if let OfferPolicy::Waived(stage) = &parsed.options.offer {

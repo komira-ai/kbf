@@ -19,9 +19,8 @@
 //! Both files are JSON printed byte for byte as Python's `json.dumps(indent=2, sort_keys=True)`, so the same settings always give
 //! the same bytes.
 //!
-//! The files are what `kbf-deploy envoy render --topology box` writes for the same
-//! numbers (the golden in `tests/golden/envoy/box`); that tool is frozen and still holds
-//! its copy.
+//! The golden in `tests/golden/envoy/box` pins the bytes for the example numbers; they
+//! are the bytes the retired `kbf-deploy envoy render --topology box` wrote for them.
 
 mod check;
 mod config;

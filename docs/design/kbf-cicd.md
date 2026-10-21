@@ -17,8 +17,9 @@ kills a node while a build is running. The assertions are numbers, not logs: zer
 under-replicated blobs back to zero.
 
 A commit that passes beta may be offered to the operator's own farm: **gamma**. The farm's pull updater applies it. The
-deploy is itself a test (no build failed because a connection was dropped), and then a 24 hour **bake** runs with the
-operator's real usage as the canary. The bake ends in a verdict document.
+deploy is itself a test (no build failed because a connection was dropped). Planned: gamma's verdict (gamma verdict TBD, on
+a generic monitoring library) then comes from the operator's real usage over the metrics the gamma farm emits (section 7);
+nothing produces that verdict today.
 
 **prod** is the existing attested-artifact release (tag, files, notes), gated in GitHub on the runs of `ci`, `beta` and
 `artifacts` and the checks of the files (section 8.1); no verdict document gates it. **Rollback** is the updater walking back through the same mechanism it walked forward with: the
@@ -29,7 +30,7 @@ desired commit is set to the older release under a higher generation.
                                                   │ result attested (same set hash)
                                                   v
                           gamma: operator's farm, pull updater, deploy-as-test
-                                                  │ 24 h bake, real usage
+                                                  │ Planned: verdict from a monitoring library
                                                   v
                          (audit only) ──> prod: tag, attested files, notes
           any gate red ──> rollback: desired = the old commit, higher generation
@@ -76,7 +77,7 @@ What carries over, unchanged in meaning:
 | build once, promote by set hash | `artifacts.yml` already builds once per commit and writes `SHA256SUMS`; the set hash is the digest of that file |
 | validation never a skip, distinct exit code | each stage ends in a result document with a verdict; "not run" is not "passed" |
 | result document written RUNNING first, FINISHED on every exit | the same, one JSON per stage, uploaded as a workflow artifact |
-| workflow checked against the stage list | a lint in `crates/kbf-it/tests` beside the existing workflow lints (hosted runners only, SHA-pinned actions, `permissions: {}`) |
+| workflow checked against the stage list | a lint in `crates/kbf-integration-test/tests` beside the existing workflow lints (hosted runners only, SHA-pinned actions, `permissions: {}`) |
 | least privilege: the job with the publish token holds nothing else | `attest` is already the only job with `id-token: write`; the new jobs hold `contents: read` |
 | dry run by default | `release.yml` dispatch is already a dry run; gamma-offer and prod get the same switch |
 
@@ -89,10 +90,11 @@ Where kbf differs, and why:
    operator's frontend state store, and it moves. A moving pointer is the opposite of never-overwrite, so every move bumps a
    generation that only grows, and a rollback is the older commit under a higher generation. Downgrades are allowed; the
    generation is the guard (`pull-updates.md`, `split-mode-updates.md` 2.3).
-3. **Gamma and its bake run outside Actions.** A hosted runner on a public repository must not reach the operator's farm, so
-   the farm's metrics cannot be read from a workflow. kci's farm-connected jobs are not adopted. The operator side runs the
-   evaluator and returns a verdict (section 7).
-4. **There is a time gate.** kci has no bake, soak or metric gate, and no rollback verb. All three are new here.
+3. **Gamma runs outside Actions.** A hosted runner on a public repository must not reach the operator's farm, so
+   the farm's metrics cannot be read from a workflow. kci's farm-connected jobs are not adopted. Planned: the operator side
+   returns a verdict (section 7).
+4. **There is a metric gate, and no rollback verb in kci.** kci has no soak or metric gate, and no rollback verb. The deploy's
+   gates are built (section 5.2); the verdict over gamma's metrics is Planned (section 7).
 5. **Code is not shared.** kci is Mojo on Buck2; kbf is Rust with `xtask`. The stage file is plain data checked by a Rust lint.
 6. **kci's DEPLOY step** (a cloud resource graph apply) does not describe restarting kbf processes on a host. The
    deploy here is the frontend update of `frontend-proxy.md`, then the pull updater's node steps.
@@ -117,7 +119,7 @@ result = "beta-result.json"
 
 [[stage]]
 name = "gamma"
-runs = "operator"         # not an Actions job: offer, deploy, bake, verdict
+runs = "operator"         # not an Actions job: offer, deploy, verdict (verdict Planned, section 7)
 after = ["beta"]
 result = "gamma-verdict.json"
 
@@ -392,7 +394,7 @@ bake, then the new frontend offers the commit), and then watches the pull update
 time. The deploy is a test because it is checked as one:
 
 - **No build failed from a dropped connection**: `kbf_frontend_relay_untraced` is 0 at every scrape of the deploy, and every
-  build that was in flight at any point of the deploy (the evaluator records the invocation ids at deploy start and at every
+  build that was in flight at any point of the deploy (the deploy records the invocation ids at its start and at every
   step) finished without a farm-class failure (`failure-classes.md`: a farm problem never reaches the client as an action
   exit code). The invocations record carries the failure class **[F: `crates/kbf-invocation`]**.
 - **No lost blobs** over the deploy: `kbf_cache_lost_blobs == 0` and the `kbf_cache_blob_losses_total` delta is 0.
@@ -448,65 +450,18 @@ sets nothing. It holds no signing key and no key is needed: the host-side trust 
 Signing operator-authored manifests for hosts to verify is deliberately not done for now; if it returns it is a new decision
 with its own page.
 
-## 7. The 24 hour bake
+## 7. Gamma's verdict (Planned)
 
-After a clean deploy the farm runs the release for 24 hours on the operator's real usage. The bake is run by an evaluator
-that is part of `kbf` and runs beside the farm [P]: it reads the farm's own metrics endpoint and invocation records, keeps
-its state in a file (so a restart does not restart the clock), and writes the verdict.
+Planned: gamma verdict TBD, on a generic monitoring library. The library reads the metrics the gamma farm emits and
+produces `gamma-verdict.json`, the document section 8.1 requires. Nothing here is built: there is no evaluator, no
+time gate over the operator's real usage, no baseline and no automatic rollback. The deploy's own gates are built and are
+section 5.2's. The earlier design of a 24 hour bake (its gate table, minimum load, baseline and hand-off) was removed with
+its code, and is in the history of this page.
 
-**A bake with no usage is not a pass.** Real usage is the canary, so the bake has a minimum-load condition: at least
-**[P]** 1000 executed actions and 10 builds across the window, and at least 3 distinct hours with load. Below that the
-bake extends (it does not pass); the operator may waive it with a waiver that the verdict records.
-
-Gates, evaluated continuously (a hard gate failing ends the bake red at once) and at the end:
-
-| gate | measure | threshold | hard? |
-|---|---|---|---|
-| no infra-attributed failures | farm-class failed actions (the failed-actions-by-class counter, M10) | 0 over the bake | yes |
-| lost blobs | `kbf_cache_lost_blobs` at every scrape; `kbf_cache_blob_losses_total` delta | gauge 0; delta 0 | yes |
-| under-replicated | `under_replicated_blobs` | 0 at the end and 0 after the post-deploy settle window; above 0 for more than **[P]** 10 minutes outside a node step is a failure | yes |
-| handover losses | `kbf_frontend_relay_untraced` at every scrape | 0 | yes |
-| error rate | `kbf_execute_errors_total` / `kbf_execute_requests_total`, excluding client aborts once M11 exists | at most the larger of twice the baseline and the baseline plus **[P]** 0.5 percentage points | yes |
-| latency | `Execute` queue-to-start p99 (`kbf_execute_queued_seconds`, a histogram **[F]**) against the baseline | not above **[P]** 1.5 times the baseline | no, reported; yes if above 3 times |
-| write tier | flush failures, unflushed bytes, corrupt, `kbf_tier_flush_digest_mismatch_total` | no new failures or mismatches | yes |
-| restarts | the updater's phase log until a process boot counter exists (M13) | no process restarted that the deploy did not restart | yes |
-
-The **baseline** is the same ratios over the 7 days before the deploy, taken by the evaluator at deploy start and stored with
-the verdict. An absent metric fails the gate, never passes it. Thresholds marked [P] are starting values; the bake's first
-runs are measured, the thresholds are written down with the evidence, and a change to a threshold is a reviewed change to
-this page and to the evaluator's table in the same commit.
-
-`FindMissingBlobs` has request counters but no latency histogram **[F]**, so it has no latency gate until one is added (M14).
-The evaluator is deliberately not a dashboard: a person reading a graph is not a gate and cannot be required.
-
-### 7.1 The verdict
-
-`gamma-verdict.json`: commit, set hash, desired generation, deploy start and end, bake start and end, each gate with measured value and
-threshold, the minimum-load numbers and any waiver. It is a record, not a credential: no host reads it. A red verdict triggers
-section 8; a green one makes the commit publishable (the tag of 8.1 carries it).
-
-### 7.2 Hand-off, baseline and automatic rollback
-
-The deploy and the evaluator are separate processes, so one file passes between them, the **hand-off**: commit, set hash, the
-evaluator's run id, the deploy's start (and end, once it has one), the generation the deploy set, whether the release is
-**reversible** (8.3: the offer knows, the evaluator only reads it; the field has no default) and the commit the deploy
-replaced. `kbf-bake run --handoff FILE` takes all of it from there.
-
-The **baseline** is taken at deploy start, for the deploy's start time, by `kbf-bake baseline`. The farm keeps no time
-series, so the error ratio is failed over executed actions across the closed invocations of the seven days before the
-deploy (`GET /v1/invocations?since&until`), and the latency baseline is the p99 of the evaluator's own earlier scrapes
-(`kbf-bake sample`, kept in a ledger file by something that runs it regularly). A baseline the records or the ledger cannot
-give (a partial list, no executed action, a ledger that does not reach back the seven days) is written down as absent with its
-reason, `baseline` exits 4, and the gate that needs it is red. The error ratio of the records is the records' measure and
-not the `kbf_execute_errors_total` ratio the gate holds the bake to; it is the closest the records give.
-
-**Automatic rollback** is off unless `--auto-rollback` is given (with `--handoff`, `--rollback-url` and
-`--rollback-token-file`). It is offered only when the bake ends red on a gate that had a measurement over its limit, the
-hand-off says the release is reversible, and it names the previous commit and the generation. The offer is
-`POST /v1/update/desired` with `expect_generation`, so a desired commit someone else moved since is a `409` and nothing is
-written; it is made once and never retried. A soft gate never ends a bake, a green or extended end never rolls back, a gate
-that is red only for want of a series or a baseline is no evidence against the release, and an irreversible release pages
-and offers nothing. The cancel hold of Q6 is not built: it is the owner's decision.
+What the verdict must be, whoever produces it: a record, not a credential (no host reads it), naming the commit, the set
+hash, the desired generation, the deploy's start and end, each gate with its measured value and threshold, and any waiver.
+A red verdict triggers section 8; a green one makes the commit publishable (the tag of 8.1 carries it). An absent metric
+fails its gate, never passes it, and a producer failure is never a pass.
 
 ## 8. Stage 3: prod, and rollback
 
@@ -561,19 +516,16 @@ Rollback is the updater walking back, and it is the forward mechanism with the o
   restarting the serving one); nodes by the node step, idle or drained, in any order; across a protocol difference the order
   reverses (nodes first).
 - **Triggers.** Local and fast: the commit-confirm auto-revert of a process that never becomes active (minutes, on the host,
-  no controller needed). During a deploy: any gate of 5.2 halts and walks back what was changed. During a bake: a hard gate
-  red makes the evaluator write a red verdict and **set the rollback automatically** when the release is reversible
-  (8.3); when it is not, it pages and offers nothing. A soft gate never rolls back by itself.
+  no controller needed). During a deploy: any gate of 5.2 halts and walks back what was changed. After a deploy: Planned (section 7);
+  nothing rolls back automatically today, and a person sets the older commit.
 - **Prod rollback** is the same move on each farm that runs the public release: its desired commit goes to the older release
   under a higher generation. The GitHub release is not rewritten (the published files are permanent, as kci's names are);
   the notes of the next release say what was withdrawn, and the release poller does not propose a withdrawn commit.
 - **When a rollback lands mid-roll [P].** A process mid-step is not interrupted: the updater finishes that step to its
   phase boundary (T13), then walks back from the current state. The first node step and the frontend handover are each a
   place a rollback can arrive; B11 tests both, with N and N-1 mixed in the reverse order.
-- **Who decides when the evaluator is down.** The evaluator that notices a red gate and the command that sets the desired
-  commit are separate. If the evaluator is down the bake extends and pages (it never passes), and automatic rollback is
-  unavailable; a person can set the older commit directly (`POST /v1/update/desired`), which does not depend on the evaluator. The only
-  guarantee with both down is the host's own commit-confirm auto-revert, which is per process and minutes-scale.
+- **Who sets the rollback.** A person sets the older commit directly (`POST /v1/update/desired`); no evaluator is involved.
+  The floor is the host's own commit-confirm auto-revert, which is per process and minutes-scale.
 - A rollback is tested in beta (B10, B11) and its result belongs to the same attested record.
 
 ### 8.3 Not reversible, and said before the click
@@ -581,7 +533,7 @@ Rollback is the updater walking back, and it is the forward mechanism with the o
 From `split-mode-updates.md` **[F]**: a release that changed the schema beyond expand (the contract step of expand then
 contract), and a node whose log version was raised (an older binary cannot open it; the walk-back wipes that node's meta
 directory and rebuilds from segment footers). A release containing either is flagged at the offer: the offer command prints it, the
-notes carry it, the evaluator's automatic rollback is off for it, and the contract step ships one release after the expand
+notes carry it, an automatic rollback (Planned) would be off for it, and the contract step ships one release after the expand
 step, never in it.
 
 ## 9. N/N-1 compatibility in CI
@@ -612,12 +564,12 @@ does not skip the check: the beta is red ("not run" is not "passed").
 - **Evidence is kept**: process logs, scraped metric series, event logs and the result document upload on every run for the
   same 90 days as the builds.
 - **Gamma halts, it does not push through.** A halted deploy leaves a state the run can name, resumable from the host's phase
-  (T13), never started from the top. An evaluator failure extends the bake and pages; it never counts as a pass.
+  (T13), never started from the top. A failure of the verdict's producer (Planned, section 7) is never a pass.
 - **A broken main**: a red full beta means no later commit is offered until a later commit has a green one.
 - **Result documents.** One per stage, one shape (`stage`, `commit`, `set_hash`, `run_id`, `attempt`, `status`, `gates[]` with
   `name`, `measured`, `threshold`, `verdict`, `started`, `finished`), written RUNNING first and FINISHED on every exit, as kci
   does. Beta also posts a job summary (gate table, time per scenario, update timeline) and keeps a per-commit history file in
-  the attested artifacts (beta duration, deploy length, bake values) so drift shows before a gate trips (M22).
+  the attested artifacts (beta duration, deploy length) so drift shows before a gate trips (M22).
 - A scenario that only gamma found gets a beta scenario in the fix; the count of such escapes goes in the release notes.
 
 ## 11. Metrics the stages read
@@ -643,7 +595,7 @@ one issue with one done criterion. "Blocked by" names open pull requests or othe
 | M6 | Pull updater end to end: release poller, desired-state rows, host-side attestation verification, no SSH push | the updater replaces the stand-in in B1 to B4 | #908, #929, M7 |  #947 |
 | M7 | `offer`: promotion by setting the desired commit, beta-result check, plan mode (no operator-signed feed) | `offer` refuses on a red or missing beta result and on an incomplete release; the generation only rises | |  #948 |
 | M8 | Gamma deploy-as-test checks: in-flight invocation record, dropped-connection and lost-blob checks, halt and walk back | a planted dropped connection fails the deploy | M6, #791, #792 |  #949 |
-| M9 | Bake evaluator: baseline, minimum load, state file, verdict | a restart keeps the clock; an absent metric fails; thin usage extends | M10, M13 |  #950 |
+| M9 | Gamma verdict producer: Planned, on a generic monitoring library over the gamma farm's metrics (the bake evaluator was removed) | an absent metric fails; a producer failure is never a pass | M10, M13 |  #950 |
 | M10 | Metric: failed actions by failure class | counter present, labelled by class | |  #951 |
 | M11 | Metric: Execute errors by cause | client abort distinguished from dropped | |  #952 |
 | M12 | Release workflow: tag check (the tag names the commit, on main; no signing key; no verdict gates), approval environment, notes | a tag naming another commit or off main fails `verify`; a tag with no record, or a failed one, passes | M7, M9, M19 |  #953 |
@@ -678,14 +630,14 @@ dependencies of every "0 failed actions" gate).
 4. **Record channel. Decided: the release tag's message, unsigned.** The Beta record (audit only; nothing gates on it) travels in the annotated `v*` tag on main;
    the tag-protection ruleset limits who can push it and the `prod` environment reviewer gates `publish`. No signing key
    (it would add custody with no new protection).
-5. **Does the operator's farm need to be the only gamma?** One farm's usage can be too thin to be a canary. The minimum-load
-   rule makes that visible (the bake extends). *Recommend keeping one gamma now*, and revisiting if bakes routinely extend.
-6. **Automatic rollback during a bake.** *Recommend automatic offer for hard gates on a reversible release, a page otherwise*,
+5. **Does the operator's farm need to be the only gamma?** One farm's usage can be too thin to be a canary. Planned: the
+   verdict producer must make thin load visible. *Recommend keeping one gamma now*.
+6. **Automatic rollback after a bad verdict (Planned).** *Recommend automatic offer for hard gates on a reversible release, a page otherwise*,
    with a person able to cancel before the desired commit is set (a short, **[P]** 10 minute hold). Owner decision.
 7. **Hosted runner capacity.** *Recommend measuring B-0 first* (peak memory and wall time of the whole farm on a standard
    runner) and deciding on a larger hosted runner only on that number. Self-hosted only under the conditions of 4.2.
-8. **Baseline for the error-rate gate** over 7 days versus the previous release's bake. *Recommend 7 days*, since the
-   previous bake is one data point and may itself have been bad.
+8. **Baseline for an error-rate gate** (Planned): 7 days versus the previous release. *Recommend 7 days*, since the
+   previous release is one data point and may itself have been bad.
 9. **Where the harness sits when #936 lands.** The stand-in runtime goes. *Recommend B-0 on the stand-in with the weakening
    stated (section 4.2)*, and a crun-with-delegation check on `ubuntu-24.04` as its own item, so beta is not delayed by #936.
 10. **Length.** The page is about 590 lines against a 300 to 500 target. Review asked for fixes that add content (the

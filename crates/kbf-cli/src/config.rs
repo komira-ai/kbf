@@ -36,6 +36,16 @@ pub const DEFAULT_PATH: &str = "/etc/kbf/kbf.toml";
 /// The group bits and other bits that may not be set on the file: write.
 const WRITABLE_BY_OTHERS: u32 = 0o022;
 
+/// The name of the node-label setting, removed with `--label`: a file that still sets it
+/// is refused with [`LABEL_KEY_REMOVED`], not with the general unknown-key line.
+const REMOVED_LABEL: &str = "label";
+
+/// What a file that still has a `label` key is told: it names the key and the way out,
+/// and the node does not start. The flag's twin is `--label was removed` in
+/// [`crate::parse_with`].
+const LABEL_KEY_REMOVED: &str =
+    "`label` was removed: placement uses what the node reports (OSFamily, ISA); delete the key";
+
 /// The table of the file a flag's key is in, by the flag's long name; `None` for a flag
 /// that is in no group (which `config::tests` refuses for every flag of every mode, so a
 /// flag cannot be added without its key).
@@ -202,7 +212,6 @@ const GROUPS: &[(&str, &[&str])] = &[
             "cert",
             "frontend",
             "key",
-            "label",
             "node-id",
             "server",
             "tls-server-name",
@@ -468,6 +477,10 @@ pub fn file_args(
                     "key `{group}` in {} is outside a table: it belongs under [{g}]",
                     path.display()
                 ),
+                _ if group == REMOVED_LABEL => format!(
+                    "unknown key `{group}` in {}: {LABEL_KEY_REMOVED}",
+                    path.display()
+                ),
                 _ => format!(
                     "unknown key `{group}` in {}: settings are keys of tables, one per group",
                     path.display()
@@ -481,8 +494,13 @@ pub fn file_args(
             }
             let Some(arg) = known.get(key.as_str()) else {
                 problems.push(format!(
-                    "unknown key `{group}.{key}` in {}: kbf has no flag --{key} in this mode",
-                    path.display()
+                    "unknown key `{group}.{key}` in {}: {}",
+                    path.display(),
+                    if key == REMOVED_LABEL {
+                        LABEL_KEY_REMOVED.to_owned()
+                    } else {
+                        format!("kbf has no flag --{key} in this mode")
+                    }
                 ));
                 continue;
             };

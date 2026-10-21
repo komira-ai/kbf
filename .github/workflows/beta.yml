@@ -2,7 +2,7 @@
 # on a push to main and never on a pull request: the whole nextest run
 # with its slow tests, the Arm run, the jobs that need a service or a root or a Mac
 # (Postgres, S3 stores, crun, the M1 and M2 cells, macOS), the Linux packages, and the beta
-# smoke below. The stage lint (crates/kbf-it/tests/workflows/stages.rs) allows `push` only.
+# smoke below. The stage lint (crates/kbf-integration-test/tests/workflows/stages.rs) allows `push` only.
 #
 # The beta smoke is a whole farm of real kbf processes (a frontend, three storage nodes, two
 # daemons; Buck2 dials the frontend's REAPI port) under real Buck2 builds, for five minutes,
@@ -18,7 +18,7 @@
 # proxy in a later change.
 #
 # Same hosted-runner, pinning and permission rules as ci.yml
-# (crates/kbf-it/tests/repo_lints.rs). The pins of the smoke job's Buck2 and actions are
+# (crates/kbf-integration-test/tests/repo_lints.rs). The pins of the smoke job's Buck2 and actions are
 # copies of the other jobs' here (module `beta_pins`). The Cargo cache is keyed on the
 # runner, the job, Cargo.lock and rust-toolchain.toml; only a push to main saves it, and
 # only when the exact key missed.
@@ -77,12 +77,12 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       # kbf (every role of the farm), kbf-beta (the scenario) and kbf-m2-act (the program
       # the sample project's actions run, as plain processes: no container runtime here).
-      - run: cargo build -p kbf-cli -p kbf-harness -p kbf-it --bins --locked
+      - run: cargo build -p kbf-cli -p kbf-harness -p kbf-integration-test --bins --locked
       - name: Fetch buck2 (pinned version, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
       - run: $RUNNER_TEMP/tools/buck2 --version
       - name: B0, the farm under build load
-        run: target/debug/kbf-beta b0 --bin-dir target/debug --buck2 "$RUNNER_TEMP/tools/buck2" --project crates/kbf-it/beta/buck2 --work "$RUNNER_TEMP/beta" --duration-secs 300 --concurrency 4 --summary "$GITHUB_STEP_SUMMARY"
+        run: target/debug/kbf-beta b0 --bin-dir target/debug --buck2 "$RUNNER_TEMP/tools/buck2" --project crates/kbf-integration-test/beta/buck2 --work "$RUNNER_TEMP/beta" --duration-secs 300 --concurrency 4 --summary "$GITHUB_STEP_SUMMARY"
       # The process logs, the scraped series, every build's console output and event log,
       # and the result document, kept 90 days whether the run passed or not; a re-run of
       # the same commit keeps its own (the attempt is in the name).
@@ -114,7 +114,7 @@ jobs:
       contents: read
     # The Envoy release the real-Envoy tests run (CI only: kbf releases pin and fetch no Envoy;
     # Envoy is a prerequisite checked against crates/kbf-installer/src/envoy/version.rs) and
-    # the installer's box render is held to, for Envoy's own validation of both renders
+    # the installer's box render is held to, for Envoy's own validation of the box render
     # and the real-Envoy tests of the box. The sha256 is the release's checksums.txt.asc
     # entry.
     env:
@@ -164,24 +164,18 @@ jobs:
       - run: cargo xtask build-commit stamps "$GITHUB_SHA"
       - name: Fetch Envoy (pinned release, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/envoyproxy/envoy/releases/download/v$ENVOY_VERSION/envoy-$ENVOY_VERSION-linux-x86_64" --sha256 "$ENVOY_SHA256" --out "$RUNNER_TEMP/tools/envoy"
-      # Envoy accepts the envoy kit's render and refuses a control with an unknown
-      # field (crates/kbf-deploy/tests/envoy_validate.rs).
-      - name: Envoy validates the envoy kit's render
-        run: cargo test -p kbf-deploy --test envoy_validate --locked -- --ignored
-        env:
-          KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
       # Envoy accepts the installer's box render and refuses a control with an unknown
-      # field (crates/kbf-it/tests/envoy_validate.rs).
+      # field (crates/kbf-integration-test/tests/envoy_validate.rs).
       - name: Envoy validates the installer's box render
-        run: cargo test -p kbf-it --test envoy_validate --locked -- --ignored
+        run: cargo test -p kbf-integration-test --test envoy_validate --locked -- --ignored
         env:
           KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
       # The installer's box render run by the pinned Envoy in front of two stub instances:
       # long silent streams, an instance turning not ready, the ceiling of open streams and
       # a hot restart, each with a control that plants the defect and sees it
-      # (crates/kbf-it/tests/envoy_box). About half a minute.
+      # (crates/kbf-integration-test/tests/envoy_box). About half a minute.
       - name: Envoy runs the installer's box render (long streams, health, ceiling, hot restart)
-        run: cargo test -p kbf-it --test envoy_box --locked -- --ignored
+        run: cargo test -p kbf-integration-test --test envoy_box --locked -- --ignored
         env:
           KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
       # The pinned gh accepts a real build attestation offline and refuses a subject
@@ -435,10 +429,10 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-  # The M2 test: pinned buck2 builds the sample project in crates/kbf-it/m2 remote-only
+  # The M2 test: pinned buck2 builds the sample project in crates/kbf-integration-test/m2 remote-only
   # through kbf-server to kbf-daemon --driver container, every action in a rootless
   # `crun` container of distroless base-debian12 pinned by its amd64 manifest digest
-  # (`kbf-cell m2`, crates/kbf-it/src/m2.rs, says what is checked; it sets the runner
+  # (`kbf-cell m2`, crates/kbf-integration-test/src/m2.rs, says what is checked; it sets the runner
   # up as `cargo xtask crun-tests` does). x86_64 only: the image digest is the amd64
   # one.
   m2-container:
@@ -463,13 +457,13 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      - run: cargo build -p kbf-server -p kbf-node -p kbf-it --bin kbf-server --bin kbf-daemon --bin kbf-cell --locked
+      - run: cargo build -p kbf-server -p kbf-node -p kbf-integration-test --bin kbf-server --bin kbf-daemon --bin kbf-cell --locked
       # The image's glibc is Debian 12's, older than the runner's, so the helper every
       # action runs is linked statically (kbf-cell m2 refuses a dynamic one).
-      - run: cargo rustc -p kbf-it --bin kbf-m2-act --locked -- -C target-feature=+crt-static
+      - run: cargo rustc -p kbf-integration-test --bin kbf-m2-act --locked -- -C target-feature=+crt-static
       - name: Fetch buck2 (pinned version, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
-      - run: target/debug/kbf-cell m2 --bin-dir target/debug --project crates/kbf-it/m2/buck2 --work "$RUNNER_TEMP/m2" --buck2 "$RUNNER_TEMP/tools/buck2"
+      - run: target/debug/kbf-cell m2 --bin-dir target/debug --project crates/kbf-integration-test/m2/buck2 --work "$RUNNER_TEMP/m2" --buck2 "$RUNNER_TEMP/tools/buck2"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
@@ -556,6 +550,10 @@ jobs:
       # (tests/slot_clean.rs). One test at a time: they make users at free uids.
       - run: cargo xtask sudo-test -p kbf-driver-native --test slots -- --test-threads=1 --nocapture
       - run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture
+      # What an action as a pool user reaches of another slot (files, loopback TCP, Unix
+      # sockets, the process table), measured and printed, not asserted, with and without
+      # the sandbox (crates/kbf-driver-native/tests/slot_reach.rs).
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_reach -- --test-threads=1 --nocapture
       # The per-binary entitlement allow list (tools/ci/darwin-entitlements.txt): the
       # kbf-vmm stub signed by `cargo xtask sign-darwin` with the virtualization
       # entitlement, kbf with none, both accepted by `darwin-asset`, and every
@@ -674,10 +672,10 @@ jobs:
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # The M1 exit test: MinIO (pinned by digest), one kbf-server and one daemon, and the
-  # sample projects in crates/kbf-it/m1 built remote-only with pinned Bazel and buck2, twice
+  # sample projects in crates/kbf-integration-test/m1 built remote-only with pinned Bazel and buck2, twice
   # each. The second build of each must be all remote cache hits. A last buck2 build holds a
   # lease in flight (an action that sleeps) while the node is drained through the operator
-  # API (`kbf-cell m1`, crates/kbf-it/src/m1.rs, says exactly what is checked).
+  # API (`kbf-cell m1`, crates/kbf-integration-test/src/m1.rs, says exactly what is checked).
   m1-cell:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -707,7 +705,7 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install
       # kbf-act (kbf-testkit) is the program the samples' `shout` action runs.
-      - run: cargo build -p kbf-server -p kbf-it -p kbf-testkit --bins --locked
+      - run: cargo build -p kbf-server -p kbf-integration-test -p kbf-testkit --bins --locked
       - name: Fetch Bazel (pinned version, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/bazelbuild/bazel/releases/download/$BAZEL_VERSION/bazel-$BAZEL_VERSION-linux-x86_64" --sha256 "$BAZEL_SHA256" --out "$RUNNER_TEMP/tools/bazel"
       - name: Fetch buck2 (pinned version, checked by SHA-256)
@@ -717,7 +715,7 @@ jobs:
       - name: Wait for MinIO, then run the store conformance suite on it
         run: cargo run -p kbf-objstore --example s3_conformance --locked -- --endpoint http://127.0.0.1:9000 --bucket kbf-m1-conformance --create-bucket --conditional-put --wait-ready 60
       - name: M1 cell, Bazel and buck2 twice each
-        run: target/debug/kbf-cell m1 --bin-dir target/debug --projects crates/kbf-it/m1 --work "$RUNNER_TEMP/m1" --s3-endpoint http://127.0.0.1:9000 --s3-bucket kbf-m1 --bazel "$RUNNER_TEMP/tools/bazel" --buck2 "$RUNNER_TEMP/tools/buck2"
+        run: target/debug/kbf-cell m1 --bin-dir target/debug --projects crates/kbf-integration-test/m1 --work "$RUNNER_TEMP/m1" --s3-endpoint http://127.0.0.1:9000 --s3-bucket kbf-m1 --bazel "$RUNNER_TEMP/tools/bazel" --buck2 "$RUNNER_TEMP/tools/buck2"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:

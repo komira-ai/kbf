@@ -7,7 +7,9 @@
 //! fetches the release (if it is not installed) before it owes a restart or moves a link, so
 //! a refused or failed fetch changes nothing. The links move before the service restarts and
 //! the restart is recorded as owed before it is tried, so a crash anywhere leaves a state the
-//! next pass completes.
+//! next pass completes. An order may name the release the host's package carries instead of
+//! one to fetch (`source = staged`, `staged.rs`): it is held to the package's manifest and to
+//! a floor on its `seq`, and then goes through the same fetcher, pipeline and swap.
 
 use std::io::Write;
 use std::time::Duration;
@@ -17,14 +19,18 @@ use crate::activate::{self, Activated, Arm, Confirmed, Expiry};
 use crate::layout::{self, Layout, Platform};
 use crate::release::{self, ReleaseError};
 use crate::spool::{Entry, read_capped};
+use crate::stage;
 use crate::state::{self, Locked, State, StateError};
 use kbf_host::plan::Mode;
 use kbf_host::{Exec, HostPath, Perms, Step};
+use kbf_update::{Facts, Source};
 
 mod frontend;
+mod staged;
 
+use self::staged::{Held, refusal_of};
 use crate::database::SchemaStep;
-use crate::helper::fetcher::{Fetcher, InstalledRelease, ReleaseLocator};
+use crate::helper::fetcher::{Fetcher, InstalledRelease};
 use crate::helper::host_mode;
 use crate::helper::leases::{self, LeaseSource};
 use crate::helper::memory::{Event, Memory, StagedFacts};
@@ -133,6 +139,12 @@ impl<E: Exec> Helper<E> {
         self.leases.as_ref()
     }
 
+    /// Replace the lease source, for a test that plays a Mac's.
+    #[cfg(test)]
+    pub(crate) fn set_leases(&mut self, leases: Box<dyn LeaseSource>) {
+        self.leases = leases;
+    }
+
     /// The host's executor, for a test to read what was done.
     pub fn exec(&self) -> &E {
         &self.exec
@@ -189,11 +201,22 @@ impl<E: Exec> Helper<E> {
         Ok(state::read_unlocked(&self.host)?.unwrap_or_default())
     }
 
-    /// Run once at start: make the links agree with the state after an interrupted verb.
-    /// A link that moved means the service may still run the old release: restart it.
+    /// Run once at start: remove the scratch a killed stage left in `work/`, and make the
+    /// links agree with the state after an interrupted verb. A link that moved means the
+    /// service may still run the old release: restart it.
+    ///
+    /// The sweep is made here and only here, under the lock: this process is not staging
+    /// yet, and a pass must not sweep, since `setup` stages the first release in a process
+    /// of its own. A sweep that fails is logged, never a refusal (as with the gc after a swap:
+    /// nothing was ordered that it could undo, and a refusal would hide the host's real
+    /// state in `status.json`); the start goes on, and a commit the leftovers still wedge is
+    /// refused when it is ordered.
     pub fn recover(&mut self) -> Result<(), HelperError> {
         let mut memory = self.load()?;
         let runs_frontend = host_mode::frontend_host(&self.host).is_ok();
+        if let Err(e) = self.sweep_scratch() {
+            let _ = writeln!(self.log, "work sweep: {e}");
+        }
         match activate::reconcile(&mut self.exec, &self.host, &mut self.log) {
             // A frontend host owes the unit a restart only for a node swap on trial: the
             // proxy owns the frontend's children, and reads `installed_commit` itself. `|`,
@@ -205,6 +228,13 @@ impl<E: Exec> Helper<E> {
             Err(e) => refuse(&mut memory, &e.to_string()),
         }
         self.save(&memory)
+    }
+
+    /// [`stage::sweep_work`] under the lock, which is let go before this returns (the repair
+    /// that follows takes it again).
+    fn sweep_scratch(&self) -> Result<(), ReleaseError> {
+        let lock = Locked::acquire(&self.host)?;
+        stage::sweep_work(&self.host, &lock)
     }
 
     /// One pass. `now` is seconds since the epoch.
@@ -548,29 +578,12 @@ impl<E: Exec> Helper<E> {
                  frontend_update, and an activate would restart it"
             ));
         }
-        // Fail closed: an activation without the release's claims is not taken.
-        let Some(claims) = &order.claims else {
-            return Err(format!(
-                "order {id}: an activation carries no release claims"
-            ));
+        // An activation that fetches claims the release it expects; a staged one claims none,
+        // since the package's manifest says what its release is.
+        let claims = match order.source {
+            Source::Fetch => Some(self.vet_claims(order)?),
+            Source::Staged => None,
         };
-        // `kbf` is the one component a release of either platform carries that an order may
-        // name (a Mac is given no `kbf-daemon`).
-        let prefix = platform_prefix(&self.host);
-        let needs = ["kbf"].as_slice();
-        if !claims.platform.starts_with(prefix) {
-            return Err(format!(
-                "order {id} is for platform {:?}, not this host's ({prefix}*)",
-                claims.platform
-            ));
-        }
-        let mut names: Vec<&str> = claims.components.iter().map(|c| c.name.as_str()).collect();
-        names.sort_unstable();
-        if names != needs {
-            return Err(format!(
-                "order {id} names components {names:?}; this platform needs exactly {needs:?}"
-            ));
-        }
         // One confirm window at a time, never two timers. The same order again (a pass
         // that died after the swap) is the repeat `activate` recognises.
         let this = format!("{}-{}", order.epoch, order.id);
@@ -583,9 +596,13 @@ impl<E: Exec> Helper<E> {
             ));
         }
         // The lease check again, from what the installer observes.
-        match self.leases.live() {
-            Ok(0) => {}
-            Ok(n) => return Err(format!("{n} leases are live; not activating")),
+        match self.leases.live_noted() {
+            Ok((0, note)) => {
+                if let Some(note) = note {
+                    let _ = writeln!(self.log, "leases: {note}");
+                }
+            }
+            Ok((n, _)) => return Err(format!("{n} leases are live; not activating")),
             Err(why) => return Err(format!("cannot tell whether leases are live: {why}")),
         }
         // Already the running release: nothing to fetch, `activate` says so.
@@ -602,22 +619,33 @@ impl<E: Exec> Helper<E> {
                 now - last
             ));
         }
-        // A directory on the host is not proof: the fetcher verifies the release whether it
-        // pulls it or finds it.
-        let rec = ReleaseLocator {
-            commit: order.commit.clone(),
-            components: claims.components.clone(),
+        // A staged order is held to the rules of the seed now: after the shortcut above (a
+        // repeat of the order for the running release is not a refusal that holds the run),
+        // before anything is done.
+        let held = match claims {
+            Some(claims) => Held::Claims(claims),
+            None => {
+                let seed = self.admitted_seed(&order.commit);
+                Held::Seed(seed.map_err(|e| refusal_of(id, e))?)
+            }
         };
-        // The node is told a fetch is under way; it may take minutes.
+        // The node is told a fetch is under way; it may take minutes. A directory on the host
+        // is not proof: the fetcher verifies the release whether it pulls it or finds it.
         memory.fetching = true;
         self.report(memory).map_err(|e| e.to_string())?;
-        let fetched = self.fetcher.fetch_activation(&rec, &claims.facts());
+        let fetched = self.fetch_held(&order.commit, &held);
         memory.fetching = false;
-        let got = fetched.map_err(|e| format!("order {id}: {e}"))?;
+        let got = fetched.map_err(|e| refusal_of(id, e))?;
         // What the fetched binary declared must be what the order expected, before a link
         // moves: a release that is attested but is another build than the one ordered is
-        // refused.
-        if let Err(why) = matches_claims(&got, order, claims) {
+        // refused. A staged order expects what the manifest said when it was admitted, and
+        // the package must still say it.
+        let checked = match &held {
+            Held::Claims(claims) => matches_facts(&got, &order.commit, &claims.facts()),
+            Held::Seed(seed) => matches_facts(&got, &order.commit, &seed.facts)
+                .and_then(|()| self.seed_unchanged(seed)),
+        };
+        if let Err(why) = checked {
             return Err(format!(
                 "order {id}: the fetched release is not the one ordered: {why}"
             ));
@@ -625,6 +653,34 @@ impl<E: Exec> Helper<E> {
         memory.staged = Some(facts(&got));
         memory.staged_profile = Some(got.profile.clone());
         Ok(())
+    }
+
+    /// An activation that fetches carries the release's claims, complete and for this host:
+    /// fail closed without them. `kbf` is the one component a release of either platform
+    /// carries that an order may name (a Mac is given no `kbf-daemon`).
+    fn vet_claims<'o>(&self, order: &'o Order) -> Result<&'o Claims, String> {
+        let id = order.id;
+        let Some(claims) = &order.claims else {
+            return Err(format!(
+                "order {id}: an activation carries no release claims"
+            ));
+        };
+        let prefix = platform_prefix(&self.host);
+        let needs = ["kbf"].as_slice();
+        if !claims.platform.starts_with(prefix) {
+            return Err(format!(
+                "order {id} is for platform {:?}, not this host's ({prefix}*)",
+                claims.platform
+            ));
+        }
+        let mut names: Vec<&str> = claims.components.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        if names != needs {
+            return Err(format!(
+                "order {id} names components {names:?}; this platform needs exactly {needs:?}"
+            ));
+        }
+        Ok(claims)
     }
 
     fn arm(&self, order: &Order) -> Arm {
@@ -844,9 +900,10 @@ fn short(c: &Option<CommitId>) -> String {
         .unwrap_or_default()
 }
 
-/// Whether the release the fetcher installed is the one the order named and expected.
-fn matches_claims(got: &InstalledRelease, order: &Order, claims: &Claims) -> Result<(), String> {
-    if got.commit != order.commit {
+/// Whether the release the fetcher installed is the one the order named (`commit`) and
+/// expected (`want`).
+fn matches_facts(got: &InstalledRelease, commit: &CommitId, want: &Facts) -> Result<(), String> {
+    if got.commit != *commit {
         return Err(format!("it is commit {}", got.commit.as_str()));
     }
     let same = (
@@ -856,11 +913,11 @@ fn matches_claims(got: &InstalledRelease, order: &Order, claims: &Claims) -> Res
         got.state_schema,
         &got.profile,
     ) == (
-        &claims.platform,
-        claims.protocol,
-        claims.min_protocol,
-        claims.state_schema,
-        &claims.profile,
+        &want.platform,
+        want.protocol,
+        want.min_protocol,
+        want.state_schema,
+        &want.profile,
     );
     if same {
         Ok(())
@@ -873,11 +930,11 @@ fn matches_claims(got: &InstalledRelease, order: &Order, claims: &Claims) -> Res
             got.min_protocol,
             got.state_schema,
             got.profile,
-            claims.platform,
-            claims.protocol,
-            claims.min_protocol,
-            claims.state_schema,
-            claims.profile
+            want.platform,
+            want.protocol,
+            want.min_protocol,
+            want.state_schema,
+            want.profile
         ))
     }
 }

@@ -20,6 +20,11 @@
 //!   version this binary speaks ([`kbf_server::worker`]); the daemon half speaks exactly
 //!   `protocol` (a test pins the two halves equal);
 //! - `profile`: the Cargo profile, `release` or `debug` ([`PROFILE`]);
+//! - `seq`: the number of commits behind the commit built (`git rev-list --count HEAD`,
+//!   [`build_seq`]), so two builds of one branch are put in order by it: a later commit has
+//!   the larger number. It is 0 when the build could not count them (a shallow checkout,
+//!   which holds only part of the history, or a source archive with no git), and nothing is
+//!   newer than 0. A build before this field prints none;
 //! - `state_schema`: the newest Postgres state schema this binary embeds a migration for
 //!   ([`kbf_state::postgres::schema::latest`]); `kbf-installer` migrates the database to it
 //!   before this release starts;
@@ -40,6 +45,13 @@ pub const PROFILE: &str = env!("KBF_BUILD_PROFILE");
 #[must_use]
 pub fn asked(args: &[OsString]) -> bool {
     matches!(args, [_, a, b] if (a == "--version" && b == "--json") || (a == "--json" && b == "--version"))
+}
+
+/// The number of commits behind the commit this binary was built from, or 0 when the build
+/// could not count them: [`kbf_server::BUILD_SEQ`], which the server's `build.rs` embeds.
+#[must_use]
+pub fn build_seq() -> u64 {
+    kbf_server::BUILD_SEQ
 }
 
 /// The identity of this build.
@@ -65,6 +77,7 @@ pub fn identity() -> Value {
         "protocol".to_owned(),
         kbf_server::worker::PROTOCOL_VERSION.into(),
     );
+    fields.insert("seq".to_owned(), build_seq().into());
     fields.insert(
         "state_schema".to_owned(),
         kbf_state::postgres::schema::latest().into(),
@@ -78,3 +91,7 @@ pub fn identity() -> Value {
 pub fn line() -> String {
     format!("{}\n", identity())
 }
+
+#[cfg(test)]
+#[path = "version_tests.rs"]
+mod tests;

@@ -155,6 +155,14 @@ pub struct OfferRecord {
     pub meta_log: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_meta_log: Option<u64>,
+    /// The host's own word where the offer claims `reversible`, checked against the
+    /// `meta_log` of the build it runs now (`offer::check_reversible`): `true` if that bears
+    /// the claim out, `false` if not or if the host could not tell. The offer's own word is
+    /// `reversible` above. Absent when the offer claims no reversibility (nothing was asked of
+    /// the host) or no offer was checked. A reader that needs a release it can roll back reads
+    /// this, not `reversible`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_reversible: Option<bool>,
 }
 
 impl OfferRecord {
@@ -169,6 +177,7 @@ impl OfferRecord {
             previous: None,
             meta_log: None,
             previous_meta_log: None,
+            host_reversible: None,
         }
     }
 
@@ -208,6 +217,10 @@ pub struct Summary {
     /// The offer the deploy ran under, or its `--no-offer`; absent when no stage was named.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offer: Option<OfferRecord>,
+    /// What the deploy did not fail on but the operator should know, for a person: a
+    /// platform uploaded with no version facts is stored and never offered.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     /// What went wrong, for a person; never a host name or a token.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub detail: String,
@@ -232,6 +245,7 @@ impl Summary {
             post: PostResult::default(),
             check_skipped: false,
             offer: None,
+            notes: Vec::new(),
             detail: String::new(),
         }
     }

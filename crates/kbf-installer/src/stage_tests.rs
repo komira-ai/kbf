@@ -642,13 +642,13 @@ fn facts_are_required_for_an_activation_and_optional_for_a_frontend_update() {
     rig.assert_nothing_installed();
 }
 
-/// Catches a probe read loosely or run unbounded: output over 4 KiB, a field the contract
-/// does not list, a field named twice, a non-zero exit and a build that declares another
-/// platform than its own header are each refused (`facts`), and a build that declares the
-/// right one passes.
+/// Catches a probe read loosely or run unbounded: output over 4 KiB, a field named twice,
+/// a non-zero exit and a build that declares another platform than its own header are
+/// each refused (`facts`); a build that declares the right one passes, and so does one
+/// carrying a field this installer does not know (a newer build's).
 ///
-/// Mutants seen red: the cap dropped; unknown fields allowed; the declared platform not
-/// compared with the header.
+/// Mutants seen red: the cap dropped; the declared platform not compared with the header;
+/// unknown fields refused again (`probe-unknown` fails).
 #[test]
 fn the_probe_is_read_strictly() {
     let json = version_json(COMMIT, "release");
@@ -659,7 +659,6 @@ fn the_probe_is_read_strictly() {
     let truth = json.replace('}', ",\"platform\":\"linux-x86_64\"}");
     for (name, runner) in [
         ("big", probing(&big)),
-        ("unknown", probing(&unknown)),
         ("twice", probing(&twice)),
         ("lies", probing(&lies)),
         ("exit", runner(ran(0, "", ""), ran(3, &json, ""))),
@@ -673,6 +672,10 @@ fn the_probe_is_read_strictly() {
     let rig = Rig::new("probe-truth");
     rig.activate(&probing(&truth))
         .expect("a declared platform that is right");
+    // A field this installer does not know is a newer build's, not a lie: ignored.
+    let rig = Rig::new("probe-unknown");
+    rig.activate(&probing(&unknown))
+        .expect("a field the installer does not know");
 }
 
 /// Catches the operator's floor and the installer's own limits being skipped: a release

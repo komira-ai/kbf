@@ -459,7 +459,7 @@ struct MemStreamed {
 }
 
 impl crate::StreamedPut for MemStreamed {
-    fn commit(self: Box<Self>) -> Answer<'static, ()> {
+    fn commit(self: Box<Self>, _mode: crate::CommitMode) -> Answer<'static, ()> {
         Box::pin(async move {
             let _permit = self.knobs.commit_gate.acquire().await.expect("open");
             if *self.knobs.fault.lock().expect("lock") == StreamFault::CommitFails {

@@ -69,7 +69,7 @@ There is no other build system in this repository.
 
 ## No new shell or Python
 
-kbf's tooling is Rust. The repository lints (`cargo test -p kbf-it --test
+kbf's tooling is Rust. The repository lints (`cargo test -p kbf-integration-test --test
 repo_lints`) refuse a workflow `run:` step with shell logic (more than one line, a
 pipe, `&&`, `;`, `$(`, a backtick, `if`, `for` or `while`) outright: a step is one
 command, and anything more is a `cargo xtask` verb or a flag of the program the
@@ -95,8 +95,17 @@ the test needs it. That list only shrinks too: a new test drives Rust (a
 
 CI is defined in [.github/workflows/ci.yml](.github/workflows/ci.yml) and runs
 only on GitHub-hosted runners: formatting, clippy, the repository lints,
-`cargo deny`, and the workspace tests on x86-64 and arm64. A pull request is
-merged only when CI is green on its head commit.
+`cargo deny` (licences, bans and sources), and the workspace tests on x86-64 and
+arm64. A pull request is merged only when CI is green on its head commit.
+
+Security advisories against our dependencies do not block a pull request: a new
+advisory against a crate we already use would fail every open pull request for
+something none of them did. [.github/workflows/advisories.yml](.github/workflows/advisories.yml)
+runs `cargo deny check advisories` daily and on every push to `main`, and
+`cargo xtask advisories` keeps the result in one issue, "Security advisories in
+kbf's dependencies": it opens it when there are advisories, rewrites its table when
+they change, and comments and closes it when none remain. The run itself is green
+whatever it finds; it fails only when cargo-deny or the GitHub API did.
 
 A tool a job needs from outside the workspace (cargo-deny, cargo-llvm-cov,
 cargo-cyclonedx, Bazel, buck2) is pinned in the workflow by URL and SHA-256 and

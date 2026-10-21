@@ -384,6 +384,9 @@ pub(super) struct Writer<M, O> {
     pub(super) born: super::clear::Born,
     /// When each object was last used, once [`Cache::track_recency`] turned it on.
     pub(super) recency: Recency,
+    /// A test's callback at the write pool's drain step ([`Cache::with_drain_hook`]).
+    #[cfg(feature = "testkit")]
+    pub(super) drain_hook: OnceLock<super::pool::HookCell>,
 }
 
 impl<M, O> Writer<M, O> {
@@ -398,6 +401,8 @@ impl<M, O> Writer<M, O> {
             tier: OnceLock::new(),
             born: super::clear::Born::default(),
             recency: Recency::default(),
+            #[cfg(feature = "testkit")]
+            drain_hook: OnceLock::new(),
         }
     }
 

@@ -3,7 +3,10 @@
 # --json` says what it is), kbf-daemon, kbf-server, kbf-deploy and kbf-installer for
 # linux-x86_64 and linux-arm64, and kbf, kbf-deploy and kbf-installer for darwin-arm64
 # (each signed ad hoc with the hardened runtime; a Mac runs `kbf daemon`). Each comes as a
-# tarball with a CycloneDX SBOM; one SHA256SUMS covers a commit's files.
+# tarball with a CycloneDX SBOM; one SHA256SUMS covers a commit's files. The kbf of each
+# platform also comes with `kbf-<commit>-<platform>.version.json`, the exact bytes its
+# `--version --json` printed on the runner that built it (only a runner of the platform can
+# run its binary).
 #
 # A pull request runs none of it unless it carries the label `needs-artifacts` (add the
 # label to get the files; every build and sums job carries the same condition, so an unlabelled
@@ -16,7 +19,7 @@
 # runners), and the verify jobs then check them, for the branch
 # that was pushed, as the planned deployment job is to. Only attest may hold `id-token:
 # write` and `attestations: write`, and only under its exact `if:` (the workflow lint,
-# crates/kbf-it/tests/workflows, requires both; crates/kbf-it/tests/release_artifacts
+# crates/kbf-integration-test/tests/workflows, requires both; crates/kbf-integration-test/tests/release_artifacts
 # pins the set of files built and attested).
 #
 # The files are kept as workflow artifacts for 90 days, GitHub's limit. A release
@@ -36,12 +39,16 @@ on:
 
 permissions: {}
 
-# A pull request's newer run replaces its older one. A RUNNING build is never cancelled
-# (cancel-in-progress is for pull requests only), and every commit on main gets its own
-# group, so no main commit's run is cancelled or dropped while queued: under steady merges
-# a cancel-in-progress group never finished an attested release, and a host roll needs one.
+# The release pipeline runs one build at a time: every push and merge-queue run shares the one
+# group `artifacts-push`, and a RUNNING build is never cancelled. GitHub keeps one pending
+# run per group, so under a burst of merges a newer pending commit replaces an older one,
+# which is then never built here; release.yml refuses to release a commit that has no
+# successful main push run of this workflow (cargo xtask release locate), so a skipped
+# commit is never released, the next one is. A pull request's label build is a build check,
+# not the release pipeline: it has its own group per pull request, and a newer run of the
+# same pull request replaces its older one.
 concurrency:
-  group: artifacts-${{ github.event_name }}-${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && github.sha || github.ref }}
+  group: artifacts-${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref) || 'push' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -88,6 +95,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The whole history: the build counts the commits behind it for `seq`, and a
+          # shallow clone counts none (0, "unknown").
+          fetch-depth: 0
       - run: rustup toolchain install
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
@@ -120,6 +130,9 @@ jobs:
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
       - name: The signed kbf-installer names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf-installer" "$GITHUB_SHA"
+      # What the signed kbf says it is, kept as an asset: only this runner can run the darwin kbf.
+      - name: Record what the signed kbf --version --json says
+        run: cargo xtask release version-facts --binary "target/$TARGET/release/kbf" --commit "$GITHUB_SHA" --platform darwin-arm64 --out dist
       - name: SBOM
         run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
       - name: The SBOM step left Cargo.lock unchanged
@@ -195,6 +208,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The whole history: the build counts the commits behind it for `seq`, and a
+          # shallow clone counts none (0, "unknown").
+          fetch-depth: 0
       - run: rustup toolchain install
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
@@ -219,6 +235,9 @@ jobs:
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
       - name: kbf-installer names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf-installer" "$GITHUB_SHA"
+      # What kbf says it is, kept as an asset (the darwin kbf cannot be run here, so every platform's job does).
+      - name: Record what kbf --version --json says
+        run: cargo xtask release version-facts --binary "target/$TARGET/release/kbf" --commit "$GITHUB_SHA" --platform linux-x86_64 --out dist
       - name: SBOM
         run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
       - name: The SBOM step left Cargo.lock unchanged
@@ -291,6 +310,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The whole history: the build counts the commits behind it for `seq`, and a
+          # shallow clone counts none (0, "unknown").
+          fetch-depth: 0
       - run: rustup toolchain install
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
@@ -315,6 +337,9 @@ jobs:
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
       - name: kbf-installer names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf-installer" "$GITHUB_SHA"
+      # What kbf says it is, kept as an asset (see linux-x86_64).
+      - name: Record what kbf --version --json says
+        run: cargo xtask release version-facts --binary "target/$TARGET/release/kbf" --commit "$GITHUB_SHA" --platform linux-arm64 --out dist
       - name: SBOM
         run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
       - name: The SBOM step left Cargo.lock unchanged

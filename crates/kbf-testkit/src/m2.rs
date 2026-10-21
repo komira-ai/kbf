@@ -1,5 +1,5 @@
 //! `kbf-m2-act`: the one program the M2 sample project's actions run
-//! (`crates/kbf-it/m2/buck2/defs.bzl`). The M2 image, distroless `base-debian12`, holds
+//! (`crates/kbf-integration-test/m2/buck2/defs.bzl`). The M2 image, distroless `base-debian12`, holds
 //! no shell and no coreutils, so every action runs this program, linked statically,
 //! from its input root (CI builds it with `-C target-feature=+crt-static`;
 //! `kbf-cell m2` refuses a dynamically linked one). An action that runs it at all
@@ -13,14 +13,14 @@
 //! - `fill OUT KIB SALT`: writes `KIB` KiB of text, lines of 64 hexadecimal digits, drawn
 //!   from a generator seeded by `SALT`: the same salt always gives the same bytes, another
 //!   salt gives other bytes. An action that makes new blobs for the farm to store (the beta
-//!   harness's uploader, `crates/kbf-it/beta/buck2`);
+//!   harness's uploader, `crates/kbf-integration-test/beta/buck2`);
 //! - `hog OUT MIB`: touches `MIB` MiB of distinct, incompressible memory at
 //!   [`HOG_MIB_PER_SEC`] and holds all of it until done, then writes `MIB`. Slow on
 //!   purpose: a lease over its cap keeps pushing into swap for several of the swap
-//!   watch's one-second samples, so the watch sees it (see `kbf_it::m2`).
+//!   watch's one-second samples, so the watch sees it (see `kbf_integration_test::m2`).
 //!
 //! Exits 0 on success, 1 when the verb fails, 2 on a usage error. Tested by running
-//! it (`crates/kbf-it/tests/m2_act.rs`).
+//! it (`crates/kbf-integration-test/tests/m2_act.rs`).
 
 use std::process::ExitCode;
 use std::time::Duration;
