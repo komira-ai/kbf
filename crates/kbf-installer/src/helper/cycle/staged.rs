@@ -1,7 +1,7 @@
 //! Orders whose source is `staged`: the release is not fetched, it is the one the host's
 //! package carries (see [`crate::seed`]). An order of that kind is a locator and nothing else;
-//! the fetcher reads the package's manifest ([`Fetcher::seed`]) and the cycle holds the order
-//! to two rules before anything is fetched, made or told:
+//! the fetcher reads the package's manifest ([`seed`](crate::helper::fetcher::Fetcher::seed))
+//! and the cycle holds the order to two rules before anything is fetched, made or told:
 //!
 //! - it names the seed's commit, all 40 digits;
 //! - the seed's `seq` is strictly above the floor in `seq_floor`, and a host with no floor
@@ -18,7 +18,7 @@ use kbf_update::Source;
 
 use super::Helper;
 use crate::CommitId;
-use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
+use crate::helper::fetcher::{FetchError, InstalledRelease, ReleaseLocator};
 use crate::helper::order::Claims;
 use crate::seed::{self, SeedFacts};
 
@@ -49,6 +49,17 @@ impl<E: Exec> Helper<E> {
         let floor = seed::read_floor(&self.host)?;
         seed::admit(&seed, commit, floor)?;
         Ok(seed)
+    }
+
+    /// Whether the package still carries the seed an order was admitted on, read again once
+    /// its release is installed: the floor was judged on one reading of the manifest and the
+    /// install ran on another, so a package that changed between them is not the one admitted.
+    pub(super) fn seed_unchanged(&self, admitted: &SeedFacts) -> Result<(), String> {
+        match self.fetcher.seed() {
+            Ok(now) if now == *admitted => Ok(()),
+            Ok(_) => Err("the package's manifest changed during the fetch".to_owned()),
+            Err(e) => Err(format!("the package's manifest cannot be read again: {e}")),
+        }
     }
 
     /// The release an activation names, fetched and verified by the fetcher: from the source

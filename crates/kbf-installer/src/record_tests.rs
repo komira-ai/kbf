@@ -4,8 +4,9 @@ type Edit = Box<dyn Fn(&mut Value)>;
 
 use super::*;
 use crate::golden::{
-    ORDER_ACTIVATE, ORDER_CONFIRM, ORDER_FRONTEND_UPDATE, ORDER_REVERT, order_activate,
-    order_confirm, order_frontend_update, order_revert,
+    ORDER_ACTIVATE, ORDER_CONFIRM, ORDER_FRONTEND_UPDATE, ORDER_FRONTEND_UPDATE_STAGED,
+    ORDER_REVERT, order_activate, order_confirm, order_frontend_update,
+    order_frontend_update_staged, order_revert,
 };
 
 fn edit(fixture: &str, f: impl FnOnce(&mut Value)) -> Vec<u8> {
@@ -28,6 +29,7 @@ fn the_golden_records_decode_and_encode_to_themselves() {
         (ORDER_CONFIRM, order_confirm()),
         (ORDER_REVERT, order_revert()),
         (ORDER_FRONTEND_UPDATE, order_frontend_update()),
+        (ORDER_FRONTEND_UPDATE_STAGED, order_frontend_update_staged()),
     ] {
         assert_eq!(OrderRecord::parse(text.as_bytes()).expect("parses"), want);
         let mut again = serde_json::to_string_pretty(&want).expect("encodes");
@@ -48,6 +50,57 @@ fn an_unknown_key_is_refused_at_every_level() {
     for (i, f) in cases.into_iter().enumerate() {
         let err = shape_error(&edit(ORDER_ACTIVATE, f));
         assert!(err.contains("unknown field"), "case {i}: {err}");
+    }
+}
+
+/// A record may name its source, and a staged one is a locator: a staged `frontend_update` and
+/// a staged `activate` (no components, no expected facts) are accepted by this parser, by
+/// `kbf-update`'s and by the root half's, which agree on the source and yield no claims;
+/// components or expected facts beside a staged `activate`, and a source on a `confirm` or a
+/// `revert`, are refused; the explicit word `fetch` is the default and any other word is no
+/// record.
+///
+/// Catches the three readers drifting apart on the key (this parser's `deny_unknown_fields`
+/// refused a staged record), and a staged record that carries claims being believed.
+///
+/// Mutants to plant: the `Confirm | Revert if staged` arm of `check_shape` removed; its staged
+/// `Activate` arm removed (the record then needs components).
+#[test]
+fn a_staged_record_is_a_locator_all_three_readers_accept_and_only_two_verbs_take_a_source() {
+    use crate::helper::order;
+    let staged = |verb: &str| {
+        edit(ORDER_FRONTEND_UPDATE, |v| {
+            v["verb"] = json!(verb);
+            v["source"] = json!("staged");
+        })
+    };
+    for verb in ["frontend_update", "activate"] {
+        let bytes = staged(verb);
+        let ours = OrderRecord::parse(&bytes).expect("a staged locator");
+        let theirs = kbf_update::OrderRecord::parse(&bytes).expect("the writer's reader");
+        let root = order::parse(3, 45, &bytes).expect("the root half's reader");
+        assert_eq!(ours.source, kbf_update::Source::Staged, "{verb}");
+        assert_eq!(theirs.source, kbf_update::Source::Staged, "{verb}");
+        assert_eq!(root.source, kbf_update::Source::Staged, "{verb}");
+        assert_eq!(root.claims, None, "{verb}");
+    }
+    for verb in ["confirm", "revert"] {
+        let err = shape_error(&staged(verb));
+        assert!(err.contains("takes no source"), "{verb}: {err}");
+    }
+    let claims = edit(ORDER_ACTIVATE, |v| v["source"] = json!("staged"));
+    let err = shape_error(&claims);
+    assert!(
+        err.contains("staged activate record carries no components"),
+        "{err}"
+    );
+
+    let explicit = edit(ORDER_ACTIVATE, |v| v["source"] = json!("fetch"));
+    let parsed = OrderRecord::parse(&explicit).expect("an explicit fetch");
+    assert_eq!(parsed, order_activate());
+    for word in ["Staged", "bundled", ""] {
+        let bytes = edit(ORDER_FRONTEND_UPDATE, |v| v["source"] = json!(word));
+        assert!(shape_error(&bytes).contains("unknown variant"), "{word:?}");
     }
 }
 

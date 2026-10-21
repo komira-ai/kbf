@@ -18,8 +18,8 @@
 //! fetcher's: the cycle checks the first before it asks, and
 //! [`HostFetcher`](super::fetcher_host::HostFetcher) decides the second.
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::slice;
@@ -27,11 +27,12 @@ use std::slice;
 use kbf_host::exec::{Entry, Exec, Kind};
 use kbf_host::path::HostPath;
 use kbf_host::step::Owner;
-use kbf_update::{Facts, Locator};
+use kbf_update::{Facts, Locator, Source};
 use sha2::{Digest, Sha256};
 
 use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
-use crate::helper::fetcher_real::{Parts, refused};
+use crate::fetch;
+use crate::helper::fetcher_real::{Parts, fetch_error, refused, replaced_bytes};
 use crate::helper::leases::LeaseSource;
 use crate::layout::Layout;
 use crate::refusal::{Refusal, TrustFault};
@@ -150,27 +151,47 @@ impl SeedFetcher {
         Ok(bytes)
     }
 
-    /// The tarball copied into `partial`, where a fetch would have left it, counted and hashed
-    /// as the fetch parent counts and hashes what it brings in. The copy is of at most one byte
-    /// more than the manifest says (the pipeline sees that the file is bigger), and a link in
-    /// the tarball's place is not followed.
+    /// The tarball streamed into a new file of `partial`, where a fetch would have left it,
+    /// counted and hashed as the fetch parent counts and hashes what it brings in. The room is
+    /// asked for first, as a fetch asks. The copy is of at most one byte more than the manifest
+    /// says (the pipeline sees that the file is bigger), a link in the tarball's place is not
+    /// followed, and a failure to read it (the package's fault) is told from one to write it
+    /// (the host's).
     fn copy(&self, partial: &Partial, seed: &Open) -> Result<Received, FetchError> {
-        let from = self.host.join(&seed.tarball);
-        let to = partial.dl().join(format!("{COMPONENT}.tar.gz"));
         // The host's cap is at most a gigabyte (`installer.toml` is held to it), so one more
         // cannot overflow.
-        let size = seed.manifest.tarball_size;
-        let cap = size.min(self.policy.max_component_bytes) + 1;
-        let copied =
-            read_capped(&from, cap).and_then(|bytes| fs::write(&to, &bytes).map(|()| bytes));
-        let bytes = copied.map_err(|e| {
+        let cap = self.policy.max_component_bytes;
+        let size = seed.manifest.tarball_size.min(cap);
+        let need = fetch::room_needed(size, replaced_bytes(&self.host));
+        fetch::ensure_room(&partial.dl(), need).map_err(fetch_error)?;
+        let from = self.host.join(&seed.tarball);
+        let to = partial.dl().join(format!("{COMPONENT}.tar.gz"));
+        let missing = |e: io::Error| {
             FetchError::Unavailable(format!("seed_missing: {}: {e}", from.display()))
-        })?;
+        };
+        let source = open_nofollow(&from).map_err(missing)?;
+        let mut out = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&to)
+            .map_err(|e| {
+                FetchError::Unavailable(format!("cannot create {}: {e}", to.display()))
+            })?;
+        let copied = copy_hashed(&mut source.take(size + 1), &mut out);
+        let (bytes, sha256) = match copied {
+            Ok(done) => done,
+            Err(CopyFault::Read(e)) => return Err(missing(e)),
+            Err(CopyFault::Write(e)) => {
+                let why = format!("cannot write {}: {e}", to.display());
+                return Err(FetchError::Unavailable(why));
+            }
+        };
         Ok(Received {
             name: COMPONENT.to_owned(),
             tarball: to,
-            bytes: bytes.len() as u64,
-            sha256: hex::encode(Sha256::digest(&bytes)),
+            bytes,
+            sha256,
         })
     }
 
@@ -183,6 +204,15 @@ impl SeedFetcher {
         rec: &ReleaseLocator,
         expected: Option<&Facts>,
     ) -> Result<InstalledRelease, FetchError> {
+        // Only the package's release is brought in here: a locator to fetch is the fetching
+        // fetcher's.
+        if rec.source != Source::Staged {
+            return Err(FetchError::Order {
+                word: "denied",
+                why: "source=fetch names a release to fetch, which the package does not carry"
+                    .to_owned(),
+            });
+        }
         let seed = self.open()?;
         let facts = seed.manifest.facts();
         if seed.manifest.commit != rec.commit {
@@ -273,15 +303,59 @@ fn is_build_commit(build: &str) -> bool {
     build.len() == 12 && build.bytes().all(hex)
 }
 
-/// Up to `cap` bytes of the file at `path`, which is not opened if it is a link.
-fn read_capped(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
-    let file = OpenOptions::new()
+/// The file at `path` opened for reading, not if it is a link (and without waiting, so a pipe
+/// in its place cannot hold root up).
+fn open_nofollow(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    let mut bytes = Vec::new();
-    file.take(cap).read_to_end(&mut bytes)?;
-    Ok(bytes)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// Why bytes did not get from the package's file to the scratch directory: the package could
+/// not be read, or the host could not write.
+#[derive(Debug)]
+enum CopyFault {
+    Read(io::Error),
+    Write(io::Error),
+}
+
+/// A writer that counts and hashes what it passes on, and remembers that a failure was its
+/// destination's.
+struct Hashing<'a, W> {
+    to: &'a mut W,
+    hasher: Sha256,
+    bytes: u64,
+    failed: bool,
+}
+
+impl<W: Write> Write for Hashing<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.to.write(buf).inspect_err(|_| self.failed = true)?;
+        self.hasher.update(&buf[..n]);
+        self.bytes += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.to.flush().inspect_err(|_| self.failed = true)
+    }
+}
+
+/// All of `from` written to `to`: how many bytes, and their sha256 in lowercase hex.
+fn copy_hashed(from: &mut impl Read, to: &mut impl Write) -> Result<(u64, String), CopyFault> {
+    let mut hashing = Hashing {
+        to,
+        hasher: Sha256::new(),
+        bytes: 0,
+        failed: false,
+    };
+    let done = io::copy(from, &mut hashing).and_then(|_| hashing.flush());
+    match done {
+        Ok(()) => Ok((hashing.bytes, hex::encode(hashing.hasher.finalize()))),
+        Err(e) if hashing.failed => Err(CopyFault::Write(e)),
+        Err(e) => Err(CopyFault::Read(e)),
+    }
 }
 
 #[cfg(test)]

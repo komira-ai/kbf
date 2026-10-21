@@ -1,6 +1,6 @@
 //! The seed fetcher on a scratch host: the real verify pipeline over the files a package
 //! leaves, with `gh` and the binary's `--version --json` played by a fake runner. What each
-//! test proves is named on it, with the mutant that turns it red.
+//! test proves is named on it, with the mutant to plant to turn it red.
 
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -75,7 +75,7 @@ fn same_build_other_commit() -> CommitId {
 /// Catches a fetcher that reports a release it did not install, that leaves its scratch
 /// behind, or whose second form is not the first with the order's facts.
 ///
-/// Mutants planted: the pipeline's report replaced by the manifest's; `Partial` leaked (the
+/// Mutants to plant: the pipeline's report replaced by the manifest's; `Partial` leaked (the
 /// directory stays in `work/`); the activation form calling the update form.
 #[test]
 fn an_honest_seed_is_installed_by_both_forms_and_the_hook_reports_its_manifest() {
@@ -106,7 +106,7 @@ fn an_honest_seed_is_installed_by_both_forms_and_the_hook_reports_its_manifest()
 /// Catches the two kinds of order verified as one kind: an activation that ignores the leases,
 /// or an update that waits for them.
 ///
-/// Mutants planted: the activation form made an update; the update form made an activation.
+/// Mutants to plant: the activation form made an update; the update form made an activation.
 #[test]
 fn an_activation_waits_for_no_lease_and_an_update_does_not() {
     let seeded = Seeded::scratch("seed-fetch-leases");
@@ -127,7 +127,7 @@ fn an_activation_waits_for_no_lease_and_an_update_does_not() {
 /// Catches a seed whose tarball is not the one the manifest names being installed, and a
 /// fetcher that takes its digest from the file it copied.
 ///
-/// Mutants planted: the locator's digest computed from the copied bytes; the pipeline's step
+/// Mutants to plant: the locator's digest computed from the copied bytes; the pipeline's step
 /// skipped.
 #[test]
 fn a_flipped_byte_in_the_tarball_is_refused_as_a_hash_mismatch() {
@@ -148,7 +148,7 @@ fn a_flipped_byte_in_the_tarball_is_refused_as_a_hash_mismatch() {
 /// Catches a swapped bundle (an attestation of another release, or none) handed to `gh`, and
 /// a package assembled from two builds.
 ///
-/// Mutants planted: the bundle's digest not compared; the manifest's commit not compared with
+/// Mutants to plant: the bundle's digest not compared; the manifest's commit not compared with
 /// the seed directory's name.
 #[test]
 fn a_swapped_bundle_and_a_manifest_of_another_build_are_refused_as_a_mismatch() {
@@ -191,7 +191,7 @@ fn a_swapped_bundle_and_a_manifest_of_another_build_are_refused_as_a_mismatch() 
 /// Catches the order's commit not compared with the manifest's, and the comparison made on the
 /// short form.
 ///
-/// Mutants planted: the comparison removed; the commits compared by their first 12 digits.
+/// Mutants to plant: the comparison removed; the commits compared by their first 12 digits.
 #[test]
 fn an_order_for_another_commit_is_refused_by_both_forms_and_makes_nothing() {
     let seeded = Seeded::scratch("seed-wrong-commit");
@@ -222,7 +222,7 @@ fn an_order_for_another_commit_is_refused_by_both_forms_and_makes_nothing() {
 /// followed to bytes the package does not own, and a gap in the checks that lets a seed with a
 /// file missing go on to the pipeline.
 ///
-/// Mutants planted: `O_NOFOLLOW` dropped from the tarball's open (the link's bytes install);
+/// Mutants to plant: `O_NOFOLLOW` dropped from the tarball's open (the link's bytes install);
 /// the tarball's trust check removed (a tarball absent from the view is copied from the disk);
 /// the manifest read made to treat a directory as an empty file.
 #[test]
@@ -285,7 +285,7 @@ fn a_file_the_package_lacks_is_a_missing_seed_and_a_link_is_not_followed() {
 /// Catches a package file that a service user could have replaced being believed, and a check
 /// made on the files but not on the directories above them.
 ///
-/// Mutants planted: `trusted_chain` skipped for the tarball; skipped for the seed directory.
+/// Mutants to plant: `trusted_chain` skipped for the tarball; skipped for the seed directory.
 #[test]
 fn a_package_file_that_root_does_not_alone_control_is_refused_as_untrusted() {
     type Tweak = fn(&Seeded, &mut FakeExec);
@@ -330,7 +330,7 @@ fn a_package_file_that_root_does_not_alone_control_is_refused_as_untrusted() {
 /// Catches a name made from `unknown` or from anything but 12 lower-case hex digits joined into
 /// a path.
 ///
-/// Mutants planted: the check removed (the path is built from the text).
+/// Mutants to plant: the check removed (the path is built from the text).
 #[test]
 fn an_installer_with_no_build_commit_knows_no_seed_directory() {
     let seeded = Seeded::scratch("seed-no-build");
@@ -359,7 +359,7 @@ fn an_installer_with_no_build_commit_knows_no_seed_directory() {
 /// Catches the seed installed without the attestation, the facts, the shape or the size being
 /// checked: each is a defect the manifest cannot see.
 ///
-/// Mutants planted: `Pipeline::verify` replaced by a copy of the tarball into `releases/` (all
+/// Mutants to plant: `Pipeline::verify` replaced by a copy of the tarball into `releases/` (all
 /// cases red).
 #[test]
 fn a_seed_the_pipeline_refuses_is_not_installed_by_either_form() {
@@ -418,7 +418,7 @@ fn a_seed_the_pipeline_refuses_is_not_installed_by_either_form() {
 /// Catches an activation checked against facts of its own while the manifest says others, and
 /// a manifest whose `seq` the floor is judged by while the binary says another.
 ///
-/// Mutants planted: the equality of the order's facts and the manifest's removed; the `seq`
+/// Mutants to plant: the equality of the order's facts and the manifest's removed; the `seq`
 /// comparison removed; a missing `seq` taken for the manifest's.
 #[test]
 fn the_facts_and_the_seq_of_the_manifest_are_the_binarys_and_the_orders() {
@@ -457,7 +457,7 @@ fn the_facts_and_the_seq_of_the_manifest_are_the_binarys_and_the_orders() {
 ///
 /// Catches the stale directory reused or removed by the seed path.
 ///
-/// Mutant planted: the stale directory removed before the stage.
+/// Mutant to plant: the stale directory removed before the stage.
 #[test]
 fn a_stale_scratch_directory_of_the_commit_is_refused_and_left() {
     let seeded = Seeded::scratch("seed-stale");
@@ -472,4 +472,109 @@ fn a_stale_scratch_directory_of_the_commit_is_refused_and_left() {
         "{got:?}"
     );
     assert!(stale.is_dir(), "not this call's to remove");
+}
+
+/// A tarball the host has no room to copy is refused as the host's trouble (the word `disk`)
+/// before a byte is read, and not as a seed that is missing.
+///
+/// Catches the copy made without the room check a fetch makes: a full disk would then be
+/// reported against the package.
+///
+/// Mutant to plant: the room check removed from `copy`.
+#[test]
+fn a_seed_with_no_room_on_the_disk_is_refused_as_disk() {
+    let mut seeded = Seeded::scratch("seed-disk");
+    seeded.manifest["tarball_size"] = serde_json::json!(1_u64 << 60);
+    let mut fetcher = seeded.fetcher();
+    fetcher.policy.max_component_bytes = 1 << 60;
+    let got = fetcher.fetch(&seeded.locator());
+    refused(&seeded, got, "fetch: disk: ");
+}
+
+/// A locator that names a release to fetch is not one the package brings in: both forms refuse
+/// it with the word `denied`, install nothing and leave no scratch.
+///
+/// Catches the routing resting on `HostFetcher` alone.
+///
+/// Mutant to plant: the source check removed from `pull`.
+#[test]
+fn a_locator_to_fetch_is_not_the_packages_to_bring_in() {
+    let seeded = Seeded::scratch("seed-fetch-locator");
+    let fetcher = seeded.fetcher();
+    let locator = ReleaseLocator {
+        source: Source::Fetch,
+        ..seeded.locator()
+    };
+    let forms = [
+        fetcher.fetch(&locator),
+        fetcher.fetch_activation(&locator, &seeded.facts()),
+    ];
+    for got in forms {
+        assert!(
+            matches!(&got, Err(FetchError::Order { word: "denied", .. })),
+            "{got:?}"
+        );
+    }
+    assert!(!seeded.installed());
+    assert_eq!(scratch_left(&seeded), Vec::<String>::new());
+}
+
+/// A reader that fails.
+struct Unreadable;
+
+impl Read for Unreadable {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::other("gone"))
+    }
+}
+
+/// A writer whose write fails, or whose flush does.
+struct Full {
+    flush_fails: bool,
+}
+
+impl Write for Full {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.flush_fails {
+            Ok(buf.len())
+        } else {
+            Err(io::Error::other("full"))
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.flush_fails {
+            Err(io::Error::other("full"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Bytes moved from the package to the scratch directory are counted and hashed as they pass,
+/// and a failure is told by its side: a read that fails is the package's, a write or a flush
+/// that fails is the host's.
+///
+/// Catches a full disk blamed on the package, and a count or digest of something other than
+/// the bytes written.
+///
+/// Mutants to plant: the destination's failure not remembered (a write error reads as a read
+/// error); the count or the hash taken from a different slice than the one written.
+#[test]
+fn a_copy_is_counted_and_hashed_and_a_failure_is_told_by_its_side() {
+    let mut out = Vec::new();
+    let (bytes, digest) = copy_hashed(&mut &b"hello"[..], &mut out).expect("copied");
+    assert_eq!(out, b"hello");
+    assert_eq!(bytes, 5);
+    assert_eq!(digest, crate::seed_fixture::sha(b"hello"));
+
+    let got = copy_hashed(&mut Unreadable, &mut Vec::new());
+    assert!(matches!(got, Err(CopyFault::Read(_))), "{got:?}");
+    for flush_fails in [false, true] {
+        let got = copy_hashed(&mut &b"hello"[..], &mut Full { flush_fails });
+        assert!(
+            matches!(got, Err(CopyFault::Write(_))),
+            "{flush_fails}: {got:?}"
+        );
+    }
 }

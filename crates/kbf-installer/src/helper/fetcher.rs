@@ -160,6 +160,9 @@ pub(crate) mod fake {
         pub tamper: Arc<Mutex<Option<Tamper>>>,
         /// The release this fetcher's package carries; `None` for a host with no package.
         pub seed: Arc<Mutex<Option<SeedFacts>>>,
+        /// What the package carries once the next fetch has installed (`Some(None)`: nothing
+        /// that can be read), a package swapped while its release was fetched.
+        pub swap_seed: Arc<Mutex<Option<Option<SeedFacts>>>>,
     }
 
     impl FakeFetcher {
@@ -171,6 +174,7 @@ pub(crate) mod fake {
                 fail: Arc::default(),
                 tamper: Arc::default(),
                 seed: Arc::default(),
+                swap_seed: Arc::default(),
             }
         }
 
@@ -206,6 +210,9 @@ pub(crate) mod fake {
             }
             if let Some(change) = *self.tamper.lock().expect("lock") {
                 change(&mut report);
+            }
+            if let Some(next) = self.swap_seed.lock().expect("lock").take() {
+                *self.seed.lock().expect("lock") = next;
             }
             Ok(report)
         }

@@ -5,9 +5,9 @@
 //! The format is `kbf_update::OrderRecord`, which the writer builds and this side reads, in
 //! a file named `<epoch:020>-<order_id:020>.json`. The writer is the service user, so the
 //! record is untrusted: the name must be the pair inside, the verb one of four words, the
-//! commit a full commit, an activation's claims complete, the other three verbs carry no
-//! claims (a `frontend_update` is a locator and nothing else), and no other or repeated key
-//! is accepted. A record may name its source ([`Source`]): the installer's configured one
+//! commit a full commit, the claims of an activation that fetches complete (a staged one has
+//! none), the other three verbs carry no claims (a `frontend_update` is a locator and nothing
+//! else), and no other or repeated key is accepted. A record may name its source ([`Source`]): the installer's configured one
 //! (the default, and what every record meant before the key) or the release its package
 //! carries; any other word is not a record.
 

@@ -304,7 +304,7 @@ impl Seeded {
         }
     }
 
-    /// The floor the host holds: the lowest `seq` that is not allowed.
+    /// The floor the host holds: the highest `seq` that is not allowed.
     pub fn set_floor(&self, floor: u64) {
         let path = self.layout.join(&self.layout.seq_floor());
         fs::write(path, format!("{floor}\n")).expect("the floor");

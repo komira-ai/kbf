@@ -10,7 +10,7 @@
 //!   releases/current.new, previous.new     a link being replaced (renamed over its name)
 //!   releases/previous                      link to <commit>, the one before it
 //!   state.json, state.json.bak             the state (crate::state) and the last good one
-//!   seq_floor                              the lowest seq a staged release must exceed
+//!   seq_floor                              the highest seq not allowed (a seed must exceed it)
 //!   work/                                  scratch of a stage in progress (crate::stage)
 //! /run/kbf-installer/lock                  the lock the state is read and written under
 //! /usr/share/kbf-installer/trust/          what offline verification trusts (package-owned)
@@ -69,8 +69,8 @@ const MACOS_API_TOKEN: &str = "/usr/local/etc/kbf/api-token";
 /// The directory of the packaged releases, one per build of the installer, in the package's
 /// directory.
 pub const SEED: &str = "seed";
-/// The root-owned file beside `state.json` that holds the lowest `seq` a staged release must
-/// exceed: decimal text, one number.
+/// The root-owned file beside `state.json` that holds the highest `seq` that is not allowed (a
+/// staged release's `seq` must be strictly above it): decimal text, one number.
 pub const SEQ_FLOOR: &str = "seq_floor";
 
 /// The files of the trust directory.
@@ -406,7 +406,8 @@ impl Layout {
         path_in(self.seed_dir(build).as_str(), name)
     }
 
-    /// `seq_floor`, beside the state: the lowest `seq` a staged release must exceed.
+    /// `seq_floor`, beside the state: the highest `seq` that is not allowed (a staged
+    /// release's `seq` must be strictly above it).
     pub fn seq_floor(&self) -> HostPath {
         path_in(self.platform.state_dir(), SEQ_FLOOR)
     }

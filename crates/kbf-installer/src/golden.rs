@@ -19,6 +19,8 @@ pub const ORDER_CONFIRM: &str = include_str!("../testdata/golden/order_confirm.j
 pub const ORDER_REVERT: &str = include_str!("../testdata/golden/order_revert.json");
 pub const ORDER_FRONTEND_UPDATE: &str =
     include_str!("../testdata/golden/order_frontend_update.json");
+pub const ORDER_FRONTEND_UPDATE_STAGED: &str =
+    include_str!("../testdata/golden/order_frontend_update_staged.json");
 pub const STATE: &str = include_str!("../testdata/golden/state.json");
 pub const STATUS: &str = include_str!("../testdata/golden/status.json");
 pub const INSTALLER_TOML_URL: &str = include_str!("../testdata/golden/installer.toml");
@@ -54,6 +56,7 @@ pub fn order_activate() -> OrderRecord {
             state_schema: 4,
             profile: "release".to_owned(),
         }),
+        source: kbf_update::Source::Fetch,
     }
 }
 
@@ -76,6 +79,15 @@ pub fn order_frontend_update() -> OrderRecord {
     }
 }
 
+/// The same update of the frontend, of the release the installer's package carries: the
+/// record names its source, which a record that fetches leaves out.
+pub fn order_frontend_update_staged() -> OrderRecord {
+    OrderRecord {
+        source: kbf_update::Source::Staged,
+        ..order_frontend_update()
+    }
+}
+
 pub fn order_confirm() -> OrderRecord {
     OrderRecord {
         order_id: 43,
@@ -86,6 +98,7 @@ pub fn order_confirm() -> OrderRecord {
         window_s: 900,
         components: Vec::new(),
         expected: None,
+        source: kbf_update::Source::Fetch,
     }
 }
 

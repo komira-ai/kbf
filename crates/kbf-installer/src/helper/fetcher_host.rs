@@ -84,8 +84,9 @@ impl HostFetcher {
     /// The same fetcher for an installer built from the commit whose first 12 hex digits are
     /// `build` (the name of the seed directory it reads). A fetcher is made for the program
     /// that runs; a test is not built from a commit that has a seed.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_build(mut self, build: &str) -> HostFetcher {
+    pub(crate) fn with_build(mut self, build: &str) -> HostFetcher {
         build.clone_into(&mut self.build);
         self
     }

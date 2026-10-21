@@ -40,7 +40,7 @@ fn same_build_other_commit() -> CommitId {
 /// ignored), a digest or commit taken in a shape the rest of the installer refuses, and a
 /// platform that would name a file the seed does not have.
 ///
-/// Mutants planted: `deny_unknown_fields` removed; the platform check removed; the size cap
+/// Mutants to plant: `deny_unknown_fields` removed; the platform check removed; the size cap
 /// raised past the oversize file.
 #[test]
 fn a_manifest_is_a_closed_set_of_keys_and_reads_back_as_what_it_says() {
@@ -130,7 +130,7 @@ fn a_manifest_is_a_closed_set_of_keys_and_reads_back_as_what_it_says() {
 /// Catches a floor read as 0 where the file is garbled (every seed is then above it), and an
 /// unreadable file taken for an absent one.
 ///
-/// Mutants planted: a parse error mapped to `Ok(None)`; the read error mapped to `Ok(None)`;
+/// Mutants to plant: a parse error mapped to `Ok(None)`; the read error mapped to `Ok(None)`;
 /// the text not trimmed (the line end after the number is refused).
 #[test]
 fn the_floor_is_one_number_in_a_file_or_none() {
@@ -159,6 +159,14 @@ fn the_floor_is_one_number_in_a_file_or_none() {
     );
 }
 
+/// The word and the reason of the refusal `got` is.
+fn refusal_of(got: Result<(), FetchError>) -> (&'static str, String) {
+    match got.expect_err("refused") {
+        FetchError::Order { word, why } => (word, why),
+        other => panic!("{other:?}"),
+    }
+}
+
 /// The two rules an order meets before the pipeline: it names the seed's commit, all 40 digits,
 /// and the seed's `seq` is strictly above the floor, a host with no floor admitting nothing.
 /// Each refusal is `commit_or_ref` and says which rule (`seed_mismatch`, `seq_floor`); the
@@ -169,7 +177,7 @@ fn the_floor_is_one_number_in_a_file_or_none() {
 /// that is running would be stageable again), a seed below the floor admitted, and a missing
 /// floor taken for zero.
 ///
-/// Mutants planted: the commit compared by its first 12 digits; `<=` made `<` (equal admitted);
+/// Mutants to plant: the commit compared by its first 12 digits; `<=` made `<` (equal admitted);
 /// `None` made `Some(0)`; the floor judged before the commit.
 #[test]
 fn an_order_is_admitted_for_the_seeds_commit_with_a_seq_above_the_floor() {
@@ -178,12 +186,7 @@ fn an_order_is_admitted_for_the_seeds_commit_with_a_seq_above_the_floor() {
     assert_eq!(admit(&seed, &c(B), Some(SEQ - 1)), Ok(()));
     assert_eq!(admit(&seed, &c(B), Some(0)), Ok(()));
 
-    let refused = |commit: &CommitId, floor: Option<u64>| {
-        match admit(&seed, commit, floor).expect_err("refused") {
-            FetchError::Order { word, why } => (word, why),
-            other => panic!("{other:?}"),
-        }
-    };
+    let refused = |commit: &CommitId, floor: Option<u64>| refusal_of(admit(&seed, commit, floor));
     for floor in [Some(SEQ), Some(SEQ + 1), Some(u64::MAX)] {
         let (word, why) = refused(&c(B), floor);
         assert_eq!(word, "commit_or_ref");
@@ -227,7 +230,10 @@ fn the_seed_is_beside_the_trust_directory_and_the_floor_beside_the_state() {
         linux.seed_file("0123456789ab", MANIFEST).as_str(),
         "/usr/share/kbf-installer/seed/0123456789ab/manifest.json"
     );
-    assert_eq!(linux.seq_floor().as_str(), "/var/lib/kbf-installer/seq_floor");
+    assert_eq!(
+        linux.seq_floor().as_str(),
+        "/var/lib/kbf-installer/seq_floor"
+    );
     assert_eq!(
         mac.seed_dir("0123456789ab").as_str(),
         "/usr/local/kbf-installer/seed/0123456789ab"

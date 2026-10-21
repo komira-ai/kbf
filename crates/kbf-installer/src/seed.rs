@@ -25,9 +25,9 @@
 //! [`SeedFetcher`](crate::helper::fetcher_seed::SeedFetcher)'s.
 //!
 //! The floor is the root-owned file `seq_floor` beside `state.json`: one decimal number, the
-//! lowest `seq` that is not allowed. The installer only reads it, and a host with none refuses
-//! every staged order (fail closed). `setup` installs the first release before any floor
-//! exists, so it asks none of the seed.
+//! highest `seq` that is not allowed: a seed's `seq` must be strictly above it. The installer
+//! only reads it, and a host with none refuses every staged order (fail closed). `setup`
+//! installs the first release before any floor exists, so it asks none of the seed.
 
 use std::io;
 

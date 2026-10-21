@@ -23,7 +23,7 @@ use crate::stage;
 use crate::state::{self, Locked, State, StateError};
 use kbf_host::plan::Mode;
 use kbf_host::{Exec, HostPath, Perms, Step};
-use kbf_update::Source;
+use kbf_update::{Facts, Source};
 
 mod frontend;
 mod staged;
@@ -629,9 +629,8 @@ impl<E: Exec> Helper<E> {
                 Held::Seed(seed.map_err(|e| refusal_of(id, e))?)
             }
         };
-        // A directory on the host is not proof: the fetcher verifies the release whether it
-        // pulls it or finds it.
-        // The node is told a fetch is under way; it may take minutes.
+        // The node is told a fetch is under way; it may take minutes. A directory on the host
+        // is not proof: the fetcher verifies the release whether it pulls it or finds it.
         memory.fetching = true;
         self.report(memory).map_err(|e| e.to_string())?;
         let fetched = self.fetch_held(&order.commit, &held);
@@ -639,11 +638,14 @@ impl<E: Exec> Helper<E> {
         let got = fetched.map_err(|e| refusal_of(id, e))?;
         // What the fetched binary declared must be what the order expected, before a link
         // moves: a release that is attested but is another build than the one ordered is
-        // refused. (A staged order expects what the manifest says, which the fetcher has held
-        // the release to.)
-        if let Held::Claims(claims) = held
-            && let Err(why) = matches_claims(&got, order, claims)
-        {
+        // refused. A staged order expects what the manifest said when it was admitted, and
+        // the package must still say it.
+        let checked = match &held {
+            Held::Claims(claims) => matches_facts(&got, &order.commit, &claims.facts()),
+            Held::Seed(seed) => matches_facts(&got, &order.commit, &seed.facts)
+                .and_then(|()| self.seed_unchanged(seed)),
+        };
+        if let Err(why) = checked {
             return Err(format!(
                 "order {id}: the fetched release is not the one ordered: {why}"
             ));
@@ -898,9 +900,10 @@ fn short(c: &Option<CommitId>) -> String {
         .unwrap_or_default()
 }
 
-/// Whether the release the fetcher installed is the one the order named and expected.
-fn matches_claims(got: &InstalledRelease, order: &Order, claims: &Claims) -> Result<(), String> {
-    if got.commit != order.commit {
+/// Whether the release the fetcher installed is the one the order named (`commit`) and
+/// expected (`want`).
+fn matches_facts(got: &InstalledRelease, commit: &CommitId, want: &Facts) -> Result<(), String> {
+    if got.commit != *commit {
         return Err(format!("it is commit {}", got.commit.as_str()));
     }
     let same = (
@@ -910,11 +913,11 @@ fn matches_claims(got: &InstalledRelease, order: &Order, claims: &Claims) -> Res
         got.state_schema,
         &got.profile,
     ) == (
-        &claims.platform,
-        claims.protocol,
-        claims.min_protocol,
-        claims.state_schema,
-        &claims.profile,
+        &want.platform,
+        want.protocol,
+        want.min_protocol,
+        want.state_schema,
+        &want.profile,
     );
     if same {
         Ok(())
@@ -927,11 +930,11 @@ fn matches_claims(got: &InstalledRelease, order: &Order, claims: &Claims) -> Res
             got.min_protocol,
             got.state_schema,
             got.profile,
-            claims.platform,
-            claims.protocol,
-            claims.min_protocol,
-            claims.state_schema,
-            claims.profile
+            want.platform,
+            want.protocol,
+            want.min_protocol,
+            want.state_schema,
+            want.profile
         ))
     }
 }

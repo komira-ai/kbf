@@ -169,6 +169,12 @@ pub struct OrderRecord {
     pub components: Vec<Component>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected: Option<Expected>,
+    /// Where the release comes from: the installer's configured source (the default, left out
+    /// of the file) or the release its package carries. A staged record is a locator: no
+    /// components and no expected facts, and only an `activate` and a `frontend_update` take
+    /// one.
+    #[serde(default, skip_serializing_if = "kbf_update::Source::is_fetch")]
+    pub source: kbf_update::Source,
 }
 
 /// Why bytes are not an order record.
@@ -210,13 +216,26 @@ impl OrderRecord {
     }
 
     fn check_shape(&self) -> Result<(), String> {
+        let staged = !self.source.is_fetch();
         match self.verb {
+            OrderVerb::Confirm | OrderVerb::Revert if staged => {
+                return Err(format!("a {:?} record takes no source", self.verb));
+            }
             OrderVerb::Confirm | OrderVerb::Revert | OrderVerb::FrontendUpdate => {
                 if !self.components.is_empty() || self.expected.is_some() {
                     return Err(format!(
                         "a {:?} record carries no components and no expected facts",
                         self.verb
                     ));
+                }
+                return Ok(());
+            }
+            OrderVerb::Activate if staged => {
+                if !self.components.is_empty() || self.expected.is_some() {
+                    return Err(
+                        "a staged activate record carries no components and no expected facts"
+                            .to_owned(),
+                    );
                 }
                 return Ok(());
             }
