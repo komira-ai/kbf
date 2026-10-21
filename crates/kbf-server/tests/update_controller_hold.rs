@@ -22,7 +22,7 @@ use std::time::Duration;
 use kbf_map::MemberState;
 use kbf_server::update::{
     Alert, Controller, ControllerError, Generation, GiveBack, HelperStatus, HoldReason, HostPhase,
-    HostRecord, HostRow, OrderId, Policy, Release, RowError, SlotClass, Stored, Tick,
+    HostRecord, HostRow, OrderId, Policy, Release, RowError, SlotClass, Source, Stored, Tick,
 };
 use kbf_state::{Fenced, Store, StoreError};
 use support::harness::{Backing, Rig, Seen, row_of, spied};
@@ -319,6 +319,7 @@ fn held_row(rig: &Rig, generation: Generation, reason: HoldReason) -> HostRow {
             boot_before: None,
         },
         commit: Release::new(NEW),
+        source: Source::Fetch,
     }
 }
 

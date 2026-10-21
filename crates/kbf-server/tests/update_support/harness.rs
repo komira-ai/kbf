@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use kbf_map::MemberId;
 use kbf_server::update::{
-    Alert, Controller, Generation, HostPhase, HostRow, OrderId, Policy, Release, Rows, Stored,
-    Tick, Transport, TransportError,
+    Alert, Controller, Generation, HostPhase, HostRow, OrderId, Policy, Release, Rows, Source,
+    Stored, Tick, Transport, TransportError,
 };
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::sqlite::{Options, SqliteStore};
@@ -312,6 +312,15 @@ impl Rig {
         let now = self.world.time();
         self.rows
             .offer(&Release::new(target), now)
+            .expect("an offer")
+            .generation
+    }
+
+    /// Offers `target` at the farm's time, to be had from `source`.
+    pub fn offer_from(&self, target: &str, source: Source) -> Generation {
+        let now = self.world.time();
+        self.rows
+            .offer_expecting(&Release::new(target), source, now, None)
             .expect("an offer")
             .generation
     }

@@ -3,10 +3,10 @@
 //!
 //! | key | value | written by |
 //! |---|---|---|
-//! | `update/desired` | `{generation, commit, set_at}` ([`Desired`]) | an offer |
+//! | `update/desired` | `{generation, commit, set_at}`, and the source when it is not a fetch ([`Desired`]) | an offer |
 //! | `update/policy` | the nine settings (the pause among them), and the node step's limits when they are not the default ([`Policy`]) | the operator, the pause button |
 //! | `update/slot` | the places in use, `{host, order_id, epoch}` each ([`Slot`]): one storage, up to `max_hosts_out` others | the controller |
-//! | `update/host/<id>` | `{phase, order_id, generation, since, boot_before}`, and the run's commit ([`HostRow`]) | the controller |
+//! | `update/host/<id>` | `{phase, order_id, generation, since, boot_before}`, and the run's commit and source ([`HostRow`]) | the controller |
 //!
 //! and two counters: `update/generation`, from which generations are drawn, and
 //! `update/order/<epoch>`, from which order ids are drawn. (The release rows belong to the
@@ -30,7 +30,7 @@ use super::codec::{
     Corrupt, Desired, HostRow, decode_desired, decode_host, decode_policy, decode_slot,
     encode_desired, encode_host, encode_policy, encode_slot,
 };
-use super::facts::{Generation, OrderId, Release};
+use super::facts::{Generation, OrderId, Release, Source};
 use super::policy::{Policy, PolicyError};
 use super::slot::{Holder, Slot, SlotClass};
 
@@ -162,12 +162,14 @@ impl Rows {
         }
     }
 
-    /// Sets the desired release to `commit`, under a higher generation. A rollback is the
-    /// older commit offered the same way (section 2.11). Setting the commit that is already
-    /// desired changes nothing and keeps the generation (`pull-updates.md` section 5), so a
-    /// repeated click is not a new run. The generation is drawn from the counter
-    /// `update/generation`; it is never below the current run's plus one, whatever the
-    /// counter says. The pause is in `update/policy` and an offer does not touch it.
+    /// Sets the desired release to `commit`, to be fetched ([`Source::Fetch`]), under a higher
+    /// generation. A rollback is the older commit offered the same way (section 2.11).
+    /// Setting the commit that is already desired, from the same source, changes nothing and
+    /// keeps the generation (`pull-updates.md` section 5), so a repeated click is not a new
+    /// run; the same commit from another source is a new run. The generation is drawn from
+    /// the counter `update/generation`; it is never below the current run's plus one,
+    /// whatever the counter says. The pause is in `update/policy` and an offer does not touch
+    /// it.
     ///
     /// A host that has done nothing irreversible is given back when the generation moves
     /// (see [`super::Controller`]); a host past the activate order finishes its step.
@@ -175,12 +177,12 @@ impl Rows {
     /// # Errors
     /// [`RowError`]: the store failed, the row cannot be read, or `commit` is empty.
     pub fn offer(&self, commit: &Release, now: FarmTime) -> Result<Desired, RowError> {
-        self.offer_expecting(commit, now, None)
+        self.offer_expecting(commit, Source::Fetch, now, None)
     }
 
-    /// [`Rows::offer`] that writes only if the desired release is at generation `expected`
-    /// (0 before any offer): a compare-and-set, so a click made on a stale page does not
-    /// replace what another operator has just set. The check and the write are one
+    /// [`Rows::offer`] from `source`, that writes only if the desired release is at generation
+    /// `expected` (0 before any offer): a compare-and-set, so a click made on a stale page
+    /// does not replace what another operator has just set. The check and the write are one
     /// conditional write of the row.
     ///
     /// # Errors
@@ -188,6 +190,7 @@ impl Rows {
     pub fn offer_expecting(
         &self,
         commit: &Release,
+        source: Source,
         now: FarmTime,
         expected: Option<u64>,
     ) -> Result<Desired, RowError> {
@@ -202,7 +205,10 @@ impl Rows {
                     return Err(RowError::Stale { expected, found });
                 }
             }
-            if let Some(same) = current.value.as_ref().filter(|d| d.commit == *commit) {
+            // The run is the pair: `Release` has equality only, so the pair is compared
+            // field by field and never ordered.
+            let is_this_run = |d: &&Desired| d.commit == *commit && d.source == source;
+            if let Some(same) = current.value.as_ref().filter(is_this_run) {
                 return Ok(same.clone());
             }
             let drawn = self.store.txn(Txn::new().next(GENERATION))??;
@@ -217,6 +223,7 @@ impl Rows {
                 generation: Generation(counter.max(above)),
                 commit: commit.clone(),
                 set_at: now,
+                source,
             };
             let txn = Txn::new().put(DESIRED, encode_desired(&next), current.cond());
             if self.store.txn(txn)?.is_ok() {
