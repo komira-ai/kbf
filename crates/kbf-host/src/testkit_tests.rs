@@ -222,3 +222,32 @@ fn two_processes_taking_one_scratch_name_do_not_share_it() {
     );
     assert!(mine.read_dir().expect("mine").next().is_none());
 }
+
+/// Catches a fake `RemoveTree` that differs from the host's: it removes the entry and
+/// everything below it, leaves a sibling whose name only starts the same (`/a/bc` beside
+/// `/a/b`), and fails for a path that is not there, as the real one does.
+///
+/// Not run as a mutant: the `/` dropped from the prefix it removes by (`/a/bc` goes with `/a/b`).
+#[test]
+fn the_fake_removes_a_tree_and_not_its_namesake() {
+    let mut exec = FakeExec::new(0);
+    let dir = |exec: &mut FakeExec, path: &str| {
+        exec.apply(&Step::Mkdir {
+            path: p(path),
+            perms: Perms::new(0o755),
+            owner: None,
+        })
+        .expect("mkdir");
+    };
+    for path in ["/a", "/a/b", "/a/b/c", "/a/bc"] {
+        dir(&mut exec, path);
+    }
+    exec.apply(&Step::RemoveTree { path: p("/a/b") })
+        .expect("remove");
+    let left: Vec<&str> = exec.entries.keys().map(HostPath::as_str).collect();
+    assert_eq!(left, ["/a", "/a/bc"]);
+    let err = exec
+        .apply(&Step::RemoveTree { path: p("/a/b") })
+        .expect_err("not there");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+}

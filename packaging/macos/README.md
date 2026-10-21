@@ -79,6 +79,10 @@ package placed and forgets its receipt. What `setup` made (the releases under
 `/usr/local/kbf-installer`, `installer.toml`, the state) stays, so a reinstall keeps the
 node; `brew uninstall --zap --cask kbf-installer` removes it too.
 
+A Mac whose adoption was rolled back (`kbf-installer migrate --rollback`) keeps the package: its
+plist, logs, receipt and launchd disable override, and the files the rollback moved aside.
+`kbf-installer uninstall --apply` removes them (see `docs/deploy/kbf-installer-migrate.md`).
+
 ## What the real kbf-installer must match
 
 The property list runs `kbf-installer run --launchd-label com.komira.kbf-daemon` (the label `setup` bootstraps

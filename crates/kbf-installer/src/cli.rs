@@ -65,6 +65,10 @@ pub enum Verb {
     /// Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's
     /// tree, or put it back with `--rollback`. A dry run without `--apply`.
     Migrate(MigrateArgs),
+    /// Remove what the package left on a host that is rolled back or was never adopted: the
+    /// LaunchDaemon plist, its receipt, disable override, logs and the files a rollback moved
+    /// aside (a Mac). A dry run without `--apply`.
+    Uninstall(UninstallArgs),
     /// For maintainer scripts: take the lock; exit 5 while a swap is pending.
     Quiesce,
     /// Validate the installer's configuration, trust files and path chain.
@@ -359,6 +363,18 @@ pub struct MigrateArgs {
 }
 
 #[derive(Args)]
+pub struct UninstallArgs {
+    /// The installer's own unit: stopped and, on Linux, disabled. A Mac without the flag acts
+    /// on the package's job, `com.komira.kbf-installer.plist`; a Linux host without it leaves
+    /// its unit to the package manager.
+    /// The unit must be `.plist` on a Mac and `.service` on Linux (else exit 2). On a Mac a
+    /// name other than the package's job replaces it as the job acted on: the package's own
+    /// plist is then left in place, while the installer's tree, logs and receipt are removed.
+    #[arg(long, value_parser = crate::migrate::Unit::new)]
+    pub installer_unit: Option<crate::migrate::Unit>,
+}
+
+#[derive(Args)]
 pub struct ProxyArgs {
     /// The installer.toml whose `[proxy]` table configures the proxy (default: the platform's,
     /// `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac).
@@ -416,6 +432,7 @@ impl Verb {
             Verb::Gc(_) => "gc",
             Verb::BootCheck(_) => "boot-check",
             Verb::Migrate(_) => "migrate",
+            Verb::Uninstall(_) => "uninstall",
             Verb::Quiesce => "quiesce",
             Verb::Check => "check",
             Verb::Proxy(_) => "proxy",
@@ -459,6 +476,9 @@ impl Verb {
             | Verb::BootCheck(_)
             | Verb::Quiesce
             | Verb::Migrate(_)
+            // `uninstall` is for a host the installer does not manage (rolled back, or never
+            // adopted), and an old-layout host that was never adopted is one.
+            | Verb::Uninstall(_)
             | Verb::Proxy(_)
             // `update` only POSTs to the proxy's API as an unprivileged client, and the proxy
             // exists only on a new-layout host; the root half of an update (`run`) is guarded.
@@ -483,6 +503,7 @@ impl Verb {
             | Verb::RecordRelease(_)
             | Verb::Gc(_)
             | Verb::Migrate(_)
+            | Verb::Uninstall(_)
             | Verb::Quiesce
             | Verb::Setup(_)
             | Verb::FetchChild(_) => None,
