@@ -190,9 +190,12 @@ fn settle<T>(value: Result<T, Vec<String>>, problems: &mut Vec<String>) -> Optio
     value.map_err(|why| problems.extend(why)).ok()
 }
 
+/// The bytes of one seed file, or every reason they are refused.
+type Bytes = Result<Vec<u8>, Vec<String>>;
+
 /// The bytes of the regular file `name` in `dir`, or why it is not one. A link is not
 /// followed: a symlink is refused.
-fn take(dir: &Path, name: &str) -> Result<Vec<u8>, Vec<String>> {
+fn take(dir: &Path, name: &str) -> Bytes {
     let path = dir.join(name);
     let meta = std::fs::symlink_metadata(&path);
     if !meta.is_ok_and(|m| m.file_type().is_file()) {
@@ -203,18 +206,14 @@ fn take(dir: &Path, name: &str) -> Result<Vec<u8>, Vec<String>> {
 }
 
 /// The file `name` in `dir`, if `check` accepts what it holds.
-fn checked(
-    dir: &Path,
-    name: &str,
-    check: fn(Vec<u8>) -> Result<Vec<u8>, Vec<String>>,
-) -> Result<Vec<u8>, Vec<String>> {
+fn checked(dir: &Path, name: &str, check: fn(Vec<u8>) -> Bytes) -> Bytes {
     check(take(dir, name)?)
 }
 
 /// `bytes` as the release tarball: a gzip tar holding the one regular file `kbf`, as the
 /// installer requires of a staged tarball. Entries that are not regular files are not seen
 /// by `members`, so the installer's shape check on a host is what refuses those.
-fn tarball_checked(bytes: Vec<u8>) -> Result<Vec<u8>, Vec<String>> {
+fn tarball_checked(bytes: Vec<u8>) -> Bytes {
     let binary = version_facts::BINARY;
     let found = match members(&bytes) {
         Ok(found) => found,
@@ -230,7 +229,7 @@ fn tarball_checked(bytes: Vec<u8>) -> Result<Vec<u8>, Vec<String>> {
 
 /// `bytes` as the attestation bundle: a JSON object (not a sigstore bundle's schema; `gh`
 /// judges that, on a host, against the tarball).
-fn bundle_checked(bytes: Vec<u8>) -> Result<Vec<u8>, Vec<String>> {
+fn bundle_checked(bytes: Vec<u8>) -> Bytes {
     match serde_json::from_slice::<Value>(&bytes) {
         Ok(Value::Object(_)) => Ok(bytes),
         Ok(_) => Err(vec!["the bundle is JSON, but not an object".to_owned()]),
