@@ -204,8 +204,9 @@ fn a_file_that_is_not_a_proxy_config_is_refused_with_its_path_and_reason() {
 
 /// Catches the proxy refusing to start because the file it shares with the installer holds a key
 /// or a value this build does not know. The file is also read by `setup` and the fetcher, which
-/// are closed (they must understand the whole file); the proxy takes three things from it (the
-/// `[proxy]` table and the update API's two numbers) and a package downgrade must not take the
+/// are closed (they must understand the whole file); the proxy checks three things in it (the
+/// `[proxy]` table and the update API's two numbers; `database` it reads on its own, leniently)
+/// and a package downgrade must not take the
 /// public port down over a source key a later build wrote. The keys it does read are still
 /// checked, and the table is still closed; a value typed into a key it reads is not repeated.
 ///

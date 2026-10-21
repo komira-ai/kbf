@@ -41,8 +41,10 @@
 //! The only environment variables read are the service manager's socket-activation markers,
 //! `LISTEN_PID` and `LISTEN_FDS`; everything else is the `[proxy]` table.
 //!
-//! `--check` loads the whole file the way a run does, so a bad key outside `[proxy]` is
-//! refused (exit 2) too. A stop signal drains for at most 5 s; the process ends within
+//! `--check` loads the file the way a run does, so a bad value of a key the verb reads (the
+//! two windows, the fetch timeout, `database`, `[proxy]`) is refused (exit 2) too. It does
+//! not check the rest of the file: `setup` and the fetcher refuse a bad key there, not this
+//! verb. A stop signal drains for at most 5 s; the process ends within
 //! [`STOP_BOUND`] of the first one is seen, whatever the drain is doing, and at once on a
 //! second. SIGTERM and SIGINT are unblocked at start, so a launcher's inherited mask cannot
 //! hide them. SIGHUP is held pending from the first line of the verb until its reload handler

@@ -27,22 +27,22 @@ const FLAGS: [&str; 3] = [
 pub struct ReleaseFlags {
     /// A PEM file of the CAs the file server's certificate is checked against instead of the
     /// system's (an absolute path, a copy owned by root): written to installer.toml as
-    /// `release_ca`. For --release-source url.
+    /// `release_ca`. For --release-source url. Not used by a fetch yet.
     #[arg(long)]
     pub release_ca: Option<String>,
     /// The frontend's worker listener, where releases are served, as https://host[:port]:
     /// written to installer.toml as `frontend_url`. For --release-source frontend, with
-    /// --frontend-ca and --frontend-ca-sha256.
+    /// --frontend-ca and --frontend-ca-sha256. Not used by a fetch yet.
     #[arg(long)]
     pub frontend_worker_url: Option<String>,
     /// A PEM file of the CA the worker listener's certificate chains to (an absolute path, a
     /// copy owned by root): written to installer.toml as `frontend_ca`. For --release-source
-    /// frontend, with --frontend-worker-url and --frontend-ca-sha256.
+    /// frontend, with --frontend-worker-url and --frontend-ca-sha256. Not used by a fetch yet.
     #[arg(long)]
     pub frontend_ca: Option<String>,
     /// The sha256 of --frontend-ca, 64 lowercase hex characters: written to installer.toml as
     /// `frontend_ca_sha256`. For --release-source frontend, with --frontend-worker-url and
-    /// --frontend-ca.
+    /// --frontend-ca. Not used by a fetch yet.
     #[arg(long)]
     pub frontend_ca_sha256: Option<String>,
 }

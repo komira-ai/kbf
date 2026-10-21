@@ -112,13 +112,19 @@ fn the_release_ca_flag_is_an_absolute_path_for_the_url_source_only() {
         .validate(Platform::Linux)
         .expect("valid");
     assert_eq!(valid.release_ca, Some(PathBuf::from(RELEASE_CA)));
-    let plain = raw(Mode::Frontend).validate(Platform::Linux).expect("valid");
+    let plain = raw(Mode::Frontend)
+        .validate(Platform::Linux)
+        .expect("valid");
     assert_eq!(plain.release_ca, None);
     for bad in ["release-ca.pem", "/a/../b", "/a b", "/"] {
         let found = refused(&with(raw(Mode::Frontend), bad));
         assert!(found.contains("--release-ca:"), "{bad}: {found}");
     }
-    for r in [raw(Mode::Daemon), bundled(Mode::Frontend), bundled(Mode::Daemon)] {
+    for r in [
+        raw(Mode::Daemon),
+        bundled(Mode::Frontend),
+        bundled(Mode::Daemon),
+    ] {
         let found = refused(&with(r, RELEASE_CA));
         assert!(
             found.contains("--release-ca is for --release-source url"),
@@ -184,7 +190,11 @@ fn the_snapshot_flags_come_together_and_are_for_the_frontend_source() {
         );
     }
 
-    let flags = ["--frontend-worker-url:", "--frontend-ca:", "--frontend-ca-sha256:"];
+    let flags = [
+        "--frontend-worker-url:",
+        "--frontend-ca:",
+        "--frontend-ca-sha256:",
+    ];
     for (which, bad) in [
         (0, "http://frontend.lan"),
         (0, "https://frontend.lan/x"),
@@ -271,8 +281,7 @@ fn setup_writes_release_ca_beside_the_url_it_belongs_to() {
     go_ok(&FakeOs::linux(), &mut exec, &r);
     assert_eq!(written(&exec).release_ca, Some(PathBuf::from(RELEASE_CA)));
     let file = text(&exec, INSTALLER_TOML);
-    let adjacent =
-        format!("release_url = \"{RELEASE_URL}\"\nrelease_ca = \"{RELEASE_CA}\"\n");
+    let adjacent = format!("release_url = \"{RELEASE_URL}\"\nrelease_ca = \"{RELEASE_CA}\"\n");
     assert!(file.contains(&adjacent), "{file}");
 }
 

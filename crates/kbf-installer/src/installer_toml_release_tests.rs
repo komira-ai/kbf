@@ -18,7 +18,7 @@ const CA: &str = "/var/lib/kbf-installer/frontend-ca.pem";
 const WORKER: &str = "https://frontend.lan:8443";
 const URL_HEAD: &str = "release_source = \"url\"\nrelease_url = \"https://m.example\"\n";
 
-/// A file the proxy verb reads: the same text as `proxy_verb_tests.rs`'s.
+/// A file the proxy verb reads: the same text as the proxy verb's own tests use.
 const PROXY: &str = r#"
 database = "postgres:///kbf?host=/nonexistent"
 [proxy]
@@ -63,9 +63,9 @@ fn snapshot() -> FrontendPull {
 /// Catches `bundled` missing from the set of sources, and the exclusion that covers `url`
 /// not covering it: a key accepted under the wrong source.
 ///
-/// Mutants to plant: `"bundled"` removed from the `non_frontend` test (the identity and the
-/// snapshot are then accepted beside it); from the `release_ca` test; the `release_url` arm
-/// for `bundled` returning a source.
+/// Mutants to plant: `"bundled"` removed from the `not_frontend` test (the identity and the
+/// snapshot are then accepted beside it); from the `not_url` test (`release_ca` is then
+/// accepted); the `release_url` arm for `bundled` returning a source.
 #[test]
 fn bundled_is_a_source_that_excludes_every_key_naming_another() {
     let file = parsed("release_source = \"bundled\"\n");

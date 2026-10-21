@@ -53,13 +53,13 @@ Options:
       --release-url <RELEASE_URL>
           The https base URL of the file server, for --release-source url
       --release-ca <RELEASE_CA>
-          A PEM file of the CAs the file server's certificate is checked against instead of the system's (an absolute path, a copy owned by root): written to installer.toml as `release_ca`. For --release-source url
+          A PEM file of the CAs the file server's certificate is checked against instead of the system's (an absolute path, a copy owned by root): written to installer.toml as `release_ca`. For --release-source url. Not used by a fetch yet
       --frontend-worker-url <FRONTEND_WORKER_URL>
-          The frontend's worker listener, where releases are served, as https://host[:port]: written to installer.toml as `frontend_url`. For --release-source frontend, with --frontend-ca and --frontend-ca-sha256
+          The frontend's worker listener, where releases are served, as https://host[:port]: written to installer.toml as `frontend_url`. For --release-source frontend, with --frontend-ca and --frontend-ca-sha256. Not used by a fetch yet
       --frontend-ca <FRONTEND_CA>
-          A PEM file of the CA the worker listener's certificate chains to (an absolute path, a copy owned by root): written to installer.toml as `frontend_ca`. For --release-source frontend, with --frontend-worker-url and --frontend-ca-sha256
+          A PEM file of the CA the worker listener's certificate chains to (an absolute path, a copy owned by root): written to installer.toml as `frontend_ca`. For --release-source frontend, with --frontend-worker-url and --frontend-ca-sha256. Not used by a fetch yet
       --frontend-ca-sha256 <FRONTEND_CA_SHA256>
-          The sha256 of --frontend-ca, 64 lowercase hex characters: written to installer.toml as `frontend_ca_sha256`. For --release-source frontend, with --frontend-worker-url and --frontend-ca
+          The sha256 of --frontend-ca, 64 lowercase hex characters: written to installer.toml as `frontend_ca_sha256`. For --release-source frontend, with --frontend-worker-url and --frontend-ca. Not used by a fetch yet
       --min-generation <MIN_GENERATION>
           Refuse orders below this generation. A floor only goes up
       --commit <COMMIT>

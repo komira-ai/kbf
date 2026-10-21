@@ -335,9 +335,8 @@ fn frontend_group(
             FrontendPull::checked(FRONTEND_KEYS, url, ca, sha256, problems)
         }
         _ => {
-            problems.push(
-                "frontend_url, frontend_ca and frontend_ca_sha256 come together".to_owned(),
-            );
+            problems
+                .push("frontend_url, frontend_ca and frontend_ca_sha256 come together".to_owned());
             None
         }
     }
@@ -446,7 +445,8 @@ impl InstallerToml {
     }
 
     /// The tolerant reader, for a reader that fetches nothing and so needs only the confirm
-    /// window, the fetch timeout and the `[proxy]` table: every other key is dropped before the
+    /// window, the fetch timeout and the `[proxy]` table (`database` it reads on its own,
+    /// leniently, as the proxy verb does): every other key is dropped before the
     /// file is looked at, so a key or a value this build has never heard of (a source a later
     /// build wrote) cannot stop it. What it does read is checked as [`InstallerToml::parse`]
     /// checks it, the `[proxy]` table stays closed, and a message repeats no text of the file.
