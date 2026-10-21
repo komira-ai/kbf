@@ -156,13 +156,9 @@ pub enum PilotError {
         os: &'static str,
     },
     #[error(
-        "KBF_DARWIN_PROPERTIES asks for {pair}, but no daemon carries --label {want} (KBF_DARWIN_LABELS={labels})"
+        "{key} names {pair}: node labels were removed, kbf places by OSFamily and ISA. Delete it"
     )]
-    LabelNotCarried {
-        pair: String,
-        want: String,
-        labels: String,
-    },
+    LabelProperty { key: &'static str, pair: String },
 }
 
 impl PilotError {
