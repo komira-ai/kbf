@@ -41,11 +41,45 @@ pub fn choose(
     }
 }
 
+/// The full commit to embed as `KBF_BUILD_COMMIT_FULL`: `git rev-parse HEAD` when it is 40
+/// lowercase hex digits and no [`OVERRIDE`] is set, else the empty text, "not known". An
+/// override stamps a commit the checkout is not, so the checkout's full commit would be a
+/// false name for the build.
+pub fn choose_full(override_value: Option<&std::ffi::OsStr>, git_head: Option<String>) -> String {
+    let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    git_head
+        .filter(|c| override_value.is_none() && c.len() == 40 && c.bytes().all(hex))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
 
-    use super::choose;
+    use super::{choose, choose_full};
+
+    const FULL: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// Catches: the checkout's full commit embedded under an override (a false name for the
+    /// stamped build), and a git answer that is not 40 lowercase hex taken for a commit.
+    #[test]
+    fn the_full_commit_is_git_head_unless_stamped_or_odd() {
+        assert_eq!(choose_full(None, Some(FULL.to_owned())), FULL);
+        assert_eq!(
+            choose_full(Some(OsStr::new("0123456789ab")), Some(FULL.to_owned())),
+            ""
+        );
+        assert_eq!(choose_full(None, None), "");
+        for odd in [
+            "",
+            "0123456789ab",
+            &FULL.to_uppercase(),
+            &format!("{FULL}0"),
+            &FULL.replace('0', "g"),
+        ] {
+            assert_eq!(choose_full(None, Some(odd.to_owned())), "", "{odd}");
+        }
+    }
 
     fn from(value: &str) -> Result<String, String> {
         choose(Some(OsStr::new(value)), Some("fedcba987654".to_owned()))

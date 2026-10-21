@@ -1565,6 +1565,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-daemon-test"
+version = "0.1.0"
+dependencies = [
+ "kbf-harness",
+ "kbf-proto",
+ "kbf-testkit",
+ "kbf-transfer",
+ "rustix",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "kbf-deploy"
 version = "0.1.0"
 dependencies = [
@@ -1837,6 +1850,7 @@ name = "kbf-installer"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "bytes",
  "clap",
  "flate2",
@@ -1850,6 +1864,7 @@ dependencies = [
  "kbf-gate",
  "kbf-host",
  "kbf-installer",
+ "kbf-oidc",
  "kbf-proto",
  "kbf-proxy",
  "kbf-state",
@@ -1894,10 +1909,12 @@ dependencies = [
  "kbf-daemon",
  "kbf-deploy",
  "kbf-front",
+ "kbf-harness",
  "kbf-host",
  "kbf-installer",
  "kbf-map",
  "kbf-objstore",
+ "kbf-oidc",
  "kbf-proto",
  "kbf-proxy",
  "kbf-sched",
@@ -2121,6 +2138,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-oidc"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "ring",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "kbf-outputs"
 version = "0.1.0"
 dependencies = [
@@ -2178,6 +2218,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "kbf-oidc",
  "kbf-peer",
  "kbf-tls",
  "loom",
@@ -2193,6 +2234,7 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

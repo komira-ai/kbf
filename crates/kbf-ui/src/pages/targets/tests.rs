@@ -242,18 +242,22 @@ fn a_partial_list_and_an_unreadable_grid_are_said() {
     assert_eq!(rows(&html).len(), 2);
 }
 
-/// Catches: the API's refusals shown as another page: history off or a bad token is its
-/// own status, an overloaded API keeps its `Retry-After`.
+/// Catches: the API's refusals shown as another page: a bad token is its own status, an
+/// overloaded API keeps its `Retry-After`, and a farm with no history (the route answers as
+/// an unknown route: `404`, no body) is a page that says so and names the flag, not a `404`.
+/// Mutant: `is_history_off` always false.
 #[test]
 fn the_apis_refusals_are_the_pages() {
-    let off = Fake::default().with(
-        LIST_URL,
-        404,
-        r#"{"error": "history is off: start the farm with --history-objects"}"#,
-    );
+    let off = Fake::default().with(LIST_URL, 404, "");
     let (status, html) = page(&off, "/ui/targets");
-    assert_eq!(status, 404);
+    assert_eq!(status, 200, "{html}");
+    assert!(html.contains("History is off on this farm"), "{html}");
     assert!(html.contains("--history-objects"), "{html}");
+    let bad = Fake::default().with(LIST_URL, 404, r#"{"error": "page_token is not one"}"#);
+    let (status, html) = page(&bad, "/ui/targets");
+    assert_eq!(status, 404);
+    assert!(html.contains("page_token is not one"), "{html}");
+    assert!(!html.contains("History is off"), "{html}");
     let busy = Fake::default().with_headers(LIST_URL, 503, &[("Retry-After", "3")], "{}");
     let a = render(&busy, "/ui/targets");
     assert_eq!(a.status(), 503);

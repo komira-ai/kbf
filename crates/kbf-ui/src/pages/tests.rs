@@ -602,6 +602,7 @@ fn attempt_ends_in_words() {
         started: None,
         ended: None,
         end,
+        run_id: None,
     };
     let end = |result: Option<&str>,
                requeue: Option<&str>,

@@ -594,6 +594,65 @@ fn a_release_tag_job_gets_no_other_write_scope() {
     }
 }
 
+/// The `if:` line under which a job may write issues, as the lint requires it.
+const MAIN_REF_IF: &str = "    if: ${{ github.ref == 'refs/heads/main' }}\n";
+
+#[test]
+fn issues_write_needs_a_job_that_runs_only_on_the_main_ref() {
+    // Catches: `issues: write` (open, edit and close any issue) allowed in a job a pull
+    // request run holds, or refused where the advisories workflow needs it.
+    clean(&workflow(&format!(
+        "    runs-on: ubuntu-latest\n{MAIN_REF_IF}    permissions: {{contents: read, issues: write}}\n"
+    )));
+    for cond in [
+        "",
+        SIGNING_PUSH_IF,
+        TAG_PUSH_IF,
+        "    if: github.ref == 'refs/heads/main'\n",
+        "    if: ${{ github.ref == 'refs/heads/main' || true }}\n",
+        "    if: ${{ github.event_name != 'pull_request' }}\n",
+        "    if: ${{ startsWith(github.ref, 'refs/heads/') }}\n",
+    ] {
+        let body =
+            format!("    runs-on: ubuntu-latest\n{cond}    permissions: {{issues: write}}\n");
+        assert_eq!(
+            scan(&workflow(&body)),
+            vec![format!(
+                "line {}: `issues: write` is allowed only in a job whose `if:` is exactly `{ISSUES_MAIN_ONLY}`",
+                if cond.is_empty() { 7 } else { 8 }
+            )],
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn an_issues_job_gets_no_other_write_scope() {
+    // Catches: the issues exception read as "any write scope", `issues` matched loosely
+    // (another case, a level other than `write`), or the main-ref `if:` unlocking the
+    // signing and release scopes.
+    for p in [
+        "{packages: write}",
+        "{pull-requests: write}",
+        "{Issues: write}",
+        "{issues: admin}",
+        "write-all",
+    ] {
+        refused(
+            &format!("    runs-on: ubuntu-latest\n{MAIN_REF_IF}    permissions: {p}\n"),
+            "a job's `permissions`",
+        );
+    }
+    for scope in ["id-token", "attestations", "contents"] {
+        refused(
+            &format!(
+                "    runs-on: ubuntu-latest\n{MAIN_REF_IF}    permissions: {{{scope}: write}}\n"
+            ),
+            &format!("`{scope}: write` is allowed only in a job whose `if:` is exactly"),
+        );
+    }
+}
+
 #[test]
 fn pull_request_target_is_refused_outside_on() {
     // Catches: a lint that looks for pull_request_target only among the triggers,

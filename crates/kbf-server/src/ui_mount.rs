@@ -22,8 +22,11 @@
 //! - **Headers on every `/ui` answer**, errors and `405` included: the
 //!   `Content-Security-Policy` of [`kbf_ui::CONTENT_SECURITY_POLICY`] (nothing loads but
 //!   the page's own stylesheet; no script; no framing; no `<base>`), `nosniff`,
-//!   `Referrer-Policy: no-referrer` (ids sit in URLs) and `Cache-Control: no-store` (pages
-//!   carry logs).
+//!   `Referrer-Policy: no-referrer` (ids sit in URLs), `Cache-Control: no-store` (pages
+//!   carry logs), `Cross-Origin-Resource-Policy: same-origin` and
+//!   `Cross-Origin-Opener-Policy: same-origin` (no other origin embeds or shares a window
+//!   with a page), and a [`PERMISSIONS_POLICY`] denying the powerful features. No HSTS:
+//!   TLS ends at the proxy.
 //! - **No `Host` check.** A check against the public names guards an identity the page
 //!   would otherwise lend to a hostile site (DNS rebinding); `/ui` has none, and what it
 //!   shows is open to anyone who can send the request.
@@ -38,7 +41,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY, RANGE, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderName, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -197,7 +200,24 @@ impl InProcess {
 
 impl Source for InProcess {
     async fn get(&self, url: &str) -> Result<Fetched, SourceError> {
-        let mut request = Request::get(url)
+        self.ask(url, None).await
+    }
+
+    /// The route asked with `Range: bytes=first-last`, so a log or a blob route reads
+    /// only those bytes.
+    async fn get_range(&self, url: &str, first: u64, last: u64) -> Result<Fetched, SourceError> {
+        self.ask(url, Some((first, last))).await
+    }
+}
+
+impl InProcess {
+    /// `GET url`, with a `Range` header for `range` (first and last byte, inclusive).
+    async fn ask(&self, url: &str, range: Option<(u64, u64)>) -> Result<Fetched, SourceError> {
+        let mut request = Request::get(url);
+        if let Some((first, last)) = range {
+            request = request.header(RANGE, format!("bytes={first}-{last}"));
+        }
+        let mut request = request
             .body(Body::empty())
             .map_err(|e| SourceError(format!("{url:?} is not a request target: {e}")))?;
         // The lowest trust: a handler that decides by who called never takes this for
@@ -259,6 +279,16 @@ async fn page(State(source): State<Arc<InProcess>>, uri: Uri) -> Response {
     response
 }
 
+/// The `Permissions-Policy` of every `/ui` answer: each powerful feature denied to the
+/// page and to any frame (an empty allowlist), so a page that ever carried script could
+/// not ask for the camera, the microphone, the location, a USB or serial device, a
+/// payment, and the like.
+const PERMISSIONS_POLICY: &str = "accelerometer=(), autoplay=(), bluetooth=(), camera=(), \
+clipboard-read=(), clipboard-write=(), display-capture=(), encrypted-media=(), \
+fullscreen=(), geolocation=(), gyroscope=(), hid=(), idle-detection=(), \
+magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(), \
+screen-wake-lock=(), serial=(), usb=(), web-share=(), xr-spatial-tracking=()";
+
 /// Sets the security headers of every `/ui` answer, over any a handler set.
 async fn secure(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
@@ -268,6 +298,18 @@ async fn secure(request: Request, next: Next) -> Response {
         (X_CONTENT_TYPE_OPTIONS, "nosniff"),
         (REFERRER_POLICY, kbf_ui::REFERRER_POLICY),
         (CACHE_CONTROL, "no-store"),
+        (
+            HeaderName::from_static("cross-origin-resource-policy"),
+            "same-origin",
+        ),
+        (
+            HeaderName::from_static("cross-origin-opener-policy"),
+            "same-origin",
+        ),
+        (
+            HeaderName::from_static("permissions-policy"),
+            PERMISSIONS_POLICY,
+        ),
     ] {
         headers.insert(name, HeaderValue::from_static(value));
     }

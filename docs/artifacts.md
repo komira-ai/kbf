@@ -510,13 +510,16 @@ release already holds must be one of the verified files, byte for byte, or the r
 fails and changes nothing; the files it lacks are uploaded (`cargo xtask release
 publish`).
 
-Two further verbs read the annotated `v*` tag, whose message is the gamma verdict
-(`docs/design/kbf-cicd.md`, section 8.1). `verify` runs both, on a checkout of the whole
+Two further verbs read the annotated `v*` tag, whose message is the verdict of the gate
+stage (`docs/design/kbf-cicd.md`, section 8.1; today Beta, written by `release
+verdict-write` after `release gates` saw the `ci`, `beta` and `artifacts` push runs of the
+commit succeed). `verify` runs both, on a checkout of the whole
 history (the tag object and `origin/main` must be there): `cargo xtask release verdict`
 refuses a lightweight tag, a commit not on main, a message
-that is not a green gamma verdict, a verdict that names another commit, tag or set (the
-set hash is the SHA-256 of `SHA256SUMS`, `kbf_gate::SetHash::of_sums`), a bake under 24
-hours, and a thin bake without a recorded `min-load` waiver; it prints `set-hash=<hex>`.
+that is not a green verdict of the gate stage, a verdict that names another commit, tag or
+set (the set hash is the SHA-256 of `SHA256SUMS`, `kbf_gate::SetHash::of_sums`), and, for
+Gamma, a bake under 24 hours and a thin bake without a recorded `min-load` waiver (a Beta
+verdict records no bake, and one that does is refused); it prints `set-hash=<hex>`.
 `cargo xtask release notes` runs the same checks and writes the notes, which `verify`
 uploads as the artifact `release-notes`, so a dry run shows them. `verify` passes the hash
 to `publish` as a job output, and `release publish` takes it as `--set-hash` and publishes

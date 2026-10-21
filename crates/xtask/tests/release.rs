@@ -1504,7 +1504,7 @@ fn publish_refuses_files_whose_set_differs_from_the_verdicts_before_asking_githu
     let other = sha_of("what gamma ran");
     let (code, _, err) = publish_set(&root, &other, None);
     assert_eq!(code, Some(1), "{err}");
-    assert!(err.contains("gamma ran other bytes"), "{err}");
+    assert!(err.contains("the gate ran other bytes"), "{err}");
     assert!(err.contains(&other), "{err}");
     assert!(released(&root).is_empty(), "nothing was released");
     assert!(
