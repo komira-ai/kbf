@@ -1,4 +1,4 @@
-//! A fake GitHub Actions issuer for tests: RSA keys generated here, a TLS server that
+//! A fake GitHub Actions issuer for tests: RSA keys from fixtures, a TLS server that
 //! serves a discovery document and a JWKS, and a token minter. Nothing is shared with
 //! the code under test but its public interface.
 
@@ -9,8 +9,6 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use ring::rand::SystemRandom;
 use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
-use rsa::pkcs8::EncodePrivateKey as _;
-use rsa::traits::PublicKeyParts as _;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_rustls::TlsAcceptor;
@@ -32,15 +30,25 @@ pub struct TestKey {
     e: Vec<u8>,
 }
 
+/// A big-endian integer without leading zero bytes, as a JWK writes it.
+fn strip(mut bytes: Vec<u8>) -> Vec<u8> {
+    let zeros = bytes.iter().take_while(|&&b| b == 0).count();
+    bytes.drain(..zeros);
+    bytes
+}
+
 impl TestKey {
-    fn generate(kid: &str) -> Self {
-        let private = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("a key");
-        let der = private.to_pkcs8_der().expect("PKCS#8");
+    fn load(kid: &str, base64_der: &str) -> Self {
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(base64_der.split_whitespace().collect::<String>())
+            .expect("base64");
+        let pair = RsaKeyPair::from_pkcs8(&der).expect("ring reads the key");
+        let public = ring::signature::RsaPublicKeyComponents::<Vec<u8>>::from(pair.public());
         Self {
             kid: kid.to_owned(),
-            pair: RsaKeyPair::from_pkcs8(der.as_bytes()).expect("ring reads the key"),
-            n: private.n().to_bytes_be(),
-            e: private.e().to_bytes_be(),
+            n: strip(public.n),
+            e: strip(public.e),
+            pair,
         }
     }
 
@@ -67,20 +75,17 @@ impl TestKey {
     }
 }
 
-/// Three keys, generated once per test binary (2048-bit generation is slow in a debug build):
-/// the issuer's, a second one for a forged signature, and one for a rotation.
+/// Three keys: the issuer's, a second one for a forged signature, and one for a rotation.
+/// They are fixtures (`testdata/k1.pk8.b64` and so on, base64 of 2048-bit PKCS#8 DER made once with
+/// `openssl genpkey`), used by no deployment: a test that signs with them proves the verifier,
+/// nothing else. Fixed keys also keep a test process from spending seconds on prime search.
 pub fn keys() -> &'static [TestKey; 3] {
     static KEYS: OnceLock<[TestKey; 3]> = OnceLock::new();
     KEYS.get_or_init(|| {
-        let handles: Vec<_> = ["k1", "k2", "k3"]
-            .into_iter()
-            .map(|kid| std::thread::spawn(move || TestKey::generate(kid)))
-            .collect();
-        let mut made = handles.into_iter().map(|h| h.join().expect("keygen"));
         [
-            made.next().expect("k1"),
-            made.next().expect("k2"),
-            made.next().expect("k3"),
+            TestKey::load("k1", include_str!("../testdata/k1.pk8.b64")),
+            TestKey::load("k2", include_str!("../testdata/k2.pk8.b64")),
+            TestKey::load("k3", include_str!("../testdata/k3.pk8.b64")),
         ]
     })
 }

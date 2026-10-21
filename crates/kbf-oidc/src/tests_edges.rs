@@ -411,3 +411,248 @@ async fn the_fake_issuer_and_the_fetch_survive_odd_clients() {
     let why = source.jwks().await.expect_err("404");
     assert!(why.contains("404"), "{why}");
 }
+
+/// A key source the test steers: the JWKS it serves, whether it fails, and whether it holds a
+/// request until released.
+struct Steered {
+    jwks: std::sync::Mutex<String>,
+    fail: std::sync::atomic::AtomicBool,
+    hold: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
+    fetches: std::sync::atomic::AtomicUsize,
+}
+
+impl KeySource for Steered {
+    fn jwks(&self) -> futures::future::BoxFuture<'_, Result<String, String>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        Box::pin(async move {
+            self.fetches.fetch_add(1, SeqCst);
+            if self.hold.load(SeqCst) {
+                self.release.notified().await;
+            }
+            if self.fail.load(SeqCst) {
+                return Err("down".to_owned());
+            }
+            Ok(self.jwks.lock().expect("lock").clone())
+        })
+    }
+}
+
+fn steered(
+    first: &[&super::testkit::TestKey],
+) -> (
+    Arc<Steered>,
+    Arc<super::Verifier>,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
+    let source = Arc::new(Steered {
+        jwks: std::sync::Mutex::new(jwks_of(first)),
+        fail: false.into(),
+        hold: false.into(),
+        release: tokio::sync::Notify::new(),
+        fetches: 0.into(),
+    });
+    let (clock, now) = super::testkit::clock();
+    let config = OidcConfig::parse(&super::testkit::config_text(STATIC_ISSUER)).expect("a config");
+    let verifier = Arc::new(super::Verifier::new(
+        config,
+        Arc::clone(&source) as Arc<dyn KeySource>,
+        Duration::from_secs(30),
+        clock,
+    ));
+    (source, verifier, now)
+}
+
+/// A token for `key`, valid at the verifier's clock `now`.
+fn token_at(key: &super::testkit::TestKey, now: u64) -> String {
+    let mut claims = good_claims(STATIC_ISSUER);
+    claims["iat"] = now.into();
+    claims["nbf"] = now.into();
+    claims["exp"] = (now + 300).into();
+    mint(key, &claims)
+}
+
+/// A key the issuer withdrew is refused once the key set is an hour old, though no token with
+/// an unknown `kid` ever asked for a fetch; until then it still verifies; and if the issuer is
+/// down at that time the keys held are kept (an outage is not a reason to refuse every deploy;
+/// a withdrawn key is trusted until a fetch succeeds).
+///
+/// Kills: a key set that never ages (the maximum age made huge), an age that is not measured
+/// from the last successful fetch, a failed refetch that empties the keys.
+#[tokio::test]
+async fn a_withdrawn_key_stops_verifying_within_the_maximum_key_age() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (source, verifier, now) = steered(&[&keys()[0]]);
+    let t0 = super::testkit::NOW;
+    assert!(verifier.verify(&token_at(&keys()[0], t0)).await.is_ok());
+    assert_eq!(source.fetches.load(SeqCst), 1);
+    *source.jwks.lock().expect("lock") = jwks_of(&[&keys()[1]]);
+
+    now.store(t0 + 3000, SeqCst);
+    assert!(
+        verifier
+            .verify(&token_at(&keys()[0], t0 + 3000))
+            .await
+            .is_ok(),
+        "not old yet"
+    );
+    assert_eq!(source.fetches.load(SeqCst), 1, "no fetch before the age");
+
+    source.fail.store(true, SeqCst);
+    let late = t0 + 3600 + 10;
+    now.store(late, SeqCst);
+    assert!(
+        verifier.verify(&token_at(&keys()[0], late)).await.is_ok(),
+        "the issuer is down: keys kept"
+    );
+    assert_eq!(source.fetches.load(SeqCst), 2);
+
+    source.fail.store(false, SeqCst);
+    now.store(late + 31, SeqCst);
+    assert_eq!(
+        verifier.verify(&token_at(&keys()[0], late + 31)).await,
+        Err(Refusal::UnknownKey),
+        "the issuer is back and no longer publishes the key"
+    );
+    assert!(
+        verifier
+            .verify(&token_at(&keys()[1], late + 31))
+            .await
+            .is_ok()
+    );
+}
+
+/// A token whose key is held is answered while a fetch for another `kid` waits on a slow issuer.
+///
+/// Kills: the lock held across the fetch, which stalls every token for as long as the issuer
+/// takes to answer.
+#[tokio::test]
+async fn a_held_key_is_not_kept_waiting_by_a_slow_fetch() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (source, verifier, now) = steered(&[&keys()[0]]);
+    let t0 = super::testkit::NOW;
+    assert!(verifier.verify(&token_at(&keys()[0], t0)).await.is_ok());
+    now.store(t0 + 31, SeqCst);
+    source.hold.store(true, SeqCst);
+    let slow = {
+        let verifier = Arc::clone(&verifier);
+        let token = token_at(&keys()[1], t0 + 31);
+        tokio::spawn(async move { verifier.verify(&token).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while source.fetches.load(SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the second fetch starts");
+    let fast = tokio::time::timeout(
+        Duration::from_secs(2),
+        verifier.verify(&token_at(&keys()[0], t0 + 31)),
+    )
+    .await;
+    assert!(matches!(fast, Ok(Ok(_))), "{fast:?}");
+    source.hold.store(false, SeqCst);
+    source.release.notify_waiters();
+    assert_eq!(slow.await.expect("joined"), Err(Refusal::UnknownKey));
+}
+
+/// A held key in a set that is old, with a fetch already under way, is used and does not wait.
+#[tokio::test]
+async fn an_old_key_is_used_while_its_refresh_is_under_way() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (source, verifier, now) = steered(&[&keys()[0]]);
+    let t0 = super::testkit::NOW;
+    assert!(verifier.verify(&token_at(&keys()[0], t0)).await.is_ok());
+    let late = t0 + 3600 + 10;
+    now.store(late, SeqCst);
+    source.hold.store(true, SeqCst);
+    let refresh = {
+        let verifier = Arc::clone(&verifier);
+        let token = token_at(&keys()[0], late);
+        tokio::spawn(async move { verifier.verify(&token).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while source.fetches.load(SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the second fetch starts");
+    let other = tokio::time::timeout(
+        Duration::from_secs(2),
+        verifier.verify(&token_at(&keys()[0], late)),
+    )
+    .await;
+    assert!(matches!(other, Ok(Ok(_))), "{other:?}");
+    source.hold.store(false, SeqCst);
+    source.release.notify_waiters();
+    assert!(refresh.await.expect("joined").is_ok());
+}
+
+/// The allow-list of the gamma deploy (docs/design/frontend-proxy.md, section 4a), whose job
+/// runs from a `workflow_run` of the release workflow on main: its token says `workflow_run`.
+const GAMMA: &str = r#"
+[remote_operator]
+issuer = "https://token.actions.githubusercontent.com"
+audience = "kbf-gamma"
+repository_id = "1234567"
+repository = "komira-ai/kbf"
+job_workflow_ref = ["komira-ai/kbf/.github/workflows/gamma.yml@refs/heads/main"]
+environments = ["gamma"]
+event_names = ["workflow_run"]
+"#;
+
+/// The gamma allow-list accepts the token of a `workflow_run` job of `gamma.yml` on main in the
+/// `gamma` environment, and refuses the same token as a `pull_request_target` (which runs fork
+/// code with secrets), a `gamma.yml` of another branch, and another environment.
+///
+/// Kills: an event list that does not take `workflow_run`, one that takes any event, a workflow
+/// pin that does not include the ref.
+#[tokio::test]
+async fn the_gamma_allow_list_takes_a_workflow_run_and_not_a_pull_request_target() {
+    use super::testkit::{StaticKeys, clock};
+    let (clock, _) = clock();
+    let verifier = super::Verifier::new(
+        OidcConfig::parse(GAMMA).expect("the gamma allow-list"),
+        Arc::new(StaticKeys(jwks_of(&[&keys()[0]]))),
+        Duration::from_secs(30),
+        clock,
+    );
+    let claims = |edit: fn(&mut Value)| {
+        let mut c = good_claims("https://token.actions.githubusercontent.com");
+        c["aud"] = json!("kbf-gamma");
+        c["repository_id"] = json!("1234567");
+        c["repository"] = json!("komira-ai/kbf");
+        c["job_workflow_ref"] = json!("komira-ai/kbf/.github/workflows/gamma.yml@refs/heads/main");
+        c["event_name"] = json!("workflow_run");
+        edit(&mut c);
+        mint(&keys()[0], &c)
+    };
+    assert!(verifier.verify(&claims(|_| {})).await.is_ok());
+    type Edit = fn(&mut Value);
+    let refused: [(Edit, Refusal); 4] = [
+        (
+            |c: &mut Value| c["event_name"] = json!("pull_request_target"),
+            Refusal::Event,
+        ),
+        (
+            |c: &mut Value| c["event_name"] = json!("push"),
+            Refusal::Event,
+        ),
+        (
+            |c: &mut Value| {
+                c["job_workflow_ref"] =
+                    json!("komira-ai/kbf/.github/workflows/gamma.yml@refs/heads/topic");
+            },
+            Refusal::Workflow,
+        ),
+        (
+            |c: &mut Value| c["environment"] = json!("prod"),
+            Refusal::Environment,
+        ),
+    ];
+    for (edit, why) in refused {
+        assert_eq!(verifier.verify(&claims(edit)).await, Err(why));
+    }
+}

@@ -70,58 +70,110 @@ pub(crate) fn parse_jwks(text: &str) -> Result<BTreeMap<String, RsaKey>, String>
     Ok(out)
 }
 
-struct State {
+/// How long a fetched key set is trusted without being fetched again: a key the issuer has
+/// withdrawn is refused within this long (and within the refetch interval after it), whether or
+/// not a token with an unknown `kid` ever comes.
+pub const MAX_KEY_AGE: Duration = Duration::from_secs(3600);
+
+struct Held {
     keys: BTreeMap<String, RsaKey>,
+    /// Unix seconds of the last fetch that gave keys, if any.
+    fetched_at: Option<u64>,
     /// Unix seconds of the last fetch attempt (a failed one counts), if any.
     last_attempt: Option<u64>,
 }
 
 /// The keys held and the rule for fetching more.
+///
+/// A fetch is made when a `kid` is unknown or the key set is older than [`MAX_KEY_AGE`], and
+/// never more than once per `refetch_interval`. A failed fetch keeps the keys already held
+/// (the issuer being down is not a reason to refuse every deploy; a withdrawn key is then
+/// trusted until a fetch succeeds); a failed first fetch fails closed.
+///
+/// The held keys are behind a lock that is never held across a fetch: a token whose key is held
+/// is answered at once while a slow issuer is being waited on. Fetches are serialized, so
+/// concurrent unknown-kid tokens make one.
 pub struct KeyCache {
     source: Arc<dyn KeySource>,
-    state: Mutex<State>,
+    held: std::sync::Mutex<Held>,
+    fetching: Mutex<()>,
     refetch_interval: Duration,
 }
 
 impl KeyCache {
-    /// A cache over `source` that refetches for an unknown `kid` at most once per
-    /// `refetch_interval`.
+    /// A cache over `source` that refetches at most once per `refetch_interval`.
     #[must_use]
     pub fn new(source: Arc<dyn KeySource>, refetch_interval: Duration) -> Self {
         Self {
             source,
-            state: Mutex::new(State {
+            held: std::sync::Mutex::new(Held {
                 keys: BTreeMap::new(),
+                fetched_at: None,
                 last_attempt: None,
             }),
+            fetching: Mutex::new(()),
             refetch_interval,
         }
     }
 
-    /// The key `kid` names, fetching if it is unknown and the interval allows.
+    fn held(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The key `kid` names if it is held and the set it is in is not too old.
+    fn fresh(&self, kid: &str, now: u64) -> Option<RsaKey> {
+        let held = self.held();
+        let age = now.saturating_sub(held.fetched_at?);
+        (age < MAX_KEY_AGE.as_secs())
+            .then(|| held.keys.get(kid).cloned())
+            .flatten()
+    }
+
+    /// The key `kid` names, fetching if it is unknown or the set is old and the interval allows.
     pub(crate) async fn key(&self, kid: &str, now: u64) -> Result<RsaKey, Refusal> {
-        // Held across the fetch, so concurrent unknown-kid tokens make one fetch.
-        let mut state = self.state.lock().await;
-        if let Some(key) = state.keys.get(kid) {
-            return Ok(key.clone());
+        if let Some(key) = self.fresh(kid, now) {
+            return Ok(key);
         }
-        let due = state
-            .last_attempt
-            .is_none_or(|at| now.saturating_sub(at) >= self.refetch_interval.as_secs());
+        let held_key = self.held().keys.get(kid).cloned();
+        // A key held but old: if a fetch is already under way, use what is held rather than
+        // wait for it (an unknown `kid` has nothing to use and waits).
+        let _fetching = match (held_key, self.fetching.try_lock()) {
+            (_, Ok(guard)) => guard,
+            (Some(key), Err(_)) => return Ok(key),
+            (None, Err(_)) => self.fetching.lock().await,
+        };
+        // Another token's fetch may have done it while this one waited.
+        if let Some(key) = self.fresh(kid, now) {
+            return Ok(key);
+        }
+        let due = {
+            let mut held = self.held();
+            let due = held
+                .last_attempt
+                .is_none_or(|at| now.saturating_sub(at) >= self.refetch_interval.as_secs());
+            if due {
+                held.last_attempt = Some(now);
+            }
+            due
+        };
         if due {
-            state.last_attempt = Some(now);
             match self.source.jwks().await.and_then(|t| parse_jwks(&t)) {
-                Ok(keys) => state.keys = keys,
+                Ok(keys) => {
+                    let mut held = self.held();
+                    held.keys = keys;
+                    held.fetched_at = Some(now);
+                }
                 Err(why) => {
                     tracing::warn!(%why, "oidc: fetching the issuer's keys failed");
-                    if state.keys.is_empty() {
-                        return Err(Refusal::KeysUnavailable);
-                    }
                 }
             }
-        } else if state.keys.is_empty() {
+        }
+        let held = self.held();
+        if held.keys.is_empty() {
             return Err(Refusal::KeysUnavailable);
         }
-        state.keys.get(kid).cloned().ok_or(Refusal::UnknownKey)
+        held.keys.get(kid).cloned().ok_or(Refusal::UnknownKey)
     }
 }

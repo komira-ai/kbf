@@ -126,7 +126,25 @@ Claims the verifier requires, in the order it checks them (`crates/kbf-oidc/src/
 | `runner_environment` | exactly (default `github-hosted`) | `runner_environment` |
 | `jti` | present, at most 256 bytes, not seen before (remembered until `exp` plus 60 s; a full memory of 10,000 refuses new tokens) | fixed |
 
-`sub` is not matched: its form is GitHub's to change, and `repository_id` with `job_workflow_ref` say the same exactly. There is no `setup` flag for the key yet: write `remote_operator_file = "/etc/kbf/remote-ci.toml"` under `[proxy]` by hand (a `setup` rerun keeps it); `kbf-installer proxy --check` reads the file. A CI job asks for the token with audience `audience` (`ACTIONS_ID_TOKEN_REQUEST_URL` with `&audience=`) and sends it as `Authorization: Bearer`; a repeated `POST /v1/update/frontend` carries the same `request_id`, as with the operator token.
+The issuer's keys are fetched on the first token and again when a token names an unknown `kid` (at most every 30 s), and a key set older than one hour is fetched again by the next token, so a key the issuer withdrew stops verifying within the hour. If that fetch fails the keys held stay in use (an issuer outage does not stop deploys; the cost is that a withdrawn key is trusted until a fetch succeeds), and a failed first fetch is a 503. A token whose key is held never waits for a fetch that is under way.
+
+Example, the gamma deploy (`gamma.yml`, which runs from a `workflow_run` of the release workflow on main, so its token's `event_name` is `workflow_run`). `/etc/kbf/remote-ci.toml`:
+
+```toml
+[remote_operator]
+issuer = "https://token.actions.githubusercontent.com"
+audience = "<the audience the job asks for>"
+repository_id = "<numeric id of komira-ai/kbf>"
+repository = "komira-ai/kbf"
+job_workflow_ref = ["komira-ai/kbf/.github/workflows/gamma.yml@refs/heads/main"]
+environments = ["gamma"]
+event_names = ["workflow_run"]
+# runner_environment: the default, github-hosted
+```
+
+The ref pin stays meaningful for a `workflow_run` job: GitHub runs it from the copy of the workflow on the default branch, so `job_workflow_ref` names `@refs/heads/main` whatever branch triggered the release run, and a copy of `gamma.yml` on another branch is a different `job_workflow_ref` and is refused. `pull_request_target` (fork code with secrets) is not in `event_names` and the file is refused if it lists any `pull_request*` event.
+
+`sub` is not matched: its form is GitHub's to change, and `repository_id` with `job_workflow_ref` say the same exactly. There is no `setup` flag for the key yet: write `remote_operator_file = "/etc/kbf/remote-ci.toml"` under `[proxy]` by hand (a `setup` rerun keeps it: the key is read and written back with the rest of `installer.toml`); `kbf-installer proxy --check` reads the file. A CI job asks for the token with audience `audience` (`ACTIONS_ID_TOKEN_REQUEST_URL` with `&audience=`) and sends it as `Authorization: Bearer`; a repeated `POST /v1/update/frontend` carries the same `request_id`, as with the operator token.
 
 ## 5. Swap sequence (frontend host)
 

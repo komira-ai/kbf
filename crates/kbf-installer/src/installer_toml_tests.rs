@@ -610,6 +610,37 @@ fn the_proxy_table_is_rendered_and_read_back_with_every_key() {
     assert_eq!(InstallerToml::parse(&back.render()).expect("again"), back);
 }
 
+/// Catches `remote_operator_file` lost on a rewrite: `setup` parses `installer.toml` and renders
+/// it again, so a key that is read and not rendered switches the CI credential off silently on
+/// the next run. The key parses, survives `render`, and a table without it renders without it.
+#[test]
+fn the_remote_operator_file_survives_a_rewrite() {
+    let with = PROXY_HOST.replace(
+        "proxy_auth_file =",
+        "remote_operator_file = \"/etc/kbf/remote-ci.toml\"\nproxy_auth_file =",
+    );
+    assert_ne!(with, PROXY_HOST);
+    let parsed = InstallerToml::parse(&with).expect("parses");
+    assert_eq!(
+        parsed
+            .proxy
+            .as_ref()
+            .and_then(|p| p.remote_operator_file.as_deref()),
+        Some(std::path::Path::new("/etc/kbf/remote-ci.toml"))
+    );
+    assert_eq!(parsed.render(), with);
+    assert_eq!(
+        InstallerToml::parse(&parsed.render()).expect("again"),
+        parsed
+    );
+    assert!(
+        !InstallerToml::parse(PROXY_HOST)
+            .expect("parses")
+            .render()
+            .contains("remote_operator_file")
+    );
+}
+
 /// Catches a UI that is off unless asked for: the golden says `ui = true` and parses to it, and
 /// a table written before the key existed (no `ui`) reads as on and renders `ui = true`, so the
 /// browser UI is on for a host that never named it.

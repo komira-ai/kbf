@@ -2135,7 +2135,6 @@ dependencies = [
  "hyper-util",
  "rcgen",
  "ring",
- "rsa",
  "rustls",
  "rustls-native-certs",
  "serde",

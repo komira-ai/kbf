@@ -12,9 +12,9 @@ publish.workspace = true
 # (`POST /v1/update/desired`, `POST /v1/update/frontend`), off unless the proxy is given the
 # allow-list. The issuer's keys are fetched over https (hyper on rustls, the ring provider,
 # the host's roots); the RS256 signature is checked by ring. `testkit` is a fake issuer with
-# RSA keys of its own, for the tests of the callers; it is never in a release build.
+# RSA key fixtures (testdata/), for the tests of the callers; it is never in a release build.
 [features]
-testkit = ["dep:rsa", "dep:rcgen"]
+testkit = ["dep:rcgen"]
 
 [dependencies]
 base64.workspace = true
@@ -25,7 +25,6 @@ hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 ring.workspace = true
 rcgen = { workspace = true, optional = true }
-rsa = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-native-certs.workspace = true
 serde.workspace = true
@@ -38,7 +37,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
-rsa.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util", "time"] }
 
 [lints]
