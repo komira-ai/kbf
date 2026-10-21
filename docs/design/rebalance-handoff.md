@@ -376,13 +376,13 @@ All from `feature/arch-v2`.
   No code or doc states list-after-PUT for S3, MinIO or RustFS; the conformance suite does not
   check it.
 - Only `file` and `s3` URIs are accepted (`crates/kbf-server/src/stores.rs:17`, `:104`).
-- Farm modes use one `s3://` cold store (`docs/deploy/kbf-modes.md:153`;
+- Farm modes use one `s3://` cold store (`docs/deploy/kbf-units.md`, "What each mode's unit carries";
   `docs/api.md:594-603`, one store registered for every storage node;
   `architecture-v2.md` section 8, a new owner rebuilds from segments an earlier owner flushed).
-  Single-box modes use `file://` (`kbf-modes.md:386`; `docs/deploy/storage-node.md:272`);
+  Single-box modes use `file://` (`docs/deploy/kbf-units.md`, "all-in-one is for a trusted box"; `docs/deploy/storage-node.md:272`);
   `file://` is one process per directory: `FsStore::open` takes an exclusive `flock` on `LOCK` with `try_lock` (`fs_store.rs:294-302`, doc `:7-8`), and a second opener gets `FsStoreError::Locked` instead of sharing the directory. No doc describes a multi-node `file://` farm. The test-farm unit uses an `s3://` store
   that is loopback unless `MINIO_S3_ENDPOINT` is remote; the rehearsal harness defaults to a
-  directory (`docs/design/kbf-cicd.md:232,241`). No doc says "every node shares one store".
+  directory (`docs/design/kbf-cicd.md` section 4.3, the harness). No doc says "every node shares one store".
 
 **Index and `put_unowned`**
 - `MetaState.blobs` is private (`crates/kbf-meta/src/state.rs:320`); public readers are

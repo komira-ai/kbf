@@ -5,7 +5,8 @@
 //!   <commit>` and `build-commit stamps <commit>` ([`build_commit`]): kbf-server names the
 //!   commit it was built from, and `kbf` does in the tarball that ships.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
-//!   row the working tree's budget file has and `<rev>`'s does not is refused. CI runs
+//!   row the working tree's budget file has and `<rev>`'s does not is refused, unless
+//!   git sees the row's path renamed from a path `<rev>` has a row for. CI runs
 //!   it on pull requests, with the base branch as `<rev>`.
 //! - `sign-darwin <binary> --minos <version> [--summary <file>]` and `darwin-asset
 //!   <tarball> <name>` ([`darwin`]): the macOS binary signed ad hoc with the hardened
@@ -30,6 +31,10 @@
 //!   attested on, and the built deb as the release asset
 //!   `kbf-installer-<commit>-<platform>.deb`, refused unless it holds the binary of the
 //!   attested tarball and trusts the branch it is attested for.
+//! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf-installer` package
+//!   carries, in the one form a deb and an rpm put in the same order, and the most a package
+//!   that carries a kbf release may weigh. `pkg-config` and `pkg-asset` take them up with
+//!   the release.
 //! - `pkg-macos-asset` and `pkg-macos-install-test` ([`pkg_macos_asset`],
 //!   [`pkg_macos_install`]): the Mac `.pkg` as the release asset
 //!   `kbf-installer-<commit>-darwin-arm64.pkg`, refused unless it holds the attested
@@ -47,7 +52,7 @@
 //!   attestations` and `release check` hold a directory to one bundle per tarball,
 //!   each that tarball's (its one subject is the tarball's digest); `verify-assets
 //!   attestations` also has `gh` verify each tarball against its bundle.
-//! - `release {locate,main-control,check,verdict,offer,notes,plan,previous,stage-offer,publish}` ([`release`]): a GitHub release of
+//! - `release {locate,main-control,check,verdict,offer,notes,plan,identity,previous,fetch-previous,stage-offer,publish}` ([`release`]): a GitHub release of
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
@@ -63,6 +68,7 @@
 //! Exit status: 0 when the check passed, 1 when it failed (one reason per line on
 //! stderr), 2 on a usage error.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -85,7 +91,9 @@ pub mod pkg_linux;
 pub mod pkg_macos_asset;
 #[cfg(target_os = "macos")]
 pub mod pkg_macos_install;
+pub mod pkg_size;
 pub mod pkg_trust;
+pub mod pkg_version;
 pub mod proxy_loom;
 pub mod release;
 pub mod sudo_test;
@@ -575,6 +583,10 @@ enum ReleaseVerb {
         /// The set hash the gamma verdict names, as `release verdict` printed it.
         #[arg(long)]
         set_hash: String,
+        /// The release's notes (`release notes --out`): the release body, followed by how
+        /// to verify the files. Required: no default body replaces it.
+        #[arg(long)]
+        notes_file: PathBuf,
         /// The `gh` program.
         #[arg(long, default_value = "gh")]
         gh: PathBuf,
@@ -597,18 +609,57 @@ enum ReleaseVerb {
     /// The release before `--sha`: the highest release tag that names a strict ancestor of it,
     /// downloaded, verified as `release offer` verifies one, and its named binaries taken
     /// out into `--out`. With no such tag, prints `previous-source=none`.
-    Previous(release::previous::PreviousArgs),
+    FetchPrevious(release::fetch_previous::FetchPreviousArgs),
     /// The offer for the release of `--sha`, for gamma only, and the bundle a gamma deploy is
     /// handed: the release verified before any of it runs. A commit with no release is
     /// `staged=false`, not an error.
     StageOffer(release::stage_offer::StageOfferArgs),
+    /// Create the annotated release tag at `--sha` through the GitHub API: create-only,
+    /// after the stale-run guards; a tag that exists is reused only when it is the same.
+    Tag(release::tag::TagArgs),
+    /// Write the verdict document a release tag carries as its message.
+    VerdictWrite(release::verdict_write::WriteArgs),
     /// The same checks, then write the release's notes.
     Notes {
         #[command(flatten)]
         subject: SubjectArgs,
+        /// `kbf --version --json` of this release's binary, run from an attested tarball.
+        #[arg(long)]
+        version_json: PathBuf,
+        /// The same for the previous release (`release previous` names it); required
+        /// exactly when there is one.
+        #[arg(long)]
+        previous_version_json: Option<String>,
         /// Write the notes here.
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Run `kbf --version --json` from the linux-x86_64 tarball of `--commit` in `<dir>` and
+    /// write what it prints. Runs a binary: only on files already checked and attested.
+    Identity {
+        dir: PathBuf,
+        /// The commit the tarball was built from, a full SHA.
+        #[arg(long)]
+        commit: String,
+        /// Write the identity here.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// The release before `--tag`, if any: prints `previous=<tag>` and
+    /// `previous-commit=<sha>` (both empty for a first release).
+    Previous {
+        /// A checkout that holds the tags and main's history.
+        #[arg(long, default_value = ".")]
+        repo_dir: PathBuf,
+        /// The release tag.
+        #[arg(long)]
+        tag: String,
+        /// The commit being released, a full SHA.
+        #[arg(long)]
+        commit: String,
+        /// Append the two lines to this file (on Actions, `GITHUB_OUTPUT`).
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -667,30 +718,45 @@ fn default_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The budget file as `rev` holds it, read with `git show` in `root`.
-fn budget_at(root: &Path, rev: &str) -> Result<String, Error> {
-    let spec = format!("{rev}:{}", budget::BUDGET);
+/// What `git <args>` prints in `root`.
+fn git_stdout(root: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["show", &spec])
+        .args(args)
         .output()
         .map_err(Error::spawn("git".to_owned()))?;
     if !out.status.success() {
         return Err(Error::Failed(format!(
-            "git show {spec}: {}",
+            "git {}: {}",
+            args.join(" "),
             String::from_utf8_lossy(&out.stderr).trim_end()
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(out.stdout)
 }
 
-/// `budget-diff --base <rev>`: the line it prints when nothing was added.
+/// The budget file as `rev` holds it, read with `git show` in `root`.
+fn budget_at(root: &Path, rev: &str) -> Result<String, Error> {
+    let spec = format!("{rev}:{}", budget::BUDGET);
+    let out = git_stdout(root, &["show", &spec])?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// The paths git sees renamed between `rev` and `HEAD` in `root`: new path to old.
+fn renames_since(root: &Path, rev: &str) -> Result<BTreeMap<String, String>, Error> {
+    let args = ["diff", "--find-renames", "--name-status", "-z", rev, "HEAD"];
+    Ok(budget::parse_renames(&git_stdout(root, &args)?))
+}
+
+/// `budget-diff --base <rev>`: the line it prints when nothing was added. A path git
+/// renamed since `rev` keeps its row.
 fn budget_diff(root: &Path, rev: &str) -> Result<String, Error> {
     let base = budget_at(root, rev)?;
+    let renames = renames_since(root, rev)?;
     let path = root.join(budget::BUDGET);
     let head = std::fs::read_to_string(&path).map_err(Error::spawn(path.display().to_string()))?;
-    let added = budget::new_rows(&base, &head).map_err(Error::Refused)?;
+    let added = budget::new_rows_renamed(&base, &head, &renames).map_err(Error::Refused)?;
     if added.is_empty() {
         return Ok(format!("ok: {} adds no row to {rev}'s", budget::BUDGET));
     }
@@ -1014,10 +1080,74 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         }
         Verb::Release(ReleaseVerb::Offer(args)) => release::offer::run(&args),
         Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
-        Verb::Release(ReleaseVerb::Previous(args)) => release::previous::run(&args),
+        Verb::Release(ReleaseVerb::FetchPrevious(args)) => release::fetch_previous::run(&args),
         Verb::Release(ReleaseVerb::StageOffer(args)) => release::stage_offer::run(&args),
-        Verb::Release(ReleaseVerb::Notes { subject, out }) => {
-            let text = release::notes::notes(&subject.subject())?;
+        Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
+        Verb::Release(ReleaseVerb::VerdictWrite(args)) => {
+            release::verdict_write::run(&args, release::verdict::GATE_STAGE)
+        }
+        Verb::Release(ReleaseVerb::Identity { dir, commit, out }) => {
+            // The binary's unpacking place, of this process alone.
+            let scratch =
+                std::env::temp_dir().join(format!("xtask-identity-{}", std::process::id()));
+            std::fs::create_dir_all(&scratch)
+                .map_err(Error::spawn(format!("create {}", scratch.display())))?;
+            let said = release::identity::identity(&dir, &commit, &scratch);
+            let _ = std::fs::remove_dir_all(&scratch);
+            let said = said?;
+            std::fs::write(&out, format!("{said}\n"))
+                .map_err(Error::spawn(format!("write {}", out.display())))?;
+            Ok(vec![format!(
+                "wrote the identity of {commit} to {}",
+                out.display()
+            )])
+        }
+        Verb::Release(ReleaseVerb::Previous {
+            repo_dir,
+            tag,
+            commit,
+            output,
+        }) => {
+            build_commit::full_commit("--commit", &commit)?;
+            let found = release::notes::previous_release(&repo_dir, &tag, &commit)?;
+            let at = match &found {
+                Some(prev) => release::commit_of(&repo_dir, prev)?,
+                None => String::new(),
+            };
+            let lines = vec![
+                format!("previous={}", found.unwrap_or_default()),
+                format!("previous-commit={at}"),
+            ];
+            if let Some(output) = output {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&output)
+                    .and_then(|mut f| {
+                        std::io::Write::write_all(
+                            &mut f,
+                            format!("{}\n", lines.join("\n")).as_bytes(),
+                        )
+                    })
+                    .map_err(Error::spawn(format!("append to {}", output.display())))?;
+            }
+            Ok(lines)
+        }
+        Verb::Release(ReleaseVerb::Notes {
+            subject,
+            version_json,
+            previous_version_json,
+            out,
+        }) => {
+            let previous = previous_version_json
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from);
+            let ids = release::notes::Identities {
+                current: &version_json,
+                // The workflow passes an empty path when there is no previous release.
+                previous: previous.as_deref(),
+            };
+            let text = release::notes::notes(&subject.subject(), &ids)?;
             std::fs::write(&out, &text)
                 .map_err(Error::spawn(format!("write {}", out.display())))?;
             Ok(vec![format!(
@@ -1033,8 +1163,10 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             run_id,
             set_hash,
+            notes_file,
             gh,
         }) => {
+            let notes = release::read_notes(&notes_file)?;
             let set_hash = kbf_gate::SetHash::parse(&set_hash)
                 .map_err(|e| Error::Usage(format!("--set-hash: {e}")))?;
             // The release's assets as it holds them, of this process alone.
@@ -1048,6 +1180,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 commit: &commit,
                 run_id,
                 set_hash: &set_hash,
+                notes: &notes,
                 gh: &gh,
                 scratch: &scratch,
             };

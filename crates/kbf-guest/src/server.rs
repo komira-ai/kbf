@@ -105,8 +105,21 @@ impl Agent {
     /// # Errors
     /// `accept` failed.
     pub fn serve(&mut self, listener: &UnixListener) -> io::Result<()> {
+        self.serve_accepted(|| listener.accept().map(|(stream, _)| stream))
+    }
+
+    /// [`Agent::serve`] over any source of connections: `accept` returns the next one
+    /// (it may wait for it). A connection that fails is reported on stderr and the
+    /// next one is served, as for a failure of any other host.
+    ///
+    /// # Errors
+    /// `accept` failed.
+    pub fn serve_accepted<S: Stream>(
+        &mut self,
+        mut accept: impl FnMut() -> io::Result<S>,
+    ) -> io::Result<()> {
         while !self.ran {
-            let (stream, _) = listener.accept()?;
+            let stream = accept()?;
             if let Err(e) = self.serve_connection(stream) {
                 eprintln!("kbf-guest: connection ended: {e}");
             }
@@ -163,7 +176,10 @@ impl Agent {
             loop {
                 let msg = read_frame(&mut reader).and_then(|f| HostMsg::decode(&f));
                 let last = msg.is_err();
-                if tx.send(msg).is_err() || last {
+                // `rx` outlives this thread (it is joined below, before `rx` is
+                // dropped), so a send cannot fail.
+                let _ = tx.send(msg);
+                if last {
                     return;
                 }
             }

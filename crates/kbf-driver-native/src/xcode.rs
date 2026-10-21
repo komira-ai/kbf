@@ -782,3 +782,7 @@ pub fn developer_dir(
 #[cfg(test)]
 #[path = "xcode_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "xcode_edge_tests.rs"]
+mod edge_tests;

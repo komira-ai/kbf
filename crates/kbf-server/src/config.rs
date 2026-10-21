@@ -508,6 +508,28 @@ pub struct Args {
     /// Build history: `--history-objects` and `--history-index-root`.
     #[command(flatten)]
     pub history: crate::history::HistoryFlags,
+    /// The release poller: `--release-poll-every-secs`, `--release-poll-repo` and
+    /// `--release-poll-refs`.
+    #[command(flatten)]
+    pub release_poll: crate::release::poll::PollFlags,
+    /// Serves the web UI on the operator API (`--api-listen`): read-only pages under `/ui`
+    /// (`docs/design/kbf-ui-v1.md`). On by default; `--ui=false` turns it off, and `/ui` is
+    /// then a `404`. The UI is open: it asks for no login or certificate, and it shows
+    /// everything unredacted, the logs of builds and the arguments of failed commands, to
+    /// whoever reaches the operator API's port, whatever the REAPI policy says of
+    /// `--invocations-open`. Only `GET` and `HEAD` are served; the operator API's write
+    /// routes and their token are unchanged. Keep the operator API on loopback, or behind
+    /// the proxy and a network you trust
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        value_name = "BOOL"
+    )]
+    pub ui: bool,
 }
 
 /// This server in the tier registry. A farm runs one server today
@@ -856,6 +878,7 @@ impl Args {
             token,
             local_cache,
             releases,
+            poll: self.release_poll.config(),
         }))
     }
 

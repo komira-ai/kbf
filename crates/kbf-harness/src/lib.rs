@@ -8,6 +8,8 @@
 //!   ([`units`]), on a loopback address of its own, under certificates of the right
 //!   rows ([`pki`]); a supervisor with `term`, `kill`, `restart`, a process table and a
 //!   report of every process's output for a hang ([`procs`]).
+//! - [`reapi`]: a client of a farm's frontend (the REAPI listener under the farm CA), and the
+//!   upload and `Execute` of one action, for the black-box test crates.
 //! - [`scrape`] and [`gates`]: the frontend's metrics read every second, and the gates a
 //!   scenario applies to what it measured.
 //! - [`load`] and [`eventlog`]: the Buck2 builds that load the farm, and what their event
@@ -16,12 +18,12 @@
 //! - [`b0`]: scenario B0, `farm_under_build_load`, and [`cli`], the command line of the
 //!   `kbf-beta` binary that runs it.
 //!
-//! To run B0 by hand, with the binaries built (`cargo build -p kbf-cli -p kbf-harness -p kbf-it
+//! To run B0 by hand, with the binaries built (`cargo build -p kbf-cli -p kbf-harness -p kbf-integration-test
 //! --bins`), and a pinned `buck2` (the beta workflow
 //! fetches it by checksum):
 //!
 //! ```text
-//! kbf-beta b0 --bin-dir target/debug --buck2 <buck2> --project crates/kbf-it/beta/buck2 \
+//! kbf-beta b0 --bin-dir target/debug --buck2 <buck2> --project crates/kbf-integration-test/beta/buck2 \
 //!     --work <a directory that does not exist yet> --duration-secs 60 --concurrency 2
 //! ```
 //!
@@ -47,6 +49,7 @@ pub mod pki;
 pub mod ports;
 pub mod procs;
 pub mod reap;
+pub mod reapi;
 pub mod result;
 pub mod scrape;
 pub mod stand_in;

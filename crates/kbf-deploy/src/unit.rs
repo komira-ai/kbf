@@ -10,7 +10,7 @@
 //! - A key given more than once keeps every assignment in order; [`UnitFile::get_in`]
 //!   reads the last, the one systemd uses for a single-valued key.
 //!
-//! The docs check in `kbf-it` reads the example units in `docs/deploy/*.md` with it,
+//! The docs check in `kbf-integration-test` reads the example units in `docs/deploy/*.md` with it,
 //! and `kbf-deploy linux check-units` the rendered ones, so both read units one way.
 
 /// One `Key=value` line, continuations joined.

@@ -40,6 +40,7 @@ fn config() -> MembershipConfig {
 
 struct Server {
     api: SocketAddr,
+    worker: SocketAddr,
     store: Arc<Hooked>,
     members: Members,
 }
@@ -76,6 +77,7 @@ fn start() -> Server {
         token: None,
         local_cache: None,
         releases: None,
+        poll: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::memory()),
@@ -87,9 +89,11 @@ fn start() -> Server {
     )
     .expect("binds");
     let api = bound.api.expect("an API address");
+    let worker = bound.worker;
     tokio::spawn(bound.serving);
     Server {
         api,
+        worker,
         members: Members::new(Arc::clone(&store.fake) as Arc<dyn Store>, config()),
         store,
     }
@@ -173,8 +177,8 @@ async fn the_api_answers_the_number_or_null_and_why() {
             "unreported": [], "debts_total": 3, "under_replicated_blobs": 3,
             "reasons": ["3 blobs owed"],
             "nodes": [
-                { "id": 1, "state": "active", "planned_down": false, "repair_debts": 0, "open_writes": null, "generation": 0 },
-                { "id": 2, "state": "active", "planned_down": false, "repair_debts": 3, "open_writes": null, "generation": 0 },
+                { "id": 1, "state": "active", "planned_down": false, "repair_debts": 0, "open_writes": null, "generation": 0, "unflushed_bytes": null, "unflushed_blocks": null, "oldest_unflushed_ms": null, "budget_bytes": null, "used_bytes": null, "flush_failures": null, "flush_conflicts": null },
+                { "id": 2, "state": "active", "planned_down": false, "repair_debts": 3, "open_writes": null, "generation": 0, "unflushed_bytes": null, "unflushed_blocks": null, "oldest_unflushed_ms": null, "budget_bytes": null, "used_bytes": null, "flush_failures": null, "flush_conflicts": null },
             ],
         })
     );
@@ -313,4 +317,95 @@ async fn a_membership_that_cannot_be_read_is_a_503_and_an_unknown_scrape() {
             .is_some_and(|e| e.contains("unreadable")),
         "{body}"
     );
+}
+
+const VITALS: [&str; 7] = [
+    "unflushed_bytes",
+    "unflushed_blocks",
+    "oldest_unflushed_ms",
+    "budget_bytes",
+    "used_bytes",
+    "flush_failures",
+    "flush_conflicts",
+];
+
+/// The seven storage-health values of node `index` in `GET /v1/storage`, in [`VITALS`] order.
+async fn vitals_of(s: &Server, index: usize) -> Vec<Value> {
+    let (_, body) = storage(s).await;
+    VITALS
+        .iter()
+        .map(|name| body["nodes"][index][name].clone())
+        .collect()
+}
+
+/// Catches, over the real membership service and the real route: a heartbeat's write-tier
+/// health lost between the wire and the JSON (a field not stored, or read from another
+/// field number); an unknown value shown as 0 (a node that sends nothing, a registration
+/// that clears the report, and a node that reports a real 0 must differ: `null` against
+/// `0`); an absurd value (above 2^53 - 1, which JSON cannot carry exactly) shown instead of
+/// dropped; and values that do not come back after the node registers again and beats.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_heartbeats_storage_health_reaches_the_api_and_null_is_unknown() {
+    use kbf_proto::kbf::map::v1 as pb;
+    use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
+
+    let s = start();
+    let mut client = MembershipClient::connect(format!("http://{}", s.worker))
+        .await
+        .expect("connects");
+    let register = pb::RegisterRequest {
+        role: pb::Role::Storage.into(),
+        instance_id: "node-1".to_owned(),
+        addr: "192.0.2.1:8982".to_owned(),
+        weight: 1,
+        protocol: PROTOCOL,
+        ..pb::RegisterRequest::default()
+    };
+    let beat = |joined: &pb::RegisterResponse| pb::HeartbeatRequest {
+        member_id: joined.member_id,
+        boot: joined.boot,
+        ..pb::HeartbeatRequest::default()
+    };
+    let unknown = vec![Value::Null; 7];
+
+    let joined = client.register(register.clone()).await.expect("registers");
+    let joined = joined.into_inner();
+    // An older node: a beat with none of the fields.
+    client.heartbeat(beat(&joined)).await.expect("beats");
+    assert_eq!(vitals_of(&s, 0).await, unknown, "an old node says nothing");
+
+    let said = pb::HeartbeatRequest {
+        unflushed_bytes: Some(11),
+        unflushed_blocks: Some(0),
+        oldest_unflushed_ms: Some(33),
+        budget_bytes: Some(44),
+        used_bytes: Some(55),
+        flush_failures: Some(66),
+        // Not a count of anything: dropped, not shown.
+        flush_conflicts: Some(u64::MAX),
+        ..beat(&joined)
+    };
+    client.heartbeat(said).await.expect("beats");
+    let shown = [11, 0, 33, 44, 55, 66].map(|v| json!(v));
+    let mut want = shown.to_vec();
+    want.push(Value::Null);
+    assert_eq!(vitals_of(&s, 0).await, want, "a real 0 stays 0");
+
+    // The node registers again (a restart): the new boot has said nothing yet.
+    let again = client
+        .register(register)
+        .await
+        .expect("registers again")
+        .into_inner();
+    assert_ne!(again.boot, joined.boot, "a new boot");
+    assert_eq!(vitals_of(&s, 0).await, unknown, "nothing carried over");
+    client
+        .heartbeat(pb::HeartbeatRequest {
+            member_id: again.member_id,
+            boot: again.boot,
+            ..said
+        })
+        .await
+        .expect("beats");
+    assert_eq!(vitals_of(&s, 0).await, want, "values recover");
 }

@@ -1370,6 +1370,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-all-in-one-test"
+version = "0.1.0"
+dependencies = [
+ "kbf-harness",
+ "kbf-testkit",
+ "kbf-transfer",
+ "tokio",
+]
+
+[[package]]
 name = "kbf-auth"
 version = "0.1.0"
 dependencies = [
@@ -1380,19 +1390,6 @@ dependencies = [
  "tonic",
  "tower-layer",
  "tracing",
-]
-
-[[package]]
-name = "kbf-bake"
-version = "0.1.0"
-dependencies = [
- "clap",
- "kbf-gate",
- "serde",
- "serde_json",
- "thiserror",
- "time",
- "ureq",
 ]
 
 [[package]]
@@ -1765,17 +1762,24 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "flate2",
+ "futures",
  "kbf-deploy",
- "kbf-it",
+ "kbf-integration-test",
+ "kbf-proto",
  "kbf-testkit",
  "kbf-transfer",
+ "kbf-types",
  "libc",
+ "prost",
+ "prost-types",
  "rcgen",
  "rustix",
  "serde",
  "serde_json",
  "thiserror",
  "time",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -1875,18 +1879,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kbf-invocation"
-version = "0.1.0"
-dependencies = [
- "kbf-sched",
- "kbf-types",
- "prost",
- "prost-build",
- "protox",
-]
-
-[[package]]
-name = "kbf-it"
+name = "kbf-integration-test"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -1896,6 +1889,7 @@ dependencies = [
  "h2",
  "hex",
  "http",
+ "kbf-auth",
  "kbf-cli",
  "kbf-daemon",
  "kbf-deploy",
@@ -1906,6 +1900,7 @@ dependencies = [
  "kbf-objstore",
  "kbf-proto",
  "kbf-proxy",
+ "kbf-sched",
  "kbf-server",
  "kbf-state",
  "kbf-storage",
@@ -1930,6 +1925,17 @@ dependencies = [
  "tonic",
  "tracing-subscriber",
  "xtask",
+]
+
+[[package]]
+name = "kbf-invocation"
+version = "0.1.0"
+dependencies = [
+ "kbf-sched",
+ "kbf-types",
+ "prost",
+ "prost-build",
+ "protox",
 ]
 
 [[package]]
@@ -2069,7 +2075,7 @@ dependencies = [
  "kbf-driver-container",
  "kbf-driver-native",
  "kbf-front",
- "kbf-it",
+ "kbf-integration-test",
  "kbf-map",
  "kbf-outputs",
  "kbf-proto",
@@ -2248,6 +2254,9 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "hex",
+ "http-body",
+ "http-body-util",
+ "hyper",
  "hyper-util",
  "kbf-auth",
  "kbf-ca",
@@ -2289,6 +2298,8 @@ dependencies = [
  "prost-types",
  "rcgen",
  "rustix",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2296,6 +2307,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "tonic-prost",
  "tower-layer",
@@ -2336,6 +2348,7 @@ dependencies = [
 name = "kbf-sim-cell"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "kbf-caps",
  "kbf-daemon",
  "kbf-front",
@@ -3705,9 +3718,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",

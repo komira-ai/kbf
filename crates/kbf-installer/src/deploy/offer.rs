@@ -17,7 +17,16 @@
 //!   installer's pinned `gh` and trust root, the flags the stage uses), and then, run as
 //!   the unprivileged user, names the offer's `meta_log` in `--version --json` (a mismatch refuses, and so does
 //!   an offer that claims a number where the binary names none, or the reverse);
-//! - every platform the farm runs is one the offer found complete.
+//! - every platform the farm runs is one the offer found complete;
+//!
+//! An offer that claims `reversible` is also asked of the build this host runs now: it is
+//! reversible only if that build's `meta_log` is at least the offer's
+//! ([`check_reversible`]). This refuses nothing. A claim the host cannot bear out is
+//! deployed and recorded as `host_reversible: false`; an irreversible release is never held.
+//!
+//! The offer is a file (`--offer offer.json`) or the bundle's own `offer.json`
+//! (`--offer -`, [`OfferPolicy::InBundle`]); the checks are the same. A caller through
+//! `sudo` can give only the second: it has no file of its own to name.
 //!
 //! No byte is run before it is attested: the host tarball's attestation is verified first
 //! ([`Attest`], by [`GhAttest`] through `GhCheck::verify`, the stage's own function), and a
@@ -35,7 +44,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use kbf_gate::{DocError, OfferDoc, SetHash, Target};
+use kbf_gate::{DocError, OfferDoc, SetHash, Target, reversible};
 use sha2::{Digest, Sha256};
 
 use super::bundle::{Bundle, Entry};
@@ -44,7 +53,7 @@ use super::{smoke, why};
 use crate::CommitId;
 use crate::attest::{GhCheck, Tools};
 use crate::binary::Version;
-use crate::layout::{Layout, Platform};
+use crate::layout::{Layout, Platform, RELEASE_BINARY};
 use crate::run::{RunAs, Runner, Spawn, SystemRunner};
 use crate::settings::Settings;
 use kbf_host::{Exec, HostExec};
@@ -104,6 +113,9 @@ pub enum OfferPolicy {
         doc: Box<OfferDoc>,
         max_age: Duration,
     },
+    /// `--offer -`: the offer is the bundle's `offer.json`, read (and judged as a file's is)
+    /// once the bundle is. Through `sudo` this is the only offer a caller can name.
+    InBundle { stage: Stage, max_age: Duration },
 }
 
 /// A refusal: the summary's reason and detail.
@@ -138,11 +150,30 @@ pub fn read(path: &Path) -> Result<OfferDoc, String> {
     if bytes.len() as u64 > MAX_OFFER {
         return Err(format!("--offer is larger than {MAX_OFFER} bytes"));
     }
-    OfferDoc::from_bytes(&bytes).map_err(|e| match e {
-        DocError::Offer(refusal) => format!("--offer: offer document: {refusal}"),
-        // A JSON error can quote the value it met; say only that the file is not an offer.
-        _ => "--offer: not a valid offer document".to_owned(),
+    parsed(&bytes).map_err(|e| format!("--offer: {e}"))
+}
+
+/// `bytes` as an offer, only through [`OfferDoc::from_bytes`]. The error never repeats
+/// them: a JSON error can quote the value it met, so it says only that they are not an offer.
+fn parsed(bytes: &[u8]) -> Result<OfferDoc, String> {
+    OfferDoc::from_bytes(bytes).map_err(|e| match e {
+        DocError::Offer(refusal) => format!("offer document: {refusal}"),
+        _ => "not a valid offer document".to_owned(),
     })
+}
+
+/// The offer a bundle carried (`--offer -`): `entry` is the bytes of its `offer.json`, which
+/// the bundle reader has capped at [`MAX_OFFER`] and found not empty. Parsed as [`read`]
+/// parses a file, and a refusal repeats nothing of the entry. No entry is `offer_missing`,
+/// one that is not an offer `offer_unreadable`.
+pub fn from_bundle(entry: Option<&[u8]>) -> Result<OfferDoc, Refused> {
+    let Some(bytes) = entry else {
+        return Err(refuse(
+            "offer_missing",
+            "the bundle carries no offer.json, so there is no offer to check",
+        ));
+    };
+    parsed(bytes).map_err(|e| refuse("offer_unreadable", e))
 }
 
 impl OfferPolicy {
@@ -150,6 +181,8 @@ impl OfferPolicy {
     pub(super) fn record(&self) -> Option<OfferRecord> {
         match self {
             OfferPolicy::Unchecked | OfferPolicy::Missing(_) => None,
+            // The offer is not known until the bundle is read; the deploy records it then.
+            OfferPolicy::InBundle { .. } => None,
             OfferPolicy::Waived(stage) => Some(OfferRecord::waived(stage.word())),
             OfferPolicy::Offer { stage, doc, .. } => Some(OfferRecord::of(stage.word(), doc)),
         }
@@ -350,6 +383,32 @@ pub(super) fn check_platforms<'a>(
     ))
 }
 
+/// The host's own word on an offer that claims `reversible`: does the build this host runs
+/// now bear the claim out? `Some(true)` if so, `Some(false)` if not, `None` when the offer
+/// claims no reversibility (the probe is not called).
+///
+/// The offer's `previous` and `previous_meta_log` are its author's word about a farm the
+/// author could not see, so the host does not take them. Going back from the offered build
+/// to the one this host runs is reversible only if `meta_log(offered) <= meta_log(running)`,
+/// and the host reads the second number from its own `current` build. Unknown is never
+/// reversible: a running build that names no `meta_log`, or cannot be asked, gives
+/// `Some(false)`.
+///
+/// This never refuses. An irreversible release is deployed all the same, and the answer is
+/// recorded as `host_reversible` for the bake's hand-off and the release notes, which must
+/// treat the release as one that cannot be rolled back. Holding a release for it would stop
+/// every following release too, since each makes the same claim against the same host.
+///
+/// This is the frontend host's build only. A node at another commit than this host's
+/// `current` one is not covered.
+pub fn check_reversible(doc: &OfferDoc, probe: &dyn Probe) -> Option<bool> {
+    if !doc.reversible {
+        return None;
+    }
+    let answer = probe.running_meta_log();
+    Some(answer.is_ok_and(|held| reversible(doc.meta_log, held)))
+}
+
 /// Why a probe gave no answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProbeFault {
@@ -370,6 +429,16 @@ pub trait Probe {
         tarball: &[u8],
         attestation: Option<&[u8]>,
     ) -> Result<Option<u64>, ProbeFault>;
+
+    /// The `meta_log` of `kbf --version --json` of the build this host runs now (its
+    /// `current` release), which an offer that claims `reversible` is checked against
+    /// ([`check_reversible`]). `Ok(None)` is a build that names none. A probe that cannot
+    /// say gives the default, which reads as not reversible.
+    fn running_meta_log(&self) -> Result<Option<u64>, ProbeFault> {
+        Err(ProbeFault::Failed(
+            "this build cannot read the running meta_log".to_owned(),
+        ))
+    }
 }
 
 /// The probe where none is built: it cannot answer, so an offer is refused.
@@ -394,12 +463,15 @@ const MAX_BINARY: u64 = 512 * 1024 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Unpacks the tarball into a scratch directory under the installer's work directory and
-/// runs `kbf --version --json` there, as the installer's `RUN_AS` user when root.
+/// runs `kbf --version --json` there, as the installer's `RUN_AS` user when root. It also
+/// runs the `kbf` of the host's `current` release the same way, for its `meta_log`.
 pub struct HostProbe {
     work: PathBuf,
     run_as: Option<RunAs>,
     runner: Box<dyn Runner>,
     attest: Box<dyn Attest>,
+    /// The `kbf` the host runs now (`<current>/kbf`); none where the probe names none.
+    running: Option<PathBuf>,
 }
 
 /// Whether a tarball is the attested build of a commit.
@@ -510,16 +582,19 @@ impl HostProbe {
             Box::new(SystemRunner),
             as_root,
         );
+        let running = layout.join(&layout.current()).join(RELEASE_BINARY);
         Ok(HostProbe {
             work,
             run_as: as_root.then_some(settings.run_as),
             runner: Box::new(SystemRunner),
             attest: Box::new(attest),
+            running: Some(running),
         })
     }
 
     /// A probe that works in `work`, as `run_as`, starting the binary with `runner` once
-    /// `attest` has vouched for the tarball.
+    /// `attest` has vouched for the tarball. It names no running `kbf`, which
+    /// [`HostProbe::with_running`] does.
     pub fn new(
         work: PathBuf,
         run_as: Option<RunAs>,
@@ -531,7 +606,14 @@ impl HostProbe {
             run_as,
             runner,
             attest,
+            running: None,
         }
+    }
+
+    /// The same probe, with `binary` (an absolute path) as the `kbf` the host runs now.
+    pub fn with_running(mut self, binary: PathBuf) -> HostProbe {
+        self.running = Some(binary);
+        self
     }
 }
 
@@ -560,6 +642,17 @@ impl Probe for HostProbe {
             .map_err(|e| ProbeFault::Unattested(format!("the host's kbf is not attested: {e}")))?;
         self.run(commit, tarball).map_err(ProbeFault::Failed)
     }
+
+    fn running_meta_log(&self) -> Result<Option<u64>, ProbeFault> {
+        let fail = |why: String| ProbeFault::Failed(format!("the running kbf failed: {why}"));
+        let Some(binary) = self.running.clone() else {
+            return Err(fail("this probe names none".to_owned()));
+        };
+        // The unprivileged user, from `/`: the release is root's and world-readable, and the
+        // answer is the build's own, as the staged binary's is.
+        let version = self.version(binary, PathBuf::from("/")).map_err(fail)?;
+        Ok(version.meta_log)
+    }
 }
 
 impl HostProbe {
@@ -573,22 +666,30 @@ impl HostProbe {
         crate::archive::unpack_one(&packed, "kbf", &binary, MAX_BINARY, PROBE_TIMEOUT)
             .map_err(|e| format!("probe: the kbf tarball: {e:?}"))?;
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).map_err(io)?;
+        let version = self
+            .version(binary, dir.0.clone())
+            .map_err(|e| format!("probe: {e}"))?;
+        version.check(commit).map_err(|e| format!("probe: {e:?}"))?;
+        Ok(version.meta_log)
+    }
+
+    /// `program --version --json` in `cwd`, as the probe's user, with an empty environment
+    /// and a time limit, read strictly.
+    fn version(&self, program: PathBuf, cwd: PathBuf) -> Result<Version, String> {
         let ran = self
             .runner
             .run(&Spawn {
-                program: binary,
+                program,
                 args: vec!["--version".into(), "--json".into()],
                 env: Vec::new(),
-                cwd: dir.0.clone(),
+                cwd,
                 run_as: self.run_as,
                 timeout: PROBE_TIMEOUT,
             })
-            .map_err(io)?;
+            .map_err(|e| e.to_string())?;
         if ran.timed_out || ran.code != Some(0) {
-            return Err(format!("probe: kbf --version --json ended {:?}", ran.code));
+            return Err(format!("kbf --version --json ended {:?}", ran.code));
         }
-        let version = Version::parse(&ran.stdout).map_err(|e| format!("probe: {e:?}"))?;
-        version.check(commit).map_err(|e| format!("probe: {e:?}"))?;
-        Ok(version.meta_log)
+        Version::parse(&ran.stdout).map_err(|e| format!("{e:?}"))
     }
 }

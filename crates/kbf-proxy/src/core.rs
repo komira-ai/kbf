@@ -2,7 +2,7 @@
 //! in-flight stream count.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::{Limits, UpstreamTable};
@@ -29,6 +29,10 @@ pub(crate) struct Core {
     pub(crate) security: Security,
     /// What `/readyz` says: the poll of the active child writes it (`crate::probe`).
     pub(crate) ready: Readiness,
+    /// Whether `/ui` is served (the `ui` key of the `[proxy]` table, fixed at start; an atomic
+    /// only so a test can switch it on a running rig); off, it is a 404 like any path
+    /// outside the table.
+    pub(crate) ui: AtomicBool,
     table: UpstreamTable,
     streams: AtomicUsize,
 }
@@ -50,6 +54,7 @@ impl Core {
             connector,
             security,
             Arc::new(Metrics::default()),
+            true,
         )
     }
 
@@ -62,8 +67,10 @@ impl Core {
         connector: Connector,
         security: Security,
         metrics: Arc<Metrics>,
+        ui: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
+            ui: AtomicBool::new(ui),
             slots,
             queue: HoldQueue::new(HoldLimits::default()),
             ready: Readiness::new(connector.clone()),

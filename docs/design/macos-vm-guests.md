@@ -340,7 +340,7 @@ gives it **[V]**:
 - The list is `tools/ci/darwin-entitlements.txt`, one line per binary that gets any:
   its file name, then its entitlements, each a boolean set to true. It holds one line:
   `kbf-vmm` gets exactly `com.apple.security.virtualization`. Every other binary gets
-  none, as before. A test in `kbf-it` (`tests/darwin_entitlements.rs`) pins those lines,
+  none, as before. A test in `kbf-integration-test` (`tests/darwin_entitlements.rs`) pins those lines,
   so a new entitlement changes that test in the same review.
 - `crates/xtask/src/entitlements.rs` reads the list and renders the plist for a name
   (nothing for an unlisted one); `sign-darwin` passes it to `codesign --entitlements`

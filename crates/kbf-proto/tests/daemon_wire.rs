@@ -4,7 +4,7 @@
 //! storage (docs/design/architecture-v2.md, section 9). The flags keep the credential
 //! off its command line and out of its environment (kbf-cli's tests), its unit loads
 //! none (kbf-deploy's `linux/modes_tests.rs`), and the layering keeps the object-store
-//! client out of the daemon crates (kbf-it's tests/layering.rs); this file keeps it off
+//! client out of the daemon crates (kbf-integration-test's tests/layering.rs); this file keeps it off
 //! the wire's schema: no message of any service in a package the daemon has clients for
 //! (`DAEMON_PACKAGES`: the work stream and segments, storage's action store, ByteStream,
 //! the REAPI services and the release fetch of self-update), and no message of the storage map (which `Welcome` and

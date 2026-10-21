@@ -1,11 +1,11 @@
 # The pull-request gate: two jobs, `lint` and `test`. GitHub-hosted runners only; the repository
-# lints in crates/kbf-it/tests/repo_lints.rs hold every workflow to that, to commit-SHA pinned
+# lints in crates/kbf-integration-test/tests/repo_lints.rs hold every workflow to that, to commit-SHA pinned
 # actions from the set the repository's Actions policy allows (actions/* and
 # tailscale/github-action), and to a top-level `permissions: {}`.
 #
 # A pull request runs only this. The rest of the suite (the slow tests, the Arm run, the
 # jobs that need a service, root, crun or a Mac, the packages and the beta smoke) runs on a
-# push to main or feature/arch-v2, in beta.yml. This workflow runs on those pushes too, so
+# push to main, in beta.yml. This workflow runs on those pushes too, so
 # the merged result meets the same gate and the Cargo cache below is saved.
 #
 # The Cargo cache (registry, git checkouts and target) is keyed on the runner, the job,
@@ -17,7 +17,7 @@ on:
   pull_request:
   merge_group:
   push:
-    branches: [main, feature/arch-v2]
+    branches: [main]
 
 permissions: {}
 
@@ -83,7 +83,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: cargo xtask release main-control --repo "$GITHUB_REPOSITORY" --on-main "$BASE_SHA" --off-main "$GITHUB_SHA"
-      - run: cargo test -p kbf-it --locked --test repo_lints
+      - run: cargo test -p kbf-integration-test --locked --test repo_lints
         if: ${{ !cancelled() }}
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
@@ -122,8 +122,6 @@ jobs:
         options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       KBF_TEST_POSTGRES_URL: postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres
-      # pg_dump and pg_restore for the installer's backup test come from here.
-      KBF_TEST_PG_BIN: /usr/lib/postgresql/17/bin
       RUSTFLAGS: ""
       COVERAGE_TOOLCHAIN: nightly-2026-10-01
       LLVM_COV_VERSION: 0.9.1
@@ -135,6 +133,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The merge commit and its first parent, the base branch (no-lowering --base-ref).
+          fetch-depth: 2
+      # The restored target/, the instrumented workspace build and its profiles outgrew a
+      # hosted runner's free disk (runs died with "No space left on device", or the runner
+      # was lost mid-test). Remove toolchains the image preinstalls that this job never
+      # uses; the Postgres service container's image is not touched.
+      - name: Free disk before (report)
+        run: df -h /
+      - name: Remove preinstalled toolchains this job does not use
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+      - name: Free disk after (report)
+        run: df -h /
       - run: rustup toolchain install "$COVERAGE_TOOLCHAIN" --profile minimal --component llvm-tools-preview
       # xtask builds with the coverage nightly, the one toolchain this job installs.
       - name: Install cargo-llvm-cov (pinned version and checksum)
@@ -169,13 +179,6 @@ jobs:
       # writing them for kbf-front's async service methods (LLVM 23.1 in this nightly;
       # it looks like LLVM issue 220574). Lines and branches, all the gate reads, are
       # unaffected: their totals match llvm-cov's own text report.
-      # pg_dump and pg_restore as new as the server (17), because a dump tool older than
-      # its server refuses to run. The runner image has no PostgreSQL apt repository:
-      # postgresql-common's own script adds the project's (with its signing key) and
-      # updates the package lists.
-      - run: sudo apt-get install -y --no-install-recommends postgresql-common
-      - run: sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-      - run: sudo apt-get install -y --no-install-recommends postgresql-client-17
       - run: mkdir -p target/coverage
       - name: Run the fast tests under coverage
         env:
@@ -189,8 +192,7 @@ jobs:
       # kbf-installer again without `test-sandbox` and put a copy of its code in the report
       # that no test runs. They run the `#[ignore]`d tests only (`--run-ignored only`): the
       # others ran above, and some (the installer's database:: ones) write files in a scratch
-      # directory another test of the full run creates. The installer's backup round trip
-      # (backup::tests::real_server_round_trip) is in the installer filter.
+      # directory another test of the full run creates.
       - name: Run the Postgres tests of kbf-state under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
@@ -198,7 +200,7 @@ jobs:
       - name: Run the installer's Postgres tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-installer) & (test(database::) or test(setup_creates_the_schema) or test(backup::tests::real_server_round_trip))'
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-installer) & (test(database::) or test(setup_creates_the_schema))'
       - name: Run the server's Postgres tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
@@ -235,7 +237,7 @@ jobs:
           persist-credentials: false
       - name: Floors are not lower than the base's
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
-        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base base/coverage-floors --floors coverage-floors
+        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base-ref HEAD^1 --base base/coverage-floors --floors coverage-floors
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:

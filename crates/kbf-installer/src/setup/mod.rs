@@ -21,16 +21,23 @@
 //!   empty plan; changed flags rewrite the files atomically and never restart a running
 //!   service. An operator floor (`min_generation`) only goes up.
 //! - The first release comes through [`Releases`], the installer's one downloader (the
-//!   [`Fetcher`](crate::helper::fetcher::Fetcher); the binary has none wired in yet, so
-//!   `--commit` stops before `kbf.toml` with that reason). On a frontend or all-in-one host the
+//!   [`Fetcher`](crate::helper::fetcher::Fetcher); the binary's is
+//!   [`HostFetcher`](crate::helper::fetcher_host::HostFetcher), which reads `installer.toml`
+//!   when asked, so it sees the file this run wrote; a fetch that fails stops `--commit` before
+//!   `kbf.toml` with its reason). On a frontend or all-in-one host the
 //!   state database's schema is created or brought forward ([`Schemas`]) once `installer.toml`
 //!   is written, and a unit that makes a frontend is enabled and never started.
 //! - `[proxy] listen` of `installer.toml` (the operator's key) becomes the drop-in
 //!   `kbf-proxy.socket.d/listen.conf` on Linux, and no key removes the drop-in. Setup never
 //!   reloads systemd or restarts the socket: it says that is needed.
+//! - `--release-source bundled` writes `release_source = "bundled"` and fetches nothing: it
+//!   takes no `--release-url` and no `--commit`. The keys a source has of its own
+//!   (`--release-ca`, the frontend snapshot flags) are checked and written, never read
+//!   ([`release_keys`]); the flags decide them, so a run for another source leaves none behind.
 //! - `kbf.toml` is written after every file a unit needs, and the units after it.
 
 pub mod backend;
+pub mod deploy_config;
 pub mod kbf_settings;
 pub mod kbf_toml;
 pub mod os;
@@ -38,6 +45,7 @@ pub mod paths;
 pub mod plan;
 pub mod provision;
 pub mod proxy;
+pub mod release_keys;
 pub mod validate;
 
 #[cfg(test)]
@@ -60,7 +68,9 @@ use self::validate::{Raw, Valid, mode_name};
 use crate::cli::{Mode, SetupArgs};
 use crate::database::database_step;
 use crate::exit::Exit;
-use crate::helper::fetcher::{FetchError, NotWired};
+use crate::helper::fetcher::FetchError;
+use crate::helper::fetcher_host::HostFetcher;
+use crate::helper::leases;
 use crate::installer_toml::{InstallerToml, Source};
 use crate::layout::{Layout, Platform};
 use crate::migrate::MigrateError;
@@ -213,6 +223,10 @@ pub fn installer_settings(
         settings.min_generation = floor;
     }
     settings.source = v.source.clone();
+    // The flags decide the keys of the source: a key of a source the host no longer has is
+    // not kept, or the file would not read back.
+    settings.release_ca = v.release_ca.clone();
+    settings.frontend = v.frontend.clone();
     settings.database = v.database.clone();
     (settings.node_cert, settings.node_key) = match (&v.source, node_role(v.mode)) {
         (Source::Frontend, Some(role)) => {
@@ -352,6 +366,11 @@ pub fn run(
     if let Some(proxy) = &valid.proxy {
         kbf_settings::check_files(&*exec, &proxy.files(), service_uid)?;
     }
+    let proxy = match valid.deploy {
+        Some(_) => installer_settings(&*exec, &valid, ctx.platform)?.proxy,
+        None => None,
+    };
+    let deploy = deploy_config::resolve(&*exec, valid.deploy.as_ref(), proxy.as_ref(), &ctx)?;
     let mut notes = Vec::new();
 
     let before = plan::before_release(os, &*exec, &valid, &ctx)?;
@@ -422,6 +441,13 @@ pub fn run(
         (None, _) => {}
     }
 
+    // `deploy.json` is a file like `kbf.toml`: written before the units that need a host that has it.
+    if let Some(config) = &deploy {
+        let written = deploy_config::plan(&*exec, &ctx, config)?;
+        steps += emit(&written.plan, exec, options.apply, out)?;
+        notes.extend(written.notes);
+    }
+
     let retired: Vec<&str> = shadows.iter().map(|s| s.unit).collect();
     let after = plan::after_release(
         os,
@@ -446,6 +472,17 @@ pub fn run(
     Ok(())
 }
 
+/// The fetcher of the first release (`--commit`): the host's own, which reads
+/// `installer_config` (else the platform's own `installer.toml`) when it is asked.
+///
+/// Its lease source is [`NotWired`](crate::helper::leases::NotWired), which is never asked:
+/// the setup fetch is `Fetcher::fetch`, a frontend update, and the verify pipeline skips the
+/// lease step for that kind (a host that has never run its unit has no cgroup to read).
+fn first_release_fetcher(layout: Layout, installer_config: Option<HostPath>) -> HostFetcher {
+    let installer_toml = installer_config.unwrap_or_else(|| layout.installer_toml());
+    HostFetcher::on_host(layout, installer_toml, || Box::new(leases::NotWired))
+}
+
 /// The verb as the binary runs it, on the host under `root`.
 pub fn cli(
     root: PathBuf,
@@ -464,22 +501,25 @@ pub fn cli(
         token_file: args.token_file.clone(),
         release_source: args.release_source,
         release_url: args.release_url.clone(),
+        release: args.release.clone(),
         min_generation: args.min_generation,
         commit: args.commit.clone(),
         database: args.database.clone(),
         kbf: args.kbf.clone(),
         proxy: args.proxy.clone(),
         create_local_database: args.create_local_database,
+        deploy: args.deploy.clone(),
         installer_config: args.installer_config.as_ref().map(ToString::to_string),
     };
     let options = Options {
         apply,
         no_start: args.no_start,
     };
-    // The installer has no release fetcher wired in yet (the fetch child is a later change):
-    // `--commit` says so and stops before it writes `kbf.toml`.
+    // The first release is fetched after `installer.toml` is written and the fetch user made,
+    // both by this run, so the fetcher reads them when `--commit` asks, not now.
     let layout = Layout::new(Root::new(&root)?, platform);
-    let releases = Fetching::new(&NotWired, layout, HostExec::new(Root::new(&root)?));
+    let fetcher = first_release_fetcher(layout.clone(), args.installer_config.clone());
+    let releases = Fetching::new(&fetcher, layout, HostExec::new(Root::new(&root)?));
     let journal = Journaled::new(
         Layout::new(Root::new(&root)?, platform),
         crate::app::owner_uid(root != std::path::Path::new("/"), exec.euid()),

@@ -65,15 +65,14 @@ pub enum Verb {
     /// Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's
     /// tree, or put it back with `--rollback`. A dry run without `--apply`.
     Migrate(MigrateArgs),
+    /// Remove what the package left on a host that is rolled back or was never adopted: the
+    /// LaunchDaemon plist, its receipt, disable override, logs and the files a rollback moved
+    /// aside (a Mac). A dry run without `--apply`.
+    Uninstall(UninstallArgs),
     /// For maintainer scripts: take the lock; exit 5 while a swap is pending.
     Quiesce,
     /// Validate the installer's configuration, trust files and path chain.
     Check,
-    /// Dump the state database to the backup directory and keep the newest few; run by
-    /// kbf-backup.timer as the service user, who connects as the role installer.toml's database URL names.
-    Backup(BackupArgs),
-    /// Restore a backup into an empty state database, as the service user, who connects as the role installer.toml's database URL names.
-    Restore(RestoreArgs),
     /// Serve the frontend host's public port: route each stream to the active child frontend.
     Proxy(ProxyArgs),
     #[command(hide = true)]
@@ -108,6 +107,7 @@ impl Mode {
 pub enum ReleaseSource {
     Url,
     Frontend,
+    Bundled,
 }
 
 #[derive(Args)]
@@ -116,12 +116,17 @@ pub struct SetupArgs {
     #[arg(long, value_enum)]
     pub mode: Mode,
     /// Where releases are fetched from. Default: the frontend for the modes that enroll,
-    /// a file server (`url`) for `frontend` and `all-in-one`.
+    /// a file server (`url`) for `frontend` and `all-in-one`. `bundled` fetches nothing: it
+    /// takes no --release-url and no --commit.
     #[arg(long, value_enum)]
     pub release_source: Option<ReleaseSource>,
     /// The https base URL of the file server, for --release-source url.
     #[arg(long)]
     pub release_url: Option<String>,
+    /// The keys of the release source that go with it in installer.toml: the file server's CA
+    /// (`url`) and the frontend's worker listener with its CA (`frontend`).
+    #[command(flatten)]
+    pub release: crate::setup::release_keys::ReleaseFlags,
     /// Refuse orders below this generation. A floor only goes up.
     #[arg(long)]
     pub min_generation: Option<u64>,
@@ -160,6 +165,10 @@ pub struct SetupArgs {
     /// A frontend host behind `kbf-installer proxy`: the `[proxy]` table of installer.toml.
     #[command(flatten)]
     pub proxy: crate::setup::proxy::ProxyFlags,
+    /// The host's deploy config (`/etc/kbf-installer/deploy.json`) of a frontend or all-in-one
+    /// host: the stage and, if the proxy is not where installer.toml says, where deploy calls.
+    #[command(flatten)]
+    pub deploy: crate::setup::deploy_config::DeployFlags,
     /// The installer.toml `setup` writes (and reads, to keep what it does not set), under the
     /// host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which
     /// is the only value setup accepts. The same flag, with the same meaning, as on `run`.
@@ -269,11 +278,13 @@ pub struct GcArgs {
 #[derive(Args)]
 pub struct RunArgs {
     /// Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it.
-    #[arg(long, default_value = "/var/lib/kbf-installer", value_parser = kbf_host::HostPath::new)]
-    pub update_dir: kbf_host::HostPath,
+    /// Default: the host's state directory (`/var/lib/kbf-installer`, `/var/db/kbf-installer` on a Mac).
+    #[arg(long, value_parser = kbf_host::HostPath::new)]
+    pub update_dir: Option<kbf_host::HostPath>,
     /// The order spool: owned by the service user, mode 0700, inside a root-owned parent.
-    #[arg(long, default_value = "/var/lib/kbf-installer/orders", value_parser = kbf_host::HostPath::new)]
-    pub orders_dir: kbf_host::HostPath,
+    /// Default: `orders` in the state directory.
+    #[arg(long, value_parser = kbf_host::HostPath::new)]
+    pub orders_dir: Option<kbf_host::HostPath>,
     /// The systemd unit to restart after a swap (Linux). Without it and without
     /// `--launchd-label`, the unit of the mode in the host's kbf.toml, which is how the one
     /// packaged kbf-installer.service serves every mode.
@@ -303,6 +314,20 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
+    /// Root's directory, as the flag gives it; else the host's own.
+    pub fn update_dir_in(&self, layout: &crate::layout::Layout) -> kbf_host::HostPath {
+        self.update_dir
+            .clone()
+            .unwrap_or_else(|| layout.update_dir())
+    }
+
+    /// The order spool, as the flag gives it; else the host's own.
+    pub fn orders_dir_in(&self, layout: &crate::layout::Layout) -> kbf_host::HostPath {
+        self.orders_dir
+            .clone()
+            .unwrap_or_else(|| layout.orders_dir())
+    }
+
     /// The service this `run` restarts, when the flags name it; `None` when neither does.
     pub fn named_service(&self) -> Option<ServiceArgs> {
         (self.unit.is_some() || self.launchd_label.is_some()).then(|| ServiceArgs {
@@ -328,7 +353,8 @@ pub struct MigrateArgs {
     /// and disabled first by a rollback.
     #[arg(long, value_parser = crate::migrate::Unit::new)]
     pub installer_unit: Option<crate::migrate::Unit>,
-    /// Where the host gets its releases: decides where the replay floor is seeded from.
+    /// Where the host gets its releases: decides where the replay floor is seeded from. Only a
+    /// `frontend` host has a frontend to ask; a `url` or `bundled` one does not.
     #[arg(long, value_enum, default_value = "url")]
     pub release_source: ReleaseSource,
     /// The lowest generation an order may carry: the floor when there is no frontend to ask.
@@ -344,39 +370,15 @@ pub struct MigrateArgs {
 }
 
 #[derive(Args)]
-pub struct BackupArgs {
-    /// installer.toml, under the host root: its `database` key names the database to dump and
-    /// its `backup_keep` how many backups stay (default 7).
-    #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]
-    pub installer_config: kbf_host::HostPath,
-    /// The backup directory: made 0700 when it is not there, owned by the user that runs this.
-    #[arg(long, default_value = "/var/lib/kbf-server/backups", value_parser = kbf_host::HostPath::new)]
-    pub dir: kbf_host::HostPath,
-    /// The `pg_dump` program (a name looked up in PATH, or a path).
-    #[arg(long, default_value = "pg_dump")]
-    pub pg_dump: String,
-    /// The `pg_restore` program, which checks the dump can be read.
-    #[arg(long, default_value = "pg_restore")]
-    pub pg_restore: String,
-}
-
-#[derive(Args)]
-pub struct RestoreArgs {
-    /// The backup to restore (a file `backup` wrote).
-    #[arg(long, value_parser = kbf_host::HostPath::new)]
-    pub file: kbf_host::HostPath,
-    /// installer.toml, under the host root: its `database` key names the database to restore
-    /// into (unless --database does), which must be empty of kbf's schema.
-    #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]
-    pub installer_config: kbf_host::HostPath,
-    /// Restore into this database instead, for a restore test: a bare NAME (a database on the
-    /// server and socket installer.toml names, for the role it names) or a URL with no
-    /// password.
-    #[arg(long)]
-    pub database: Option<String>,
-    /// The `pg_restore` program (a name looked up in PATH, or a path).
-    #[arg(long, default_value = "pg_restore")]
-    pub pg_restore: String,
+pub struct UninstallArgs {
+    /// The installer's own unit: stopped and, on Linux, disabled. A Mac without the flag acts
+    /// on the package's job, `com.komira.kbf-installer.plist`; a Linux host without it leaves
+    /// its unit to the package manager.
+    /// The unit must be `.plist` on a Mac and `.service` on Linux (else exit 2). On a Mac a
+    /// name other than the package's job replaces it as the job acted on: the package's own
+    /// plist is then left in place, while the installer's tree, logs and receipt are removed.
+    #[arg(long, value_parser = crate::migrate::Unit::new)]
+    pub installer_unit: Option<crate::migrate::Unit>,
 }
 
 #[derive(Args)]
@@ -386,17 +388,34 @@ pub struct ProxyArgs {
     #[arg(long)]
     pub config: Option<std::path::PathBuf>,
     /// The order spool the update API writes and the root half reads: owned by the service
-    /// user. As `run --orders-dir`.
-    #[arg(long, default_value = "/var/lib/kbf-installer/orders")]
-    pub orders_dir: std::path::PathBuf,
+    /// user. As `run --orders-dir`. Default: `orders` in the host's state directory.
+    #[arg(long)]
+    pub orders_dir: Option<std::path::PathBuf>,
     /// Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing.
     #[arg(long)]
     pub check: bool,
     /// Root's directory: the proxy reads `status.json` here, to start the installed release
     /// when no frontend child is running, and the update API reads its status. As
-    /// `run --update-dir`.
-    #[arg(long, default_value = "/var/lib/kbf-installer")]
-    pub update_dir: std::path::PathBuf,
+    /// `run --update-dir`. Default: the host's state directory (`/var/lib/kbf-installer`,
+    /// `/var/db/kbf-installer` on a Mac).
+    #[arg(long)]
+    pub update_dir: Option<std::path::PathBuf>,
+}
+
+impl ProxyArgs {
+    /// Root's directory, as the flag gives it; else the host's own (as [`RunArgs::update_dir_in`]).
+    pub fn update_dir_in(&self, layout: &crate::layout::Layout) -> std::path::PathBuf {
+        self.update_dir
+            .clone()
+            .unwrap_or_else(|| layout.update_dir().as_str().into())
+    }
+
+    /// The order spool, as the flag gives it; else the host's own.
+    pub fn orders_dir_in(&self, layout: &crate::layout::Layout) -> std::path::PathBuf {
+        self.orders_dir
+            .clone()
+            .unwrap_or_else(|| layout.orders_dir().as_str().into())
+    }
 }
 
 #[derive(Args)]
@@ -420,10 +439,9 @@ impl Verb {
             Verb::Gc(_) => "gc",
             Verb::BootCheck(_) => "boot-check",
             Verb::Migrate(_) => "migrate",
+            Verb::Uninstall(_) => "uninstall",
             Verb::Quiesce => "quiesce",
             Verb::Check => "check",
-            Verb::Backup(_) => "backup",
-            Verb::Restore(_) => "restore",
             Verb::Proxy(_) => "proxy",
             Verb::Stage => "stage",
             Verb::Activate => "activate",
@@ -432,26 +450,19 @@ impl Verb {
     }
 
     /// Every verb but `status`, `check`, `proxy` (which runs as the unprivileged service
-    /// user), `update` (a client of the proxy's update API: it needs whoever can read the
-    /// token file, which is the only thing it asks of its user), `backup` and `restore` needs
-    /// root. `backup` and `restore` run as the user that is the database's role under peer
-    /// authentication, which root is not.
+    /// user) and `update` (a client of the proxy's update API: it needs whoever can read the
+    /// token file, which is the only thing it asks of its user) needs root.
     pub fn needs_root(&self) -> bool {
         !matches!(
             self,
-            Verb::Status
-                | Verb::Check
-                | Verb::Proxy(_)
-                | Verb::Update(_)
-                | Verb::Backup(_)
-                | Verb::Restore(_)
+            Verb::Status | Verb::Check | Verb::Proxy(_) | Verb::Update(_)
         )
     }
 
     /// Whether the verb changes what a host runs or how it is managed, so it must not run
     /// while the old layout's state is the host's and unmigrated (the old helper and the
     /// installer never both manage one host; `migrate` is how that ends). `status`, `check`,
-    /// `boot-check`, `quiesce`, `backup`, `restore` and `migrate` itself change no release; `fetch-child` is the
+    /// `boot-check`, `quiesce` and `migrate` itself change no release; `fetch-child` is the
     /// unprivileged process a verb that does manage the host starts, and manages nothing.
     ///
     /// Every verb is named (no `_`): a verb added later does not compile until it says
@@ -472,13 +483,14 @@ impl Verb {
             | Verb::BootCheck(_)
             | Verb::Quiesce
             | Verb::Migrate(_)
+            // `uninstall` is for a host the installer does not manage (rolled back, or never
+            // adopted), and an old-layout host that was never adopted is one.
+            | Verb::Uninstall(_)
             | Verb::Proxy(_)
             // `update` only POSTs to the proxy's API as an unprivileged client, and the proxy
             // exists only on a new-layout host; the root half of an update (`run`) is guarded.
             // `dispatch` returns for it before the old-layout guard, so the table says so.
             | Verb::Update(_)
-            | Verb::Backup(_)
-            | Verb::Restore(_)
             | Verb::FetchChild(_) => false,
         }
     }
@@ -498,9 +510,8 @@ impl Verb {
             | Verb::RecordRelease(_)
             | Verb::Gc(_)
             | Verb::Migrate(_)
+            | Verb::Uninstall(_)
             | Verb::Quiesce
-            | Verb::Backup(_)
-            | Verb::Restore(_)
             | Verb::Setup(_)
             | Verb::FetchChild(_) => None,
             Verb::Check => Some("P10"),

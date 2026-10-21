@@ -1,6 +1,6 @@
 //! The static unit files of the kbf-installer package (`packaging/linux/units/`) against
 //! this build's own `kbf` parser. The rules over the files are in
-//! `crates/kbf-it/tests/package_units.rs`; this layer has `kbf_cli`.
+//! `crates/kbf-integration-test/tests/package_units.rs`; this layer has `kbf_cli`.
 //!
 //! Catches:
 //! - a package unit for a mode `kbf` does not have (the files and `kbf_cli::names::MODES`
@@ -25,7 +25,7 @@ fn units() -> Vec<(String, String)> {
                 .strip_suffix(".service")?
                 .trim_end_matches('@')
                 .to_owned();
-            (!["envoy", "installer", "backup", "proxy"].contains(&mode.as_str()))
+            (!["envoy", "installer", "proxy"].contains(&mode.as_str()))
                 .then(|| (mode, std::fs::read_to_string(&p).expect("read")))
         })
         .collect();

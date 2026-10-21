@@ -11,7 +11,7 @@ publish.workspace = true
 # calls into the server (`LocalDataPlane`). A library: the `kbf` binary runs it as
 # `kbf all-in-one` and `kbf storage-and-daemon` (crates/kbf-cli). The one crate, with
 # kbf-cli, that links both the server and the node library
-# (crates/kbf-it/tests/layering.rs).
+# (crates/kbf-integration-test/tests/layering.rs).
 
 [dependencies]
 bytes.workspace = true

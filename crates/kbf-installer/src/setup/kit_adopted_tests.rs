@@ -34,21 +34,31 @@ fn ours<'a>() -> Ours<'a> {
     }
 }
 
+/// What `setup` asks of a Mac: the Mac's `[daemon]` keys are `kbf-mac-provision`'s, checked by
+/// the caller and never part of what setup writes (G9), so `update` is `None`.
+fn mac_ours<'a>() -> Ours<'a> {
+    Ours {
+        update: None,
+        ..ours()
+    }
+}
+
 /// Catches the refusal that left a migrated Mac without a setup: the kit's file has no
 /// `[frontend] url` or `[enroll] token_file` (it keeps its identity under `[identity]`), which
-/// the generic decision counts as "differing". The adopted arm adds the missing keys and the
-/// update directory, leaves every kit line as it was (the kit's text is a subsequence of the
-/// result, in order), and parses with each added key set.
+/// the generic decision counts as "differing". The adopted arm adds the missing keys, leaves
+/// every kit line as it was (the kit's text is a subsequence of the result, in order), and
+/// parses with each added key set. It adds no `[daemon]` directory key: on a Mac those are
+/// `kbf-mac-provision`'s (G9) and the kit's file already has them.
 ///
-/// Mutants seen red: the generic `decide` used (refused); a kit line rewritten; the update
-/// directory not added.
+/// Mutants seen red: the generic `decide` used (refused); a kit line rewritten; a daemon key
+/// added.
 #[test]
 fn the_kits_keys_are_kept_and_the_missing_ones_added() {
     assert!(matches!(
-        decide(Some(KBF_TOML), &ours(), PATH),
+        decide(Some(KBF_TOML), &mac_ours(), PATH),
         Decision::Refuse(_)
     ));
-    let Decision::Write(text) = decide_adopted(KBF_TOML, &ours(), PATH) else {
+    let Decision::Write(text) = decide_adopted(KBF_TOML, &mac_ours(), PATH) else {
         panic!("adopted arm refused");
     };
     let mut rest = text.lines();
@@ -68,24 +78,25 @@ fn the_kits_keys_are_kept_and_the_missing_ones_added() {
         Some("/usr/local/etc/kbf/enroll.token")
     );
     assert_eq!(table["daemon"]["update-dir"].as_str(), Some(UPDATE_DIR));
-    assert_eq!(table["daemon"]["orders-dir"].as_str(), Some(ORDERS_DIR));
+    assert!(table["daemon"].get("orders-dir").is_none(), "{text}");
     assert_eq!(table["daemon"]["driver"][0].as_str(), Some("native"));
-    // Only these four keys are new.
+    // Only these two keys are new.
     let was: toml::Table = KBF_TOML.parse().expect("toml");
     let count = |t: &toml::Table| {
         t.values()
             .map(|v| v.as_table().map_or(1, |x| x.len()))
             .sum::<usize>()
     };
-    assert_eq!(count(&table), count(&was) + 4);
+    assert_eq!(count(&table), count(&was) + 2);
     // Run again on the result: nothing to add.
-    assert_eq!(decide_adopted(&text, &ours(), PATH), Decision::Keep);
+    assert_eq!(decide_adopted(&text, &mac_ours(), PATH), Decision::Keep);
 }
 
-/// Catches a kit key rewritten: a key that is there with another value (the update directory,
-/// the frontend URL, the mode) is refused naming the key, not changed.
+/// Catches a kit key rewritten: a key that is there with another value (the frontend URL, the
+/// mode) is refused naming the key, not changed. (The `[daemon]` directories of a Mac are
+/// checked by `check_provisioned`, not here.)
 ///
-/// Mutants seen red: a differing key overwritten; the update directory exempt.
+/// Mutant seen red: a differing key overwritten.
 #[test]
 fn a_kit_key_that_differs_is_refused_not_rewritten() {
     for (text, want) in [
@@ -94,15 +105,11 @@ fn a_kit_key_that_differs_is_refused_not_rewritten() {
             "[frontend] url",
         ),
         (
-            KBF_TOML.replace("[daemon]\n", "[daemon]\nupdate-dir = \"/elsewhere\"\n"),
-            "[daemon] update-dir",
-        ),
-        (
             KBF_TOML.replace("mode = \"daemon\"", "mode = \"storage\""),
             "mode",
         ),
     ] {
-        let Decision::Refuse(why) = decide_adopted(&text, &ours(), PATH) else {
+        let Decision::Refuse(why) = decide_adopted(&text, &mac_ours(), PATH) else {
             panic!("{want}: not refused");
         };
         assert!(
@@ -184,11 +191,13 @@ fn raw() -> Raw {
         token_file: Some("/root/kbf.token".to_owned()),
         release_source: None,
         release_url: None,
+        release: Default::default(),
         min_generation: None,
         commit: None,
         database: None,
         kbf: Default::default(),
         proxy: Default::default(),
+        deploy: Default::default(),
         create_local_database: false,
         installer_config: None,
     }
@@ -228,8 +237,9 @@ fn adopt(rig: &mut Rig) {
 
 /// Catches `setup` unusable after a kit-host migration, on jerry's fixtures: adopt the kit Mac
 /// (`testdata/kit_host`), then `setup --mode=daemon` succeeds, every kit line of `kbf.toml` is
-/// still there in order, and the four keys it adds ([frontend] url, [enroll] token_file,
-/// [daemon] update-dir and orders-dir) are the only new ones. Setup also writes `installer.toml`.
+/// still there in order, and the two keys it adds ([frontend] url, [enroll] token_file) are the
+/// only new ones: the Mac's `[daemon]` directories were checked, never written (G9). Setup also
+/// writes `installer.toml`.
 ///
 /// Mutants seen red: the journal's `kit` ignored (the old refusal); `Done` not required.
 #[test]
@@ -258,7 +268,7 @@ fn setup_after_a_kit_host_migration_keeps_the_kits_file_and_adds_its_keys() {
             .map(|v| v.as_table().map_or(1, |x| x.len()))
             .sum::<usize>()
     };
-    assert_eq!(count(&is), count(&was) + 4);
+    assert_eq!(count(&is), count(&was) + 2);
     assert!(rig.at("usr/local/etc/kbf/installer.toml").is_file());
 }
 
@@ -286,7 +296,8 @@ fn before_migrate_and_on_a_non_kit_host_setup_refuses_as_before() {
     let path = rig.at("usr/local/etc/kbf/kbf.toml");
     crate::migrate::rig::put(
         &path,
-        "mode = \"daemon\"\n[frontend]\nurl = \"https://other.example:1\"\n[x]\ny = \"1\"\n",
+        "mode = \"daemon\"\n[frontend]\nurl = \"https://other.example:1\"\n[x]\ny = \"1\"\n\
+         [daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n",
         0o644,
     );
     let before = fs::read(&path).expect("file");

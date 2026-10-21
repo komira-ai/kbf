@@ -209,10 +209,86 @@ fn a_mac_rollback_uses_launchd() {
             "disable com.komira.kbf-installer.plist links=true",
             "stop com.komira.kbf-daemon.plist links=true",
             "enable com.komira.kbf-helper.plist links=true",
+            "enable com.komira.kbf-helper.plist links=true",
             "start com.komira.kbf-helper.plist links=true",
+            "enable com.komira.kbf-daemon.plist links=true",
             "start com.komira.kbf-daemon.plist links=true",
         ]
     );
+}
+
+/// Catches a rollback that starts the old jobs by another path than the migration's: a job
+/// that does not run after its bootstrap fails the rollback naming the unit, and the
+/// journal still says it was stopped, so a second rollback starts it again.
+///
+/// Mutants seen red: the rollback bootstrapping without the readiness wait.
+#[test]
+fn a_mac_rollback_waits_for_the_jobs_and_can_be_run_again() {
+    let mut rig = Rig::mac("mac-rollback-wait");
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    rig.start_lag.set(1000);
+    let error = rollback_now(&mut rig, Mode::Apply).expect_err("never runs");
+    assert!(
+        error.to_string().contains("com.komira.kbf-helper.plist"),
+        "{error}"
+    );
+    rig.start_lag.set(0);
+    rollback_now(&mut rig, Mode::Apply).expect("the rollback is resumed");
+    assert!(rig.active.borrow().contains("com.komira.kbf-daemon.plist"));
+}
+
+/// Catches a rollback that touches a Mac's `kbf.toml` (G9: `kbf-mac-provision` is its one
+/// writer, so migrate keeps no original of it and a rollback has none to put back): after a
+/// migrate and a real rollback, on a kit Mac and on a Mac the kit never touched (one whose
+/// file has no `orders-dir`, which a Linux host would have been given), the file is byte for
+/// byte what it was, with its mode, and no kept original is left behind.
+///
+/// Mutant seen red: `daemon_dirs::restore` removing `kbf.toml` when no original is kept.
+#[test]
+fn a_mac_rollback_leaves_kbf_toml_byte_for_byte() {
+    use crate::migrate::kit_host::{Form, KBF_TOML_PATH, at};
+    use std::os::unix::fs::MetadataExt;
+    let plain_text = "mode = \"daemon\"\n\n[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n\
+                      driver = [\"native\"]\n";
+    for kit in [true, false] {
+        let mut rig = if kit {
+            Rig::kit(
+                "mac-rollback-toml-kit",
+                crate::layout::Platform::MacOs,
+                Form::New,
+            )
+        } else {
+            Rig::mac("mac-rollback-toml-plain")
+        };
+        let path = at(&rig.host.root, KBF_TOML_PATH);
+        if !kit {
+            put(&path, plain_text, 0o640);
+        }
+        let (before, mode) = (
+            fs::read(&path).expect("kbf.toml"),
+            fs::metadata(&path).expect("meta").mode() & 0o7777,
+        );
+        run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+        assert_eq!(fs::read(&path).expect("kbf.toml"), before, "kit={kit}");
+        let report = rollback_now(&mut rig, Mode::Apply).expect("rollback");
+        assert_eq!(report.outcome, Outcome::RolledBack);
+        assert_eq!(fs::read(&path).expect("kbf.toml"), before, "kit={kit}");
+        assert_eq!(
+            fs::metadata(&path).expect("meta").mode() & 0o7777,
+            mode,
+            "kit={kit}"
+        );
+        assert!(
+            !rig.new_state_dir()
+                .join("migration-units/kbf.toml")
+                .exists(),
+            "kit={kit}"
+        );
+        assert!(
+            !report.to_string().contains("kbf.toml: the original"),
+            "{report}"
+        );
+    }
 }
 
 /// Catches a `setup` that is told the wrong thing about a host: `standing` is the guard plus

@@ -1,4 +1,4 @@
-//! The deploy gates (docs/design/kbf-cicd.md, section 7; kbf#949 part 1). A deploy that
+//! The deploy gates (docs/design/kbf-cicd.md, section 5.2; kbf#949 part 1). A deploy that
 //! `--apply`s is judged by six gates besides its own steps, and the verdict is written as a
 //! `kbf-gate` result document (`RUNNING` first, `FINISHED` on every exit this process can
 //! see):

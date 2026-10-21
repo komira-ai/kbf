@@ -17,10 +17,9 @@ Commands:
   gc              Remove the releases nothing needs: current, previous, staged, the swap on trial and any a process executes from stay, and so do the newest `--keep` others
   boot-check      Run before each start of a release on trial; counts the start
   migrate         Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's tree, or put it back with `--rollback`. A dry run without `--apply`
+  uninstall       Remove what the package left on a host that is rolled back or was never adopted: the LaunchDaemon plist, its receipt, disable override, logs and the files a rollback moved aside (a Mac). A dry run without `--apply`
   quiesce         For maintainer scripts: take the lock; exit 5 while a swap is pending
   check           Validate the installer's configuration, trust files and path chain
-  backup          Dump the state database to the backup directory and keep the newest few; run by kbf-backup.timer as the service user, who connects as the role installer.toml's database URL names
-  restore         Restore a backup into an empty state database, as the service user, who connects as the role installer.toml's database URL names
   proxy           Serve the frontend host's public port: route each stream to the active child frontend
   help            Print this message or the help of the given subcommand(s)
 
@@ -50,9 +49,17 @@ Options:
       --apply
           Do what the verb says. Without it a mutating verb is a dry run
       --release-source <RELEASE_SOURCE>
-          Where releases are fetched from. Default: the frontend for the modes that enroll, a file server (`url`) for `frontend` and `all-in-one` [possible values: url, frontend]
+          Where releases are fetched from. Default: the frontend for the modes that enroll, a file server (`url`) for `frontend` and `all-in-one`. `bundled` fetches nothing: it takes no --release-url and no --commit [possible values: url, frontend, bundled]
       --release-url <RELEASE_URL>
           The https base URL of the file server, for --release-source url
+      --release-ca <RELEASE_CA>
+          A PEM file of the CAs the file server's certificate is checked against instead of the system's (an absolute path, a copy owned by root): written to installer.toml as `release_ca`. For --release-source url. Not used by a fetch yet
+      --frontend-worker-url <FRONTEND_WORKER_URL>
+          The frontend's worker listener, where releases are served, as https://host[:port]: written to installer.toml as `frontend_url`. For --release-source frontend, with --frontend-ca and --frontend-ca-sha256. Not used by a fetch yet
+      --frontend-ca <FRONTEND_CA>
+          A PEM file of the CA the worker listener's certificate chains to (an absolute path, a copy owned by root): written to installer.toml as `frontend_ca`. For --release-source frontend, with --frontend-worker-url and --frontend-ca-sha256. Not used by a fetch yet
+      --frontend-ca-sha256 <FRONTEND_CA_SHA256>
+          The sha256 of --frontend-ca, 64 lowercase hex characters: written to installer.toml as `frontend_ca_sha256`. For --release-source frontend, with --frontend-worker-url and --frontend-ca. Not used by a fetch yet
       --min-generation <MIN_GENERATION>
           Refuse orders below this generation. A floor only goes up
       --commit <COMMIT>
@@ -113,6 +120,16 @@ Options:
           How REAPI and Buck2 callers authenticate to the proxy; default none. With --proxy [possible values: none, bearer, mtls]
       --buck2-token-file <BUCK2_TOKEN_FILE>
           The Buck2 API key file, an absolute path, for --buck2-auth bearer
+      --deploy-stage <DEPLOY_STAGE>
+          The stage this host is, gamma or prod: setup writes /etc/kbf-installer/deploy.json so `kbf-installer deploy` binds an offer to it. frontend, all-in-one
+      --deploy-api <DEPLOY_API>
+          The operator API deploy calls, as a loopback IP:PORT. Default: the proxy's public port (installer.toml `[proxy] listen`, else 127.0.0.1:8980)
+      --deploy-api-ca <DEPLOY_API_CA>
+          A PEM file of the CA the API's certificate is verified against (absolute path; it must exist). Default: the system's roots only
+      --deploy-server-name <DEPLOY_SERVER_NAME>
+          The DNS name the API's certificate carries. Default: the API address's IP
+      --deploy-token-file <DEPLOY_TOKEN_FILE>
+          The operator token's file (absolute path, mode 0600 or 0400, owned by root; it must exist, except the token setup makes itself, /etc/kbf/api-token on Linux). Default: installer.toml `[proxy] operator_token_file`
       --installer-config <INSTALLER_CONFIG>
           The installer.toml `setup` writes (and reads, to keep what it does not set), under the host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which is the only value setup accepts. The same flag, with the same meaning, as on `run`
   -h, --help
@@ -137,11 +154,11 @@ Options:
       --json
           Print the result as one JSON object on standard output
       --update-dir <UPDATE_DIR>
-          Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it [default: /var/lib/kbf-installer]
+          Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it. Default: the host's state directory (`/var/lib/kbf-installer`, `/var/db/kbf-installer` on a Mac)
       --apply
           Do what the verb says. Without it a mutating verb is a dry run
       --orders-dir <ORDERS_DIR>
-          The order spool: owned by the service user, mode 0700, inside a root-owned parent [default: /var/lib/kbf-installer/orders]
+          The order spool: owned by the service user, mode 0700, inside a root-owned parent. Default: `orders` in the state directory
       --unit <UNIT>
           The systemd unit to restart after a swap (Linux). Without it and without `--launchd-label`, the unit of the mode in the host's kbf.toml, which is how the one packaged kbf-installer.service serves every mode
       --launchd-label <LAUNCHD_LABEL>
@@ -270,6 +287,21 @@ Options:
       --apply                      Do what the verb says. Without it a mutating verb is a dry run
   -h, --help                       Print help
 
+=== kbf-installer uninstall --help ===
+Remove what the package left on a host that is rolled back or was never adopted: the LaunchDaemon plist, its receipt, disable override, logs and the files a rollback moved aside (a Mac). A dry run without `--apply`
+
+Usage: kbf-installer uninstall [OPTIONS]
+
+Options:
+      --installer-unit <INSTALLER_UNIT>
+          The installer's own unit: stopped and, on Linux, disabled. A Mac without the flag acts on the package's job, `com.komira.kbf-installer.plist`; a Linux host without it leaves its unit to the package manager. The unit must be `.plist` on a Mac and `.service` on Linux (else exit 2). On a Mac a name other than the package's job replaces it as the job acted on: the package's own plist is then left in place, while the installer's tree, logs and receipt are removed
+      --json
+          Print the result as one JSON object on standard output
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help
+          Print help
+
 === kbf-installer quiesce --help ===
 For maintainer scripts: take the lock; exit 5 while a swap is pending
 
@@ -290,48 +322,6 @@ Options:
       --apply  Do what the verb says. Without it a mutating verb is a dry run
   -h, --help   Print help
 
-=== kbf-installer backup --help ===
-Dump the state database to the backup directory and keep the newest few; run by kbf-backup.timer as the service user, who connects as the role installer.toml's database URL names
-
-Usage: kbf-installer backup [OPTIONS]
-
-Options:
-      --installer-config <INSTALLER_CONFIG>
-          installer.toml, under the host root: its `database` key names the database to dump and its `backup_keep` how many backups stay (default 7) [default: /etc/kbf/installer.toml]
-      --json
-          Print the result as one JSON object on standard output
-      --apply
-          Do what the verb says. Without it a mutating verb is a dry run
-      --dir <DIR>
-          The backup directory: made 0700 when it is not there, owned by the user that runs this [default: /var/lib/kbf-server/backups]
-      --pg-dump <PG_DUMP>
-          The `pg_dump` program (a name looked up in PATH, or a path) [default: pg_dump]
-      --pg-restore <PG_RESTORE>
-          The `pg_restore` program, which checks the dump can be read [default: pg_restore]
-  -h, --help
-          Print help
-
-=== kbf-installer restore --help ===
-Restore a backup into an empty state database, as the service user, who connects as the role installer.toml's database URL names
-
-Usage: kbf-installer restore [OPTIONS] --file <FILE>
-
-Options:
-      --file <FILE>
-          The backup to restore (a file `backup` wrote)
-      --json
-          Print the result as one JSON object on standard output
-      --apply
-          Do what the verb says. Without it a mutating verb is a dry run
-      --installer-config <INSTALLER_CONFIG>
-          installer.toml, under the host root: its `database` key names the database to restore into (unless --database does), which must be empty of kbf's schema [default: /etc/kbf/installer.toml]
-      --database <DATABASE>
-          Restore into this database instead, for a restore test: a bare NAME (a database on the server and socket installer.toml names, for the role it names) or a URL with no password
-      --pg-restore <PG_RESTORE>
-          The `pg_restore` program (a name looked up in PATH, or a path) [default: pg_restore]
-  -h, --help
-          Print help
-
 === kbf-installer proxy --help ===
 Serve the frontend host's public port: route each stream to the active child frontend
 
@@ -341,8 +331,8 @@ Options:
       --config <CONFIG>          The installer.toml whose `[proxy]` table configures the proxy (default: the platform's, `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac)
       --json                     Print the result as one JSON object on standard output
       --apply                    Do what the verb says. Without it a mutating verb is a dry run
-      --orders-dir <ORDERS_DIR>  The order spool the update API writes and the root half reads: owned by the service user. As `run --orders-dir` [default: /var/lib/kbf-installer/orders]
+      --orders-dir <ORDERS_DIR>  The order spool the update API writes and the root half reads: owned by the service user. As `run --orders-dir`. Default: `orders` in the host's state directory
       --check                    Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing
-      --update-dir <UPDATE_DIR>  Root's directory: the proxy reads `status.json` here, to start the installed release when no frontend child is running, and the update API reads its status. As `run --update-dir` [default: /var/lib/kbf-installer]
+      --update-dir <UPDATE_DIR>  Root's directory: the proxy reads `status.json` here, to start the installed release when no frontend child is running, and the update API reads its status. As `run --update-dir`. Default: the host's state directory (`/var/lib/kbf-installer`, `/var/db/kbf-installer` on a Mac)
   -h, --help                     Print help
 

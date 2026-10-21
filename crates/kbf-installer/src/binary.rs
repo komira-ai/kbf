@@ -5,7 +5,7 @@
 //! file for another platform is refused before anything executes it. The version is what
 //! `kbf --version --json` prints (crates/kbf-cli/src/version.rs): `commit` (the first 12
 //! hex digits), `min_protocol`, `protocol`, `profile`, `state_schema` and `version`, and
-//! `admin_protocol` and `meta_log` when the build has them.
+//! `admin_protocol`, `meta_log` and `seq` when the build has them.
 //! It is a consistency check on a file the attestation already vouches for, not trust.
 
 use std::fmt;
@@ -116,8 +116,8 @@ pub const VERSION_CAP: usize = 4096;
 
 /// What `--version --json` prints. A field this type does not name is refused, and so is
 /// one named twice or a required one missing. `platform` (the installer derives it from
-/// the binary's header), `admin_protocol` and `meta_log` (builds before them lack them)
-/// may be absent and are then `None`; `meta_log: None` means not reversible.
+/// the binary's header), `admin_protocol`, `meta_log` and `seq` (builds before them lack
+/// them) may be absent and are then `None`; `meta_log: None` means not reversible.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Version {
@@ -134,6 +134,11 @@ pub struct Version {
     pub min_protocol: u64,
     pub protocol: u64,
     pub profile: String,
+    /// The number of commits behind the build's commit, which puts two builds of one branch
+    /// in order; 0 when the build could not count them (a shallow checkout), which is below
+    /// every counted build. `None` for a build that predates the field.
+    #[serde(default)]
+    pub seq: Option<u64>,
     pub state_schema: u64,
     pub version: String,
     /// `linux-x86_64`, `linux-arm64` or `darwin-arm64`, when the build says.

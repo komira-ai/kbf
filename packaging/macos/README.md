@@ -26,7 +26,7 @@ writes `<dir>/kbf-installer-<v>-macos-arm64.pkg`, a flat component package (iden
 | `/Library/Logs/kbf-installer` | 0755 | where the job writes |
 
 Every directory on the way to the tool is 0755 root:wheel. The package creates no
-configuration, no release and no user (`kbf`, `_kbf-fetch`, `kbf-verify` and the lease
+configuration, no release and no user (`kbf`, `_kbf-fetch` and the lease
 users are made by `setup`, as root; a payload cannot make users).
 
 ### The release asset
@@ -78,6 +78,10 @@ cask. Its `uninstall launchctl:` unloads the job and `pkgutil:` removes the file
 package placed and forgets its receipt. What `setup` made (the releases under
 `/usr/local/kbf-installer`, `installer.toml`, the state) stays, so a reinstall keeps the
 node; `brew uninstall --zap --cask kbf-installer` removes it too.
+
+A Mac whose adoption was rolled back (`kbf-installer migrate --rollback`) keeps the package: its
+plist, logs, receipt and launchd disable override, and the files the rollback moved aside.
+`kbf-installer uninstall --apply` removes them (see `docs/deploy/kbf-installer-migrate.md`).
 
 ## What the real kbf-installer must match
 

@@ -31,6 +31,7 @@ use tonic::transport::Channel;
 use tonic::{Code, Status};
 
 use crate::cold_apply::Applied;
+use crate::fill::FillState;
 use crate::members::{LastBoot, PROTOCOL};
 use crate::node_map::NodeMap;
 use crate::storage_health::{Debts, Writes};
@@ -111,6 +112,8 @@ pub struct Joiner {
     applied: Applied,
     /// The registration generation the frontend last announced.
     announced: u64,
+    /// What the heartbeats say of the node's flush and tail ([`crate::fill`]).
+    fill: Arc<FillState>,
 }
 
 impl Joiner {
@@ -131,7 +134,16 @@ impl Joiner {
             last: None,
             applied: Applied::unreported(),
             announced: 0,
+            fill: FillState::new(),
         }
+    }
+
+    /// What this joiner's heartbeats say of the node's flush and tail, and which the node's
+    /// [`crate::fill::run`] fills in. Without it running, a heartbeat says the node cannot
+    /// say (no flush generation, no pass done), so a joiner is never promoted automatically.
+    #[must_use]
+    pub fn fill(&self) -> Arc<FillState> {
+        Arc::clone(&self.fill)
     }
 
     /// The joiner of a node whose metadata log last wrote as `last`: every registration
@@ -280,6 +292,8 @@ impl Joiner {
             .into_inner();
         self.take(answer.map.clone(), answer.retained_previous);
         self.node.registered(MemberId(answer.member_id));
+        // A new boot has done no pass under it.
+        self.fill.registered();
         self.announced = answer.objstore_generation;
         Ok(Joined {
             member_id: answer.member_id,
@@ -304,9 +318,10 @@ impl Joiner {
         let (writes_known, open_writes) = self.writes().to_wire();
         let (debts_known, repair_debts) = self.debts().await.to_wire();
         let (applied_objstore_generation, apply_status) = self.applied.for_beat(self.announced);
+        let fill = self.fill.beat();
         let answer = self
             .client
-            .heartbeat(pb::HeartbeatRequest {
+            .heartbeat(fill.vitals.put_on(pb::HeartbeatRequest {
                 member_id: joined.member_id,
                 boot: joined.boot,
                 repair_debts,
@@ -317,11 +332,17 @@ impl Joiner {
                 catching_up: self.catch_up.is_catching_up(),
                 applied_objstore_generation,
                 apply_status: apply_status.into(),
-                // Not reported yet: the node's cache is not asked here, so it cannot say.
-                ..Default::default()
-            })
+                flush_known: fill.flush_clear_gen.is_some(),
+                flush_clear_gen: fill.flush_clear_gen.unwrap_or(0),
+                staged_objects: fill.staged_objects,
+                staged_bytes: fill.staged_bytes,
+                tail_epoch_done: fill.tail_epoch_done,
+                fill_fp: fill.fill_fp,
+                ..pb::HeartbeatRequest::default()
+            }))
             .await?
             .into_inner();
+        self.fill.learn(answer.tail_epoch);
         self.announced = answer.objstore_generation;
         self.take(answer.map, answer.retained_previous);
         Ok(answer.map_generation)
