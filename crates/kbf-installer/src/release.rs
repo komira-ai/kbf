@@ -67,6 +67,8 @@ pub enum ReleaseError {
     State(#[from] StateError),
     #[error(transparent)]
     Host(#[from] HostError),
+    #[error("the metadata log: {0}")]
+    MetaLog(#[from] crate::meta_log::MetaLogError),
     #[error("cannot read {path}: {source}")]
     Read { path: PathBuf, source: io::Error },
     #[error("{0:?} is not a UTF-8 name")]
