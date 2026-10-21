@@ -81,14 +81,14 @@ pub trait Storage: Send + Sync {
     /// [`Storage::find_missing`] counting only blobs that are durable: committed to the
     /// index, not merely held in RAM awaiting their write to disk. What a caller asks
     /// before it writes something durable that names a blob (`kbf-durable: only` on the
-    /// wire). The default is [`Storage::find_missing`], right for a storage that holds
-    /// nothing in RAM; one that does overrides it. Touches nothing.
+    /// wire). There is no default: a storage that holds nothing in RAM answers with
+    /// [`Storage::find_missing`] explicitly, and one that does (or wraps one) decides, so
+    /// no wrapper answers a durable question with the held-inclusive answer by omission.
+    /// Touches nothing.
     ///
     /// # Errors
     /// The store could not answer; never a partial answer.
-    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
-        self.find_missing(digests)
-    }
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>>;
 
     /// A whole blob, checked against its digest, after touching it: for a blob the
     /// caller decodes. A blob of any size is read with [`Storage::read_range`], a window

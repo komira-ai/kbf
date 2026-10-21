@@ -104,6 +104,31 @@ impl Held {
         )
     }
 
+    /// The held blobs among `digests` (one entry per distinct digest, with its bytes) and
+    /// the rest, in order, from a single look at the set: a blob the drain moves is in
+    /// one part or the other, never neither. The rest is `digests` itself, borrowed,
+    /// while nothing is held.
+    pub(super) fn split<'a>(
+        &self,
+        digests: &'a [Digest],
+    ) -> (Vec<(Digest, Bytes)>, Cow<'a, [Digest]>) {
+        let blobs = self.blobs();
+        if blobs.is_empty() {
+            return (Vec::new(), Cow::Borrowed(digests));
+        }
+        let mut held = BTreeMap::new();
+        let mut unheld = Vec::new();
+        for d in digests {
+            match blobs.get(d) {
+                Some(bytes) => {
+                    held.insert(*d, bytes.clone());
+                }
+                None => unheld.push(*d),
+            }
+        }
+        (held.into_iter().collect(), Cow::Owned(unheld))
+    }
+
     /// Which of `digests` are held, in order.
     pub(super) fn which(&self, digests: &[Digest]) -> Vec<bool> {
         let blobs = self.blobs();

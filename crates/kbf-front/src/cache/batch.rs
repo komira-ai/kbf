@@ -5,7 +5,7 @@
 //! that lie back to back in one segment are read with one range GET, and up to
 //! [`BATCH_READS_IN_FLIGHT`] GETs run at once.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -49,17 +49,9 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     ) -> Result<BTreeMap<Digest, Result<Bytes, CacheError>>, CacheError> {
         // Held first, then the index for the rest (`held` module docs). A held blob is
         // read from RAM, whole and hashed as any read is.
-        let unheld = self.held.unheld(digests);
-        let held: Vec<(Digest, Bytes)> = if unheld.len() == digests.len() {
-            Vec::new()
-        } else {
-            digests
-                .iter()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .filter_map(|d| self.held.get(d).map(|bytes| (*d, bytes)))
-                .collect()
-        };
+        // One look at the set gives both parts, so a blob the drain moves cannot fall
+        // between them.
+        let (held, unheld) = self.held.split(digests);
         self.between_steps().await;
         let answers = self
             .touched(|s| {

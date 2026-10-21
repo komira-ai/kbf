@@ -128,6 +128,11 @@ impl Storage for Slow {
         })
     }
 
+    /// Forwards: the inner storage decides what is durable.
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        self.0.find_durable(digests)
+    }
+
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes> {
         self.0.read_blob(digest)
     }

@@ -148,6 +148,11 @@ impl Storage for Fake {
         })
     }
 
+    /// Holds nothing in RAM: durable is present.
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        self.find_missing(digests)
+    }
+
     fn read_blob<'a>(&'a self, _: &'a Digest) -> Answer<'a, Bytes> {
         Box::pin(async { Err(StorageError::Internal("the router reads ranges".to_owned())) })
     }

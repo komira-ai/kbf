@@ -527,12 +527,14 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 
     /// Whether `digest` is complete on this node, what `QueryWriteStatus` reports: held
-    /// in RAM, or committed to the index at a reachable object (not necessarily durable:
-    /// [`Cache::durable`]). Bytes still arriving count for nothing.
+    /// in RAM, or committed to the index at a reachable object. **Not a durability
+    /// barrier**: a held blob is complete and a restart loses it. A caller that writes
+    /// something durable naming the blob asks [`Cache::durable`]. Bytes still arriving
+    /// count for nothing.
     ///
     /// # Errors
     /// The metadata log is unavailable.
-    pub async fn is_durable(&self, digest: &Digest) -> Result<bool, CacheError> {
+    pub async fn is_complete(&self, digest: &Digest) -> Result<bool, CacheError> {
         if is_empty_blob(digest) {
             return Ok(true);
         }

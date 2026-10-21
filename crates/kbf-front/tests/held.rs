@@ -94,14 +94,14 @@ async fn present_counts_a_held_blob_present() {
     );
 }
 
-/// Catches `is_durable` (the `QueryWriteStatus` answer of a cache) skipping the set.
-/// Mutant: `is_durable` asks the index alone.
+/// Catches `is_complete` (the `QueryWriteStatus` answer of a cache) skipping the set.
+/// Mutant: `is_complete` asks the index alone.
 #[tokio::test]
 async fn a_held_blob_is_complete_for_a_write_status() {
     let held = blob(5, 100);
     let cache = cache_with(&[&held], &[]).await;
-    assert!(cache.is_durable(&held.digest()).await.expect("status"));
-    assert!(!cache.is_durable(&absent()).await.expect("status"));
+    assert!(cache.is_complete(&held.digest()).await.expect("status"));
+    assert!(!cache.is_complete(&absent()).await.expect("status"));
 }
 
 /// Catches `read_windows` and `read_blob` skipping the set (the blob would be NOT_FOUND
@@ -231,7 +231,7 @@ async fn a_digest_is_held_once_and_released_once() {
 enum Reader {
     FindMissing,
     Present,
-    IsDurable,
+    IsComplete,
     ReadBlob,
     ReadBlobs,
 }
@@ -240,7 +240,7 @@ impl Reader {
     const ALL: [Reader; 5] = [
         Self::FindMissing,
         Self::Present,
-        Self::IsDurable,
+        Self::IsComplete,
         Self::ReadBlob,
         Self::ReadBlobs,
     ];
@@ -255,7 +255,7 @@ impl Reader {
                 .expect("found")
                 .is_empty(),
             Self::Present => cache.present(&[digest]).await.expect("present")[0],
-            Self::IsDurable => cache.is_durable(&digest).await.expect("status"),
+            Self::IsComplete => cache.is_complete(&digest).await.expect("status"),
             Self::ReadBlob => cache
                 .read_blob(&digest)
                 .await
@@ -309,6 +309,57 @@ async fn a_blob_moving_from_the_set_to_the_index_between_the_steps_is_never_miss
         let cache = draining_between_the_steps(&moving);
         assert!(reader.finds(&cache, &moving).await, "{reader:?} missed it");
     }
+}
+
+/// The drain race for a batch (T6, batch form): `read_blobs` over a held blob that moves
+/// to the index mid-read, an indexed blob, and an absent one answers every digest. The
+/// held bytes and the unheld list come from one look at the set, so a blob the drain
+/// moves between that look and the index query is in the set's part or the index's,
+/// never in neither. Mutant: `read_blobs` looks at the set twice (the unheld list, then
+/// the held bytes) with the drain between them: the moving blob is in no answer.
+#[tokio::test]
+async fn a_batch_read_never_loses_a_blob_the_drain_moves_mid_read() {
+    let moving = blob(15, 300);
+    let indexed = blob(16, 120);
+    let absent = blob(17, 50);
+    let cache = draining_between_the_steps(&moving);
+    cache
+        .store_blobs(vec![indexed.verified.clone()])
+        .await
+        .expect("stored");
+    let digests = [moving.digest(), indexed.digest(), absent.digest()];
+    let read = cache.read_blobs(&digests).await.expect("read");
+    assert_eq!(read.len(), 3, "one answer per digest");
+    assert_eq!(
+        read[&moving.digest()].as_ref().expect("moving"),
+        &moving.bytes
+    );
+    assert_eq!(
+        read[&indexed.digest()].as_ref().expect("indexed"),
+        &indexed.bytes
+    );
+    assert!(matches!(
+        read[&absent.digest()],
+        Err(CacheError::NotFound(_))
+    ));
+}
+
+/// Several readers of one cache race one drain: each parks between its steps, the first
+/// hook to run moves the blob, and every reader of every kind still finds it. Catches a
+/// reader whose answer depends on the drain having run before or after it, not during.
+#[tokio::test]
+async fn several_readers_racing_one_drain_all_find_the_blob() {
+    let moving = blob(18, 250);
+    let cache = draining_between_the_steps(&moving);
+    let found = futures::future::join_all(
+        Reader::ALL
+            .iter()
+            .cycle()
+            .take(15)
+            .map(|reader| reader.finds(&cache, &moving)),
+    )
+    .await;
+    assert!(found.iter().all(|f| *f), "{found:?}");
 }
 
 fn serve(service: StorageService) -> Channel {

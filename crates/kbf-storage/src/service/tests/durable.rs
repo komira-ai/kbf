@@ -150,8 +150,7 @@ async fn the_durable_question_is_judged_as_the_plain_one_in_process_and_while_ca
     }
 }
 
-/// A storage that implements only the required calls: it holds nothing in RAM, so the
-/// default [`Storage::find_durable`] is its `find_missing`.
+/// A storage that holds nothing in RAM, so its `find_durable` is its `find_missing`.
 struct Plain(Arc<Mem>);
 
 impl Storage for Plain {
@@ -160,6 +159,14 @@ impl Storage for Plain {
         digests: &'a [kbf_types::Digest],
     ) -> crate::Answer<'a, Vec<kbf_types::Digest>> {
         self.0.find_missing(digests)
+    }
+
+    /// Holds nothing in RAM: durable is present.
+    fn find_durable<'a>(
+        &'a self,
+        digests: &'a [kbf_types::Digest],
+    ) -> crate::Answer<'a, Vec<kbf_types::Digest>> {
+        self.find_missing(digests)
     }
 
     fn read_blob<'a>(&'a self, digest: &'a kbf_types::Digest) -> crate::Answer<'a, Bytes> {
@@ -211,9 +218,9 @@ impl Storage for Plain {
     }
 }
 
-/// Catches a default `find_durable` that answers something other than the storage's own
+/// Catches a `find_durable` of such a storage that answers something other than the storage's own
 /// `find_missing` (a storage with nothing in RAM is durable wherever it is present), or
-/// reaches the store another way: the default names the absent digest missing and
+/// reaches the store another way: it names the absent digest missing and
 /// the present one not, through `find_missing` alone.
 #[tokio::test]
 async fn a_storage_with_nothing_in_ram_answers_the_durable_question_as_the_plain_one() {
