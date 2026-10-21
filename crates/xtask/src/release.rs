@@ -22,10 +22,16 @@
 //!   commit and no other, and each tarball has exactly
 //!   one provenance bundle, `<tarball>.sigstore.json`, whose one subject is that
 //!   tarball's digest ([`bundles`]), and no bundle is there for anything else.
+//! - `release gates --repo <owner/repo> --sha <sha> --branch <name> [--timeout-s <n>]
+//!   [--poll-s <n>] [--output <file>] [--gh <program>]` ([`gates`]): waits for the push runs
+//!   of `ci`, `beta` and `artifacts` for that commit on that branch (by workflow path, the
+//!   latest run of each) and requires all three to have succeeded; a timeout is red.
+//!   Prints `ci_run=`, `beta_run=` and `artifacts_run=`, the ids `verdict-write` takes.
 //! - `release verdict <dir> --repo-dir <checkout> --tag <tag> --commit <sha> [--main-ref
 //!   <ref>] [--output <file>]` ([`verdict`]): the annotated tag's message is a green
-//!   gamma verdict for that tag, that commit (on main) and the set `<dir>`'s `SHA256SUMS`
-//!   hashes to, after a bake of 24 hours or more. Prints `set-hash=<hex>`, which
+//!   verdict of the stage [`verdict::GATE_STAGE`] for that tag, that commit (on main) and
+//!   the set `<dir>`'s `SHA256SUMS` hashes to; a Gamma verdict also records a bake of 24
+//!   hours or more, a Beta verdict records none. Prints `set-hash=<hex>`, which
 //!   `publish --set-hash` must be given.
 //! - `release offer <dir> --repo <owner/repo> --commit <sha> --platform <p>... (--beta-result
 //!   <file> | --waive-beta <reason> --operator <name>) [--previous <sha> --version-json <file>
@@ -76,6 +82,7 @@
 //!   verdict document the tag's message carries, for the stage [`verdict::GATE_STAGE`].
 
 pub mod fetch_previous;
+pub mod gates;
 mod git;
 pub mod identity;
 pub mod notes;
@@ -364,7 +371,7 @@ pub struct Release<'a> {
     pub commit: &'a str,
     /// The run of the artifacts workflow that built and attested them.
     pub run_id: u64,
-    /// The set hash the gamma verdict names (`release verdict` prints it): the files must
+    /// The set hash the verdict names (`release verdict` prints it): the files must
     /// be that set, or nothing is published.
     pub set_hash: &'a kbf_gate::SetHash,
     /// The notes `release notes` wrote: the first part of the release's body.
@@ -436,7 +443,7 @@ pub fn publish(dir: &Path, r: &Release) -> Result<Vec<String>, Error> {
     let held_set = verdict::set_hash_of(dir)?;
     if &held_set != r.set_hash {
         return Err(Error::Refused(vec![format!(
-            "the files in {} are set {}, the gamma verdict names set {}: gamma ran other bytes",
+            "the files in {} are set {}, the verdict names set {}: the gate ran other bytes",
             dir.display(),
             held_set.as_str(),
             r.set_hash.as_str()

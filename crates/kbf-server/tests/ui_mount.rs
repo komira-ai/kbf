@@ -68,6 +68,24 @@ fn assert_secure(answer: &Answer, what: &str) {
         "{what}"
     );
     assert_eq!(answer.header("cache-control"), Some("no-store"), "{what}");
+    assert_eq!(
+        answer.header("cross-origin-resource-policy"),
+        Some("same-origin"),
+        "{what}"
+    );
+    assert_eq!(
+        answer.header("cross-origin-opener-policy"),
+        Some("same-origin"),
+        "{what}"
+    );
+    let policy = answer.header("permissions-policy").expect("a policy");
+    for feature in ["camera", "microphone", "geolocation", "usb", "payment"] {
+        assert!(
+            policy.contains(&format!("{feature}=()")),
+            "{what}: {feature} is not denied in {policy}"
+        );
+    }
+    assert_eq!(answer.header("strict-transport-security"), None, "{what}");
 }
 
 /// Catches (the CEO's ruling: the UI is open): a page that asks the policy-gated reads

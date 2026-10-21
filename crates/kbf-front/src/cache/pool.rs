@@ -105,6 +105,23 @@ impl PoolConfig {
     };
 }
 
+/// A test's callback at the pool's drain step ([`Cache::with_drain_hook`]): given the
+/// digests of a batch whose `PutStaged` is applied, before the batch is answered. It runs
+/// only on the batched pool path, not on the single-blob `put_staged` path.
+#[cfg(feature = "testkit")]
+pub type DrainHook = Arc<dyn Fn(&[Digest]) + Send + Sync>;
+
+/// A [`DrainHook`] a `Debug` struct can hold.
+#[cfg(feature = "testkit")]
+pub(super) struct HookCell(pub(super) DrainHook);
+
+#[cfg(feature = "testkit")]
+impl std::fmt::Debug for HookCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DrainHook")
+    }
+}
+
 /// What a writer is asked to do.
 enum Job {
     /// A blob held whole: batched with the others waiting.
@@ -283,6 +300,13 @@ impl<M: MetaLog, O: ObjectStore> Worker<M, O> {
             }
         };
         let committed = self.put_staged(synced, listed, false);
+        #[cfg(feature = "testkit")]
+        if committed.is_ok()
+            && let Some(hook) = self.writer.drain_hook.get()
+        {
+            let digests: Vec<Digest> = unique.keys().copied().collect();
+            (hook.0)(&digests);
+        }
         self.note_files(&*staging.tier);
         for blob in batch {
             let outcome = match &committed {

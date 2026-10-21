@@ -217,6 +217,10 @@ pub struct Summary {
     /// The offer the deploy ran under, or its `--no-offer`; absent when no stage was named.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offer: Option<OfferRecord>,
+    /// What the deploy did not fail on but the operator should know, for a person: a
+    /// platform uploaded with no version facts is stored and never offered.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     /// What went wrong, for a person; never a host name or a token.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub detail: String,
@@ -241,6 +245,7 @@ impl Summary {
             post: PostResult::default(),
             check_skipped: false,
             offer: None,
+            notes: Vec::new(),
             detail: String::new(),
         }
     }

@@ -268,6 +268,18 @@ fn latest_builds(h: &mut Html, builds: &Result<Builds, crate::read::ReadError>) 
     });
     let all = Href::root_relative(BUILDS_PATH).expect("the Builds path is root-relative");
     match builds {
+        Err(e) if e.is_history_off() => {
+            h.el("p", &[attr("class", "hint")], |h| {
+                h.text("History is off on this farm, so no builds are listed (start the server ")
+                    .text("with ")
+                    .el("code", &[], |h| {
+                        h.text("--history-objects=<URI>");
+                    })
+                    .text("). A live build can still be looked up by its id on the ")
+                    .link(&all, "Builds page")
+                    .text(".");
+            });
+        }
         Err(e) => {
             h.el("p", &[attr("class", "hint")], |h| {
                 h.text("The list of builds is not available (")

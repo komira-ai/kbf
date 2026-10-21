@@ -258,7 +258,7 @@ mod tests {
             ("xcode", "16C5032a"),
             ("os", "macos"),
             ("xcode", "15F31d"),
-            ("label.xcode", "nope"),
+            ("xcode.nope", "nope"),
         ]);
         let before = report.clone();
         let software = macos_software("ProductName: macOS\n");

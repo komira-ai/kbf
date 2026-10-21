@@ -124,8 +124,8 @@ fn the_overlay_is_written_with_the_marker_and_every_value_and_then_left_alone() 
         "  instance_name = main",
         "  tls = false",
         "  execution_concurrency_limit = 8",
-        "  linux_x86_64_properties = OSFamily=Linux,label.pool=linux",
-        "  darwin_arm64_properties = OSFamily=Darwin,label.pool=mac",
+        "  linux_x86_64_properties = OSFamily=Linux",
+        "  darwin_arm64_properties = OSFamily=Darwin",
         "  darwin_macos_hosts = 26.0-0123456789abcdef",
     ] {
         assert!(text.lines().any(|l| l == line), "{line} in\n{text}");
@@ -283,17 +283,47 @@ fn a_main_checkout_a_non_checkout_or_an_unignored_overlay_is_refused() {
     assert!(exec.log.is_empty());
 }
 
+/// Catches a `label.<k>` property (a node label, removed: kbf reads no such name from a
+/// platform) written to the overlay, where it would be ignored and the action placed
+/// anywhere: either set, in any case of the name, is refused naming the key and the pair
+/// before git is asked, with the way out.
+#[test]
+fn a_label_property_is_refused_naming_it() {
+    type Plant = fn(&mut OverlaySettings);
+    let cases: [(Plant, &str); 3] = [
+        (
+            |s| s.darwin_properties = "OSFamily=Darwin,label.pool=mac".into(),
+            "KBF_DARWIN_PROPERTIES names label.pool=mac: node labels were removed, kbf places by OSFamily and ISA. Delete it",
+        ),
+        (
+            |s| s.linux_properties = "OSFamily=Linux,LABEL.pool=linux".into(),
+            "KBF_LINUX_PROPERTIES names LABEL.pool=linux: node labels were removed, kbf places by OSFamily and ISA. Delete it",
+        ),
+        (
+            |s| s.darwin_properties = "label.pool=mac,OSFamily=Darwin".into(),
+            "KBF_DARWIN_PROPERTIES names label.pool=mac: node labels were removed, kbf places by OSFamily and ISA. Delete it",
+        ),
+    ];
+    for (plant, want) in cases {
+        let (exec, _) = host();
+        let mut a = overlay();
+        plant(&mut a.settings);
+        assert_eq!(refusal(&exec, &a), want);
+        assert!(exec.queries.borrow().is_empty(), "{want}: asked git");
+    }
+}
+
 /// Catches a property set kbf would not route as meant written to the overlay: no
-/// OSFamily (it matches every node), two, another OS's, a malformed pair, a darwin
-/// label no daemon carries, the two sets the same, and a value the overlay cannot
-/// carry; and a check that refuses the spellings kbf takes.
+/// OSFamily (it matches every node), two, another OS's, a malformed pair, the two sets
+/// the same, and a value the overlay cannot carry; and a check that refuses the
+/// spellings kbf takes.
 #[test]
 fn each_bad_property_set_is_refused() {
     type Plant = fn(&mut OverlaySettings);
-    let cases: [(Plant, &str); 10] = [
+    let cases: [(Plant, &str); 9] = [
         (
-            |s| s.linux_properties = "label.pool=linux".into(),
-            "KBF_LINUX_PROPERTIES (label.pool=linux) names no OSFamily: kbf ignores names it does not know, so it would match every node. Add OSFamily=Linux",
+            |s| s.linux_properties = "pool=linux".into(),
+            "KBF_LINUX_PROPERTIES (pool=linux) names no OSFamily: kbf ignores names it does not know, so it would match every node. Add OSFamily=Linux",
         ),
         (
             |s| s.darwin_properties = "pool=mac".into(),
@@ -304,24 +334,20 @@ fn each_bad_property_set_is_refused() {
             "KBF_LINUX_PROPERTIES names OSFamily 2 times (OSFamily=Linux,osfamily=linux); kbf refuses that",
         ),
         (
-            |s| s.linux_properties = "OSFamily=Darwin".into(),
-            "KBF_LINUX_PROPERTIES: OSFamily=Darwin does not name linux",
+            |s| s.linux_properties = "OSFamily=macos".into(),
+            "KBF_LINUX_PROPERTIES: OSFamily=macos does not name linux",
         ),
         (
             |s| s.darwin_properties = "OSFamily=Windows".into(),
             "KBF_DARWIN_PROPERTIES: OSFamily=Windows does not name darwin",
         ),
         (
-            |s| s.darwin_properties = "OSFamily=Linux,label.pool=mac".into(),
+            |s| s.darwin_properties = "OSFamily=Linux,pool=mac".into(),
             "KBF_DARWIN_PROPERTIES: OSFamily=Linux does not name darwin",
         ),
         (
             |s| s.linux_properties = "OSFamily=Linux,pool".into(),
             "KBF_LINUX_PROPERTIES: property 'pool' is not KEY=VALUE",
-        ),
-        (
-            |s| s.darwin_properties = "OSFamily=Darwin,label.pool=big".into(),
-            "KBF_DARWIN_PROPERTIES asks for label.pool=big, but no daemon carries --label pool=big (KBF_DARWIN_LABELS=pool=mac)",
         ),
         (
             |s| s.darwin_properties = s.linux_properties.clone(),
@@ -349,16 +375,8 @@ fn each_bad_property_set_is_refused() {
         );
     }
     assert!(routes_to(Os::Linux, "OSFAMILY=LINUX,ISA=x86-64").is_ok());
-    assert!(
-        labels_carried(
-            "OSFamily=Darwin,LABEL.pool=mac,label.x=1",
-            "a=b,pool=mac,x=1"
-        )
-        .is_ok()
-    );
     let bad = ["=x", "x=", "a=b=c", "a b=c"];
     for pair in bad {
         assert!(pair_of("K", pair).is_err(), "{pair}");
     }
-    assert!(labels_carried("pool", "").is_err());
 }

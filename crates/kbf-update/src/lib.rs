@@ -42,5 +42,5 @@ pub use record::{
 };
 pub use types::{
     COMPONENT_NAMES, Component, Expected, MAX_ATTESTATION_BYTES, MAX_COMPONENT_BYTES, Offer, Order,
-    Staged, State, Status, Verb,
+    Source, Staged, State, Status, Verb,
 };

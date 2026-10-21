@@ -12,9 +12,10 @@
 //!   (its daemon reported a quarantine), then its placement: `cordoned`, `draining` (a
 //!   drain running or paused at its deadline), `drained`, or `serving`. `total` is the
 //!   number of nodes listed, and is the sum of the six.
-//! - `queue.depth`: the operations queued for a lease ([`Farm::queued_operations`], the
-//!   `queued_operations` of `GET /v1/frontend/drain`). `queue.oldest_age_ms` is `null`:
-//!   the scheduler does not report how long its oldest operation has waited yet.
+//! - `queue`: `depth` and `oldest_age_ms`, both from one [`Farm::queue_view`] snapshot,
+//!   the one `GET /v1/queue` shows (`depth` is also the `queued_operations` of
+//!   `GET /v1/frontend/drain`). `oldest_age_ms` is how long the longest-waiting
+//!   operation has waited, and `null` only when nothing waits.
 //! - `leases`: the leases held on all nodes, the sum of `lease_count` of `GET /v1/nodes`.
 //! - `storage`: [`crate::members::Members::storage_health`], the numbers of
 //!   `GET /v1/storage`; `null` when this server keeps no storage members, and when the
@@ -68,6 +69,8 @@ async fn health(State(sources): State<Arc<Sources>>) -> Response {
     let nodes = sources.farm.nodes();
     let (by_state, leases) = count(&nodes.nodes);
     let (storage, unavailable) = storage(sources.members.clone()).await;
+    // One snapshot of the scheduler's queue, the one `GET /v1/queue` shows, for both numbers.
+    let queue = sources.farm.queue_view();
     let mut body = json!({
         "ready": failing.is_empty(),
         "failing": failing
@@ -76,8 +79,8 @@ async fn health(State(sources): State<Arc<Sources>>) -> Response {
             .collect::<Vec<_>>(),
         "nodes": by_state,
         "queue": {
-            "depth": sources.farm.queued_operations(),
-            "oldest_age_ms": Value::Null,
+            "depth": queue.depth,
+            "oldest_age_ms": queue.oldest_age.map(crate::http_sched::millis),
         },
         "leases": leases,
         "storage": storage,

@@ -209,6 +209,13 @@ impl RealFetcher {
         rec: &ReleaseLocator,
         expected: Option<&Facts>,
     ) -> Result<InstalledRelease, FetchError> {
+        // The package's release is the seed fetcher's: a locator that names it is not fetched.
+        if rec.source != kbf_update::Source::Fetch {
+            return Err(FetchError::Order {
+                word: "denied",
+                why: "source=staged names the package's release, which is not fetched".to_owned(),
+            });
+        }
         let plan = self.plan(kind, rec)?;
         let replaced = replaced_bytes(&self.host);
         let partial = Partial::create(&self.host, &rec.commit, self.owner).map_err(refused)?;
@@ -344,7 +351,7 @@ fn is_plain_name(name: &str) -> bool {
 /// The bytes of the release that is current, which the new one sits beside until the swap
 /// is confirmed. Counted for the disk check only, so a state or a directory that cannot be
 /// read counts as none: the pipeline reads them again and refuses.
-fn replaced_bytes(host: &Layout) -> u64 {
+pub(super) fn replaced_bytes(host: &Layout) -> u64 {
     let Ok(Some(state)) = state::read_unlocked(host) else {
         return 0;
     };
@@ -380,7 +387,7 @@ fn with_word(word: &str, text: &dyn std::fmt::Display) -> String {
 /// that will not describe a release, or whose description cannot be used, is the second: the
 /// release could not be had, and its refusal word is `fetch` (`Unavailable` is what the
 /// frontend's cycle words `fetch`; a `Rejected` it words `stage`).
-fn fetch_error(e: fetch::FetchError) -> FetchError {
+pub(super) fn fetch_error(e: fetch::FetchError) -> FetchError {
     use fetch::FetchError as Step;
     let said = with_word(e.word(), &e);
     match e {
@@ -399,7 +406,7 @@ fn fetch_error(e: fetch::FetchError) -> FetchError {
 /// A pipeline refusal as the trait reports it: a refusal with a contract word is a verdict
 /// on the release (`Rejected`, the word first); one without is the host failing to do the
 /// work (a scratch directory, a tool that would not start), which says nothing of the release.
-fn refused(r: Refusal) -> FetchError {
+pub(super) fn refused(r: Refusal) -> FetchError {
     match r.word() {
         Some(word) => FetchError::Rejected(with_word(word, &r)),
         None => FetchError::Unavailable(r.to_string()),

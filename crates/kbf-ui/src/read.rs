@@ -110,6 +110,60 @@ impl ReadError {
     pub(crate) const fn is_page_bug(&self) -> bool {
         matches!(self, Self::Undeclared { .. })
     }
+
+    /// Whether the read was refused because the farm keeps no history: a `404` from
+    /// one of the routes that exist only with `--history-objects` (`docs/api.md`,
+    /// "Across builds": otherwise `404` as any unknown path), with the empty body of
+    /// an unknown route (or the words `history is off`). A record the history does not
+    /// hold is a `404` with its own code (`no_record`, `no_shape`, `no_run`, `no_log`),
+    /// and the routes being off by policy a `404` with `off`; neither is this.
+    pub(crate) fn is_history_off(&self) -> bool {
+        match self {
+            Self::Status {
+                url,
+                status: 404,
+                message,
+                ..
+            } => {
+                is_history_route(url)
+                    && (message.is_empty() || message.starts_with("history is off"))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Whether `url` is a route that exists only when the farm keeps history: the list of
+/// builds, the shapes, tests and grid, and the runs (with their logs).
+fn is_history_route(url: &str) -> bool {
+    let path = url.split_once('?').map_or(url, |(path, _)| path);
+    let under = |root: &str| {
+        path == root
+            || path
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    ["/v1/shapes", "/v1/tests", "/v1/grid", "/v1/runs"]
+        .into_iter()
+        .any(under)
+        || path == "/v1/invocations"
+}
+
+/// A ranged read: the bytes the API sent, and the size of the whole when it said.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Slice {
+    pub(crate) bytes: Vec<u8>,
+    /// The whole object's size: from `Content-Range` of a `206` or `416`, or the body's
+    /// length when the API ignored the range and sent it all.
+    pub(crate) total: Option<u64>,
+}
+
+/// The size after the `/` of a `Content-Range` value (`bytes 0-9/100`, `bytes */0`).
+fn content_range_total(headers: &[(String, String)]) -> Option<u64> {
+    let (_, value) = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-range"))?;
+    value.rsplit_once('/')?.1.trim().parse().ok()
 }
 
 /// A URL a page asked for, and whether it was sent (a refused one was not).
@@ -155,8 +209,43 @@ impl<'a, S: Source> Reader<'a, S> {
         Ok(String::from_utf8_lossy(&body).into_owned())
     }
 
+    /// Bytes `first` to `last` (inclusive) of the object at `url`, read with a `Range`
+    /// header, so no more than that is read. The answer is `206` (the size is the
+    /// `Content-Range`'s), `416` for a start past the end (an empty object: no bytes,
+    /// the size from `Content-Range`), or `200` when the API ignored the range (the
+    /// whole body, which is the size).
+    pub(crate) async fn range(
+        &mut self,
+        url: &str,
+        first: u64,
+        last: u64,
+    ) -> Result<Slice, ReadError> {
+        let got = self.send(url, Some((first, last))).await?;
+        let total = match got.status {
+            200 => Some(got.body.len() as u64),
+            206 | 416 => content_range_total(&got.headers),
+            _ => return Err(refused(url, got)),
+        };
+        let bytes = if got.status == 416 {
+            Vec::new()
+        } else {
+            got.body
+        };
+        Ok(Slice { bytes, total })
+    }
+
     /// The body of a `200` answer at `url`.
     async fn ok(&mut self, url: &str) -> Result<Vec<u8>, ReadError> {
+        let got = self.send(url, None).await?;
+        if got.status == 200 {
+            return Ok(got.body);
+        }
+        Err(refused(url, got))
+    }
+
+    /// The answer at `url`, whatever its status: refused before any request when the
+    /// page does not declare `url`.
+    async fn send(&mut self, url: &str, range: Option<(u64, u64)>) -> Result<Fetched, ReadError> {
         let sent = self.page.declares(url);
         self.asked.push(Asked {
             url: url.to_owned(),
@@ -167,27 +256,24 @@ impl<'a, S: Source> Reader<'a, S> {
                 url: url.to_owned(),
             });
         }
-        let Fetched {
-            status,
-            body,
-            headers,
-        } = self
-            .source
-            .get(url)
-            .await
-            .map_err(|e| ReadError::Unreachable {
-                url: url.to_owned(),
-                why: e.to_string(),
-            })?;
-        if status == 200 {
-            return Ok(body);
-        }
-        Err(ReadError::Status {
+        let asking = match range {
+            None => self.source.get(url).await,
+            Some((first, last)) => self.source.get_range(url, first, last).await,
+        };
+        asking.map_err(|e| ReadError::Unreachable {
             url: url.to_owned(),
-            status,
-            message: error_message(&body),
-            headers: passed_on(headers),
+            why: e.to_string(),
         })
+    }
+}
+
+/// The error of an answer that is not the one the page wanted.
+fn refused(url: &str, got: Fetched) -> ReadError {
+    ReadError::Status {
+        url: url.to_owned(),
+        status: got.status,
+        message: error_message(&got.body),
+        headers: passed_on(got.headers),
     }
 }
 

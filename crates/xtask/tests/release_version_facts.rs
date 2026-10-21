@@ -170,15 +170,15 @@ fn refuses(name: &str, says: &str, why: &str) {
 #[test]
 fn it_refuses_what_is_no_release_build_of_the_commit_and_writes_nothing() {
     // Catches: the answer of another commit's build or of a debug build, an answer that is
-    // no JSON object, one with a field no build reports or without a field every build
-    // reports, and one over the cap, each taken as the facts of this build; and a refusal
-    // that leaves a file, the directory or a sums line behind. Mutants: the commit not
-    // compared; the profile not compared; `Version::parse` replaced by a lenient reader;
-    // the cap dropped.
+    // no JSON object, one without a field every build reports, and one over the cap, each
+    // taken as the facts of this build; and a refusal that leaves a file, the directory or a
+    // sums line behind. A field this xtask does not know is a newer build's and is kept (the
+    // installer's reader ignores it; `binary_tests` pins that), so it is no refusal here.
+    // Mutants: the commit not compared; the profile not compared; a required field made
+    // optional; the cap dropped.
     let ok = says(COMMIT, "release");
     let other = says(OTHER, "release");
     let debug = says(COMMIT, "debug");
-    let unknown = ok.replace("\"seq\"", "\"sequence\"");
     let missing = ok.replace("\"state_schema\": 1, ", "");
     let long = ok.replace("0.1.0", &"9".repeat(5000));
     refuses("commit", &other, "it says commit badbad012345");
@@ -186,7 +186,6 @@ fn it_refuses_what_is_no_release_build_of_the_commit_and_writes_nothing() {
     refuses("not-json", "meta_log=3\n", "no JSON object");
     refuses("array", "[3]\n", "no JSON object");
     refuses("empty", "", "no JSON object");
-    refuses("unknown", &unknown, "unknown field");
     refuses("missing", &missing, "missing field");
     refuses("long", &long, "more than 4096 bytes");
 }

@@ -1,8 +1,8 @@
 //! Tests of the release keys `setup` writes into `installer.toml` (docs/design/kbf-installer.md
 //! section 3): `--release-source bundled`, `--release-ca` and the frontend snapshot flags
 //! (`--frontend-worker-url`, `--frontend-ca`, `--frontend-ca-sha256`). `setup` checks and
-//! writes the values; it does not install the release a bundled host carries (a later change)
-//! and does not read the CA files. The helpers are `tests.rs`'s. Each test says the defect it
+//! writes the values; installing the release a bundled host carries is `seed_tests.rs`'s,
+//! and it does not read the CA files. The helpers are `tests.rs`'s. Each test says the defect it
 //! catches and the mutants to plant to see it go red.
 
 use std::path::PathBuf;

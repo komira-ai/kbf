@@ -8,7 +8,7 @@
 //! | `isa_level` | at least, within the family (`x86-64-v3` is served by v3 and v4) |
 //! | `cpu.feature` (repeatable) | subset: every requested feature is present |
 //! | `cpus`, `mem_gib`, `nvme_gib`, `gpu` | countable: the node has at least the amount |
-//! | `os`, `os_image`, `cpu.model`, `page_size`, `label.<k>` | exact |
+//! | `os`, `os_image`, `cpu.model`, `page_size` | exact |
 //! | `xcode` | membership: the node reports a set (one entry per installed Xcode build) and the request names one |
 //! | `vm.image` | membership on the digest: the request names `<name>@sha256:<64 hex>`, the node reports one entry in that form per image it holds, and only the `sha256:<hex>` parts are compared |
 //! | `ios.device` (`1`) with `ios.device.<attribute>` | one device: the node reports one `ios.device` entry per ready device, and **one** of them must satisfy every attribute (exact) |
@@ -83,7 +83,7 @@ impl fmt::Display for Consumable {
     }
 }
 
-/// Keys compared as exact strings, besides `label.<k>`.
+/// Keys compared as exact strings.
 const EXACT_KEYS: [&str; 4] = ["os", "os_image", "cpu.model", "page_size"];
 
 /// Keys a node reports as a set and a request names one member of.
@@ -129,10 +129,9 @@ pub(crate) fn is_ios_device_key(key: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
-/// Whether `key` is compared as an exact string: one of the exact keys, or
-/// `label.<k>` with a non-empty `<k>`.
+/// Whether `key` is compared as an exact string: one of the exact keys.
 pub(crate) fn is_exact_key(key: &str) -> bool {
-    EXACT_KEYS.contains(&key) || key.strip_prefix("label.").is_some_and(|k| !k.is_empty())
+    EXACT_KEYS.contains(&key)
 }
 
 /// Whether `key` names a set the node reports, matched by membership.
@@ -184,7 +183,7 @@ fn is_capability_key(key: &str) -> bool {
 pub struct NodeCaps {
     /// Detected CPU capabilities.
     pub cpu: CpuCaps,
-    /// Values compared exactly, by request key (`os`, `cpu.model`, `label.rack`, ...).
+    /// Values compared exactly, by request key (`os`, `cpu.model`, `os_image`, ...).
     pub exact: BTreeMap<String, String>,
     /// Sets a request names one member of, by request key (`xcode`: every installed
     /// build; `vm.image`: the `sha256:<hex>` digest of every image).
@@ -441,8 +440,8 @@ impl Request {
         Ok(req)
     }
 
-    /// The value the request asks `key` to have exactly (`os`, `cpu.model`,
-    /// `label.<k>`, ...), if it names one.
+    /// The value the request asks `key` to have exactly (`os`, `cpu.model`, ...), if it
+    /// names one.
     #[must_use]
     pub fn exact(&self, key: &str) -> Option<&str> {
         self.exact.get(key).map(String::as_str)

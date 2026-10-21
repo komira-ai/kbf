@@ -647,6 +647,7 @@ fn what_the_root_half_reads_is_what_was_written() {
         commit: commit(c),
         window_s,
         claims: None,
+        source: kbf_update::Source::Fetch,
     };
     assert_eq!(
         String::from_utf8(read(4242)).expect("text"),

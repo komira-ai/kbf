@@ -674,7 +674,7 @@ That document owns `update/release/<commit>/<platform>/<name>`, `update/desired 
 - `update/host/<id> {phase, order_id, generation, since, boot_before}`: what the controller resumes from; `boot_before` is the node's boot counter before the step, which the rejoin check compares with the registered one;
 - `update/policy {auto_nodes (bool), auto_frontend (bool), paused (bool), idle_wait, min_serving, max_hosts_out (default 1), new_work_only_to_updated, mac_force_after, accept_failing_builds}`
   (`pull-updates.md`'s `update/auto {enabled}` is `auto_nodes`);
-- `update/available/<commit>` from the poller: proposals and preflight results, metadata only.
+- `update/available/<commit>` from the poller: proposals and preflight results, metadata only. Not built: the release facts an offer carries are the release store's per-platform version facts document (`pull-updates.md` 6.2).
 
 The release store on disk is the source of truth for bytes; the `update/release/...` rows are metadata over it and are rebuilt
 from the disk index if lost (`pull-updates.md` 6.2).
