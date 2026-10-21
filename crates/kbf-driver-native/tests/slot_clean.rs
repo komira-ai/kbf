@@ -10,6 +10,11 @@
 //! user that cannot be made again quarantines the slot; the start cleans what a
 //! killed daemon left; and a lease's job labelled like launchd's own is still counted.
 //!
+//! The mutant tests (`tests/slot_clean/mutants.rs`) run the same scenario with one step
+//! of the clean skipped and the clean's own check blind, and see which rows turn red; the
+//! table is `tests/support/slot_rows.rs`, its model `tests/slot_mutants.rs` (every
+//! platform).
+//!
 //! Every test is `#[ignore]`: each needs root and real users. The macOS CI job runs them
 //! with `cargo xtask sudo-test -p kbf-driver-native --test slot_clean`, after
 //! `tests/slots.rs`, with the users of `tests/support/pool.rs`.
@@ -30,7 +35,9 @@ use kbf_daemon::Runtime as _;
 use kbf_daemon::uid;
 use kbf_driver_native::NativeRuntime;
 use kbf_driver_native::slots::SlotUser;
+use kbf_driver_native::slots::clean::Mutant;
 use support::pool::{Scratch, Users, config, home_of, ids_of, name_of};
+use support::slot_rows::ROWS;
 use support::{MemoryCas, PROMPT, Spec, stdout};
 
 fn assert_root() {
@@ -39,59 +46,6 @@ fn assert_root() {
 
 /// Where a recreate moves a home it could not empty: `<homes>/<prefix><user>-...`.
 const ASIDE: &str = ".kbf-recreated-";
-
-/// The rows of the freshness test: each place lease A leaves a marker, and what looks
-/// for it after the clean. Lease B looks for most from inside its sandbox; the sandbox
-/// refuses an action the setuid tools (`crontab`, `at`, `ps`), so the test runs those
-/// as the slot user outside it, and reads the process table and the disk images as
-/// root.
-const ROWS: [(&str, &str); 18] = [
-    (
-        "lease-dir",
-        "a file in lease A's directory (lease B: test -e)",
-    ),
-    (
-        "home",
-        "a file in the slot user's real home (lease B: test -e)",
-    ),
-    ("defaults", "a preference (lease B: defaults read)"),
-    (
-        "keychain",
-        "a keychain with a generic password (lease B: security)",
-    ),
-    ("T", "a file in DARWIN_USER_TEMP_DIR (lease B: test -e)"),
-    ("C", "a file in DARWIN_USER_CACHE_DIR (lease B: test -e)"),
-    ("tmp", "a file in /private/tmp (lease B: test -e)"),
-    ("var-tmp", "a file in /private/var/tmp (lease B: test -e)"),
-    (
-        "shared",
-        "a file in the Shared folder under /Users (lease B: test -e)",
-    ),
-    (
-        "agent",
-        "a KeepAlive LaunchAgent in user/<uid> (lease B: launchctl print)",
-    ),
-    (
-        "apple-agent",
-        "a KeepAlive LaunchAgent labelled com.apple.* in user/<uid>, its plist the lease's (lease B: launchctl print)",
-    ),
-    ("crontab", "a crontab line (the user: crontab -l)"),
-    ("at", "an at job (the user: atq)"),
-    (
-        "sleeper",
-        "a sleep in a session of its own whose parent exited (root: libproc)",
-    ),
-    (
-        "setuid",
-        "a setuid-root sleep the slot user started (root: libproc)",
-    ),
-    ("image", "an attached disk image (root: hdiutil info)"),
-    ("sem", "a System V semaphore (lease B: ipcs)"),
-    (
-        "processes",
-        "a process of the uid, by effective or real uid, but launchd's own agents (root: libproc)",
-    ),
-];
 
 /// Lease A's part inside the sandbox, as the slot user: `$1` the marker. Each place
 /// written prints `planted <row>`; then it waits for the test's `go`.
@@ -283,7 +237,50 @@ fn slots_reported(rt: &NativeRuntime<MemoryCas>) -> Option<String> {
         .map(|(_, value)| value)
 }
 
-/// The freshness test. With one slot, lease A leaves a marker in each place of
+/// What one run of the freshness scenario ([`freshness`]) saw.
+struct Fresh {
+    /// The rows of [`ROWS`] it did not (so those rows prove nothing).
+    not_planted: Vec<String>,
+    /// Each marker found after the clean, by row, and what the finder said.
+    found: Vec<(String, String)>,
+    /// The rows of `found`.
+    red: BTreeSet<String>,
+    /// Lease A's exit code, and what it printed to stdout and stderr.
+    a_exit: i32,
+    a_text: String,
+    /// Lease B's exit code, its stdout and its stderr.
+    b_exit: i32,
+    b_out: String,
+    b_err: String,
+    /// What the part of lease A outside the sandbox said.
+    outside: String,
+    diagnosis: String,
+}
+
+impl Fresh {
+    /// The scenario ran: both leases exited 0, lease A planted every row, and lease B
+    /// reached its end. Without it a green or red row means nothing.
+    fn assert_ran(&self) {
+        assert_eq!(self.a_exit, 0, "lease A: {}\n{}", self.a_text, self.outside);
+        assert!(
+            self.not_planted.is_empty(),
+            "lease A did not plant {:?} (so those rows prove nothing):\n{}\n{}\n{}",
+            self.not_planted,
+            self.a_text,
+            self.outside,
+            self.diagnosis
+        );
+        assert_eq!(self.b_exit, 0, "lease B: {}{}", self.b_out, self.b_err);
+        assert!(
+            self.b_out.ends_with("checked\n"),
+            "lease B: {}{}",
+            self.b_out,
+            self.b_err
+        );
+    }
+}
+
+/// The freshness scenario. With one slot, lease A leaves a marker in each place of
 /// [`ROWS`]: from inside its sandbox, its own directory, the real home, a preference,
 /// a keychain, `T/` and `C/` of its `/var/folders` entry, a setsid sleeper, an attached
 /// disk image and a System V semaphore; and as the slot user outside the sandbox
@@ -292,24 +289,25 @@ fn slots_reported(rt: &NativeRuntime<MemoryCas>) -> Option<String> {
 /// `Shared` folder under `/Users`, a crontab line, an `at` job, a setuid-root sleep and
 /// two KeepAlive LaunchAgents bootstrapped into `user/<uid>` from the home, one of them
 /// labelled `com.apple.kbf-ci-fresh` like launchd's own agents. After the
-/// clean that follows lease A, none is found: lease B, on the same user, looks for each
+/// clean that follows lease A, lease B, on the same user, looks for each
 /// through the tool that would use it, the slot user runs `crontab -l` and `atq`, and
 /// root reads the process table and `hdiutil info`. Background Task Management entries
-/// of the uid, if the agent made any, are gone too.
+/// of the uid, if the agent made any, are among the findings too.
 ///
-/// Catches every step of the clean skipped, each turning its own rows red: the
-/// bootout (agent, apple-agent), the crontab and `at` sweep (crontab, at), the image detach (image),
-/// the IPC removal (sem), the home wipe (home, defaults, keychain, agent), the
-/// `/var/folders` wipe (T, C), the shared sweep (tmp, var-tmp, shared).
-#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
-#[tokio::test]
-async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
+/// `mutant` makes the clean of the slot wrong on purpose ([`Mutant`]); `None` is the
+/// clean as the daemon runs it. `name` names the scratch directory and the user.
+async fn freshness(name: &str, mutant: Option<Mutant>) -> Fresh {
     assert_root();
-    let scratch = Scratch::new("fresh");
-    let users = Users::new("fresh", 1);
+    let scratch = Scratch::new(name);
+    let users = Users::new(name, 1);
     let user = users.0[0].clone();
     let cas = Arc::new(MemoryCas::default());
-    let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
+    let config = config(&scratch, users.pool());
+    let rt = match mutant {
+        None => NativeRuntime::new(config, Arc::clone(&cas)),
+        Some(mutant) => NativeRuntime::with_clean_mutant(config, Arc::clone(&cas), mutant),
+    };
+    let rt = rt.expect("runtime");
     let mark = format!("kbf-fresh-{}", std::process::id());
     let setuid = scratch.setuid_sleep();
     let act = scratch.act();
@@ -405,29 +403,48 @@ async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
         .map(|(row, _)| *row)
         .filter(|row| !planted.contains(*row))
         .collect();
-    let red: BTreeSet<&str> = found.iter().map(|(row, _)| row.as_str()).collect();
+    let red: BTreeSet<String> = found.iter().map(|(row, _)| row.clone()).collect();
     let diagnosis = diagnosis(&user);
     eprintln!(
-        "freshness: planted {planted:?}; red rows {red:?}; found {found:?}\n{}",
+        "freshness {name}: planted {planted:?}; red rows {red:?}; found {found:?}\n{}",
         outside.text
     );
-    assert_eq!(
-        first.exit_code, 0,
-        "lease A: {a_out}{a_err}\n{}",
-        outside.text
-    );
+    Fresh {
+        not_planted: not_planted.into_iter().map(str::to_owned).collect(),
+        found,
+        red,
+        a_exit: first.exit_code,
+        a_text: format!("{a_out}{a_err}"),
+        b_exit: second.exit_code,
+        b_out,
+        b_err,
+        outside: outside.text,
+        diagnosis,
+    }
+}
+
+/// The freshness test. Lease A leaves a marker in each place of [`ROWS`], and after the
+/// clean that follows it lease B, on the same user, finds none ([`freshness`]).
+///
+/// The test of the clean as the daemon runs it; the mutant tests below run the same
+/// scenario with one step of the clean skipped and show which rows then turn red. This
+/// one fails if a row was not planted, so a row cannot pass by never having been left.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
+#[tokio::test]
+async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
+    let fresh = freshness("fresh", None).await;
+    fresh.assert_ran();
     assert!(
-        not_planted.is_empty(),
-        "lease A did not plant {not_planted:?} (so those rows prove nothing):\n{a_out}{a_err}\n{}\n{diagnosis}",
-        outside.text
-    );
-    assert_eq!(second.exit_code, 0, "lease B: {b_out}{b_err}");
-    assert!(b_out.ends_with("checked\n"), "lease B: {b_out}{b_err}");
-    assert!(
-        found.is_empty(),
-        "what lease A left was found, rows {red:?}: {found:?}\n{diagnosis}"
+        fresh.found.is_empty(),
+        "what lease A left was found, rows {:?}: {:?}\n{}",
+        fresh.red,
+        fresh.found,
+        fresh.diagnosis
     );
 }
+
+#[path = "slot_clean/mutants.rs"]
+mod mutants;
 
 /// `go` in lease A's directory: it ends lease A's wait.
 fn scratch_go(a_root: &Path) -> PathBuf {

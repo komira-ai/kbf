@@ -19,7 +19,7 @@ use kbf_daemon::uid;
 use tokio::process::Child;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::clean::{self, Outcome};
+use super::clean::{self, Mutant, Mutated, Outcome};
 use super::{AS_USER_ARG, Pool, SlotUser};
 use crate::network::{Isolation, Network};
 use crate::procs;
@@ -86,6 +86,21 @@ impl Slots {
     /// # Errors
     /// A user cannot be resolved, or its home lies in a place the clean sweeps.
     pub fn start(pool: &Pool, within: Duration) -> io::Result<Self> {
+        Self::start_mutated(pool, within, None)
+    }
+
+    /// [`Slots::start`] with the clean made wrong on purpose when `mutant` is given
+    /// ([`clean::Mutant`]): for the mutant tests of `tests/slot_clean.rs` alone. `None`
+    /// is [`Slots::start`].
+    ///
+    /// # Errors
+    /// As [`Slots::start`].
+    #[doc(hidden)]
+    pub fn start_mutated(
+        pool: &Pool,
+        within: Duration,
+        mutant: Option<Mutant>,
+    ) -> io::Result<Self> {
         let program = kbf_daemon::keeper::program()?;
         let mut ready = Vec::new();
         for user in pool.users() {
@@ -104,7 +119,7 @@ impl Slots {
             }
             warn_if_indexed(&slot.home);
         }
-        let cleaner = mac_cleaner(within, program.clone());
+        let cleaner = mac_cleaner(within, program.clone(), mutant);
         Ok(Self::with(ready, cleaner, program))
     }
 
@@ -156,15 +171,19 @@ impl Slots {
     }
 }
 
-/// The cleaner of a root daemon's slots: [`host::MacSlot`] through [`clean::clean`].
-fn mac_cleaner(within: Duration, program: PathBuf) -> Cleaner {
+/// The cleaner of a root daemon's slots: [`host::MacSlot`] through [`clean::clean`],
+/// wrapped in [`Mutated`] when `mutant` is given (only a test gives one).
+fn mac_cleaner(within: Duration, program: PathBuf, mutant: Option<Mutant>) -> Cleaner {
     Arc::new(move |ready: &Ready| {
         let slot = host::MacSlot {
             ready,
             within,
             program: &program,
         };
-        clean::clean(&slot)
+        match mutant {
+            None => clean::clean(&slot),
+            Some(mutant) => clean::clean(&Mutated::new(&slot, mutant)),
+        }
     })
 }
 
