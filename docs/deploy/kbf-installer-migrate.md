@@ -22,7 +22,7 @@ installed is a different case, see "A host the Mac kit installed" below, and
 ```text
 kbf-installer migrate [--apply] --unit kbf-daemon.service [--unit ...] \
     [--helper-unit kbf-helper.service] [--installer-unit kbf-installer.service] \
-    [--release-source url|frontend] [--min-generation N] [--fetch-user NAME]
+    [--release-source url|frontend|bundled] [--min-generation N] [--fetch-user NAME]
 kbf-installer migrate --rollback [--apply] [--unit ...] [--helper-unit ...] [--installer-unit ...]
 ```
 
@@ -31,7 +31,7 @@ kbf-installer migrate --rollback [--apply] [--unit ...] [--helper-unit ...] [--i
 | `--unit` | a unit that runs kbf from `/usr/local/kbf/current`, to repoint at the installer's tree; repeat for several; `.service`, or `.plist` for launchd |
 | `--helper-unit` | the old helper's unit: stopped and disabled, so the installer is the only manager |
 | `--installer-unit` | the installer's own unit: enabled and started as the last step; a rollback stops and disables it first |
-| `--release-source` | where the host gets its releases (`url`, the default, or `frontend`); decides where the replay floor is seeded from |
+| `--release-source` | where the host gets its releases (`url`, the default, `frontend`, or `bundled`, which fetches nothing); decides where the replay floor is seeded from |
 | `--min-generation` | the lowest generation an order may carry; the floor when there is no frontend to ask |
 | `--fetch-user` | the unprivileged user the old binaries' `--version --json` runs as; default `kbf-fetch` (`_kbf-fetch` on a Mac) |
 | `--rollback` | put the old layout back instead |
@@ -147,8 +147,8 @@ decide the generation:
 
 | source | `--min-generation` | result |
 |---|---|---|
-| `url` (default) | given | generation is that value |
-| `url` | not given | generation zero, and the warning `NO REPLAY FLOOR: no frontend to ask and no --min-generation: replay memory starts from generation zero, so a stale signed order for an older release is not refused until you set min_generation` |
+| `url` (default) or `bundled` | given | generation is that value |
+| `url` or `bundled` | not given | generation zero, and the warning `NO REPLAY FLOOR: no frontend to ask and no --min-generation: replay memory starts from generation zero, so a stale signed order for an older release is not refused until you set min_generation` |
 | `frontend` | given | the frontend's generation, or the flag when the frontend cannot be asked (a warning says so) |
 | `frontend` | not given | the frontend's generation; when it cannot be had, exit 5 (`the frontend's current generation could not be had (...): retry, or give --min-generation`) |
 

@@ -23,6 +23,10 @@ const ROOT: Owner = Owner { uid: 0, gid: 0 };
 
 const URL_FILE: &str = "release_source = \"url\"\nrelease_url = \"https://mirror.example\"\n";
 
+/// The frontend snapshot of a LAN-pull host: the worker listener, the root-owned copy of the
+/// CA that authenticates it, and that copy's digest.
+const SNAPSHOT: &str = "frontend_url = \"https://frontend.lan:8443\"\nfrontend_ca = \"/var/lib/kbf-installer/frontend-ca.pem\"\nfrontend_ca_sha256 = \"d2a84f4b8b650937ec8f73cd8be2c74add5a911ba64df27458ed8229da804a26\"\n";
+
 /// What is on the fake host, changed by a test between two fetches.
 #[derive(Default)]
 struct Disk {
@@ -253,25 +257,79 @@ fn a_fetch_is_made_from_the_file_and_the_hosts_parts() {
     assert_eq!(real.host.platform(), Platform::Linux);
 }
 
-/// The frontend source is not buildable: `installer.toml` has no key for the frontend's
-/// address or its pinned CA, so the fetch is refused with that said, and the default file (which
-/// is a frontend source) is the case.
+/// The frontend source is not buildable yet: `installer.toml` can now hold the frontend's
+/// address and its pinned CA (`frontend_url`, `frontend_ca`, `frontend_ca_sha256`), and this
+/// build reads them without using them, so the fetch is refused with that said. The default
+/// file (which is a frontend source), the file that names the source, and the file with the
+/// whole snapshot are the cases.
 ///
 /// Catches a frontend source built from nothing (a fetch to no address, or with the system's
-/// roots where the farm's CA is required).
+/// roots where the farm's CA is required), a message that still says the file has no key for
+/// them, and the snapshot read as a licence to fetch.
 ///
 /// Mutants planted: the frontend arm returning a `url` source.
 #[test]
-fn the_frontend_source_is_refused_until_installer_toml_can_name_it() {
+fn the_frontend_source_is_refused_until_the_fetcher_uses_the_snapshot() {
     let rig = Rig::new("host-fetcher-frontend");
-    for text in ["", "release_source = \"frontend\"\n"] {
+    let snapshot = format!("release_source = \"frontend\"\n{SNAPSHOT}");
+    for text in ["", "release_source = \"frontend\"\n", snapshot.as_str()] {
         rig.write(text);
         let why = rig.refused();
         assert!(
-            why.contains("release_source = \"frontend\"") && why.contains("no key"),
-            "{why}"
+            why.contains("release_source = \"frontend\"")
+                && why.contains("cannot fetch from the frontend yet"),
+            "{text:?}: {why}"
         );
     }
+}
+
+/// A bundled host fetches nothing, and this build has no fetcher for the release the package
+/// carries (a later change), so every fetch under `bundled` is refused naming the source, and
+/// not read as a `url` or a `frontend` source.
+///
+/// Catches `bundled` falling through to a source that fetches (the network where the host is
+/// air-gapped), and a refusal that does not say why.
+///
+/// Mutants to plant: the `bundled` arm returning the `frontend` refusal (red: the message);
+/// returning a `url` source built from nothing (red: no refusal).
+#[test]
+fn a_bundled_host_is_refused_by_a_build_without_the_bundled_fetcher() {
+    let rig = Rig::new("host-fetcher-bundled");
+    rig.write("release_source = \"bundled\"\n");
+    let why = rig.refused();
+    assert!(
+        why.contains("release_source = \"bundled\"") && why.contains("no bundled fetcher"),
+        "{why}"
+    );
+}
+
+/// `release_ca` names the roots a `url` source is checked against instead of the system's, and
+/// this build does not use the file yet: a fetch with the key set is refused, not made with
+/// the system's roots (which would widen what the operator narrowed). The same file without the
+/// key is a `url` source as before.
+///
+/// Catches a key that is parsed and silently dropped on the way to the fetch child.
+///
+/// Mutants to plant: the `release_ca` arm removed (the key ignored: red, no refusal).
+#[test]
+fn a_url_host_with_a_release_ca_is_refused_not_fetched_with_the_system_roots() {
+    let rig = Rig::new("host-fetcher-release-ca");
+    rig.write(&format!(
+        "{URL_FILE}release_ca = \"/var/lib/kbf-installer/release-ca.pem\"\n"
+    ));
+    let why = rig.refused();
+    assert!(
+        why.contains("release_ca") && why.contains("does not use it yet"),
+        "{why}"
+    );
+    rig.write(URL_FILE);
+    assert_eq!(
+        rig.made().source,
+        Source::Url {
+            base: "https://mirror.example".to_owned(),
+            ca_file: None
+        }
+    );
 }
 
 /// `installer.toml`'s `source_refs` narrows `installer.conf`'s list through the fetcher: the

@@ -1662,3 +1662,67 @@ fn a_path_is_not_joined_to_a_relative_root() {
         PathBuf::from("/srv/root/etc/kbf/installer.toml")
     );
 }
+
+/// Catches the release keys' flags missing from the command line of `setup`: `bundled` is a
+/// value of `--release-source`, and the four flags that write `release_ca` and the frontend
+/// snapshot reach the arguments `setup` validates, each by its own name. (The checks and the
+/// writing are `setup/release_config_tests.rs`'s.)
+///
+/// Mutants to plant: `Bundled` removed from `ReleaseSource`; a flag renamed; the flattened
+/// `ReleaseFlags` removed from `SetupArgs`.
+#[test]
+fn setup_takes_bundled_and_the_release_key_flags() {
+    let cli = parse(&[
+        "setup",
+        "--mode=daemon",
+        "--release-source=bundled",
+        "--release-ca",
+        "/ca.pem",
+        "--frontend-worker-url",
+        "https://w.example:8981",
+        "--frontend-ca",
+        "/fe.pem",
+        "--frontend-ca-sha256",
+        "ab",
+    ]);
+    let Verb::Setup(args) = &cli.verb else {
+        panic!("not the setup verb");
+    };
+    assert_eq!(args.release_source, Some(ReleaseSource::Bundled));
+    assert_eq!(args.release.release_ca.as_deref(), Some("/ca.pem"));
+    assert_eq!(
+        args.release.frontend_worker_url.as_deref(),
+        Some("https://w.example:8981")
+    );
+    assert_eq!(args.release.frontend_ca.as_deref(), Some("/fe.pem"));
+    assert_eq!(args.release.frontend_ca_sha256.as_deref(), Some("ab"));
+    let plain = parse(&["setup", "--mode=daemon"]);
+    let Verb::Setup(args) = &plain.verb else {
+        panic!("not the setup verb");
+    };
+    assert_eq!(
+        args.release,
+        crate::setup::release_keys::ReleaseFlags::default()
+    );
+}
+
+/// Catches a bundled host's replay floor asked of a frontend it does not have: `migrate` seeds the
+/// floor from the frontend only for a `frontend` host, and a `url` or `bundled` host takes it
+/// from `--min-generation` or starts without one, saying so.
+///
+/// Mutants to plant: `Bundled` mapped to `Frontend` (the migration would then ask for a frontend
+/// and stop); `Url` mapped to `Frontend`.
+#[test]
+fn a_bundled_hosts_replay_floor_is_seeded_like_a_url_hosts() {
+    assert_eq!(floor_source(ReleaseSource::Url), migrate::Source::Url);
+    assert_eq!(floor_source(ReleaseSource::Bundled), migrate::Source::Url);
+    assert_eq!(
+        floor_source(ReleaseSource::Frontend),
+        migrate::Source::Frontend
+    );
+    let cli = parse(&["migrate", "--release-source", "bundled"]);
+    let Verb::Migrate(args) = &cli.verb else {
+        panic!("not the migrate verb");
+    };
+    assert_eq!(args.release_source, ReleaseSource::Bundled);
+}

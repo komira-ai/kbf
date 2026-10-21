@@ -357,6 +357,16 @@ fn user_found(
         })
 }
 
+/// Where the replay floor of a host whose releases come from `source` is seeded from. Only a
+/// frontend can be asked for it; a `url` host and a `bundled` one have none to ask, so the floor
+/// is `--min-generation` or, said aloud, nothing.
+fn floor_source(source: ReleaseSource) -> migrate::Source {
+    match source {
+        ReleaseSource::Url | ReleaseSource::Bundled => migrate::Source::Url,
+        ReleaseSource::Frontend => migrate::Source::Frontend,
+    }
+}
+
 /// `migrate`: the report to print, or why it stopped.
 fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String, Failure> {
     let rehearsal = root != Path::new("/");
@@ -384,10 +394,7 @@ fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String
         helper_unit: args.helper_unit.clone(),
         installer_unit: args.installer_unit.clone(),
         seed: migrate::Seed {
-            source: match args.release_source {
-                ReleaseSource::Url => migrate::Source::Url,
-                ReleaseSource::Frontend => migrate::Source::Frontend,
-            },
+            source: floor_source(args.release_source),
             min_generation: args.min_generation,
         },
         node_user,
