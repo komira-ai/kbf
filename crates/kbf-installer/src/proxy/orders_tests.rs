@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_update::record::{file_name, parse_file_name};
-use kbf_update::{MAX_RECORDS, RecordError, Verb as RecordVerb};
+use kbf_update::{MAX_RECORDS, OrderRecord, RecordError, Verb as RecordVerb};
 
 use super::api::traits::OrderWriter;
 use super::model::{Locator, Source, Verb};
@@ -700,6 +700,79 @@ fn a_record_the_reader_would_refuse_is_not_built() {
         let built = record(&locator(verb), record_verb).expect("a record the reader takes");
         assert_eq!(built.order_id, 7);
     }
+}
+
+/// Catches the source lost between the API and the record the root half reads: the record of a
+/// `frontend_update` names its source when it is not a fetch, the root half's own reader takes
+/// that record, and the record of a fetch is the bytes it has always been (no `source`), so a
+/// root half from before the key reads it. A locator that is written again is written as it
+/// was, source included: the swap rewrites a record the root half has not yet taken, and a
+/// staged order rewritten as a fetch would fetch.
+///
+/// Mutants planted: the record built with source `fetch`; the key written for a fetch; the
+/// source dropped from the locator that is written again.
+#[test]
+fn a_frontend_update_record_names_its_source_only_when_it_is_not_a_fetch() {
+    let d = dirs("source");
+    let mut spool = open(&d, &Clock::at(1_000));
+    let staged = spool
+        .write_update(&commit('a'), 900, Source::Staged)
+        .expect("written");
+    assert_eq!(staged.source, Source::Staged);
+    let path = d.orders.join(file_name(staged.epoch, staged.order_id));
+    let bytes = fs::read(&path).expect("the record");
+    let text = String::from_utf8(bytes.clone()).expect("text");
+    assert!(text.contains(r#""source":"staged""#), "{text}");
+    let parsed = OrderRecord::parse(&bytes).expect("the reader takes it");
+    assert_eq!(parsed.verb, RecordVerb::FrontendUpdate);
+    assert_eq!(parsed.source, Source::Staged);
+
+    fs::remove_file(&path).expect("the root half took it");
+    spool.frontend_update(&staged).expect("written again");
+    let bytes = fs::read(&path).expect("the record");
+    let again = OrderRecord::parse(&bytes).expect("a record");
+    assert_eq!(again.source, Source::Staged);
+
+    let fetching = spool
+        .write_update(&commit('a'), 900, Source::Fetch)
+        .expect("written");
+    let path = d.orders.join(file_name(fetching.epoch, fetching.order_id));
+    let text = fs::read_to_string(&path).expect("the record");
+    assert!(!text.contains("source"), "{text}");
+    let plain = frontend(&mut spool);
+    let path = d.orders.join(file_name(plain.epoch, plain.order_id));
+    let text = fs::read_to_string(&path).expect("the record");
+    assert!(!text.contains("source"), "{text}");
+}
+
+/// Catches a record that names a source for a verb the reader gives none: a `confirm` or a
+/// `revert` with a source is refused when it is built, before the counter moves, and the
+/// `frontend_update` with the same source is built.
+///
+/// Mutant planted: the source left out of the record (the `confirm` is built).
+#[test]
+fn a_record_that_names_a_source_for_a_verb_that_takes_none_is_not_built() {
+    let locator = |verb| Locator {
+        order_id: 7,
+        epoch: EPOCH,
+        generation: 7,
+        verb,
+        commit: commit('a'),
+        window_s: 0,
+        source: Source::Staged,
+    };
+    for (verb, record_verb) in [
+        (Verb::Confirm, RecordVerb::Confirm),
+        (Verb::Revert, RecordVerb::Revert),
+    ] {
+        let err = record(&locator(verb), record_verb).unwrap_err();
+        assert!(
+            matches!(err, SpoolError::Record(RecordError::Unexpected(_))),
+            "{err:?}"
+        );
+    }
+    let built = record(&locator(Verb::FrontendUpdate), RecordVerb::FrontendUpdate);
+    assert_eq!(built.expect("built").source, Source::Staged);
 }
 
 /// Catches `frontend_update` (the swap's write of a locator the API already issued)
