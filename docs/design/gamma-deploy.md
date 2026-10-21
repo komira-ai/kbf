@@ -114,8 +114,10 @@ release it is about to move is the one the offer is for. Nothing is taken from a
   recorded in the summary (`offer.kind: "waived"`); it is for a test farm.
 - **The commit**: the offer's `commit` is `--commit` (`offer_wrong_commit`).
 - **The set**: with an offer the bundle must carry `SHA256SUMS` (one entry, not uploaded). Its
-  SHA-256 is the offer's `set_hash` (`offer_set_mismatch`), and every tarball in the bundle is
-  the file those sums name, by its bytes (`offer_file_mismatch`). A bundle with no
+  SHA-256 is the offer's `set_hash` (`offer_set_mismatch`), and every tarball in the bundle,
+  and every platform's version facts (`kbf-<commit>-<platform>.version.json`, which the store
+  makes a node's offer from), is the file those sums name, by its bytes
+  (`offer_file_mismatch`). A bundle with no
   `SHA256SUMS`, or no bundle, refuses (`offer_set_unverified`): the deploy cannot say which set
   it moves. Attestation bundles are not in the sums; they are verified offline downstream.
 - **The `meta_log`**: the `kbf` of the host's platform in the bundle is first attested offline
@@ -173,7 +175,9 @@ Each is a named entry in the summary's `steps`, with its duration.
 
 1. `bundle`: with `--bundle -`, a tar on standard input holding
    `<name>-<commit>-<platform>.tar.gz` and the same plus `.attestation`, for `kbf` and
-   `kbf-daemon` only, and the two entries read and not uploaded: `SHA256SUMS` and, for
+   `kbf-daemon` only, a platform's `kbf-<commit>-<platform>.version.json` (stored as
+   `version.json`, put before the platform's tarballs), and the two entries read and not
+   uploaded: `SHA256SUMS` and, for
    `--offer -`, `offer.json`. Any other entry is exit 2 before an upload. Each file is
    `PUT /v1/releases/{commit}/{platform}/{name}`; other bytes under a stored key is 409, exit 3.
    This is bytes, not trust: every node and the frontend's own update verify the

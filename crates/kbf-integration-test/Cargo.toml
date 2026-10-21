@@ -95,6 +95,8 @@ rustls.workspace = true
 saphyr-parser.workspace = true
 sha2.workspace = true
 syn.workspace = true
+# `tests/stage_offer_bundle.rs`: the tar the stager makes, read entry by entry, and edited.
+tar.workspace = true
 # The real-Envoy tests (tests/envoy_box): stub servers and Envoy as a child process.
 tokio = { workspace = true, features = ["io-util", "net", "process", "sync", "time"] }
 tokio-rustls.workspace = true
