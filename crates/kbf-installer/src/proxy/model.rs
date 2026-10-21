@@ -342,7 +342,7 @@ impl Plan {
             to: intent.to.clone(),
             nodes: intent.nodes,
             rollback: intent.rollback,
-            source: Source::Fetch,
+            source: intent.source,
             old_slot: intent.old_slot,
             timing,
         }
@@ -403,7 +403,7 @@ impl Intent {
             to: plan.to.clone(),
             nodes: plan.nodes,
             rollback: plan.rollback,
-            source: Source::Fetch,
+            source: plan.source,
             phase: Phase::Staged,
             phase_started: now,
             bake_started: None,
@@ -470,4 +470,11 @@ pub enum DesiredError {
     /// answered that it is busy or failed. Sending the same order again is the same offer.
     #[error("{0}")]
     Unreached(String),
+}
+
+impl DesiredError {
+    /// Whether the order got no answer to go by, so that sending it again is the same offer.
+    pub fn is_unreached(&self) -> bool {
+        matches!(self, DesiredError::Unreached(_))
+    }
 }

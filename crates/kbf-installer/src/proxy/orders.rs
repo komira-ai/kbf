@@ -356,9 +356,10 @@ impl Inner {
     }
 }
 
-/// The record of `locator`: the six keys of every record and nothing else (no components,
-/// no facts), as the root half's `frontend_update`, `confirm` and `revert` are, checked by
-/// the rules the root half's reader holds.
+/// The record of `locator`: the six keys of every record, and `source` when it is not `fetch`,
+/// and nothing else (no components, no facts), as the root half's `frontend_update`, `confirm`
+/// and `revert` are, checked by the rules the root half's reader holds (which refuse a source on
+/// a `confirm` or a `revert`).
 pub(super) fn record(locator: &Locator, verb: RecordVerb) -> Result<OrderRecord, SpoolError> {
     let record = OrderRecord {
         order_id: locator.order_id,
@@ -369,8 +370,9 @@ pub(super) fn record(locator: &Locator, verb: RecordVerb) -> Result<OrderRecord,
         window_s: locator.window_s,
         components: Vec::new(),
         expected: None,
-        // The proxy's records name no source: they fetch.
-        source: kbf_update::Source::Fetch,
+        // A source that is not `fetch` is the one thing a record of the proxy adds to the six
+        // keys: the reader holds it to the verbs that take it.
+        source: locator.source,
     };
     record.check().map_err(SpoolError::Record)?;
     Ok(record)

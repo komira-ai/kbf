@@ -24,7 +24,18 @@
 //! `frontend_update` order (a locator; the root half fetches, verifies and stages without
 //! flipping, FP section 2) and answers 202 with phase `accepted`. From then on the API
 //! reads `status.json` on every call that matters to it and on the actor's own tick
-//! ([`actor::ActorTiming::tick`]):
+//! ([`actor::ActorTiming::tick`]).
+//!
+//! A request also says where its release comes from (`source`). `fetch`, or nothing, is the
+//! source the installer is configured with; `staged` is the release the host's package
+//! carries (`available` in `status.json`). `POST` refuses a source the host cannot take
+//! before it saves or writes anything: 409 `source_refused` for a fetch on a host whose
+//! `release_source` is bundled, and for a staged update that asks for a rollback or for the
+//! nodes (its order for the nodes does not name a source yet); 422 `not_staged` for a staged
+//! update whose commit is not the one the package carries. The source is kept in the request
+//! map, written into the order, reported by the status and handed to the supervisor.
+//!
+//! What `status.json` says moves the update:
 //!
 //! - `state: fetching` is phase `fetching`;
 //! - `state: refused` with `refused_order_id` naming our order is phase `failed` with the
@@ -60,8 +71,9 @@
 //!   cannot attribute a refusal. The API reads `refused_order_id`
 //!   ([`traits::InstallerStatus`]) and a refusal is an update's own only when that names
 //!   its order ([`core::Core::advance`]); a stale refusal names an older order, or none.
-//!   The root half does not write the field yet, so today a refusal ends its update at
-//!   the staging deadline, with reason `timeout`, not with its own word.
+//!   The root half writes the field for every order it refuses, so a refused update ends
+//!   with the installer's own word. A root half from before the field names no order, and
+//!   then a refusal ends its update at the staging deadline, with reason `timeout`.
 //! - **Compatibility before the fetch (Q1, U9).** `POST` asks the gate with no facts, so
 //!   a 409 `incompatible` or 422 at `POST` time is possible only for what U9 can know
 //!   without the release; the verdict on the staged facts arrives as `failed` /

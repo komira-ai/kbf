@@ -101,6 +101,12 @@
 //!   it never lands, the new child keeps serving, the staged release is kept, the nodes
 //!   are not sent, the old child is drained and retired, and the update ends `failed`
 //!   with `failure.step == confirm`. After the switch no failure drops the staged release.
+//! - **Nodes** (step 9): the order for the nodes is posted again, one `Timing::poll` apart,
+//!   while the new child gives no answer, for `Timing::desired_within`. A child that answers
+//!   and refuses it (a 4xx, or a 409 with a code such as `not_own`) and one that never answers
+//!   end the update `failed` with `failure.step == nodes` (`failure.reason` is the child's code
+//!   and words, or `timeout`). The frontend was swapped and keeps serving, and the old child is
+//!   still drained and retired. The order names the update's source when it is not a fetch.
 //! - **All-in-one stop**: after `quiesce`, the proxy sends SIGTERM to the old process
 //!   ([`aio`]).
 //! - A dead new child during the bake (the proxy running) leaves the update parked in

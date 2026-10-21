@@ -7,8 +7,6 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use kbf_update::Source;
-
 use crate::CommitId;
 use crate::testkit::{A, B, c};
 

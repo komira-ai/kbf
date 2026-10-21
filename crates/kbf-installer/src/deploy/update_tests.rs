@@ -486,10 +486,10 @@ fn an_update_that_failed_at_the_order_for_the_nodes_exits_three_with_the_childs_
 #[test]
 fn the_source_flag_is_fetch_or_staged_and_defaults_to_fetch() {
     assert_eq!(args(&["--api", "127.0.0.1:8443"]).source, Source::Fetch);
-    let staged = args(&["--api", "127.0.0.1:8443", "--source", "staged"]);
-    assert_eq!(staged.source, Source::Staged);
-    let fetch = args(&["--api", "127.0.0.1:8443", "--source", "fetch"]);
-    assert_eq!(fetch.source, Source::Fetch);
+    let packaged = args(&["--api", "127.0.0.1:8443", "--source", "staged"]);
+    assert_eq!(packaged.source, Source::Staged);
+    let fetching = args(&["--api", "127.0.0.1:8443", "--source", "fetch"]);
+    assert_eq!(fetching.source, Source::Fetch);
     for bad in ["bogus", "Staged", ""] {
         let mut full = vec!["kbf-installer", "update", "--commit", B, "--frontend"];
         full.extend_from_slice(&["--api", "127.0.0.1:8443", "--source", bad]);

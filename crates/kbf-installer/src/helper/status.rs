@@ -105,7 +105,7 @@ pub fn render_with(state: &State, memory: &Memory, unverified: &[CommitId]) -> V
         state: word(state, memory),
         refusal: &memory.refusal,
         acked_order_id: memory.acked_order_id.max(memory.last_acted_id),
-        refused_order_id: None,
+        refused_order_id: memory.refused_order_id,
         staged,
         envoy: Envoy {
             current: None,

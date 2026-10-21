@@ -794,13 +794,44 @@ fn an_offer_on_standard_input_is_judged_before_the_farm_is_asked() {
     assert_eq!((code, out.as_str()), (2, ""), "{err}");
 }
 
-/// Writes `text` as the host's `installer.toml`, where the deploy reads it.
-fn installer_toml(rig: &Rig, text: &str) {
+/// Writes `content` as the host's `installer.toml`, where the deploy reads it.
+fn installer_toml(rig: &Rig, content: impl AsRef<[u8]>) {
     let base = kbf_host::Root::new(&rig.dir).unwrap();
     let layout = Layout::new(base, Platform::current());
     let file = layout.join(&layout.installer_toml());
     fs::create_dir_all(file.parent().unwrap()).unwrap();
-    fs::write(&file, text).unwrap();
+    fs::write(&file, content).unwrap();
+}
+
+/// Catches a host taken for bundled that is not, and one that is not noticed: only a settings
+/// file that is text, is TOML and says `release_source = "bundled"` makes a bundled host. A root
+/// that is not absolute, no file, a file that is not text, not TOML, says another source or a
+/// value that is not a word, and one whose `bundled` is past the size the installer reads,
+/// are each not bundled here (the installer refuses a bad file where it reads it).
+///
+/// Mutants planted: any `release_source` taken for bundled; the size cap dropped; a file that
+/// cannot be parsed taken for bundled.
+#[test]
+fn only_a_settings_file_that_says_bundled_makes_a_bundled_host() {
+    let rig = Rig::new("is-bundled");
+    assert!(!cli::is_bundled(std::path::Path::new("not/absolute")));
+    assert!(!cli::is_bundled(&rig.dir));
+    let mut past_the_cap = vec![b'#'; 70_000];
+    past_the_cap.extend_from_slice(b"\nrelease_source = \"bundled\"\n");
+    let cases: [(&[u8], bool); 7] = [
+        (b"release_source = \"bundled\"\n", true),
+        (b"release_source = \"frontend\"\n", false),
+        (b"release_source = 3\n", false),
+        (b"confirm_window_s = 600\n", false),
+        (b"= = =\n", false),
+        (&[0xff, 0xfe, 0xfd], false),
+        (&past_the_cap, false),
+    ];
+    for (content, want) in cases {
+        installer_toml(&rig, content);
+        let text = String::from_utf8_lossy(&content[..content.len().min(40)]).into_owned();
+        assert_eq!(cli::is_bundled(&rig.dir), want, "{text}");
+    }
 }
 
 /// Catches a deploy on a host that fetches nothing going on to read its bundle: a deploy can

@@ -7,8 +7,6 @@
 
 use std::time::Duration;
 
-use kbf_update::Source;
-
 use super::model::{
     Failure, Halt, Intent, Phase, Plan, ProcIdent, Request, RoleInfo, RoleState, Slot, Start, Step,
 };
@@ -148,7 +146,7 @@ impl<'a> Swap<'a> {
         }
         // Nodes follow a confirmed release only: with the confirm failed the host still
         // boots the old `current`, so the nodes are not sent to the new one.
-        if self.intent.phase <= Phase::Nodes && !self.confirm_failed() {
+        if self.intent.phase <= Phase::Nodes && !self.confirm_failed() && !self.nodes_failed() {
             go_end!(self.nodes());
         }
         if self.intent.mode == super::model::Mode::AllInOne {
@@ -191,6 +189,12 @@ impl<'a> Swap<'a> {
         matches!(&self.intent.failure, Some(f) if f.step == Step::Confirm)
     }
 
+    /// The order for the nodes would not land; the failure is recorded and the update goes on
+    /// to retire the old child. The nodes are not asked again (a restart finds this record).
+    pub(super) fn nodes_failed(&self) -> bool {
+        matches!(&self.intent.failure, Some(f) if f.step == Step::Nodes)
+    }
+
     /// The phase a swap that got through the drain ends in.
     pub(super) fn end_phase(&self) -> Phase {
         if self.intent.rolling_back {
@@ -202,7 +206,7 @@ impl<'a> Swap<'a> {
             } else {
                 Phase::RolledBack
             }
-        } else if self.confirm_failed() {
+        } else if self.confirm_failed() || self.nodes_failed() {
             Phase::Failed
         } else {
             Phase::Done
@@ -596,23 +600,52 @@ impl<'a> Swap<'a> {
         }
     }
 
-    /// Step 9: the new child updates the nodes. A failure here does not undo the frontend.
+    /// Step 9: the new child updates the nodes. The order is posted again, one `poll` apart,
+    /// while the child gives no answer (for `desired_within`); a child that answers and refuses
+    /// it, and one that never answers, end the update `failed` at `nodes`, with the child's own
+    /// code or `timeout`. A failure here does not undo the frontend: it was swapped and keeps
+    /// serving, and the old child is drained and retired as in any update.
     pub(super) fn nodes(&mut self) -> Result<Flow, Halt> {
         if !self.plan.nodes {
             return Ok(Flow::Go);
         }
         self.set_phase(Phase::Nodes)?;
-        match self
-            .ports
-            .admin
-            .post_desired(self.intent.new_slot, &self.plan.to, Source::Fetch)
-        {
-            Ok(()) => {
+        let t = self.plan.timing;
+        let began = self.now();
+        let (admin, slot) = (self.ports.admin, self.intent.new_slot);
+        let (to, source) = (self.plan.to.clone(), self.plan.source);
+        loop {
+            let posted = admin.post_desired(slot, &to, source);
+            let Err(e) = posted else {
                 self.intent.nodes_posted = true;
                 self.save()?;
+                return Ok(Flow::Go);
+            };
+            if !e.is_unreached() {
+                return self.fail_nodes(e.to_string());
             }
-            Err(e) => self.note(format!("posting desired failed: {e}")),
+            self.note(format!("posting desired failed: {e}"));
+            if self.now().saturating_sub(began) >= t.desired_within {
+                let reason = format!(
+                    "timeout: no answer in {} s (the last: {e})",
+                    t.desired_within.as_secs()
+                );
+                return self.fail_nodes(reason);
+            }
+            self.sleep(t.poll)?;
         }
+    }
+
+    /// The order for the nodes will not land: record why and go on to drain the old child.
+    /// Only the nodes were not told, so the phase is not `failed` yet: the end of the update
+    /// is (see [`Swap::end_phase`]).
+    fn fail_nodes(&mut self, reason: String) -> Result<Flow, Halt> {
+        self.note(format!("the order for the nodes failed: {reason}"));
+        self.intent.failure = Some(Failure {
+            step: Step::Nodes,
+            reason,
+        });
+        self.save()?;
         Ok(Flow::Go)
     }
 }

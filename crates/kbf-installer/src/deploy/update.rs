@@ -22,12 +22,22 @@
 //! Exit codes are `deploy`'s: 0 for `done` (and for a frontend that already runs the
 //! commit, which the summary says), 1 for `failed`, `rolled_back`, a timeout or an API that
 //! does not answer, 2 for a usage error, 3 when the release is incompatible or incomplete,
-//! 4 when an update is open, an old child is draining or the installer is busy.
+//! when the host will not take the source (`--source`: a host that fetches nothing is not told to
+//! fetch, and a package is asked only for the release it carries) or when the new frontend
+//! would not take the order for the nodes, 4 when an update is open, an old child is draining or
+//! the installer is busy.
+//!
+//! `--source` is `fetch` (the default: the installer fetches from the source it is configured
+//! with) or `staged` (the release the host's package carries). The request names it only when it
+//! is `staged`, so a fetch is the request every build has sent. A staged update takes no
+//! `--nodes` yet.
 
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::time::Duration;
+
+use kbf_update::Source;
 
 use super::api::{Https, Trust};
 use super::cli::{CALL_TIMEOUT, host_platform, read_token};
@@ -65,11 +75,16 @@ pub fn run(args: &UpdateArgs, out: &mut dyn Write, err: &mut dyn Write) -> Exit 
 }
 
 /// The client and the options for `args`, or what is wrong with them. `rng` is the random
-/// source of a request id the caller did not give.
+/// source of a request id the caller did not give. A staged update asking for the nodes is
+/// refused first, before anything is read: the order for the nodes does not name its source
+/// yet, so the proxy would refuse it too.
 pub(super) fn plan(
     args: &UpdateArgs,
     rng: fn(usize) -> Result<Vec<u8>, String>,
 ) -> Result<(Https, Options), String> {
+    if args.source == Source::Staged && args.nodes {
+        return Err("--source staged takes no --nodes yet".to_owned());
+    }
     let addr: SocketAddr = args
         .api
         .parse()
@@ -88,6 +103,7 @@ pub(super) fn plan(
     let api = Https::new(addr, &trust, token, CALL_TIMEOUT).map_err(|e| format!("--api: {e}"))?;
     let mut options = Options::new(args.commit.clone(), host_platform(), request_id);
     options.nodes = args.nodes;
+    options.source = args.source;
     options.poll = POLL;
     options.handover_timeout = Duration::from_secs(args.handover_timeout_s);
     Ok((api, options))

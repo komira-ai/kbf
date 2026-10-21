@@ -2,7 +2,8 @@
 //! (`docs/design/frontend-proxy.md`, section 4).
 //!
 //! `POST /v1/update/frontend {commit, request_id, nodes, rollback: false}` (`nodes` is
-//! [`super::Options::nodes`]: true for a deploy) starts it, and
+//! [`super::Options::nodes`]: true for a deploy; `"source": "staged"` follows when
+//! [`super::Options::source`] is not a fetch, and only then) starts it, and
 //! `GET /v1/update/frontend` is read until the update the POST named is `done` (the step
 //! succeeds), `failed` or `rolled_back` (it fails, with the step and the reason the API gave).
 //! The deploy does not set the desired release: with `nodes: true` the new frontend does, once
@@ -28,7 +29,7 @@ use super::api::{Reply, Request};
 use super::summary::{Exit, Frontend};
 use super::{Fail, Run, fail};
 use crate::proxy::api::model::{StatusBody, UpdateId, UpdateRequest};
-use crate::proxy::model::{Failure, Phase};
+use crate::proxy::model::{Failure, Phase, Step};
 
 const UPDATE: &str = "/v1/update/frontend";
 
@@ -88,6 +89,10 @@ fn refused(status: u16, body: &[u8]) -> Posted {
     match (status, why.error.as_str()) {
         (409, "same_commit") => Posted::Running,
         (409, "incompatible") => Posted::Stop(fail(Exit::Refused, "incompatible", said)),
+        // The host will not take the source the update names (it fetches nothing, or its
+        // package carries no such release): the same answer next time, not a busy frontend.
+        (409, "source_refused") => Posted::Stop(fail(Exit::Refused, "source_refused", said)),
+        (422, "not_staged") => Posted::Stop(fail(Exit::Refused, "not_staged", said)),
         (409, "state_lost" | "request_id_reused" | "request_id_retired") => {
             Posted::Stop(fail(Exit::Failed, "api_error", said))
         }
@@ -150,20 +155,28 @@ fn shown_instead(status: &StatusBody) -> String {
     }
 }
 
+/// Whether the update failed at the order for the nodes: the frontend itself was swapped and
+/// serves, and the new frontend would not take the order to update the nodes.
+fn at_nodes(failure: Option<&Failure>) -> bool {
+    failure.is_some_and(|f| f.step == Step::Nodes)
+}
+
 /// The failure of an update that ended `failed` or `rolled_back`, with the step and the
-/// reason as the API gave them.
+/// reason as the API gave them. A failure at the order for the nodes is exit 3 under its own
+/// reason, as every refusal is: the frontend is updated and the nodes were not told, which a
+/// second run of the same command does not change; any other failed update is exit 1.
 fn ended(id: &UpdateId, phase: Phase, failure: Option<&Failure>) -> Fail {
-    let reason = if phase == Phase::Failed {
-        "frontend_failed"
-    } else {
-        "frontend_rolled_back"
+    let (exit, reason) = match (phase, at_nodes(failure)) {
+        (Phase::Failed, true) => (Exit::Refused, "nodes_refused"),
+        (Phase::Failed, false) => (Exit::Failed, "frontend_failed"),
+        _ => (Exit::Failed, "frontend_rolled_back"),
     };
     let what = match failure {
         Some(f) => format!("at step {}: {}", word(&f.step), f.reason),
         None => "(the API named no step)".to_owned(),
     };
     fail(
-        Exit::Failed,
+        exit,
         reason,
         format!("update {} ended {} {what}", id.0, word(&phase)),
     )
@@ -199,7 +212,7 @@ impl Run<'_> {
                 request_id: self.opts.request_id.clone(),
                 nodes: self.opts.nodes,
                 rollback: false,
-                source: kbf_update::Source::Fetch,
+                source: self.opts.source,
             },
         );
         let id = loop {
@@ -256,9 +269,11 @@ impl Run<'_> {
                     Verdict::Ended(phase, failure) => {
                         self.record(id, phase, failure.clone());
                         // Failed or rolled back: the new child never served, or was stood
-                        // down. Gate F, and the old child serves, so the gates read it.
+                        // down. Gate F, and the old child serves, so the gates read it. A
+                        // failure at the order for the nodes is the one exception: the new
+                        // child serves, and the frontend did not revert.
                         self.gate_step("frontend");
-                        self.gate_revert(Some("frontend"));
+                        self.gate_revert((!at_nodes(failure.as_ref())).then_some("frontend"));
                         let _ = self.resolve_observed("frontend", Exit::Failed);
                         return Err(ended(id, phase, failure.as_ref()));
                     }

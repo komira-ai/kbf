@@ -121,12 +121,13 @@ hold is in force), or when the other slot is still running a process.
 **What works, and what does not yet.** The API writes a `frontend_update` order, and the root half
 (`kbf-installer run`) fetches, verifies and stages the release. The root half now has a release
 fetcher: it reads `installer.toml` and `installer.conf` at each fetch and fetches from the `url`
-source, the only source a frontend or all-in-one host can be set up with. Two things are missing:
+source, the only source a frontend or all-in-one host can be set up with. The root half names the
+order it refused (`status.json` carries `refused_order_id` beside the `refusal`), so an order that is
+refused (a failed fetch, a failed check) ends the update failed at once, with the refusal's own
+word as the reason. An installer from before that field names no order, and then the update waits out
+the API's staging deadline (15 minutes by default) and ends failed with reason `timeout`; the cause
+is in the `refusal` of `status.json`. One thing is missing:
 
-- The root half does not name which order it refused (`status.json` carries a `refusal` but no
-  `refused_order_id`). A refused order (a failed fetch, a failed check) therefore leaves the update
-  waiting out the API's staging deadline (15 minutes by default), and it ends failed with reason
-  `timeout` and not with the refusal's own word. The cause is in the `refusal` of `status.json`.
 - No test drives a fetch through the fetch child from `installer.toml`, so the first update on a
   host is the first proof that its `url` source, its trust files and its fetch user work. Keep the
   by-hand path (a) as the way back.

@@ -437,6 +437,9 @@ pub fn update_frontend(env: &Env, opts: &Options) -> (Summary, Exit) {
 
 impl Run<'_> {
     fn go(&mut self, bundle: Option<&mut dyn Read>) -> Result<(), Fail> {
+        if self.opts.bundled {
+            self.step("source", |r| r.refuse_bundled())?;
+        }
         if !matches!(self.opts.offer, OfferPolicy::Unchecked) {
             self.step("offer", |r| r.check_offer())?;
         }
@@ -460,6 +463,18 @@ impl Run<'_> {
             self.sum.end(Exit::Ok, "", "");
         }
         Ok(())
+    }
+
+    /// A deploy can only fetch, which a host whose release is the one its package carries
+    /// refuses at the installer, after the bundle is uploaded and the proxy asked. The deploy
+    /// of such a host ends here, before either, with the reason the update verb uses.
+    fn refuse_bundled(&mut self) -> Result<(), Fail> {
+        Err(fail(
+            Exit::Refused,
+            "source_refused",
+            "this host's release_source is bundled: it fetches nothing, and a deploy can only \
+             fetch (update it with `update --source staged`)",
+        ))
     }
 
     /// Step 0, when a stage is named: the offer (or the `--no-offer`) the deploy runs under.
