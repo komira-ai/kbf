@@ -27,8 +27,9 @@ use crate::build_seq::UNKNOWN;
 pub struct Build<'a> {
     /// Its commit count; [`UNKNOWN`] (0) when it could not count.
     pub seq: u64,
-    /// Its commit: 12 hex digits for the running build ([`crate::BUILD_COMMIT`]), 40 for a
-    /// release of the store. One names the other when it is a prefix of it.
+    /// Its commit: 40 hex digits when known (a release of the store, and the running build
+    /// when [`crate::BUILD_COMMIT_FULL`] is), else the running build's 12
+    /// ([`crate::BUILD_COMMIT`]), which names a 40-digit commit it is a prefix of.
     pub commit: &'a str,
 }
 
@@ -55,8 +56,11 @@ impl Refusal {
     }
 }
 
-/// Whether `a` and `b` name one commit: the shorter is a prefix of the longer, at least a
-/// full 12 digits (`unknown` and the empty text name nothing).
+/// Whether `a` and `b` name one commit: the shorter is a prefix of the longer, at least 12
+/// digits. Two full commits (40 digits each) are then compared exactly, which is why the
+/// running build is given its full commit when it has one: a 12-digit prefix may name two
+/// commits, and is only the best a build that does not know its full commit can say.
+/// `unknown` and the empty text name nothing.
 fn same_commit(a: &str, b: &str) -> bool {
     let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     short.len() >= 12 && long.starts_with(short)

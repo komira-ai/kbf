@@ -1988,13 +1988,16 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
   the release store holds for the commit. `409` naming both builds, and nothing is written, when
   the target's `seq` is below the server's (`older`), when it equals the server's and the commit
   is another one (`seq_tie`: two branches cannot be ordered; a repeat of the running commit is
-  allowed), or when the server's `seq` is known and the target's is not (`seq_unknown`: a
+  allowed; the commits are compared in full when the build knows its own, else by the 12
+  digits it has as a prefix), or when the server's `seq` is known and the target's is not (`seq_unknown`: a
   release stored before `seq` was recorded). A server built where commits could not be counted
   (`seq` 0) does not apply R4. The release store does not record `seq` yet, so today R4 allows
   every offer. The answer is `{"error": "<code>: ...", "code": "older" | "seq_tie" | "seq_unknown"}`;
   the other `409`s of this route have no `code`.
-  `"rollback": true` (optional, default false) skips this check and no other: the release
-  must still be complete, and `expect_generation` still applies.
+  `"rollback": true` (optional, default false; spelled as `rollback` of the proxy's
+  `POST /v1/update/frontend`) skips this check and no other: the release must still be complete,
+  `expect_generation` still applies, and so will the own-commit rule of `source=staged`.
+  The codes `older`, `seq_unknown` and `seq_tie` are stable: a client may key on them.
 - `POST /v1/update/pause` and `POST /v1/update/resume` (the write gates, no body) set `paused` of the policy
   row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
   needed, and an offer leaves the flag as it is: while set, no host is started.

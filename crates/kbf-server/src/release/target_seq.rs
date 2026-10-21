@@ -92,9 +92,15 @@ impl AgeCheck {
         }
     }
 
-    /// The check of this process: [`crate::BUILD_SEQ`] and [`crate::BUILD_COMMIT`].
+    /// The check of this process: [`crate::BUILD_SEQ`] and its commit, in full when the build
+    /// knew it ([`crate::BUILD_COMMIT_FULL`]), else [`crate::BUILD_COMMIT`].
     pub fn running(lookup: Arc<dyn SeqLookup>) -> Self {
-        Self::new(crate::BUILD_SEQ, crate::BUILD_COMMIT, lookup)
+        let commit = if crate::BUILD_COMMIT_FULL.is_empty() {
+            crate::BUILD_COMMIT
+        } else {
+            crate::BUILD_COMMIT_FULL
+        };
+        Self::new(crate::BUILD_SEQ, commit, lookup)
     }
 
     /// Whether `commit` may be offered as the desired release.

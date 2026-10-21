@@ -93,3 +93,20 @@ fn the_codes_are_stable_and_distinct() {
     assert_eq!(Refusal::SeqTie.code(), "seq_tie");
     assert_eq!(Refusal::Older.to_string(), "older");
 }
+
+/// Catches: a running build that knows its full commit comparing by prefix. One 12-digit
+/// prefix names two 40-digit commits; with the full commit the first is the same build and
+/// the second, equal in seq, is another commit (a tie). Only exact comparison passes both.
+#[test]
+fn a_full_running_commit_tells_two_commits_with_one_prefix_apart() {
+    let own = Build {
+        seq: 500,
+        commit: OWN_FULL,
+    };
+    let sibling = "aaaaaaaaaaaa1111111111111111111111111111";
+    assert_eq!(check(own, Some(500), OWN_FULL), Ok(()));
+    assert_eq!(check(own, Some(500), sibling), Err(Refusal::SeqTie));
+    // With only the 12 digits both look like the running build: the best it can say.
+    assert_eq!(check(OWN, Some(500), OWN_FULL), Ok(()));
+    assert_eq!(check(OWN, Some(500), sibling), Ok(()));
+}

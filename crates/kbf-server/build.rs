@@ -39,6 +39,10 @@ fn main() {
         Err(e) => panic!("{e}"),
     };
     println!("cargo:rustc-env=KBF_BUILD_COMMIT={commit}");
+    // The full commit, for the one comparison a 12-digit prefix cannot settle (R4); empty
+    // when not known.
+    let full = build_commit::choose_full(given.as_deref(), git(&["rev-parse", "HEAD"]));
+    println!("cargo:rustc-env=KBF_BUILD_COMMIT_FULL={full}");
     // The number of commits behind HEAD, as `KBF_BUILD_SEQ` (`src/build_seq.rs` has the rule).
     println!("cargo:rerun-if-changed=src/build_seq.rs");
     let seq = build_seq::from_git(Path::new("."));

@@ -28,6 +28,8 @@ const OWN_SEQ: u64 = 500;
 const OWN_COMMIT: &str = "aaaaaaaaaaaa";
 /// The 40 digits of the running build, and of two other commits.
 const OWN_FULL: &str = "aaaaaaaaaaaa0000000000000000000000000000";
+/// Another commit with the same first 12 digits as `OWN_FULL`.
+const SIBLING: &str = "aaaaaaaaaaaa1111111111111111111111111111";
 const OTHER: &str = "bbbbbbbbbbbb0000000000000000000000000000";
 const NO_PLATFORM: &str = "cccccccccccc0000000000000000000000000000";
 
@@ -81,9 +83,18 @@ async fn put(store: &ReleaseStore, commit: &str) {
 /// build is `own_seq` and which learns release seqs from `answers` (or from the store
 /// itself when `answers` is `None`).
 async fn rig(own_seq: u64, answers: Option<&[(&'static str, TargetSeq)]>) -> Rig {
+    rig_of(own_seq, OWN_COMMIT, answers).await
+}
+
+/// [`rig`] for a running build of commit `own_commit`.
+async fn rig_of(
+    own_seq: u64,
+    own_commit: &str,
+    answers: Option<&[(&'static str, TargetSeq)]>,
+) -> Rig {
     let dir = crate::test_dir::scratch_dir("kbf-desired-age");
     let store = Arc::new(ReleaseStore::open(&dir, Limits::default()).expect("a store"));
-    for commit in [OWN_FULL, OTHER, FAILS] {
+    for commit in [OWN_FULL, SIBLING, OTHER, FAILS] {
         put(&store, commit).await;
     }
     let lookup: Arc<dyn SeqLookup> = match answers {
@@ -106,7 +117,7 @@ async fn rig(own_seq: u64, answers: Option<&[(&'static str, TargetSeq)]>) -> Rig
     ));
     let update = Arc::new(Update {
         held: Some(Held {
-            age: AgeCheck::new(own_seq, OWN_COMMIT, lookup),
+            age: AgeCheck::new(own_seq, own_commit, lookup),
             store,
         }),
         rows: Some(rows.clone()),
@@ -383,4 +394,44 @@ async fn an_r4_refusal_carries_its_stable_code_and_no_other_conflict_does() {
         assert_eq!(status, 409, "{text}");
         assert!(text.get("code").is_none(), "{text}");
     }
+}
+
+/// Catches: a server that knows its full commit offering a sibling of it (the same 12 digits,
+/// another commit) as a repeat of itself: of the two, only its own commit is allowed.
+#[tokio::test]
+async fn a_server_that_knows_its_full_commit_tells_a_sibling_apart() {
+    let answers = [(OWN_FULL, SEQ_500), (SIBLING, SEQ_500)];
+    let rig = rig_of(OWN_SEQ, OWN_FULL, Some(&answers)).await;
+    let (code, body) = offer(&rig, &json!({"commit": SIBLING})).await;
+    assert_eq!(code, 409, "{body}");
+    assert!(body.contains("seq_tie"), "{body}");
+    assert_eq!(desired_commit(&rig), None);
+    let (code, body) = offer(&rig, &json!({"commit": OWN_FULL})).await;
+    assert_eq!(code, 200, "{body}");
+}
+
+/// Catches: the production check naming itself by the 12 digits when the build knew its full
+/// commit: a commit with the build's 12 digits and another tail at the build's seq is a tie
+/// exactly when the build knows its full commit and its seq.
+#[tokio::test]
+async fn the_check_of_a_server_uses_its_full_commit_when_it_has_one() {
+    let sibling = format!("{}{:1<28}", crate::BUILD_COMMIT, "");
+    let lookup: Arc<dyn SeqLookup> = Arc::new(Recorded {
+        answers: [(
+            Box::leak(sibling.clone().into_boxed_str()) as &'static str,
+            TargetSeq::Seq(crate::BUILD_SEQ),
+        )]
+        .into_iter()
+        .collect(),
+    });
+    let sibling = Commit::parse(&sibling).expect("a commit");
+    let refused = AgeCheck::running(lookup)
+        .check(&sibling)
+        .await
+        .expect("a check")
+        .is_err();
+    assert_eq!(
+        refused,
+        !crate::BUILD_COMMIT_FULL.is_empty() && crate::BUILD_SEQ >= 1
+    );
 }
