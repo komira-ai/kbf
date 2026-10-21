@@ -157,8 +157,10 @@ impl SeedFetcher {
     fn copy(&self, partial: &Partial, seed: &Open) -> Result<Received, FetchError> {
         let from = self.host.join(&seed.tarball);
         let to = partial.dl().join(format!("{COMPONENT}.tar.gz"));
+        // The host's cap is at most a gigabyte (`installer.toml` is held to it), so one more
+        // cannot overflow.
         let size = seed.manifest.tarball_size;
-        let cap = size.min(self.policy.max_component_bytes).saturating_add(1);
+        let cap = size.min(self.policy.max_component_bytes) + 1;
         let copied =
             read_capped(&from, cap).and_then(|bytes| fs::write(&to, &bytes).map(|()| bytes));
         let bytes = copied.map_err(|e| {
@@ -267,7 +269,8 @@ fn mismatch(why: &str) -> FetchError {
 
 /// The first 12 hex digits of a commit, as a seed directory is named.
 fn is_build_commit(build: &str) -> bool {
-    build.len() == 12 && build.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    let hex = |b: u8| matches!(b, b'0'..=b'9' | b'a'..=b'f');
+    build.len() == 12 && build.bytes().all(hex)
 }
 
 /// Up to `cap` bytes of the file at `path`, which is not opened if it is a link.

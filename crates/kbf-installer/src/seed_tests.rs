@@ -4,6 +4,7 @@
 use std::fs;
 
 use kbf_host::path::Root;
+use serde_json::json;
 
 use super::*;
 use crate::layout::Platform;
@@ -69,7 +70,7 @@ fn a_manifest_is_a_closed_set_of_keys_and_reads_back_as_what_it_says() {
 
     type Break = (&'static str, fn(&mut serde_json::Value), &'static str);
     let breaks: [Break; 8] = [
-        ("an unknown key", |m| m["extra"] = 1.into(), "`extra`"),
+        ("an unknown key", |m| m["extra"] = json!(1), "`extra`"),
         (
             "a missing key",
             |m| {
@@ -99,7 +100,7 @@ fn a_manifest_is_a_closed_set_of_keys_and_reads_back_as_what_it_says() {
         ),
         (
             "a negative size",
-            |m| m["tarball_size"] = (-1).into(),
+            |m| m["tarball_size"] = json!(-1),
             "expected u64",
         ),
         (

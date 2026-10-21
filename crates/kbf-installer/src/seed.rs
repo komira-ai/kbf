@@ -170,11 +170,7 @@ pub fn read_floor(host: &Layout) -> Result<Option<u64>, FetchError> {
 ///
 /// # Errors
 /// [`FetchError::Order`] under the word `commit_or_ref`, saying which rule.
-pub fn admit(
-    seed: &SeedFacts,
-    commit: &CommitId,
-    floor: Option<u64>,
-) -> Result<(), FetchError> {
+pub fn admit(seed: &SeedFacts, commit: &CommitId, floor: Option<u64>) -> Result<(), FetchError> {
     let refuse = |why: String| FetchError::Order {
         word: "commit_or_ref",
         why,

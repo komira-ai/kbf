@@ -384,7 +384,8 @@ fn the_host_fetcher_reports_the_seed_of_its_package_or_why_it_has_none() {
         facts: seeded.facts(),
     };
     for file in ["release_source = \"bundled\"\n", URL_FILE] {
-        assert_eq!(seeded.host_fetcher(file).seed(), Ok(want.clone()), "{file:?}");
+        let got = seeded.host_fetcher(file).seed();
+        assert_eq!(got, Ok(want.clone()), "{file:?}");
     }
     let other = seeded.host_fetcher(URL_FILE).with_build("ffffffffffff");
     let got = other.seed();

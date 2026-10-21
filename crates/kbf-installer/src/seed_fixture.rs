@@ -155,7 +155,8 @@ impl Seeded {
                 perms: Perms::new(0o755),
                 owner: root,
             };
-            exec.entries.insert(HostPath::new(&dir).expect("a path"), entry);
+            let at = HostPath::new(&dir).expect("a path");
+            exec.entries.insert(at, entry);
         }
         let manifest = serde_json::to_vec(&self.manifest).expect("json");
         let files = [

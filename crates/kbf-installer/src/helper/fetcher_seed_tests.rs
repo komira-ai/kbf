@@ -10,6 +10,7 @@ use kbf_host::testkit::FakeExec;
 
 use super::*;
 use crate::CommitId;
+use crate::fixtures::{elf, file, tar_gz};
 use crate::seed_fixture::{SEQ, Seeded};
 use crate::testkit::{A, B, c};
 
@@ -382,10 +383,7 @@ fn a_seed_the_pipeline_refuses_is_not_installed_by_either_form() {
         (
             "the binary is another CPU's",
             |s| {
-                s.tarball = crate::fixtures::tar_gz(&[crate::fixtures::file(
-                    "kbf",
-                    &crate::fixtures::elf(0xb7, "payload"),
-                )]);
+                s.tarball = tar_gz(&[file("kbf", &elf(0xb7, "payload"))]);
                 s.reseal();
             },
             "fetch: rejected: platform: ",
