@@ -27,7 +27,8 @@ use crate::slot::{ActiveSlot, Slot};
 const DESIRED: &str = "/v1/update/desired";
 const FRONTEND: &str = "/v1/update/frontend";
 const DESIRED_BODY: &[u8] = b"{\"commit\":\"0123456789abcdef0123456789abcdef01234567\"}";
-const FRONTEND_BODY: &[u8] = b"{\"commit\":\"0123456789abcdef0123456789abcdef01234567\",\"request_id\":\"r1\"}";
+const FRONTEND_BODY: &[u8] =
+    b"{\"commit\":\"0123456789abcdef0123456789abcdef01234567\",\"request_id\":\"r1\"}";
 
 /// What the active child saw of one request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,19 +48,21 @@ fn recording_child(log: &ChildLog) -> Script {
         let log = Arc::clone(&log);
         async move {
             let body = read_all(&mut call.body).await;
-            log.lock().unwrap_or_else(PoisonError::into_inner).push(Got {
-                method: call.method.to_string(),
-                uri: call
-                    .uri
-                    .path_and_query()
-                    .map_or_else(String::new, |p| p.as_str().to_owned()),
-                body,
-                authorization: call
-                    .headers
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned),
-            });
+            log.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Got {
+                    method: call.method.to_string(),
+                    uri: call
+                        .uri
+                        .path_and_query()
+                        .map_or_else(String::new, |p| p.as_str().to_owned()),
+                    body,
+                    authorization: call
+                        .headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned),
+                });
             let response = http::Response::builder()
                 .status(200)
                 .header("content-type", "application/json")
@@ -76,7 +79,10 @@ struct Handler(HandlerLog);
 
 impl UpdateHandler for Handler {
     async fn handle(&self, request: UpdateRequest) -> UpdateReply {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).push(request);
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(request);
         UpdateReply::json(202, b"{\"from\":\"handler\"}".to_vec())
     }
 }
@@ -129,8 +135,14 @@ impl Case {
 
     fn reached(&self) -> (Vec<Got>, Vec<UpdateRequest>) {
         (
-            self.child.lock().unwrap_or_else(PoisonError::into_inner).clone(),
-            self.handler.lock().unwrap_or_else(PoisonError::into_inner).clone(),
+            self.child
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+            self.handler
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
         )
     }
 }
@@ -198,19 +210,34 @@ async fn a_token_that_is_wrong_in_one_way_is_refused_on_both_routes() {
     let (verifier, now) = static_verifier();
     let other = &keys()[1];
     let wrong: Vec<(&str, String)> = vec![
-        ("issuer", edited(|c| c["iss"] = json!("https://evil.example"))),
+        (
+            "issuer",
+            edited(|c| c["iss"] = json!("https://evil.example")),
+        ),
         ("audience", edited(|c| c["aud"] = json!("someone-else"))),
-        ("audience list", edited(|c| c["aud"] = json!(["kbf-gamma", "x"]))),
+        (
+            "audience list",
+            edited(|c| c["aud"] = json!(["kbf-gamma", "x"])),
+        ),
         ("repository_id", edited(|c| c["repository_id"] = json!("1"))),
-        ("repository", edited(|c| c["repository"] = json!("evil/fork"))),
+        (
+            "repository",
+            edited(|c| c["repository"] = json!("evil/fork")),
+        ),
         ("ref", edited(|c| c["ref"] = json!("refs/heads/evil"))),
         ("environment", edited(|c| c["environment"] = json!("prod"))),
         (
             "workflow",
-            edited(|c| c["job_workflow_ref"] = json!("komira-ai/komira-build-farm/.github/workflows/evil.yml@refs/heads/main")),
+            edited(|c| {
+                c["job_workflow_ref"] =
+                    json!("komira-ai/komira-build-farm/.github/workflows/evil.yml@refs/heads/main")
+            }),
         ),
         ("event", edited(|c| c["event_name"] = json!("pull_request"))),
-        ("runner", edited(|c| c["runner_environment"] = json!("self-hosted"))),
+        (
+            "runner",
+            edited(|c| c["runner_environment"] = json!("self-hosted")),
+        ),
         (
             "expired",
             edited(|c| {
@@ -280,10 +307,18 @@ async fn a_token_that_is_wrong_in_one_way_is_refused_on_both_routes() {
         // same address, so keep under the burst by refilling with the paused clock.
         tokio::time::advance(std::time::Duration::from_secs(FAILURE_BURST.into())).await;
         for (route, body) in [(DESIRED, DESIRED_BODY), (FRONTEND, FRONTEND_BODY)] {
-            assert_eq!(case.call("POST", route, body, bad).await, 401, "{what} {route}");
+            assert_eq!(
+                case.call("POST", route, body, bad).await,
+                401,
+                "{what} {route}"
+            );
         }
     }
-    assert_eq!(case.reached(), (Vec::new(), Vec::new()), "nothing was reached");
+    assert_eq!(
+        case.reached(),
+        (Vec::new(), Vec::new()),
+        "nothing was reached"
+    );
     // The rig is sound: the same verifier admits a good token, and `now` was not moved.
     assert_eq!(now.load(Ordering::SeqCst), NOW);
     assert_eq!(case.call("POST", DESIRED, DESIRED_BODY, &good()).await, 200);
@@ -319,7 +354,11 @@ async fn a_good_token_is_refused_on_every_other_route() {
         ("GET", "/v1/update/desired", b""),
         ("POST", "/v1/update/frontend/abort", b"{}"),
         ("POST", "/v1/update/frontend/rollback", b"{}"),
-        ("POST", "/v1/update/frontend/force-retire", b"{\"reason\":\"x\"}"),
+        (
+            "POST",
+            "/v1/update/frontend/force-retire",
+            b"{\"reason\":\"x\"}",
+        ),
         ("POST", "/v1/update/pause", b"{}"),
         ("POST", "/v1/update/resume", b"{}"),
         ("GET", "/v1/update", b""),
@@ -340,7 +379,8 @@ async fn a_good_token_is_refused_on_every_other_route() {
     assert_eq!(case.reached(), (Vec::new(), Vec::new()));
     // And the operator token still opens each of them (the rig reaches the child).
     assert_eq!(
-        case.call("POST", "/v1/update/pause", b"{}", OPERATOR_TOKEN).await,
+        case.call("POST", "/v1/update/pause", b"{}", OPERATOR_TOKEN)
+            .await,
         200
     );
 }
@@ -353,11 +393,23 @@ async fn a_good_token_is_refused_on_every_other_route() {
 async fn without_an_allow_list_a_good_token_is_refused() {
     let case = case(None).await;
     for (route, body) in [(DESIRED, DESIRED_BODY), (FRONTEND, FRONTEND_BODY)] {
-        assert_eq!(case.call("POST", route, body, &good()).await, 401, "{route}");
+        assert_eq!(
+            case.call("POST", route, body, &good()).await,
+            401,
+            "{route}"
+        );
     }
     assert_eq!(case.reached(), (Vec::new(), Vec::new()));
-    assert_eq!(case.call("POST", DESIRED, DESIRED_BODY, OPERATOR_TOKEN).await, 200);
-    assert_eq!(case.call("POST", FRONTEND, FRONTEND_BODY, OPERATOR_TOKEN).await, 202);
+    assert_eq!(
+        case.call("POST", DESIRED, DESIRED_BODY, OPERATOR_TOKEN)
+            .await,
+        200
+    );
+    assert_eq!(
+        case.call("POST", FRONTEND, FRONTEND_BODY, OPERATOR_TOKEN)
+            .await,
+        202
+    );
 }
 
 /// An address that has presented too many wrong tokens is turned away before its token is
@@ -375,9 +427,15 @@ async fn wrong_tokens_count_against_the_address() {
     }
     assert_eq!(case.call("POST", DESIRED, DESIRED_BODY, &good()).await, 429);
     assert_eq!(case.reached(), (Vec::new(), Vec::new()));
-    let mut other = case.rig.client_from("192.0.2.77".parse().expect("an ip")).await;
+    let mut other = case
+        .rig
+        .client_from("192.0.2.77".parse().expect("an ip"))
+        .await;
     other.bearer = Some(good());
-    assert_eq!(other.plain("POST", DESIRED, DESIRED_BODY).await.status, Some(200));
+    assert_eq!(
+        other.plain("POST", DESIRED, DESIRED_BODY).await.status,
+        Some(200)
+    );
 }
 
 struct NoKeys;
@@ -409,4 +467,47 @@ async fn an_issuer_that_cannot_be_reached_is_a_503_that_costs_the_caller_nothing
     }
     assert_eq!(case.reached(), (Vec::new(), Vec::new()));
     assert_eq!(case.rig.core.security.failures.tracked(), 0);
+}
+
+/// The allow-list is off unless `remote_operator_file` is set; set, a start reads it first and
+/// a bad one stops the start before the secret the children read is made, and `--check`'s
+/// read (`check_remote_file`) refuses the same files without binding.
+///
+/// Kills: the key defaulting to on, a start that serves with an allow-list it could not read
+/// (the gate silently off, or open), and a refusal that names no key.
+#[test]
+fn the_allow_list_is_off_by_default_and_a_bad_one_stops_the_start() {
+    use super::bypass::files;
+    use crate::scratch::write_file;
+    use std::os::fd::OwnedFd;
+
+    let off = files("remote-off", 20_000, "");
+    assert_eq!(off.config.remote_operator_file, None);
+    assert_eq!(off.config.check_remote_file(), Ok(()));
+
+    let missing = files(
+        "remote-missing",
+        20_000,
+        "remote_operator_file = \"/nonexistent/ci.toml\"",
+    );
+    let empty_table = files("remote-empty", 20_000, "");
+    let bad = empty_table.dir.join("ci.toml");
+    write_file(&bad, b"[remote_operator]\n", 0o600);
+    let mut not_a_list = empty_table.config.clone();
+    not_a_list.remote_operator_file = Some(bad);
+    for config in [missing.config, not_a_list] {
+        let text = config.check_remote_file().expect_err("refused").to_string();
+        assert!(text.contains("remote_operator_file"), "{text}");
+        let secret = config.proxy_auth_file.clone();
+        let socket = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let refusal = crate::Proxy::bind(config, OwnedFd::from(socket))
+            .map(|_| ())
+            .expect_err("a bad allow-list stops the start")
+            .to_string();
+        assert!(refusal.contains("remote_operator_file"), "{refusal}");
+        assert!(
+            !secret.exists(),
+            "no secret was made for a start that failed"
+        );
+    }
 }

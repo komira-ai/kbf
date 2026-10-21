@@ -293,6 +293,19 @@ impl ProxyConfig {
         Ok(config)
     }
 
+    /// Reads the allow-list `remote_operator_file` names, if any, and fetches nothing: the
+    /// check of `kbf-installer proxy --check`, so a bad allow-list is found before a restart.
+    ///
+    /// # Errors
+    /// [`ConfigError::Parse`], naming the key and the reason.
+    pub fn check_remote_file(&self) -> Result<(), ConfigError> {
+        match &self.remote_operator_file {
+            None => Ok(()),
+            Some(file) => crate::remote::RemoteCi::check_file(file)
+                .map_err(|e| ConfigError::Parse(format!("remote_operator_file: {e}"))),
+        }
+    }
+
     /// The rules between keys that a parse cannot see: the same checks
     /// [`ProxyConfig::from_toml_str`] makes, for a caller (`kbf-installer setup`) that builds
     /// a table from flags and must refuse what the proxy would refuse at start.

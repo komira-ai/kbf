@@ -66,6 +66,16 @@ impl RemoteCi {
         ))))
     }
 
+    /// Reads the allow-list in `file` and fetches nothing: whether `from_file` would accept it.
+    ///
+    /// # Errors
+    /// The file is unreadable or refused.
+    pub fn check_file(file: &Path) -> Result<(), String> {
+        OidcConfig::from_file(file)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     /// Whether a call is one an OIDC token may make.
     #[must_use]
     pub fn allows(method: &Method, uri: &Uri) -> bool {

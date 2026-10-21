@@ -268,6 +268,7 @@ keeps the table, enables `kbf-frontend.service` as before and says so.
 | `--proxy-base-port` (default 18000, 1024 to 65521) | `[proxy.upstream] base_port`: slot A uses it and the four after, slot B ten above |
 | `--buck2-auth none\|bearer\|mtls`, `--buck2-token-file` | `[proxy] buck2_auth`, `buck2_token_file` (a key file only with `bearer`) |
 | (none) | `[proxy] operator_token_file`: the operator token `setup` makes |
+| (none) | `[proxy] remote_operator_file`: optional, off when absent; a path to the allow-list of a CI job's GitHub OIDC token (`[remote_operator]` table; claims in `docs/design/frontend-proxy.md` section 4a). Written by hand; a rerun keeps it |
 | (none) | `[proxy] ui = true`: the proxy serves the read-only web UI at `/ui`, open (no certificate or token), `GET` and `HEAD` only; set `ui = false` in `installer.toml` to make `/ui` a 404 |
 
 `setup` enables `kbf-proxy.socket` and `kbf-proxy.service` instead of `kbf-frontend.service`,

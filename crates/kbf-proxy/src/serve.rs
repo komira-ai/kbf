@@ -31,8 +31,8 @@ use crate::limits::h2_server_builder;
 use crate::metrics::Metrics;
 use crate::pool::BoxIo;
 use crate::reply::{from_update, is_grpc, method_not_allowed, refused, text, unknown};
-use crate::security::Admitted;
 use crate::route::{Route, Target, auth_class, route_of, ui_method_allowed};
+use crate::security::Admitted;
 use crate::stream::proxy_child;
 use crate::tls::{Acceptor, Peer, Proto};
 
@@ -131,7 +131,14 @@ impl<U: UpdateHandler + 'static> Service<U> {
             let security = &self.core.security;
             let call = (request.method(), request.uri());
             let verdict = security
-                .authorize_call(class, call, request.headers(), peer.identity.as_ref(), peer.ip, now())
+                .authorize_call(
+                    class,
+                    call,
+                    request.headers(),
+                    peer.identity.as_ref(),
+                    peer.ip,
+                    now(),
+                )
                 .await;
             match verdict {
                 Ok(Admitted::Credential) => {}
@@ -152,7 +159,9 @@ impl<U: UpdateHandler + 'static> Service<U> {
                             Metrics::inc(&self.core.metrics.auth_refused);
                             return refused(route.grpc(), AuthRefusal::PermissionDenied);
                         };
-                        request.headers_mut().insert(header::AUTHORIZATION, operator);
+                        request
+                            .headers_mut()
+                            .insert(header::AUTHORIZATION, operator);
                     }
                 }
                 Err(refusal) => {

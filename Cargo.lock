@@ -1837,6 +1837,7 @@ name = "kbf-installer"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "bytes",
  "clap",
  "flate2",
@@ -1850,6 +1851,7 @@ dependencies = [
  "kbf-gate",
  "kbf-host",
  "kbf-installer",
+ "kbf-oidc",
  "kbf-proto",
  "kbf-proxy",
  "kbf-state",
@@ -1909,6 +1911,7 @@ dependencies = [
  "kbf-installer",
  "kbf-map",
  "kbf-objstore",
+ "kbf-oidc",
  "kbf-proto",
  "kbf-proxy",
  "kbf-sched",
