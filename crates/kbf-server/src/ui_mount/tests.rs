@@ -145,6 +145,34 @@ fn assert_headers(response: &Response, what: &str) {
     assert_eq!(h["x-content-type-options"], "nosniff", "{what}");
     assert_eq!(h["referrer-policy"], "no-referrer", "{what}");
     assert_eq!(h["cache-control"], "no-store", "{what}");
+    assert_eq!(h["cross-origin-resource-policy"], "same-origin", "{what}");
+    assert_eq!(h["cross-origin-opener-policy"], "same-origin", "{what}");
+    let policy = h["permissions-policy"].to_str().expect("ASCII");
+    let denied: Vec<&str> = policy.split(", ").collect();
+    for feature in [
+        "camera",
+        "microphone",
+        "geolocation",
+        "usb",
+        "serial",
+        "hid",
+        "bluetooth",
+        "payment",
+        "display-capture",
+        "clipboard-read",
+        "midi",
+        "xr-spatial-tracking",
+    ] {
+        assert!(
+            denied.contains(&format!("{feature}=()").as_str()),
+            "{what}: {feature} is not denied in {policy}"
+        );
+    }
+    assert!(
+        denied.iter().all(|d| d.ends_with("=()")),
+        "{what}: a feature is allowed to someone in {policy}"
+    );
+    assert!(!h.contains_key("strict-transport-security"), "{what}");
 }
 
 /// Catches: the security headers on a page but not on the stylesheet, a page the UI does

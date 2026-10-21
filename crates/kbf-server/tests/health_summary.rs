@@ -91,7 +91,12 @@ async fn health_is_what_readyz_and_the_source_routes_report() {
             health["queue"]["depth"], drain["queued_operations"],
             "queue: {health}"
         );
-        assert_eq!(health["queue"]["oldest_age_ms"], Value::Null);
+        // Null exactly when nothing waits; a number otherwise.
+        assert_eq!(
+            health["queue"]["oldest_age_ms"].is_null(),
+            health["queue"]["depth"] == 0,
+            "oldest_age_ms is null only when nothing waits: {health}"
+        );
     };
     let read = || async {
         let (code, health) = get(api, "/v1/health").await;
@@ -157,6 +162,19 @@ async fn health_is_what_readyz_and_the_source_routes_report() {
         health["queue"]["depth"], 1,
         "the second job waits: {health}"
     );
+    // The age is the scheduler's, the one `GET /v1/queue` shows: bracketed by two reads
+    // of that route around the health read (the oldest operation is the same one).
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let (_, before) = get(api, "/v1/queue").await;
+    let (health, ..) = read().await;
+    let (_, after) = get(api, "/v1/queue").await;
+    let (low, mid, high) = (
+        before["oldest_age_ms"].as_u64().expect("an age"),
+        health["queue"]["oldest_age_ms"].as_u64().expect("an age"),
+        after["oldest_age_ms"].as_u64().expect("an age"),
+    );
+    assert!(low >= 60, "the job has waited at least the sleep: {before}");
+    assert!(low <= mid && mid <= high, "{low} <= {mid} <= {high}");
 
     // The frontend drains: `/readyz` fails with its reason, and so does the summary.
     let (code, _) = post(api, "/v1/frontend/drain", "").await;

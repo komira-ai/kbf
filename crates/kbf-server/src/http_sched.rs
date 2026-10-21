@@ -165,7 +165,8 @@ fn bad(why: &str) -> Response {
     answer
 }
 
-fn millis(d: Duration) -> u64 {
+/// A duration in whole milliseconds, saturating.
+pub(crate) fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
