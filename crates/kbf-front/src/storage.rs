@@ -52,6 +52,12 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
         Box::pin(async move { Ok(self.cache.durable(digests).await?) })
     }
 
+    /// The cache's durable answer after it has waited for the held blobs among `digests`
+    /// ([`Cache::durable_waiting`]).
+    fn find_durable_waiting<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(async move { Ok(self.cache.durable_waiting(digests).await?) })
+    }
+
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes> {
         Box::pin(async move { Ok(self.cache.read_blob(digest).await?) })
     }

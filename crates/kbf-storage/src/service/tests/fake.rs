@@ -56,9 +56,15 @@ pub(crate) struct Mem {
     pub blobs: Arc<Mutex<BTreeMap<Digest, Bytes>>>,
     /// Blobs of `blobs` held in RAM only: present to `find_missing`, missing to
     /// `find_durable`, as a blob acknowledged from RAM is until it is on disk.
-    pub ram_only: Mutex<BTreeSet<Digest>>,
+    pub ram_only: Arc<Mutex<BTreeSet<Digest>>>,
     /// Calls of `find_durable`.
     pub durable_asked: AtomicUsize,
+    /// The digests a `find_missing`, `find_durable` or `find_durable_waiting` answered as
+    /// present, as the node's cache touches them to keep their retention (a question
+    /// whose positives are not touched here would let an entry's blobs expire).
+    pub touched: Mutex<Vec<Digest>>,
+    /// How many `find_durable_waiting` calls reached the store.
+    pub waited: AtomicUsize,
     pub actions: Mutex<BTreeMap<Digest, (Digest, ActionResult)>>,
     /// An entry is answered without its closure, as a node from before the field does.
     pub legacy_actions: AtomicBool,
@@ -108,6 +114,11 @@ impl Storage for Mem {
             }
             self.failing()?;
             let blobs = self.blobs.lock().expect("lock");
+            self.touched.lock().expect("lock").extend(
+                digests
+                    .iter()
+                    .filter(|d| d.size_bytes != 0 && blobs.contains_key(d)),
+            );
             Ok(digests
                 .iter()
                 .filter(|d| d.size_bytes != 0 && !blobs.contains_key(d))
@@ -119,9 +130,36 @@ impl Storage for Mem {
     fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
         Box::pin(async move {
             self.durable_asked.fetch_add(1, Ordering::SeqCst);
+            if self.knobs.hang_find_missing.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             self.failing()?;
             let blobs = self.blobs.lock().expect("lock");
             let ram_only = self.ram_only.lock().expect("lock");
+            self.touched.lock().expect("lock").extend(
+                digests.iter().filter(|d| {
+                    d.size_bytes != 0 && blobs.contains_key(d) && !ram_only.contains(d)
+                }),
+            );
+            Ok(digests
+                .iter()
+                .filter(|d| d.size_bytes != 0 && (!blobs.contains_key(d) || ram_only.contains(d)))
+                .copied()
+                .collect())
+        })
+    }
+
+    fn find_durable_waiting<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(async move {
+            self.waited.fetch_add(1, Ordering::SeqCst);
+            self.failing()?;
+            let blobs = self.blobs.lock().expect("lock");
+            let ram_only = self.ram_only.lock().expect("lock");
+            self.touched.lock().expect("lock").extend(
+                digests.iter().filter(|d| {
+                    d.size_bytes != 0 && blobs.contains_key(d) && !ram_only.contains(d)
+                }),
+            );
             Ok(digests
                 .iter()
                 .filter(|d| d.size_bytes != 0 && (!blobs.contains_key(d) || ram_only.contains(d)))
@@ -191,6 +229,8 @@ impl Storage for Mem {
             self.active.fetch_sub(1, Ordering::SeqCst);
             let digest = sha(&bytes);
             self.blobs.lock().expect("lock").insert(digest, bytes);
+            // Written to the disk: durable from here.
+            self.ram_only.lock().expect("lock").remove(&digest);
             Ok(digest)
         })
     }
@@ -205,6 +245,7 @@ impl Storage for Mem {
             self.knobs.begun.fetch_add(1, Ordering::SeqCst);
             Box::new(MemPut {
                 blobs: Arc::clone(&self.blobs),
+                ram_only: Arc::clone(&self.ram_only),
                 puts: Arc::clone(&self.puts),
                 knobs: Arc::clone(&self.knobs),
                 size,
@@ -409,6 +450,7 @@ pub(crate) enum StreamFault {
 /// A blob being written to [`Mem`] as it arrives.
 struct MemPut {
     blobs: Arc<Mutex<BTreeMap<Digest, Bytes>>>,
+    ram_only: Arc<Mutex<BTreeSet<Digest>>>,
     puts: Arc<AtomicUsize>,
     knobs: Arc<Knobs>,
     size: u64,
@@ -461,6 +503,7 @@ impl PutStream for MemPut {
         );
         Ok(Box::new(MemStreamed {
             blobs: self.blobs,
+            ram_only: self.ram_only,
             puts: self.puts,
             knobs: self.knobs,
             digest,
@@ -471,6 +514,7 @@ impl PutStream for MemPut {
 
 struct MemStreamed {
     blobs: Arc<Mutex<BTreeMap<Digest, Bytes>>>,
+    ram_only: Arc<Mutex<BTreeSet<Digest>>>,
     puts: Arc<AtomicUsize>,
     knobs: Arc<Knobs>,
     digest: Digest,
@@ -488,6 +532,8 @@ impl crate::StreamedPut for MemStreamed {
                 .lock()
                 .expect("lock")
                 .insert(self.digest, self.data);
+            // Written to the disk: durable from here.
+            self.ram_only.lock().expect("lock").remove(&self.digest);
             self.puts.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })

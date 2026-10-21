@@ -44,7 +44,7 @@ use kbf_map::{Member, MemberId, MemberState};
 use kbf_proto::google::bytestream::WriteRequest;
 use kbf_types::Digest;
 
-use super::{RepairRecord, Repairs};
+use super::{PeerConfirmer, RepairRecord, Repairs};
 use crate::replicate::{Chain, Leg, View};
 use crate::service::RemoteStorage;
 use crate::{Storage, StorageError};
@@ -62,6 +62,13 @@ pub struct RepairConfig {
     /// answer is a debt waiting, not a pass that never ends. (A copy is bounded like a
     /// write: [`crate::replicate::ChainConfig`].)
     pub probe: Duration,
+    /// How long after its own write to disk a node waits before it asks the other owner of
+    /// a blob it acknowledged from RAM whether the blob is on its disk too
+    /// (`--ram-peer-grace`, [`PeerConfirmer`]): long enough that the usual answer is yes
+    /// and no debt is journalled.
+    pub peer_grace: Duration,
+    /// The most digests [`PeerConfirmer`] keeps; past it a debt is journalled at once.
+    pub unconfirmed_cap: usize,
 }
 
 impl Default for RepairConfig {
@@ -70,6 +77,8 @@ impl Default for RepairConfig {
             interval: Duration::from_secs(5),
             concurrency: 4,
             probe: Duration::from_secs(10),
+            peer_grace: Duration::from_secs(5),
+            unconfirmed_cap: 1 << 20,
         }
     }
 }
@@ -108,6 +117,7 @@ pub struct RepairWorker {
     repairs: Arc<Repairs>,
     config: RepairConfig,
     uploads: AtomicU64,
+    confirmer: Arc<PeerConfirmer>,
 }
 
 impl RepairWorker {
@@ -122,11 +132,23 @@ impl RepairWorker {
     ) -> Self {
         Self {
             storage,
+            confirmer: Arc::new(PeerConfirmer::new(
+                Arc::clone(&chain),
+                Arc::clone(&repairs),
+                &config,
+            )),
             chain,
             repairs,
             config,
             uploads: AtomicU64::new(0),
         }
+    }
+
+    /// The node's peer confirmer, which [`RepairWorker::run`] confirms on every tick: what
+    /// an acknowledgement from RAM registers its blob with.
+    #[must_use]
+    pub fn confirmer(&self) -> Arc<PeerConfirmer> {
+        Arc::clone(&self.confirmer)
     }
 
     /// Tells the frontend what is owed (a frontend that was away, or lost its state, learns
@@ -145,7 +167,10 @@ impl RepairWorker {
                     // owner), and the debts stay owed.
                     tokio::select! {
                         () = &mut stop => return,
-                        _ = self.pass() => {}
+                        _ = async {
+                            self.pass().await;
+                            self.confirmer.confirm(tokio::time::Instant::now()).await;
+                        } => {}
                     }
                 }
             }
@@ -224,7 +249,9 @@ impl RepairWorker {
         let generation = view.map.generation();
         let remote = RemoteStorage::new(channel, generation);
         let digests = [*digest];
-        let asked = remote.find_missing(&digests);
+        // Durable, not servable: an owner that holds the blob only in RAM may lose it at a
+        // restart, so it does not settle the debt (`kbf-durable: only`).
+        let asked = remote.find_durable(&digests);
         let missing = tokio::time::timeout(self.config.probe, asked)
             .await
             .map_err(|_| {

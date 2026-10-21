@@ -209,6 +209,11 @@ pub struct Cache<M, O> {
     pool: std::sync::OnceLock<Option<WritePool>>,
     /// The blobs held in RAM, which every reader consults before the index.
     held: Held,
+    /// How long a caller that needs held blobs written waits for them ([`Cache::durable_waiting`]).
+    durable_wait: std::time::Duration,
+    /// How many waits for held blobs have parked, for a test to wait on.
+    #[cfg(feature = "testkit")]
+    parks: tokio::sync::watch::Sender<usize>,
     /// A test's callback between a reader's Held step and its index step.
     #[cfg(feature = "testkit")]
     between: std::sync::OnceLock<held::BetweenCell>,
@@ -274,6 +279,9 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             pool_config: PoolConfig::DEFAULT,
             pool: std::sync::OnceLock::new(),
             held: Held::default(),
+            durable_wait: held::DEFAULT_DURABLE_WAIT,
+            #[cfg(feature = "testkit")]
+            parks: tokio::sync::watch::channel(0).0,
             #[cfg(feature = "testkit")]
             between: std::sync::OnceLock::new(),
         }
@@ -689,6 +697,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         result: &reapi::ActionResult,
     ) -> Result<ActionRecord, CacheError> {
         let closure = self.closure_of(result).await?;
+        // Rule 2, the AC owner's barrier: the check below reads the index, which a blob held
+        // only in RAM is not in, so the blobs of the entry are first given time to be
+        // written (and a blob still held after `--durable-wait` is refused as absent).
+        self.wait_for_entry(None, &closure).await;
         let lack = self.writer.query(|s| s.lacking(closure.iter())).await?;
         if let Some(lack) = lack {
             return Err(lack.into());
@@ -714,6 +726,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         action: Digest,
         record: ActionRecord,
     ) -> Result<(), CacheError> {
+        // Rule 2, the AC owner's barrier, as in `prepare_action_result`: the commit's own
+        // check reads the index, so what this node holds only in RAM is written first.
+        self.wait_for_entry(Some(&record.result), &record.closure)
+            .await;
         match self
             .writer
             .commit(Command::PutAction {
@@ -858,6 +874,7 @@ pub use flush::{
 };
 #[cfg(feature = "testkit")]
 pub use held::BetweenHook;
+pub use held::DEFAULT_DURABLE_WAIT;
 use held::Held;
 pub use losses::Losses;
 #[cfg(feature = "testkit")]

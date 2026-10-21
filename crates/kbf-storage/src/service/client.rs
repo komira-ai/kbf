@@ -30,7 +30,8 @@ use tonic::transport::Channel;
 use tonic::{Code, Request, Response, Status};
 
 use super::{
-    DURABLE_HEADER, DURABLE_ONLY, MAP_GENERATION_HEADER, MAX_MESSAGE_BYTES, UNOWNED_HEADER, wire,
+    DURABLE_HEADER, DURABLE_ONLY, DURABLE_WAIT, MAP_GENERATION_HEADER, MAX_MESSAGE_BYTES,
+    UNOWNED_HEADER, wire,
 };
 use crate::{ActionEntry, Answer, PutStream, ReadStream, Storage, StorageError, in_flight};
 
@@ -235,11 +236,12 @@ fn record_to_proto(record: &ActionRecord) -> Record {
 const READ_BLOB_PREALLOCATE: u64 = 64 << 20;
 
 impl RemoteStorage {
-    /// `FindMissingBlobs` for `digests`, marked [`DURABLE_HEADER`] when `durable`.
+    /// `FindMissingBlobs` for `digests`, marked [`DURABLE_HEADER`] with `durable` when
+    /// there is one.
     async fn ask_missing(
         &self,
         digests: &[Digest],
-        durable: bool,
+        durable: Option<&'static str>,
     ) -> Result<Vec<Digest>, StorageError> {
         let request = FindMissingBlobsRequest {
             instance_name: String::new(),
@@ -247,10 +249,10 @@ impl RemoteStorage {
             digest_function: 0,
         };
         let mut request = self.tag(request);
-        if durable {
+        if let Some(value) = durable {
             request
                 .metadata_mut()
-                .insert(DURABLE_HEADER, MetadataValue::from_static(DURABLE_ONLY));
+                .insert(DURABLE_HEADER, MetadataValue::from_static(value));
         }
         let mut client = ContentAddressableStorageClient::new(self.channel.clone())
             .max_decoding_message_size(MAX_MESSAGE_BYTES);
@@ -267,12 +269,19 @@ impl RemoteStorage {
 
 impl Storage for RemoteStorage {
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
-        Box::pin(self.ask_missing(digests, false))
+        Box::pin(self.ask_missing(digests, None))
     }
 
     /// Asks with [`DURABLE_HEADER`]: the node answers from its index alone.
     fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
-        Box::pin(self.ask_missing(digests, true))
+        Box::pin(self.ask_missing(digests, Some(DURABLE_ONLY)))
+    }
+
+    /// Asks with [`DURABLE_HEADER`] `wait`: the node waits, for at most its own bound
+    /// (`--durable-wait`), for its held blobs among `digests` to be written, then answers
+    /// from its index alone.
+    fn find_durable_waiting<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(self.ask_missing(digests, Some(DURABLE_WAIT)))
     }
 
     /// The whole blob, collected from the stream of [`Storage::read_range`]; its length

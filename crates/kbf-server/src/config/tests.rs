@@ -228,6 +228,39 @@ fn a_segment_upload_cap_over_the_write_bound_is_refused() {
     assert!(message.contains("--write-bytes-in-flight"), "{message}");
 }
 
+/// Catches `--durable-wait` and `--ram-peer-grace` that do not reach the cache and the
+/// repair worker, defaults other than the design's (10 s and 5 s), a zero, and a wait that
+/// could outlast the chain's commit bound (mutants: the check removed; the bound compared
+/// without the half). A wait of 59 s starts; 60 s (half of the 120 s replica commit bound)
+/// is refused, naming the flag.
+#[test]
+fn the_durable_wait_and_the_peer_grace_are_flags_and_the_wait_is_bounded() {
+    let defaults = Args::parse_from(["kbf-server"]);
+    assert_eq!(defaults.durable_wait(), kbf_front::DEFAULT_DURABLE_WAIT);
+    assert_eq!(defaults.durable_wait(), Duration::from_secs(10));
+    assert_eq!(defaults.repair_config().peer_grace, Duration::from_secs(5));
+    assert_eq!(
+        defaults.repair_config().interval,
+        kbf_storage::repair::RepairConfig::default().interval
+    );
+    let set = Args::parse_from(["kbf-server", "--durable-wait=59", "--ram-peer-grace=3"]);
+    assert_eq!(set.durable_wait(), Duration::from_secs(59));
+    assert_eq!(set.repair_config().peer_grace, Duration::from_secs(3));
+    set.listeners().expect("59 s is under half of 120 s");
+    for flag in ["--durable-wait", "--ram-peer-grace"] {
+        assert!(
+            Args::try_parse_from(["kbf-server", &format!("{flag}=0")]).is_err(),
+            "{flag}=0 was accepted"
+        );
+    }
+    let refused = Args::parse_from(["kbf-server", "--durable-wait=60"])
+        .listeners()
+        .map(drop)
+        .expect_err("half the commit bound or more");
+    let message = refused.to_string();
+    assert!(message.contains("--durable-wait 60"), "{message}");
+}
+
 /// Catches a server that starts with a `--segment-upload-max-bytes` larger than one
 /// admission counts (mutant: the flag's upper limit removed). `Cache::admit` counts
 /// at most `kbf_front::MAX_ADMISSION_BYTES` (what its semaphore holds) for one call;
