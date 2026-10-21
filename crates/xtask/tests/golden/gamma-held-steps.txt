@@ -1,0 +1,36 @@
+# gamma: what a person runs, once. This command prints the steps and changes nothing.
+# Each GitHub step needs admin on komira-ai/kbf. Every name below comes from the flags.
+
+# 1. GitHub: the environment (deployments from main only), then the variables and the secrets
+gh api -X PUT repos/komira-ai/kbf/environments/gamma -F 'deployment_branch_policy[protected_branches]=false' -F 'deployment_branch_policy[custom_branch_policies]=true'
+gh api -X POST repos/komira-ai/kbf/environments/gamma/deployment-branch-policies -f name=main -f type=branch
+gh variable set GAMMA_HOST --repo komira-ai/kbf --body farm-front
+gh variable set GAMMA_USER --repo komira-ai/kbf --body kbf-deploy
+gh variable set TS_TAG --repo komira-ai/kbf --body tag:kbf-gamma-ci
+gh variable set GAMMA_CHECK_TARGETS --repo komira-ai/kbf
+gh secret set TS_OAUTH_CLIENT_ID --env gamma --repo komira-ai/kbf
+gh secret set TS_OAUTH_SECRET --env gamma --repo komira-ai/kbf
+gh secret set GAMMA_FARM_BUCKCONFIG --env gamma --repo komira-ai/kbf
+# The secrets are asked for on the terminal: no value is on a command line.
+# GAMMA_CHECK_TARGETS, asked for the same way, is the komira targets the check job builds after a deploy, separated by spaces. It is a variable, so it is public.
+# GAMMA_FARM_BUCKCONFIG is the text of the buckconfig that points buck2 at the farm. It is a secret and not a variable because it names the farm and this repository's logs are public (GitHub masks it line by line).
+# While GAMMA_HOST, GAMMA_USER or TS_TAG is unset the deploy job is skipped (a green run), and so is the check job that follows it. To stop gamma, delete one: gh variable delete GAMMA_HOST --repo komira-ai/kbf
+# GitHub prints a variable's value in the log of any step that has it in its environment, and this repository's logs are public: use the short tailnet name for the host, never an address.
+
+# 2. Tailscale: an OAuth client with the scope "Auth Keys: Write" only, restricted to tag:kbf-gamma-ci; its id and secret are the two secrets of step 1.
+# Add to the policy file (merge, do not replace). An SSH rule's "dst" is a tag, not a device name, so the host carries tag:kbf-gamma-host (step 3b):
+{
+  "tagOwners": { "tag:kbf-gamma-ci": ["autogroup:admin"], "tag:kbf-gamma-host": ["autogroup:admin"] },
+  "grants": [{ "src": ["tag:kbf-gamma-ci"], "dst": ["tag:kbf-gamma-host"], "ip": ["22"] }],
+  "ssh": [{ "action": "accept", "src": ["tag:kbf-gamma-ci"], "dst": ["tag:kbf-gamma-host"], "users": ["kbf-deploy"] }]
+}
+# The check job builds on the farm over the tailnet with the same identity (tag:kbf-gamma-ci): also grant it the farm's build port in that policy, and nothing else.
+
+# 3. The frontend host, as root there
+# a. The account kbf-deploy exists. It has no password: it only receives the ssh command.
+# b. Give the host its tag, which the rules of step 2 name: tailscale set --advertise-tags=tag:kbf-gamma-host
+# c. Run: visudo -f /etc/sudoers.d/kbf-gamma, and put this one line in it. It has no wildcard; only the commit varies, as forty hex digits.
+kbf-deploy ALL=(root) NOPASSWD: /usr/bin/kbf-installer deploy --apply --json --commit [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f] --offer - --bundle -
+# d. kbf-installer is set up with --deploy-stage gamma, which writes /etc/kbf-installer/deploy.json (the API address, the token file and the stage): the workflow names none of them.
+
+# 4. Repository settings: the Actions policy allows tailscale/github-action.
