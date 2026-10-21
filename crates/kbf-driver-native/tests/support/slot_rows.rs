@@ -61,6 +61,11 @@ pub const ROWS: [(&str, &str); 18] = [
 /// The rows each step of the clean is the only thing removing: the rows that must turn
 /// red when that step alone is skipped. A row two steps remove is under both (`agent`:
 /// the loaded job is [`Step::Bootout`]'s, the plist in the home [`Step::Home`]'s).
+/// On a Mac the lease's end has run a bootout and a kill before the clean, so the real
+/// mutant tests assert that no row is red for [`Step::Kill`], and assert nothing for
+/// [`Step::Bootout`] yet (`tests/slot_clean/mutants.rs`); the entries are the clean's
+/// claim, not what those tests see.
+///
 /// Every step has an entry (the array's length is [`STEPS`](kbf_driver_native::slots::clean::STEPS)'s).
 ///
 /// This is a claim about the clean as written (`src/slots/clean.rs`,

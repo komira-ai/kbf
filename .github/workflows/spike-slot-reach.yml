@@ -55,3 +55,24 @@ jobs:
       - run: cargo build -p kbf-cli --bin kbf --locked
       - name: What the runner does for a root daemon with a pool of two users (root, real users)
         run: cargo xtask sudo-test -p kbf-daemon-test --test mac_pool_spike -- --test-threads=1 --nocapture
+
+  # M2 of the Mac legs (crates/kbf-driver-native/tests/slot_clean.rs): the freshness
+  # scenario of the slot clean, and the mutant tests that run it with one step of the
+  # clean skipped and print which rows turn red. By hand on a branch, so what the mutants
+  # show on a Mac (the bootout's rows are printed, not asserted, until it has) is
+  # measured before the branch merges. The same command as the native-macos job of
+  # beta.yml runs after a push to main.
+  slot-clean-mutants:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: The slot clean and its mutants, on real users (root)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture

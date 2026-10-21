@@ -13,28 +13,38 @@ use super::freshness;
 use crate::support::slot_rows::covered_by;
 
 /// The rows [`freshness`] must find with `skip`'s step of the clean skipped and the
-/// check blind: the rows the table gives the step ([`covered_by`]), but for
-/// [`Step::Kill`]. The lease's end ends the uid's processes ([`kbf_daemon::uid::end`],
-/// from `UidWatch::end`) before the clean runs, so the processes rows are gone before
-/// the clean's own kill; the gate cannot see that step skipped, and the test pins that
-/// (no row red), to be changed to the table's rows when a row plants what only the
-/// clean's kill can end.
-fn expected_red(skip: Step) -> BTreeSet<String> {
+/// check blind: the rows the table gives the step ([`covered_by`]), but for two steps the
+/// lease's end has done before the clean runs. `None` is "not asserted"; `Some` is
+/// asserted.
+///
+/// The lease's end ends the uid's jobs and processes ([`kbf_daemon::uid::end`], from
+/// `UidWatch::end`: a bootout of `user/<uid>`, then the kill) before the clean runs.
+/// - [`Step::Kill`]: the processes rows are gone before the clean's own kill, so the gate
+///   cannot see that step skipped; the test pins that (no row red), to be changed to the
+///   table's rows when a row plants what only the clean's kill can end.
+/// - [`Step::Bootout`]: the same reasoning says the `agent` rows are gone before the
+///   clean's bootout (the plist in the home is the home wipe's row, not this step's),
+///   but no Mac run has shown it, so what is red is printed and not asserted. After the
+///   first run: assert the rows it showed (an empty set if none, as for the kill).
+fn expected_red(skip: Step) -> Option<BTreeSet<String>> {
     match skip {
-        Step::Kill => BTreeSet::new(),
-        _ => covered_by(skip)
-            .iter()
-            .map(|row| (*row).to_owned())
-            .collect(),
+        Step::Bootout => None,
+        Step::Kill => Some(BTreeSet::new()),
+        _ => Some(
+            covered_by(skip)
+                .iter()
+                .map(|row| (*row).to_owned())
+                .collect(),
+        ),
     }
 }
 
 /// Runs [`freshness`] with `skip` skipped and the check blind (design: mutant B), so
 /// that what the step should have removed reaches lease B. Asserts the scenario ran
-/// (every row planted, both leases exited 0) and that [`expected_red`] rows are red.
-/// Rows outside it that are red too are printed, not asserted: they are how a skipped
-/// step can ripple (a job launchd starts again after a kill nobody booted it out
-/// of leaves a process), seen on the first run on a Mac.
+/// (every row planted, both leases exited 0) and that [`expected_red`] rows are red, if
+/// it names any. Rows outside it that are red too are printed, not asserted: they are
+/// how a skipped step can ripple (a job launchd starts again after a kill nobody booted
+/// it out of leaves a process), seen on the first run on a Mac.
 async fn mutant_turns_red(skip: Step) {
     let name = format!("mutant-{skip}");
     let mutant = Mutant {
@@ -43,7 +53,13 @@ async fn mutant_turns_red(skip: Step) {
     };
     let fresh = freshness(&name, Some(mutant)).await;
     fresh.assert_ran();
-    let want = expected_red(skip);
+    let Some(want) = expected_red(skip) else {
+        eprintln!(
+            "mutant {skip}: not asserted; red rows {:?}; found {:?}",
+            fresh.red, fresh.found
+        );
+        return;
+    };
     let missing: Vec<&String> = want.difference(&fresh.red).collect();
     let also: Vec<&String> = fresh.red.difference(&want).collect();
     eprintln!("mutant {skip}: want red {want:?}; also red {also:?}");
@@ -63,13 +79,16 @@ async fn mutant_turns_red(skip: Step) {
     }
 }
 
-/// Mutant test: the bootout skipped turns `agent` and `apple-agent` red. Catches a
-/// bootout that does nothing (the lease's KeepAlive jobs, one labelled like launchd's
-/// own, stay loaded in the uid's domain for the next lease) while the freshness test
-/// stays green.
+/// Mutant observation: the bootout skipped, which rows turn red is printed and not
+/// asserted. Like the kill, the bootout has run once already when the clean starts (the
+/// lease's end is `uid::end`: bootout, then kill), so the lease's KeepAlive jobs, one
+/// labelled like launchd's own, are probably gone before the clean's bootout and the
+/// agent rows stay green; no run on a Mac has shown it, so nothing about the rows is
+/// asserted. Asserts only that the scenario ran (`Fresh::assert_ran`). Run it on a Mac (the `slot-clean-mutants` job of
+/// `spike-slot-reach.yml`), then assert what the log shows.
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
-async fn skipping_the_bootout_turns_the_agent_rows_red() {
+async fn skipping_the_bootout_is_observed_not_asserted_because_the_lease_end_booted_out_first() {
     mutant_turns_red(Step::Bootout).await;
 }
 

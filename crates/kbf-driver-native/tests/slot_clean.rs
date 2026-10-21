@@ -308,7 +308,13 @@ async fn freshness(name: &str, mutant: Option<Mutant>) -> Fresh {
         Some(mutant) => NativeRuntime::with_clean_mutant(config, Arc::clone(&cas), mutant),
     };
     let rt = rt.expect("runtime");
-    let mark = format!("kbf-fresh-{}", std::process::id());
+    // The test's name is in the marker: every run in this process has the same pid, and
+    // what a mutant run leaves on the runner (an attached image, files in the shared
+    // places) would be found by the runs after it if their markers were the same.
+    let mark = format!("kbf-fresh-{name}-{}", std::process::id());
+    // Declared after `users`, so it is dropped first: the user is still there to remove
+    // its crontab and `at` jobs.
+    let mut residue = Residue::new(&user, &mark);
     let setuid = scratch.setuid_sleep();
     let act = scratch.act();
     let a = Spec::argv(&[
@@ -382,6 +388,7 @@ async fn freshness(name: &str, mutant: Option<Mutant>) -> Fresh {
         .find(|(row, _)| row == "sem")
         .map(|(_, id)| id)
         .unwrap_or_default();
+    residue.sem.clone_from(&sem);
     let a_dir = a_root.to_string_lossy().into_owned();
     let b = Spec::argv(&["/bin/sh", "-c", CHECK, "sh", &mark, &sem, &a_dir]);
     let second = support::run(&rt, &cas, 2, &b).await.expect("lease B ran");
@@ -582,17 +589,18 @@ fn bootstrap(
     }
 }
 
-/// The images `hdiutil info -plist` lists as `uid`'s or by a path naming `mark`.
-fn images(uid: u32, mark: &str) -> Vec<String> {
+/// The images `hdiutil info -plist` lists as `uid`'s or by a path naming `mark`, each
+/// as its dictionary; or what was wrong with the listing.
+fn listed_images(uid: u32, mark: &str) -> Result<Vec<plist::Dictionary>, String> {
     let out = Command::new("/usr/bin/hdiutil")
         .args(["info", "-plist"])
         .output()
         .expect("hdiutil");
     let Ok(info) = plist::Value::from_reader_xml(out.stdout.as_slice()) else {
-        return vec![format!(
+        return Err(format!(
             "unreadable: {}",
             String::from_utf8_lossy(&out.stdout)
-        )];
+        ));
     };
     let images = info
         .as_dictionary()
@@ -600,17 +608,106 @@ fn images(uid: u32, mark: &str) -> Vec<String> {
         .and_then(plist::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    images
+    Ok(images
         .iter()
         .filter_map(plist::Value::as_dictionary)
-        .filter_map(|image| {
-            let path = image.get("image-path").and_then(plist::Value::as_string)?;
+        .filter(|image| {
+            let path = image.get("image-path").and_then(plist::Value::as_string);
             let owner = image
                 .get("owner-uid")
                 .and_then(plist::Value::as_unsigned_integer);
-            (owner == Some(u64::from(uid)) || path.contains(mark)).then(|| path.to_owned())
+            owner == Some(u64::from(uid)) || path.is_some_and(|path| path.contains(mark))
         })
-        .collect()
+        .cloned()
+        .collect())
+}
+
+/// The paths of the images [`listed_images`] finds.
+fn images(uid: u32, mark: &str) -> Vec<String> {
+    match listed_images(uid, mark) {
+        Err(why) => vec![why],
+        Ok(images) => images
+            .iter()
+            .filter_map(|image| image.get("image-path").and_then(plist::Value::as_string))
+            .map(str::to_owned)
+            .collect(),
+    }
+}
+
+/// What a run of [`freshness`] can leave on the runner when a step of the clean is
+/// skipped, removed when it is dropped (so also when the test panics): the clean that
+/// should have removed it did not run, and the next test, or the next run on the same
+/// runner, must start clean. The user's own state (its home, preferences, keychain, and
+/// its processes and jobs) goes with the user ([`Users`]); what is here is what
+/// outlives it.
+struct Residue {
+    user: SlotUser,
+    /// Lease A's marker.
+    mark: String,
+    /// Lease A's semaphore id, once known; empty before.
+    sem: String,
+}
+
+impl Residue {
+    fn new(user: &SlotUser, mark: &str) -> Self {
+        Self {
+            user: user.clone(),
+            mark: mark.to_owned(),
+            sem: String::new(),
+        }
+    }
+}
+
+impl Drop for Residue {
+    fn drop(&mut self) {
+        // The attached image: found by its path (it names the marker) or its owner, and
+        // detached by its device.
+        for image in listed_images(self.user.uid, &self.mark).unwrap_or_default() {
+            let devices = image
+                .get("system-entities")
+                .and_then(plist::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(plist::Value::as_dictionary)
+                .filter_map(|entity| entity.get("dev-entry").and_then(plist::Value::as_string));
+            for dev in devices {
+                let (_, said) = root("/usr/bin/hdiutil", &["detach", "-force", dev]);
+                eprintln!("cleanup: hdiutil detach {dev}: {said}");
+            }
+        }
+        if !self.sem.is_empty() {
+            let (removed, said) = root("/usr/bin/ipcrm", &["-s", &self.sem]);
+            eprintln!("cleanup: ipcrm -s {}: {removed} {said}", self.sem);
+        }
+        // The user's crontab and `at` jobs live outside its home, and outlive the user.
+        let removed = as_user(&self.user, "/usr/bin/crontab", &["-r"]);
+        eprintln!("cleanup: crontab -r: {}", removed.status);
+        let queue = as_user(&self.user, "/usr/bin/atq", &[]);
+        for job in String::from_utf8_lossy(&queue.stdout)
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+        {
+            let removed = as_user(&self.user, "/usr/bin/atrm", &[job]);
+            eprintln!("cleanup: atrm {job}: {}", removed.status);
+        }
+        // The marker files of the shared places, and of this uid's `T/` and `C/`, which a
+        // user made later at the same uid would find.
+        let mut files = vec![
+            PathBuf::from("/private/tmp").join(&self.mark),
+            PathBuf::from("/private/var/tmp").join(&self.mark),
+            PathBuf::from("/Users").join("Shared").join(&self.mark),
+        ];
+        for key in ["DARWIN_USER_TEMP_DIR", "DARWIN_USER_CACHE_DIR"] {
+            let dir = as_user(&self.user, "/usr/bin/getconf", &[key]);
+            let dir = String::from_utf8_lossy(&dir.stdout).trim().to_owned();
+            if !dir.is_empty() {
+                files.push(Path::new(&dir).join("kbf-fresh"));
+            }
+        }
+        for file in files {
+            let _ = std::fs::remove_file(file);
+        }
+    }
 }
 
 /// A process with the real uid 0 and the effective uid of a slot: listed among the
