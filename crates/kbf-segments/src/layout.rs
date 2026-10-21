@@ -191,9 +191,8 @@ impl Footer {
     /// narrow the search to blobs sharing the hash's first byte.
     #[must_use]
     pub fn find(&self, digest: &Digest) -> Option<&IndexEntry> {
-        if digest.function != DigestFunction::Sha256 {
-            return None;
-        }
+        // Only SHA-256 digests exist (`DigestFunction` has one variant), and every entry
+        // of a segment is one; a second function needs its own check here.
         let first = usize::from(digest.hash[0]);
         let start = if first == 0 {
             0

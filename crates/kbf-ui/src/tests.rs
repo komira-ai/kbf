@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use futures::executor::block_on;
 use serde_json::{Value, json};
 
-use crate::pages::{ACTION, BUILD, BUILDS, PAGES, UPDATES};
+use crate::pages::{ACTION, BUILD, BUILDS, OVERVIEW, PAGES, UPDATES};
 use crate::read::Page;
 use crate::{Answer, CONTENT_SECURITY_POLICY, Fetched, Source, SourceError, respond};
 
@@ -299,16 +299,16 @@ fn action_page() -> String {
 fn every_answer_carries_the_csp_and_nosniff() {
     assert_eq!(
         CONTENT_SECURITY_POLICY,
-        "default-src 'none'; style-src 'self'; img-src 'self'; script-src 'self'; \
-         frame-ancestors 'none'"
+        "default-src 'none'; style-src 'self'; img-src 'self'; frame-ancestors 'none'; \
+         base-uri 'none'; form-action 'self'"
     );
     let fake = farm().down("/v1/invocations/down");
     let paths = [
         "/ui".to_owned(),
         "/ui/".to_owned(),
-        format!("/ui?id={ID}"),
-        "/ui?id=missing".to_owned(),
-        "/ui?id=down".to_owned(),
+        format!("/ui/builds?id={ID}"),
+        "/ui/builds?id=missing".to_owned(),
+        "/ui/builds?id=down".to_owned(),
         format!("/ui/builds/{ID}"),
         "/ui/builds/missing".to_owned(),
         action_page(),
@@ -362,7 +362,7 @@ fn a_page_with_the_apis_status_passes_on_the_headers_it_needs() {
                 r#"{"error": "no"}"#,
             );
         for path in [
-            format!("/ui?id={ID}"),
+            format!("/ui/builds?id={ID}"),
             format!("/ui/builds/{ID}"),
             action_page(),
         ] {
@@ -420,7 +420,11 @@ fn a_stderr_of_script_renders_as_text() {
 /// every route it declares.
 fn contract_table() -> Vec<(&'static Page, Vec<String>)> {
     vec![
-        (&BUILDS, vec!["/ui".to_owned(), format!("/ui?id={ID}")]),
+        (&OVERVIEW, vec!["/ui".to_owned()]),
+        (
+            &BUILDS,
+            vec!["/ui/builds".to_owned(), format!("/ui/builds?id={ID}")],
+        ),
         (
             &BUILD,
             vec![
@@ -563,7 +567,6 @@ fn routing() {
     let fake = farm();
     for path in [
         "/uix",
-        "/ui/builds",
         "/ui/builds/",
         "/ui/builds//actions/x",
         "/ui/builds/x/actions/",

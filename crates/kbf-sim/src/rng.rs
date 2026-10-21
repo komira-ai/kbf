@@ -141,6 +141,37 @@ mod tests {
         assert_eq!(Chance::percent(250), Chance::always());
     }
 
+    /// Catches: `below` taking a biased value from the short final bucket instead of
+    /// redrawing, and a redraw that discards the wrong side of the cut. With `n = 2^63 + 1`
+    /// the cut is `2^63 - 1`, so about half of all draws are rejected.
+    #[test]
+    fn below_redraws_values_in_the_short_bucket() {
+        let n = (1_u64 << 63) + 1;
+        let cut = (1_u64 << 63) - 1;
+        let seed = (0..64)
+            .find(|s| SimRng::from_seed(*s).next_u64() < cut)
+            .expect("some seed starts with a rejected draw");
+        let mut probe = SimRng::from_seed(seed);
+        let first_kept = std::iter::repeat_with(|| probe.next_u64())
+            .find(|x| *x >= cut)
+            .expect("the stream reaches a kept draw");
+        assert_eq!(SimRng::from_seed(seed).below(n), first_kept % n);
+        let mut r = SimRng::from_seed(seed);
+        assert!((0..1_000).all(|_| r.below(n) < n));
+    }
+
+    /// Catches: `per_million` and `percent` clamping at the wrong point (a value above a
+    /// million wrapping or exceeding "always"), or scaling percent by the wrong factor.
+    #[test]
+    fn chance_constructors_clamp_and_scale() {
+        assert_eq!(Chance::per_million(1_000_001), Chance::always());
+        assert_eq!(Chance::per_million(1_000_000), Chance::always());
+        assert_ne!(Chance::per_million(999_999), Chance::always());
+        assert_eq!(Chance::percent(50), Chance::per_million(500_000));
+        assert_eq!(Chance::percent(0), Chance::never());
+        assert_eq!(Chance::percent(u32::MAX), Chance::always());
+    }
+
     /// Catches: a shuffle that loses or duplicates items.
     #[test]
     fn shuffle_permutes() {

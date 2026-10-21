@@ -145,6 +145,79 @@ pub fn scan(
     (naming, problems)
 }
 
+/// The host's own paths: a test that opens, lists, writes or runs one of these reads whatever
+/// the box it runs on has there (a host with kbf installed has `/etc/kbf/kbf.toml` and a
+/// `/var/lib/kbf-installer` it cannot read), so it passes or fails by the host.
+pub const HOST_PATHS: &[&str] = &["/var/lib/kbf-installer", "/etc/kbf"];
+
+/// What on a line makes a host-path literal a use of the path (a file operation, a path
+/// built from it, a child started with it) rather than text a test compares with.
+const PATH_USE: &[&str] = &[
+    "fs::",
+    "File::",
+    "Path::new(",
+    "PathBuf::from(",
+    "read_to_string",
+    "read_dir",
+    "metadata(",
+    ".exists()",
+    ".is_dir()",
+    ".is_file()",
+    "canonicalize",
+    ".join(",
+    "Command",
+    ".arg(",
+];
+
+/// Test files that use a host path on purpose, with how many lines do (the count is pinned,
+/// so a second use in the same file is refused until it is argued here). Key: path, count,
+/// reason.
+pub const HOST_PATH_ALLOWANCE: &[(&str, usize, &str)] = &[(
+    "crates/kbf-cli/tests/deploy_units.rs",
+    2,
+    "asserts the default of `api-token-file` as a `Path` value; nothing is opened",
+)];
+
+/// Lines of `text` (comments left out) that name a [`HOST_PATHS`] literal in a path use.
+fn host_path_uses(text: &str) -> usize {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .filter(|l| HOST_PATHS.iter().any(|h| l.contains(&format!("\"{h}"))))
+        .filter(|l| PATH_USE.iter().any(|u| l.contains(u)))
+        .count()
+}
+
+/// The problems of the host-path rule over the files read: a use not allowed, a count that
+/// differs from the row, a row naming a file that is gone or has no use any more.
+pub fn scan_host_paths(
+    files: &[String],
+    read: impl Fn(&str) -> Option<String>,
+    allowance: &[(&str, usize, &str)],
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for f in files.iter().filter(|f| is_read(f)) {
+        let Some(text) = read(f) else { continue };
+        let n = host_path_uses(&text);
+        let allowed = allowance.iter().find(|(p, ..)| p == f).map_or(0, |r| r.1);
+        if n != allowed {
+            problems.push(format!(
+                "`{f}` uses a host path ({n} lines naming {HOST_PATHS:?}, {allowed} allowed): \
+                 root the test in a `TestDir` and pass it by the binary's root flag or build the \
+                 paths under it; a test that asserts a default on purpose gets a row in \
+                 HOST_PATH_ALLOWANCE with its reason"
+            ));
+        }
+    }
+    for (p, _, why) in allowance {
+        if why.is_empty() || !files.iter().any(|f| f == p) {
+            problems.push(format!(
+                "`{p}` is on HOST_PATH_ALLOWANCE without a reason or a file"
+            ));
+        }
+    }
+    problems
+}
+
 /// The scan over planted trees: each defect the rule refuses, against a clean control.
 #[cfg(test)]
 mod planted {
@@ -264,5 +337,79 @@ mod planted {
             got,
             vec!["no test file was read; the scan reads too little".to_owned()]
         );
+    }
+
+    use super::scan_host_paths;
+
+    const ALLOW: &[(&str, usize, &str)] =
+        &[("crates/k/tests/default.rs", 1, "asserts the default")];
+
+    fn host_problems(t: &BTreeMap<String, String>) -> Vec<String> {
+        let files: Vec<String> = t.keys().cloned().collect();
+        scan_host_paths(&files, |f| t.get(f).cloned(), ALLOW)
+    }
+
+    fn host_tree() -> BTreeMap<String, String> {
+        [
+            (
+                "crates/k/tests/default.rs",
+                "let p = Path::new(\"/etc/kbf/api-token\");",
+            ),
+            (
+                "crates/k/tests/rooted.rs",
+                "let p = root.join(\"var/lib/kbf-installer\"); // /etc/kbf in a comment\nassert_eq!(s, \"/etc/kbf/kbf.toml\");",
+            ),
+        ]
+        .into_iter()
+        .map(|(p, t)| (p.to_owned(), t.to_owned()))
+        .collect()
+    }
+
+    #[test]
+    fn host_paths_control_passes() {
+        // Catches: the control refused (an allowed default, a rooted join, a comment and
+        // a compared string), so the defects below would go red for the wrong reason.
+        assert_eq!(host_problems(&host_tree()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_host_path_opened_by_a_test_is_refused_and_an_extra_allowed_use_too() {
+        // Catches (planted defects): a test reading the host's real directory, in each
+        // spelling, and a second use in a file with a one-use row.
+        let plants = [
+            (
+                "crates/k/tests/new.rs",
+                "let t = fs::read_to_string(\"/etc/kbf/kbf.toml\");",
+            ),
+            (
+                "crates/k/tests/sub/mod.rs",
+                "let d = PathBuf::from(\"/var/lib/kbf-installer\");",
+            ),
+            (
+                "crates/k/tests/default.rs",
+                "let p = Path::new(\"/etc/kbf/api-token\");\nlet q = Path::new(\"/etc/kbf/x\");",
+            ),
+        ];
+        for (path, text) in plants {
+            let mut t = host_tree();
+            t.insert(path.to_owned(), text.to_owned());
+            let got = host_problems(&t);
+            assert_eq!(got.len(), 1, "{path}: {got:?}");
+            assert!(
+                got[0].starts_with(&format!("`{path}` uses a host path")),
+                "{got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_host_path_row_is_refused() {
+        // Catches (planted defect): a row for a file that is gone, which would let a
+        // future file of that name use the host path.
+        let mut t = host_tree();
+        t.remove("crates/k/tests/default.rs");
+        let got = host_problems(&t);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].contains("without a reason or a file"), "{got:?}");
     }
 }

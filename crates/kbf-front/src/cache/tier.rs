@@ -92,6 +92,26 @@ impl Staging {
     }
 }
 
+/// The attached write tier's health ([`Cache::tier_health`]): the numbers of its metric
+/// families that a heartbeat carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TierHealth {
+    /// The tier's budget.
+    pub budget_bytes: u64,
+    /// The bytes counted against it.
+    pub used_bytes: u64,
+    /// Committed bytes of every block not yet flushed.
+    pub unflushed_bytes: u64,
+    /// The blocks holding them.
+    pub unflushed_blocks: u64,
+    /// The age of the oldest such block; `None` when there is none.
+    pub oldest_unflushed: Option<Duration>,
+    /// Flush attempts that failed, since the start.
+    pub flush_failures: u64,
+    /// Objects whose key in the store held another object, since the start.
+    pub flush_conflicts: u64,
+}
+
 /// What [`Cache::attach_tier`] found and did at this start.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TierStartup {
@@ -254,6 +274,24 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// The attached tier's disk layer, if one is attached: its usage and exposure.
     pub fn write_tier(&self) -> Option<&dyn WriteTier> {
         self.writer.tier.get().map(|s| &*s.tier)
+    }
+
+    /// What the attached tier says of its health now, for a storage node's heartbeat;
+    /// `None` with no tier attached.
+    #[must_use]
+    pub fn tier_health(&self) -> Option<TierHealth> {
+        let staging = self.writer.tier.get()?;
+        let usage = staging.tier.usage();
+        let unflushed = staging.tier.unflushed(Instant::now());
+        Some(TierHealth {
+            budget_bytes: usage.budget,
+            used_bytes: usage.used,
+            unflushed_bytes: unflushed.bytes,
+            unflushed_blocks: unflushed.blocks,
+            oldest_unflushed: unflushed.oldest,
+            flush_failures: staging.counters.flush_failures.get(),
+            flush_conflicts: staging.counters.conflicts.get(),
+        })
     }
 
     /// Every metric family: [`CacheMetrics::render`](crate::metrics::CacheMetrics::render),
