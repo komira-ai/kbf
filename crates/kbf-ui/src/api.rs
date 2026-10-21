@@ -315,3 +315,36 @@ pub(crate) struct Host {
     pub(crate) running_commit: Option<String>,
     pub(crate) refusal: Option<String>,
 }
+
+/// `GET /v1/storage`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct StorageDoc {
+    pub(crate) members_total: u64,
+    pub(crate) members_active: u64,
+    pub(crate) not_active: Vec<u64>,
+    pub(crate) silent: Vec<u64>,
+    pub(crate) unreported: Vec<u64>,
+    pub(crate) debts_total: u64,
+    /// `null` while unknown: never read as zero.
+    pub(crate) under_replicated_blobs: Option<u64>,
+    pub(crate) reasons: Vec<String>,
+    pub(crate) nodes: Vec<StorageNode>,
+}
+
+/// One storage member of `GET /v1/storage`; each `Option` is `null` when unknown.
+#[derive(Debug, Deserialize)]
+pub(crate) struct StorageNode {
+    pub(crate) id: u64,
+    pub(crate) state: String,
+    pub(crate) planned_down: bool,
+    pub(crate) repair_debts: Option<u64>,
+    pub(crate) open_writes: Option<u64>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) unflushed_bytes: Option<u64>,
+    pub(crate) unflushed_blocks: Option<u64>,
+    pub(crate) oldest_unflushed_ms: Option<u64>,
+    pub(crate) budget_bytes: Option<u64>,
+    pub(crate) used_bytes: Option<u64>,
+    pub(crate) flush_failures: Option<u64>,
+    pub(crate) flush_conflicts: Option<u64>,
+}

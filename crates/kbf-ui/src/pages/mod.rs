@@ -21,6 +21,7 @@ mod overview;
 mod queue;
 mod refresh;
 mod sched;
+mod storage;
 mod strip;
 mod target;
 mod targets;
@@ -51,6 +52,9 @@ pub(crate) use queue::queue;
 #[cfg(test)]
 pub(crate) use sched::fixtures::sched_farm;
 #[cfg(test)]
+pub(crate) use storage::STORAGE;
+pub(crate) use storage::storage;
+#[cfg(test)]
 pub(crate) use target::TARGET;
 pub(crate) use target::target;
 #[cfg(test)]
@@ -66,9 +70,9 @@ pub(crate) const BUILDS_PATH: &str = "/ui/builds";
 
 /// Every page, for the contract test.
 #[cfg(test)]
-pub(crate) const PAGES: [&Page; 11] = [
+pub(crate) const PAGES: [&Page; 12] = [
     &OVERVIEW, &BUILDS, &BUILD, &ACTION, &NODES, &NODE, &UPDATES, &LEASES, &QUEUE, &TARGETS,
-    &TARGET,
+    &TARGET, &STORAGE,
 ];
 
 /// What a path segment keeps unencoded: RFC 3986's unreserved characters.

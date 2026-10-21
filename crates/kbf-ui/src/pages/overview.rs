@@ -175,7 +175,11 @@ fn farm(h: &mut Html, health: &Health) {
         ("Under-replicated blobs", under_replicated(health)),
     ];
     definitions(h, &fields);
-    let updates = Href::root_relative(UPDATES_PATH).expect("the Updates path is root-relative");
+    let storage = Href::root_relative("/ui/storage").expect("the Storage path is root-relative");
+    h.el("p", &[], |h| {
+        h.link(&storage, "Storage");
+    });
+    let updates =Href::root_relative(UPDATES_PATH).expect("the Updates path is root-relative");
     h.el("p", &[attr("class", "hint")], |h| {
         h.text("Update state is not part of this summary: see ")
             .link(&updates, "Updates")
