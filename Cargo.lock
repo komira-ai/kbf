@@ -1920,7 +1920,6 @@ dependencies = [
  "kbf-auth",
  "kbf-cli",
  "kbf-daemon",
- "kbf-deploy",
  "kbf-front",
  "kbf-harness",
  "kbf-host",

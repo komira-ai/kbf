@@ -26,7 +26,6 @@ path = "src/bin/kbf-m2-act.rs"
 clap.workspace = true
 # `kbf-cell cross-version`'s probe stream (a Hello of its own, as a fake daemon sends it).
 futures.workspace = true
-kbf-deploy.workspace = true
 kbf-unitfile.workspace = true
 kbf-daemon.workspace = true
 # `kbf-cell cross-version`'s check that the installer goes first is the installer's own
