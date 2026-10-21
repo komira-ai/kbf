@@ -1,0 +1,467 @@
+== rehearsal frontend
+mode frontend
+--api-listen=127.0.0.1:41002
+--api-token-file=/farm/frontend/etc/api-token
+--default-platform=none
+--handover-socket=/tmp/kbf-farm-1.sock
+--listen={host}:41000
+--reapi-tls-cert=/farm/frontend/etc/reapi.pem
+--reapi-tls-key=/farm/frontend/etc/reapi.key
+--state-store=sqlite:///farm/frontend/state/state.db
+--storage-ca=/farm/frontend/etc/ca.pem
+--storage-client-cert=/farm/frontend/etc/worker.pem
+--storage-client-key=/farm/frontend/etc/worker.key
+--storage=https://{host:node-1}:41010
+--worker-client-ca=/farm/frontend/etc/ca.pem
+--worker-listen={host}:41001
+--worker-tls-cert=/farm/frontend/etc/worker.pem
+--worker-tls-key=/farm/frontend/etc/worker.key
+== rehearsal node-1
+mode storage-and-daemon
+env XDG_RUNTIME_DIR=/run/user/1000
+--actions-memory-max-gib=10
+--advertise-addr={host}:41010
+--ca-cert=/farm/node-1/etc/ca.pem
+--cert=/farm/node-1/etc/node.pem
+--cgroup-root=/farm/node-1/bin/cgroup
+--cold-store=file:///farm/node-1/cold
+--data-dir=/farm/node-1/data
+--driver=container
+--frontend=https://localhost:41001
+--hot-store=file:///farm/node-1/hot
+--id-files=/farm/node-1/ids
+--image=docker://registry.test/busybox@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+--key=/farm/node-1/etc/node.key
+--meta-dir=/farm/node-1/meta
+--metrics-listen=127.0.0.1:41030
+--node-id=node-1
+--oci-runtime=/farm/node-1/bin/crun
+--self-cgroup=/farm/node-1/bin/cgroup/kbf
+--server=https://localhost:41001
+--storage-client-ca=/farm/node-1/etc/ca.pem
+--storage-listen={host}:41010
+--storage-tls-cert=/farm/node-1/etc/storage.pem
+--storage-tls-key=/farm/node-1/etc/storage.key
+--supervisor-memory-min-mib=256
+== rehearsal node-2
+mode storage-and-daemon
+env XDG_RUNTIME_DIR=/run/user/1000
+--actions-memory-max-gib=10
+--advertise-addr={host}:41011
+--ca-cert=/farm/node-2/etc/ca.pem
+--cert=/farm/node-2/etc/node.pem
+--cgroup-root=/farm/node-2/bin/cgroup
+--cold-store=file:///farm/node-2/cold
+--data-dir=/farm/node-2/data
+--driver=container
+--frontend=https://localhost:41001
+--hot-store=file:///farm/node-2/hot
+--id-files=/farm/node-2/ids
+--image=docker://registry.test/busybox@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+--key=/farm/node-2/etc/node.key
+--meta-dir=/farm/node-2/meta
+--metrics-listen=127.0.0.1:41031
+--node-id=node-2
+--oci-runtime=/farm/node-2/bin/crun
+--self-cgroup=/farm/node-2/bin/cgroup/kbf
+--server=https://localhost:41001
+--storage-client-ca=/farm/node-2/etc/ca.pem
+--storage-listen={host}:41011
+--storage-tls-cert=/farm/node-2/etc/storage.pem
+--storage-tls-key=/farm/node-2/etc/storage.key
+--supervisor-memory-min-mib=256
+== rehearsal daemon-1
+mode daemon
+env XDG_RUNTIME_DIR=/run/user/1000
+--actions-memory-max-gib=10
+--ca-cert=/farm/daemon-1/etc/ca.pem
+--cas=https://localhost:41001
+--cert=/farm/daemon-1/etc/node.pem
+--cgroup-root=/farm/daemon-1/bin/cgroup
+--data-dir=/farm/daemon-1/data
+--driver=container
+--id-files=/farm/daemon-1/ids
+--image=docker://registry.test/busybox@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+--key=/farm/daemon-1/etc/node.key
+--node-id=daemon-1
+--oci-runtime=/farm/daemon-1/bin/crun
+--self-cgroup=/farm/daemon-1/bin/cgroup/kbf
+--server=https://localhost:41001
+--supervisor-memory-min-mib=256
+== rehearsal-small frontend
+mode frontend
+--api-listen=127.0.0.1:41002
+--api-token-file=/farm/frontend/etc/api-token
+--default-platform=none
+--handover-socket=/tmp/kbf-farm-1.sock
+--listen={host}:41000
+--reapi-tls-cert=/farm/frontend/etc/reapi.pem
+--reapi-tls-key=/farm/frontend/etc/reapi.key
+--state-store=sqlite:///farm/frontend/state/state.db
+--storage-ca=/farm/frontend/etc/ca.pem
+--storage-client-cert=/farm/frontend/etc/worker.pem
+--storage-client-key=/farm/frontend/etc/worker.key
+--storage=https://{host:node-1}:41010
+--worker-client-ca=/farm/frontend/etc/ca.pem
+--worker-listen={host}:41001
+--worker-tls-cert=/farm/frontend/etc/worker.pem
+--worker-tls-key=/farm/frontend/etc/worker.key
+== rehearsal-small node-1
+mode storage-and-daemon
+env XDG_RUNTIME_DIR=/run/user/1000
+--actions-memory-max-gib=10
+--advertise-addr={host}:41010
+--ca-cert=/farm/node-1/etc/ca.pem
+--cert=/farm/node-1/etc/node.pem
+--cgroup-root=/farm/node-1/bin/cgroup
+--cold-store=file:///farm/node-1/cold
+--data-dir=/farm/node-1/data
+--driver=container
+--frontend=https://localhost:41001
+--hot-store-max-bytes=268435456
+--hot-store=file:///farm/node-1/hot
+--id-files=/farm/node-1/ids
+--image=docker://registry.test/busybox@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+--key=/farm/node-1/etc/node.key
+--meta-dir=/farm/node-1/meta
+--metrics-listen=127.0.0.1:41030
+--node-id=node-1
+--oci-runtime=/farm/node-1/bin/crun
+--self-cgroup=/farm/node-1/bin/cgroup/kbf
+--server=https://localhost:41001
+--storage-client-ca=/farm/node-1/etc/ca.pem
+--storage-listen={host}:41010
+--storage-tls-cert=/farm/node-1/etc/storage.pem
+--storage-tls-key=/farm/node-1/etc/storage.key
+--supervisor-memory-min-mib=256
+--write-bytes-in-flight=134217728
+== rehearsal-small node-2
+mode storage-and-daemon
+env XDG_RUNTIME_DIR=/run/user/1000
+--actions-memory-max-gib=10
+--advertise-addr={host}:41011
+--ca-cert=/farm/node-2/etc/ca.pem
+--cert=/farm/node-2/etc/node.pem
+--cgroup-root=/farm/node-2/bin/cgroup
+--cold-store=file:///farm/node-2/cold
+--data-dir=/farm/node-2/data
+--driver=container
+--frontend=https://localhost:41001
+--hot-store-max-bytes=268435456
+--hot-store=file:///farm/node-2/hot
+--id-files=/farm/node-2/ids
+--image=docker://registry.test/busybox@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+--key=/farm/node-2/etc/node.key
+--meta-dir=/farm/node-2/meta
+--metrics-listen=127.0.0.1:41031
+--node-id=node-2
+--oci-runtime=/farm/node-2/bin/crun
+--self-cgroup=/farm/node-2/bin/cgroup/kbf
+--server=https://localhost:41001
+--storage-client-ca=/farm/node-2/etc/ca.pem
+--storage-listen={host}:41011
+--storage-tls-cert=/farm/node-2/etc/storage.pem
+--storage-tls-key=/farm/node-2/etc/storage.key
+--supervisor-memory-min-mib=256
+--write-bytes-in-flight=134217728
+== rehearsal-small daemon-1
+mode daemon
+env XDG_RUNTIME_DIR=/run/user/1000
+--actions-memory-max-gib=10
+--ca-cert=/farm/daemon-1/etc/ca.pem
+--cas=https://localhost:41001
+--cert=/farm/daemon-1/etc/node.pem
+--cgroup-root=/farm/daemon-1/bin/cgroup
+--data-dir=/farm/daemon-1/data
+--driver=container
+--id-files=/farm/daemon-1/ids
+--image=docker://registry.test/busybox@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+--key=/farm/daemon-1/etc/node.key
+--node-id=daemon-1
+--oci-runtime=/farm/daemon-1/bin/crun
+--reserve-cpus=1
+--self-cgroup=/farm/daemon-1/bin/cgroup/kbf
+--server=https://localhost:41001
+--supervisor-memory-min-mib=256
+== beta frontend
+mode frontend
+--api-listen=127.0.0.1:41002
+--api-token-file=/farm/frontend/etc/api-token
+--default-platform=none
+--handover-socket=/tmp/kbf-farm-1.sock
+--listen={host}:41000
+--reapi-tls-cert=/farm/frontend/etc/reapi.pem
+--reapi-tls-key=/farm/frontend/etc/reapi.key
+--state-store=sqlite:///farm/frontend/state/state.db
+--storage-ca=/farm/frontend/etc/ca.pem
+--storage-client-cert=/farm/frontend/etc/worker.pem
+--storage-client-key=/farm/frontend/etc/worker.key
+--storage=https://{host:node-1}:41010
+--worker-client-ca=/farm/frontend/etc/ca.pem
+--worker-listen={host}:41001
+--worker-tls-cert=/farm/frontend/etc/worker.pem
+--worker-tls-key=/farm/frontend/etc/worker.key
+== beta node-1
+mode storage
+--advertise-addr={host}:41010
+--cold-store=file:///farm/node-1/cold
+--frontend=https://localhost:41001
+--hot-store-max-bytes=268435456
+--hot-store=file:///farm/node-1/hot
+--meta-dir=/farm/node-1/meta
+--metrics-listen=127.0.0.1:41030
+--storage-client-ca=/farm/node-1/etc/ca.pem
+--storage-listen={host}:41010
+--storage-tls-cert=/farm/node-1/etc/storage.pem
+--storage-tls-key=/farm/node-1/etc/storage.key
+--write-bytes-in-flight=134217728
+== beta node-2
+mode storage
+--advertise-addr={host}:41011
+--cold-store=file:///farm/node-2/cold
+--frontend=https://localhost:41001
+--hot-store-max-bytes=268435456
+--hot-store=file:///farm/node-2/hot
+--meta-dir=/farm/node-2/meta
+--metrics-listen=127.0.0.1:41031
+--storage-client-ca=/farm/node-2/etc/ca.pem
+--storage-listen={host}:41011
+--storage-tls-cert=/farm/node-2/etc/storage.pem
+--storage-tls-key=/farm/node-2/etc/storage.key
+--write-bytes-in-flight=134217728
+== beta node-3
+mode storage
+--advertise-addr={host}:41012
+--cold-store=file:///farm/node-3/cold
+--frontend=https://localhost:41001
+--hot-store-max-bytes=268435456
+--hot-store=file:///farm/node-3/hot
+--meta-dir=/farm/node-3/meta
+--metrics-listen=127.0.0.1:41032
+--storage-client-ca=/farm/node-3/etc/ca.pem
+--storage-listen={host}:41012
+--storage-tls-cert=/farm/node-3/etc/storage.pem
+--storage-tls-key=/farm/node-3/etc/storage.key
+--write-bytes-in-flight=134217728
+== beta daemon-1
+mode daemon
+env XDG_RUNTIME_DIR=/run/user/1000
+--actions-memory-max-gib=10
+--ca-cert=/farm/daemon-1/etc/ca.pem
+--cas=https://localhost:41001
+--cert=/farm/daemon-1/etc/node.pem
+--data-dir=/farm/daemon-1/data
+--driver=native
+--key=/farm/daemon-1/etc/node.key
+--node-id=daemon-1
+--oci-runtime=/usr/bin/crun
+--reserve-cpus=1
+--server=https://localhost:41001
+--supervisor-memory-min-mib=256
+== beta daemon-2
+mode daemon
+env XDG_RUNTIME_DIR=/run/user/1000
+--actions-memory-max-gib=10
+--ca-cert=/farm/daemon-2/etc/ca.pem
+--cas=https://localhost:41001
+--cert=/farm/daemon-2/etc/node.pem
+--data-dir=/farm/daemon-2/data
+--driver=native
+--key=/farm/daemon-2/etc/node.key
+--node-id=daemon-2
+--oci-runtime=/usr/bin/crun
+--reserve-cpus=1
+--server=https://localhost:41001
+--supervisor-memory-min-mib=256
+== beta-mutant frontend
+mode frontend
+--api-listen=127.0.0.1:41002
+--api-token-file=/farm/frontend/etc/api-token
+--default-platform=none
+--handover-socket=/tmp/kbf-farm-1.sock
+--listen={host}:41000
+--reapi-tls-cert=/farm/frontend/etc/reapi.pem
+--reapi-tls-key=/farm/frontend/etc/reapi.key
+--state-store=sqlite:///farm/frontend/state/state.db
+--storage-ca=/farm/frontend/etc/ca.pem
+--storage-client-cert=/farm/frontend/etc/worker.pem
+--storage-client-key=/farm/frontend/etc/worker.key
+--storage=https://{host:node-1}:41010
+--worker-client-ca=/farm/frontend/etc/ca.pem
+--worker-listen={host}:41001
+--worker-tls-cert=/farm/frontend/etc/worker.pem
+--worker-tls-key=/farm/frontend/etc/worker.key
+== beta-mutant node-1
+mode storage
+--advertise-addr={host}:41010
+--cold-store-evict-grace-ms=0
+--cold-store-floor-bytes=0
+--cold-store-size-bytes=1048576
+--cold-store=file:///farm/node-1/cold
+--frontend=https://localhost:41001
+--hot-store-max-bytes=1048576
+--hot-store=file:///farm/node-1/hot
+--meta-dir=/farm/node-1/meta
+--metrics-listen=127.0.0.1:41030
+--storage-client-ca=/farm/node-1/etc/ca.pem
+--storage-listen={host}:41010
+--storage-tls-cert=/farm/node-1/etc/storage.pem
+--storage-tls-key=/farm/node-1/etc/storage.key
+--write-bytes-in-flight=134217728
+== beta-mutant node-2
+mode storage
+--advertise-addr={host}:41011
+--cold-store=file:///farm/node-2/cold
+--frontend=https://localhost:41001
+--hot-store-max-bytes=268435456
+--hot-store=file:///farm/node-2/hot
+--meta-dir=/farm/node-2/meta
+--metrics-listen=127.0.0.1:41031
+--storage-client-ca=/farm/node-2/etc/ca.pem
+--storage-listen={host}:41011
+--storage-tls-cert=/farm/node-2/etc/storage.pem
+--storage-tls-key=/farm/node-2/etc/storage.key
+--write-bytes-in-flight=134217728
+== beta-mutant node-3
+mode storage
+--advertise-addr={host}:41012
+--cold-store=file:///farm/node-3/cold
+--frontend=https://localhost:41001
+--hot-store-max-bytes=268435456
+--hot-store=file:///farm/node-3/hot
+--meta-dir=/farm/node-3/meta
+--metrics-listen=127.0.0.1:41032
+--storage-client-ca=/farm/node-3/etc/ca.pem
+--storage-listen={host}:41012
+--storage-tls-cert=/farm/node-3/etc/storage.pem
+--storage-tls-key=/farm/node-3/etc/storage.key
+--write-bytes-in-flight=134217728
+== beta-mutant daemon-1
+mode daemon
+env XDG_RUNTIME_DIR=/run/user/1000
+--actions-memory-max-gib=10
+--ca-cert=/farm/daemon-1/etc/ca.pem
+--cas=https://localhost:41001
+--cert=/farm/daemon-1/etc/node.pem
+--data-dir=/farm/daemon-1/data
+--driver=native
+--key=/farm/daemon-1/etc/node.key
+--node-id=daemon-1
+--oci-runtime=/usr/bin/crun
+--reserve-cpus=1
+--server=https://localhost:1
+--supervisor-memory-min-mib=256
+== beta-mutant daemon-2
+mode daemon
+env XDG_RUNTIME_DIR=/run/user/1000
+--actions-memory-max-gib=10
+--ca-cert=/farm/daemon-2/etc/ca.pem
+--cas=https://localhost:41001
+--cert=/farm/daemon-2/etc/node.pem
+--data-dir=/farm/daemon-2/data
+--driver=native
+--key=/farm/daemon-2/etc/node.key
+--node-id=daemon-2
+--oci-runtime=/usr/bin/crun
+--reserve-cpus=1
+--server=https://localhost:41001
+--supervisor-memory-min-mib=256
+== beta-every frontend
+mode frontend
+--api-listen=127.0.0.1:41002
+--api-token-file=/farm/frontend/etc/api-token
+--default-platform=none
+--handover-socket=/tmp/kbf-farm-1.sock
+--listen={host}:41000
+--reapi-tls-cert=/farm/frontend/etc/reapi.pem
+--reapi-tls-key=/farm/frontend/etc/reapi.key
+--state-store=sqlite:///farm/frontend/state/state.db
+--storage-ca=/farm/frontend/etc/ca.pem
+--storage-client-cert=/farm/frontend/etc/worker.pem
+--storage-client-key=/farm/frontend/etc/worker.key
+--storage=https://{host:node-1}:41010
+--worker-client-ca=/farm/frontend/etc/ca.pem
+--worker-listen={host}:41001
+--worker-tls-cert=/farm/frontend/etc/worker.pem
+--worker-tls-key=/farm/frontend/etc/worker.key
+== beta-every node-1
+mode storage
+--advertise-addr={host}:41010
+--cold-store-evict-grace-ms=0
+--cold-store-floor-bytes=0
+--cold-store-size-bytes=1048576
+--cold-store=file:///farm/node-1/cold
+--frontend=https://localhost:41001
+--hot-store-max-bytes=1048576
+--hot-store=file:///farm/node-1/hot
+--meta-dir=/farm/node-1/meta
+--metrics-listen=127.0.0.1:41030
+--storage-client-ca=/farm/node-1/etc/ca.pem
+--storage-listen={host}:41010
+--storage-tls-cert=/farm/node-1/etc/storage.pem
+--storage-tls-key=/farm/node-1/etc/storage.key
+--write-bytes-in-flight=134217728
+== beta-every node-2
+mode storage
+--advertise-addr={host}:41011
+--cold-store-evict-grace-ms=0
+--cold-store-floor-bytes=0
+--cold-store-size-bytes=1048576
+--cold-store=file:///farm/node-2/cold
+--frontend=https://localhost:41001
+--hot-store-max-bytes=1048576
+--hot-store=file:///farm/node-2/hot
+--meta-dir=/farm/node-2/meta
+--metrics-listen=127.0.0.1:41031
+--storage-client-ca=/farm/node-2/etc/ca.pem
+--storage-listen={host}:41011
+--storage-tls-cert=/farm/node-2/etc/storage.pem
+--storage-tls-key=/farm/node-2/etc/storage.key
+--write-bytes-in-flight=134217728
+== beta-every node-3
+mode storage
+--advertise-addr={host}:41012
+--cold-store-evict-grace-ms=0
+--cold-store-floor-bytes=0
+--cold-store-size-bytes=1048576
+--cold-store=file:///farm/node-3/cold
+--frontend=https://localhost:41001
+--hot-store-max-bytes=1048576
+--hot-store=file:///farm/node-3/hot
+--meta-dir=/farm/node-3/meta
+--metrics-listen=127.0.0.1:41032
+--storage-client-ca=/farm/node-3/etc/ca.pem
+--storage-listen={host}:41012
+--storage-tls-cert=/farm/node-3/etc/storage.pem
+--storage-tls-key=/farm/node-3/etc/storage.key
+--write-bytes-in-flight=134217728
+== beta-every daemon-1
+mode daemon
+env XDG_RUNTIME_DIR=/run/user/1000
+--actions-memory-max-gib=10
+--ca-cert=/farm/daemon-1/etc/ca.pem
+--cas=https://localhost:41001
+--cert=/farm/daemon-1/etc/node.pem
+--data-dir=/farm/daemon-1/data
+--driver=native
+--key=/farm/daemon-1/etc/node.key
+--node-id=daemon-1
+--oci-runtime=/usr/bin/crun
+--reserve-cpus=1
+--server=https://localhost:41001
+--supervisor-memory-min-mib=256
+== beta-every daemon-2
+mode daemon
+env XDG_RUNTIME_DIR=/run/user/1000
+--actions-memory-max-gib=10
+--ca-cert=/farm/daemon-2/etc/ca.pem
+--cas=https://localhost:41001
+--cert=/farm/daemon-2/etc/node.pem
+--data-dir=/farm/daemon-2/data
+--driver=native
+--key=/farm/daemon-2/etc/node.key
+--node-id=daemon-2
+--oci-runtime=/usr/bin/crun
+--reserve-cpus=1
+--server=https://localhost:41001
+--supervisor-memory-min-mib=256

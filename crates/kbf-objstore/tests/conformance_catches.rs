@@ -13,8 +13,8 @@ use futures::StreamExt;
 use futures::executor::block_on;
 use kbf_objstore::conformance::{self, Check, Outcome, Report};
 use kbf_objstore::{
-    BodyStream, ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey,
-    ObjectStore, ObjectStoreError, PageSize,
+    BodyStream, ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectInfo,
+    ObjectKey, ObjectStore, ObjectStoreError, PageSize,
 };
 
 const ALL: Capabilities = Capabilities {
@@ -69,6 +69,23 @@ enum Defect {
     DeniesRetainedDelete,
     /// Writes a streamed body's bytes as they came even when it failed or ended short.
     KeepsBrokenStream,
+    /// Answers a ranged read with as many bytes as asked, the first one altered.
+    AltersTheFirstByte,
+    /// Lists one key more than was ever written, after the last real one.
+    ListsAKeyThatWasNeverWritten,
+    /// Refuses every streamed write with a server error.
+    RefusesStreamedWrites,
+    /// Refuses a streamed body that fails, but stores one that ends short of its length.
+    AcceptsAShortStream,
+    /// Answers a delete of a retained object with success and keeps the object.
+    ReportsADeleteItDidNot,
+    /// Answers a read past the end of an object with empty bytes, not `InvalidRange`.
+    ReadsPastTheEndAsEmpty,
+    /// Answers a delete of a retained object with success and leaves a tombstone: the
+    /// key then reads as other bytes.
+    LeavesATombstone,
+    /// Claims no capability and keeps to it: refuses a retention date.
+    HonestWithoutLock,
 }
 
 struct Broken {
@@ -77,6 +94,8 @@ struct Broken {
     defect: Defect,
     /// [`Defect::PagesByPosition`]: how many keys were listed before each token issued.
     positions: Mutex<HashMap<ObjectKey, usize>>,
+    /// [`Defect::LeavesATombstone`]: the keys whose delete was answered with success.
+    tombstones: Mutex<std::collections::HashSet<ObjectKey>>,
 }
 
 impl Broken {
@@ -96,7 +115,9 @@ impl Broken {
                 },
                 ALL,
             ),
-            Defect::DropsRetention => (Capabilities::default(), Capabilities::default()),
+            Defect::DropsRetention | Defect::HonestWithoutLock => {
+                (Capabilities::default(), Capabilities::default())
+            }
             _ => (ALL, ALL),
         };
         Self {
@@ -104,6 +125,7 @@ impl Broken {
             claims,
             defect,
             positions: Mutex::default(),
+            tombstones: Mutex::default(),
         }
     }
 }
@@ -132,9 +154,26 @@ impl ObjectStore for Broken {
         len: u64,
         mut body: BodyStream,
     ) -> Result<(), ObjectStoreError> {
-        if !matches!(self.defect, Defect::KeepsBrokenStream) {
-            let bytes = kbf_objstore::gather(body, len).await?;
-            return self.put_new(key, bytes, None).await;
+        match self.defect {
+            Defect::KeepsBrokenStream => {}
+            Defect::RefusesStreamedWrites => {
+                return Err(ObjectStoreError::Service {
+                    status: 500,
+                    code: "InternalError".into(),
+                    message: "refused".into(),
+                });
+            }
+            Defect::AcceptsAShortStream => {
+                let mut got = Vec::new();
+                while let Some(piece) = body.next().await {
+                    got.extend_from_slice(&piece?);
+                }
+                return self.put_new(key, Bytes::from(got), None).await;
+            }
+            _ => {
+                let bytes = kbf_objstore::gather(body, len).await?;
+                return self.put_new(key, bytes, None).await;
+            }
         }
         let mut got = Vec::new();
         while let Some(Ok(piece)) = body.next().await {
@@ -157,6 +196,21 @@ impl ObjectStore for Broken {
                 let b = self.inner.get_range(key, range).await?;
                 Ok(b.slice(..b.len().saturating_sub(1)))
             }
+            Defect::ReadsPastTheEndAsEmpty => match self.inner.get_range(key, range).await {
+                Err(ObjectStoreError::InvalidRange { .. }) => Ok(Bytes::new()),
+                other => other,
+            },
+            Defect::LeavesATombstone if self.tombstones.lock().unwrap().contains(key) => {
+                Ok(Bytes::from_static(b"deleted"))
+            }
+            Defect::AltersTheFirstByte => {
+                let b = self.inner.get_range(key, range).await?;
+                let mut altered = b.to_vec();
+                if let Some(first) = altered.first_mut() {
+                    *first ^= 0xff;
+                }
+                Ok(Bytes::from(altered))
+            }
             Defect::MissingIsEmpty => match self.inner.get_range(key, range).await {
                 Err(ObjectStoreError::NotFound(_)) => Ok(Bytes::new()),
                 other => other,
@@ -175,6 +229,17 @@ impl ObjectStore for Broken {
             Defect::RefusesOneDelete if key.as_str().ends_with("/round-trip-1") => {
                 Err(server_error(500, "InternalError"))
             }
+            Defect::LeavesATombstone => match self.inner.delete(key).await {
+                Err(ObjectStoreError::Locked(_)) => {
+                    self.tombstones.lock().unwrap().insert(key.clone());
+                    Ok(())
+                }
+                other => other,
+            },
+            Defect::ReportsADeleteItDidNot => match self.inner.delete(key).await {
+                Err(ObjectStoreError::Locked(_)) => Ok(()),
+                other => other,
+            },
             Defect::DeniesRetainedDelete => match self.inner.delete(key).await {
                 Err(ObjectStoreError::Locked(_)) => Err(server_error(403, "AccessDenied")),
                 other => other,
@@ -249,6 +314,15 @@ impl ObjectStore for Broken {
                     .last()
                     .map_or_else(|| ObjectKey::new("x").unwrap(), |o| o.key.clone());
                 page.next = Some(ListToken::after(&last));
+                Ok(page)
+            }
+            Defect::ListsAKeyThatWasNeverWritten => {
+                let mut page = self.inner.list(prefix, after, max_keys).await?;
+                if page.next.is_none() && prefix.as_str().ends_with("/list/") {
+                    let key =
+                        ObjectKey::new(format!("{}zz-never-written", prefix.as_str())).unwrap();
+                    page.objects.push(ObjectInfo { key, size: 1 });
+                }
                 Ok(page)
             }
             Defect::PagesByPosition => self.list_by_position(prefix, after, max_keys).await,
@@ -801,4 +875,116 @@ fn every_key_a_streamed_put_writes_is_deleted() {
     let mut want = neighbours();
     want.insert(2, "conformance/locked".to_owned());
     assert_eq!(bucket_keys(&store.inner), want, "{report}");
+}
+
+/// Catches: a suite that compares only the length of a ranged read, so a store that
+/// answers with the right number of the wrong bytes passes and kbf would serve a
+/// corrupt blob.
+#[test]
+fn a_store_that_alters_the_bytes_of_a_range_fails_naming_the_range() {
+    let report = run(Defect::AltersTheFirstByte);
+    let Some(Outcome::Failed(why)) = report.outcome(Check::RangeBoundaries) else {
+        panic!("RangeBoundaries did not fail:\n{report}");
+    };
+    assert!(
+        why.contains("of a 1000-byte object returned 1 bytes, expected 1 (bytes 0..1)"),
+        "{why}"
+    );
+}
+
+/// Catches: a listing check that looks only for missing keys, so a store that lists a
+/// key nobody wrote (a deleted object, another tenant's) passes.
+#[test]
+fn a_listing_with_a_key_that_was_never_written_fails_naming_it() {
+    let report = run(Defect::ListsAKeyThatWasNeverWritten);
+    let Some(Outcome::Failed(why)) = report.outcome(Check::ListPagination) else {
+        panic!("ListPagination did not fail:\n{report}");
+    };
+    assert!(why.contains("missing [], unexpected"), "{why}");
+    assert!(why.contains("zz-never-written"), "{why}");
+}
+
+/// Catches: a suite that takes a store's refusal of a retention date for a pass only
+/// by luck: a store that claims nothing and refuses the date must pass the Object Lock
+/// check and skip the conditional-write ones, not fail them.
+#[test]
+fn a_store_without_object_lock_that_refuses_a_retention_date_passes() {
+    let report = run(Defect::HonestWithoutLock);
+    assert!(report.passed(), "{report}");
+    assert_eq!(report.outcome(Check::ObjectLock), Some(&Outcome::Passed));
+    assert!(matches!(
+        report.outcome(Check::PutNewRefusesOverwrite),
+        Some(Outcome::Skipped(_))
+    ));
+    assert_eq!(report.outcome(Check::StreamedPut), Some(&Outcome::Passed));
+}
+
+/// Catches: an Object Lock check that accepts a delete answered with success because
+/// the bytes happen to survive: kbf would believe an object gone that is still held.
+#[test]
+fn a_delete_of_a_retained_object_that_reports_success_fails_even_if_the_bytes_survive() {
+    let report = run(Defect::ReportsADeleteItDidNot);
+    assert_fails_only(&report, &[Check::ObjectLock]);
+    let Some(Outcome::Failed(why)) = report.outcome(Check::ObjectLock) else {
+        unreachable!("checked above");
+    };
+    assert!(why.contains("reported success (the bytes survive"), "{why}");
+}
+
+/// Catches: a streamed-write check that does not fail when the store cannot write at
+/// all, leaving a store whose uploads always fail looking conformant.
+#[test]
+fn a_store_that_refuses_streamed_writes_fails_naming_the_answer() {
+    let report = run(Defect::RefusesStreamedWrites);
+    assert_fails_only(&report, &[Check::StreamedPut]);
+    let Some(Outcome::Failed(why)) = report.outcome(Check::StreamedPut) else {
+        unreachable!("checked above");
+    };
+    assert!(why.contains("/streamed: Err(Service"), "{why}");
+}
+
+/// Catches: a streamed-write check that tries only a body that fails, so a store that
+/// stores a body shorter than the length it was told passes (a truncated segment).
+#[test]
+fn a_store_that_stores_a_short_streamed_body_fails_naming_the_answer() {
+    let report = run(Defect::AcceptsAShortStream);
+    assert_fails_only(&report, &[Check::StreamedPut]);
+    let Some(Outcome::Failed(why)) = report.outcome(Check::StreamedPut) else {
+        unreachable!("checked above");
+    };
+    assert!(
+        why.contains("streamed-short: a short body answered Ok"),
+        "{why}"
+    );
+}
+
+/// Catches: a range check that treats an empty answer to a read past the end as fine,
+/// so a store that hides a bad offset (a corrupt index) as empty bytes passes.
+#[test]
+fn a_store_that_answers_a_read_past_the_end_with_empty_bytes_fails_naming_the_offset() {
+    let report = run(Defect::ReadsPastTheEndAsEmpty);
+    let Some(Outcome::Failed(why)) = report.outcome(Check::RangeBoundaries) else {
+        panic!("RangeBoundaries did not fail:\n{report}");
+    };
+    assert!(
+        why.contains("a range starting at 1000 of a 1000-byte object: expected InvalidRange, got"),
+        "{why}"
+    );
+}
+
+/// Catches: an Object Lock check that knows only "the bytes survive" and "the object no
+/// longer reads": a delete answered with success that leaves other bytes under the key
+/// is also a lost object, and must say the bytes are not the retained ones.
+#[test]
+fn a_delete_of_a_retained_object_that_leaves_other_bytes_fails() {
+    let report = run(Defect::LeavesATombstone);
+    assert_fails_only(&report, &[Check::ObjectLock]);
+    let Some(Outcome::Failed(why)) = report.outcome(Check::ObjectLock) else {
+        unreachable!("checked above");
+    };
+    assert!(
+        why.contains("succeeded and the object no longer reads"),
+        "{why}"
+    );
+    assert!(why.ends_with(": success"), "{why}");
 }
