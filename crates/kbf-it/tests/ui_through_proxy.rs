@@ -333,7 +333,7 @@ async fn grpc_status(client: &SendRequest<Bytes>, path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// A caller with no credential reads the UI: the index, the lookup page, an error page, the
+/// A caller with no credential reads the UI: the index, the builds list, an error page, the
 /// stylesheet and HEAD, each `200` (or the page's own `404`) with the ruling's headers, each
 /// of them once.
 ///
@@ -346,7 +346,9 @@ async fn the_ui_answers_without_credentials_with_the_security_headers() {
     for (method, path, status) in [
         ("GET", "/ui", 200),
         ("GET", "/ui/", 200),
-        ("GET", "/ui/builds", 200),
+        // The list reads `/v1/invocations`, which this server has no history for: the page
+        // answers that route's `404`, with the headers.
+        ("GET", "/ui/builds", 404),
         ("GET", "/ui/static/kbf.css", 200),
         ("HEAD", "/ui", 200),
         ("GET", "/ui/builds/no-such-build", 404),

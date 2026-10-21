@@ -15,7 +15,7 @@ const TAGS: &[&str] = &[
     "a", "body", "code", "dd", "details", "div", "dl", "dt", "footer", "form", "h1", "h2", "head",
     "header", "html", "input", "label", "li", "link", "main", "meta", "nav", "ol", "p", "pre",
     "section", "small", "span", "summary", "table", "tbody", "td", "th", "thead", "time", "title",
-    "tr", "ul",
+    "tr", "ul", "h3", "option", "select",
 ];
 
 /// Elements written without a closing tag.
@@ -39,6 +39,7 @@ const TEXT_ATTRS: &[&str] = &[
     "rel",
     "required",
     "scope",
+    "selected",
     "spellcheck",
     "title",
     "type",
