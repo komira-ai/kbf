@@ -192,3 +192,54 @@ async fn an_owner_that_cannot_answer_is_not_a_blob_that_is_absent() {
     assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
     assert!(rig.commits().is_empty());
 }
+
+/// Catches a barrier that fails the commit for an owner that could not answer when another
+/// owner holds every blob durably: the primary fails the barrier's call, the replica holds
+/// the output, so the commit goes through. Mutant: an owner's failure fails the call
+/// whatever the later owners say.
+#[tokio::test]
+async fn an_owner_that_cannot_answer_does_not_fail_a_blob_another_owner_holds() {
+    let rig = rig();
+    let blobs = rig.blobs(2);
+    let (result, output) = (&blobs[0], &blobs[1]);
+    for node in [1, 2] {
+        rig.cluster.node(node).hold(&result.0);
+    }
+    rig.cluster.node(2).hold(&output.0);
+    rig.cluster.node(1).fail_next(super::support::unavailable());
+
+    rig.commit(Rig::record(result.1, &[output.1]))
+        .await
+        .expect("the replica holds it");
+    assert_eq!(rig.commits(), [rig.action]);
+}
+
+/// Catches a barrier that does not follow the stale-map rule: the primary answers
+/// STALE_MAP to the barrier's call, the router fetches the new map and the commit goes
+/// through against it. Mutant: the stale answer counted as an owner that could not answer.
+#[tokio::test]
+async fn a_stale_map_in_the_barrier_is_followed() {
+    let one = map(1, 2, active(&[1, 2, 3]));
+    let two = map(2, 2, active(&[1, 2, 3]));
+    let cluster = Cluster::of(3);
+    let (router, cell) = router(&one, &cluster);
+    cluster.node(3).check_closure();
+    let action = blobs_written_to(&one, &[3, 1], 1)[0].1;
+    let blobs = blobs_written_to(&one, &[1, 2], 2);
+    // The blobs must be placed the same by the new map, which has the same members.
+    for (bytes, _) in &blobs {
+        cluster.node(1).hold(bytes);
+    }
+    cell.answer_fetch(Ok(super::support::view(&two)));
+    // The first call to node 1 is the barrier's (the copies read, and node 3 is the
+    // action's owner).
+    cluster
+        .node(1)
+        .fail_next(StorageError::StaleMap { current: 2 });
+
+    router
+        .commit_with_closure(Role::Daemon, action, Rig::record(blobs[0].1, &[blobs[1].1]))
+        .await
+        .expect("committed against the newer map");
+    assert_eq!(cell.fetched(), [2]);
+}

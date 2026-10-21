@@ -73,6 +73,19 @@ async fn write(cache: &MemCache, blob: &Blob) {
         .expect("stored");
 }
 
+/// Returns when `count` waits have parked on `cache`; fails the test, rather than waiting
+/// for ever, if `task` finishes first (it did not wait for the blob).
+async fn parked_while<T: std::fmt::Debug>(
+    cache: &MemCache,
+    count: usize,
+    task: &mut tokio::task::JoinHandle<T>,
+) {
+    tokio::select! {
+        () = cache.parked_for_test(count) => {}
+        done = task => panic!("finished without waiting for the blob: {done:?}"),
+    }
+}
+
 /// The drain: the index takes the blob, then the set drops it.
 async fn drain(cache: &MemCache, blob: &Blob) {
     write(cache, blob).await;
@@ -102,35 +115,58 @@ async fn a_wait_for_a_held_blob_ends_when_it_is_in_the_index() {
     );
     assert!(cache.hold_for_test(&held.verified));
 
-    let waiting = tokio::spawn({
+    let mut waiting = tokio::spawn({
         let cache = Arc::clone(&cache);
         let digest = held.digest();
         async move { cache.durable_waiting(&[digest]).await }
     });
-    cache.parked_for_test(1).await;
+    parked_while(&cache, 1, &mut waiting).await;
     drain(&cache, &held).await;
     assert_eq!(waiting.await.expect("joined").expect("answer"), []);
 }
 
 /// Catches a wait that ends for the wrong blob, or never ends: two blobs are held; the wait
 /// is for the first; the second leaving does not end it (it parks again), the first does.
-/// Mutant: the wait ends when any entry leaves.
-#[tokio::test]
+/// Then the other way round, on the paused clock: a wait for the first ends when the first
+/// leaves though the second is still held (well inside the bound). Mutants: the wait ends
+/// when any entry leaves; the wait ends only when the whole set is empty.
+#[tokio::test(start_paused = true)]
 async fn a_wait_ends_only_when_its_own_blobs_have_left() {
     let cache = cache();
     let (mine, other) = (blob_of(b"mine".to_vec()), blob_of(b"another".to_vec()));
     assert!(cache.hold_for_test(&mine.verified));
     assert!(cache.hold_for_test(&other.verified));
-    let waiting = tokio::spawn({
+    let mut waiting = tokio::spawn({
         let cache = Arc::clone(&cache);
         let digest = mine.digest();
         async move { cache.durable_waiting(&[digest]).await }
     });
-    cache.parked_for_test(1).await;
+    parked_while(&cache, 1, &mut waiting).await;
     drain(&cache, &other).await;
-    cache.parked_for_test(2).await;
+    parked_while(&cache, 2, &mut waiting).await;
     drain(&cache, &mine).await;
     assert_eq!(waiting.await.expect("joined").expect("answer"), []);
+
+    // The other way round: `other` stays held.
+    let (mine, other) = (
+        blob_of(b"mine again".to_vec()),
+        blob_of(b"still held".to_vec()),
+    );
+    assert!(cache.hold_for_test(&mine.verified));
+    assert!(cache.hold_for_test(&other.verified));
+    let mut waiting = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        let digest = mine.digest();
+        async move { cache.durable_waiting(&[digest]).await }
+    });
+    parked_while(&cache, 3, &mut waiting).await;
+    drain(&cache, &mine).await;
+    let answer = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("ended when its own blob left, not at the bound")
+        .expect("joined")
+        .expect("answer");
+    assert_eq!(answer, []);
 }
 
 /// Catches a wait with no bound or the wrong one: a blob that never leaves is reported
@@ -143,12 +179,12 @@ async fn a_blob_still_held_when_the_wait_ends_is_reported_missing() {
     let cache = cache();
     let held = blob_of(b"never written".to_vec());
     assert!(cache.hold_for_test(&held.verified));
-    let waiting = tokio::spawn({
+    let mut waiting = tokio::spawn({
         let cache = Arc::clone(&cache);
         let digest = held.digest();
         async move { cache.durable_waiting(&[digest]).await }
     });
-    cache.parked_for_test(1).await;
+    parked_while(&cache, 1, &mut waiting).await;
     tokio::time::advance(WAIT - Duration::from_millis(1)).await;
     assert!(!waiting.is_finished(), "inside the bound");
     tokio::time::advance(Duration::from_millis(1)).await;
@@ -251,7 +287,7 @@ async fn committing_an_entry_waits_for_its_blobs_to_be_written() {
                 .await
         }
     });
-    cache.parked_for_test(2).await;
+    parked_while(&cache, 2, &mut committing).await;
     tokio::time::advance(WAIT).await;
     let refused = (&mut committing).await.expect("joined");
     assert!(
@@ -580,12 +616,12 @@ async fn the_wait_header_makes_a_node_wait_for_its_held_blobs() {
         [held.digest()],
         "`only` does not wait"
     );
-    let asking = tokio::spawn({
+    let mut asking = tokio::spawn({
         let remote = Arc::clone(&remote);
         let digest = held.digest();
         async move { remote.find_durable_waiting(&[digest]).await }
     });
-    cache.parked_for_test(1).await;
+    parked_while(&cache, 1, &mut asking).await;
     drain(&cache, &held).await;
     assert_eq!(asking.await.expect("joined").expect("answer"), []);
 }

@@ -238,19 +238,9 @@ impl PeerConfirmer {
         peer: MemberId,
         entries: &[(Digest, Entry)],
     ) -> Vec<Digest> {
-        let Some(view) = view else {
+        let Some(remote) = self.dial(view, peer) else {
             return Vec::new();
         };
-        let Some(member) = view.map.member(peer) else {
-            return Vec::new();
-        };
-        if member.state == MemberState::Down {
-            return Vec::new();
-        }
-        let Ok(channel) = self.chain.peer(&member.addr) else {
-            return Vec::new();
-        };
-        let remote = RemoteStorage::new(channel, view.map.generation());
         let mut durable = Vec::new();
         for batch in entries.chunks(MAX_FIND_MISSING_DIGESTS) {
             let digests: Vec<Digest> = batch.iter().map(|(digest, _)| *digest).collect();
@@ -262,6 +252,18 @@ impl PeerConfirmer {
             durable.extend(digests.into_iter().filter(|d| !missing.contains(d)));
         }
         durable
+    }
+
+    /// A client of `peer`; `None` when there is no map, the map does not name the peer or
+    /// names it down, or it cannot be dialled: then it is not known to hold anything.
+    fn dial(&self, view: Option<&crate::replicate::View>, peer: MemberId) -> Option<RemoteStorage> {
+        let view = view?;
+        let member = view.map.member(peer)?;
+        if member.state == MemberState::Down {
+            return None;
+        }
+        let channel = self.chain.peer(&member.addr).ok()?;
+        Some(RemoteStorage::new(channel, view.map.generation()))
     }
 
     /// Journals the debt for `digest`; whether it is durable now.
