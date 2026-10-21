@@ -868,7 +868,11 @@ fn source_allowed(req: &UpdateRequest, status: &InstallerStatus) -> Result<(), A
         }
         None => "this host's package carries nothing to order yet".to_owned(),
     };
-    Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "not_staged", said))
+    Err(ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "not_staged",
+        said,
+    ))
 }
 
 /// The first twelve digits of a commit, for a message.
