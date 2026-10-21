@@ -42,18 +42,26 @@
 //!   not reversible; the waivers; the verdict in a line), then the commits since the
 //!   previous release, the verdict, the gamma escapes and what is withdrawn. Without the
 //!   identity of the previous release, when there is one, it refuses (fail closed).
+//! - `release plan --repo <owner/repo> --sha <sha> --before <sha> [--repo-dir <checkout>]
+//!   [--freeze <text>] [--output <file>] [--gh <program>]` ([`plan`]): the next version
+//!   (`VERSION` and the release tags), the push's class (code, site, pipeline), and the
+//!   refusals: a freeze, a base below an existing tag, a superseded commit ([`tags::superseded`]).
+//!   Prints `key=value` lines and appends them to `--output`.
 //! - `release publish <dir> --repo <owner/repo> --tag <tag> --commit <sha> --run-id <id>
 //!   --set-hash <hex> --notes-file <file> [--gh <program>]` ([`publish`]): `check`, then
 //!   creates release `<tag>` with every file of `<dir>` (the bundles beside their
 //!   tarballs) and the notes file, verbatim, as the start of its body. When the release exists,
 //!   every asset it holds must be one of these files, byte for byte, or nothing is
 //!   changed; the files it lacks are uploaded. A re-run therefore creates no second
-//!   release and replaces no asset.
+//!   release and replaces no asset. It refuses first when the highest release tag is not
+//!   at `--commit` or an ancestor of it ([`tags::superseded`]).
 
 mod git;
 pub mod identity;
 pub mod notes;
 pub mod offer;
+pub mod plan;
+pub mod tags;
 pub mod verdict;
 
 use std::io::Write;
@@ -366,6 +374,26 @@ impl Release<'_> {
     }
 }
 
+/// Rule S compares the commit with the highest tag only, so `--tag` is checked too: it
+/// is the highest tag when it already names this commit (a re-run of the same release),
+/// and otherwise it must be strictly above the highest existing release tag.
+fn tag_is_current(tag: &str, standing: &tags::Standing) -> Result<(), Error> {
+    let given = tags::Version::parse_tag(tag);
+    let (top, ok) = match standing {
+        tags::Standing::Untagged => return Ok(()),
+        tags::Standing::Is(top) => (top, given == Some(*top)),
+        tags::Standing::Ahead(top) => (top, given.is_some_and(|v| v > *top)),
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(Error::Refused(vec![format!(
+        "--tag {tag} is no release above the highest release tag {}: a release tag \
+         is v<MAJOR>.<MINOR>.<PATCH>, strictly above the highest unless it names this commit",
+        top.tag()
+    )]))
+}
+
 /// The `release publish` verb: the lines to print.
 pub fn publish(dir: &Path, r: &Release) -> Result<Vec<String>, Error> {
     let (mut printed, names) = checked(dir, r.commit)?;
@@ -378,13 +406,17 @@ pub fn publish(dir: &Path, r: &Release) -> Result<Vec<String>, Error> {
             r.set_hash.as_str()
         )]));
     }
+    // Refused before GitHub is asked anything (not even the tags), whether or not the
+    // release exists.
+    r.body()?;
+    // Rule S, before the first read of the release: an old run does nothing.
+    let standing = tags::superseded(r.gh, r.repo, r.commit)?;
+    tag_is_current(r.tag, &standing)?;
     let paths: Vec<String> = names
         .iter()
         .map(|n| dir.join(n).display().to_string())
         .collect();
     let path_args = paths.iter().map(String::as_str);
-    // Refused before GitHub is asked anything, whether or not the release exists.
-    r.body()?;
     let held = api(r.gh, &format!("repos/{}/releases/tags/{}", r.repo, r.tag))?;
     let Some(held) = held else {
         let notes = r.body()?;

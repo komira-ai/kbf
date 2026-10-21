@@ -7,7 +7,7 @@ use std::process::Command;
 use crate::Error;
 
 /// Runs `git -C <repo> <args>`: its stdout, or the error holding what it printed on stderr.
-fn git(repo: &Path, args: &[&str]) -> Result<String, Error> {
+pub(super) fn git(repo: &Path, args: &[&str]) -> Result<String, Error> {
     let out = git_output(repo, args)?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -20,7 +20,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, Error> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, Error> {
+pub(super) fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, Error> {
     Command::new("git")
         .arg("-C")
         .arg(repo)

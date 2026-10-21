@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use kbf_sim::{Chance, Event, Faults, Node, NodeId, NodeInput, Output, Partition, Sim};
-use kbf_types::{Effect, FarmTime, StateMachine};
+use kbf_types::{Effect, FarmTime, OperationId, StateMachine, Waiting};
 
 /// Sends scripted messages at scripted times and records what it receives.
 #[derive(Default)]
@@ -13,6 +13,8 @@ struct Recorder {
     out: Vec<Output<u32>>,
     /// (sender, message, arrival time in ms)
     got: Vec<(NodeId, u32, u64)>,
+    /// Effects returned from `Start`.
+    announce: Vec<Effect>,
 }
 
 impl Recorder {
@@ -35,8 +37,10 @@ impl StateMachine for Recorder {
     type Input = NodeInput<u32>;
 
     fn apply(&mut self, input: NodeInput<u32>) -> Vec<Effect> {
+        let mut effects = Vec::new();
         match input.event {
             Event::Start => {
+                effects.clone_from(&self.announce);
                 for (i, (at, _, _)) in self.script.iter().enumerate() {
                     self.out.push(Output::Timer {
                         after: Duration::from_millis(*at),
@@ -50,7 +54,7 @@ impl StateMachine for Recorder {
             }
             Event::Message { from, msg } => self.got.push((from, msg, input.now.as_millis())),
         }
-        Vec::new()
+        effects
     }
 }
 
@@ -221,4 +225,54 @@ fn a_node_changed_between_steps_keeps_the_change() {
     sim.run_until(FarmTime::from_millis(1_000));
     let b = sim.node(&NodeId::from("b")).expect("b was added");
     assert_eq!(b.msgs(), [1, 7]);
+}
+
+/// Catches: effects a node returns being dropped from the trace (two runs that differ only
+/// in what a node asked for would share a hash), or a trace line written for a node that
+/// returned none.
+#[test]
+fn effects_a_node_returns_are_traced_and_change_the_hash() {
+    let run = |announce: Vec<Effect>| {
+        let mut sim = Sim::new(0, Faults::default()).with_trace_lines();
+        sim.add_node(
+            "a",
+            Recorder {
+                announce,
+                ..Recorder::default()
+            },
+        );
+        sim.add_node("b", Recorder::default());
+        sim.run_until(FarmTime::from_millis(10));
+        let lines = sim.trace_lines().unwrap().to_vec();
+        (sim.trace_hash(), lines)
+    };
+    let (quiet_hash, quiet) = run(Vec::new());
+    assert!(quiet.iter().all(|l| !l.contains("effects")), "{quiet:?}");
+    let waiting = Effect::Waiting(Waiting {
+        operation: OperationId(7),
+        reason: Some("no worker".to_owned()),
+    });
+    let (loud_hash, loud) = run(vec![waiting]);
+    let effects: Vec<&String> = loud.iter().filter(|l| l.contains("effects")).collect();
+    assert_eq!(
+        effects,
+        [
+            r#"0 effects a [Waiting(Waiting { operation: OperationId(7), reason: Some("no worker") })]"#
+        ]
+    );
+    assert_ne!(quiet_hash, loud_hash);
+}
+
+/// Catches: `random_split` with fewer than two nodes panicking (an empty range for the
+/// cut) or inventing a split, instead of leaving every node connected.
+#[test]
+fn random_split_of_fewer_than_two_nodes_is_no_partition() {
+    let mut sim: Sim<Recorder> = Sim::new(5, Faults::default());
+    assert_eq!(sim.random_split(), Partition::none());
+    sim.add_node("a", Recorder::default());
+    assert_eq!(sim.random_split(), Partition::none());
+    sim.add_node("b", Recorder::default());
+    let split = sim.random_split();
+    let (a, b) = (NodeId::from("a"), NodeId::from("b"));
+    assert!(!split.connected(&a, &b), "two nodes split into two groups");
 }

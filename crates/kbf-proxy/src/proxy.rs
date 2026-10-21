@@ -86,6 +86,7 @@ impl Proxy {
             tcp_connector(),
             security,
             metrics,
+            cfg.ui,
         );
         let (stop, stopped) = watch::channel(false);
         let handle = ProxyHandle {

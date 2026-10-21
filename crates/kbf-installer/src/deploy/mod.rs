@@ -29,6 +29,7 @@ mod frontend_addr;
 #[cfg(test)]
 mod frontend_addr_tests;
 mod gates;
+pub mod host_config;
 mod interrupt;
 mod nodes;
 pub mod observe;

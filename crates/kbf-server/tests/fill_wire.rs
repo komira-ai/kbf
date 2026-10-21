@@ -166,3 +166,55 @@ async fn a_node_reports_its_fill_and_is_promoted_by_its_own_heartbeat() {
         "a new boot has done no pass"
     );
 }
+
+/// Catches: a node's write-tier health that never leaves the node (the heartbeat built
+/// without it), arrives on other fields, or is not unknown before the node has any: a real
+/// node-side [`Joiner`] beats once with the health its fill state holds and the frontend's
+/// storage health shows those values for it; before the node has said any they are unknown
+/// (`NONE`, never zeros); after it registers again (a restart) they are unknown until its
+/// next beat, which brings them back.
+#[tokio::test]
+async fn a_nodes_write_tier_health_reaches_the_frontends_view_and_recovers() {
+    use kbf_server::vitals::Vitals;
+
+    let store = Hooked::new();
+    let (members, channel) = serve(&store).await;
+    let mut joiner = Joiner::new(
+        channel,
+        Identity {
+            instance_id: "node-1".to_owned(),
+            addr: "192.0.2.1:8982".to_owned(),
+            zone: String::new(),
+            weight: 1,
+        },
+        MS,
+    );
+    let fill = joiner.fill();
+    let seen = |members: &Members| {
+        let health = members.storage_health().expect("health");
+        health.nodes[0].vitals
+    };
+    let said = Vitals {
+        unflushed_bytes: Some(1),
+        unflushed_blocks: Some(2),
+        oldest_unflushed_ms: Some(3),
+        budget_bytes: Some(4),
+        used_bytes: Some(5),
+        flush_failures: Some(6),
+        flush_conflicts: Some(7),
+    };
+
+    let joined = joiner.register().await.expect("registers");
+    joiner.beat(&joined).await.expect("beat");
+    assert_eq!(seen(&members), Vitals::NONE, "a node with no round yet");
+
+    fill.tiered(said);
+    joiner.beat(&joined).await.expect("beat");
+    assert_eq!(seen(&members), said, "every value, on its own field");
+
+    let again = joiner.register().await.expect("registers again");
+    assert_ne!(again.boot, joined.boot);
+    assert_eq!(seen(&members), Vitals::NONE, "a new boot has said nothing");
+    joiner.beat(&again).await.expect("beat");
+    assert_eq!(seen(&members), said, "recovered");
+}

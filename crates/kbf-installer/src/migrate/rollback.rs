@@ -21,9 +21,9 @@ use super::tree::{self, Rules};
 use super::units;
 use super::units::Unit;
 use super::{Migration, Outcome, Report};
-use crate::backup::utc_stamp;
 use crate::layout::Layout;
 use crate::state::{self, Locked, State, StateError};
+use crate::utc_stamp::utc_stamp;
 
 /// What a look at the journal and the installer's state came to.
 enum Look {

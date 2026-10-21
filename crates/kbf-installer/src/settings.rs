@@ -16,7 +16,9 @@
 //! settings it may hold decide what is believed.
 //!
 //! Neither the inbox nor the frontend supplies a ref: the refs a release may come from are
-//! this host's own setting, so a hostile offer cannot name a branch it likes.
+//! this host's own setting, so a hostile offer cannot name a branch it likes. The one other
+//! file that may touch the list is `installer.toml`, whose `source_refs` can only narrow it
+//! ([`Settings::narrowed_to`]).
 
 use std::time::Duration;
 
@@ -96,7 +98,34 @@ impl Settings {
         let text = String::from_utf8(bytes).map_err(|_| refuse(SettingsFault::NotUtf8))?;
         parse(&text, Settings::defaults(host)).map_err(refuse)
     }
+
+    /// These settings with `installer.toml`'s `source_refs` applied: the refs of the trust
+    /// files that `wanted` also names, in the trust files' order. An empty `wanted` is no
+    /// narrowing. A ref `wanted` names that the trust files do not allow is dropped, so the
+    /// result is never wider than the trust files' list.
+    ///
+    /// # Errors
+    /// [`NoCommonRef`] when `wanted` is not empty and names none the trust files allow: the
+    /// host would accept no release, and the file cannot add a ref to make one.
+    pub fn narrowed_to(mut self, wanted: &[String]) -> Result<Settings, NoCommonRef> {
+        if wanted.is_empty() {
+            return Ok(self);
+        }
+        self.source_refs
+            .retain(|allowed| wanted.iter().any(|w| w == allowed.as_str()));
+        if self.source_refs.is_empty() {
+            return Err(NoCommonRef);
+        }
+        Ok(self)
+    }
 }
+
+/// `installer.toml`'s `source_refs` names no ref that `installer.conf` allows.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "installer.toml source_refs names no ref that installer.conf's SOURCE_REFS allows (it may narrow that list, never widen it)"
+)]
+pub struct NoCommonRef;
 
 /// `text` applied over `settings`.
 fn parse(text: &str, mut settings: Settings) -> Result<Settings, SettingsFault> {
