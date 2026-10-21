@@ -127,48 +127,8 @@ impl<U: UpdateHandler + 'static> Service<U> {
         }
         // Who may call it, before the call is counted or held or forwarded.
         let mut request = request;
-        if let Some(class) = auth_class(route) {
-            let security = &self.core.security;
-            let call = (request.method(), request.uri());
-            let verdict = security
-                .authorize_call(
-                    class,
-                    call,
-                    request.headers(),
-                    peer.identity.as_ref(),
-                    peer.ip,
-                    now(),
-                )
-                .await;
-            match verdict {
-                Ok(Admitted::Credential) => {}
-                Ok(Admitted::Ci(who)) => {
-                    tracing::info!(jti = %who.jti, workflow = %who.job_workflow_ref,
-                        git_ref = ?who.git_ref, sha = ?who.sha, path = request.uri().path(),
-                        "remote ci: admitted");
-                    // A call for the child carries the operator token from here on: the
-                    // child's gate takes no other credential, and the OIDC token goes no
-                    // further than this proxy. The update API is the proxy's own.
-                    if route != Route::Update {
-                        let operator = security
-                            .tokens
-                            .operator
-                            .as_ref()
-                            .and_then(crate::auth::Token::bearer_header);
-                        let Some(operator) = operator else {
-                            Metrics::inc(&self.core.metrics.auth_refused);
-                            return refused(route.grpc(), AuthRefusal::PermissionDenied);
-                        };
-                        request
-                            .headers_mut()
-                            .insert(header::AUTHORIZATION, operator);
-                    }
-                }
-                Err(refusal) => {
-                    Metrics::inc(&self.core.metrics.auth_refused);
-                    return refused(route.grpc(), refusal);
-                }
-            }
+        if let Err(refused) = admit(&self.core, route, &mut request, peer).await {
+            return *refused;
         }
         // Counted from accept: a bypass stream is one for its whole life, a backend stream
         // until its permit exists.
@@ -243,6 +203,65 @@ impl<U: UpdateHandler + 'static> Service<U> {
             Err(error) => std::panic::resume_unwind(error.into_panic()),
         }
     }
+}
+
+/// Decides whether the caller of `request` may make it ([`crate::security::Security`]), and
+/// for a CI job admitted by OIDC puts the operator token where the OIDC token was when the call
+/// goes to a child. `Err` is the refusal to answer with. Not generic, so that every
+/// instantiation of the service shares one copy.
+async fn admit(
+    core: &Core,
+    route: Route,
+    request: &mut Request<Incoming>,
+    peer: &Peer,
+) -> Result<(), Box<Response<ProxyBody>>> {
+    let Some(class) = auth_class(route) else {
+        return Ok(());
+    };
+    let security = &core.security;
+    let call = (request.method(), request.uri());
+    let verdict = security
+        .authorize_call(
+            class,
+            call,
+            request.headers(),
+            peer.identity.as_ref(),
+            peer.ip,
+            now(),
+        )
+        .await;
+    let who = match verdict {
+        Ok(Admitted::Credential) => return Ok(()),
+        Ok(Admitted::Ci(who)) => who,
+        Err(refusal) => {
+            Metrics::inc(&core.metrics.auth_refused);
+            return Err(Box::new(refused(route.grpc(), refusal)));
+        }
+    };
+    tracing::info!(jti = %who.jti, workflow = %who.job_workflow_ref,
+        git_ref = ?who.git_ref, sha = ?who.sha, path = request.uri().path(),
+        "remote ci: admitted");
+    // A call for the child carries the operator token from here on: the child's gate takes no
+    // other credential, and the OIDC token goes no further than this proxy. The update API is
+    // the proxy's own.
+    if route != Route::Update {
+        let operator = security
+            .tokens
+            .operator
+            .as_ref()
+            .and_then(crate::auth::Token::bearer_header);
+        let Some(operator) = operator else {
+            Metrics::inc(&core.metrics.auth_refused);
+            return Err(Box::new(refused(
+                route.grpc(),
+                AuthRefusal::PermissionDenied,
+            )));
+        };
+        request
+            .headers_mut()
+            .insert(header::AUTHORIZATION, operator);
+    }
+    Ok(())
 }
 
 /// The per-connection limits: total, and per client address.
