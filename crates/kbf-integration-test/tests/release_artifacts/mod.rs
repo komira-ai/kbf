@@ -783,6 +783,23 @@ fn the_workflow_builds_signs_checks_and_attests_what_the_release_set_says() {
 }
 
 #[test]
+fn every_component_a_platform_needs_is_in_its_release_set() {
+    // Catches: `ReleasePlatform::components()` naming a tarball the artifacts workflow
+    // does not build for that platform (the Mac's was `kbf-daemon`, which only Linux
+    // builds), so the release store never calls the platform complete, or calls it
+    // complete on a file no host takes. `the_workflow_builds_signs_checks_and_attests_what_the_release_set_says`
+    // holds the workflow to `ASSETS`; this holds the store's idea of complete to it.
+    for platform in kbf_types::ReleasePlatform::ALL {
+        for need in platform.components() {
+            assert!(
+                ASSETS.contains(&(*need, platform.as_str())),
+                "the release store needs {need} for {platform}, which the release set does not build: {ASSETS:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn the_macos_jobs_run_on_every_push_and_on_no_pull_request() {
     // Catches: a condition added to native-macos or pkg-macos in beta.yml (a push that
     // skips the only real-Mac test), or a `pull_request` trigger on beta.yml, which
