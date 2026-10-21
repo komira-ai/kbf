@@ -126,6 +126,28 @@ fn limited_role(admin: &mut Client, name: &str, limit: i32) -> String {
     as_user(&url(), name)
 }
 
+/// How many backends the server has for `role`.
+fn backends_of(admin: &mut Client, role: &str) -> i64 {
+    admin
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE usename = $1",
+            &[&role],
+        )
+        .expect("the activity view")
+        .get(0)
+}
+
+/// Waits until the server has no backend for `role`. A client that drops its connection
+/// (the installer step that made the schema) has only sent the goodbye: the server frees
+/// the role's slot when its backend exits, a moment later, and a role limited to one
+/// connection refuses the next connect until then (SQLSTATE 53300). The bound only ends
+/// a hang.
+fn wait_for_no_backend_of(admin: &mut Client, role: &str) {
+    until(&format!("the backends of {role} to exit"), || {
+        backends_of(admin, role) == 0
+    });
+}
+
 /// The configuration for the limited role's own schema (`DROP OWNED BY` removes it with
 /// the role at the start of the next run).
 fn limited_config(url: &str, schema: &str) -> PostgresConfig {
@@ -328,7 +350,9 @@ fn a_connection_the_server_refuses_does_not_take_a_pool_slot() {
 fn a_liveness_lock_whose_connection_is_refused_is_an_error() {
     let mut admin = admin();
     let url = limited_role(&mut admin, "kbf_fault_hold", 1);
-    let store = PostgresStore::open(&limited_config(&url, "kbf_fault_hold_schema")).expect("opens");
+    let config = limited_config(&url, "kbf_fault_hold_schema");
+    wait_for_no_backend_of(&mut admin, "kbf_fault_hold");
+    let store = PostgresStore::open(&config).expect("opens");
     let Err(StoreError::Failed(why)) = store.hold_liveness(1) else {
         panic!("the holder connection is over the role's limit");
     };
@@ -501,4 +525,34 @@ fn a_transaction_that_writes_nothing_commits_at_the_head_and_adds_no_feed_row() 
         .expect("store")
         .expect("commits");
     assert_eq!(commit.revision, Revision::ZERO);
+}
+
+// Catches a test that opens a store on a one-connection role while the installer step's
+// backend is still being reaped: the open is refused with the role's limit (the flake
+// this file's liveness-lock test had), and the wait for the role's backends to exit must
+// return only when the slot is free. A wait that returned at once would open into the
+// refusal.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn a_slot_still_held_refuses_the_open_and_the_wait_ends_when_it_is_freed() {
+    let mut admin = admin();
+    let url = limited_role(&mut admin, "kbf_slot_wait", 1);
+    let config = limited_config(&url, "kbf_slot_wait_schema");
+    wait_for_no_backend_of(&mut admin, "kbf_slot_wait");
+
+    let held = Client::connect(&url, NoTls).expect("takes the role's one slot");
+    let Err(StoreError::Failed(why)) = PostgresStore::open(&config) else {
+        panic!("the open ran over the role's limit");
+    };
+    assert!(why.contains("too many connections"), "{why}");
+
+    let (waiting, release) = mpsc::channel::<()>();
+    let freer = thread::spawn(move || {
+        release.recv().expect("told to free the slot");
+        drop(held);
+    });
+    waiting.send(()).expect("the freeing thread is there");
+    wait_for_no_backend_of(&mut admin, "kbf_slot_wait");
+    freer.join().expect("no panic");
+    PostgresStore::open(&config).expect("opens once the slot is free");
 }
