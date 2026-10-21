@@ -441,11 +441,12 @@ fn a_clean_host_has_nothing_to_uninstall() {
 
 /// Catches a glob that is too wide or too narrow: only `<name>.rolled-back-<UTC stamp>` goes
 /// (every one of them, from earlier rollbacks too); a name that only starts like one, a longer
-/// stamp, another name and the live file stay (the live `installer.toml` of a never-adopted
-/// host goes with the host, but a sibling named `installer.toml.keep` does not).
+/// stamp, a stamp of the right length with no `T` or no `Z` where they go, another name and the
+/// live file stay (the live `installer.toml` of a never-adopted host goes with the host, but a
+/// sibling named `installer.toml.keep` does not).
 ///
-/// Mutant seen red: the stamp test replaced by "not empty". Not run as a mutant: only the first match
-/// removed.
+/// Mutants seen red: the stamp test replaced by "not empty"; the `T` check dropped; the `Z` check
+/// dropped. Not run as a mutant: only the first match removed.
 #[test]
 fn only_the_names_a_rollback_makes_are_removed() {
     let mut rig = never_adopted_mac("globs");
@@ -463,6 +464,8 @@ fn only_the_names_a_rollback_makes_are_removed() {
             format!("{name}.rolled-back-"),
             format!("{name}.rolled-back-{STAMP}x"),
             format!("{name}.rolled-back-2026102OT120000Z"),
+            format!("{name}.rolled-back-20261020X120000Z"),
+            format!("{name}.rolled-back-20261020T120000X"),
             format!("{name}.keep"),
             format!("other.rolled-back-{STAMP}"),
         ] {
@@ -478,7 +481,9 @@ fn only_the_names_a_rollback_makes_are_removed() {
         [
             "installer.toml.keep".to_owned(),
             "installer.toml.rolled-back-".to_owned(),
+            "installer.toml.rolled-back-20261020T120000X".to_owned(),
             format!("installer.toml.rolled-back-{STAMP}x"),
+            "installer.toml.rolled-back-20261020X120000Z".to_owned(),
             "installer.toml.rolled-back-2026102OT120000Z".to_owned(),
         ]
     );
