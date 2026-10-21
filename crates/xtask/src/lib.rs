@@ -4,6 +4,10 @@
 //! - `build-commit check <binary> <commit>`, `build-commit check-asset <tarball>
 //!   <commit>` and `build-commit stamps <commit>` ([`build_commit`]): kbf-server names the
 //!   commit it was built from, and `kbf` does in the tarball that ships.
+//! - `advisories --repo <owner>/<repo> [--commit <sha>]` ([`advisories`]): `cargo deny check
+//!   advisories`, kept in one GitHub issue (opened, updated, or commented on and closed when
+//!   none remain) instead of failing a pull request. Exit 0 whatever it found; 1 when
+//!   cargo-deny or `gh` failed. `advisories.yml` runs it daily and on every push to `main`.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
 //!   row the working tree's budget file has and `<rev>`'s does not is refused, unless
 //!   git sees the row's path renamed from a path `<rev>` has a row for. CI runs
@@ -81,6 +85,7 @@ use std::process::{Command, ExitCode};
 
 use clap::{Parser, Subcommand};
 
+pub mod advisories;
 pub mod budget;
 pub mod build_commit;
 pub mod bundles;
@@ -156,6 +161,8 @@ enum Verb {
     /// kbf-server's `--version` names the commit it was built from.
     #[command(subcommand)]
     BuildCommit(BuildCommit),
+    /// Keep the advisories `cargo deny` reports in one GitHub issue.
+    Advisories(advisories::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
         /// The revision to compare with (on a pull request, the base branch).
@@ -834,6 +841,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             sudo: &sudo,
             root: &root,
         }),
+        Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::Fetch {
             url,
