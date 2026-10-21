@@ -71,7 +71,7 @@ use crate::cli::ProxyArgs;
 use crate::database::{Database, DatabaseError};
 use crate::exit::Exit;
 use crate::installer_toml::{InstallerToml, MAX_FILE_BYTES};
-use crate::layout::Platform;
+use crate::layout::{Layout, Platform};
 use crate::proxy::api::actor::ActorTiming;
 use crate::proxy::api::core::{Core, Parts};
 use crate::proxy::api::handler::{Handler, HandlerRequest};
@@ -190,7 +190,7 @@ fn loaded_from(path: &Path, text: &str) -> Result<Loaded, VerbError> {
 }
 
 /// Where the update API reads and writes: the flags and the file.
-fn handover_config(args: &ProxyArgs, loaded: &Loaded) -> HandoverConfig {
+fn handover_config(args: &ProxyArgs, loaded: &Loaded, layout: &Layout) -> HandoverConfig {
     let table = loaded.proxy.upstream;
     let at = |port: u16| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let admin = |slot| at(table.admin_port(slot));
@@ -204,8 +204,8 @@ fn handover_config(args: &ProxyArgs, loaded: &Loaded) -> HandoverConfig {
         installer_toml: config_path(args, Platform::current()),
         gate: GateSlot::new(),
         state_dir: loaded.proxy.state_dir.clone(),
-        orders_dir: args.orders_dir.clone(),
-        status_file: args.update_dir.join("status.json"),
+        orders_dir: args.orders_dir_in(layout),
+        status_file: args.update_dir_in(layout).join("status.json"),
         confirm_window_s: loaded.confirm_window_s,
         fetch_timeout_s: loaded.fetch_timeout_s,
     }
@@ -762,7 +762,11 @@ pub fn run(args: &ProxyArgs, root: &Path) -> Result<(), VerbError> {
         std::process::id(),
         FIRST_FD,
     )?;
-    let handover = handover_config(args, &loaded);
+    let handover = handover_config(
+        args,
+        &loaded,
+        &Layout::new(root.clone(), Platform::current()),
+    );
     serve(loaded.proxy, database, &handover, listener, &root)
 }
 

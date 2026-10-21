@@ -52,6 +52,7 @@ fn raw(mode: Mode) -> Raw {
         kbf: serving_flags(mode),
         proxy: Default::default(),
         create_local_database: false,
+        deploy: Default::default(),
         installer_config: None,
     }
 }
@@ -112,7 +113,21 @@ fn host() -> FakeExec {
 }
 
 /// A host with a release installed: `releases/current` is a link.
+/// A Mac's `kbf.toml` as `kbf-mac-provision` leaves it for `raw(Mode::Daemon)`: the keys setup
+/// writes, and `[daemon] update-dir`, which setup only checks on a Mac.
+fn provisioned(mut exec: FakeExec) -> FakeExec {
+    let text = format!(
+        "mode = \"daemon\"\n\n[frontend]\nurl = \"https://farm.example:8443\"\n\n[enroll]\ntoken_file = \"{}\"\n\n[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n",
+        Platform::MacOs.enroll_token()
+    );
+    put(&mut exec, Platform::MacOs.kbf_toml(), 0o640, ROOT, &text);
+    exec
+}
+
 fn released(mut exec: FakeExec, platform: Platform) -> FakeExec {
+    if platform == Platform::MacOs {
+        exec = provisioned(exec);
+    }
     exec.entries.insert(
         hp(&current_release(platform)),
         Entry::Link {
@@ -736,15 +751,9 @@ fn each_mode_enables_its_own_units() {
         } else {
             " --now"
         };
-        // The modes that keep their state in Postgres also get the backup timer, started
-        // (the schema it dumps is made before the units are enabled).
-        let backup = mode
-            .keeps_state_in_database()
-            .then(|| "run /usr/bin/systemctl enable --now -- kbf-backup.timer".to_owned());
         let expected: Vec<String> = units
             .iter()
             .map(|u| format!("run /usr/bin/systemctl enable{now} -- {u}"))
-            .chain(backup)
             .chain(["run /usr/bin/systemctl enable --now -- kbf-installer.service".to_owned()])
             .collect();
         assert_eq!(enables, expected, "{mode:?}");
@@ -1202,6 +1211,7 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
         kbf: super::kbf_settings::KbfFlags::default(),
         proxy: Default::default(),
         create_local_database: false,
+        deploy: Default::default(),
         installer_config: Some("/tmp/i.toml".to_owned()),
     };
     let mut exec = host();
@@ -1455,7 +1465,7 @@ fn a_mac_node_gets_its_fetch_account_and_launchd_jobs() {
 fn a_mac_refuses_the_frontend_and_waits_for_a_release() {
     let err = go(&FakeOs::mac(), &mut host(), &raw(Mode::Frontend), APPLY);
     assert!(matches!(err, Err(SetupError::Unsupported(_))), "{err:?}");
-    let mut exec = host();
+    let mut exec = provisioned(host());
     let out = go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
     assert!(
         cmds(&exec).iter().all(|c| !c.contains("kbf-daemon.plist")),
@@ -1667,6 +1677,8 @@ fn a_view_forwards_reads_and_refuses_steps() {
 #[path = "more_tests.rs"]
 mod more;
 
+#[path = "deploy_config_tests.rs"]
+mod deploy_config_tests;
 #[path = "kbf_settings_tests.rs"]
 mod kbf_settings_tests;
 #[path = "provision_tests.rs"]
@@ -1678,8 +1690,8 @@ mod proxy_tests;
 #[path = "proxy_listen_tests.rs"]
 mod proxy_listen;
 
-#[path = "backup_dropin_tests.rs"]
-mod backup_dropin;
+#[path = "old_backup_tests.rs"]
+mod old_backup;
 
 /// Catches the journal's `kit` flag not reaching the `kbf.toml` decision: on the same Mac with
 /// the same kit file, a finished kit migration (`DoneKit`) lets setup add its keys and keep the
@@ -1688,7 +1700,7 @@ mod backup_dropin;
 /// Mutant seen red: `ctx.kit_adopted` left false.
 #[test]
 fn the_journals_kit_flag_picks_the_kbf_toml_decision() {
-    const KIT: &str = "mode = \"daemon\"\n\n[identity]\nnode-id = \"mac-a\"\n";
+    const KIT: &str = "mode = \"daemon\"\n\n[identity]\nnode-id = \"mac-a\"\n\n[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n";
     let mut os = FakeOs::mac();
     os.users.push(user("_kbf-fetch", 303));
     os.users.last_mut().expect("user").home = "/var/empty".to_owned();
@@ -1710,9 +1722,10 @@ fn the_journals_kit_flag_picks_the_kbf_toml_decision() {
     ok.expect("kit host");
     let written = text(&exec, "/usr/local/etc/kbf/kbf.toml");
     assert!(written.starts_with(KIT.trim_end()), "{written}");
+    assert!(written.contains("[frontend]"), "{written}");
     assert!(
-        written.contains("update-dir = \"/var/db/kbf-installer\""),
-        "{written}"
+        !written.contains("orders-dir"),
+        "a Mac's keys are not written: {written}"
     );
     let (refused, _) = go_kit(Standing::Done(&[]));
     assert!(

@@ -70,6 +70,7 @@ impl Server {
             token: None,
             local_cache: None,
             releases: None,
+            poll: None,
         };
         let bound =
             bind_server_with_policy(Arc::clone(&cache), listeners, Some(api), policy, shutdown)

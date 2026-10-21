@@ -126,7 +126,8 @@ impl Os for SystemOs<'_> {
     }
 
     fn user(&self, name: &str) -> io::Result<Option<RunUser>> {
-        kbf_host::user::lookup(&View(self.exec), name).map_err(io::Error::other)
+        kbf_host::user::lookup_on(&View(self.exec), name, self.platform.user_db())
+            .map_err(io::Error::other)
     }
 
     fn login_shell(&self, name: &str) -> io::Result<String> {

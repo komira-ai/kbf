@@ -113,7 +113,7 @@ use crate::handover::{
 };
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
 use crate::listen::{Binder, Socket};
-use crate::members::Members;
+use crate::members::{Handoff, Members};
 use crate::object_store::delivery::{Delivery, RegistrySource, Reports};
 use crate::proxy_auth::ProxyAuthLayer;
 use crate::serve::{
@@ -163,6 +163,9 @@ pub const ALLOWED: &[&str] = &[
     "member_dwell_secs",
     "history_objects",
     "history_index_root",
+    "release_poll_every_secs",
+    "release_poll_repo",
+    "release_poll_refs",
     "log_dir",
     "log_max_bytes",
     "log_files",
@@ -230,6 +233,10 @@ pub struct FrontendFlags {
     /// frontend that has none. Its history writer is named by it, so the history rows
     /// the process writes carry its id and no other process writes them.
     pub instance_id: Option<String>,
+    /// `--auto-promote` and its companions: a joiner is promoted by its own beat when it is
+    /// filled ([`crate::members::Members::with_handoff`]); `None` without the flag, where only
+    /// an operator promotes one.
+    pub handoff: Option<Handoff>,
 }
 
 /// The long names of the flags of [`Args`] that `kbf frontend` hides and refuses by name
@@ -361,6 +368,7 @@ pub fn command() -> Command {
     )
     .args(crate::enroll::flags::args())
     .args(crate::managed::flags::args())
+    .args(handoff::args())
     .arg(
         Arg::new(SECRETS_DIR)
             .long("object-store-secrets-dir")
@@ -447,6 +455,7 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         admin,
         object_store_secrets_dir: m.get_one::<PathBuf>(SECRETS_DIR).cloned(),
         instance_id: None,
+        handoff: handoff::from_matches(m),
     })
 }
 
@@ -980,7 +989,7 @@ impl<'a> Prepared<'a> {
         let writer = (flags.instance_id.as_deref()).map(kbf_history::WriterId::from_instance);
         let state = crate::history::with_history_as(state, &args.history, writer)?;
         let (state, history) = crate::history::take(state);
-        let members = members_of(state.as_ref());
+        let members = members_of(state.as_ref(), flags.handoff);
         let map = map_of(None, members.as_ref())?;
         let readiness = Arc::new(Readiness::default());
         let timeout = listeners.store_probe_timeout;
@@ -1056,7 +1065,10 @@ impl<'a> Prepared<'a> {
         let (worker_incoming, worker_latch) = worker.grpc(worker_tls)?;
         worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
-        let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
+        let (token, releases, poll) = api.map_or((None, None, None), |api| {
+            (api.token, api.releases, api.poll)
+        });
+        let poll_stats = poll.as_ref().map(|_| Arc::default());
         // The enroll listener (which is closed the moment the drain begins, like the
         // others) and the operator API's enrollment routes, which need the CA's pin: both
         // are off without `--enroll-listen`, and the routes then answer 404.
@@ -1121,10 +1133,11 @@ impl<'a> Prepared<'a> {
             token,
             Arc::clone(&farm),
         ))
-        .merge(crate::health::router_of(Arc::clone(&checks)))
+        .merge(crate::health::routes(&checks, &farm, members.as_ref()))
         .merge(metrics_route(
             backend.clone(),
             history.as_ref().map(crate::history::History::stats),
+            poll_stats.clone(),
             members.clone(),
             tls_sources,
         ));
@@ -1262,6 +1275,16 @@ impl<'a> Prepared<'a> {
             let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
             // The rolling-update controller; it starts hosts for the desired release unless the
             // operator wrote `auto_nodes` false or paused it.
+            let _poller = poll_stats
+                .and_then(|stats| {
+                    crate::release::poll::spawn(
+                        Arc::clone(&farm),
+                        update_store.clone(),
+                        poll,
+                        stats,
+                    )
+                })
+                .map(AbortOnDrop);
             let _updates = crate::update::spawn_controller(
                 Arc::clone(&farm),
                 update_store,
@@ -1446,17 +1469,21 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
 fn metrics_route(
     backend: Backend,
     history: Option<Arc<crate::history::Stats>>,
+    poll: Option<Arc<crate::release::poll::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
 ) -> axum::Router {
     let tls = Arc::new(tls);
     let render = move || {
         let (backend, members, tls) = (backend.clone(), members.clone(), Arc::clone(&tls));
-        let history = history.clone();
+        let (history, poll) = (history.clone(), poll.clone());
         async move {
             let mut text = backend.render_metrics();
             if let Some(history) = history {
                 history.render(&mut text);
+            }
+            if let Some(poll) = poll {
+                poll.render(&mut text);
             }
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
@@ -1527,6 +1554,8 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
         Ok(frontend.serve().await?)
     })
 }
+
+mod handoff;
 
 #[cfg(test)]
 mod tests;

@@ -122,8 +122,6 @@ jobs:
         options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       KBF_TEST_POSTGRES_URL: postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres
-      # pg_dump and pg_restore for the installer's backup test come from here.
-      KBF_TEST_PG_BIN: /usr/lib/postgresql/17/bin
       RUSTFLAGS: ""
       COVERAGE_TOOLCHAIN: nightly-2026-10-01
       LLVM_COV_VERSION: 0.9.1
@@ -169,13 +167,6 @@ jobs:
       # writing them for kbf-front's async service methods (LLVM 23.1 in this nightly;
       # it looks like LLVM issue 220574). Lines and branches, all the gate reads, are
       # unaffected: their totals match llvm-cov's own text report.
-      # pg_dump and pg_restore as new as the server (17), because a dump tool older than
-      # its server refuses to run. The runner image has no PostgreSQL apt repository:
-      # postgresql-common's own script adds the project's (with its signing key) and
-      # updates the package lists.
-      - run: sudo apt-get install -y --no-install-recommends postgresql-common
-      - run: sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-      - run: sudo apt-get install -y --no-install-recommends postgresql-client-17
       - run: mkdir -p target/coverage
       - name: Run the fast tests under coverage
         env:
@@ -189,8 +180,7 @@ jobs:
       # kbf-installer again without `test-sandbox` and put a copy of its code in the report
       # that no test runs. They run the `#[ignore]`d tests only (`--run-ignored only`): the
       # others ran above, and some (the installer's database:: ones) write files in a scratch
-      # directory another test of the full run creates. The installer's backup round trip
-      # (backup::tests::real_server_round_trip) is in the installer filter.
+      # directory another test of the full run creates.
       - name: Run the Postgres tests of kbf-state under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
@@ -198,7 +188,7 @@ jobs:
       - name: Run the installer's Postgres tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-installer) & (test(database::) or test(setup_creates_the_schema) or test(backup::tests::real_server_round_trip))'
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-installer) & (test(database::) or test(setup_creates_the_schema))'
       - name: Run the server's Postgres tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions

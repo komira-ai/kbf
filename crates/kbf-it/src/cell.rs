@@ -157,6 +157,24 @@ pub(crate) fn wait_for_line(path: &Path, needle: &str, failure: &str) -> Result<
     }
 }
 
+/// Calls `look` every `every` until it says it is done (its second value) or `limit` has
+/// passed, and returns what the last call saw. Every call is made at least once, so a
+/// `limit` of zero is one look. A call that fails ends the wait with its error.
+pub(crate) fn poll_until<T>(
+    limit: Duration,
+    every: Duration,
+    mut look: impl FnMut() -> Result<(T, bool), CellError>,
+) -> Result<T, CellError> {
+    let deadline = Instant::now() + limit;
+    loop {
+        let (seen, done) = look()?;
+        if done | (Instant::now() >= deadline) {
+            return Ok(seen);
+        }
+        std::thread::sleep(every);
+    }
+}
+
 /// Copies the directory `from` to `to`, recursively.
 pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<(), CellError> {
     std::fs::create_dir_all(to).or_broken(&to.display())?;
@@ -245,5 +263,70 @@ pub(crate) fn print_tails(logs: &Path, n: usize) {
                 println!("{line}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches: a wait that returns before `look` says it is done while time remains
+    /// (it would take the first look for the answer), looks again after it is done, or
+    /// returns something other than what the last look saw.
+    #[test]
+    fn polling_stops_at_the_first_look_that_is_done() {
+        let mut looks = 0;
+        let seen = poll_until(Duration::from_secs(600), Duration::ZERO, || {
+            looks += 1;
+            Ok((looks, looks == 3))
+        });
+        assert_eq!(seen.expect("done"), 3);
+        assert_eq!(looks, 3);
+    }
+
+    /// Catches: a wait that never ends when `look` never says it is done (the cell would
+    /// hang rather than fail), that gives up before one look, or that returns the first
+    /// look instead of the last: a limit of zero is exactly one look, and its answer
+    /// comes back though it was not done; a limit of 30 ms is not up before 30 ms.
+    #[test]
+    fn polling_gives_up_at_the_deadline_with_what_the_last_look_saw() {
+        let mut looks = 0;
+        let seen = poll_until(Duration::ZERO, Duration::ZERO, || {
+            looks += 1;
+            Ok(("still waiting", false))
+        });
+        assert_eq!(seen.expect("late"), "still waiting");
+        assert_eq!(looks, 1);
+
+        let started = Instant::now();
+        let mut looks = 0;
+        let seen = poll_until(Duration::from_millis(30), Duration::from_millis(1), || {
+            looks += 1;
+            Ok((looks, false))
+        });
+        assert!(
+            started.elapsed() >= Duration::from_millis(30),
+            "gave up early"
+        );
+        assert_eq!(seen.expect("late"), looks, "not the last look's answer");
+    }
+
+    /// Catches: a failed look swallowed (the wait goes on, or ends with a stale answer)
+    /// instead of ending the wait with that error at once.
+    #[test]
+    fn polling_ends_with_the_error_of_a_look_that_fails() {
+        let mut looks = 0;
+        let seen = poll_until(Duration::from_secs(600), Duration::ZERO, || {
+            looks += 1;
+            if looks == 2 {
+                Err(CellError::Broken("the log is gone".to_owned()))
+            } else {
+                Ok((looks, false))
+            }
+        });
+        let error = seen.expect_err("the failed look ends the wait");
+        assert_eq!(error.to_string(), "the log is gone");
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(looks, 2);
     }
 }

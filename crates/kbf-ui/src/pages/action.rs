@@ -9,7 +9,7 @@ use crate::api::{Action, Attempt, Blob, Output};
 use crate::html::{Href, Html, attr};
 use crate::layout;
 use crate::read::{Page, ReadError, Reader};
-use crate::{Answer, PREFIX, Source};
+use crate::{Answer, Source};
 
 /// Action: the action's answer and the log blobs it links.
 pub(crate) const ACTION: Page = Page {
@@ -56,7 +56,8 @@ pub(crate) async fn action<S: Source>(source: &S, id: &str, digest: &str) -> Ans
         &a.row.action,
     );
     let body = layout::page(ACTION.name, &here, r.asked(), |h| {
-        let builds = Href::root_relative(PREFIX).expect("the prefix is root-relative");
+        let builds =
+            Href::root_relative(super::BUILDS_PATH).expect("the Builds path is root-relative");
         let build = Href::root_relative(&build_page(id)).expect("a build page is root-relative");
         h.el("p", &[attr("class", "crumbs")], |h| {
             h.link(&builds, "Builds").text(" / ").link(&build, id);

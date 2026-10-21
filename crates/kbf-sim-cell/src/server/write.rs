@@ -138,8 +138,10 @@ pub(super) fn read_back_cuts(up: &Up, cuts: &mut [Cut]) {
     for cut in cuts.iter_mut().filter(|c| c.survived.is_none()) {
         let digest = cut.digest;
         let answer = up.query(move |m| m.blob(&digest));
-        let held =
-            matches!(answer, BlobAnswer::Present { location: at, .. } if at.object == cut.object);
+        let held = match answer {
+            BlobAnswer::Present { location: at, .. } => at.object == cut.object,
+            _ => false,
+        };
         cut.survived = Some(held);
     }
 }

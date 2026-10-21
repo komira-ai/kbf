@@ -431,3 +431,15 @@ fn a_bake_without_baselines_ends_red() {
     assert_eq!(code, EXIT_RED);
     assert!(err.contains("`error-rate` is red"), "{err}");
 }
+
+/// Catches a scratch directory two tests (or two runs on a reused process id) share: a second
+/// directory of the same name is a different, empty one, so a state file left by the first is
+/// not read by the second bake as its own ended bake.
+#[test]
+fn two_scratch_directories_of_one_name_are_apart_and_empty() {
+    let first = scratch("cli-apart");
+    std::fs::write(first.join("state.json"), b"left by an earlier bake").unwrap();
+    let second = scratch("cli-apart");
+    assert_ne!(first, second);
+    assert!(!second.join("state.json").exists());
+}

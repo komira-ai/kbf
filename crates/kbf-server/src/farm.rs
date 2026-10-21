@@ -8,9 +8,11 @@
 //!
 //! **Single node.** The control log is this process: a record the scheduler asks to
 //! commit is committed as soon as it is appended, and fed straight back (see
-//! [`State::feed`]). The replicated log replaces exactly that step. Since the leases
-//! die with the process, each process grants them under its own term, so a lease id
-//! names one lease ever and an earlier process's `Result` is refused (issue #137).
+//! [`State::feed`]). The replicated log replaces exactly that step. Each process grants
+//! leases under its own term (and a store continues the sequence), so a lease id
+//! names one lease ever (issue #137). Under a state store the predecessor's own leases are
+//! restored (`take_stored`): its `Result` ends its own operation until the daemon's heartbeat omits
+//! the lease, and one naming another action is a MISMATCH; an id no row holds is UNKNOWN_LEASE.
 //! Operations die with it too, so the term is part of every operation name (issue
 //! #154). The term, and the lease epoch `Welcome` names, come from the metadata log
 //! ([`MetaLog::leadership`]):
@@ -64,8 +66,10 @@ mod ack;
 mod beat;
 mod durable;
 mod handover;
+mod nodes;
 mod phase;
 mod record;
+pub mod sched_view;
 
 pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
 pub use handover::UNTRACED_LOOKS;
@@ -75,15 +79,13 @@ use self::ack::{Verdict, refusal};
 use self::durable::Durable;
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
-use crate::fleet::{
-    NodeView, NodesView, PhaseView, PlacementView, SoftwareView, attention_changes, needs_attention,
-};
+use crate::fleet::{NodeView, SoftwareView, attention_changes};
 use crate::machine::{FarmMachine, Platform, Sent, Waiter};
 use crate::memory;
 use crate::missing;
 use crate::run_record;
 use crate::stamp::Stamp;
-use crate::update_status::{HostUpdate, UpdateReport, UpdateSummary};
+use crate::update_status::{HostUpdate, UpdateReport};
 
 /// The scheduler term of a new single-node server process: the wall-clock time of its
 /// start in milliseconds since the Unix epoch, times 2^16, plus 16 random bits.
@@ -761,30 +763,6 @@ impl Farm {
         FarmTime::from_millis(unix_ms())
     }
 
-    /// This build, and every node registered since this farm started, in node-id order,
-    /// with the oldest protocol version among them ([`NodesView::of_this_build`]).
-    pub fn nodes(&self) -> NodesView {
-        let mut state = self.lock();
-        state.note_closed_streams();
-        let nodes = state
-            .machine
-            .nodes()
-            .map(|worker| self.node(&state, worker))
-            .collect();
-        NodesView::of_this_build(nodes)
-    }
-
-    /// `worker` as `GET /v1/nodes` lists it, if it has registered.
-    pub fn node_view(&self, worker: &WorkerId) -> Option<NodeView> {
-        let mut state = self.lock();
-        state.note_closed_streams();
-        state
-            .machine
-            .node(worker)
-            .is_some()
-            .then(|| self.node(&state, worker))
-    }
-
     /// Cordons, drains or uncordons `worker` (see `kbf_sched::Cordon`), and returns
     /// the node as it is now. A drain's deadline counts from now.
     ///
@@ -811,47 +789,6 @@ impl Farm {
         let at = self.epoch_unix_ms.saturating_add(now.as_millis());
         state.durably("a cordon", |d| d.cordoned(worker, action.stored(at)));
         Ok(self.node(&state, worker))
-    }
-
-    /// One node's view; `worker` is registered, and every closed stream noted
-    /// ([`State::note_closed_streams`]).
-    fn node(&self, state: &State, worker: &WorkerId) -> NodeView {
-        let wall = |at: FarmTime| self.epoch_unix_ms.saturating_add(at.as_millis());
-        let leases = || {
-            let held = state.sched.leases_on(worker);
-            held.iter().map(ToString::to_string).collect()
-        };
-        let placement = match state.sched.cordon(worker) {
-            None => PlacementView::Serving,
-            Some(Cordon::Cordoned) => PlacementView::Cordoned,
-            Some(Cordon::Draining { deadline }) => PlacementView::Draining {
-                deadline_unix_ms: wall(*deadline),
-                leases: leases(),
-            },
-            Some(Cordon::Drained) => PlacementView::Drained,
-            Some(Cordon::Paused { deadline }) => PlacementView::DrainPaused {
-                deadline_unix_ms: wall(*deadline),
-                leases: leases(),
-            },
-        };
-        let node = state.machine.node(worker);
-        let software = node.and_then(|n| n.status.clone());
-        let phase = state.sched.phase(worker).cloned().unwrap_or_default();
-        let connected = node.is_some_and(|n| n.connected);
-        NodeView {
-            node_id: worker.as_str().to_owned(),
-            connected,
-            protocol: state.links.get(worker).and_then(|link| link.protocol),
-            needs_attention: needs_attention(software.as_ref(), &phase),
-            software,
-            update: UpdateSummary::new(
-                node.and_then(|n| n.update.as_ref()),
-                connected,
-                node.is_some_and(|n| n.update_live),
-            ),
-            placement,
-            phase: PhaseView::new(&phase),
-        }
     }
 
     /// Expires leases of silent workers and places queued work. A silent lease lost

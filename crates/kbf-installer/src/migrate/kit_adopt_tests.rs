@@ -31,7 +31,7 @@ fn new_bin(rig: &Rig) -> String {
 /// Catches `migrate` answering "nothing to migrate" for a Mac the kit installed, and a
 /// migration that is not whole: both releases adopted from the links, state schema 2 with
 /// `current` and `previous` as the links named them, the plist repointed at the installer's
-/// tree with every other byte kept, the kit's tree untouched and `kbf.toml` with the node's two keys added, the version
+/// tree with every other byte kept, the kit's tree untouched and `kbf.toml` byte for byte (G9), the version
 /// asked of `releases/<sha>/kbf`, and nothing made in the old tools' places (no
 /// `/var/db/kbf-deploy`, no lock file).
 ///
@@ -82,18 +82,12 @@ fn a_kit_host_is_adopted_from_its_links_and_plist_in_both_forms() {
             tree,
             "the kit's tree is kept"
         );
-        // Only the node's two keys are new: the layout's directories, in the `[daemon]` table.
-        let wanted = String::from_utf8(toml).expect("text").replacen(
-            "[daemon]\n",
-            "[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\norders-dir = \"/var/db/kbf-installer/orders\"\n",
-            1,
-        );
+        // G9: a Mac's kbf.toml is kbf-mac-provision's, so migrate leaves it byte for byte.
         assert_eq!(
-            fs::read_to_string(at(&rig.host.root, KBF_TOML_PATH)).expect("toml"),
-            wanted,
+            fs::read(at(&rig.host.root, KBF_TOML_PATH)).expect("toml"),
+            toml,
             "{form:?}"
         );
-        assert!(rig.at("var/db/kbf-installer/orders").is_dir());
         assert!(!rig.at("var/db/kbf-deploy").exists());
         assert!(!rig.at("var/run/kbf-deploy.lock").exists());
         let journal = rig.json(&rig.new_state_dir().join("migration.json"));
@@ -408,26 +402,13 @@ fn a_dated_name_that_is_taken_is_refused_and_a_rerun_finishes() {
         assert_eq!(error.exit(), Exit::NeedsOperator);
         assert!(rig.at("usr/local/kbf-installer").is_dir());
         assert!(rig.at(INSTALLER_TOML_PATH).is_file());
-        // Nothing moved and nothing replaced. The one change before the refusal is the
-        // revert of the two lines migrate added to the kit's kbf.toml (update-dir and
-        // orders-dir, #1321): the kit's own job is back by then and runs from that file.
-        let after = rig.snapshot("usr/local");
-        let toml = "etc/kbf/kbf.toml";
-        let without_added = |text: &str| {
-            text.lines()
-                .filter(|l| !l.starts_with("update-dir = ") && !l.starts_with("orders-dir = "))
-                .map(|l| format!("{l}\n"))
-                .collect::<String>()
-        };
+        // Nothing moved and nothing replaced, and the kit's kbf.toml is untouched: a Mac's file
+        // is checked, never written, by migrate (G9), so there is nothing to revert.
         assert_eq!(
-            after[toml],
-            without_added(&before[toml]),
-            "only migrate's two lines go"
+            rig.snapshot("usr/local"),
+            before,
+            "nothing moved, nothing replaced"
         );
-        let (mut after_rest, mut before_rest) = (after.clone(), before.clone());
-        after_rest.remove(toml);
-        before_rest.remove(toml);
-        assert_eq!(after_rest, before_rest, "nothing moved, nothing replaced");
         assert!(
             !rig.active.borrow().contains(INSTALLER_JOB),
             "booted out first"

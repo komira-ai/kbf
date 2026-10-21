@@ -45,6 +45,9 @@ impl Target {
 pub enum Route {
     /// Forward to the active child's listener.
     Child(Target),
+    /// The read-only web UI: `/ui` and `/ui/...`, forwarded to the active child's operator
+    /// listener ([`Target::Operator`]). Open: [`AuthClass::Ui`] asks for no credential.
+    Ui,
     /// Served by the proxy: `/v1/update/frontend*`.
     Update,
     /// `/healthz`.
@@ -83,6 +86,10 @@ pub enum AuthClass {
     Enroll,
     /// Open: health and readiness.
     Probe,
+    /// Open to anyone who can reach the port, for the read-only UI (`/ui`). It is its own
+    /// class and never the operator's: nothing under `/v1` takes it, and the proxy admits
+    /// only GET and HEAD on it (see [`ui_method_allowed`]).
+    Ui,
 }
 
 /// How long a stream may sit silent before the proxy closes it.
@@ -115,6 +122,7 @@ const WORKER_PREFIXES: [&str; 4] = [
 const ENROLL_PREFIX: &str = "/kbf.enroll.v1.Enroll/";
 const UPDATE_PREFIX: &str = "/v1/update/frontend";
 const BYTESTREAM_PREFIX: &str = "/google.bytestream.ByteStream/";
+const UI_PREFIX: &str = "/ui";
 
 /// The path with any query string removed.
 fn bare(path: &str) -> &str {
@@ -128,10 +136,47 @@ fn at_boundary(path: &str, prefix: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
+/// Whether `path` (under `/ui`) names a place by plain segments. The UI is open, so the
+/// proxy does not let a path walk out of it: a `.` or `..` segment, an empty segment, a
+/// backslash and a percent-encoded dot, slash or backslash are refused here, where a client
+/// that sends them raw (a browser normalizes them away) gets the 404 of any unknown path.
+fn ui_path_is_plain(path: &str) -> bool {
+    let rest = path.strip_prefix(UI_PREFIX).unwrap_or_default();
+    if rest.contains('\\') {
+        return false;
+    }
+    let lower = rest.to_ascii_lowercase();
+    if ["%2e", "%2f", "%5c"].iter().any(|bad| lower.contains(bad)) {
+        return false;
+    }
+    // `/ui` and `/ui/` are the index; below it no segment is empty, `.` or `..`.
+    let below = rest.strip_prefix('/').unwrap_or_default();
+    below.is_empty()
+        || below
+            .strip_suffix('/')
+            .unwrap_or(below)
+            .split('/')
+            .all(|s| !matches!(s, "" | "." | ".."))
+}
+
+/// Whether the proxy lets `method` through to the UI: `GET` and `HEAD` only. The UI is
+/// read-only, and the proxy says so before the child is asked.
+#[must_use]
+pub fn ui_method_allowed(method: &http::Method) -> bool {
+    matches!(*method, http::Method::GET | http::Method::HEAD)
+}
+
 /// The route of `path`.
 #[must_use]
 pub fn route_of(path: &str) -> Route {
     let path = bare(path);
+    if at_boundary(path, UI_PREFIX) {
+        return if ui_path_is_plain(path) {
+            Route::Ui
+        } else {
+            Route::Unknown
+        };
+    }
     if REAPI_PREFIXES.iter().any(|p| path.starts_with(p)) {
         return Route::Child(Target::Reapi);
     }
@@ -163,6 +208,7 @@ pub const fn auth_class(route: Route) -> Option<AuthClass> {
         Route::Child(Target::Worker) => Some(AuthClass::Worker),
         Route::Child(Target::Operator) => Some(AuthClass::Operator),
         Route::Child(Target::Enroll) => Some(AuthClass::Enroll),
+        Route::Ui => Some(AuthClass::Ui),
         Route::Update => Some(AuthClass::Update),
         Route::Health | Route::Ready => Some(AuthClass::Probe),
         Route::Metrics => Some(AuthClass::Operator),
@@ -178,7 +224,7 @@ pub const fn auth_class(route: Route) -> Option<AuthClass> {
 /// answered 503 at the bound.
 #[must_use]
 pub const fn bypasses_hold(route: Route) -> bool {
-    !matches!(route, Route::Child(_))
+    !matches!(route, Route::Child(_) | Route::Ui)
 }
 
 /// The idle timeout of `path`. Execute and WaitExecution are matched by their full method
@@ -234,6 +280,7 @@ mod tests {
         assert!(!Target::Operator.grpc());
         assert!(route_of(reapi).grpc());
         for route in [
+            Route::Ui,
             Route::Update,
             Route::Health,
             Route::Ready,
@@ -316,6 +363,111 @@ mod tests {
         assert_eq!(auth_class(Route::Health), Some(AuthClass::Probe));
         assert_eq!(auth_class(Route::Ready), Some(AuthClass::Probe));
         assert_eq!(auth_class(Route::Metrics), Some(AuthClass::Operator));
+    }
+
+    /// `/ui` and what is under it is the UI route, with the UI's own auth class; a look-alike
+    /// is not, and nothing under `/v1` is.
+    ///
+    /// Kills: a prefix match that takes `/uix` or `/v1/ui` for the UI; the UI given the
+    /// operator class (or an operator route the UI class); the UI answered by the proxy or
+    /// let past the hold gate.
+    #[test]
+    fn the_ui_is_its_own_route_and_class() {
+        for p in [
+            "/ui",
+            "/ui/",
+            "/ui/runs/r1",
+            "/ui/static/ui.css",
+            "/ui?x=1",
+            "/ui/a?x=/../y",
+        ] {
+            assert_eq!(route_of(p), Route::Ui, "{p}");
+            assert_eq!(auth_class(route_of(p)), Some(AuthClass::Ui), "{p}");
+            assert!(
+                !bypasses_hold(route_of(p)),
+                "{p}: the UI is forwarded, so it is held"
+            );
+        }
+        for p in [
+            "/uix",
+            "/ui.css",
+            "/UI",
+            "/u",
+            "/x/ui",
+            "/v1/ui",
+            "/v1/ui/runs",
+            "/v1/uix",
+        ] {
+            assert_ne!(route_of(p), Route::Ui, "{p}");
+        }
+        // Everything under `/v1`, the update API and `/metrics` keeps a credential class.
+        for p in [
+            "/v1/ui",
+            "/v1/status",
+            "/v1/nodes",
+            "/v1/blobs/x",
+            "/v1/update/desired",
+        ] {
+            assert_eq!(auth_class(route_of(p)), Some(AuthClass::Operator), "{p}");
+        }
+        assert_eq!(
+            auth_class(route_of("/v1/update/frontend")),
+            Some(AuthClass::Update)
+        );
+        assert_eq!(auth_class(route_of("/metrics")), Some(AuthClass::Operator));
+    }
+
+    /// A UI path is plain segments. The UI is open, so a way out of it is a path outside the
+    /// table.
+    ///
+    /// Kills: a `..`, `.`, empty segment, backslash or encoded dot or slash let through.
+    #[test]
+    fn a_ui_path_that_is_not_plain_segments_is_outside_the_table() {
+        for p in [
+            "/ui/..",
+            "/ui/../v1/nodes",
+            "/ui/a/../b",
+            "/ui/.",
+            "/ui/./a",
+            "/ui//a",
+            "/ui/a//b",
+            "/ui/a\\b",
+            "/ui/%2e%2e/v1",
+            "/ui/%2E/a",
+            "/ui/a%2Fb",
+            "/ui/a%5cb",
+        ] {
+            assert_eq!(route_of(p), Route::Unknown, "{p}");
+        }
+        // Dots inside a name, and a percent-encoding that is neither dot nor slash, are fine.
+        for p in [
+            "/ui/a.b",
+            "/ui/..a",
+            "/ui/a..",
+            "/ui/runs/r%201",
+            "/ui/runs/",
+        ] {
+            assert_eq!(route_of(p), Route::Ui, "{p}");
+        }
+    }
+
+    #[test]
+    fn the_ui_takes_get_and_head_only() {
+        use http::Method;
+        for m in [Method::GET, Method::HEAD] {
+            assert!(ui_method_allowed(&m), "{m}");
+        }
+        for m in [
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::PATCH,
+            Method::OPTIONS,
+            Method::CONNECT,
+            Method::TRACE,
+        ] {
+            assert!(!ui_method_allowed(&m), "{m}");
+        }
     }
 
     #[test]

@@ -391,6 +391,7 @@ async fn a_fenced_redispatch_carries_the_same_identity_headers() {
     let daemon = pki.client(&["node-7.farm"], Some("daemon"));
     let mut client = h2_over_tls(&rig, client_config(&pki.ca_pem, Some(&daemon), &["h2"])).await;
     let forged = [
+        ("x-kbf-client-addr", "203.0.113.66"),
         ("x-kbf-node-id", "forged-node"),
         ("x-kbf-role", "storage"),
         ("x-kbf-proxy-auth", "guess"),
@@ -406,6 +407,10 @@ async fn a_fenced_redispatch_carries_the_same_identity_headers() {
     let seen = rig.a.state.headers_of(CAPS);
     assert_eq!(seen.len(), 2, "the child saw the request twice");
     let want = vec![
+        (
+            "x-kbf-client-addr".to_owned(),
+            super::kit::CLIENT_IP.to_string(),
+        ),
         ("x-kbf-node-id".to_owned(), "node-7.farm".to_owned()),
         ("x-kbf-proxy-auth".to_owned(), hex::encode(SECRET)),
         ("x-kbf-role".to_owned(), "daemon".to_owned()),
