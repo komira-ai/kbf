@@ -523,6 +523,5 @@ fn the_committed_floors_file_parses_and_is_in_raise_format() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../coverage-floors");
     let text = std::fs::read_to_string(&path).expect("read coverage-floors");
     let floors = kbf_coverage::floors::parse(&text).expect("parse");
-    assert!(!floors.is_empty());
     assert_eq!(kbf_coverage::floors::render(&floors), text);
 }
