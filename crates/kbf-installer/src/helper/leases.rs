@@ -3,14 +3,243 @@
 //! anything in the order record (the node's check is a courtesy, and the record is the
 //! service user's word).
 //!
-//! The real source (Linux: the cgroup of the action unit; macOS: the launchd job and the
-//! processes by lease uid) is wired by a later change; until then the binary uses
-//! [`NotWired`], which says it cannot tell, and an activation is refused (fail closed).
+//! The real sources are [`CgroupLeases`] (Linux: the lease cgroups of the daemon's
+//! `actions/` cgroup), [`MacLeases`] (a Mac whose daemon runs as its own account: the
+//! daemon's keeper processes and lease directories) and [`PoolLeases`] (the processes of a
+//! lease-user pool, not yet chosen by [`for_restart`]). `run` chooses by the service it
+//! restarts ([`for_restart`]): a mode's systemd unit gets [`CgroupLeases`]; a launchd label
+//! gets [`MacLeases`], which says it cannot tell wherever it could be blind, and an
+//! activation is then refused (fail closed). A frontend's unit holds no leases, so its count would
+//! always read idle: [`frontend_unit`] names it, and the helper refuses a node activation
+//! that would restart it.
+
+use std::collections::BTreeSet;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::cli::Mode;
+use crate::helper::mac_leases::MacLeases;
+use crate::helper::restart::Restart;
+use crate::layout::Layout;
+use crate::run::{Runner, Spawn};
+use crate::setup::plan::mode_units;
 
 /// How many leases are live on this host.
 pub trait LeaseSource {
     /// The count, or why it cannot be told.
     fn live(&self) -> Result<usize, String>;
+
+    /// [`LeaseSource::live`], with a note for the log when the source let the check through
+    /// on a judgment rather than on an idle host. The default has none.
+    fn live_noted(&self) -> Result<(usize, Option<String>), String> {
+        self.live().map(|live| (live, None))
+    }
+}
+
+/// The prefix of a lease's cgroup, `kbf-lease-<term>-<seq>` (kbf-driver-container).
+pub const LEASE_PREFIX: &str = "kbf-lease-";
+
+/// The cgroup2 mount.
+pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// The slice every kbf unit is in (`Slice=kbf.slice`).
+pub const SLICE: &str = "kbf.slice";
+
+/// Linux: a lease is live while its cgroup (`<unit>/actions/kbf-lease-*`) is populated,
+/// that is while a process runs in it or under it (`cgroup.events` says `populated 1`; the
+/// container's own cgroup is a child, so the lease's `cgroup.procs` would miss it). A lease
+/// cgroup outlives its action, empty, to be read for its OOM events, and is not counted.
+///
+/// The daemon delegates `actions/` under its own unit's cgroup, so the path depends on
+/// the mode's unit (`kbf-daemon.service`, `kbf-storage-and-daemon.service` or
+/// `kbf-all-in-one.service`; a frontend or a storage-only node runs no builds). No
+/// `actions/` in a unit cgroup that exists means the daemon never ran an action: none is
+/// live. A unit cgroup that does not exist cannot tell: the path may be wrong, and a
+/// wrong path must not read as "idle".
+pub struct CgroupLeases {
+    /// The unit's cgroup directory, `<cgroup root>/kbf.slice/<unit>`.
+    pub unit: PathBuf,
+}
+
+impl CgroupLeases {
+    /// The lease source of the daemon in `unit` (a unit file name) under a cgroup2 mount
+    /// at `cgroup_root` ([`CGROUP_ROOT`] on a host).
+    pub fn of_unit(cgroup_root: &Path, unit: &str) -> CgroupLeases {
+        CgroupLeases {
+            unit: cgroup_root.join(SLICE).join(unit),
+        }
+    }
+
+    /// The daemon's delegated `actions/` cgroup.
+    pub fn actions(&self) -> PathBuf {
+        self.unit.join("actions")
+    }
+}
+
+impl LeaseSource for CgroupLeases {
+    fn live(&self) -> Result<usize, String> {
+        let actions = self.actions();
+        let listed = match fs::read_dir(&actions).and_then(Iterator::collect::<io::Result<Vec<_>>>)
+        {
+            Ok(listed) => listed,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return if self.unit.is_dir() {
+                    Ok(0)
+                } else {
+                    Err(format!("{}: no such cgroup", self.unit.display()))
+                };
+            }
+            Err(e) => return Err(format!("{}: {e}", actions.display())),
+        };
+        let mut live = 0;
+        for entry in listed {
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with(LEASE_PREFIX) {
+                continue;
+            }
+            let events = entry.path().join("cgroup.events");
+            let text =
+                fs::read_to_string(&events).map_err(|e| format!("{}: {e}", events.display()))?;
+            if text.lines().any(|l| l.trim() == "populated 1") {
+                live += 1;
+            }
+        }
+        Ok(live)
+    }
+}
+
+/// The program that lists every process's uid.
+pub const PS: &str = "/bin/ps";
+
+/// macOS: a lease runs as one user of the pool, `first_uid ..< first_uid + users`, and
+/// everything it starts (launchd jobs included) runs as that uid. A pool uid with a
+/// process is a live lease. The processes are listed by `ps` (absolute path, empty
+/// environment).
+pub struct PoolLeases<'a> {
+    pub runner: &'a dyn Runner,
+    pub first_uid: u32,
+    pub users: u32,
+    pub timeout: Duration,
+}
+
+impl LeaseSource for PoolLeases<'_> {
+    fn live(&self) -> Result<usize, String> {
+        let spawn = Spawn {
+            program: PathBuf::from(PS),
+            args: vec!["-A".into(), "-o".into(), "uid=".into()],
+            env: Vec::new(),
+            cwd: PathBuf::from("/"),
+            run_as: None,
+            timeout: self.timeout,
+        };
+        let ran = self.runner.run(&spawn).map_err(|e| format!("{PS}: {e}"))?;
+        if ran.timed_out || ran.code != Some(0) {
+            return Err(format!("{PS} did not finish well (status {:?})", ran.code));
+        }
+        let text = String::from_utf8(ran.stdout).map_err(|_| format!("{PS}: not UTF-8"))?;
+        let end = self.first_uid.saturating_add(self.users);
+        let mut busy = BTreeSet::new();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let uid: u32 = line
+                .trim()
+                .parse()
+                .map_err(|_| format!("{PS}: {line:?} is not a uid"))?;
+            if (self.first_uid..end).contains(&uid) {
+                busy.insert(uid);
+            }
+        }
+        Ok(busy.len())
+    }
+}
+
+/// Where the lease sources look on this host.
+#[derive(Clone, Debug)]
+pub struct LeaseHost {
+    /// The cgroup2 mount ([`CGROUP_ROOT`] under the host root).
+    pub cgroup_root: PathBuf,
+    /// The host's layout: where `kbf.toml` is and what the host root is.
+    pub layout: Layout,
+}
+
+/// The lease source of the service `restart` restarts, on `host`.
+///
+/// - A systemd unit of a `kbf` mode gets [`CgroupLeases`] of that unit, which fails closed
+///   while the unit's cgroup does not exist. The units are the ones `setup` enables
+///   ([`mode_units`]); an instance of a template (`kbf-frontend@b.service`) and the plain
+///   form of a unit (`kbf-frontend.service`, for a host without the proxy) are the same
+///   mode's.
+/// - Any other unit gets a source that cannot tell, whatever cgroup the unit has: the leases
+///   of a unit that is no mode's are not the daemon's, so a count read from it would be
+///   "idle" by accident.
+/// - A launchd label gets [`MacLeases`], the source of a daemon that runs as its own
+///   account (no lease-user pool); an empty label names no service and cannot tell.
+pub fn for_restart(restart: &Restart, host: &LeaseHost) -> Box<dyn LeaseSource> {
+    match restart {
+        Restart::Systemd(unit) if is_mode_unit(unit) => {
+            Box::new(CgroupLeases::of_unit(&host.cgroup_root, unit))
+        }
+        Restart::Systemd(unit) => Box::new(CannotTell(format!(
+            "{unit:?} is no unit of any mode of kbf, so its leases are not known"
+        ))),
+        Restart::Launchd(label) if label.is_empty() => {
+            Box::new(CannotTell("no launchd label names the service".to_owned()))
+        }
+        Restart::Launchd(_) => Box::new(MacLeases::on_host(host.layout.clone())),
+    }
+}
+
+/// The unit `restart` restarts, when it is a frontend's (`kbf --mode=frontend`: the
+/// family of the unit `setup` names for that mode). A frontend holds no leases, so a count
+/// read from its cgroup is "idle" whether or not it serves; the helper uses this to refuse a
+/// node `activate` that would restart it. A launchd label is never one.
+pub fn frontend_unit(restart: &Restart) -> Option<&str> {
+    match restart {
+        Restart::Systemd(unit) if is_unit_of(unit, &[Mode::Frontend]) => Some(unit.as_str()),
+        Restart::Systemd(_) | Restart::Launchd(_) => None,
+    }
+}
+
+/// Whether `unit` is a unit of some mode.
+fn is_mode_unit(unit: &str) -> bool {
+    use clap::ValueEnum;
+    is_unit_of(unit, Mode::value_variants())
+}
+
+/// Whether `unit` is a unit of one of `modes`: of the same family as one `setup` names for it.
+fn is_unit_of(unit: &str, modes: &[Mode]) -> bool {
+    family(unit).is_some_and(|f| {
+        modes
+            .iter()
+            .flat_map(|m| mode_units(*m, false))
+            .any(|u| family(u) == Some(f))
+    })
+}
+
+/// The family of a unit file name: `kbf-frontend` for `kbf-frontend.service` and for every
+/// instance of its template, `kbf-frontend@<instance>.service`. A name that is neither, or
+/// whose instance is empty or holds more than a unit instance does (a `/` would leave the
+/// slice), has none.
+fn family(unit: &str) -> Option<&str> {
+    let name = unit.strip_suffix(".service")?;
+    match name.split_once('@') {
+        None => Some(name),
+        Some((stem, instance)) => (!instance.is_empty()
+            && instance
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.:".contains(c)))
+        .then_some(stem),
+    }
+}
+
+/// A source that cannot tell, and says why.
+struct CannotTell(String);
+
+impl LeaseSource for CannotTell {
+    fn live(&self) -> Result<usize, String> {
+        Err(self.0.clone())
+    }
 }
 
 /// The source of a build that has none.
@@ -48,3 +277,7 @@ pub(crate) mod fake {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "leases_tests.rs"]
+mod tests;

@@ -51,7 +51,7 @@ What the script did not do:
 ```text
 kbf-mac-provision check   --profile FILE [--keys K,K]   # one PASS/FAIL line per item; exit 1 on any FAIL
 kbf-mac-provision apply   --profile FILE [--keys K,K]   # root: fix each FAIL, one CHANGE line per change
-kbf-mac-provision print   --profile FILE                # the resolved profile, its SHA-256, the node label
+kbf-mac-provision print   --profile FILE                # the resolved profile and its SHA-256
 kbf-mac-provision restart --profile FILE                # root: restart kbf-daemon, truncating its error log
 kbf-mac-provision revert                                # root: put back the recorded power and update settings
 ```
@@ -63,8 +63,9 @@ kbf-mac-provision revert                                # root: put back the rec
 - **Check only** items are never changed by `apply`; it reports them and exits 1. An
   erase or a restore is the remedy for macOS and for simulator runtimes; FileVault and
   the administrator are the operator's.
-- The node label is `profile=<profile>@<first 12 hex digits of the profile's SHA-256>`,
-  passed to `kbf --mode=daemon` as a `--label`.
+- A node carries no label: `kbf.toml` has no `label` key, and a profile that sets
+  `kbf_labels` is refused (delete the line). An earlier version wrote the key; a Mac
+  provisioned then fails `check` on `launchd_label` until `apply` rewrites its `kbf.toml`.
 - `--keys` limits `check` and `apply` to the named items. `--root DIR` runs everything
   under DIR; only the tests use it.
 - The job runs `/usr/local/kbf-installer/releases/current/kbf --mode=daemon --config /usr/local/etc/kbf/kbf.toml`
@@ -75,7 +76,7 @@ kbf-mac-provision revert                                # root: put back the rec
   what the profile renders, or has another owner or mode; `apply` writes it, then the
   property list, then restarts the job. The file is not in `revert`'s record, which holds
   the power and update settings only, and `revert` leaves it (as it leaves the property
-  list). The node label and the profile's labels are the `label` key. The file holds only
+  list). The file holds only
   flag tables and `mode`, so `kbf` runs the daemon on those flags (a file with `[enroll]`,
   `[frontend]` or `[node]` tables is the enrolling start instead; this tool writes none).
   Each profile key goes to the table kbf-cli's `GROUPS` puts its flag in:
@@ -91,7 +92,18 @@ kbf-mac-provision revert                                # root: put back the rec
   | `--key` | `kbf_key` | `[identity]` | `key` |
   | `--node-id` | `hostname` | `[identity]` | `node-id` |
   | `--data-dir` | `kbf_data_dir` | `[daemon]` | `data-dir` |
-  | `--label` (the node label, then each of `kbf_labels`) | `kbf_labels` | `[identity]` | `label = [...]` |
+  | `--update-dir` (always `/var/db/kbf-installer`) | | `[daemon]` | `update-dir` |
+  | `--orders-dir` (always `/var/db/kbf-installer/orders`) | | `[daemon]` | `orders-dir` |
+
+  `update-dir` turns on the node's update client: it takes the frontend's offers and orders
+  and writes the orders to `orders/` beneath it, which the root `kbf-installer` reads. The
+  directory is the installer's state directory on macOS, so `tests/node_config.rs` compares
+  it with kbf-installer's layout. `launchd_label` also checks and makes the state directory
+  (root's, mode 755) and `orders/` (the daemon account's, mode 700, root's for a root
+  daemon): the daemon account writes the orders and no other account may. kbf-installer
+  does not check who owns the spool; it opens it without following a link, reads only
+  regular files with one link, and acts on an order only after its own fetch and
+  verification of the commit it names.
 
   The profile has no size key, so `--data-max-bytes` (`[daemon]`, `data-max-bytes`) is not
   rendered; the daemon sizes the data directory from the filesystem.
@@ -128,7 +140,7 @@ letters and `_` only.
 | `default_developer_dir` | a pinned Xcode's path | `xcode-select -p` | `xcode-select -s` |
 | `probe` (`expect_probe`) | `KEY:/PATH:SHA256`; `KEY:XCODE_BUILD=VALUE` | each probe script's SHA-256 | check only. `expect_probe` lines are validated (a known probe, a pinned Xcode, once each) and printed |
 | `simulator_runtimes` | none | `/Library/Developer/CoreSimulator`: `Images/*.dmg`, `Profiles/Runtimes/*.simruntime`, `Volumes/*` | check only: runtimes live in VM images |
-| `launchd_label` (`kbf_labels`, `role_user`, and the profile's own SHA-256 in the node label) | label | `/usr/local/etc/kbf/kbf.toml` equals the one the profile renders, root-owned, mode 644, in a root's 755 directory; `/Library/LaunchDaemons/<label>.plist` equals the one the profile renders (section 5.3: `UserName`/`GroupName` the role account, `ProcessType` `Interactive`, `ExitTimeOut` 30, `kbf --mode=daemon --config <kbf.toml>` and nothing else), root-owned, mode 644; `/Library/Logs/kbf` root's, mode 755; the error log in it a regular file with one link, the role account's, mode 644; the job loaded | writes `kbf.toml` (and its directory, root's, mode 755), makes the log directory root's, replaces anything else at the error log's path (unlinked, never followed) with a new file of the role account, writes the plist, then restarts the job: `launchctl bootout`, the error log truncated while it is stopped, `launchctl bootstrap`. `restart` refuses, before it stops anything, when the error log is not such a file, so a link the role account plants is never emptied as root |
+| `launchd_label` (`role_user`) | label | `/usr/local/etc/kbf/kbf.toml` equals the one the profile renders, root-owned, mode 644, in a root's 755 directory; `/Library/LaunchDaemons/<label>.plist` equals the one the profile renders (section 5.3: `UserName`/`GroupName` the role account, `ProcessType` `Interactive`, `ExitTimeOut` 30, `kbf --mode=daemon --config <kbf.toml>` and nothing else), root-owned, mode 644; `/var/db/kbf-installer` root's, mode 755 and `/var/db/kbf-installer/orders` the daemon account's, mode 700; `/Library/Logs/kbf` root's, mode 755; the error log in it a regular file with one link, the role account's, mode 644; the job loaded | writes `kbf.toml` (and its directory, root's, mode 755), makes the two directories above (a link at either is removed, never followed), makes the log directory root's, replaces anything else at the error log's path (unlinked, never followed) with a new file of the role account, writes the plist, then restarts the job: `launchctl bootout`, the error log truncated while it is stopped, `launchctl bootstrap`. `restart` refuses, before it stops anything, when the error log is not such a file, so a link the role account plants is never emptied as root |
 
 ## Tests
 

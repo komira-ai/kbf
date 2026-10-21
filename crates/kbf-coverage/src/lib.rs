@@ -1,27 +1,25 @@
-//! Per-crate line and branch coverage for the workspace, and the ratchet that keeps it
-//! from falling.
+//! Per-crate line and branch coverage for the workspace, and the gate that keeps it up.
 //!
-//! CI runs the workspace tests under `cargo llvm-cov --branch`, which writes an lcov
-//! tracefile. This crate reads it ([`lcov`]), sums its per-file counts into one
-//! [`CrateCoverage`] per directory under `crates/` ([`ratchet::by_crate`]), and compares
-//! each crate with its line in the `coverage-baseline` file ([`baseline`]). The baseline
-//! records how many lines and branches of each crate no test runs, and CI fails when
-//! either count rises: new code must be covered, or the change must cover as much
-//! existing code as it leaves uncovered. A percentage cannot enforce that, since
-//! partly covered new code can still raise it. CI also fails when either count falls
-//! below the file's, until the file is lowered to match, so the baseline never keeps
-//! slack for a later change to spend: `kbf-coverage tighten` ([`tighten`]) lowers it
-//! from the measured file CI uploads, and refuses any rise, so running it when
-//! coverage improves is required and is not a bypass. The table CI prints also shows each
-//! crate's percentages and gap to 100%, the project's target.
+//! CI runs the fast tests (the nextest `pr` profile) under `cargo llvm-cov --branch`,
+//! which writes an lcov tracefile. This crate reads it ([`lcov`]), sums its per-file
+//! counts into one [`CrateCoverage`] per directory under `crates/`
+//! ([`gate::by_crate`]) and fails any crate whose line or branch coverage is under its
+//! threshold ([`gate`]). The threshold is 99.00% ([`Percent::TARGET`]) unless the
+//! `coverage-floors` file ([`floors`]) lists the crate with a lower floor for that
+//! metric. A floor is the crate's current coverage, floored to hundredths of a
+//! percent; it may only rise: `kbf-coverage raise` ([`raise`]) lifts floors to what a
+//! run measured and never adds or lowers one, and `kbf-coverage no-lowering` fails a
+//! pull request whose floors file is lower anywhere than its base's.
 //!
 //! Percentages are floored to hundredths ([`Percent`]), so one uncovered line in a
-//! large crate shows as 99.99% and a gap of 0.01%, never as a rounded-up 100.00%.
+//! large crate shows as 99.99%, never as a rounded-up 100.00%. The gate compares in
+//! integers (`hit * 10000 >= percent * found`, see [`Counts::meets`]), never floats.
 
-pub mod baseline;
+pub mod floors;
+pub mod gate;
 pub mod lcov;
-pub mod ratchet;
-pub mod tighten;
+pub mod raise;
+pub mod renames;
 
 use std::fmt;
 
@@ -61,6 +59,13 @@ impl Counts {
         }
     }
 
+    /// Whether the share that ran is at least `p`; true when there is nothing to
+    /// measure. Exact: no division, so `99.00` of 10000 items passes at 9900 hits and
+    /// fails at 9899.
+    pub fn meets(self, p: Percent) -> bool {
+        u128::from(self.hit) * 10_000 >= u128::from(p.0) * u128::from(self.found)
+    }
+
     /// The share that ran, or `None` when there is nothing to measure.
     pub fn percent(self) -> Option<Percent> {
         if self.found == 0 {
@@ -95,6 +100,25 @@ pub struct Percent(u16);
 
 impl Percent {
     pub const FULL: Percent = Percent(10_000);
+    /// What every crate must reach unless its floor says otherwise: 99.00%.
+    pub const TARGET: Percent = Percent(9_900);
+
+    /// `None` above 100.00%.
+    pub fn from_hundredths(h: u16) -> Option<Self> {
+        (h <= Self::FULL.0).then_some(Self(h))
+    }
+
+    /// Reads what [`Display`](fmt::Display) writes: digits, a point, two digits, at
+    /// most `100.00`. `99`, `99.5`, `+99.00` and `1e2` are refused.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (whole, frac) = s.split_once('.')?;
+        let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+        if !digits(whole) || frac.len() != 2 || !digits(frac) || whole.len() > 3 {
+            return None;
+        }
+        let h = whole.parse::<u16>().ok()? * 100 + frac.parse::<u16>().ok()?;
+        Self::from_hundredths(h)
+    }
 
     /// What is left to 100%.
     #[must_use]
@@ -151,7 +175,7 @@ mod tests {
     }
 
     /// Catches: the missed count computed from the wrong field, which would let a drop
-    /// in hits pass the ratchet.
+    /// in hits pass the gate.
     #[test]
     fn missed_is_found_minus_hit() {
         assert_eq!(counts(10, 7).missed(), Some(3));
@@ -184,5 +208,42 @@ mod tests {
         let max = counts(u64::MAX, u64::MAX);
         assert_eq!(max.plus(max), max);
         assert_eq!(max.percent(), Some(Percent::FULL));
+    }
+
+    /// Catches: a gate that compares floats or rounds, or `>` for `>=`: exactly the
+    /// threshold passes, one hit fewer fails, and an empty source always passes.
+    #[test]
+    fn meets_is_exact_at_the_threshold() {
+        let t = Percent::TARGET;
+        assert!(counts(10_000, 9_900).meets(t));
+        assert!(!counts(10_000, 9_899).meets(t));
+        assert!(counts(100, 99).meets(t));
+        assert!(!counts(101, 99).meets(t), "98.01% is under 99.00%");
+        assert!(counts(200, 198).meets(t));
+        assert!(Counts::default().meets(Percent::FULL));
+        assert!(counts(u64::MAX, u64::MAX).meets(Percent::FULL));
+        assert!(!counts(u64::MAX, u64::MAX - 1).meets(Percent::FULL));
+        // Whatever `percent` reports is met by the counts it came from.
+        for (f, h) in [(3, 2), (7, 5), (9_103, 9_031), (1_000_003, 999_999)] {
+            let c = counts(f, h);
+            assert!(c.meets(c.percent().expect("found")), "{h}/{f}");
+        }
+    }
+
+    /// Catches: a floor read back as another number, or a malformed one accepted.
+    #[test]
+    fn percent_text_round_trips_and_refuses_the_rest() {
+        for text in ["0.00", "5.05", "97.43", "99.00", "100.00"] {
+            let p = Percent::parse(text).expect(text);
+            assert_eq!(p.to_string(), text);
+        }
+        for bad in [
+            "", "99", "99.", ".99", "99.5", "99.000", "+99.00", "-1.00", "1e2", "100.01",
+            "1000.00", "9a.00", "99.0a", "0x9.00",
+        ] {
+            assert_eq!(Percent::parse(bad), None, "{bad:?}");
+        }
+        assert_eq!(Percent::from_hundredths(10_000), Some(Percent::FULL));
+        assert_eq!(Percent::from_hundredths(10_001), None);
     }
 }

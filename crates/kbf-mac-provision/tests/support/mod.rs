@@ -27,6 +27,10 @@ pub const EXAMPLE: &str = include_str!("../../example.profile");
 pub const CONFIG: &str = "/usr/local/etc/kbf/kbf.toml";
 pub const PLIST: &str = "/Library/LaunchDaemons/org.example.kbf-daemon.plist";
 pub const DROPIN: &str = "/etc/ssh/sshd_config.d/000-kbf.conf";
+/// Root's directory of the installer's state, where the node reads `status.json`, and the
+/// order spool inside it: written out here, not taken from the tool's constants.
+pub const UPDATE_DIR: &str = "/var/db/kbf-installer";
+pub const ORDERS: &str = "/var/db/kbf-installer/orders";
 pub const ERR_LOG: &str = "/Library/Logs/kbf/kbf-daemon.err.log";
 pub const SOFTWARE_UPDATE: &str = "/Library/Preferences/com.apple.SoftwareUpdate";
 pub const XCODE: &str = "/Library/Preferences/com.apple.dt.Xcode";
@@ -280,12 +284,14 @@ impl FakeMac {
         mac.mkdir("/usr/local/etc/kbf");
         mac.chmod("/usr/local/etc/kbf", 0o755);
         mac.own("/usr/local/etc/kbf", 0, 0);
-        mac.write(
-            CONFIG,
-            &golden_config(&sha256_hex(profile.as_bytes())[..12]),
-        );
+        mac.write(CONFIG, &golden_config());
         mac.chmod(CONFIG, 0o644);
         mac.own(CONFIG, 0, 0);
+        mac.mkdir(ORDERS);
+        mac.chmod(UPDATE_DIR, 0o755);
+        mac.own(UPDATE_DIR, 0, 0);
+        mac.chmod(ORDERS, 0o700);
+        mac.own(ORDERS, 480, 480);
         mac.mkdir("/Library/Logs/kbf");
         mac.chmod("/Library/Logs/kbf", 0o755);
         mac.own("/Library/Logs/kbf", 0, 0);

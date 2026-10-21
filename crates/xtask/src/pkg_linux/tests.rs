@@ -2,24 +2,18 @@ use std::cell::RefCell;
 use std::os::unix::fs::MetadataExt;
 
 use super::*;
+use kbf_testkit::dir::TestDir;
 
-/// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps")
-        .join("xtask-pkg-unit")
-        .join(format!("{name}-{}", std::process::id()));
-    // Absent unless a run with this pid left it.
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// An empty directory of its own for one test, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    let beside = std::env::current_exe().expect("test binary");
+    let deps = beside.parent().expect("deps");
+    TestDir::under(deps.join("xtask-pkg-unit"), name)
 }
 
 /// The inputs a package is built from, in `dir`.
 struct Tree {
-    dir: PathBuf,
+    dir: TestDir,
 }
 
 impl Tree {
@@ -107,7 +101,7 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
                 t.put("units/other.service", "x");
                 t.inputs()
             },
-            "other.service: a package unit is named kbf-*.service",
+            "other.service: a package unit is named kbf-*.service or kbf-*.socket",
         ),
         (
             "a unit that is a timer",
@@ -115,7 +109,7 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
                 t.put("units/kbf-gc.timer", "x");
                 t.inputs()
             },
-            "kbf-gc.timer: a package unit is named kbf-*.service",
+            "kbf-gc.timer: a package unit is named kbf-*.service or kbf-*.socket",
         ),
         (
             "a directory among the units",
@@ -351,7 +345,27 @@ fn the_real_sysusers_and_tmpfiles_files_say_what_the_contract_says() {
             .map(|l| l.split_whitespace().map(str::to_owned).collect())
             .collect()
     };
-    let users: Vec<String> = lines("sysusers.d/kbf-installer.conf")
+    let entries = lines("sysusers.d/kbf-installer.conf");
+    // Design section 3: `kbf-signer` owns the CA key and has no home, no login and a
+    // system id with a group of its own name; there is no `kbf-verify` user.
+    let signer: Vec<&Vec<String>> = entries.iter().filter(|f| f[1] == "kbf-signer").collect();
+    assert_eq!(signer.len(), 1, "exactly one kbf-signer entry: {entries:?}");
+    let f = signer[0];
+    assert_eq!(
+        [
+            f[0].as_str(),
+            f[2].as_str(),
+            f[f.len() - 2].as_str(),
+            f[f.len() - 1].as_str()
+        ],
+        ["u", "-", "/nonexistent", "/usr/sbin/nologin"],
+        "{f:?}"
+    );
+    assert!(
+        entries.iter().all(|f| f[1] != "kbf-verify"),
+        "section 3: there is no kbf-verify user: {entries:?}"
+    );
+    let users: Vec<String> = entries
         .into_iter()
         .map(|f| {
             assert_eq!((f[0].as_str(), f[3].starts_with('"')), ("u", true), "{f:?}");
@@ -453,7 +467,7 @@ impl Model {
 fn built(
     name: &str,
     leave: impl Fn(&str, &str) -> Vec<(String, String)>,
-) -> (Result<Vec<String>, Error>, PathBuf, Model) {
+) -> (Result<Vec<String>, Error>, TestDir, Model) {
     let dir = scratch(name);
     let source = dir.join("kbf-installer");
     std::fs::write(&source, "binary").expect("source");
@@ -471,7 +485,8 @@ fn built(
         epoch: 77,
     };
     let result = super::build(&mut model.nfpm(&source, leave), &build);
-    (result, out, model)
+    // The caller holds the directory, which the output is in, until it is done.
+    (result, dir, model)
 }
 
 /// Package bytes that depend on the environment's time only.
@@ -485,7 +500,8 @@ fn by_epoch(format: &str, seen: &str) -> Vec<(String, String)> {
 
 #[test]
 fn a_package_that_depends_on_the_epoch_alone_is_built_twice_and_the_same() {
-    let (result, out, model) = built("build-same", by_epoch);
+    let (result, dir, model) = built("build-same", by_epoch);
+    let out = dir.join("out");
     let printed = result.expect("reproducible");
     assert_eq!(printed.len(), 2);
     assert!(printed[0].ends_with("kbf-installer.deb"), "{printed:?}");
@@ -666,6 +682,29 @@ fn no_dependency_of_either_package_names_envoy() {
     }
 }
 
+/// The package suggests a Postgres server and does not depend on it: node hosts never use
+/// one, and apt installs `Recommends` by default, which would start a database on every node.
+/// Catches Postgres moving into `depends` (every node gets a server) and the hint vanishing
+/// (the frontend operator is not told what to install).
+#[test]
+fn postgres_is_suggested_not_required() {
+    for dep in DEB_DEPENDS.iter().chain(RPM_DEPENDS.iter()) {
+        assert!(!dep.to_lowercase().contains("postgres"), "{dep}");
+    }
+    let cfg = config(&[], Platform::LinuxX86_64, "0.0.0+ci");
+    let top: Vec<&str> = cfg.lines().collect();
+    let at = |key: &str| top.iter().position(|l| *l == key).expect(key);
+    assert!(
+        top[at("suggests:") + 1].contains("\"postgresql\""),
+        "the deb suggests postgresql: {cfg}"
+    );
+    assert!(
+        cfg.contains("    suggests:\n      - \"postgresql-server\"\n"),
+        "the rpm suggests postgresql-server: {cfg}"
+    );
+    assert!(!cfg.contains("recommends"), "{cfg}");
+}
+
 /// The slice is the one non-`.service` unit; any other name is still refused.
 #[test]
 fn a_unit_that_is_neither_a_service_nor_the_slice_is_refused() {
@@ -676,6 +715,36 @@ fn a_unit_that_is_neither_a_service_nor_the_slice_is_refused() {
     let got = refused(plan(&t.inputs()));
     assert!(got.contains("kbf-x.timer"), "{got}");
     assert!(!got.contains("kbf.slice:"), "{got}");
+}
+
+/// A `kbf-*.socket` is packaged beside its service, in the same directory and mode.
+#[test]
+fn a_socket_unit_is_packaged_beside_the_services_with_the_same_mode() {
+    let t = Tree::new("socket");
+    t.put("units/kbf-x.socket", "[Socket]");
+    t.put("units/other.socket", "[Socket]");
+    let got = refused(plan(&t.inputs()));
+    assert!(
+        got.contains("other.socket: a package unit is named"),
+        "{got}"
+    );
+    assert!(!got.contains("kbf-x.socket:"), "{got}");
+    std::fs::remove_file(t.dir.join("units/other.socket")).expect("rm");
+    let entries = plan(&t.inputs()).expect("a socket is a plan");
+    let find = |n: &str| {
+        entries
+            .iter()
+            .find(|e| e.dst.ends_with(&format!("/{n}")))
+            .map(|e| (e.dst.clone(), e.mode))
+            .expect(n)
+    };
+    let (sock, sock_mode) = find("kbf-x.socket");
+    let (svc, svc_mode) = find("kbf-node.service");
+    assert_eq!(sock_mode, svc_mode);
+    assert_eq!(
+        sock.rsplit_once('/').map(|p| p.0),
+        svc.rsplit_once('/').map(|p| p.0)
+    );
 }
 
 #[test]

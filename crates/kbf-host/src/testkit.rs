@@ -157,6 +157,16 @@ impl Exec for FakeExec {
             Step::Remove { path } => {
                 self.entries.remove(path);
             }
+            // The entry and everything under it (a path is under `path` when it starts with
+            // `path/`, so `/a/bc` is not under `/a/b`); what is not there is an error, as on
+            // the host.
+            Step::RemoveTree { path } => {
+                if self.entries.remove(path).is_none() {
+                    return Err(io::Error::from(io::ErrorKind::NotFound));
+                }
+                let below = format!("{path}/");
+                self.entries.retain(|p, _| !p.as_str().starts_with(&below));
+            }
             Step::Run(cmd) => {
                 crate::exec::succeeded(cmd, (self.answer)(cmd)?)?;
             }
@@ -191,15 +201,21 @@ impl Exec for FakeExec {
     }
 }
 
-/// A fresh, empty directory for one test: `<target>/tmp/kbf-host/<name>`. Every crate
-/// that uses it shares that directory, so `name` must be unique among them.
+/// A fresh, empty directory for one test: `<target>/tmp/kbf-host/<pid>/<name>`. `name`
+/// must be unique among the tests of one process; the process id keeps it apart from
+/// other processes of the same target, which `cargo nextest` runs one per test and
+/// which would otherwise empty each other's directory.
 pub fn scratch(name: &str) -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let target = exe
         .ancestors()
         .nth(3)
         .expect("<target>/<profile>/deps/<test binary>");
-    let dir = target.join("tmp").join("kbf-host").join(name);
+    let dir = target
+        .join("tmp")
+        .join("kbf-host")
+        .join(std::process::id().to_string())
+        .join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("make the scratch directory");
     dir

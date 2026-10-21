@@ -44,10 +44,17 @@ flate2 = { version = "1.1.10", default-features = false, features = ["rust_backe
 # a browser encodes it. Already in the tree through url.
 form_urlencoded = "1.2.2"
 futures = "0.3.34"
+# The front-door proxy's upstream client (kbf-proxy): the window, concurrent-stream and
+# GOAWAY facts the pool needs are on h2's own types, not hyper's. Already in the tree
+# through hyper and tonic.
+h2 = "0.4.20"
 hex = "0.4.3"
-# The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`).
+# The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`)
+# and of the installer's loopback calls to a child (kbf-installer: `proxy::child_http`).
 # Already in the tree through hyper.
 httparse = "1.10.1"
+# Header maps of the front-door proxy (kbf-proxy); already in the tree through hyper.
+http = "1.5.0"
 # The frontend proxy's pass-through bodies (kbf-front); already in the tree through tonic.
 http-body = "1.1.0"
 # The registry client of kbf-image reads response bodies frame by frame. Already in the tree
@@ -66,6 +73,9 @@ postgres = "0.19.10"
 # takes plain TCP only). Both are already in the tree through axum and tonic.
 hyper = { version = "1.12.0", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false }
+# The model checker behind kbf-proxy's permit and hold-gate models (`--cfg kbf_loom`,
+# `cargo xtask proxy-loom`). A dev-dependency only, and only under that cfg.
+loom = "0.7.2"
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
 objc2 = "0.6.5"
@@ -133,7 +143,7 @@ ssh-key = { version = "0.6.7", default-features = false, features = ["alloc", "e
 # Constant-time comparison of the operator API token (kbf-server). Already in the tree
 # through rustls.
 subtle = "2.6.1"
-# Parses Rust sources for the interpreter budget's shell scan (kbf-it, tests only).
+# Parses Rust sources for the interpreter budget's shell scan (kbf-integration-test, tests only).
 # Already in the tree through the derive macros.
 syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "visit"] }
 # The tar archives kbf-deploy installs (`mdm install`) and `cargo xtask fetch` unpacks;
@@ -141,7 +151,7 @@ syn = { version = "2.0.119", default-features = false, features = ["full", "pars
 tar = { version = "0.4.46", default-features = false }
 thiserror = "2.0.21"
 # `kbf.toml`, the node's config file (kbf-enroll), and `installer.toml`, the installer's settings (kbf-installer); no datetime or display support.
-toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
+toml = { version = "1.1.8", default-features = false, features = ["display", "parse", "serde", "std"] }
 # RFC 3339 times in the MDM gate's signed messages. Already in the tree through
 # x509-parser.
 time = { version = "0.3.55", default-features = false, features = ["formatting", "macros", "parsing", "std"] }
@@ -178,6 +188,7 @@ kbf-auth = { path = "crates/kbf-auth" }
 kbf-ca = { path = "crates/kbf-ca" }
 kbf-caps = { path = "crates/kbf-caps" }
 kbf-cas-conformance = { path = "crates/kbf-cas-conformance" }
+kbf-cli = { path = "crates/kbf-cli" }
 kbf-daemon = { path = "crates/kbf-daemon" }
 kbf-deploy = { path = "crates/kbf-deploy" }
 kbf-driver-container = { path = "crates/kbf-driver-container" }
@@ -186,12 +197,14 @@ kbf-enroll-registry = { path = "crates/kbf-enroll-registry" }
 kbf-enroll = { path = "crates/kbf-enroll" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
+kbf-gate = { path = "crates/kbf-gate" }
+kbf-harness = { path = "crates/kbf-harness" }
 kbf-history = { path = "crates/kbf-history" }
 kbf-image = { path = "crates/kbf-image" }
 kbf-host = { path = "crates/kbf-host" }
 kbf-installer = { path = "crates/kbf-installer" }
 kbf-invocation = { path = "crates/kbf-invocation" }
-kbf-it = { path = "crates/kbf-it" }
+kbf-integration-test = { path = "crates/kbf-integration-test" }
 kbf-log = { path = "crates/kbf-log" }
 kbf-map = { path = "crates/kbf-map" }
 kbf-mapsync = { path = "crates/kbf-mapsync" }
@@ -204,11 +217,13 @@ kbf-objstore = { path = "crates/kbf-objstore" }
 kbf-outputs = { path = "crates/kbf-outputs" }
 kbf-peer = { path = "crates/kbf-peer" }
 kbf-proto = { path = "crates/kbf-proto" }
+kbf-proxy = { path = "crates/kbf-proxy" }
 kbf-raft = { path = "crates/kbf-raft" }
 kbf-route = { path = "crates/kbf-route" }
 kbf-sched = { path = "crates/kbf-sched" }
 kbf-segments = { path = "crates/kbf-segments" }
 kbf-server = { path = "crates/kbf-server" }
+kbf-signer = { path = "crates/kbf-signer" }
 kbf-sim = { path = "crates/kbf-sim" }
 kbf-sim-cell = { path = "crates/kbf-sim-cell" }
 kbf-state = { path = "crates/kbf-state" }
@@ -216,19 +231,26 @@ kbf-storage = { path = "crates/kbf-storage" }
 kbf-store = { path = "crates/kbf-store" }
 kbf-testkit = { path = "crates/kbf-testkit" }
 kbf-threads = { path = "crates/kbf-threads" }
+kbf-oidc = { path = "crates/kbf-oidc" }
 kbf-tls = { path = "crates/kbf-tls" }
 kbf-tier = { path = "crates/kbf-tier" }
 kbf-transfer = { path = "crates/kbf-transfer" }
 kbf-types = { path = "crates/kbf-types" }
 kbf-ui = { path = "crates/kbf-ui" }
 kbf-update = { path = "crates/kbf-update" }
-# The CI verbs (`cargo xtask`); kbf-it reads the interpreter budget with its parser.
+# The CI verbs (`cargo xtask`); kbf-integration-test reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
 
 # `clippy.toml` lists the clock, sleep, network and hashed-collection items that pure
 # crates must not use. They are allowed workspace-wide; each pure crate denies them in
 # its `lib.rs` (an in-source attribute overrides this table), and the layering test in
-# `kbf-it` checks that the deny is present.
+# `kbf-integration-test` checks that the deny is present.
+[workspace.lints.rust]
+# `kbf_loom` swaps kbf-proxy's atomics for loom's (`cargo xtask proxy-loom`). Not `loom`:
+# tokio reads `cfg(loom)` too and then needs a loom dependency of its own.
+# `coverage` is set by cargo-llvm-cov (crates/kbf-all-in-one-test and crates/kbf-daemon-test compile their tests out under it).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kbf_loom)", "cfg(coverage)"] }
+
 [workspace.lints.clippy]
 disallowed_methods = "allow"
 disallowed_types = "allow"

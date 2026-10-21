@@ -41,7 +41,7 @@ fn write_config(path: &Path, text: &str) {
 
 struct Harness {
     run: Running,
-    root: PathBuf,
+    root: kbf_testkit::dir::TestDir,
     /// The waits a start asked for before trying again.
     waits: Arc<Mutex<Vec<Duration>>>,
     /// How many waits are honoured (the start then tries again); the next one gives up.
@@ -146,7 +146,6 @@ impl Harness {
             mode,
             config: self.config_path(),
             check: false,
-            labels: Vec::new(),
         }
     }
 
@@ -547,6 +546,96 @@ async fn a_configuration_missing_the_cold_store_is_refused_after_enrolling() {
     assert!(h.node_json().contains("storage"));
 }
 
+/// Catches a node enrolled before the farm registered a cold store staying unable to
+/// start its storage half: the first start is refused (no store), then the store is
+/// registered, and the next start asks the frontend for the configuration (one `Renew`)
+/// and runs the storage mode on the store it was sent. A node that holds one asks nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_enrolled_before_the_store_was_registered_asks_for_it_at_its_next_start() {
+    let h = Harness::new("node-cold-store-late");
+    h.ready("");
+    let launches = Arc::new(Launches::default());
+    start_mode(&h, names::STORAGE, &launches)
+        .await
+        .expect_err("no cold store yet");
+    assert!(launches.seen().is_empty());
+    assert_eq!(h.fake().enrolls().len(), 1);
+
+    h.fake().set_cold_store(COLD);
+    h.fake().set_generation(2);
+    start_mode(&h, names::STORAGE, &launches)
+        .await
+        .expect("the store was sent");
+    assert_eq!(launches.seen(), [names::STORAGE]);
+    assert_eq!(h.fake().enrolls().len(), 1, "no second enrollment");
+    assert!(
+        h.node_json().contains("objects.example"),
+        "kept in node.json"
+    );
+    let asked = h.fake().renews().len();
+    assert_eq!(
+        asked, 1,
+        "one Renew, to ask; the renewer's first look is not due"
+    );
+
+    start_mode(&h, names::STORAGE, &launches)
+        .await
+        .expect("a node with a store");
+    assert_eq!(
+        h.fake().renews().len(),
+        asked,
+        "a node that holds a cold store asks for nothing"
+    );
+}
+
+/// Catches a start that dies with the frontend's refusal instead of saying what is missing:
+/// a storage node holding no cold store whose frontend refuses the one `Renew` it sends at
+/// start still gets the plan error naming the cold store, exit 2, and starts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_cold_store_ask_leaves_the_plan_error() {
+    let h = Harness::new("node-cold-ask-refused");
+    h.ready("");
+    let launches = Arc::new(Launches::default());
+    start_mode(&h, names::STORAGE, &launches)
+        .await
+        .expect_err("no cold store yet");
+    h.fake().refuse_with(Some(RefusalReason::StoreUnavailable));
+    let failure = start_mode(&h, names::STORAGE, &launches)
+        .await
+        .expect_err("the frontend refused");
+    assert!(
+        matches!(&failure, Failure::Plan(m) if m.contains("cold store")),
+        "{failure:?}"
+    );
+    assert_eq!(failure.exit_code(), 2);
+    assert_eq!(h.fake().renews().len(), 1, "the second start asked once");
+    assert!(launches.seen().is_empty());
+}
+
+/// Catches a node with no storage role asking the frontend for a cold store at start: a
+/// daemon-only node holds none by design (the frontend sends it none), so a start that
+/// asked would send a `Renew` at every start of every daemon, and reach a frontend that is
+/// down for a node that has no use for the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_only_node_asks_for_no_cold_store_at_start() {
+    let h = Harness::new("node-daemon-no-cold-ask");
+    h.ready("");
+    // The fake sends no cold store until told to: the daemon holds none, as in life.
+    let launches = Arc::new(Launches::default());
+    for _ in 0..2 {
+        start_mode(&h, names::DAEMON, &launches)
+            .await
+            .expect("a daemon starts with no cold store");
+    }
+    assert_eq!(launches.seen(), [names::DAEMON, names::DAEMON]);
+    assert_eq!(h.fake().enrolls().len(), 1);
+    assert_eq!(
+        h.fake().renews().len(),
+        0,
+        "a daemon sends no Renew at start"
+    );
+}
+
 /// Catches an answer the node refused being retried as if the network were at fault, or a
 /// node with a wrong clock being given up on for good: a frontend whose clock is ten
 /// minutes off is exit 1 (the clock may be set right and the start tried again), an answer
@@ -620,34 +709,40 @@ async fn a_setting_for_a_role_the_node_does_not_hold_is_a_warning_not_a_refusal(
     assert_eq!(launches.seen(), [names::DAEMON]);
 }
 
-/// Catches a mode that refuses the flags the start built (here a label the daemon does not
-/// accept) starting anyway, or being reported as anything but a usage error: the node is
-/// enrolled, the mode's own parser says what it refused, and nothing runs.
+/// Catches a `label` key left in `kbf.toml` (a node label, removed: placement uses what
+/// the node reports) starting the node, or being found only after the token is spent: the
+/// start is refused with the key and its replacement named, exit 2, before the token is
+/// sent, with nothing installed and the token file kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_label_the_mode_refuses_stops_the_start() {
+async fn a_label_in_kbf_toml_stops_the_start_before_enrolling() {
     let h = Harness::new("node-bad-label");
-    h.ready("[daemon]\n");
-    let launches = Arc::new(Launches::default());
-    let (node, env) = (
-        Start {
-            labels: vec!["no-equals-sign".to_owned()],
-            ..h.start_of(Some(names::DAEMON))
-        },
-        h.env(),
+    h.write_config_with(
+        h.run.enroll_addr.port(),
+        "",
+        "",
+        "[identity]\nlabel = [\"pool=mac\"]\n\n[daemon]\n",
     );
+    h.put_token(&h.fake().mint(1, 1));
+    let launches = Arc::new(Launches::default());
 
-    let failure = tokio::task::spawn_blocking(move || {
-        run_with(&node, &env, Driver::Container, &|_| ExitCode::SUCCESS)
-    })
-    .await
-    .expect("no panic")
-    .expect_err("refused");
+    let failure = start(&h, &launches, || {}).await.expect_err("refused");
 
-    assert!(matches!(failure, Failure::Mode(_)), "{failure:?}");
+    assert!(matches!(failure, Failure::Settings(_)), "{failure:?}");
     assert_eq!(failure.exit_code(), 2);
-    assert!(failure.to_string().contains("--label"), "{failure}");
+    let said = failure.to_string();
+    assert!(said.contains("`identity.label`"), "{said}");
+    assert!(
+        said.contains(&h.config_path().display().to_string()),
+        "{said}"
+    );
+    assert!(
+        said.contains("`label` was removed: placement uses what the node reports (OSFamily, ISA); delete the key"),
+        "{said}"
+    );
     assert!(launches.seen().is_empty());
-    assert!(h.node_json().contains("node-02"), "enrolled all the same");
+    assert!(h.fake().enrolls().is_empty(), "the token was not sent");
+    assert!(!h.state().join("pki/node.json").exists());
+    assert!(h.token_path().exists());
 }
 
 /// An enrolled node and a renewer for it, with the clock at the fake's.

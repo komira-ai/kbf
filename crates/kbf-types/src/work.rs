@@ -517,4 +517,16 @@ mod tests {
             u64::MAX
         );
     }
+
+    /// Catches: ids that print as the bare number (an operation unreadable in a log next
+    /// to a waiter or a lease), or a worker whose name is changed on the way in or out.
+    #[test]
+    fn operations_and_workers_print_as_their_names() {
+        assert_eq!(OperationId(0).to_string(), "op-0");
+        assert_eq!(OperationId(4_000).to_string(), "op-4000");
+        let worker = WorkerId::new("node-07");
+        assert_eq!(worker.as_str(), "node-07");
+        assert_eq!(worker.to_string(), "node-07");
+        assert_ne!(worker, WorkerId::new("node-7"));
+    }
 }

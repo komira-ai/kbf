@@ -28,7 +28,7 @@
 //!
 //! **A start with no mode flags reads `kbf.toml`** ([`node`]): `kbf --mode=storage`,
 //! `daemon` or `storage-and-daemon` with at most `--config FILE` (default where the
-//! packages put it) and `--label`, or `kbf` alone. The start enrolls the host on its first
+//! packages put it), or `kbf` alone. The start enrolls the host on its first
 //! run when the token file is there, for exactly the roles the mode needs, renews without
 //! the token on later runs, and runs the mode on the configuration the frontend sent
 //! ([`node`], [`enroll`]). `--check` checks that host and exits, starting nothing: 0 for
@@ -36,9 +36,9 @@
 //! cannot work. A start that gives mode flags runs on them and does not read the file.
 //! There is no `node` mode and no `enroll` word: the host's config states what it is.
 //!
-//! And words that are not modes: `kbf cluster status|drain|undrain` ([`cluster`]), a
-//! client of the frontend's operator API that starts nothing, and `check-args`. Like it
-//! they are outside [`names::MODES`]; `kbf --help` ends with a line naming them.
+//! And words that are not modes: `kbf cluster status|drain|undrain|member|denied|object-store` ([`cluster`]), a
+//! client of the frontend's operator API that starts nothing. It is outside
+//! [`names::MODES`]; `kbf --help` ends with a line naming it.
 //!
 //! A mode refuses the flags that belong to another mode ([`refused_by`]): the set is
 //! derived from each mode's own flag set, nothing is listed by hand, so a flag added to
@@ -49,14 +49,8 @@
 //! anyway, so the artifacts workflow can check `kbf` as it checks `kbf-server`.
 //!
 //! `kbf --version --json` ([`version`]) prints one JSON object on one line naming the
-//! commit, the build profile, the protocol versions and the state schema, so a host can
-//! check what it runs.
-//!
-//! `kbf check-args <mode>|--mode=<mode> [flags...]` ([`check_args`]) parses the command
-//! line as a start would, then exits, starting nothing: 0 when the mode would start with
-//! those flags, 2 with clap's message when it would refuse them (and for a mode not
-//! built yet, which refuses every start). `kbf-deploy linux check-units --mode` runs
-//! it on a unit's `ExecStart=`. It is not a mode, so `kbf --help` does not list it.
+//! commit and the number of commits behind it, the build profile, the protocol versions and
+//! the state schema, so a host can check what it runs.
 //!
 //! And `kbf frontend handover` ([`handover`]): starts the idle instance of the frontend's
 //! systemd template (`kbf-frontend@a`, `kbf-frontend@b`) while the other serves, so the
@@ -66,15 +60,13 @@
 //! Before a mode starts, [`preflight`] checks what it needs of its host (the files its
 //! flags name, its certificate's role, the S3 key pair, the container driver's programs,
 //! ...) and refuses, with every missing piece on stderr, one line each, and exit status 2
-//! (75 for a piece that heals shortly). `check-args`, `cluster` and `frontend handover`
-//! read nothing of the host and skip it.
+//! (75 for a piece that heals shortly). `cluster` and `frontend handover` read nothing of
+//! the host and skip it.
 //!
 //! Every mode also takes `--config FILE` and `--check` ([`config`]): the settings may be in
 //! `/etc/kbf/kbf.toml` (one TOML table per setting group, one key per flag, a flag on the
 //! command line overriding its key), and `--check` parses the flags and the file, runs the
 //! startup checks and exits 0, 2 or 75 without starting ([`preflight::check_only`]).
-//! `check-args` is `--check`'s parse stage only, kept for `kbf-deploy`, with a deprecation
-//! note on its last line of standard error.
 //!
 //! The `kbf-server`, `kbf-daemon` and `kbf-all-in-one` binaries are unchanged.
 
@@ -281,19 +273,12 @@ pub fn command() -> Command {
                      and exit: 0 when it can start, 2 when a restart cannot fix it; \
                      starts and enrolls nothing",
                 ),
-        )
-        .arg(
-            Arg::new("label")
-                .long("label")
-                .value_name("KEY=VALUE")
-                .action(ArgAction::Append)
-                .help("A label the daemon half reports to the frontend (repeatable)"),
         );
     for mode in MODES {
         cmd = cmd.subcommand(mode_command(mode.name, mode.entry));
     }
     cmd.after_help(format!(
-        "Not a mode: `kbf {CLUSTER} status|drain|undrain` calls a frontend's operator API \
+        "Not a mode: `kbf {CLUSTER} status|drain|undrain|member|denied|object-store` calls a frontend's operator API \
          (`kbf {CLUSTER} --help`); `kbf {} {HANDOVER}` updates a frontend without failing a \
          build (`kbf {} {HANDOVER} --help`).",
         names::FRONTEND,
@@ -312,7 +297,7 @@ pub fn config_template(mode: &str) -> Option<String> {
 }
 
 /// The word after `kbf` that calls the operator API ([`cluster`]) instead of starting a
-/// mode. Like [`CHECK_ARGS`] it is not in [`names::MODES`], so the mode list stays exact.
+/// mode. It is not in [`names::MODES`], so the mode list stays exact.
 pub const CLUSTER: &str = "cluster";
 
 /// The word after `kbf frontend` that starts the idle instance of the frontend's unit
@@ -347,7 +332,6 @@ pub fn parse_handover(args: &[std::ffi::OsString]) -> Result<handover::Handover,
 pub fn cluster_command() -> Command {
     let cmd = Command::new(CLUSTER)
         .bin_name(format!("kbf {CLUSTER}"))
-        .about("Drain, undrain and show the cluster through the frontend's operator API.")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .disable_help_subcommand(true);
@@ -366,17 +350,22 @@ pub fn parse_cluster(args: &[std::ffi::OsString]) -> Result<cluster::Cluster, cl
 }
 
 /// What the words of a command line say before any mode parses its flags: the mode
-/// (`--mode`, or the hidden alias word), `kbf.toml`'s path, `--check` and the labels, and
-/// every other word, untouched.
+/// (`--mode`, or the hidden alias word), `kbf.toml`'s path and `--check`, and every other
+/// word, untouched.
 #[derive(Default)]
 struct Split {
     alias: Option<OsString>,
     mode: Option<OsString>,
     config: Option<PathBuf>,
     check: bool,
-    labels: Vec<OsString>,
     rest: Vec<OsString>,
 }
+
+/// What a start that still gives `--label` is told. Node labels are gone: placement uses
+/// what the node reports, so there is nothing to carry the flag over to; it names the flag
+/// and the way out, and the daemon does not start.
+const LABEL_REMOVED: &str =
+    "--label was removed: placement uses what the node reports (OSFamily, ISA); delete the flag";
 
 /// A flag that takes a value, as `--name value` or `--name=value`; `None` for another word.
 fn value_of<'a>(
@@ -423,8 +412,8 @@ fn split(args: &[OsString]) -> Result<Split, clap::Error> {
             out.mode = Some(value);
         } else if let Some(value) = value_of("config", text, &mut words)? {
             out.config = Some(PathBuf::from(value));
-        } else if let Some(value) = value_of("label", text, &mut words)? {
-            out.labels.push(value);
+        } else if text == "--label" || text.starts_with("--label=") {
+            return Err(command().error(ErrorKind::UnknownArgument, LABEL_REMOVED));
         } else {
             out.rest.push(arg.clone());
         }
@@ -529,7 +518,7 @@ fn parse_words(
     args: Vec<OsString>,
     default_config: Option<&std::path::Path>,
 ) -> Result<Parsed, clap::Error> {
-    let mut split = split(&args)?;
+    let split = split(&args)?;
     let mut named = named_mode(&split, &args)?;
     let flag_named = named.is_some();
     let path = split
@@ -562,8 +551,8 @@ fn parse_words(
     // A start that gives no flag of its mode reads the host's file; one whose file is not
     // there is refused by that start, naming the file, not by a list of missing flags. A
     // file that exists and has none of enrollment's tables is the mode's flags alone.
-    // The old alias word with no `--config` and no `--check` (a `--label` is a flag of the
-    // old start) is the old start and wants its flags.
+    // The old alias word with no `--config` and no `--check` is the old start and wants
+    // its flags.
     let bare_alias = split.alias.is_some() && split.config.is_none() && !split.check;
     if split.rest.is_empty()
         && !bare_alias
@@ -577,11 +566,6 @@ fn parse_words(
                 mode: Some(mode.name),
                 config: path.unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH)),
                 check: split.check,
-                labels: split
-                    .labels
-                    .iter()
-                    .map(|l| l.to_string_lossy().into_owned())
-                    .collect(),
             })),
             check: false,
         });
@@ -599,12 +583,7 @@ fn parse_words(
             path.display()
         );
     }
-    // The mode's own flags: its subcommand word, the labels the split took out put back.
-    let labels = split.labels.drain(..).map(|mut l| {
-        let mut flag = OsString::from("--label=");
-        flag.push(std::mem::take(&mut l));
-        flag
-    });
+    // The mode's own flags: its subcommand word.
     let config = path.as_ref().map(|path| {
         let mut flag = OsString::from("--config=");
         flag.push(path);
@@ -614,7 +593,6 @@ fn parse_words(
         .into_iter()
         .chain(config)
         .chain(split.check.then(|| OsString::from("--check")))
-        .chain(labels)
         .chain(split.rest)
         .collect();
     let check = split.check;
@@ -818,42 +796,9 @@ pub fn run(invocation: &Invocation) -> ExitCode {
     }
 }
 
-/// The word after `kbf` that checks a command line instead of starting it
-/// ([`check_args`]).
-pub const CHECK_ARGS: &str = "check-args";
-
-/// `kbf check-args <mode>|--mode=<mode> [flags...]`: parses `kbf [flags...]` as [`main`]
-/// would, and starts nothing (the parse reads no file and opens no socket). `args` is
-/// the whole command line, its first word the program's name and its second
-/// [`CHECK_ARGS`].
-///
-/// # Errors
-/// What [`parse_from`] refuses, and `--help` or `--version`, which would print and exit 0 without
-/// starting the mode.
-pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
-    // `kbf <word> [flags...]`, as the start would be given.
-    let argv = args
-        .iter()
-        .take(1)
-        .chain(args.iter().skip(2))
-        .cloned()
-        .collect::<Vec<_>>();
-    let parsed = parse_from(argv).map(|_| ());
-    match parsed {
-        Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
-            Err(command().error(
-                ErrorKind::ArgumentConflict,
-                "--help and --version print and exit 0: the mode would not start",
-            ))
-        }
-        other => other,
-    }
-}
-
 /// The `kbf` binary: the daemon's helper re-execs first (a keeper or a `__chown-dirs`
 /// run of this binary never reads the command line as `kbf`'s), then [`version::line`]
-/// for `kbf --version --json`, then the command line, then [`check_args`] for `kbf
-/// check-args ...`, [`cluster::run`] for `kbf cluster ...`, [`handover::run`] for `kbf frontend handover ...` or else
+/// for `kbf --version --json`, then the command line, then [`cluster::run`] for `kbf cluster ...`, [`handover::run`] for `kbf frontend handover ...` or else
 /// [`preflight::refusal`] and [`run`]. A command
 /// line that
 /// does not parse exits 2 (0 for `--help` and `--version`).
@@ -869,21 +814,6 @@ pub fn main() -> ExitCode {
     if version::asked(&args) {
         print!("{}", version::line());
         return ExitCode::SUCCESS;
-    }
-    if args.get(1).is_some_and(|word| word == CHECK_ARGS) {
-        let code = match check_args(&args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                let _ = e.print();
-                ExitCode::from(2)
-            }
-        };
-        // After the result: `kbf-deploy` reports the first line this prints.
-        eprintln!(
-            "kbf: `check-args` is deprecated: it only parses the flags; use `kbf <mode> ... \
-             --check`, which also reads the config file and runs the startup checks"
-        );
-        return code;
     }
     if args.get(1).is_some_and(|word| word == names::FRONTEND)
         && args.get(2).is_some_and(|word| word == HANDOVER)

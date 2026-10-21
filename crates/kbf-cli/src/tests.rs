@@ -184,7 +184,7 @@ fn the_mode_flag_names_every_mode_like_the_alias_does() {
 /// Catches the alias word reading `kbf.toml` when it is given nothing (the old units run
 /// `kbf storage` on their own flags and must go on doing so), and a flag-form start that
 /// carries no flag of its mode not reading it: `--mode=storage` alone, `--mode=daemon
-/// --label`, a bare `kbf` and the alias with `--config` or `--check` are starts that read
+/// --check`, a bare `kbf` and the alias with `--config` or `--check` are starts that read
 /// the file; a start that gives mode flags is never one.
 #[test]
 fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
@@ -198,25 +198,15 @@ fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
         start.config,
         std::path::PathBuf::from(enroll::DEFAULT_CONFIG)
     );
-    assert!(!start.check && start.labels.is_empty());
-    let start = registered(&[
-        "kbf",
-        "--mode=daemon",
-        "--config",
-        "/x/kbf.toml",
-        "--label=pool=mac",
-        "--label",
-        "rack=r2",
-    ])
-    .expect("config and labels");
+    assert!(!start.check);
+    let start =
+        registered(&["kbf", "--mode=daemon", "--config", "/x/kbf.toml"]).expect("mode and config");
     assert_eq!(start.config, std::path::PathBuf::from("/x/kbf.toml"));
-    assert_eq!(start.labels, ["pool=mac", "rack=r2"]);
     // No mode named: the file's `mode`, and with no file, or none in it, a refusal naming
     // both places.
     let e = error(vec!["kbf".into()]);
     assert!(e.contains("no mode") && e.contains("--mode=<"), "{e}");
-    let dir = std::env::temp_dir().join(format!("kbf-cli-lib-mode-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch");
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-cli-lib-mode");
     let file = dir.join("kbf.toml");
     std::fs::write(
         &file,
@@ -247,7 +237,7 @@ fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
         parse_from(["kbf", "storage"]),
         Ok(Invocation::Storage(_))
     ));
-    assert!(registered(&["kbf", "daemon", "--label=a=b"]).is_none());
+    assert!(registered(&["kbf", "daemon"]).is_none());
     // Flags of the mode: the flags are the configuration.
     assert!(registered(&["kbf", "--mode=storage", "--storage-listen=127.0.0.1:1"]).is_none());
     // Flags and a file together are one start: the flags win over the file's keys, so
@@ -275,19 +265,15 @@ fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
 
 /// Catches `--help` that lists the old words as commands, or misses a mode: the five
 /// modes are the possible values of `--mode`, the hidden aliases are no `Commands:`
-/// section, and `--config`, `--check` and `--label` are listed.
+/// section, and `--config` and `--check` are listed, and `--label` (removed) is not.
 #[test]
 fn help_lists_the_modes_under_the_mode_flag_and_no_commands() {
     let help = command().render_long_help().to_string();
     assert!(!help.contains("Commands:"), "{help}");
-    for flag in [
-        "--mode <MODE>",
-        "--config <FILE>",
-        "--check",
-        "--label <KEY=VALUE>",
-    ] {
+    for flag in ["--mode <MODE>", "--config <FILE>", "--check"] {
         assert!(help.contains(flag), "{flag}: {help}");
     }
+    assert!(!help.contains("--label"), "{help}");
     let named: Vec<&str> = MODES.iter().map(|m| m.name).collect();
     let cmd = command();
     let values = cmd
@@ -543,8 +529,7 @@ fn the_daemon_takes_no_store_credential_or_environment_variable() {
 /// Catches a build node that can be pointed at the cold store (docs/design/architecture-v2.md,
 /// section 9: a daemon-only node holds no cold-store credential and reaches bytes only
 /// through storage): every cold-store flag of the modes that have one, the hidden sizing
-/// flags included, is refused by `kbf daemon` with the store reason, by `kbf check-args
-/// daemon` (what `kbf-deploy linux check-units --mode` runs on a unit), and as an unknown
+/// flags included, is refused by `kbf daemon` with the store reason, and as an unknown
 /// argument by the `kbf-daemon` binary's own parser. Also catches a set of cold-store
 /// flags that is empty or misses `--cold-store`, which would pass vacuously.
 #[test]
@@ -571,11 +556,6 @@ fn a_build_node_refuses_every_cold_store_flag() {
             )),
             "{flag}: {err}"
         );
-        let mut checked = vec!["kbf", CHECK_ARGS];
-        checked.extend(&DAEMON[1..]);
-        checked.push(given.as_str());
-        let e = check(&checked).expect_err("refused");
-        assert!(e.contains(&format!("refuses --{flag}")), "{flag}: {e}");
         let mut alone: Vec<&str> = vec!["kbf-daemon"];
         alone.extend(&DAEMON[2..]);
         alone.push(given.as_str());
@@ -707,52 +687,45 @@ fn a_refusal_comes_before_a_missing_required_flag() {
 }
 
 fn check(argv: &[&str]) -> Result<(), String> {
-    let args: Vec<std::ffi::OsString> = argv.iter().map(Into::into).collect();
-    check_args(&args).map_err(|e| e.to_string())
+    parse_from(argv.iter().copied())
+        .map(drop)
+        .map_err(|e| e.to_string())
 }
 
-/// Catches `check_args` reading the wrong words (the program's name or `check-args`
-/// itself as the mode), passing `--help`, and refusing a built
-/// mode's own command line. The binary's exit codes are tests/binary.rs's.
+/// Catches the parser reading the wrong words (the program's name as the mode), and
+/// refusing a built mode's own command line. The binary's exit codes are tests/binary.rs's.
 #[test]
-fn check_args_parses_the_words_after_check_args() {
-    let mut daemon = vec!["kbf", CHECK_ARGS];
+fn the_parser_takes_a_modes_own_command_line() {
+    let mut daemon = vec!["kbf"];
     daemon.extend(&DAEMON[1..]);
     assert_eq!(check(&daemon), Ok(()));
-    let mut both = vec!["kbf", CHECK_ARGS];
+    let mut both = vec!["kbf"];
     both.extend(&BOTH[1..]);
     assert_eq!(check(&both), Ok(()));
     assert_eq!(
-        check(&[
-            "kbf",
-            CHECK_ARGS,
-            names::FRONTEND,
-            "--storage=http://127.0.0.1:1"
-        ]),
+        check(&["kbf", names::FRONTEND, "--storage=http://127.0.0.1:1"]),
         Ok(())
     );
-    let e = check(&["kbf", CHECK_ARGS, names::FRONTEND]).expect_err("refused");
+    let e = check(&["kbf", names::FRONTEND]).expect_err("refused");
     assert!(e.contains("--storage"), "{e}");
     daemon.push("--bogus-flag");
     let e = check(&daemon).expect_err("refused");
     assert!(e.contains("unexpected argument '--bogus-flag'"), "{e}");
     assert_eq!(
-        check(&[
-            "kbf",
-            CHECK_ARGS,
-            names::STORAGE,
-            "--storage-listen=127.0.0.1:1"
-        ]),
+        check(&["kbf", names::STORAGE, "--storage-listen=127.0.0.1:1"]),
         Ok(())
     );
-    let mut converged = vec!["kbf", CHECK_ARGS];
+    let mut converged = vec!["kbf"];
     converged.extend(&CONVERGED[1..]);
     assert_eq!(check(&converged), Ok(()));
-    let e = check(&["kbf", CHECK_ARGS, names::STORAGE_AND_DAEMON]).expect_err("refused");
+    let e = check(&["kbf", names::STORAGE_AND_DAEMON]).expect_err("refused");
     assert!(e.contains("required arguments were not provided"), "{e}");
-    for word in ["--help", "--version"] {
-        let e = check(&["kbf", CHECK_ARGS, word]).expect_err("refused");
-        assert!(e.contains("the mode would not start"), "{word}: {e}");
+    for (word, kind) in [
+        ("--help", ErrorKind::DisplayHelp),
+        ("--version", ErrorKind::DisplayVersion),
+    ] {
+        let e = parse_from(["kbf", word]).expect_err("prints and starts nothing");
+        assert_eq!(e.kind(), kind, "{word}");
     }
 }
 
@@ -906,6 +879,23 @@ fn only_version_and_json_ask_for_the_identity() {
     }
 }
 
+/// Catches `meta_log` written as a literal: a literal equal to the constant today passes
+/// the value check above and goes stale the day the constant is bumped, and a rollout
+/// then calls an irreversible step reversible. The one place the number may come from is
+/// `kbf_server::raft_log::RUNS`, so the source of `identity` must read it.
+#[test]
+fn meta_log_is_read_from_the_log_constant_not_written_down() {
+    let source = include_str!("version.rs");
+    let at = source
+        .find("\"meta_log\".to_owned()")
+        .expect("meta_log is inserted");
+    let insert = &source[at..source[at..].find(");").map_or(source.len(), |e| at + e)];
+    assert!(
+        insert.contains("kbf_server::raft_log::RUNS"),
+        "meta_log must be read from kbf_server::raft_log::RUNS: {insert}"
+    );
+}
+
 /// An empty protocol range is a build error.
 const _: () =
     assert!(kbf_server::worker::OLDEST_PROTOCOL_VERSION <= kbf_server::worker::PROTOCOL_VERSION);
@@ -928,7 +918,10 @@ fn the_identity_is_the_libraries_own_and_both_halves_speak_one_protocol() {
         v["min_protocol"],
         kbf_server::worker::OLDEST_PROTOCOL_VERSION
     );
-    assert_eq!(v["state_schema"], kbf_state::sqlite::SCHEMA_VERSION);
+    assert_eq!(v["meta_log"], kbf_server::raft_log::RUNS.get());
+    assert_eq!(v["state_schema"], kbf_state::postgres::schema::latest());
+    assert_eq!(v["admin_protocol"], kbf_server::managed::ADMIN_PROTOCOL);
+    assert_eq!(v["seq"], version::build_seq());
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
     assert!(
         ["debug", "release"].contains(&version::PROFILE),
@@ -943,41 +936,33 @@ fn the_identity_is_the_libraries_own_and_both_halves_speak_one_protocol() {
     assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), v);
 }
 
-/// Catches `check-args` (what `check-units` runs on a unit's `ExecStart=` and
-/// `ExecStartPre=`) refusing the flag form of a mode or the file flags, accepting a
-/// start with no mode (it reads no file, so it can check nothing), or passing `--help`.
+/// Catches the parser (a unit's `ExecStart=` and `ExecStartPre=` words) refusing the flag
+/// form of a mode or the file flags, accepting a start with no mode (it reads no file, so
+/// it can check nothing), or passing `--help`.
 #[test]
-fn check_args_takes_the_mode_flag_and_the_file_flags() {
+fn the_parser_takes_the_mode_flag_and_the_file_flags() {
     for line in [
-        &["kbf", CHECK_ARGS, "--mode=daemon", "--check"][..],
-        &["kbf", CHECK_ARGS, "--mode=storage"],
-        &[
-            "kbf",
-            CHECK_ARGS,
-            "--mode=daemon",
-            "--config=/etc/kbf/kbf.toml",
-            "--label=a=b",
-        ],
-        &["kbf", CHECK_ARGS, "storage-and-daemon", "--check"],
+        &["kbf", "--mode=daemon", "--check"][..],
+        &["kbf", "--mode=storage"],
+        &["kbf", "--mode=daemon", "--config=/etc/kbf/kbf.toml"],
+        &["kbf", "storage-and-daemon", "--check"],
     ] {
         assert_eq!(check(line), Ok(()), "{line:?}");
     }
-    let mut flags = vec!["kbf", CHECK_ARGS, "--mode=daemon"];
+    let mut flags = vec!["kbf", "--mode=daemon"];
     flags.extend(&DAEMON[2..]);
     assert_eq!(check(&flags), Ok(()));
-    let e = check(&["kbf", CHECK_ARGS, "--mode=daemon", "--bogus"]).expect_err("refused");
+    let e = check(&["kbf", "--mode=daemon", "--bogus"]).expect_err("refused");
     assert!(e.contains("unexpected argument"), "{e}");
     // A flag with a file that is not there: the file is what is refused.
-    let e = check(&["kbf", CHECK_ARGS, "--mode=daemon", "--config=/x", "--bogus"])
-        .expect_err("refused");
+    let e = check(&["kbf", "--mode=daemon", "--config=/x", "--bogus"]).expect_err("refused");
     assert!(e.contains("cannot read the config file /x"), "{e}");
-    let e = check(&["kbf", CHECK_ARGS]).expect_err("no mode checks nothing");
+    let e = check(&["kbf"]).expect_err("no mode checks nothing");
     assert!(e.contains("no mode"), "{e}");
-    let e = check(&["kbf", CHECK_ARGS, "--config=/x"]).expect_err("no mode checks nothing");
+    let e = check(&["kbf", "--config=/x"]).expect_err("no mode checks nothing");
     assert!(e.contains("no mode"), "{e}");
-    let e = check(&["kbf", CHECK_ARGS, "--mode=daemon", "--help"]).expect_err("refused");
-    assert!(e.contains("the mode would not start"), "{e}");
+    check(&["kbf", "--mode=daemon", "--help"]).expect_err("help prints and starts nothing");
     for word in ["node", "enroll"] {
-        assert!(check(&["kbf", CHECK_ARGS, word]).is_err(), "{word}");
+        assert!(check(&["kbf", word]).is_err(), "{word}");
     }
 }

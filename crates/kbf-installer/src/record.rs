@@ -9,8 +9,9 @@
 //!
 //! Unknown keys and duplicate keys are refused (serde's derived parser does both), a record
 //! larger than [`MAX_RECORD_BYTES`] is refused before it is parsed, and the key set a verb
-//! carries is checked: `activate` and `frontend_update` have components and the expected facts,
-//! `confirm` and `revert` have neither.
+//! carries is checked: `activate` has components and the expected facts; `confirm`, `revert`
+//! and `frontend_update` have neither (a `frontend_update` is a locator: the installer fetches
+//! the commit from its own source).
 
 use std::fmt;
 use std::str::FromStr;
@@ -33,9 +34,10 @@ pub enum OrderVerb {
     Activate,
     Confirm,
     Revert,
-    /// The frontend host's own update: accepted only on a frontend host, from `orders/`, and
-    /// carries components and expected facts like `activate` (built from the frontend's own
-    /// release store).
+    /// The frontend host's own update: accepted only on a frontend host, from `orders/`. A
+    /// locator and nothing else, like `confirm`: no components and no expected facts, because
+    /// the proxy that writes it has no release store; the installer fetches the commit from
+    /// the source in `installer.toml`, takes the attestation from there and probes the binary.
     FrontendUpdate,
 }
 
@@ -70,6 +72,13 @@ impl TryFrom<String> for Sha256Hex {
 impl From<Sha256Hex> for String {
     fn from(h: Sha256Hex) -> String {
         h.0
+    }
+}
+
+impl Sha256Hex {
+    /// The digest as text: 64 lowercase hex characters.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -160,6 +169,12 @@ pub struct OrderRecord {
     pub components: Vec<Component>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected: Option<Expected>,
+    /// Where the release comes from: the installer's configured source (the default, left out
+    /// of the file) or the release its package carries. A staged record is a locator: no
+    /// components and no expected facts, and only an `activate` and a `frontend_update` take
+    /// one.
+    #[serde(default, skip_serializing_if = "kbf_update::Source::is_fetch")]
+    pub source: kbf_update::Source,
 }
 
 /// Why bytes are not an order record.
@@ -201,8 +216,12 @@ impl OrderRecord {
     }
 
     fn check_shape(&self) -> Result<(), String> {
+        let staged = !self.source.is_fetch();
         match self.verb {
-            OrderVerb::Confirm | OrderVerb::Revert => {
+            OrderVerb::Confirm | OrderVerb::Revert if staged => {
+                return Err(format!("a {:?} record takes no source", self.verb));
+            }
+            OrderVerb::Confirm | OrderVerb::Revert | OrderVerb::FrontendUpdate => {
                 if !self.components.is_empty() || self.expected.is_some() {
                     return Err(format!(
                         "a {:?} record carries no components and no expected facts",
@@ -211,19 +230,25 @@ impl OrderRecord {
                 }
                 return Ok(());
             }
-            OrderVerb::Activate | OrderVerb::FrontendUpdate => {}
+            OrderVerb::Activate if staged => {
+                if !self.components.is_empty() || self.expected.is_some() {
+                    return Err(
+                        "a staged activate record carries no components and no expected facts"
+                            .to_owned(),
+                    );
+                }
+                return Ok(());
+            }
+            OrderVerb::Activate => {}
         }
         if self.components.is_empty() || self.components.len() > MAX_COMPONENTS {
             return Err(format!(
-                "a {:?} record carries 1 to {MAX_COMPONENTS} components, not {}",
-                self.verb,
+                "an activate record carries 1 to {MAX_COMPONENTS} components, not {}",
                 self.components.len()
             ));
         }
         let Some(expected) = &self.expected else {
-            return Err(
-                "an activate or frontend_update record carries the expected facts".to_owned(),
-            );
+            return Err("an activate record carries the expected facts".to_owned());
         };
         if !name_ok(&expected.profile, 32) || expected.profile.contains('.') {
             return Err(format!("profile {:?} is not [a-z0-9_-]", expected.profile));

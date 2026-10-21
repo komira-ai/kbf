@@ -10,7 +10,7 @@ publish.workspace = true
 # The routing library of architecture v2 (docs/design/architecture-v2.md, sections 6 to 8):
 # blob and action-cache calls over the storage map, for the frontend and the daemon. It
 # depends on the storage client and the map, never on the frontend's scheduler or
-# authorization, nor on the daemon's transfer engine (crates/kbf-it/tests/layering.rs).
+# authorization, nor on the daemon's transfer engine (crates/kbf-integration-test/tests/layering.rs).
 [dependencies]
 bytes.workspace = true
 futures.workspace = true
@@ -21,11 +21,13 @@ kbf-segments.workspace = true
 kbf-storage.workspace = true
 kbf-types.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tonic = { workspace = true, features = ["tls-ring"] }
+tracing.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
+tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
 
 [lints]

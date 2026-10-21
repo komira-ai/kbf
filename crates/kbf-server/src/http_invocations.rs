@@ -42,6 +42,7 @@ use crate::history::HistoryReads;
 use crate::http_blobs::{ReadBudget, error, off, refusal};
 use crate::http_history::{Durable, Presence, cross_router, run_router};
 
+mod failures;
 mod pages;
 mod views;
 
@@ -154,7 +155,7 @@ where
         .recorder
         .evicted_last_seen()
         .map_or(state.started, |t| t.max(state.started));
-    let draft = match read(
+    let mut draft = match read(
         readers,
         &state.recorder,
         state.durable.as_deref(),
@@ -170,7 +171,13 @@ where
     // An index that does not answer leaves every `available` null: the page is still
     // what the record holds.
     let present = state.cache.present(&digests).await.unwrap_or_default();
-    json(&draft.fill(&present))
+    let reads = std::mem::take(&mut draft.reads);
+    let mut value = draft.fill(&present);
+    if value.get("failures").is_none() {
+        return json(&value);
+    }
+    failures::fill(&state.cache, &mut value, &reads, readers.blobs).await;
+    failures::respond(&value)
 }
 
 /// The answer to one request before its blobs are looked up: the caller

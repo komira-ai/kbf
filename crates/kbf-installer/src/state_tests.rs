@@ -1,6 +1,7 @@
 use std::fs::TryLockError;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -52,7 +53,46 @@ fn the_lock_is_held_while_a_locked_lives() {
     );
     held.write(&full_state()).expect("write");
     drop(held);
-    other.try_lock().expect("free once dropped");
+    free_once_dropped(&other);
+}
+
+/// The lock on `other` is free the moment the holder is dropped: one try, no wait.
+///
+/// `Locked`'s `Drop` unlocks explicitly, so a child forked meanwhile and still holding a
+/// duplicate of the descriptor does not keep the `flock` held.
+fn free_once_dropped(other: &File) {
+    other
+        .try_lock()
+        .expect("the lock is free once its holder is dropped");
+}
+
+/// Catches a lock that is not released once its holder is dropped while processes are being
+/// spawned: the drop must free it for good, though a forked child briefly keeps a duplicate
+/// of the descriptor.
+///
+/// Mutant: the `Drop` of `Locked` removed (the close alone releases the lock): with the
+/// spawner thread running, the single `try_lock` failed 6 of 300 rounds before the unlock
+/// on drop. `tests/state_lock.rs` holds the deterministic version with a forked child.
+#[test]
+fn the_lock_is_free_after_a_drop_while_children_are_spawned() {
+    let (root, dir) = host_root("deploy-host-state-lock-spawn");
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawner = {
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = std::process::Command::new("/bin/true").status();
+            }
+        })
+    };
+    for _ in 0..300 {
+        let held = Locked::acquire(&root).expect("lock");
+        let other = File::open(dir.join("run/kbf-installer/lock")).expect("the lock file exists");
+        drop(held);
+        free_once_dropped(&other);
+    }
+    stop.store(true, Ordering::Relaxed);
+    spawner.join().expect("spawner");
 }
 
 /// Catches a lock file or state file another user can read or write: the state says
@@ -199,6 +239,20 @@ fn a_state_this_build_does_not_know_is_refused() {
         );
         assert!(err.to_string().contains(why), "{text}: {err}");
     }
+}
+
+/// Catches a lock file that cannot be opened being read as a lock that was taken: with the
+/// lock's directory made and a directory where the file goes, `acquire` ends with the lock
+/// error naming the lock file.
+#[test]
+fn a_lock_file_that_cannot_be_opened_is_a_lock_error_naming_it() {
+    let (root, dir) = host_root("lock-file-is-a-directory");
+    fs::create_dir_all(dir.join("run/kbf-installer/lock")).expect("a directory for the file");
+    let err = Locked::acquire(&root).expect_err("cannot open");
+    assert!(
+        matches!(&err, StateError::Lock { path, .. } if path.ends_with("kbf-installer/lock")),
+        "{err}"
+    );
 }
 
 /// Catches errors read as "no state" or passed over: a lock whose directory is missing,
@@ -585,4 +639,32 @@ fn a_write_that_dies_between_the_backup_and_the_state_loses_nothing() {
         state_before,
         "the backup was not made first"
     );
+}
+
+/// Catches a verb that queues behind a pass for ever, or gives up at once, or reports the
+/// wrong thing: with the lock held `acquire_within` waits its time and then says busy; when
+/// the holder lets go within the time it gets the lock; a lock file that cannot be opened is
+/// a lock error (not busy).
+///
+/// Mutants planted: no wait (busy at once with a holder that lets go in time); the busy
+/// error turned into a lock error.
+#[test]
+fn acquire_within_waits_for_a_holder_then_says_busy() {
+    use std::time::{Duration, Instant};
+    let (root, _dir) = host_root("acquire-within");
+    let held = Locked::acquire(&root).expect("held");
+    let started = Instant::now();
+    let err = Locked::acquire_within(&root, Duration::from_millis(60)).expect_err("busy");
+    assert!(matches!(err, StateError::Busy { .. }), "{err}");
+    assert!(started.elapsed() >= Duration::from_millis(60));
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        drop(held);
+    });
+    Locked::acquire_within(&root, Duration::from_secs(20)).expect("got it once it was let go");
+    holder.join().expect("the holder ends");
+    let lock = root.join(&root.lock());
+    fs::remove_dir_all(lock.parent().expect("a directory")).expect("no lock directory");
+    let err = Locked::acquire_within(&root, Duration::ZERO).expect_err("cannot open");
+    assert!(matches!(err, StateError::Lock { .. }), "{err}");
 }

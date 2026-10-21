@@ -74,6 +74,7 @@ fn listeners() -> Listeners {
         hello_wait: HELLO_WAIT,
         tick: TICK,
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -144,6 +145,7 @@ fn start(releases: Option<Arc<ReleaseStore>>, state: Option<StateStore>, dir: &D
         token: Some(ApiToken::from_file(&path).expect("a usable token")),
         local_cache: None,
         releases,
+        poll: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),
@@ -789,4 +791,39 @@ async fn a_pause_does_not_lose_a_policy_written_under_it() {
     hooked.conflict_on(None);
     let (code, _) = http(running.api, "POST", "/v1/update/pause", true, None, b"").await;
     assert_eq!(code, 200);
+}
+
+/// Catches proposals missing from `GET /v1/update`, listed out of release order, or a
+/// proposal making a run: the poller's rows are shown and `desired` stays null.
+///
+/// Mutants seen red: the `proposals` field dropped; the sort removed.
+#[tokio::test]
+async fn proposals_are_listed_oldest_first_and_start_no_run() {
+    let dir = Dir::new();
+    let store =
+        Arc::new(ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"));
+    let (state, rows_store) = state_and_store();
+    let running = start(Some(store), Some(state), &dir);
+    let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
+    assert_eq!(view["proposals"], json!([]));
+    let rows = kbf_server::update::Rows::new(rows_store);
+    for (commit, at) in [(B, 30), (A, 10)] {
+        let proposal = kbf_server::update::Proposal {
+            commit: commit.to_owned(),
+            tag: format!("v{at}"),
+            published_at_secs: at,
+            proposed_at_ms: 9,
+        };
+        assert!(rows.propose(&proposal).expect("proposal"));
+    }
+    let (code, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
+    assert_eq!(code, 200);
+    assert_eq!(
+        view["proposals"],
+        json!([
+            {"commit": A, "tag": "v10", "published_at_secs": 10, "proposed_at_ms": 9},
+            {"commit": B, "tag": "v30", "published_at_secs": 30, "proposed_at_ms": 9},
+        ])
+    );
+    assert_eq!(view["desired"], Value::Null);
 }

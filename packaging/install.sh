@@ -16,8 +16,8 @@
 # daemon hosts do not need it.
 #
 # The payload (`cargo xtask installer-tarball`) is the Debian package's file list, made
-# from the same Rust list: usr/bin/kbf-installer, usr/lib/systemd/system/kbf-*.service
-# and kbf.slice, usr/share/kbf-installer/trust/{gh,installer.conf,trusted_root.jsonl},
+# from the same Rust list: usr/bin/kbf-installer, usr/lib/systemd/system/kbf-*.service and
+# kbf.slice, usr/share/kbf-installer/trust/{gh,installer.conf,trusted_root.jsonl},
 # usr/lib/sysusers.d/kbf-installer.conf and usr/lib/tmpfiles.d/kbf-installer.conf, and
 # no kbf release: `sudo kbf-installer setup` installs the first one. After placing, the
 # script makes the users and directories from those two files (systemd-sysusers and

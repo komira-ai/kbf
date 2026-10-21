@@ -7,7 +7,16 @@ use crate::{PREFIX, STYLESHEET};
 
 /// The navigation: each section's label and page. More sections come with their
 /// routes (nodes, queue, tests).
-const NAV: &[(&str, &str)] = &[("Builds", PREFIX), ("Updates", "/ui/updates")];
+const NAV: &[(&str, &str)] = &[
+    ("Overview", PREFIX),
+    ("Builds", "/ui/builds"),
+    ("Targets", "/ui/targets"),
+    ("Nodes", "/ui/nodes"),
+    ("Updates", "/ui/updates"),
+    ("Leases", "/ui/leases"),
+    ("Queue", "/ui/queue"),
+    ("Storage", "/ui/storage"),
+];
 
 /// A URL the page asked for, as the page lists it.
 struct Link<'a> {
@@ -24,6 +33,18 @@ pub(crate) fn page(
     title: &str,
     here: &str,
     asked: &[Asked],
+    content: impl FnOnce(&mut Html),
+) -> String {
+    page_refreshing(title, here, asked, None, content)
+}
+
+/// [`page`] that reloads itself every `refresh` seconds when that is given
+/// ([`Html::refresh`]).
+pub(crate) fn page_refreshing(
+    title: &str,
+    here: &str,
+    asked: &[Asked],
+    refresh: Option<u32>,
     content: impl FnOnce(&mut Html),
 ) -> String {
     let stylesheet =
@@ -50,6 +71,9 @@ pub(crate) fn page(
             h.el("title", &[], |h| {
                 h.text(title).text(" - kbf");
             });
+            if let Some(seconds) = refresh {
+                h.refresh(seconds);
+            }
             h.void(
                 "link",
                 &[attr("rel", "stylesheet"), url("href", &stylesheet)],

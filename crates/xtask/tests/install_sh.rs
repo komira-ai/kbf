@@ -26,6 +26,7 @@ use sha2::Digest;
 use xtask::package::Platform;
 
 mod support;
+use kbf_testkit::dir::TestDir;
 use support::{BUSY_WAIT, output_unbusy};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
@@ -61,15 +62,11 @@ fn installer_binary() -> &'static str {
 }
 
 /// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("install-sh")
-        .join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear scratch");
-    }
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("install-sh"),
+        name,
+    )
 }
 
 fn xtask(args: &[&str]) {
@@ -228,6 +225,8 @@ struct Run {
     root: PathBuf,
     /// The lines the fake `systemd-sysusers` and `systemd-tmpfiles` logged.
     systemd: Vec<String>,
+    /// The directory `root` is in; last, so it is removed after everything above.
+    _dir: TestDir,
 }
 
 /// Every path under `dir` with its mode, directories with a trailing `/`.
@@ -280,7 +279,7 @@ impl Run {
 fn run_in(name: &str, files: Release, args: &[&str], extra_path: Option<&Path>, root: bool) -> Run {
     let dir = scratch(name);
     let path = path_with_fake_systemd(&dir);
-    run_with_path(&dir, files, args, extra_path, root, path)
+    run_with_path(dir, files, args, extra_path, root, path)
 }
 
 /// Copies the fake to `to` and returns once it can be executed.
@@ -314,7 +313,7 @@ fn path_with_fake_systemd(dir: &Path) -> std::ffi::OsString {
 
 /// [`run_in`] with the whole PATH given (before `extra_path`).
 fn run_with_path(
-    dir: &Path,
+    dir: TestDir,
     files: Release,
     args: &[&str],
     extra_path: Option<&Path>,
@@ -361,6 +360,7 @@ fn run_with_path(
             .lines()
             .map(str::to_owned)
             .collect(),
+        _dir: dir,
     }
 }
 
@@ -488,7 +488,7 @@ fn a_host_without_systemd_tools_is_refused_before_anything_is_placed() {
         std::os::unix::fs::symlink(found, bin.join(tool)).expect("link");
     }
     let r = run_with_path(
-        &dir,
+        dir,
         release().clone(),
         &[],
         None,
@@ -543,7 +543,7 @@ fn help_prints_the_usage_and_says_envoy_is_a_frontend_prerequisite() {
 #[test]
 fn a_restrictive_umask_does_not_narrow_the_directories_it_makes() {
     // Catches: the script not setting its own umask: `usr/share/kbf-installer` made
-    // 0700 under the caller's 077 would hide the trust files from the `kbf-verify` user.
+    // 0700 under the caller's 077 would hide the trust files from every account but root.
     if host().is_none() {
         return;
     }
@@ -650,7 +650,7 @@ fn a_linux_host_is_mapped_to_the_payload_of_its_machine_name() {
         let root = dir.join("root");
         std::fs::create_dir_all(&root).expect("root");
         let (url, seen) = serve(release().clone());
-        let mut path = dir.clone().into_os_string();
+        let mut path = dir.path().as_os_str().to_owned();
         path.push(":");
         path.push(path_with_fake_systemd(&dir));
         let out = Command::new(SCRIPT)

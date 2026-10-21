@@ -126,7 +126,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let key = self.object_key(run.object).ok()?;
         let range = ByteRange::new(run.start, run.end - run.start)?;
         match self.writer.get_range(&key, range).await {
-            Ok(bytes) => Some(bytes),
+            // Counted (`kbf_bytes_in_flight`) until the last blob sliced from it is
+            // dropped: the run (up to `MAX_BATCH_TOTAL_BYTES`) is alive as long as any
+            // slice is.
+            Ok(bytes) => Some(kbf_storage::in_flight::counted(bytes)),
             Err(error) => {
                 let blobs = run.blobs.len();
                 tracing::debug!(%key, %error, blobs, "joined read failed; reading each alone");

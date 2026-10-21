@@ -23,20 +23,26 @@ route stays local, and the last column says why.
 - **policy**: the REAPI authentication policy and `invocations.getAuthorizer`; off (404) without
   them.
 - **none**: health and metrics, which need no credentials.
+- **admin**: the admin port (`--admin-listen`), a separate listener that binds loopback only
+  and carries no credential; the calls move the scheduler's role ([../api.md](../api.md), "The
+  admin calls").
 
 ## 1. Routes, one row each
 
 Every row is one method and one path. A router `.route(` call that serves two methods has a row
 per method; a custom method (`:cordon`) has a row per verb. The sources of the router are
 `crates/kbf-server/src/{api,release/http,storage_health,health,metrics,http_blobs,
-http_invocations,http_history,enroll/api}.rs` and `frontend.rs`, where they are merged.
+http_invocations,http_sched,http_history,enroll/api,managed/http,ui_mount}.rs` and `frontend.rs`, where they are merged.
 
 ### Cluster
 
 | Verb | Method and route | Status | Gate |
 |---|---|---|---|
 | cluster status (nodes, software, placement) | `GET /v1/nodes` | [F] | open |
+| one node (capacity, booked, free, leases) | `GET /v1/nodes/{node}` | [F] | open |
 | list members of the storage map | `GET /v1/members` | [F] | open |
+| leases the scheduler holds (paged, by node) | `GET /v1/leases` | [F] | open |
+| the queue: depth, ages, why work waits | `GET /v1/queue` | [F] | open |
 | cordon a node | `POST /v1/nodes/{node}:cordon` | [F] | write |
 | drain a node | `POST /v1/nodes/{node}:drain` | [F] | write |
 | uncordon a node | `POST /v1/nodes/{node}:uncordon` | [F] | write |
@@ -50,6 +56,16 @@ http_invocations,http_history,enroll/api}.rs` and `frontend.rs`, where they are 
 
 There is no rebalance verb: handoff of data between members is not built, and none is invented
 here **[D]**.
+
+### Admin port (a separate loopback listener, `--admin-listen`)
+
+| Verb | Method and route | Status | Gate |
+|---|---|---|---|
+| the role of this process (candidate, active, quiesced, stood-down) | `GET /v1/admin/role` | [F] | admin |
+| stop scheduling, assigning and requeueing | `POST /v1/admin/quiesce` | [F] | admin |
+| undo a quiesce | `POST /v1/admin/resume` | [F] | admin |
+| a candidate takes the generation | `POST /v1/admin/takeover` | [F] | admin |
+| end worker streams after a takeover elsewhere | `POST /v1/admin/stand-down` | [F] | admin |
 
 ### Enrollment
 
@@ -86,6 +102,7 @@ All answer 404 when the feature is off.
 |---|---|---|---|
 | upload a release file | `PUT /v1/releases/{commit}/{platform}/{name}` | [F] | write, no content-type gate |
 | list releases | `GET /v1/releases` | [F] | open |
+| describe a release (its files by digest; the `releases/<commit>.json` of a `url` source) | `GET /v1/releases/{commit}` | [F] | open |
 | read the desired release, releases, policy | `GET /v1/update` | [V] #976, #985 | open |
 | set the desired release (also a rollback: an older commit, a higher generation) | `POST /v1/update/desired` | [V] #976 | write |
 | preview what a commit would change | `GET /v1/update/plan` | [V] #985 (design) | open |
@@ -109,6 +126,7 @@ route on this branch: all three are out of scope of the object-store series (Q5)
 | its artifacts | `GET /v1/invocations/{id}/artifacts` | [F] | policy |
 | its logs | `GET /v1/invocations/{id}/logs` | [F] | policy |
 | its metrics | `GET /v1/invocations/{id}/metrics` | [F] | policy |
+| its failed actions, with reasons, commands and log tails | `GET /v1/invocations/{id}/failures` | [F] | policy |
 | list invocations | `GET /v1/invocations` | [F] | policy |
 | list shapes | `GET /v1/shapes` | [F] | policy |
 | list tests | `GET /v1/tests` | [F] | policy |
@@ -121,12 +139,24 @@ route on this branch: all three are out of scope of the object-store series (Q5)
 | runs of an action digest | `GET /v1/actions/{digest}/runs` | [V] #891 | policy |
 | runs on a node in a window | `GET /v1/runs` | [V] #891 | policy |
 
+### The web UI
+
+The pages of `kbf-ui`, read-only HTML under `/ui` ([api.md](../api.md#get-ui-the-web-ui)); on by
+default, `--ui=false` turns them off. Open: no gate, whatever the REAPI policy says.
+
+| Verb | Method and route | Status | Gate |
+|---|---|---|---|
+| the Overview page | `GET /ui` | [F] | none (open) |
+| the same, with a trailing slash | `GET /ui/` | [F] | none (open) |
+| every other page and the stylesheet (`/ui/nodes`, `/ui/nodes/{id}`, `/ui/builds`, `/ui/builds/{id}`, `/ui/updates`, `/ui/leases`, `/ui/queue`, `/ui/static/kbf.css`) | `GET /ui/{*rest}` | [F] | none (open) |
+
 ### Health
 
 | Verb | Method and route | Status | Gate |
 |---|---|---|---|
 | liveness | `GET /healthz` | [F] | none |
 | readiness | `GET /readyz` | [F] | none |
+| farm summary (ready, nodes by state, queue, leases, storage) | `GET /v1/health` | [F] | open |
 | metrics | `GET /metrics` | [F] | none |
 
 The Mac device manager is a separate service, not the operator API (`crates/kbf-mdm`: `GET
@@ -144,11 +174,11 @@ section 8) and is not an operator verb of the farm.
 | meta-backup, meta-verify | `kbf-deploy linux` **[F]** | briefly stops `kbf-server`; installer or root only |
 | install, update, roll back, confirm, revert, gc, status and check of a host | `kbf-installer` (#1048, #1051, #1082, #1083) **[V]** | root and host-local; the installer is the root tool, and `setup` mints the first token |
 | the rollout controller | `kbf-deploy rollout`, #803, #970 **[V]** | a host state machine; installer territory |
-| start a mode, `--check`, check-args | `kbf <mode>` **[F]** | the local runtime; it installs nothing |
+| start a mode, `--check` | `kbf <mode>` **[F]** | the local runtime; it installs nothing |
 | frontend handover, enroll, `kbf node` | `kbf frontend handover`, `kbf enroll`, `kbf node` **[F]** | replaced by the installer's side-by-side children (#1054, #1062) and removed by #1049 **[V]** |
 | render, check, install units, swap, verify certificate; envoy render, check, apply | `kbf-deploy` **[F]** | become installer logic and package units; root |
 | `mdm`, `minio`, `pilot`, `erase-request` | `kbf-deploy` **[F]** | leave the product (distribution.md section 8); an erase request is signed with a security key on the operator's machine |
-| `kbf cluster status`, `drain`, `undrain`, `member` | the `kbf` CLI **[F]**, with object-store verbs in unit G1 | a thin client of the routes above, no logic |
+| `kbf cluster status`, `drain`, `undrain`, `member`, `denied`, `object-store status\|audit\|connection\|bind\|unbind\|verify` | the `kbf` CLI **[F]** (the last two groups: unit G1) | a thin client of the routes above, no logic |
 | frontend log tail | none | cut (Q4) |
 | update policy, image pull | none | no source verb exists (Q5) |
 | rotate the CA | its own unit | out of the object-store series (Q5) |

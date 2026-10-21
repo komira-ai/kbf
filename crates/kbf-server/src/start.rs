@@ -34,7 +34,7 @@ use crate::local::LocalStore;
 use crate::startup_pass::StartPass;
 use crate::stores::{COLD_FILE_FLOOR, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
-use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_options, s3_store};
+use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_ui, s3_store};
 
 /// The server's thread sizes on a given machine shape: every CPU, then the overrides.
 pub fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
@@ -312,8 +312,9 @@ where
     let shutdown = shutdown()?;
     let api = args.api()?;
     let storage = args.storage()?;
-    let bound = bind_server_with_options(
-        cache, listeners, api, policy, state, storage, None, shutdown,
+    let proxy = args.proxy()?;
+    let bound = bind_server_with_ui(
+        cache, listeners, api, policy, state, storage, None, proxy, args.ui, shutdown,
     )?;
     let plain = args.plain_text_off_loopback();
     Ok(ServerHandle {
@@ -526,9 +527,7 @@ mod tests {
     /// log.
     #[tokio::test(flavor = "current_thread")]
     async fn serve_with_binds_over_a_store_the_caller_opened() {
-        let root =
-            std::env::temp_dir().join(format!("kbf-server-serve-with-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_dir::scratch_dir("kbf-server-serve-with");
         let args = Args::parse_from([
             "kbf-server",
             "--listen=127.0.0.1:0",
@@ -546,7 +545,6 @@ mod tests {
         let line = server.start_line().to_owned();
         assert!(line.ends_with(&format!(" log={id}")), "{line}");
         drop(server);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Catches: `--state-store` accepted by the flags and then ignored at start (the
@@ -556,9 +554,7 @@ mod tests {
     /// opened stops the start before anything is served.
     #[tokio::test(flavor = "current_thread")]
     async fn serve_with_opens_the_state_store_and_refuses_a_second_frontend() {
-        let root =
-            std::env::temp_dir().join(format!("kbf-server-state-flag-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_dir::scratch_dir("kbf-server-state-flag");
         let state = root.join("state").join("state.db");
         let args = Args::parse_from([
             "kbf-server".to_owned(),
@@ -586,7 +582,6 @@ mod tests {
         assert!(said.contains("another kbf process"), "{said}");
         drop(first);
         start("three").await.expect("free once the first is gone");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Catches the server sizing itself from anything but the CPU count: on the 44-core,

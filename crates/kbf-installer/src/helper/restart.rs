@@ -3,6 +3,16 @@
 
 use kbf_host::{Cmd, HostPath, Step};
 
+use crate::layout::Layout;
+
+/// The file an operator verb leaves while a restart it needs is not done: root-owned, in
+/// the state directory. It is written before the links move, so that a verb killed
+/// between the links and its own restart leaves the restart to the service's next pass.
+pub fn owed_marker(host: &Layout) -> HostPath {
+    HostPath::new(&format!("{}/restart.owed", host.state_dir().as_str()))
+        .expect("the state directory and a plain name")
+}
+
 /// What to run to restart the service.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Restart {

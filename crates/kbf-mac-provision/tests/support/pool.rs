@@ -1,8 +1,8 @@
 //! The fake Mac's lease-user pool, its volume and a root daemon, as `apply` leaves them.
 
 use super::{
-    CONFIG, ERR_LOG, FakeMac, HOMES, KEY, PLIST, SCRATCH, VOLUME, golden_config, golden_plist_as,
-    sha256_hex,
+    CONFIG, ERR_LOG, FakeMac, HOMES, KEY, ORDERS, PLIST, SCRATCH, VOLUME, golden_config,
+    golden_plist_as, sha256_hex,
 };
 
 impl FakeMac {
@@ -14,6 +14,7 @@ impl FakeMac {
         let text = format!("{}daemon_user=root\n", mac.profile);
         mac.set_profile(text);
         mac.own(ERR_LOG, 0, 0);
+        mac.own(ORDERS, 0, 0);
         mac.write(KEY, "key\n");
         mac.chmod(KEY, 0o600);
         mac.own(KEY, 0, 0);
@@ -71,7 +72,7 @@ impl FakeMac {
             PLIST,
             &golden_plist_as(&sha256_hex(text.as_bytes())[..12], user),
         );
-        self.write(CONFIG, &golden_config(&sha256_hex(text.as_bytes())[..12]));
+        self.write(CONFIG, &golden_config());
         self.profile = text;
     }
 }

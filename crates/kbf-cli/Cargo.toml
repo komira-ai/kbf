@@ -10,7 +10,7 @@ publish.workspace = true
 # The one binary: `kbf <mode>` over the libraries of kbf-node and kbf-all-in-one
 # (docs/design/cluster.md, sections 1 and 5.1). Like kbf-all-in-one it links both the
 # server and the node library (the version stamp is kbf-server's), so it is listed in
-# `JOINERS` in crates/kbf-it/tests/layering.rs.
+# `JOINERS` in crates/kbf-integration-test/tests/layering.rs.
 [[bin]]
 name = "kbf"
 path = "src/main.rs"
@@ -56,10 +56,15 @@ tracing.workspace = true
 # The stand-in `crun`'s (kbf-cli-fake-crun); the effective uid and the host name that
 # a start that enrolls reads.
 rustix = { workspace = true, features = ["process", "system"] }
-# The schema version of the SQLite state file, which `kbf --version --json` reports.
-kbf-state.workspace = true
-# The identity `kbf --version --json` prints (src/version.rs).
+# The Postgres state schema version, which `kbf --version --json` reports.
+kbf-state = { workspace = true, features = ["postgres"] }
+# The identity `kbf --version --json` prints (src/version.rs), and the bodies of
+# `kbf cluster` (src/cluster.rs).
 serde_json.workspace = true
+# The request bodies of `kbf cluster object-store` (src/cluster/object_store.rs), and the
+# secret key read for one, which is zeroed when dropped.
+serde.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 # The REAPI conformance suite, run against a `kbf storage` process (tests/storage_process.rs):
@@ -71,6 +76,10 @@ kbf-transfer.workspace = true
 # The protocol the daemon half speaks, which `kbf --version --json` reports as the
 # server's (src/tests.rs pins them equal).
 kbf-daemon.workspace = true
+# tests/installer_reads_version.rs: the installer parses what this binary prints.
+kbf-installer.workspace = true
+# tests/setup_update_dirs.rs: the installer's layout of a host, for the paths `setup` writes.
+kbf-host.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tonic.workspace = true
 # The state-postgres job's process test reads the frontend's tables back (tests/frontend_process.rs).
@@ -84,8 +93,6 @@ prost.workspace = true
 # The units `kbf-deploy linux render-units --mode` writes, parsed with kbf's own
 # parser (tests/deploy_units.rs).
 kbf-deploy.workspace = true
-# The host `check-units --mode` runs `kbf check-args` on (tests/deploy_units.rs).
-kbf-host.workspace = true
 # Certificates made as the farm's issuer makes them, checked by `kbf-deploy linux
 # verify-cert` and read back with the storage node's own role check
 # (tests/deploy_units.rs), and the node's certificates (tests/storage_and_daemon.rs).
@@ -104,6 +111,9 @@ kbf-front.workspace = true
 # image store layout; the macOS tests of this package (tests/macos_daemon.rs) build without it.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 kbf-driver-container.workspace = true
+# The farm of real `kbf` processes the rehearsal (tests/rehearsal_in_a_box.rs) drives, and
+# the stand-in `podman`'s store (tests/support, through kbf-all-in-one's node.rs).
+kbf-harness.workspace = true
 
 [lints]
 workspace = true

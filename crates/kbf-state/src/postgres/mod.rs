@@ -33,6 +33,8 @@
 #[cfg(any(test, feature = "test-support"))]
 mod backend;
 mod conn;
+mod reach;
+pub mod schema;
 mod session;
 mod tx;
 
@@ -49,6 +51,7 @@ use postgres::types::ToSql;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use backend::PostgresBackend;
+pub use reach::{Unreached, reach};
 use session::{Edge, Pool, RangeShape, Session};
 use tx::{Level, Row, Tx, micros};
 
@@ -127,6 +130,7 @@ pub struct PostgresConfig {
     pg: postgres::Config,
     schema: String,
     max_connections: usize,
+    supported: schema::Supported,
 }
 
 impl fmt::Debug for PostgresConfig {
@@ -176,6 +180,7 @@ impl PostgresConfig {
             pg,
             schema: Self::DEFAULT_SCHEMA.to_owned(),
             max_connections: Self::DEFAULT_MAX_CONNECTIONS,
+            supported: schema::Supported::this_build(),
         })
     }
 
@@ -197,6 +202,15 @@ impl PostgresConfig {
         Ok(self)
     }
 
+    /// Makes the store accept schema versions `min` to `max` instead of what this build
+    /// embeds. For tests that play another release.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_supported_schema(mut self, min: u32, max: u32) -> PostgresConfig {
+        self.supported = schema::Supported { min, max };
+        self
+    }
+
     /// Names the connections in `pg_stat_activity`.
     #[must_use]
     pub fn with_application_name(mut self, name: &str) -> PostgresConfig {
@@ -215,6 +229,47 @@ impl PostgresConfig {
     #[must_use]
     pub fn has_password(&self) -> bool {
         self.pg.get_password().is_some()
+    }
+
+    /// The role the URL names (`user=` or the user part of the authority).
+    #[must_use]
+    pub fn user(&self) -> Option<&str> {
+        self.pg.get_user()
+    }
+
+    /// The database the URL names.
+    #[must_use]
+    pub fn dbname(&self) -> Option<&str> {
+        self.pg.get_dbname()
+    }
+
+    /// The directory of the first host when it is a Unix socket directory (`host=/run/...`),
+    /// `None` when the first host is a name or address.
+    #[must_use]
+    pub fn socket_dir(&self) -> Option<&std::path::Path> {
+        match self.pg.get_hosts().first() {
+            Some(postgres::config::Host::Unix(dir)) => Some(dir.as_path()),
+            _ => None,
+        }
+    }
+
+    /// How many hosts the URL names (a list after `host=`, or comma-separated in the
+    /// authority): each is a server the client may try.
+    #[must_use]
+    pub fn host_count(&self) -> usize {
+        self.pg.get_hosts().len()
+    }
+
+    /// How many ports the URL names.
+    #[must_use]
+    pub fn port_count(&self) -> usize {
+        self.pg.get_ports().len()
+    }
+
+    /// The port the URL names, `None` for the server's default.
+    #[must_use]
+    pub fn port(&self) -> Option<u16> {
+        self.pg.get_ports().first().copied()
     }
 
     /// The schema the store's tables are in.
@@ -340,17 +395,20 @@ impl Pending<'_> {
 }
 
 impl PostgresStore {
-    /// Connects, checks that the server makes commits durable, and creates the tables
-    /// if they are not there. Expiry is judged by the database's clock.
+    /// Connects, checks that the server makes commits durable and that the schema is one
+    /// this build supports ([`schema`]). It creates nothing: `kbf-installer` owns the
+    /// schema. Expiry is judged by the database's clock.
     ///
     /// # Errors
-    /// [`StoreError`] when the server cannot be reached or does not flush commits
-    /// (`synchronous_commit` is not on).
+    /// [`StoreError`] when the server cannot be reached, does not flush commits
+    /// (`synchronous_commit` is not on), or holds no schema or one outside the supported
+    /// range (one line saying which and what to run).
     pub fn open(config: &PostgresConfig) -> Result<PostgresStore, StoreError> {
         let pool = Pool::open(
             config.pg.clone(),
             config.schema.clone(),
             config.max_connections,
+            config.supported,
         )
         .map_err(Fail::into_store)?;
         Ok(PostgresStore {
@@ -770,6 +828,55 @@ mod tests {
         assert_eq!(config.pg.get_dbname(), Some("kbf"));
     }
 
+    // Catches a URL form the install recipe uses parsing to the wrong socket, role, database
+    // or port (setup creates the role and database these accessors name, and the frontend
+    // connects with the same URL): the query form, the authority form, a hyphenated role,
+    // a port, and a URL with no role at all.
+    #[test]
+    fn the_urls_of_the_install_recipe_name_their_socket_role_and_database() {
+        let parsed = |url: &str| PostgresConfig::parse(url).expect("the recipe's URL parses");
+        for (url, user, db, port) in [
+            (
+                "postgresql:///kbf?host=/run/postgresql&user=kbf",
+                "kbf",
+                "kbf",
+                None,
+            ),
+            (
+                "postgres:///kbf?host=/run/postgresql&user=kbf-server",
+                "kbf-server",
+                "kbf",
+                None,
+            ),
+            (
+                "postgres://kbf-server@/state?host=/var/run/postgresql&port=5433",
+                "kbf-server",
+                "state",
+                Some(5433),
+            ),
+        ] {
+            let config = parsed(url);
+            assert_eq!(config.user(), Some(user), "{url}");
+            assert_eq!(config.dbname(), Some(db), "{url}");
+            assert_eq!(config.port(), port, "{url}");
+            assert!(
+                config.socket_dir().is_some_and(|d| d.is_absolute()),
+                "{url}"
+            );
+            assert!(!config.has_password(), "{url}");
+        }
+        assert_eq!(
+            parsed("postgres:///kbf?host=/run/postgresql").user(),
+            None,
+            "a URL with no role leaves it to the process's own user"
+        );
+        assert_eq!(
+            parsed("postgres://db.example/kbf?user=kbf").socket_dir(),
+            None,
+            "a host name is not a socket directory"
+        );
+    }
+
     // Catches a URI with no host being accepted (it would connect to a default socket the
     // operator never chose).
     #[test]
@@ -876,7 +983,22 @@ mod tests {
         client
             .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
             .expect("a clean schema");
+        installed(&config);
         (PostgresStore::open(&config).expect("opens"), client)
+    }
+
+    /// The schema in `config`, as the installer makes it.
+    fn installed(config: &PostgresConfig) {
+        postgres::Client::connect(&url(), postgres::NoTls)
+            .and_then(|mut client| {
+                client.batch_execute(&format!(
+                    "DROP SCHEMA IF EXISTS {} CASCADE",
+                    config.schema()
+                ))
+            })
+            .expect("a clean schema");
+        super::schema::apply(config, &super::schema::embedded(), super::schema::latest())
+            .expect("the installer's step");
     }
 
     /// The error the server gives for `code`.
@@ -978,6 +1100,7 @@ mod tests {
             .and_then(|config| config.with_schema("kbf_unit_empty"))
             .expect("a usable URL and schema")
             .with_application_name("kbf_unit_empty");
+        installed(&config);
         let store = PostgresStore::open(&config).expect("opens");
         let mut client = postgres::Client::connect(&url(), postgres::NoTls).expect("connect");
         let sessions = |client: &mut postgres::Client| -> i64 {

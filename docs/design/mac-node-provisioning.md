@@ -35,8 +35,7 @@ The rules this design keeps:
 - **Nothing updates by itself.** macOS and Xcode change only when the operator rolls
   out a new profile, one canary node first. A node whose toolchain identity changed
   must re-qualify before it serves again.
-- **A desk Mac and a rack Mac run the same profile.** Moving one re-applies it, with
-  other labels.
+- **A desk Mac and a rack Mac run the same profile.** Moving one re-applies it.
 
 ## Summary of the recommendations
 
@@ -58,10 +57,11 @@ This design builds on the code on `main`, read at the time of writing.
 
 - **The binary.** `kbf-daemon` lives in crate `kbf-node` and takes
   `--driver fake|container|native`. On a Mac it runs `--driver native` with `--server`,
-  `--cas`, `--ca-cert`, `--cert`, `--key`, `--node-id`, `--data-dir` and repeatable
-  `--label key=value` (reported as `label.<key>`). It is configured by flags only. On
-  SIGTERM it abandons running leases (their processes are killed and their directories
-  removed) and exits zero.
+  `--cas`, `--ca-cert`, `--cert`, `--key`, `--node-id` and `--data-dir`. It is configured
+  by flags only. On
+  SIGTERM it drains (no new lease; running ones finish and report) and exits zero. A
+  second signal, or `--drain-deadline-secs` after the first, abandons the leases still
+  running (their processes are killed and their directories removed).
 - **The native driver** (`kbf-driver-native`) runs each action as a process tree in a
   fresh lease directory. It gives the action the network unless the action turns it off
   (`network=off`, enforced with `sandbox-exec`), and denies job submission to launchd
@@ -203,9 +203,9 @@ kbf-mac-provision print   --profile FILE   # the profile as resolved, and its SH
   node, or a CI job over SSH), never by hand on a node once the node exists.
 - `apply` ends by running `check`. A run that changes anything prints what it changed;
   a second run must print nothing.
-- The node reports `label.profile=<name>@<first 12 hex digits of the profile's
-  SHA-256>` (a `--label`), so the server and the farm's UI see which profile each node
-  runs.
+- The node does not report which profile it runs: node labels were removed, so the
+  profile's hash no longer reaches the node's `kbf.toml` and `check` on the node is what
+  sees a profile that differs.
 - **The profile holds host settings only.** The `kbf-daemon` commit and its SHA-256
   are not in it: they are the deployment job's input for each commit it rolls out
   (section 4.3). A daemon upgrade is then not a profile change, and every green
@@ -244,7 +244,6 @@ expect_probe=host_identity:17A000=26.6-0123456789abcdef
 expect_probe=host_identity:18A000=27.0-fedcba9876543210
 kbf_server=https://farm.example.net:8981
 kbf_cas=https://farm.example.net:8981
-kbf_labels=pool=mac rack=r2
 ```
 
 ## 3. Host profile and worker profile
@@ -349,8 +348,7 @@ compilers changed must not keep serving cache keys computed for the old ones.
 1. Drain the node (section 9).
 2. Apply the new profile. For a first-of-its-kind change, that Xcode's `expect_probe`
    is left empty, so the Xcode is not reported.
-3. Run the qualification set on the node, for that Xcode, through a label only the node
-   carries:
+3. Run the qualification set on the node, for that Xcode, on the drained node alone:
    - compile, link and run a small C program;
    - the client's canary targets;
    - the native driver's freshness test (a marker left by one lease is never seen by
@@ -358,7 +356,7 @@ compilers changed must not keep serving cache keys computed for the old ones.
 4. Record the value the probe now prints, in the profile's `expect_probe` and in each
    client's list of allowed identities, in the same reviewed change. An identity is
    listed before its host serves, and removed only after the host has stopped serving.
-5. Put the node back in its pool label.
+5. Put the node back in service.
 
 The second and later nodes with the same new value skip step 4: their value is already
 listed, and step 3 checks that they print it.
@@ -377,8 +375,12 @@ listed, and step 3 checks that they print it.
 >   a token that can sign.
 > - **The Linux binaries** (`kbf-daemon` and `kbf-server`, x86_64 and arm64) are built
 >   by their own jobs, not by the macOS job.
-> - **The darwin tarball holds `kbf-daemon` only:** `kbf-mac-provision` is built and
->   tested in CI but not packaged yet. Only `kbf-daemon` is signed; the fleet-updates helpers do not exist yet.
+> - **The darwin release holds `kbf` (and the deploy tool and installer), not `kbf-daemon`:**
+>   a Mac runs `kbf --mode=daemon` from `releases/current/kbf`, and no darwin `kbf-daemon` is
+>   built (`ReleasePlatform::components` names `kbf` for every platform). The text of this
+>   section that says `kbf-daemon-<commit>-darwin-arm64.tar.gz` is the design as first written.
+>   `kbf-mac-provision` is built and tested in CI but not packaged yet; the fleet-updates
+>   helpers do not exist yet.
 > - **The oldest macOS supported is 14.0** (`MACOSX_DEPLOYMENT_TARGET`), a choice of
 >   that workflow; this design names none.
 > - **Signing is ad hoc with the hardened runtime** (`--options runtime`). CI checks
@@ -633,7 +635,7 @@ daemon starts at boot with nobody logged in
   daemon and the actions it starts must not be throttled.
 - `ExitTimeOut` gives the daemon time to kill its leases on SIGTERM before launchd
   sends SIGKILL.
-- The server's address, the node id, the labels and the certificate paths are flags in
+- The server's address, the node id and the certificate paths are flags in
   `ProgramArguments`, written from the profile. No environment variables.
 
 ### 5.4 FileVault and auto-login
@@ -717,8 +719,8 @@ server with `sntp` (read-only) and fails above an offset the profile names.
   its client certificate.
 - Lower-case ASCII letters, digits and `-`: `<farm>-mac-<nn>` (`kbf-mac-07`). Never a
   person's name, and nothing with an apostrophe or a space.
-- **No location in the name.** Where a node is (desk, rack, slot) is a label
-  (`--label rack=r2`), which changes when the Mac moves. The name does not, so a move
+- **No location in the name.** Where a node is (desk, rack, slot) is inventory kept outside the node
+  (node labels were removed), which changes when the Mac moves. The name does not, so a move
   does not change the node's identity, its certificate or its history.
 
 ### 5.7 Logs (partly planned)
@@ -807,7 +809,7 @@ it is live.
 ## 7. From the desk to the rack
 
 The move is **the same profile, re-applied**. Nothing in the profile knows whether the
-Mac is on a desk or in a rack, except its labels.
+Mac is on a desk or in a rack.
 
 1. Drain the node (section 9) and stop its daemon.
 2. If the Mac was ever used as a workstation, or carries anything the profile does not
@@ -815,11 +817,11 @@ Mac is on a desk or in a rack, except its labels.
 3. Rack it: wired network only (Wi-Fi off), power through the rack's PDU, no display.
    With MDM, it enrolls on first boot. Without MDM, the one-time Setup Assistant and
    Remote Login steps need a display and keyboard once.
-4. Apply the profile with the rack's labels (`rack=<id>`). The name, node id and
+4. Apply the profile. The name, node id and
    certificate do not change (section 5.6).
 5. Re-qualify (section 3.1), whether or not the identity changed: a moved Mac proves
    itself before serving.
-6. Back in its pool label.
+6. Back in service.
 
 Desk habits that must not reach the profile: Wi-Fi, a logged-in user, a GUI-only
 overlay-network client, a person's accounts, and remote-desktop servers.
@@ -849,7 +851,7 @@ The cutover of one Mac, using the first option:
 2. **Drain the other farm's worker** in that farm's own way: stop new work and let
    running actions finish, then unload its launchd jobs. Keep its files (binaries,
    configuration, job definitions) for rollback.
-3. **Re-provision:** erase (section 1.2) or apply, then join kbf with the pool label
+3. **Re-provision:** erase (section 1.2) or apply, then join kbf
    (section 9) and re-qualify (section 3.1).
 4. **Shadow:** send a sample of the client's Mac actions to kbf (a second build
    configuration), and compare results and times with the other farm.
@@ -890,13 +892,12 @@ Steps 1 to 3 and 5 are planned. Step 4, the binding, is in the server
    names the node id. The cell CA signs a certificate for that node id with a short
    lifetime (30 days is a starting point), as an operator step for now, and later
    through an enrollment endpoint.
-3. The operator adds the node to the cell's configuration: node id, labels, profile
+3. The operator adds the node to the cell's configuration: node id, profile
    name, expected probe values per Xcode.
 4. The daemon starts. **The server checks that the certificate names the node id the
    `Hello` carries** and refuses the stream otherwise. Then a certificate taken from
    one node can impersonate only that node.
-5. The node serves only its qualification label until re-qualification passes, then
-   gets its pool label.
+5. The node is not put in service until re-qualification passes.
 
 ### 9.3 Drain and leave (planned)
 

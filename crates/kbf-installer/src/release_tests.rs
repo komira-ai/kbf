@@ -80,7 +80,7 @@ fn rollback_on(exec: &mut ScratchHost, root: &Layout, mode: Mode) -> Result<Stri
 
 fn gc_on(exec: &mut ScratchHost, root: &Layout, keep: usize) -> Result<String, ReleaseError> {
     let mut out = Vec::new();
-    gc(exec, root, keep, Mode::Apply, &mut out)?;
+    gc(exec, root, keep, &BTreeSet::new(), Mode::Apply, &mut out)?;
     Ok(String::from_utf8(out).expect("utf-8"))
 }
 
@@ -412,7 +412,15 @@ fn a_dry_run_writes_nothing() {
     );
     assert!(!out.contains("next, by hand"), "{out}");
     let mut out = Vec::new();
-    gc(&mut exec, &root, 0, Mode::DryRun, &mut out).expect("dry gc");
+    gc(
+        &mut exec,
+        &root,
+        0,
+        &BTreeSet::new(),
+        Mode::DryRun,
+        &mut out,
+    )
+    .expect("dry gc");
     assert_eq!(
         String::from_utf8(out).expect("utf-8"),
         "keeping: none; removing: none\nnothing to do\n"
@@ -455,7 +463,15 @@ fn a_dry_run_writes_nothing() {
         "{out}"
     );
     let mut out = Vec::new();
-    gc(&mut exec, &root, 0, Mode::DryRun, &mut out).expect("dry gc");
+    gc(
+        &mut exec,
+        &root,
+        0,
+        &BTreeSet::new(),
+        Mode::DryRun,
+        &mut out,
+    )
+    .expect("dry gc");
     let out = String::from_utf8(out).expect("utf-8");
     assert!(
         out.contains(&format!(
@@ -587,11 +603,47 @@ fn every_verb_refuses_while_a_deploy_is_pending() {
     let errs = [
         install_on(&mut exec, &root, A, &from, Mode::DryRun).expect_err("install"),
         rollback_on(&mut exec, &root, Mode::Apply).expect_err("rollback"),
-        gc_on(&mut exec, &root, 0).expect_err("gc"),
     ];
     for err in errs {
         assert_eq!(err.to_string(), want);
     }
+}
+
+/// Catches a `gc` that removes the release on trial or the one it came from (S22), and a
+/// `gc` that is refused for the trial: with a swap pending the releases it names stay, a
+/// release a process runs stays, and the rest go.
+///
+/// Mutants planted: the pending commit not kept; the pending `previous` not kept; `in_use`
+/// not kept.
+#[test]
+fn gc_keeps_the_swap_on_trial_and_what_runs() {
+    let (mut exec, root) = host("gc-pending");
+    let (p, q) = ("1".repeat(40), "2".repeat(40));
+    for r in [A, B, C, &p, &q] {
+        fs::create_dir_all(exec.at(&format!("/var/lib/kbf-installer/releases/{r}"))).expect("dir");
+    }
+    let state = State {
+        current: Some(c(C)),
+        pending_confirm: Some(PendingConfirm {
+            commit: c(C),
+            previous: Some(c(&p)),
+            activation: "1-1".to_owned(),
+            deadline_wall: Some(1),
+            deadline_mono_s: None,
+            starts_left: None,
+        }),
+        ..State::default()
+    };
+    Locked::acquire(&root)
+        .expect("lock")
+        .write(&state)
+        .expect("write");
+    let running: BTreeSet<_> = [c(&q)].into();
+    let mut out = Vec::new();
+    gc(&mut exec, &root, 0, &running, Mode::Apply, &mut out).expect("gc");
+    let mut want = vec![C.to_owned(), p, q];
+    want.sort();
+    assert_eq!(releases_left(&exec), want);
 }
 
 /// Catches a unit name that is not UTF-8 being used (it could not be named in a plan
@@ -931,6 +983,45 @@ fn stage_copies_and_records_the_release_and_moves_no_link() {
         exec.at(&format!("/var/lib/kbf-installer/releases/{B}/kbf"))
             .exists()
     );
+}
+
+/// Catches a release that `install` makes current staying staged as well: with B staged, the
+/// install of B makes it current (A previous) and nothing is staged; with C staged, the
+/// install of B leaves C staged (another release's decision is not this one's).
+///
+/// Mutants planted: `staged` kept by the switch; `staged` cleared whatever it names.
+#[test]
+fn installing_the_staged_release_makes_it_current_and_no_longer_staged() {
+    let stage_on = |exec: &mut ScratchHost, root: &Layout, commit: &str, from: &Path| {
+        let a = Install {
+            commit: c(commit),
+            from: from.to_owned(),
+        };
+        stage(exec, root, me(), &a, Mode::Apply, &mut Vec::new()).expect("stage");
+    };
+    for (staged, want) in [(B, None), (C, Some(c(C)))] {
+        let (mut exec, root) = host(&format!("install-staged-{staged}"));
+        let a = source(&format!("install-staged-a-{staged}"), "kbf A", None);
+        let b = source(&format!("install-staged-b-{staged}"), "kbf B", None);
+        let other = source(&format!("install-staged-c-{staged}"), "kbf C", None);
+        install_on(&mut exec, &root, A, &a, Mode::Apply).expect("install A");
+        stage_on(
+            &mut exec,
+            &root,
+            staged,
+            if staged == B { &b } else { &other },
+        );
+        assert_eq!(state_of(&root).staged, Some(c(staged)));
+
+        install_on(&mut exec, &root, B, &b, Mode::Apply).expect("install B");
+        let s = state_of(&root);
+        assert_eq!(
+            (s.current, s.previous),
+            (Some(c(B)), Some(c(A))),
+            "{staged}"
+        );
+        assert_eq!(s.staged, want, "{staged}");
+    }
 }
 
 /// Catches a stage that replaces a release or leaves a half copy: a release directory with
@@ -1605,7 +1696,14 @@ fn gc_on_an_unreadable_releases_directory_is_an_error_not_an_empty_one() {
     let releases = exec.at("/var/lib/kbf-installer/releases");
     fs::set_permissions(&releases, fs::Permissions::from_mode(0o100))
         .expect("traversable, not listable");
-    let result = gc(&mut exec, &root, 2, Mode::DryRun, &mut Vec::new());
+    let result = gc(
+        &mut exec,
+        &root,
+        2,
+        &Default::default(),
+        Mode::DryRun,
+        &mut Vec::new(),
+    );
     fs::set_permissions(&releases, fs::Permissions::from_mode(0o755)).expect("unlock");
     let err = result.expect_err("denied");
     assert!(matches!(err, ReleaseError::Read { .. }), "{err}");

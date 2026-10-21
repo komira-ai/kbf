@@ -4,7 +4,7 @@
 
 use std::io::{BufRead as _, BufReader};
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use kbf_cli::config::group_of;
@@ -19,11 +19,11 @@ const BIN: &str = env!("CARGO_BIN_EXE_kbf");
 /// The stand-in `crun` the container driver's check runs `--version` on.
 const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-crun");
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("config-process-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("config-process-{name}"),
+    )
 }
 
 fn write(path: &Path, text: &str, mode: u32) {
@@ -342,7 +342,8 @@ fn check_refuses_what_a_start_refuses() {
     // A mode given none of its flags reads the host's file: with no file there, the file
     // is what the refusal names (a list of every missing flag would send the operator to
     // the wrong place). With some of its flags, the flags are the start.
-    let none = scratch("check-no-file").join("absent.toml");
+    let empty = scratch("check-no-file");
+    let none = empty.join("absent.toml");
     let r = run(&strings(&[
         "daemon",
         "--check",
@@ -386,49 +387,47 @@ fn check_refuses_what_a_start_refuses() {
     );
 }
 
-/// Catches `kbf check-args` changed from what `kbf-deploy` calls: it still parses the
-/// flags and exits 0, with nothing on stdout and none of the host's checks (a certificate
-/// that is not there is fine), and it says on stderr, in one line, that it is deprecated
-/// and what to use. Exit 2 is kept for flags a start refuses.
+/// Catches `--check` that passes a command line a start refuses for its words, not its
+/// host: a flag no mode has, and a mode that is not one (`cluster` is a command, not a
+/// mode). Each exits 2 in both spellings of the mode, with the refusal as the first line
+/// of standard error, nothing on standard output, and a data directory a start would make
+/// still absent. `kbf-deploy` used to ask this of `kbf check-args`.
 #[test]
-fn check_args_still_parses_and_says_it_is_deprecated() {
-    let ok = run(&strings(&[
-        "check-args",
-        "daemon",
+fn check_refuses_an_unknown_flag_and_a_word_that_is_not_a_mode() {
+    let dir = scratch("check-unknown-flag");
+    let data = dir.join("data");
+    let node = [
         "--driver=container",
         "--server=https://127.0.0.1:1",
         "--ca-cert=/nonexistent/ca.pem",
         "--cert=/nonexistent/node.pem",
         "--key=/nonexistent/node.key",
         "--node-id=n",
-    ]));
-    assert_eq!(ok.code, Some(0), "{}", ok.err);
-    assert!(ok.out.is_empty());
-    assert_eq!(ok.err.lines().count(), 1, "{}", ok.err);
-    assert!(
-        ok.err.contains("deprecated") && ok.err.contains("--check"),
-        "{}",
-        ok.err
-    );
-    let bad = run(&strings(&["check-args", "daemon", "--bogus-flag"]));
-    assert_eq!(bad.code, Some(2));
-    // The refusal is the first line, which `kbf-deploy` reports; the note is the last.
-    assert!(
-        bad.err
-            .lines()
-            .next()
-            .is_some_and(|l| l.contains("unexpected argument '--bogus-flag'")),
-        "{}",
-        bad.err
-    );
-    assert!(
-        bad.err
-            .lines()
-            .last()
-            .is_some_and(|l| l.contains("deprecated")),
-        "{}",
-        bad.err
-    );
+    ];
+    for mode in ["daemon", "--mode=daemon"] {
+        let mut words = vec![mode.to_owned(), "--check".to_owned()];
+        words.extend(node.iter().map(|f| (*f).to_owned()));
+        words.push(format!("--data-dir={}", data.display()));
+        words.push("--bogus-flag".to_owned());
+        let r = run(&words);
+        assert_eq!(r.code, Some(2), "{mode}: {}", r.err);
+        assert!(r.out.is_empty(), "{mode}: {}", r.out);
+        assert!(
+            r.err
+                .lines()
+                .next()
+                .is_some_and(|l| l.contains("unexpected argument '--bogus-flag'")),
+            "{mode}: {}",
+            r.err
+        );
+        assert!(!data.exists(), "{mode}: --check made {}", data.display());
+    }
+    for word in ["cluster", "no-such-mode"] {
+        let r = run(&strings(&[&format!("--mode={word}"), "--check"]));
+        assert_eq!(r.code, Some(2), "{word}: {}", r.err);
+        assert!(r.out.is_empty(), "{word}: {}", r.out);
+        assert!(r.err.contains(word), "{word}: {}", r.err);
+    }
 }
 
 /// A running `kbf storage`, killed when dropped.
@@ -550,5 +549,110 @@ fn a_start_with_a_bad_file_exits_2_and_makes_nothing() {
             !meta.exists(),
             "{want}: a refused start made its metadata directory"
         );
+    }
+}
+
+/// Catches a `kbf.toml` that `kbf-installer setup` writes and `kbf` does not accept. The five
+/// files the installer's tests pin (`kbf-installer/tests/golden/kbf_toml`, one per mode) are
+/// put under a scratch directory with the certificates, keys and token they name, and `kbf
+/// --mode=<mode> --config <file> --check` must exit 0 and print `ok` (a node that enrolls says it is configured and not enrolled yet): a key `kbf` does not
+/// have, a key in the wrong table, a required flag the file lacks, a certificate of the wrong
+/// role and a private key of the wrong mode each fail it (`--check` reads the same flags a
+/// start does and starts nothing).
+#[test]
+fn the_kbf_toml_that_setup_writes_passes_check_in_every_mode() {
+    let goldens =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-installer/tests/golden/kbf_toml");
+    for mode in names::MODES {
+        let dir = scratch(&format!("installer-{}", mode.name));
+        let etc = dir.join("etc");
+        std::fs::create_dir_all(&etc).expect("etc");
+        let pki = Pki::new(&etc);
+        pki.issue(&etc, "reapi", Row::FrontendWorker, &["localhost"], false);
+        pki.issue(
+            &etc,
+            "worker",
+            Row::FrontendWorker,
+            &["localhost", "127.0.0.1", "farm.example"],
+            false,
+        );
+        pki.issue(&etc, "node", Row::Daemon, &["farm-1"], false);
+        write(&etc.join("api-token"), "a-token-of-no-importance\n", 0o600);
+        // A token of the right form: `--check` parses it and calls no frontend.
+        let token = kbf_types::Token::new(
+            kbf_types::TokenId::from_bits(1),
+            kbf_types::TokenSecret::from_bytes([7; 32]),
+            kbf_types::CaPin::from_bytes([9; 32]),
+        );
+        write(&etc.join("enroll.token"), &token.to_line(), 0o600);
+        let golden = std::fs::read_to_string(goldens.join(format!("{}.toml", mode.name)))
+            .unwrap_or_else(|e| panic!("the installer's golden for {}: {e}", mode.name));
+        // The golden names the paths of a host; this one is a scratch directory.
+        let text = golden
+            .replace("/etc/kbf/", &format!("{}/", etc.display()))
+            .replace("/var/lib/kbf-meta", &dir.join("meta").display().to_string())
+            .replace("/var/lib/kbf", &dir.join("data").display().to_string());
+        // A node's directories default to places only a service user may make; the test's own
+        // are the operator's keys that `setup` leaves to the operator.
+        let here = dir.display();
+        let mut text = text;
+        if [names::DAEMON, names::STORAGE, names::STORAGE_AND_DAEMON].contains(&mode.name) {
+            text.push_str(&format!("\n[dirs]\nstate = \"{here}/state\"\n"));
+        }
+        if [names::STORAGE, names::STORAGE_AND_DAEMON].contains(&mode.name) {
+            text.push_str(&format!(
+                "\n[storage]\nhot_dir = \"{here}/hot\"\nmeta_dir = \"{here}/meta\"\n"
+            ));
+        }
+        let mut twice = None;
+        if [names::DAEMON, names::STORAGE_AND_DAEMON].contains(&mode.name) {
+            // `setup` writes a `[daemon]` table here (the update directories): the key goes into
+            // it, as the file's header says. A second table of the name is the operator's
+            // mistake, tried below.
+            let key = format!("data_dir = \"{here}/data\"\n");
+            let header = "[daemon]\n";
+            let at = text.find(header).expect("setup writes a [daemon] table") + header.len();
+            twice = Some(format!("{text}\n[daemon]\n{key}"));
+            text.insert_str(at, &key);
+        }
+        let file = dir.join("kbf.toml");
+        write(&file, &text, 0o600);
+        if let Some(twice) = twice {
+            let second = dir.join("twice.toml");
+            write(&second, &twice, 0o600);
+            let args = vec![
+                format!("--mode={}", mode.name),
+                "--check".to_owned(),
+                format!("--config={}", second.display()),
+            ];
+            let r = run_in(&args, &host_env(&dir));
+            assert_eq!(r.code, Some(2), "{}: {}", mode.name, r.err);
+            assert!(r.err.contains("duplicate"), "{}: {}", mode.name, r.err);
+        }
+        let mut args = vec![
+            format!("--mode={}", mode.name),
+            "--check".to_owned(),
+            format!("--config={}", file.display()),
+        ];
+        // The stand-in `crun` for the one mode that runs builds without enrolling; a daemon flag on
+        // the line of a node that enrolls would make it a node that does not.
+        if mode.name == names::ALL_IN_ONE {
+            args.push(format!("--oci-runtime={FAKE_CRUN}"));
+        }
+        let r = run_in(&args, &host_env(&dir));
+        assert_eq!(r.code, Some(0), "{}: {}\n{text}", mode.name, r.err);
+        let enrolls =
+            [names::DAEMON, names::STORAGE, names::STORAGE_AND_DAEMON].contains(&mode.name);
+        // A node that enrolls says so instead of `ok`: the file is accepted, the host is not
+        // enrolled yet.
+        if enrolls {
+            let want = format!(
+                "mode {} is configured; this node is not enrolled yet",
+                mode.name
+            );
+            assert!(r.out.contains(&want), "{}: {}", mode.name, r.out);
+        } else {
+            assert_eq!(r.out, format!("kbf {}: ok\n", mode.name), "{}", mode.name);
+        }
     }
 }

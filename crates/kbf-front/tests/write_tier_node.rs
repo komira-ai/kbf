@@ -12,6 +12,8 @@ mod support;
 
 use std::num::NonZeroU64;
 
+use bytes::Bytes;
+
 use kbf_front::{Cache, CacheError, ObjectKeys, TierStartError};
 use kbf_meta::{NodeWriter, TierId, Writer};
 use kbf_objstore::{Capabilities, KeyPrefix};
@@ -128,4 +130,91 @@ async fn a_log_that_misanswers_a_node_start_refuses_it() {
         "{:?}",
         refused.err()
     );
+}
+
+/// Catches: a node whose member and boot were handed out again by a fresh state store
+/// (the keys `cas/<member>/<boot>/<seq>` of the earlier store's lifetime are in the
+/// bucket) that leaves each segment staged for ever, or that moves it to the next
+/// number, which the earlier lifetime used too, one conflict and one wasted upload per
+/// number. The first conflict must move the numbering past the earlier lifetime's, so
+/// the segment's next flush is the last; the earlier lifetime's objects stay as they were.
+/// Mutants seen red: `leave_numbering` doing nothing (the segment moves to number 2,
+/// one of the three taken), and a conflict that commits `FlushConflict` and leaves the
+/// object staged.
+#[tokio::test]
+async fn a_member_and_boot_handed_out_again_by_a_fresh_store_do_not_strand_segments() {
+    let first = Farm::new(support::CONDITIONAL);
+    let (old, _) = start_as(&first, node(1, 2)).await.expect("first lifetime");
+    let mut taken = Vec::new();
+    for seed in 1..=3 {
+        let written = blobs(seed * 10, 1, 2048);
+        old.store_blobs(verified(&written)).await.expect("staged");
+        let object = first.log.object_of(&written[0].digest);
+        let round = old.flush_tier(later()).await.expect("flush");
+        assert_eq!(round.flushed, [object]);
+        taken.push((object, old.object_key(object).expect("key")));
+    }
+    assert_eq!(
+        taken.iter().map(|(o, _)| o.seq()).collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    let before = bytes_of(&first, &taken).await;
+    drop(old);
+
+    // A frontend on a fresh state store: a new log, the same member and boot, the same
+    // bucket.
+    let second = Farm {
+        fs: kbf_store::FaultFs::new(),
+        log: support::Log::new(),
+        store: first.store.clone(),
+    };
+    let (cache, _) = start_as(&second, node(1, 2))
+        .await
+        .expect("second lifetime");
+    let written = blobs(100, 2, 2048);
+    cache.store_blobs(verified(&written)).await.expect("staged");
+    let object = second.log.object_of(&written[0].digest);
+    assert_eq!(object.seq(), 1, "the numbering started again");
+
+    let round = cache.flush_tier(later()).await.expect("conflict round");
+    assert_eq!(
+        (round.conflicts.clone(), round.flushed.len()),
+        (vec![object], 0)
+    );
+    assert_eq!(second.log.staged_state(object), None);
+    assert_eq!(second.log.losses(), (0, 0), "a move is not a loss");
+    let moved = second.log.object_of(&written[0].digest);
+    assert!(
+        moved.seq() > 3,
+        "past the earlier lifetime's: {}",
+        moved.seq()
+    );
+    for b in &written {
+        assert_eq!(cache.read_blob(&b.digest).await.expect("read"), b.bytes);
+    }
+    let round = cache.flush_tier(later()).await.expect("flush round");
+    assert_eq!((round.conflicts.len(), round.flushed), (0, vec![moved]));
+    assert_eq!(second.log.staged_state(moved), None);
+    for b in &written {
+        assert_eq!(cache.read_blob(&b.digest).await.expect("read"), b.bytes);
+    }
+    assert_eq!(
+        bytes_of(&second, &taken).await,
+        before,
+        "the earlier lifetime's objects are as they were"
+    );
+}
+
+/// The bytes under each of `taken`'s keys.
+async fn bytes_of(
+    farm: &Farm,
+    taken: &[(kbf_meta::ObjectId, kbf_objstore::ObjectKey)],
+) -> Vec<Bytes> {
+    use kbf_objstore::{ByteRange, ObjectStore};
+    let all = ByteRange::new(0, 1 << 20).expect("range");
+    let mut got = Vec::new();
+    for (_, key) in taken {
+        got.push(farm.store.get_range(key, all).await.expect("get"));
+    }
+    got
 }

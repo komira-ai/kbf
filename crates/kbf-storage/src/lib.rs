@@ -23,9 +23,10 @@
 //!   needs is held.
 //!
 //! This crate depends on no frontend crate: not the scheduler (`kbf-sched`) and not
-//! authorization (`kbf-auth`). `crates/kbf-it/tests/layering.rs` checks it.
+//! authorization (`kbf-auth`). `crates/kbf-integration-test/tests/layering.rs` checks it.
 
 pub mod flush;
+pub mod in_flight;
 pub mod local_cache;
 pub mod repair;
 pub mod replicate;
@@ -181,6 +182,16 @@ pub trait Storage: Send + Sync {
     /// can name: the handlers a remote daemon's `Begin`, `PutRange` and `Commit` reach.
     fn segments(&self) -> Arc<dyn Segments>;
 
+    /// [`Storage::segments`], counting each upload in `open` from its `Begin` until the
+    /// commit started for it ends or it is dropped, so a node that reports its open writes
+    /// does not report none while a daemon uploads its outputs. The service of a storage node
+    /// asks for this one. A store whose uploads are not counted answers [`Storage::segments`]
+    /// and the node under-reports; the store a node runs (kbf-front's) overrides it.
+    fn segments_counted(&self, open: &service::OpenWrites) -> Arc<dyn Segments> {
+        let _ = open;
+        self.segments()
+    }
+
     /// `GetActionResult`: the result and the digest of the blob it was read from, if
     /// the entry passes the closure check and its result blob reads back; `None` (a
     /// miss) otherwise.
@@ -255,13 +266,25 @@ pub trait PutStream: Send {
     ) -> Result<Box<dyn StreamedPut>, StorageError>;
 }
 
+/// What a [`StreamedPut::commit`] may answer on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CommitMode {
+    /// Answer once the blob is durable on this node's disk and present in its index.
+    #[default]
+    Durable,
+    /// Answer once the node holds the blob in memory, before its disk has it. No
+    /// implementation does that yet: every one commits as [`CommitMode::Durable`].
+    Held,
+}
+
 /// A streamed blob whose bytes are written and checked, not yet committed.
 pub trait StreamedPut: Send {
-    /// Makes the blob durable and present: present once this answers.
+    /// Makes the blob present, as `mode` asks: present once this answers. Every
+    /// implementation commits as [`CommitMode::Durable`] whatever `mode` is.
     ///
     /// # Errors
     /// The store's sync or its index commit failed.
-    fn commit(self: Box<Self>) -> Answer<'static, ()>;
+    fn commit(self: Box<Self>, mode: CommitMode) -> Answer<'static, ()>;
 }
 
 /// Why a [`Storage`] call failed. [`Status`] has a `From` for it, so a service answers

@@ -58,6 +58,12 @@
 //! seen it, forwards the calls Envoy still sends it ([`kbf_front::Relay`]) and exits when
 //! it holds nothing, without failing a build; [`start_or_take_over`] is its start.
 //!
+//! **Under the admin port** (`--admin-listen`, optionally `--await-takeover`,
+//! [`crate::managed`]): a loopback port answers `GET role` and takes `quiesce`, `resume`,
+//! `takeover` and `stand-down`, so a supervisor can start a candidate beside the serving
+//! frontend and move the state store's generation to it without the Unix-socket handover
+//! above (which stays until the supervisor replaces it).
+//!
 //! **Not served here:** the worker listener's `ByteStream`, CAS and `Segments` (a
 //! daemon's blob traffic; daemons reach storage directly once the map reaches them,
 //! av2-08), the build pages and the blob route of the operator API (they read a local
@@ -69,7 +75,7 @@ use std::ffi::OsString;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -96,6 +102,8 @@ use tonic::service::Routes;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 
 use crate::drain::Drain;
+use crate::enroll::flags::EnrollFlags;
+use crate::enroll::start as enroll_start;
 use crate::farm::Farm;
 use crate::front_maps::FrontMaps;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
@@ -105,12 +113,15 @@ use crate::handover::{
 };
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
 use crate::listen::{Binder, Socket};
-use crate::members::Members;
+use crate::members::{Handoff, Members};
+use crate::object_store::delivery::{Delivery, RegistrySource, Reports};
+use crate::proxy_auth::ProxyAuthLayer;
 use crate::serve::{
-    AbortOnDrop, ServeError, drain_and_stop, flow_control, keepalive, log_state, map_of,
-    members_of, membership, serve_api, stop_api, sweeping, worker_peers,
+    AbortOnDrop, ServeError, cold_store, drain_and_stop, flow_control, keepalive, log_state,
+    map_of, members_of, membership, serve_api, stop_api, sweeping, worker_peers,
 };
 use crate::start::{Escalation, escalating, interruptions};
+use crate::store_config::acks::Acks;
 use crate::worker::WorkerService;
 use crate::{Args, ConfigError, SERVER_VERSION, sizes_on};
 
@@ -132,6 +143,7 @@ pub const ALLOWED: &[&str] = &[
     "worker_client_ca",
     "tls_reload_interval_secs",
     "worker_deny_list",
+    "proxy_auth_file",
     "heartbeat_interval_ms",
     "progress_interval_secs",
     "http2_keepalive_interval_secs",
@@ -141,6 +153,7 @@ pub const ALLOWED: &[&str] = &[
     "reapi_max_streams",
     "worker_max_streams",
     "unservable_wait_secs",
+    "default_platform",
     "memory_ladder_gib",
     "finished_retention_secs",
     "shutdown_timeout_secs",
@@ -150,6 +163,9 @@ pub const ALLOWED: &[&str] = &[
     "member_dwell_secs",
     "history_objects",
     "history_index_root",
+    "release_poll_every_secs",
+    "release_poll_repo",
+    "release_poll_refs",
     "log_dir",
     "log_max_bytes",
     "log_files",
@@ -166,6 +182,10 @@ const HANDOVER: [&str; 3] = [
     "handover_quiesce_secs",
     "handover_follow_interval_ms",
 ];
+
+/// The id of the flag that turns on the object-store registration API and names where its
+/// secret files are kept.
+const SECRETS_DIR: &str = "object_store_secrets_dir";
 
 /// The ids of the flags that say which instance this is, how long a holder waits for its
 /// successor to serve, the name the successor's certificate carries, and Envoy's check
@@ -200,6 +220,23 @@ pub struct FrontendFlags {
     /// How this frontend hands over to a successor and takes over from a predecessor;
     /// `None` without `--handover-socket`.
     pub handover: Option<Handover>,
+    /// The enroll listener (`--enroll-listen` and its companions); `None` without it.
+    pub enroll: Option<EnrollFlags>,
+    /// The admin port and whether to start as a candidate ([`crate::managed`]); `None`
+    /// without `--admin-listen`.
+    pub admin: Option<crate::managed::AdminFlags>,
+    /// `--object-store-secrets-dir`: where the secret keys of the registered object-store
+    /// connections are kept (one 0600 file each), which also turns on the
+    /// `/v1/object-stores` routes of the operator API. `None`: they answer 404.
+    pub object_store_secrets_dir: Option<PathBuf>,
+    /// The id of this process under the admin port ([`crate::managed`]); `None` for a
+    /// frontend that has none. Its history writer is named by it, so the history rows
+    /// the process writes carry its id and no other process writes them.
+    pub instance_id: Option<String>,
+    /// `--auto-promote` and its companions: a joiner is promoted by its own beat when it is
+    /// filled ([`crate::members::Members::with_handoff`]); `None` without the flag, where only
+    /// an operator promotes one.
+    pub handoff: Option<Handoff>,
 }
 
 /// The long names of the flags of [`Args`] that `kbf frontend` hides and refuses by name
@@ -329,6 +366,25 @@ pub fn command() -> Command {
                  and this name; without it such a frontend refuses a handover.",
             ),
     )
+    .args(crate::enroll::flags::args())
+    .args(crate::managed::flags::args())
+    .args(handoff::args())
+    .arg(
+        Arg::new(SECRETS_DIR)
+            .long("object-store-secrets-dir")
+            .value_name("DIR")
+            .value_parser(clap::value_parser!(PathBuf))
+            .requires_all(["api_listen", "api_token_file", "state_store"])
+            .help(
+                "Turns on the object-store registration routes of the operator API \
+                 (/v1/object-stores, docs/api.md) and names the directory where the secret \
+                 key of each registered connection is kept, one file of mode 0600 each, in a \
+                 directory made 0700. The directory must be readable by every frontend \
+                 child that serves at once and left out of any backup of the host. The \
+                 registration itself (endpoints, buckets, the audit log) is kept in the \
+                 state store. Without it those routes answer 404.",
+            ),
+    )
     .arg(check_arg(0, "envoy-check-interval-ms", "MILLISECONDS", "The time between two of Envoy's health checks of a frontend (the cluster's `interval`)."))
     .arg(check_arg(1, "envoy-check-timeout-ms", "MILLISECONDS", "How long Envoy's health check waits for an answer (the cluster's `timeout`)."))
     .arg(check_arg(2, "envoy-unhealthy-threshold", "N", "How many of Envoy's checks in a row must fail before it stops choosing a frontend (`unhealthy_threshold`). The three give the settle: a frontend waits interval x threshold + timeout + interval before it goes not ready (Envoy has then seen the successor) and again before it exits (Envoy then sends it nothing)."))
@@ -365,8 +421,9 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
     }
     let mut server = Args::from_arg_matches(m)?;
     let instance = m.get_one::<Instance>(INSTANCE).copied();
+    let mut enroll = crate::enroll::flags::from_matches(m).map_err(refuse)?;
     if let Some(instance) = instance {
-        place(&mut server, instance).map_err(refuse)?;
+        place(&mut server, enroll.as_mut(), instance).map_err(refuse)?;
     }
     let storage = server
         .storage()
@@ -388,11 +445,17 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         envoy: envoy_check(m),
         peer_name: m.get_one::<String>(PEER_NAME).cloned(),
     });
+    let admin = crate::managed::flags::parse(m).map_err(refuse)?;
     Ok(FrontendFlags {
         server,
         storage,
         tls,
         handover,
+        enroll,
+        admin,
+        object_store_secrets_dir: m.get_one::<PathBuf>(SECRETS_DIR).cloned(),
+        instance_id: None,
+        handoff: handoff::from_matches(m),
     })
 }
 
@@ -406,12 +469,16 @@ fn envoy_check(m: &ArgMatches) -> EnvoyCheck {
     }
 }
 
-/// Moves the listeners of `server` to the port block of `instance`: the flags' for a, ten
-/// ports above for b ([`Instance::port`]).
+/// Moves the listeners of `server` (and the enroll listener, if there is one) to the port
+/// block of `instance`: the flags' for a, ten ports above for b ([`Instance::port`]).
 ///
 /// # Errors
 /// A port of instance b would run past 65535.
-fn place(server: &mut Args, instance: Instance) -> Result<(), String> {
+fn place(
+    server: &mut Args,
+    enroll: Option<&mut EnrollFlags>,
+    instance: Instance,
+) -> Result<(), String> {
     let shift = |flag: &str, addr: SocketAddr| {
         instance
             .port(addr.port())
@@ -430,6 +497,9 @@ fn place(server: &mut Args, instance: Instance) -> Result<(), String> {
         .api_listen
         .map(|addr| shift("api-listen", addr))
         .transpose()?;
+    if let Some(enroll) = enroll {
+        enroll.listen = shift("enroll-listen", enroll.listen)?;
+    }
     Ok(())
 }
 
@@ -539,10 +609,13 @@ pub struct FrontendHandle {
     pub worker: SocketAddr,
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
+    /// Where the enroll listener is, if there is one.
+    pub enroll: Option<SocketAddr>,
+    enroll_tls: Option<kbf_tls::TlsSource>,
     drain: Arc<Drain>,
     /// Completes on the second stop signal; [`FrontendHandle::serve`] then closes the
     /// drain ([`Drain::close`]).
-    escalation: Option<Escalation>,
+    pub(crate) escalation: Option<Escalation>,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     /// Tasks that run while the frontend serves and end with it: the one that expires
@@ -550,6 +623,9 @@ pub struct FrontendHandle {
     background: Vec<BoxFuture<'static, ()>>,
     /// Tells the service manager the frontend serves, once its probes pass.
     ready: Ready,
+    /// What gives the roles up and takes them back ([`crate::managed`]); with a state
+    /// store only.
+    stand: Option<Stand>,
 }
 
 impl FrontendHandle {
@@ -558,6 +634,19 @@ impl FrontendHandle {
     #[must_use]
     pub fn drain(&self) -> Arc<Drain> {
         Arc::clone(&self.drain)
+    }
+
+    /// The enroll listener's TLS configuration, if there is a listener: its
+    /// `reloads().applied` counts the certificates the frontend's renewal task has put in
+    /// place (what a test observes to see that the task runs).
+    #[must_use]
+    pub fn enroll_tls(&self) -> Option<kbf_tls::TlsSource> {
+        self.enroll_tls.clone()
+    }
+
+    /// What gives this frontend's roles up, if it has a state store.
+    pub(crate) const fn stand(&self) -> Option<&Stand> {
+        self.stand.as_ref()
     }
 
     /// The line the frontend prints once it is bound:
@@ -671,6 +760,31 @@ fn bind_frontend(
     prepared.start(state, shutdown, None)
 }
 
+/// A start over a state store that is already open and held (`state`), with no
+/// predecessor: [`start_frontend`] with the store given instead of opened from
+/// `--state-store`. `stop` completes to stop the frontend.
+pub(crate) fn start_over(
+    flags: &FrontendFlags,
+    state: crate::StateStore,
+    stop: &Stop,
+) -> Result<FrontendHandle, Box<dyn Error>> {
+    let stop = stop.clone();
+    Prepared::new(flags)?.start(Some(state), Box::new(move || Ok(stop.fired())), None)
+}
+
+/// A start over a state store whose generation was just taken, on the REAPI and operator
+/// API sockets a candidate bound ([`crate::managed`]); only the worker listener is bound
+/// here.
+pub(crate) fn start_over_sockets(
+    flags: &FrontendFlags,
+    sockets: crate::managed::Sockets,
+    state: crate::StateStore,
+    stop: Stop,
+) -> Result<FrontendHandle, Box<dyn Error>> {
+    let prepared = Prepared::over(flags, sockets)?;
+    prepared.start(Some(state), Box::new(move || Ok(stop.fired())), None)
+}
+
 /// Starts the frontend the flags describe, taking over from the one serving on
 /// `--handover-socket`, if there is one (see [`crate::handover`]): it binds its own
 /// listeners, tells that frontend where it listens, waits for it to stand down, and opens
@@ -747,10 +861,13 @@ fn state_uri(flags: &FrontendFlags) -> Result<&crate::StateStoreUri, HandoverErr
 struct Prepared<'a> {
     flags: &'a FrontendFlags,
     listeners: crate::serve::Listeners,
+    proxy: Option<crate::serve::Behind>,
     policy: kbf_auth::Policy,
     api: Option<crate::serve::Api>,
     channel: tonic::transport::Channel,
     sockets: Bound,
+    /// The enroll listener bound and its CA open, if `--enroll-listen` is given.
+    enroll: Option<enroll_start::Prepared>,
 }
 
 /// The three listening sockets.
@@ -781,24 +898,61 @@ impl Bound {
 impl<'a> Prepared<'a> {
     /// Reads the flags and binds the listeners.
     fn new(flags: &'a FrontendFlags) -> Result<Self, Box<dyn Error>> {
+        Self::bound(flags, |listeners, api, binder| {
+            Bound::bind(
+                listeners.reapi,
+                listeners.worker,
+                api.map(|api| api.listen),
+                binder,
+            )
+        })
+    }
+
+    /// [`Prepared::new`] on the REAPI and operator API sockets of a candidate: only the
+    /// worker listener is bound.
+    fn over(
+        flags: &'a FrontendFlags,
+        sockets: crate::managed::Sockets,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::bound(flags, |listeners, _, binder| {
+            Ok(Bound {
+                reapi: sockets.reapi,
+                worker: Socket::bind(listeners.worker, binder)?,
+                api: sockets.api,
+            })
+        })
+    }
+
+    fn bound(
+        flags: &'a FrontendFlags,
+        sockets: impl FnOnce(
+            &crate::serve::Listeners,
+            Option<&crate::serve::Api>,
+            &Binder,
+        ) -> Result<Bound, ServeError>,
+    ) -> Result<Self, Box<dyn Error>> {
         let args = &flags.server;
         let listeners = args.listeners()?;
+        let proxy = args.proxy()?;
         let policy = args.reapi_auth_policy()?;
         let api = args.api()?;
         let channel = flags.storage_endpoint()?.connect_lazy();
-        let sockets = Bound::bind(
-            listeners.reapi,
-            listeners.worker,
-            api.as_ref().map(|api| api.listen),
-            &Binder::new(),
-        )?;
+        let binder = Binder::new();
+        let enroll = flags
+            .enroll
+            .as_ref()
+            .map(|enroll| enroll_start::prepare_with(enroll, &binder))
+            .transpose()?;
+        let sockets = sockets(&listeners, api.as_ref(), &binder)?;
         Ok(Self {
             flags,
             listeners,
+            proxy,
             policy,
             api,
             channel,
             sockets,
+            enroll,
         })
     }
 
@@ -823,16 +977,19 @@ impl<'a> Prepared<'a> {
         let Self {
             flags,
             listeners,
+            proxy,
             policy,
             api,
             channel,
             sockets,
+            enroll,
         } = self;
         let args = &flags.server;
         let state = crate::start::with_members(state, args.members());
-        let state = crate::history::with_history(state, &args.history)?;
+        let writer = (flags.instance_id.as_deref()).map(kbf_history::WriterId::from_instance);
+        let state = crate::history::with_history_as(state, &args.history, writer)?;
         let (state, history) = crate::history::take(state);
-        let members = members_of(state.as_ref());
+        let members = members_of(state.as_ref(), flags.handoff);
         let map = map_of(None, members.as_ref())?;
         let readiness = Arc::new(Readiness::default());
         let timeout = listeners.store_probe_timeout;
@@ -861,7 +1018,10 @@ impl<'a> Prepared<'a> {
 
         let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
         let recording = crate::history::install(recording, history.as_ref());
-        let default_memory = listeners.memory_ladder.first();
+        let defaults = kbf_front::Defaults {
+            memory: listeners.memory_ladder.first(),
+            platform: listeners.default_platform,
+        };
         let durable = state.is_some();
         let farm = Farm::new(
             backend.clone(),
@@ -879,6 +1039,7 @@ impl<'a> Prepared<'a> {
                 listeners.streams,
             ),
             listeners.worker_tls,
+            proxy.as_ref(),
         );
         let tls_sources: Vec<TlsSource> = listeners
             .reapi_tls
@@ -904,9 +1065,44 @@ impl<'a> Prepared<'a> {
         let (worker_incoming, worker_latch) = worker.grpc(worker_tls)?;
         worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
-        let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
+        let (token, releases, poll) = api.map_or((None, None, None), |api| {
+            (api.token, api.releases, api.poll)
+        });
+        let poll_stats = poll.as_ref().map(|_| Arc::default());
+        // The enroll listener (which is closed the moment the drain begins, like the
+        // others) and the operator API's enrollment routes, which need the CA's pin: both
+        // are off without `--enroll-listen`, and the routes then answer 404.
+        let enroll_addr = enroll.as_ref().map(enroll_start::Prepared::local);
+        let enrolled = enroll
+            .map(|prepared| {
+                let store = state_store
+                    .clone()
+                    .ok_or("--enroll-listen needs --state-store: the registry lives in it")?;
+                prepared.serve(store)
+            })
+            .transpose()?;
+        let (enroll_api, enroll_serve, enroll_renewal, enroll_tls) = match enrolled {
+            Some(enroll_start::Serving {
+                api,
+                listener,
+                latch,
+                renewal,
+                tls,
+            }) => {
+                drain.begins().closes(latch);
+                (Some(api), listener, Some(renewal), Some(tls))
+            }
+            None => (None, futures::future::pending().boxed(), None, None),
+        };
         let update_store = state_store.clone();
+        let update_members = members.clone();
         let update_rows = state_store.clone().map(crate::update::Rows::new);
+        let object_stores = flags
+            .object_store_secrets_dir
+            .as_deref()
+            .map(|dir| open_object_stores(dir, state_store.clone().zip(members.clone())))
+            .transpose()?;
+        let delivery = object_stores.as_ref().map(|stores| stores.delivery.clone());
         let offers = crate::release::offers::offers_of(
             releases.clone(),
             update_rows.clone(),
@@ -918,11 +1114,14 @@ impl<'a> Prepared<'a> {
             Arc::clone(&drain),
             members.clone(),
             update_rows.clone(),
-            // The enroll service and the CA that gives it a pin come with the frontend's
-            // enroll listener; until it exists, the enrollment routes answer 404.
-            None,
+            enroll_api,
         )
+        .merge(crate::verbs::routes(token.clone(), members.clone()))
         .merge(crate::release::router(releases.clone(), token.clone()))
+        .merge(crate::object_store::api::routes(
+            token.clone(),
+            object_stores.map(|stores| stores.api),
+        ))
         .merge(crate::update_hosts::router(
             Arc::clone(&farm),
             update_rows.clone(),
@@ -934,10 +1133,11 @@ impl<'a> Prepared<'a> {
             token,
             Arc::clone(&farm),
         ))
-        .merge(crate::health::router_of(Arc::clone(&checks)))
+        .merge(crate::health::routes(&checks, &farm, members.as_ref()))
         .merge(metrics_route(
             backend.clone(),
             history.as_ref().map(crate::history::History::stats),
+            poll_stats.clone(),
             members.clone(),
             tls_sources,
         ));
@@ -946,11 +1146,14 @@ impl<'a> Prepared<'a> {
             routes.merge(crate::storage_health::router(Arc::clone(members)))
         });
 
+        let proxy_secret = proxy.as_ref().map(|behind| Arc::clone(&behind.secret));
         let mut reapi_server = keepalive(
             flow_control(Server::builder(), listeners.stream_limits.reapi),
             listeners.streams,
-        );
-        let membership = membership(members.clone(), &peers);
+        )
+        .layer(ProxyAuthLayer::new(proxy_secret.clone()));
+        let membership = membership(members.clone(), &peers, delivery.as_ref());
+        let cold_store = cold_store(members.clone(), &peers, delivery.as_ref());
         let sessions = WorkerService::new(
             Arc::clone(&farm),
             peers,
@@ -986,7 +1189,7 @@ impl<'a> Prepared<'a> {
                 streams,
                 authorizers,
                 &recorder,
-                default_memory,
+                defaults,
                 Relaying {
                     farm: Arc::clone(&farm) as Arc<dyn Handed>,
                     successor: successor.clone(),
@@ -1000,7 +1203,7 @@ impl<'a> Prepared<'a> {
                 streams,
                 authorizers,
                 &recorder,
-                default_memory,
+                defaults,
             ),
         };
         let reapi_routes = Routes::from(
@@ -1025,25 +1228,28 @@ impl<'a> Prepared<'a> {
         // Told by the control socket's task when a handed-over frontend holds nothing and
         // may exit, or could not stand down.
         let (departing, departed) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let stand = state_store.map(|store| Stand {
+            drain: Arc::clone(&drain),
+            farm: Arc::clone(&farm),
+            worker: worker_stop.clone(),
+            sweeper: sweeper.clone(),
+            store,
+            wait: flags
+                .handover
+                .as_ref()
+                .map_or(crate::managed::QUIESCE_WAIT, |handover| handover.quiesce),
+        });
         let holder = flags
             .handover
             .as_ref()
-            .zip(state_store)
-            .map(|(handover, store)| {
+            .zip(stand.clone())
+            .map(|(handover, stand)| {
                 let facts = Facts {
                     instance: handover.instance,
                     state: args
                         .state_store
                         .as_ref()
                         .map_or_else(PathBuf::new, crate::StateStoreUri::identity),
-                };
-                let stand = Stand {
-                    drain: Arc::clone(&drain),
-                    farm: Arc::clone(&farm),
-                    worker: worker_stop.clone(),
-                    sweeper: sweeper.clone(),
-                    store,
-                    wait: handover.quiesce,
                 };
                 let peer = Peer {
                     successor,
@@ -1060,16 +1266,32 @@ impl<'a> Prepared<'a> {
             })
             .transpose();
         background.extend(holder?);
+        background.extend(enroll_renewal);
 
         let shutdown = shutdown()?;
         let stopper = Arc::clone(&drain);
         let serving = async move {
             let history = crate::history::spawn(history);
             let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
-            // The rolling-update controller; it starts no host until `auto_nodes` is set.
-            let _updates =
-                crate::update::spawn_controller(Arc::clone(&farm), update_store, listeners.tick)
-                    .map(AbortOnDrop);
+            // The rolling-update controller; it starts hosts for the desired release unless the
+            // operator wrote `auto_nodes` false or paused it.
+            let _poller = poll_stats
+                .and_then(|stats| {
+                    crate::release::poll::spawn(
+                        Arc::clone(&farm),
+                        update_store.clone(),
+                        poll,
+                        stats,
+                    )
+                })
+                .map(AbortOnDrop);
+            let _updates = crate::update::spawn_controller(
+                Arc::clone(&farm),
+                update_store,
+                update_members,
+                listeners.tick,
+            )
+            .map(AbortOnDrop);
             let reapi_serve = reapi_server
                 .add_routes(reapi_routes)
                 .serve_with_incoming_shutdown(reapi_incoming, async {
@@ -1080,12 +1302,18 @@ impl<'a> Prepared<'a> {
                 .add_service(worker_service)
                 .add_service(crate::release::service(releases))
                 .add_optional_service(membership)
+                .add_optional_service(cold_store)
                 .serve_with_incoming_shutdown(worker_incoming, worker_stopped);
             // Told when the REAPI listener is done (see `serve::stop_api`).
             let (api_stop_when_done, api_stopped) = tokio::sync::oneshot::channel::<()>();
-            let api_serve = serve_api(api_listener, api_routes, async {
-                let _ = api_stopped.await;
-            })
+            let api_serve = serve_api(
+                api_listener,
+                api_routes,
+                async {
+                    let _ = api_stopped.await;
+                },
+                proxy_secret,
+            )
             .fuse();
             tokio::pin!(api_serve);
             let ticking = async {
@@ -1104,6 +1332,7 @@ impl<'a> Prepared<'a> {
             // A listener that ends without an error does not end the frontend: the worker
             // listener ends when a handover stops it, and the frontend goes on answering
             // the callers it kept until it holds nothing (`departed`).
+            let mut enroll_serve = enroll_serve;
             let outcome = tokio::select! {
                 served = reapi_serve => {
                     reapi_done = true;
@@ -1111,6 +1340,7 @@ impl<'a> Prepared<'a> {
                 }
                 Err(e) = worker_serve => Err(ServeError::from(e)),
                 Err(e) = &mut api_serve => Err(ServeError::Api(e)),
+                Err(e) = &mut enroll_serve => Err(ServeError::from(e)),
                 () = ticking => Ok(()),
                 () = ticker.run() => Ok(()),
                 () = stopping => Ok(()),
@@ -1127,12 +1357,15 @@ impl<'a> Prepared<'a> {
             reapi: reapi_addr,
             worker: worker_addr,
             api: api_addr,
+            enroll: enroll_addr,
+            enroll_tls,
             drain,
             escalation: None,
             start_line: start_line(
                 reapi_addr,
                 worker_addr,
                 api_addr,
+                enroll_addr,
                 &flags.storage.uri().to_string(),
                 &plain,
             ),
@@ -1143,6 +1376,7 @@ impl<'a> Prepared<'a> {
                 notify: None,
                 predecessor,
             },
+            stand,
         })
     }
 }
@@ -1186,6 +1420,44 @@ fn dial_of(flags: &FrontendFlags) -> Result<crate::handover::Dial, ConfigError> 
     }))
 }
 
+/// What `--object-store-secrets-dir` turns on: the operator routes, and what the worker
+/// listener serves from the same registry.
+struct ObjectStores {
+    api: Arc<crate::object_store::api::ObjectStoreApi>,
+    delivery: Delivery,
+}
+
+/// The object-store registration over the state store, with secret files in `dir`
+/// (`--object-store-secrets-dir`): the operator API; the source `Membership` announces the
+/// generation from and `ColdStore` answers from; and the acks the nodes' heartbeats leave,
+/// which the API's convergence reads.
+fn open_object_stores(
+    dir: &Path,
+    state: Option<(Arc<dyn kbf_state::Store>, Arc<Members>)>,
+) -> Result<ObjectStores, Box<dyn Error>> {
+    let (store, members) = state.ok_or("--object-store-secrets-dir needs --state-store")?;
+    let runtime = tokio::runtime::Handle::try_current()?;
+    let registry = crate::object_store::Registry::open(
+        Arc::clone(&store),
+        dir,
+        Arc::new(crate::enroll::OsRandom),
+    )
+    .map(Arc::new)
+    .map_err(|e| format!("--object-store-secrets-dir {}: {e}", dir.display()))?;
+    let acks = Arc::new(Acks::new(store));
+    let reports = Reports::new(members, Arc::clone(&acks), Arc::clone(&registry));
+    let delivery = Delivery {
+        source: Arc::new(RegistrySource::new(Arc::clone(&registry))),
+        acks,
+    };
+    let probe = Arc::new(crate::object_store::probe::S3Probe::new(runtime));
+    let api = crate::object_store::api::ObjectStoreApi::new(registry, probe, Arc::new(reports));
+    Ok(ObjectStores {
+        api: Arc::new(api),
+        delivery,
+    })
+}
+
 /// The store `/readyz` probes: the open state store's, if there is one.
 fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Store>> {
     state.map(|state| Arc::clone(&state.store))
@@ -1197,17 +1469,21 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
 fn metrics_route(
     backend: Backend,
     history: Option<Arc<crate::history::Stats>>,
+    poll: Option<Arc<crate::release::poll::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
 ) -> axum::Router {
     let tls = Arc::new(tls);
     let render = move || {
         let (backend, members, tls) = (backend.clone(), members.clone(), Arc::clone(&tls));
-        let history = history.clone();
+        let (history, poll) = (history.clone(), poll.clone());
         async move {
             let mut text = backend.render_metrics();
             if let Some(history) = history {
                 history.render(&mut text);
+            }
+            if let Some(poll) = poll {
+                poll.render(&mut text);
             }
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
@@ -1222,17 +1498,19 @@ fn start_line(
     reapi: SocketAddr,
     worker: SocketAddr,
     api: Option<SocketAddr>,
+    enroll: Option<SocketAddr>,
     storage: &str,
     plain: &[&str],
 ) -> String {
     let api = api.map(|a| format!(" api={a}")).unwrap_or_default();
+    let enroll = enroll.map(|a| format!(" enroll={a}")).unwrap_or_default();
     let warning = if plain.is_empty() {
         String::new()
     } else {
         format!(" warning=plaintext-off-loopback:{}", plain.join(","))
     };
     format!(
-        "kbf-frontend {SERVER_VERSION} reapi={reapi} worker={worker}{api} storage={storage}{warning}"
+        "kbf-frontend {SERVER_VERSION} reapi={reapi} worker={worker}{api}{enroll} storage={storage}{warning}"
     )
 }
 
@@ -1255,6 +1533,18 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
     sizes.log();
     sizes.runtime()?.block_on(async {
         let (first, second) = interruptions()?;
+        if flags.admin.is_some() {
+            let managed =
+                crate::managed::Managed::start(flags, crate::managed::StoreSource::Flags, first)
+                    .await?;
+            println!("{}", managed.start_line());
+            managed
+                .escalating(second)
+                .notifying(std::env::var_os("NOTIFY_SOCKET"))
+                .serve()
+                .await?;
+            return Ok(());
+        }
         let mut frontend = start_or_take_over(flags, move || Ok(first)).await?;
         frontend.escalation = Some(second);
         println!("{}", frontend.start_line());
@@ -1264,6 +1554,8 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
         Ok(frontend.serve().await?)
     })
 }
+
+mod handoff;
 
 #[cfg(test)]
 mod tests;

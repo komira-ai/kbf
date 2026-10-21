@@ -129,11 +129,36 @@ pub(super) fn refuse_hard_link(db: &Path) -> Result<(), SqliteError> {
     }
 }
 
+/// A lock file with its `flock` held, released when this is dropped (or the process ends).
+///
+/// An `flock` belongs to the open file description, not to the descriptor, and a
+/// description lives until every copy of the descriptor is closed. A process forked while
+/// the lock is held (any spawn of a child by another thread of this process) carries a
+/// copy until it execs, so closing the file would leave the state file locked for as
+/// long as that takes. Dropping unlocks first, which no copy outlives, so the state file
+/// can be opened again once the drop returns.
+#[derive(Debug)]
+pub(super) struct LockFile(File);
+
+impl LockFile {
+    /// Takes an exclusive lock on `file` without waiting.
+    fn try_take(file: File) -> Result<LockFile, TryLockError> {
+        file.try_lock().map(|()| LockFile(file))
+    }
+}
+
+impl Drop for LockFile {
+    fn drop(&mut self) {
+        // An error leaves the close that follows to release the lock, as before.
+        let _ = self.0.unlock();
+    }
+}
+
 /// Creates `db`'s lock file if missing and takes an exclusive `flock` on it; returns it
 /// and its name. The lock file is beside the file's one name ([`canonical_db`]), so a
-/// link to the file, or a linked directory, names the same lock. The lock goes with the
-/// descriptor: dropping the file, or the process ending, releases it.
-pub(super) fn take_lock(db: &Path) -> Result<(File, PathBuf), SqliteError> {
+/// link to the file, or a linked directory, names the same lock. Dropping the lock, or
+/// the process ending, releases it.
+pub(super) fn take_lock(db: &Path) -> Result<(LockFile, PathBuf), SqliteError> {
     let lock = canonical_lock(db)?;
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = OpenOptions::new()
@@ -142,8 +167,8 @@ pub(super) fn take_lock(db: &Path) -> Result<(File, PathBuf), SqliteError> {
         .write(true)
         .mode(0o600)
         .open(&lock)?;
-    match file.try_lock() {
-        Ok(()) => Ok((file, lock)),
+    match LockFile::try_take(file) {
+        Ok(taken) => Ok((taken, lock)),
         Err(error) => Err(lock_failed(db, lock, error)),
     }
 }
@@ -157,7 +182,7 @@ pub(super) fn take_lock(db: &Path) -> Result<(File, PathBuf), SqliteError> {
 pub struct StoreLock {
     db: PathBuf,
     lock: PathBuf,
-    _file: File,
+    _file: LockFile,
 }
 
 impl StoreLock {
@@ -188,15 +213,7 @@ impl StoreLock {
     /// The file's name cannot be resolved, the lock file cannot be opened, or the lock
     /// call failed.
     pub fn is_held(db: &Path) -> Result<bool, SqliteError> {
-        let opened = canonical_lock(db).and_then(|lock| Ok((File::open(&lock)?, lock)));
-        match opened {
-            Ok((file, lock)) => held(db, lock, file.try_lock()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(SqliteError::Io(format!(
-                "the lock of {}: {error}",
-                db.display()
-            ))),
-        }
+        probe_lock(db, || ())
     }
 
     /// The state file this locks, as the caller named it.
@@ -212,8 +229,28 @@ impl StoreLock {
     }
 }
 
-/// What a probing `try_lock` says: taken (and released again as the file closes) means
-/// nobody holds it, `WouldBlock` that someone does; any other failure is an error.
+/// [`StoreLock::is_held`], calling `probing` once the probe has tried the lock, so while
+/// the probe holds it when it took it: the instant in which a process forked by another
+/// thread would carry a copy of the probe's descriptor, which a test makes happen there.
+pub(super) fn probe_lock(db: &Path, probing: impl FnOnce()) -> Result<bool, SqliteError> {
+    let opened = canonical_lock(db).and_then(|lock| Ok((File::open(&lock)?, lock)));
+    match opened {
+        Ok((file, lock)) => {
+            let attempt = LockFile::try_take(file);
+            probing();
+            // The probe lets go as soon as it has its answer: consuming the lock drops it.
+            held(db, lock, attempt.map(drop))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(SqliteError::Io(format!(
+            "the lock of {}: {error}",
+            db.display()
+        ))),
+    }
+}
+
+/// What a probing `try_lock` says: taken (and released again at once) means nobody holds
+/// it, `WouldBlock` that someone does; any other failure is an error.
 pub(super) fn held(
     db: &Path,
     lock: PathBuf,

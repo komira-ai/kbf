@@ -4,17 +4,15 @@
 pub mod fake;
 pub mod pki;
 
-use std::path::PathBuf;
-
 use kbf_enroll::config::{Config, Host};
 use kbf_proto::kbf::enroll::v1::NodeFacts;
+use kbf_testkit::dir::TestDir;
 
-/// A fresh scratch directory.
-pub fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-enroll-it-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    std::fs::canonicalize(&dir).expect("canonical")
+/// A fresh scratch directory, removed when it drops (declare it before whatever writes
+/// into it). Its path is canonical.
+pub fn scratch(name: &str) -> TestDir {
+    let temp = std::fs::canonicalize(std::env::temp_dir()).expect("canonical");
+    TestDir::under(temp, &format!("kbf-enroll-it-{name}"))
 }
 
 /// A `kbf.toml` for a node that dials `127.0.0.1:port` and keeps its state under `root`.

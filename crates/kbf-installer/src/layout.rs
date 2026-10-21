@@ -10,16 +10,21 @@
 //!   releases/current.new, previous.new     a link being replaced (renamed over its name)
 //!   releases/previous                      link to <commit>, the one before it
 //!   state.json, state.json.bak             the state (crate::state) and the last good one
+//!   seq_floor                              the highest seq not allowed (a seed must exceed it)
 //!   work/                                  scratch of a stage in progress (crate::stage)
 //! /run/kbf-installer/lock                  the lock the state is read and written under
 //! /usr/share/kbf-installer/trust/          what offline verification trusts (package-owned)
 //!   gh, trusted_root.jsonl, installer.conf
+//! /usr/share/kbf-installer/seed/<commit12>/  the release the package carries (package-owned)
+//!   manifest.json, kbf-<commit>-<platform>.tar.gz, and that file with .sigstore.json
 //! ```
 //!
-//! macOS differs in four paths ([`Platform`]): the installer tree is root's
+//! macOS differs in these paths ([`Platform`]): the configuration directory is
+//! `/usr/local/etc/kbf` (`kbf.toml`, `installer.toml`, the tokens), the installer tree is root's
 //! `/usr/local/kbf-installer` (never a user-owned Homebrew prefix), the state is in
 //! `/var/db/kbf-installer` (with `work/`), the lock is `/var/run/kbf-installer/lock`, and the
-//! trust directory is `/usr/local/kbf-installer/trust` (the pkg's PREFIX/trust).
+//! trust directory is `/usr/local/kbf-installer/trust` (the pkg's PREFIX/trust) and the seed
+//! directory `/usr/local/kbf-installer/seed/<commit12>` (PREFIX/seed).
 //!
 //! Nothing else is named anywhere else: `kbf-deploy host ...`, the helper and the tests ask a
 //! [`Layout`]. The kbf runtime's own state, `/var/lib/kbf`, is not here and is never touched.
@@ -43,6 +48,30 @@ const LINUX_LOCK: &str = "/run/kbf-installer/lock";
 const MACOS_LOCK: &str = "/var/run/kbf-installer/lock";
 const LINUX_TRUST: &str = "/usr/share/kbf-installer/trust";
 const MACOS_TRUST: &str = "/usr/local/kbf-installer/trust";
+/// What the package installs: the trust directory and the seed directory are in it. The
+/// Mac pkg installs into the installer's own tree.
+const LINUX_PACKAGE: &str = "/usr/share/kbf-installer";
+const MACOS_PACKAGE: &str = MACOS_ROOT;
+/// The configuration directory, and the files `setup` keeps in it: `/etc/kbf` on Linux,
+/// `/usr/local/etc/kbf` on macOS (the launchd gate of the installer's job waits on the
+/// `installer.toml` there).
+const LINUX_CONFIG_DIR: &str = "/etc/kbf";
+const MACOS_CONFIG_DIR: &str = "/usr/local/etc/kbf";
+const LINUX_CONFIG: &str = "/etc/kbf/kbf.toml";
+const MACOS_CONFIG: &str = "/usr/local/etc/kbf/kbf.toml";
+const LINUX_INSTALLER_TOML: &str = "/etc/kbf/installer.toml";
+const MACOS_INSTALLER_TOML: &str = "/usr/local/etc/kbf/installer.toml";
+const LINUX_ENROLL_TOKEN: &str = "/etc/kbf/enroll.token";
+const MACOS_ENROLL_TOKEN: &str = "/usr/local/etc/kbf/enroll.token";
+const LINUX_API_TOKEN: &str = "/etc/kbf/api-token";
+const MACOS_API_TOKEN: &str = "/usr/local/etc/kbf/api-token";
+
+/// The directory of the packaged releases, one per build of the installer, in the package's
+/// directory.
+pub const SEED: &str = "seed";
+/// The root-owned file beside `state.json` that holds the highest `seq` that is not allowed (a
+/// staged release's `seq` must be strictly above it): decimal text, one number.
+pub const SEQ_FLOOR: &str = "seq_floor";
 
 /// The files of the trust directory.
 pub const GH: &str = "gh";
@@ -57,6 +86,10 @@ pub const PREVIOUS: &str = "previous";
 pub const NEW_SUFFIX: &str = ".new";
 /// A release being installed is made under this prefix in `releases/`, then renamed.
 pub const STAGE_PREFIX: &str = ".stage-";
+/// The helper's memory (replay floors, the last event), beside the state.
+pub const MEMORY: &str = "helper.json";
+/// The order spool, in the state directory.
+pub const ORDERS: &str = "orders";
 /// The state file's name, and the copy of the last good one.
 pub const STATE_FILE: &str = "state.json";
 pub const STATE_BACKUP: &str = "state.json.bak";
@@ -83,6 +116,15 @@ impl Platform {
     /// The platform this program was built for: macOS, else Linux.
     pub fn current() -> Platform {
         Platform::named(std::env::consts::OS)
+    }
+
+    /// The user database this platform has: `getent` on Linux, `dscl` on a Mac. The platform
+    /// is the layout's, not the build's, so a rehearsal and a test see the platform they plan.
+    pub fn user_db(self) -> kbf_host::user::UserDb {
+        match self {
+            Platform::Linux => kbf_host::user::UserDb::Getent,
+            Platform::MacOs => kbf_host::user::UserDb::Dscl,
+        }
     }
 
     /// The platform Rust calls `os` (`macos`, else Linux).
@@ -123,10 +165,57 @@ impl Platform {
         }
     }
 
+    /// kbf's configuration directory.
+    pub fn config_dir(self) -> &'static str {
+        match self {
+            Platform::Linux => LINUX_CONFIG_DIR,
+            Platform::MacOs => MACOS_CONFIG_DIR,
+        }
+    }
+
+    /// The node's `kbf.toml`.
+    pub fn kbf_toml(self) -> &'static str {
+        match self {
+            Platform::Linux => LINUX_CONFIG,
+            Platform::MacOs => MACOS_CONFIG,
+        }
+    }
+
+    /// The installer's settings, `installer.toml`.
+    pub fn installer_toml(self) -> &'static str {
+        match self {
+            Platform::Linux => LINUX_INSTALLER_TOML,
+            Platform::MacOs => MACOS_INSTALLER_TOML,
+        }
+    }
+
+    /// The enrollment token `setup` places.
+    pub fn enroll_token(self) -> &'static str {
+        match self {
+            Platform::Linux => LINUX_ENROLL_TOKEN,
+            Platform::MacOs => MACOS_ENROLL_TOKEN,
+        }
+    }
+
+    /// The first operator token.
+    pub fn api_token(self) -> &'static str {
+        match self {
+            Platform::Linux => LINUX_API_TOKEN,
+            Platform::MacOs => MACOS_API_TOKEN,
+        }
+    }
+
     fn trust(self) -> &'static str {
         match self {
             Platform::Linux => LINUX_TRUST,
             Platform::MacOs => MACOS_TRUST,
+        }
+    }
+
+    fn package(self) -> &'static str {
+        match self {
+            Platform::Linux => LINUX_PACKAGE,
+            Platform::MacOs => MACOS_PACKAGE,
         }
     }
 }
@@ -237,6 +326,19 @@ impl Layout {
         path_in(self.platform.state_dir(), STATE_BACKUP)
     }
 
+    /// The directory the node's update client reads `status.json` from: the state directory,
+    /// root's. A node's `kbf.toml` names it as `[daemon] update-dir`.
+    pub fn update_dir(&self) -> HostPath {
+        self.state_dir()
+    }
+
+    /// The order spool, `orders/` in the state directory: owned by the user the node runs
+    /// as (mode 0700, inside root's directory). A node's `kbf.toml` names it as
+    /// `[daemon] orders-dir`.
+    pub fn orders_dir(&self) -> HostPath {
+        path_in(self.platform.state_dir(), ORDERS)
+    }
+
     /// The lock the state is read and written under.
     pub fn lock(&self) -> HostPath {
         path(self.platform.lock())
@@ -245,6 +347,31 @@ impl Layout {
     /// The directory a stage makes its scratch directory in (`work/`).
     pub fn work_dir(&self) -> HostPath {
         path_in(self.platform.state_dir(), "work")
+    }
+
+    /// The node's own `kbf.toml`: its `mode` says what this host runs.
+    pub fn kbf_toml(&self) -> HostPath {
+        path(self.platform.kbf_toml())
+    }
+
+    /// kbf's configuration directory.
+    pub fn config_dir(&self) -> HostPath {
+        path(self.platform.config_dir())
+    }
+
+    /// The installer's settings: the file the launchd gate waits on, on a Mac.
+    pub fn installer_toml(&self) -> HostPath {
+        path(self.platform.installer_toml())
+    }
+
+    /// The enrollment token `setup` places.
+    pub fn enroll_token(&self) -> HostPath {
+        path(self.platform.enroll_token())
+    }
+
+    /// The first operator token.
+    pub fn api_token(&self) -> HostPath {
+        path(self.platform.api_token())
     }
 
     /// The directory of what offline verification trusts.
@@ -265,6 +392,24 @@ impl Layout {
     /// The host's settings (`installer.conf`), optional.
     pub fn settings(&self) -> HostPath {
         path_in(self.platform.trust(), SETTINGS)
+    }
+
+    /// `seed/<build>`, beside the trust directory: the release the package carries. `build`
+    /// is the first 12 hex digits of the commit this installer was built from, a plain name
+    /// (the caller checks that it is one).
+    pub fn seed_dir(&self, build: &str) -> HostPath {
+        path_in(&format!("{}/{SEED}", self.platform.package()), build)
+    }
+
+    /// A file of the seed directory of `build`, by its plain `name`.
+    pub fn seed_file(&self, build: &str, name: &str) -> HostPath {
+        path_in(self.seed_dir(build).as_str(), name)
+    }
+
+    /// `seq_floor`, beside the state: the highest `seq` that is not allowed (a staged
+    /// release's `seq` must be strictly above it).
+    pub fn seq_floor(&self) -> HostPath {
+        path_in(self.platform.state_dir(), SEQ_FLOOR)
     }
 }
 

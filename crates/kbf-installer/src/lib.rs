@@ -29,10 +29,18 @@
 //! - [`attest`]: `gh attestation verify`, pinned, offline, as an unprivileged user.
 //! - [`trust`] and [`settings`]: what the check believes without looking at its content
 //!   (`gh`, the trusted root, the host's settings) and the root-ownership check on it.
+//! - [`stage`]: the verify pipeline, in the order of the contract: size, digest,
+//!   attestation, shape, the binary's own report, the lease check, then the install behind a
+//!   `VERIFIED` marker; behind the [`stage::Verifier`] trait.
+//! - [`seed`]: the release the package itself carries, its manifest, and the rules by which an
+//!   order that names it ([`helper::fetcher_seed`]) is admitted. It goes through the same
+//!   [`stage`] pipeline as a fetched release.
 //! - [`archive`], [`binary`] and [`darwin`]: the tarball, the kind of executable and its
 //!   `--version --json`, and on macOS the quarantine attribute and the code signature.
 //! - [`envoy`]: the Envoy of a frontend host, rendered from settings and checked (a library
 //!   for the frontend-update path, with no command line).
+//! - [`proxy_verb`]: `kbf-installer proxy`, the host of the `kbf-proxy` runtime (the one
+//!   public port of a frontend host); it shares nothing with the root helper above.
 //! - [`proxy`]: the frontend proxy's update machinery, against traits (no socket, no child):
 //!   the swap orchestrator, and in `proxy::api` the update API (routes, bearer-token check,
 //!   the actor that owns one update, idempotent request ids).
@@ -51,28 +59,40 @@ pub mod attest;
 pub mod binary;
 pub mod cli;
 pub mod darwin;
+pub mod database;
+pub mod deploy;
 pub mod envoy;
 pub mod exit;
-#[cfg(test)]
-mod fixtures;
+pub mod fetch;
+#[cfg(any(test, feature = "testkit"))]
+pub mod fixtures;
 #[cfg(any(test, feature = "testkit"))]
 pub mod golden;
 pub mod helper;
 pub mod installer_toml;
 pub mod layout;
+pub mod migrate;
 pub mod proxy;
+pub mod proxy_verb;
 pub mod record;
+pub mod record_release;
 pub mod refusal;
 pub mod release;
 pub mod run;
+pub mod seed;
+#[cfg(test)]
+mod seed_fixture;
 pub mod settings;
+pub mod setup;
 pub mod spool;
+pub mod stage;
 pub mod state;
 pub mod state_v2;
 pub mod status_v2;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod trust;
+pub mod utc_stamp;
 pub mod version;
 
 use std::fmt;
@@ -128,6 +148,12 @@ impl std::str::FromStr for CommitId {
     }
 }
 
+impl AsRef<str> for CommitId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 impl fmt::Display for CommitId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -136,3 +162,5 @@ impl fmt::Display for CommitId {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod units_tests;

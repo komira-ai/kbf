@@ -3,21 +3,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use super::*;
+use kbf_testkit::dir::TestDir;
 
 const COMMIT: &str = "c0ffee0123456789c0ffee0123456789c0ffee01";
 
-/// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps")
-        .join("xtask-installer-tarball-unit")
-        .join(format!("{name}-{}", std::process::id()));
-    // Absent unless a run with this pid left it.
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// An empty directory of its own for one test, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    let beside = std::env::current_exe().expect("test binary");
+    let deps = beside.parent().expect("deps");
+    TestDir::under(deps.join("xtask-installer-tarball-unit"), name)
 }
 
 /// The source paths of one package.
@@ -180,7 +174,7 @@ fn the_same_inputs_are_the_same_bytes_whatever_their_times_and_order() {
 #[test]
 fn a_payload_that_is_not_the_contracts_is_refused() {
     // Catches: a glob that matched nothing shipping a payload that starts or trusts
-    // nothing, a unit that is not kbf-*.service or kbf.slice, a fourth or a missing
+    // nothing, a unit that is not kbf-*.service, kbf-*.socket or kbf.slice, a fourth or a missing
     // trust file, and a sub-directory in a unit directory reaching the host.
     let dir = scratch("refuse");
     let i = inputs(&dir);

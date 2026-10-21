@@ -327,6 +327,20 @@ kbf-server \
   version 3, objects held back by the guard, the bytes held and how long it took. A
   pass that fails is logged and runs again at the next start; until then nothing is
   evicted.
+- Joining a farm that holds data (a node registered with `--frontend`): a node whose
+  instance id (its advertise address) the farm has not seen, registering more than a
+  minute after the farm's first active member, is written `joining` whatever it says of
+  its index, and the frontend logs a warning. A joining node takes writes but is rank 1 of
+  nothing and is read last, so it never answers `FindMissingBlobs` for blobs it never got.
+  It stays `joining` through restarts and caught-up beats until the operator runs
+  `kbf cluster member <id> --state active`. Nothing copies the blobs that existed before
+  it joined: promote it when that is acceptable. Nodes that start within a minute of each
+  other to make a farm are active at once, but a farm whose nodes start more than a
+  minute apart leaves the later ones `joining` (safe, and visible in `GET /v1/members`),
+  and the storage update gate (`NotActive`) waits on a joining peer until it is promoted.
+  A `down` member cannot be promoted until it registers again, and then it is `joining`
+  again. A replacement host that reuses an advertise address is a known instance, so it
+  registers active with an empty store (a known limit: the instance id is the address).
 - The rebuild of the index (a node registered with `--frontend`, over either kind of cold
   store): a metadata log that has not finished one (a new or wiped directory, or an
   upgrade of a node that has run before) makes the node register as catching up, serve
@@ -501,7 +515,7 @@ metadata directory.
 `kbf.slice`, from templates compiled into the binary
 (`crates/kbf-deploy/templates/linux/`) and a settings file (`config.example` documents
 each key; an unknown or repeated key is refused). They are described, with every rule
-`check-units` applies, in [kbf-modes.md](kbf-modes.md). The converged form of these
+`check-units` applies, in [kbf-units.md](kbf-units.md). The converged form of these
 verbs (no `--mode`: four files for MinIO, `kbf-server` and `kbf-daemon`, with
 `--restart-minio` and `--uninstall`) is gone; the units above remain the hand-written
 example of that layout. A node that still runs `kbf-server.service` and
@@ -604,7 +618,7 @@ backup.
 
 ## What the tests check
 
-- `crates/kbf-it/tests/deploy_units.rs` runs `kbf-server`'s flag parser over the
+- `crates/kbf-integration-test/tests/deploy_units.rs` runs `kbf-server`'s flag parser over the
   `ExecStart=` of every server unit in `docs/deploy/`, checks that the planned flag
   above is still refused, that the worked example adds up and matches the converged
   daemon unit's `--actions-memory-max-gib`, and that the units keep the
@@ -613,7 +627,7 @@ backup.
   every daemon unit in `docs/deploy/`.
 - `kbf-deploy`'s tests (`src/linux/tests.rs`) refuse each bad setting and check that an
   unset key takes the default `config.example` shows. The mode verbs' rules and host
-  verbs are tested as [kbf-modes.md](kbf-modes.md) says; the swap verb's tests
+  verbs are tested as [kbf-units.md](kbf-units.md) says; the swap verb's tests
   (`src/linux/swap_tests.rs`) apply each plan into a scratch directory with the tools
   played by a fake, check what landed, and require a re-run to plan nothing; each
   missing prerequisite is a row that must be refused with its own refusal.

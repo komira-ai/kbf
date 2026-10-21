@@ -281,12 +281,26 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         self
     }
 
+    /// The same cache, calling `hook` from a write-pool writer after each batch's
+    /// `PutStaged` is applied to the index and before its blobs are answered, with the
+    /// batch's digests. The writer waits for `hook`, so a test can park it between the
+    /// two steps and read the cache there. Only with the `testkit` feature: a release
+    /// build has no hook. Set it before the cache stores anything; a second call keeps
+    /// the first hook.
+    #[cfg(feature = "testkit")]
+    #[must_use]
+    pub fn with_drain_hook(self, hook: DrainHook) -> Self {
+        let _ = self.writer.drain_hook.set(pool::HookCell(hook));
+        self
+    }
+
     /// The same cache, flushing only the staged objects that hold a digest `gate` says
     /// this node flushes (one flusher per digest, `kbf_storage::flush`). A sealed object
     /// of digests the node does not flush stays staged, whole, off the flusher's queue.
     /// Without a gate every sealed object is flushed.
     #[must_use]
     pub fn with_flush_gate(mut self, gate: Arc<dyn FlushGate>) -> Self {
+        self.writer.born.judge_by(Arc::clone(&gate));
         self.gate = Some(gate);
         self
     }
@@ -790,6 +804,7 @@ fn unexpected(applied: &Applied) -> CacheError {
 }
 
 mod batch;
+mod clear;
 mod consistency;
 mod direct;
 mod evict;
@@ -800,6 +815,7 @@ mod read;
 mod rebuild;
 mod stream;
 mod stream_store;
+mod tail;
 mod tier;
 mod touches;
 mod upload;
@@ -807,6 +823,7 @@ mod verify;
 mod write_group;
 
 pub use batch::BATCH_READS_IN_FLIGHT;
+pub use clear::FlushReport;
 pub use consistency::{
     EVICT_BATCH, EvictReady, HeldObject, NEEDS_V3, PASS_OPENS_PER_SEC, PassReport,
 };
@@ -815,13 +832,16 @@ pub use flush::{
     FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
 };
 pub use losses::Losses;
+#[cfg(feature = "testkit")]
+pub use pool::DrainHook;
 use pool::WritePool;
 pub use pool::{BATCH_BLOBS, BATCH_BYTES, BUFFERED_BLOB_BYTES, PoolConfig};
 pub use read::{BlobRead, MAX_DECODED_BLOB_BYTES, READ_WINDOW_BYTES};
 pub use rebuild::{ADOPT_RECORDS, RebuildConfig, RebuildReport};
 pub(crate) use stream::TierRange;
 pub use stream::{RecordStream, StreamedRecord};
-pub use tier::{TierStartError, TierStartup};
+pub use tail::{TailReport, TailState};
+pub use tier::{TierHealth, TierStartError, TierStartup};
 pub use touches::TouchConfig;
 use touches::Touches;
 pub(crate) use upload::BuiltSegment;

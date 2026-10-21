@@ -36,6 +36,16 @@ pub const DEFAULT_PATH: &str = "/etc/kbf/kbf.toml";
 /// The group bits and other bits that may not be set on the file: write.
 const WRITABLE_BY_OTHERS: u32 = 0o022;
 
+/// The name of the node-label setting, removed with `--label`: a file that still sets it
+/// is refused with [`LABEL_KEY_REMOVED`], not with the general unknown-key line.
+const REMOVED_LABEL: &str = "label";
+
+/// What a file that still has a `label` key is told: it names the key and the way out,
+/// and the node does not start. The flag's twin is `--label was removed` in
+/// [`crate::parse_with`].
+const LABEL_KEY_REMOVED: &str =
+    "`label` was removed: placement uses what the node reports (OSFamily, ISA); delete the key";
+
 /// The table of the file a flag's key is in, by the flag's long name; `None` for a flag
 /// that is in no group (which `config::tests` refuses for every flag of every mode, so a
 /// flag cannot be added without its key).
@@ -57,7 +67,11 @@ const GROUPS: &[(&str, &[&str])] = &[
             "http2-keepalive-interval-secs",
             "http2-keepalive-timeout-secs",
             "listen",
+            "metrics-listen",
             "reapi-max-streams",
+            "release-poll-every-secs",
+            "release-poll-refs",
+            "release-poll-repo",
             "releases-dir",
             "shutdown-timeout-secs",
             "storage-listen",
@@ -70,6 +84,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         "tls",
         &[
             "api-token-file",
+            "proxy-auth-file",
             "reapi-auth-policy",
             "reapi-tls-cert",
             "reapi-tls-key",
@@ -85,6 +100,7 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "scheduler",
         &[
+            "default-platform",
             "finished-retention-secs",
             "heartbeat-interval-ms",
             "input-tree-cache-bytes",
@@ -103,11 +119,14 @@ const GROUPS: &[(&str, &[&str])] = &[
             "history-objects",
             "invocation-memory",
             "invocations-open",
+            "ui",
         ],
     ),
     (
         "handover",
         &[
+            "admin-listen",
+            "await-takeover",
             "envoy-check-interval-ms",
             "envoy-check-timeout-ms",
             "envoy-unhealthy-threshold",
@@ -142,6 +161,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "hot-store-abandon",
             "hot-store-max-bytes",
             "meta-dir",
+            "object-store-secrets-dir",
             "store-put-attempts",
             "write-bytes-in-flight",
             "write-linger",
@@ -155,6 +175,9 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "storage-node",
         &[
+            "auto-promote",
+            "handoff-allow-degraded",
+            "handoff-settle-secs",
             "member-dwell-secs",
             "member-ttl-secs",
             "storage-weight",
@@ -163,6 +186,25 @@ const GROUPS: &[(&str, &[&str])] = &[
     ),
     ("log", &["log-dir", "log-files", "log-max-bytes"]),
     (
+        // Not `enroll` or `frontend`: those tables are the enrollment client's own.
+        "enroll-service",
+        &[
+            "ca-dev-file-signer",
+            "ca-dir",
+            "ca-signer",
+            "enroll-allow-unenforced-deny",
+            "enroll-cas-endpoint",
+            "enroll-cert-lifetime-secs",
+            "enroll-listen",
+            "enroll-max-in-flight",
+            "enroll-rate-burst",
+            "enroll-rate-per-minute",
+            "enroll-storage-port",
+            "enroll-worker-endpoint",
+            "frontend-name",
+        ],
+    ),
+    (
         "identity",
         &[
             "ca-cert",
@@ -170,7 +212,6 @@ const GROUPS: &[(&str, &[&str])] = &[
             "cert",
             "frontend",
             "key",
-            "label",
             "node-id",
             "server",
             "tls-server-name",
@@ -185,6 +226,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "daemon-user",
             "data-dir",
             "data-max-bytes",
+            "drain-deadline-secs",
             "driver",
             "image",
             "orders-dir",
@@ -435,6 +477,10 @@ pub fn file_args(
                     "key `{group}` in {} is outside a table: it belongs under [{g}]",
                     path.display()
                 ),
+                _ if group == REMOVED_LABEL => format!(
+                    "unknown key `{group}` in {}: {LABEL_KEY_REMOVED}",
+                    path.display()
+                ),
                 _ => format!(
                     "unknown key `{group}` in {}: settings are keys of tables, one per group",
                     path.display()
@@ -448,8 +494,13 @@ pub fn file_args(
             }
             let Some(arg) = known.get(key.as_str()) else {
                 problems.push(format!(
-                    "unknown key `{group}.{key}` in {}: kbf has no flag --{key} in this mode",
-                    path.display()
+                    "unknown key `{group}.{key}` in {}: {}",
+                    path.display(),
+                    if key == REMOVED_LABEL {
+                        LABEL_KEY_REMOVED.to_owned()
+                    } else {
+                        format!("kbf has no flag --{key} in this mode")
+                    }
                 ));
                 continue;
             };

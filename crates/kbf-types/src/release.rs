@@ -43,14 +43,14 @@ impl ReleasePlatform {
         }
     }
 
-    /// The tarballs a host of this platform needs for a release: `kbf` on Linux, `kbf-daemon`
-    /// on a Mac (`docs/design/pull-updates.md` section 5). The release store calls a platform
-    /// complete when it holds each of these with its attestation.
+    /// The tarballs a host of this platform needs for a release: `kbf` on every platform
+    /// (`docs/design/pull-updates.md` section 5). A Mac runs `kbf --mode=daemon` from its
+    /// release, and no darwin `kbf-daemon` is built (`docs/artifacts.md`). The release store
+    /// calls a platform complete when it holds each of these with its attestation.
     #[must_use]
     pub const fn components(self) -> &'static [&'static str] {
         match self {
-            Self::LinuxX86_64 | Self::LinuxArm64 => &["kbf"],
-            Self::DarwinArm64 => &["kbf-daemon"],
+            Self::LinuxX86_64 | Self::LinuxArm64 | Self::DarwinArm64 => &["kbf"],
         }
     }
 
@@ -118,6 +118,22 @@ mod tests {
             "macos-arm64",
         ] {
             assert_eq!(ReleasePlatform::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    /// Catches: a host asked for a tarball it does not run (the Mac was asked for a
+    /// `kbf-daemon` that is not built for darwin, so no Mac release was ever complete or
+    /// taken), and a platform with no component at all. The cross-crate pins are
+    /// `kbf-installer` (`the_components_of_each_platform_are_the_binary_its_host_runs`,
+    /// `an_order_naming_the_components_the_store_needs_passes_the_name_check`) and `kbf-it`
+    /// (`every_component_a_platform_needs_is_in_its_release_set`).
+    #[test]
+    fn each_platform_needs_the_tarballs_of_its_host() {
+        assert_eq!(ReleasePlatform::LinuxX86_64.components(), ["kbf"]);
+        assert_eq!(ReleasePlatform::LinuxArm64.components(), ["kbf"]);
+        assert_eq!(ReleasePlatform::DarwinArm64.components(), ["kbf"]);
+        for platform in ReleasePlatform::ALL {
+            assert!(!platform.components().is_empty(), "{platform}");
         }
     }
 }

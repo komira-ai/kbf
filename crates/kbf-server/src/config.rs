@@ -22,7 +22,8 @@ use kbf_meta::ServerId;
 use kbf_threads::disk::FreeSpace;
 
 use crate::identity::{DenyList, DenyListError};
-use crate::serve::{Api, Listeners, StreamTiming, WorkerTls};
+use crate::proxy_auth::{ProxySecret, ProxySecretError};
+use crate::serve::{Api, Behind, Listeners, StreamTiming, WorkerTls};
 use crate::stores::{S3Uri, StoreFlags, StoreUri, Stores, StoresError};
 use crate::token::{ApiToken, TokenFileError};
 
@@ -244,9 +245,23 @@ pub struct Args {
     /// calls, a storage node's `Register` and `Heartbeat`), so an edit takes effect
     /// without a restart. A `node` entry also refuses a storage certificate with that DNS
     /// name. A list that cannot be read after start refuses all of those calls. Needs
-    /// mutual TLS.
-    #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key", "worker_client_ca"])]
+    /// mutual TLS, or `--proxy-auth-file` (then only `node` entries can name a caller: the
+    /// proxy forwards a node id, not a certificate, so a `serial` or `spki-sha256` entry
+    /// never matches).
+    #[arg(long)]
     pub worker_deny_list: Option<PathBuf>,
+    /// A file holding the per-boot secret of the TLS-terminating proxy in front of this
+    /// server (`docs/design/frontend-proxy.md`, section 3): exactly 32 bytes, owned by the
+    /// server's user with mode 0600 or 0400, read at start. The proxy presents them as 64
+    /// lower-case hex digits in `x-kbf-proxy-auth`. With it, the REAPI, worker and operator
+    /// listeners take calls from loopback only, and believe `x-kbf-node-id` and
+    /// `x-kbf-role` only from a call that presents the secret; every other `x-kbf-*` header is dropped. The worker listener then
+    /// takes the proxy's identity in place of a client certificate (it needs no TLS flags),
+    /// and the operator API's writes must come through the proxy as well as carry the token (a
+    /// local `curl` write is refused). The storage listener is not covered: it keeps its own
+    /// mutual TLS. Without it, behavior is as before.
+    #[arg(long, value_name = "PATH")]
+    pub proxy_auth_file: Option<PathBuf>,
     /// How often, in seconds, a TLS listener looks at its certificate, key and client CA
     /// files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is
     /// applied to the next TLS handshake, with no restart and without ending a connection
@@ -275,6 +290,14 @@ pub struct Args {
     /// refused FAILED_PRECONDITION. The wait restarts whenever one can.
     #[arg(long, default_value_t = kbf_sched::UNSERVABLE_WAIT.as_secs())]
     pub unservable_wait_secs: u64,
+    /// The OS and architecture, as `<os>/<arch>` (`linux` or `macos`; `x86_64` or
+    /// `arm64`), of an action whose platform names no OS, no architecture and no ISA
+    /// level, so that it is not given to whichever node sorts first, a Mac among them.
+    /// Not applied to an action that asks for `xcode` or an iOS device, which only a
+    /// Mac reports. `none` applies no default: such an action runs on any node that
+    /// fits. Placement only: the action's digest and cache key do not change.
+    #[arg(long, default_value_t = kbf_front::DefaultPlatform::LINUX_X86_64)]
+    pub default_platform: kbf_front::DefaultPlatform,
     /// The memory rungs of an action, in GiB, ascending and each at least 1. The first
     /// is what an action that names no size (`kbf-book-mem-gib`) books. An action that
     /// passes its own memory limit runs again on the next rung above what it booked,
@@ -485,6 +508,28 @@ pub struct Args {
     /// Build history: `--history-objects` and `--history-index-root`.
     #[command(flatten)]
     pub history: crate::history::HistoryFlags,
+    /// The release poller: `--release-poll-every-secs`, `--release-poll-repo` and
+    /// `--release-poll-refs`.
+    #[command(flatten)]
+    pub release_poll: crate::release::poll::PollFlags,
+    /// Serves the web UI on the operator API (`--api-listen`): read-only pages under `/ui`
+    /// (`docs/design/kbf-ui-v1.md`). On by default; `--ui=false` turns it off, and `/ui` is
+    /// then a `404`. The UI is open: it asks for no login or certificate, and it shows
+    /// everything unredacted, the logs of builds and the arguments of failed commands, to
+    /// whoever reaches the operator API's port, whatever the REAPI policy says of
+    /// `--invocations-open`. Only `GET` and `HEAD` are served; the operator API's write
+    /// routes and their token are unchanged. Keep the operator API on loopback, or behind
+    /// the proxy and a network you trust
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        value_name = "BOOL"
+    )]
+    pub ui: bool,
 }
 
 /// This server in the tier registry. A farm runs one server today
@@ -519,6 +564,15 @@ pub enum ConfigError {
     /// The operator API token file is refused.
     #[error("--api-token-file: {0}")]
     ApiToken(#[from] TokenFileError),
+    /// The proxy's secret file is refused.
+    #[error("--proxy-auth-file: {0}")]
+    ProxyAuth(#[from] ProxySecretError),
+    /// `--worker-deny-list` with neither mutual TLS nor a proxy: nothing would read it.
+    #[error(
+        "--worker-deny-list needs mutual TLS (--worker-tls-cert, --worker-tls-key, \
+         --worker-client-ca) or --proxy-auth-file"
+    )]
+    DenyListWithoutIdentity,
     /// The release store's directory cannot be made.
     #[error("--releases-dir {dir}: {source}", dir = dir.display())]
     Releases {
@@ -594,6 +648,41 @@ impl Args {
         .resolve(space)
     }
 
+    /// The proxy in front of every listener, if `--proxy-auth-file` names its secret
+    /// ([`Behind`]; `None`: the server is reached directly).
+    ///
+    /// # Errors
+    /// The secret file or the `--worker-deny-list` file cannot be read, or the secret is
+    /// not one the proxy can present ([`ProxySecret::from_file`]). A deny list that cannot be
+    /// read or parsed, at open or at the recount for the warning, stops the start (it is
+    /// never ignored); the error names the flag's path and line, never the secret.
+    pub fn proxy(&self) -> Result<Option<Behind>, ConfigError> {
+        let Some(path) = self.proxy_auth_file.as_deref() else {
+            return Ok(None);
+        };
+        let secret = ProxySecret::from_file(path)?;
+        let deny_list = self
+            .worker_deny_list
+            .as_deref()
+            .map(DenyList::open)
+            .transpose()?;
+        if let Some(list) = &deny_list {
+            let inert = list.certificate_entries()?;
+            if inert > 0 {
+                tracing::warn!(
+                    entries = inert,
+                    "--worker-deny-list has serial or spki-sha256 entries, which never match \
+                     a call behind --proxy-auth-file (the proxy forwards a node id, not a \
+                     certificate): only node entries take effect"
+                );
+            }
+        }
+        Ok(Some(Behind {
+            secret: Arc::new(secret),
+            deny_list,
+        }))
+    }
+
     /// The listeners these flags describe.
     ///
     /// # Errors
@@ -602,6 +691,11 @@ impl Args {
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
         self.segment_upload_fits_write_bound()?;
         let reload = Duration::from_secs(self.tls_reload_interval_secs);
+        let deny_list = self
+            .worker_deny_list
+            .as_deref()
+            .map(DenyList::open)
+            .transpose()?;
         let worker_tls = match (
             &self.worker_tls_cert,
             &self.worker_tls_key,
@@ -617,14 +711,13 @@ impl Args {
                     },
                     reload,
                 )?,
-                deny_list: self
-                    .worker_deny_list
-                    .as_deref()
-                    .map(DenyList::open)
-                    .transpose()?,
+                deny_list: deny_list.clone(),
             }),
             _ => None,
         };
+        if deny_list.is_some() && worker_tls.is_none() && self.proxy_auth_file.is_none() {
+            return Err(ConfigError::DenyListWithoutIdentity);
+        }
         let reapi_tls = match (&self.reapi_tls_cert, &self.reapi_tls_key) {
             (Some(cert), Some(key)) => Some(TlsSource::files(
                 "reapi",
@@ -646,6 +739,7 @@ impl Args {
             hello_wait: Duration::from_secs(10),
             tick: Duration::from_secs(1),
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
+            default_platform: self.default_platform,
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {
@@ -784,6 +878,7 @@ impl Args {
             token,
             local_cache,
             releases,
+            poll: self.release_poll.config(),
         }))
     }
 
@@ -847,6 +942,18 @@ impl Args {
 pub fn s3_store(uri: &S3Uri, env: impl Fn(&str) -> Option<String>) -> Result<S3Store, ConfigError> {
     let need = |name: &'static str| env(name).ok_or(ConfigError::MissingEnv(name));
     let credentials = Credentials::new(need("AWS_ACCESS_KEY_ID")?, need("AWS_SECRET_ACCESS_KEY")?);
+    Ok(S3Store::new(s3_config(uri, credentials))?)
+}
+
+/// The store `uri` names, signed with `credentials` that did not come from the
+/// environment (the key pair a frontend registered).
+///
+/// # Errors
+/// The configuration is refused.
+pub(crate) fn s3_store_keyed(
+    uri: &S3Uri,
+    credentials: Credentials,
+) -> Result<S3Store, ConfigError> {
     Ok(S3Store::new(s3_config(uri, credentials))?)
 }
 

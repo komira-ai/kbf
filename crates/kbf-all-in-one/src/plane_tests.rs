@@ -98,13 +98,12 @@ fn a_gone_server_half_fails_every_call() {
 #[test]
 fn a_file_changed_after_the_walk_is_not_stored() {
     // Under the test binary's directory: unit tests get no `CARGO_TARGET_TMPDIR`.
-    let dir = std::env::current_exe()
+    let beside = std::env::current_exe()
         .expect("test binary")
         .parent()
         .expect("deps")
-        .join("kbf-all-in-one-unit")
-        .join(format!("changed-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch");
+        .join("kbf-all-in-one-unit");
+    let dir = kbf_testkit::dir::TestDir::under(beside, "changed");
     let walked = b"what the walk hashed";
     std::fs::write(dir.join("out"), walked).expect("write");
     let stamp = Stamp::of(&std::fs::File::open(dir.join("out")).expect("open")).expect("stamp");
@@ -275,6 +274,214 @@ fn put_chunks_of_a_large_blob_without_a_server_half_is_unavailable() {
     );
 }
 
+/// `parts` as the chunks of a blob.
+fn parts(parts: &[&[u8]]) -> Chunks {
+    let chunks: Vec<std::io::Result<Vec<u8>>> = parts.iter().map(|p| Ok(p.to_vec())).collect();
+    Box::pin(futures::stream::iter(chunks))
+}
+
+/// Catches a streamed store that drops a blob, re-reads one the cache holds, or says
+/// stored for bytes it did not keep (mutants: the held-blob return removed, so the
+/// chunks are read again; the result taken for `Ok` whatever the store answered): a
+/// blob streamed in two chunks is `Ok`, is held after and reads back; the same blob
+/// again is `Ok` without one chunk read. `put_streamed` is called directly with small
+/// blobs: through `put_chunks` it takes only blobs over `MAX_UNSTAGED_BLOB_BYTES`, and
+/// the test of those is too slow for the fast run.
+#[test]
+fn a_streamed_blob_is_stored_and_not_read_again_once_held() {
+    let server = server();
+    let plane = plane(&server);
+    server.block_on(async {
+        let digest = digest_of(b"streamed blob");
+        let stored = plane
+            .put_streamed(digest.clone(), parts(&[b"streamed", b" blob"]))
+            .await;
+        assert_eq!(stored, Ok(digest.clone()));
+        assert!(
+            plane
+                .missing(std::slice::from_ref(&digest))
+                .await
+                .is_empty()
+        );
+        assert_eq!(plane.get(&digest).await, Ok(b"streamed blob".to_vec()));
+        let never: Chunks = Box::pin(futures::stream::once(async {
+            panic!("a chunk of a held blob was read")
+        }));
+        assert_eq!(plane.put_streamed(digest.clone(), never).await, Ok(digest));
+    });
+}
+
+/// Catches bytes stored under a digest that is not theirs, or too many bytes taken for
+/// the blob (mutants: the `DigestMismatch` arm answering `Unavailable`, or the other
+/// store errors answering `Corrupt`): a blob whose bytes hash to another digest is
+/// `Corrupt`, naming the claimed digest and the one its bytes have, and is not held; one
+/// with more bytes than its digest's size, which the store refuses, is `Unavailable`
+/// and not held.
+#[test]
+fn a_streamed_blob_with_other_bytes_than_its_digest_is_refused() {
+    let server = server();
+    let plane = plane(&server);
+    server.block_on(async {
+        let claimed = digest_of(b"the bytes claimed");
+        let wrong = plane
+            .put_streamed(claimed.clone(), parts(&[b"the bytes sent!!"]))
+            .await;
+        assert!(
+            matches!(&wrong, Err(CasError::Corrupt(blob, actual))
+                if *blob == label(&claimed) && *actual == label(&digest_of(b"the bytes sent!!"))),
+            "{wrong:?}"
+        );
+        assert_eq!(
+            plane.missing(std::slice::from_ref(&claimed)).await,
+            [claimed]
+        );
+
+        // Far more than the digest names: the store refuses the body before it ends,
+        // while a few bytes too many show only as another digest at the end (above).
+        let named = digest_of(b"short");
+        let flood = vec![b'x'; 4096];
+        let long = plane
+            .put_streamed(named.clone(), parts(&[b"short", &flood]))
+            .await;
+        assert!(matches!(long, Err(CasError::Unavailable(..))), "{long:?}");
+        assert_eq!(plane.missing(std::slice::from_ref(&named)).await, [named]);
+    });
+}
+
+/// Catches a chunk that could not be read reported as the store's failure, or the
+/// upload taken for stored (mutant: the note of the failed chunk dropped): a stream
+/// whose second chunk fails is `Read` with the chunk's error, and the blob is not held.
+#[test]
+fn a_streamed_blob_whose_chunk_cannot_be_read_is_a_read_failure() {
+    let server = server();
+    let plane = plane(&server);
+    server.block_on(async {
+        let digest = digest_of(b"unreadable blob");
+        let chunks: Vec<std::io::Result<Vec<u8>>> = vec![
+            Ok(b"unreadable".to_vec()),
+            Err(std::io::Error::other("the file went away")),
+        ];
+        let read = plane
+            .put_streamed(digest.clone(), Box::pin(futures::stream::iter(chunks)))
+            .await;
+        assert!(
+            matches!(&read, Err(CasError::Read(blob, why))
+                if *blob == label(&digest) && why.contains("the file went away")),
+            "{read:?}"
+        );
+        assert_eq!(plane.missing(std::slice::from_ref(&digest)).await, [digest]);
+    });
+}
+
+/// Catches a digest that is not a SHA-256 one handed to the store, or a gone server half
+/// taken for stored: `put_streamed` of a hash that is not hex is `Unavailable` and says
+/// so, and with the server half's runtime shut down is `Unavailable` and says the server
+/// half did not answer, not `Read` or `Corrupt`.
+#[test]
+fn a_streamed_blob_is_unavailable_for_a_bad_digest_or_a_gone_server_half() {
+    let server = server();
+    let plane = plane(&server);
+    let bad = Digest {
+        hash: "not hex".to_owned(),
+        size_bytes: 3,
+    };
+    let refused = server.block_on(plane.put_streamed(bad, parts(&[b"abc"])));
+    assert!(
+        matches!(&refused, Err(CasError::Unavailable(_, why)) if why == "not a SHA-256 digest"),
+        "{refused:?}"
+    );
+    drop(server);
+    let here = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let digest = digest_of(b"abc");
+    let gone = here.block_on(plane.put_streamed(digest, parts(&[b"abc"])));
+    assert!(
+        matches!(&gone, Err(CasError::Unavailable(_, why)) if why.contains("did not answer")),
+        "{gone:?}"
+    );
+}
+
+/// Catches a small blob stored with other bytes than its digest's, or a failed read taken
+/// for stored (mutants: the digest compare dropped; a chunk's error answered as the
+/// store's): `put_chunks` of a small blob in two chunks is `Ok` and held; one whose
+/// bytes hash to another digest is `Corrupt` naming the claimed digest and the actual
+/// one, and is not held; one whose chunk fails is `Read` with the chunk's error. (The
+/// same arms for a blob over `MAX_UNSTAGED_BLOB_BYTES` are in the slow test.)
+#[test]
+fn put_chunks_gathers_a_small_blob_and_refuses_one_that_is_not_its_digest() {
+    let server = server();
+    let plane = plane(&server);
+    server.block_on(async {
+        let small = digest_of(b"small blob");
+        let stored = plane
+            .put_chunks(small.clone(), parts(&[b"small", b" blob"]))
+            .await;
+        assert_eq!(stored, Ok(small.clone()));
+        assert_eq!(plane.get(&small).await, Ok(b"small blob".to_vec()));
+
+        let claimed = digest_of(b"claimed bytes");
+        let wrong = plane
+            .put_chunks(claimed.clone(), parts(&[b"other bytes!!"]))
+            .await;
+        assert!(
+            matches!(&wrong, Err(CasError::Corrupt(blob, actual))
+                if *blob == label(&claimed) && *actual == label(&digest_of(b"other bytes!!"))),
+            "{wrong:?}"
+        );
+        assert_eq!(
+            plane.missing(std::slice::from_ref(&claimed)).await,
+            [claimed]
+        );
+
+        let chunks: Vec<std::io::Result<Vec<u8>>> = vec![
+            Ok(b"unread".to_vec()),
+            Err(std::io::Error::other("the file went away")),
+        ];
+        let unread = digest_of(b"unreadable");
+        let read = plane
+            .put_chunks(unread.clone(), Box::pin(futures::stream::iter(chunks)))
+            .await;
+        assert!(
+            matches!(&read, Err(CasError::Read(blob, why))
+                if *blob == label(&unread) && why.contains("the file went away")),
+            "{read:?}"
+        );
+        assert_eq!(plane.missing(std::slice::from_ref(&unread)).await, [unread]);
+    });
+}
+
+/// Catches a blob over `MAX_UNSTAGED_BLOB_BYTES` gathered in memory, and a small blob
+/// reported stored when the server half is gone (mutants: the size test dropped, so every
+/// blob is gathered; the store's error dropped): a digest of one byte over the limit is
+/// handed to the streamed store (its answer for a hash that is not hex, with no chunk
+/// read, where a gathered blob would be `Corrupt`); a small blob with the server half's
+/// runtime gone is `Unavailable`.
+#[test]
+fn put_chunks_streams_a_digest_over_the_limit_and_a_small_blob_needs_the_server_half() {
+    let server = server();
+    let plane = plane(&server);
+    let over = Digest {
+        hash: "not hex".to_owned(),
+        size_bytes: i64::try_from(MAX_UNSTAGED_BLOB_BYTES + 1).expect("size"),
+    };
+    let never: Chunks = Box::pin(futures::stream::once(async {
+        panic!("a chunk of a blob over the limit was gathered")
+    }));
+    let streamed = server.block_on(plane.put_chunks(over, never));
+    assert!(
+        matches!(&streamed, Err(CasError::Unavailable(_, why)) if why == "not a SHA-256 digest"),
+        "{streamed:?}"
+    );
+    drop(server);
+    let here = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let small = digest_of(b"small");
+    let gone = here.block_on(plane.put_chunks(small, parts(&[b"small"])));
+    assert!(matches!(gone, Err(CasError::Unavailable(..))), "{gone:?}");
+}
+
 /// Catches a `read_to` that writes other bytes than the blob's, takes a blob whose
 /// bytes fail their digest (past its first window) for read, answers a file it cannot
 /// write as anything but `Write`, or a blob not held as anything but `Missing`. A held
@@ -284,6 +491,12 @@ fn put_chunks_of_a_large_blob_without_a_server_half_is_unavailable() {
 fn read_to_writes_the_blob_or_says_why_not() {
     use kbf_meta::BlobAnswer;
     use kbf_objstore::{ByteRange, ObjectStore};
+    let beside = std::env::current_exe()
+        .expect("test binary")
+        .parent()
+        .expect("deps")
+        .join("kbf-all-in-one-unit");
+    let dir = kbf_testkit::dir::TestDir::under(beside, "read-to");
     let server = server();
     let cache = {
         let _context = server.enter();
@@ -294,7 +507,7 @@ fn read_to_writes_the_blob_or_says_why_not() {
         LocalStore::new(Arc::clone(&cache), SegmentsConfig::DEFAULT)
     };
     let plane = LocalDataPlane::new(store, server.handle().clone());
-    let path = std::env::temp_dir().join(format!("kbf-read-to-{}", std::process::id()));
+    let path = dir.join("blob");
     server.block_on(async {
         let held = plane.put(b"held bytes".to_vec()).await.expect("put");
         let mut file = tokio::fs::File::create(&path).await.expect("create");
@@ -337,5 +550,4 @@ fn read_to_writes_the_blob_or_says_why_not() {
             "{damaged:?}"
         );
     });
-    let _ = std::fs::remove_file(&path);
 }

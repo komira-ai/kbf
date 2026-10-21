@@ -11,6 +11,7 @@
 //! daemons' worker listener) counts into the same families.
 
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
@@ -18,12 +19,17 @@ use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use futures::FutureExt as _;
 use kbf_front::{Cache, MetaLog};
 use kbf_objstore::ObjectStore;
 use kbf_storage::local_cache::{Fill, LocalCache};
 use kbf_tls::TlsSource;
 
+use crate::listen::{Binder, Socket};
 use crate::members::Members;
+use crate::proxy_auth::Caller;
+use crate::serve::{ServeError, StorageSocket, bind};
+use crate::start::AbortOnDrop;
 
 /// The media type of the answer: the Prometheus text exposition format.
 pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -35,6 +41,7 @@ pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
 struct Extras {
     local: Option<Arc<LocalCache>>,
     history: Option<Arc<crate::history::Stats>>,
+    poll: Option<Arc<crate::release::poll::Stats>>,
 }
 
 impl Extras {
@@ -45,6 +52,9 @@ impl Extras {
         }
         if let Some(history) = self.history {
             history.render(out);
+        }
+        if let Some(poll) = self.poll {
+            poll.render(out);
         }
     }
 }
@@ -75,6 +85,7 @@ pub fn router<M, O>(
     cache: Arc<Cache<M, O>>,
     local: Option<Arc<LocalCache>>,
     history: Option<Arc<crate::history::Stats>>,
+    poll: Option<Arc<crate::release::poll::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
 ) -> Router
@@ -86,13 +97,17 @@ where
         .route("/metrics", get(metrics::<M, O>))
         .with_state(Sources {
             cache,
-            extras: Extras { local, history },
+            extras: Extras {
+                local,
+                history,
+                poll,
+            },
             members,
             tls: tls.into(),
         })
 }
 
-async fn metrics<M, O>(State(sources): State<Sources<M, O>>) -> Response
+async fn metrics<M, O>(_gated: Caller, State(sources): State<Sources<M, O>>) -> Response
 where
     M: MetaLog,
     O: ObjectStore + 'static,
@@ -106,6 +121,71 @@ where
     scrape_health(&mut text, sources.members.as_ref()).await;
     kbf_tls::render_metrics(sources.tls.iter(), &mut text);
     ([(CONTENT_TYPE, TEXT_FORMAT)], text).into_response()
+}
+
+/// A storage node's `/metrics` listener (`--metrics-listen`): the same route, over the
+/// node's cache, on a listener of its own, since the node has no operator API. Plain
+/// HTTP on any address, as the frontend's operator API is, and for the same reason: it
+/// names no blob, build or node, only counts and latencies. Bound with the node's
+/// storage socket ([`NodeMetrics::bind`]) so a taken address fails the start, and served
+/// once the cache is open ([`NodeMetrics::serve`]).
+pub(crate) struct NodeMetrics {
+    listener: tokio::net::TcpListener,
+    addr: SocketAddr,
+}
+
+impl NodeMetrics {
+    /// Binds `addr` through `binder` (so a late interface is waited for out of the start's
+    /// one budget), on the runtime that will serve it.
+    ///
+    /// # Errors
+    /// The address cannot be bound, or the runtime cannot register the socket.
+    pub fn bind(addr: SocketAddr, binder: &Binder) -> Result<Self, ServeError> {
+        let socket = Socket::bind(addr, binder)?;
+        let addr = socket.local;
+        socket.http().map(|listener| Self { listener, addr })
+    }
+
+    /// Serves `/metrics` over `cache` (and `local`'s fill, when the process has one
+    /// cache for the daemon half and the store; and the reloads of the listener's
+    /// `tls`) until the returned task is dropped: where it listens, and the task.
+    pub fn serve<M, O>(
+        self,
+        cache: Arc<Cache<M, O>>,
+        local: Option<Arc<LocalCache>>,
+        tls: Option<TlsSource>,
+    ) -> (SocketAddr, AbortOnDrop)
+    where
+        M: MetaLog,
+        O: ObjectStore + 'static,
+    {
+        let routes = router(cache, local, None, None, None, tls.into_iter().collect());
+        // `pending` is its stop, so it ends only when the task is aborted; an error of
+        // the accept loop has nothing to be reported to.
+        // The node is not behind the proxy: no secret, so `gate_requests` admits a direct caller.
+        let serving =
+            crate::serve::serve_api(Some(self.listener), routes, std::future::pending(), None);
+        (self.addr, AbortOnDrop(tokio::spawn(serving.map(drop))))
+    }
+}
+
+/// A storage node's two listeners, the storage socket and, when `--metrics-listen` is
+/// given, the `/metrics` one, bound through one [`Binder`]: both wait for a late interface
+/// out of the same budget, as the frontend's three do.
+///
+/// # Errors
+/// Either address cannot be bound.
+pub(crate) fn bind_node_sockets(
+    listen: SocketAddr,
+    metrics: Option<SocketAddr>,
+    binder: &Binder,
+) -> Result<(StorageSocket, Option<NodeMetrics>), ServeError> {
+    let (incoming, addr) = bind(listen, binder)?;
+    let socket = StorageSocket { incoming, addr };
+    let metrics = metrics
+        .map(|addr| NodeMetrics::bind(addr, binder))
+        .transpose()?;
+    Ok((socket, metrics))
 }
 
 /// Appends the storage health of `members`, when there are any; not generic, so every

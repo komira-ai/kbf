@@ -85,6 +85,7 @@ use super::{
     refused_as,
 };
 use crate::action_usage::Subject;
+use crate::machine::Platform;
 use crate::state_store::StateStore;
 
 use self::inflight::Submitted;
@@ -998,6 +999,16 @@ impl State {
         }
     }
 
+    /// Whether the finish of `operation` (its answer or refusal) is held back, unwritten.
+    /// Bounded by what is held, which is capped.
+    pub(super) fn finish_held(&self, operation: OperationId) -> bool {
+        self.unwritten.iter().flatten().any(|effect| match effect {
+            Effect::Answer(answer) => answer.operation == operation,
+            Effect::Refuse(refusal) => refusal.operation == operation,
+            Effect::Start(_) | Effect::Commit(_) | Effect::Waiting(_) => false,
+        })
+    }
+
     /// Forgets the details parked for the answers among `dropped` effects, which will
     /// never be written. The details of answers the store has taken stay: they are
     /// settled after this feed's writes, whatever a later record does.
@@ -1005,6 +1016,8 @@ impl State {
         for effect in dropped {
             if let Effect::Answer(answer) = effect {
                 self.parked.remove(&answer.lease);
+                // Never written, so never acknowledged: the daemon keeps the result.
+                self.owed.remove(&answer.lease);
             }
         }
     }
@@ -1142,6 +1155,7 @@ impl State {
             kind: op.request.kind,
             do_not_cache: op.request.do_not_cache,
             queued: now,
+            platform: Platform::of(&op.request.needs),
             // A row from a writer that did not record the subject (an older build)
             // leaves the `action usage:` line naming the empty shape.
             usage: op
@@ -1227,8 +1241,26 @@ impl State {
         match submitted {
             Some(Submitted::Queued(used)) => self.sched.skip_to(used),
             Some(Submitted::Joined(op)) => {
+                // The store names an operation the scheduler holds and has no twin
+                // for: it finished it, and the finish (which removes the rows) is
+                // held back. The request cannot join a finished operation, and
+                // taking the rows up again would run the action twice. It asks again:
+                // once the finish is written, the rows are gone and it queues afresh
+                // (or the cache answers it).
+                //
+                // The scheduler retires a finished operation after its retention
+                // whether or not the finish was written, so the held finish itself is
+                // asked too: while it waits, the operation's rows are not free.
+                if self.sched.state(op.operation).is_some() || self.finish_held(op.operation) {
+                    return Err(Status::unavailable(
+                        "the action's previous run is finishing; the request is not queued",
+                    ));
+                }
                 let recovered = self.take_stored(*op, SystemTime::now());
-                self.sched.take_in(recovered);
+                // The operation is neither in the scheduler nor finished (checked
+                // above), so `take_in` has nothing to refuse.
+                let taken = self.sched.take_in(recovered);
+                debug_assert!(taken, "the stored operation was already in the scheduler");
             }
             None => {}
         }

@@ -5,7 +5,6 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kbf_map::MemberId;
@@ -34,16 +33,12 @@ pub enum Backing {
 pub struct Cell {
     store: Arc<dyn Store>,
     sqlite: Option<(Arc<SqliteStore>, PathBuf)>,
+    /// The directory of the SQLite file, last so it is removed after the store is closed.
+    _dir: Option<kbf_testkit::dir::TestDir>,
 }
 
-fn scratch(name: &str) -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let n = NEXT.fetch_add(1, Ordering::SeqCst);
-    let pid = std::process::id();
-    let dir =
-        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("kbf-update-{name}-{pid}-{n}"));
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("kbf-update-{name}"))
 }
 
 impl Cell {
@@ -55,14 +50,17 @@ impl Cell {
                 Self {
                     store: Arc::new(fake),
                     sqlite: None,
+                    _dir: None,
                 }
             }
             Backing::Sqlite => {
-                let path = scratch(name).join("state.db");
+                let dir = scratch(name);
+                let path = dir.join("state.db");
                 let store = Self::open(&path);
                 Self {
                     store: Arc::clone(&store) as Arc<dyn Store>,
                     sqlite: Some((store, path)),
+                    _dir: Some(dir),
                 }
             }
         }

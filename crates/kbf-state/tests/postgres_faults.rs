@@ -9,12 +9,13 @@
 //! expects to end has a bound so a lost wake-up fails the test and does not hang it.
 #![cfg(feature = "postgres")]
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use kbf_state::postgres::{Flaw, PostgresBackend, PostgresConfig, PostgresStore};
+use kbf_state::postgres::{Flaw, PostgresBackend, PostgresConfig, PostgresStore, schema};
 use kbf_state::{Cond, Revision, Store, StoreError, Txn, Version};
 use postgres::{Client, NoTls};
 
@@ -126,12 +127,64 @@ fn limited_role(admin: &mut Client, name: &str, limit: i32) -> String {
     as_user(&url(), name)
 }
 
-fn limited_config(url: &str, backend: &PostgresBackend) -> PostgresConfig {
-    let schema = config(backend).schema().to_owned();
-    PostgresConfig::parse(url)
-        .and_then(|c| c.with_schema(&schema))
+/// How many backends the server has for `role`.
+fn backends_of(admin: &mut Client, role: &str) -> i64 {
+    admin
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE usename = $1",
+            &[&role],
+        )
+        .expect("the activity view")
+        .get(0)
+}
+
+/// Waits until the server has no backend for `role`. A client that drops its connection
+/// (the installer step that made the schema) has only sent the goodbye: the server frees
+/// the role's slot when its backend exits, a moment later, and a role limited to one
+/// connection refuses the next connect until then (SQLSTATE 53300). The bound only ends
+/// a hang.
+fn wait_for_no_backend_of(admin: &mut Client, role: &str) {
+    until(&format!("the backends of {role} to exit"), || {
+        backends_of(admin, role) == 0
+    });
+}
+
+/// Opens the store on a one-connection role, again while the server refuses it for the
+/// role's limit, and counts each refusal in `refusals`. Any other error panics at once.
+///
+/// It exists because [`wait_for_no_backend_of`] can return a moment before the slot is
+/// free. Postgres clears a backend's `pg_stat_activity` row in `pgstat_beshutdown_hook`
+/// (a `before_shmem_exit` callback) and releases its process slot, the one the
+/// connection limit counts, later in `ProcKill` (an `on_shmem_exit` callback), so a
+/// connect between the two is refused with SQLSTATE 53300. The bound only ends a hang.
+fn open_when_the_slot_is_free(config: &PostgresConfig, refusals: &AtomicU64) -> PostgresStore {
+    let started = Instant::now();
+    loop {
+        match PostgresStore::open(config) {
+            Ok(store) => return store,
+            Err(StoreError::Failed(why)) if why.contains("SQLSTATE 53300") => {
+                assert!(
+                    started.elapsed() < BOUND,
+                    "still refused after {BOUND:?}: {why}"
+                );
+                refusals.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(other) => panic!("opens: {other:?}"),
+        }
+    }
+}
+
+/// The configuration for the limited role's own schema (`DROP OWNED BY` removes it with
+/// the role at the start of the next run).
+fn limited_config(url: &str, schema: &str) -> PostgresConfig {
+    let config = PostgresConfig::parse(url)
+        .and_then(|c| c.with_schema(schema))
         .expect("a usable URL")
-        .with_application_name(&schema)
+        .with_application_name(schema);
+    // The installer's step, as the role the store will connect as.
+    schema::apply(&config, &schema::embedded(), schema::latest()).expect("the installer's step");
+    config
 }
 
 // Catches a pool that keeps a session the server killed: the call that meets the dead
@@ -288,8 +341,7 @@ fn a_pool_of_two_opens_a_second_connection_and_makes_a_third_call_wait() {
 fn a_connection_the_server_refuses_does_not_take_a_pool_slot() {
     let mut admin = admin();
     let url = limited_role(&mut admin, "kbf_fault_pool", 2);
-    let backend = PostgresBackend::new(&url, Flaw::None);
-    let config = limited_config(&url, &backend).with_max_connections(3);
+    let config = limited_config(&url, "kbf_fault_pool_schema").with_max_connections(3);
     let store = Arc::new(PostgresStore::open(&config).expect("opens"));
     let held = store.begin(put("held")).expect("runs to the commit");
     let second = {
@@ -325,8 +377,10 @@ fn a_connection_the_server_refuses_does_not_take_a_pool_slot() {
 fn a_liveness_lock_whose_connection_is_refused_is_an_error() {
     let mut admin = admin();
     let url = limited_role(&mut admin, "kbf_fault_hold", 1);
-    let backend = PostgresBackend::new(&url, Flaw::None);
-    let store = PostgresStore::open(&limited_config(&url, &backend)).expect("opens");
+    let config = limited_config(&url, "kbf_fault_hold_schema");
+    wait_for_no_backend_of(&mut admin, "kbf_fault_hold");
+    // Only this first open is retried; the refusal the test is about comes after it.
+    let store = open_when_the_slot_is_free(&config, &AtomicU64::new(0));
     let Err(StoreError::Failed(why)) = store.hold_liveness(1) else {
         panic!("the holder connection is over the role's limit");
     };
@@ -392,7 +446,7 @@ fn pids(admin: &mut Client, app: &str) -> Vec<i32> {
 
 // Catches a store whose tables were dropped under it either hanging or handing out a
 // half-prepared session: every call fails with the server's words (the relation is
-// missing) until the tables are back, and the failed connection attempts leave no slot
+// missing) until the installer's step has made them again, and the failed connection attempts leave no slot
 // taken (a pool of two would block for good on a leaked slot), so the store works again
 // once they are.
 #[test]
@@ -415,8 +469,8 @@ fn a_store_whose_tables_were_dropped_fails_its_calls_and_recovers_when_they_retu
             "{said:?}"
         );
     }
-    let again = PostgresStore::open(&config).expect("creates the tables again");
-    again.txn(put("k")).expect("store").expect("commits");
+    schema::apply(&config, &schema::embedded(), schema::latest()).expect("the installer's step");
+    store.txn(put("k")).expect("store").expect("commits");
     assert!(store.get("k").expect("recovered").is_some());
 }
 
@@ -499,4 +553,95 @@ fn a_transaction_that_writes_nothing_commits_at_the_head_and_adds_no_feed_row() 
         .expect("store")
         .expect("commits");
     assert_eq!(commit.revision, Revision::ZERO);
+}
+
+// Catches a wait that returns while the role still has a backend: it ends a hang, and
+// the role's backends must be gone when it returns. The slot is held, the wait starts on
+// its own thread, and only then is the slot freed (`freed` is set before the drop). A
+// no-op wait, or one that filters on a column that never matches, returns while `freed` is
+// still false.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn the_wait_for_a_roles_backends_ends_only_after_they_are_gone() {
+    let waiter_admin = admin();
+    let mut admin = admin();
+    let url = limited_role(&mut admin, "kbf_slot_wait", 1);
+    let _config = limited_config(&url, "kbf_slot_wait_schema");
+    wait_for_no_backend_of(&mut admin, "kbf_slot_wait");
+
+    let held = Client::connect(&url, NoTls).expect("takes the role's one slot");
+    assert_eq!(backends_of(&mut admin, "kbf_slot_wait"), 1);
+    let started = Arc::new(AtomicBool::new(false));
+    let freed = Arc::new(AtomicBool::new(false));
+    let waiter = {
+        let (started, freed) = (Arc::clone(&started), Arc::clone(&freed));
+        thread::spawn(move || {
+            let mut admin = waiter_admin;
+            started.store(true, Ordering::SeqCst);
+            wait_for_no_backend_of(&mut admin, "kbf_slot_wait");
+            (
+                freed.load(Ordering::SeqCst),
+                backends_of(&mut admin, "kbf_slot_wait"),
+            )
+        })
+    };
+    until("the waiter to start", || started.load(Ordering::SeqCst));
+    assert_eq!(backends_of(&mut admin, "kbf_slot_wait"), 1, "still held");
+    freed.store(true, Ordering::SeqCst);
+    drop(held);
+    let (freed_when_it_returned, left) = waiter.join().expect("no panic");
+    assert!(
+        freed_when_it_returned,
+        "the wait returned with the slot held"
+    );
+    assert_eq!(left, 0);
+}
+
+// Catches an open that gives up on a refusal that is only the previous backend's slot not
+// yet released, and one that retries every error. The slot is held across the first
+// attempts; the helper counts its refusals, and only after it has refused once is the slot
+// freed, so the open must have retried and then succeeded. A helper that does not retry
+// panics on the first refusal.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn an_open_refused_for_the_roles_limit_is_retried_until_the_slot_is_free() {
+    let mut admin = admin();
+    let url = limited_role(&mut admin, "kbf_slot_retry", 1);
+    let config = limited_config(&url, "kbf_slot_retry_schema");
+    wait_for_no_backend_of(&mut admin, "kbf_slot_retry");
+
+    let held = Client::connect(&url, NoTls).expect("takes the role's one slot");
+    let refusals = Arc::new(AtomicU64::new(0));
+    let freer = {
+        let refusals = Arc::clone(&refusals);
+        thread::spawn(move || {
+            until("the open to be refused once", || {
+                refusals.load(Ordering::SeqCst) > 0
+            });
+            drop(held);
+        })
+    };
+    let _store = open_when_the_slot_is_free(&config, &refusals);
+    freer.join().expect("no panic");
+    assert!(refusals.load(Ordering::SeqCst) >= 1);
+}
+
+// Catches a retry that hides other failures: an open that fails for another reason (a
+// schema this store does not support, here a role that does not exist) fails at once.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn an_open_refused_for_another_reason_is_not_retried() {
+    let mut admin = admin();
+    let url = limited_role(&mut admin, "kbf_slot_other", 1);
+    let config = limited_config(&url, "kbf_slot_other_schema");
+    wait_for_no_backend_of(&mut admin, "kbf_slot_other");
+    admin
+        .batch_execute("ALTER ROLE kbf_slot_other NOLOGIN")
+        .expect("revokes the login");
+    let refusals = AtomicU64::new(0);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        open_when_the_slot_is_free(&config, &refusals)
+    }));
+    assert!(failed.is_err(), "an open that cannot log in succeeded");
+    assert_eq!(refusals.load(Ordering::SeqCst), 0, "it was retried");
 }

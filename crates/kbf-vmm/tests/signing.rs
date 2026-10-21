@@ -5,7 +5,7 @@
 //! Ignored by default: it runs `codesign` on copies of the stub, so the hosted macOS job
 //! runs it on its own (`cargo test -p kbf-vmm --test signing -- --ignored`). Each case
 //! says which defect it catches. The same comparisons on `codesign`'s text, without a
-//! Mac, are in crates/kbf-it/tests/darwin_entitlements.rs.
+//! Mac, are in crates/kbf-integration-test/tests/darwin_entitlements.rs.
 #![cfg(target_os = "macos")]
 
 use std::path::{Path, PathBuf};

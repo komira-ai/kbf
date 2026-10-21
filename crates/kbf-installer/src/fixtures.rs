@@ -1,5 +1,6 @@
-//! Test fixtures shared by the modules' tests: a runner that plays the programs, a
-//! trusted host, tarballs and inboxes.
+//! Test fixtures shared by the modules' tests (and, with the `testkit` feature, by the
+//! integration tests): a runner that plays the programs, a trusted host, tarballs and
+//! inboxes.
 
 use std::cell::RefCell;
 use std::io;
@@ -63,7 +64,7 @@ pub fn ran(code: i32, stdout: &str, stderr: &str) -> Ran {
 /// What `kbf --version --json` prints for a build of `commit` (12 digits are shown).
 pub fn version_json(commit: &str, profile: &str) -> String {
     format!(
-        "{{\"commit\":\"{}\",\"min_protocol\":3,\"profile\":\"{profile}\",\"protocol\":4,\
+        "{{\"admin_protocol\":1,\"commit\":\"{}\",\"meta_log\":4,\"min_protocol\":3,\"profile\":\"{profile}\",\"protocol\":4,\
          \"state_schema\":7,\"version\":\"0.1.0\"}}\n",
         &commit[..12]
     )

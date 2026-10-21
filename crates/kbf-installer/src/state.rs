@@ -30,6 +30,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -48,7 +49,12 @@ pub struct State {
     /// The release `previous` should point to: what a rollback goes back to. Only ever a
     /// confirmed release.
     pub previous: Option<CommitId>,
-    /// A release verified and ready to swap in.
+    /// The one release installed and waiting for a decision: a frontend update staged by the
+    /// proxy's order (until its confirm makes it current or its revert drops it) or by the
+    /// operator's `stage`. Every verb that makes a release current clears it when it names
+    /// that release: `activate`, `first`, the frontend's confirm, `revert`, and the operator's
+    /// `install` and `rollback`. The verify pipeline does not write it; whoever keeps a
+    /// verified release does.
     pub staged: Option<CommitId>,
     /// A release swapped in and not yet confirmed.
     pub pending_confirm: Option<PendingConfirm>,
@@ -119,6 +125,9 @@ pub struct PendingConfirm {
 pub enum StateError {
     #[error("cannot lock {path}: {source}")]
     Lock { path: PathBuf, source: io::Error },
+    /// Another run holds the lock and did not let go within the time given.
+    #[error("{path} is held by another run")]
+    Busy { path: PathBuf },
     #[error("cannot read {path}: {source}")]
     Read { path: PathBuf, source: io::Error },
     #[error("{path} is not an installer state: {source}")]
@@ -221,10 +230,39 @@ impl Files {
 
 /// The deploy lock, held: the only way to read the state for a change and to write it.
 /// Dropping it releases the lock.
+///
+/// An `flock` belongs to the open file description, not to the descriptor, and a
+/// description lives until every copy of the descriptor is closed. A process forked while
+/// the lock is held (any spawn of a child by another thread of this process) carries a
+/// copy until it execs, so closing the file would leave the host locked for as long as
+/// that takes. Dropping unlocks first, which no copy outlives, so the lock can be taken
+/// again once the drop returns.
 #[derive(Debug)]
 pub struct Locked {
-    _lock: File,
+    lock: File,
     files: Files,
+}
+
+impl Drop for Locked {
+    fn drop(&mut self) {
+        // An error leaves the close that follows to release the lock, as before.
+        let _ = self.lock.unlock();
+    }
+}
+
+/// Make the directory of the layout's lock file (0755) when it is missing: it is on a tmpfs,
+/// and a host the installer never ran on has none. [`Locked::acquire`] does it; a caller of
+/// [`Locked::acquire_within`], which does not, on a host that may be new does it first.
+pub fn make_lock_dir(host: &Layout) -> Result<(), StateError> {
+    use std::os::unix::fs::DirBuilderExt;
+    let path = host.join(&host.lock());
+    // A lock path always has a parent; the root stands in for the impossible case.
+    let dir = path.parent().unwrap_or(Path::new("/"));
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(dir)
+        .map_err(|source| StateError::Lock { path, source })
 }
 
 impl Locked {
@@ -232,19 +270,12 @@ impl Locked {
     /// directory is made, 0755, when missing), waiting while another run holds it. The lock
     /// file is made (mode 0600) when missing.
     pub fn acquire(host: &Layout) -> Result<Locked, StateError> {
+        make_lock_dir(host)?;
         let path = host.join(&host.lock());
         let fail = |source| StateError::Lock {
             path: path.clone(),
             source,
         };
-        use std::os::unix::fs::DirBuilderExt;
-        // A lock path always has a parent; the root stands in for the impossible case.
-        let dir = path.parent().unwrap_or(std::path::Path::new("/"));
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o755)
-            .create(dir)
-            .map_err(fail)?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -255,7 +286,37 @@ impl Locked {
             .map_err(fail)?;
         lock.lock().map_err(fail)?;
         Ok(Locked {
-            _lock: lock,
+            lock,
+            files: Files::of(host),
+        })
+    }
+
+    /// Like [`Locked::acquire`], but gives up with [`StateError::Busy`] if another run still
+    /// holds the lock after `wait`: for the operator's verbs, which report "busy" (exit 4)
+    /// rather than queue behind a pass.
+    pub fn acquire_within(host: &Layout, wait: Duration) -> Result<Locked, StateError> {
+        let path = host.join(&host.lock());
+        let fail = |source| StateError::Lock {
+            path: path.clone(),
+            source,
+        };
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(fail)?;
+        let end = Instant::now() + wait;
+        while lock.try_lock().is_err() {
+            if Instant::now() >= end {
+                return Err(StateError::Busy { path });
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(Locked {
+            lock,
             files: Files::of(host),
         })
     }

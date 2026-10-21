@@ -70,8 +70,8 @@ pub struct Proc {
     pub quiesce_at: Option<Duration>,
     /// A resumed child reports `Active` from this time on (it holds the generation at once).
     pub active_at: Option<Duration>,
-    pub executions: Until,
-    pub queued: Until,
+    pub streams: Until,
+    pub sessions: Until,
 }
 
 pub struct State {
@@ -80,6 +80,8 @@ pub struct State {
     pub migrate_err: Option<String>,
     pub takeover: Takeover,
     pub quiesce_takes: Duration,
+    /// How each child was started, in order.
+    pub starts: Vec<(Slot, Start)>,
     pub open_counts_err: bool,
     pub desired_err: bool,
     pub resume_fails: Vec<Slot>,
@@ -102,6 +104,8 @@ pub struct State {
     pub installed_err: bool,
     /// `status.json` cannot be read.
     pub staged_err: bool,
+    /// The `state_schema` the staged release reports.
+    pub staged_schema: u32,
     /// How long a resumed child takes to report `Active`.
     pub resume_lag: Duration,
     /// Each call is refused (the process is gone, the root half is down, ...).
@@ -122,6 +126,12 @@ pub struct State {
     pub fed: Vec<(Slot, usize)>,
     pub expired: usize,
     pub active: Slot,
+    /// `clear_active` ran and no release has set a slot since.
+    pub cleared: bool,
+    /// Slots the gate closed (`retire` answered `Closed`) and no release opened again.
+    pub retired: Vec<Slot>,
+    /// Slots the gate never opened: `retire` answers `NeverOpened`.
+    pub never_opened: Vec<Slot>,
     pub requests: Vec<(Duration, Request)>,
     pub events: Vec<(Duration, String)>,
     pub limit: Duration,
@@ -153,6 +163,7 @@ impl World {
                 migrate_err: None,
                 takeover: Takeover::Ok,
                 quiesce_takes: Duration::from_millis(200),
+                starts: Vec::new(),
                 open_counts_err: false,
                 desired_err: false,
                 resume_fails: Vec::new(),
@@ -167,6 +178,7 @@ impl World {
                 installed: Some(c(A)),
                 installed_err: false,
                 staged_err: false,
+                staged_schema: 3,
                 resume_lag: Duration::ZERO,
                 terminate_err: false,
                 kill_err: false,
@@ -183,6 +195,9 @@ impl World {
                 fed: Vec::new(),
                 expired: 0,
                 active: Slot::A,
+                cleared: false,
+                retired: Vec::new(),
+                never_opened: Vec::new(),
                 requests: Vec::new(),
                 events: Vec::new(),
                 limit: START + secs(48 * 3600),
@@ -223,8 +238,8 @@ impl World {
             holder: false,
             quiesce_at: None,
             active_at: None,
-            executions: Until(0, None),
-            queued: Until(0, None),
+            streams: Until(0, None),
+            sessions: Until(0, None),
         });
         ProcIdent {
             pid,
@@ -295,18 +310,19 @@ impl World {
         self.st.borrow_mut().scripts.push_back(s);
     }
 
-    /// Make the serving child hold `n` open executions until `until` (since START).
+    /// Make the serving child report `n` open streams until `until` (since START).
     pub fn busy(&self, slot: Slot, n: u64, until: Option<Duration>) {
         let mut st = self.st.borrow_mut();
         for p in st.procs.iter_mut().filter(|p| p.slot == slot) {
-            p.executions = Until(n, until.map(|d| START + d));
+            p.streams = Until(n, until.map(|d| START + d));
         }
     }
 
-    pub fn queued(&self, slot: Slot, n: u64, until: Option<Duration>) {
+    /// The same for open worker sessions.
+    pub fn sessions(&self, slot: Slot, n: u64, until: Option<Duration>) {
         let mut st = self.st.borrow_mut();
         for p in st.procs.iter_mut().filter(|p| p.slot == slot) {
-            p.queued = Until(n, until.map(|d| START + d));
+            p.sessions = Until(n, until.map(|d| START + d));
         }
     }
 
@@ -446,7 +462,7 @@ fn gone(slot: Slot) -> PortError {
 }
 
 impl Child for World {
-    fn spawn(&self, slot: Slot, release: &CommitId) -> Result<ProcIdent, PortError> {
+    fn spawn(&self, slot: Slot, release: &CommitId, start: Start) -> Result<ProcIdent, PortError> {
         let failing = {
             let mut st = self.st.borrow_mut();
             let n = st.spawn_counts.entry(slot).or_insert(0);
@@ -458,8 +474,28 @@ impl Child for World {
             self.log_event(format!("spawn {slot:?} refused"));
             return Err(PortError("exec failed".into()));
         }
+        self.refresh();
+        if self
+            .st
+            .borrow()
+            .procs
+            .iter()
+            .any(|p| p.slot == slot && p.alive)
+        {
+            // As the real port: one child to a slot, a stopped one still counts until gone.
+            self.log_event(format!("spawn {slot:?} refused: live child"));
+            return Err(PortError(format!("slot {slot:?} has a live child already")));
+        }
         let script = self.st.borrow_mut().scripts.pop_front().unwrap_or_default();
         let ident = self.push(slot, release.clone(), script);
+        self.st.borrow_mut().starts.push((slot, start));
+        if start == Start::Active {
+            // Serves from its first moment: it holds the generation itself.
+            let mut st = self.st.borrow_mut();
+            let p = st.procs.last_mut().expect("just pushed");
+            p.state = RoleState::Active;
+            p.holder = true;
+        }
         self.log_event(format!(
             "spawn {slot:?} {} pid {}",
             &release.as_str()[..4],
@@ -490,6 +526,34 @@ impl Child for World {
         match st.procs.get((ident.pid as usize).wrapping_sub(100)) {
             Some(p) if p.alive => None,
             _ => Some(0),
+        }
+    }
+
+    /// The wait runs on the fake's own time: it moves to the exit, or by `limit`.
+    fn await_exit(&self, ident: &ProcIdent, limit: Duration) -> bool {
+        self.log_event(format!("await_exit pid {}", ident.pid));
+        let left = {
+            self.refresh();
+            let st = self.st.borrow();
+            match st.procs.get((ident.pid as usize).wrapping_sub(100)) {
+                Some(p) if p.alive => Some(
+                    p.script
+                        .exit_after
+                        .map(|d| (p.spawned_at + d).saturating_sub(self.now.get())),
+                ),
+                _ => None,
+            }
+        };
+        match left {
+            None => true,
+            Some(Some(left)) if left <= limit => {
+                self.advance(left);
+                self.exited(ident).is_some()
+            }
+            Some(_) => {
+                self.advance(limit);
+                false
+            }
         }
     }
 
@@ -543,8 +607,11 @@ impl ChildAdmin for World {
         .ok_or_else(|| gone(slot))
     }
 
-    fn takeover(&self, slot: Slot, _limit: Duration) -> Result<(), PortError> {
-        self.log_event(format!("admin:takeover {slot:?}"));
+    fn takeover(&self, slot: Slot, limit: Duration) -> Result<(), PortError> {
+        self.log_event(format!(
+            "admin:takeover {slot:?} limit {} ms",
+            limit.as_millis()
+        ));
         let mode = self.st.borrow().takeover;
         match mode {
             Takeover::Err => return Err(PortError("takeover refused".into())),
@@ -652,8 +719,8 @@ impl ChildAdmin for World {
             return Err(PortError("admin port closed".into()));
         }
         self.with_slot(slot, |p, now| OpenCounts {
-            open_executions: p.executions.at(now),
-            queued_operations: p.queued.at(now),
+            open_streams: p.streams.at(now),
+            open_sessions: p.sessions.at(now),
         })
         .ok_or_else(|| gone(slot))
     }
@@ -690,6 +757,8 @@ impl Gate for World {
             st.held.clear();
             st.hold_on = false;
             st.active = slot;
+            st.cleared = false;
+            st.retired.retain(|r| *r != slot);
             st.fed.push((slot, n));
             n
         };
@@ -720,6 +789,31 @@ impl Gate for World {
     fn open_streams(&self, slot: Slot) -> u64 {
         let now = self.now.get();
         self.st.borrow().permits.get(&slot).map_or(0, |u| u.at(now))
+    }
+
+    fn clear_active(&self) {
+        self.log_event("clear_active");
+        self.st.borrow_mut().cleared = true;
+    }
+
+    fn retire(&self, slot: Slot) -> Retired {
+        let open = self.open_streams(slot);
+        let mut st = self.st.borrow_mut();
+        let answer = if st.never_opened.contains(&slot) {
+            Retired::NeverOpened
+        } else if st.retired.contains(&slot) {
+            Retired::AlreadyClosed
+        } else if slot == st.active && !st.cleared {
+            Retired::Current
+        } else if open > 0 {
+            Retired::Busy(open)
+        } else {
+            st.retired.push(slot);
+            Retired::Closed
+        };
+        drop(st);
+        self.log_event(format!("gate:retire {slot:?} {answer:?}"));
+        answer
     }
 }
 
@@ -770,7 +864,7 @@ impl RootOrders for World {
             commit,
             protocol: 7,
             min_protocol: 5,
-            state_schema: 3,
+            state_schema: self.st.borrow().staged_schema,
             profile: Some("frontend".into()),
         }))
     }

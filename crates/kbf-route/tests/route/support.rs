@@ -594,6 +594,11 @@ impl Cluster {
         node
     }
 
+    /// Takes node `id` out of the farm: a member the map names that no node answers for.
+    pub fn remove(&self, id: u64) {
+        self.nodes.lock().expect("lock").remove(&MemberId(id));
+    }
+
     pub fn node(&self, id: u64) -> Arc<Node> {
         self.nodes
             .lock()
@@ -643,6 +648,11 @@ impl Cell {
         Arc::default()
     }
 
+    /// The process loses its map.
+    pub fn clear(&self) {
+        *self.view.lock().expect("lock") = None;
+    }
+
     /// The map the process has from now on.
     pub fn set(&self, view: MapView) {
         *self.view.lock().expect("lock") = Some(view);
@@ -684,6 +694,7 @@ pub fn view(map: &Arc<Map>) -> MapView {
     MapView {
         map: Arc::clone(map),
         previous: None,
+        earlier: Vec::new(),
     }
 }
 

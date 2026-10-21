@@ -13,6 +13,7 @@ use kbf_enroll::client::{
 use kbf_enroll::config::{Config, FrontendUrl, HostName};
 use kbf_enroll::pin::Anchor;
 use kbf_enroll::store::Store;
+use kbf_testkit::dir::TestDir;
 use kbf_types::{RefusalReason, Role, RoleSet, Token};
 use support::fake::{self, Running, Spoil};
 use support::pki::now;
@@ -20,10 +21,11 @@ use support::{config_for, facts, scratch};
 
 struct Harness {
     running: Running,
-    root: PathBuf,
     config: Config,
     token: Token,
     store: Store,
+    /// Last, so it drops after the store that has files in it.
+    root: TestDir,
 }
 
 fn harness(name: &str, extra: &str, uses: u32) -> Harness {
@@ -37,10 +39,10 @@ fn harness(name: &str, extra: &str, uses: u32) -> Harness {
     let store = Store::open(&config.state_dir).expect("store");
     Harness {
         running,
-        root,
         config,
         token,
         store,
+        root,
     }
 }
 

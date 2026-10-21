@@ -34,6 +34,8 @@ use kbf_types::{
 use tokio::sync::mpsc;
 use tonic::{Code, Status};
 
+#[path = "state_store/ack_reasons.rs"]
+mod ack_reasons;
 #[path = "state_store/budgets.rs"]
 mod budgets;
 #[path = "state_store/fate.rs"]
@@ -42,8 +44,12 @@ mod fate;
 mod floors;
 #[path = "state_store/handover.rs"]
 mod handover;
+#[path = "state_store/result_ack.rs"]
+mod result_ack;
 #[path = "state_store/subject.rs"]
 mod subject;
+#[path = "state_store/takeover.rs"]
+mod takeover;
 mod thread_log;
 
 const GIB: u64 = 1 << 30;
@@ -121,22 +127,14 @@ impl Inner {
 }
 
 /// A directory removed when dropped.
-struct Scratch(std::path::PathBuf);
+struct Scratch(kbf_testkit::dir::TestDir);
 
 impl Scratch {
     fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("kbf-state-store-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        Self(dir)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        Self(kbf_testkit::dir::TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            "kbf-state-store",
+        ))
     }
 }
 
@@ -438,13 +436,18 @@ fn node() -> WorkerId {
 
 /// Registers `node-a` with room for four actions, as a daemon opening a stream does.
 fn register(farm: &TestFarm) -> (StreamId, Inbox) {
+    register_as(farm, &node())
+}
+
+/// Registers `worker` the same way.
+fn register_as(farm: &TestFarm, worker: &WorkerId) -> (StreamId, Inbox) {
     let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
         .expect("caps")
         .with_drivers(["container"]);
     let reported = Reported::serving(Resources::new(4_000, 8 * GIB), caps);
     let (outbound, inbox) = mpsc::unbounded_channel();
     let stream = farm.register(
-        &node(),
+        worker,
         DaemonInstance::new("daemon"),
         DaemonInstance::new(""),
         reported,
@@ -485,9 +488,12 @@ fn invalid(lease: LeaseId) -> worker::Result {
     }
 }
 
+/// Whether the farm answers a result of `lease` with an ack that says accepted. A result
+/// the store has not taken is not acknowledged at all (`Farm::report` is `None`), which is
+/// not accepted either.
 async fn accepted(farm: &TestFarm, lease: LeaseId) -> bool {
     let ack = farm.report(&node(), invalid(lease)).await;
-    ack.expect("an acknowledgement").accepted
+    ack.is_some_and(|ack| ack.accepted)
 }
 
 /// Catches: a farm that forgets a claim it acknowledged (the daemon runs a lease the
@@ -1119,6 +1125,7 @@ fn listeners() -> Listeners {
         hello_wait: Duration::from_secs(1),
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -1390,6 +1397,113 @@ async fn a_committed_result_the_store_refused_is_written_and_answered_when_it_re
         farm.ended(OperationId(0)).expect("read"),
         Some(Finished::Failed(status)),
         "the row is not what the caller was sent"
+    );
+}
+
+/// Catches: a request for an action whose finish the store has not taken yet that joins
+/// the finished operation. The scheduler finished it in memory, but its `op/` row and
+/// `inflight/` pin stay until the finish lands, so the submit finds a pin whose
+/// operation exists and takes it up again: the finished operation is queued afresh over
+/// itself, granted a second time (two runs), and the held answer and the new grant
+/// disagree. The request is refused UNAVAILABLE while the finish is held, no second
+/// `Start` goes out, and a request after the finish landed queues a fresh operation.
+#[tokio::test(start_paused = true)]
+async fn a_request_while_the_finish_is_held_does_not_retake_the_finished_operation() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (_, mut inbox) = register(&farm);
+    let ticket = farm
+        .submit(Submission {
+            request: request(1),
+            call: None,
+            described: Described::default(),
+        })
+        .expect("submitted");
+    let leases = starts(&mut inbox);
+    assert_eq!(leases.len(), 1);
+    disk.store.set_down(true);
+    assert!(!accepted(&farm, leases[0]).await, "the store was down");
+    assert_eq!((disk.rows("op/"), disk.rows("inflight/")), (1, 1));
+
+    let again = submit(&farm, request(1));
+    assert_eq!(
+        again.err().map(|status| status.code()),
+        Some(Code::Unavailable),
+        "the request joined an operation the scheduler finished"
+    );
+
+    disk.store.set_down(false);
+    for _ in 0..3 {
+        farm.tick().await;
+    }
+    let Finished::Failed(status) = ended(&ticket) else {
+        panic!("the caller was answered with something else");
+    };
+    assert_eq!(status.message, "test");
+    assert!(
+        starts(&mut inbox).is_empty(),
+        "the action ran a second time"
+    );
+    assert_eq!(
+        (disk.rows("op/"), disk.rows("inflight/"), disk.rows("done/")),
+        (0, 0, 1)
+    );
+
+    submit(&farm, request(1)).expect("a request after the finish landed");
+    assert_eq!(starts(&mut inbox).len(), 1, "a fresh run is granted");
+    assert_eq!((disk.rows("op/"), disk.rows("inflight/")), (1, 1));
+}
+
+/// Catches: a held finish that outlives the scheduler's retention of finished operations.
+/// The scheduler retires a finished operation after `FINISHED_RETENTION` whether or not its
+/// finish was written; a request after that finds the store's pin, no operation in the
+/// scheduler, and takes the rows up again: a second run, and the held finish then deletes
+/// the new operation's rows. The request is refused UNAVAILABLE for as long as the finish
+/// is held, no second `Start` goes out, and the rows are right once the store is back.
+#[tokio::test(start_paused = true)]
+async fn a_request_after_the_retention_of_a_held_finish_does_not_retake_the_operation() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (_, mut inbox) = register(&farm);
+    let ticket = farm
+        .submit(Submission {
+            request: request(1),
+            call: None,
+            described: Described::default(),
+        })
+        .expect("submitted");
+    let leases = starts(&mut inbox);
+    assert_eq!(leases.len(), 1);
+    disk.store.set_down(true);
+    assert!(!accepted(&farm, leases[0]).await, "the store was down");
+
+    // The scheduler retires its finished operation while the finish is still held: a
+    // feed after the retention moves its clock past it, the store still refusing.
+    tokio::time::advance(kbf_sched::FINISHED_RETENTION + Duration::from_secs(1)).await;
+    farm.tick().await;
+    assert_eq!(disk.rows("op/"), 1, "the finish was written");
+    disk.store.set_down(false);
+    let held = submit(&farm, request(1));
+    assert_eq!(
+        held.err().map(|status| status.code()),
+        Some(Code::Unavailable),
+        "the request re-took an operation whose finish is held"
+    );
+    assert!(
+        starts(&mut inbox).is_empty(),
+        "the action ran a second time"
+    );
+
+    for _ in 0..3 {
+        farm.tick().await;
+    }
+    let Finished::Failed(status) = ended(&ticket) else {
+        panic!("the caller was answered with something else");
+    };
+    assert_eq!(status.message, "test");
+    assert_eq!(
+        (disk.rows("op/"), disk.rows("inflight/"), disk.rows("done/")),
+        (0, 0, 1)
     );
 }
 

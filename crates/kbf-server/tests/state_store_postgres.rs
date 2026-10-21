@@ -2,12 +2,14 @@
 //!
 //! The tests are `#[ignore]`d so `cargo test --workspace` stays hermetic; the
 //! `state-postgres` job in ci.yml runs them with `--include-ignored` against a service
-//! container. `KBF_TEST_POSTGRES_URL` names a database they may create and drop the
-//! `kbf_state` schema in (the schema a flag-opened store lives in, as the flag takes no
-//! other). One test holds that schema from start to end, so the checks that need the same
-//! rows run in order inside it.
+//! container. `KBF_TEST_POSTGRES_URL` names a server they may create and drop databases on.
+//! The schema a flag-opened store lives in is `kbf_state`, as the flag takes no other, so
+//! each test makes a database of its own and uses that one: nextest runs every test in a
+//! process of its own, side by side, and a process-wide lock cannot keep them off one
+//! schema (the test that drops it saw the tables another was applying).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kbf_front::Cache;
 use kbf_server::{EpochPolicy, Farm, StateError, StateStore, StateStoreUri};
@@ -15,10 +17,85 @@ use kbf_state::{Cond, GENERATION, StoreError, Txn};
 
 const URL_VAR: &str = "KBF_TEST_POSTGRES_URL";
 
-fn url() -> String {
+fn server_url() -> String {
     std::env::var(URL_VAR).unwrap_or_else(|_| {
-        panic!("{URL_VAR} must name a postgres:// URL the tests may create schemas in")
+        panic!("{URL_VAR} must name a postgres:// URL the tests may create databases in")
     })
+}
+
+static NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// A database made for one test and dropped with it, named `kbf_t_<pid>_<n>`: no other test
+/// (of this process or another) reads or writes it.
+struct Scratch {
+    name: String,
+}
+
+impl Scratch {
+    fn new() -> Scratch {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let name = format!("kbf_t_{}_{n}", std::process::id());
+        let mut admin =
+            postgres::Client::connect(&server_url(), postgres::NoTls).expect("the test server");
+        admin
+            .batch_execute(&format!("CREATE DATABASE \"{name}\""))
+            .expect("create the test's database");
+        Scratch { name }
+    }
+
+    /// `KBF_TEST_POSTGRES_URL` with this database in place of its own.
+    fn url(&self) -> String {
+        with_database(&server_url(), &self.name)
+    }
+
+    /// The tables as `kbf-installer setup` leaves them: kbf creates no table itself.
+    fn install_schema(&self) {
+        let config =
+            kbf_state::postgres::PostgresConfig::parse(&self.url()).expect("the URL parses");
+        let schema = kbf_state::postgres::schema::embedded();
+        kbf_state::postgres::schema::apply(&config, &schema, kbf_state::postgres::schema::latest())
+            .expect("the installer's step");
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Ok(mut admin) = postgres::Client::connect(&server_url(), postgres::NoTls) {
+            let _ = admin.batch_execute(&format!(
+                "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
+                self.name
+            ));
+        }
+    }
+}
+
+/// `url` with its database (the path after the host) replaced, its query kept.
+fn with_database(url: &str, database: &str) -> String {
+    let (head, query) = url
+        .split_once('?')
+        .map_or((url, None), |(h, q)| (h, Some(q)));
+    let (scheme, rest) = head.split_once("://").expect("a postgres:// URL");
+    let authority = rest.split_once('/').map_or(rest, |(a, _)| a);
+    let mut out = format!("{scheme}://{authority}/{database}");
+    if let Some(query) = query {
+        out.push('?');
+        out.push_str(query);
+    }
+    out
+}
+
+#[test]
+fn with_database_replaces_only_the_database() {
+    for (from, to) in [
+        ("postgres://u:p@h:5432/postgres", "postgres://u:p@h:5432/d"),
+        (
+            "postgres://u@h/x?sslmode=disable",
+            "postgres://u@h/d?sslmode=disable",
+        ),
+        ("postgres://u@h", "postgres://u@h/d"),
+    ] {
+        assert_eq!(with_database(from, "d"), to);
+    }
 }
 
 fn uri(url: &str) -> StateStoreUri {
@@ -40,12 +117,29 @@ fn farm_over(state: StateStore) -> Farm {
     .expect("a farm over the store")
 }
 
-/// The default schema, dropped, so the test starts on a store that has never been used.
-fn fresh_database() {
-    let mut client = postgres::Client::connect(&url(), postgres::NoTls).expect("connect");
-    client
-        .batch_execute("DROP SCHEMA IF EXISTS kbf_state CASCADE")
-        .expect("drop the schema");
+/// Catches a start that creates the tables itself (the installer owns the schema) and a
+/// refusal that is not one clear line: a start on a database nobody ran `setup` on fails
+/// as a `StateError::Open` that says what to run, without the URL, and leaves no schema.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn a_start_on_a_database_without_the_installers_schema_is_refused() {
+    let db = Scratch::new();
+    let refused = uri(&db.url()).open().err().expect("refused");
+    let said = refused.to_string();
+    assert!(matches!(refused, StateError::Open(_)), "{said}");
+    assert!(
+        said.contains("kbf-installer setup") && !said.contains('\n'),
+        "{said}"
+    );
+    assert!(!said.contains("kbf-ci-throwaway"), "{said}");
+    let mut client = postgres::Client::connect(&db.url(), postgres::NoTls).expect("connect");
+    let made = client
+        .query(
+            "SELECT 1 FROM pg_namespace WHERE nspname = 'kbf_state'",
+            &[],
+        )
+        .expect("catalog");
+    assert!(made.is_empty(), "the refused start created the schema");
 }
 
 /// Catches: a Postgres `--state-store` that is parsed and then not opened; a fresh store
@@ -56,12 +150,13 @@ fn fresh_database() {
 #[test]
 #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_flag_opened_postgres_store_takes_generations_and_epochs_as_sqlite_does() {
-    fresh_database();
-    let uri = uri(&url());
+    let db = Scratch::new();
+    db.install_schema();
+    let uri = uri(&db.url());
     assert_eq!(uri.epoch_policy(), EpochPolicy::Bump);
 
     let first = uri.open().expect("a first start on a fresh database");
-    let named: i64 = postgres::Client::connect(&url(), postgres::NoTls)
+    let named: i64 = postgres::Client::connect(&db.url(), postgres::NoTls)
         .expect("connect")
         .query_one(
             "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'kbf-server'",
@@ -135,7 +230,8 @@ fn a_flag_opened_postgres_store_takes_generations_and_epochs_as_sqlite_does() {
 #[test]
 #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_server_that_does_not_flush_commits_refuses_the_start() {
-    let base = url();
+    let db = Scratch::new();
+    let base = db.url();
     let sep = if base.contains('?') { '&' } else { '?' };
     for setting in ["off", "local", "remote_write"] {
         let with = format!("{base}{sep}options=-c%20synchronous_commit%3D{setting}");

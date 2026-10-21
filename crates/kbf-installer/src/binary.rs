@@ -4,16 +4,13 @@
 //! The kind is read from the first bytes of the file, never by running it: an attested
 //! file for another platform is refused before anything executes it. The version is what
 //! `kbf --version --json` prints (crates/kbf-cli/src/version.rs): `commit` (the first 12
-//! hex digits), `min_protocol`, `protocol`, `profile`, `state_schema` and `version`.
+//! hex digits), `min_protocol`, `protocol`, `profile`, `state_schema` and `version`, and
+//! `admin_protocol`, `meta_log` and `seq` when the build has them.
 //! It is a consistency check on a file the attestation already vouches for, not trust.
 
 use std::fmt;
 
-use serde::Deserialize;
-
-use crate::CommitId;
 use crate::layout::Platform;
-use crate::refusal::VersionFault;
 
 /// The CPU a binary is built for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,40 +107,9 @@ impl BinaryKind {
     }
 }
 
-/// What `--version --json` prints.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub struct Version {
-    pub commit: String,
-    pub min_protocol: u64,
-    pub protocol: u64,
-    pub profile: String,
-    pub state_schema: u64,
-    pub version: String,
-}
-
-impl Version {
-    /// The object a binary printed. Fields beyond these are ignored: a later build may
-    /// report more.
-    pub fn parse(stdout: &[u8]) -> Result<Version, VersionFault> {
-        serde_json::from_slice(stdout).map_err(|e| VersionFault::Unreadable(e.to_string()))
-    }
-
-    /// Whether this build is `commit`'s release build: it names the commit's first 12 hex
-    /// digits and is a `release` profile, not a debug build.
-    pub fn check(&self, commit: &CommitId) -> Result<(), VersionFault> {
-        let want = &commit.as_str()[..12];
-        if self.commit != want {
-            return Err(VersionFault::Commit {
-                want: want.to_owned(),
-                got: self.commit.clone(),
-            });
-        }
-        if self.profile != "release" {
-            return Err(VersionFault::Profile(self.profile.clone()));
-        }
-        Ok(())
-    }
-}
+// What `--version --json` prints is read by `kbf_types::Version`, the one parser the release
+// store reads its version facts with too.
+pub use kbf_types::{VERSION_CAP, Version};
 
 #[cfg(test)]
 #[path = "binary_tests.rs"]

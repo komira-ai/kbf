@@ -13,14 +13,15 @@ use crate::CommitId;
 
 use super::model::{
     AdoptError, CrashPoint, Halt, Intent, Locator, OpenCounts, PortError, ProcIdent, Readiness,
-    Request, RoleInfo, Slot, StagedFacts,
+    Request, Retired, RoleInfo, Slot, StagedFacts, Start,
 };
 
 /// The process side of the children. The proxy starts them as its own processes.
 pub trait Child {
-    /// Start `releases/<commit>/kbf --mode frontend` in `slot`. The returned identity is
+    /// Start `releases/<commit>/kbf --mode=frontend` in `slot`, listening on the slot's
+    /// ports and, for [`Start::Candidate`], waiting for a takeover. The returned identity is
     /// what the intent record keeps for adoption.
-    fn spawn(&self, slot: Slot, release: &CommitId) -> Result<ProcIdent, PortError>;
+    fn spawn(&self, slot: Slot, release: &CommitId, start: Start) -> Result<ProcIdent, PortError>;
 
     /// Take over a process recorded before a restart. Refuses a recycled pid: the live
     /// process must match pid, start time and executable ([`super::model::verify_ident`]).
@@ -32,6 +33,12 @@ pub trait Child {
     /// SIGTERM. This is the only signal the swap sends a child that has served; there is
     /// no SIGKILL for it and no timeout behind it.
     fn terminate(&self, ident: &ProcIdent) -> Result<(), PortError>;
+
+    /// Block until the process is gone, for `limit` at most; `true` when it is (an identity
+    /// this port does not hold counts as gone). The one wait that is not [`Clock::sleep`]: it
+    /// ends the moment the process exits, so a caller that must not start the next process
+    /// before this one is gone does not guess how long an exit takes.
+    fn await_exit(&self, ident: &ProcIdent, limit: Duration) -> bool;
 
     /// SIGKILL a candidate that never served (FP section 5 steps 4 and 6). The swap calls
     /// it only on the process it spawned (or adopted) as the candidate, never on the old child.
@@ -69,7 +76,7 @@ pub trait ChildAdmin {
 }
 
 /// The proxy's routing state for the update: the hold and the per-slot permits. The hold
-/// lives in U4b; the swap only drives it.
+/// lives in `kbf-proxy` (U4b); the swap only drives it ([`super::gate_real::ProxyGate`]).
 pub trait Gate {
     /// Accept new streams and read their headers but open nothing to a backend, for at
     /// most `max`. The update API, `/healthz`, `/readyz` and metrics bypass it.
@@ -80,22 +87,33 @@ pub trait Gate {
     fn release_into(&self, slot: Slot) -> Result<(), PortError>;
 
     /// Fail each held stream that has waited `hold_max` with gRPC `UNAVAILABLE` and count
-    /// it in `kbf_proxy_hold_expired_total`. Returns how many. Does not end the update.
+    /// it in the hold-expired counter of the proxy's metrics. Returns how many. Does not end the update.
     /// The swap calls it on every poll of a wait and before it releases the hold.
     fn expire(&self) -> usize;
 
     /// The proxy's permits on `slot`: client streams bound to it that are still open.
     fn open_streams(&self, slot: Slot) -> u64;
+
+    /// No slot is active; a hold in force stays. The all-in-one swap calls it as soon as
+    /// the old process is stopped, so the release that follows (or a failed start) answers
+    /// `UNAVAILABLE` at once instead of binding streams to a dead child.
+    fn clear_active(&self);
+
+    /// The proxy's commit on `slot`: close it if it is not active and no stream is bound.
+    /// The swap signals a child only when this says [`Retired::Closed`], after the child's
+    /// own counts are zero. A slot closed here is opened again, under a new generation, by
+    /// the next `release_into` it receives.
+    fn retire(&self, slot: Slot) -> Retired;
 }
 
 /// Forward, backward-compatible Postgres migrations. The kbf child never alters tables
-/// (CEO 14:58Z), so this runs before the candidate starts.
-///
-/// OPEN: who implements it (a root-half order or the proxy) and with which database
-/// credential is undecided. The swap needs only this call.
+/// (CEO 14:58Z), so this runs before the candidate starts. The real one is
+/// [`super::migrator::DbMigrator`].
 pub trait Migrator {
     /// Apply every forward migration release `release` needs. Idempotent: running it
-    /// again after a crash changes nothing.
+    /// again after a crash changes nothing. An `Err` text starts with a stable refusal
+    /// word and a colon ([`super::migrator::Refusal::word`]); it never carries the
+    /// database URL.
     fn migrate_forward(&self, release: &CommitId) -> Result<(), PortError>;
 }
 
@@ -129,6 +147,28 @@ pub trait RootOrders {
 
     /// Drop the staged release; `current` was never touched (Q2).
     fn revert(&self, commit: &CommitId) -> Result<(), PortError>;
+}
+
+/// The two facts of the root half's `status.json` that the migration reads, and nothing
+/// that writes an order. Every [`RootOrders`] has them; the proxy's start has no order spool
+/// (that is the update API's), so it reads them through
+/// [`super::root_orders::StatusFile`] alone.
+pub trait StatusFacts {
+    /// As [`RootOrders::staged`].
+    fn staged(&self) -> Result<Option<StagedFacts>, PortError>;
+
+    /// As [`RootOrders::installed`].
+    fn installed(&self) -> Result<Option<CommitId>, PortError>;
+}
+
+impl<T: RootOrders> StatusFacts for T {
+    fn staged(&self) -> Result<Option<StagedFacts>, PortError> {
+        RootOrders::staged(self)
+    }
+
+    fn installed(&self) -> Result<Option<CommitId>, PortError> {
+        RootOrders::installed(self)
+    }
 }
 
 /// Time. `now` is the wall clock as a duration since the Unix epoch, so a bake start

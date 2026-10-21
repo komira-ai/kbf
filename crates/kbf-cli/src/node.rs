@@ -14,7 +14,7 @@
 //!    fix exits 2.
 //! 3. Builds the mode's command line from `kbf.toml`, the configuration the frontend sent
 //!    and the certificate files, parses it with the mode's own parser
-//!    ([`crate::parse_from`], the same one `kbf check-args` and the units use, so a flag
+//!    ([`crate::parse_from`], the same one the units use, so a flag
 //!    the mode would refuse is refused here the same way) and runs the mode in this
 //!    process.
 //! 4. While the mode runs, renews the certificates at half their life
@@ -36,10 +36,15 @@
 //! uses only until the frontend sends it a map.
 //!
 //! **The object-store credentials.** A storage node is given the cold store
-//! (`NodeConfig.cold_store`), never a key. This build does not fetch keys from the
-//! frontend (`kbf_enroll::keys` is not called): the object-store client uses the
-//! credentials of the process, as `kbf storage` does, and a frontend that asks for
-//! `KEYS` mode is told so on stderr.
+//! (`NodeConfig.cold_store`), never a key. The storage half fetches the keys itself
+//! after it registers: `ColdStore.GetStoreConfig` on the worker listener
+//! (`kbf_server::cold_apply`, `kbf_server::join`), held in memory only; a node that has
+//! its own `AWS_*` key pair starts on it when the frontend has none to give
+//! (`kbf_enroll::keys` is not called from here). The frontend builds `cold_store` from the store
+//! registered for the farm (`kbf cluster object-store`): the bucket, prefix, endpoint
+//! and put settings, nothing else. A farm with no store registered sends none, and a
+//! storage node cannot start; one enrolled before the registration asks the frontend
+//! once, at its next start, for the configuration it lacks ([`refresh_cold_store`]).
 //!
 //! Exit codes are [`crate::enroll`]'s until the mode starts, and the mode's own after.
 
@@ -65,9 +70,9 @@ use crate::{Invocation, names, parse_with, preflight};
 /// machine that slept) is noticed within this.
 const NAP_MAX_S: u64 = 3600;
 
-/// A start that reads `kbf.toml`: the words `kbf --mode=<mode> --config FILE`, `--check`
-/// and `--label` mean ([`crate::parse_from`] makes it from a command line that carries no
-/// other flag of a mode).
+/// A start that reads `kbf.toml`: the words `kbf --mode=<mode> --config FILE` and `--check`
+/// mean ([`crate::parse_from`] makes it from a command line that carries no other flag of
+/// a mode).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Start {
     /// The mode `--mode` (or the alias word) named; `None` reads it from the file.
@@ -76,8 +81,6 @@ pub struct Start {
     pub config: PathBuf,
     /// Check the host and exit, starting and enrolling nothing.
     pub check: bool,
-    /// Labels the daemon half reports to the frontend (`--label`, repeatable), `key=value`.
-    pub labels: Vec<String>,
 }
 
 /// How the daemon half runs its leases on this platform.
@@ -172,7 +175,6 @@ fn daemon_flags(
     stored: &StoredConfig,
     store: &Store,
     driver: Driver,
-    labels: &[String],
     with_cas: bool,
 ) -> Vec<OsString> {
     let mut out = vec![
@@ -197,7 +199,6 @@ fn daemon_flags(
     if let Some(cpus) = config.reserve_cpus {
         out.push(flag("reserve-cpus", cpus.to_string()));
     }
-    out.extend(labels.iter().map(|label| flag("label", label)));
     out
 }
 
@@ -211,7 +212,6 @@ pub fn plan(
     node: &Enrolled,
     store: &Store,
     driver: Driver,
-    labels: &[String],
     want: Want,
 ) -> Result<Vec<OsString>, Failure> {
     let (mode, roles) = (want.mode, want.roles);
@@ -225,11 +225,40 @@ pub fn plan(
     }
     if roles.contains(Role::Daemon) {
         let with_cas = !roles.contains(Role::Storage);
-        argv.extend(daemon_flags(
-            config, stored, store, driver, labels, with_cas,
-        ));
+        argv.extend(daemon_flags(config, stored, store, driver, with_cas));
     }
     Ok(argv)
+}
+
+/// A storage half cannot start without the cold store, and a node enrolled before the farm
+/// registered one holds none until its next renewal. Asks the frontend once, now, for the
+/// configuration (a renewal, which sends it when the node's generation is not the
+/// frontend's). Any other node, and one that holds a cold store, is returned as it is; a
+/// frontend that cannot be reached or refuses is told on stderr and the node as it was is
+/// returned, so the plan says what is missing.
+///
+/// # Errors
+/// The runtime could not be built.
+fn refresh_cold_store(
+    loaded: &Loaded,
+    node: Enrolled,
+    want: Want,
+    env: &Env,
+) -> Result<Enrolled, Failure> {
+    if !want.roles.contains(Role::Storage) || !node.config.cold_store.is_empty() {
+        return Ok(node);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let renewer = Renewer::new(loaded, &node, env, 0);
+    match runtime.block_on(renewer.attempt((env.now)())) {
+        Ok(fresh) => Ok(fresh),
+        Err(error) => {
+            eprintln!("kbf: cannot ask the frontend for the cold store: {error}");
+            Ok(node)
+        }
+    }
 }
 
 /// Parses the mode's command line `argv` together with the settings of `kbf.toml`: the
@@ -462,7 +491,6 @@ fn check(
     want: Want,
     env: &Env,
     driver: Driver,
-    labels: &[String],
 ) -> Result<ExitCode, Failure> {
     crate::check_settings(want.mode, path).map_err(Failure::Settings)?;
     let Some(node) = enrolled(loaded, want)? else {
@@ -480,7 +508,7 @@ fn check(
         );
         return Ok(ExitCode::SUCCESS);
     };
-    let argv = plan(&loaded.config, &node, &loaded.store, driver, labels, want)?;
+    let argv = plan(&loaded.config, &node, &loaded.store, driver, want)?;
     let invocation = parse_planned(argv, path).map_err(Failure::Mode)?;
     println!(
         "kbf: --check: mode {} is configured and this node is enrolled as {}",
@@ -516,27 +544,26 @@ pub fn run_with(
         eprintln!("kbf: {note}");
     }
     if args.check {
-        return check(&loaded, &args.config, want, env, driver, &args.labels);
+        return check(&loaded, &args.config, want, env, driver);
     }
     // Before the token is spent: a table that is no setting of the mode would be found
     // only after the node had enrolled.
     crate::check_settings(want.mode, &args.config).map_err(Failure::Settings)?;
     let outcome = enroll_with_retry(&loaded, want, env)?;
-    let node = outcome.node;
+    // An enrollment just made was sent the frontend's configuration; only an older one can
+    // lack a store registered since.
+    let node = if outcome.fresh {
+        outcome.node
+    } else {
+        refresh_cold_store(&loaded, outcome.node, want, env)?
+    };
     if wants_keys(&node.config) {
         eprintln!(
             "kbf: warning: the frontend asks for object-store keys to be fetched; this \
              build does not, and the object-store client uses the credentials of this process"
         );
     }
-    let argv = plan(
-        &loaded.config,
-        &node,
-        &loaded.store,
-        driver,
-        &args.labels,
-        want,
-    )?;
+    let argv = plan(&loaded.config, &node, &loaded.store, driver, want)?;
     let invocation = parse_planned(argv, &args.config).map_err(Failure::Mode)?;
 
     let renewer = Renewer::new(&loaded, &node, env, jitter());

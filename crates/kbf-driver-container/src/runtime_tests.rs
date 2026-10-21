@@ -157,10 +157,7 @@ fn the_private_paths_are_the_outputs_from_the_input_root() {
 /// does not stop), and a store that is not opened when it can be.
 #[test]
 fn a_tree_store_opens_where_its_path_is_allowed() {
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/kbf-driver-unit")
-        .join(format!("trees-{}", std::process::id()));
-    std::fs::create_dir_all(&base).expect("scratch");
+    let base = crate::unit_dir("trees");
     let config = |dir: PathBuf| TreeConfig::new(dir, 1 << 20);
     assert!(open_trees(config(base.join("fine"))).is_some());
     assert!(base.join("fine").is_dir());

@@ -144,13 +144,9 @@ fn an_unreachable_postgres_store_refuses_the_open_without_the_password() {
     assert!(!format!("{after} {after:?}").contains("hunter2"));
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "kbf-server-state-uri-{}-{name}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// A fresh directory for `name`, removed when it drops.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    crate::test_dir::scratch_dir(&format!("kbf-server-state-uri-{name}"))
 }
 
 fn mode(path: &std::path::Path) -> u32 {
@@ -180,7 +176,6 @@ fn a_sqlite_value_opens_its_file_and_holds_it() {
     );
     drop(store);
     uri.open().expect("free once the first is gone");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches: a store opened without the writer fence (a handle left over from an earlier
@@ -210,7 +205,6 @@ fn every_open_takes_the_next_writer_generation_and_fences_the_one_before() {
     Fenced::take(Arc::clone(&second.store), Some(2)).expect("a successor");
     assert_eq!(second.store.txn(write()).unwrap_err(), StoreError::Fenced);
     drop(second);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches: a successor that takes a store it was not told about, and one that does not
@@ -246,7 +240,6 @@ fn a_store_opened_after_a_handover_expects_its_generation_and_keeps_the_epoch() 
         .expect("the generation it was told");
     assert_eq!(successor.epoch, EpochPolicy::Keep);
     assert_eq!(generation(&successor), 2);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches: a scheduler that opened a store with a generation row it cannot read taking
@@ -265,7 +258,6 @@ fn a_generation_row_that_is_not_a_number_refuses_the_open() {
     let refused = uri.open().err().expect("junk");
     assert!(matches!(refused, StateError::Open(_)), "{refused:?}");
     assert!(refused.to_string().contains("generation"), "{refused}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches: the scheduler's state (every operation's request, every lease) readable by
@@ -288,7 +280,6 @@ fn the_state_directory_and_files_are_private() {
     }
     assert!(seen >= 2, "the file and its lock were checked: {seen}");
     drop(store);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches: a path that cannot be a state file (a directory) taken, and an error that
@@ -297,7 +288,7 @@ fn the_state_directory_and_files_are_private() {
 fn a_sqlite_value_that_cannot_be_opened_names_the_path() {
     let dir = scratch("bad");
     std::fs::create_dir_all(&dir).expect("dir");
-    let refused = StateStoreUri::Sqlite(dir.clone())
+    let refused = StateStoreUri::Sqlite(dir.to_path_buf())
         .open()
         .err()
         .expect("a directory");
@@ -313,8 +304,7 @@ fn a_sqlite_value_that_cannot_be_opened_names_the_path() {
     let refused = under.open().err().expect("no directory");
     assert!(matches!(refused, StateError::Open(_)), "{refused:?}");
     assert!(refused.to_string().contains("a-file"), "{refused}");
-    let _ = std::fs::remove_dir_all(&dir);
-    let mut lock = dir.into_os_string();
+    let mut lock = dir.as_os_str().to_owned();
     lock.push(".lock");
     let _ = std::fs::remove_file(lock);
 }
@@ -393,4 +383,100 @@ fn a_refused_state_store_never_echoes_its_value() {
     ])
     .expect_err("not UTF-8");
     assert!(!refused.to_string().contains("hunter2"), "{refused}");
+}
+
+fn fake() -> Arc<dyn Store> {
+    use kbf_state::ManualClock;
+    use kbf_state::fake::{Fake, Flaw};
+    Arc::new(Fake::with_flaw(
+        Arc::new(ManualClock::default()),
+        Flaw::None,
+    ))
+}
+
+/// Catches: a candidate that can write (its reader accepts a transaction or a reap), one
+/// that moves the generation before it is told to take it, and a takeover that does not
+/// check the generation it is told to expect (it would fence a holder it was not told
+/// about) or that does not keep the epoch.
+#[test]
+fn a_candidate_reads_writes_nothing_and_takes_exactly_the_generation_it_expects() {
+    use kbf_state::{Cond, Txn};
+    let inner = fake();
+    let holder = Fenced::take(Arc::clone(&inner), None).expect("the first generation");
+    let candidate = Candidate::over(Arc::clone(&inner));
+    assert_eq!(candidate.generation().expect("read"), 1);
+
+    let reader = candidate.reader();
+    assert!(reader.get(GENERATION).expect("reads").is_some());
+    let write = Txn::new().put("probe", b"x".to_vec(), Cond::Any);
+    assert!(reader.txn(write).is_err(), "the reader wrote");
+    assert!(reader.reap_expired().is_err());
+    assert!(inner.get("probe").expect("read").is_none());
+    assert_eq!(
+        candidate.generation().expect("read"),
+        1,
+        "nothing was taken"
+    );
+
+    let refused = candidate.take_over(7).err().expect("not the generation");
+    assert!(refused.to_string().contains("generation 1"), "{refused}");
+    assert_eq!(candidate.generation().expect("read"), 1);
+
+    let state = candidate.take_over(1).expect("takes generation 1");
+    assert_eq!(state.epoch, EpochPolicy::Keep);
+    assert_eq!(candidate.generation().expect("read"), 2);
+    let stale = Txn::new().put("probe", b"x".to_vec(), Cond::Any);
+    assert!(
+        matches!(holder.txn(stale), Err(StoreError::Fenced)),
+        "the old holder was not fenced"
+    );
+}
+
+/// Catches: a reader that answers from nothing (every read of the candidate's handle is
+/// the store's), a store with no generation reported as anything but 0, a generation row
+/// that is not a number taken for one, and a candidate over a SQLite file that makes the
+/// file anything but held (a second open is refused) and unwritten (the generation stays
+/// 0, no writer took one).
+#[test]
+fn a_candidate_reader_passes_reads_through_and_a_sqlite_candidate_holds_the_file() {
+    use kbf_state::{Cond, Revision, ScanRange, Txn};
+    let inner = fake();
+    let candidate = Candidate::over(Arc::clone(&inner));
+    assert_eq!(candidate.generation().expect("read"), 0, "no writer yet");
+    inner
+        .txn(Txn::new().put("a/1", b"x".to_vec(), Cond::Any))
+        .expect("write")
+        .expect("applied");
+    let reader = candidate.reader();
+    assert_eq!(reader.scan_prefix("a/").expect("scan").len(), 1);
+    let page = reader
+        .scan_range(ScanRange::new(
+            "a/",
+            std::num::NonZeroUsize::new(10).expect("nonzero"),
+        ))
+        .expect("a range");
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(reader.changes(Revision(0), 10).expect("feed").rows.len(), 1);
+    assert_eq!(reader.commit_stats(), inner.commit_stats());
+    assert_eq!(reader.now(), inner.now());
+    inner
+        .txn(Txn::new().put(GENERATION, b"abc".to_vec(), Cond::Any))
+        .expect("write")
+        .expect("applied");
+    let corrupt = candidate.generation().expect_err("not eight bytes");
+    assert!(matches!(corrupt, StateError::Corrupt { .. }), "{corrupt:?}");
+
+    let dir = scratch("candidate");
+    let uri = StateStoreUri::Sqlite(dir.join("state.db"));
+    let waiting = uri.open_candidate().expect("opened");
+    assert_eq!(
+        waiting.generation().expect("read"),
+        0,
+        "a candidate took one"
+    );
+    let refused = uri.open().err().expect("held by the candidate");
+    assert!(
+        matches!(&refused, StateError::Open(why) if why.contains("another kbf process")),
+        "{refused:?}"
+    );
 }

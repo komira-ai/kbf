@@ -48,7 +48,7 @@ This is the design behind two lines that already promise it: `daemon.md` § Plan
 | Container lease | `crates/kbf-driver-container/src/runtime.rs`, `oci/lease.rs` | `materialize` writes the input root `lease/root`, which becomes the **overlay lower** (`lowerdir=root,upperdir=upper,workdir=work` at `/kbf/root`). `prepare_outputs` **renames** every input that an output names from `root` into `upper` (`tree.rs`). Then a helper container gives root, upper and work to id 1 of its user namespace (`__chown-dirs`); after exit, it gives them back to 0:0. The container's user namespace maps only the daemon user's subordinate ids, so the daemon's uid maps to nothing inside. |
 | Native lease | `crates/kbf-driver-native/src/runtime.rs`, `lib.rs` | Writes the input root into the lease directory and runs the action **as the daemon's user**. On macOS a `sandbox-exec` profile lets the action write only under its lease directory. On Linux nothing is enforced. |
 | Per-lease timing | `runtime.rs:322-341` (container), native `:487` | `input_fetch_start/completed_timestamp` cover all of prepare. Resource usage travels as an `auxiliary_metadata` Any (`kbf-daemon/src/usage.rs`). |
-| Placement | `scheduler.md` § Placement | The first live, feasible worker in name order. No locality input. `Heartbeat` (`worker.proto:251`) carries `seq`, `report_hash` and `running`. Capabilities live in the Hello and are hashed (`report.rs`). |
+| Placement | `scheduler.md` § Placement | The least loaded live, feasible worker (the least booked share of its CPU or memory, then the fewest leases, then name order). No locality input. `Heartbeat` (`worker.proto:251`) carries `seq`, `report_hash` and `running`. Capabilities live in the Hello and are hashed (`report.rs`). |
 
 **Stage A as of this revision.** The `daemon/parallel-cas` work is not pushed yet. In its
 current form it fetches a lease's Directory messages a level at a time and its file
@@ -924,7 +924,7 @@ Every new module stays under 1,000 lines; `cache` is split into
 ## 10. Test plan
 
 Every test names the defect it catches and the mutant that makes it go red. C-1, C-2,
-C-9, C-12 and C-18 need real rootless `crun` (the M2 harness, `kbf-it`). C-3 and C-3b
+C-9, C-12 and C-18 need real rootless `crun` (the M2 harness, `kbf-integration-test`). C-3 and C-3b
 need macOS. The rest run against `MemoryCas`, `kbf_front::routes` in process (which
 serve FindMissing and Batch today), or a counting fake CAS.
 

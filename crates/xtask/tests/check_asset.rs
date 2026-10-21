@@ -2,6 +2,7 @@
 //! tarball `package` wrote, with `xtask-fake` as the `kbf` inside it (its stamp and
 //! identity ride on its own bytes, so the tarball decides what the extracted binary says).
 
+use kbf_testkit::dir::TestDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -12,21 +13,17 @@ const OTHER: &str = "d0ffee0123456789c0ffee0123456789c0ffee01";
 const PLATFORM: &str = "linux-x86_64";
 
 /// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("xtask-check-asset")
-        .join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear scratch");
-    }
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-check-asset"),
+        name,
+    )
 }
 
 /// The identity `kbf --version --json` prints, as a build of `commit` makes it.
 fn identity(commit: &str, profile: &str) -> String {
     format!(
-        "{{\"commit\":\"{commit}\",\"min_protocol\":1,\"profile\":\"{profile}\",\"protocol\":1,\"state_schema\":1,\"version\":\"0.1.0\"}}\n"
+        "{{\"admin_protocol\":1,\"commit\":\"{commit}\",\"meta_log\":4,\"min_protocol\":1,\"profile\":\"{profile}\",\"protocol\":1,\"seq\":812,\"state_schema\":1,\"version\":\"0.1.0\"}}\n"
     )
 }
 
@@ -151,7 +148,7 @@ fn check_asset_runs_the_binary_it_took_out_of_the_tarball_inside_the_workspace()
     std::fs::copy(root.join("bin/kbf"), root.join("dist/kbf")).expect("copy");
     let out = Command::new(XTASK)
         .arg("--root")
-        .arg(&root)
+        .arg(&*root)
         .args(["build-commit", "check-asset"])
         .arg(&tarball)
         .arg(COMMIT)

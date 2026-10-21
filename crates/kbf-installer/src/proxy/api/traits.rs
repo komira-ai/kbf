@@ -42,8 +42,17 @@ pub struct InstallerStatus {
     /// `<word>: <message>`, or empty (`helper/cycle.rs` writes the word first).
     #[serde(default)]
     pub refusal: String,
+    /// The id of the last `activate`, `confirm` or `revert` order the installer acted on.
+    /// A `frontend_update` order has a floor of its own and a refused one moves none, so
+    /// this cannot say whose refusal `refusal` is: see `refused_order_id`.
     #[serde(default)]
     pub acked_order_id: u64,
+    /// The id of the order that `refusal` answers, when the root half writes it. A refused
+    /// state is an update's own only when this names that update's order; without it (the
+    /// root half writes no such field yet) no refusal is attributed to any update, and an
+    /// order the installer refuses ends at the staging deadline instead.
+    #[serde(default)]
+    pub refused_order_id: Option<u64>,
     #[serde(default)]
     pub staged: Option<StagedWire>,
 }
@@ -121,21 +130,11 @@ impl StatusReader for JsonFileStatus {
     }
 }
 
-/// The marker the package's postinst writes when the proxy itself has been upgraded and
-/// not restarted (FP section 10). Its path is not named by the design: the proxy state
-/// directory is assumed.
-pub struct RestartMarker {
-    path: PathBuf,
-}
-
-impl RestartMarker {
-    pub fn new(path: impl Into<PathBuf>) -> RestartMarker {
-        RestartMarker { path: path.into() }
-    }
-
-    pub fn is_set(&self) -> bool {
-        self.path.exists()
-    }
+/// Whether the running proxy is no longer the installed program (FP section 10): the
+/// package manager replaced the binary and nothing restarted the proxy. There is no marker
+/// file; [`crate::proxy::RunningBinary`] compares file identities.
+pub trait RestartPending: Send {
+    fn restart_pending(&self) -> bool;
 }
 
 /// One update's facts as the supervisor (U7) reports them.
@@ -146,6 +145,12 @@ pub struct RunningUpdate {
     pub to: CommitId,
     pub phase: Phase,
     pub since_s: u64,
+    /// The slot of the child that is SERVING requests now, not the candidate and not the
+    /// child that was started last: the old child's slot until the switch, the new child's
+    /// from `switched` on, and the old child's again after a rollback or a revert (the new
+    /// child was stood down). `GET /v1/update/frontend` reports it as `active_slot`, and
+    /// `kbf-installer deploy` reads it to follow the frontend across a handover
+    /// (docs/design/frontend-proxy.md section 4).
     pub active_slot: Slot,
     pub old: Option<OldChild>,
     pub new: NewChild,
@@ -196,6 +201,12 @@ pub enum SupervisorError {
 /// The U7 swap. Every call is made by the one actor, so an implementation sees them one
 /// at a time. `start` is idempotent on `update_id`.
 pub trait Supervisor: Send {
+    /// Why `start` cannot be called at all, when that is known before an update is
+    /// accepted. `POST` then answers 503 with this text, and saves no `request_id` and
+    /// writes no order, so the installer does not fetch a release that nothing can take
+    /// over. `None` is a supervisor that can start.
+    fn start_blocked(&self) -> Option<String>;
+
     fn start(&mut self, spec: &UpdateSpec) -> Result<(), SupervisorError>;
     fn abort(&mut self) -> Result<Phase, SupervisorError>;
     fn rollback(&mut self) -> Result<Phase, SupervisorError>;

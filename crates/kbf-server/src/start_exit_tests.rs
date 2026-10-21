@@ -13,6 +13,7 @@ use kbf_objstore::FsStoreError;
 use super::{NOT_READY, REFUSED, StartFailure};
 use crate::RaftLogError;
 use crate::RaftMetaLog;
+use crate::cold_apply::ColdApplyError;
 use crate::write_tier::WriteTierError;
 
 fn class(e: impl Error + 'static) -> StartFailure {
@@ -94,8 +95,7 @@ fn a_stale_writer_is_not_ready() {
 /// failure a later try can clear (a busy, read-only or full device) that exits 2.
 #[tokio::test]
 async fn a_held_directory_and_a_device_not_ready_are_not_ready() {
-    let dir = std::env::temp_dir().join(format!("kbf-start-exit-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_dir::scratch_dir("kbf-start-exit");
     let _first = RaftMetaLog::open_dir(&dir, Retention::default(), "kbf/")
         .await
         .expect("open the log");
@@ -105,7 +105,6 @@ async fn a_held_directory_and_a_device_not_ready_are_not_ready() {
     };
     assert!(matches!(second, RaftLogError::Locked { .. }), "{second}");
     assert_eq!(class(second), StartFailure::NotReady);
-    let _ = std::fs::remove_dir_all(dir);
     let locked = FsStoreError::Locked {
         path: PathBuf::from("/x/LOCK"),
         source: std::fs::TryLockError::WouldBlock,
@@ -184,4 +183,30 @@ fn what_a_failed_start_says_is_its_error_then_the_hint() {
     );
     let busy: Box<dyn Error> = Box::new(io::Error::from(io::ErrorKind::ResourceBusy));
     assert_eq!(super::said("kbf storage", busy.as_ref()).lines().count(), 1);
+}
+
+/// Catches a node whose registered keys fail its probe being left down (mutant: the
+/// `ColdApplyError` arm removed): the operator registers a working pair and the restart
+/// reads it, so the exit is 75; the failures a restart cannot clear (no keys of its own,
+/// a refused node, core dumps that stay on) are 2.
+#[test]
+fn registered_keys_that_do_not_work_yet_are_not_ready() {
+    use kbf_objstore::probe::ProbeStep;
+    assert_eq!(
+        class(ColdApplyError::Probe(ProbeStep::Put)),
+        StartFailure::NotReady
+    );
+    assert_eq!(class(ColdApplyError::Unusable), StartFailure::NotReady);
+    assert_eq!(
+        class(Wrapped(Box::new(ColdApplyError::Unusable))),
+        StartFailure::NotReady
+    );
+    for refused in [
+        ColdApplyError::MissingKeys("AWS_ACCESS_KEY_ID"),
+        ColdApplyError::MismatchNoKeys,
+        ColdApplyError::Refused(tonic::Code::PermissionDenied),
+        ColdApplyError::Harden(io::Error::other("no")),
+    ] {
+        assert_eq!(class(refused), StartFailure::Refused);
+    }
 }

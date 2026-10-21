@@ -1,4 +1,5 @@
-//! One placement round, checked against the reference first fit and verdict.
+//! One placement round, checked against the reference placement (the least loaded worker
+//! with room) and verdict.
 
 use super::*;
 
@@ -40,27 +41,49 @@ impl Checker {
             // An operation with farm runs avoids their workers while another could run
             // it, so its fit is its own, not its class's.
             let avoids = !op.avoid.is_empty();
+            let m = matching.entry(op.needs).or_insert_with(|| {
+                (0..live.len())
+                    .filter(|&i| needs.matches(&self.workers[live[i]].caps))
+                    .collect()
+            });
+            let avoided = |i: usize| op.avoid.contains(live[i]);
+            let elsewhere = m
+                .iter()
+                .copied()
+                .any(|i| !avoided(i) && fits(self.workers[live[i]].capacity, op.request.resources));
+            // What worker `i` holds now: its bookings, how many leases, and whether one
+            // holds it alone.
+            let held_on = |extra: &BTreeMap<usize, (Resources, usize, bool)>, i: usize| {
+                let w = &self.workers[live[i]];
+                let (more, leases, whole) = extra.get(&i).copied().unwrap_or_default();
+                (
+                    add(w.booked, more),
+                    w.leases.len() + leases,
+                    w.whole || whole,
+                )
+            };
             if grants.len() < PLACEMENT_ROUND && (avoids || !no_room.contains(&class)) {
-                let m = matching.entry(op.needs).or_insert_with(|| {
-                    (0..live.len())
-                        .filter(|&i| needs.matches(&self.workers[live[i]].caps))
-                        .collect()
-                });
-                let avoided = |i: usize| op.avoid.contains(live[i]);
-                let elsewhere = m.iter().copied().any(|i| {
-                    !avoided(i) && fits(self.workers[live[i]].capacity, op.request.resources)
-                });
-                let fit = m.iter().copied().find(|i| {
-                    let w = &self.workers[live[*i]];
-                    let (more, leases, whole) = extra.get(i).copied().unwrap_or_default();
-                    room(
-                        w.capacity,
-                        add(w.booked, more),
-                        w.whole || whole,
-                        w.leases.len() + leases,
-                        op.request.resources,
-                    ) && !(elsewhere && avoided(*i))
-                });
+                // The least loaded worker with room; of equals, the first by name.
+                let fit = m
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        let (booked, leases, whole) = held_on(&extra, i);
+                        room(
+                            self.workers[live[i]].capacity,
+                            booked,
+                            whole,
+                            leases,
+                            op.request.resources,
+                        ) && !(elsewhere && avoided(i))
+                    })
+                    .min_by(|&a, &b| {
+                        let load = |i: usize| {
+                            let (booked, leases, _) = held_on(&extra, i);
+                            (self.workers[live[i]].capacity, booked, leases)
+                        };
+                        by_load(load(a), load(b))
+                    });
                 match fit {
                     Some(i) => {
                         let alone = exclusive(self.workers[live[i]].capacity, op.request.resources);
@@ -114,7 +137,7 @@ impl Checker {
             }
         }
 
-        // Grants: the explicit invariants first, then the reference first fit.
+        // Grants: the explicit invariants first, then the reference placement.
         let mut booked_now: BTreeMap<WorkerId, (Resources, usize, bool)> = BTreeMap::new();
         for g in &granted {
             if self.next_seq != g.lease.seq || g.lease.term != TERM {
@@ -163,7 +186,7 @@ impl Checker {
         if got != grants {
             self.violated(
                 "I11",
-                format!("placement differs from the reference first fit\n  expected {grants:?}\n  got      {got:?}"),
+                format!("placement differs from the reference\n  expected {grants:?}\n  got      {got:?}"),
             );
         }
 

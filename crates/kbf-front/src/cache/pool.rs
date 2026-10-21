@@ -33,6 +33,14 @@
 //! writer, so the bound holds for it too. Not covered: the files other callers
 //! write (a `Segments` upload's ranges, `Cache::store_blobs`' segments), which have their
 //! own bounds.
+//!
+//! **Not counted** in `kbf_bytes_in_flight`: the pool's own copies. A buffered blob is
+//! appended chunk by chunk into a buffer of the pool's (`append`) and a streaming blob's
+//! chunk is copied into the queue to its writer (`Bytes::copy_from_slice`); both are
+//! write-tier internals beside the counted receive buffer or message they were copied
+//! from, so the gauge, and the bound on a large `Write` read from it, understates
+//! resident memory by those copies (a blob of at most [`BUFFERED_BLOB_BYTES`] once more,
+//! a few chunks of a streaming one).
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -95,6 +103,23 @@ impl PoolConfig {
         queue: NonZeroUsize::MIN.saturating_add(4095),
         stream_idle: Duration::from_secs(30),
     };
+}
+
+/// A test's callback at the pool's drain step ([`Cache::with_drain_hook`]): given the
+/// digests of a batch whose `PutStaged` is applied, before the batch is answered. It runs
+/// only on the batched pool path, not on the single-blob `put_staged` path.
+#[cfg(feature = "testkit")]
+pub type DrainHook = Arc<dyn Fn(&[Digest]) + Send + Sync>;
+
+/// A [`DrainHook`] a `Debug` struct can hold.
+#[cfg(feature = "testkit")]
+pub(super) struct HookCell(pub(super) DrainHook);
+
+#[cfg(feature = "testkit")]
+impl std::fmt::Debug for HookCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DrainHook")
+    }
 }
 
 /// What a writer is asked to do.
@@ -275,6 +300,13 @@ impl<M: MetaLog, O: ObjectStore> Worker<M, O> {
             }
         };
         let committed = self.put_staged(synced, listed, false);
+        #[cfg(feature = "testkit")]
+        if committed.is_ok()
+            && let Some(hook) = self.writer.drain_hook.get()
+        {
+            let digests: Vec<Digest> = unique.keys().copied().collect();
+            (hook.0)(&digests);
+        }
         self.note_files(&*staging.tier);
         for blob in batch {
             let outcome = match &committed {

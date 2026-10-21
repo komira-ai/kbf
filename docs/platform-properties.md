@@ -18,7 +18,7 @@ These properties change how kbf schedules an action today:
 
 Any other value of `kbf-lease`, `gpu`, `kbf-book-cpus` or `kbf-book-mem-gib` is refused
 with `INVALID_ARGUMENT`. kbf's own
-capability keys (`os`, `arch`, `isa_level`, `cpu.feature`, `label.<k>`, ...; see
+capability keys (`os`, `arch`, `isa_level`, `cpu.feature`, ...; see
 [capabilities.md](design/capabilities.md#matching)) are matched too. Other properties
 (`container-image`, `Pool`, ...) are accepted and not acted on by the scheduler.
 
@@ -30,8 +30,8 @@ meant for kbf is never ignored because of how it is spelled: `osfamily=darwin`,
 names (`OSFamily`, `ISA`, `Arch`) and for every kbf key: the capability keys above
 (`OS` is `os`, `ISA_Level` is `isa_level`), `gpu` (`GPU=1` books a GPU), and the
 reserved `kbf-lease`, `kbf-cpu`, `kbf-mac-admin`, `kbf-book-cpus` and
-`kbf-book-mem-gib`. In `label.<k>` only `label.` is
-read in any case; the label's own name `<k>` is compared exactly, as its value is.
+`kbf-book-mem-gib`. A `label.<k>` is not one of them in any case: node labels were
+removed, so it is a name kbf does not read and is ignored like `Pool`.
 `arch` spelled exactly so is kbf's own `arch` key (values `x86_64`, `arm64`); in any
 other spelling (`Arch`, `ARCH`) it is REAPI's `Arch` and takes the values in the
 table. Values are compared as described for each key: `OSFamily`, `ISA` and `Arch`
@@ -74,6 +74,15 @@ names the closest worker and what it lacks. The server logs it too. If no live w
 satisfies it for `--unservable-wait-secs` (300 by default; the wait restarts whenever
 one does), it fails with `FAILED_PRECONDITION` and that reason. Work larger than every
 worker that satisfies its platform (`gpu=2` where nodes have one) is treated the same.
+
+An action that names no OS, no architecture and no ISA level (an empty platform, or one
+with only properties kbf does not read, such as `pool`) is placed by
+`--default-platform` (`linux/x86_64` by default), so it is never handed to a Mac that
+merely sorts first. The default is not applied to an action that names `OSFamily` or
+`ISA` alone, or asks for `xcode`, an iOS device or a VM image, which only a Mac reports.
+`--default-platform none` applies none. It changes placement only: the action digest and
+the cache key are the client's. Each application is logged with the action digest, at
+most once in ten seconds.
 
 ## `gpu`
 

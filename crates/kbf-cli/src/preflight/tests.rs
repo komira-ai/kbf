@@ -14,7 +14,7 @@ use super::{
     CertNeed, Class, ContainerNeed, FileNeed, Host, NOT_READY, Needs, REFUSED, Report, Row, check,
 };
 
-const ME: u32 = 1000;
+pub(super) const ME: u32 = 1000;
 const CA: &str = "/etc/kbf/ca.pem";
 const CERT: &str = "/etc/kbf/node.pem";
 const KEY: &str = "/etc/kbf/node.key";
@@ -23,10 +23,10 @@ const CRUN: &str = "/usr/bin/crun";
 // ---- a planted host -------------------------------------------------------------------
 
 #[derive(Clone)]
-struct Fake {
+pub(super) struct Fake {
     files: BTreeMap<PathBuf, (Stat, Vec<u8>)>,
     stat_errors: BTreeMap<PathBuf, io::ErrorKind>,
-    read_errors: BTreeMap<PathBuf, io::ErrorKind>,
+    pub(super) read_errors: BTreeMap<PathBuf, io::ErrorKind>,
     vars: BTreeMap<String, String>,
     euid: u32,
     nofile: u64,
@@ -34,7 +34,7 @@ struct Fake {
 }
 
 impl Fake {
-    fn empty() -> Self {
+    pub(super) fn empty() -> Self {
         Self {
             files: BTreeMap::new(),
             stat_errors: BTreeMap::new(),
@@ -54,7 +54,7 @@ impl Fake {
         self
     }
 
-    fn file(self, path: &str, mode: u32, bytes: &[u8]) -> Self {
+    pub(super) fn file(self, path: &str, mode: u32, bytes: &[u8]) -> Self {
         self.put(path, Kind::File, ME, mode, bytes)
     }
 
@@ -64,7 +64,7 @@ impl Fake {
     }
 
     /// Changes the owner and mode of a file already there, keeping its bytes.
-    fn chmod(mut self, path: &str, uid: u32, mode: u32) -> Self {
+    pub(super) fn chmod(mut self, path: &str, uid: u32, mode: u32) -> Self {
         let (stat, _) = self.files.get_mut(Path::new(path)).expect("file there");
         stat.uid = uid;
         stat.mode = mode;
@@ -212,6 +212,7 @@ fn file(flag: &'static str, path: &str, secret: bool) -> FileNeed {
         flag,
         path: PathBuf::from(path),
         secret,
+        exact_len: None,
     }
 }
 
@@ -1115,6 +1116,19 @@ mod wiring {
         assert!(n.container.is_none());
     }
 
+    /// Catches a preflight that refuses a node for want of `AWS_*` variables when the
+    /// frontend it registers with may give it the key pair (mutant: `s3` ignoring
+    /// `--frontend`): such a node needs none in its environment; the same node without a
+    /// frontend still does.
+    #[test]
+    fn a_node_that_registers_with_a_frontend_may_be_given_the_s3_pair() {
+        let mut registered = STORAGE.to_vec();
+        registered.push("--frontend=https://frontend.example:8981");
+        assert!(!with("storage", &registered, &[]).s3);
+        assert!(!with("storage-and-daemon", &registered, &DAEMON).s3);
+        assert!(with("storage", &STORAGE, &[]).s3);
+    }
+
     #[test]
     fn a_file_cold_store_needs_no_s3_pair() {
         let file: Vec<&str> = STORAGE
@@ -1173,6 +1187,7 @@ mod wiring {
             "--worker-deny-list=/c/deny",
             "--api-listen=127.0.0.1:8990",
             "--api-token-file=/c/token",
+            "--proxy-auth-file=/c/proxy-secret",
             "--storage-client-cert=/c/fe.pem",
             "--storage-client-key=/c/fe.key",
             "--storage-ca=/c/ca.pem",
@@ -1189,6 +1204,7 @@ mod wiring {
             [
                 "--reapi-tls-key",
                 "--api-token-file",
+                "--proxy-auth-file",
                 "--worker-tls-key",
                 "--storage-client-key"
             ]

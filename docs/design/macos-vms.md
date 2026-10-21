@@ -359,8 +359,9 @@ filled by nothing yet (`kbf-lease=vm` is refused). An `action` lease books 1 cor
 The lease kind is in the scheduler's request: a worker is feasible only if its `drivers`
 serve the kind, and a `whole_machine` lease books the whole worker and, when it fits
 nowhere, holds one worker in queue order ([scheduler.md](scheduler.md#placement)).
-Otherwise placement is first fit in worker-name order **[V]**. The changes still
-planned:
+Otherwise placement goes to the least loaded feasible worker (the least booked share
+of its CPU or memory, then the fewest leases, then worker-name order) **[V]**. The
+changes still planned:
 
 1. **A `vms` dimension** in `Resources`, filled from `vm.slots`, checked by `fits` like
    `gpus`. A VM lease books `vms=1`, `kbf-book-cpus` and `kbf-book-mem-gib`. The
@@ -674,7 +675,7 @@ only if the `ibtool`/`actool` probe passes.
 | `kbf-driver-vm` (new) | section 6 | ~3,000 with tests |
 | `kbf-vmm`, `kbf-guest` (new) | the VM helper, run as a dedicated non-admin uid (needs `kbf-mac-session run`, [fleet-updates.md](fleet-updates.md) phase P1), and the guest agent | ~1,000 |
 | `kbf-segments`, `kbf-front` | chunked upload, if images ship through the CAS | ~400 |
-| `kbf-it` | the freshness test on VMs | ~150 |
+| `kbf-integration-test` | the freshness test on VMs | ~150 |
 
 Exit: two XCUITest actions run at once on one Mac beside bare-metal builds; a third
 waits; each VM is gone afterwards; measured boot time, idle guest memory and a real

@@ -33,11 +33,14 @@ use kbf_host::path::{HostPath, Root};
 use kbf_host::step::{Owner, Perms};
 use kbf_host::testkit::FakeExec;
 use kbf_installer::CommitId;
-use kbf_installer::attest::{SourceRef, Tools, Verifier};
+use kbf_installer::attest::{GhCheck, SourceRef, Tools};
 use kbf_installer::run::{RunAs, SystemRunner};
 
 /// The commit the fixture attests, and the branch it was built on.
 const COMMIT: &str = "0f4a3825305cc79733ef098eae9725948eb5d6db";
+// HISTORIC FIXTURE: a real attestation made while the development branch was
+// `feature/arch-v2` (the branch is gone; main is the only integration branch). It cannot
+// be regenerated offline, so it keeps its original ref.
 const REF: &str = "refs/heads/feature/arch-v2";
 /// The version of `gh` CI pins.
 const GH_VERSION: &str = "2.102.0";
@@ -118,9 +121,9 @@ fn verify(
     file: &Path,
     commit: &str,
     refs: &[&str],
-    change: impl FnOnce(&mut Verifier),
+    change: impl FnOnce(&mut GhCheck),
 ) -> Result<kbf_installer::attest::Verified, kbf_installer::refusal::Refusal> {
-    let mut verifier = Verifier {
+    let mut verifier = GhCheck {
         root: Root::host(),
         gh: host_path(&gh()),
         trusted_root: host_path(&testdata("trusted_root.jsonl")),

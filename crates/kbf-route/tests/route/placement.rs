@@ -26,6 +26,7 @@ async fn a_placement_is_what_the_map_says() {
     let cell = Cell::with(MapView {
         map: now.clone(),
         previous: Some(before.clone()),
+        earlier: Vec::new(),
     });
     let router = Router::new(cell, Cluster::of(4));
     let (_, digest) =
@@ -96,4 +97,41 @@ async fn a_placement_lists_the_writers_in_the_order_a_write_tries_them() {
             .writers
             .is_empty()
     );
+}
+
+/// Catches an epoch that does not move when what a remembered "held" answer rests on
+/// moves: a new generation, a member that restarted (a new boot at the same generation
+/// number's members), or a member added; and one that moves when nothing did. A member of
+/// unknown boot (0) or no map gives no epoch at all, so nothing is remembered.
+#[tokio::test]
+async fn the_epoch_moves_with_the_generation_and_every_boot() {
+    let base = map(1, 2, active(&[1, 2, 3]));
+    let (first_router, _) = router_for(&base);
+    let first = first_router.epoch().expect("an epoch");
+    assert_eq!(
+        first_router.epoch(),
+        Some(first),
+        "the same map, the same epoch"
+    );
+
+    let (next_generation, _) = router_for(&map(2, 2, active(&[1, 2, 3])));
+    assert_ne!(next_generation.epoch(), Some(first));
+
+    let mut restarted = active(&[1, 2, 3]);
+    restarted[1].boot = 2;
+    let (rebooted, _) = router_for(&map(1, 2, restarted));
+    assert_ne!(
+        rebooted.epoch(),
+        Some(first),
+        "a boot moved at the same generation"
+    );
+
+    let (grown, _) = router(&map(1, 2, active(&[1, 2, 3, 4])), &Cluster::of(4));
+    assert_ne!(grown.epoch(), Some(first));
+
+    let mut unknown = active(&[1, 2, 3]);
+    unknown[0].boot = 0;
+    let (unknown, _) = router_for(&map(1, 2, unknown));
+    assert_eq!(unknown.epoch(), None);
+    assert_eq!(Router::new(Cell::empty(), Cluster::of(1)).epoch(), None);
 }

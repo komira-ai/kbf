@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use kbf_daemon::keeper::{self, Mode};
 use kbf_deploy::linux::verify_cert::{CLIENT_AUTH, ROLE_URI_PREFIX, Row, verify};
+use kbf_testkit::dir::TestDir;
 use rcgen::{
     CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
     SanType,
@@ -62,12 +63,14 @@ impl Drop for Guarded {
 /// never says `Hello`. The front's certificate is a plain TLS server's: the fake front
 /// checks the client's certificate against the CA only, not its role. Both keys are
 /// private to this user (0600), as the self-checks require.
-fn tls(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-macos-daemon")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
+///
+/// The directory is removed when the returned [`TestDir`] drops: bind it before the
+/// processes that run in it, so they are reaped first.
+fn tls(name: &str) -> TestDir {
+    let dir = TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-macos-daemon-{name}"),
+    );
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -148,10 +151,6 @@ fn unit_args(dir: &Path, data: &Path, port: u16) -> Vec<String> {
         &data.display().to_string(),
         "--data-max-bytes",
         "4294967296",
-        "--label",
-        "pool=darwin-sized",
-        "--label",
-        "os=macos",
     ]
     .map(str::to_owned)
     .to_vec()
@@ -187,40 +186,33 @@ fn pid_in(file: &Path) -> i32 {
     }
 }
 
-/// `kbf check-args` on `args`: the status the unit's words get before an installer
-/// starts the unit.
-fn check_args(args: &[String]) -> (Option<i32>, String) {
-    let out = Command::new(BIN)
-        .arg("check-args")
-        .args(args)
-        .output()
-        .expect("run");
-    (
-        out.status.code(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+/// kbf's own parser on `args` (the unit's words, the mode first), as `kbf` reads them:
+/// the exit status a start of the unit gets before it reaches the host, and what it says.
+fn parse_unit_words(args: &[String]) -> (Option<i32>, String) {
+    match kbf_cli::parse_from(std::iter::once("kbf").chain(args.iter().map(String::as_str))) {
+        Ok(_) => (Some(0), String::new()),
+        Err(e) => (Some(e.exit_code()), e.to_string()),
+    }
 }
 
-/// The unit's words are accepted by `kbf check-args daemon ...`, which is what an
-/// installer asks before it loads a unit, and a flag the daemon does not take is not:
-/// the same words with `--data-dir` spelled as another flag exit 2.
+/// The unit's words are accepted by kbf's parser for `daemon`, and a flag the daemon does
+/// not take is not: the same words with `--data-dir` spelled as another flag exit 2.
 ///
 /// Catches a `kbf daemon` that no longer takes a flag the unit passes (a flag renamed or
 /// dropped in the node's flags while the unit still writes it: launchd would restart the
-/// daemon every ten seconds, each start exiting 2), and a `check-args` that accepts
-/// everything.
+/// daemon every ten seconds, each start exiting 2), and a parser that accepts everything.
 #[test]
-fn check_args_accepts_the_units_words_and_refuses_a_renamed_flag() {
-    let dir = tls("check-args");
+fn the_units_words_parse_and_a_renamed_flag_is_refused() {
+    let dir = tls("unit-words");
     let args = unit_args(&dir, &dir.join("data"), 8981);
-    let (code, err) = check_args(&args);
+    let (code, err) = parse_unit_words(&args);
     assert_eq!(code, Some(0), "{err}");
 
     let renamed: Vec<String> = args
         .iter()
         .map(|a| if a == "--data-dir" { "--datadir" } else { a }.to_owned())
         .collect();
-    let (code, err) = check_args(&renamed);
+    let (code, err) = parse_unit_words(&renamed);
     assert_eq!(code, Some(2), "{err}");
     assert!(err.contains("--datadir"), "{err}");
 }
@@ -283,7 +275,7 @@ fn kbf_daemon_starts_as_the_units_words_start_it() {
     let mut daemon = Command::new(BIN)
         .args(unit_args(&dir, &data, front.worker.port()))
         .current_dir(&dir)
-        .env("HOME", &dir)
+        .env("HOME", dir.path())
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log).expect("log file"))
         .spawn()
@@ -341,7 +333,7 @@ fn rendered_config(dir: &Path, data: &Path, port: u16) -> PathBuf {
     let url = format!("https://localhost:{port}");
     let text = format!(
         "mode = \"daemon\"\n\n[identity]\nserver = \"{url}\"\ncas = \"{url}\"\nca-cert = \"{}\"\n\
-         cert = \"{}\"\nkey = \"{}\"\nnode-id = \"node-1\"\nlabel = [\"pool=darwin-sized\", \"os=macos\"]\n\n\
+         cert = \"{}\"\nkey = \"{}\"\nnode-id = \"node-1\"\n\n\
          [daemon]\ndriver = [\"native\"]\ndata-dir = \"{}\"\n",
         at("ca.pem"),
         at("node.pem"),
@@ -374,7 +366,7 @@ fn kbf_daemon_starts_from_the_config_file_the_unit_names() {
         .args(["--mode=daemon", "--config"])
         .arg(&config)
         .current_dir(&dir)
-        .env("HOME", &dir)
+        .env("HOME", dir.path())
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log).expect("log file"))
         .spawn()

@@ -6,7 +6,6 @@ mod support;
 
 use std::future::pending;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +31,7 @@ const PROMPT: Duration = Duration::from_secs(5);
 
 /// A cell CA on disk, a server certificate, and client certificates on demand.
 struct Pki {
-    dir: PathBuf,
+    dir: kbf_testkit::dir::TestDir,
     ca: CertifiedIssuer<'static, KeyPair>,
 }
 
@@ -51,10 +50,10 @@ impl Pki {
 
     /// A PKI whose CA is made from `ca`.
     fn with_ca(name: &str, ca: CertificateParams) -> Self {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join("kbf-server-node-binding")
-            .join(name);
-        std::fs::create_dir_all(&dir).expect("create the TLS directory");
+        let dir = kbf_testkit::dir::TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            &format!("kbf-server-node-binding-{name}"),
+        );
         let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
         let pki = Self { dir, ca };
         let (cert, key) = pki.leaf(
@@ -174,6 +173,7 @@ fn hello(node: &str) -> daemon_message::Message {
         protocol_version: 1,
         node_id: node.to_owned(),
         capabilities: vec![
+            entry("os", "linux"),
             entry("arch", "x86_64"),
             entry("cpus", "1"),
             entry("mem_gib", "1"),
@@ -436,14 +436,18 @@ async fn a_resent_hello_from_a_denied_node_ends_the_stream() {
     );
 }
 
-/// Catches: a deny list flag accepted without mutual TLS (it could never be applied),
-/// and a server that starts with a deny list it cannot read or parse.
+/// Catches: a deny list flag accepted with neither mutual TLS nor a proxy (it could never
+/// be applied), and a server that starts with a deny list it cannot read or parse.
 #[test]
 fn the_deny_list_flag_needs_tls_and_a_good_file() {
-    let plain = Args::try_parse_from(["kbf-server", "--worker-deny-list", "deny.list"]);
-    assert!(plain.is_err(), "a deny list without TLS");
-
     let pki = Pki::new("deny-flag");
+    let good = pki.write("good.list", "node mac-07\n");
+    let plain =
+        Args::try_parse_from(["kbf-server", "--worker-deny-list", &good]).expect("the flag parses");
+    assert!(matches!(
+        plain.listeners(),
+        Err(ConfigError::DenyListWithoutIdentity)
+    ));
     let bad = pki.write("bad.list", "serial\n");
     let error = pki
         .args(&["--worker-deny-list", &bad])
@@ -661,6 +665,7 @@ async fn a_revoked_daemon_cannot_report_its_status() {
         token: None,
         local_cache: None,
         releases: None,
+        poll: None,
     };
     let bound = bind_server_with_api(Arc::new(Cache::memory()), listeners, Some(api), pending())
         .expect("bind");
@@ -733,6 +738,7 @@ async fn a_revoked_daemon_cannot_report_its_update_status() {
         token: None,
         local_cache: None,
         releases: None,
+        poll: None,
     };
     let farm_get = kbf_auth::Policy::from_json(
         r#"{"authenticationPolicy": {"allow": {}}, "farm": {"getAuthorizer": {"allow": {}}}}"#,

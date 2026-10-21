@@ -74,7 +74,6 @@ pub fn private_runtime(config: &mut ContainerConfig) {
 
 /// One test's fake `crun`, fake cgroup mount, scratch directory and runtime.
 pub struct Fake {
-    pub dir: PathBuf,
     /// The stand-in `crun`'s state and knobs.
     pub state: PathBuf,
     /// The registry in this process, for a fake made with [`Fake::fetching`].
@@ -85,6 +84,10 @@ pub struct Fake {
     pub cas: Arc<MemoryCas>,
     pub runtime: Arc<ContainerRuntime<MemoryCas>>,
     nonce: String,
+    /// Last: removed after the runtime and the rest of the fake are gone.
+    pub dir: super::Scratch,
+    /// More directories the test gives the fake to remove, after `dir`.
+    extras: Vec<super::Scratch>,
 }
 
 /// The id files of a daemon user with one range of 65,536 subordinate ids at 100000.
@@ -175,7 +178,6 @@ impl Fake {
         let runtime =
             Arc::new(ContainerRuntime::new(config.clone(), Arc::clone(&cas)).expect("runtime"));
         Self {
-            dir,
             state,
             registry,
             cgroup,
@@ -184,7 +186,16 @@ impl Fake {
             cas,
             runtime,
             nonce,
+            dir,
+            extras: Vec::new(),
         }
+    }
+
+    /// This fake, removing `dir` too when it is dropped.
+    #[must_use]
+    pub fn owning(mut self, dir: super::Scratch) -> Self {
+        self.extras.push(dir);
+        self
     }
 
     pub fn knob(&self, name: &str, contents: &str) {
@@ -218,6 +229,16 @@ impl Fake {
     /// The next run fails as `crun` does when the program's exec finds it busy.
     pub fn busy_once(&self) {
         self.knob("busy-once", "");
+    }
+
+    /// The container's init cannot start the program: it says `words` (in `crun`'s) on
+    /// the report file and the run ends `code`; every run, or only the next if `once`.
+    pub fn init_says(&self, words: &str, code: i32, once: bool) {
+        self.knob("init-says", words);
+        self.knob("init-says-code", &code.to_string());
+        if once {
+            self.knob("init-says-once", "");
+        }
     }
 
     /// The pid of the last action, as the stand-in published it.
@@ -446,7 +467,6 @@ impl Drop for Fake {
     fn drop(&mut self) {
         if !std::thread::panicking() {
             self.wait_until_nothing_runs();
-            super::force_remove(&self.dir);
         }
     }
 }

@@ -26,6 +26,7 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use runc::error::Error;
@@ -51,7 +52,37 @@ pub(crate) fn code_of(status: ExitStatus) -> i32 {
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
 }
 
-/// The `Spawner` of this driver: [`runc::DefaultExecutor`], with `kill_on_drop`.
+/// How long a dropped child is waited for after its `SIGKILL`. A killed process exits
+/// once it leaves the system call it is in; a child still there at the limit is left
+/// to tokio's orphan queue (`kill_on_drop`).
+const REAP_ON_DROP: Duration = Duration::from_secs(5);
+
+/// A running `crun`, killed and reaped when dropped. tokio's `kill_on_drop` alone sends
+/// the `SIGKILL` and leaves the reaping to its orphan queue, so an aborted `crun run`
+/// could still be there, dying or a zombie, when the lease clean went on to `crun
+/// delete` its container: the delete then raced the run's own removal of its state.
+/// Dropping blocks (microseconds for a process that has the signal pending) on the
+/// thread that polled the future.
+struct Reaped(tokio::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.start_kill();
+        wait_exited(&mut self.0, REAP_ON_DROP);
+    }
+}
+
+/// Polls `child` until it has exited (and so is reaped) or `limit` has passed.
+fn wait_exited(child: &mut tokio::process::Child, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    // `Ok(None)`: not exited yet. An error is not a process to wait for.
+    while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The `Spawner` of this driver: [`runc::DefaultExecutor`], with `kill_on_drop` and a
+/// child that is reaped when its future is dropped ([`Reaped`]).
 #[derive(Debug)]
 struct KillOnDrop;
 
@@ -60,24 +91,37 @@ impl Spawner for KillOnDrop {
     async fn execute(&self, mut cmd: Command) -> runc::Result<(ExitStatus, u32, String, String)> {
         cmd.kill_on_drop(true);
         without_credentials(cmd.as_std_mut());
-        let child = cmd.spawn().map_err(Error::ProcessSpawnFailed)?;
+        let mut child = cmd.spawn().map_err(Error::ProcessSpawnFailed)?;
         let pid = child.id().unwrap_or(0);
-        let out = child
-            .wait_with_output()
-            .await
-            .map_err(Error::InvalidCommand)?;
+        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let mut child = Reaped(child);
+        let waiting = child.0.wait();
+        let (status, out, err) = tokio::join!(waiting, read_all(stdout), read_all(stderr));
+        let status = status.map_err(Error::InvalidCommand)?;
         Ok((
-            out.status,
+            status,
             pid,
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
+            String::from_utf8_lossy(&out.map_err(Error::InvalidCommand)?).into_owned(),
+            String::from_utf8_lossy(&err.map_err(Error::InvalidCommand)?).into_owned(),
         ))
     }
 }
 
-/// `Io` that gives `crun run` the lease's stdout and stderr files, and no stdin.
+/// Everything `pipe` says until it closes; nothing for a stream that was not piped.
+async fn read_all<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+    let mut bytes = Vec::new();
+    if let Some(mut pipe) = pipe {
+        pipe.read_to_end(&mut bytes).await?;
+    }
+    Ok(bytes)
+}
+
+/// `Io` that gives `crun run` the lease's stdout and stderr files, and as stdin the file
+/// the container's init reports a program it could not start in (`oci::init`).
 #[derive(Debug)]
 struct FileIo {
+    stdin: std::fs::File,
     stdout: std::fs::File,
     stderr: std::fs::File,
 }
@@ -85,7 +129,7 @@ struct FileIo {
 #[async_trait]
 impl Io for FileIo {
     async fn set(&self, cmd: &mut Command) -> std::io::Result<()> {
-        cmd.stdin(std::process::Stdio::null());
+        cmd.stdin(self.stdin.try_clone()?);
         cmd.stdout(self.stdout.try_clone()?);
         cmd.stderr(self.stderr.try_clone()?);
         Ok(())
@@ -135,6 +179,7 @@ impl Crun {
         lease: &Path,
         id: &str,
         bundle: &Path,
+        stdin: std::fs::File,
         stdout: std::fs::File,
         stderr: std::fs::File,
     ) -> RunEnd {
@@ -142,7 +187,11 @@ impl Crun {
             Ok(client) => client,
             Err(e) => return RunEnd::Failed(e),
         };
-        let opts = CreateOpts::new().io(Arc::new(FileIo { stdout, stderr }));
+        let opts = CreateOpts::new().io(Arc::new(FileIo {
+            stdin,
+            stdout,
+            stderr,
+        }));
         match client.run(id, bundle, Some(&opts)).await {
             Ok(()) => RunEnd::Exited(0),
             Err(Error::CommandFailed { status, .. }) => RunEnd::Exited(code_of(status)),
@@ -208,9 +257,12 @@ impl Crun {
         let state = state_dir(lease);
         let deleted = self.blocking(&state, &["delete", "--force", id], "delete");
         // A `crun run` killed with its container (a sweep's case) deletes its own state as
-        // it exits, and a `crun delete` that lost that race fails on the directory it
-        // listed: with the state gone there is nothing left to delete.
-        if deleted.is_err() && !state.join(id).exists() {
+        // it exits, and a `crun delete` that lost that race fails on what it listed or
+        // loaded (the directory, or the `config.json` the other removed first, with the
+        // directory itself still there for a moment): once the state is gone there is
+        // nothing left to delete. The state of a delete that failed for another reason
+        // stays, and that failure is returned after the wait.
+        if deleted.is_err() && wait_gone(&state.join(id), STATE_REMOVAL_WAIT) {
             return Ok(());
         }
         deleted
@@ -255,8 +307,29 @@ impl Crun {
     }
 }
 
+/// How long a failed `crun delete` waits for the container's state to be removed by
+/// the `crun run` that owns it. That run is removing it already; the wait ends the moment
+/// the directory is gone.
+const STATE_REMOVAL_WAIT: Duration = Duration::from_secs(3);
+
+/// Whether `path` is gone, polling until `limit` has passed.
+fn wait_gone(path: &Path, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if !path.exists() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     /// Catches `crun`'s status being read as anything but a shell reads it: an exit code
@@ -270,12 +343,83 @@ mod tests {
         assert_eq!(code_of(ExitStatus::from_raw(15)), 143);
     }
 
+    /// Catches a `crun` that is aborted (its future dropped, which `Running::force` does
+    /// when the grace after `cgroup.kill` runs out) and is still there, alive or a
+    /// zombie, when the drop returns: the clean then ran `crun delete` beside a
+    /// `crun run` that had not been reaped. Each round polls `execute` once (which
+    /// spawns `sleep`, no timer: a zero timeout polls its future first), finds the new
+    /// child in the thread's `children` list, drops the future, and looks for the pid at
+    /// once. Rounds repeat so a child that dies fast enough on its own cannot hide a
+    /// driver that does not wait.
+    #[test]
+    fn a_dropped_crun_is_reaped_before_the_drop_returns() {
+        let children = format!(
+            "/proc/self/task/{}/children",
+            rustix::thread::gettid().as_raw_nonzero()
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut seen = std::collections::HashSet::new();
+        for round in 0..25 {
+            let mut command = Command::new("sleep");
+            command.arg("600");
+            let mut run = Box::pin(KillOnDrop.execute(command));
+            let polled =
+                runtime.block_on(async { tokio::time::timeout(Duration::ZERO, &mut run).await });
+            assert!(polled.is_err(), "round {round}: sleep 600 ended");
+            let listed = std::fs::read_to_string(&children).expect("the thread's children");
+            let new: Vec<_> = listed
+                .split_whitespace()
+                .filter(|p| seen.insert((*p).to_owned()))
+                .collect();
+            assert_eq!(
+                new.len(),
+                1,
+                "round {round}: new children {new:?} of {listed:?}"
+            );
+            let pid = new[0];
+            drop(run);
+            assert!(
+                !Path::new("/proc").join(pid).exists(),
+                "round {round}: pid {pid} is still there after its future was dropped"
+            );
+        }
+    }
+
+    /// Catches a wait for a killed child that returns early or never returns: with the
+    /// limit passed it gives up on a child that still runs (and leaves it running), and
+    /// with room it returns once the killed child has been reaped.
+    #[test]
+    fn the_wait_for_a_child_is_bounded_and_ends_when_it_is_reaped() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut child = Command::new("sleep").arg("600").spawn().expect("sleep");
+            wait_exited(&mut child, Duration::from_millis(20));
+            assert!(
+                matches!(child.try_wait(), Ok(None)),
+                "a child that was not killed is gone"
+            );
+            child.start_kill().expect("kill");
+            wait_exited(&mut child, Duration::from_secs(30));
+            assert!(
+                matches!(child.try_wait(), Ok(Some(_))),
+                "the killed child is not reaped"
+            );
+        });
+    }
+
     /// The `Io` hook `crun run` is given has nothing to close once the child has the
     /// files (the crate calls it for `create` and `exec`, not `run`).
     #[tokio::test]
     async fn the_file_io_has_nothing_to_close_after_the_start() {
         let null = || std::fs::File::open("/dev/null").expect("/dev/null");
         FileIo {
+            stdin: null(),
             stdout: null(),
             stderr: null(),
         }

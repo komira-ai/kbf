@@ -126,6 +126,30 @@ pub fn verify_ident(recorded: &ProcIdent, live: &ProcIdent) -> Result<(), AdoptE
     }
 }
 
+/// What the gate answers to [`super::ports::Gate::retire`], the proxy's commit on a slot.
+/// Only `Closed` (this call retired it) lets the supervisor signal the child: the other
+/// answers either mean an earlier call did, or that the slot is not safe to retire yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retired {
+    /// This call closed the slot: no stream is bound to it and none can bind.
+    Closed,
+    /// An earlier call closed it and nothing opened it since.
+    AlreadyClosed,
+    /// The slot was never opened: nothing to retire, and no proof a child is gone.
+    NeverOpened,
+    /// The slot is the active one.
+    Current,
+    /// This many streams are still bound to it.
+    Busy(u64),
+}
+
+impl Retired {
+    /// The slot is closed to new streams, by this call or an earlier one.
+    pub fn is_closed(self) -> bool {
+        matches!(self, Retired::Closed | Retired::AlreadyClosed)
+    }
+}
+
 /// What a child says about itself on `GET role`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoleState {
@@ -144,6 +168,14 @@ pub struct RoleInfo {
     pub state: RoleState,
 }
 
+/// How a child is started: the one that serves from its first moment (all-in-one hosts, a
+/// release put back), or a candidate that waits for `POST takeover` (`--await-takeover`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Start {
+    Active,
+    Candidate,
+}
+
 /// Readiness of a candidate: `/readyz`, a `grpc.health.v1` check and one synthetic
 /// `GetCapabilities` through it (FP section 5 step 5). All three must hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,16 +191,18 @@ impl Readiness {
     }
 }
 
-/// What the child itself counts (Q8). Streams are counted by the proxy's permits, not here.
+/// What the child itself counts (Q8): the Execute and WaitExecution streams it has open, and
+/// the worker sessions it has open. Operations queued and not yet leased are not counted: they
+/// live in the shared store, and the new holder serves them (design §5 step 10).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenCounts {
-    pub open_executions: u64,
-    pub queued_operations: u64,
+    pub open_streams: u64,
+    pub open_sessions: u64,
 }
 
 impl OpenCounts {
     pub fn idle(self) -> bool {
-        self.open_executions == 0 && self.queued_operations == 0
+        self.open_streams == 0 && self.open_sessions == 0
     }
 }
 

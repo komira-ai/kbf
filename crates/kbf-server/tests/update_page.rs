@@ -67,6 +67,7 @@ fn listeners() -> Listeners {
         hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -118,6 +119,7 @@ fn start(policy: kbf_auth::Policy, dir: &Dir) -> (Running, Arc<dyn Store>) {
         token: Some(ApiToken::from_file(&path).expect("a usable token")),
         local_cache: None,
         releases: Some(releases),
+        poll: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),

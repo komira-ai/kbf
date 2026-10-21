@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::offer::{Refusal, check_component};
-use crate::types::{Offer, Order, Verb, is_hex};
+use crate::types::{Offer, Order, Source, Verb, is_hex};
 
 /// The most bytes a record may be; the installer refuses a larger file unread.
 pub const MAX_RECORD_BYTES: u64 = 1 << 20;
@@ -43,7 +43,7 @@ pub struct Locator {
 }
 
 /// What the release is expected to declare about itself (`kbf --version --json`), as the
-/// frontend's preflight recorded it. The installer requires the fetched binary to say the
+/// frontend's release store holds it (the platform's version facts document). The installer requires the fetched binary to say the
 /// same, before it switches to it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,6 +72,13 @@ pub struct OrderRecord {
     /// For an activation: what the fetched binary must declare. Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected: Option<Facts>,
+    /// Where the release comes from. Written only when it is [`Source::Staged`], so the
+    /// bytes of a record that fetches are what they have always been; a reader takes the
+    /// explicit word `fetch` as the default. Only an `activate` and a `frontend_update` take
+    /// it, and a staged one is a locator: no components and no expected facts, since the
+    /// installer holds the release's facts in its own package.
+    #[serde(default, skip_serializing_if = "Source::is_fetch")]
+    pub source: Source,
 }
 
 /// Why a record cannot be written or is not acceptable.
@@ -83,7 +90,7 @@ pub enum RecordError {
     NotForNodes,
     #[error("an activation names no release component")]
     NoComponents,
-    #[error("a {0} order carries components or expected facts")]
+    #[error("a {0} order carries components, expected facts or a source it does not take")]
     Unexpected(&'static str),
     #[error("an activation carries no expected facts of the release")]
     NoFacts,
@@ -170,6 +177,8 @@ impl OrderRecord {
             window_s: order.window_s,
             components,
             expected,
+            // A node's order says nothing of a source yet: it is the default.
+            source: Source::Fetch,
         };
         record.check()?;
         record.to_bytes()?;
@@ -210,9 +219,14 @@ impl OrderRecord {
     }
 
     /// The shape rules both ends hold: a full commit; an activation names its components
-    /// (each within the offer's limits) and the expected facts, every one there (a release
-    /// the frontend never preflighted is not activated); a frontend update names its
-    /// components and may leave the facts out; the other verbs carry neither.
+    /// (each within the offer's limits) and the expected facts, every one there (an offer
+    /// without facts is not activated); every other verb carries neither.
+    /// A `frontend_update` is a locator like a `confirm`: the root half fetches the commit
+    /// from its own source and re-derives every fact, so the record names no file, no
+    /// digest and no claim. An activation whose source is [`Source::Staged`] is a locator
+    /// too (the release is the one the installer's package carries, and its manifest holds the
+    /// facts), and only an `activate` and a `frontend_update` take a source: a `confirm` or a
+    /// `revert` that names one is refused.
     ///
     /// # Errors
     /// The first rule broken.
@@ -220,7 +234,14 @@ impl OrderRecord {
         if !is_hex(&self.commit, 40) {
             return Err(RecordError::Commit(self.commit.clone()));
         }
-        if !matches!(self.verb, Verb::Activate | Verb::FrontendUpdate) {
+        let locator = match (self.verb, self.source) {
+            (Verb::Activate, Source::Fetch) => false,
+            (Verb::Activate | Verb::FrontendUpdate, _) | (_, Source::Fetch) => true,
+            (Verb::Confirm | Verb::Revert, Source::Staged) => {
+                return Err(RecordError::Unexpected(self.verb.name()));
+            }
+        };
+        if locator {
             if !self.components.is_empty() || self.expected.is_some() {
                 return Err(RecordError::Unexpected(self.verb.name()));
             }
@@ -233,15 +254,9 @@ impl OrderRecord {
         for c in &self.components {
             check_component(&c.name, &c.sha256, c.size, c.attestation.len(), &mut seen)?;
         }
-        // The expected facts are the fail-closed claim of an activation. A frontend update
-        // is built from the frontend's own release store, which holds none: optional there,
-        // and complete when given.
+        // The expected facts are the fail-closed claim of an activation.
         let Some(f) = &self.expected else {
-            return if self.verb == Verb::FrontendUpdate {
-                Ok(())
-            } else {
-                Err(RecordError::NoFacts)
-            };
+            return Err(RecordError::NoFacts);
         };
         if f.platform.is_empty() || f.profile.is_empty() {
             return Err(RecordError::Facts("no platform or profile".to_owned()));
@@ -357,25 +372,31 @@ mod tests {
 
     /// Catches a shape rule of `check` that is missing or has the wrong bound, on the reader's
     /// side as on the writer's: each break of a good activation record is refused with its own
-    /// reason (no components, no platform, no profile, protocol 0, state schema 0, a minimum
-    /// protocol above the protocol), the bound is inclusive (equal is accepted), a confirm
-    /// carrying only expected facts is refused as a confirm with extras, and the word of every
-    /// verb is the one the file carries.
+    /// reason (no components, no expected facts at all, no platform, no profile, protocol 0,
+    /// state schema 0, a minimum protocol above the protocol), the bound is inclusive (equal
+    /// is accepted), a confirm carrying only expected facts is refused as a confirm with
+    /// extras, and the word of every verb is the one the file carries.
     ///
     /// Mutants planted: `min_protocol >= protocol` (equal is refused); the components check
     /// removed (an activation with none is accepted); the facts check on `||` replaced by `&&`
-    /// (an empty platform with a profile is accepted).
+    /// (an empty platform with a profile is accepted); the facts-required arm made to pass an
+    /// activation with none (the "no facts" break is accepted).
     #[test]
     fn a_record_that_breaks_a_shape_rule_is_refused() {
         let good = OrderRecord::for_order(&order(COMMIT), Verb::Activate, Some(&good_offer()))
             .expect("record");
         assert_eq!(good.check(), Ok(()));
         type Break = (&'static str, fn(&mut OrderRecord), &'static str);
-        let breaks: [Break; 6] = [
+        let breaks: [Break; 7] = [
             (
                 "components",
                 |r| r.components.clear(),
                 "names no release component",
+            ),
+            (
+                "no facts",
+                |r| r.expected = None,
+                "carries no expected facts",
             ),
             (
                 "platform",
@@ -432,36 +453,48 @@ mod tests {
         assert_eq!(words, ["activate", "confirm", "revert", "frontend_update"]);
     }
 
-    /// The golden fixture of a `frontend_update` record: the exact bytes the frontend's writer
-    /// and the installer's reader agree on. Facts are optional for it and complete when
-    /// present; an activation without them is refused (fail closed).
+    /// The golden bytes of a `frontend_update` record: a locator and nothing else, the six
+    /// keys of every record and no `components` or `expected` (the installer fetches the
+    /// commit from its own source and re-derives every fact, so the record cannot name a
+    /// path, a URL or a digest). It round-trips byte for byte; the same bytes as an
+    /// activation have no files to fetch; adding components, facts or both is refused
+    /// whole, each with the reason that names the verb.
     ///
-    /// Mutant planted: the exemption widened to every verb (the activation is then accepted).
+    /// Mutants planted: the old rule restored (a `frontend_update` must name components, so
+    /// the locator is refused); the check widened so a `frontend_update` may carry components
+    /// (the `components` case is accepted); the same for facts (the `facts` case).
     #[test]
-    fn a_frontend_update_record_is_the_golden_bytes_and_its_facts_are_optional() {
-        let sha = "ab".repeat(32);
+    fn a_frontend_update_record_is_a_locator_and_nothing_else() {
         let golden = format!(
-            "{{\"order_id\":5,\"epoch\":2,\"generation\":9,\"verb\":\"frontend_update\",\"commit\":\"{COMMIT}\",\"window_s\":600,\"components\":[{{\"name\":\"kbf\",\"sha256\":\"{sha}\",\"size\":1000,\"attestation\":\"{{}}\"}}]}}"
+            "{{\"order_id\":5,\"epoch\":2,\"generation\":9,\"verb\":\"frontend_update\",\"commit\":\"{COMMIT}\",\"window_s\":600}}"
         );
-        let record = OrderRecord::parse(golden.as_bytes()).expect("parses without facts");
+        let record = OrderRecord::parse(golden.as_bytes()).expect("the locator parses");
         assert_eq!(record.verb, Verb::FrontendUpdate);
+        assert!(record.components.is_empty());
         assert!(record.expected.is_none());
         assert_eq!(record.to_bytes().expect("bytes"), golden.as_bytes());
-        // The same record as an activation has no claims to stand on.
         let as_activate = golden.replace("frontend_update", "activate");
         assert_eq!(
             OrderRecord::parse(as_activate.as_bytes()),
-            Err(RecordError::NoFacts)
+            Err(RecordError::NoComponents)
         );
-        // Given, the facts are held to the same rules.
-        let with_bad_facts = golden.replace(
-            "}]}",
-            "}],\"expected\":{\"platform\":\"linux-x86_64\",\"protocol\":0,\"min_protocol\":0,\"state_schema\":3,\"profile\":\"release\"}}",
+        let sha = "ab".repeat(32);
+        let components = format!(
+            "\"components\":[{{\"name\":\"kbf\",\"sha256\":\"{sha}\",\"size\":1000,\"attestation\":\"{{}}\"}}]"
         );
-        assert!(matches!(
-            OrderRecord::parse(with_bad_facts.as_bytes()),
-            Err(RecordError::Facts(_))
-        ));
+        let facts = "\"expected\":{\"platform\":\"linux-x86_64\",\"protocol\":7,\"min_protocol\":6,\"state_schema\":3,\"profile\":\"release\"}";
+        for (what, extra) in [
+            ("facts", facts.to_owned()),
+            ("components", components.clone()),
+            ("both", format!("{components},{facts}")),
+        ] {
+            let bytes = golden.replace("600}", &format!("600,{extra}}}"));
+            assert_eq!(
+                OrderRecord::parse(bytes.as_bytes()),
+                Err(RecordError::Unexpected("frontend_update")),
+                "{what}"
+            );
+        }
     }
 
     /// Catches a node writing a frontend update: `for_order` refuses that verb whatever
@@ -489,9 +522,9 @@ mod tests {
             });
             assert_ne!(mapped.verb, Some(Verb::FrontendUpdate), "wire verb {value}");
         }
-        // The word, as the reader sees it from the frontend's own writer.
-        let mut by_hand =
-            OrderRecord::for_order(&o, Verb::Activate, Some(&good_offer())).expect("ok");
+        // The word, as the reader sees it from the frontend's own writer: a confirm's
+        // record (a locator) with the verb changed.
+        let mut by_hand = OrderRecord::for_order(&o, Verb::Confirm, None).expect("ok");
         by_hand.verb = Verb::FrontendUpdate;
         let text = String::from_utf8(by_hand.to_bytes().expect("bytes")).expect("text");
         assert!(text.contains("\"verb\":\"frontend_update\""), "{text}");
@@ -499,9 +532,6 @@ mod tests {
             OrderRecord::parse(text.as_bytes()).expect("parses"),
             by_hand
         );
-        // A frontend update carries claims like an activation; without them it is refused.
-        by_hand.components.clear();
-        assert_eq!(by_hand.check(), Err(RecordError::NoComponents));
     }
 
     /// Catches a reader that accepts what the writer never makes: an extra key (a path or a
@@ -538,5 +568,137 @@ mod tests {
         ] {
             assert_eq!(parse_file_name(bad), None, "{bad}");
         }
+    }
+
+    /// The bytes of a record that fetches are what they were before the record had a source:
+    /// the key is left out, an explicit `"source":"fetch"` is read as the default and written
+    /// back without the key, and the activation a node writes names no source.
+    ///
+    /// Catches a sender that always writes the key (an installer that does not know it, or a
+    /// proxy whose request type is closed, refuses the record whole, so a fetch would break
+    /// after any upgrade), and a reader that refuses the word `fetch`.
+    ///
+    /// Mutants to plant: `skip_serializing_if` removed from the field (the golden bytes gain
+    /// the key); the word `fetch` made an unknown variant.
+    #[test]
+    fn a_record_that_fetches_is_todays_bytes_and_an_explicit_fetch_is_read() {
+        let golden = format!(
+            "{{\"order_id\":5,\"epoch\":2,\"generation\":9,\"verb\":\"confirm\",\"commit\":\"{COMMIT}\",\"window_s\":600}}"
+        );
+        let record = OrderRecord::parse(golden.as_bytes()).expect("parses");
+        assert_eq!(record.source, Source::Fetch);
+        assert_eq!(record.to_bytes().expect("bytes"), golden.as_bytes());
+        let explicit = golden.replace("600}", "600,\"source\":\"fetch\"}");
+        let again = OrderRecord::parse(explicit.as_bytes()).expect("an explicit fetch parses");
+        assert_eq!(again, record);
+        assert_eq!(
+            again.to_bytes().expect("bytes"),
+            golden.as_bytes(),
+            "and is written without the key"
+        );
+        let act = OrderRecord::for_order(&order(COMMIT), Verb::Activate, Some(&good_offer()))
+            .expect("record");
+        assert_eq!(act.source, Source::Fetch);
+        let text = String::from_utf8(act.to_bytes().expect("bytes")).expect("text");
+        assert!(!text.contains("source"), "{text}");
+    }
+
+    /// A staged record is a locator that names its source last, and only an `activate` and a
+    /// `frontend_update` take the key: a staged activation with components, with expected
+    /// facts or with both is refused as an activation that takes neither, a `confirm` or a
+    /// `revert` with the key is refused as one that takes no source, and an activation that
+    /// names no source and no components is still one that names no component. A source that
+    /// is neither word is not a record.
+    ///
+    /// Catches a staged activation that also carries the release it would have fetched (two
+    /// ways to say where the bytes come from), a source on a verb that moves no release, and
+    /// the check widened until the empty activation passes.
+    ///
+    /// Mutants to plant: the staged arm for `activate` removed (the golden is `NoComponents`);
+    /// components allowed beside a staged source; the source refused on `frontend_update`;
+    /// allowed on `confirm`; an unknown word read as `fetch`.
+    #[test]
+    fn a_staged_record_is_a_locator_and_only_two_verbs_take_the_key() {
+        let golden = format!(
+            "{{\"order_id\":5,\"epoch\":2,\"generation\":9,\"verb\":\"activate\",\"commit\":\"{COMMIT}\",\"window_s\":600,\"source\":\"staged\"}}"
+        );
+        let record = OrderRecord::parse(golden.as_bytes()).expect("a staged activation parses");
+        assert_eq!(
+            (record.verb, record.source),
+            (Verb::Activate, Source::Staged)
+        );
+        assert!(record.components.is_empty());
+        assert!(record.expected.is_none());
+        assert_eq!(record.to_bytes().expect("bytes"), golden.as_bytes());
+
+        let without = golden.replace(",\"source\":\"staged\"", "");
+        assert_eq!(
+            OrderRecord::parse(without.as_bytes()),
+            Err(RecordError::NoComponents),
+            "without the key it is an activation that names nothing"
+        );
+        let update = golden.replace("activate", "frontend_update");
+        let parsed = OrderRecord::parse(update.as_bytes()).expect("a staged frontend update");
+        assert_eq!(
+            (parsed.verb, parsed.source),
+            (Verb::FrontendUpdate, Source::Staged)
+        );
+
+        for verb in [Verb::Confirm, Verb::Revert] {
+            let bytes = golden.replace("activate", verb.name());
+            assert_eq!(
+                OrderRecord::parse(bytes.as_bytes()),
+                Err(RecordError::Unexpected(verb.name())),
+                "{verb:?} takes no source"
+            );
+        }
+
+        let sha = "ab".repeat(32);
+        let components = format!(
+            "\"components\":[{{\"name\":\"kbf\",\"sha256\":\"{sha}\",\"size\":1000,\"attestation\":\"{{}}\"}}]"
+        );
+        let facts = "\"expected\":{\"platform\":\"linux-x86_64\",\"protocol\":7,\"min_protocol\":6,\"state_schema\":3,\"profile\":\"release\"}";
+        for verb in ["activate", "frontend_update"] {
+            for (what, extra) in [
+                ("facts", facts.to_owned()),
+                ("components", components.clone()),
+                ("both", format!("{components},{facts}")),
+            ] {
+                let bytes = golden
+                    .replace("activate", verb)
+                    .replace("600,", &format!("600,{extra},"));
+                assert_eq!(
+                    OrderRecord::parse(bytes.as_bytes()),
+                    Err(RecordError::Unexpected(verb)),
+                    "{verb} with {what}"
+                );
+            }
+        }
+
+        let bogus = golden.replace("staged", "bogus");
+        let parsed = OrderRecord::parse(bogus.as_bytes());
+        assert!(
+            matches!(parsed, Err(RecordError::Parse(_))),
+            "a source that is neither word is not a record: {parsed:?}"
+        );
+        assert!(format!("{parsed:?}").contains("bogus"), "{parsed:?}");
+    }
+
+    /// The words of the two sources, and the default a record leaves out.
+    ///
+    /// Catches the two words swapped or renamed on the way to a file.
+    #[test]
+    fn the_sources_have_their_words_and_fetch_is_the_default() {
+        assert_eq!(
+            [Source::Fetch.name(), Source::Staged.name()],
+            ["fetch", "staged"]
+        );
+        assert_eq!(Source::default(), Source::Fetch);
+        assert!(Source::Fetch.is_fetch());
+        assert!(!Source::Staged.is_fetch());
+        assert_eq!(
+            serde_json::to_string(&Source::Staged).expect("json"),
+            "\"staged\""
+        );
     }
 }

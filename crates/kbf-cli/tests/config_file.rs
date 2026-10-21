@@ -14,13 +14,11 @@ use std::path::{Path, PathBuf};
 
 use clap::error::ErrorKind;
 use kbf_cli::{Invocation, config, names};
+use kbf_testkit::dir::TestDir;
 
-/// The scratch directory a test may write under (the workspace's `target/`), empty.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("config-file-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// A fresh, empty scratch directory under the workspace's `target/`, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("config-file-{name}"))
 }
 
 /// A file named `kbf.toml` in `dir` holding `text`, with permission bits `mode`.
@@ -278,17 +276,57 @@ fn a_value_gets_the_validation_of_its_flag() {
     }
 }
 
-/// Catches a repeatable flag read as one value, and a switch read as a value: `label`
-/// (given once per label on the command line) is an array in the file, and a switch is
+/// Catches a `label` key (a node label, removed: placement uses what the node reports)
+/// read again, or refused like any unknown key without saying that it was removed and
+/// what replaces it: in `[identity]`, where it used to be, in another table, and outside
+/// any table, it exits 2 naming the key, the file and the one-line tombstone.
+#[test]
+fn a_label_key_is_refused_with_its_replacement() {
+    let dir = scratch("label-key");
+    let identity = "server = \"https://127.0.0.1:1\"\nca-cert = \"ca.pem\"\ncert = \"node.pem\"\nkey = \"node.key\"\nnode-id = \"n\"\n";
+    for (body, key) in [
+        (
+            format!("[identity]\n{identity}label = [\"a=b\"]\n\n[daemon]\ndriver = \"native\"\n"),
+            "`identity.label`",
+        ),
+        (
+            format!("[identity]\n{identity}\n[daemon]\ndriver = \"native\"\nlabel = [\"a=b\"]\n"),
+            "`daemon.label`",
+        ),
+        (
+            format!("label = [\"a=b\"]\n[identity]\n{identity}\n[daemon]\ndriver = \"native\"\n"),
+            "`label`",
+        ),
+    ] {
+        let path = file(&dir, &body, 0o600);
+        let err = kbf_cli::parse_with(argv(&["kbf", "daemon"], Some(&path)), None).expect_err(key);
+        assert_eq!(err.exit_code(), 2, "{key}");
+        let msg = err.to_string();
+        assert!(msg.contains(key), "{key}: {msg}");
+        assert!(msg.contains(&path.display().to_string()), "{key}: {msg}");
+        assert!(
+            msg.contains(
+                "`label` was removed: placement uses what the node reports (OSFamily, ISA); delete the key"
+            ),
+            "{key}: {msg}"
+        );
+    }
+}
+
+/// Catches a repeatable flag read as one value, and a switch read as a value: `server`
+/// (given once per frontend on the command line) is an array in the file, and a switch is
 /// `true` to turn it on and `false` to leave it off, refused for anything else.
 #[test]
 fn a_repeatable_flag_is_an_array_and_a_switch_is_a_boolean() {
     let dir = scratch("shapes");
-    let node = "[identity]\nserver = \"https://127.0.0.1:1\"\nca-cert = \"ca.pem\"\ncert = \"node.pem\"\nkey = \"node.key\"\nnode-id = \"n\"\nlabel = [\"a=b\", \"c=d\"]\n\n[daemon]\ndriver = \"native\"\n";
+    let node = "[identity]\nserver = [\"https://127.0.0.1:1\", \"https://farm.example:1\"]\nca-cert = \"ca.pem\"\ncert = \"node.pem\"\nkey = \"node.key\"\nnode-id = \"n\"\n\n[daemon]\ndriver = \"native\"\n";
     let path = file(&dir, node, 0o600);
     let parsed = kbf_cli::parse_with(argv(&["kbf", "daemon"], Some(&path)), None).expect("parses");
     let text = format!("{:?}", parsed.invocation);
-    assert!(text.contains(r#"("a", "b"), ("c", "d")"#), "{text}");
+    assert!(
+        text.contains(r#"["https://127.0.0.1:1", "https://farm.example:1"]"#),
+        "{text}"
+    );
     // `require-metal-toolchain` is a switch of the daemon.
     for (value, on) in [("true", true), ("false", false)] {
         let path = file(

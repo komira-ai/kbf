@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use kbf_objstore::ObjectKey;
-use kbf_state::{Cond, Txn};
+use kbf_state::{Cond, Op, Txn};
 
 /// An object whose index rows were dropped: its key and footer range (about 100 bytes).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +68,27 @@ impl Row {
             origin,
             also: Vec::new(),
         }
+    }
+
+    /// Whether `permits` accepts every operation the row makes under `key`: its own put
+    /// and each companion write.
+    pub fn permitted(&self, key: &str, permits: &dyn Fn(&Op) -> bool) -> bool {
+        let put = |key: &str, value: &[u8], cond| {
+            permits(&Op::Put {
+                key: key.to_owned(),
+                value: value.to_vec(),
+                ttl: None,
+                cond,
+            })
+        };
+        put(key, &self.value, self.cond)
+            && self.also.iter().all(|also| match also {
+                Also::Put(key, value) => put(key, value, Cond::Any),
+                Also::Delete(key) => permits(&Op::Delete {
+                    key: key.clone(),
+                    cond: Cond::Any,
+                }),
+            })
     }
 
     fn bytes(key: &str, row: &Row) -> usize {
@@ -473,5 +494,45 @@ mod tests {
         assert_eq!(Row::bytes("b", &with), 1 + 1 + 1 + 1 + 3);
         let mut p = Pending::new(PendingLimits { keys: 10, bytes: 6 });
         assert!(p.insert("b".into(), with).is_err(), "7 bytes do not fit 6");
+    }
+
+    #[test]
+    fn a_row_is_permitted_only_when_each_of_its_writes_is() {
+        // Catches: a permit asked about the row's own put alone (a companion delete of
+        // the by-status move would then ride around the fence with it), or companions
+        // judged with the row's precondition, or a row that is judged by the first
+        // companion only.
+        let only = |keys: &'static [&'static str]| {
+            move |op: &Op| match op {
+                Op::Put { key, cond, .. } => keys.contains(&key.as_str()) && *cond != Cond::Absent,
+                _ => false,
+            }
+        };
+        let mut with = Row::new(b"v".to_vec(), Cond::Any, None);
+        with.also = vec![
+            Also::Put("p".into(), b"x".to_vec()),
+            Also::Delete("d".into()),
+        ];
+        assert!(
+            !with.permitted("a", &only(&["a", "p"])),
+            "the delete is not a put"
+        );
+        assert!(!with.permitted("a", &only(&["a"])), "p is not named");
+        assert!(
+            !with.permitted("z", &only(&["a", "p"])),
+            "the row's key is not named"
+        );
+        let alone = Row::new(b"v".to_vec(), Cond::Any, None);
+        assert!(alone.permitted("a", &only(&["a"])));
+        let all = |_: &Op| true;
+        assert!(
+            with.permitted("a", &all),
+            "a permit that takes everything takes the delete"
+        );
+        let created = Row::new(b"v".to_vec(), Cond::Absent, None);
+        assert!(
+            !created.permitted("a", &only(&["a"])),
+            "the precondition is the row's own"
+        );
     }
 }

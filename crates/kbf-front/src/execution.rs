@@ -80,6 +80,14 @@
 //! (`kbf_caps::property_name`): `GPU`, `Kbf-Lease` and `osfamily` are `gpu`,
 //! `kbf-lease` and `OSFamily`, never ignored. One name sent in two spellings is
 //! INVALID_ARGUMENT.
+//!
+//! **When the platform is refused.** As early as it is known, before any input blob is
+//! read: an Action that carries a platform is checked right after it is decoded (so a bad
+//! platform beside missing blobs is INVALID_ARGUMENT or FAILED_PRECONDITION for the
+//! platform, not MISSING), and a Command's platform as soon as the Command is read. An
+//! Execute the action cache answers is checked too: when the CAS holds the action (and its
+//! Command), a refused platform is an error instead of the cached result. An action the
+//! CAS does not hold, or that does not decode, is answered from the cache.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -112,6 +120,7 @@ use kbf_auth::AuthenticationMetadata;
 use kbf_invocation::{CallKind, ExecuteAnswer};
 
 use crate::backend::Backend;
+use crate::default_platform::{DefaultPlatform, Quiet};
 use crate::described::Described;
 use crate::metrics::{CacheMetrics, OpenExecute};
 use crate::recorder::{ActionLabel, ExecuteCall, Recorder, listing};
@@ -375,6 +384,17 @@ struct Presubmit<'a> {
     walk: Duration,
     submit: Duration,
     dir_reads: u64,
+    /// Of a walk over a store: Directories skipped as verified, the time reading
+    /// Directories and the time asking about files, the FindMissing calls and the files.
+    dirs_skipped: u64,
+    /// With the content cache: Directories taken without a read, and the cached ones
+    /// put to FindMissing.
+    dir_cache_hits: u64,
+    dirs_present_checked: u64,
+    dirs: Duration,
+    files: Duration,
+    file_asks: u64,
+    files_checked: u64,
     _in_flight: crate::metrics::Raised<'a>,
 }
 
@@ -389,6 +409,13 @@ impl<'a> Presubmit<'a> {
             walk: Duration::ZERO,
             submit: Duration::ZERO,
             dir_reads: 0,
+            dirs_skipped: 0,
+            dir_cache_hits: 0,
+            dirs_present_checked: 0,
+            dirs: Duration::ZERO,
+            files: Duration::ZERO,
+            file_asks: 0,
+            files_checked: 0,
             _in_flight: metrics.execute_presubmit_in_flight.raise(),
         }
     }
@@ -409,6 +436,13 @@ impl Drop for Presubmit<'_> {
             walk_ms = self.walk.as_millis(),
             submit_ms = self.submit.as_millis(),
             dir_reads = self.dir_reads,
+            dirs_skipped = self.dirs_skipped,
+            dir_cache_hits = self.dir_cache_hits,
+            dirs_present_checked = self.dirs_present_checked,
+            dirs_ms = self.dirs.as_millis(),
+            files_ms = self.files.as_millis(),
+            file_asks = self.file_asks,
+            files_checked = self.files_checked,
             "Execute spent {PRESUBMIT_WARN:?} or more before its first operation"
         );
     }
@@ -426,6 +460,10 @@ pub struct ExecutionService<D> {
     recorder: Recorder,
     /// The memory an `action` that names no size books, in bytes.
     default_memory: u64,
+    /// The OS and architecture of an `action` that names neither.
+    default_platform: DefaultPlatform,
+    /// Holds the log lines of [`Self::default_platform`] to a few a minute.
+    defaulted_log: Quiet,
 }
 
 /// The gRPC path of Execute, as calls are logged.
@@ -452,7 +490,18 @@ impl<D> ExecutionService<D> {
             authorizers,
             recorder: Recorder::off(),
             default_memory: DEFAULT_RESOURCES.memory_bytes,
+            default_platform: DefaultPlatform::NONE,
+            defaulted_log: Quiet::default(),
         }
+    }
+
+    /// This service, giving an `action` that names no OS, no architecture and no ISA
+    /// level (and asks for nothing only a Mac reports) the OS and architecture of
+    /// `platform` (instead of none): placement only, the digest is the client's.
+    #[must_use]
+    pub const fn with_default_platform(mut self, platform: DefaultPlatform) -> Self {
+        self.default_platform = platform;
+        self
     }
 
     /// This service, booking `bytes` of memory for an `action` that names no size
@@ -575,6 +624,8 @@ where
                 action.hash_hex(),
                 action.size_bytes
             );
+            // A result is not an excuse for a platform kbf refuses.
+            self.refuse_platform_of(&action).await?;
             tracing::debug!(%action, "answered from the action cache");
             let instance = &request.instance_name;
             self.recorder
@@ -634,6 +685,12 @@ impl<D> ExecutionService<D> {
         let decoded = Action::decode(bytes).map_err(|e| {
             Status::invalid_argument(format!("action {action} does not decode: {e}"))
         })?;
+        // A platform the Action carries is refused before anything else is read.
+        let own = if platform(&decoded, None).is_some() {
+            Some(self.place(&decoded, None)?)
+        } else {
+            None
+        };
         let command_digest = required(decoded.command_digest.as_ref(), "command_digest")?;
         let root = required(decoded.input_root_digest.as_ref(), "input_root_digest")?;
 
@@ -647,6 +704,11 @@ impl<D> ExecutionService<D> {
                 None
             }
         };
+        // And a Command's, as soon as the Command is read: before the input tree is walked.
+        let placed = match own {
+            Some(placed) => placed,
+            None => self.place(&decoded, command.as_ref())?,
+        };
         let walking = Instant::now();
         let walked = self.cache.walk_inputs(root).await;
         window.walk = walking.elapsed();
@@ -656,23 +718,45 @@ impl<D> ExecutionService<D> {
             .observe_duration(window.walk);
         let walked = walked?;
         window.dir_reads += walked.dirs_read;
+        window.dirs_skipped += walked.dirs_skipped;
+        window.dir_cache_hits += walked.dir_cache_hits;
+        window.dirs_present_checked += walked.dirs_present_checked;
+        window.dirs += walked.dirs_time;
+        window.files += walked.files_time;
+        window.file_asks += walked.file_asks;
+        window.files_checked += walked.files_checked;
+        self.observe_phases(&walked);
         absent.extend(walked.absent);
         if !absent.is_empty() {
+            tracing::warn!(
+                %action,
+                count = absent.len(),
+                first = %absent
+                    .iter()
+                    .take(REFUSED_LOGGED)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "execute refused: input blob(s) are not in the CAS"
+            );
             return Err(missing(&absent));
         }
 
-        let platform = properties(platform(&decoded, command.as_ref()))?;
-        let kind = lease_kind(&platform)?;
-        let booked = booking(&platform, kind, self.default_memory)?;
-        let needs = needs(&platform)?;
-        let gpus = mac_gpus(kind, gpus(&platform)?, &needs)?;
-        device_kind(kind, &needs)?;
+        let Placed {
+            kind,
+            booked,
+            needs,
+            defaulted,
+        } = placed;
+        if defaulted {
+            self.log_defaulted(&action);
+        }
         let submission = Submission {
             request: Request {
                 key: ActionKey { instance, action },
                 qos: Qos::Ci,
                 kind,
-                resources: booked.with_gpus(gpus),
+                resources: booked,
                 hermetic: true,
                 do_not_cache: decoded.do_not_cache,
                 needs,
@@ -684,6 +768,101 @@ impl<D> ExecutionService<D> {
         Ok((submission, command_digest))
     }
 
+    /// What the platform of an action asks of the scheduler, or the status that refuses
+    /// it: INVALID_ARGUMENT for a malformed platform, FAILED_PRECONDITION for one no
+    /// daemon can run. Reads nothing: it runs before any input of the action is read,
+    /// and for a cached result too ([`Self::refuse_platform_of`]).
+    fn place(&self, action: &Action, command: Option<&Command>) -> Result<Placed, Status> {
+        let platform = properties(platform(action, command))?;
+        let kind = lease_kind(&platform)?;
+        let booked = booking(&platform, kind, self.default_memory)?;
+        let asked = needs(&platform)?;
+        let (needs, defaulted) = match self.default_platform.apply(&asked) {
+            Some(placed) => (placed, true),
+            None => (asked, false),
+        };
+        let gpus = mac_gpus(kind, gpus(&platform)?, &needs)?;
+        device_kind(kind, &needs)?;
+        Ok(Placed {
+            kind,
+            booked: booked.with_gpus(gpus),
+            needs,
+            defaulted,
+        })
+    }
+
+    /// Logs, at most a few a minute, that the default platform placed `action`
+    /// ([`DefaultPlatform::apply`]). Placement only: the action's digest is the client's.
+    fn log_defaulted(&self, action: &Digest) {
+        if let Some(held_back) = self.defaulted_log.turn() {
+            tracing::info!(
+                %action,
+                default_platform = %self.default_platform,
+                held_back,
+                "platform defaulted: the action named no OS and no architecture"
+            );
+        }
+    }
+
+    /// Refuses, for an Execute the action cache answers, the platform of the action that
+    /// cached result is for, if the action and its Command are in the CAS: the Action's
+    /// platform, else the Command's, as an Execute that ran would have read it. An action
+    /// or Command the CAS does not hold, or that does not decode, is not refused here (an
+    /// Execute that runs says so); a store that fails is the call's error.
+    async fn refuse_platform_of(&self, action: &Digest) -> Result<(), Status> {
+        let Some(decoded) = self.held::<Action>(action).await? else {
+            return Ok(());
+        };
+        let command = match decoded
+            .command_digest
+            .as_ref()
+            .map(|d| wire::digest(Some(d)))
+        {
+            Some(Ok(digest)) if platform(&decoded, None).is_none() => {
+                self.held::<Command>(&digest).await?
+            }
+            _ => None,
+        };
+        self.place(&decoded, command.as_ref()).map(drop)
+    }
+
+    /// The message `digest` names, if the CAS holds it and it decodes.
+    async fn held<T: prost::Message + Default>(
+        &self,
+        digest: &Digest,
+    ) -> Result<Option<T>, Status> {
+        Ok(self
+            .read_input(digest)
+            .await?
+            .and_then(|bytes| T::decode(bytes).ok()))
+    }
+
+    /// The phases of a walk over a store in the metrics (a walk by the in-process cache
+    /// has none to report: its figures are zero and it counts its own).
+    fn observe_phases(&self, walked: &crate::input_tree::Walked) {
+        let m = self.cache.metrics();
+        m.execute_walk_dirs_read.add(walked.dirs_read);
+        m.execute_walk_dirs_skipped.add(walked.dirs_skipped);
+        m.execute_walk_file_asks.add(walked.file_asks);
+        m.execute_walk_files_checked.add(walked.files_checked);
+        for took in &walked.read_times {
+            m.execute_walk_dir_read.observe_duration(*took);
+        }
+        m.execute_dir_cache_hits.add(walked.dir_cache_hits);
+        m.execute_dir_cache_misses.add(walked.dir_cache_misses);
+        m.execute_dir_cache_merged.add(walked.dir_cache_merged);
+        m.execute_dir_cache_evictions.add(walked.dir_cache_evicted);
+        m.execute_dir_cache_present_checked
+            .add(walked.dirs_present_checked);
+        if walked.phased {
+            m.execute_dir_cache_bytes.set(walked.dir_cache_bytes);
+        }
+        if walked.phased {
+            m.execute_walk_dirs.observe_duration(walked.dirs_time);
+            m.execute_walk_files.observe_duration(walked.files_time);
+        }
+    }
+
     /// A blob's bytes, or `None` if it is not held. Anything else (unreachable, store
     /// down) fails the call: the input exists, so it is not MISSING.
     async fn read_input(&self, digest: &Digest) -> Result<Option<Bytes>, Status> {
@@ -693,6 +872,16 @@ impl<D> ExecutionService<D> {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// What an action's platform asks of the scheduler ([`ExecutionService::place`]).
+struct Placed {
+    kind: LeaseKind,
+    /// The resources to book, GPUs included.
+    booked: Resources,
+    needs: kbf_caps::Request,
+    /// Whether the default platform completed `needs`.
+    defaulted: bool,
 }
 
 /// The action's platform. REAPI 2.2 moved it into the `Action`; older clients set it
@@ -862,6 +1051,9 @@ fn lease_kind(platform: &Platform) -> Result<LeaseKind, Status> {
             ))
         })
 }
+
+/// How many of the digests an Execute refused for missing inputs a log line names.
+const REFUSED_LOGGED: usize = 5;
 
 /// FAILED_PRECONDITION with one `MISSING` violation per blob, as REAPI asks.
 fn missing(digests: &[Digest]) -> Status {

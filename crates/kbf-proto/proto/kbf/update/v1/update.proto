@@ -34,7 +34,7 @@ message Component {
 
 // The desired release for one host, level-triggered: sent after `Welcome` and again at
 // every change of the desired release, so a host that connects later gets it too. A
-// host whose platform has no complete release gets no offer.
+// host whose platform has no complete release, or no version facts document, gets no offer.
 message UpdateOffer {
   // Strictly increases at each change of the desired release, and survives a frontend
   // restart. An offer with the generation a host already holds is a repeat (for example,
@@ -46,10 +46,12 @@ message UpdateOffer {
   string platform = 3;
   // The tarballs the host needs for that platform.
   repeated Component components = 4;
-  // What the frontend's preflight recorded about the release (what its `kbf --version
-  // --json` declares; the platform is field 3). They are claims: the installer runs the
-  // fetched binary and requires its own report to equal them. Zeros and "" (a frontend
-  // that predates the fields, or a release never preflighted) are refused: fail closed.
+  // What the release's version facts document states for this platform: the exact bytes
+  // of that platform's `kbf --version --json`, stored by the frontend with the release (the
+  // platform is field 3). They are a hint: the installer runs the fetched binary and
+  // requires its own report to equal them. The frontend sends no offer for a platform it
+  // holds no document for, so a real offer never carries zeros; the installer refuses zeros
+  // and "" all the same (an offer from a frontend that predates the fields): fail closed.
   uint32 protocol = 5;
   uint32 min_protocol = 6;
   uint32 state_schema = 7;
@@ -133,9 +135,60 @@ message FetchChunk {
   bytes data = 1;
 }
 
+message DescribeRequest {
+  // The commit: 40 lowercase hex digits.
+  string commit = 1;
+  // One platform (`linux-x86_64`, `linux-arm64` or `darwin-arm64`), or empty for every
+  // platform the release is complete for.
+  string platform = 2;
+}
+
+// One tarball of a described release and the attestation bundle that attests it. Both are
+// files `ReleaseService.Fetch` serves under their digests, and a `url` source serves as
+// `files/<digest>`.
+message ReleaseComponent {
+  // The binary the tarball holds: `kbf` or `kbf-daemon` (as `Component.name`).
+  string name = 1;
+  // The platform the tarball is built for.
+  string platform = 2;
+  // The tarball's file name, `<name>-<commit>-<platform>.tar.gz`: the subject name its
+  // attestation names.
+  string tarball = 3;
+  // 64 lowercase hex digits: the SHA-256 of the tarball (as `Component.sha256`).
+  string sha256 = 4;
+  // The tarball's size in bytes.
+  uint64 size = 5;
+  // 64 lowercase hex digits: the SHA-256 of the build-provenance attestation bundle
+  // (`<tarball>.sigstore.json`, JSON lines), verified by the caller against its pinned
+  // trusted root like an `UpdateOffer`'s `Component.attestation`.
+  string bundle_sha256 = 6;
+  // The bundle's size in bytes: at most 256 KiB.
+  uint64 bundle_size = 7;
+}
+
+// What the frontend holds of one release: for each platform it is complete for, the
+// tarballs a host of that platform needs, in platform order and then component order.
+// Claims, not trust: a host fetches each file by its digest and verifies it.
+message ReleaseDescription {
+  // The commit: 40 lowercase hex digits.
+  string commit = 1;
+  repeated ReleaseComponent components = 2;
+}
+
 // Served on the frontend's worker listener, to admitted nodes only (mutual TLS).
 service ReleaseService {
   // Streams the stored file whose SHA-256 is `sha256` in 1 MiB chunks. NOT_FOUND for a
   // digest the store does not hold, INVALID_ARGUMENT for anything but 64 lowercase hex.
+  // The files are the release's tarballs and their attestation bundles.
   rpc Fetch(FetchRequest) returns (stream FetchChunk);
+
+  // What the store holds of `commit`, for a caller that was not given an offer (the
+  // installer's locator-only `frontend_update`). For the platform asked, or for every
+  // platform that is complete, the components a host needs, with the digest and size of
+  // each tarball and of its bundle. Same callers as `Fetch`. INVALID_ARGUMENT for a
+  // commit that is not 40 lowercase hex digits or a platform that is not one of the three;
+  // NOT_FOUND when no tarball of the commit is stored; FAILED_PRECONDITION when the
+  // platform asked is not complete (the message names each tarball or bundle it lacks), or
+  // when none is and no platform was asked.
+  rpc Describe(DescribeRequest) returns (ReleaseDescription);
 }

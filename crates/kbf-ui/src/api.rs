@@ -74,6 +74,9 @@ pub(crate) struct Attempt {
     pub(crate) started: Option<String>,
     pub(crate) ended: Option<String>,
     pub(crate) end: Option<End>,
+    /// The run's id in history (24 hex digits): only on a farm that keeps history.
+    #[serde(default)]
+    pub(crate) run_id: Option<String>,
 }
 
 /// How an attempt ended: `{"result": "ok"}`, `{"requeue": .., "reason": ..}` or
@@ -122,7 +125,7 @@ enum Tag {
 /// An outcome: an object of one tag this page does not know is [`Outcome::Other`];
 /// anything else is read as [`Outcome`], so a known tag of another shape, or an
 /// outcome that is not one tag, is malformed.
-fn known_or_other<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Outcome>, D::Error> {
+pub(crate) fn known_or_other<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Outcome>, D::Error> {
     let Some(v) = Option::<Value>::deserialize(d)? else {
         return Ok(None);
     };
@@ -314,4 +317,37 @@ pub(crate) struct Host {
     pub(crate) desired_commit: Option<String>,
     pub(crate) running_commit: Option<String>,
     pub(crate) refusal: Option<String>,
+}
+
+/// `GET /v1/storage`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct StorageDoc {
+    pub(crate) members_total: u64,
+    pub(crate) members_active: u64,
+    pub(crate) not_active: Vec<u64>,
+    pub(crate) silent: Vec<u64>,
+    pub(crate) unreported: Vec<u64>,
+    pub(crate) debts_total: u64,
+    /// `null` while unknown: never read as zero.
+    pub(crate) under_replicated_blobs: Option<u64>,
+    pub(crate) reasons: Vec<String>,
+    pub(crate) nodes: Vec<StorageNode>,
+}
+
+/// One storage member of `GET /v1/storage`; each `Option` is `null` when unknown.
+#[derive(Debug, Deserialize)]
+pub(crate) struct StorageNode {
+    pub(crate) id: u64,
+    pub(crate) state: String,
+    pub(crate) planned_down: bool,
+    pub(crate) repair_debts: Option<u64>,
+    pub(crate) open_writes: Option<u64>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) unflushed_bytes: Option<u64>,
+    pub(crate) unflushed_blocks: Option<u64>,
+    pub(crate) oldest_unflushed_ms: Option<u64>,
+    pub(crate) budget_bytes: Option<u64>,
+    pub(crate) used_bytes: Option<u64>,
+    pub(crate) flush_failures: Option<u64>,
+    pub(crate) flush_conflicts: Option<u64>,
 }

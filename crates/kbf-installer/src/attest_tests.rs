@@ -7,7 +7,7 @@ use super::*;
 use crate::fixtures::{COMMIT, FakeRunner, me, ran, trusted_host};
 use crate::layout::Platform;
 
-fn verifier(refs: &[&str]) -> Verifier {
+fn verifier(refs: &[&str]) -> GhCheck {
     let host = Layout::new(Root::new("/").expect("absolute"), Platform::Linux);
     let mut settings = Settings::defaults(&host);
     settings.run_as = me();
@@ -16,14 +16,14 @@ fn verifier(refs: &[&str]) -> Verifier {
         .map(|r| SourceRef::new(r).expect("ref"))
         .collect();
     settings.timeout = Duration::from_secs(9);
-    Verifier::pinned(&host, &settings)
+    GhCheck::pinned(&host, &settings)
 }
 
 fn commit() -> CommitId {
     CommitId::new(COMMIT).expect("commit")
 }
 
-fn verify(v: &Verifier, runner: &FakeRunner) -> Result<Verified, Refusal> {
+fn verify(v: &GhCheck, runner: &FakeRunner) -> Result<Verified, Refusal> {
     let trust = trusted_host();
     let tools = Tools {
         trust: &trust,
@@ -328,7 +328,7 @@ fn an_untrusted_gh_is_refused_before_it_runs() {
 fn only_a_plain_branch_ref_is_a_source_ref() {
     for ok in [
         "refs/heads/main",
-        "refs/heads/feature/arch-v2",
+        "refs/heads/team/topic-2",
         "refs/heads/release_1.2",
     ] {
         assert_eq!(SourceRef::new(ok).expect(ok).as_str(), ok);

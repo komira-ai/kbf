@@ -182,20 +182,27 @@ armed at activation and `window_s` is clamped to 120 to 1800. Either way a compr
 
 **UpdateStatus.** Sent after `Welcome` and on every change. `running_commit` is the process's own build commit
 (12 hex or `unknown`); `installed_commit` and `staged_commit` are 40 hex from the helper, empty if not known.
-`acked_order_id` is the newest order acted on; `offered_generation` the newest offer seen. `helper_present` (field 8) says whether the privileged installer is on the host (the field keeps its name; it is `kbf-installer` now). `STATE_FETCHING` is the installer pulling the release for an order (section 7.1); `STATE_STAGED` is a release verified and installed into its directory but not yet activated, a window of one order, since the fetch is part of the `ACTIVATE` order and there is no pre-staging. `staged_protocol`, `staged_min_protocol` and `staged_state_schema` (fields 9 to 11) are what the newest installed, not yet active, release declares in `kbf --version --json`, 0 when none. **Because nothing is staged before the order, the frontend's ordering decision (split-mode-updates.md 2.4 and 3.3) cannot read these fields in advance: its inputs are the release's declared protocol and schema recorded when the release was uploaded or proposed (the preflight row `update/available/<commit>`), and the fields are the host's check afterwards, which the controller compares with the preflight value before it sends `CONFIRM`.** A node that never sends
+`acked_order_id` is the newest order acted on; `offered_generation` the newest offer seen. `helper_present` (field 8) says whether the privileged installer is on the host (the field keeps its name; it is `kbf-installer` now). `STATE_FETCHING` is the installer pulling the release for an order (section 7.1); `STATE_STAGED` is a release verified and installed into its directory but not yet activated, a window of one order, since the fetch is part of the `ACTIVATE` order and there is no pre-staging. `staged_protocol`, `staged_min_protocol` and `staged_state_schema` (fields 9 to 11) are what the newest installed, not yet active, release declares in `kbf --version --json`, 0 when none. **Because nothing is staged before the order, the frontend's ordering decision (split-mode-updates.md 2.4 and 3.3) cannot read these fields in advance: its inputs are the release's declared protocol and schema, which the release store keeps as the platform's version facts document when the release is uploaded (section 6.2), and the fields are the host's check afterwards, which the controller compares with those facts before it sends `CONFIRM`.** A node that never sends
 it is listed `unsupported`, and a rollout halts at it (it never skips a host silently).
 
 **ReleaseService.Fetch.** On the worker listener, admitted nodes only (mutual TLS). The argument is 64 lowercase
 hex digits and nothing else; an unknown digest is `NOT_FOUND`. The server never builds a path from anything but the
-validated digest. Chunks are at most 1 MiB. **The caller is the installer's fetch child (section 7.1), not the `kbf` process.**
+validated digest. Chunks are at most 1 MiB. **The caller is the installer's fetch child (section 7.1), not the `kbf` process.** It serves the release's tarballs and its attestation bundles, each under the digest of its bytes.
+
+**ReleaseService.Describe.** For a caller that was given no offer (a `frontend_update` order is a locator). `DescribeRequest{commit, platform}`
+(`platform` optional) returns a `ReleaseDescription{commit, components}`: per described platform, the tarballs a host of it needs, each with
+its `sha256` and `size` and its bundle's `bundle_sha256` and `bundle_size`; a platform is described only when it is complete, as for an offer.
+Admitted as `Fetch` is (one row of the role table). `INVALID_ARGUMENT` for a commit that is not 40 lowercase hex digits or an unknown platform,
+`NOT_FOUND` for a commit with no stored tarball, `FAILED_PRECONDITION` naming what an incomplete platform lacks. The same description is
+`GET /v1/releases/{commit}` as JSON, the file `releases/<commit>.json` of a `url` source (`docs/api.md`). It is a claim; the installer verifies
+what it fetches (`kbf-installer.md` section 5).
 
 **The order, as the node relays it.** `UpdateOrder` is unchanged and carries `order_id`, `epoch`, `verb`, `commit` and
 `window_s`. The "update to commit `<hash>`" order is `VERB_ACTIVATE`. It gains one additive field, `uint64 generation = 6`
 (proto3, compatible both ways; an older node ignores it). **Generation 0, or a frontend that predates the field, means the
 installer refuses `activate`**: the frontend must be updated first (section 8 item 1). `UpdateOffer` gains the expected facts of
 the release, `uint32 protocol = 5`, `uint32 min_protocol = 6`, `uint32 state_schema = 7` and `string profile = 8` (the platform
-is the existing field 3); the frontend fills them from the preflight row `update/available/<commit>` and an offer without them
-carries zeros, which the installer refuses (fail closed). **Both additions count against the frozen contract of this section:**
+is the existing field 3); the frontend fills them from the stored version facts document of that commit and platform (section 6.2). It sends **no offer** for a platform it holds no document for, so an offer never carries zeros; an offer that does (a frontend that predates the fields) is still refused by the installer (fail closed). **Both additions count against the frozen contract of this section:**
 they are additive and compatible, but they are two changes to frozen messages and are made together in one wire change with the
 tests of section 10. The installer checks the generation is monotonic and above the operator floor (section 7), which the (epoch, id) rule alone
 cannot give it. The offer's components, attestation and expected facts reach the installer in the order record the node writes from
@@ -217,9 +224,9 @@ URL or a unit.
 
 ### 6.1 Flags and failure
 
-`--releases-dir DIR` names the content-addressed release store (files named by their SHA-256). Every update
-endpoint needs it **and** a state store (`--state-store`). Without either, every update endpoint answers **503**
-saying which is missing; nothing answers an empty 200.
+`--releases-dir DIR` names the content-addressed release store (files named by their SHA-256). `GET /v1/update` and
+`POST /v1/update/desired` need `--releases-dir` and `--state-store`; pause and resume need only `--state-store`. Without what an endpoint
+needs it answers **503** saying which flag is missing; nothing answers an empty 200.
 
 ### 6.2 State store rows
 
@@ -230,14 +237,54 @@ saying which is missing; nothing answers an empty 200.
 | `update/generation` | the counter (C3) the generations come from |
 | `update/slot` | the rollout slot: one storage holder plus up to `max_hosts_out` host holders, each `{host, order_id, epoch}`, with the run state; no time to live (section 8) |
 | `update/host/<id>` | the controller's per-host phase `{phase, order_id, generation, since, boot_before}`: what a restarted controller resumes from (split-mode-updates.md 2.6) |
-| `update/available/<commit>` | the release source's proposal and its preflight result; metadata only (split-mode-updates.md 6.2) |
-| `update/policy` | `{paused (bool), idle_wait, min_serving, max_hosts_out (default 1), mac_force_after, new_work_only_to_updated, accept_failing_builds}`; the older `update/auto {enabled}` row is removed |
+| `update/available/<commit>` | not built: the facts a preflight would have recorded are the release store's version facts document (section 6.2); the row is not written |
+| `update/policy` | the policy fields listed below; the older `update/auto {enabled}` row is removed |
 
-**A release upload triggers its preflight.** The `PUT` of a release's last needed component starts the preflight for the commit and
-writes the `update/available/<commit>` row (metadata, the declared `protocol`, `min_protocol`, `state_schema`, `profile`, and the
-result). **Until the row exists the frontend sends no offer for that commit**, since the offer's expected facts (section 5) come from it.
-The operator sees the release as "preflight pending" until the row is written, and "preflight failed" with the reason if it fails; neither
-state can be set as the desired release.
+**The `update/policy` fields.** The row stores durations in milliseconds (`idle_wait_ms`, `ttl_ms`, and so on) and omits a field that
+equals its default; `GET /v1/update` shows the policy with durations in seconds (key `<name>_secs`) and leaves out `ttl` and `dwell`. Defaults are those of `Policy::default`.
+
+| key | value |
+|---|---|
+| `paused` | bool, default false: while set no host is started |
+| `auto_nodes` | bool, default true: the controller starts hosts for the desired release (read by the frontend runner) |
+| `auto_frontend` | bool, default false: as `auto_nodes` for the frontend's own update; carried, not acted on |
+| `new_work_only_to_updated` | bool, default false; carried, not acted on |
+| `accept_failing_builds` | bool, default false; carried, not acted on |
+| `idle_wait` | how long the picker waits for a node to go idle before it cordons the least-loaded one, default 120 s (`idle_wait_secs` in GET) |
+| `min_serving` | count of other hosts of the platform that must stay connected and uncordoned, default 0 (no floor) |
+| `max_hosts_out` | daemon-only hosts and Macs in a step at once, default 1, must be at least 1 |
+| `mac_force_after` | optional: after this long without an idle Mac the least-loaded Mac is cordoned, default null (never) (`mac_force_after_secs`) |
+| `ttl` | member row time to live, default 15 s; in the row, not shown by GET /v1/update |
+| `dwell` | how long a Down member stays in the map, default 300 s; in the row, not shown by GET; must exceed 2 x `ttl` |
+| `lease_limit` | step 3 on Linux, wait for leases to end, default 900 s (`lease_limit_secs` in GET) |
+| `mac_lease_limit` | step 3 on a Mac, default 3600 s (`mac_lease_limit_secs`) |
+| `write_limit` | steps 4 and 5, wait for write sessions to reach zero, default 60 s (`write_limit_secs`); 2 x it must be below `dwell` - 2 x `ttl` |
+| `activate_limit` | step 6, wait for ACTIVATED_UNCONFIRMED, default 300 s (`activate_limit_secs`) |
+| `health_limit` | claim, cordon, return and confirm wait, default 120 s (`health_limit_secs`) |
+| `rebuild_limit` | step 7, optional (null = no bound), default null (`rebuild_limit_secs`) |
+| `repair_wait` | step 8, default 300 s (`repair_wait_secs`) |
+
+The first nine keys are the operator-facing fields; the rest are limits of the node step. A writer that knows only the nine leaves the others at their defaults.
+
+**A release carries its version facts, and the store keeps them.** There is no preflight and no `update/available/<commit>` row. The
+declared `protocol`, `min_protocol`, `state_schema` and `profile` of a platform are a document the release's build writes: the exact
+bytes of that platform's `kbf --version --json`, named `kbf-<commit>-<platform>.version.json`, uploaded with the tarballs by
+`PUT /v1/releases/{commit}/{platform}/version.json` (at most 4 KiB) and stored beside them, immutable per commit and platform. The
+store reads it with the one parser the installer reads a staged binary's report with, and **refuses** a document that does not parse,
+that names another commit or platform than the upload, that is not a `release` build, or whose `protocol` or `state_schema` is 0 or
+whose `min_protocol` is above `protocol` (400, naming the file and the reason). The offer's expected facts (section 5) are read from
+that document. **A platform stored without it is accepted and held, and is never offered**: the answer to the `PUT` of its tarball
+and `GET /v1/releases` say `no version facts (kbf-<commit>-<platform>.version.json): nodes will not be offered this platform; rebuild
+the release to include it`. That is how a commit built before the pipeline wrote the file, a rollback target included, stays
+deployable on the paths that need no offer. The document is a hint, not trust: the installer still runs the staged binary and
+requires its own report to equal the offer's facts (section 7.2). The store does not check an attestation for any file, and the document has no
+attestation of its own: it is unattested, and what makes it safe is the node's probe of the attested binary. A document that is
+well formed but wrong (right shape, wrong numbers) is pinned like a tarball (a different body is a 409), and every node then refuses
+the activation with facts-differ; the repair is a new commit. The platform check applies only if the document names a platform, and
+`kbf --version --json` does not today, so it is the node's probe, not the store, that catches a report uploaded under another platform.
+A stored document that later becomes unreadable fails the offer look and keeps the previous offers for every platform until repaired.
+The deploy summary carries the same no-facts text in `notes` for each platform its bundle has no document for.
+The release pipeline writing the file is a separate change from the store accepting it.
 
 **Who supplies what the host verifies.** The attestation bundles an offer carries are **stored by the frontend's release store** (the
 release's CI upload `PUT`s `<name>.attestation` beside each tarball, section 6.3); the frontend is a courier and not a trust anchor, since the
@@ -246,7 +293,7 @@ installer verifies each bundle against the pinned root. **Envoy is a dependency,
 never fetches it. Release-manifest and Envoy-component pinning, and cross-version Envoy upgrades, are deferred (section 12).
 
 **The disk index is the source of truth for bytes.** The release store on disk (`files/<sha256>` and
-`index/<commit>/<platform>/<name>`, with attestation bundles) is authoritative for what the frontend can serve. The
+`index/<commit>/<platform>/<name>`, with attestation bundles, which are also named by their digest in `files/`) is authoritative for what the frontend can serve. The
 `update/release/...` rows are metadata over it (digest, size, attestation present); a lost or stale row is rebuilt from
 the disk index, never the reverse. The desired release, the slot, the per-host phase rows and the policy are state-store rows.
 
@@ -259,11 +306,17 @@ the disk index, never the reverse. The desired release, the slot, the per-host p
   exactly one regular file named `<name>`; that is an early failure for mistakes, not trust. Path segments are
   validated (40 lowercase hex, a known platform, a known name) and never joined raw.
 - `GET /v1/releases`: commits with, per platform, which components are present and whether the platform is complete.
+- `GET /v1/releases/{commit}`: the description `ReleaseService.Describe` gives for every complete platform, as JSON (section 5): the
+  files of the release by digest, and the `releases/<commit>.json` of a `url` source.
+- **Write gates.** Writes are accepted only from the server's own host, need `Authorization: Bearer <token from --api-token-file>`, and
+  refuse an `Origin` header (403 or 401). `POST /v1/update/desired` wants `Content-Type: application/json` exactly (else 415).
 - `POST /v1/update/desired {commit}`: the commit needs at least one complete platform (else 409). Compare-and-set
   on `update/desired`; the counter gives the new generation only when the commit differs from the current one.
-- `GET /v1/update`: `{desired, releases}`. The policy fields are set through `POST /v1/update/policy` (admin). There is no auto-update endpoint.
-- `GET /v1/nodes` gains, per node, an `update` object: state, the three commits, offered generation, refusal,
-  `helper_present`, `up_to_date` (true, false or null) and `availability` (`ok`, `unavailable`, `unsupported`).
+- `GET /v1/update` (open): `{desired, paused, policy, proposals, releases}`. `desired` is `null` or `{generation, commit, set_at_ms}`; `paused` is the policy row's flag (false when no policy row exists); `policy` is the `update/policy` row, or `null` when the operator never wrote one; `proposals` are the releases the release poller found (a proposal starts nothing); `releases` is the body of `GET /v1/releases`. Without `--state-store` or `--releases-dir` it is 503.
+- `POST /v1/update/desired {commit, expect_generation?}` (write gates, JSON body, no other key): without `expect_generation` the write is as above. With it, the write happens only if the desired release is at that generation (0 before any offer); otherwise it is 409 with a message naming both generations and nothing is written. The answer is the desired release. The 409 has two causes, told apart only by the error text: the commit has no complete platform, or `expect_generation` is not the current generation. The stale check runs before the same-commit shortcut, so a stale `expect_generation` with the commit already desired is 409, not a 200 no-op; a missing or null `expect_generation` skips the check. A negative or non-integer value is 400. A malformed body or commit is 400; contended retries are 503 with `Retry-After: 1`.
+- `POST /v1/update/pause` and `POST /v1/update/resume` (write gates, no body) set `paused` in the policy row by compare-and-set of that field alone, need no run, and answer `{paused}` whatever the current value. The first pause or resume creates the policy row with the defaults, so `policy` in `GET /v1/update` is non-null from then on. While `paused` is set no host is started. An offer leaves the flag as it is. These two need only `--state-store`.
+- Updates are triggered externally: the deployment that rolls out a release calls `POST /v1/update/desired`. There is no auto-update endpoint. Planned: `POST /v1/update/policy` (admin), to set the other policy fields, and `GET /v1/update/plan?commit=`, a read that computes the plan (hosts and blockers) and stores nothing; neither route exists yet.
+- `GET /v1/nodes` gains, per node, `update: {state, up_to_date, availability}` (`up_to_date` is true, false or null; `availability` is `ok`, `unavailable` or `unsupported`). The three commits, the offered generation, the refusal (capped at 512 bytes) and `helper_present` are on `GET /v1/update/hosts` (off unless the policy names `farm.getAuthorizer`).
 
 ### 6.4 Sessions
 
@@ -272,14 +325,21 @@ keeps one offer per complete platform; each session sends its node's platform of
 `Welcome` and whenever that offer changes (the same offer is never sent twice on a session).
 A look that fails keeps the table. The node's platform is read from its first `Hello`.
 The rollout controller (`kbf-server/src/update`) runs on the frontend with a state store, once a
-farm tick, and starts no host unless `update/policy.auto_nodes` is true (hosts already in a step
-are always moved). Its orders go out as `UpdateOrder` on the host's stream with the `Welcome`
+farm tick, and starts no host when an operator wrote `update/policy.auto_nodes` false or paused the
+run (a policy never written reads as `auto_nodes` true: the desired write is the click; hosts already
+in a step are always moved). Its orders go out as `UpdateOrder` on the host's stream with the `Welcome`
 epoch (an order of another epoch is refused before it is sent); a confirmation carries an id
 of its own, drawn from the order counter, because a node drops a repeated id. Its facts come
-from the farm and each node's `UpdateStatus` of its current stream. **Not yet:** hosts with a
-storage half are never started (the planned-down mark and the member join are U3, #914, in
-`feature/arch-v2`), and no operator action starts a run with `auto_nodes` off.
+from the farm and each node's `UpdateStatus` of its current stream. A Linux host
+is joined to its storage member by the address it advertised at enrollment, matched exactly; the
+mark is `Members::plan_down` and its undoing `Members::undo_plan`; a host that matches no member is
+never started. **Not yet:** no operator action starts a run with `auto_nodes` written off.
 `GET /v1/nodes` lists `update` per node and `GET /v1/update/hosts` its detail (`docs/api.md`).
+
+**Mixed versions.** `auto_nodes` is a plain bool in the `update/policy` row, so a row that does not
+carry it reads false; a policy row that was never written reads as the defaults, true. An old frontend's
+`set_paused` on a never-written row stores a row without `auto_nodes`, so a new frontend reads `auto_nodes`
+off after the resume until an operator writes `true`.
 
 After `Welcome`, and to every connected node at every change of the desired release or of a platform's
 completeness, the frontend sends an `UpdateOffer` for that node's platform. `UpdateStatus` is kept as the newest per
@@ -290,7 +350,7 @@ node and ignored from a replaced stream, exactly as `NodeStatus` is.
 `POST /v1/update/frontend {commit}` (write gate as the other writes; admin) is the one route that updates the frontend. Gamma calls it. The commit must have a complete platform for the frontend host (else 409), and no frontend
 update may be in flight (409). The frontend then **writes an order record into its own host's `orders/` directory**, by the same mechanism as
 `kbf-update` uses for nodes (a dot-prefixed temporary name, then rename; section 7), with `verb=frontend_update`, the `commit`, a `generation` from the
-store counter, the store `epoch` and an `order_id`, and the components and expected facts of the release from its own store. The route returns the order id; the installer refuses a second order while one is in flight (`frontend_busy`) and one whose installed Envoy is outside the tested range (`envoy_range`). The root CLI `kbf-installer update --commit SHA --frontend` stays as the **local fallback** and runs the same code. It does not go
+store counter, the store `epoch` and an `order_id`. The record is a locator: it carries no components and no expected facts, and the root half fetches and verifies the release itself ([kbf-installer.md](kbf-installer.md) section 6). The route returns the order id; the installer refuses a second order while one is in flight (`frontend_busy`) and one whose installed Envoy is outside the tested range (`envoy_range`). The root CLI `kbf-installer update --commit SHA --frontend` stays as the **local fallback** and runs the same code. It does not go
 through a node session, and nothing is sent on the wire. The installer's reply is the host's `status.json`, which the route's status
 read (`GET /v1/update`) reports.
 
@@ -324,8 +384,8 @@ still run unprivileged there, so a fault in them is not root.
 
 | Command | Does |
 |---|---|
-| `kbf-installer run` | every 5 seconds (a fixed constant, not a key), each pass: finish a restart it owes; revert a swap whose confirm window ran out; sweep leftover scratch (7.3); act on order records from `orders/` in (epoch, id) order, once each. For `activate`: refuse it while a trial is pending (a release activated and not yet confirmed or reverted: there is one confirm window at a time, never two timers), check the order (below), **fetch, verify and install the release for the commit (7.1, 7.2)**, write `pending_confirm`, flip `previous` then `current`, restart the one configured service; `confirm`: keep it; `revert`: flip back and restart; write `status.json` |
-| `kbf-installer confirm`, `revert`, `rollback`, `update --frontend` | the operator verbs: **inline root CLI runs under the installer's lock** (exit 4 while a `run` pass holds it); no socket, and `kbf` cannot run them. `confirm` and `revert` name the activation; `rollback` is the only verb below the floor. `update --commit SHA --frontend` is the local fallback of the `frontend_update` order (section 6.5) |
+| `kbf-installer run` | at start, once, under the lock: remove the `work/*.partial` and `work/*.check` a killed stage left (7.3). Then every 5 seconds (a fixed constant, not a key), each pass: finish a restart it owes; revert a swap whose confirm window ran out; act on order records from `orders/` in (epoch, id) order, once each. For `activate`: refuse it while a trial is pending (a release activated and not yet confirmed or reverted: there is one confirm window at a time, never two timers), check the order (below), **fetch, verify and install the release for the commit (7.1, 7.2)**, write `pending_confirm`, flip `previous` then `current`, restart the one configured service; `confirm`: keep it; `revert`: flip back and restart; write `status.json` |
+| `kbf-installer confirm`, `revert`, `rollback` | the operator verbs: **inline root CLI runs under the installer's lock** (exit 4 while a `run` pass holds it); no socket, and `kbf` cannot run them. `confirm` and `revert` name the activation; `rollback` is the only verb below the floor. `update --commit SHA --frontend` is not among them: it needs no root, is refused through `sudo`, and is a client of the proxy's update API (`--api`, `--token-file`, `--api-ca`) that waits for the swap; the API writes the `frontend_update` order (section 6.5) |
 | `kbf-installer boot-check` | `ExecStartPre` on Linux: count the starts of a release on trial and revert one that keeps failing before it starts again; start the confirm window at the first start |
 
 **The order spool.** `orders/` is owned by `kbf` with mode 0700. Root opens it with `openat` and `O_NOFOLLOW` relative to a
@@ -340,7 +400,7 @@ non-regular record is refused and removed.
 An order record is `{order_id, epoch, generation, verb, commit, window_s}` (`verb` is `activate`, `confirm`, `revert` or `frontend_update`, the contract's record, [kbf-installer.md](kbf-installer.md) section 4) plus, for `activate`, the offer's components
 for the host's platform (`name`, `sha256`, `size`, `attestation`: the same bytes the offer carried, at most 256 KiB each) and the
 **expected facts about the release**: `platform`, `protocol`, `min_protocol`, `state_schema` and `profile`, as the frontend's
-preflight recorded them. These are **locators and claims, not trust**: section 7.2 re-derives every one that matters, and the
+release store holds them (the platform's version facts document, section 6.2). These are **locators and claims, not trust**: section 7.2 re-derives every one that matters, and the
 expected facts are the claim that 7.2 step 5 checks the binary against *before* the flip. Before fetching, the installer refuses
 (and says why in `status.json`) an order that is a replay or older by the (epoch, id) rule of section 5, a commit that is not 40
 lowercase hex, a component set that is not exactly what the host's platform needs, a size over the cap (7.1), a pending trial,
@@ -481,9 +541,7 @@ parsed strictly (anything else is a failure), `gh` run with an empty environment
 5. **The binary names itself, and must match the order, before the flip**: `<name> --version --json`, run as `kbf-fetch` with an
    empty environment, reports the order's commit (12 hex prefix) and a `protocol`, `min_protocol`, `state_schema`, `profile` and
    `platform` that must **equal the expected facts in the order record**, and must satisfy the operator floor. A mismatch refuses
-   the order **before** anything is renamed or flipped. If the record carries no expected facts (the frontend had no preflight
-   row), the order is refused: fail closed. The values are also written to `status.json`; the frontend compares them with its own
-   preflight (section 5, UpdateStatus). macOS: quarantine and `codesign --verify --strict`.
+   the order **before** anything is renamed or flipped. If the record carries no expected facts (an offer without them, from a frontend that predates them), the order is refused: fail closed. The values are also written to `status.json`; the frontend compares them with the stored version facts (section 5, UpdateStatus). macOS: quarantine and `codesign --verify --strict`.
 6. **Only now** does the parent write `VERIFIED` into the directory, `rename` it to `releases/<commit>/` and `fsync` the parent
    directory. Before this rename no link, no unit and no path a service looks at has changed.
 
@@ -499,8 +557,9 @@ test-farm switch (§2, attestation off) never carry the marker and so never coun
   sets `STATE_REFUSED` with the reason (`fetch: short read`, `fetch: timeout`, `fetch: source unreachable`) and does **not**
   retry. Nothing but scratch has changed. The frontend's controller treats it as a failure before the swap: the host is
   uncordoned, the run goes `held`, and a person re-issues the update (a new order id).
-- **Parent or host dies during the fetch**: `work/*.partial` is left. The installer deletes every
-  entry under `work/` and every unreferenced `releases/` directory without `VERIFIED` at the start of each run; **the sweep never removes
+- **Parent or host dies during the fetch**: `work/*.partial` is left. At the start of each run, under the lock
+  and before its first pass, the installer deletes every `work/*.partial` and `work/*.check` (nothing else in `work/`; a link is removed, never followed), and the operator's verbs
+  sweep the `releases/.stage-*` directories; neither sweep removes a `releases/` directory that has a name of its own. **The sweep never removes
 the target of `current` or `previous`**, whatever its marker: a referenced directory without `VERIFIED` stays and `status.json`
 flags it "unverified: rollback to it refused"; a partial file is never resumed or trusted, since its bytes were not verified. The child
   has `PDEATHSIG` (Linux) or is killed by process group (macOS), and a closed pipe, so it does not outlive the parent. A
@@ -570,7 +629,7 @@ held and the run goes `held`; a broken host never lets another take its place.
    of versions in the farm is within N/N-1, so order does not matter for correctness. At most one storage-and-daemon node
    is in a step at a time (R=2); daemon-only hosts and Macs may be in a step concurrently up to `max_hosts_out` (default 1) and the capacity floor `min_serving`; a busy
    Mac is deferred, not killed. **Because the frontend no longer goes first on its own, the planner refuses to order a node to a
-   release whose `[min_protocol, protocol]` the running frontend does not accept** (409, "update the frontend first"; it reads the same preflight row `update/available/<commit>` that fills the offer's expected facts, section 5), and refuses
+   release whose `[min_protocol, protocol]` the running frontend does not accept** (409, "update the frontend first"; it reads the same stored version facts that fill the offer's expected facts, section 6.2), and refuses
    a node downgrade whose protocol the running frontend no longer accepts; the operator updates the frontend as a separate
    action and then the nodes. This replaces the "frontend first on an upgrade, nodes first on a downgrade" ordering of
    split-mode-updates.md 3.3, which assumed one rollout; that document needs the matching edit.

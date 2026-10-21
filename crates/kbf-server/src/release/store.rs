@@ -1,11 +1,19 @@
 //! The release store: a directory of immutable files.
 //!
 //! ```text
-//! <dir>/files/<sha256>                          a tarball, named by the digest of its bytes
+//! <dir>/files/<sha256>                          a tarball, or an attestation bundle, named by
+//!                                               the digest of its bytes
 //! <dir>/index/<commit>/<platform>/<name>        "<sha256> <size>\n": what a component is
 //! <dir>/index/<commit>/<platform>/<name>.attestation    its build attestation bundle
+//! <dir>/index/<commit>/<platform>/version.json  the platform's version facts: the exact
+//!                                               bytes of its `kbf --version --json`
 //! ```
 //!
+//! - **A bundle has two names, one file.** The attestation is stored under the index and
+//!   hard-linked into `files/` under its own digest, so that `Fetch` and a `url` mirror of
+//!   `files/` serve it like a tarball (`ReleaseService.Describe` names it by that digest).
+//!   The link is made by every put of the bundle, the repeat of identical bytes included,
+//!   which also repairs a bundle stored before the link existed.
 //! - **Immutable per key.** A key (commit, platform, component) names the same bytes for
 //!   good: a second write of the same bytes changes nothing, of other bytes is
 //!   [`PutError::Conflict`]. An entry is created with a hard link, which fails when the
@@ -15,6 +23,12 @@
 //!   link for an entry), and the directory is synced. Nothing reads a `.partial`: a tarball
 //!   is found by a 64-digit digest, an entry by the exact names above. A write that fails
 //!   or is dropped removes its partial; one a power cut left stays, unseen and unserved.
+//! - **Version facts are per platform, and checked on the way in.** The document is kept as
+//!   it came, under the same immutability rule, and only when it parses, names this commit
+//!   and platform (when it names one) and states numbers a node accepts
+//!   ([`super::facts::Facts::of_document`]). A platform stored without one is held as always
+//!   and is never offered ([`super::offers`]); a rollback target built before the release
+//!   pipeline wrote the file stays deployable that way.
 //! - **Paths are typed.** Every path is built from a [`Key`] or a [`Sha256Hex`], never from
 //!   request text ([`super::key`]).
 //! - **A tarball is stored as it came.** Nothing here opens it or checks an attestation:
@@ -31,9 +45,12 @@ use sha2::{Digest, Sha256};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
-use kbf_types::ReleasePlatform;
+use kbf_types::{ReleasePlatform, VERSION_CAP};
 
-use super::key::{ATTESTATION_SUFFIX, Commit, Component, Key, Sha256Hex};
+use super::facts::Facts;
+use super::key::{
+    ATTESTATION_SUFFIX, Commit, Component, FACTS_SEGMENT, Key, Sha256Hex, facts_file,
+};
 
 /// The largest tarball the store takes: 512 MiB.
 pub const MAX_TARBALL_BYTES: u64 = 512 << 20;
@@ -77,6 +94,10 @@ pub enum PutError {
     /// The body could not be read to its end (the client went away or sent garbage).
     #[error("reading the body: {0}")]
     Body(#[source] io::Error),
+    /// The version facts are not ones the store keeps: `file` is
+    /// `kbf-<commit>-<platform>.version.json`.
+    #[error("{file}: {why}")]
+    Facts { file: String, why: String },
     /// The store's directory failed.
     #[error("the release store: {0}")]
     Disk(#[source] io::Error),
@@ -109,6 +130,9 @@ pub struct PlatformListing {
     pub components: Vec<ComponentInfo>,
     /// Every component is stored with its attestation.
     pub complete: bool,
+    /// The platform's version facts are stored. Without them the platform is held and never
+    /// offered.
+    pub facts: bool,
 }
 
 /// What is stored for one commit.
@@ -235,6 +259,13 @@ impl ReleaseStore {
 
     fn entry_path(&self, key: &Key) -> PathBuf {
         self.platform_dir(key).join(key.component.as_str())
+    }
+
+    fn facts_path(&self, commit: &Commit, platform: ReleasePlatform) -> PathBuf {
+        self.index
+            .join(commit.as_str())
+            .join(platform.as_str())
+            .join(FACTS_SEGMENT)
     }
 
     fn attestation_path(&self, key: &Key) -> PathBuf {
@@ -368,11 +399,89 @@ impl ReleaseStore {
             return Err(PutError::Empty);
         }
         let created = Self::publish_for(key, &self.attestation_path(key), &bundle).await?;
+        let sha256 = Sha256Hex::of_digest(&Sha256::digest(&bundle));
+        self.link_bundle(key, &sha256)
+            .await
+            .map_err(PutError::Disk)?;
         Ok(Stored {
             created,
-            sha256: Sha256Hex::of_digest(&Sha256::digest(&bundle)),
+            sha256,
             size: bundle.len() as u64,
         })
+    }
+
+    /// Stores the version facts `body` of `platform` at `commit`, whether or not its
+    /// tarballs are stored yet.
+    ///
+    /// # Errors
+    /// As [`ReleaseStore::put_tarball`] (a body past [`VERSION_CAP`] bytes is too large), and
+    /// [`PutError::Facts`] for a document the store does not keep.
+    pub async fn put_facts(
+        &self,
+        commit: &Commit,
+        platform: ReleasePlatform,
+        body: Body<'_>,
+    ) -> Result<Stored, PutError> {
+        let file = facts_file(commit, platform);
+        let mut doc = Vec::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(PutError::Body)?;
+            if doc.len() + chunk.len() > VERSION_CAP {
+                return Err(PutError::TooLarge {
+                    limit: VERSION_CAP as u64,
+                });
+            }
+            doc.extend_from_slice(&chunk);
+        }
+        if doc.is_empty() {
+            return Err(PutError::Empty);
+        }
+        Facts::of_document(commit, platform, &doc).map_err(|why| PutError::Facts {
+            file: file.clone(),
+            why,
+        })?;
+        let created = match Self::publish(&self.facts_path(commit, platform), &doc)
+            .await
+            .map_err(PutError::Disk)?
+        {
+            Published::Created => true,
+            Published::Same => false,
+            Published::Differs => return Err(PutError::Conflict(file)),
+        };
+        Ok(Stored {
+            created,
+            sha256: Sha256Hex::of_digest(&Sha256::digest(&doc)),
+            size: doc.len() as u64,
+        })
+    }
+
+    /// The version facts stored for `platform` at `commit`; `None` when there are none.
+    ///
+    /// # Errors
+    /// The directory fails, or the stored document is not one the store keeps.
+    pub async fn facts(
+        &self,
+        commit: &Commit,
+        platform: ReleasePlatform,
+    ) -> io::Result<Option<Facts>> {
+        let path = self.facts_path(commit, platform);
+        let Some(doc) = read_optional(&path).await? else {
+            return Ok(None);
+        };
+        Facts::of_document(commit, platform, &doc)
+            .map(Some)
+            .map_err(|_| corrupt(&path))
+    }
+
+    /// Names the stored bundle of `key` in `files/` by its digest `sha256`: the same file,
+    /// not a copy. A name that exists already is the same bytes (it is their digest).
+    async fn link_bundle(&self, key: &Key, sha256: &Sha256Hex) -> io::Result<()> {
+        let to = self.files.join(sha256.as_str());
+        match tokio::fs::hard_link(self.attestation_path(key), to).await {
+            Ok(()) => sync_dir(&self.files).await,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// The stored tarball of `key`.
@@ -400,7 +509,8 @@ impl ReleaseStore {
         read_optional(&self.attestation_path(key)).await
     }
 
-    /// The stored tarball whose digest is `sha256`, open.
+    /// The stored file whose digest is `sha256` (a tarball, or an attestation bundle),
+    /// open.
     ///
     /// # Errors
     /// The directory fails.
@@ -437,10 +547,12 @@ impl ReleaseStore {
                         .iter()
                         .any(|c| c.component.as_str() == *name && c.attested)
                 });
+                let facts = tokio::fs::try_exists(self.facts_path(&commit, platform)).await?;
                 platforms.push(PlatformListing {
                     platform,
                     components,
                     complete,
+                    facts,
                 });
             }
         }

@@ -245,6 +245,47 @@ async fn a_write_dropped_mid_upload_aborts_it() {
     panic!("the dropped write's upload was not aborted");
 }
 
+/// Catches: a write dropped while its own abort is still on the wire (the body failed,
+/// the abort began, and then the caller went away, as a gRPC handler is cancelled when
+/// its client resets the stream) leaving the upload behind: the guard was disarmed
+/// before the abort finished, so the cancelled abort was never sent again. The first
+/// AbortMultipartUpload is held at the service until the write is dropped, so the
+/// order is fixed: body fails, abort in flight, write dropped. The dropped write must
+/// abort the upload from a task of its own.
+#[tokio::test]
+async fn a_write_dropped_while_its_abort_is_in_flight_aborts_the_upload_again() {
+    let s3 = FakeS3::start().await;
+    let store = s3.store(CONDITIONAL);
+    s3.hold_next_abort();
+    let failing = stream::iter(vec![Err(ObjectStoreError::Body("cut".to_owned()))]);
+    let k = key("abort-in-flight");
+    let writing = tokio::spawn(async move {
+        let _ = store.put_stream(&k, 4 * PART_BYTES, failing.boxed()).await;
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while s3.held_aborts() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the abort never reached the service"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(s3.incomplete_uploads(), 1, "the upload is open");
+    writing.abort();
+    assert!(writing.await.is_err_and(|e| e.is_cancelled()));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while s3.incomplete_uploads() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the upload was left behind: {} incomplete, requests {:?}",
+            s3.incomplete_uploads(),
+            s3.requests()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(s3.stats().aborted, 1);
+}
+
 /// Catches a failure of any other step taken for a stored object, or a failure that
 /// leaves its upload behind: a refused create (nothing to abort), a refused completion
 /// and a part answered without an ETag each fail the write, store nothing, and leave no

@@ -32,7 +32,7 @@ fn run_with(args: &[&str], env: &[(&str, &str)]) -> (Option<i32>, String, String
 /// directory of `name`: the `--ca-cert`, `--cert` and `--key` flags. The tests below that
 /// reach the mode's own start need a host the self-checks pass.
 #[cfg(target_os = "linux")]
-fn daemon_files(name: &str) -> [String; 3] {
+fn daemon_files(name: &str) -> ([String; 3], kbf_testkit::dir::TestDir) {
     use std::os::unix::fs::PermissionsExt as _;
 
     use rcgen::{ExtendedKeyUsagePurpose, KeyUsagePurpose, SanType};
@@ -59,11 +59,12 @@ fn daemon_files(name: &str) -> [String; 3] {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("mode");
         path.display().to_string()
     };
-    [
+    let flags = [
         format!("--ca-cert={}", write("ca.pem", ca.pem(), 0o644)),
         format!("--cert={}", write("node.pem", cert.pem(), 0o644)),
         format!("--key={}", write("node.key", key.serialize_pem(), 0o600)),
-    ]
+    ];
+    (flags, dir)
 }
 
 /// Catches a build node that starts with a flag of another mode (exit 0 or 1 instead of
@@ -134,16 +135,20 @@ fn version_json_reports_the_build_identity() {
         assert_eq!(
             fields,
             [
+                "admin_protocol",
                 "commit",
+                "meta_log",
                 "min_protocol",
                 "profile",
                 "protocol",
+                "seq",
                 "state_schema",
                 "version"
             ],
             "{out}"
         );
         assert_eq!(v["commit"], kbf_server::BUILD_COMMIT);
+        assert_eq!(v["admin_protocol"], kbf_server::managed::ADMIN_PROTOCOL);
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         let profile = if cfg!(debug_assertions) {
             "debug"
@@ -151,12 +156,15 @@ fn version_json_reports_the_build_identity() {
             "release"
         };
         assert_eq!(v["profile"], profile);
+        assert_eq!(v["meta_log"], kbf_server::raft_log::RUNS.get());
         assert_eq!(v["protocol"], kbf_server::worker::PROTOCOL_VERSION);
         assert_eq!(
             v["min_protocol"],
             kbf_server::worker::OLDEST_PROTOCOL_VERSION
         );
         assert!(v["state_schema"].as_u64().is_some_and(|n| n >= 1), "{out}");
+        // A number, whatever the checkout the test was built in: 0 where it could not count.
+        assert!(v["seq"].is_u64(), "{out}");
     }
 }
 
@@ -297,7 +305,7 @@ fn the_readmes_smoke_test_runs() {
 /// directory cannot be made exits 1 with the daemon's message.
 #[test]
 fn daemon_runs_the_daemons_start() {
-    let [ca, cert, key] = daemon_files("daemon_runs_the_daemons_start");
+    let ([ca, cert, key], _files) = daemon_files("daemon_runs_the_daemons_start");
     let (code, _, err) = run(&[
         names::DAEMON,
         "--driver=native",
@@ -318,7 +326,7 @@ fn daemon_runs_the_daemons_start() {
 /// refuses a cold store that cannot be made (exit 2, as in `kbf-all-in-one`).
 #[test]
 fn all_in_one_runs_both_halves_start() {
-    let [ca, cert, key] = daemon_files("all_in_one_runs_both_halves_start");
+    let ([ca, cert, key], _files) = daemon_files("all_in_one_runs_both_halves_start");
     // The container driver's host, as the self-checks want it: a `crun` that answers
     // `--version` (never run otherwise; the start stops at the cold store).
     let dir = scratch("all_in_one_runs_both_halves_start_host");
@@ -360,96 +368,100 @@ fn the_binary_answers_as_a_keeper_before_it_reads_its_command_line() {
     assert!(out.is_empty(), "{out}");
 }
 
-/// The scratch directory a test may write under (the workspace's `target/`).
-fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// A fresh scratch directory under the workspace's `target/`, removed when it drops.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
-/// Catches `kbf check-args` starting the mode it checks (the daemon's start makes its
-/// `--data-dir`; here the directory must stay absent), printing anything for a command
-/// line that parses, and exiting other than 0 for one: each built mode's own flags,
-/// with a data directory that a start would make.
+/// Catches `--label` (a node label, removed: placement uses what the node reports) coming
+/// back as a flag of the binary: a start that gives it exits 2 with the tombstone naming the
+/// flag and the way out, nothing on stdout and nothing started (no data directory made, no
+/// enrolment), with or without a mode's flags, whatever the spelling; and `kbf --help` and
+/// each mode's help do not list it.
 #[test]
-fn check_args_parses_and_starts_nothing() {
-    let dir = scratch("check_args_starts_nothing");
+fn the_label_flag_is_not_a_flag_of_kbf() {
+    let dir = scratch("label_retired");
     let data = dir.join("data");
     let data_flag = format!("--data-dir={}", data.display());
-    for mode in [names::DAEMON, names::ALL_IN_ONE] {
-        let (code, out, err) = run(&[
-            kbf_cli::CHECK_ARGS,
-            mode,
+    let config = dir.join("kbf.toml");
+    let config_flag = format!("--config={}", config.display());
+    let argvs: [&[&str]; 4] = [
+        &[
+            "--mode=daemon",
+            "--label",
+            "pool=x",
             "--driver=container",
             "--server=https://127.0.0.1:1",
-            "--ca-cert=/nonexistent/ca.pem",
-            "--cert=/nonexistent/node.pem",
-            "--key=/nonexistent/node.key",
+            "--ca-cert=ca.pem",
+            "--cert=node.pem",
+            "--key=node.key",
             "--node-id=n",
             &data_flag,
-        ]);
-        assert_eq!((code, out.as_str()), (Some(0), ""), "{mode}");
-        // Only the deprecation note (tests/config_process.rs).
-        assert_eq!(err.lines().count(), 1, "{mode}: {err}");
-        assert!(err.contains("deprecated"), "{mode}: {err}");
-        assert!(!data.exists(), "{mode} started: {} made", data.display());
-    }
-}
-
-/// Catches `kbf check-args` passing what a start refuses: a flag no mode has, another
-/// mode's flag (named, as the start names it), a mode not built yet (every start of it
-/// exits 2), `--help` (which prints and starts nothing), no mode, and an unknown one.
-/// Each exits 2 with the message on stderr and nothing on stdout.
-#[test]
-fn check_args_exits_2_with_the_refusal_a_start_gets() {
-    let daemon = [
-        names::DAEMON,
-        "--driver=container",
-        "--server=https://127.0.0.1:1",
-        "--ca-cert=ca.pem",
-        "--cert=node.pem",
-        "--key=node.key",
-        "--node-id=n",
+        ],
+        &["--mode=daemon", "--label=pool=x"],
+        &["--mode=daemon", &config_flag, "--label", "pool=x"],
+        &["--mode=storage-and-daemon", "--label=pool=x"],
     ];
-    let with = |extra: &'static str| -> Vec<&'static str> {
-        std::iter::once(kbf_cli::CHECK_ARGS)
-            .chain(daemon.iter().copied())
-            .chain([extra])
-            .collect()
-    };
-    let bogus = with("--bogus-flag");
-    let cold = with("--cold-store=file:///x");
-    let help = with("--help");
-    let rows: [(&[&str], &str); 6] = [
-        (&bogus, "unexpected argument '--bogus-flag'"),
-        (&cold, "kbf daemon refuses --cold-store: "),
-        (
-            &[kbf_cli::CHECK_ARGS, names::STORAGE_AND_DAEMON],
-            "required arguments were not provided",
-        ),
-        (&help, "--help and --version print and exit 0"),
-        (&[kbf_cli::CHECK_ARGS], "Usage: kbf"),
-        (&[kbf_cli::CHECK_ARGS, "no-such-mode"], "no-such-mode"),
-    ];
-    for (argv, want) in rows {
+    for argv in argvs {
         let (code, out, err) = run(argv);
         assert_eq!(code, Some(2), "{argv:?}: {err}");
-        assert!(err.contains(want), "{argv:?}: {err}");
         assert!(out.is_empty(), "{argv:?}: {out}");
+        assert!(
+            err.contains(
+                "--label was removed: placement uses what the node reports (OSFamily, ISA); delete the flag"
+            ),
+            "{argv:?}: {err}"
+        );
+        assert!(!data.exists(), "{argv:?} started: {} made", data.display());
+        assert!(!config.exists(), "{argv:?} wrote {}", config.display());
+    }
+    for help in [
+        &["--help"][..],
+        &["--mode=daemon", "--help"],
+        &["--mode=storage-and-daemon", "--help"],
+        &["daemon", "--help"],
+    ] {
+        let (code, out, err) = run(help);
+        assert_eq!(code, Some(0), "{help:?}: {err}");
+        assert!(!out.contains("--label"), "{help:?}: {out}");
     }
 }
 
-/// Catches `check-args` shown to an operator as if it were a mode or a flag: neither
-/// `kbf --help` nor `kbf -h` names it anywhere (it is for `kbf-deploy`, and its
-/// absence from the help is what keeps the five-mode list exact).
+/// Catches `check-args` coming back as a word of `kbf`: it was `--check`'s parse stage for
+/// `kbf-deploy`, with a deprecation note, and is retired. Now it is refused as any word
+/// that is not a mode is (exit 2, nothing on stdout, nothing started), with or without a
+/// mode after it, and `kbf --help` and `-h` do not name it.
 #[test]
-fn help_does_not_name_check_args() {
+fn check_args_is_not_a_word_of_kbf() {
+    let dir = scratch("check_args_retired");
+    let data = dir.join("data");
+    let data_flag = format!("--data-dir={}", data.display());
+    let argvs: [&[&str]; 2] = [
+        &[
+            "check-args",
+            names::DAEMON,
+            "--driver=container",
+            "--server=https://127.0.0.1:1",
+            "--ca-cert=ca.pem",
+            "--cert=node.pem",
+            "--key=node.key",
+            "--node-id=n",
+            &data_flag,
+        ],
+        &["check-args"],
+    ];
+    for argv in argvs {
+        let (code, out, err) = run(argv);
+        assert_eq!(code, Some(2), "{argv:?}: {err}");
+        assert!(out.is_empty(), "{argv:?}: {out}");
+        assert!(!err.contains("deprecated"), "{argv:?}: {err}");
+        assert!(!data.exists(), "{argv:?} started: {} made", data.display());
+    }
     for flag in ["--help", "-h"] {
         let (code, out, err) = run(&[flag]);
         assert_eq!(code, Some(0), "{flag}: {err}");
-        assert!(!out.contains(kbf_cli::CHECK_ARGS), "{flag}: {out}");
-        assert!(!err.contains(kbf_cli::CHECK_ARGS), "{flag}: {err}");
+        assert!(!out.contains("check-args"), "{flag}: {out}");
+        assert!(!err.contains("check-args"), "{flag}: {err}");
     }
 }
 

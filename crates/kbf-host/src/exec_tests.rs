@@ -103,6 +103,39 @@ fn a_write_replaces_the_file_through_a_fresh_copy() {
     assert!(!dir.join(".f.kbf-host-tmp").exists());
 }
 
+/// Catches a file with secret bytes that is readable by others before it is given its mode.
+/// The copy is written first and chmodded after, so it is created 0600 whatever the umask. A
+/// step that fails between the write and the chmod (here the chown, refused to a process that
+/// is not root) leaves the copy behind, and the copy must be private: the bytes may be a
+/// token. A root process's chown does not fail, so there is nothing to look at and the test
+/// says so.
+///
+/// Mutant seen red: the copy created 0644.
+#[test]
+fn a_copy_left_by_a_failed_write_is_private() {
+    let (mut exec, dir) = host("private-copy");
+    let mine = me();
+    if mine.uid == 0 {
+        eprintln!("skipped: a root process's chown does not fail, so no copy is left to look at");
+        return;
+    }
+    let step = Step::WriteFile {
+        path: p("/secret"),
+        perms: Perms::new(0o600),
+        owner: Some(Owner {
+            uid: mine.uid + 1,
+            gid: mine.gid,
+        }),
+        bytes: b"token".to_vec(),
+    };
+    exec.apply(&step)
+        .expect_err("the chown to another user is refused");
+    assert!(!dir.join("secret").exists());
+    let copy = dir.join(".secret.kbf-host-tmp");
+    assert_eq!(fs::read(&copy).expect("the copy is left"), b"token");
+    assert_eq!(mode_of(&copy) & 0o077, 0, "{:o}", mode_of(&copy));
+}
+
 /// Catches `Mkdir` treating a file at the path as the directory (it would chmod the
 /// file, and every later run would plan the directory again), and an existing
 /// directory refused instead of having its permissions set.
@@ -712,4 +745,53 @@ fn a_flip_goes_through_name_dot_new_and_leaves_none() {
         Path::new("b")
     );
     assert_eq!(names_in(&dir), ["current"]);
+}
+
+/// Catches `RemoveTree` that leaves part of a tree behind (a directory with files and a
+/// nested directory is gone whole), that follows a link out of the tree (the file a link
+/// inside the tree names must survive), that follows a link as its argument (a link to a
+/// directory is removed and the directory stays), that goes outside the root, and that
+/// reports success for a path that is not there.
+///
+/// Mutant seen red: `remove_dir` (the empty-directory call) in place of `remove_dir_all`. Not run
+/// as a mutant: the `is_dir` test dropped so a link to a directory is walked into.
+#[test]
+fn remove_tree_removes_the_tree_and_never_follows_a_link() {
+    let (mut exec, dir) = host("remove-tree");
+    fs::create_dir_all(dir.join("tree/sub/deeper")).expect("seed");
+    fs::write(dir.join("tree/a"), "a").expect("seed");
+    fs::write(dir.join("tree/sub/deeper/b"), "b").expect("seed");
+    fs::create_dir(dir.join("keep")).expect("seed");
+    fs::write(dir.join("keep/precious"), "p").expect("seed");
+    std::os::unix::fs::symlink(dir.join("keep"), dir.join("tree/sub/out")).expect("link");
+    std::os::unix::fs::symlink(dir.join("keep"), dir.join("alias")).expect("link");
+
+    exec.apply(&Step::RemoveTree { path: p("/tree") })
+        .expect("remove the tree");
+    assert!(!dir.join("tree").exists(), "part of the tree is left");
+    assert!(
+        dir.join("keep/precious").exists(),
+        "a link inside the tree was followed"
+    );
+
+    exec.apply(&Step::RemoveTree { path: p("/alias") })
+        .expect("remove the link");
+    assert!(
+        fs::symlink_metadata(dir.join("alias")).is_err(),
+        "the link stays"
+    );
+    assert!(
+        dir.join("keep/precious").exists(),
+        "a link given as the path was followed"
+    );
+
+    fs::write(dir.join("file"), "f").expect("seed");
+    exec.apply(&Step::RemoveTree { path: p("/file") })
+        .expect("a file is a tree of one");
+    assert!(!dir.join("file").exists());
+
+    let err = exec
+        .apply(&Step::RemoveTree { path: p("/tree") })
+        .expect_err("gone already");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
 }

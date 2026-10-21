@@ -56,10 +56,10 @@ pub fn golden_plist_as(_sha12: &str, user: Option<&str>) -> String {
 
 /// The golden `kbf.toml` of the test profile: written by hand, not by the renderer, so a
 /// key, a table or a value the renderer gets wrong differs from it. Each key is in the
-/// table of kbf-cli's `GROUPS` for the flag of that name.
-pub fn golden_config(sha12: &str) -> String {
-    format!(
-        r#"# Written by kbf-mac-provision from its profile; `apply` puts it back if it is edited.
+/// table of kbf-cli's `GROUPS` for the flag of that name. It has no `label` key, and so
+/// does not depend on the profile's SHA-256.
+pub fn golden_config() -> String {
+    r#"# Written by kbf-mac-provision from its profile; `apply` puts it back if it is edited.
 # One table per flag group, one key per flag long name (kbf-cli, config.rs).
 mode = "daemon"
 
@@ -70,11 +70,12 @@ ca-cert = "/usr/local/kbf/etc/ca.pem"
 cert = "/usr/local/kbf/etc/node.pem"
 key = "/usr/local/kbf/etc/node.key"
 node-id = "kbf-mac-07"
-label = ["profile=mac-arm64-test@{sha12}", "pool=mac", "rack=r2"]
 
 [daemon]
 driver = ["native"]
 data-dir = "/Volumes/kbf/data"
+update-dir = "/var/db/kbf-installer"
+orders-dir = "/var/db/kbf-installer/orders"
 "#
-    )
+    .to_owned()
 }

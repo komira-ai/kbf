@@ -36,7 +36,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use kbf_front::MAX_UNSTAGED_BLOB_BYTES;
-use kbf_storage::{PutStream, StorageError, StreamedPut};
+use kbf_storage::{CommitMode, PutStream, StorageError, StreamedPut};
 use kbf_transfer::{
     Cas, CasError, DEFAULT_SEGMENT_UPLOADS, Intake, IntakeFile, MAX_UPLOAD_RECORDS, Record,
     SEGMENT_UPLOAD_BYTES, Source,
@@ -175,7 +175,10 @@ impl Shared {
             if held {
                 return Ok(());
             }
-            streamed.commit().await.map_err(not_stored)
+            streamed
+                .commit(CommitMode::Durable)
+                .await
+                .map_err(not_stored)
         });
         lock(&self.state).uploads.push(upload);
     }

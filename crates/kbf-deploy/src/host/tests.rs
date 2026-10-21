@@ -279,3 +279,40 @@ fn rollback_and_gc_run_from_the_command_line() {
         (Mode::DryRun, Mode::Apply)
     );
 }
+
+/// A process table that cannot be read.
+struct Blind;
+
+impl Procs for Blind {
+    fn exe_of(&self, _: u32) -> std::io::Result<std::path::PathBuf> {
+        Err(std::io::Error::other("no process table"))
+    }
+
+    fn executables(&self) -> std::io::Result<Vec<std::path::PathBuf>> {
+        Err(std::io::Error::other("no process table"))
+    }
+}
+
+/// Catches a `gc` that removes releases on a host where it cannot tell which ones run: it
+/// fails (exit 1), says so on standard error, prints no plan and leaves a stray release in
+/// place; with a readable table the same release goes.
+///
+/// Mutants planted: the in-use error treated as "nothing runs" (the release is removed).
+#[test]
+fn gc_removes_nothing_where_it_cannot_tell_what_runs() {
+    let (layout, dir) = host_root("deploy-host-gc-blind");
+    let stray = dir
+        .join("var/lib/kbf-installer/releases")
+        .join("dddddddddddddddddddddddddddddddddddddddd");
+    fs::create_dir_all(&stray).unwrap();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = gc(&Blind, &layout, 0, Mode::Apply, &mut out, &mut err);
+    assert_eq!(code, ExitCode::FAILURE);
+    assert!(out.is_empty());
+    let err = String::from_utf8(err).unwrap();
+    assert!(
+        err.contains("cannot tell which releases run: no process table"),
+        "{err}"
+    );
+    assert!(stray.exists());
+}

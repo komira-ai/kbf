@@ -1,0 +1,145 @@
+//! Why a migration stopped, and the exit each way ends with ([`Exit`]).
+
+use std::io;
+
+use super::tree::TreeError;
+use crate::exit::Exit;
+use crate::state::StateError;
+
+#[derive(Debug, thiserror::Error)]
+pub enum MigrateError {
+    /// Applying needs the user that owns the new tree.
+    #[error("migrating changes root's files: run it as root (this is uid {have}, not {want})")]
+    NotRoot { have: u32, want: u32 },
+    /// A swap is on trial: there is one confirm window at a time, and the move must not
+    /// take a release out from under it.
+    #[error(
+        "release {commit} is on trial (activated, not confirmed): confirm or revert it with the old tool first"
+    )]
+    Pending { commit: String },
+    /// The old state and the old links say different things (an interrupted verb of the
+    /// old tool): the migration will not guess which is right.
+    #[error("the old layout disagrees with itself: {0}")]
+    Disagree(String),
+    /// The old layout moved under the migration, between its first look and its locks (a
+    /// verb of the old tools, or another run of this verb) or while it stopped the old
+    /// helper (which acted on an order): what was probed and planned is not what is there
+    /// now. Nothing was migrated; a run again starts from what is there.
+    #[error("the old layout changed under the migration ({0}): nothing was migrated, run it again")]
+    Changed(String),
+    /// A link of the old layout that is not `releases/<40 hex>`.
+    #[error("{link} points at {target:?}, not at releases/<commit>")]
+    BadLink { link: &'static str, target: String },
+    /// The directory is named for one commit and the binary in it is another. `probed` is
+    /// text the binary printed, which nobody has vetted: it is shown quoted and escaped.
+    #[error("releases/{dir} holds a build of {probed:?}: its name does not match its binary")]
+    Mislabeled { dir: String, probed: String },
+    /// A tree and no plist, or a plist and no `releases/` or `current`: half of what the Mac
+    /// kit installs, so not a host to adopt.
+    #[error("not a whole kit host: {0}")]
+    HalfKit(String),
+    /// The kit's job runs something that is neither of the kit's two argument forms.
+    #[error("the kit's job is in no form this knows: {0}")]
+    UnknownPlist(String),
+    /// The kit's job is on a host that is not a Mac.
+    #[error("{0} is the Mac kit's job file and this is not a Mac")]
+    KitOnLinux(String),
+    /// `--version --json` of an old release could not be had.
+    #[error("{release}: the version probe failed: {why}")]
+    Probe { release: String, why: String },
+    /// The floor cannot be seeded and the operator did not give one.
+    #[error("{0}")]
+    FloorUnavailable(String),
+    /// A file the migration wrote earlier does not read back as it should.
+    #[error("{file}: {why}")]
+    Corrupt { file: &'static str, why: String },
+    /// The new layout already manages this host without a migration having run.
+    #[error("{0}")]
+    Conflict(String),
+    /// The old layout's state is still the host's: `setup` and the installer's verbs wait
+    /// for the migration, so the old helper and the installer never both manage a host.
+    #[error(
+        "this host still has the old layout's state ({0}) and is not migrated: run `kbf-installer migrate --apply` first"
+    )]
+    Unmigrated(String),
+    /// A kit host was rolled back and the installer's tree was moved aside with it: what is
+    /// asked of the installer cannot be done from here, and the next step is the package.
+    #[error(
+        "this Mac was rolled back to the Mac kit and the installer's tree was moved aside: \
+         reinstall the kbf-installer .pkg to hand the host to the installer again"
+    )]
+    KitRolledBack,
+    /// The migration is written but the installer's own unit would not come up: without it
+    /// the host takes no orders. The journal is not `done`, so a run again finishes it.
+    #[error(
+        "{unit} could not be enabled and started ({why}): the host is moved but takes no orders; \
+         fix the unit, then run `kbf-installer migrate --apply` again"
+    )]
+    InstallerUnit { unit: String, why: String },
+    /// A rollback that would throw away what the installer did since.
+    #[error("cannot roll back: {0}")]
+    MovedOn(String),
+    /// An uninstall of a host the installer manages: only a host that is rolled back or was
+    /// never adopted has nothing of the installer in use.
+    #[error("cannot uninstall: {0}")]
+    Adopted(String),
+    /// Applying an uninstall needs the user that owns the installer's files.
+    #[error("uninstalling changes root's files: run it as root (this is uid {have}, not {want})")]
+    NotRootToUninstall { have: u32, want: u32 },
+    /// The installer's unit is of the other platform's kind.
+    #[error("--installer-unit {unit}: this host's units are {want}")]
+    UnitKind { unit: String, want: &'static str },
+    /// There is nothing to roll back.
+    #[error("cannot roll back: this host was not migrated (no migration.json)")]
+    NoJournal,
+    #[error(transparent)]
+    Tree(#[from] TreeError),
+    #[error(transparent)]
+    State(#[from] StateError),
+    #[error("{what}: {source}")]
+    Io { what: String, source: io::Error },
+}
+
+impl MigrateError {
+    pub fn io<E: Into<io::Error>>(what: impl Into<String>) -> impl FnOnce(E) -> MigrateError {
+        let what = what.into();
+        move |source| MigrateError::Io {
+            what,
+            source: source.into(),
+        }
+    }
+
+    /// How the verb ends (docs/design/kbf-installer.md section 2).
+    pub fn exit(&self) -> Exit {
+        match self {
+            MigrateError::NotRoot { .. }
+            | MigrateError::NotRootToUninstall { .. }
+            | MigrateError::UnitKind { .. } => Exit::Usage,
+            MigrateError::BadLink { .. }
+            | MigrateError::Mislabeled { .. }
+            | MigrateError::HalfKit(_)
+            | MigrateError::UnknownPlist(_)
+            | MigrateError::KitOnLinux(_)
+            | MigrateError::Probe { .. } => Exit::Refused,
+            // A swap of the old tool on trial, and the disagreements only a person settles.
+            MigrateError::Pending { .. }
+            | MigrateError::Disagree(_)
+            | MigrateError::Changed(_)
+            | MigrateError::FloorUnavailable(_)
+            | MigrateError::Conflict(_)
+            | MigrateError::Unmigrated(_)
+            | MigrateError::KitRolledBack
+            | MigrateError::MovedOn(_)
+            | MigrateError::Adopted(_)
+            | MigrateError::InstallerUnit { .. }
+            | MigrateError::NoJournal => Exit::NeedsOperator,
+            // The old tools' lock or the installer's, held past the wait: ask again.
+            MigrateError::State(StateError::Busy { .. }) => Exit::Busy,
+            MigrateError::State(e) if e.needs_operator() => Exit::NeedsOperator,
+            MigrateError::Corrupt { .. }
+            | MigrateError::Tree(_)
+            | MigrateError::State(_)
+            | MigrateError::Io { .. } => Exit::Failed,
+        }
+    }
+}

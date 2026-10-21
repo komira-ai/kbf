@@ -12,9 +12,13 @@
 //!   job summary).
 //! - `verify-assets sums <dir>` ([`verify_sums`]): `<dir>/SHA256SUMS` lists every other
 //!   file in `<dir>` (but the provenance bundles, which are made after the sums and so
-//!   cannot be listed: [`crate::bundles`]), each once, and each matches its line.
-//!   Control: a copy of the first tarball with its last byte flipped must not match
-//!   that line, so a check that accepts anything fails instead of passing.
+//!   cannot be listed: [`crate::bundles`]), each once, and each matches its line, and
+//!   every listed `kbf` tarball has its version facts listed too
+//!   ([`version_facts::facts_of`]; [`verify_sums_with`] waives that for the release made
+//!   before the facts were recorded) and every listed facts file its tarball
+//!   ([`version_facts::tarball_of`]). Control: a copy of the first tarball with its last byte
+//!   flipped must not match that line, so a check that accepts anything fails instead of
+//!   passing.
 //! - `verify-assets attestations <dir> --repo <owner/repo> --workflow-ref <ref> --commit
 //!   <sha> [--source-ref refs/heads/<branch>] [--trusted-root <file>] [--gh <program>]`
 //!   ([`verify_attestations`]): every listed tarball and SBOM has build provenance
@@ -22,6 +26,10 @@
 //!   (default `refs/heads/main`; a value that is not `refs/heads/<branch>` is a usage
 //!   error), on a GitHub-hosted runner, and every tarball has an SBOM attestation from
 //!   the same workflow: the `gh attestation verify` commands docs/artifacts.md gives.
+//!   A `.deb` or `.pkg` (the `kbf-installer` package, [`crate::pkg_asset`], [`crate::pkg_macos_asset`]) is listed and verified
+//!   like a tarball except that it has no SBOM attestation: build provenance and its own
+//!   bundle. The version facts of a `kbf` ([`crate::version_facts`]) are verified like an
+//!   SBOM: build provenance, and nothing else.
 //!   First, before `gh` is run, `<dir>` holds exactly one bundle per listed tarball and
 //!   no other, each the bundle of that tarball ([`bundles::pairing`]). Every tarball
 //!   also verifies against its own bundle, as a host's installer does it (`--bundle`,
@@ -32,7 +40,10 @@
 //!   Controls: the first tarball must not verify as signed by `ci.yml`, the flipped
 //!   copy must not verify, the second tarball's bundle must not verify the first (a
 //!   bundle is one tarball's own), the first's bundle must not verify for another
-//!   commit, and the flipped copy must not verify against its bundle.
+//!   commit, and the flipped copy must not verify against its bundle. With a package
+//!   listed, first the same across kinds: the package must not verify under the first
+//!   tarball's bundle, that tarball not under the package's, and the package's bundle
+//!   not for another commit.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -44,6 +55,7 @@ use crate::build_commit::full_commit;
 use crate::bundles;
 use crate::fetch::Sha256;
 use crate::package::{Platform, read, write_new};
+use crate::version_facts::{self, Pairing};
 
 /// The file name of the merged sums file.
 pub const SUMS: &str = "SHA256SUMS";
@@ -226,8 +238,17 @@ fn flipped_tarball<'a>(dir: &Path, lines: &'a [Line]) -> Result<(&'a Line, Vec<u
 
 /// The `verify-assets sums` verb, with the digest `digest` (the real one is
 /// [`Sha256::of`]; tests pass a broken one to see the control refuse it): the line to
-/// print.
+/// print. Every `kbf` tarball must have its version facts listed.
 pub fn verify_sums(dir: &Path, digest: fn(&[u8]) -> Sha256) -> Result<String, Error> {
+    verify_sums_with(dir, digest, Pairing::Required)
+}
+
+/// [`verify_sums`], holding a `kbf` tarball to its version facts as `pairing` says.
+pub fn verify_sums_with(
+    dir: &Path,
+    digest: fn(&[u8]) -> Sha256,
+    pairing: Pairing,
+) -> Result<String, Error> {
     let lines = read_sums(&dir.join(SUMS))?;
     let mut problems: Vec<String> = duplicates(&lines)
         .iter()
@@ -249,6 +270,29 @@ pub fn verify_sums(dir: &Path, digest: fn(&[u8]) -> Sha256) -> Result<String, Er
     for name in &present {
         if !lines.iter().any(|l| &l.name == name) {
             problems.push(format!("not listed in {SUMS}: {name}"));
+        }
+    }
+    // The facts a `kbf` states of itself are part of its release: the tarball of `kbf`
+    // does not go without them (unless the release is one made before they were recorded),
+    // and they do not go without the tarball they state the facts of.
+    let listed = |name: &str| lines.iter().any(|m| m.name == name);
+    for l in &lines {
+        if let Some(facts) = version_facts::facts_of(&l.name)
+            && pairing == Pairing::Required
+            && !listed(&facts)
+        {
+            problems.push(format!(
+                "{}: its version facts {facts} are not listed in {SUMS}",
+                l.name
+            ));
+        }
+        if let Some(tarball) = version_facts::tarball_of(&l.name)
+            && !listed(&tarball)
+        {
+            problems.push(format!(
+                "{}: the tarball it states the facts of, {tarball}, is not listed in {SUMS}",
+                l.name
+            ));
         }
     }
     if !problems.is_empty() {
@@ -337,7 +381,7 @@ impl Attestations<'_> {
     /// Returns whether it accepted the file, and what it printed on stderr. With a
     /// trusted root, the proxies point at nothing, so an acceptance used no network.
     /// An error when `gh` cannot be run.
-    fn bundle_run(
+    pub(crate) fn bundle_run(
         &self,
         file: &Path,
         bundle: &Path,
@@ -398,6 +442,49 @@ impl Attestations<'_> {
             "{}: its bundle {bundle_name} does not verify: {tail}",
             file.display()
         )))
+    }
+
+    /// The controls on the packages' bundles, each a verification that must be refused: the
+    /// first package against the bundle of the first tarball, and that tarball against
+    /// the package's bundle (a bundle is its own asset's, whatever the extension), and
+    /// the package for another commit. `tarball` is the first tarball of the sums (the
+    /// caller has one: it flipped a byte of it). Nothing to do when no package is listed.
+    fn package_controls(
+        &self,
+        dir: &Path,
+        lines: &[Line],
+        tarball: &Line,
+        signer: &str,
+    ) -> Result<(), Error> {
+        let Some(package) = lines.iter().find(|l| bundles::is_package(&l.name)) else {
+            return Ok(());
+        };
+        let (deb, tgz) = (dir.join(&package.name), dir.join(&tarball.name));
+        let (deb_bundle, tgz_bundle) = (
+            dir.join(bundles::name_of(&package.name)),
+            dir.join(bundles::name_of(&tarball.name)),
+        );
+        if self.bundle_run(&deb, &tgz_bundle, signer, self.commit)?.0 {
+            return Err(Error::Failed(format!(
+                "control failed: the bundle of {} verified the package {}",
+                tarball.name, package.name
+            )));
+        }
+        if self.bundle_run(&tgz, &deb_bundle, signer, self.commit)?.0 {
+            return Err(Error::Failed(format!(
+                "control failed: the bundle of the package {} verified {}",
+                package.name, tarball.name
+            )));
+        }
+        let other = bundles::other_commit(self.commit);
+        if self.bundle_run(&deb, &deb_bundle, signer, &other)?.0 {
+            return Err(Error::Failed(format!(
+                "control failed: the bundle of {} verified for commit {other}, not the commit \
+                 it attests",
+                package.name
+            )));
+        }
+        Ok(())
     }
 
     /// The controls on the bundle check, each a verification that must be refused:
@@ -478,12 +565,19 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
             a.require(&file, workflow, Some(SBOM_PREDICATE))?;
             a.require_bundle(dir, &l.name, workflow)?;
             printed.push(format!("verified: {} (provenance, SBOM, bundle)", l.name));
-        } else if l.name.ends_with(".cdx.json") {
+        } else if bundles::is_package(&l.name) {
+            // A package has build provenance and its own bundle, and no SBOM attestation
+            // (docs/artifacts.md): what it holds is the tarball's binary, which has one.
+            a.require(&file, workflow, None)?;
+            a.require_bundle(dir, &l.name, workflow)?;
+            printed.push(format!("verified: {} (provenance, bundle)", l.name));
+        } else if l.name.ends_with(".cdx.json") || l.name.ends_with(version_facts::SUFFIX) {
+            // An SBOM and the version facts of a `kbf` have build provenance only.
             a.require(&file, workflow, None)?;
             printed.push(format!("verified: {} (provenance)", l.name));
         } else {
             return Err(Error::Failed(format!(
-                "{SUMS} lists {}, neither a tarball nor an SBOM",
+                "{SUMS} lists {}, neither a tarball, a package, an SBOM nor version facts",
                 l.name
             )));
         }
@@ -509,6 +603,7 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
         .filter(|l| l.name.ends_with(".tar.gz"))
         .nth(1)
         .map(|l| l.name.as_str());
+    a.package_controls(dir, &lines, first, workflow)?;
     a.bundle_controls(dir, &first.name, second, &flipped_path, workflow)?;
     printed.push(
         "attestations: every asset verifies; another signer workflow, another tarball's \

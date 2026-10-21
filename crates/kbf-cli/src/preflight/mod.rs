@@ -38,6 +38,8 @@ mod env;
 mod files;
 mod needs;
 #[cfg(test)]
+mod proxy_secret_tests;
+#[cfg(test)]
 mod tests;
 
 pub mod host;
@@ -145,9 +147,12 @@ pub struct FileNeed {
     /// Whether it holds a secret (a private key, a token): owned by the process's user and
     /// readable by no one else.
     pub secret: bool,
+    /// The exact size the file must have, in bytes, where the flag's value is a fixed-size
+    /// secret (the proxy's, 32 bytes); `None` for any size.
+    pub exact_len: Option<usize>,
 }
 
-/// A row of the farm's certificate table (docs/deploy/kbf-modes.md, "A node's
+/// A row of the farm's certificate table (docs/deploy/kbf-units.md, "A node's
 /// certificate").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Row {

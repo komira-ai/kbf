@@ -34,12 +34,15 @@
 //!   exception is a host that leaves its step: the orders that undo the step come first
 //!   ([`Controller`]).
 //!
-//! **The farm side.** [`ports`] gives a [`Transport`] over the worker sessions and a
-//! [`FactsSource`] over the `Farm` (`session`), and [`spawn_controller`] runs the controller
-//! where the frontend starts, starting hosts only when `update/policy.auto_nodes` is set.
-//! What it cannot do yet: mark a storage member down and read its facts (U3, #914, is not in
-//! this branch), so no host with a storage half is ever started.
+//! **The farm side.** [`ports`] gives a [`Transport`] over the worker sessions and the
+//! members and a [`FactsSource`] over the `Farm`, the members and the enrollment registry
+//! (`session`), and [`spawn_controller`] runs the controller where the frontend starts,
+//! starting hosts unless an operator wrote `update/policy.auto_nodes` false or paused the run.
+//! A Linux host is joined to its storage member by the address it advertised at enrollment,
+//! matched on its lower-cased spelling; a host that matches no member is never started and `FarmFacts::unlinked`
+//! says why.
 
+pub mod age;
 mod codec;
 mod command;
 mod controller;
@@ -50,6 +53,7 @@ mod node_step;
 mod pick;
 mod policy;
 mod ports;
+mod proposal;
 mod report;
 mod rows;
 mod runner;
@@ -69,6 +73,7 @@ pub use node_step::{HostPhase, Transition, step};
 pub use pick::{Pick, Picked, Skip, WaitReason, pick};
 pub use policy::{Policy, PolicyError};
 pub use ports::{FactsSource, FarmView, SourceError, Transport, TransportError};
+pub use proposal::{PROPOSED, Proposal, proposal_key};
 pub use report::{CommandError, ControllerError, Moved, Tick};
 pub use rows::{RowError, Rows, Stored};
 pub use runner::spawn as spawn_controller;

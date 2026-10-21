@@ -1,5 +1,5 @@
 use super::*;
-use crate::fixtures::{COMMIT, OTHER, elf, macho, version_json};
+use crate::fixtures::{elf, macho};
 
 /// Catches a header read as the wrong kind or CPU: ELF and Mach-O, for both CPUs each,
 /// are told apart; and what only looks like one is `Other`: a 32-bit ELF, a big-endian
@@ -84,61 +84,4 @@ fn the_kinds_print_for_an_operator() {
         BinaryKind::Other.to_string(),
         "neither an ELF nor a thin Mach-O binary"
     );
-}
-
-/// Catches `--version --json` read loosely: the six fields are read, a later build's
-/// extra field is ignored, and a missing field, a field of the wrong type and text that
-/// is not JSON are refused.
-#[test]
-fn the_version_object_is_read_by_its_fields() {
-    let v = Version::parse(version_json(COMMIT, "release").as_bytes()).expect("parses");
-    assert_eq!(
-        v,
-        Version {
-            commit: COMMIT[..12].to_owned(),
-            min_protocol: 3,
-            protocol: 4,
-            profile: "release".to_owned(),
-            state_schema: 7,
-            version: "0.1.0".to_owned(),
-        }
-    );
-    let more = version_json(COMMIT, "release").replace('}', ",\"future\":true}");
-    assert_eq!(Version::parse(more.as_bytes()).expect("parses"), v);
-    for bad in [
-        r#"{"commit":"abc"}"#,
-        "kbf 0.1.0",
-        "",
-        &version_json(COMMIT, "release").replace("\"protocol\":4", "\"protocol\":\"4\""),
-    ] {
-        let err = Version::parse(bad.as_bytes()).expect_err(bad);
-        assert_eq!(err.code(), "version-unreadable", "{bad}");
-    }
-}
-
-/// Catches each check of a version being skipped: the commit (the first 12 digits of the
-/// offered one) and the profile (a debug build is not a release). Each is its own refusal.
-///
-/// Mutants seen red: the commit comparison dropped; the profile comparison dropped.
-#[test]
-fn a_version_must_name_the_commit_and_be_a_release_build() {
-    let commit = CommitId::new(COMMIT).expect("commit");
-    let release = Version::parse(version_json(COMMIT, "release").as_bytes()).expect("parses");
-    release.check(&commit).expect("the release of the commit");
-
-    let other = Version::parse(version_json(OTHER, "release").as_bytes()).expect("parses");
-    let err = other.check(&commit).expect_err("another commit");
-    assert_eq!(err.code(), "version-commit");
-    assert_eq!(
-        err.to_string(),
-        format!(
-            "it says commit {}, and the release is {}",
-            &OTHER[..12],
-            &COMMIT[..12]
-        )
-    );
-
-    let debug = Version::parse(version_json(COMMIT, "debug").as_bytes()).expect("parses");
-    let err = debug.check(&commit).expect_err("debug");
-    assert_eq!(err.code(), "version-profile");
 }

@@ -51,8 +51,8 @@ verbs (`kbf cluster status|drain|undrain|member` is the model) are clients of it
   host's `kbf-installer` pulls and verifies the release, starts the new instance behind the installed Envoy,
   waits for its `/readyz`, then hands over; the old instance stops scheduling, relays its open `Execute`
   streams until they close, and exits. The installer confirms, and reverts if the new instance never becomes
-  ready. One frontend update at a time; a second is refused. `kbf-installer update --frontend` stays as the
-  local fallback. For
+  ready. One frontend update at a time; a second is refused. `kbf-installer update --frontend` is the
+  command-line client of that call (no root, refused through `sudo`). For
   our own farm the trigger is its deployment pipeline. kbf has no update button and does not poll for releases
   (section 10).
 - A same-host proxy makes every caller loopback, which defeats the loopback gate, so the operator API and UI do
@@ -186,7 +186,7 @@ sections 4 and 5):
   `current`, restart the unit; the **confirm** order keeps it, a missed window or a crash loop **reverts** to
   `previous` locally (commit-confirm).
 - **Frontend update**, ordered by a `frontend_update` record the frontend writes for its own host after
-  `POST /v1/update/frontend` (the local fallback is `kbf-installer update --commit SHA --frontend`): it starts
+  `POST /v1/update/frontend` (its command-line client is `kbf-installer update --commit SHA --frontend --api ADDR`, which needs no root and is refused through `sudo`): it starts
   the new instance behind the installed Envoy, waits for its readiness, confirms or reverts, and hands over; the old instance stops
   scheduling and relays its open `Execute` streams until they close, with no timeout (OSS Buck2 never calls
   `WaitExecution`). One frontend on SQLite now; Postgres and several frontends later.
@@ -236,7 +236,6 @@ already deleted; the all-in-one tests run `kbf all-in-one`.
 - `kbf-helper` (folded into `kbf-installer`), and later the `kbf-server` and `kbf-daemon`
   binaries (after the farm and the Macs run `kbf --mode=<mode>`); the old subcommand forms, which are aliases until then;
 - `kbf frontend handover` and its unit rule, once the installer performs the baton in the frontend update;
-  `kbf check-args`, once `--check` exists on every mode;
 - `kbf-deploy`, last: `host` becomes the installer, `linux render-units|install-units` become package units,
   `envoy` becomes the installer's config render, `log`, backups and image pull become API routes, and the MDM,
   object-store provisioning and pilot kits leave the product.

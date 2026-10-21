@@ -1,0 +1,1071 @@
+//! `kbf-cell cross-version` against fakes: every check of the cross-version test passes
+//! on a pair of builds that fits, and each one fails the run when a build breaks it.
+//!
+//! The fakes are this test binary, run through links named `kbf`, `kbf-server` and
+//! `kbf-daemon` in a `--server-dir` and a `--daemon-dir` of the test's own: a start-up
+//! hook answers as the program its argv0 names before the test harness starts. A
+//! directory's `facts.json` is what its fake `kbf --version --json` prints, and the fake
+//! server accepts the range that file states, as a build does. The fake server is a real
+//! gRPC `Worker` over mutual TLS and a small HTTP answer for `GET /v1/nodes`; the fake
+//! daemon only logs `welcomed`. Each fake appends its call to `<dir>/calls` and plants
+//! the defect `KBF_XV_FAKE_DEFECT` names, if it is one of its own.
+//!
+//! The real builds are checked by the `cross-version` job of beta.yml (the whole pair of an
+//! earlier release and the tip, both ways); `the_tip_runs_against_itself` below is the
+//! same run by hand.
+
+#![cfg(target_os = "linux")]
+
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+// The fakes' start-up hook: before the harness reads its arguments, this binary
+// answers as the program its argv0 names, if it names one.
+const _: () = {
+    extern "C" fn fake_hook() {
+        fake::hook();
+    }
+    #[used]
+    #[unsafe(link_section = ".init_array")]
+    static FAKE_HOOK: extern "C" fn() = fake_hook;
+};
+
+const BIN: &str = env!("CARGO_BIN_EXE_kbf-cell");
+
+/// The fake programs.
+mod fake {
+    use std::io::Write as _;
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    use futures::{Stream, StreamExt as _};
+    use kbf_proto::worker::worker_server::{Worker, WorkerServer};
+    use kbf_proto::worker::{
+        DaemonMessage, ServerMessage, Welcome, daemon_message, server_message,
+    };
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
+    use tonic::transport::server::TcpIncoming;
+    use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+    use tonic::{Request, Response, Status, Streaming};
+
+    /// The directory the fakes write `calls` to.
+    pub const DIR: &str = "KBF_XV_FAKE_DIR";
+    /// The defect to plant.
+    pub const DEFECT: &str = "KBF_XV_FAKE_DEFECT";
+    /// What the fake operator API says of the node's `protocol` (JSON; unset: no key).
+    pub const NODE_PROTOCOL: &str = "KBF_XV_FAKE_NODE_PROTOCOL";
+
+    pub fn hook() {
+        let mut args = std::env::args();
+        let argv0 = args.next().unwrap_or_default();
+        let program = Path::new(&argv0);
+        let role = program.file_name().and_then(|n| n.to_str());
+        let role = role.unwrap_or_default().to_owned();
+        if !matches!(role.as_str(), "kbf" | "kbf-server" | "kbf-daemon") {
+            return;
+        }
+        let dir = program.parent().expect("a directory").to_owned();
+        let args: Vec<String> = args.collect();
+        // This runs before the Rust runtime does, which is what sets SIGPIPE to ignored:
+        // without it, tonic's vectored write to a connection the client already closed
+        // (the refusal, then a client that drops the channel) ends the server silently.
+        // SAFETY: `signal` with `SIG_IGN` installs no handler.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        record(&role, &dir, &args);
+        let code = match role.as_str() {
+            "kbf" => kbf(&dir, &args),
+            "kbf-server" | "kbf-daemon" if args == ["--version"] => version(&role, &dir),
+            "kbf-server" => server(&dir, &args),
+            _ => daemon(&args),
+        };
+        std::process::exit(code);
+    }
+
+    /// The commit the directory's `facts.json` states.
+    fn commit(dir: &Path) -> String {
+        let facts = std::fs::read_to_string(dir.join("facts.json")).expect("facts.json");
+        let facts: serde_json::Value = serde_json::from_str(&facts).expect("facts are JSON");
+        facts["commit"].as_str().expect("a commit").to_owned()
+    }
+
+    /// `<program> 0.0.0+<commit>`, as `--version` prints: of another commit than the
+    /// directory's `kbf` states, or of none, as the defect says.
+    fn version(role: &str, dir: &Path) -> i32 {
+        match (role, defect().as_str()) {
+            ("kbf-server", "server-skew") | ("kbf-daemon", "daemon-skew") => {
+                println!("{role} 0.0.0+ffffffffffff");
+            }
+            ("kbf-server", "server-no-commit") => println!("{role} 0.0.0"),
+            _ => println!("{role} 0.0.0+{}", commit(dir)),
+        }
+        0
+    }
+
+    fn defect() -> String {
+        std::env::var(DEFECT).unwrap_or_default()
+    }
+
+    /// Appends `<role>\t<directory name>\t<arguments>` to `calls`.
+    fn record(role: &str, dir: &Path, args: &[String]) {
+        let calls = std::env::var(DIR).expect("the fakes' directory");
+        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{calls}/calls"))
+            .expect("open for append");
+        writeln!(file, "{role}\t{name}\t{}", args.join(" ")).expect("append");
+    }
+
+    /// Runs for 30 s (so a lost SIGINT does not linger): a process that hangs.
+    fn hang() -> i32 {
+        std::thread::sleep(Duration::from_secs(30));
+        0
+    }
+
+    fn kbf(dir: &Path, args: &[String]) -> i32 {
+        if args != ["--version", "--json"] {
+            eprintln!("the fake kbf was given {args:?}");
+            return 3;
+        }
+        match defect().as_str() {
+            "facts-hang" => return hang(),
+            "facts-fail" => {
+                eprintln!("kbf: broken");
+                return 1;
+            }
+            _ => {}
+        }
+        print!(
+            "{}",
+            std::fs::read_to_string(dir.join("facts.json")).expect("facts.json")
+        );
+        0
+    }
+
+    /// The value after the flag `name`.
+    fn flag(args: &[String], name: &str) -> Option<String> {
+        let at = args.iter().position(|a| a == name)?;
+        args.get(at + 1).cloned()
+    }
+
+    fn server(dir: &Path, args: &[String]) -> i32 {
+        match defect().as_str() {
+            "server-exits" => return 4,
+            "server-silent" => return hang(),
+            _ => {}
+        }
+        let wanted = [
+            "--listen",
+            "--worker-listen",
+            "--api-listen",
+            "--cold-store",
+            "--meta-dir",
+            "--worker-tls-cert",
+            "--worker-tls-key",
+            "--worker-client-ca",
+        ];
+        let given: Vec<Option<String>> = wanted.iter().map(|w| flag(args, w)).collect();
+        let [
+            Some(_),
+            Some(worker),
+            Some(api),
+            Some(_),
+            Some(_),
+            Some(cert),
+            Some(key),
+            Some(ca),
+        ] = given.as_slice()
+        else {
+            eprintln!("the fake kbf-server was given {args:?}, not all of {wanted:?}");
+            return 3;
+        };
+        let read = |path: &String| std::fs::read_to_string(path).expect("read a TLS file");
+        let tls = ServerTlsConfig::new()
+            .identity(Identity::from_pem(read(cert), read(key)))
+            .client_ca_root(Certificate::from_pem(read(ca)));
+        let facts = std::fs::read_to_string(dir.join("facts.json")).expect("facts.json");
+        let facts: serde_json::Value = serde_json::from_str(&facts).expect("facts are JSON");
+        let number = |key: &str| u32::try_from(facts[key].as_u64().expect(key)).expect("u32");
+        let worker_service = FakeWorker {
+            range: (number("min_protocol"), number("protocol")),
+            defect: defect(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let worker = worker.parse::<SocketAddr>().expect("worker address");
+            let incoming = TcpIncoming::bind(worker).expect("bind the worker listener");
+            let worker = incoming.local_addr().expect("worker address");
+            let api = TcpListener::bind(api).await.expect("bind the API");
+            let api_address = api.local_addr().expect("API address");
+            // The start line, with the listeners the defect names wrong or leaves out.
+            let (reported, api_word) = match defect().as_str() {
+                "server-wrong-worker" => ("127.0.0.1:1".to_owned(), format!(" api={api_address}")),
+                "server-no-api" => (worker.to_string(), String::new()),
+                _ => (worker.to_string(), format!(" api={api_address}")),
+            };
+            println!("kbf-server 0.0.0+fake reapi=127.0.0.1:0 worker={reported}{api_word}");
+            std::io::stdout().flush().expect("flush");
+            tokio::spawn(answer_nodes(api, nodes_body()));
+            Server::builder()
+                .tls_config(tls)
+                .expect("server TLS")
+                .add_service(WorkerServer::new(worker_service))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("serve");
+        });
+        0
+    }
+
+    /// The answer of `GET /v1/nodes`: the daemon's node, as the defect says.
+    fn nodes_body() -> String {
+        let protocol =
+            std::env::var(NODE_PROTOCOL).map_or(String::new(), |p| format!(",\"protocol\":{p}"));
+        let node = |connected: bool| {
+            format!("{{\"node_id\":\"cell-node-1\",\"connected\":{connected}{protocol}}}")
+        };
+        let nodes = match defect().as_str() {
+            "api-empty" => String::new(),
+            "api-disconnected" => node(false),
+            _ => node(true),
+        };
+        format!("{{\"server\":{{}},\"nodes\":[{nodes}]}}")
+    }
+
+    /// Answers every request on `listener` with `body` as JSON.
+    async fn answer_nodes(listener: TcpListener, body: String) {
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await.expect("read the request");
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).await.expect("answer");
+        }
+    }
+
+    /// The `Worker` service of a server that accepts `range`.
+    struct FakeWorker {
+        range: (u32, u32),
+        defect: String,
+    }
+
+    #[tonic::async_trait]
+    impl Worker for FakeWorker {
+        type SessionStream = Pin<Box<dyn Stream<Item = Result<ServerMessage, Status>> + Send>>;
+
+        async fn session(
+            &self,
+            request: Request<Streaming<DaemonMessage>>,
+        ) -> Result<Response<Self::SessionStream>, Status> {
+            let mut inbound = request.into_inner();
+            let first = inbound.message().await?.and_then(|m| m.message);
+            let Some(daemon_message::Message::Hello(hello)) = first else {
+                return Err(Status::invalid_argument("the first message must be Hello"));
+            };
+            let version = hello.protocol_version;
+            let (oldest, newest) = self.range;
+            match self.defect.as_str() {
+                "hang-hello" => std::future::pending::<()>().await,
+                "silent-stream" => return Ok(Response::new(futures::stream::empty().boxed())),
+                _ => {}
+            }
+            // As the real server's `negotiate`: refused below its oldest, else the lesser
+            // of the Hello's version and its newest.
+            let below = version < oldest;
+            let above_refused = version > newest && self.defect == "refuses-above";
+            if (below && self.defect != "accepts-all") || above_refused {
+                return Err(match self.defect.as_str() {
+                    "refuse-invalid" => Status::invalid_argument(format!(
+                        "protocol version {version} is not accepted; this server speaks {oldest} to {newest}"
+                    )),
+                    "refuse-unnamed" => Status::failed_precondition("this server is full"),
+                    _ => Status::failed_precondition(format!(
+                        "protocol version {version} is not accepted; this server speaks {oldest} to {newest}"
+                    )),
+                });
+            }
+            let named = match self.defect.as_str() {
+                "welcome-newest" => newest,
+                "welcome-unclamped" => version,
+                _ => version.min(newest),
+            };
+            let welcome = ServerMessage {
+                message: Some(server_message::Message::Welcome(Welcome {
+                    protocol_version: named,
+                    heartbeat_interval_ms: 1000,
+                    ..Welcome::default()
+                })),
+            };
+            let stream = futures::stream::once(std::future::ready(Ok(welcome)));
+            Ok(Response::new(
+                stream.chain(futures::stream::pending()).boxed(),
+            ))
+        }
+    }
+
+    fn daemon(args: &[String]) -> i32 {
+        match defect().as_str() {
+            "daemon-exits" => return 5,
+            "daemon-silent" => {
+                eprintln!("WARN kbf_daemon: cannot reach a server; retrying");
+                return hang();
+            }
+            _ => {}
+        }
+        let server = flag(args, "--server").unwrap_or_default();
+        let wanted = [
+            ("--driver", "fake"),
+            ("--node-id", "cell-node-1"),
+            ("--tls-server-name", "localhost"),
+        ];
+        let flags_ok = wanted
+            .iter()
+            .all(|(n, v)| flag(args, n).as_deref() == Some(*v));
+        let files_ok = ["--ca-cert", "--cert", "--key", "--data-dir"]
+            .iter()
+            .all(|n| flag(args, n).is_some());
+        if !(flags_ok && files_ok && server.starts_with("https://127.0.0.1:")) {
+            eprintln!("the fake kbf-daemon was given {args:?}");
+            return 3;
+        }
+        eprintln!("\x1b[32m INFO\x1b[0m kbf_daemon: welcomed server={server}");
+        hang()
+    }
+}
+
+/// A fresh directory for one run of one test.
+fn scratch(name: &str) -> PathBuf {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("kbf-cross-version-tests")
+        .join(format!("{name}-{}-{call}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create a scratch directory");
+    dir
+}
+
+/// The commit of the server's build, and of the daemon's when it is another build.
+const SERVER_COMMIT: &str = "0123456789ab";
+const DAEMON_COMMIT: &str = "fedcba987654";
+
+/// The facts a build of `commit` states: its `kbf --version --json` line.
+fn facts(commit: &str, min_protocol: u32, protocol: u32) -> String {
+    facts_with_schema(commit, min_protocol, protocol, 3)
+}
+
+/// The same, with the state schema the build embeds.
+fn facts_with_schema(commit: &str, min_protocol: u32, protocol: u32, schema: u32) -> String {
+    format!(
+        "{{\"commit\":\"{commit}\",\"min_protocol\":{min_protocol},\"profile\":\"debug\",\
+         \"protocol\":{protocol},\"state_schema\":{schema},\"version\":\"0.1.0\"}}\n"
+    )
+}
+
+/// The commit of the build whose installer stages the others.
+const INSTALLER_COMMIT: &str = "aaaaaaaaaaaa";
+
+/// What one run of `kbf-cell cross-version` did.
+struct Run {
+    code: Option<i32>,
+    text: String,
+    calls: Vec<String>,
+    elapsed: Duration,
+}
+
+impl Run {
+    fn ok(&self) -> bool {
+        self.code == Some(0)
+    }
+
+    /// Whether `call` (`role<TAB>directory<TAB>arguments`) asked a program only for its
+    /// `--version`: the check that it is the build its directory's `kbf` states.
+    fn is_identity(call: &str) -> bool {
+        call.ends_with("\t--version")
+    }
+
+    /// The calls that ran a fake for its work (`kbf --version --json` included), in order.
+    fn ran(&self) -> Vec<&str> {
+        let ran = self.calls.iter().filter(|c| !Self::is_identity(c));
+        ran.map(String::as_str).collect()
+    }
+
+    /// The fakes that ran for their work, in order, by role.
+    fn started(&self) -> Vec<&str> {
+        let roles = self.ran().into_iter();
+        roles
+            .map(|c| c.split('\t').next().unwrap_or_default())
+            .collect()
+    }
+
+    /// The `<role>@<directory>` of each call that only asked for a `--version`.
+    fn identities(&self) -> Vec<String> {
+        let asked = self.calls.iter().filter(|c| Self::is_identity(c));
+        let fields = asked.map(|c| c.split('\t').collect::<Vec<_>>());
+        fields.map(|f| format!("{}@{}", f[0], f[1])).collect()
+    }
+}
+
+/// One fake cell: the fakes in `<dir>/server` and `<dir>/daemon` (or both in
+/// `<dir>/server`), and `kbf-cell cross-version`'s work directory `<dir>/work`.
+struct Cell {
+    dir: PathBuf,
+    server_dir: PathBuf,
+    daemon_dir: PathBuf,
+    installer_dir: Option<PathBuf>,
+    defect: String,
+    node_protocol: Option<String>,
+    wait: u64,
+}
+
+impl Cell {
+    /// A server accepting `server.0..=server.1` and a daemon speaking `daemon`.
+    fn new(name: &str, server: (u32, u32), daemon: u32, defect: &str) -> Self {
+        Self::build(name, (server.0, server.1, 3), daemon, defect)
+    }
+
+    /// The same, the server's build embedding state schema `server.2`.
+    fn new_with_schema(name: &str, server: (u32, u32, u32), daemon: u32) -> Self {
+        Self::build(name, server, daemon, "")
+    }
+
+    fn build(name: &str, server: (u32, u32, u32), daemon: u32, defect: &str) -> Self {
+        let dir = scratch(name);
+        let (server_dir, daemon_dir) = (dir.join("server"), dir.join("daemon"));
+        let me = std::env::current_exe().expect("this test binary");
+        for (path, links, text) in [
+            (
+                &server_dir,
+                ["kbf", "kbf-server"],
+                facts_with_schema(SERVER_COMMIT, server.0, server.1, server.2),
+            ),
+            (
+                &daemon_dir,
+                ["kbf", "kbf-daemon"],
+                facts(DAEMON_COMMIT, 1, daemon),
+            ),
+        ] {
+            std::fs::create_dir_all(path).expect("a build directory");
+            std::fs::write(path.join("facts.json"), text).expect("facts.json");
+            for link in links {
+                std::os::unix::fs::symlink(&me, path.join(link)).expect("link a fake");
+            }
+        }
+        Self {
+            dir,
+            server_dir,
+            daemon_dir,
+            installer_dir: None,
+            defect: defect.to_owned(),
+            node_protocol: None,
+            wait: 20,
+        }
+    }
+
+    /// One build directory for both, as the self-test has it: it holds `kbf`,
+    /// `kbf-server` and `kbf-daemon`, stating `min..=protocol`.
+    fn one_directory(name: &str, min: u32, protocol: u32, defect: &str) -> Self {
+        let mut cell = Self::new(name, (min, protocol), protocol, defect);
+        let both = cell.dir.join("both");
+        std::fs::create_dir_all(&both).expect("the build directory");
+        let text = facts(SERVER_COMMIT, min, protocol);
+        std::fs::write(both.join("facts.json"), text).expect("facts.json");
+        let me = std::env::current_exe().expect("this test binary");
+        for link in ["kbf", "kbf-server", "kbf-daemon"] {
+            std::os::unix::fs::symlink(&me, both.join(link)).expect("link a fake");
+        }
+        cell.server_dir = both.clone();
+        cell.daemon_dir = both;
+        cell
+    }
+
+    /// The daemon's build speaks protocols from `min` (its `kbf`'s `min_protocol`).
+    fn daemon_min(self, min: u32, protocol: u32) -> Self {
+        let text = facts(DAEMON_COMMIT, min, protocol);
+        std::fs::write(self.daemon_dir.join("facts.json"), text).expect("facts.json");
+        self
+    }
+
+    /// The installer on the hosts is the one of a build stating `min..=protocol` and
+    /// state schema `schema` (the fake `kbf` of `<dir>/installer`).
+    fn installer(mut self, min: u32, protocol: u32, schema: u32) -> Self {
+        let dir = self.dir.join("installer");
+        std::fs::create_dir_all(&dir).expect("the installer's build directory");
+        let text = facts_with_schema(INSTALLER_COMMIT, min, protocol, schema);
+        std::fs::write(dir.join("facts.json"), text).expect("facts.json");
+        let me = std::env::current_exe().expect("this test binary");
+        // Only the installer's release states its numbers: a fake `kbf`, like the others.
+        for link in ["kbf"] {
+            std::os::unix::fs::symlink(&me, dir.join(link)).expect("link a fake");
+        }
+        self.installer_dir = Some(dir);
+        self
+    }
+
+    /// The fake operator API says the node speaks `json` (a JSON value).
+    fn node_protocol(mut self, json: &str) -> Self {
+        self.node_protocol = Some(json.to_owned());
+        self
+    }
+
+    /// Every wait of the harness is `secs` seconds.
+    fn wait(mut self, secs: u64) -> Self {
+        self.wait = secs;
+        self
+    }
+
+    /// Runs `kbf-cell cross-version`, ended by force after 45 s: a harness that does
+    /// not bound a wait would otherwise hang the test.
+    fn run(&self) -> Run {
+        let out = self.dir.join("out.txt");
+        let file = std::fs::File::create(&out).expect("the output file");
+        let mut command = Command::new(BIN);
+        command
+            .arg("cross-version")
+            .arg("--server-dir")
+            .arg(&self.server_dir)
+            .arg("--daemon-dir")
+            .arg(&self.daemon_dir)
+            .arg("--work")
+            .arg(self.dir.join("work"))
+            .args(["--wait", &self.wait.to_string()])
+            .env(fake::DIR, &self.dir)
+            .env(fake::DEFECT, &self.defect)
+            .stdin(std::process::Stdio::null())
+            .stdout(file.try_clone().expect("clone the output file"))
+            .stderr(file);
+        if let Some(json) = &self.node_protocol {
+            command.env(fake::NODE_PROTOCOL, json);
+        }
+        if let Some(dir) = &self.installer_dir {
+            command.arg("--installer-dir").arg(dir);
+        }
+        let start = Instant::now();
+        let mut child = command.spawn().expect("start kbf-cell");
+        let code = loop {
+            if let Some(status) = child.try_wait().expect("poll kbf-cell") {
+                break status.code();
+            }
+            if start.elapsed() > Duration::from_secs(45) {
+                child.kill().expect("end kbf-cell");
+                child.wait().expect("reap kbf-cell");
+                panic!(
+                    "kbf-cell cross-version did not end within 45 s ({})",
+                    self.defect
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let elapsed = start.elapsed();
+        let text = std::fs::read_to_string(&out).expect("the output");
+        let calls = std::fs::read_to_string(self.dir.join("calls")).unwrap_or_default();
+        let calls = calls.lines().map(str::to_owned).collect();
+        Run {
+            code,
+            text,
+            calls,
+            elapsed,
+        }
+    }
+}
+
+/// Asserts the run failed (exit `code`) and its output holds every needle.
+#[track_caller]
+fn fails(run: &Run, code: i32, needles: &[&str]) {
+    assert_eq!(run.code, Some(code), "{}", run.text);
+    for needle in needles {
+        assert!(
+            run.text.contains(needle),
+            "{needle:?} not in:\n{}",
+            run.text
+        );
+    }
+}
+
+/// Catches a step left out or run in another order, a daemon started with other flags
+/// than the real one takes (the fake exits 3 on those), a server given no listener or
+/// TLS flag, the probes sent inside the range or not around it (the fake server refuses
+/// exactly outside what its facts state), and a run that prints no proof of a step: the
+/// output names each. Server 2 to 4 and a daemon at 3: the probes are 3, 5 (welcomed at
+/// 4, the server's newest) and 1 (refused). The
+/// two directories are two builds (two commits) and the server accepts from 2: neither
+/// note of the self-test appears.
+#[test]
+fn a_pair_that_fits_passes_every_step() {
+    let run = Cell::new("fits", (2, 4), 3, "").run();
+    assert!(run.ok(), "{}", run.text);
+    for line in [
+        "the builds are compatible: the daemon speaks protocol 1 to 3, the server 2 to 4",
+        "a Hello at protocol 3 (the daemon's) is welcomed as protocol 3",
+        "a Hello at protocol 5 (newer than the server) is welcomed as the server's newest, protocol 4",
+        "a Hello at protocol 1 is refused",
+        "kbf-daemon was welcomed by kbf-server",
+        // The fake API names no `protocol`, as a server that predates the field.
+        "NOTE: GET /v1/nodes lists cell-node-1, connected; its entry carries no `protocol`",
+        // No --installer-dir: the order is said not to be checked.
+        "NOTE: no --installer-dir: the order of installer and kbf is not checked",
+    ] {
+        assert!(run.text.contains(line), "{line:?} not in:\n{}", run.text);
+    }
+    for line in ["one build", "self-test", "lower edge"] {
+        assert!(!run.text.contains(line), "{line:?} in:\n{}", run.text);
+    }
+    assert_eq!(run.started(), ["kbf", "kbf", "kbf-server", "kbf-daemon"]);
+    // Each directory's binary was asked which build it is, once, before anything started.
+    assert_eq!(run.identities(), ["kbf-server@server", "kbf-daemon@daemon"]);
+    assert_eq!(run.calls.len(), 6, "{:?}", run.calls);
+    let ran = run.ran();
+    assert!(
+        ran[0].starts_with("kbf\tserver\t--version --json"),
+        "{ran:?}"
+    );
+    assert!(
+        ran[1].starts_with("kbf\tdaemon\t--version --json"),
+        "{ran:?}"
+    );
+    assert!(ran[2].contains("--worker-listen 127.0.0.1:0"), "{ran:?}");
+    assert!(
+        ran[3].contains("--driver fake --server https://127.0.0.1:"),
+        "{ran:?}"
+    );
+}
+
+/// Catches the self-test shape (one directory as both) refused or mixed up with two, and
+/// a node protocol the operator API names being compared to the wrong number, and a run
+/// that does not say what it is: two directories of one commit are a self-test, and a
+/// server accepting from 1 has no real lower edge (the probe is 0, which any server
+/// refuses). A server of one protocol: the probes outside it are 0 (the wire's "not
+/// named", refused) and 2 (newer, welcomed at 1).
+#[test]
+fn one_directory_is_the_self_test_and_a_named_node_protocol_is_checked() {
+    let run = Cell::one_directory("self", 1, 1, "")
+        .node_protocol("1")
+        .run();
+    assert!(run.ok(), "{}", run.text);
+    for line in [
+        "a Hello at protocol 0 is refused",
+        "a Hello at protocol 2 (newer than the server) is welcomed as the server's newest, protocol 1",
+        "OK: GET /v1/nodes lists cell-node-1, connected, at protocol 1",
+        "NOTE: the server and the daemon are one build (commit 0123456789ab): this run is a \
+         self-test, not a cross-version run",
+        "NOTE: the server's min_protocol is 1, so the probe below its range is protocol 0",
+        "the lower edge of the range is not exercised",
+    ] {
+        assert!(run.text.contains(line), "{line:?} not in:\n{}", run.text);
+    }
+    assert!(
+        run.calls.iter().all(|c| c.contains("\tboth\t")),
+        "{:?}",
+        run.calls
+    );
+}
+
+/// Catches an incompatible pair started anyway, in the two ways the builds can part: the
+/// release that raised `min_protocol` past a shipped daemon (the daemon speaks 1, the
+/// server accepts from 2), and a daemon that speaks only from a version past what the
+/// server speaks (daemon 5 and newer, server up to 3). Also the edges read as exclusive,
+/// and a daemon newer than its server refused: that one is compatible (welcomed at the
+/// server's newest) and must run. Nothing starts for the failures: the facts are all the
+/// run has asked for, and the failure names the numbers of both builds.
+#[test]
+fn an_incompatible_pair_fails_before_anything_starts() {
+    for (name, daemon_min, daemon, message) in [
+        (
+            "min-raised",
+            1,
+            1,
+            "speaks protocol 1, but the server (build 0123456789ab) accepts protocol 2 and newer",
+        ),
+        (
+            "daemon-ahead",
+            5,
+            6,
+            "speaks protocol 5 and newer, but the server (build 0123456789ab) speaks up to protocol 3",
+        ),
+    ] {
+        let run = Cell::new(name, (2, 3), daemon, "")
+            .daemon_min(daemon_min, daemon)
+            .run();
+        fails(&run, 1, &[message]);
+        assert_eq!(run.started(), ["kbf", "kbf"], "{}", run.text);
+    }
+    // The edges are in, and so is a daemon newer than the server.
+    for (daemon_min, daemon) in [(1, 2), (1, 3), (1, 4), (3, 9)] {
+        let run = Cell::new("edge", (2, 3), daemon, "")
+            .daemon_min(daemon_min, daemon)
+            .run();
+        assert!(run.ok(), "{daemon_min}..{daemon}: {}", run.text);
+    }
+}
+
+/// The upgrade-order rule, the order that is right. Release N states 1 to 1; release N+1
+/// states 1 to 2 and a state schema one higher. The new frontend (accepting 1 to 2) serves
+/// the old daemon (protocol 1), and the installer of N+1 is on the hosts first. Catches an
+/// installer taken to need an exact match with the kbf it stages (the installer ahead of
+/// the daemon's older kbf must pass), a daemon's build left out of the check (the daemon
+/// here is the one that is older), and a pass that does not say so. Both of the installer's
+/// two checks print one line; the numbers differ, so the note that no order could fail
+/// does not appear.
+#[test]
+fn the_installer_of_the_newer_release_stages_both_builds() {
+    let run = Cell::new("installer-first", (1, 2), 1, "")
+        .installer(1, 2, 4)
+        .run();
+    assert!(run.ok(), "{}", run.text);
+    for line in [
+        "commit aaaaaaaaaaaa, protocol 1 to 2, state schema 4",
+        "OK: the installer of build aaaaaaaaaaaa can stage both builds",
+    ] {
+        assert!(run.text.contains(line), "{line:?} not in:\n{}", run.text);
+    }
+    for line in [
+        "order is not exercised",
+        "the order of installer and kbf is not checked",
+    ] {
+        assert!(!run.text.contains(line), "{line:?} in:\n{}", run.text);
+    }
+    // The installer's `kbf` is asked its facts, and nothing else of the installer's
+    // directory runs; the rest of the run is as without it.
+    assert_eq!(
+        run.started(),
+        ["kbf", "kbf", "kbf", "kbf-server", "kbf-daemon"]
+    );
+    // An installer that declares what the new frontend does but not what the old daemon
+    // does: the order still has something at stake, and the run does not say otherwise.
+    let run = Cell::new("installer-as-server", (1, 2), 1, "")
+        .installer(1, 2, 3)
+        .run();
+    assert!(run.ok(), "{}", run.text);
+    assert!(!run.text.contains("order is not exercised"), "{}", run.text);
+}
+
+/// The upgrade-order rule, reversed: the same two releases, but the host still has the
+/// installer of release N when release N+1's frontend is staged. Catches an order that is
+/// not checked at all (the run goes on to start the server), each of the three numbers
+/// the installer refuses a release by taken for a pass in turn (protocol 2 past 1,
+/// `min_protocol` 2 past 1, schema 4 past 3: each alone is enough), the installer's
+/// numbers compared the wrong way round, and a failure that names neither build nor the
+/// number. Nothing is started: the order is checked with the facts.
+#[test]
+fn an_installer_older_than_the_kbf_it_stages_fails_before_anything_starts() {
+    for (name, server, daemon, installer, number) in [
+        ("protocol", (1, 2, 3), 1, (1, 1, 3), "protocol 2"),
+        ("min", (2, 2, 3), 2, (1, 2, 3), "min_protocol 2"),
+        ("schema", (1, 1, 4), 1, (1, 1, 3), "state_schema 4"),
+    ] {
+        let cell = Cell::new_with_schema(name, server, daemon).installer(
+            installer.0,
+            installer.1,
+            installer.2,
+        );
+        let run = cell.run();
+        fails(
+            &run,
+            1,
+            &[
+                number,
+                "the installer of build aaaaaaaaaaaa cannot stage the kbf-server of build 0123456789ab",
+                "needs a newer installer",
+                "update the installer before the kbf",
+            ],
+        );
+        assert_eq!(run.started(), ["kbf", "kbf", "kbf"], "{name}: {}", run.text);
+    }
+}
+
+/// An installer and two builds that declare the same numbers: the order cannot fail, and the
+/// run says it did not exercise it (the state of the tree today, where release N and the
+/// tip both state 1 to 1). Catches a run that passes in silence, so the check of the
+/// order looks done when nothing was at stake.
+#[test]
+fn equal_declarations_pass_and_say_the_order_was_not_exercised() {
+    let run = Cell::one_directory("installer-equal", 1, 1, "")
+        .installer(1, 1, 3)
+        .run();
+    assert!(run.ok(), "{}", run.text);
+    assert!(
+        run.text.contains(
+            "NOTE: the installer and both builds declare the same protocols and state schema"
+        ),
+        "{}",
+        run.text
+    );
+}
+
+/// Catches a directory that mixes two builds passed: its `kbf` states one build's
+/// protocols and its `kbf-server` or `kbf-daemon` is another build (an older release's
+/// `kbf` beside a newer daemon, say), so the run would test protocols nobody runs. Also a
+/// `--version` with no commit taken for a match. Nothing is started: the identity of the
+/// binaries is asked with the facts, and for the daemon only after the server's.
+#[test]
+fn a_binary_of_another_build_than_its_kbf_fails_before_anything_starts() {
+    let skewed: &[&str] = &["ffffffffffff, but ", "mixes two builds"];
+    let commitless: &[&str] = &["prints no <version>+<commit> as its second word"];
+    for (defect, program, needles, roles) in [
+        (
+            "server-skew",
+            "kbf-server",
+            skewed,
+            vec!["kbf", "kbf-server"],
+        ),
+        (
+            "server-no-commit",
+            "kbf-server",
+            commitless,
+            vec!["kbf", "kbf-server"],
+        ),
+        (
+            "daemon-skew",
+            "kbf-daemon",
+            skewed,
+            vec!["kbf", "kbf-server", "kbf", "kbf-daemon"],
+        ),
+    ] {
+        let run = Cell::new(defect, (1, 1), 1, defect).run();
+        fails(&run, 1, needles);
+        assert!(run.text.contains(&format!("/{program}")), "{}", run.text);
+        let called: Vec<&str> = run
+            .calls
+            .iter()
+            .map(|c| c.split('\t').next().unwrap_or_default())
+            .collect();
+        assert_eq!(called, roles, "{defect}: {}", run.text);
+    }
+}
+
+/// Catches a facts line that is not read (the run goes on with no range), a `kbf` that
+/// exits non-zero taken for one that answered, a `kbf` that never answers waited for
+/// without end (the run must fail within its wait, naming the build's command), and a
+/// directory with no `kbf` taken for a failed check (it is a cell that cannot be driven:
+/// exit 2).
+#[test]
+fn a_kbf_that_fails_or_hangs_or_is_missing_fails_the_run() {
+    let mut cell = Cell::new("garbage", (1, 1), 1, "");
+    std::fs::write(cell.server_dir.join("facts.json"), "kbf 0.1.0\n").expect("facts.json");
+    fails(&cell.run(), 1, &["not one JSON object"]);
+
+    cell = Cell::new("facts-fail", (1, 1), 1, "facts-fail");
+    fails(
+        &cell.run(),
+        1,
+        &["--version --json failed, or ran past", "kbf: broken"],
+    );
+
+    let run = Cell::new("facts-hang", (1, 1), 1, "facts-hang")
+        .wait(2)
+        .run();
+    fails(&run, 1, &["--version --json failed, or ran past 2s"]);
+    assert!(run.elapsed < Duration::from_secs(30), "{:?}", run.elapsed);
+
+    cell = Cell::new("no-kbf", (1, 1), 1, "");
+    std::fs::remove_file(cell.daemon_dir.join("kbf")).expect("remove the link");
+    fails(&cell.run(), 2, &["kbf --version --json"]);
+}
+
+/// Catches a server that exits before its start line taken for a slow one (the run
+/// must say it exited, at once, not wait out the deadline), a server that never prints
+/// the line waited for without end, a start line without the operator API's address
+/// (the run needs it) passed, and a start line whose worker address nothing listens at:
+/// the probe's connection fails and the run says so.
+#[test]
+fn a_server_that_does_not_start_fails_the_run() {
+    let run = Cell::new("server-exits", (1, 1), 1, "server-exits").run();
+    fails(
+        &run,
+        1,
+        &["kbf-server exited", "without logging \" reapi=\""],
+    );
+    assert!(run.elapsed < Duration::from_secs(15), "{:?}", run.elapsed);
+
+    let run = Cell::new("server-silent", (1, 1), 1, "server-silent")
+        .wait(2)
+        .run();
+    fails(&run, 1, &["kbf-server did not log \" reapi=\" within 2s"]);
+
+    let run = Cell::new("no-api", (1, 1), 1, "server-no-api").run();
+    fails(&run, 1, &["names no api=<address>"]);
+    assert_eq!(run.started(), ["kbf", "kbf", "kbf-server"]);
+
+    let run = Cell::new("wrong-worker", (1, 1), 1, "server-wrong-worker")
+        .wait(5)
+        .run();
+    fails(&run, 1, &["was not welcomed", "Unavailable", "connect"]);
+    assert_eq!(run.started(), ["kbf", "kbf", "kbf-server"]);
+}
+
+/// Catches the wrong answers: a server that welcomes a protocol below its oldest (the
+/// floor is not enforced), one that refuses with another code, one that refuses with the
+/// right code for another reason, a `Welcome` that names the server's newest protocol
+/// instead of the one the Hello sent (a daemon takes none above what it sent, and a
+/// shipped one ends the session over any other), one that refuses a daemon newer than
+/// itself (the rolling upgrade's other half: it is welcomed at the server's newest), one
+/// that welcomes it at the daemon's own newer version (a version the server does not
+/// speak), a server that never answers a Hello (the run must give up within its wait, not
+/// hang) and one that ends the stream without a `Welcome`. In each the daemon is never
+/// started: the probes come first.
+#[test]
+fn a_server_that_refuses_wrongly_fails_the_run() {
+    for (defect, message) in [
+        (
+            "accepts-all",
+            "was welcomed (as protocol 0); it is outside the range",
+        ),
+        ("refuse-invalid", "refused with InvalidArgument"),
+        (
+            "refuse-unnamed",
+            "refused with FailedPrecondition \"this server is full\"",
+        ),
+        ("welcome-newest", "was welcomed as protocol 3, not 2"),
+        ("refuses-above", "was not welcomed: FailedPrecondition"),
+        ("welcome-unclamped", "was welcomed as protocol 4, not 3"),
+        ("hang-hello", "no answer within 2s"),
+        ("silent-stream", "the first answer was not a Welcome: None"),
+    ] {
+        // A server accepting 1 to 3 and a daemon at 2 for the welcome, the probe at 4 for
+        // the newer daemon and 0 for the refusals: `welcome-newest` names 3 to the
+        // daemon's 2.
+        let run = Cell::new(defect, (1, 3), 2, defect).wait(2).run();
+        fails(&run, 1, &[message]);
+        assert_eq!(run.started(), ["kbf", "kbf", "kbf-server"], "{defect}");
+    }
+}
+
+/// Catches a daemon that exits before it is welcomed taken for one still starting (the
+/// run must say it exited, at once), a daemon that never logs `welcomed` waited for
+/// without end (fails at the deadline, with the daemon's last log lines printed), and
+/// the logs of a failed run not printed.
+#[test]
+fn a_daemon_that_is_never_welcomed_fails_the_run() {
+    let run = Cell::new("daemon-exits", (1, 1), 1, "daemon-exits").run();
+    fails(
+        &run,
+        1,
+        &["kbf-daemon exited", "without logging \"welcomed\""],
+    );
+    assert!(run.elapsed < Duration::from_secs(15), "{:?}", run.elapsed);
+
+    let run = Cell::new("daemon-silent", (1, 1), 1, "daemon-silent")
+        .wait(2)
+        .run();
+    fails(
+        &run,
+        1,
+        &[
+            "kbf-daemon did not log \"welcomed\" within 2s",
+            "--- last lines of daemon.err",
+            "cannot reach a server; retrying",
+            "--- last lines of server.err",
+        ],
+    );
+    assert_eq!(run.started(), ["kbf", "kbf", "kbf-server", "kbf-daemon"]);
+}
+
+/// Catches an operator API that lists no such node, or one that is not connected,
+/// passed; a node protocol of another number, of another type, or `null` (the server
+/// named none) passed; and the session's protocol (the lesser of the daemon's and the server's newest)
+/// compared with the daemon's own.
+#[test]
+fn a_node_the_operator_api_shows_wrongly_fails_the_run() {
+    for (defect, protocol, message) in [
+        ("api-empty", None, "does not list cell-node-1"),
+        ("api-disconnected", None, "but not connected"),
+        ("", Some("3"), "at protocol 3, but its session speaks 2"),
+        (
+            "",
+            Some("\"2\""),
+            "at protocol \"2\", but its session speaks 2",
+        ),
+        (
+            "",
+            Some("null"),
+            "at protocol null, but its session speaks 2",
+        ),
+    ] {
+        let mut cell = Cell::new("nodes", (1, 3), 2, defect);
+        if let Some(json) = protocol {
+            cell = cell.node_protocol(json);
+        }
+        let run = cell.run();
+        fails(&run, 1, &[message]);
+        assert_eq!(run.started(), ["kbf", "kbf", "kbf-server", "kbf-daemon"]);
+    }
+    let run = Cell::new("nodes-ok", (1, 3), 2, "")
+        .node_protocol("2")
+        .run();
+    assert!(run.ok(), "{}", run.text);
+    assert!(
+        run.text
+            .contains("OK: GET /v1/nodes lists cell-node-1, connected, at protocol 2"),
+        "{}",
+        run.text
+    );
+    // A daemon newer than its server (protocol 3 against a server of 1 to 2) speaks the
+    // server's newest in its session, and the list says that: 2, not the daemon's 3.
+    let run = Cell::new("nodes-clamped", (1, 2), 3, "")
+        .node_protocol("2")
+        .run();
+    assert!(run.ok(), "{}", run.text);
+    assert!(
+        run.text
+            .contains("OK: GET /v1/nodes lists cell-node-1, connected, at protocol 2"),
+        "{}",
+        run.text
+    );
+    let run = Cell::new("nodes-unclamped", (1, 2), 3, "")
+        .node_protocol("3")
+        .run();
+    fails(&run, 1, &["at protocol 3, but its session speaks 2"]);
+}
+
+/// Catches `--wait 0` accepted (every step would fail at once, or never wait).
+#[test]
+fn a_wait_of_zero_is_refused() {
+    let cell = Cell::new("wait-zero", (1, 1), 1, "").wait(0);
+    let run = cell.run();
+    fails(&run, 2, &["--wait", "0"]);
+    assert!(run.calls.is_empty(), "{:?}", run.calls);
+}
+
+/// The self-test on the real tip, by hand: `kbf-cell cross-version` with the directory of
+/// the built `kbf`, `kbf-server` and `kbf-daemon` as both. Build them first (`cargo build
+/// -p kbf-server -p kbf-node -p kbf-cli -p kbf-integration-test --bins`). The `cross-version` job
+/// of beta.yml runs the tip against release N instead; this is the run that needs no second
+/// build, and shows the harness works on the tip before a push.
+#[test]
+#[ignore = "needs the built kbf, kbf-server and kbf-daemon beside kbf-cell"]
+fn the_tip_runs_against_itself() {
+    let bin = std::path::Path::new(BIN)
+        .parent()
+        .expect("the binaries' directory");
+    let out = Command::new(BIN)
+        .arg("cross-version")
+        .arg("--server-dir")
+        .arg(bin)
+        .arg("--daemon-dir")
+        .arg(bin)
+        .arg("--installer-dir")
+        .arg(bin)
+        .arg("--work")
+        .arg(scratch("tip"))
+        .output()
+        .expect("start kbf-cell");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    println!("{text}");
+    assert!(out.status.success(), "{text}");
+}

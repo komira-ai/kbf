@@ -1,19 +1,11 @@
 //! Topology parsing, placement and the start-up fallbacks of `--lease-placement`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::*;
 
-fn scratch(name: &str) -> PathBuf {
-    let exe = std::env::current_exe().expect("test binary");
-    let dir = exe
-        .parent()
-        .expect("deps directory")
-        .join("kbf-driver-container-unit")
-        .join(format!("numa-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch");
-    dir
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    crate::unit_dir(&format!("numa-{name}"))
 }
 
 fn set(text: &str) -> CpuSet {
@@ -26,9 +18,8 @@ fn put(path: &Path, text: &str) {
 }
 
 /// A sysfs node directory with one `node<N>/cpulist` per entry.
-fn sysfs(name: &str, nodes: &[(u32, &str)]) -> PathBuf {
-    let dir = scratch(name).join("node");
-    std::fs::create_dir_all(&dir).expect("mkdir");
+fn sysfs(name: &str, nodes: &[(u32, &str)]) -> kbf_testkit::dir::TestDir {
+    let dir = scratch(name);
     for (id, list) in nodes {
         put(&dir.join(format!("node{id}/cpulist")), &format!("{list}\n"));
     }
@@ -292,8 +283,12 @@ fn start_gives_the_placer_the_node_memory() {
 
 /// A host's cgroup tree as plain directories: the unit offers `offered`, `actions/`
 /// under it.
-fn cgroups(name: &str, offered: &str, effective: Option<&str>) -> (PathBuf, &'static str) {
-    let root = scratch(&format!("{name}-cgroups")).join("cgroup");
+fn cgroups(
+    name: &str,
+    offered: &str,
+    effective: Option<&str>,
+) -> (kbf_testkit::dir::TestDir, &'static str) {
+    let root = scratch(&format!("{name}-cgroups"));
     let unit = root.join("kbf.slice/kbf.service");
     put(&unit.join("cgroup.controllers"), offered);
     put(&unit.join("cgroup.subtree_control"), "cpu memory pids\n");
@@ -357,7 +352,8 @@ fn a_dual_node_host_is_placed_over_the_cpus_the_daemon_may_use() {
 /// `cgroup.controllers`, so touching it would be an error.
 #[test]
 fn a_host_without_two_nodes_falls_back_to_no_placement() {
-    let no_cgroups = scratch("none").join("cgroup");
+    let none = scratch("none");
+    let no_cgroups = none.join("cgroup");
     for (name, nodes) in [
         ("single", vec![(0, "0-87")]),
         ("memory-only", vec![(0, "0-87"), (1, "")]),
@@ -366,7 +362,8 @@ fn a_host_without_two_nodes_falls_back_to_no_placement() {
         let placer = start(&dir, &no_cgroups, "/kbf/actions", None).expect("started");
         assert!(placer.is_none(), "{name}");
     }
-    let absent = scratch("absent").join("no-such-dir");
+    let empty = scratch("absent");
+    let absent = empty.join("no-such-dir");
     assert!(
         start(&absent, &no_cgroups, "/kbf/actions", None)
             .expect("started")

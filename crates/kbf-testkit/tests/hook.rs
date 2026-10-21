@@ -1,21 +1,16 @@
 //! `act_test_hook!`: this test binary, run through links `act::link_self` makes,
 //! answers as `kbf-act` or as a fake, and as itself under any other name.
 
-use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use kbf_testkit::act::{NAME, link_self};
+use kbf_testkit::dir::TestDir;
 
 kbf_testkit::act_test_hook!();
 
 /// A fresh directory for one test, under Cargo's per-target temporary directory.
-fn dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("old dir");
-    }
-    std::fs::create_dir_all(&dir).expect("dir");
-    dir
+fn dir(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
 fn text(bytes: &[u8]) -> String {

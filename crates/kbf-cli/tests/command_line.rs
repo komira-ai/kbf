@@ -1,5 +1,5 @@
 //! How the command line is split before a mode parses it: the three flags `kbf` takes
-//! itself (`--mode`, `--config`, `--label`), the end-of-flags word, an argument that is
+//! itself (`--mode`, `--config`), the end-of-flags word, an argument that is
 //! not text, and the mode that comes from the file. Each case is a refusal that exits 2
 //! naming its cause, or a parse to the value the words stand for.
 
@@ -11,11 +11,8 @@ use std::path::{Path, PathBuf};
 use clap::error::ErrorKind;
 use kbf_cli::{Invocation, config};
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("command-line-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("command-line-{name}"))
 }
 
 fn file(dir: &Path, text: &str) -> PathBuf {
@@ -46,7 +43,7 @@ listen = \"127.0.0.1:9980\"
 /// "a value is required for '--<flag>'".
 #[test]
 fn a_flag_of_ours_with_no_value_is_refused_naming_it() {
-    for flag in ["mode", "config", "label"] {
+    for flag in ["mode", "config"] {
         let err = refused(&["kbf", "--mode=daemon", &format!("--{flag}")]);
         assert_eq!(err.exit_code(), 2, "{flag}");
         let msg = err.to_string();
@@ -56,6 +53,36 @@ fn a_flag_of_ours_with_no_value_is_refused_naming_it() {
             )),
             "{flag}: {msg}"
         );
+    }
+}
+
+/// Catches `--label` (a node label, removed: placement uses what the node reports) being
+/// accepted again, passed on to the mode, or refused without saying what replaces it: in
+/// every spelling and position, with a mode named by flag or by the old word, with or
+/// without a file, it exits 2 with the one-line tombstone naming the flag and the way out.
+#[test]
+fn the_label_flag_is_refused_with_its_replacement() {
+    let tombstone = "--label was removed: placement uses what the node reports (OSFamily, ISA); delete the flag";
+    for argv in [
+        &["kbf", "--mode=daemon", "--label", "pool=x"][..],
+        &["kbf", "--mode=daemon", "--label=pool=x"],
+        &["kbf", "--mode=daemon", "--label"],
+        &["kbf", "--label=pool=x", "--mode=storage-and-daemon"],
+        &["kbf", "daemon", "--label", "pool=x"],
+        &[
+            "kbf",
+            "--mode",
+            "daemon",
+            "--config=/nonexistent/kbf.toml",
+            "--label=a=b",
+        ],
+        &["kbf", "--mode=daemon", "--check", "--label=a=b"],
+    ] {
+        let err = refused(argv);
+        assert_eq!(err.exit_code(), 2, "{argv:?}");
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{argv:?}");
+        let msg = err.to_string();
+        assert!(msg.contains(tombstone), "{argv:?}: {msg}");
     }
 }
 
