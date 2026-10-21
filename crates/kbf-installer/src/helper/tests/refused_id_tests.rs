@@ -74,7 +74,10 @@ fn a_node_order_refused_for_its_epoch_names_no_order() {
     rig.put(&rig.rec(10, 1, 1, Verb::Activate, A));
     rig.cycle(T0 + 3);
     let status = rig.status();
-    assert_eq!(status["state"], "refused");
+    // B's swap is still on trial, and a swap on trial outranks a refusal in `state`, so the
+    // refusal is read from its own field.
+    let refusal = status["refusal"].as_str().expect("a refusal field");
+    assert!(!refusal.is_empty(), "{status}");
     assert!(status.get("refused_order_id").is_none(), "{status}");
 }
 
