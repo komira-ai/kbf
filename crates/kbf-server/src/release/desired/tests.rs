@@ -308,3 +308,40 @@ async fn the_other_conflicts_are_unchanged() {
     assert!(body.contains('7'), "{body}");
     assert_eq!(desired_commit(&rig), None);
 }
+
+/// Catches: `rollback` ignored (an older, tied or unknown release refused with it), applied
+/// to the other conflicts, or sticking to the offer after it (the next plain offer is checked).
+#[tokio::test]
+async fn a_rollback_skips_the_age_check_and_only_that() {
+    for answer in [
+        TargetSeq::Seq(499),
+        SEQ_500,
+        TargetSeq::Missing,
+        TargetSeq::Seq(0),
+    ] {
+        let rig = rig(OWN_SEQ, Some(&[(OTHER, answer)])).await;
+        let (code, body) = offer(&rig, &json!({"commit": OTHER, "rollback": true})).await;
+        assert_eq!(code, 200, "{answer:?}: {body}");
+        assert_eq!(desired_commit(&rig).as_deref(), Some(OTHER));
+    }
+    let rig = rig(OWN_SEQ, Some(&[(NO_PLATFORM, TargetSeq::Seq(1))])).await;
+    let (code, body) = offer(&rig, &json!({"commit": NO_PLATFORM, "rollback": true})).await;
+    assert_eq!(code, 409, "{body}");
+    assert!(body.contains("no platform"), "{body}");
+    let rig = rig_older().await;
+    let (code, _) = offer(
+        &rig,
+        &json!({"commit": OTHER, "rollback": true, "expect_generation": 7}),
+    )
+    .await;
+    assert_eq!(code, 409, "expect_generation still applies");
+    let (code, body) = offer(&rig, &json!({"commit": OTHER, "rollback": false})).await;
+    assert_eq!(code, 409, "{body}");
+    assert!(body.contains("older"), "{body}");
+    let (code, body) = offer(&rig, &json!({"commit": OTHER, "rollback": "yes"})).await;
+    assert_eq!(code, 400, "{body}");
+}
+
+async fn rig_older() -> Rig {
+    rig(OWN_SEQ, Some(&[(OTHER, TargetSeq::Seq(499))])).await
+}

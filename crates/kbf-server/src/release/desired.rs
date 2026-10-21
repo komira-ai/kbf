@@ -10,7 +10,8 @@
 //!   it complete (tarball and attestation) for at least one platform, else `409` naming
 //!   what is missing. The row's generation moves only when the commit differs from the
 //!   desired one (a repeated click keeps it); a rollback is the older commit offered the same
-//!   way. R4 refuses a release older than this build by build seq ([`super::target_seq`]). It
+//!   way. R4 refuses a release older than this build by build seq ([`super::target_seq`]) unless
+//!   the body says `"rollback": true`, which skips only that check. It
 //!   passes the gates of every `/v1` write ([`crate::api::operator_gate`]) and wants a
 //!   JSON body.
 //!   An optional `expect_generation` makes it a compare-and-set: the row is written only if the
@@ -219,6 +220,9 @@ struct Offer {
     commit: String,
     /// Compare-and-set: write only if the desired release is at this generation (0 before any).
     expect_generation: Option<u64>,
+    /// An older release on purpose: skips R4, the age check, and nothing else.
+    #[serde(default)]
+    rollback: bool,
 }
 
 /// The gates of a write, then the JSON content type for a body.
@@ -257,6 +261,7 @@ async fn set_desired(
     let Ok(Offer {
         commit,
         expect_generation,
+        rollback,
     }) = serde_json::from_slice::<Offer>(&body)
     else {
         return error(
@@ -286,7 +291,13 @@ async fn set_desired(
         );
     }
     // R4: not older than the running build, by build seq.
-    match age.check(&parsed).await {
+    // A rollback is the explicit exception; it still needs a complete release.
+    let aged = if rollback {
+        Ok(Ok(()))
+    } else {
+        age.check(&parsed).await
+    };
+    match aged {
         Ok(Ok(())) => {}
         Ok(Err(refused)) => return error(StatusCode::CONFLICT, &refused.to_string()),
         Err(e) => return store_failed(&e),
