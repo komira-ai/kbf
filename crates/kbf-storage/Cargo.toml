@@ -11,7 +11,7 @@ publish.workspace = true
 # the `Storage` trait and its error, which the front, the server and the combined binary
 # call the cache through, and the gRPC service that serves one (`service`) with the client
 # that calls it. Never the frontend's crates: no scheduler, no
-# authorization (crates/kbf-it/tests/layering.rs).
+# authorization (crates/kbf-integration-test/tests/layering.rs).
 [dependencies]
 bytes.workspace = true
 crc32c.workspace = true

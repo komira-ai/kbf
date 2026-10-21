@@ -59,7 +59,7 @@ struct B0Flags {
     /// The pinned buck2.
     #[arg(long)]
     buck2: PathBuf,
-    /// The sample project (`crates/kbf-it/beta/buck2`).
+    /// The sample project (`crates/kbf-integration-test/beta/buck2`).
     #[arg(long)]
     project: PathBuf,
     /// The run's directory (fresh): the farm, `logs/` and `beta-result.json`.

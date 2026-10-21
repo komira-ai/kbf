@@ -104,15 +104,19 @@ fn the_version_object_is_read_by_its_fields() {
             min_protocol: 3,
             protocol: 4,
             profile: "release".to_owned(),
+            seq: None,
             state_schema: 7,
             version: "0.1.0".to_owned(),
             platform: None,
         }
     );
-    // A build before `admin_protocol` and `meta_log` omits them: unknown, not refused.
+    // A build before `admin_protocol`, `meta_log` and `seq` omits them: unknown, not refused.
     let old = r#"{"commit":"0123456789ab","min_protocol":3,"profile":"release","protocol":4,"state_schema":7,"version":"0.1.0"}"#;
     let old = Version::parse(old.as_bytes()).expect("an older build parses");
-    assert_eq!((old.admin_protocol, old.meta_log), (None, None));
+    assert_eq!(
+        (old.admin_protocol, old.meta_log, old.seq),
+        (None, None, None)
+    );
     let said = version_json(COMMIT, "release").replace('}', ",\"platform\":\"linux-arm64\"}");
     assert_eq!(
         Version::parse(said.as_bytes()).expect("parses").platform,
@@ -133,6 +137,25 @@ fn the_version_object_is_read_by_its_fields() {
         let err = Version::parse(bad.as_bytes()).expect_err(bad);
         assert_eq!(err.code(), "version-unreadable", "{bad}");
     }
+}
+
+/// Catches the `seq` that `kbf --version --json` prints (the number of commits behind the
+/// build) refused as a field the contract does not list, which would refuse every release
+/// built from the day the field was added, and a `seq` that is read as something else than
+/// the number: 0 ("could not count") is a value, not an absent field.
+///
+/// Mutant to plant: the `seq` field dropped from `Version` (the object is then refused).
+#[test]
+fn the_version_object_may_carry_seq() {
+    let said = version_json(COMMIT, "release").replace('}', ",\"seq\":812}");
+    let v = Version::parse(said.as_bytes()).expect("a build with a seq parses");
+    assert_eq!(v.seq, Some(812));
+    let zero = version_json(COMMIT, "release").replace('}', ",\"seq\":0}");
+    let v = Version::parse(zero.as_bytes()).expect("a build that could not count parses");
+    assert_eq!(v.seq, Some(0));
+    let text = version_json(COMMIT, "release").replace('}', ",\"seq\":\"812\"}");
+    let err = Version::parse(text.as_bytes()).expect_err("a seq that is text");
+    assert_eq!(err.code(), "version-unreadable");
 }
 
 /// Catches an unbounded read of what a not yet trusted binary prints: more than 4 KiB is

@@ -1766,7 +1766,10 @@ there is nothing to mount it on.
   gates. Keep the operator API on loopback, or behind the proxy and a network you trust.
 - **Read-only.** `GET` and `HEAD`; every other method is `405`. The write routes and their
   token are unchanged, and the pages mount none of them.
-- **Pages:** `GET /ui` and `GET /ui/` (Overview), `GET /ui/builds` (the recent builds of
+- **Pages:** `GET /ui` and `GET /ui/` (Overview: readiness, nodes by state, queue, leases and
+  storage from `GET /v1/health`, the ten latest builds from `GET /v1/invocations`),
+  `GET /ui/nodes` (`GET /v1/nodes`), `/ui/nodes/{id}` (`GET /v1/nodes/{id}`),
+  `GET /ui/builds` (the recent builds of
   `GET /v1/invocations`, filtered by `?state=open|closed` and `?instance=`, paged by
   `?page_token=`; `?id=` looks one build up by id; any other parameter, one given twice or
   another state is `400`), `/ui/builds/{id}` (the summary, the failed actions of
@@ -1780,6 +1783,10 @@ there is nothing to mount it on.
   stylesheet at `/ui/static/kbf.css`. Each page lists, at its foot, the `/v1` routes it read, each a link
   to the JSON. The Action page looks a failed action up in the first 5 pages of
   `/failures`, or in the one page `?failures_token=` names (the Build page's links name it).
+  The Overview, Nodes and Node pages reload themselves when asked:
+  `?refresh=N` with N one of 5, 10, 30 or 60 (`<meta http-equiv="refresh">` with only the
+  integer); any other value, a repeated `refresh` or another parameter is `400`, and a page
+  whose read failed does not reload.
 - **Headers on every `/ui` answer**, errors included: `Content-Security-Policy:
   default-src 'none'; style-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri
   'none'; form-action 'self'` (no script of any kind; the forms are the Builds id lookup and

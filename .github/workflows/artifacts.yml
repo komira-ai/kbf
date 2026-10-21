@@ -16,7 +16,7 @@
 # runners), and the verify jobs then check them, for the branch
 # that was pushed, as the planned deployment job is to. Only attest may hold `id-token:
 # write` and `attestations: write`, and only under its exact `if:` (the workflow lint,
-# crates/kbf-it/tests/workflows, requires both; crates/kbf-it/tests/release_artifacts
+# crates/kbf-integration-test/tests/workflows, requires both; crates/kbf-integration-test/tests/release_artifacts
 # pins the set of files built and attested).
 #
 # The files are kept as workflow artifacts for 90 days, GitHub's limit. A release

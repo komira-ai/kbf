@@ -156,6 +156,34 @@ h3 { font-size: 1rem; margin: var(--space-3) 0 var(--space-1); }
 .problem { color: var(--fail-fg); }
 .outputs { list-style: none; padding: 0; }
 
+/* The target strip: one linked cell per build, oldest left. The glyph carries the
+   outcome as well as the colour. */
+.strip { display: flex; flex-wrap: wrap; gap: 2px; list-style: none; margin: 0; padding: 0; }
+.strip .cell {
+  display: inline-block;
+  min-width: 1.25rem;
+  text-align: center;
+  line-height: 1.25rem;
+  border-radius: 3px;
+  text-decoration: none;
+  font-size: 0.85em;
+}
+.strip .cell:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.strip .ok { background: var(--ok-bg); color: var(--ok-fg); }
+.strip .fail { background: var(--fail-bg); color: var(--fail-fg); }
+.strip .pending, .strip .other { background: var(--pending-bg); color: var(--pending-fg); }
+.tally { font-weight: 600; }
+.filters { display: flex; gap: var(--space-3); list-style: none; padding: 0; }
+.filters a[aria-current="true"] { font-weight: 600; color: var(--fg); }
+
+/* The auto-refresh choice: the current one is bracketed and bold, not only coloured. */
+.refresh { color: var(--muted); }
+.refresh .current { font-weight: 600; color: var(--fg); }
+.refresh .current::before { content: "["; }
+.refresh .current::after { content: "]"; }
+
+table.rows td ul { margin: 0; padding-left: var(--space-3); }
+
 footer.reads { color: var(--muted); border-top: 1px solid var(--line); margin-top: var(--space-4); }
 footer.reads h2 { font-size: 0.95rem; }
 footer.reads ul { padding-left: var(--space-3); }

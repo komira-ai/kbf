@@ -4,7 +4,7 @@
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 use crate::api::{Attempt, Counts, Invocation, Outcome, Text};
-use crate::html::{Href, Html, attr};
+use crate::html::{Html, attr};
 use crate::layout;
 use crate::read::{Page, ReadError};
 use crate::{Answer, PREFIX};
@@ -13,14 +13,29 @@ mod action;
 mod build;
 mod builds;
 mod failures;
+#[cfg(test)]
+pub(crate) mod history_fixtures;
 mod leases;
+mod nodes;
+mod overview;
 mod queue;
+mod refresh;
 mod sched;
+mod storage;
+mod strip;
+mod target;
+mod targets;
 mod updates;
 
 #[cfg(test)]
 pub(crate) use builds::BUILDS;
 pub(crate) use builds::builds;
+#[cfg(test)]
+pub(crate) use nodes::{NODE, NODES};
+pub(crate) use nodes::{node, nodes};
+#[cfg(test)]
+pub(crate) use overview::OVERVIEW;
+pub(crate) use overview::overview;
 
 pub(crate) use action::action;
 #[cfg(test)]
@@ -30,14 +45,21 @@ pub(crate) use build::BUILD;
 pub(crate) use build::build;
 #[cfg(test)]
 pub(crate) use leases::LEASES;
-use leases::LEASES_PATH;
 pub(crate) use leases::leases;
 #[cfg(test)]
 pub(crate) use queue::QUEUE;
-use queue::QUEUE_PATH;
 pub(crate) use queue::queue;
 #[cfg(test)]
 pub(crate) use sched::fixtures::sched_farm;
+#[cfg(test)]
+pub(crate) use storage::STORAGE;
+pub(crate) use storage::storage;
+#[cfg(test)]
+pub(crate) use target::TARGET;
+pub(crate) use target::target;
+#[cfg(test)]
+pub(crate) use targets::TARGETS;
+pub(crate) use targets::targets;
 #[cfg(test)]
 pub(crate) use updates::UPDATES;
 use updates::UPDATES_PATH;
@@ -46,17 +68,11 @@ pub(crate) use updates::updates;
 /// The Builds page's path: the build id lookup, moved here from the prefix itself.
 pub(crate) const BUILDS_PATH: &str = "/ui/builds";
 
-/// Overview: the first page. It reads no route yet; the pages that carry the farm's
-/// health and the latest builds come with their routes.
-pub(crate) const OVERVIEW: Page = Page {
-    name: "Overview",
-    reads: &[],
-};
-
 /// Every page, for the contract test.
 #[cfg(test)]
-pub(crate) const PAGES: [&Page; 7] = [
-    &OVERVIEW, &BUILDS, &BUILD, &ACTION, &UPDATES, &LEASES, &QUEUE,
+pub(crate) const PAGES: [&Page; 12] = [
+    &OVERVIEW, &BUILDS, &BUILD, &ACTION, &NODES, &NODE, &UPDATES, &LEASES, &QUEUE, &TARGETS,
+    &TARGET, &STORAGE,
 ];
 
 /// What a path segment keeps unencoded: RFC 3986's unreserved characters.
@@ -131,35 +147,6 @@ pub(crate) fn not_found(path: &str) -> Answer {
         });
     });
     Answer::html(404, body)
-}
-
-/// The Overview page: where the pages are. It reads no route.
-pub(crate) fn overview() -> Answer {
-    let body = layout::page(OVERVIEW.name, PREFIX, &[], |h| {
-        h.el("h1", &[], |h| {
-            h.text("Overview");
-        });
-        h.el("p", &[attr("class", "hint")], |h| {
-            h.text(
-                "A read-only view of the farm: every page shows what the farm's own API \
-                 answers, and lists the routes it read at its foot.",
-            );
-        });
-        h.el("ul", &[], |h| {
-            for (path, label) in [
-                (BUILDS_PATH, "Builds"),
-                (UPDATES_PATH, "Updates"),
-                (LEASES_PATH, "Leases"),
-                (QUEUE_PATH, "Queue"),
-            ] {
-                let href = Href::root_relative(path).expect("a page's path is root-relative");
-                h.el("li", &[], |h| {
-                    h.link(&href, label);
-                });
-            }
-        });
-    });
-    Answer::html(200, body)
 }
 
 /// The invocation's header fields and counters, as a definition list.

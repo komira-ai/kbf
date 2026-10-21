@@ -1,6 +1,8 @@
 use super::*;
 use crate::golden::{
-    INSTALLER_TOML_FRONTEND, INSTALLER_TOML_URL, installer_toml_frontend, installer_toml_url,
+    INSTALLER_TOML_BUNDLED, INSTALLER_TOML_FRONTEND, INSTALLER_TOML_FRONTEND_PULL,
+    INSTALLER_TOML_URL, INSTALLER_TOML_URL_CA, installer_toml_bundled, installer_toml_frontend,
+    installer_toml_frontend_pull, installer_toml_url, installer_toml_url_ca,
 };
 
 fn problems(text: &str) -> String {
@@ -8,12 +10,20 @@ fn problems(text: &str) -> String {
 }
 
 /// Catches a change to the file's keys, defaults or spelling that does not move the golden
-/// files: both decode to the expected values and render back byte for byte.
+/// files: both decode to the expected values and render back byte for byte. The first two
+/// are files written before `bundled`, the snapshot and `release_ca` (they decode as they did);
+/// the other three carry the new keys, in the order `render` writes them.
+///
+/// Mutants to plant: `render` writing the snapshot before `node_cert`, or `release_ca` after
+/// the limits; a key dropped from `render`; `bundled` spelt otherwise.
 #[test]
 fn the_golden_files_decode_and_render_to_themselves() {
     for (text, want) in [
         (INSTALLER_TOML_URL, installer_toml_url()),
         (INSTALLER_TOML_FRONTEND, installer_toml_frontend()),
+        (INSTALLER_TOML_BUNDLED, installer_toml_bundled()),
+        (INSTALLER_TOML_FRONTEND_PULL, installer_toml_frontend_pull()),
+        (INSTALLER_TOML_URL_CA, installer_toml_url_ca()),
     ] {
         assert_eq!(InstallerToml::parse(text).expect("parses"), want);
         assert_eq!(want.render(), text);

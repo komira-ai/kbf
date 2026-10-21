@@ -1764,7 +1764,7 @@ dependencies = [
  "flate2",
  "futures",
  "kbf-deploy",
- "kbf-it",
+ "kbf-integration-test",
  "kbf-proto",
  "kbf-testkit",
  "kbf-transfer",
@@ -1881,18 +1881,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kbf-invocation"
-version = "0.1.0"
-dependencies = [
- "kbf-sched",
- "kbf-types",
- "prost",
- "prost-build",
- "protox",
-]
-
-[[package]]
-name = "kbf-it"
+name = "kbf-integration-test"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -1938,6 +1927,17 @@ dependencies = [
  "tonic",
  "tracing-subscriber",
  "xtask",
+]
+
+[[package]]
+name = "kbf-invocation"
+version = "0.1.0"
+dependencies = [
+ "kbf-sched",
+ "kbf-types",
+ "prost",
+ "prost-build",
+ "protox",
 ]
 
 [[package]]
@@ -2077,7 +2077,7 @@ dependencies = [
  "kbf-driver-container",
  "kbf-driver-native",
  "kbf-front",
- "kbf-it",
+ "kbf-integration-test",
  "kbf-map",
  "kbf-outputs",
  "kbf-proto",
