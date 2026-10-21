@@ -375,6 +375,60 @@ fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
     kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
+/// Catches `--label` (a node label, removed: placement uses what the node reports) coming
+/// back as a flag of the binary: a start that gives it exits 2 with the tombstone naming the
+/// flag and the way out, nothing on stdout and nothing started (no data directory made, no
+/// enrolment), with or without a mode's flags, whatever the spelling; and `kbf --help` and
+/// each mode's help do not list it.
+#[test]
+fn the_label_flag_is_not_a_flag_of_kbf() {
+    let dir = scratch("label_retired");
+    let data = dir.join("data");
+    let data_flag = format!("--data-dir={}", data.display());
+    let config = dir.join("kbf.toml");
+    let config_flag = format!("--config={}", config.display());
+    let argvs: [&[&str]; 4] = [
+        &[
+            "--mode=daemon",
+            "--label",
+            "pool=x",
+            "--driver=container",
+            "--server=https://127.0.0.1:1",
+            "--ca-cert=ca.pem",
+            "--cert=node.pem",
+            "--key=node.key",
+            "--node-id=n",
+            &data_flag,
+        ],
+        &["--mode=daemon", "--label=pool=x"],
+        &["--mode=daemon", &config_flag, "--label", "pool=x"],
+        &["--mode=storage-and-daemon", "--label=pool=x"],
+    ];
+    for argv in argvs {
+        let (code, out, err) = run(argv);
+        assert_eq!(code, Some(2), "{argv:?}: {err}");
+        assert!(out.is_empty(), "{argv:?}: {out}");
+        assert!(
+            err.contains(
+                "--label was removed: placement uses what the node reports (OSFamily, ISA); delete the flag"
+            ),
+            "{argv:?}: {err}"
+        );
+        assert!(!data.exists(), "{argv:?} started: {} made", data.display());
+        assert!(!config.exists(), "{argv:?} wrote {}", config.display());
+    }
+    for help in [
+        &["--help"][..],
+        &["--mode=daemon", "--help"],
+        &["--mode=storage-and-daemon", "--help"],
+        &["daemon", "--help"],
+    ] {
+        let (code, out, err) = run(help);
+        assert_eq!(code, Some(0), "{help:?}: {err}");
+        assert!(!out.contains("--label"), "{help:?}: {out}");
+    }
+}
+
 /// Catches `check-args` coming back as a word of `kbf`: it was `--check`'s parse stage for
 /// `kbf-deploy`, with a deprecation note, and is retired. Now it is refused as any word
 /// that is not a mode is (exit 2, nothing on stdout, nothing started), with or without a

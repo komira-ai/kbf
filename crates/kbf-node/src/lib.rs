@@ -18,7 +18,7 @@
 //! ```text
 //! kbf-daemon --driver native --server https://kbf-server:8981 --cas https://kbf-server:8981 \
 //!   --ca-cert ca.pem --cert node.pem --key node.key --node-id mac-studio-1 \
-//!   --data-dir /var/kbf --label pool=darwin-sized
+//!   --data-dir /var/kbf
 //! ```
 //!
 //! Exits non-zero when the node cannot be detected or the configuration cannot be
@@ -843,7 +843,7 @@ impl<C: Cas> Node<C> {
 /// configuration `native` makes and the `xcrun` it surveys with and
 /// warms (a test names its own user folders and sandbox, and an `xcrun` of its own).
 /// Also returns what the native driver's Xcode watch sends the daemon, for a test to
-/// follow. Its node report is the detected entries, the labels and a `drivers` entry
+/// follow. Its node report is the detected entries and a `drivers` entry
 /// per runtime (which `Daemon::new` adds), its `cpus` and `mem_gib` no more than the
 /// container driver allows; the native driver adds its own with
 /// `Daemon::with_driver_report`. Its status lists every `--image`, which only the
@@ -899,10 +899,7 @@ fn node_over<C: Cas>(
     let leases = sizes(cli)?.lease_cpus() as u64;
     node.capacity.cpus = Some(node.capacity.cpus.map_or(leases, |cpus| cpus.min(leases)));
     // `Daemon::new` adds every runtime's driver.
-    let report = offered(
-        NodeReport::detect(&[])?.with_entries(cli.daemon.label_entries()),
-        node.capacity,
-    );
+    let report = offered(NodeReport::detect(&[])?, node.capacity);
     // A node without the whole-machine runtime is always serving: a phase that never
     // changes.
     let phase = node

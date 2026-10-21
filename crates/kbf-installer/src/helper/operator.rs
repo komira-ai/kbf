@@ -16,6 +16,7 @@ use kbf_host::{Exec, Perms, Step};
 
 use crate::CommitId;
 use crate::activate::{self, Reverted};
+use crate::binary;
 use crate::helper::fetcher::Fetcher;
 use crate::helper::restart::{self, Restart};
 use crate::helper::service::{self, Procs};
@@ -180,7 +181,10 @@ impl<E: Exec> Operator<'_, E> {
         if self.fetcher.source() != Some("bundled") {
             return Ok(());
         }
-        let relays = self.fetcher.probe(to).is_ok_and(|version| version.relays());
+        let relays = self
+            .fetcher
+            .probe(to)
+            .is_ok_and(|version| binary::relays(&version));
         if relays {
             return Ok(());
         }

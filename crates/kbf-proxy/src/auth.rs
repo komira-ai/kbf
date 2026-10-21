@@ -69,6 +69,9 @@ pub enum Refusal {
     /// The address has presented too many wrong tokens lately: gRPC `RESOURCE_EXHAUSTED` (8),
     /// HTTP 429. The token was not looked at.
     RateLimited,
+    /// The credential could not be judged now (the OIDC issuer's keys cannot be fetched and
+    /// none are held): gRPC `UNAVAILABLE` (14), HTTP 503. Not a verdict on the caller.
+    Unavailable,
 }
 
 impl Refusal {
@@ -79,6 +82,7 @@ impl Refusal {
             Self::Unauthenticated => 16,
             Self::PermissionDenied => 7,
             Self::RateLimited => 8,
+            Self::Unavailable => 14,
         }
     }
 
@@ -89,14 +93,20 @@ impl Refusal {
             Self::Unauthenticated => 401,
             Self::PermissionDenied => 403,
             Self::RateLimited => 429,
+            Self::Unavailable => 503,
         }
     }
 }
 
 /// A token as the proxy keeps it: its SHA-256, so the comparison is over equal-length
-/// digests and the token itself is not held after the file is read.
+/// digests, and the bytes themselves. The bytes are kept only for the operator token, which
+/// the proxy presents to the child on behalf of a CI job it admitted by OIDC (the child's
+/// operator API takes no other credential); nothing else reads them.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Token([u8; 32]);
+pub struct Token {
+    digest: [u8; 32],
+    secret: Vec<u8>,
+}
 
 impl std::fmt::Debug for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -108,7 +118,22 @@ impl Token {
     /// The token whose value is `secret`.
     #[must_use]
     pub fn new(secret: &[u8]) -> Self {
-        Self(Sha256::digest(secret).into())
+        Self {
+            digest: Sha256::digest(secret).into(),
+            secret: secret.to_vec(),
+        }
+    }
+
+    /// `Authorization: Bearer <this token>`, marked sensitive so it is not logged. `None` if
+    /// the token has a byte a header cannot hold (a token file's content never does).
+    #[must_use]
+    pub fn bearer_header(&self) -> Option<http::HeaderValue> {
+        let mut value = Vec::with_capacity(7 + self.secret.len());
+        value.extend_from_slice(b"Bearer ");
+        value.extend_from_slice(&self.secret);
+        let mut value = http::HeaderValue::from_bytes(&value).ok()?;
+        value.set_sensitive(true);
+        Some(value)
     }
 
     /// Whether `presented` is this token, in constant time. The caller rate limits before
@@ -116,7 +141,7 @@ impl Token {
     #[must_use]
     pub fn admits(&self, presented: &[u8]) -> bool {
         let digest: [u8; 32] = Sha256::digest(presented).into();
-        self.0.ct_eq(&digest).into()
+        self.digest.ct_eq(&digest).into()
     }
 }
 

@@ -13,15 +13,25 @@
 //!   pass and `--off-main` must be refused. CI runs it on pull requests into `main`
 //!   with the base commit and the pull request's merge commit, so a check that accepts
 //!   every commit (or none) fails there instead of at a release.
-//! - `release check <dir> --commit <sha>` ([`check`]): `<dir>` passes `verify-assets
-//!   sums`, every file `SHA256SUMS` lists is `<binary>-<sha>-<platform>.tar.gz` or
-//!   `.cdx.json`: the assets of that commit and no other, and each tarball has exactly
+//! - `release check <dir> --commit <sha> [--without-version-facts]` ([`check`]): `<dir>`
+//!   passes `verify-assets sums` (so each `kbf` tarball has its version facts listed; the
+//!   flag, for the release before the build jobs recorded them, waives that and nothing
+//!   else: [`Pairing::Waived`]), every file `SHA256SUMS`
+//!   lists is `<binary>-<sha>-<platform>.tar.gz` or `.cdx.json`, or `kbf`'s
+//!   `kbf-<sha>-<platform>.version.json` ([`crate::version_facts`]): the assets of that
+//!   commit and no other, and each tarball has exactly
 //!   one provenance bundle, `<tarball>.sigstore.json`, whose one subject is that
 //!   tarball's digest ([`bundles`]), and no bundle is there for anything else.
+//! - `release gates --repo <owner/repo> --sha <sha> --branch <name> [--timeout-s <n>]
+//!   [--poll-s <n>] [--output <file>] [--gh <program>]` ([`gates`]): waits for the push runs
+//!   of `ci`, `beta` and `artifacts` for that commit on that branch (by workflow path, the
+//!   latest run of each) and requires all three to have succeeded; a timeout is red.
+//!   Prints `ci_run=`, `beta_run=` and `artifacts_run=`, the ids `verdict-write` takes.
 //! - `release verdict <dir> --repo-dir <checkout> --tag <tag> --commit <sha> [--main-ref
 //!   <ref>] [--output <file>]` ([`verdict`]): the annotated tag's message is a green
-//!   gamma verdict for that tag, that commit (on main) and the set `<dir>`'s `SHA256SUMS`
-//!   hashes to, after a bake of 24 hours or more. Prints `set-hash=<hex>`, which
+//!   verdict of the stage [`verdict::GATE_STAGE`] for that tag, that commit (on main) and
+//!   the set `<dir>`'s `SHA256SUMS` hashes to; a Gamma verdict also records a bake of 24
+//!   hours or more, a Beta verdict records none. Prints `set-hash=<hex>`, which
 //!   `publish --set-hash` must be given.
 //! - `release offer <dir> --repo <owner/repo> --commit <sha> --platform <p>... (--beta-result
 //!   <file> | --waive-beta <reason> --operator <name>) [--previous <sha> --version-json <file>
@@ -55,6 +65,11 @@
 //!   changed; the files it lacks are uploaded. A re-run therefore creates no second
 //!   release and replaces no asset. It refuses first when the highest release tag is not
 //!   at `--commit` or an ancestor of it ([`tags::superseded`]).
+//! - `release bump-internal --version <v> --sha <sha> --internal-repo <owner/repo> --submodule
+//!   <name> [--repo <owner/repo>] [--workdir <dir>] [--gh <program>] [--git <program>]`
+//!   ([`bump`]): after the release is published, a pull request in the internal repository
+//!   that moves its submodule to `--sha`, with auto-merge on, if the tag `v<v>` names `--sha`
+//!   and the submodule is not already at or beyond it. The token is `GH_TOKEN`.
 //! - `release tag --repo <owner/repo> --sha <sha> --tag <tag> --message-file <file>
 //!   [--tagger <login>] [--output <file>] [--gh <program>]` ([`tag`]): the annotated tag
 //!   `--tag` at `--sha` through the GitHub API, create-only, after the same stale-run
@@ -64,6 +79,8 @@
 //!   --beta-run <id> --artifacts-run <id> --out <file> [...]` ([`verdict_write`]): the
 //!   verdict document the tag's message carries, for the stage [`verdict::GATE_STAGE`].
 
+pub mod bump;
+pub mod gates;
 mod git;
 pub mod identity;
 pub mod notes;
@@ -86,6 +103,7 @@ use crate::bundles;
 use crate::fetch::Sha256;
 use crate::package::{Platform, read};
 use crate::sums::{self, SUMS};
+use crate::version_facts::{self, Pairing};
 
 /// The branch a released commit must be on.
 pub const MAIN: &str = "main";
@@ -240,8 +258,11 @@ pub fn main_control(gh: &Path, repo: &str, on: &str, off: &str) -> Result<String
 /// Whether `name` is an asset of `commit`: `<binary>-<commit>-<platform>` and
 /// `.tar.gz`, `.cdx.json`, `.deb` or `.pkg` (the packages; nfpm's own `kbf-installer_<version>_
 /// <arch>.deb` and `pkg build`'s `kbf-installer-<version>-macos-arm64.pkg` name no commit and are
-/// not one).
+/// not one), or the version facts of `kbf` for a platform ([`version_facts::is_facts_of`]).
 fn is_asset_of(name: &str, commit: &str) -> bool {
+    if version_facts::is_facts_of(name, commit) {
+        return true;
+    }
     let stem = name
         .strip_suffix(".tar.gz")
         .or_else(|| name.strip_suffix(".cdx.json"))
@@ -254,9 +275,13 @@ fn is_asset_of(name: &str, commit: &str) -> bool {
 
 /// The `release check` verb: the lines to print, then every file name of `dir`
 /// (`SHA256SUMS` first, then the listed files, then the bundles).
-fn checked(dir: &Path, commit: &str) -> Result<(Vec<String>, Vec<String>), Error> {
+fn checked(
+    dir: &Path,
+    commit: &str,
+    pairing: Pairing,
+) -> Result<(Vec<String>, Vec<String>), Error> {
     full_commit("--commit", commit)?;
-    let sums_line = sums::verify_sums(dir, Sha256::of)?;
+    let sums_line = sums::verify_sums_with(dir, Sha256::of, pairing)?;
     let lines = sums::read_sums(&dir.join(SUMS))?;
     let foreign: Vec<String> = lines
         .iter()
@@ -304,9 +329,10 @@ fn checked(dir: &Path, commit: &str) -> Result<(Vec<String>, Vec<String>), Error
     Ok((printed, names))
 }
 
-/// The `release check` verb: the lines to print.
-pub fn check(dir: &Path, commit: &str) -> Result<Vec<String>, Error> {
-    Ok(checked(dir, commit)?.0)
+/// The `release check` verb: the lines to print. `pairing` is [`Pairing::Waived`] only for
+/// the release before the build jobs recorded version facts (`--without-version-facts`).
+pub fn check(dir: &Path, commit: &str, pairing: Pairing) -> Result<Vec<String>, Error> {
+    Ok(checked(dir, commit, pairing)?.0)
 }
 
 /// The most characters GitHub takes in a release body.
@@ -343,7 +369,7 @@ pub struct Release<'a> {
     pub commit: &'a str,
     /// The run of the artifacts workflow that built and attested them.
     pub run_id: u64,
-    /// The set hash the gamma verdict names (`release verdict` prints it): the files must
+    /// The set hash the verdict names (`release verdict` prints it): the files must
     /// be that set, or nothing is published.
     pub set_hash: &'a kbf_gate::SetHash,
     /// The notes `release notes` wrote: the first part of the release's body.
@@ -411,11 +437,11 @@ fn tag_is_current(tag: &str, standing: &tags::Standing) -> Result<(), Error> {
 
 /// The `release publish` verb: the lines to print.
 pub fn publish(dir: &Path, r: &Release) -> Result<Vec<String>, Error> {
-    let (mut printed, names) = checked(dir, r.commit)?;
+    let (mut printed, names) = checked(dir, r.commit, Pairing::Required)?;
     let held_set = verdict::set_hash_of(dir)?;
     if &held_set != r.set_hash {
         return Err(Error::Refused(vec![format!(
-            "the files in {} are set {}, the gamma verdict names set {}: gamma ran other bytes",
+            "the files in {} are set {}, the verdict names set {}: the gate ran other bytes",
             dir.display(),
             held_set.as_str(),
             r.set_hash.as_str()

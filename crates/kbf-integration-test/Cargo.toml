@@ -54,6 +54,9 @@ futures.workspace = true
 h2.workspace = true
 hex.workspace = true
 http.workspace = true
+# `tests/planned_restart.rs`: the farm of real `kbf` processes it drives and the REAPI
+# client of its frontend (`kbf_harness::reapi`).
+kbf-harness.workspace = true
 # `tests/ui_through_proxy.rs`: the real server's policy, and the scheduler's timings its
 # listeners are given.
 kbf-auth.workspace = true
@@ -66,10 +69,13 @@ kbf-host = { workspace = true, features = ["testkit"] }
 # node's heartbeat; the S3 service the nodes and the frontend's probe talk to is the fake.
 kbf-map.workspace = true
 kbf-objstore = { workspace = true, features = ["testkit"] }
+# `tests/remote_ci_through_proxy.rs`: the fake issuer and keys a CI job's OIDC token is minted from.
+kbf-oidc = { workspace = true, features = ["testkit"] }
 kbf-state = { workspace = true, features = ["test-support"] }
 kbf-storage.workspace = true
 kbf-types.workspace = true
-# The Envoy render the real-Envoy tests (tests/envoy_box, tests/envoy_check.rs) run.
+# The Envoy render the real-Envoy tests (tests/envoy_box, tests/envoy_validate.rs) run, and
+# the names tests/envoy_check.rs compares with the server's.
 kbf-installer.workspace = true
 kbf-proto.workspace = true
 kbf-proxy.workspace = true

@@ -29,7 +29,7 @@ fn linux_v3() -> NodeCaps {
 
 fn mac() -> NodeCaps {
     let cpu = CpuCaps::from_macos_sysctl(include_str!("fixtures/apple_m3_ultra.sysctl")).unwrap();
-    let mut entries = vec![("arch", "arm64"), ("os", "macos"), ("label.pool", "darwin")];
+    let mut entries = vec![("arch", "arm64"), ("os", "macos")];
     for f in cpu.features() {
         entries.push(("cpu.features", f));
     }
@@ -116,7 +116,6 @@ fn own_keys_pass_through_and_others_are_left_alone() {
         ("os", "linux"),
         ("isa_level", "x86-64-v2"),
         ("cpu.feature", "avx2"),
-        ("label.pool", "big"),
         ("cpus", "4"),
         ("gpu", "1"),
         ("container-image", "docker://img@sha256:00"),
@@ -129,17 +128,33 @@ fn own_keys_pass_through_and_others_are_left_alone() {
             ("os", "linux"),
             ("isa_level", "x86-64-v2"),
             ("cpu.feature", "avx2"),
-            ("label.pool", "big"),
             ("cpus", "4"),
         ]))
     );
     assert_eq!(from(&[]), Ok(Request::default()));
 }
 
+/// Catches: a `label.<k>` platform property still read as a requirement (node labels are
+/// removed, so it names nothing a node reports and would make the action unplaceable), or
+/// refused where `Pool` and `container-image` are not: it is a name kbf does not read,
+/// like them, in any case and however often it is sent.
+#[test]
+fn a_label_property_is_a_name_kbf_does_not_read() {
+    assert_eq!(
+        from(&[
+            ("OSFamily", "Linux"),
+            ("label.pool", "mac"),
+            ("Label.Pool", "mac"),
+            ("label.rack", "r1"),
+        ]),
+        Ok(req(&[("os", "linux")]))
+    );
+}
+
 /// Catches: a property name kbf reads ignored because of its case (`osfamily=darwin`,
 /// `isa=arm-a64`, `OS=macos` dropped as unknown, so the action may run on any worker,
-/// Linux included); a label's own name folded to lower case (labels are compared
-/// exactly); and a property kbf does not read taken as one it does.
+/// Linux included); and a property kbf does not read (node labels are removed: no
+/// `label.<k>` in any case) taken as one it does.
 #[test]
 fn property_names_are_read_in_any_case() {
     for (sent, read) in [
@@ -159,9 +174,6 @@ fn property_names_are_read_in_any_case() {
         ("GPU", "gpu"),
         ("gpu", "gpu"),
         ("KBF-Lease", "kbf-lease"),
-        ("label.pool", "label.pool"),
-        ("Label.Pool", "label.Pool"),
-        ("LABEL.x", "label.x"),
     ] {
         assert_eq!(
             kbf_caps::property_name(sent).as_deref(),
@@ -173,6 +185,9 @@ fn property_names_are_read_in_any_case() {
         "container-image",
         "Pool",
         "dockerNetwork",
+        "label.pool",
+        "Label.Pool",
+        "LABEL.x",
         "LABEL.",
         "label.",
         "labels",
@@ -196,10 +211,7 @@ fn property_names_are_read_in_any_case() {
             vec![("arch", "x86_64"), ("isa_level", "x86-64-v3")],
         ),
         (vec![("OS", "macos")], vec![("os", "macos")]),
-        (
-            vec![("Label.Pool", "darwin")],
-            vec![("label.Pool", "darwin")],
-        ),
+        (vec![("Label.Pool", "darwin")], vec![]),
         (vec![("CPUS", "4"), ("GPU", "1")], vec![("cpus", "4")]),
     ] {
         assert_eq!(from(&props), Ok(req(&want)), "{props:?}");
@@ -272,7 +284,6 @@ fn a_report_becomes_node_caps() {
         ("cpu.features", "avx2"),
         ("cpu.features", "sse2"),
         ("os", "linux"),
-        ("label.rack", "r1"),
         ("cpus", "16"),
         ("mem_gib", "64"),
         ("gpu", "2"),
@@ -283,7 +294,6 @@ fn a_report_becomes_node_caps() {
     assert_eq!(node.cpu.arch(), Arch::X86_64);
     assert!(node.cpu.has("avx2") && node.cpu.has("sse2"));
     assert_eq!(node.exact.get("os").map(String::as_str), Some("linux"));
-    assert_eq!(node.exact.get("label.rack").map(String::as_str), Some("r1"));
     assert!(!node.exact.contains_key("drivers"));
     assert_eq!(node.drivers, ["container".to_owned()].into());
     assert_eq!(node.consumables.get(&Consumable::Gpus), Some(&2));

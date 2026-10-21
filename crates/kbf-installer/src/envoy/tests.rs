@@ -18,7 +18,8 @@ use super::{ENVOY, ENVOY_ARGS, EnvoyError, check, check_dir, render, write_files
 
 const GOLDEN_ENVOY: &str = include_str!("../../tests/golden/envoy/box/envoy.json");
 const GOLDEN_ARGS: &str = include_str!("../../tests/golden/envoy/box/envoy.args");
-/// The bytes `kbf-deploy envoy render --topology box` wrote (#925), kept verbatim.
+/// The bytes the retired `kbf-deploy envoy render --topology box` wrote (#925), kept
+/// verbatim.
 const GOLDEN_925_ENVOY: &str = include_str!("../../tests/golden/envoy/box-925/envoy.json");
 const GOLDEN_925_ARGS: &str = include_str!("../../tests/golden/envoy/box-925/envoy.args");
 
@@ -39,8 +40,8 @@ fn scratch(name: &str) -> std::path::PathBuf {
 }
 
 /// Catches drift in the render: a key, a value or an order changed. The golden is the
-/// bytes `kbf-deploy envoy render --topology box` wrote for these numbers (copied from
-/// that tool's tests; this renderer is a port of it), validated by Envoy itself
+/// bytes the retired `kbf-deploy envoy render --topology box` wrote for these numbers
+/// (this renderer is a port of it), validated by Envoy itself
 /// (`tests/envoy_validate.rs`), so it pins what was reviewed rather than proves it right.
 #[test]
 fn the_example_renders_the_golden_bytes() {

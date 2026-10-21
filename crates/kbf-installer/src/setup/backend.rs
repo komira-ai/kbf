@@ -12,6 +12,7 @@ use kbf_update::Source;
 use super::SetupError;
 use crate::CommitId;
 use crate::activate;
+use crate::binary;
 use crate::database::{Database, SchemaOps};
 use crate::helper::fetcher::{FetchError, Fetcher, ReleaseLocator};
 use crate::layout::Layout;
@@ -114,7 +115,7 @@ impl<E: Exec> Releases for Fetching<'_, E> {
         let Some(current) = state.and_then(|state| state.current) else {
             return Ok(false);
         };
-        Ok(self.fetcher.probe(&current)?.relays())
+        Ok(binary::relays(&self.fetcher.probe(&current)?))
     }
 }
 

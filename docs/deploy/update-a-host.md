@@ -13,6 +13,16 @@ All three use the same layout: each release in `releases/<commit>/` of the insta
 `releases/current` and `releases/previous`, and `state.json`. See
 [host releases](host-releases.md) for the layout and what is trusted.
 
+## Upgrade the installer first (seq)
+
+A kbf built from main at or after commit 0c650e54 prints `seq` in `--version --json`, and every
+`kbf-installer` built before that commit refuses that output (it refused any field it did not know),
+so it cannot stage such a kbf.
+
+On each host, upgrade the `kbf-installer` package before staging such a kbf. After the change that
+makes the installer ignore fields it does not know, a field a newer kbf adds no longer strands an
+installer that has that change. An installer without it still refuses.
+
 ## (a) By hand
 
 Put the release in a directory that holds `kbf` (and `kbf-daemon` if the release has one, and

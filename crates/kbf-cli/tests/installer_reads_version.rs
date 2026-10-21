@@ -1,6 +1,7 @@
 //! The contract between `kbf --version --json` and the installer that reads it before it
-//! stages a release: the installer's strict parser (`deny_unknown_fields`) must accept
-//! every field kbf-cli emits, and keep each one.
+//! stages a release: the installer's parser (which ignores fields it does not know) must
+//! accept what kbf-cli emits, and keep each field it names: a field the parser does not
+//! hold would be dropped without notice.
 
 use kbf_installer::binary::Version;
 
@@ -59,7 +60,7 @@ fn the_installer_parses_what_kbf_prints() {
 #[test]
 fn the_build_declares_the_relay_its_installer_needs() {
     let parsed = Version::parse(kbf_cli::version::line().as_bytes()).expect("parses");
-    assert!(parsed.relays(), "{parsed:?}");
+    assert!(kbf_installer::binary::relays(&parsed), "{parsed:?}");
     let declared = kbf_cli::version::RELAY;
     let needed = kbf_installer::binary::RELAY_NEEDED;
     assert!(declared >= needed, "declares {declared}, needs {needed}");

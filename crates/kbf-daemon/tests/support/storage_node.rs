@@ -14,7 +14,7 @@ use kbf_objstore::MemoryStore;
 use kbf_proto::reapi::{ActionResult, Digest as ReapiDigest};
 use kbf_proto::worker::segments_server::Segments;
 use kbf_storage::service::{Admission, Config, StorageService};
-use kbf_storage::{Answer, PutStream, ReadStream, Storage, StorageError, StreamedPut};
+use kbf_storage::{Answer, CommitMode, PutStream, ReadStream, Storage, StorageError, StreamedPut};
 use kbf_types::{Digest, DigestFunction};
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
@@ -186,7 +186,7 @@ impl PutStream for Buffered {
 }
 
 impl StreamedPut for Buffered {
-    fn commit(self: Box<Self>) -> Answer<'static, ()> {
+    fn commit(self: Box<Self>, _mode: CommitMode) -> Answer<'static, ()> {
         Box::pin(async move {
             self.written.fetch_add(self.bytes.len(), Ordering::SeqCst);
             self.store.put(Bytes::from(self.bytes)).await.map(drop)

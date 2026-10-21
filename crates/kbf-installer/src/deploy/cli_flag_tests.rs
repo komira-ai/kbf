@@ -785,8 +785,13 @@ fn an_offer_on_standard_input_is_judged_before_the_farm_is_asked() {
     assert_eq!(line["reason"], "offer_missing");
     assert!(line.get("offer").is_none(), "{out}");
     // A settings file the host refuses whoever owns it (the unprivileged user is never root),
-    // so this holds for any uid the test runs as.
-    let layout = crate::layout::Layout::linux(kbf_host::Root::new(&rig.dir).unwrap());
+    // so this holds for any uid the test runs as. It is planted where the platform the deploy
+    // runs on keeps its settings (`HostProbe::at`): on a Mac that is not the Linux path, and a
+    // file there would go unread, leaving the offer to be judged (`offer_stale`).
+    let layout = crate::layout::Layout::new(
+        kbf_host::Root::new(&rig.dir).unwrap(),
+        crate::layout::Platform::current(),
+    );
     let settings = layout.join(&layout.settings());
     fs::create_dir_all(settings.parent().unwrap()).unwrap();
     fs::write(&settings, "RUN_AS_UID=0\n").unwrap();

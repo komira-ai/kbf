@@ -48,9 +48,12 @@ on:
 
 permissions: {}
 
-# One run per tag (or per branch, for a dry run) at a time, none cancelled.
+# One release at a time across the repository, none cancelled: every tag push shares the one
+# group `release-push` (a second tag waits for the first; a third pending one replaces the
+# second while it waits, as GitHub keeps one pending run per group). A dry run by hand
+# (workflow_dispatch) publishes nothing, so each has its own group and never holds a release.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'push' && 'push' || github.run_id }}
   cancel-in-progress: false
 
 env:
@@ -149,11 +152,14 @@ jobs:
         if: ${{ steps.previous.outputs.previous != '' }}
         working-directory: previous
         run: sha256sum --check --strict SHA256SUMS
+      # The release before the build jobs recorded version facts has none, and this is the
+      # only check that waives them: the release being made (`release check dist`) never does.
+      # Remove the flag once the release before this one was made with the facts.
       - name: Every one is an asset of the previous release's commit, with its bundle
         if: ${{ steps.previous.outputs.previous != '' }}
         env:
           PREVIOUS_COMMIT: ${{ steps.previous.outputs.previous-commit }}
-        run: cargo xtask release check previous --commit "$PREVIOUS_COMMIT"
+        run: cargo xtask release check previous --commit "$PREVIOUS_COMMIT" --without-version-facts
       - name: Verify the previous release's attestations as these were
         if: ${{ steps.previous.outputs.previous != '' }}
         env:

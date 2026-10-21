@@ -46,7 +46,6 @@ pub const KEYS: &[&str] = &[
     "KBF_CONCURRENCY",
     "KBF_LINUX_PROPERTIES",
     "KBF_DARWIN_PROPERTIES",
-    "KBF_DARWIN_LABELS",
     "KBF_DARWIN_MACOS_HOSTS",
     "KBF_EXIT_TARGET",
 ];
@@ -150,8 +149,6 @@ pub struct OverlaySettings {
     pub concurrency: String,
     pub linux_properties: String,
     pub darwin_properties: String,
-    /// The daemons' labels, comma separated; may be empty.
-    pub darwin_labels: String,
     pub darwin_macos_hosts: String,
 }
 
@@ -172,7 +169,6 @@ impl OverlaySettings {
             concurrency,
             linux_properties: require(c, "KBF_LINUX_PROPERTIES")?,
             darwin_properties: require(c, "KBF_DARWIN_PROPERTIES")?,
-            darwin_labels: text(c, "KBF_DARWIN_LABELS", ""),
             darwin_macos_hosts: require(c, "KBF_DARWIN_MACOS_HOSTS")?,
         })
     }

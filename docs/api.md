@@ -1120,7 +1120,7 @@ says which in `ready`.
 { "ready": true, "failing": [],
   "nodes": { "total": 5, "serving": 2, "cordoned": 1, "draining": 1, "drained": 0,
              "quarantined": 0, "disconnected": 1 },
-  "queue": { "depth": 3, "oldest_age_ms": null },
+  "queue": { "depth": 3, "oldest_age_ms": 41200 },
   "leases": 7,
   "storage": { "members_active": 3, "members_total": 3, "under_replicated_blobs": 0 } }
 ```
@@ -1129,7 +1129,7 @@ says which in `ready`.
 |---|---|
 | `ready`, `failing` | `GET /readyz`: the same evaluation, `failing` as `[{"check", "reason"}]` |
 | `nodes` | the list of `GET /v1/nodes`, each node counted once, in the first of these that holds: `disconnected` (`connected` is false), `quarantined` (`phase.state`), then `placement.state`: `cordoned`, `draining` (a drain running, or paused at its deadline), `drained`, or `serving`. `total` is the number of nodes listed and the sum of the six |
-| `queue.depth` | `queued_operations` of `GET /v1/frontend/drain`. `queue.oldest_age_ms` is `null`: the scheduler does not report the age of its oldest operation yet |
+| `queue.depth`, `queue.oldest_age_ms` | `depth` and `oldest_age_ms` of `GET /v1/queue`, both read from one scheduler snapshot (`depth` is also `queued_operations` of `GET /v1/frontend/drain`). `oldest_age_ms` is how long the longest-waiting operation has waited, in milliseconds, and `null` only when nothing waits |
 | `leases` | the sum of `lease_count` of `GET /v1/nodes` |
 | `storage` | `members_active`, `members_total` and `under_replicated_blobs` of `GET /v1/storage` (`null` while unknown, never zero); `storage` is `null` when this server keeps no storage members, and when the membership cannot be read, with `storage_unavailable` saying why |
 
@@ -1754,7 +1754,7 @@ Errors are JSON, `{"error": "<why>"}`, as everywhere in this API.
 ## `GET /ui`: the web UI
 
 Read-only pages for people with a browser, server-rendered HTML from the `kbf-ui` crate
-([design](design/kbf-ui-v1.md)). On the operator API listener, **on by default**:
+([design](design/kbf-ui-v1.md), [operator guide](deploy/kbf-ui.md)). On the operator API listener, **on by default**:
 `--ui=false` turns it off and every `/ui` path is then a `404`. Without `--api-listen`
 there is nothing to mount it on.
 
@@ -1790,8 +1790,12 @@ there is nothing to mount it on.
 - **Headers on every `/ui` answer**, errors included: `Content-Security-Policy:
   default-src 'none'; style-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri
   'none'; form-action 'self'` (no script of any kind; the forms are the Builds id lookup and
-  the Leases node filter, both `GET`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
-  `Cache-Control: no-store`.
+  the Leases node filter, both `GET`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+  `Cache-Control: no-store`, `Cross-Origin-Resource-Policy: same-origin`,
+  `Cross-Origin-Opener-Policy: same-origin` and a `Permissions-Policy` denying every
+  powerful feature (camera, microphone, geolocation, usb, serial, hid, bluetooth,
+  payment, display capture, clipboard, midi, xr, and the rest of its list) with an
+  empty allowlist. No `Strict-Transport-Security`: TLS ends at the proxy.
 - **Bounds.** Each caller has at most 4 reads open at once on `/ui`, and 4 on the read
   routes the pages use (`/v1/blobs`, `/v1/invocations` and below, `/v1/runs` and the history
   routes, `/v1/update/hosts`): the fifth is `429` with `Retry-After: 1`, before its handler
@@ -1852,8 +1856,8 @@ release and their build attestations, kept as uploaded. Mounted by `--releases-d
 
 - `commit` is 40 lowercase hex digits, `platform` is `linux-x86_64`, `linux-arm64` or
   `darwin-arm64`, `name` is `kbf` or `kbf-daemon` (the tarball) or either with the suffix
-  `.attestation` (its build attestation bundle). Anything else is `400`; no segment is ever joined
-  into a path as it arrived.
+  `.attestation` (its build attestation bundle), or `version.json` (the platform's version
+  facts, below). Anything else is `400`; no segment is ever joined into a path as it arrived.
 - `PUT` takes the file as the body, with the write gates of the section "Who may write" except
   the JSON content type (loopback peer, and the proxy's secret with `--proxy-auth-file`, no `Origin`, the bearer token). A tarball is at most
   512 MiB (`413` past it), a bundle at most 256 KiB; an empty body is `400`. The body is written to
@@ -1866,10 +1870,30 @@ release and their build attestations, kept as uploaded. Mounted by `--releases-d
   bundle like a tarball. A bundle stored before that link existed has no such name until the
   same bytes are put again (`200`); `Describe` reports it as lacking until then, though
   `GET /v1/releases` and the offers still count its platform complete.
+- **Version facts.** `PUT /v1/releases/{commit}/{platform}/version.json` takes, as the body
+  (at most 4 KiB), the exact bytes of that platform's `kbf --version --json`: the file
+  `kbf-<commit>-<platform>.version.json` the release's build writes. The offers carry its
+  `protocol`, `min_protocol`, `state_schema` and `profile` (`docs/design/pull-updates.md`
+  section 6.2). The document is read with the parser the installer reads a staged binary's report
+  with, and is `400`, naming the file and the reason, when it does not parse, names another commit
+  (its first 12 digits) or, if it names one, another platform than the path, is not a `release`
+  build, has a `protocol` or `state_schema` of 0 or past 32 bits, or a `min_protocol` above
+  `protocol`. Same immutability and answers as a tarball. **A platform stored without it is
+  accepted and held, and is never offered:** the `201`/`200` answer of its tarball or attestation
+  `PUT` carries `"note": "no version facts (kbf-<commit>-<platform>.version.json): nodes will not
+  be offered this platform; rebuild the release to include it"`, and `GET /v1/releases` lists the
+  platform with `"version_facts": false` and the same `note` (`true` and no `note` when stored).
+  A commit stored before this field existed lists as `false` and is not offered either.
+  The document is unattested (the store attests no file) and is only a hint: the node runs the staged,
+  attested binary and refuses the activation unless its own report equals the offer's facts. The platform
+  check applies only if the document names a platform, which `kbf --version --json` does not today. A
+  well-formed document with wrong numbers is pinned (a different body is a `409`) and every node then
+  refuses that release with facts-differ; the repair is a new commit.
 - `GET` is open and lists `{"releases": [{"commit", "platforms": [{"platform", "complete",
-  "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
+  "version_facts", "note"?, "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
   order above, a platform `complete` when it holds, with their attestations, the tarballs its
-  hosts need: `kbf` for a Linux platform, `kbf-daemon` for `darwin-arm64`. A component is
+  hosts need: `kbf` for every platform, `darwin-arm64` included (a Mac runs `kbf --mode=daemon`,
+  and no darwin `kbf-daemon` is built). A component is
   listed when its tarball is stored.
 - `GET /v1/releases` and the gRPC `ReleaseService.Fetch` are unauthenticated at the router and
   the service. `Fetch` is mounted on the worker listener, behind its mutual TLS and the role
@@ -1975,7 +1999,7 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
   `min_serving` and the limits in seconds), else `null`; `paused` is its flag (false without
   a row).
 - `POST /v1/update/desired` with `{"commit": "<40 lowercase hex>"}` and, optionally,
-  `"expect_generation": N` (JSON content type, the write gates) offers the commit. With
+  `"expect_generation": N` and `"rollback": bool` (JSON content type, the write gates) offers the commit. With
   `expect_generation` it is a compare-and-set: it writes only if the desired release is at
   generation N (0 before any offer), else `409` naming both and nothing is written. `409` unless the release store holds some platform of it complete
   (see above); `400` for a body that is not exactly that. The answer is the desired release.
@@ -1983,6 +2007,22 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
   not a new run; a rollback is the older commit offered the same way and gets a higher
   generation. Generations increase, but may skip numbers: each write that loses a race has
   already drawn a counter value.
+  **R4, the age check.** Before the write, the offer is compared with the build of this server
+  (`seq` of `kbf --version --json`, the number of commits behind its commit), using the `seq`
+  the release store holds for the commit. `409` naming both builds, and nothing is written, when
+  the target's `seq` is below the server's (`older`), when it equals the server's and the commit
+  is another one (`seq_tie`: two branches cannot be ordered; a repeat of the running commit is
+  allowed; the commits are compared in full when the build knows its own, else by the 12
+  digits it has as a prefix), or when the server's `seq` is known and the target's is not (`seq_unknown`: a
+  release stored before `seq` was recorded). A server built where commits could not be counted
+  (`seq` 0) does not apply R4. The release store does not record `seq` yet, so today R4 allows
+  every offer. A release naming the running build's own commit is never refused by R4, and the
+  store is not asked about it. The answer is `{"error": "<code>: ...", "code": "older" | "seq_tie" | "seq_unknown"}`;
+  the other `409`s of this route have no `code`.
+  `"rollback": true` (optional, default false; spelled as `rollback` of the proxy's
+  `POST /v1/update/frontend`) skips this check and no other: the release must still be complete,
+  `expect_generation` still applies, and so will the own-commit rule of `source=staged`.
+  The codes `older`, `seq_unknown` and `seq_tie` are stable: a client may key on them.
 - `POST /v1/update/pause` and `POST /v1/update/resume` (the write gates, no body) set `paused` of the policy
   row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
   needed, and an offer leaves the flag as it is: while set, no host is started.

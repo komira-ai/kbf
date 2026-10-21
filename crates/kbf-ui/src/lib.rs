@@ -22,6 +22,10 @@
 //! build's summary from `GET /v1/invocations/{id}`),
 //! `/ui/builds/{id}` (Build: the summary, a page of `GET /v1/invocations/{id}/failures`
 //! and a page of `.../actions`), and
+//! `/ui/runs/{run_id}/logs/{stream}` (Log: the first MiB of a run's `stdout`, `stderr` or
+//! `result` from `GET /v1/runs/{run_id}/logs/{stream}`, read with a `Range` header, as
+//! escaped text, with a link to the route that downloads all of it; linked from each
+//! attempt of the Action page that has a run id),
 //! `/ui/builds/{id}/actions/{digest}` (Action: `GET /v1/invocations/{id}/actions/
 //! {digest}`; for a failed action its failure class, command and log tails from
 //! `/failures`, each tail with a link that downloads the whole log; else stdout and stderr
@@ -92,6 +96,44 @@ pub struct SourceError(pub String);
 pub trait Source {
     /// `GET url`, a root-relative path with its query.
     fn get(&self, url: &str) -> impl Future<Output = Result<Fetched, SourceError>> + Send;
+
+    /// `GET url` with `Range: bytes=first-last` (both inclusive), as the API's log and
+    /// blob routes read it: `206` with a `Content-Range`, `416` for a start past the
+    /// end, or `200` with the whole body when the range is ignored. A source that
+    /// cannot send a header keeps this default, which reads the whole answer and
+    /// answers a non-empty `200` as the server would have: the range as `206` with its
+    /// `Content-Range` (`416` for a start past the end), so the page never shows more
+    /// than it asked for; a source that can send the header should, so that a large
+    /// log is never read whole.
+    fn get_range(
+        &self,
+        url: &str,
+        first: u64,
+        last: u64,
+    ) -> impl Future<Output = Result<Fetched, SourceError>> + Send {
+        let whole = self.get(url);
+        async move {
+            let mut fetched = whole.await?;
+            if fetched.status != 200 || fetched.body.is_empty() {
+                return Ok(fetched);
+            }
+            let total = fetched.body.len() as u64;
+            if first >= total {
+                fetched.status = 416;
+                fetched.body = Vec::new();
+                fetched.headers = vec![("content-range".to_owned(), format!("bytes */{total}"))];
+                return Ok(fetched);
+            }
+            let end = last.min(total - 1);
+            fetched.status = 206;
+            fetched.body = fetched.body[first as usize..=end as usize].to_vec();
+            fetched.headers = vec![(
+                "content-range".to_owned(),
+                format!("bytes {first}-{end}/{total}"),
+            )];
+            Ok(fetched)
+        }
+    }
 }
 
 /// A page's answer: status, media type and body; [`Answer::headers`] adds the
@@ -189,6 +231,11 @@ pub async fn respond<S: Source + Sync>(source: &S, path: &str, query: &str) -> A
         ["builds", id] if !id.is_empty() => pages::build(source, id, query).await,
         ["builds", id, "actions", digest] if !id.is_empty() && !digest.is_empty() => {
             pages::action(source, id, digest, query).await
+        }
+        ["runs", run_id, "logs", stream]
+            if !run_id.is_empty() && pages::STREAMS.contains(&stream) =>
+        {
+            pages::run_log(source, run_id, stream).await
         }
         ["updates"] => pages::updates(source).await,
         ["leases"] => pages::leases(source, query).await,

@@ -1,10 +1,18 @@
 //! `cargo xtask release verdict` and `release notes` against real git repositories: the
 //! tags are made by `git tag`, so a lightweight tag is a ref to a commit and an
 //! annotated one a tag object, as GitHub would hold them.
+//!
+//! The binary judges `GATE_STAGE` (Beta): `good()` is a Beta verdict, which records no
+//! bake. The bake rule belongs to Gamma, which the binary has no flag to ask for, so the
+//! Gamma tests (`gamma()`, `refused_gamma`, `accepted_gamma`) call the library with
+//! `Stage::Gamma` on the same fixtures.
 
 use kbf_testkit::dir::TestDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use xtask::release::notes::{Identities, notes};
+use xtask::release::verdict::{Subject, verify};
 
 use kbf_gate::{
     CommitId, Floor, GateResult, Header, Limit, MinLoad, ResultDoc, Sample, SetHash, Stage, Status,
@@ -20,6 +28,11 @@ const GOLDEN: &str = concat!(
 /// so the golden verdict can name it.
 const RELEASE: &str = "357494ac6b0fecfa065d6c8fa038cfca9ae9c13f";
 const TAG: &str = "v0.10.0";
+/// The verdict `release verdict-write` writes (its golden), for tag `v0.3.7`.
+const WRITTEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/golden/release-verdict-write.json"
+);
 /// What `SHA256SUMS` holds in every test, and its set hash.
 const SUMS: &str = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881  a\n";
 const SET: &str = "4a4b874a1e9776a52e38fd82a053825f309f46187a803a0fc0c6670c6670e768";
@@ -140,8 +153,8 @@ fn fx(name: &str) -> Fx {
     }
 }
 
-/// A verdict that passes for [`TAG`], [`RELEASE`] and [`SET`].
-fn good() -> ResultDoc {
+/// A Gamma verdict that passes for [`TAG`], [`RELEASE`] and [`SET`] when judged as Gamma.
+fn gamma() -> ResultDoc {
     let header = Header {
         stage: Stage::Gamma,
         commit: CommitId::parse(RELEASE).unwrap(),
@@ -175,6 +188,18 @@ fn good() -> ResultDoc {
         2_000 + DAY,
     )];
     d.tag = Some(TAG.to_owned());
+    d
+}
+
+/// A Beta verdict that passes for [`TAG`], [`RELEASE`] and [`SET`]: the gate stage, with no
+/// deploy, no bake and no load.
+fn good() -> ResultDoc {
+    let mut d = gamma();
+    d.stage = Stage::Beta;
+    d.deploy = None;
+    d.bake = None;
+    d.load = None;
+    d.desired_generation = None;
     d
 }
 
@@ -230,12 +255,59 @@ fn accepted(name: &str, doc: &ResultDoc) {
     assert_eq!(code, Some(0), "{out}{err}");
 }
 
+/// `release verdict` (or `notes`) judging for `stage`, in this process: the same checks as
+/// the binary, as a `Ran`.
+fn judged(fx: &Fx, verb: &str, stage: Stage, tag: &str, commit: &str) -> Ran {
+    let (dist, repo) = (fx.dist(), fx.repo());
+    let s = Subject {
+        repo_dir: &repo,
+        tag,
+        commit,
+        dir: &dist,
+        main_ref: "main",
+        stage,
+    };
+    let done = if verb == "notes" {
+        // Both builds say the same log version and protocol: nothing is not reversible.
+        let (cur, prev) = (fx.root.join("version.json"), fx.root.join("previous.json"));
+        std::fs::write(&cur, identity(commit, Some(3), Some(1))).unwrap();
+        std::fs::write(&prev, identity(&fx.first, Some(3), Some(1))).unwrap();
+        let ids = Identities {
+            current: &cur,
+            previous: Some(&prev),
+        };
+        notes(&s, &ids)
+    } else {
+        verify(&s).map(|v| v.set_hash.as_str().to_owned())
+    };
+    match done {
+        Ok(text) => (Some(0), text, String::new()),
+        Err(e) => (Some(1), String::new(), e.to_string()),
+    }
+}
+
+/// Tags [`RELEASE`] with `doc` and expects the Gamma check to refuse it with `why`.
+fn refused_gamma(name: &str, doc: &ResultDoc, why: &str) {
+    let fx = fx(name);
+    fx.annotate(TAG, RELEASE, &msg(doc));
+    let (code, out, err) = judged(&fx, "verdict", Stage::Gamma, TAG, RELEASE);
+    assert_eq!(code, Some(1), "{out}{err}");
+    assert!(err.contains(why), "wanted `{why}` in:\n{err}");
+}
+
+fn accepted_gamma(name: &str, doc: &ResultDoc) {
+    let fx = fx(name);
+    fx.annotate(TAG, RELEASE, &msg(doc));
+    let (code, out, err) = judged(&fx, "verdict", Stage::Gamma, TAG, RELEASE);
+    assert_eq!(code, Some(0), "{out}{err}");
+}
+
 #[test]
 fn the_golden_verdict_bytes_are_what_the_gate_crate_writes() {
     // Catches: a serializer change that a verdict producer and this check would both follow
     // (they share the type), so a verdict already in a tag stops parsing. `BLESS=1`
     // rewrites the file; the diff is then reviewed.
-    let bytes = msg(&good());
+    let bytes = msg(&gamma());
     if std::env::var_os("BLESS").is_some() {
         std::fs::write(GOLDEN, &bytes).unwrap();
     }
@@ -256,10 +328,22 @@ fn the_golden_verdict_in_a_real_annotated_tag_passes_and_prints_the_set_hash() {
         fx.git(&["cat-file", "-t", &format!("refs/tags/{TAG}")]),
         "tag"
     );
+    let (code, set, err) = judged(&fx, "verdict", Stage::Gamma, TAG, RELEASE);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(set, SET);
+}
+
+#[test]
+fn the_beta_verdict_verdict_write_writes_passes_with_no_bake_and_prints_the_set_hash() {
+    // Catches: the pipeline's own verdict refused by its own check (the gate stage written
+    // as Beta, judged as Gamma), or another set hash printed than the files'.
+    let fx = fx("written");
+    fx.annotate("v0.3.7", RELEASE, &std::fs::read(WRITTEN).unwrap());
     let output = fx.root.join("out");
     let out = output.to_str().unwrap();
-    let (code, stdout, err) = run(&fx, "verdict", TAG, RELEASE, &["--output", out]);
+    let (code, stdout, err) = run(&fx, "verdict", "v0.3.7", RELEASE, &["--output", out]);
     assert_eq!(code, Some(0), "{err}");
+    assert!(stdout.contains("a green Beta verdict for"), "{stdout}");
     assert!(stdout.ends_with(&format!("set-hash={SET}\n")), "{stdout}");
     assert_eq!(
         std::fs::read_to_string(&output).unwrap(),
@@ -357,9 +441,52 @@ fn a_green_verdict_over_a_red_gate_fails() {
 
 #[test]
 fn a_verdict_for_another_stage_fails() {
+    // Catches: a check that takes any stage: a Gamma verdict (with its bake) or a Prod one
+    // is not the gate stage's.
+    refused("stage-gamma", &gamma(), "stage Gamma, not Beta");
     let mut d = good();
+    d.stage = Stage::Prod;
+    refused("stage-prod", &d, "stage Prod, not Beta");
+    let mut d = gamma();
     d.stage = Stage::Beta;
-    refused("stage", &d, "not Gamma");
+    refused("stage-beta-with-bake", &d, "records a bake or a load");
+}
+
+#[test]
+fn a_beta_verdict_needs_no_bake_and_no_load() {
+    // Catches: the Gamma bake rule applied to the gate stage, which refuses every verdict
+    // the pipeline writes.
+    accepted("beta-plain", &good());
+}
+
+#[test]
+fn a_beta_verdict_that_records_a_bake_or_a_load_is_refused() {
+    // Catches: a bake the stage never ran carried along unchecked (verdict-write refuses
+    // to write one; this refuses to accept one), by either record.
+    let mut d = good();
+    d.bake = gamma().bake;
+    refused("beta-bake", &d, "records a bake or a load");
+    let mut d = good();
+    d.load = gamma().load;
+    refused("beta-load", &d, "records a bake or a load");
+    let mut d = good();
+    d.bake = gamma().bake;
+    d.load = gamma().load;
+    refused("beta-both", &d, "only Gamma has a bake");
+}
+
+#[test]
+fn a_gamma_verdict_without_a_bake_is_refused_and_with_one_accepted() {
+    // Catches: the bake rule dropped for Gamma when the gate stage was made Beta.
+    let mut d = gamma();
+    d.bake = None;
+    refused_gamma("gamma-no-bake", &d, "no finished bake");
+    let mut d = gamma();
+    d.load = None;
+    refused_gamma("gamma-no-load", &d, "minimum load was not met");
+    accepted_gamma("gamma-baked", &gamma());
+    // Judged as Gamma, a Beta verdict is refused: the stage is compared with the one asked.
+    refused_gamma("beta-as-gamma", &good(), "stage Beta, not Gamma");
 }
 
 #[test]
@@ -447,39 +574,39 @@ fn a_tag_object_named_other_than_its_ref_fails() {
 #[test]
 fn a_bake_one_second_short_of_24_hours_fails_and_24_hours_passes() {
     // Catches: `>` against 24 h (exactly 24 h fails) and `>=` against less.
-    let mut d = good();
+    let mut d = gamma();
     d.bake = Some(Window {
         start: 2_000,
         end: Some(2_000 + DAY - 1),
     });
-    refused("bake-short", &d, "less than");
-    let mut d = good();
+    refused_gamma("bake-short", &d, "less than");
+    let mut d = gamma();
     d.bake = Some(Window {
         start: 2_000,
         end: Some(2_000 + DAY),
     });
-    accepted("bake-exact", &d);
-    let mut d = good();
+    accepted_gamma("bake-exact", &d);
+    let mut d = gamma();
     d.bake = Some(Window {
         start: 2_000,
         end: None,
     });
-    refused("bake-open", &d, "no finished bake");
-    let mut d = good();
+    refused_gamma("bake-open", &d, "no finished bake");
+    let mut d = gamma();
     d.bake = None;
-    refused("bake-none", &d, "no finished bake");
+    refused_gamma("bake-none", &d, "no finished bake");
 }
 
 #[test]
 fn a_bake_that_ends_before_it_starts_is_refused_not_wrapped_to_a_long_one() {
     // Catches: the duration taken with `wrapping_sub` (end before start becomes ~2^64 s,
     // past the 24 h floor), a verdict forged past the bake gate.
-    let mut d = good();
+    let mut d = gamma();
     d.bake = Some(Window {
         start: 2_000 + DAY,
         end: Some(2_000),
     });
-    refused("bake-backwards", &d, "the bake ends before it starts");
+    refused_gamma("bake-backwards", &d, "the bake ends before it starts");
 }
 
 #[test]
@@ -488,20 +615,20 @@ fn thin_load_needs_a_recorded_waiver() {
     let thin = |d: &mut ResultDoc| {
         d.load.as_mut().unwrap().actions.measured = 999;
     };
-    let mut d = good();
+    let mut d = gamma();
     thin(&mut d);
-    refused("thin", &d, "minimum load was not met");
-    let mut d = good();
+    refused_gamma("thin", &d, "minimum load was not met");
+    let mut d = gamma();
     thin(&mut d);
     d.waivers = vec![Waiver::new("lost-blobs", "op", "because").unwrap()];
-    refused("thin-other-waiver", &d, "minimum load was not met");
-    let mut d = good();
+    refused_gamma("thin-other-waiver", &d, "minimum load was not met");
+    let mut d = gamma();
     thin(&mut d);
     d.waivers = vec![Waiver::new("min-load", "op", "holiday week").unwrap()];
-    accepted("thin-waived", &d);
-    let mut d = good();
+    accepted_gamma("thin-waived", &d);
+    let mut d = gamma();
     d.load = None;
-    refused("no-load", &d, "minimum load was not met");
+    refused_gamma("no-load", &d, "minimum load was not met");
 }
 
 #[test]
@@ -661,7 +788,7 @@ fn before_you_click_comes_first_with_waivers_and_the_verdict_in_a_line() {
         at("## Before you click") < at("## Commits since"),
         "{notes}"
     );
-    assert!(at("## Commits since") < at("## Gamma verdict"), "{notes}");
+    assert!(at("## Commits since") < at("## Beta verdict"), "{notes}");
     let top = part(&notes, "## Before you click");
     assert!(
         top.contains("### Waivers\n\n- min-load waived by op: holiday week\n"),
@@ -669,7 +796,7 @@ fn before_you_click_comes_first_with_waivers_and_the_verdict_in_a_line() {
     );
     assert!(
         top.contains(
-            "### Verdict\n\n- green for the set it names; bake: 24h 00m, 1 gate(s), 0 warning(s);"
+            "### Verdict\n\n- green for the set it names; 1 gate(s), 0 warning(s); detail under Beta verdict"
         ),
         "{notes}"
     );
@@ -986,9 +1113,33 @@ fn a_first_release_has_no_previous_and_the_verb_says_so() {
 }
 
 #[test]
-fn the_notes_carry_the_verdict_summary_the_escapes_and_the_withdrawn() {
+fn the_gamma_notes_carry_the_bake_the_load_and_the_waiver() {
+    // Catches: a Gamma verdict's bake and load lost from its notes (the Gamma stage keeps
+    // everything it printed before the gate stage was Beta), or titled as another stage.
+    let fx = fx("notes-gamma");
+    fx.git(&["tag", "v0.9.0", &fx.first]);
+    let mut d = gamma();
+    d.load.as_mut().unwrap().actions.measured = 1_500;
+    d.waivers = vec![Waiver::new("min-load", "op", "holiday week").unwrap()];
+    fx.annotate(TAG, RELEASE, &msg(&d));
+    let (code, notes, err) = judged(&fx, "notes", Stage::Gamma, TAG, RELEASE);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(
+        notes.contains("## Gamma verdict\n\n- bake: 24h 00m\n"),
+        "{notes}"
+    );
+    assert!(notes.contains("actions 1500 (needs 1000)"), "{notes}");
+    assert!(notes.contains("builds 12 (needs 10)"), "{notes}");
+    assert!(notes.contains("## Gamma escapes\n\n0 scenario"), "{notes}");
+    assert!(
+        notes.contains("- waived min-load by op: holiday week\n"),
+        "{notes}"
+    );
+}
+
+#[test]
+fn the_beta_notes_carry_the_gates_the_escapes_and_the_withdrawn() {
     let notes = notes_of(&with_notes("notes-summary", |d| {
-        d.load.as_mut().unwrap().actions.measured = 1_500;
         d.escapes = vec![
             "handover with a build in flight".to_owned(),
             "two".to_owned(),
@@ -997,16 +1148,57 @@ fn the_notes_carry_the_verdict_summary_the_escapes_and_the_withdrawn() {
         d.waivers = vec![Waiver::new("min-load", "op", "holiday week").unwrap()];
         d.gates[0] = GateResult::decide("lost-blobs", Sample::Value(0.0), Limit::AtMost(0.0), 1, 2);
     }));
-    assert!(notes.contains("- bake: 24h 00m\n"), "{notes}");
-    assert!(notes.contains("actions 1500 (needs 1000)"), "{notes}");
-    assert!(notes.contains("builds 12 (needs 10)"), "{notes}");
-    assert!(notes.contains("- gate lost-blobs: 0\n"), "{notes}");
+    assert!(
+        notes.contains("## Beta verdict\n\n- gate lost-blobs: 0\n"),
+        "{notes}"
+    );
+    assert!(
+        !notes.contains("bake:") && !notes.contains("load:"),
+        "{notes}"
+    );
     assert!(
         notes.contains("- waived min-load by op: holiday week\n"),
         "{notes}"
     );
-    assert!(notes.contains("2 scenario(s) only gamma found."), "{notes}");
+    assert!(
+        notes.contains("## Beta escapes\n\n2 scenario(s) only gamma found.\n"),
+        "{notes}"
+    );
     assert!(notes.contains("## Withdrawn\n\n- v0.9.0\n"), "{notes}");
+}
+
+#[test]
+fn the_notes_of_the_verdict_verdict_write_writes_come_from_the_builds_not_its_list() {
+    // Catches: the notes refusing the pipeline's own (Beta) verdict, or reading the verdict's
+    // typed `not_reversible` list (a list in a tag is no source; the two builds are), which
+    // would say "meta-log format" here though both builds agree.
+    let fx = fx("notes-written");
+    fx.annotate("v0.3.7", RELEASE, &std::fs::read(WRITTEN).unwrap());
+    let (version, out) = (fx.root.join("version.json"), fx.root.join("notes.md"));
+    std::fs::write(&version, identity(RELEASE, Some(3), Some(1))).unwrap();
+    let (code, o, err) = run(
+        &fx,
+        "notes",
+        "v0.3.7",
+        RELEASE,
+        &[
+            "--version-json",
+            version.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, Some(0), "{o}{err}");
+    let notes = std::fs::read_to_string(out).unwrap();
+    assert!(
+        notes.contains("### Not reversible\n\n- first release: there is no earlier release"),
+        "{notes}"
+    );
+    assert!(!notes.contains("meta-log format"), "{notes}");
+    assert!(
+        notes.contains("## Beta verdict\n\n- gate ci: 1\n- gate beta: 1\n"),
+        "{notes}"
+    );
 }
 
 #[test]
