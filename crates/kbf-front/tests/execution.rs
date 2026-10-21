@@ -5,6 +5,8 @@
 mod common;
 #[path = "execution/platform.rs"]
 mod platform_tests;
+#[path = "execution/refuse_platform.rs"]
+mod refuse_platform_tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};

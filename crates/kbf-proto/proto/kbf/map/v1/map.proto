@@ -191,6 +191,32 @@ message HeartbeatRequest {
   // finished a pass again. 0 is also what an older node sends, and reads as "no pass done".
   // Numbers 11 to 14 are the flush report of the same handoff.
   uint64 tail_epoch_done = 15;
+  // The placement fingerprint (Map.placement_fingerprint) of the map this node held when the
+  // pass that tail_epoch_done reports began, computed with this node assumed Active
+  // (Map.assuming): the frontend accepts a joiner's report only when it equals its own for
+  // the current map, so a pass begun under another placement is never taken as the fill
+  // (docs/design/rebalance-handoff.md, section 3). 0 with tail_epoch_done 0: no pass done.
+  uint64 fill_fp = 16;
+  // The write tier's health, for the operator API (`GET /v1/storage`). Each field has
+  // presence: unset says "I cannot say", never "zero". An older node sends none of them,
+  // and a node with no write tier sends none. Read-only information: no decision of the
+  // frontend depends on it, and the frontend bounds each value before it shows it.
+  //
+  // Committed bytes of every block not yet flushed to the cold store: what a loss of the
+  // node's disk would take.
+  optional uint64 unflushed_bytes = 17;
+  // The blocks holding those bytes.
+  optional uint64 unflushed_blocks = 18;
+  // The age, in milliseconds, of the oldest such block; 0 with none.
+  optional uint64 oldest_unflushed_ms = 19;
+  // The write tier's budget, and the bytes counted against it (blocks not yet flushed and
+  // open uploads' reservations).
+  optional uint64 budget_bytes = 20;
+  optional uint64 used_bytes = 21;
+  // Flush attempts that failed and were retried, and objects whose key in the cold store
+  // held another object, since the node started. Volatile: a restarted node counts again.
+  optional uint64 flush_failures = 22;
+  optional uint64 flush_conflicts = 23;
 }
 
 // A closed set: a node never sends free text about its store, so a credential cannot ride

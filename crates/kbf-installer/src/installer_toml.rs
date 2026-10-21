@@ -7,13 +7,33 @@
 //! every problem found is reported, not only the first. Every key has a default, so an empty
 //! file means a frontend source with the defaults below.
 //!
+//! `release_source` is one of three. `url`: a file server (`release_url`, and `release_ca` for
+//! roots to trust instead of the system's). `frontend`: the frontend's release store, with the
+//! node identity (`node_cert`, `node_key`) and, for a pull over the LAN, the snapshot of its
+//! worker listener (`frontend_url`, `frontend_ca`, `frontend_ca_sha256`: the three come
+//! together). `bundled`: nothing is fetched, the release is the one the package carries. Each
+//! source takes the keys of its own and refuses the others'. Parsing checks the shape of every
+//! value and reads no file: the CA files are looked at when they are used.
+//!
+//! [`InstallerToml::parse`] is the closed reader, for whoever decides where a release comes
+//! from (the fetcher) or rewrites the file (`setup`): it must understand all of it. A reader
+//! that takes only some of the keys (the proxy verb) reads it with
+//! [`InstallerToml::parse_tolerant`], which ignores every other key, whatever its value, so a
+//! file a later build wrote does not stop it after a package downgrade.
+//!
 //! [`InstallerToml::render`] writes the one canonical form (every key but the unset optional
-//! ones, in a fixed order); the golden fixture `testdata/golden/installer.toml` is that form.
+//! ones, in a fixed order); the golden fixtures `testdata/golden/installer*.toml` are that form.
 
 use std::path::PathBuf;
 
+use kbf_host::exec::{Entry, Exec, Kind};
+use kbf_host::path::HostPath;
 use kbf_proxy::config::ProxyConfig;
 use serde::Deserialize;
+
+use crate::record::Sha256Hex;
+use crate::refusal::{Refusal, TrustFault};
+use crate::trust::trusted_chain;
 
 /// The largest file read.
 pub const MAX_FILE_BYTES: usize = 64 * 1024;
@@ -23,11 +43,6 @@ pub const FETCH_TIMEOUT_S: std::ops::RangeInclusive<u32> = 60..=3600;
 pub const MAX_COMPONENT_BYTES_CEILING: u64 = 1 << 30;
 /// A day: the longest minimum gap between two activations.
 pub const MIN_ACTIVATION_INTERVAL_CEILING_S: u32 = 86_400;
-/// The backups `kbf-installer backup` keeps (`backup_keep`): at least the newest one, at most a
-/// year of daily dumps.
-pub const BACKUP_KEEP: std::ops::RangeInclusive<u32> = 1..=365;
-/// What `backup_keep` is when the file does not say.
-pub const DEFAULT_BACKUP_KEEP: u32 = 7;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,12 +59,26 @@ struct Raw {
     min_activation_interval_s: Option<u32>,
     node_cert: Option<String>,
     node_key: Option<String>,
+    frontend_url: Option<String>,
+    frontend_ca: Option<String>,
+    frontend_ca_sha256: Option<String>,
+    release_ca: Option<String>,
     /// The proxy's table, checked by `kbf_proxy::config::ProxyConfig::from_value`; its own
     /// keys are closed the same way.
     proxy: Option<toml::Value>,
     database: Option<String>,
-    backup_keep: Option<u32>,
 }
+
+/// The keys [`InstallerToml::parse_tolerant`] reads; it drops every other before it looks.
+const TOLERANT_KEYS: [&str; 4] = [
+    "confirm_window_s",
+    "confirm_window_max_s",
+    "fetch_timeout_s",
+    "proxy",
+];
+
+/// The keys of the frontend snapshot, in the order `render` writes them.
+const FRONTEND_KEYS: [&str; 3] = ["frontend_url", "frontend_ca", "frontend_ca_sha256"];
 
 /// Where releases are fetched from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +87,51 @@ pub enum Source {
     Frontend,
     /// An https file server serving `files/<sha256>`: the base URL, without a trailing `/`.
     Url(String),
+    /// Nothing is fetched: the release is the one the package carries.
+    Bundled,
+}
+
+/// The frontend's worker listener and the CA that authenticates it, as `setup` saw them: a
+/// snapshot, taken once, because the root half cannot take its source from the service user's
+/// directory. The CA is meant to be a copy that root owns; whether it is, and whether it still
+/// has the digest, is looked at when it is used, not when the file is read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrontendPull {
+    /// `https://host[:port]` of the worker listener, where `ReleaseService.Fetch` is served.
+    pub url: String,
+    /// The copy of the CA the listener's certificate chains to.
+    pub ca: PathBuf,
+    /// The sha256 of that copy.
+    pub ca_sha256: Sha256Hex,
+}
+
+impl FrontendPull {
+    /// The three values as a snapshot, each held to its rule. `names` are what the address, the
+    /// CA path and the digest are called where they came from (the keys, or the flags of
+    /// `setup`); every bad value is a problem pushed to `problems`, which names it and does not
+    /// repeat its text.
+    pub(crate) fn checked(
+        names: [&str; 3],
+        url: &str,
+        ca: &str,
+        sha256: &str,
+        problems: &mut Vec<String>,
+    ) -> Option<FrontendPull> {
+        let url = https_authority_named(names[0], url)
+            .map_err(|e| problems.push(e))
+            .ok();
+        let ca = absolute_path(names[1], ca)
+            .map_err(|e| problems.push(e))
+            .ok();
+        let ca_sha256 = sha256_named(names[2], sha256)
+            .map_err(|e| problems.push(e))
+            .ok();
+        Some(FrontendPull {
+            url: url?,
+            ca: ca?,
+            ca_sha256: ca_sha256?,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +149,12 @@ pub struct InstallerToml {
     /// The node identity the fetch child is lent, for the frontend source.
     pub node_cert: Option<PathBuf>,
     pub node_key: Option<PathBuf>,
+    /// The roots a `url` source is checked against instead of the system's. Only for the `url`
+    /// source.
+    pub release_ca: Option<PathBuf>,
+    /// The frontend's worker listener and its CA, for pulling over the LAN. Only for the
+    /// `frontend` source.
+    pub frontend: Option<FrontendPull>,
     /// The `[proxy]` table, read by `kbf-installer proxy`. `setup` writes the keys it has
     /// flags for on a `--proxy` host and keeps the rest; [`InstallerToml::render`] writes the
     /// whole table, so a file that is read and rendered keeps every key of it.
@@ -84,10 +164,6 @@ pub struct InstallerToml {
     /// leniently (only this key, and it refuses a password); this field exists so that the
     /// closed reader here does not reject the key, and it has no other consumer.
     pub database: Option<String>,
-    /// How many backups of the state database `kbf-installer backup` keeps; `None` is
-    /// [`DEFAULT_BACKUP_KEEP`]. Read by `crate::backup`, which refuses a file this reader
-    /// refuses.
-    pub backup_keep: Option<u32>,
 }
 
 impl Default for InstallerToml {
@@ -104,11 +180,23 @@ impl Default for InstallerToml {
             min_activation_interval_s: 60,
             node_cert: None,
             node_key: None,
+            release_ca: None,
+            frontend: None,
             proxy: None,
             database: None,
-            backup_keep: None,
         }
     }
+}
+
+/// What a reader that fetches nothing takes from the file ([`InstallerToml::parse_tolerant`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tolerant {
+    /// `confirm_window_s`, checked as the closed reader checks it.
+    pub confirm_window_s: u32,
+    /// `fetch_timeout_s`, checked as the closed reader checks it.
+    pub fetch_timeout_s: u32,
+    /// The `[proxy]` table, which is closed whoever reads it.
+    pub proxy: Option<ProxyConfig>,
 }
 
 /// Why a file is not an `installer.toml`.
@@ -122,19 +210,42 @@ pub enum ConfigError {
     Invalid(Vec<String>),
 }
 
+/// Why the file at a path could not be taken as the installer's settings.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError {
+    /// It is missing, not a plain file, owned by someone but root, writable by group or
+    /// others, or in a directory that is ([`trusted_chain`]).
+    #[error("{0}")]
+    Untrusted(Refusal),
+    #[error("{0}")]
+    Invalid(ConfigError),
+}
+
 fn absolute(key: &str, value: &Option<String>, problems: &mut Vec<String>) -> Option<PathBuf> {
     let v = value.as_deref()?;
+    absolute_path(key, v).map_err(|e| problems.push(e)).ok()
+}
+
+/// `v` as an absolute path of plain characters with no empty, `.` or `..` part. `label` (the
+/// key or flag the text came from) is in the refusal; the text is not.
+pub(crate) fn absolute_path(label: &str, v: &str) -> Result<PathBuf, String> {
     let plain = v
         .bytes()
         .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\');
     if plain && v.starts_with('/') && v.split('/').skip(1).all(|c| !matches!(c, "" | "." | "..")) {
-        Some(PathBuf::from(v))
+        Ok(PathBuf::from(v))
     } else {
-        problems.push(format!(
-            "{key}: must be an absolute path of plain characters with no empty, . or .. part"
-        ));
-        None
+        Err(format!(
+            "{label}: must be an absolute path of plain characters with no empty, . or .. part"
+        ))
     }
+}
+
+/// `text` as a sha256 digest, 64 lowercase hex characters. The refusal names `label` and does
+/// not repeat the text.
+pub(crate) fn sha256_named(label: &str, text: &str) -> Result<Sha256Hex, String> {
+    Sha256Hex::try_from(text.to_owned())
+        .map_err(|_| format!("{label}: must be 64 lowercase hex characters"))
 }
 
 /// `https://host[:port][/path]` with no user information, query or fragment, lower-cased
@@ -200,6 +311,37 @@ pub(crate) fn https_base_named(label: &str, url: &str) -> Result<String, String>
     Ok(format!("https://{host}{port}{path}"))
 }
 
+/// [`https_base_named`] for an address with nothing after the port: `https://host[:port]`.
+pub(crate) fn https_authority_named(label: &str, url: &str) -> Result<String, String> {
+    let base = https_base_named(label, url)?;
+    if base["https://".len()..].contains('/') {
+        return Err(format!(
+            "{label}: must be https://host[:port] and nothing after it"
+        ));
+    }
+    Ok(base)
+}
+
+/// The frontend snapshot of a file: the three keys together or none, each held to its rule.
+fn frontend_group(
+    url: Option<&str>,
+    ca: Option<&str>,
+    sha256: Option<&str>,
+    problems: &mut Vec<String>,
+) -> Option<FrontendPull> {
+    match (url, ca, sha256) {
+        (None, None, None) => None,
+        (Some(url), Some(ca), Some(sha256)) => {
+            FrontendPull::checked(FRONTEND_KEYS, url, ca, sha256, problems)
+        }
+        _ => {
+            problems
+                .push("frontend_url, frontend_ca and frontend_ca_sha256 come together".to_owned());
+            None
+        }
+    }
+}
+
 fn ref_ok(r: &str) -> bool {
     r.starts_with("refs/")
         && r.len() <= 200
@@ -254,21 +396,94 @@ fn syntax_line(text: &str, error: &toml::de::Error) -> String {
 }
 
 impl InstallerToml {
+    /// The settings in `file`, read through `trust` (the host's own executor, or a test's).
+    ///
+    /// The file decides where a release comes from and which versions the host refuses, so
+    /// it is held to the rule of the trust files ([`trusted_chain`]): a plain file of root's
+    /// that group and others cannot write, in directories of root's that they cannot write.
+    /// `setup` leaves it so (root:root 0644 in a root-owned 0755 directory).
+    ///
+    /// # Errors
+    /// [`ReadError::Untrusted`] when the rule is not met (or the file cannot be read),
+    /// [`ReadError::Invalid`] when its content is not an `installer.toml`.
+    pub fn read(trust: &dyn Exec, file: &HostPath) -> Result<InstallerToml, ReadError> {
+        let untrusted = |fault| {
+            ReadError::Untrusted(Refusal::Untrusted {
+                path: file.as_str().into(),
+                fault,
+            })
+        };
+        let read = trust
+            .inspect(file)
+            .map_err(|e| untrusted(TrustFault::Unreadable(e)))?;
+        let Some(entry) = read else {
+            return Err(untrusted(TrustFault::Missing));
+        };
+        // A link, a directory or a device where the file should be.
+        let Entry::File { bytes, .. } = entry else {
+            return Err(untrusted(TrustFault::Link));
+        };
+        trusted_chain(trust, file, Kind::File).map_err(ReadError::Untrusted)?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| ReadError::Invalid(ConfigError::Syntax("it is not UTF-8".to_owned())))?;
+        InstallerToml::parse(&text).map_err(ReadError::Invalid)
+    }
+
+    /// The closed reader: every key of the file is known, every value is the right type and
+    /// inside its bounds, and the keys of one source are not beside another's, or it is
+    /// refused with every problem found.
+    ///
+    /// # Errors
+    /// [`ConfigError`]: the file is too big, is not TOML of this shape, or holds a bad value.
     pub fn parse(text: &str) -> Result<InstallerToml, ConfigError> {
         if text.len() > MAX_FILE_BYTES {
             return Err(ConfigError::TooLarge(text.len()));
         }
         let raw: Raw =
             toml::from_str(text).map_err(|e| ConfigError::Syntax(syntax_line(text, &e)))?;
+        InstallerToml::from_raw(raw)
+    }
+
+    /// The tolerant reader, for a reader that fetches nothing and so needs only the confirm
+    /// window, the fetch timeout and the `[proxy]` table (`database` it reads on its own,
+    /// leniently, as the proxy verb does): every other key is dropped before the
+    /// file is looked at, so a key or a value this build has never heard of (a source a later
+    /// build wrote) cannot stop it. What it does read is checked as [`InstallerToml::parse`]
+    /// checks it, the `[proxy]` table stays closed, and a message repeats no text of the file.
+    /// The file still has to be TOML and within the size cap.
+    ///
+    /// Whoever chooses where a release comes from must not use this: it would read the source
+    /// of a later build as nothing.
+    ///
+    /// # Errors
+    /// [`ConfigError`]: the file is too big or is not TOML, or a key this reads is wrong.
+    pub fn parse_tolerant(text: &str) -> Result<Tolerant, ConfigError> {
+        if text.len() > MAX_FILE_BYTES {
+            return Err(ConfigError::TooLarge(text.len()));
+        }
+        let mut table: toml::Table =
+            toml::from_str(text).map_err(|e| ConfigError::Syntax(syntax_line(text, &e)))?;
+        table.retain(|key, _| TOLERANT_KEYS.contains(&key));
+        let raw: Raw = toml::Value::Table(table)
+            .try_into()
+            .map_err(|e: toml::de::Error| ConfigError::Syntax(redact(e.message())))?;
+        let file = InstallerToml::from_raw(raw)?;
+        Ok(Tolerant {
+            confirm_window_s: file.confirm_window_s,
+            fetch_timeout_s: file.fetch_timeout_s,
+            proxy: file.proxy,
+        })
+    }
+
+    fn from_raw(raw: Raw) -> Result<InstallerToml, ConfigError> {
         let d = InstallerToml::default();
         let mut problems = Vec::new();
 
-        let source = match (
-            raw.release_source.as_deref().unwrap_or("frontend"),
-            &raw.release_url,
-        ) {
+        let declared = raw.release_source.as_deref().unwrap_or("frontend");
+        let source = match (declared, &raw.release_url) {
             ("frontend", None) => Some(Source::Frontend),
-            ("frontend", Some(_)) => {
+            ("bundled", None) => Some(Source::Bundled),
+            ("frontend" | "bundled", Some(_)) => {
                 problems.push("release_url is only for release_source = \"url\"".to_owned());
                 None
             }
@@ -281,10 +496,16 @@ impl InstallerToml {
                 .map_err(|e| problems.push(e))
                 .ok(),
             (_, _) => {
-                problems.push("release_source: must be \"url\" or \"frontend\"".to_owned());
+                problems.push(
+                    "release_source: must be \"url\", \"frontend\" or \"bundled\"".to_owned(),
+                );
                 None
             }
         };
+        // The keys of one source are not beside another's: a bundled host fetches nothing, and
+        // a key that names where to fetch from beside it says two things.
+        let not_frontend = matches!(declared, "url" | "bundled");
+        let not_url = matches!(declared, "frontend" | "bundled");
         let refs = raw.source_refs.unwrap_or_default();
         for _ in refs.iter().filter(|r| !ref_ok(r)) {
             problems.push("source_refs: an entry is not a refs/... name".to_owned());
@@ -334,25 +555,33 @@ impl InstallerToml {
             MIN_ACTIVATION_INTERVAL_CEILING_S,
             &mut problems,
         );
-        if let Some(n) = raw.backup_keep
-            && !BACKUP_KEEP.contains(&n)
-        {
-            problems.push(format!(
-                "backup_keep = {n}: must be {} to {}",
-                BACKUP_KEEP.start(),
-                BACKUP_KEEP.end()
-            ));
-        }
         let node_cert = absolute("node_cert", &raw.node_cert, &mut problems);
         let node_key = absolute("node_key", &raw.node_key, &mut problems);
         if node_cert.is_some() != node_key.is_some() && problems.is_empty() {
             problems.push("node_cert and node_key come together".to_owned());
         }
-        if (raw.node_cert.is_some() || raw.node_key.is_some())
-            && matches!(raw.release_source.as_deref(), Some("url"))
-        {
+        let frontend = frontend_group(
+            raw.frontend_url.as_deref(),
+            raw.frontend_ca.as_deref(),
+            raw.frontend_ca_sha256.as_deref(),
+            &mut problems,
+        );
+        let release_ca = absolute("release_ca", &raw.release_ca, &mut problems);
+        let identity_given = raw.node_cert.is_some() || raw.node_key.is_some();
+        let snapshot_given = raw.frontend_url.is_some()
+            || raw.frontend_ca.is_some()
+            || raw.frontend_ca_sha256.is_some();
+        if not_frontend && identity_given {
             problems
                 .push("node_cert and node_key are for release_source = \"frontend\"".to_owned());
+        }
+        if not_frontend && snapshot_given {
+            problems.push(
+                "frontend_url, frontend_ca and frontend_ca_sha256 are for release_source = \"frontend\"".to_owned(),
+            );
+        }
+        if not_url && raw.release_ca.is_some() {
+            problems.push("release_ca is for release_source = \"url\"".to_owned());
         }
         let proxy = raw.proxy.and_then(|table| {
             ProxyConfig::from_value(table)
@@ -372,9 +601,10 @@ impl InstallerToml {
                 min_activation_interval_s,
                 node_cert,
                 node_key,
+                release_ca,
+                frontend,
                 proxy,
                 database: raw.database,
-                backup_keep: raw.backup_keep,
             }),
             _ => Err(ConfigError::Invalid(problems)),
         }
@@ -390,6 +620,10 @@ impl InstallerToml {
             Source::Url(u) => out.push_str(&format!(
                 "release_source = \"url\"\nrelease_url = \"{u}\"\n"
             )),
+            Source::Bundled => out.push_str("release_source = \"bundled\"\n"),
+        }
+        if let Some(p) = &self.release_ca {
+            out.push_str(&format!("release_ca = \"{}\"\n", p.display()));
         }
         if !self.source_refs.is_empty() {
             let refs: Vec<_> = self
@@ -421,11 +655,14 @@ impl InstallerToml {
         if let Some(p) = &self.node_key {
             out.push_str(&format!("node_key = \"{}\"\n", p.display()));
         }
+        if let Some(pull) = &self.frontend {
+            let digest = String::from(pull.ca_sha256.clone());
+            out.push_str(&format!("frontend_url = \"{}\"\n", pull.url));
+            out.push_str(&format!("frontend_ca = \"{}\"\n", pull.ca.display()));
+            out.push_str(&format!("frontend_ca_sha256 = \"{digest}\"\n"));
+        }
         if let Some(url) = &self.database {
             out.push_str(&format!("database = {}\n", toml_string(url)));
-        }
-        if let Some(n) = self.backup_keep {
-            out.push_str(&format!("backup_keep = {n}\n"));
         }
         if let Some(proxy) = &self.proxy {
             render_proxy(proxy, &mut out);
@@ -460,6 +697,7 @@ fn render_proxy(p: &ProxyConfig, out: &mut String) {
     out.push_str(&format!("proxy_auth_file = {}\n", path(&p.proxy_auth_file)));
     out.push_str(&format!("state_dir = {}\n", path(&p.state_dir)));
     out.push_str(&format!("hold_max_s = {}\n", p.hold_max_s));
+    out.push_str(&format!("ui = {}\n", p.ui));
     for cert in &p.server_cert {
         out.push_str("\n[[proxy.server_cert]]\n");
         let names: Vec<String> = cert.names.iter().map(|n| toml_string(n)).collect();
@@ -506,3 +744,7 @@ pub(crate) fn toml_string(text: &str) -> String {
 #[cfg(test)]
 #[path = "installer_toml_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "installer_toml_release_tests.rs"]
+mod release_tests;

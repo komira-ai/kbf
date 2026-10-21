@@ -619,7 +619,12 @@ fn a_stale_offer_ends_the_deploy_and_untrusted_settings_stop_it() {
     if current_uid() == 0 {
         return;
     }
-    let layout = crate::layout::Layout::linux(kbf_host::Root::new(&rig.dir).unwrap());
+    // The deploy reads the settings of the platform it runs on (`HostProbe::at`), so they are
+    // planted where that platform's layout keeps them.
+    let layout = crate::layout::Layout::new(
+        kbf_host::Root::new(&rig.dir).unwrap(),
+        crate::layout::Platform::current(),
+    );
     let settings = layout.join(&layout.settings());
     fs::create_dir_all(settings.parent().unwrap()).unwrap();
     fs::write(&settings, "RUN_AS_UID=65534\n").unwrap();
@@ -633,4 +638,157 @@ fn a_stale_offer_ends_the_deploy_and_untrusted_settings_stop_it() {
         err.contains("installer.conf") || err.contains("settings"),
         "{err}"
     );
+}
+
+/// Proves the config `setup` writes is the whole input of a deploy: with only that file (the
+/// type both share, rendered as setup writes it) and a commit, the API, the CA, the server name,
+/// the token and the stage all come from it. An apply with no offer is refused at the stage the
+/// file names (exit 3, `offer_required`: only a stage read from the file can say so), and
+/// `--no-offer` goes on to the API the file names (a closed port, exit 1). Catches a key the
+/// writer renders that the reader does not take, and a reader that drifted from the writer.
+///
+/// Mutants planted: the stage not read from the file; the token key renamed on the reader.
+#[test]
+fn the_config_setup_writes_is_all_a_deploy_needs() {
+    use crate::deploy::host_config::HostConfig;
+    let rig = Rig::new("setup-config");
+    let config = rig.dir.join("deploy.json");
+    let written = HostConfig {
+        api: Some("127.0.0.1:1".to_owned()),
+        api_ca: Some(rig.ca.clone()),
+        api_server_name: Some("farm.example".to_owned()),
+        token_file: Some(rig.token.clone()),
+        stage: Some("gamma".to_owned()),
+        observe_base_port: Some("18000".to_owned()),
+        ..HostConfig::default()
+    };
+    fs::write(&config, written.render()).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let lock = rig.dir.join("deploy.lock");
+    let result = rig.dir.join("result.json");
+    let args = [
+        "--commit",
+        &rig.commit,
+        "--result",
+        result.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+        "--lock",
+        lock.to_str().unwrap(),
+        "--apply",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let (code, out, err) = rig.go_with(args.clone(), &[], b"", &rig.host(true));
+    assert_eq!(code, 3, "{out} {err}");
+    let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(line["reason"], "offer_required");
+    let (code, out, err) = rig.go_with(args, &["--no-offer"], b"", &rig.host(true));
+    assert_eq!(code, 1, "{out} {err}");
+}
+
+/// A tar of `entries`, as the standard input of `--bundle -`.
+fn tar_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, bytes) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, *bytes).unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+/// (a) Proves `--offer -` is the offer in the bundle, not a file named `-`: with `--bundle -`
+/// the policy is `InBundle` with the stage and the age limit; without it (no bundle, or a
+/// directory) it is a usage error that says what is missing; it excludes `--no-offer`; and
+/// like any offer it needs the stage. Catches `-` opened as a path, an offer in a bundle that
+/// is not the one on standard input, and the age limit lost on the way.
+///
+/// Mutants to plant: `-` read as a file name; the `--bundle -` requirement removed; the age
+/// limit not carried to `InBundle`.
+#[test]
+fn offer_dash_is_the_offer_in_the_bundle_on_standard_input() {
+    let rig = Rig::new("offerdash");
+    let in_bundle = |extra: &[&str]| {
+        let mut flags = vec!["--stage", "gamma", "--offer", "-"];
+        flags.extend_from_slice(extra);
+        rig.policy(&flags)
+    };
+    match in_bundle(&["--bundle", "-", "--offer-max-age-h", "5"]) {
+        Ok(OfferPolicy::InBundle { stage, max_age }) => {
+            assert_eq!(stage, Stage::Gamma);
+            assert_eq!(max_age, Duration::from_secs(5 * 3600));
+        }
+        other => panic!("{other:?}"),
+    }
+    for extra in [&[] as &[&str], &["--bundle", "/some/dir"]] {
+        let err = in_bundle(extra).unwrap_err();
+        assert!(err.contains("--bundle -"), "{extra:?}: {err}");
+    }
+    let err = in_bundle(&["--bundle", "-", "--no-offer"]).unwrap_err();
+    assert!(err.contains("exclude"), "{err}");
+    let err = rig.policy(&["--offer", "-", "--bundle", "-"]).unwrap_err();
+    assert!(err.contains("--stage"), "{err}");
+}
+
+/// (a) Proves a caller through `sudo` can name no offer file: `--offer <path>` is refused as
+/// the host flags are, while `--offer -` is not (the parse goes on and stops later, for want of
+/// a config on this machine, with another message). Catches a path accepted through `sudo`,
+/// where root would read a file of the caller's choosing.
+///
+/// Mutant to plant: the check that `sudo` gives only `-` removed.
+#[test]
+fn through_sudo_the_offer_can_only_be_the_bundles() {
+    let commit = "a".repeat(40);
+    let parse = |offer: &str| {
+        let args = ["--commit", &commit, "--offer", offer, "--bundle", "-"];
+        cli::parse(&args.map(str::to_owned), true, current_uid()).err()
+    };
+    let refused = parse("/etc/shadow").expect("a path is refused");
+    assert!(refused.contains("through sudo"), "{refused}");
+    let later = parse("-").unwrap_or_default();
+    assert!(!later.contains("through sudo"), "{later}");
+}
+
+/// Proves the command line reads the offer from the bundle on standard input and builds the
+/// host probe for it, in a plan as in an apply (the bundle's checks run in both). `--offer -`
+/// with no `--bundle -` is exit 2 with nothing on standard output. An old offer
+/// ends in its own refusal on the summary line (exit 3, `offer_stale`, the offer recorded); a
+/// bundle without `offer.json` ends in `offer_missing` (nothing recorded); and settings the
+/// host does not trust stop the deploy before it starts (exit 2), which only a probe built
+/// for the bundle's offer can do. Catches an offer never read from standard input, and no
+/// probe built for it.
+///
+/// Mutants to plant: the probe built for a file's offer only; the bundle's offer ignored.
+#[test]
+fn an_offer_on_standard_input_is_judged_before_the_farm_is_asked() {
+    let rig = Rig::new("offerstdin");
+    let (code, out, err) = rig.go(&["--stage", "gamma", "--offer", "-"], b"", true);
+    assert_eq!((code, out.as_str()), (2, ""), "{err}");
+    assert!(err.contains("--bundle -"), "{err}");
+    let release = format!("kbf-{}-linux-x86_64.tar.gz", rig.commit);
+    let offer = fs::read(rig.offer_file()).unwrap();
+    let flags = ["--stage", "gamma", "--offer", "-", "--bundle", "-"];
+    let go = |entries: &[(&str, &[u8])]| rig.go(&flags, &tar_of(entries), true);
+    let (code, out, _) = go(&[(&release, b"tarball"), ("offer.json", offer.as_slice())]);
+    assert_eq!(code, 3, "{out}");
+    let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(line["reason"], "offer_stale");
+    assert_eq!(line["offer"]["kind"], "offer");
+    assert_eq!(line["offer"]["commit"], rig.commit);
+    let (code, out, _) = go(&[(&release, b"tarball")]);
+    assert_eq!(code, 3, "{out}");
+    let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(line["reason"], "offer_missing");
+    assert!(line.get("offer").is_none(), "{out}");
+    // A settings file the host refuses whoever owns it (the unprivileged user is never root),
+    // so this holds for any uid the test runs as.
+    let layout = crate::layout::Layout::linux(kbf_host::Root::new(&rig.dir).unwrap());
+    let settings = layout.join(&layout.settings());
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(&settings, "RUN_AS_UID=0\n").unwrap();
+    let (code, out, err) = go(&[(&release, b"tarball"), ("offer.json", offer.as_slice())]);
+    assert_eq!((code, out.as_str()), (2, ""), "{err}");
 }

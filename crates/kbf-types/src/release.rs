@@ -120,4 +120,17 @@ mod tests {
             assert_eq!(ReleasePlatform::parse(bad), None, "{bad:?}");
         }
     }
+
+    /// Catches: a Linux host asked for the Mac daemon's tarball (or a Mac for `kbf`), so
+    /// a platform is called complete while holding the wrong files, and a platform with
+    /// no component at all.
+    #[test]
+    fn each_platform_needs_the_tarballs_of_its_host() {
+        assert_eq!(ReleasePlatform::LinuxX86_64.components(), ["kbf"]);
+        assert_eq!(ReleasePlatform::LinuxArm64.components(), ["kbf"]);
+        assert_eq!(ReleasePlatform::DarwinArm64.components(), ["kbf-daemon"]);
+        for platform in ReleasePlatform::ALL {
+            assert!(!platform.components().is_empty(), "{platform}");
+        }
+    }
 }

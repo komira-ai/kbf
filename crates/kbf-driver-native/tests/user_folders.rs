@@ -569,7 +569,8 @@ fn untouched(temp: &Path) -> bool {
 #[tokio::test]
 async fn temporary_items_itself_cannot_be_removed_or_replaced() {
     setup();
-    let dir = std::fs::canonicalize(scratch("items-itself")).expect("real");
+    let scratch_dir = scratch("items-itself");
+    let dir = std::fs::canonicalize(&scratch_dir).expect("real");
     let cas = Arc::new(MemoryCas::default());
     let mut got = Vec::new();
     let mut want = Vec::new();
@@ -628,7 +629,8 @@ async fn a_temporary_items_of_another_user_is_not_swept() {
         eprintln!("no passwordless sudo: nothing to check");
         return;
     }
-    let dir = std::fs::canonicalize(scratch("items-owner")).expect("real");
+    let scratch_dir = scratch("items-owner");
+    let dir = std::fs::canonicalize(&scratch_dir).expect("real");
     let (temp, cache) = (dir.join("T"), dir.join("C"));
     let items = temp.join("TemporaryItems");
     let left = items.join("old");
@@ -860,7 +862,8 @@ async fn a_volume_mounted_in_the_leases_home_does_not_keep_the_lease() {
     let _tools = DEVELOPER_TOOLS.write().await;
     // `mount` lists real paths, and the scratch directory may sit under a symlink
     // (`/var`, `/tmp`): without this `below(&after, &dir)` is empty and checks nothing.
-    let dir = std::fs::canonicalize(scratch("volume-mount")).expect("real");
+    let scratch_dir = scratch("volume-mount");
+    let dir = std::fs::canonicalize(&scratch_dir).expect("real");
     let config: NativeConfig = config(&dir);
     let scratch_root = config.clone();
     let cas = Arc::new(MemoryCas::default());

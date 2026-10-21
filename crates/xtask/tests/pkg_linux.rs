@@ -391,11 +391,11 @@ fn pkg_trust_writes_the_trust_directory_and_refuses_a_ref_no_host_would_load() {
     let bad = run("main");
     assert_eq!(bad.status.code(), Some(1), "{}", text(&bad.stderr));
     assert!(!out.exists());
-    let good = run("refs/heads/feature/arch-v2");
+    let good = run("refs/heads/team/topic-2");
     assert_eq!(good.status.code(), Some(0), "{}", text(&good.stderr));
     assert_eq!(
         std::fs::read_to_string(out.join("installer.conf")).expect("conf"),
-        "SOURCE_REFS=refs/heads/feature/arch-v2\n"
+        "SOURCE_REFS=refs/heads/team/topic-2\n"
     );
     assert_eq!(std::fs::read(out.join("gh")).expect("gh"), b"the pinned gh");
     let mode = std::fs::metadata(out.join("gh"))

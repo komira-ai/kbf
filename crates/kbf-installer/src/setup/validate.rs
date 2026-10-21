@@ -5,14 +5,19 @@
 //! node modes `storage`, `daemon` and `storage-and-daemon` enroll with a frontend, so they
 //! need its URL and an enrollment token, and may fetch releases from it once enrolled; the
 //! `frontend` and `all-in-one` hosts do not enroll, so they take neither and fetch from a
-//! file server.
+//! file server. Any mode may take `--release-source bundled`, which fetches nothing and so
+//! takes no URL and no first release to name.
 
+use std::path::PathBuf;
+
+use super::deploy_config::{DeployFlags, DeploySettings};
 use super::kbf_settings::{KbfFlags, Setting};
 use super::paths;
 use super::proxy::{ProxyFlags, ProxyPlan};
+use super::release_keys::ReleaseFlags;
 use crate::CommitId;
 use crate::cli::{Mode, ReleaseSource};
-use crate::installer_toml::{Source, https_base_named};
+use crate::installer_toml::{FrontendPull, Source, https_authority_named, https_base_named};
 use crate::layout::Platform;
 use kbf_state::postgres::PostgresConfig;
 
@@ -24,6 +29,8 @@ pub struct Raw {
     pub token_file: Option<String>,
     pub release_source: Option<ReleaseSource>,
     pub release_url: Option<String>,
+    /// `--release-ca` and the frontend snapshot flags: the keys a release source has of its own.
+    pub release: ReleaseFlags,
     pub min_generation: Option<u64>,
     pub commit: Option<CommitId>,
     /// `--database`: the state database's URL.
@@ -34,6 +41,8 @@ pub struct Raw {
     pub proxy: ProxyFlags,
     /// `--create-local-database`.
     pub create_local_database: bool,
+    /// The `--deploy-*` flags: the host's deploy config (frontend, all-in-one).
+    pub deploy: DeployFlags,
     /// `--installer-config`, as the host path it names; `None` is the platform's default.
     pub installer_config: Option<String>,
 }
@@ -47,6 +56,10 @@ pub struct Valid {
     /// The operator's enrollment token file, an absolute path, for the node modes.
     pub token_file: Option<String>,
     pub source: Source,
+    /// The roots a `url` source is checked against instead of the system's.
+    pub release_ca: Option<PathBuf>,
+    /// The frontend's worker listener and CA, for a `frontend` source that pulls over the LAN.
+    pub frontend: Option<FrontendPull>,
     /// The operator floor the flag gives; the file's own is kept when there is none.
     pub min_generation: Option<u64>,
     /// The first release to install.
@@ -60,6 +73,8 @@ pub struct Valid {
     pub proxy: Option<ProxyPlan>,
     /// With `--create-local-database`: what to create, from the URL.
     pub local_database: Option<LocalDatabase>,
+    /// What the `--deploy-*` flags ask of `deploy.json`; none when no flag was given.
+    pub deploy: Option<DeploySettings>,
 }
 
 /// The role and database `--create-local-database` makes, and where the local server's socket
@@ -93,7 +108,9 @@ impl Raw {
         let name = mode_name(self.mode);
 
         let frontend_url = match (&self.frontend_url, node) {
-            (Some(u), true) => frontend_authority(u).map_err(|e| problems.push(e)).ok(),
+            (Some(u), true) => https_authority_named("--frontend-url", u)
+                .map_err(|e| problems.push(e))
+                .ok(),
             (None, true) => {
                 problems.push(format!("--mode={name} enrolls: --frontend-url is required"));
                 None
@@ -132,6 +149,7 @@ impl Raw {
         let proxy = self
             .proxy
             .validate(platform, self.mode, &self.kbf, &mut kbf, &mut problems);
+        let deploy = self.deploy.validate(self.mode, &mut problems);
         let installer_toml = paths::installer_toml(platform);
         if self
             .installer_config
@@ -143,13 +161,20 @@ impl Raw {
             ));
         }
         let source = self.source(node, &mut problems);
-        if self.commit.is_some() && source.as_ref().is_some_and(|s| *s == Source::Frontend) {
-            problems.push(
+        match (&self.commit, &source) {
+            (Some(_), Some(Source::Frontend)) => problems.push(
                 "--commit installs the first release before the host has enrolled, so it cannot \
                  come from the frontend: use --release-source url"
                     .to_owned(),
-            );
+            ),
+            (Some(_), Some(Source::Bundled)) => problems.push(
+                "--release-source bundled takes no --commit: the release is the one the package \
+                 carries"
+                    .to_owned(),
+            ),
+            _ => {}
         }
+        let (release_ca, frontend) = self.release.validate(source.as_ref(), &mut problems);
         if self.min_generation == Some(0) {
             problems.push("--min-generation 0 is no floor: leave it out".to_owned());
         }
@@ -159,12 +184,15 @@ impl Raw {
                 frontend_url,
                 token_file,
                 source,
+                release_ca,
+                frontend,
                 min_generation: self.min_generation,
                 commit: self.commit.clone(),
                 database,
                 kbf,
                 proxy,
                 local_database,
+                deploy,
             }),
             _ => Err(problems),
         }
@@ -261,7 +289,8 @@ impl Raw {
                 ));
                 None
             }
-            (ReleaseSource::Frontend, Some(_)) => {
+            (ReleaseSource::Bundled, None) => Some(Source::Bundled),
+            (ReleaseSource::Frontend | ReleaseSource::Bundled, Some(_)) => {
                 problems.push("--release-url is only for --release-source url".to_owned());
                 None
             }
@@ -321,16 +350,6 @@ fn plain_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-/// The frontend URL in its one spelling: `https://host[:port]` and nothing after it.
-fn frontend_authority(text: &str) -> Result<String, String> {
-    let base = https_base_named("--frontend-url", text)?;
-    let after_scheme = &base["https://".len()..];
-    if after_scheme.contains('/') {
-        return Err("--frontend-url: must be https://host[:port] and nothing after it".to_owned());
-    }
-    Ok(base)
 }
 
 pub fn mode_name(mode: Mode) -> &'static str {

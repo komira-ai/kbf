@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 use super::*;
 use crate::deploy::offer::{self, Attest, HostProbe, ProbeFault, Stage};
 
+mod in_bundle;
+
 /// The farm's clock at the start of a run (`Clk`).
 const NOW: u64 = 1_790_000_000;
 const HOUR: u64 = 3600;
@@ -23,6 +25,11 @@ impl Probe for Says {
         _: Option<&[u8]>,
     ) -> Result<Option<u64>, ProbeFault> {
         self.0.clone().map_err(ProbeFault::Failed)
+    }
+
+    /// The build this host runs: the `previous_meta_log` of `Fields::good()`.
+    fn running_meta_log(&self) -> Result<Option<u64>, ProbeFault> {
+        Ok(Some(5))
     }
 }
 
@@ -101,6 +108,7 @@ struct Fields {
     created: u64,
     platforms: Vec<&'static str>,
     meta_log: Option<u64>,
+    previous_meta_log: Option<u64>,
 }
 
 impl Fields {
@@ -112,6 +120,7 @@ impl Fields {
             created: NOW - HOUR,
             platforms: vec!["darwin-arm64", "linux-x86_64"],
             meta_log: Some(4),
+            previous_meta_log: Some(5),
         }
     }
 
@@ -126,8 +135,8 @@ impl Fields {
             "beta": {"kind": "attested", "run_id": "77"},
             "meta_log": self.meta_log,
             "previous": OLD,
-            "previous_meta_log": 5,
-            "reversible": self.meta_log.is_some_and(|n| n <= 5),
+            "previous_meta_log": self.previous_meta_log,
+            "reversible": kbf_gate::reversible(self.meta_log, self.previous_meta_log),
         });
         OfferDoc::from_bytes(json.to_string().as_bytes()).expect("a valid offer")
     }
@@ -925,6 +934,9 @@ fn a_deploy_with_an_unattested_host_binary_is_refused_without_running_it() {
     let sums = sums_of(&files);
     let mut fields = Fields::good();
     fields.set_hash = SetHash::of_sums(&sums).as_str().to_owned();
+    // Irreversible, so the probe of this test is asked only for the staged `kbf` (it counts
+    // its runs); the host's running build is the subject of `in_bundle`.
+    fields.previous_meta_log = Some(3);
     let attested = |with_att: bool| {
         let mut all: Vec<(String, Vec<u8>)> = files.clone();
         if with_att {
@@ -1121,6 +1133,8 @@ fn only_the_hosts_kbf_is_attested_against_its_own_attestation() {
     let sums = sums_of(&files);
     let mut fields = Fields::good();
     fields.set_hash = SetHash::of_sums(&sums).as_str().to_owned();
+    // Irreversible: this probe names no running build, and only the staged `kbf` is asked.
+    fields.previous_meta_log = Some(3);
     let mut all = files.clone();
     all.push((
         format!("{}.attestation", files[0].0),

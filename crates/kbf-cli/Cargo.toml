@@ -10,7 +10,7 @@ publish.workspace = true
 # The one binary: `kbf <mode>` over the libraries of kbf-node and kbf-all-in-one
 # (docs/design/cluster.md, sections 1 and 5.1). Like kbf-all-in-one it links both the
 # server and the node library (the version stamp is kbf-server's), so it is listed in
-# `JOINERS` in crates/kbf-it/tests/layering.rs.
+# `JOINERS` in crates/kbf-integration-test/tests/layering.rs.
 [[bin]]
 name = "kbf"
 path = "src/main.rs"

@@ -351,6 +351,120 @@ async fn get_tree_returns_every_present_directory_in_pages() {
     assert_eq!(missing.code(), Code::NotFound);
 }
 
+/// Catches: a page token past the last directory answered with an error or with a
+/// directory sent again, or with no message at all (a client waiting for its first page
+/// would see an empty stream): it is one empty last page.
+#[tokio::test]
+async fn get_tree_answers_one_empty_last_page_for_a_token_past_the_end() {
+    let farm = Farm::start().await;
+    let root = Blob::of(&Directory::default());
+    farm.upload(&[&root]).await;
+    let mut stream = farm
+        .cas()
+        .get_tree(GetTreeRequest {
+            root_digest: Some(root.proto.clone()),
+            page_token: "99".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("GetTree past the end")
+        .into_inner();
+    let page = stream.message().await.expect("page").expect("one page");
+    assert!(page.directories.is_empty());
+    assert!(page.next_page_token.is_empty());
+    assert!(stream.message().await.expect("end").is_none());
+}
+
+/// Catches: a root that is not a Directory taken for an empty one (the client would
+/// build from nothing), a child that is not a Directory failing the whole tree instead
+/// of being left out like a missing one, and the root's refusal not naming the digest.
+#[tokio::test]
+async fn get_tree_refuses_a_root_that_is_not_a_directory_and_skips_such_a_child() {
+    let farm = Farm::start().await;
+    let junk = Blob::new(vec![0xff; 3]);
+    let kept = Blob::of(&Directory::default());
+    let root = Blob::of(&Directory {
+        directories: vec![dir_node("junk", &junk), dir_node("kept", &kept)],
+        ..Default::default()
+    });
+    farm.upload(&[&junk, &kept, &root]).await;
+    let get = |blob: &Blob| GetTreeRequest {
+        root_digest: Some(blob.proto.clone()),
+        ..Default::default()
+    };
+
+    let refused = farm
+        .cas()
+        .get_tree(get(&junk))
+        .await
+        .expect_err("a root that is not a Directory");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(
+        refused
+            .message()
+            .contains(&format!("tree root {} is not a Directory", junk.digest)),
+        "{refused:?}"
+    );
+
+    let mut stream = farm
+        .cas()
+        .get_tree(get(&root))
+        .await
+        .expect("GetTree")
+        .into_inner();
+    let page = stream.message().await.expect("page").expect("one page");
+    let sent: Vec<Vec<u8>> = page
+        .directories
+        .iter()
+        .map(prost::Message::encode_to_vec)
+        .collect();
+    assert_eq!(sent, [root.data.clone(), kept.data.clone()]);
+}
+
+/// Catches: a compressed upload stored as if it were the blob (its bytes would not
+/// hash to the digest, or worse, would), or failing the whole batch: each compressed
+/// request is refused on its own, the identity one beside it stored.
+#[tokio::test]
+async fn batch_update_refuses_a_compressed_blob_and_stores_the_others() {
+    let farm = Farm::start().await;
+    let plain = Blob::new("plain");
+    let zipped = Blob::new("zipped");
+    let request = |blob: &Blob, compressor: reapi::compressor::Value| {
+        reapi::batch_update_blobs_request::Request {
+            digest: Some(blob.proto.clone()),
+            data: blob.data.clone(),
+            compressor: compressor as i32,
+        }
+    };
+    let response = farm
+        .cas()
+        .batch_update_blobs(BatchUpdateBlobsRequest {
+            requests: vec![
+                request(&zipped, reapi::compressor::Value::Zstd),
+                request(&plain, reapi::compressor::Value::Identity),
+            ],
+            ..Default::default()
+        })
+        .await
+        .expect("BatchUpdateBlobs")
+        .into_inner();
+    let codes: Vec<i32> = response
+        .responses
+        .iter()
+        .map(|r| r.status.as_ref().expect("status").code)
+        .collect();
+    assert_eq!(codes, [Code::InvalidArgument as i32, 0]);
+    assert!(
+        response.responses[0]
+            .status
+            .as_ref()
+            .expect("status")
+            .message
+            .contains("is not supported")
+    );
+    assert_eq!(farm.find_missing(&[&plain, &zipped]).await, [zipped.digest]);
+}
+
 /// Catches a batch limit or gRPC message limit left below 16 MiB in the server or in
 /// the capabilities: a `BatchUpdateBlobs` of exactly 16 MiB (four blobs) is stored, and
 /// a `BatchReadBlobs` of the same four comes back whole, each blob byte for byte. The

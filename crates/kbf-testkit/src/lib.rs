@@ -4,7 +4,8 @@
 //!   append, env, pwd, id, kill-self, spawn-child, run, setsid, alloc, upper,
 //!   rename, symlink, chmod, wait-for, sleep-once, mkdir, cat, mtime, pgid, leads, write-lines,
 //!   copy, remove, mkfifo, truncate, zeros, ignore-signal, test, points-to, holds,
-//!   inode-links) that a test puts in an action's or a child's argv where it would
+//!   inode-links, and the probes try-read, try-write, try-list, tcp-listen,
+//!   tcp-connect, unix-listen, unix-connect, procargs, proc-sees, ps-sees) that a test puts in an action's or a child's argv where it would
 //!   have written `sh -c`.
 //! - [`fake`]: the same binary run through a link named `xcrun`, `xcodebuild` or
 //!   `sandbox-exec` answers as that tool, from a rules file the test writes.
@@ -18,6 +19,8 @@
 //!   start fails with `ETXTBSY` because such a child still holds the file open.
 //! - [`m2`]: the verbs of `kbf-m2-act`, the program every action of the M2 sample
 //!   project runs (the M2 image has no shell).
+//! - [`tree`]: an action's input root and the action around it, as plain data (the black-box
+//!   suites upload them through `kbf-harness`).
 //! - [`reaped`]: a child a test starts, stopped and reaped when the guard drops (SIGTERM,
 //!   then SIGKILL), holding only the descriptors the test gave it.
 //!
@@ -46,8 +49,10 @@ pub mod fake;
 pub mod forked;
 pub mod m2;
 pub mod port;
+mod probe;
 pub mod reaped;
 pub mod spawn;
+pub mod tree;
 
 /// Why a program here stopped short.
 #[derive(Debug, PartialEq, Eq)]

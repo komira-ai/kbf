@@ -338,7 +338,7 @@ fn installer_places_files_and_loads_nothing() {
     assert!(!Path::new(JOB_LOG).exists());
     assert!(!Path::new("/usr/local/kbf-installer/releases").exists());
     assert!(!Path::new("/usr/local/kbf-installer/current").exists());
-    for user in ["kbf", "_kbf-fetch", "kbf-verify"] {
+    for user in ["kbf", "_kbf-fetch"] {
         failure("id", &["-u", user]);
     }
 
@@ -365,7 +365,7 @@ fn installer_places_files_and_loads_nothing() {
     std::fs::write(gate(), b"# configured\n").unwrap();
     assert!(
         within(60, || std::fs::read_to_string(JOB_LOG)
-            .is_ok_and(|log| log.contains("kbf-installer-stub serve"))),
+            .is_ok_and(|log| log.contains("kbf-installer-stub run"))),
         "the job did not run once {} existed",
         gate()
     );

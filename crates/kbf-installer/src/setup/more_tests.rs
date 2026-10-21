@@ -159,7 +159,7 @@ fn a_run_that_stopped_at_the_database_is_finished_by_running_again() {
     };
     assert_eq!(installer_writes(&exec), 1);
     let up = Server::fresh();
-    let mut os = settled(&["kbf-frontend.service", "kbf-backup.timer"]);
+    let mut os = settled(&["kbf-frontend.service"]);
     os.users.push(user("kbf-server", 989));
     let out = go_on(&os, &mut exec, &Unwired, &up, &raw(Mode::Frontend), APPLY).expect("finished");
     assert_eq!(
@@ -314,6 +314,9 @@ fn a_migrated_host_keeps_its_old_roots_and_passes_setup() {
         (FakeOs::mac(), Mode::Daemon),
     ] {
         let mut exec = with_old_roots(host());
+        if os.platform == Platform::MacOs {
+            exec = provisioned(exec);
+        }
         let out = after(
             &os,
             &mut exec,
@@ -911,6 +914,32 @@ fn an_invalid_config_file_is_refused_without_its_text() {
     );
 }
 
+/// `setup`'s first release is fetched by the host's fetcher, which reads `installer.toml` and
+/// the fetch user when it is asked (`setup` builds it before it has written the file or made
+/// the user): on a scratch host with neither, the fetch is `Unavailable` with a reason, where
+/// the unwired fetcher said it had none at all (`NotWired`, code `not_implemented`).
+///
+/// Catches `cli` building its backend on `NotWired` again (`--commit` would stop with "no
+/// fetcher wired in" whatever the host holds). `cli` itself is root's and cannot run in a
+/// test, so the mutant is also caught by the compiler: the function this tests is unused
+/// when `cli` does not call it.
+///
+/// Mutants planted: `cli` building `Fetching::new(&NotWired, ..)`.
+#[test]
+fn the_first_release_is_fetched_by_the_host_fetcher_not_the_unwired_one() {
+    use crate::helper::fetcher::{Fetcher, ReleaseLocator};
+    let (_, layout) = scratch("first-release-fetcher");
+    let fetcher = crate::setup::first_release_fetcher(layout, None);
+    let got = fetcher.fetch(&ReleaseLocator {
+        commit: c(A),
+        components: Vec::new(),
+    });
+    assert!(
+        matches!(&got, Err(FetchError::Unavailable(why)) if !why.is_empty()),
+        "{got:?}"
+    );
+}
+
 /// The `<key>`s of the property list's `PathState`: the files its `KeepAlive` waits for.
 fn gate_files(plist: &str) -> Vec<String> {
     let after = plist
@@ -958,9 +987,11 @@ fn the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac() {
         gate_files(&plist).iter().collect::<Vec<_>>(),
         "setup wrote installer.toml somewhere the launchd gate does not wait"
     );
-    // The node job reads kbf.toml from the layout; setup wrote it there.
+    // The node job reads kbf.toml from the layout; on a Mac that file is kbf-mac-provision's
+    // (G9), so it was there before setup and setup wrote none.
     assert!(
-        files.iter().any(|p| p == Platform::MacOs.kbf_toml()),
+        planted.iter().any(|p| p == Platform::MacOs.kbf_toml())
+            && !files.iter().any(|p| p == Platform::MacOs.kbf_toml()),
         "{files:?}"
     );
     assert!(

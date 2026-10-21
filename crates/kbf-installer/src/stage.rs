@@ -50,7 +50,8 @@
 //! Every external step is bounded: `gh` 120 s, unpacking 120 s, the probe 10 s
 //! ([`Timeouts`]); a program is killed with its whole process group. The scratch
 //! directories (`work/<commit>.partial/` and `work/<commit>.check/`) are root's and go
-//! whatever the outcome.
+//! whatever the outcome, unless the process is killed first (a crash, the OOM killer, a
+//! reboot): then `run` removes what is left when it starts ([`sweep_work`]).
 //!
 //! A refusal carries the contract's stable word ([`Refusal::word`]).
 
@@ -72,10 +73,13 @@ use crate::binary::{Arch, BinaryKind, Version};
 use crate::darwin;
 use crate::helper::fetcher::InstalledRelease;
 use crate::helper::leases::LeaseSource;
+use crate::installer_toml::InstallerToml;
 use crate::layout::{Layout, Platform};
 use crate::refusal::{ArchiveFault, FactsFault, Refusal, TrustFault, VersionFault, WHAT_PROBE};
+use crate::release::{ReleaseError, sweep_dir};
 use crate::run::{Runner, Spawn};
 use crate::settings::Settings;
+use crate::state::Locked;
 
 /// The marker written into a release directory once every check has passed.
 pub const VERIFIED: &str = "VERIFIED";
@@ -136,10 +140,12 @@ pub struct Partial {
 }
 
 impl Partial {
-    /// Make the directory and `dl/` in it, owned by `owner`. A directory already there
-    /// is a crashed stage's, which `run` sweeps at its start: it is refused, not reused.
+    /// Make the directory and `dl/` in it, owned by `owner`. A directory already there is
+    /// not this call's: it is a stage's that was killed, which `run` removes when it starts
+    /// ([`sweep_work`]), or one that is running now. It is refused here, never reused or
+    /// removed.
     pub fn create(host: &Layout, commit: &CommitId, owner: Owner) -> Result<Partial, Refusal> {
-        let dir = work_path(host, commit, "partial")?;
+        let dir = work_path(host, commit, PARTIAL)?;
         // Only a directory made here is removed on drop: a refused stale one is not ours.
         make_dir(&dir, 0o755, owner)?;
         let made = Partial { dir };
@@ -163,13 +169,40 @@ impl Drop for Partial {
     }
 }
 
-/// `work/<commit>.<suffix>`, with `work/` made when it is missing.
+/// The suffixes of a stage's scratch directories in `work/`: `<commit>.partial` (the
+/// download, then the release being made) and `<commit>.check` (the checks' own).
+const PARTIAL: &str = ".partial";
+const CHECK: &str = ".check";
+
+/// `work/<commit><suffix>`, with `work/` made when it is missing.
 fn work_path(host: &Layout, commit: &CommitId, suffix: &str) -> Result<PathBuf, Refusal> {
     let work = host.join(&host.work_dir());
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true).mode(0o755);
     builder.create(&work).map_err(work_err(&work))?;
-    Ok(work.join(format!("{commit}.{suffix}")))
+    Ok(work.join(format!("{commit}{suffix}")))
+}
+
+/// Remove every `work/*.partial` and `work/*.check`: the scratch of a stage that was killed
+/// before it could remove it (a crash, the OOM killer, a reboot, `SIGKILL`), which
+/// [`Partial::create`] refuses for ever. Nothing else in `work/` is touched, and a link is
+/// removed, never followed ([`sweep_dir`], the sweep the operator's verbs make of
+/// `releases/.stage-*`).
+///
+/// `lock` is the installer lock, held: it shows that no verb of the operator is at work. It
+/// does not keep a stage out, since a stage takes no lock, so the caller must know that none
+/// is running. `run` calls this once, before its first pass, when nothing of this process
+/// is staging; the stages it cannot see are another process's (`setup` fetching the first
+/// release, or a second `run` started by hand, which nothing excludes), which is why a pass
+/// never sweeps.
+pub fn sweep_work(host: &Layout, _lock: &Locked) -> Result<(), ReleaseError> {
+    let work = host.join(&host.work_dir());
+    sweep_dir(&work, is_scratch)
+}
+
+/// Whether `name` is one of a stage's scratch directories.
+fn is_scratch(name: &str) -> bool {
+    name.ends_with(PARTIAL) || name.ends_with(CHECK)
 }
 
 fn make_dir(dir: &Path, mode: u32, owner: Owner) -> Result<(), Refusal> {
@@ -210,6 +243,25 @@ pub struct Supported {
     pub state_schema: u64,
 }
 
+/// What this build of the installer understands, which is what [`Policy::of`] gives a host.
+///
+/// **Decision D3 (open, with the lead):** these numbers decide which releases a host can ever
+/// accept, and the installer never updates itself, so a release that raises one is refused
+/// (`installer_too_old`) until a newer installer is put on the host by hand. They are the
+/// numbers of the first protocol (1 and 1) and the newest state schema this build embeds a
+/// migration for (the installer migrates the database to the release's schema before the
+/// swap, so a schema it does not embed is one it cannot reach). The installer cannot link
+/// `kbf-server` for the protocol numbers; `kbf-cli`'s test
+/// `the_installer_understands_what_kbf_declares` fails when a release would declare more
+/// than these.
+pub fn supported() -> Supported {
+    Supported {
+        protocol: 1,
+        min_protocol: 1,
+        state_schema: u64::from(kbf_state::postgres::schema::latest()),
+    }
+}
+
 /// What the host decides about how a release is verified.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -221,6 +273,20 @@ pub struct Policy {
     pub min_protocol: u64,
     pub supported: Supported,
     pub timeouts: Timeouts,
+}
+
+impl Policy {
+    /// The policy of a host whose `installer.toml` is `toml`: its component cap and operator
+    /// floor, this build's [`supported`] numbers, the contract's timeouts and binary cap.
+    pub fn of(toml: &InstallerToml) -> Policy {
+        Policy {
+            max_component_bytes: toml.max_component_bytes,
+            max_binary_bytes: MAX_BINARY,
+            min_protocol: u64::from(toml.min_protocol),
+            supported: supported(),
+            timeouts: Timeouts::DEFAULT,
+        }
+    }
 }
 
 /// A release that passed every check and is installed in `releases/<commit>/`. The state does
@@ -394,7 +460,7 @@ impl Scratch {
         settings: &Settings,
         owner: Owner,
     ) -> Result<Scratch, Refusal> {
-        let dir = work_path(host, commit, "check")?;
+        let dir = work_path(host, commit, CHECK)?;
         // A check directory left by a crash is ours alone to remove.
         let _ = fs::remove_dir_all(&dir);
         let made = Scratch { dir };

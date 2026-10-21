@@ -81,11 +81,12 @@ fn the_update_apis_numbers_and_places_come_from_the_file_and_the_flags() {
     );
     let args = ProxyArgs {
         config: Some(path),
-        update_dir: "/srv/root-half".into(),
-        orders_dir: "/srv/orders".into(),
+        update_dir: Some("/srv/root-half".into()),
+        orders_dir: Some("/srv/orders".into()),
         check: false,
     };
-    let cfg = handover_config(&args, &loaded);
+    let (layout, _) = crate::testkit::host_root_on("places", Platform::Linux);
+    let cfg = handover_config(&args, &loaded, &layout);
     // The children's ports are the upstream table's: in a slot the operator listener is at
     // offset 2 and the admin calls at 3, slot B ten ports above slot A, all on loopback; and
     // the operator token is the one the proxy checks callers against.
@@ -120,9 +121,59 @@ fn the_update_apis_numbers_and_places_come_from_the_file_and_the_flags() {
     );
 }
 
+/// Catches `proxy` watching the Linux state directory on a Mac: without `--update-dir` and
+/// `--orders-dir` the update API's places are the layout's (the ones `setup` and the Mac
+/// provisioner write) on each platform, and the flags still win.
+#[test]
+fn the_update_apis_places_default_to_the_layouts_on_every_platform() {
+    let path = file("default-places", PROXY.as_bytes());
+    let loaded = load(&path).expect("valid");
+    let none = ProxyArgs {
+        config: Some(path.clone()),
+        check: false,
+        update_dir: None,
+        orders_dir: None,
+    };
+    for (platform, state) in [
+        (Platform::Linux, "/var/lib/kbf-installer"),
+        (Platform::MacOs, "/var/db/kbf-installer"),
+    ] {
+        let (layout, _) = crate::testkit::host_root_on("default-places-dirs", platform);
+        let cfg = handover_config(&none, &loaded, &layout);
+        assert_eq!(
+            cfg.status_file,
+            PathBuf::from(format!("{state}/status.json")),
+            "{platform:?}"
+        );
+        assert_eq!(
+            cfg.orders_dir,
+            PathBuf::from(format!("{state}/orders")),
+            "{platform:?}"
+        );
+        assert_eq!(
+            none.update_dir_in(&layout).to_str(),
+            Some(layout.update_dir().as_str())
+        );
+        assert_eq!(
+            none.orders_dir_in(&layout).to_str(),
+            Some(layout.orders_dir().as_str())
+        );
+        let given = ProxyArgs {
+            config: Some(path.clone()),
+            check: false,
+            update_dir: Some("/srv/u".into()),
+            orders_dir: Some("/srv/o".into()),
+        };
+        let cfg = handover_config(&given, &loaded, &layout);
+        assert_eq!(cfg.status_file, PathBuf::from("/srv/u/status.json"));
+        assert_eq!(cfg.orders_dir, PathBuf::from("/srv/o"));
+    }
+}
+
 /// Catches each way a file is refused being accepted, or refused without its path and its
 /// reason: unreadable, a directory, not text, no `[proxy]` table, an unknown key in the table,
-/// an unknown key outside it, a table whose own rules fail and a file over the size limit.
+/// a table whose own rules fail and a file over the size limit. (A key outside the table that
+/// this build does not know is not a refusal: the next test.)
 #[test]
 fn a_file_that_is_not_a_proxy_config_is_refused_with_its_path_and_reason() {
     let path = file("none", b"min_generation = 4\n");
@@ -142,16 +193,6 @@ fn a_file_that_is_not_a_proxy_config_is_refused_with_its_path_and_reason() {
         "unknown field",
     );
     refused(
-        &file("outside", format!("surprise = 1\n{PROXY}").as_bytes()),
-        "line 1: unknown field (the text is not shown)",
-    );
-    // The parser quotes the key it met; the message must not carry it.
-    let text = usage_of(load(&file(
-        "outside-redacted",
-        format!("surprise = 1\n{PROXY}").as_bytes(),
-    )));
-    assert!(!text.contains("surprise"), "{text}");
-    refused(
         &file("port", PROXY.replace("18000", "80").as_bytes()),
         "proxy: upstream.base_port must be 1024 to 65521 so both slots fit",
     );
@@ -159,6 +200,39 @@ fn a_file_that_is_not_a_proxy_config_is_refused_with_its_path_and_reason() {
         &file("big", &vec![b'#'; MAX_FILE_BYTES + 1]),
         "bytes; at most",
     );
+}
+
+/// Catches the proxy refusing to start because the file it shares with the installer holds a key
+/// or a value this build does not know. The file is also read by `setup` and the fetcher, which
+/// are closed (they must understand the whole file); the proxy checks three things in it (the
+/// `[proxy]` table and the update API's two numbers; `database` it reads on its own, leniently)
+/// and a package downgrade must not take the
+/// public port down over a source key a later build wrote. The keys it does read are still
+/// checked, and the table is still closed; a value typed into a key it reads is not repeated.
+///
+/// Mutants to plant: `loaded_from` back on the closed `InstallerToml::parse` (red: a usage error
+/// at line 1); the tolerant reader keeping the unread keys (the same); the bounds of
+/// `confirm_window_s` skipped.
+#[test]
+fn the_proxy_reads_the_keys_it_needs_and_ignores_the_rest_of_the_file() {
+    let future = "release_source = \"mirror-pull\"\nrelease_ca = 7\nfuture_key = true\n";
+    let text = format!("{future}confirm_window_s = 300\nfetch_timeout_s = 1200\n{PROXY}");
+    let loaded = load(&file("future-keys", text.as_bytes())).expect("valid");
+    assert_eq!(
+        (loaded.confirm_window_s, loaded.fetch_timeout_s),
+        (300, 1200)
+    );
+    assert_eq!(loaded.proxy.upstream.base_port, 18_000);
+    assert_eq!(loaded.proxy.hold_max_s, 15);
+    let low = format!("confirm_window_s = 10\n{PROXY}");
+    let refused = usage_of(load(&file("low-window", low.as_bytes())));
+    assert!(refused.contains("confirm_window_s"), "{refused}");
+    let typed = format!("confirm_window_s = \"surprise\"\n{PROXY}");
+    let refused = usage_of(load(&file("typed-window", typed.as_bytes())));
+    assert!(!refused.contains("surprise"), "{refused}");
+    let in_table = PROXY.replace("[proxy.upstream]", "[proxy.upstream]\nsurprise = 1");
+    let refused = usage_of(load(&file("typo-in-table", in_table.as_bytes())));
+    assert!(refused.contains("unknown field"), "{refused}");
 }
 
 /// Catches an activation rule loosened: the markers must name this process and exactly one
@@ -418,8 +492,8 @@ fn check_stops_at_the_table_and_a_run_needs_its_socket() {
     let path = file("run", PROXY.as_bytes());
     let args = |check| ProxyArgs {
         config: Some(path.clone()),
-        update_dir: path.with_file_name("update"),
-        orders_dir: path.with_file_name("orders"),
+        update_dir: Some(path.with_file_name("update")),
+        orders_dir: Some(path.with_file_name("orders")),
         check,
     };
     assert_eq!(run(&args(true), Path::new("/")), Ok(()));
@@ -439,8 +513,8 @@ fn a_root_that_is_not_absolute_is_a_usage_error() {
     let path = file("rel-root", PROXY.as_bytes());
     let args = ProxyArgs {
         config: Some(path.clone()),
-        update_dir: path.with_file_name("update"),
-        orders_dir: path.with_file_name("orders"),
+        update_dir: Some(path.with_file_name("update")),
+        orders_dir: Some(path.with_file_name("orders")),
         check: false,
     };
     let result = run(&args, Path::new("relative"));
@@ -827,8 +901,8 @@ fn proxy_reads_the_installer_toml_setup_wrote_on_the_platform() {
     let args = |config| ProxyArgs {
         config,
         check: true,
-        update_dir: "/nonexistent".into(),
-        orders_dir: "/nonexistent/orders".into(),
+        update_dir: Some("/nonexistent".into()),
+        orders_dir: Some("/nonexistent/orders".into()),
     };
     assert_eq!(
         config_path(&args(None), Platform::Linux),
@@ -902,8 +976,8 @@ fn check_refuses_a_file_without_a_database() {
     let args = ProxyArgs {
         config: Some(path),
         check: true,
-        update_dir: "/nonexistent".into(),
-        orders_dir: "/nonexistent/orders".into(),
+        update_dir: Some("/nonexistent".into()),
+        orders_dir: Some("/nonexistent/orders".into()),
     };
     assert!(usage_of(run(&args, Path::new("/"))).contains("state database"));
 }

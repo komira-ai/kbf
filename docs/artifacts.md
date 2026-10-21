@@ -5,8 +5,8 @@ only bytes CI built and attested. The workflow is
 [`.github/workflows/artifacts.yml`](../.github/workflows/artifacts.yml).
 
 What exists today is the build, the signing, the sums, the attestations (and, for each
-tarball, a provenance bundle a host verifies it with offline) on a push to `main` or to
-`feature/arch-v2`, and releases of those files ([`.github/workflows/release.yml`](../.github/workflows/release.yml)).
+tarball, a provenance bundle a host verifies it with offline) on a push to `main`,
+and releases of those files ([`.github/workflows/release.yml`](../.github/workflows/release.yml)).
 The deployment job that verifies an asset before it reaches a node and the node's own
 SHA-256 check are **planned** and not built yet
 ([mac-node-provisioning.md](design/mac-node-provisioning.md) sections 4.1 and 4.2).
@@ -19,19 +19,19 @@ build.
 ## Pull request labels
 
 A pull request runs the two jobs of `ci.yml` (`lint`, and `test` on the fast set) and nothing
-else; the full suite, the macOS jobs and the packages run on a push to `main` or
-`feature/arch-v2` (`beta.yml`). One label opts a pull request in to more, to spare the small
+else; the full suite, the macOS jobs and the packages run on a push to `main`
+(`beta.yml`). One label opts a pull request in to more, to spare the small
 macOS runner pool. Adding it to an open pull request starts a run.
 
 | Label | Effect |
 |---|---|
-| `needs-artifacts` | `artifacts.yml` builds, packages and sums the files for the pull request (never for the darwin-arm64 job of a pull request into `feature/arch-v2`, which no label enables: nothing is attested from a pull request, and the push to `feature/arch-v2` builds it) |
+| `needs-artifacts` | `artifacts.yml` builds, packages and sums the files for the pull request (without the label a pull request builds nothing; nothing is attested from a pull request, and the push to `main` builds and attests every file) |
 
 `artifacts.yml` runs on the `labeled` event so that the label starts something. Any label
 added to a pull request therefore starts a whole `artifacts` run, which replaces the pull
 request's earlier run: add labels together, before the run you want to keep. `native-macos`
 and `pkg-macos` run in `beta.yml` on every push and never on a pull request; that is pinned
-by `crates/kbf-it/tests/release_artifacts`.
+by `crates/kbf-integration-test/tests/release_artifacts`.
 
 ## What is built
 
@@ -68,7 +68,7 @@ The packages are the two Linux jobs' debs and the macOS job's `.pkg`:
 | `kbf-installer-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
 | `kbf-installer-<commit>-darwin-arm64.pkg` | the `darwin-arm64` job (`macos-15`, `cargo xtask pkg build`) | the `kbf-installer` of the tarball of the same name, its LaunchDaemon property list, the pinned darwin `gh` and a trust directory |
 
-The set above is pinned: `crates/kbf-it/tests/release_artifacts` fails a pull request
+The set above is pinned: `crates/kbf-integration-test/tests/release_artifacts` fails a pull request
 that drops one of these files from the workflow, packages one that is not listed, or
 leaves this table describing another set.
 
@@ -79,12 +79,8 @@ it as it does every macOS binary (below), but no CI job runs `kbf-deploy`'s test
 macOS: the bytes are known to start, and nothing more is claimed for them until a job
 tests the crate there.
 
-A pull request into `feature/arch-v2` builds only the Linux files: the macOS job and the
-sums are skipped there to spare the macOS runners, and the push to `feature/arch-v2`
-builds and attests all of them for its head. A newer push to `feature/arch-v2` never
-cancels a running build: it replaces only a run still waiting to start, so a recent
-attested release always finishes even under steady merges. Every commit on `main` keeps
-a run of its own.
+A running build is never cancelled by a newer push, so a recent attested release always
+finishes even under steady merges. Every commit on `main` keeps a run of its own.
 
 `<commit>` is the full SHA of the commit built (`GITHUB_SHA`: on `main`, the pushed
 commit; on a pull request, the test merge commit). Each tarball holds one release binary (`cargo build
@@ -131,7 +127,7 @@ words, in either order): one JSON object on one line of stdout, exit 0, the fiel
 sorted by name.
 
 ```text
-{"admin_protocol":1,"commit":"0123456789ab","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"state_schema":1,"version":"0.1.0"}
+{"admin_protocol":1,"commit":"0123456789ab","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"seq":812,"state_schema":1,"version":"0.1.0"}
 ```
 
 - `admin_protocol`: the version of the admin calls of `kbf --mode frontend` (`GET role`,
@@ -148,6 +144,17 @@ sorted by name.
 - `protocol` and `min_protocol`: the newest and the oldest `kbf.worker.v1` version the
   binary speaks. The daemon half speaks exactly `protocol`; the server half accepts
   `min_protocol` through `protocol`.
+- `seq`: the number of commits behind the commit built (`git rev-list --count HEAD`), so
+  two builds of one branch are put in order by it: a later commit has the larger number.
+  It is `0` when the build could not count them (a shallow checkout, which holds only part
+  of the history, or a source archive with no git), and nothing is newer than `0`: a build
+  that cannot count is never ranked above another. A build before this field prints none.
+  `artifacts.yml` checks out at the default shallow depth, so the assets it builds print
+  `seq: 0` until it checks out with `fetch-depth: 0`; no package is ranked by `seq` before
+  that. The strict reader of this line in `kbf-installer` (`deny_unknown_fields`) accepts
+  `seq` from this change on: an installer older than that refuses a kbf that prints it
+  (`version-unreadable`), so the installer package that reads `seq` ships before the kbf
+  that prints it.
 - `state_schema`: the schema version of the SQLite state file the binary creates and
   reads.
 - `version`: the package version.
@@ -176,19 +183,20 @@ renamed.
 | Event | What happens |
 |---|---|
 | Pull request, merge queue | A build check: every asset is built, signed, packaged and summed, and `SHA256SUMS` is checked. Nothing is attested, so nothing is published. |
-| Push to `main` or to `feature/arch-v2` | The same, then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`), an SBOM attestation for every tarball (`actions/attest-sbom`) and a build provenance attestation of each tarball alone, whose bundle it saves (artifact `bundles-linux` or `bundles-darwin-arm64`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`), and every tarball against its bundle, offline, for the commit (`--commit "$GITHUB_SHA"`). |
+| Push to `main` | The same, then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`), an SBOM attestation for every tarball (`actions/attest-sbom`) and a build provenance attestation of each tarball alone, whose bundle it saves (artifact `bundles-linux` or `bundles-darwin-arm64`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`), and every tarball against its bundle, offline, for the commit (`--commit "$GITHUB_SHA"`). |
 
-An attestation names the ref it was signed on: `refs/heads/main` or
-`refs/heads/feature/arch-v2`. The second is there so that a rehearsal of a deployment
-runs attested builds before they reach `main`; whoever verifies one asks for the branch
-they mean, and an asset attested on `feature/arch-v2` does not verify as `main`'s. A
-release (below) verifies as `main` and only takes the files of a push run on `main`, so
-a file built from the development branch is never released.
+An attestation names the ref it was signed on, and only `refs/heads/main` signs now.
+Until main became the only integration branch, pushes to a development branch,
+`feature/arch-v2`, were attested too (historic: those assets and packages still exist,
+and a host that trusts one asks for that branch with `--source-ref`; an asset attested on
+`feature/arch-v2` never verifies as `main`'s). A release (below) verifies as `main` and
+only takes the files of a push run on `main`, so a file built from any other branch is
+never released.
 
 Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write`, and only
-under the exact `if:` that limits it to a push to `main` or to `feature/arch-v2` (the
+under the exact `if:` that limits it to a push to `main` (the
 `verify-*` jobs run under the same one). The workflow lint
-(`crates/kbf-it/tests/workflows`) refuses those scopes in any other job, and in one
+(`crates/kbf-integration-test/tests/workflows`) refuses those scopes in any other job, and in one
 whose `if:` is any other spelling, so no pull request or merge-queue run holds a token
 that can sign an attestation. No repository code runs in
 an `attest-*` job and nothing is built there: it holds those scopes for the pinned signing
@@ -197,10 +205,10 @@ SHA, and that lint refuses one that is not.
 
 The attest job of a platform group names each tarball of the group and its SBOM, one `actions/attest-sbom` step per
 tarball, and runs only on a push to one of those two branches. So that a binary added to a build job cannot reach
-`main` without its step, the repository lint (`crates/kbf-it/tests/attested_assets`)
+`main` without its step, the repository lint (`crates/kbf-integration-test/tests/attested_assets`)
 reads the workflow's `cargo xtask package` lines and its attest steps on every pull
 request, and refuses a packaged tarball with no step pairing it with its own SBOM, or a
-step for a tarball no job packages. The lint `crates/kbf-it/tests/attested_bundles` does
+step for a tarball no job packages. The lint `crates/kbf-integration-test/tests/attested_bundles` does
 the same for the bundles: a packaged tarball with no provenance step of its own, no step
 that names its bundle, or a bundle that is not uploaded, downloaded by the verify job and
 by the release workflow, and required by `release locate`, is named in the pull request. It
@@ -310,7 +318,8 @@ refusing it unless:
   SHA-256 before use) and executable, `trusted_root.jsonl` is the Sigstore trusted root
   that `gh` fetched, and `installer.conf` is exactly `SOURCE_REFS=refs/heads/<branch>`,
   **the branch the package is attested on**: a package built on `main` trusts `main`
-  releases and one built on `feature/arch-v2` trusts that branch's, never the other.
+  releases; a package built on a branch other than `main` (historically `feature/arch-v2`)
+  trusts that branch's, never the other.
 
 It is attested like a tarball: build provenance (as one subject of the `SHA256SUMS`
 attestation, and alone, with its bundle `kbf-installer-<commit>-<platform>.deb.sigstore.json`
@@ -334,7 +343,7 @@ gh attestation verify kbf-installer-<commit>-linux-x86_64.deb \
   --repo komira-ai/kbf \
   --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
   --cert-oidc-issuer https://token.actions.githubusercontent.com \
-  --source-ref refs/heads/feature/arch-v2 \
+  --source-ref refs/heads/main \
   --source-digest <commit> \
   --predicate-type https://slsa.dev/provenance/v1 \
   --deny-self-hosted-runners
@@ -370,7 +379,7 @@ layout (`crates/kbf-installer/src/layout.rs`; a test compares the package's path
 
 `installer.conf` is exactly `SOURCE_REFS=refs/heads/<branch>`, **the branch the package is
 attested on**, as in the deb: a package built on `main` trusts `main` releases, one built on
-`feature/arch-v2` trusts that branch's. It sets nothing else, so `RUN_AS_UID` and `RUN_AS_GID` are
+a branch other than `main` (historically `feature/arch-v2`) trusts that branch's. It sets nothing else, so `RUN_AS_UID` and `RUN_AS_GID` are
 the installer's defaults (`nobody`). What is per host is not shipped: `kbf-installer setup`
 writes `installer.toml` (and `kbf.toml`, the tokens, the users) at adopt time.
 
@@ -401,7 +410,7 @@ gh attestation verify kbf-installer-<commit>-darwin-arm64.pkg \
   --custom-trusted-root trusted_root.jsonl \
   --repo komira-ai/kbf \
   --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
-  --source-ref refs/heads/feature/arch-v2 \
+  --source-ref refs/heads/main \
   --cert-oidc-issuer https://token.actions.githubusercontent.com \
   --source-digest <commit> \
   --predicate-type https://slsa.dev/provenance/v1 \
@@ -479,7 +488,7 @@ whose required reviewer approves it.
 The workflow can also be run by hand (`workflow_dispatch`) with a commit SHA and the
 annotated tag to check. Only `verify` runs then: every check above, and nothing is
 published (`publish` runs only for a pushed tag, and only `publish` holds a write scope).
-`crates/kbf-it/tests/release_workflow` holds the file to this: the verdict step, the
+`crates/kbf-integration-test/tests/release_workflow` holds the file to this: the verdict step, the
 `prod` environment, a `v*` tag push and a dispatch as the only triggers (no pull request),
 pinned actions and an empty top-level `permissions`. On every pull request
 into `main`, CI asks GitHub the same on-`main` question for the pull request's base
@@ -515,8 +524,8 @@ gh attestation verify kbf-<commit>-darwin-arm64.tar.gz \
 
 - `--signer-workflow` and `--source-ref`: without them, an attestation signed by any
   workflow of the repository, on any branch, would verify. Name the branch the asset
-  was built on: `refs/heads/main` above, `refs/heads/feature/arch-v2` for a build of
-  the development branch (`cargo xtask verify-assets attestations --source-ref`, which
+  was built on: `refs/heads/main` above, the branch's own ref for a build of another branch
+  (historically `refs/heads/feature/arch-v2`, the retired development branch) (`cargo xtask verify-assets attestations --source-ref`, which
   defaults to `main` and refuses a value that is not `refs/heads/<branch>`).
 - `--deny-self-hosted-runners`: the signing job ran on a GitHub-hosted runner.
 - For the SBOM attestation, add `--predicate-type https://cyclonedx.org/bom`.

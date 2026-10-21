@@ -277,3 +277,49 @@ fn encode_footer_is_the_writers_footer() {
     let records_len = usize::try_from(footer.records_len()).unwrap();
     assert_eq!(built, segment[records_len..]);
 }
+
+/// Catches: a trailer read that panics, or reads past the start, on fewer than
+/// `TRAILER_LEN` bytes (a range reader that got a short answer): every entry point that
+/// takes the trailer says how many bytes it needed and how many it had.
+#[test]
+fn a_tail_shorter_than_the_trailer_is_truncated() {
+    let short = || {
+        Some(SegmentError::Truncated {
+            needed: TRAILER_LEN as u64,
+            available: TRAILER_LEN as u64 - 1,
+        })
+    };
+    let tail = [0u8; TRAILER_LEN - 1];
+    assert_eq!(Footer::len_from_trailer(&tail).err(), short());
+    assert_eq!(Footer::parse(&tail, tail.len() as u64).err(), short());
+    assert_eq!(SegmentReader::open(&tail).err(), short());
+    assert_eq!(
+        Footer::len_from_trailer(&[]),
+        Err(SegmentError::Truncated {
+            needed: TRAILER_LEN as u64,
+            available: 0
+        })
+    );
+}
+
+/// Catches: reserved trailer bytes ignored, so a future layout that uses them is read
+/// as this one: a nonzero byte in any of the three is refused before anything else.
+#[test]
+fn reserved_trailer_bytes_must_be_zero() {
+    let segment = segment_of(&blobs());
+    let n = segment.len();
+    for at in [n - 19, n - 18, n - 17] {
+        let mut marked = segment.clone();
+        marked[at] = 1;
+        assert_eq!(
+            SegmentReader::open(&marked).err(),
+            Some(SegmentError::ReservedNotZero),
+            "byte {at}"
+        );
+        assert_eq!(
+            Footer::len_from_trailer(&marked[n - TRAILER_LEN..]),
+            Err(SegmentError::ReservedNotZero),
+            "byte {at}"
+        );
+    }
+}

@@ -16,19 +16,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use kbf_host::{HostExec, HostPath, Root};
 
 use crate::activate;
-use crate::backup;
 use crate::cli::{
-    BackupArgs, BootArgs, Cli, MigrateArgs, ReleaseSource, RestoreArgs, RunArgs, ServiceArgs, Verb,
+    BootArgs, Cli, MigrateArgs, ReleaseSource, RunArgs, ServiceArgs, UninstallArgs, Verb,
 };
 use crate::database::Database;
 use crate::exit::Exit;
 use crate::helper::cycle::{Config, Helper, HelperError};
+use crate::helper::fetcher_host::HostFetcher;
 use crate::helper::host_mode;
+use crate::helper::leases;
 use crate::helper::operator::{self, Operator};
 use crate::helper::restart::Restart;
 use crate::helper::serve::{FileIdentity, Flow, PASS_INTERVAL, Serve};
 use crate::helper::service::HostProcs;
-use crate::helper::{fetcher, leases};
 use crate::layout::{Layout, Platform};
 use crate::migrate;
 use crate::proxy_verb;
@@ -139,17 +139,26 @@ struct Target {
 /// The target of `run`: the service its flags name, else (Linux) the unit of the mode in the
 /// host's `kbf.toml`, which is how the one packaged `kbf-installer.service` serves every mode.
 /// A unit found that way on a frontend or all-in-one host reads the host's `installer.toml`
-/// (`/etc/kbf`, `/usr/local/etc/kbf` on a Mac) when `--installer-config` is not given (`setup`
-/// wrote it there); a Mac names its launchd label in the property list.
+/// (`/etc/kbf`) when `--installer-config` is not given (`setup` wrote it there). A Mac derives
+/// nothing: it is a daemon-only node whose property list always names its launchd label, so
+/// `run` there needs `--launchd-label`.
 fn target_of(root: &Path, args: &RunArgs) -> Result<Target, Failure> {
+    target_on(root, args, Platform::current())
+}
+
+/// [`target_of`] for the host of `platform`, which the layout (the `kbf.toml` it reads, the
+/// `installer.toml` it defaults to) is of: the platform is a parameter so that a test can say
+/// which platform's rule it pins.
+fn target_on(root: &Path, args: &RunArgs, platform: Platform) -> Result<Target, Failure> {
     if let Some(service) = args.named_service() {
         return Ok(Target {
             service,
             installer_config: args.installer_config.clone(),
         });
     }
-    let (layout, _) = host(root.to_path_buf()).map_err(usage)?;
-    let service = derived_service(&layout, layout.platform())?;
+    let root = Root::new(root.to_path_buf()).map_err(|e| usage(e.to_string()))?;
+    let layout = Layout::new(root, platform);
+    let service = derived_service(&layout, platform)?;
     let default = (args.installer_config.is_none() && service.runs_database_mode())
         .then(|| layout.installer_toml());
     let installer_config = args.installer_config.clone().or(default);
@@ -189,6 +198,15 @@ fn run(root: PathBuf, args: &RunArgs) -> Result<(), Failure> {
     run_from(root, args, &me, watch)
 }
 
+/// The `installer.toml` the fetcher reads: `--installer-config`, else the file `setup` writes
+/// on the host's platform.
+fn installer_toml_of(args: &RunArgs, layout: &Layout) -> HostPath {
+    match &args.installer_config {
+        Some(path) => path.clone(),
+        None => layout.installer_toml(),
+    }
+}
+
 /// The helper `run` drives: the host's, with the schema step of `--installer-config` attached
 /// when the flag is given.
 fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failure> {
@@ -203,23 +221,33 @@ fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failu
     let (layout, exec) = host(root)?;
     let platform = layout.platform();
     let cfg = Config {
-        update_dir: args.update_dir.clone(),
-        orders_dir: args.orders_dir.clone(),
+        update_dir: args.update_dir_in(&layout),
+        orders_dir: args.orders_dir_in(&layout),
         restart: target.service.restart(),
         window_secs: args.window_secs,
         starts: args.starts,
         min_activation_interval_secs: args.min_activation_interval_secs,
     };
     // The leases are those of the unit restarted after a swap, read below the host root's
-    // cgroup mount. The release fetcher is wired by a later change; until then an
-    // activation of a release that is not installed is refused.
+    // cgroup mount; the helper and each fetch's pipeline get a source of their own. The
+    // fetcher reads `installer.toml` (the flag's, else the host's own) at each fetch.
     let cgroups = HostPath::new(leases::CGROUP_ROOT).expect("CGROUP_ROOT is an absolute path");
-    let lease_source = leases::for_restart(&cfg.restart, &layout.join(&cgroups));
+    let cgroup_root = layout.join(&cgroups);
+    let lease_host = leases::LeaseHost {
+        cgroup_root,
+        layout: layout.clone(),
+    };
+    let lease_source = leases::for_restart(&cfg.restart, &lease_host);
+    let restart = cfg.restart.clone();
+    let installer_toml = installer_toml_of(args, &layout);
+    let fetcher = HostFetcher::on_host(layout.clone(), installer_toml, move || {
+        leases::for_restart(&restart, &lease_host)
+    });
     let mut helper = Helper::new(
         layout,
         exec,
         cfg,
-        Box::new(fetcher::NotWired),
+        Box::new(fetcher),
         lease_source,
         Box::new(HostProcs::new(platform)),
     );
@@ -295,8 +323,12 @@ fn probe_user<E: kbf_host::Exec>(
     exec: &E,
     name: &str,
     rehearsal: bool,
+    platform: Platform,
 ) -> Result<kbf_host::RunUser, Failure> {
-    let user = user_found(kbf_host::user::lookup(exec, name), name)?;
+    let user = user_found(
+        kbf_host::user::lookup_on(exec, name, platform.user_db()),
+        name,
+    )?;
     // The probe runs a binary nobody has trusted yet, and who it runs as is the whole of what
     // it is confined by (settings refuse root for the same reason). A rehearsal runs on the
     // caller's own tree as the caller, whoever that is.
@@ -325,6 +357,16 @@ fn user_found(
         })
 }
 
+/// Where the replay floor of a host whose releases come from `source` is seeded from. Only a
+/// frontend can be asked for it; a `url` host and a `bundled` one have none to ask, so the floor
+/// is `--min-generation` or, said aloud, nothing.
+fn floor_source(source: ReleaseSource) -> migrate::Source {
+    match source {
+        ReleaseSource::Url | ReleaseSource::Bundled => migrate::Source::Url,
+        ReleaseSource::Frontend => migrate::Source::Frontend,
+    }
+}
+
 /// `migrate`: the report to print, or why it stopped.
 fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String, Failure> {
     let rehearsal = root != Path::new("/");
@@ -333,9 +375,10 @@ fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String
     let (user, made) = probe_account(&mut exec, &layout, args, apply, rehearsal, owner)?;
     // A node that is not on a host with the user simply has no owner for its spool: the
     // migration says so and leaves the node's `kbf.toml` as it is.
-    let node_user = kbf_host::user::lookup(
+    let node_user = kbf_host::user::lookup_on(
         &exec,
         crate::setup::plan::service_user_name(crate::cli::Mode::Daemon),
+        layout.platform().user_db(),
     )
     .ok()
     .flatten();
@@ -351,10 +394,7 @@ fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String
         helper_unit: args.helper_unit.clone(),
         installer_unit: args.installer_unit.clone(),
         seed: migrate::Seed {
-            source: match args.release_source {
-                ReleaseSource::Url => migrate::Source::Url,
-                ReleaseSource::Frontend => migrate::Source::Frontend,
-            },
+            source: floor_source(args.release_source),
             min_generation: args.min_generation,
         },
         node_user,
@@ -384,6 +424,31 @@ fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String
     let mut shown = made;
     shown.push(report.to_string().trim_end().to_owned());
     Ok(shown.join("\n"))
+}
+
+/// `uninstall`: the report to print, or why it stopped. Nothing is looked up: the verb
+/// removes files and a job, and runs no program of the host's releases.
+fn uninstall_verb(root: PathBuf, apply: bool, args: &UninstallArgs) -> Result<String, Failure> {
+    let rehearsal = root != Path::new("/");
+    let (layout, mut exec) = host(root)?;
+    let u = migrate::Uninstall {
+        roots: migrate::Roots::new(layout.platform()),
+        layout,
+        owner_uid: owner_uid(rehearsal, rustix::process::geteuid().as_raw()),
+        installer_unit: args.installer_unit.clone(),
+        lock_wait: operator::LOCK_WAIT,
+    };
+    let mode = if apply {
+        kbf_host::Mode::Apply
+    } else {
+        kbf_host::Mode::DryRun
+    };
+    migrate::uninstall(&u, &mut exec, mode)
+        .map(|report| report.to_string().trim_end().to_owned())
+        .map_err(|e| Failure {
+            exit: e.exit(),
+            why: e.to_string(),
+        })
 }
 
 /// The account the version probe runs as, and the lines of the steps that made it. The first
@@ -416,7 +481,7 @@ fn probe_account<E: kbf_host::Exec>(
     {
         made = make_fetch_user(exec, platform)?;
     }
-    let user = probe_user(&*exec, name, rehearsal).map_err(|f| {
+    let user = probe_user(&*exec, name, rehearsal, platform).map_err(|f| {
         if !apply && name == standard && platform == Platform::MacOs {
             Failure {
                 why: format!(
@@ -532,91 +597,6 @@ fn quiesce(root: PathBuf) -> Result<(), Failure> {
     operator::quiesce(&layout, operator::LOCK_WAIT).map_err(Failure::from)
 }
 
-/// What `backup` and `restore` say when they work, on the error stream (standard output is
-/// for `--json`).
-fn progress(err: &mut dyn Write, text: &str) {
-    // A closed pipe is the reader's business; the exit code still tells.
-    let _ = writeln!(err, "kbf-installer: {text}");
-}
-
-/// `kbf-installer backup`: without `--apply` it says what it would do and touches nothing.
-fn run_backup(
-    tool: &dyn backup::Tool,
-    root: PathBuf,
-    apply: bool,
-    args: &BackupArgs,
-    err: &mut dyn Write,
-) -> Result<(), Failure> {
-    let settings = backup::Settings::read(&under(&root, &args.installer_config)?)?;
-    let dir = under(&root, &args.dir)?;
-    if !apply {
-        progress(
-            err,
-            &format!(
-                "backup: dry run: would dump the state database into {}, keeping the newest {}",
-                dir.display(),
-                settings.keep
-            ),
-        );
-        return Ok(());
-    }
-    let spec = backup::Spec {
-        dir: &dir,
-        url: &settings.url,
-        keep: settings.keep,
-        pg_dump: &args.pg_dump,
-        pg_restore: &args.pg_restore,
-    };
-    let done = backup::backup(tool, &spec, now())?;
-    progress(
-        err,
-        &format!(
-            "backup: wrote {} ({} bytes); removed {} old",
-            done.file.display(),
-            done.bytes,
-            done.removed.len()
-        ),
-    );
-    Ok(())
-}
-
-/// `kbf-installer restore`: without `--apply` it says what it would do and touches nothing.
-fn run_restore(
-    tool: &dyn backup::Tool,
-    root: PathBuf,
-    apply: bool,
-    args: &RestoreArgs,
-    err: &mut dyn Write,
-) -> Result<(), Failure> {
-    let url = match &args.database {
-        // A bare name: a scratch database on the configured server, for the configured role.
-        Some(name) if !name.contains(['/', ':']) => {
-            let settings = backup::Settings::read(&under(&root, &args.installer_config)?)?;
-            settings.target.url_for(name)?
-        }
-        Some(url) => {
-            crate::database::check_url("the --database flag", url)
-                .map_err(|e| Failure::from(e.to_string()))?;
-            url.clone()
-        }
-        None => backup::Settings::read(&under(&root, &args.installer_config)?)?.url,
-    };
-    let file = under(&root, &args.file)?;
-    if !apply {
-        progress(
-            err,
-            &format!(
-                "restore: dry run: would restore {} into the state database",
-                file.display()
-            ),
-        );
-        return Ok(());
-    }
-    backup::restore(tool, &args.pg_restore, &url, &file)?;
-    progress(err, &format!("restore: restored {}", file.display()));
-    Ok(())
-}
-
 /// The directory the host's paths are under: `/`, except in a build with the sandbox flag.
 fn root_of(cli: &Cli) -> PathBuf {
     #[cfg(feature = "test-sandbox")]
@@ -692,9 +672,14 @@ fn update_verb(
 /// How a `migrate` that went through ends: its report on `out`, as text, or with `--json` as
 /// one object. (A failure is said like every other verb's, by `dispatch`.)
 fn finish_migrate(json: bool, apply: bool, report: &str, out: &mut dyn Write) -> Exit {
+    finish_report("migrate", json, apply, report, out)
+}
+
+/// [`finish_migrate`] for the verb `verb`, which reports the same way (`uninstall`).
+fn finish_report(verb: &str, json: bool, apply: bool, report: &str, out: &mut dyn Write) -> Exit {
     // A closed pipe is the reader's business; the exit code still tells.
     let _ = if json {
-        let object = serde_json::json!({"verb": "migrate", "apply": apply, "message": report});
+        let object = serde_json::json!({"verb": verb, "apply": apply, "message": report});
         writeln!(out, "{object}")
     } else {
         writeln!(out, "{report}")
@@ -730,8 +715,6 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
             serde_json::json!({"verb": name, "error": "needs_root", "euid": euid}),
         );
     }
-    // What `backup` and `restore` report when they work; written once `say` is done with `err`.
-    let mut said = Vec::new();
     // The old helper and the installer never both manage one host: while the old layout's
     // state is the host's and no migration finished, the verbs that manage it wait.
     // (A verb that is not built yet only says so; the PR that builds it calls this first.)
@@ -770,6 +753,10 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
             Ok(report) => return finish_migrate(cli.json, cli.apply, &report, out),
             Err(failure) => Err(failure),
         },
+        Verb::Uninstall(args) => match uninstall_verb(root_of(cli), cli.apply, args) {
+            Ok(report) => return finish_report(name, cli.json, cli.apply, &report, out),
+            Err(failure) => Err(failure),
+        },
         Verb::Confirm(n) => operate(root_of(cli), cli.apply, n.service.restart(), |o| {
             o.confirm(&n.id.to_string())
         }),
@@ -796,12 +783,6 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
                 }
             };
         }
-        Verb::Backup(args) => {
-            run_backup(&backup::Process, root_of(cli), cli.apply, args, &mut said)
-        }
-        Verb::Restore(args) => {
-            run_restore(&backup::Process, root_of(cli), cli.apply, args, &mut said)
-        }
         other => {
             let phase = other.built_by().unwrap_or("?");
             return say(
@@ -817,10 +798,7 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         }
     };
     match result {
-        Ok(()) => {
-            let _ = err.write_all(&said);
-            Exit::Ok
-        }
+        Ok(()) => Exit::Ok,
         Err(Failure { exit, why }) => say(
             exit,
             format!("kbf-installer: {why}"),

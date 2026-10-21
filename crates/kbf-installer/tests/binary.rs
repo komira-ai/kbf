@@ -16,7 +16,8 @@ fn root(name: &str) -> PathBuf {
     // The platform the binary was built for, as the binary lays the host out.
     let (_, dir) =
         kbf_installer::testkit::host_root_on(&format!("helper-bin-{name}"), Platform::current());
-    fs::create_dir_all(dir.join("var/lib/kbf-installer/orders")).expect("order spool");
+    let host = layout(&dir);
+    kbf_installer::testkit::mkdirs(&dir, &host.join(&host.orders_dir()), 0o755);
     dir
 }
 
@@ -44,14 +45,13 @@ fn helper(root: &Path, args: &[&str]) -> Output {
 }
 
 fn status(root: &Path) -> serde_json::Value {
-    let bytes = fs::read(root.join("var/lib/kbf-installer/status.json")).expect("status.json");
+    let bytes = fs::read(in_state_dir(root, "status.json")).expect("status.json");
     serde_json::from_slice(&bytes).expect("json")
 }
 
 /// Catches a helper that cannot do one pass of its own: it writes a world-readable
 /// status.json and exits 0 (here as a non-root user, so with the installer's refusal); with an order it cannot
-/// carry out (the binary has no fetcher yet, and no cgroup of the unit's leases exists on
-/// this root), the pass ends and the refusal is the node's to read, not a crash.
+/// carry out (no cgroup of the unit's leases exists on this root), the pass ends and the refusal is the node's to read, not a crash.
 ///
 /// Mutant seen red: `leases::NotWired` left in `build_helper` (the refusal says there is no
 /// lease source wired in, not that the unit's cgroup is missing).
@@ -67,7 +67,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
         })
         .expect("state");
     let release = host.join(&host.release_dir(&c(A)));
-    fs::create_dir_all(&release).expect("release");
+    kbf_installer::testkit::mkdirs(&root, &release, 0o755);
     fs::write(release.join("kbf"), b"x").expect("binary");
 
     let run = ["run", "--passes", "1", "--unit", "kbf-daemon.service"];
@@ -88,7 +88,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
     );
     assert_eq!(status(&root)["installed_commit"], A);
     use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(root.join("var/lib/kbf-installer/status.json"))
+    let mode = fs::metadata(in_state_dir(&root, "status.json"))
         .expect("meta")
         .permissions()
         .mode();
@@ -96,7 +96,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
 
     // An activation: the binary reads the leases of the daemon's unit from its cgroup, and
     // this scratch root has none, so it cannot tell and the order is refused with that
-    // reason (fail closed), and the pass ends. (It has no fetcher yet either.)
+    // reason (fail closed), and the pass ends before any fetch.
     let record = kbf_update::OrderRecord {
         order_id: 2,
         epoch: 1,
@@ -125,8 +125,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
         }),
     };
     fs::write(
-        root.join("var/lib/kbf-installer/orders")
-            .join(record.file_name()),
+        host.join(&host.orders_dir()).join(record.file_name()),
         record.to_bytes().expect("bytes"),
     )
     .expect("record");
@@ -156,7 +155,7 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
     let host = layout(&root);
     for commit in [A, B] {
         let dir = host.join(&host.release_dir(&c(commit)));
-        fs::create_dir_all(&dir).expect("release");
+        kbf_installer::testkit::mkdirs(&root, &dir, 0o755);
         fs::write(dir.join("kbf"), b"x").expect("binary");
     }
     let lock = Locked::acquire(&host).expect("lock");
@@ -318,8 +317,8 @@ fn the_operator_verbs_exit_by_the_contract() {
         .write(&state(None))
         .expect("state");
     for dir in [A, B] {
-        let d = root.join("var/lib/kbf-installer/releases").join(dir);
-        fs::create_dir_all(&d).expect("release");
+        let d = host.join(&host.releases()).join(dir);
+        kbf_installer::testkit::mkdirs(&root, &d, 0o755);
         fs::write(d.join("kbf"), b"x").expect("binary");
     }
     let code = |verb: &[&str]| helper(&root, verb).status.code();
@@ -358,7 +357,7 @@ fn the_operator_verbs_exit_by_the_contract() {
         .expect("there");
     assert_eq!(kept.current, Some(c(B)), "a dry run moves nothing");
     assert_eq!(code(&["gc"]), Some(0));
-    assert!(root.join("var/lib/kbf-installer/releases").join(A).exists());
+    assert!(host.join(&host.releases()).join(A).exists());
 }
 
 /// Catches the gate in front of the verbs being absent from the shipped binary (the unit tests
@@ -481,7 +480,7 @@ fn a_service_whose_file_was_replaced_says_so_and_ends_when_the_new_one_cannot_st
         }
     }
     let child = child.expect("starts");
-    let status_file = root.join("var/lib/kbf-installer/status.json");
+    let status_file = in_state_dir(&root, "status.json");
     for _ in 0..400 {
         if status_file.exists() {
             break;
