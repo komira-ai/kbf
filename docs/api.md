@@ -1976,7 +1976,7 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
   `min_serving` and the limits in seconds), else `null`; `paused` is its flag (false without
   a row).
 - `POST /v1/update/desired` with `{"commit": "<40 lowercase hex>"}` and, optionally,
-  `"expect_generation": N` (JSON content type, the write gates) offers the commit. With
+  `"expect_generation": N` and `"rollback": bool` (JSON content type, the write gates) offers the commit. With
   `expect_generation` it is a compare-and-set: it writes only if the desired release is at
   generation N (0 before any offer), else `409` naming both and nothing is written. `409` unless the release store holds some platform of it complete
   (see above); `400` for a body that is not exactly that. The answer is the desired release.
@@ -1984,6 +1984,22 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
   not a new run; a rollback is the older commit offered the same way and gets a higher
   generation. Generations increase, but may skip numbers: each write that loses a race has
   already drawn a counter value.
+  **R4, the age check.** Before the write, the offer is compared with the build of this server
+  (`seq` of `kbf --version --json`, the number of commits behind its commit), using the `seq`
+  the release store holds for the commit. `409` naming both builds, and nothing is written, when
+  the target's `seq` is below the server's (`older`), when it equals the server's and the commit
+  is another one (`seq_tie`: two branches cannot be ordered; a repeat of the running commit is
+  allowed; the commits are compared in full when the build knows its own, else by the 12
+  digits it has as a prefix), or when the server's `seq` is known and the target's is not (`seq_unknown`: a
+  release stored before `seq` was recorded). A server built where commits could not be counted
+  (`seq` 0) does not apply R4. The release store does not record `seq` yet, so today R4 allows
+  every offer. A release naming the running build's own commit is never refused by R4, and the
+  store is not asked about it. The answer is `{"error": "<code>: ...", "code": "older" | "seq_tie" | "seq_unknown"}`;
+  the other `409`s of this route have no `code`.
+  `"rollback": true` (optional, default false; spelled as `rollback` of the proxy's
+  `POST /v1/update/frontend`) skips this check and no other: the release must still be complete,
+  `expect_generation` still applies, and so will the own-commit rule of `source=staged`.
+  The codes `older`, `seq_unknown` and `seq_tie` are stable: a client may key on them.
 - `POST /v1/update/pause` and `POST /v1/update/resume` (the write gates, no body) set `paused` of the policy
   row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
   needed, and an offer leaves the flag as it is: while set, no host is started.

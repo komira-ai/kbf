@@ -853,7 +853,4 @@ pub fn main() -> ExitCode {
 }
 
 #[cfg(test)]
-mod build_seq;
-
-#[cfg(test)]
 mod tests;

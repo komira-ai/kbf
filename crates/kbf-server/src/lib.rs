@@ -76,6 +76,8 @@ pub mod api_client;
 pub mod blobs;
 #[cfg(test)]
 mod build_commit;
+#[doc(hidden)]
+pub mod build_seq;
 pub mod cold_apply;
 pub mod config;
 pub mod drain;
@@ -179,6 +181,19 @@ pub use worker::WorkerService;
 /// including the CI-only `KBF_BUILD_COMMIT_OVERRIDE`).
 pub const BUILD_COMMIT: &str = env!("KBF_BUILD_COMMIT");
 
+/// The commit the server was built from in full: 40 lowercase hex digits, or the empty text
+/// when the build did not know it (no git checkout, or a `KBF_BUILD_COMMIT_OVERRIDE` stamp).
+/// [`BUILD_COMMIT`] is its first 12 digits when both are known.
+pub const BUILD_COMMIT_FULL: &str = env!("KBF_BUILD_COMMIT_FULL");
+
+/// The number of commits behind the commit the server was built from (`git rev-list --count
+/// HEAD`), or 0 when the build could not count them (a shallow clone, no git): the rule is
+/// `src/build_seq.rs`, and nothing is newer than 0. `kbf --version --json` prints it as `seq`.
+pub const BUILD_SEQ: u64 = match u64::from_str_radix(env!("KBF_BUILD_SEQ"), 10) {
+    Ok(seq) => seq,
+    Err(_) => build_seq::UNKNOWN,
+};
+
 /// The server's version as it reports it in `--version`, the start line and the
 /// `server` field of `GET /v1/nodes`: the package version, `+`, and [`BUILD_COMMIT`].
 pub const SERVER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT"));
@@ -187,7 +202,7 @@ pub const SERVER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("K
 mod tests {
     use std::process::Command;
 
-    use super::{BUILD_COMMIT, SERVER_VERSION};
+    use super::{BUILD_COMMIT, BUILD_COMMIT_FULL, SERVER_VERSION};
 
     /// `git rev-parse --short=12 HEAD` in this crate's checkout.
     fn git_head() -> String {
@@ -216,5 +231,23 @@ mod tests {
         assert_eq!(commit, expected);
         assert_eq!(commit.len(), 12, "{commit}");
         assert!(commit.bytes().all(|b| b.is_ascii_hexdigit()), "{commit}");
+    }
+
+    /// Catches: a full commit that is not the commit built, or one that disagrees with the
+    /// 12 digits: it is `git rev-parse HEAD` when nothing was stamped, else unknown.
+    #[test]
+    fn the_full_commit_is_the_one_built_or_unknown() {
+        let head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git runs");
+        let head = String::from_utf8(head.stdout)
+            .expect("UTF-8")
+            .trim()
+            .to_owned();
+        let stamped = option_env!("KBF_BUILD_COMMIT_OVERRIDE").is_some();
+        let want = if stamped { "" } else { head.as_str() };
+        assert_eq!(BUILD_COMMIT_FULL, want);
+        assert!(BUILD_COMMIT_FULL.is_empty() || BUILD_COMMIT_FULL.starts_with(BUILD_COMMIT));
     }
 }

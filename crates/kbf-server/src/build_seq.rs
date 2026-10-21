@@ -1,6 +1,7 @@
 //! Which commit count `build.rs` embeds as `KBF_BUILD_SEQ`, the `seq` of `kbf --version
-//! --json`. The build script includes this file by path, and the library compiles it only for
-//! its unit tests, so the rule the build applies is the rule the tests check.
+//! --json` and [`crate::BUILD_SEQ`]. The build script includes this file by path, and the
+//! library compiles it too (`kbf-cli` tests the live checkout against [`choose`]), so the
+//! rule the build applies is the rule the tests check.
 //!
 //! `seq` is the number of commits behind `HEAD` (`git rev-list --count HEAD`). It grows with
 //! every commit on a branch, so two builds of one branch can be put in order by it. It is right
