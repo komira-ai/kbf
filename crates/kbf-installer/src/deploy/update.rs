@@ -66,7 +66,7 @@ pub fn run(args: &UpdateArgs, out: &mut dyn Write, err: &mut dyn Write) -> Exit 
 
 /// The client and the options for `args`, or what is wrong with them. `rng` is the random
 /// source of a request id the caller did not give.
-fn plan(
+pub(super) fn plan(
     args: &UpdateArgs,
     rng: fn(usize) -> Result<Vec<u8>, String>,
 ) -> Result<(Https, Options), String> {

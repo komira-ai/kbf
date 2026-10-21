@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use bytes::Bytes;
 use hyper::{Request, Response};
+use kbf_update::Source;
 use serde::Deserialize;
 
 use super::model::{NewChild, OldChild, UpdateId};
@@ -22,6 +23,15 @@ pub trait OrderWriter: Send {
         verb: Verb,
         commit: &CommitId,
         window_s: u32,
+    ) -> Result<Locator, OrderError>;
+
+    /// A `frontend_update` for `commit` that takes its release from `source`: the record names
+    /// it unless it is `fetch`, which a record without the key means.
+    fn write_update(
+        &mut self,
+        commit: &CommitId,
+        window_s: u32,
+        source: Source,
     ) -> Result<Locator, OrderError>;
 }
 
@@ -172,6 +182,8 @@ pub struct RunningUpdate {
     /// How many nodes the new child has begun to update.
     pub nodes_updated: u32,
     pub failure: Option<Failure>,
+    /// Where the update's release came from.
+    pub source: Source,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -194,6 +206,8 @@ pub struct UpdateSpec {
     pub to: CommitId,
     pub nodes: bool,
     pub rollback: bool,
+    /// Where the release came from; the order for the nodes names the same.
+    pub source: Source,
     pub facts: StagedFacts,
     pub order: Locator,
 }

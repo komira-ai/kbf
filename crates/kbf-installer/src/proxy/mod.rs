@@ -165,6 +165,8 @@ mod gate_tests;
 #[cfg(test)]
 mod migrator_tests;
 #[cfg(test)]
+mod nodes_tests;
+#[cfg(test)]
 mod orders_tests;
 #[cfg(test)]
 mod reconcile_tests;

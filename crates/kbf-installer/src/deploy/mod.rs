@@ -54,6 +54,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use kbf_gate::OfferDoc;
+use kbf_update::Source;
 use serde_json::Value;
 
 use crate::CommitId;
@@ -135,6 +136,13 @@ pub struct Options {
     /// Ask the new frontend to update the nodes once it has baked (the update API's `nodes`).
     /// `deploy` does; `update` leaves it to the caller.
     pub nodes: bool,
+    /// Where the frontend's release comes from: fetched from the installer's configured
+    /// source (what every update has meant so far), or the one this host's package carries.
+    /// The request names it only when it is `staged`; `deploy` always fetches.
+    pub source: Source,
+    /// This host fetches nothing: its `installer.toml` says `release_source = "bundled"`. A
+    /// `deploy` can only fetch, so on such a host it is refused before the bundle is read.
+    pub bundled: bool,
     pub node_timeout: Duration,
     /// The whole frontend step: the POST (and its retries) and the wait for `done`. It
     /// includes the new frontend's bake.
@@ -165,6 +173,8 @@ impl Options {
             request_id,
             apply: false,
             nodes: true,
+            source: Source::Fetch,
+            bundled: false,
             node_timeout: Duration::from_secs(1800),
             handover_timeout: Duration::from_secs(3600),
             smoke_timeout: Duration::from_secs(60),

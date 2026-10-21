@@ -8,11 +8,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use clap::Parser;
+use kbf_update::Source;
 use serde_json::{Value, json};
 
 use super::api::{Operator, Reply, Request};
 use super::observe::{NoObserve, Observe};
-use super::update::{finish, installer_exit, request_id, run};
+use super::update::{finish, installer_exit, plan, request_id, run};
 use super::{Check, Clock, Env, NoCheck, NoProbe, NoSmoke, Options};
 use crate::cli::{Cli, Verb};
 use crate::exit::Exit;
@@ -124,6 +125,11 @@ fn options(nodes: bool) -> Options {
 
 /// Run `update` against `api`; the exit and the one summary line.
 fn go(api: &Api, nodes: bool) -> (Exit, Value) {
+    go_with(api, &options(nodes))
+}
+
+/// [`go`] with the options the test chose.
+fn go_with(api: &Api, options: &Options) -> (Exit, Value) {
     let clock = Clk(Cell::new(0));
     let check = NoCheck;
     let env = Env {
@@ -135,7 +141,7 @@ fn go(api: &Api, nodes: bool) -> (Exit, Value) {
         probe: &NoProbe,
     };
     let mut out = Vec::new();
-    let exit = finish(&env, &options(nodes), &mut out);
+    let exit = finish(&env, options, &mut out);
     let text = String::from_utf8(out).expect("text");
     assert_eq!(text.lines().count(), 1, "one summary line: {text:?}");
     (exit, serde_json::from_str(&text).expect("the line is JSON"))
@@ -386,4 +392,137 @@ fn a_proxy_that_does_not_answer_ends_the_run_with_one_summary_line_and_exit_one(
 fn the_update_verb_has_no_frontend_to_observe() {
     let why = NoObserve.resolve(None).err().expect("no frontend");
     assert_eq!(why, "this verb observes no frontend");
+}
+
+/// The options of an update whose release is the one the host's package carries.
+fn staged(nodes: bool) -> Options {
+    Options {
+        source: Source::Staged,
+        ..options(nodes)
+    }
+}
+
+/// The status of update `upd-1`, failed at `step` for `reason`.
+fn failed_at(step: &str, reason: &str) -> Reply {
+    reply(
+        200,
+        json!({
+            "update_id": "upd-1", "from": A, "to": B, "phase": "failed", "since": 1,
+            "active_slot": "b", "restart_pending": false, "rollback_allowed": false,
+            "rollback_blocked_reason": null, "old": null, "new": null,
+            "failure": {"step": step, "reason": reason},
+        }),
+    )
+}
+
+/// Catches a staged update whose request does not say so, which the proxy would take for a
+/// fetch and answer by fetching. The request of an update that fetches is held to its four
+/// keys by `a_done_update_exits_zero_and_asks_for_the_frontend_only_by_default`, which a
+/// client that always sent `source` breaks (and so would every proxy that has not restarted
+/// since its package was upgraded).
+///
+/// Mutants planted: the source never sent; `fetch` sent as a word.
+#[test]
+fn a_staged_update_names_its_source_in_the_request() {
+    let api = Api::new(vec![accepted()], vec![status("done")]);
+    let (exit, _) = go_with(&api, &staged(false));
+    assert_eq!(exit, Exit::Ok);
+    let want = json!({
+        "commit": B, "request_id": ID, "nodes": false, "rollback": false, "source": "staged",
+    });
+    assert_eq!(api.posted(), [want]);
+}
+
+/// Catches the new refusals of the API falling into the arms made for the old ones: today any
+/// other 409 is a busy frontend (exit 4, try again) and any 422 an incomplete release. A
+/// source the host refuses, or a package that carries no such release, is not something a
+/// second try fixes: exit 3, under the API's own code.
+///
+/// Mutants planted: the 409 arm deleted (exit 4); the 422 arm deleted (reason
+/// `release_incomplete`).
+#[test]
+fn a_source_the_api_refuses_exits_three_under_its_own_reason() {
+    for (code, reason) in [(409, "source_refused"), (422, "not_staged")] {
+        let api = Api::new(vec![refused(code, reason)], vec![]);
+        let (exit, line) = go_with(&api, &staged(false));
+        assert_eq!(exit, Exit::Refused, "{reason}: {line}");
+        assert_eq!(line["exit"], 3, "{reason}");
+        assert_eq!(line["reason"], reason);
+    }
+}
+
+/// Catches an update that ended `failed` at the order for the nodes exiting as any failure:
+/// the frontend was swapped and the nodes were not told, and the child said why. It is exit 3
+/// with the step's own reason and the child's words in the detail; any other step is still
+/// exit 1.
+///
+/// Mutants planted: the step not looked at (exit 1, `frontend_failed`); the step taken for a
+/// success (exit 0).
+#[test]
+fn an_update_that_failed_at_the_order_for_the_nodes_exits_three_with_the_childs_words() {
+    let api = Api::new(
+        vec![accepted()],
+        vec![failed_at("nodes", "not_own: not the child's own release")],
+    );
+    let (exit, line) = go_with(&api, &options(true));
+    assert_eq!(exit, Exit::Refused, "{line}");
+    assert_eq!(line["exit"], 3);
+    assert_eq!(line["reason"], "nodes_refused");
+    let detail = line["detail"].as_str().expect("detail");
+    assert!(detail.contains("not_own"), "{detail}");
+
+    let api = Api::new(vec![accepted()], vec![failed_at("confirm", "x")]);
+    let (exit, line) = go_with(&api, &options(true));
+    assert_eq!(
+        (exit, &line["reason"]),
+        (Exit::Failed, &json!("frontend_failed"))
+    );
+}
+
+/// Catches `--source` read as anything but the two words, or dropped on the way to the
+/// request: the flag defaults to `fetch`, takes `fetch` and `staged`, and no other word.
+///
+/// Mutants planted: the default `staged`; any word read as `fetch`.
+#[test]
+fn the_source_flag_is_fetch_or_staged_and_defaults_to_fetch() {
+    assert_eq!(args(&["--api", "127.0.0.1:8443"]).source, Source::Fetch);
+    let staged = args(&["--api", "127.0.0.1:8443", "--source", "staged"]);
+    assert_eq!(staged.source, Source::Staged);
+    let fetch = args(&["--api", "127.0.0.1:8443", "--source", "fetch"]);
+    assert_eq!(fetch.source, Source::Fetch);
+    for bad in ["bogus", "Staged", ""] {
+        let mut full = vec!["kbf-installer", "update", "--commit", B, "--frontend"];
+        full.extend_from_slice(&["--api", "127.0.0.1:8443", "--source", bad]);
+        assert!(Cli::try_parse_from(full).is_err(), "{bad:?}");
+    }
+}
+
+/// Catches the flag stopping short of the request: the options the verb builds carry the
+/// source the flag named.
+///
+/// Mutant planted: `options.source` left at its default.
+#[test]
+fn the_source_of_the_flags_is_the_source_of_the_options() {
+    let token = token_in("update-source");
+    let token = token.to_str().expect("utf8");
+    let base = ["--api", "127.0.0.1:8443", "--token-file", token];
+    let (_, fetching) = plan(&args(&base), fixed_random).expect("a plan");
+    assert_eq!(fetching.source, Source::Fetch);
+    let mut named = base.to_vec();
+    named.extend_from_slice(&["--source", "staged"]);
+    let (_, packaged) = plan(&args(&named), fixed_random).expect("a plan");
+    assert_eq!(packaged.source, Source::Staged);
+}
+
+/// Catches a staged update that asks for the nodes getting as far as the proxy: the order for
+/// the nodes does not name its source yet, so the flags are refused (exit 2) before the token
+/// is read or anything is sent, naming both flags.
+///
+/// Mutant planted: the refusal dropped (the run goes on to read the token file, which is not
+/// there).
+#[test]
+fn a_staged_update_takes_no_nodes_yet_and_the_flags_say_so_before_anything_is_read() {
+    let why = usage(&["--api", "127.0.0.1:8443", "--source", "staged", "--nodes"]);
+    assert!(why.contains("--source staged"), "{why}");
+    assert!(why.contains("--nodes"), "{why}");
 }

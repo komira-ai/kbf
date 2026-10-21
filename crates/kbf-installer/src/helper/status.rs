@@ -36,6 +36,10 @@ struct File<'a> {
     state: &'static str,
     refusal: &'a str,
     acked_order_id: u64,
+    /// The id of the order `refusal` answers; left out when the refusal is not one order's (or
+    /// there is none), so the status of a host that refused nothing reads as it always did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refused_order_id: Option<u64>,
     staged: Option<Staged>,
     envoy: Envoy,
     /// The word `installer.toml` holds for `release_source`; left out when the file could not
@@ -101,6 +105,7 @@ pub fn render_with(state: &State, memory: &Memory, unverified: &[CommitId]) -> V
         state: word(state, memory),
         refusal: &memory.refusal,
         acked_order_id: memory.acked_order_id.max(memory.last_acted_id),
+        refused_order_id: None,
         staged,
         envoy: Envoy {
             current: None,

@@ -21,7 +21,7 @@ use std::time::Duration;
 use kbf_installer::CommitId;
 use kbf_installer::deploy::api::{Https, Operator, Reply, Request, Trust};
 use kbf_installer::proxy::api::model::{StatusBody, UpdateId, UpdateRequest as ApiRequest};
-use kbf_installer::proxy::model::Phase;
+use kbf_installer::proxy::model::{Phase, Source};
 use kbf_proxy::config::ProxyConfig;
 use kbf_proxy::control::{UpdateHandler, UpdateReply, UpdateRequest};
 use kbf_proxy::slot::Slot;
@@ -239,6 +239,7 @@ fn a_deploy_reaches_the_update_api_and_the_active_child_through_the_proxy() {
         request_id: "deploy-test".to_owned(),
         nodes: true,
         rollback: false,
+        source: Source::Fetch,
     };
     let posted = send(&https, &Request::post_json("/v1/update/frontend", &body));
     assert_eq!(

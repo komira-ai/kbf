@@ -78,6 +78,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use kbf_update::Source;
+
 use super::api::traits::{Retired, Supervisor, SupervisorError, SupervisorStatus, UpdateSpec};
 use super::model::{
     Failure, Halt, Intent, Mode, Phase, Plan, ProcIdent, Request, Slot, Step, Timing,
@@ -377,6 +379,7 @@ impl Supervisor for SwapSupervisor {
             to: spec.to.clone(),
             nodes: spec.nodes,
             rollback: spec.rollback,
+            source: Source::Fetch,
             old_slot: state.active,
             timing: self.config.timing,
         };

@@ -15,7 +15,7 @@ use kbf_update::record::{file_name, parse_file_name};
 use kbf_update::{MAX_RECORDS, RecordError, Verb as RecordVerb};
 
 use super::api::traits::OrderWriter;
-use super::model::{Locator, Verb};
+use super::model::{Locator, Source, Verb};
 use super::orders::{EPOCH, MAX_PENDING, OrderSpool, SpoolError, record};
 use super::record::{Durable, Fsync};
 use crate::CommitId;
@@ -685,6 +685,7 @@ fn a_record_the_reader_would_refuse_is_not_built() {
         verb,
         commit: commit('a'),
         window_s: 0,
+        source: Source::Fetch,
     };
     let err = record(&locator(Verb::Activate), RecordVerb::Activate).unwrap_err();
     assert!(

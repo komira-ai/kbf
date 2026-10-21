@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use hyper::StatusCode;
+use kbf_update::Source;
 
 use super::idempotency::{Entry, Idempotency, Waiting};
 use super::model::{
@@ -222,6 +223,7 @@ struct Staging {
     to: CommitId,
     nodes: bool,
     rollback: bool,
+    source: Source,
     order: Locator,
     phase: Phase,
     since: u64,
@@ -236,6 +238,7 @@ struct Ended {
     phase: Phase,
     since: u64,
     failure: Option<Failure>,
+    source: Source,
 }
 
 enum Active {
@@ -299,6 +302,7 @@ impl Core {
             to: entry.commit,
             nodes: entry.nodes,
             rollback: entry.rollback,
+            source: Source::Fetch,
             order: waiting.order,
             phase: Phase::Accepted,
             since: waiting.since_s,
@@ -334,7 +338,13 @@ impl Core {
         let entry = self
             .parts
             .requests
-            .insert(&req.request_id, &req.commit, req.nodes, req.rollback)
+            .insert(
+                &req.request_id,
+                &req.commit,
+                req.nodes,
+                req.rollback,
+                Source::Fetch,
+            )
             .map_err(|e| ApiError::unavailable("state_unwritable", e.to_string()))?;
         self.parts.hook.at(CrashPoint::AfterRequestSaved)?;
         self.launch(&entry, status.installed_commit)
@@ -434,11 +444,7 @@ impl Core {
         let order = self
             .parts
             .orders
-            .write(
-                Verb::FrontendUpdate,
-                &entry.commit,
-                self.parts.config.window_s,
-            )
+            .write_update(&entry.commit, self.parts.config.window_s, Source::Fetch)
             .map_err(|e| ApiError::unavailable("order_unwritable", e.to_string()))?;
         let since = self.parts.clock.wall_s();
         let deadline_s = since.saturating_add(self.parts.config.staging_deadline.secs());
@@ -455,6 +461,7 @@ impl Core {
             to: entry.commit.clone(),
             nodes: entry.nodes,
             rollback: entry.rollback,
+            source: Source::Fetch,
             order,
             phase: Phase::Accepted,
             since,
@@ -568,6 +575,7 @@ impl Core {
                     to: st.to.clone(),
                     nodes: st.nodes,
                     rollback: st.rollback,
+                    source: st.source,
                     facts: facts.clone(),
                     order: st.order.clone(),
                 };
@@ -642,6 +650,7 @@ impl Core {
             phase,
             since: self.parts.clock.wall_s(),
             failure,
+            source: st.source,
         }))
     }
 
@@ -662,6 +671,7 @@ impl Core {
             old: None,
             new: None,
             failure: None,
+            source: Source::Fetch,
         };
         match &self.active {
             Active::Staging(s) => {
@@ -671,6 +681,7 @@ impl Core {
                 body.phase = Some(s.phase);
                 body.since = Some(s.since);
                 body.rollback_blocked_reason = Some(RollbackBlocked::NotSwitched);
+                body.source = s.source;
             }
             Active::Ended(e) => {
                 body.update_id = Some(e.update_id.clone());
@@ -679,6 +690,7 @@ impl Core {
                 body.phase = Some(e.phase);
                 body.since = Some(e.since);
                 body.failure = e.failure.clone();
+                body.source = e.source;
             }
             _ => {
                 if let Some(u) = self.parts.supervisor.status().update {
@@ -802,6 +814,7 @@ fn fill_from_supervisor(body: &mut StatusBody, u: RunningUpdate) {
     body.old = u.old;
     body.new = Some(u.new);
     body.failure = u.failure;
+    body.source = u.source;
 }
 
 fn valid_request_id(id: &str) -> Result<(), ApiError> {

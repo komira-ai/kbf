@@ -22,7 +22,7 @@ use kbf_installer::CommitId;
 use kbf_installer::proxy::admin::{Admin, AdminError, Deadlines};
 use kbf_installer::proxy::child_http::Headers;
 use kbf_installer::proxy::model::{
-    OpenCounts, Readiness as ChildReadiness, RoleInfo, RoleState, Slot,
+    OpenCounts, Readiness as ChildReadiness, RoleInfo, RoleState, Slot, Source,
 };
 use kbf_installer::proxy::ports::ChildAdmin;
 use kbf_state::Op;
@@ -989,7 +989,7 @@ async fn post_desired_reaches_the_new_childs_operator_port_with_its_own_release(
     assert_eq!(
         host.run({
             let new = new.clone();
-            move |admin| admin.post_desired(Slot::B, &new)
+            move |admin| admin.post_desired(Slot::B, &new, Source::Fetch)
         })
         .await,
         Ok(())
@@ -1001,7 +1001,7 @@ async fn post_desired_reaches_the_new_childs_operator_port_with_its_own_release(
     assert_eq!(
         host.run({
             let new = new.clone();
-            move |admin| admin.post_desired(Slot::B, &new)
+            move |admin| admin.post_desired(Slot::B, &new, Source::Fetch)
         })
         .await,
         Ok(()),

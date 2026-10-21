@@ -78,6 +78,7 @@ fn request(request_id: &str) -> UpdateRequest {
         request_id: request_id.to_owned(),
         nodes: false,
         rollback: false,
+        source: kbf_update::Source::Fetch,
     }
 }
 

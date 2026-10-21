@@ -102,6 +102,9 @@ enum FrontendFate {
     Failed,
     /// `rolled_back` twenty seconds after the POST, with no failure.
     RolledBack,
+    /// `failed` forty seconds after the POST, at step `nodes`: the new frontend, which has
+    /// served since the twentieth second, would not take the order for the nodes.
+    NodesRefused,
     /// Stays in `baking` for ever.
     Hang,
     /// Answers the POST with 409 `update_open`.
@@ -486,6 +489,13 @@ impl Farm {
                 }),
             ),
             FrontendFate::RolledBack if e >= 20 => (Phase::RolledBack, None),
+            FrontendFate::NodesRefused if e >= 40 => (
+                Phase::Failed,
+                Some(Failure {
+                    step: FailedStep::Nodes,
+                    reason: "not_own: not the child's own release".to_owned(),
+                }),
+            ),
             FrontendFate::Hang => (by_time.min(Phase::Baking), None),
             FrontendFate::StuckInNodes => (by_time.min(Phase::Nodes), None),
             _ => (by_time, None),
@@ -523,6 +533,7 @@ impl Farm {
             old: None,
             new: None,
             failure,
+            source: kbf_update::Source::Fetch,
         }
     }
 
@@ -1053,6 +1064,7 @@ fn a_clean_deploy_updates_the_frontend_first_then_watches_the_nodes_and_checks_t
             request_id: REQUEST_ID.to_owned(),
             nodes: true,
             rollback: false,
+            source: kbf_update::Source::Fetch,
         }]
     );
     assert_eq!(f.requests("POST"), 1);

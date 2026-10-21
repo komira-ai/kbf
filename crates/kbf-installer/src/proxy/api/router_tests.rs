@@ -12,9 +12,9 @@ use super::core::CrashPoint;
 use super::fakes::{COMMIT_C, FakeClock, FakeForwarder, FakeTokens, Rig, TOKEN, api, idle, staged};
 use super::model::OldChild;
 use super::router::{MAX_BODY, Router};
-use super::traits::{Compat, InstallerState, InstallerStatus};
+use super::traits::{AvailableWire, Compat, InstallerState, InstallerStatus};
 use crate::proxy::model::{Phase, Verb};
-use crate::testkit::{A, B};
+use crate::testkit::{A, B, c};
 
 struct Harness {
     rig: Rig,
@@ -583,4 +583,79 @@ async fn post_abort_and_rollback_in_one_burst_each_get_a_defined_answer() {
         (StatusCode::CONFLICT, Some("no_update_open".to_owned()))
     );
     assert_eq!(h.rig.sup.starts(), 0);
+}
+
+fn staged_body(commit: &str, request_id: &str) -> Value {
+    json!({"commit": commit, "request_id": request_id, "nodes": false, "source": "staged"})
+}
+
+fn carrying(commit: &str) -> InstallerStatus {
+    InstallerStatus {
+        available: Some(AvailableWire {
+            commit: c(commit),
+            seq: 812,
+        }),
+        ..idle()
+    }
+}
+
+/// Catches the refusals of a source reaching the client as other statuses or other codes
+/// (the `update` verb keys its exit on them: 409 `source_refused` and 422 `not_staged` are
+/// refusals, not a busy host), and a word that is not a source being taken: it is a 400 and
+/// nothing is saved or written.
+///
+/// Mutants planted: the 409 sent with the code `update_open`; the 422 sent as a 409.
+#[tokio::test]
+async fn the_source_refusals_reach_the_client_with_their_codes_and_an_unknown_source_is_a_400() {
+    let h = harness("pr5a-r-source", quick());
+    h.rig.set_status(InstallerStatus {
+        release_source: Some("bundled".to_owned()),
+        ..idle()
+    });
+    let fetch = json!({"commit": B, "request_id": "r1", "nodes": false});
+    let (s, v) = send(&h, Method::POST, U, fetch).await;
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (StatusCode::CONFLICT, Some("source_refused"))
+    );
+    let (s, v) = send(&h, Method::POST, U, staged_body(B, "r1")).await;
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("not_staged"))
+    );
+    h.rig.set_status(carrying(B));
+    for source in [json!("bogus"), json!("Staged"), json!(2), Value::Null] {
+        let mut body = staged_body(B, "r1");
+        body["source"] = source.clone();
+        let (s, v) = send(&h, Method::POST, U, body).await;
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("bad_request")),
+            "{source}"
+        );
+    }
+    assert!(h.rig.orders.written.lock().unwrap().is_empty());
+}
+
+/// Catches a status that names a source for an update that fetches (the bytes of every status
+/// a client has read so far), and one that does not say a staged update is staged: the key is
+/// there only for `staged`, and the client reads it back as it was sent.
+///
+/// Mutants planted: the key written for a fetch; the key never written.
+#[tokio::test]
+async fn a_status_names_the_source_of_an_update_only_when_it_is_not_a_fetch() {
+    let h = harness("pr5a-r-status-fetch", quick());
+    let (s, _) = send(&h, Method::POST, U, post_body(B, "r1")).await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let (_, status) = send(&h, Method::GET, U, Value::Null).await;
+    assert_eq!(status["update_id"], "upd-1");
+    assert!(status.get("source").is_none(), "{status}");
+
+    let h = harness("pr5a-r-status-staged", quick());
+    h.rig.set_status(carrying(B));
+    let (s, _) = send(&h, Method::POST, U, staged_body(B, "r1")).await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let (_, status) = send(&h, Method::GET, U, Value::Null).await;
+    assert_eq!(status["update_id"], "upd-1");
+    assert_eq!(status["source"], "staged");
 }

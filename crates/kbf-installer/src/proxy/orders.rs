@@ -61,7 +61,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use kbf_update::record::parse_file_name;
 use kbf_update::spool::Spool;
-use kbf_update::{MAX_RECORDS, OrderRecord, RecordError, Verb as RecordVerb};
+use kbf_update::{MAX_RECORDS, OrderRecord, RecordError, Source, Verb as RecordVerb};
 use serde::{Deserialize, Serialize};
 
 use super::api::traits::{OrderError, OrderWriter};
@@ -201,7 +201,13 @@ impl OrderSpool {
     }
 
     /// Writes a record for `verb` and returns its locator.
-    fn issue(&self, verb: Verb, commit: &CommitId, window_s: u32) -> Result<Locator, SpoolError> {
+    fn issue(
+        &self,
+        verb: Verb,
+        commit: &CommitId,
+        window_s: u32,
+        source: Source,
+    ) -> Result<Locator, SpoolError> {
         let record_verb = match verb {
             Verb::Activate => return Err(SpoolError::NoActivate),
             Verb::Confirm => RecordVerb::Confirm,
@@ -223,6 +229,7 @@ impl OrderSpool {
             verb,
             commit: commit.clone(),
             window_s,
+            source,
         };
         let record = record(&locator, record_verb)?;
         inner.persist(id).map_err(SpoolError::Counter)?;
@@ -276,7 +283,7 @@ impl OrderSpool {
     /// # Errors
     /// `orders/` is full or cannot be written, or the counter cannot be made durable.
     pub fn confirm(&self, commit: &CommitId) -> Result<(), PortError> {
-        self.issue(Verb::Confirm, commit, NO_WINDOW)?;
+        self.issue(Verb::Confirm, commit, NO_WINDOW, Source::Fetch)?;
         Ok(())
     }
 
@@ -286,21 +293,31 @@ impl OrderSpool {
     /// # Errors
     /// As [`confirm`](Self::confirm).
     pub fn revert(&self, commit: &CommitId) -> Result<(), PortError> {
-        self.issue(Verb::Revert, commit, NO_WINDOW)?;
+        self.issue(Verb::Revert, commit, NO_WINDOW, Source::Fetch)?;
         Ok(())
     }
 }
 
 impl OrderWriter for OrderSpool {
-    /// A `frontend_update`, a `confirm` or a `revert`. An `activate` is refused: it would be
-    /// a record without components, which the root half never takes.
+    /// A `frontend_update`, a `confirm` or a `revert`, all of which fetch. An `activate` is
+    /// refused: it would be a record without components, which the root half never takes.
     fn write(
         &mut self,
         verb: Verb,
         commit: &CommitId,
         window_s: u32,
     ) -> Result<Locator, OrderError> {
-        Ok(self.issue(verb, commit, window_s)?)
+        Ok(self.issue(verb, commit, window_s, Source::Fetch)?)
+    }
+
+    /// A `frontend_update` whose record names `source` when it is not `fetch`.
+    fn write_update(
+        &mut self,
+        commit: &CommitId,
+        window_s: u32,
+        source: Source,
+    ) -> Result<Locator, OrderError> {
+        Ok(self.issue(Verb::FrontendUpdate, commit, window_s, source)?)
     }
 }
 

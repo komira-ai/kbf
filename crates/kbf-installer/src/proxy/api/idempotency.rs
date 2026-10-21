@@ -20,11 +20,18 @@
 //! A file that exists and does not parse is not treated as empty: that would let a retry
 //! start a second update. The store reports [`Idempotency::lost`] and the API refuses new
 //! updates (`409 state_lost`) until an operator removes the file.
+//!
+//! An entry carries `source` only when the update's release is not fetched. The file of
+//! updates that all fetch is the file every build has written; a file with an entry that
+//! has the key is one a build from before `source` cannot read, so after a downgrade that
+//! build answers `state_lost` until the file is removed or the entry is pushed out by
+//! [`KEEP`] newer ones.
 
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use kbf_update::Source;
 use serde::{Deserialize, Serialize};
 
 use super::model::UpdateId;
@@ -44,6 +51,11 @@ pub struct Entry {
     pub commit: CommitId,
     pub nodes: bool,
     pub rollback: bool,
+    /// Where the update's release comes from. Left out of the file for a fetch, and a file
+    /// without the key reads as one: the file of every update that fetches is what it has
+    /// always been. (A proxy of a build before `source` cannot read an entry that has it.)
+    #[serde(default, skip_serializing_if = "Source::is_fetch")]
+    pub source: Source,
     /// The order has been written and the update is in motion. An entry that is not
     /// started was accepted and then the process died or the order could not be written.
     pub started: bool,
@@ -136,6 +148,7 @@ impl Idempotency {
         commit: &CommitId,
         nodes: bool,
         rollback: bool,
+        source: Source,
     ) -> Result<Entry, SaveError> {
         let entry = Entry {
             request_id: request_id.to_owned(),
@@ -143,6 +156,7 @@ impl Idempotency {
             commit: commit.clone(),
             nodes,
             rollback,
+            source,
             started: false,
             waiting: None,
         };

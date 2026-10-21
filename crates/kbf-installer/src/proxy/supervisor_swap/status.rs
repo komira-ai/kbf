@@ -95,6 +95,7 @@ pub(super) fn assemble(
         // The intent keeps `nodes_posted` as a flag; the API reads only whether it is zero.
         nodes_updated: u32::from(intent.nodes_posted),
         failure: intent.failure.clone(),
+        source: intent.source,
     };
     SupervisorStatus {
         update: Some(update),

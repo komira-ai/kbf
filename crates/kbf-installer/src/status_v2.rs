@@ -113,6 +113,9 @@ pub struct StatusV2 {
     /// `<word>: <message>` of the last refusal or revert, or empty.
     pub refusal: String,
     pub acked_order_id: u64,
+    /// The id of the order `refusal` answers. Left out when the refusal is not one order's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused_order_id: Option<u64>,
     pub staged: Option<StagedFacts>,
     pub envoy: Envoy,
     /// The word `installer.toml` holds for `release_source`: `url`, `frontend` or `bundled`. Left

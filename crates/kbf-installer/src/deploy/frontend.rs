@@ -199,6 +199,7 @@ impl Run<'_> {
                 request_id: self.opts.request_id.clone(),
                 nodes: self.opts.nodes,
                 rollback: false,
+                source: kbf_update::Source::Fetch,
             },
         );
         let id = loop {

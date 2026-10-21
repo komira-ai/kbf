@@ -7,6 +7,8 @@
 
 use std::time::Duration;
 
+use kbf_update::Source;
+
 use super::model::{
     Failure, Halt, Intent, Phase, Plan, ProcIdent, Request, RoleInfo, RoleState, Slot, Start, Step,
 };
@@ -603,7 +605,7 @@ impl<'a> Swap<'a> {
         match self
             .ports
             .admin
-            .post_desired(self.intent.new_slot, &self.plan.to)
+            .post_desired(self.intent.new_slot, &self.plan.to, Source::Fetch)
         {
             Ok(()) => {
                 self.intent.nodes_posted = true;

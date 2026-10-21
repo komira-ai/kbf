@@ -49,6 +49,10 @@ pub struct Memory {
     pub event: Event,
     /// Why the last order was refused, or what was reverted.
     pub refusal: String,
+    /// The id of the order `refusal` answers, when it answers one: what lets the frontend proxy
+    /// tell its own order's refusal from another's. Left out of `helper.json` when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused_order_id: Option<u64>,
     /// When root first saw each record now in the spool, in seconds. A record expires by
     /// this, never by the file's modification time, which its writer sets.
     pub first_seen: BTreeMap<String, u64>,

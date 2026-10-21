@@ -111,13 +111,16 @@ use std::net::SocketAddr;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use kbf_update::Source;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::CommitId;
 
 use super::child_http::{Client, Headers, HttpError, Limits, Response};
-use super::model::{OpenCounts, PortError, Readiness, RoleInfo, RoleState, Slot, Timing};
+use super::model::{
+    DesiredError, OpenCounts, PortError, Readiness, RoleInfo, RoleState, Slot, Timing,
+};
 use super::ports::ChildAdmin;
 
 /// The `admin_protocol` this client reads. Every `role` answer says its own.
@@ -531,8 +534,14 @@ impl ChildAdmin for Admin {
         self.try_open_counts(slot).map_err(PortError::from)
     }
 
-    fn post_desired(&self, slot: Slot, commit: &CommitId) -> Result<(), PortError> {
-        self.try_post_desired(slot, commit).map_err(PortError::from)
+    fn post_desired(
+        &self,
+        slot: Slot,
+        commit: &CommitId,
+        _source: Source,
+    ) -> Result<(), DesiredError> {
+        self.try_post_desired(slot, commit)
+            .map_err(|e| DesiredError::Unreached(e.to_string()))
     }
 }
 
