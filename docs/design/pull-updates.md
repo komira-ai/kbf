@@ -192,7 +192,7 @@ validated digest. Chunks are at most 1 MiB. **The caller is the installer's fetc
 **ReleaseService.Describe.** For a caller that was given no offer (a `frontend_update` order is a locator). `DescribeRequest{commit, platform}`
 (`platform` optional) returns a `ReleaseDescription{commit, components}`: per described platform, the tarballs a host of it needs, each with
 its `sha256` and `size` and its bundle's `bundle_sha256` and `bundle_size`; a platform is described only when it is complete, as for an offer.
-Admitted as `Fetch` is (one row of the role table). `INVALID_ARGUMENT` for a commit that is not 40 lowercase hex digits or an unknown platform,
+Admitted as `Fetch` is (one row of the role table: the daemon and storage roles). `INVALID_ARGUMENT` for a commit that is not 40 lowercase hex digits or an unknown platform,
 `NOT_FOUND` for a commit with no stored tarball, `FAILED_PRECONDITION` naming what an incomplete platform lacks. The same description is
 `GET /v1/releases/{commit}` as JSON, the file `releases/<commit>.json` of a `url` source (`docs/api.md`). It is a claim; the installer verifies
 what it fetches (`kbf-installer.md` section 5).

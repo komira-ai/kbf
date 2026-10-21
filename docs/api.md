@@ -1902,8 +1902,8 @@ release and their build attestations, kept as uploaded. Mounted by `--releases-d
   listed when its tarball is stored.
 - `GET /v1/releases` and the gRPC `ReleaseService.Fetch` are unauthenticated at the router and
   the service. `Fetch` is mounted on the worker listener, behind its mutual TLS and the role
-  table (the daemon role alone may call it) when TLS is configured; in plain-text worker mode
-  it is open, like every worker method. `GET /v1/releases` is open to whoever reaches the
+  table (the daemon and storage roles may call it) when TLS is configured; in plain-text worker
+  mode it is open, like every worker method. `GET /v1/releases` is open to whoever reaches the
   operator API, like `GET /v1/nodes`: it lists commits, platforms and digests, no bytes. The
   store is mounted by `--releases-dir`, which needs `--api-listen`; without the flag every
   update endpoint answers `503`.
@@ -1943,8 +1943,8 @@ tarball against its bundle, which it does for an offer's components too.
   of kbf`, or a bundle not served by its digest, which putting it again repairs);
   `UNAVAILABLE` without `--releases-dir`; `INTERNAL` for a store that fails, saying only that.
 - **Who may call it** is the rule of `Fetch`, one row of the worker listener's role table:
-  under mutual TLS the daemon role alone (another role is `PERMISSION_DENIED`, no certificate
-  is `UNAUTHENTICATED`); in plain-text worker mode it is open, like every worker method.
+  under mutual TLS the daemon and storage roles (the frontend role is `PERMISSION_DENIED`, no
+  certificate is `UNAUTHENTICATED`); in plain-text worker mode it is open, like every worker method.
   The service itself checks nothing.
 
 `GET /v1/releases/{commit}` answers the same description for every complete platform as

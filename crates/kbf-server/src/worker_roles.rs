@@ -7,9 +7,11 @@
 //!
 //! - The daemon role opens a worker session (`kbf.worker.v1.Worker/Session`, which also
 //!   carries the storage map to the daemon) and makes the blob calls: `ByteStream`,
-//!   `ContentAddressableStorage` (the chunking calls too) and `kbf.worker.v1.Segments`, and
-//!   fetches the release it was offered (`kbf.update.v1.ReleaseService/Fetch`) and asks what
-//!   a commit holds (`kbf.update.v1.ReleaseService/Describe`).
+//!   `ContentAddressableStorage` (the chunking calls too) and `kbf.worker.v1.Segments`.
+//! - The daemon and storage roles both fetch the release they were offered
+//!   (`kbf.update.v1.ReleaseService/Fetch`) and ask what a commit holds
+//!   (`kbf.update.v1.ReleaseService/Describe`): the installer on a storage-only host has no
+//!   daemon certificate. These two are the only rows that take two roles.
 //! - The storage role registers and heartbeats (`kbf.map.v1.Membership`); a storage
 //!   node gets the map in those answers. It also fetches the farm's registered cold store
 //!   and its keys (`kbf.enroll.v1.ColdStore/GetStoreConfig`): the only method that
@@ -49,6 +51,7 @@ use crate::identity::{Presented, presented};
 
 const DAEMON: &[PeerRole] = &[PeerRole::Daemon];
 const STORAGE: &[PeerRole] = &[PeerRole::Storage];
+const DAEMON_OR_STORAGE: &[PeerRole] = &[PeerRole::Daemon, PeerRole::Storage];
 
 /// Each gRPC method path the worker listener serves, and the roles that may call it.
 pub const WORKER_LISTENER_ROLES: &[(&str, &[PeerRole])] = &[
@@ -89,10 +92,11 @@ pub const WORKER_LISTENER_ROLES: &[(&str, &[PeerRole])] = &[
         DAEMON,
     ),
     // The node's update client fetches the release it was offered (the daemon half of a
-    // storage-and-daemon host presents its daemon certificate).
-    ("/kbf.update.v1.ReleaseService/Fetch", DAEMON),
+    // storage-and-daemon host presents its daemon certificate, a storage-only host its
+    // storage one).
+    ("/kbf.update.v1.ReleaseService/Fetch", DAEMON_OR_STORAGE),
     // What the release it is to fetch holds (the installer asks before it fetches).
-    ("/kbf.update.v1.ReleaseService/Describe", DAEMON),
+    ("/kbf.update.v1.ReleaseService/Describe", DAEMON_OR_STORAGE),
     ("/kbf.worker.v1.Segments/Begin", DAEMON),
     ("/kbf.worker.v1.Segments/PutRange", DAEMON),
     ("/kbf.worker.v1.Segments/Commit", DAEMON),

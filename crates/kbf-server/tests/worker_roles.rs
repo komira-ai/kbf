@@ -2,11 +2,12 @@
 //! and `admit` without a network, the layer over a stand-in service, then a frontend
 //! with a state store (so `kbf.map.v1.Membership` is served there) under mutual TLS. A
 //! storage certificate registers and heartbeats and a daemon certificate opens its
-//! session, side by side; each is refused every method of the other; a frontend
-//! certificate is refused every method; and a method not in the table is refused for
-//! every certificate and in plain text. Past the role, a storage certificate registers
-//! and beats only for the names it carries, and the worker listener's deny list applies
-//! to it as it does to a daemon's.
+//! session, side by side; each is refused every method of the other except the release
+//! service's `Fetch` and `Describe`, which take both; a frontend certificate is refused
+//! every method; and a method not in the table is refused for every certificate and in
+//! plain text. Past the role, a storage certificate registers and beats only for the
+//! names it carries, and the worker listener's deny list applies to it as it does to a
+//! daemon's.
 
 #[path = "support/hooked.rs"]
 mod hooked;
@@ -63,59 +64,61 @@ const GET_STORE_CONFIG: &str = "/kbf.enroll.v1.ColdStore/GetStoreConfig";
 const FETCH: &str = "/kbf.update.v1.ReleaseService/Fetch";
 const DESCRIBE: &str = "/kbf.update.v1.ReleaseService/Describe";
 
-/// Every method the worker listener serves and the one role that may call it, spelled
-/// out here and not read from the table.
-const EXPECTED: [(&str, PeerRole); 22] = {
-    use PeerRole::{Daemon, Storage};
-    [
-        (SESSION, Daemon),
-        ("/google.bytestream.ByteStream/Read", Daemon),
-        ("/google.bytestream.ByteStream/Write", Daemon),
-        ("/google.bytestream.ByteStream/QueryWriteStatus", Daemon),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs",
-            Daemon,
-        ),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchUpdateBlobs",
-            Daemon,
-        ),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchReadBlobs",
-            Daemon,
-        ),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/GetTree",
-            Daemon,
-        ),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/SplitBlob",
-            Daemon,
-        ),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/SpliceBlob",
-            Daemon,
-        ),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/GetChunkMapping",
-            Daemon,
-        ),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/RegisterChunkMapping",
-            Daemon,
-        ),
-        (FETCH, PeerRole::Daemon),
-        (DESCRIBE, PeerRole::Daemon),
-        ("/kbf.worker.v1.Segments/Begin", Daemon),
-        ("/kbf.worker.v1.Segments/PutRange", Daemon),
-        ("/kbf.worker.v1.Segments/Commit", Daemon),
-        ("/kbf.worker.v1.Segments/Locate", Daemon),
-        ("/kbf.worker.v1.Segments/ReadRange", Daemon),
-        (REGISTER, Storage),
-        (HEARTBEAT, Storage),
-        (GET_STORE_CONFIG, Storage),
-    ]
-};
+const DAEMON: &[PeerRole] = &[PeerRole::Daemon];
+const STORAGE: &[PeerRole] = &[PeerRole::Storage];
+const EITHER: &[PeerRole] = &[PeerRole::Daemon, PeerRole::Storage];
+
+/// Every method the worker listener serves and the roles that may call it (one, but for
+/// the release service's two, which take a daemon or a storage node), spelled out here
+/// and not read from the table.
+const EXPECTED: [(&str, &[PeerRole]); 22] = [
+    (SESSION, DAEMON),
+    ("/google.bytestream.ByteStream/Read", DAEMON),
+    ("/google.bytestream.ByteStream/Write", DAEMON),
+    ("/google.bytestream.ByteStream/QueryWriteStatus", DAEMON),
+    (
+        "/build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs",
+        DAEMON,
+    ),
+    (
+        "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchUpdateBlobs",
+        DAEMON,
+    ),
+    (
+        "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchReadBlobs",
+        DAEMON,
+    ),
+    (
+        "/build.bazel.remote.execution.v2.ContentAddressableStorage/GetTree",
+        DAEMON,
+    ),
+    (
+        "/build.bazel.remote.execution.v2.ContentAddressableStorage/SplitBlob",
+        DAEMON,
+    ),
+    (
+        "/build.bazel.remote.execution.v2.ContentAddressableStorage/SpliceBlob",
+        DAEMON,
+    ),
+    (
+        "/build.bazel.remote.execution.v2.ContentAddressableStorage/GetChunkMapping",
+        DAEMON,
+    ),
+    (
+        "/build.bazel.remote.execution.v2.ContentAddressableStorage/RegisterChunkMapping",
+        DAEMON,
+    ),
+    (FETCH, EITHER),
+    (DESCRIBE, EITHER),
+    ("/kbf.worker.v1.Segments/Begin", DAEMON),
+    ("/kbf.worker.v1.Segments/PutRange", DAEMON),
+    ("/kbf.worker.v1.Segments/Commit", DAEMON),
+    ("/kbf.worker.v1.Segments/Locate", DAEMON),
+    ("/kbf.worker.v1.Segments/ReadRange", DAEMON),
+    (REGISTER, STORAGE),
+    (HEARTBEAT, STORAGE),
+    (GET_STORE_CONFIG, STORAGE),
+];
 
 /// Methods the worker listener does not serve: REAPI's others, health, a method of a
 /// served service that does not exist, a served one in another case or with a slash
@@ -156,34 +159,44 @@ fn der(sans: Vec<SanType>) -> Vec<u8> {
     params.self_signed(&key).expect("sign").der().to_vec()
 }
 
-/// What the table refuses a certificate naming `who` on `path` with.
-fn refusal(who: PeerRole, path: &str, takes: PeerRole) -> String {
-    format!("role {who} may not call {path} on the worker listener; it takes {takes}")
+/// What the table refuses a certificate naming `who` on `path` with, when the path
+/// takes the roles `takes`.
+fn refusal(who: PeerRole, path: &str, takes: &[PeerRole]) -> String {
+    let takes: Vec<&str> = takes.iter().map(|r| r.name()).collect();
+    format!(
+        "role {who} may not call {path} on the worker listener; it takes {}",
+        takes.join(", ")
+    )
 }
 
 /// Catches a row of the table changed, added or dropped (the Membership calls taken
 /// from a daemon, a blob call or the session from a storage node, any call from a
-/// frontend), and `admit` reading it other than it says: each row admits its role's
-/// certificate and refuses the other two PERMISSION_DENIED, saying which role it takes.
+/// frontend, `Fetch` or `Describe` taken from a daemon or a storage node, or given to
+/// any role), and `admit` reading it other than it says: each row admits the roles it
+/// lists and refuses the others PERMISSION_DENIED, saying which roles it takes.
 ///
-/// Mutant seen red: the Membership rows written `&[Daemon, Storage]`.
+/// Mutants it catches: the Membership rows written `&[Daemon, Storage]`; the
+/// `Fetch` or `Describe` row written for the daemon role alone (a storage certificate
+/// refused) or for the storage role alone (a daemon certificate refused); `Describe`
+/// left out of the table; the two-role constant used for every row (the session and a
+/// blob call admit a storage certificate, `Register` a daemon one).
 #[test]
-fn each_method_takes_its_one_role_and_refuses_the_others() {
+fn each_method_takes_its_roles_and_refuses_the_others() {
     let table: Vec<(&str, Vec<PeerRole>)> = WORKER_LISTENER_ROLES
         .iter()
         .map(|(path, roles)| (*path, roles.to_vec()))
         .collect();
     let expected: Vec<(&str, Vec<PeerRole>)> = EXPECTED
         .iter()
-        .map(|(path, role)| (*path, vec![*role]))
+        .map(|(path, roles)| (*path, roles.to_vec()))
         .collect();
     assert_eq!(table, expected);
     for (path, takes) in EXPECTED {
-        assert_eq!(roles_for(path), Some(&[takes][..]), "{path}");
+        assert_eq!(roles_for(path), Some(takes), "{path}");
         for who in PeerRole::ALL {
             let cert = der(vec![role(who.name())]);
             let got = admit(Admission::Certified, path, Some(&cert));
-            if who == takes {
+            if takes.contains(&who) {
                 assert!(got.is_ok(), "{who} on {path}: {got:?}");
                 continue;
             }
@@ -565,7 +578,10 @@ async fn raw(channel: &Channel, path: &'static str) -> Status {
 /// Asserts that `who` is refused every row of the table that does not take it, by the
 /// table (its message, not a service's own check).
 async fn refused_by_the_table(channel: &Channel, who: PeerRole) {
-    for (path, takes) in EXPECTED.into_iter().filter(|(_, takes)| *takes != who) {
+    for (path, takes) in EXPECTED
+        .into_iter()
+        .filter(|(_, takes)| !takes.contains(&who))
+    {
         let status = raw(channel, path).await;
         assert_eq!(status.code(), Code::PermissionDenied, "{who} on {path}");
         assert_eq!(status.message(), refusal(who, path, takes));
@@ -635,7 +651,7 @@ async fn a_daemon_certificate_may_not_register_or_heartbeat() {
         .expect_err("refused");
     for (path, status) in [(REGISTER, register), (HEARTBEAT, heartbeat)] {
         assert_eq!(status.code(), Code::PermissionDenied, "{path}");
-        let want = refusal(PeerRole::Daemon, path, PeerRole::Storage);
+        let want = refusal(PeerRole::Daemon, path, STORAGE);
         assert_eq!(status.message(), want);
     }
     refused_by_the_table(&channel, PeerRole::Daemon).await;
@@ -643,7 +659,8 @@ async fn a_daemon_certificate_may_not_register_or_heartbeat() {
 
 /// Catches the worker session or a blob call taken from a storage node's certificate
 /// (naming node-a, as a daemon's would, so nothing but the role tells them apart): its
-/// session is refused PERMISSION_DENIED, and every daemon row is refused by the table.
+/// session is refused PERMISSION_DENIED, and every daemon-only row is refused by the
+/// table (`Fetch` and `Describe`, which take a storage node too, are not among them).
 ///
 /// Mutant seen red: the layer left off the worker listener (`worker_peers` without
 /// `.layer`): the session is welcomed and FindMissingBlobs answered.
@@ -656,7 +673,7 @@ async fn a_storage_certificate_opens_no_session_and_makes_no_blob_call() {
     assert_eq!(status.code(), Code::PermissionDenied);
     assert_eq!(
         status.message(),
-        refusal(PeerRole::Storage, SESSION, PeerRole::Daemon)
+        refusal(PeerRole::Storage, SESSION, DAEMON)
     );
     refused_by_the_table(&channel, PeerRole::Storage).await;
 }
@@ -1135,15 +1152,18 @@ async fn store_a_release(store: &ReleaseStore) -> String {
 }
 
 /// Catches `Describe` served to a caller `Fetch` refuses, or refused to one it serves: on
-/// the live worker listener under mutual TLS, a daemon certificate has its release
-/// described and fetched; a storage and a frontend certificate are refused both calls
-/// PERMISSION_DENIED by the table, saying it takes the daemon role; a caller with no
-/// certificate has both calls fail at the transport, the handshake being refused.
+/// the live worker listener under mutual TLS, a daemon certificate and a storage
+/// certificate (a storage-only host has no daemon one) each have the release described
+/// and fetched; a frontend certificate is refused both calls PERMISSION_DENIED by the
+/// table, saying it takes the daemon and storage roles; a caller with no certificate has
+/// both calls fail at the transport, the handshake being refused.
 ///
-/// Mutants seen red: the `Describe` row left out of the table (a daemon is refused
-/// "not served"); the row given every role (the storage certificate is described).
+/// Mutants it catches: the `Describe` row left out of the table (a daemon is refused
+/// "not served"); either row written for the daemon role alone (the storage certificate
+/// is refused) or for the storage role alone (the daemon certificate is refused); the
+/// row given every role (the frontend certificate is described).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn describe_is_a_daemon_call_as_fetch_is() {
+async fn describe_and_fetch_take_a_daemon_or_a_storage_certificate() {
     let pki = Pki::new();
     let scratch = Scratch::new("describe");
     let store = Arc::new(ReleaseStore::open(&scratch.0, Limits::default()).expect("a store"));
@@ -1157,31 +1177,29 @@ async fn describe_is_a_daemon_call_as_fetch_is() {
         sha256: digest.clone(),
     };
 
-    let mut daemon = ReleaseServiceClient::new(pki.channel(worker, PeerRole::Daemon).await);
-    let described = daemon
-        .describe(describe())
-        .await
-        .expect("a daemon certificate is described to")
-        .into_inner();
-    assert_eq!(described.commit, COMMIT);
-    assert_eq!(described.components.len(), 1);
-    assert_eq!(described.components[0].sha256, digest);
-    daemon
-        .fetch(fetch())
-        .await
-        .expect("a daemon certificate fetches");
-
-    for who in [PeerRole::Storage, PeerRole::Frontend] {
+    for who in [PeerRole::Daemon, PeerRole::Storage] {
         let mut client = ReleaseServiceClient::new(pki.channel(worker, who).await);
-        let described = client.describe(describe()).await.expect_err("refused");
-        assert_eq!(described.code(), Code::PermissionDenied, "{who}");
-        assert_eq!(
-            described.message(),
-            refusal(who, DESCRIBE, PeerRole::Daemon)
-        );
-        let fetched = client.fetch(fetch()).await.expect_err("refused");
-        assert_eq!(fetched.code(), Code::PermissionDenied, "{who}");
-        assert_eq!(fetched.message(), refusal(who, FETCH, PeerRole::Daemon));
+        let described = client
+            .describe(describe())
+            .await
+            .unwrap_or_else(|e| panic!("{who} is described to: {e}"))
+            .into_inner();
+        assert_eq!(described.commit, COMMIT, "{who}");
+        assert_eq!(described.components.len(), 1, "{who}");
+        assert_eq!(described.components[0].sha256, digest, "{who}");
+        client
+            .fetch(fetch())
+            .await
+            .unwrap_or_else(|e| panic!("{who} fetches: {e}"));
+    }
+
+    let mut client = ReleaseServiceClient::new(pki.channel(worker, PeerRole::Frontend).await);
+    let described = client.describe(describe()).await.expect_err("refused");
+    let fetched = client.fetch(fetch()).await.expect_err("refused");
+    for (path, status) in [(DESCRIBE, described), (FETCH, fetched)] {
+        assert_eq!(status.code(), Code::PermissionDenied, "{path}");
+        let want = refusal(PeerRole::Frontend, path, EITHER);
+        assert_eq!(status.message(), want, "{path}");
     }
 
     let tls = ClientTlsConfig::new()
