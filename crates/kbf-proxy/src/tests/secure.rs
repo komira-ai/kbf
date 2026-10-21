@@ -19,8 +19,8 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use super::kit::{
-    Access, BUCK2_TOKEN, CAPS, Client, OPERATOR, OPERATOR_TOKEN, Rig, SECRET, client_builder,
-    finish,
+    Access, BUCK2_TOKEN, CAPS, CLIENT_IP, Client, OPERATOR, OPERATOR_TOKEN, Rig, SECRET,
+    client_builder, finish,
 };
 use super::pki::{Pki, client_config};
 use crate::auth::Buck2Auth;
@@ -408,17 +408,18 @@ fn reserved(headers: &http::HeaderMap) -> Vec<(String, String)> {
     found
 }
 
-const FORGED: [(&str, &str); 4] = [
+const FORGED: [(&str, &str); 5] = [
+    ("x-kbf-client-addr", "203.0.113.66"),
     ("x-kbf-node-id", "forged-node"),
     ("x-kbf-role", "storage"),
     ("x-kbf-proxy-auth", "guess"),
     ("x-kbf-extra", "1"),
 ];
 
-/// A verified certificate reaches the child as exactly three headers (its node id, its role,
-/// the secret) and nothing the client forged under those names.
+/// A verified certificate reaches the child as exactly four headers (its node id, its role,
+/// the secret, the connection's address) and nothing the client forged under those names.
 ///
-/// Kills: headers set from the client's own; identity set with no verified certificate; an
+/// Kills: headers set from the client's own (the address included); identity set with no verified certificate; an
 /// inbound `x-kbf-*` that survives the strip; two values for one header.
 #[tokio::test(start_paused = true)]
 async fn a_verified_certificate_reaches_the_child_as_identity_headers() {
@@ -435,6 +436,7 @@ async fn a_verified_certificate_reaches_the_child_as_identity_headers() {
     assert_eq!(
         reserved(&seen[0]),
         [
+            ("x-kbf-client-addr".to_owned(), CLIENT_IP.to_string()),
             ("x-kbf-node-id".to_owned(), "node-7.farm".to_owned()),
             ("x-kbf-proxy-auth".to_owned(), hex::encode(SECRET)),
             ("x-kbf-role".to_owned(), "daemon".to_owned()),
@@ -442,7 +444,7 @@ async fn a_verified_certificate_reaches_the_child_as_identity_headers() {
     );
 }
 
-/// A client with no certificate is anonymous to the child: the secret, and no node id or
+/// A client with no certificate is anonymous to the child: the secret and its address, and no node id or
 /// role, whatever it forged.
 ///
 /// Kills: identity taken from the request; the secret left off.
@@ -457,7 +459,10 @@ async fn a_client_without_a_certificate_is_anonymous_to_the_child() {
     let seen = rig.a.state.headers_of(CAPS);
     assert_eq!(
         reserved(&seen[0]),
-        [("x-kbf-proxy-auth".to_owned(), hex::encode(SECRET))]
+        [
+            ("x-kbf-client-addr".to_owned(), CLIENT_IP.to_string()),
+            ("x-kbf-proxy-auth".to_owned(), hex::encode(SECRET)),
+        ]
     );
 }
 
@@ -534,6 +539,7 @@ async fn the_identity_is_the_leafs_when_a_chain_is_sent() {
     assert_eq!(
         reserved(&seen[0]),
         [
+            ("x-kbf-client-addr".to_owned(), CLIENT_IP.to_string()),
             ("x-kbf-node-id".to_owned(), "node-5.farm".to_owned()),
             ("x-kbf-proxy-auth".to_owned(), hex::encode(SECRET)),
             ("x-kbf-role".to_owned(), "storage".to_owned()),

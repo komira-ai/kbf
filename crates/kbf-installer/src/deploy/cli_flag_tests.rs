@@ -639,3 +639,50 @@ fn a_stale_offer_ends_the_deploy_and_untrusted_settings_stop_it() {
         "{err}"
     );
 }
+
+/// Proves the config `setup` writes is the whole input of a deploy: with only that file (the
+/// type both share, rendered as setup writes it) and a commit, the API, the CA, the server name,
+/// the token and the stage all come from it. An apply with no offer is refused at the stage the
+/// file names (exit 3, `offer_required`: only a stage read from the file can say so), and
+/// `--no-offer` goes on to the API the file names (a closed port, exit 1). Catches a key the
+/// writer renders that the reader does not take, and a reader that drifted from the writer.
+///
+/// Mutants planted: the stage not read from the file; the token key renamed on the reader.
+#[test]
+fn the_config_setup_writes_is_all_a_deploy_needs() {
+    use crate::deploy::host_config::HostConfig;
+    let rig = Rig::new("setup-config");
+    let config = rig.dir.join("deploy.json");
+    let written = HostConfig {
+        api: Some("127.0.0.1:1".to_owned()),
+        api_ca: Some(rig.ca.clone()),
+        api_server_name: Some("farm.example".to_owned()),
+        token_file: Some(rig.token.clone()),
+        stage: Some("gamma".to_owned()),
+        observe_base_port: Some("18000".to_owned()),
+        ..HostConfig::default()
+    };
+    fs::write(&config, written.render()).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let lock = rig.dir.join("deploy.lock");
+    let result = rig.dir.join("result.json");
+    let args = [
+        "--commit",
+        &rig.commit,
+        "--result",
+        result.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+        "--lock",
+        lock.to_str().unwrap(),
+        "--apply",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let (code, out, err) = rig.go_with(args.clone(), &[], b"", &rig.host(true));
+    assert_eq!(code, 3, "{out} {err}");
+    let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(line["reason"], "offer_required");
+    let (code, out, err) = rig.go_with(args, &["--no-offer"], b"", &rig.host(true));
+    assert_eq!(code, 1, "{out} {err}");
+}

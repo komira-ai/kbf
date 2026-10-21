@@ -52,12 +52,11 @@ pub enum DatabaseError {
     Password(String),
 }
 
-/// The `database` URL of the file `shown`, parsed and refused when it carries a password. The
-/// one place the rule lives: `setup`, `run` and `backup` all hold the file's URL to it.
+/// The `database` URL of the file `shown`, parsed and refused when it carries a password.
 ///
 /// # Errors
 /// [`DatabaseError::BadUrl`] or [`DatabaseError::Password`]; neither quotes the URL.
-pub(crate) fn check_url(shown: &str, url: &str) -> Result<PostgresConfig, DatabaseError> {
+fn check_url(shown: &str, url: &str) -> Result<PostgresConfig, DatabaseError> {
     let config = PostgresConfig::parse(url).map_err(|why| DatabaseError::BadUrl {
         path: shown.to_owned(),
         why,

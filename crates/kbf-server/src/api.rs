@@ -80,6 +80,8 @@ use crate::release::desired::blocking;
 use crate::token::ApiToken;
 use crate::update::Rows;
 
+mod node_detail;
+
 /// The media type of every body this API returns, and of every write it accepts.
 pub const JSON: &str = "application/json";
 
@@ -148,10 +150,11 @@ pub fn router(
     enroll: Option<Arc<EnrollApi>>,
 ) -> Router {
     let enrollment = crate::enroll::api::routes(token.clone(), enroll);
+    let scheduler = crate::http_sched::router(Arc::clone(&farm));
     Router::new()
         .route(NODES, get(nodes))
         .route(MEMBERS, get(members_view))
-        .route("/v1/nodes/{target}", post(act))
+        .route("/v1/nodes/{target}", get(node_detail::one).post(act))
         .route("/v1/members/{id}", post(set_member_state))
         .route(DENIED, post(deny_entry).delete(allow_entry))
         .route(FRONTEND_DRAIN, get(drain_status).post(begin_drain))
@@ -163,6 +166,7 @@ pub fn router(
             update,
         }))
         .merge(enrollment)
+        .merge(scheduler)
 }
 
 /// The drain as it is now.

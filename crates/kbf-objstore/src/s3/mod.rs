@@ -169,11 +169,9 @@ impl S3Store {
         if base.path() != "/" || base.query().is_some() || base.fragment().is_some() {
             return Err(bad("path-style addressing needs an endpoint with no path"));
         }
-        let host = match (base.host_str(), base.port()) {
-            (Some(h), Some(p)) => format!("{h}:{p}"),
-            (Some(h), None) => h.to_owned(),
-            (None, _) => return Err(bad("no host")),
-        };
+        // An `http` URL always has a host, and the userinfo was refused above, so the
+        // authority is the host with its port, if it is not the scheme's default.
+        let host = base.authority().to_owned();
         if !valid_bucket(&config.bucket) {
             return Err(S3ConfigError::Bucket(config.bucket));
         }
@@ -623,6 +621,8 @@ mod tests {
             "ftp://127.0.0.1",
             "http://127.0.0.1:9000/base",
             "http://u:p@127.0.0.1:9000",
+            "http://:p@127.0.0.1:9000",
+            "http://127.0.0.1:9000/#frag",
             "http://127.0.0.1:9000/?x=1",
             "127.0.0.1:9000",
         ] {
@@ -649,9 +649,65 @@ mod tests {
     #[test]
     fn debug_hides_the_secret() {
         let text = format!("{:?}", config("http://127.0.0.1", "kbf-cas"));
-        assert!(
-            text.contains("<redacted>") && !text.contains("\"s\""),
-            "{text}"
-        );
+        assert!(text.contains("<redacted>"), "{text}");
+        assert!(!text.contains("\"s\""), "{text}");
+    }
+
+    /// Catches: the store's `Debug` (it is logged) that prints the credentials or leaves
+    /// out which endpoint, bucket and capabilities it addresses.
+    #[test]
+    fn the_store_debug_names_its_bucket_and_hides_its_credentials() {
+        let mut c = config("http://127.0.0.1:9000", "kbf-cas");
+        c.credentials = Credentials::new("AKIDSECRETISH", "hunter2");
+        let text = format!("{:?}", S3Store::new(c).unwrap());
+        assert!(text.starts_with("S3Store {"), "{text}");
+        assert!(text.contains("base: \"http://127.0.0.1:9000/\""), "{text}");
+        assert!(text.contains("bucket: \"kbf-cas\""), "{text}");
+        assert!(text.contains("capabilities:"), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains("AKIDSECRETISH"), "{text}");
+    }
+
+    /// Catches: bucket-name edges: a dot inside, a digit at either end, and the exact
+    /// length limits (3 and 63) refused or accepted wrongly.
+    #[test]
+    fn bucket_names_allow_dots_digits_and_the_length_limits() {
+        for ok in ["kbf.cas1", "1kbf", "kbf1", "abc", &"a".repeat(63)] {
+            assert!(valid_bucket(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "ab",
+            "kbf.cas.",
+            ".kbf",
+            "kbf cas",
+            "kbf/cas",
+            &"a".repeat(64),
+        ] {
+            assert!(!valid_bucket(bad), "{bad}");
+        }
+    }
+
+    /// Catches: a 206 whose Content-Range is malformed in each field, or that names the
+    /// right first byte and wrong last (or inverted) bytes, accepted as the window asked.
+    #[test]
+    fn partial_answers_with_malformed_or_inverted_ranges_are_refused() {
+        for cr in [
+            "items 0-9/10",
+            "bytes 0-9",
+            "bytes 0/10",
+            "bytes a-9/10",
+            "bytes 0-b/10",
+            "bytes 0-9/c",
+        ] {
+            let why = check_partial(Some(cr), r(0, 10), 10).unwrap_err();
+            assert!(why.contains("does not parse"), "{cr}: {why}");
+        }
+        let why = check_partial(Some("bytes 0-4/10"), r(0, 10), 5).unwrap_err();
+        assert!(why.contains("asked for bytes 0-9"), "{why}");
+        let why = check_partial(Some("bytes 5-4/5"), r(5, 1), 0).unwrap_err();
+        assert!(why.contains("asked for bytes 5-5"), "{why}");
+        let why = check_partial(Some("bytes 0-9/10"), r(0, 10), 9).unwrap_err();
+        assert!(why.contains("the body has 9 bytes"), "{why}");
     }
 }

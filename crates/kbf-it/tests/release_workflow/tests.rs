@@ -90,7 +90,7 @@ fn a_verdict_against_another_main_is_refused() {
     // Catches: main-only weakened by pointing the on-main test at another ref.
     let found = plant(
         "--output \"$GITHUB_OUTPUT\"\n      # What the release changes",
-        "--main-ref origin/feature/arch-v2 --output \"$GITHUB_OUTPUT\"\n      # What the release changes",
+        "--main-ref origin/next --output \"$GITHUB_OUTPUT\"\n      # What the release changes",
     );
     red(&found, "main ref other than `origin/main`");
 }

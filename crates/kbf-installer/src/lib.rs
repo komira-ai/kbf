@@ -53,7 +53,6 @@ pub mod activate;
 pub mod app;
 pub mod archive;
 pub mod attest;
-pub mod backup;
 pub mod binary;
 pub mod cli;
 pub mod darwin;
@@ -87,6 +86,7 @@ pub mod status_v2;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod trust;
+pub mod utc_stamp;
 pub mod version;
 
 use std::fmt;
