@@ -281,7 +281,7 @@ fn the_harness_runs_and_the_runner_is_measured() {
     ];
     let mut observe = Observe::new(&scratch, &pool, &go);
     let first = lease.run("identity", &identity, &mut daemon, |_| observe.poll());
-    let mut ran_as = ran_as_pool_uid(&first, &pool);
+    let ran_as = ran_as_pool_uid(&first, &pool);
     facts.push(format!("action-ran-as-a-pool-uid: {ran_as}"));
     facts.push(format!(
         "lease-dir-appeared-while-the-action-ran: {}",
@@ -293,46 +293,23 @@ fn the_harness_runs_and_the_runner_is_measured() {
     facts.push(format!("lease-dir-gone-after-the-Result: {gone}"));
     after_lease(&pool, &scratch);
 
-    // A lease that failed to start because the daemon made `leases` closed to the pool user:
-    // write it down, apply the one change that opens it, and measure again.
-    if !first.succeeded() {
-        let leases = scratch.leases();
-        let mode = std::fs::metadata(&leases)
-            .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o7777);
-        say(
-            "workaround",
-            format!(
-                "lease 1 did not run to exit 0; {} has mode {mode:?}; opening it to 0711 and running the identity action again",
-                leases.display()
-            ),
-        );
-        facts.push(format!(
-            "identity-lease-first-try-failed: {} ({})",
-            first.summary(),
-            leases.display()
-        ));
-        let _ =
-            std::fs::set_permissions(&leases, std::os::unix::fs::PermissionsExt::from_mode(0o711));
-        let again = [
-            act.as_str(),
-            "id",
-            ";",
-            "pwd",
-            ";",
-            "env",
-            "HOME",
-            "unset",
-            ";",
-            "env",
-            "TMPDIR",
-            "unset",
-        ];
-        let second = lease.run("identity-after-opening-leases", &again, &mut daemon, |_| {});
-        ran_as = ran_as_pool_uid(&second, &pool);
-        facts.push(format!(
-            "action-ran-as-a-pool-uid-after-opening-leases: {ran_as}"
-        ));
-    }
+    // Since #1447 a pool daemon makes `leases` 0711, so the pool user enters its own lease
+    // directory and the first lease runs. A first lease that did not run means pool mode
+    // itself is broken on this Mac: the run stops here rather than measure the rest.
+    let leases = scratch.leases();
+    let mode = std::fs::metadata(&leases).map(|m| {
+        format!(
+            "{:o}",
+            std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o7777
+        )
+    });
+    facts.push(format!("leases-root-mode: {mode:?} ({})", leases.display()));
+    assert!(
+        first.succeeded(),
+        "the first lease did not run as a pool user ({}); {} has mode {mode:?}",
+        first.summary(),
+        leases.display()
+    );
 
     // One lease per probe: a program that fails ends its action, so each gets its own.
     for probe in PROBES {
