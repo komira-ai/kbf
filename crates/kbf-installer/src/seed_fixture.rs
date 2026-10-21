@@ -278,7 +278,8 @@ impl Seeded {
                 owner: root,
                 bytes: text.into_bytes(),
             });
-            exec.entries.extend(ids.map(|conf| (path(SETTINGS_PATH), conf)));
+            exec.entries
+                .extend(ids.map(|conf| (path(SETTINGS_PATH), conf)));
             Ok(seeded.parts(exec))
         })
         .with_build(&self.build)
