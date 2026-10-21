@@ -204,6 +204,22 @@ impl Frontend {
         assert_eq!(code, 201, "{path}");
     }
 
+    /// Stores the version facts of `commit` for `platform`: the report of a build with these
+    /// numbers.
+    async fn facts(&self, commit: &str, platform: &str, numbers: (u32, u32, u32)) {
+        let path = format!("/v1/releases/{commit}/{platform}/version.json");
+        let (code, answer) = http(
+            self.api,
+            "PUT",
+            &path,
+            true,
+            None,
+            &facts_doc(commit, numbers),
+        )
+        .await;
+        assert_eq!(code, 201, "{path}: {answer}");
+    }
+
     /// Offers `commit` as the desired release; its generation.
     async fn desire(&self, commit: &str) -> u64 {
         let body = json!({ "commit": commit }).to_string();
@@ -254,11 +270,26 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-/// A complete linux-x86_64 release (`kbf`) of `commit`.
+/// What `kbf --version --json` prints for a build of `commit` with these `(protocol,
+/// min_protocol, state_schema)`.
+fn facts_doc(commit: &str, (protocol, min_protocol, state_schema): (u32, u32, u32)) -> Vec<u8> {
+    format!(
+        "{{\"commit\":\"{}\",\"min_protocol\":{min_protocol},\"profile\":\"release\",\
+         \"protocol\":{protocol},\"state_schema\":{state_schema},\"version\":\"0.1.0\"}}",
+        &commit[..12]
+    )
+    .into_bytes()
+}
+
+/// The facts the Linux release of every test states.
+const LINUX_FACTS: (u32, u32, u32) = (7, 6, 3);
+
+/// A complete linux-x86_64 release (`kbf`) of `commit`, with its version facts.
 async fn linux(front: &Frontend, commit: &str) {
     front
         .put(commit, "linux-x86_64", "kbf", &tarball(commit, "kbf"), true)
         .await;
+    front.facts(commit, "linux-x86_64", LINUX_FACTS).await;
 }
 
 /// The next `UpdateOffer` the daemon is sent, within `within`.
@@ -295,7 +326,9 @@ async fn mac_node(front: &Frontend, name: &str, arch: &str) -> FakeDaemon {
 /// `/v1/nodes` list.
 ///
 /// Mutants seen red: no offer after `Welcome`; every stored component offered, not the
-/// platform's; the digest, the size or the attestation taken from another component.
+/// platform's; the digest, the size or the attestation taken from another component (all
+/// seen red before this change); one fact (`min_protocol`) left at its default (seen red with
+/// this change).
 #[tokio::test]
 async fn a_node_is_offered_the_desired_release_after_welcome_and_its_client_takes_it() {
     let front = start();
@@ -320,8 +353,11 @@ async fn a_node_is_offered_the_desired_release_after_welcome_and_its_client_take
                 size: kbf.len() as u64,
                 attestation: attestation(A, "kbf"),
             }],
-            // The release facts are sent by the preflight, a later change.
-            ..UpdateOffer::default()
+            // Each fact is the document's, and different from the others.
+            protocol: 7,
+            min_protocol: 6,
+            state_schema: 3,
+            profile: "release".to_owned(),
         }
     );
 
@@ -333,16 +369,8 @@ async fn a_node_is_offered_the_desired_release_after_welcome_and_its_client_take
     );
     let (handle, worker) = kbf_update::start(config).expect("the client starts");
     let running = tokio::spawn(worker.run());
-    // The server does not send the release facts yet; the client refuses an offer without
-    // them, so the test gives the client what a preflight will.
-    let complete = UpdateOffer {
-        protocol: 7,
-        min_protocol: 6,
-        state_schema: 3,
-        profile: "release".to_owned(),
-        ..offered
-    };
-    handle.offer(kbf_update::Offer::from(complete));
+    // The offer is taken as the server sent it: it carries the facts the client requires.
+    handle.offer(kbf_update::Offer::from(offered));
     let mut changes = handle.status();
     let reported = tokio::time::timeout(PROMPT, changes.wait_for(|s| s.offered_generation == 1))
         .await
@@ -379,7 +407,8 @@ async fn a_node_is_offered_the_desired_release_after_welcome_and_its_client_take
 /// release moves to B and both are offered generation 2; a rollback to A is generation 3 (a
 /// higher one); a node that connects after that gets the current offer. A Mac node, whose
 /// platform is not complete for A, gets nothing while its tarball lacks an attestation, and
-/// the offer (generation 1, the generation of A, repeated) when the attestation is stored.
+/// the offer (generation 3, the generation of A, repeated) once its attestation and its
+/// version facts are stored: with the attestation alone it still gets nothing.
 ///
 /// Mutants seen red: the offer pushed once per session (no re-offer on a change); the table
 /// not republished when only a platform's completeness changed.
@@ -426,12 +455,22 @@ async fn offers_follow_the_desired_release_and_a_platforms_completeness() {
         "not attested yet"
     );
     front.attest(A, "darwin-arm64", "kbf").await;
+    assert!(
+        offer_within(&mut mac, QUIET).await.is_none(),
+        "attested, but no version facts"
+    );
+    front.facts(A, "darwin-arm64", (12, 9, 5)).await;
     let offered = offer(&mut mac).await;
     assert_eq!(
         (offered.generation, offered.platform.as_str()),
         (3, "darwin-arm64")
     );
     assert_eq!(offered.components[0].name, "kbf");
+    assert_eq!(
+        (offered.protocol, offered.min_protocol, offered.state_schema),
+        (12, 9, 5),
+        "the Mac's own document, not the Linux one"
+    );
     assert!(
         offer_within(&mut one, QUIET).await.is_none(),
         "Linux is told nothing of it"
@@ -481,6 +520,68 @@ async fn an_unknown_or_incomplete_platform_is_offered_nothing() {
         let mut fresh = linux_node(&front, &format!("fresh-{}", &name[..3])).await;
         assert!(offer_within(&mut fresh, QUIET).await.is_none(), "{name}");
     }
+}
+
+/// Catches a platform stored without a version facts document being offered (the installer
+/// refuses an offer without facts, so it would only block the node) or hiding the other
+/// platforms' offers, and a release stored without one being refused or left unexplained:
+/// with `linux-x86_64` complete and documented and `darwin-arm64` complete but undocumented,
+/// the upload of the Mac's files is accepted (`201`) and its answers name the missing file,
+/// the listing says the same for that platform only, the Linux node gets its offer and the
+/// Mac gets none.
+///
+/// Mutants seen red: the offer sent with the facts at their defaults for a platform with no
+/// document; the upload of a platform without a document refused.
+#[tokio::test]
+async fn a_platform_without_version_facts_is_held_with_a_note_and_offered_nowhere() {
+    let front = start();
+    linux(&front, A).await;
+    let path = format!("/v1/releases/{A}/darwin-arm64/kbf");
+    let (code, stored) = http(front.api, "PUT", &path, true, None, b"mac tarball").await;
+    assert_eq!(code, 201, "{stored}");
+    let note = format!(
+        "no version facts (kbf-{A}-darwin-arm64.version.json): nodes will not be offered this \
+         platform; rebuild the release to include it"
+    );
+    assert_eq!(stored["note"], note.as_str());
+    let (code, stored) = http(
+        front.api,
+        "PUT",
+        &format!("{path}.attestation"),
+        true,
+        None,
+        b"b",
+    )
+    .await;
+    assert_eq!(code, 201, "{stored}");
+    assert_eq!(
+        stored["note"],
+        note.as_str(),
+        "said at every put of the platform"
+    );
+    front.desire(A).await;
+
+    let mut linux_node = linux_node(&front, "n1").await;
+    assert_eq!(offer(&mut linux_node).await.protocol, 7);
+    let mut mac = mac_node(&front, "m1", "arm64").await;
+    assert!(
+        offer_within(&mut mac, QUIET).await.is_none(),
+        "no facts, no offer"
+    );
+
+    let (code, listing) = http(front.api, "GET", "/v1/releases", false, None, b"").await;
+    assert_eq!(code, 200);
+    let platforms = &listing["releases"][0]["platforms"];
+    assert_eq!(platforms[0]["platform"], "linux-x86_64");
+    assert_eq!(platforms[0]["version_facts"], true);
+    assert_eq!(platforms[0].get("note"), None);
+    assert_eq!(platforms[1]["platform"], "darwin-arm64");
+    assert_eq!(
+        platforms[1]["complete"], true,
+        "held as complete all the same"
+    );
+    assert_eq!(platforms[1]["version_facts"], false);
+    assert_eq!(platforms[1]["note"], note.as_str());
 }
 
 /// Catches tasks that outlive their frontend: the polling of the table and the sending task of

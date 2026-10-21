@@ -184,7 +184,7 @@ fn the_mode_flag_names_every_mode_like_the_alias_does() {
 /// Catches the alias word reading `kbf.toml` when it is given nothing (the old units run
 /// `kbf storage` on their own flags and must go on doing so), and a flag-form start that
 /// carries no flag of its mode not reading it: `--mode=storage` alone, `--mode=daemon
-/// --label`, a bare `kbf` and the alias with `--config` or `--check` are starts that read
+/// --check`, a bare `kbf` and the alias with `--config` or `--check` are starts that read
 /// the file; a start that gives mode flags is never one.
 #[test]
 fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
@@ -198,19 +198,10 @@ fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
         start.config,
         std::path::PathBuf::from(enroll::DEFAULT_CONFIG)
     );
-    assert!(!start.check && start.labels.is_empty());
-    let start = registered(&[
-        "kbf",
-        "--mode=daemon",
-        "--config",
-        "/x/kbf.toml",
-        "--label=pool=mac",
-        "--label",
-        "rack=r2",
-    ])
-    .expect("config and labels");
+    assert!(!start.check);
+    let start =
+        registered(&["kbf", "--mode=daemon", "--config", "/x/kbf.toml"]).expect("mode and config");
     assert_eq!(start.config, std::path::PathBuf::from("/x/kbf.toml"));
-    assert_eq!(start.labels, ["pool=mac", "rack=r2"]);
     // No mode named: the file's `mode`, and with no file, or none in it, a refusal naming
     // both places.
     let e = error(vec!["kbf".into()]);
@@ -246,7 +237,7 @@ fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
         parse_from(["kbf", "storage"]),
         Ok(Invocation::Storage(_))
     ));
-    assert!(registered(&["kbf", "daemon", "--label=a=b"]).is_none());
+    assert!(registered(&["kbf", "daemon"]).is_none());
     // Flags of the mode: the flags are the configuration.
     assert!(registered(&["kbf", "--mode=storage", "--storage-listen=127.0.0.1:1"]).is_none());
     // Flags and a file together are one start: the flags win over the file's keys, so
@@ -274,19 +265,15 @@ fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
 
 /// Catches `--help` that lists the old words as commands, or misses a mode: the five
 /// modes are the possible values of `--mode`, the hidden aliases are no `Commands:`
-/// section, and `--config`, `--check` and `--label` are listed.
+/// section, and `--config` and `--check` are listed, and `--label` (removed) is not.
 #[test]
 fn help_lists_the_modes_under_the_mode_flag_and_no_commands() {
     let help = command().render_long_help().to_string();
     assert!(!help.contains("Commands:"), "{help}");
-    for flag in [
-        "--mode <MODE>",
-        "--config <FILE>",
-        "--check",
-        "--label <KEY=VALUE>",
-    ] {
+    for flag in ["--mode <MODE>", "--config <FILE>", "--check"] {
         assert!(help.contains(flag), "{flag}: {help}");
     }
+    assert!(!help.contains("--label"), "{help}");
     let named: Vec<&str> = MODES.iter().map(|m| m.name).collect();
     let cmd = command();
     let values = cmd
@@ -957,12 +944,7 @@ fn the_parser_takes_the_mode_flag_and_the_file_flags() {
     for line in [
         &["kbf", "--mode=daemon", "--check"][..],
         &["kbf", "--mode=storage"],
-        &[
-            "kbf",
-            "--mode=daemon",
-            "--config=/etc/kbf/kbf.toml",
-            "--label=a=b",
-        ],
+        &["kbf", "--mode=daemon", "--config=/etc/kbf/kbf.toml"],
         &["kbf", "storage-and-daemon", "--check"],
     ] {
         assert_eq!(check(line), Ok(()), "{line:?}");

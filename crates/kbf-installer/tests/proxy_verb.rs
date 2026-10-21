@@ -282,6 +282,29 @@ fn start_args(
     block_term: bool,
     flags: &[&std::ffi::OsStr],
 ) -> Reaped {
+    start_env(path, listener, stderr, block_term, flags, &[])
+}
+
+/// [`start_args`] with `env` set in the verb's environment (name, value).
+fn start_env(
+    path: &Path,
+    listener: &TcpListener,
+    stderr: Stdio,
+    block_term: bool,
+    flags: &[&std::ffi::OsStr],
+    env: &[(&str, &Path)],
+) -> Reaped {
+    use std::os::unix::ffi::OsStrExt as _;
+    // Built before the fork: the child only calls `setenv` on them.
+    let env: Vec<(std::ffi::CString, std::ffi::CString)> = env
+        .iter()
+        .map(|(name, value)| {
+            (
+                std::ffi::CString::new(*name).expect("a name"),
+                std::ffi::CString::new(value.as_os_str().as_bytes()).expect("a value"),
+            )
+        })
+        .collect();
     let fd = listener.as_raw_fd();
     let mut command = Command::new(BIN);
     command
@@ -334,6 +357,9 @@ fn start_args(
             // environment to `exec` as soon as one variable is set on the command.
             libc::setenv(c"LISTEN_PID".as_ptr(), digits[at..].as_ptr().cast(), 1);
             libc::setenv(c"LISTEN_FDS".as_ptr(), c"1".as_ptr(), 1);
+            for (name, value) in &env {
+                libc::setenv(name.as_ptr(), value.as_ptr(), 1);
+            }
             Ok(())
         });
     }
@@ -1311,4 +1337,169 @@ async fn the_proxy_refuses_before_the_update_api_is_called() {
 
     let (status, text) = call(addr, &ca, "POST", UPDATE, Some(TOKEN), body.as_bytes()).await;
     assert_eq!(status, 503, "with the token the API is reached: {text}");
+}
+
+// A CI job's OIDC token (`remote_operator_file`), through the shipped binary: the real update API
+// behind the real proxy, with a fake issuer that the verb trusts through `SSL_CERT_FILE`.
+
+/// A fake issuer, and a verb whose proxy admits its tokens: the guard, the proxy's address, the
+/// CA a client trusts, the config, and the issuer (kept alive).
+async fn serving_remote(
+    name: &str,
+    with_key: bool,
+) -> (
+    Reaped,
+    SocketAddr,
+    PathBuf,
+    PathBuf,
+    kbf_oidc::testkit::FakeIssuer,
+) {
+    use base64::Engine as _;
+    let issuer = kbf_oidc::testkit::FakeIssuer::start(kbf_oidc::testkit::jwks_of(&[
+        &kbf_oidc::testkit::keys()[0],
+    ]))
+    .await;
+    let (config, ca) = served_config(name);
+    let dir = config.parent().expect("the directory").to_owned();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(issuer.root.as_ref());
+    let pem = format!(
+        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+        b64.as_bytes()
+            .chunks(64)
+            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let trust = dir.join("issuer-ca.pem");
+    fs::write(&trust, pem).expect("write");
+    let allow = dir.join("remote-ci.toml");
+    fs::write(&allow, kbf_oidc::testkit::config_text(&issuer.url)).expect("write");
+    if with_key {
+        let text = fs::read_to_string(&config).expect("read");
+        let text = text.replace(
+            "[proxy.upstream]",
+            &format!("remote_operator_file = {allow:?}\n[proxy.upstream]"),
+        );
+        fs::write(&config, text).expect("write");
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let proxy = start_env(
+        &config,
+        &listener,
+        Stdio::piped(),
+        false,
+        &[],
+        &[("SSL_CERT_FILE", &trust)],
+    );
+    drop(listener);
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca, "/healthz"))
+        .await
+        .expect("the proxy answers");
+    assert_eq!(status, 200);
+    (proxy, addr, ca, config, issuer)
+}
+
+/// A token CI would send, valid now.
+fn ci_token(edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs();
+    let mut claims = kbf_oidc::testkit::good_claims("");
+    claims["exp"] = (now + 300).into();
+    claims["iat"] = now.into();
+    claims["nbf"] = now.into();
+    edit(&mut claims);
+    kbf_oidc::testkit::mint(&kbf_oidc::testkit::keys()[0], &claims)
+}
+
+/// Catches a CI token that does not reach the update API the operator's reaches, or reaches
+/// more of it: with the allow-list a good token's `POST` is answered by the same API in the
+/// same words as the operator's (503, the API is not bound yet, and no order is written),
+/// where a stub or a refusal would differ; and the same token opens no other call (`GET`
+/// status, `abort`), is spent by its first use, and a token for another audience is refused.
+/// The issuer is a TLS server of the test that the verb trusts through `SSL_CERT_FILE`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_ci_token_reaches_the_update_api_as_the_operator_token_does() {
+    let (_proxy, addr, ca, config, issuer) = serving_remote("ci-token", true).await;
+    let issuer_url = issuer.url.clone();
+    let token = |edit: fn(&mut serde_json::Value)| {
+        let url = issuer_url.clone();
+        ci_token(move |claims| {
+            claims["iss"] = url.into();
+            edit(claims);
+        })
+    };
+    let body = post_body("r1");
+    let (status, by_operator) = call(addr, &ca, "POST", UPDATE, Some(TOKEN), body.as_bytes()).await;
+    assert_eq!(status, 503, "{by_operator}");
+    let good = token(|_| {});
+    let (status, by_token) = call(addr, &ca, "POST", UPDATE, Some(&good), body.as_bytes()).await;
+    assert_eq!(status, 503, "{by_token}");
+    assert_eq!(
+        json(&by_token)["error"],
+        json(&by_operator)["error"],
+        "{by_token}"
+    );
+    assert_eq!(names_in(&orders_dir_of(&config)), Vec::<String>::new());
+
+    let (status, text) = call(addr, &ca, "POST", UPDATE, Some(&good), body.as_bytes()).await;
+    assert_eq!(status, 401, "spent: {text}");
+    for (method, path) in [
+        ("GET", UPDATE),
+        ("POST", "/v1/update/frontend/abort"),
+        ("POST", "/v1/update/frontend/rollback"),
+    ] {
+        let (status, text) = call(addr, &ca, method, path, Some(&token(|_| {})), b"{}").await;
+        assert_eq!(status, 401, "{method} {path}: {text}");
+    }
+    let wrong = token(|claims| claims["aud"] = "someone-else".into());
+    let (status, text) = call(addr, &ca, "POST", UPDATE, Some(&wrong), body.as_bytes()).await;
+    assert_eq!(status, 401, "{text}");
+}
+
+/// Catches the CI credential on when `remote_operator_file` is not set: the same good token is
+/// 401 on a verb started without it.
+#[tokio::test(flavor = "current_thread")]
+async fn without_the_allow_list_a_ci_token_is_refused() {
+    let (_proxy, addr, ca, _config, issuer) = serving_remote("ci-off", false).await;
+    let url = issuer.url.clone();
+    let good = ci_token(move |claims| claims["iss"] = url.into());
+    let body = post_body("r1");
+    let (status, text) = call(addr, &ca, "POST", UPDATE, Some(&good), body.as_bytes()).await;
+    assert_eq!(status, 401, "{text}");
+}
+
+/// Catches an allow-list that `--check` does not read: it refuses a `remote_operator_file`
+/// that does not exist or is not an allow-list, naming the key.
+#[test]
+fn a_bad_allow_list_is_refused_by_check() {
+    let (config, _) = served_config("ci-bad");
+    let dir = config.parent().expect("the directory").to_owned();
+    let bad = dir.join("remote-ci.toml");
+    for (what, text) in [
+        ("missing", None),
+        ("not an allow-list", Some("[remote_operator]\n")),
+    ] {
+        if let Some(text) = text {
+            fs::write(&bad, text).expect("write");
+        }
+        let table = fs::read_to_string(&config).expect("read").replace(
+            "[proxy.upstream]",
+            &format!("remote_operator_file = {bad:?}\n[proxy.upstream]"),
+        );
+        fs::write(&config, table).expect("write");
+        let out = run(&["--check"], &config);
+        assert_eq!(out.status.code(), Some(2), "{what}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("remote_operator_file"), "{what}: {stderr}");
+        // Only the first pass adds the key to the table; the second reads it again.
+        let table = fs::read_to_string(&config).expect("read");
+        fs::write(
+            &config,
+            table.replacen(&format!("remote_operator_file = {bad:?}\n"), "", 1),
+        )
+        .expect("write");
+    }
 }

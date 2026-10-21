@@ -975,6 +975,7 @@ fn run_builds_its_helper_with_the_host_fetcher_not_the_unwired_one() {
     let rec = crate::helper::fetcher::ReleaseLocator {
         commit: c(B),
         components: Vec::new(),
+        source: kbf_update::Source::Fetch,
     };
     let got = helper.fetcher().fetch(&rec);
     assert!(
@@ -1577,10 +1578,10 @@ fn uninstall_parses_runs_through_the_dispatcher_and_refuses_an_adopted_host() {
     }
 
     // A host `setup` ran on is the installer's: refused, with the way out.
-    let (_, adopted) = seeded("uninstall-adopted");
+    let (layout, adopted) = seeded("uninstall-adopted");
     // The installer's directory as a host has it (the check judges it like every file).
     fs::set_permissions(
-        adopted.join("var/lib/kbf-installer"),
+        layout.join(&layout.state_dir()),
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
     )
     .expect("mode");

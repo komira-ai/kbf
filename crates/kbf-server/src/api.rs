@@ -816,6 +816,12 @@ pub(crate) fn error(code: StatusCode, why: &str) -> Response {
     answer
 }
 
+/// [`error`] with a stable machine `code` beside the text, for a refusal a program tells from
+/// the other answers of one status.
+pub(crate) fn error_coded(status: StatusCode, why: &str, code: &str) -> Response {
+    json(status, &serde_json::json!({ "error": why, "code": code }))
+}
+
 #[cfg(test)]
 mod tests {
     use kbf_map::{Member, Rule};

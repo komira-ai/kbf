@@ -754,7 +754,10 @@ pub fn run(args: &ProxyArgs, root: &Path) -> Result<(), VerbError> {
         &text,
     ))?;
     if args.check {
-        return Ok(());
+        return loaded
+            .proxy
+            .check_remote_file()
+            .map_err(|e| VerbError::Usage(format!("{}: {e}", path.display())));
     }
     let root = kbf_host::Root::new(root).map_err(|e| VerbError::Usage(format!("--root: {e}")))?;
     let listen_pid = std::env::var("LISTEN_PID").ok();

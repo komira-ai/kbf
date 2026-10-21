@@ -53,6 +53,7 @@ mod pool;
 mod probe;
 #[cfg(not(kbf_loom))]
 mod proxy;
+pub mod remote;
 pub mod replay;
 #[cfg(not(kbf_loom))]
 mod reply;

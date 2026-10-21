@@ -4,6 +4,10 @@
 //! - `build-commit check <binary> <commit>`, `build-commit check-asset <tarball>
 //!   <commit>` and `build-commit stamps <commit>` ([`build_commit`]): kbf-server names the
 //!   commit it was built from, and `kbf` does in the tarball that ships.
+//! - `advisories --repo <owner>/<repo> [--commit <sha>]` ([`advisories`]): `cargo deny check
+//!   advisories`, kept in one GitHub issue (opened, updated, or commented on and closed when
+//!   none remain) instead of failing a pull request. Exit 0 whatever it found; 1 when
+//!   cargo-deny or `gh` failed. `advisories.yml` runs it daily and on every push to `main`.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
 //!   row the working tree's budget file has and `<rev>`'s does not is refused, unless
 //!   git sees the row's path renamed from a path `<rev>` has a row for. CI runs
@@ -81,6 +85,7 @@ use std::process::{Command, ExitCode};
 
 use clap::{Parser, Subcommand};
 
+pub mod advisories;
 pub mod budget;
 pub mod build_commit;
 pub mod bundles;
@@ -156,6 +161,8 @@ enum Verb {
     /// kbf-server's `--version` names the commit it was built from.
     #[command(subcommand)]
     BuildCommit(BuildCommit),
+    /// Keep the advisories `cargo deny` reports in one GitHub issue.
+    Advisories(advisories::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
         /// The revision to compare with (on a pull request, the base branch).
@@ -592,7 +599,7 @@ enum ReleaseVerb {
         /// The artifacts workflow run that built and attested the files.
         #[arg(long)]
         run_id: u64,
-        /// The set hash the gamma verdict names, as `release verdict` printed it.
+        /// The set hash the verdict names, as `release verdict` printed it.
         #[arg(long)]
         set_hash: String,
         /// The release's notes (`release notes --out`): the release body, followed by how
@@ -603,8 +610,8 @@ enum ReleaseVerb {
         #[arg(long, default_value = "gh")]
         gh: PathBuf,
     },
-    /// The tag's message is a green gamma verdict for this tag, commit and set, after a bake
-    /// of 24 hours or more. Prints `set-hash=<hex>`.
+    /// The tag's message is a green verdict of the gate stage for this tag, commit and set
+    /// (a Gamma one after a bake of 24 hours or more). Prints `set-hash=<hex>`.
     Verdict {
         #[command(flatten)]
         subject: SubjectArgs,
@@ -615,6 +622,9 @@ enum ReleaseVerb {
     /// The checks that make a commit offerable to a farm; writes `offer.json`, sets
     /// nothing on any farm.
     Offer(release::offer::OfferArgs),
+    /// Wait for the push runs of ci, beta and artifacts for `--sha` on `--branch` and
+    /// require all three to succeed; print their run ids. Only reads.
+    Gates(release::gates::GatesArgs),
     /// What a push would release: the next version, the push's class, and the freeze and
     /// superseded refusals. Writes nothing but `--output`.
     Plan(release::plan::PlanArgs),
@@ -698,6 +708,7 @@ impl SubjectArgs {
             commit: &self.commit,
             dir: &self.dir,
             main_ref: &self.main_ref,
+            stage: release::verdict::GATE_STAGE,
         }
     }
 }
@@ -830,6 +841,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             sudo: &sudo,
             root: &root,
         }),
+        Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::Fetch {
             url,
@@ -1089,8 +1101,9 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             }
             Ok(vec![
                 format!(
-                    "tag {}: a green gamma verdict for {} and set {}",
+                    "tag {}: a green {:?} verdict for {} and set {}",
                     subject.tag,
+                    verified.doc.stage,
                     subject.commit,
                     verified.set_hash.as_str()
                 ),
@@ -1098,6 +1111,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             ])
         }
         Verb::Release(ReleaseVerb::Offer(args)) => release::offer::run(&args),
+        Verb::Release(ReleaseVerb::Gates(args)) => release::gates::run(&args),
         Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
         Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
         Verb::Release(ReleaseVerb::VersionFacts(args)) => version_facts::run(&args),

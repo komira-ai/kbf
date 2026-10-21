@@ -1,6 +1,8 @@
 //! `release notes`: the notes of a release, from the commits since the previous release
-//! and the gamma verdict that was checked (docs/design/kbf-cicd.md, section 8.1, item 3).
-//! A dry run shows them as an artifact of the verify job before anyone approves.
+//! and the verdict that was checked, of the stage [`super::verdict::GATE_STAGE`]
+//! (docs/design/kbf-cicd.md, section 8.1, item 3). A dry run shows them as an artifact of
+//! the verify job. What is not reversible comes from the two builds, for every stage, never
+//! from the verdict.
 
 use std::path::Path;
 
@@ -134,8 +136,7 @@ fn floor(name: &str, f: Floor) -> String {
     format!("{name} {} (needs {})", f.measured, f.required)
 }
 
-/// `bake: 24h 00m`. A verified verdict has a finished, forward bake, so this always
-/// yields a line.
+/// `bake: 24h 00m`. A Gamma verdict has a finished, forward bake; a Beta one has none.
 fn bake_line(doc: &ResultDoc) -> Option<String> {
     bake_secs(doc)
         .flatten()
@@ -152,8 +153,9 @@ fn summary(doc: &ResultDoc) -> String {
     let mut parts: Vec<String> = bake_line(doc).into_iter().collect();
     parts.push(format!("{} gate(s), {warned} warning(s)", doc.gates.len()));
     format!(
-        "green for the set it names; {}; detail under Gamma verdict",
-        parts.join(", ")
+        "green for the set it names; {}; detail under {:?} verdict",
+        parts.join(", "),
+        doc.stage
     )
 }
 
@@ -198,9 +200,9 @@ fn render(
         out.push_str(&format!("- and {} more\n", commits.len() - MAX_COMMITS));
     }
 
-    let mut gamma = Vec::new();
-    gamma.extend(bake_line(doc));
-    gamma.extend(doc.load.map(|l| {
+    let mut detail = Vec::new();
+    detail.extend(bake_line(doc));
+    detail.extend(doc.load.map(|l| {
         format!(
             "load: {}, {}, {}",
             floor("actions", l.actions),
@@ -215,14 +217,16 @@ fn render(
         } else {
             ""
         };
-        gamma.push(format!("gate {}: {measured}{mark}", g.name));
+        detail.push(format!("gate {}: {measured}{mark}", g.name));
     }
     for w in &doc.waivers {
-        gamma.push(format!("waived {} by {}: {}", w.what, w.by, w.reason));
+        detail.push(format!("waived {} by {}: {}", w.what, w.by, w.reason));
     }
-    section(&mut out, "## Gamma verdict", &gamma, "No detail recorded.");
+    let title = format!("## {:?} verdict", doc.stage);
+    section(&mut out, &title, &detail, "No detail recorded.");
     out.push_str(&format!(
-        "\n## Gamma escapes\n\n{} scenario(s) only gamma found.\n",
+        "\n## {:?} escapes\n\n{} scenario(s) only gamma found.\n",
+        doc.stage,
         doc.escapes.len()
     ));
     for e in &doc.escapes {

@@ -1,0 +1,43 @@
+[package]
+name = "kbf-oidc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Verifies a GitHub Actions OIDC token against an allow-list (the claim set in src/lib.rs). The
+# front door (`kbf-proxy`) is the caller: it lets a CI job with such a token start two updates
+# (`POST /v1/update/desired`, `POST /v1/update/frontend`), off unless the proxy is given the
+# allow-list. The issuer's keys are fetched over https (hyper on rustls, the ring provider,
+# the host's roots); the RS256 signature is checked by ring. `testkit` is a fake issuer with
+# RSA key fixtures (testdata/), for the tests of the callers; it is never in a release build.
+[features]
+testkit = ["dep:rcgen"]
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+futures.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+ring.workspace = true
+rcgen = { workspace = true, optional = true }
+rustls.workspace = true
+rustls-native-certs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "sync", "time", "io-util"] }
+tokio-rustls.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util", "time"] }
+
+[lints]
+workspace = true

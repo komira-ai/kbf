@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::offer::{Refusal, check_component};
-use crate::types::{Offer, Order, Verb, is_hex};
+use crate::types::{Offer, Order, Source, Verb, is_hex};
 
 /// The most bytes a record may be; the installer refuses a larger file unread.
 pub const MAX_RECORD_BYTES: u64 = 1 << 20;
@@ -43,7 +43,7 @@ pub struct Locator {
 }
 
 /// What the release is expected to declare about itself (`kbf --version --json`), as the
-/// frontend's preflight recorded it. The installer requires the fetched binary to say the
+/// frontend's release store holds it (the platform's version facts document). The installer requires the fetched binary to say the
 /// same, before it switches to it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,6 +72,13 @@ pub struct OrderRecord {
     /// For an activation: what the fetched binary must declare. Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected: Option<Facts>,
+    /// Where the release comes from. Written only when it is [`Source::Staged`], so the
+    /// bytes of a record that fetches are what they have always been; a reader takes the
+    /// explicit word `fetch` as the default. Only an `activate` and a `frontend_update` take
+    /// it, and a staged one is a locator: no components and no expected facts, since the
+    /// installer holds the release's facts in its own package.
+    #[serde(default, skip_serializing_if = "Source::is_fetch")]
+    pub source: Source,
 }
 
 /// Why a record cannot be written or is not acceptable.
@@ -83,7 +90,7 @@ pub enum RecordError {
     NotForNodes,
     #[error("an activation names no release component")]
     NoComponents,
-    #[error("a {0} order carries components or expected facts")]
+    #[error("a {0} order carries components, expected facts or a source it does not take")]
     Unexpected(&'static str),
     #[error("an activation carries no expected facts of the release")]
     NoFacts,
@@ -170,6 +177,8 @@ impl OrderRecord {
             window_s: order.window_s,
             components,
             expected,
+            // A node's order says nothing of a source yet: it is the default.
+            source: Source::Fetch,
         };
         record.check()?;
         record.to_bytes()?;
@@ -210,11 +219,14 @@ impl OrderRecord {
     }
 
     /// The shape rules both ends hold: a full commit; an activation names its components
-    /// (each within the offer's limits) and the expected facts, every one there (a release
-    /// the frontend never preflighted is not activated); every other verb carries neither.
+    /// (each within the offer's limits) and the expected facts, every one there (an offer
+    /// without facts is not activated); every other verb carries neither.
     /// A `frontend_update` is a locator like a `confirm`: the root half fetches the commit
     /// from its own source and re-derives every fact, so the record names no file, no
-    /// digest and no claim.
+    /// digest and no claim. An activation whose source is [`Source::Staged`] is a locator
+    /// too (the release is the one the installer's package carries, and its manifest holds the
+    /// facts), and only an `activate` and a `frontend_update` take a source: a `confirm` or a
+    /// `revert` that names one is refused.
     ///
     /// # Errors
     /// The first rule broken.
@@ -222,14 +234,18 @@ impl OrderRecord {
         if !is_hex(&self.commit, 40) {
             return Err(RecordError::Commit(self.commit.clone()));
         }
-        match self.verb {
-            Verb::Activate => {}
-            Verb::Confirm | Verb::Revert | Verb::FrontendUpdate => {
-                if !self.components.is_empty() || self.expected.is_some() {
-                    return Err(RecordError::Unexpected(self.verb.name()));
-                }
-                return Ok(());
+        let locator = match (self.verb, self.source) {
+            (Verb::Activate, Source::Fetch) => false,
+            (Verb::Activate | Verb::FrontendUpdate, _) | (_, Source::Fetch) => true,
+            (Verb::Confirm | Verb::Revert, Source::Staged) => {
+                return Err(RecordError::Unexpected(self.verb.name()));
             }
+        };
+        if locator {
+            if !self.components.is_empty() || self.expected.is_some() {
+                return Err(RecordError::Unexpected(self.verb.name()));
+            }
+            return Ok(());
         }
         if self.components.is_empty() {
             return Err(RecordError::NoComponents);
@@ -552,5 +568,137 @@ mod tests {
         ] {
             assert_eq!(parse_file_name(bad), None, "{bad}");
         }
+    }
+
+    /// The bytes of a record that fetches are what they were before the record had a source:
+    /// the key is left out, an explicit `"source":"fetch"` is read as the default and written
+    /// back without the key, and the activation a node writes names no source.
+    ///
+    /// Catches a sender that always writes the key (an installer that does not know it, or a
+    /// proxy whose request type is closed, refuses the record whole, so a fetch would break
+    /// after any upgrade), and a reader that refuses the word `fetch`.
+    ///
+    /// Mutants to plant: `skip_serializing_if` removed from the field (the golden bytes gain
+    /// the key); the word `fetch` made an unknown variant.
+    #[test]
+    fn a_record_that_fetches_is_todays_bytes_and_an_explicit_fetch_is_read() {
+        let golden = format!(
+            "{{\"order_id\":5,\"epoch\":2,\"generation\":9,\"verb\":\"confirm\",\"commit\":\"{COMMIT}\",\"window_s\":600}}"
+        );
+        let record = OrderRecord::parse(golden.as_bytes()).expect("parses");
+        assert_eq!(record.source, Source::Fetch);
+        assert_eq!(record.to_bytes().expect("bytes"), golden.as_bytes());
+        let explicit = golden.replace("600}", "600,\"source\":\"fetch\"}");
+        let again = OrderRecord::parse(explicit.as_bytes()).expect("an explicit fetch parses");
+        assert_eq!(again, record);
+        assert_eq!(
+            again.to_bytes().expect("bytes"),
+            golden.as_bytes(),
+            "and is written without the key"
+        );
+        let act = OrderRecord::for_order(&order(COMMIT), Verb::Activate, Some(&good_offer()))
+            .expect("record");
+        assert_eq!(act.source, Source::Fetch);
+        let text = String::from_utf8(act.to_bytes().expect("bytes")).expect("text");
+        assert!(!text.contains("source"), "{text}");
+    }
+
+    /// A staged record is a locator that names its source last, and only an `activate` and a
+    /// `frontend_update` take the key: a staged activation with components, with expected
+    /// facts or with both is refused as an activation that takes neither, a `confirm` or a
+    /// `revert` with the key is refused as one that takes no source, and an activation that
+    /// names no source and no components is still one that names no component. A source that
+    /// is neither word is not a record.
+    ///
+    /// Catches a staged activation that also carries the release it would have fetched (two
+    /// ways to say where the bytes come from), a source on a verb that moves no release, and
+    /// the check widened until the empty activation passes.
+    ///
+    /// Mutants to plant: the staged arm for `activate` removed (the golden is `NoComponents`);
+    /// components allowed beside a staged source; the source refused on `frontend_update`;
+    /// allowed on `confirm`; an unknown word read as `fetch`.
+    #[test]
+    fn a_staged_record_is_a_locator_and_only_two_verbs_take_the_key() {
+        let golden = format!(
+            "{{\"order_id\":5,\"epoch\":2,\"generation\":9,\"verb\":\"activate\",\"commit\":\"{COMMIT}\",\"window_s\":600,\"source\":\"staged\"}}"
+        );
+        let record = OrderRecord::parse(golden.as_bytes()).expect("a staged activation parses");
+        assert_eq!(
+            (record.verb, record.source),
+            (Verb::Activate, Source::Staged)
+        );
+        assert!(record.components.is_empty());
+        assert!(record.expected.is_none());
+        assert_eq!(record.to_bytes().expect("bytes"), golden.as_bytes());
+
+        let without = golden.replace(",\"source\":\"staged\"", "");
+        assert_eq!(
+            OrderRecord::parse(without.as_bytes()),
+            Err(RecordError::NoComponents),
+            "without the key it is an activation that names nothing"
+        );
+        let update = golden.replace("activate", "frontend_update");
+        let parsed = OrderRecord::parse(update.as_bytes()).expect("a staged frontend update");
+        assert_eq!(
+            (parsed.verb, parsed.source),
+            (Verb::FrontendUpdate, Source::Staged)
+        );
+
+        for verb in [Verb::Confirm, Verb::Revert] {
+            let bytes = golden.replace("activate", verb.name());
+            assert_eq!(
+                OrderRecord::parse(bytes.as_bytes()),
+                Err(RecordError::Unexpected(verb.name())),
+                "{verb:?} takes no source"
+            );
+        }
+
+        let sha = "ab".repeat(32);
+        let components = format!(
+            "\"components\":[{{\"name\":\"kbf\",\"sha256\":\"{sha}\",\"size\":1000,\"attestation\":\"{{}}\"}}]"
+        );
+        let facts = "\"expected\":{\"platform\":\"linux-x86_64\",\"protocol\":7,\"min_protocol\":6,\"state_schema\":3,\"profile\":\"release\"}";
+        for verb in ["activate", "frontend_update"] {
+            for (what, extra) in [
+                ("facts", facts.to_owned()),
+                ("components", components.clone()),
+                ("both", format!("{components},{facts}")),
+            ] {
+                let bytes = golden
+                    .replace("activate", verb)
+                    .replace("600,", &format!("600,{extra},"));
+                assert_eq!(
+                    OrderRecord::parse(bytes.as_bytes()),
+                    Err(RecordError::Unexpected(verb)),
+                    "{verb} with {what}"
+                );
+            }
+        }
+
+        let bogus = golden.replace("staged", "bogus");
+        let parsed = OrderRecord::parse(bogus.as_bytes());
+        assert!(
+            matches!(parsed, Err(RecordError::Parse(_))),
+            "a source that is neither word is not a record: {parsed:?}"
+        );
+        assert!(format!("{parsed:?}").contains("bogus"), "{parsed:?}");
+    }
+
+    /// The words of the two sources, and the default a record leaves out.
+    ///
+    /// Catches the two words swapped or renamed on the way to a file.
+    #[test]
+    fn the_sources_have_their_words_and_fetch_is_the_default() {
+        assert_eq!(
+            [Source::Fetch.name(), Source::Staged.name()],
+            ["fetch", "staged"]
+        );
+        assert_eq!(Source::default(), Source::Fetch);
+        assert!(Source::Fetch.is_fetch());
+        assert!(!Source::Staged.is_fetch());
+        assert_eq!(
+            serde_json::to_string(&Source::Staged).expect("json"),
+            "\"staged\""
+        );
     }
 }

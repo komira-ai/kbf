@@ -694,6 +694,9 @@ fn render_proxy(p: &ProxyConfig, out: &mut String) {
     if let Some(file) = &p.buck2_token_file {
         out.push_str(&format!("buck2_token_file = {}\n", path(file)));
     }
+    if let Some(file) = &p.remote_operator_file {
+        out.push_str(&format!("remote_operator_file = {}\n", path(file)));
+    }
     out.push_str(&format!("proxy_auth_file = {}\n", path(&p.proxy_auth_file)));
     out.push_str(&format!("state_dir = {}\n", path(&p.state_dir)));
     out.push_str(&format!("hold_max_s = {}\n", p.hold_max_s));

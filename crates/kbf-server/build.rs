@@ -5,11 +5,15 @@
 //! tests that stamp two builds of one checkout; anything else fails the build), else
 //! `git rev-parse --short=12 HEAD` in the checkout being built, or `unknown` where that
 //! fails (a source archive, no `git`). Uncommitted changes are not marked. The rule is
-//! in `src/build_commit.rs`. Cargo runs this again when the override changes, `HEAD`
-//! moves or the branch it names gets a new commit.
+//! in `src/build_commit.rs`. The number of commits behind `HEAD` is `KBF_BUILD_SEQ` (the rule
+//! is in `src/build_seq.rs`). Cargo runs this again when the override changes, `HEAD` moves, the branch it names gets a new commit or a
+//! shallow clone is deepened.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[path = "src/build_seq.rs"]
+mod build_seq;
 
 #[path = "src/build_commit.rs"]
 mod build_commit;
@@ -35,10 +39,23 @@ fn main() {
         Err(e) => panic!("{e}"),
     };
     println!("cargo:rustc-env=KBF_BUILD_COMMIT={commit}");
-    // Watched: HEAD (a checkout), the ref it names (a commit), and packed-refs (where
-    // that ref lives once packed).
+    // The full commit, for the one comparison a 12-digit prefix cannot settle (R4); empty
+    // when not known.
+    let full = build_commit::choose_full(given.as_deref(), git(&["rev-parse", "HEAD"]));
+    println!("cargo:rustc-env=KBF_BUILD_COMMIT_FULL={full}");
+    // The number of commits behind HEAD, as `KBF_BUILD_SEQ` (`src/build_seq.rs` has the rule).
+    println!("cargo:rerun-if-changed=src/build_seq.rs");
+    let seq = build_seq::from_git(Path::new("."));
+    println!("cargo:rustc-env=KBF_BUILD_SEQ={seq}");
+    // Watched: HEAD (a checkout), the ref it names (a commit), packed-refs (where that ref
+    // lives once packed) and shallow (the file a clone has while it holds part of the history).
     let branch = git(&["symbolic-ref", "-q", "HEAD"]);
-    let watched = [Some("HEAD"), branch.as_deref(), Some("packed-refs")];
+    let watched = [
+        Some("HEAD"),
+        branch.as_deref(),
+        Some("packed-refs"),
+        Some("shallow"),
+    ];
     for path in watched.into_iter().flatten().filter_map(git_path) {
         if path.exists() {
             println!("cargo:rerun-if-changed={}", path.display());

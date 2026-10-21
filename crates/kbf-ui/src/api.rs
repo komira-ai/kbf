@@ -74,6 +74,9 @@ pub(crate) struct Attempt {
     pub(crate) started: Option<String>,
     pub(crate) ended: Option<String>,
     pub(crate) end: Option<End>,
+    /// The run's id in history (24 hex digits): only on a farm that keeps history.
+    #[serde(default)]
+    pub(crate) run_id: Option<String>,
 }
 
 /// How an attempt ended: `{"result": "ok"}`, `{"requeue": .., "reason": ..}` or

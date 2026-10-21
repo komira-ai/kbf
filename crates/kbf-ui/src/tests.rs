@@ -11,8 +11,8 @@ use futures::executor::block_on;
 use serde_json::{Value, json};
 
 use crate::pages::{
-    ACTION, BUILD, BUILDS, LEASES, NODE, NODES, OVERVIEW, PAGES, QUEUE, STORAGE, TARGET, TARGETS,
-    UPDATES, sched_farm,
+    ACTION, BUILD, BUILDS, LEASES, LOG, NODE, NODES, OVERVIEW, PAGES, QUEUE, STORAGE, TARGET,
+    TARGETS, UPDATES, sched_farm,
 };
 use crate::read::Page;
 use crate::{Answer, CONTENT_SECURITY_POLICY, Fetched, Source, SourceError, respond};
@@ -22,6 +22,8 @@ use crate::{Answer, CONTENT_SECURITY_POLICY, Fetched, Source, SourceError, respo
 pub(crate) struct Fake {
     answers: BTreeMap<String, Result<Fetched, String>>,
     seen: Mutex<Vec<String>>,
+    /// The ranges asked, as `(url, first, last)`.
+    ranges: Mutex<Vec<(String, u64, u64)>>,
 }
 
 impl Fake {
@@ -67,6 +69,11 @@ impl Fake {
         self.seen.lock().expect("not poisoned").clone()
     }
 
+    /// Every range asked, `(url, first, last)`, in order.
+    pub(crate) fn ranges(&self) -> Vec<(String, u64, u64)> {
+        self.ranges.lock().expect("not poisoned").clone()
+    }
+
     /// Forgets the URLs asked so far.
     pub(crate) fn forget_seen(&self) {
         self.seen.lock().expect("not poisoned").clear();
@@ -74,6 +81,21 @@ impl Fake {
 }
 
 impl Source for Fake {
+    /// Asked with a range: the table's answer is what a server sends for that range
+    /// (a `206` with its `Content-Range`, or a `200`), and the range is remembered.
+    fn get_range(
+        &self,
+        url: &str,
+        first: u64,
+        last: u64,
+    ) -> impl Future<Output = Result<Fetched, SourceError>> + Send {
+        self.ranges
+            .lock()
+            .expect("not poisoned")
+            .push((url.to_owned(), first, last));
+        self.get(url)
+    }
+
     fn get(&self, url: &str) -> impl Future<Output = Result<Fetched, SourceError>> + Send {
         self.seen.lock().expect("not poisoned").push(url.to_owned());
         let answer = self.answers.get(url).cloned().unwrap_or_else(|| {
@@ -295,7 +317,16 @@ pub(crate) fn farm() -> Fake {
             &json!({"invocations": [], "partial": true}),
         )
         .with(&stderr_href, 200, STDERR)
+        .with_headers(
+            &format!("/v1/runs/{RUN_ID}/logs/stderr"),
+            206,
+            &[("Content-Range", &format!("bytes 0-{}/{}", STDERR.len() - 1, STDERR.len()))],
+            STDERR,
+        )
 }
+
+/// A run's id in history.
+pub(crate) const RUN_ID: &str = "0a0b0c0d0e0f0a0b0c0d0e0f";
 
 /// The answer of `/actions/{digest}` for `retried()`.
 fn retried_action() -> Value {
@@ -690,6 +721,7 @@ fn contract_table() -> Vec<(&'static Page, Vec<String>)> {
                 format!("/ui/builds/{ID}/actions/{}", digest('b', 10)),
             ],
         ),
+        (&LOG, vec![format!("/ui/runs/{RUN_ID}/logs/stderr")]),
         (&NODES, vec!["/ui/nodes".to_owned()]),
         (&NODE, vec!["/ui/nodes/mac-1".to_owned()]),
         (&UPDATES, vec!["/ui/updates".to_owned()]),

@@ -36,6 +36,7 @@ pub mod cycle;
 pub mod fetcher;
 pub mod fetcher_host;
 pub mod fetcher_real;
+pub mod fetcher_seed;
 pub mod host_mode;
 pub mod leases;
 pub mod mac_config;
