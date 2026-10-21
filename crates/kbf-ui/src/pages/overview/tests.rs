@@ -5,9 +5,7 @@ use serde_json::{Value, json};
 
 use crate::html::escape;
 use crate::pages::build_page;
-use crate::tests::{
-    Fake, HOSTILE, LATEST_URL, body, fleet_farm, health_doc, latest_build, render,
-};
+use crate::tests::{Fake, HOSTILE, LATEST_URL, body, fleet_farm, health_doc, latest_build, render};
 
 fn page(fake: &Fake, path: &str) -> (u16, String) {
     let a = render(fake, path);
