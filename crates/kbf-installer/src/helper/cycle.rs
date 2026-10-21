@@ -196,13 +196,15 @@ impl<E: Exec> Helper<E> {
     ///
     /// The sweep is made here and only here, under the lock: this process is not staging
     /// yet, and a pass must not sweep, since `setup` stages the first release in a process
-    /// of its own. A sweep that fails is a refusal like the repair's, and the start goes on
-    /// (the repair's refusal, if it has one, is the one shown).
+    /// of its own. A sweep that fails is logged, never a refusal (as with the gc after a swap:
+    /// nothing was ordered that it could undo, and a refusal would hide the host's real
+    /// state in `status.json`); the start goes on, and a commit the leftovers still wedge is
+    /// refused when it is ordered.
     pub fn recover(&mut self) -> Result<(), HelperError> {
         let mut memory = self.load()?;
         let runs_frontend = host_mode::frontend_host(&self.host).is_ok();
         if let Err(e) = self.sweep_scratch() {
-            refuse(&mut memory, &e.to_string());
+            let _ = writeln!(self.log, "work sweep: {e}");
         }
         match activate::reconcile(&mut self.exec, &self.host, &mut self.log) {
             // A frontend host owes the unit a restart only for a node swap on trial: the

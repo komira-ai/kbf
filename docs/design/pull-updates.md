@@ -341,7 +341,7 @@ still run unprivileged there, so a fault in them is not root.
 
 | Command | Does |
 |---|---|
-| `kbf-installer run` | every 5 seconds (a fixed constant, not a key), each pass: finish a restart it owes; revert a swap whose confirm window ran out; sweep leftover scratch (7.3); act on order records from `orders/` in (epoch, id) order, once each. For `activate`: refuse it while a trial is pending (a release activated and not yet confirmed or reverted: there is one confirm window at a time, never two timers), check the order (below), **fetch, verify and install the release for the commit (7.1, 7.2)**, write `pending_confirm`, flip `previous` then `current`, restart the one configured service; `confirm`: keep it; `revert`: flip back and restart; write `status.json` |
+| `kbf-installer run` | at start, once, under the lock: remove the `work/*.partial` and `work/*.check` a killed stage left (7.3). Then every 5 seconds (a fixed constant, not a key), each pass: finish a restart it owes; revert a swap whose confirm window ran out; act on order records from `orders/` in (epoch, id) order, once each. For `activate`: refuse it while a trial is pending (a release activated and not yet confirmed or reverted: there is one confirm window at a time, never two timers), check the order (below), **fetch, verify and install the release for the commit (7.1, 7.2)**, write `pending_confirm`, flip `previous` then `current`, restart the one configured service; `confirm`: keep it; `revert`: flip back and restart; write `status.json` |
 | `kbf-installer confirm`, `revert`, `rollback` | the operator verbs: **inline root CLI runs under the installer's lock** (exit 4 while a `run` pass holds it); no socket, and `kbf` cannot run them. `confirm` and `revert` name the activation; `rollback` is the only verb below the floor. `update --commit SHA --frontend` is not among them: it needs no root, is refused through `sudo`, and is a client of the proxy's update API (`--api`, `--token-file`, `--api-ca`) that waits for the swap; the API writes the `frontend_update` order (section 6.5) |
 | `kbf-installer boot-check` | `ExecStartPre` on Linux: count the starts of a release on trial and revert one that keeps failing before it starts again; start the confirm window at the first start |
 
@@ -516,8 +516,9 @@ test-farm switch (§2, attestation off) never carry the marker and so never coun
   sets `STATE_REFUSED` with the reason (`fetch: short read`, `fetch: timeout`, `fetch: source unreachable`) and does **not**
   retry. Nothing but scratch has changed. The frontend's controller treats it as a failure before the swap: the host is
   uncordoned, the run goes `held`, and a person re-issues the update (a new order id).
-- **Parent or host dies during the fetch**: `work/*.partial` is left. The installer deletes every
-  entry under `work/` and every unreferenced `releases/` directory without `VERIFIED` at the start of each run; **the sweep never removes
+- **Parent or host dies during the fetch**: `work/*.partial` is left. At the start of each run, under the lock
+  and before its first pass, the installer deletes every `work/*.partial` and `work/*.check` (nothing else in `work/`; a link is removed, never followed), and the operator's verbs
+  sweep the `releases/.stage-*` directories; neither sweep removes a `releases/` directory that has a name of its own. **The sweep never removes
 the target of `current` or `previous`**, whatever its marker: a referenced directory without `VERIFIED` stays and `status.json`
 flags it "unverified: rollback to it refused"; a partial file is never resumed or trusted, since its bytes were not verified. The child
   has `PDEATHSIG` (Linux) or is killed by process group (macOS), and a closed pipe, so it does not outlive the parent. A

@@ -132,39 +132,53 @@ fn the_sweep_removes_the_two_suffixes_and_nothing_else_and_follows_no_link() {
 
 /// Catches a start that dies, or says nothing, when `work/` cannot be listed (a file stands
 /// where the directory belongs). The start goes on, since the service must still take
-/// orders, and the failure is the refusal the node reports.
+/// orders, and the failure is logged and is not a refusal: nothing was ordered that it
+/// could undo, and a refusal would hide the host's real state in `status.json`.
 ///
-/// Red on main: `recover` never looks at `work/`, so nothing is refused.
+/// Red on main: `recover` never looks at `work/`, so nothing is logged.
 ///
-/// Mutant it is meant to catch (reasoned, not run): the error of the sweep dropped (red: no
-/// refusal in `helper.json`); the error returned from `recover` (red: `expect` fails).
+/// Mutants it is meant to catch (reasoned, not run): the error of the sweep dropped (red:
+/// nothing in the log); the error returned from `recover` (red: `expect` fails); the error
+/// made a refusal (red: `helper.json` says "refused").
 #[test]
-fn a_work_directory_that_cannot_be_listed_is_a_refusal_not_a_failed_start() {
+fn a_work_directory_that_cannot_be_listed_is_logged_not_a_failed_start() {
     let mut rig = Rig::new("sweep-unlistable");
     fs::write(work_dir(&rig), b"not a directory").expect("a file where work/ belongs");
     rig.helper.recover().expect("the start goes on");
+    let mut log = Vec::new();
+    rig.helper.drain_log(&mut log);
+    let log = String::from_utf8(log).expect("text");
+    assert!(log.contains("work sweep: "), "{log}");
+    assert!(log.contains("/work: "), "{log}");
     let path = rig.root.join("var/lib/kbf-installer/helper.json");
     let memory = fs::read_to_string(path).expect("memory");
-    assert!(memory.contains("refused"), "{memory}");
-    assert!(memory.contains("/work: "), "{memory}");
+    assert!(!memory.contains("refused"), "{memory}");
 }
 
 /// Catches a start that dies when the lock cannot be taken (a directory stands where the
-/// lock file belongs): the sweep, like the repair after it, is a refusal, and the start
-/// goes on.
+/// lock file belongs): the sweep's failure is logged, and the start goes on to the repair,
+/// which fails the same way and is the refusal the node reports.
 ///
-/// Not red on main: the repair fails the same way there, so this does not tell the sweep's
-/// refusal from the repair's. It is the one test that reaches the sweep's own lock error.
+/// Not red on main: nothing there takes the lock before the repair. It is the one test that
+/// reaches the sweep's own lock error, and the log line tells it from the repair's refusal.
+///
+/// Mutant it is meant to catch (reasoned, not run): the sweep's error dropped (red: nothing
+/// in the log).
 #[test]
-fn a_lock_that_cannot_be_taken_is_a_refusal_not_a_failed_start() {
+fn a_lock_that_cannot_be_taken_is_logged_by_the_sweep_and_the_start_goes_on() {
     let mut rig = Rig::new("sweep-no-lock");
     let lock = rig.root.join("run/kbf-installer/lock");
     fs::remove_file(&lock).expect("the lock file");
     fs::create_dir(&lock).expect("a directory where the lock file belongs");
     rig.helper.recover().expect("the start goes on");
+    let mut log = Vec::new();
+    rig.helper.drain_log(&mut log);
+    let log = String::from_utf8(log).expect("text");
+    assert!(log.contains("work sweep: "), "{log}");
+    assert!(log.contains("cannot lock"), "{log}");
     let path = rig.root.join("var/lib/kbf-installer/helper.json");
     let memory = fs::read_to_string(path).expect("memory");
-    assert!(memory.contains("cannot lock"), "{memory}");
+    assert!(memory.contains("cannot lock"), "no refusal: {memory}");
 }
 
 /// Catches a sweep made in a pass. A stage takes no lock, and `setup` stages the first

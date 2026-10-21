@@ -192,8 +192,9 @@ fn work_path(host: &Layout, commit: &CommitId, suffix: &str) -> Result<PathBuf, 
 /// `lock` is the installer lock, held: it shows that no verb of the operator is at work. It
 /// does not keep a stage out, since a stage takes no lock, so the caller must know that none
 /// is running. `run` calls this once, before its first pass, when nothing of this process
-/// is staging; the one stage it cannot see is another process's (`setup` fetching the first
-/// release), which is why a pass never sweeps.
+/// is staging; the stages it cannot see are another process's (`setup` fetching the first
+/// release, or a second `run` started by hand, which nothing excludes), which is why a pass
+/// never sweeps.
 pub fn sweep_work(host: &Layout, _lock: &Locked) -> Result<(), ReleaseError> {
     let work = host.join(&host.work_dir());
     sweep_dir(&work, is_scratch)

@@ -498,6 +498,33 @@ fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
     assert!(err.starts_with("kbf-installer:"), "{err}");
 }
 
+/// Catches `run` not removing the scratch a killed stage left in `work/` when it starts: the
+/// verb is run as an ordinary user over a host with a `<commit>.partial` directory (with a
+/// download in it) and a `<commit>.check` directory, and both are gone afterwards while a
+/// neighbour that is not scratch stays. The helper's tests drive `recover` directly; this
+/// one pins that the verb calls it.
+///
+/// Red on main: nothing sweeps `work/`, so the directories are still there.
+///
+/// Mutant it is meant to catch (reasoned, not run): the `recover` call dropped from `run`
+/// (red: the directories stay).
+#[test]
+fn run_removes_the_scratch_a_killed_stage_left_when_it_starts() {
+    let (layout, root) = seeded("run-sweeps");
+    let work = layout.join(&layout.work_dir());
+    let partial = work.join(format!("{B}.partial"));
+    fs::create_dir_all(partial.join("dl")).expect("a killed stage's directory");
+    fs::write(partial.join("dl/kbf.tar.gz"), b"half a download").expect("its download");
+    fs::create_dir_all(work.join(format!("{B}.check"))).expect("a killed stage's checks");
+    fs::write(work.join("notes.txt"), b"not scratch").expect("a neighbour");
+    let (exit, err) = on(&root, &RUN);
+    assert_eq!(exit, Exit::Ok, "{err}");
+    let (check, notes) = (work.join(format!("{B}.check")), work.join("notes.txt"));
+    assert!(!partial.exists(), "the .partial directory stays");
+    assert!(!check.exists(), "the .check directory stays");
+    assert!(notes.is_file(), "a file that is not scratch went");
+}
+
 /// Catches `run` not waiting between passes, or not stopping after the last: two passes on a
 /// host take one `PASS_INTERVAL` (the only wait, none after the last pass) and exit 0.
 ///

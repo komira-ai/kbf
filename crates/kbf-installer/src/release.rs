@@ -429,7 +429,8 @@ fn unique() -> String {
 }
 
 /// Remove the `.stage-` directories of `releases/` that a run killed between making a release
-/// and renaming it left behind. Called with the lock held, so no run is making one.
+/// and renaming it left behind. Called with the lock held, which is what keeps a run from
+/// making one meanwhile (see [`sweep_dir`], whose caller must exclude the makers).
 fn sweep_stages(host: &Layout) -> Result<(), ReleaseError> {
     let dir = host.join(&host.releases());
     sweep_dir(&dir, |name| name.starts_with(layout::STAGE_PREFIX))
@@ -438,7 +439,9 @@ fn sweep_stages(host: &Layout) -> Result<(), ReleaseError> {
 /// Remove the entries of `dir` whose names `doomed` picks, and nothing else: a directory
 /// with all it holds, any other entry by itself. The type of an entry is its own, so a link
 /// is removed and never followed, here or inside a directory removed. A `dir` that is not
-/// there has none. The caller holds the lock, so no run is making one of them.
+/// there has none. The caller must see that nothing is making an entry that `doomed` picks:
+/// for `releases/` the lock does it, for `work/` only where no stage of this process runs
+/// (see [`crate::stage::sweep_work`]).
 pub(crate) fn sweep_dir(dir: &Path, doomed: fn(&str) -> bool) -> Result<(), ReleaseError> {
     let items = match fs::read_dir(dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
