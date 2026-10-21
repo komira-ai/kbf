@@ -323,7 +323,6 @@ impl Core {
     /// `POST /v1/update/frontend`.
     pub fn post(&mut self, req: UpdateRequest) -> Result<Reply, Fault> {
         valid_request_id(&req.request_id)?;
-        source_fits(&req)?;
         if self.parts.requests.lost() {
             return Err(ApiError::conflict(
                 "state_lost",
@@ -335,6 +334,8 @@ impl Core {
         if let Some(entry) = self.parts.requests.get(&req.request_id).cloned() {
             return self.replay(&entry, &req);
         }
+        // A new request only: a retry is judged by its id first (`request_id_reused`).
+        source_fits(&req)?;
         let status = self.preflight(&req)?;
         let entry = self
             .parts
@@ -823,7 +824,7 @@ fn fill_from_supervisor(body: &mut StatusBody, u: RunningUpdate) {
 
 /// What a request that takes its release from the host's package cannot also ask for, whatever
 /// the host is: a rollback goes back to a release the host fetched (the package carries only
-/// the newest), and the order for the nodes does not say where its release comes from yet.
+/// the newest), and the nodes cannot yet take a release from the host's package.
 fn source_fits(req: &UpdateRequest) -> Result<(), ApiError> {
     if req.source.is_fetch() {
         return Ok(());
@@ -852,7 +853,8 @@ fn source_allowed(req: &UpdateRequest, status: &InstallerStatus) -> Result<(), A
         if status.release_source.as_deref() == Some("bundled") {
             return Err(ApiError::conflict(
                 "source_refused",
-                "this host fetches nothing (release_source is bundled): ask for source staged",
+                "this host fetches nothing (release_source is bundled): ask for source staged, \
+                 or roll back with kbf-installer rollback on the host",
             ));
         }
         return Ok(());

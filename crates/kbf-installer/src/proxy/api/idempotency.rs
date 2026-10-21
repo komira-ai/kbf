@@ -24,8 +24,8 @@
 //! An entry carries `source` only when the update's release is not fetched. The file of
 //! updates that all fetch is the file every build has written; a file with an entry that
 //! has the key is one a build from before `source` cannot read, so after a downgrade that
-//! build answers `state_lost` until the file is removed or the entry is pushed out by
-//! [`KEEP`] newer ones.
+//! build answers `state_lost` until the file is removed (it refuses new updates while the
+//! map is lost, so no newer entry pushes the staged one out).
 
 use std::fs::{self, File};
 use std::io::Write;

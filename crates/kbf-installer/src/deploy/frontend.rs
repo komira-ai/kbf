@@ -161,24 +161,34 @@ fn at_nodes(failure: Option<&Failure>) -> bool {
     failure.is_some_and(|f| f.step == Step::Nodes)
 }
 
+/// What the summary adds to an update that failed at the order for the nodes. Running the
+/// command again does not help: the frontend already runs the commit, which the API answers
+/// as `same_commit` (exit 0).
+const NODES_NOT_TOLD: &str = "; the frontend runs the commit and serves, the nodes were not \
+                              told, and the same command will not tell them";
+
 /// The failure of an update that ended `failed` or `rolled_back`, with the step and the
 /// reason as the API gave them. A failure at the order for the nodes is exit 3 under its own
-/// reason, as every refusal is: the frontend is updated and the nodes were not told, which a
-/// second run of the same command does not change; any other failed update is exit 1.
+/// reason, as every refusal is, when the new frontend answered and refused it: the same order
+/// fails the same way. One it never answered (the reason starts `timeout`) refused nothing: it
+/// is exit 1 under `nodes_unreached`. Any other failed update is exit 1.
 fn ended(id: &UpdateId, phase: Phase, failure: Option<&Failure>) -> Fail {
-    let (exit, reason) = match (phase, at_nodes(failure)) {
-        (Phase::Failed, true) => (Exit::Refused, "nodes_refused"),
-        (Phase::Failed, false) => (Exit::Failed, "frontend_failed"),
+    let at = failure.filter(|f| f.step == Step::Nodes);
+    let (exit, reason) = match (phase, at.map(|f| f.reason.starts_with("timeout"))) {
+        (Phase::Failed, Some(false)) => (Exit::Refused, "nodes_refused"),
+        (Phase::Failed, Some(true)) => (Exit::Failed, "nodes_unreached"),
+        (Phase::Failed, None) => (Exit::Failed, "frontend_failed"),
         _ => (Exit::Failed, "frontend_rolled_back"),
     };
     let what = match failure {
         Some(f) => format!("at step {}: {}", word(&f.step), f.reason),
         None => "(the API named no step)".to_owned(),
     };
+    let told = if at.is_some() { NODES_NOT_TOLD } else { "" };
     fail(
         exit,
         reason,
-        format!("update {} ended {} {what}", id.0, word(&phase)),
+        format!("update {} ended {} {what}{told}", id.0, word(&phase)),
     )
 }
 

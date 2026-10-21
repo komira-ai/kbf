@@ -31,9 +31,9 @@
 //! carries (`available` in `status.json`). `POST` refuses a source the host cannot take
 //! before it saves or writes anything: 409 `source_refused` for a fetch on a host whose
 //! `release_source` is bundled, and for a staged update that asks for a rollback or for the
-//! nodes (its order for the nodes does not name a source yet); 422 `not_staged` for a staged
-//! update whose commit is not the one the package carries. The source is kept in the request
-//! map, written into the order, reported by the status and handed to the supervisor.
+//! nodes (the nodes cannot yet take a release from the host's package); 422 `not_staged` for
+//! a staged update whose commit is not the one the package carries. The source is kept in the
+//! request map, written into the order, reported by the status and handed to the supervisor.
 //!
 //! What `status.json` says moves the update:
 //!
@@ -71,8 +71,10 @@
 //!   cannot attribute a refusal. The API reads `refused_order_id`
 //!   ([`traits::InstallerStatus`]) and a refusal is an update's own only when that names
 //!   its order ([`core::Core::advance`]); a stale refusal names an older order, or none.
-//!   The root half writes the field for every order it refuses, so a refused update ends
-//!   with the installer's own word. A root half from before the field names no order, and
+//!   The root half writes the field for the proxy's orders it refuses once it has read them
+//!   (not for the node's, whose ids are another counter's, and not for a record it deletes
+//!   unread because it expired or the spool was crowded), so a refused update ends with the
+//!   installer's own word. A root half from before the field names no order, and
 //!   then a refusal ends its update at the staging deadline, with reason `timeout`.
 //! - **Compatibility before the fetch (Q1, U9).** `POST` asks the gate with no facts, so
 //!   a 409 `incompatible` or 422 at `POST` time is possible only for what U9 can know
