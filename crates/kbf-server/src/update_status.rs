@@ -19,6 +19,7 @@
 //!   `ok`, a running commit that is not a hex prefix of a commit).
 
 use kbf_proto::update::UpdateStatus;
+use kbf_proto::update::update_status::ReleaseSource as WireSource;
 use kbf_proto::update::update_status::State;
 use serde::Serialize;
 
@@ -31,6 +32,31 @@ pub const COMMIT_MAX_BYTES: usize = 64;
 /// The shortest running commit judged against the desired one (the daemon reports 12
 /// hex digits).
 const MIN_RUNNING_DIGITS: usize = 12;
+
+/// Where a host's installer fetches releases from, as the host reported it. A host that
+/// fetches nothing ([`ReleaseSource::Bundled`]) cannot carry out an order that fetches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseSource {
+    /// The host does not say: its installer predates the field, or the host sent a number
+    /// this build does not know. Never read as one of the others.
+    Unreported,
+    /// An https file server.
+    Url,
+    /// The frontend's release store.
+    Frontend,
+    /// Nothing: the release is the one the host's package carries.
+    Bundled,
+}
+
+/// A release the host's package carries, as the host reported it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AvailableRelease {
+    /// The commit as the host said it, at most [`COMMIT_MAX_BYTES`] bytes with control
+    /// characters replaced; not checked to be a commit.
+    pub commit: String,
+    /// The number of commits behind it: puts two builds of one branch in order.
+    pub seq: u64,
+}
 
 /// A host's newest `UpdateStatus`, and when the server received it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +83,14 @@ pub struct UpdateReport {
     pub acked_order_id: u64,
     /// The state as the wire gave it, for the controller (`state` says it for a reader).
     pub kind: State,
+    /// The release the host's package carries, when its installer has found it whole; `None`
+    /// if it reported none, or its installer predates the field. Kept for the update
+    /// controller; no view lists it.
+    pub available: Option<AvailableRelease>,
+    /// Where the host's installer fetches releases from; [`ReleaseSource::Unreported`] if it
+    /// did not say or sent a number this build does not know. Kept for the update controller;
+    /// no view lists it.
+    pub release_source: ReleaseSource,
     /// When the server received it: milliseconds since the Unix epoch, server clock.
     pub received_at_unix_ms: u64,
 }
@@ -76,6 +110,12 @@ impl UpdateReport {
             Ok(State::Manual) => "manual",
             Ok(State::Unspecified) | Err(_) => "unknown",
         };
+        let release_source = match WireSource::try_from(status.release_source) {
+            Ok(WireSource::Url) => ReleaseSource::Url,
+            Ok(WireSource::Frontend) => ReleaseSource::Frontend,
+            Ok(WireSource::Bundled) => ReleaseSource::Bundled,
+            Ok(WireSource::Unspecified) | Err(_) => ReleaseSource::Unreported,
+        };
         Self {
             state,
             running_commit: as_data(&status.running_commit, COMMIT_MAX_BYTES),
@@ -86,6 +126,11 @@ impl UpdateReport {
             helper_present: status.helper_present,
             acked_order_id: status.acked_order_id,
             kind: State::try_from(status.state).unwrap_or(State::Unspecified),
+            available: status.available.map(|a| AvailableRelease {
+                commit: as_data(&a.commit, COMMIT_MAX_BYTES),
+                seq: a.seq,
+            }),
+            release_source,
             received_at_unix_ms,
         }
     }

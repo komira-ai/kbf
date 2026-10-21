@@ -4,20 +4,19 @@
 //! `releases/<tag>/` the files that release holds, and its `attested` the attestations the
 //! artifacts workflow made of them.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use base64::{Engine, engine::general_purpose::STANDARD};
-use kbf_testkit::dir::TestDir;
 use serde_json::{Value, json};
-use sha2::Digest;
 use xtask::bundles::DEAD_PROXY;
 use xtask::package::tarball;
 
-const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
-const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
-const REPO: &str = "komira-ai/kbf";
+#[path = "support/release_fake.rs"]
+mod release_fake;
+use release_fake::{
+    Fx, REPO, Ran, SBOM, bundle_flags, bundle_json, mode_of, names_in, refs, refs_path,
+    release_answer, s, sha_of, value,
+};
+
 /// N, the commit whose previous release is asked for.
 const SHA: &str = "c0ffee0123456789c0ffee0123456789c0ffee01";
 /// The commit the tag of the previous release names.
@@ -26,8 +25,6 @@ const PREV: &str = "abcdef0123456789abcdef0123456789abcdef01";
 const TAG: &str = "v0.1.2";
 /// The id of a tag object, for the tests that write its answer by hand.
 const OBJ: &str = "1111111111111111111111111111111111111111";
-const ARTIFACTS: &str = "komira-ai/kbf/.github/workflows/artifacts.yml";
-const SBOM: &str = "https://cyclonedx.org/bom";
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/golden/release-fetch-previous.txt"
@@ -40,129 +37,26 @@ const ASSETS: [(&str, &str); 3] = [
     ("kbf", "darwin-arm64"),
 ];
 
-/// The exit code, stdout and stderr of a run.
-type Ran = (Option<i32>, String, String);
-
-fn s(p: &Path) -> &str {
-    p.to_str().expect("utf-8 path")
-}
-
-fn sha_of(bytes: &[u8]) -> String {
-    hex::encode(sha2::Sha256::digest(bytes))
-}
-
-/// The line `key=` of the verb's output.
-fn value<'a>(out: &'a str, key: &str) -> &'a str {
-    out.lines()
-        .find_map(|l| l.strip_prefix(&format!("{key}=")))
-        .unwrap_or_else(|| panic!("no {key}= in {out}"))
-}
-
 /// What `binary` of `commit` for `platform` is: bytes that tell which one it is.
 fn asset_bytes(binary: &str, platform: &str, commit: &str) -> Vec<u8> {
     format!("{binary} of {commit} for {platform}\n").into_bytes()
 }
 
-/// The flags a host verifies a tarball against its bundle with.
-fn bundle_flags(commit: &str) -> String {
-    format!(
-        "--repo {REPO} --signer-workflow {ARTIFACTS} --cert-oidc-issuer \
-         https://token.actions.githubusercontent.com --source-ref refs/heads/main \
-         --source-digest {commit} --predicate-type https://slsa.dev/provenance/v1 \
-         --deny-self-hosted-runners"
-    )
-}
-
-/// The provenance bundle of the tarball whose digest is `sha`: the fake gh verifies it
-/// under the flags `flags`.
-fn bundle_json(sha: &str, flags: &str) -> String {
-    let statement = json!({
-        "_type": "https://in-toto.io/Statement/v1",
-        "subject": [{ "name": "asset", "digest": { "sha256": sha } }],
-        "predicateType": "https://slsa.dev/provenance/v1",
-        "predicate": {},
-    });
-    let b = json!({
-        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
-        "verificationMaterial": {},
-        "dsseEnvelope": {
-            "payloadType": "application/vnd.in-toto+json",
-            "payload": STANDARD.encode(statement.to_string()),
-            "signatures": [],
-        },
-        "fakeAttestations": [format!("{sha} {flags}")],
-    });
-    format!("{b}\n")
-}
-
-/// The names of the entries of `dir`, sorted.
-fn names_in(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .expect("the directory")
-        .map(|e| {
-            e.expect("an entry")
-                .file_name()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
-    names.sort();
-    names
-}
-
-fn mode_of(path: &Path) -> u32 {
-    let meta = std::fs::metadata(path).expect("metadata");
-    meta.permissions().mode()
-}
-
-fn refs_path(page: u32) -> String {
-    format!("repos/{REPO}/git/matching-refs/tags/v?per_page=100&page={page}")
-}
-
-/// GitHub's list of the release tags `tags`.
-fn refs(tags: &[&str]) -> (String, Value) {
-    let list: Vec<Value> = tags
-        .iter()
-        .map(|t| json!({ "ref": format!("refs/tags/{t}") }))
-        .collect();
-    (refs_path(1), Value::Array(list))
-}
-
 /// GitHub's compare of the tag `tag` against N.
 fn compare(tag: &str, status: &str) -> (String, Value) {
-    (
-        format!("repos/{REPO}/compare/{tag}...{SHA}"),
-        json!({ "status": status }),
-    )
+    release_fake::compare(tag, SHA, status)
 }
 
 /// The ref of the annotated tag `tag`, and the tag object it names, which names `commit`;
 /// and GitHub's compare of `commit` against N, which says `ahead`.
 fn annotated(tag: &str, commit: &str) -> Vec<(String, Value)> {
-    let object = hex::encode(sha2::Sha256::digest(tag))[..40].to_owned();
-    let reference = json!({ "object": { "type": "tag", "sha": object } });
-    let annotation = json!({ "object": { "type": "commit", "sha": commit } });
-    vec![
-        (format!("repos/{REPO}/git/ref/tags/{tag}"), reference),
-        (format!("repos/{REPO}/git/tags/{object}"), annotation),
-        compare(commit, "ahead"),
-    ]
-}
-
-/// GitHub's release of the tag `tag`.
-fn release_answer(tag: &str) -> (String, Value) {
-    (
-        format!("repos/{REPO}/releases/tags/{tag}"),
-        json!({ "tag_name": tag }),
-    )
+    release_fake::annotated(tag, commit, SHA)
 }
 
 /// What GitHub holds of the tag that wins: its annotated tag, naming `commit`, and its
 /// release.
 fn found(tag: &str, commit: &str) -> Vec<(String, Value)> {
-    let mut entries = annotated(tag, commit);
-    entries.push(release_answer(tag));
-    entries
+    release_fake::found(tag, commit, SHA)
 }
 
 /// The arguments of `release fetch-previous` for `sha` into `out`: platform linux-x86_64 and the
@@ -176,22 +70,8 @@ fn args_for<'a>(sha: &'a str, out: &'a str) -> Vec<&'a str> {
 
 /// One test's world: a directory holding the fake as `gh/gh` and an empty `tmp/` (the
 /// verb's `TMPDIR`); the verb unpacks into `out/`.
-struct Fx {
-    root: PathBuf,
-    /// Last field: the directory is removed with the fixture.
-    _own: TestDir,
-}
-
 fn fx(name: &str) -> Fx {
-    let own = TestDir::under(
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-release-fetch-previous"),
-        name,
-    );
-    let root = own.to_path_buf();
-    std::fs::create_dir_all(root.join("gh")).expect("gh dir");
-    std::fs::create_dir_all(root.join("tmp")).expect("tmp dir");
-    std::fs::hard_link(FAKE, root.join("gh/gh")).expect("link the fake as gh");
-    Fx { root, _own: own }
+    release_fake::fx("xtask-release-fetch-previous", name)
 }
 
 /// A world where `TAG` is the previous release: `ahead` of N, annotated, and published.
@@ -213,102 +93,33 @@ impl Fx {
         self.root.join("gh/releases").join(TAG).join(name)
     }
 
-    /// Writes GitHub's answers, `(path, JSON)`, to the fake's `gh-api.json`.
-    fn answers(&self, answers: &[(String, Value)]) {
-        let map: serde_json::Map<String, Value> = answers.iter().cloned().collect();
-        std::fs::write(
-            self.root.join("gh/gh-api.json"),
-            Value::Object(map).to_string(),
-        )
-        .expect("gh-api.json");
-    }
-
     /// GitHub with the release tags `tags`, `(tag, status of its compare against N)`, and
     /// the answers `more`.
     fn github(&self, tags: &[(&str, &str)], more: Vec<(String, Value)>) {
-        let names: Vec<&str> = tags.iter().map(|(t, _)| *t).collect();
-        let mut all = vec![refs(&names)];
-        all.extend(tags.iter().map(|(t, status)| compare(t, status)));
-        all.extend(more);
-        self.answers(&all);
+        self.github_for(SHA, tags, more);
     }
 
-    /// What the fake gh was asked, one line per command.
-    fn gh_args(&self) -> String {
-        std::fs::read_to_string(self.root.join("gh/gh-args")).unwrap_or_default()
-    }
-
-    fn tmp_is_empty(&self) -> bool {
-        let mut entries = std::fs::read_dir(self.root.join("tmp")).expect("tmp");
-        entries.next().is_none()
-    }
-
-    /// The release `tag` of `commit` as the pipeline publishes it, in the fake's
-    /// `releases/<tag>/`: a tarball for each of [`ASSETS`] with its SBOM and bundle, and the
-    /// `SHA256SUMS`; and the artifacts workflow's attestations of them, in its `attested`.
-    /// The tarball of `kbf-server` holds the entry `server_entry`.
+    /// The release `tag` of `commit` as the pipeline publishes it: a tarball for each of
+    /// [`ASSETS`] with its SBOM and bundle, and the `SHA256SUMS`; and the artifacts
+    /// workflow's attestations of them. The tarball of `kbf-server` holds the entry
+    /// `server_entry`.
     fn release_with(&self, tag: &str, commit: &str, server_entry: &str) {
-        let dir = self.root.join("gh/releases").join(tag);
-        std::fs::create_dir_all(&dir).expect("release dir");
-        let signed = format!(
-            "--repo {REPO} --signer-workflow {ARTIFACTS} --source-ref refs/heads/main \
-             --deny-self-hosted-runners"
-        );
-        let mut lines: Vec<(String, String)> = Vec::new();
-        let mut attested = String::new();
+        let mut assets = Vec::new();
         for (binary, platform) in ASSETS {
-            let stem = format!("{binary}-{commit}-{platform}");
             let entry = if binary == "kbf-server" {
                 server_entry
             } else {
                 binary
             };
             let tgz = tarball(entry, &asset_bytes(binary, platform, commit)).expect("tarball");
-            let bom = json!({ "bomFormat": "CycloneDX", "stem": stem });
-            let sbom = format!("{bom}\n");
-            let (tgz_sha, sbom_sha) = (sha_of(&tgz), sha_of(sbom.as_bytes()));
-            std::fs::write(dir.join(format!("{stem}.tar.gz")), &tgz).expect("tarball");
-            std::fs::write(dir.join(format!("{stem}.cdx.json")), &sbom).expect("sbom");
-            std::fs::write(
-                dir.join(format!("{stem}.tar.gz.sigstore.json")),
-                bundle_json(&tgz_sha, &bundle_flags(commit)),
-            )
-            .expect("bundle");
-            attested.push_str(&format!("{tgz_sha} {signed}\n{sbom_sha} {signed}\n"));
-            attested.push_str(&format!("{tgz_sha} {signed} --predicate-type {SBOM}\n"));
-            lines.push((tgz_sha, format!("{stem}.tar.gz")));
-            lines.push((sbom_sha, format!("{stem}.cdx.json")));
+            assets.push((format!("{binary}-{commit}-{platform}"), tgz));
         }
-        lines.sort_by(|a, b| a.1.cmp(&b.1));
-        let sums: String = lines.iter().map(|(s, n)| format!("{s}  {n}\n")).collect();
-        std::fs::write(dir.join("SHA256SUMS"), sums).expect("SHA256SUMS");
-        let store = self.root.join("gh/attested");
-        let mut text = std::fs::read_to_string(&store).unwrap_or_default();
-        text.push_str(&attested);
-        std::fs::write(&store, text).expect("attested");
+        self.publish(tag, commit, &assets);
     }
 
     /// The release `tag` of `commit`, whole.
     fn release(&self, tag: &str, commit: &str) {
         self.release_with(tag, commit, "kbf-server");
-    }
-
-    /// `cargo xtask <args> --gh <the fake>` with `TMPDIR` at `tmp`, planting the fake's
-    /// defect `defect` (or none).
-    fn xtask(&self, tmp: &Path, args: &[&str], defect: Option<&str>) -> Ran {
-        let gh = self.root.join("gh/gh");
-        let mut cmd = Command::new(XTASK);
-        cmd.args(args)
-            .arg("--gh")
-            .arg(&gh)
-            .env("TMPDIR", tmp)
-            .env_remove("XTASK_FAKE_DEFECT");
-        if let Some(d) = defect {
-            cmd.env("XTASK_FAKE_DEFECT", d);
-        }
-        let out = cmd.output().expect("run xtask");
-        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-        (out.status.code(), text(&out.stdout), text(&out.stderr))
     }
 
     /// `release fetch-previous` for N into `out/`, with `extra` flags and `TMPDIR` at `tmp`.

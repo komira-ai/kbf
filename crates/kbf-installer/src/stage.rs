@@ -266,6 +266,39 @@ pub fn supported() -> Supported {
     }
 }
 
+/// Whether an installer that understands `supported` may stage `component`, which declared
+/// `declared`: `Err(InstallerTooOld)` when any of its numbers is past what the installer
+/// understands (the last check of step 5, and the rule behind upgrading the installer
+/// before a kbf that raises one).
+pub fn understood(
+    supported: Supported,
+    component: &str,
+    declared: Supported,
+) -> Result<(), Refusal> {
+    let newer = [
+        ("protocol", declared.protocol, supported.protocol),
+        (
+            "min_protocol",
+            declared.min_protocol,
+            supported.min_protocol,
+        ),
+        (
+            "state_schema",
+            declared.state_schema,
+            supported.state_schema,
+        ),
+    ];
+    for (field, got, most) in newer {
+        if got > most {
+            return Err(Refusal::InstallerTooOld {
+                component: component.to_owned(),
+                what: format!("{field} {got}; this installer understands up to {most}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// What the host decides about how a release is verified.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -750,21 +783,12 @@ impl Pipeline<'_> {
                 ),
             });
         }
-        let s = self.policy.supported;
-        let newer = [
-            ("protocol", said.protocol, s.protocol),
-            ("min_protocol", said.min_protocol, s.min_protocol),
-            ("state_schema", said.state_schema, s.state_schema),
-        ];
-        for (field, got, most) in newer {
-            if got > most {
-                return Err(Refusal::InstallerTooOld {
-                    component: name.to_owned(),
-                    what: format!("{field} {got}; this installer understands up to {most}"),
-                });
-            }
-        }
-        Ok(())
+        let declared = Supported {
+            protocol: said.protocol,
+            min_protocol: said.min_protocol,
+            state_schema: said.state_schema,
+        };
+        understood(self.policy.supported, name, declared)
     }
 
     /// Step 7. Returns whether the same release was already in place.

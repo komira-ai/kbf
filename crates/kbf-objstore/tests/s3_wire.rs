@@ -795,6 +795,38 @@ async fn a_ranged_read_failing_with_a_server_error_is_a_service_error() {
     );
 }
 
+/// Catches: a ranged read that reads a 404 as a service error (the caller could not
+/// tell a lost object from a failing store), or a 416 as anything but `InvalidRange`
+/// naming the key and the range asked for.
+#[tokio::test]
+async fn a_ranged_read_of_a_missing_key_or_past_the_end_is_typed() {
+    let (endpoint, _) = script(vec![
+        answer(
+            "404 Not Found",
+            &[],
+            "<Error><Code>NoSuchKey</Code><Message>gone</Message></Error>",
+        ),
+        answer(
+            "416 Range Not Satisfiable",
+            &[],
+            "<Error><Code>InvalidRange</Code><Message>past</Message></Error>",
+        ),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let r = ByteRange::new(50, 4).unwrap();
+    let err = s.get_range(&key(), r).await.unwrap_err();
+    assert!(
+        matches!(&err, ObjectStoreError::NotFound(k) if *k == key()),
+        "{err}"
+    );
+    let err = s.get_range(&key(), r).await.unwrap_err();
+    assert!(
+        matches!(&err, ObjectStoreError::InvalidRange { key: k, range } if *k == key() && *range == r),
+        "{err}"
+    );
+}
+
 /// Catches: a delete on an Object Lock store whose HEAD failed (here 500) carried on to
 /// a DELETE blind (it may delete the wrong version, or report success for an object the
 /// store refused to describe); the HEAD's error is the answer and no DELETE is sent.

@@ -206,16 +206,21 @@ impl Source for InProcess {
     /// The route asked with `Range: bytes=first-last`, so a log or a blob route reads
     /// only those bytes.
     async fn get_range(&self, url: &str, first: u64, last: u64) -> Result<Fetched, SourceError> {
-        self.ask(url, Some((first, last))).await
+        self.ask(url, Some(format!("bytes={first}-{last}"))).await
+    }
+
+    /// The route asked with `Range: bytes=-n`, so a log is read from its end.
+    async fn get_suffix(&self, url: &str, n: u64) -> Result<Fetched, SourceError> {
+        self.ask(url, Some(format!("bytes=-{n}"))).await
     }
 }
 
 impl InProcess {
-    /// `GET url`, with a `Range` header for `range` (first and last byte, inclusive).
-    async fn ask(&self, url: &str, range: Option<(u64, u64)>) -> Result<Fetched, SourceError> {
+    /// `GET url`, with `range` as its `Range` header value.
+    async fn ask(&self, url: &str, range: Option<String>) -> Result<Fetched, SourceError> {
         let mut request = Request::get(url);
-        if let Some((first, last)) = range {
-            request = request.header(RANGE, format!("bytes={first}-{last}"));
+        if let Some(range) = range {
+            request = request.header(RANGE, range);
         }
         let mut request = request
             .body(Body::empty())

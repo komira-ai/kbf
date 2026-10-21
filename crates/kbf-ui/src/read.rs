@@ -173,6 +173,16 @@ pub(crate) struct Asked {
     pub(crate) sent: bool,
 }
 
+/// How much of an object a read asks for.
+#[derive(Clone, Copy)]
+enum Ask {
+    Whole,
+    /// Bytes `first` to `last`, inclusive.
+    Span(u64, u64),
+    /// The last `n` bytes.
+    Suffix(u64),
+}
+
 /// Reads for one page, through its contract.
 pub(crate) struct Reader<'a, S> {
     source: &'a S,
@@ -220,7 +230,18 @@ impl<'a, S: Source> Reader<'a, S> {
         first: u64,
         last: u64,
     ) -> Result<Slice, ReadError> {
-        let got = self.send(url, Some((first, last))).await?;
+        self.ranged(url, Ask::Span(first, last)).await
+    }
+
+    /// The last `n` bytes of the object at `url`, read with `Range: bytes=-n`: answered as
+    /// [`Self::range`] is (a `206` carries the size in its `Content-Range`; a `200` is the
+    /// whole body, which the caller cuts to its end).
+    pub(crate) async fn suffix(&mut self, url: &str, n: u64) -> Result<Slice, ReadError> {
+        self.ranged(url, Ask::Suffix(n)).await
+    }
+
+    async fn ranged(&mut self, url: &str, ask: Ask) -> Result<Slice, ReadError> {
+        let got = self.send(url, ask).await?;
         let total = match got.status {
             200 => Some(got.body.len() as u64),
             206 | 416 => content_range_total(&got.headers),
@@ -236,7 +257,7 @@ impl<'a, S: Source> Reader<'a, S> {
 
     /// The body of a `200` answer at `url`.
     async fn ok(&mut self, url: &str) -> Result<Vec<u8>, ReadError> {
-        let got = self.send(url, None).await?;
+        let got = self.send(url, Ask::Whole).await?;
         if got.status == 200 {
             return Ok(got.body);
         }
@@ -245,7 +266,7 @@ impl<'a, S: Source> Reader<'a, S> {
 
     /// The answer at `url`, whatever its status: refused before any request when the
     /// page does not declare `url`.
-    async fn send(&mut self, url: &str, range: Option<(u64, u64)>) -> Result<Fetched, ReadError> {
+    async fn send(&mut self, url: &str, ask: Ask) -> Result<Fetched, ReadError> {
         let sent = self.page.declares(url);
         self.asked.push(Asked {
             url: url.to_owned(),
@@ -256,9 +277,10 @@ impl<'a, S: Source> Reader<'a, S> {
                 url: url.to_owned(),
             });
         }
-        let asking = match range {
-            None => self.source.get(url).await,
-            Some((first, last)) => self.source.get_range(url, first, last).await,
+        let asking = match ask {
+            Ask::Whole => self.source.get(url).await,
+            Ask::Span(first, last) => self.source.get_range(url, first, last).await,
+            Ask::Suffix(n) => self.source.get_suffix(url, n).await,
         };
         asking.map_err(|e| ReadError::Unreachable {
             url: url.to_owned(),

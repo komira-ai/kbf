@@ -1571,8 +1571,8 @@ name = "kbf-daemon-test"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "kbf-ca",
  "kbf-daemon",
- "kbf-deploy",
  "kbf-front",
  "kbf-harness",
  "kbf-proto",
@@ -1788,7 +1788,6 @@ dependencies = [
  "flate2",
  "futures",
  "kbf-ca",
- "kbf-deploy",
  "kbf-integration-test",
  "kbf-proto",
  "kbf-testkit",
@@ -1805,6 +1804,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "toml",
  "tonic",
 ]
 
@@ -1920,7 +1920,6 @@ dependencies = [
  "kbf-auth",
  "kbf-cli",
  "kbf-daemon",
- "kbf-deploy",
  "kbf-front",
  "kbf-harness",
  "kbf-host",
@@ -1939,6 +1938,7 @@ dependencies = [
  "kbf-transfer",
  "kbf-types",
  "kbf-unitfile",
+ "libc",
  "proc-macro2",
  "prost",
  "rcgen",
@@ -1949,6 +1949,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "syn 2.0.119",
+ "tar",
  "thiserror",
  "tokio",
  "tokio-rustls",
@@ -5024,6 +5025,7 @@ dependencies = [
  "kbf-host",
  "kbf-installer",
  "kbf-testkit",
+ "kbf-types",
  "lzma-rs",
  "rcgen",
  "rustix",

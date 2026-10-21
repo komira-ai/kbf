@@ -151,3 +151,76 @@ async fn a_retention_date_without_object_lock_is_unsupported_and_writes_nothing(
     );
     assert!(!store.may_hold(&key("a")).await.unwrap());
 }
+
+/// Catches: a conditional-write store that replaces an existing key, or that refuses
+/// it with another error, or that lets the refused put change the stored bytes.
+#[tokio::test]
+async fn with_conditional_writes_a_second_put_is_refused_and_keeps_the_first() {
+    let store = MemoryStore::new(Capabilities {
+        conditional_put: true,
+        object_lock: false,
+    });
+    store
+        .put_new(&key("a"), Bytes::from("one"), None)
+        .await
+        .unwrap();
+    let err = store
+        .put_new(&key("a"), Bytes::from("two"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ObjectStoreError::AlreadyExists(k) if *k == key("a")),
+        "{err}"
+    );
+    let got = store.get_range(&key("a"), whole(10)).await.unwrap();
+    assert_eq!(got, Bytes::from("one"));
+}
+
+/// Catches: a delete that removes a retained object, or that refuses with another
+/// error, or that removes it while refusing.
+#[tokio::test]
+async fn deleting_a_retained_object_is_locked_and_leaves_it_readable() {
+    let store = MemoryStore::new(Capabilities {
+        conditional_put: true,
+        object_lock: true,
+    });
+    let until = SystemTime::now() + Duration::from_secs(3600);
+    store
+        .put_new(&key("held"), Bytes::from("one"), Some(until))
+        .await
+        .unwrap();
+    let err = store.delete(&key("held")).await.unwrap_err();
+    assert!(
+        matches!(&err, ObjectStoreError::Locked(k) if *k == key("held")),
+        "{err}"
+    );
+    let got = store.get_range(&key("held"), whole(10)).await.unwrap();
+    assert_eq!(got, Bytes::from("one"));
+}
+
+/// Catches: a ranged read starting at or past the end that answers empty bytes
+/// instead of `InvalidRange`, or a read of a missing key that is not `NotFound`.
+#[tokio::test]
+async fn a_range_starting_at_the_end_is_invalid_and_a_missing_key_is_not_found() {
+    let store = MemoryStore::new(Capabilities::default());
+    store
+        .put_new(&key("a"), Bytes::from("abc"), None)
+        .await
+        .unwrap();
+    let at_end = ByteRange::new(3, 1).unwrap();
+    let err = store.get_range(&key("a"), at_end).await.unwrap_err();
+    assert!(
+        matches!(&err, ObjectStoreError::InvalidRange { key: k, range } if *k == key("a") && *range == at_end),
+        "{err}"
+    );
+    let err = store.get_range(&key("b"), whole(1)).await.unwrap_err();
+    assert!(
+        matches!(&err, ObjectStoreError::NotFound(k) if *k == key("b")),
+        "{err}"
+    );
+    let tail = store
+        .get_range(&key("a"), ByteRange::new(1, 100).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(tail, Bytes::from("bc"));
+}
