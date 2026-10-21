@@ -881,9 +881,8 @@ fn check_waives_the_version_facts_of_a_release_made_before_them_and_only_that() 
     let tarball = format!("kbf-{COMMIT}-linux-arm64.tar.gz");
     let (code, _, err) = check(&d, COMMIT);
     assert_eq!(code, Some(1), "{err}");
-    let want = format!(
-        "xtask: {tarball}: its version facts {facts} are not listed in SHA256SUMS\n"
-    );
+    let want =
+        format!("xtask: {tarball}: its version facts {facts} are not listed in SHA256SUMS\n");
     assert_eq!(err, want);
     let (code, out, err) = check_without_facts(&d, COMMIT);
     assert_eq!(code, Some(0), "{err}");

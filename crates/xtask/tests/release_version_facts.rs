@@ -239,7 +239,18 @@ fn the_binary_runs_with_an_empty_environment() {
     std::fs::write(&log, "").expect("marker");
     let (code, _, err) = run(&f, COMMIT, PLATFORM);
     assert_eq!(code, Some(0), "{err}");
-    assert_eq!(std::fs::read_to_string(&log).expect("env log"), "ran\n");
+    let seen = std::fs::read_to_string(&log).expect("env log");
+    // Under coverage the instrumented child's own profiling runtime sets LLVM_PROFILE
+    // variables; they are not inherited, so only they are ignored.
+    let seen: Vec<&str> = seen
+        .lines()
+        .filter(|l| !l.starts_with("__LLVM_PROFILE") && !l.starts_with("LLVM_PROFILE"))
+        .collect();
+    assert_eq!(seen, ["ran"]);
+    assert!(
+        !seen.iter().any(|l| l.contains("KBF_TEST_SECRET")),
+        "the caller's secret reached the binary: {seen:?}"
+    );
 }
 
 #[test]

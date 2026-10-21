@@ -116,7 +116,11 @@ pub fn rules(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
 fn full_history(steps: &[workflows::Step]) -> bool {
     steps
         .iter()
-        .filter(|s| s.uses.as_deref().is_some_and(|u| u.starts_with("actions/checkout@")))
+        .filter(|s| {
+            s.uses
+                .as_deref()
+                .is_some_and(|u| u.starts_with("actions/checkout@"))
+        })
         .any(|s| s.with.iter().any(|(k, v)| k == "fetch-depth" && v == "0"))
 }
 
@@ -161,7 +165,9 @@ mod tests {
     fn workflow_checking_out(checkout: &str, steps: impl Fn(&str) -> Vec<String>) -> String {
         let mut w = String::from("on: push\njobs:\n");
         for job in BUILD_JOBS {
-            w.push_str(&format!("  {job}:\n    runs-on: ubuntu-24.04\n    steps:\n"));
+            w.push_str(&format!(
+                "  {job}:\n    runs-on: ubuntu-24.04\n    steps:\n"
+            ));
             w.push_str(checkout);
             for step in steps(job) {
                 w.push_str(&step);
@@ -218,8 +224,7 @@ mod tests {
         // one, or no checkout at all) while recording the facts: its kbf counts no
         // commits, `seq` is 0 in the facts, and the age check refuses every update once the
         // store holds them. Mutant: `full_history` always true. One defect, one problem.
-        let shallow =
-            "      - uses: actions/checkout@abc\n        with:\n          persist-credentials: false\n";
+        let shallow = "      - uses: actions/checkout@abc\n        with:\n          persist-credentials: false\n";
         let partial =
             "      - uses: actions/checkout@abc\n        with:\n          fetch-depth: 1\n";
         for checkout in [shallow, partial, ""] {

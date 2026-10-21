@@ -286,7 +286,9 @@ pub fn verify_sums_with(
                 l.name
             ));
         }
-        if let Some(tarball) = version_facts::tarball_of(&l.name) && !listed(&tarball) {
+        if let Some(tarball) = version_facts::tarball_of(&l.name)
+            && !listed(&tarball)
+        {
             problems.push(format!(
                 "{}: the tarball it states the facts of, {tarball}, is not listed in {SUMS}",
                 l.name

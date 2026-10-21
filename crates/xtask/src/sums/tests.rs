@@ -14,6 +14,10 @@ fn scratch(name: &str) -> TestDir {
     TestDir::under(deps.join("xtask-sums-unit"), name)
 }
 
+/// One row of the pairing test: what is listed, then the problem wanted when the pairing is
+/// required and when it is waived.
+type PairingRow<'a> = (&'a str, &'a [&'a str], Option<&'a str>, Option<&'a str>);
+
 fn line(name: &str, bytes: &[u8]) -> String {
     format!("{}  {name}\n", Sha256::of(bytes))
 }
@@ -101,14 +105,11 @@ fn a_kbf_tarball_and_its_version_facts_are_listed_together() {
     // refused either way; both listed pass either way. Mutants: either `if` dropped.
     let tarball = "kbf-c0ffee012345-linux-x86_64.tar.gz";
     let facts = "kbf-c0ffee012345-linux-x86_64.version.json";
-    let no_facts = format!(
-        "{tarball}: its version facts {facts} are not listed in {SUMS}"
-    );
-    let no_tarball = format!(
-        "{facts}: the tarball it states the facts of, {tarball}, is not listed in {SUMS}"
-    );
+    let no_facts = format!("{tarball}: its version facts {facts} are not listed in {SUMS}");
+    let no_tarball =
+        format!("{facts}: the tarball it states the facts of, {tarball}, is not listed in {SUMS}");
     let (no_facts, no_tarball) = (no_facts.as_str(), no_tarball.as_str());
-    let rows: [(&str, &[&str], Option<&str>, Option<&str>); 3] = [
+    let rows: [PairingRow; 3] = [
         ("tarball", &[tarball], Some(no_facts), None),
         ("facts", &[facts], Some(no_tarball), Some(no_tarball)),
         ("both", &[tarball, facts], None, None),
