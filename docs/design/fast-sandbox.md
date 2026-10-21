@@ -148,7 +148,7 @@ linked per action. A walk visits at most 4,194,304 directory places (`MAX_DIRECT
 are loops over a `Vec`, so a deep client tree cannot overflow a stack.
 
 Summaries (digest to file and byte counts) are kept in memory in a map of at most 2^20 entries, emptied
-when full. A node whose summary is already known to qualify is not read again: that is the walk a warm
+when an insert would pass that cap. A node whose summary is already known to qualify is not read again: that is the walk a warm
 node does not repeat. They are not written to disk.
 
 **Planned:** a recurrence rule (a node becomes a tree only after it has been seen in several
@@ -301,7 +301,7 @@ dropped is killed and reaped. `crun delete --force` runs at clean.
 The binary named by `--oci-runtime` (and the daemon's own binary) must be a file at start; a node
 that names a missing one refuses to start. The node also needs `newuidmap` and `newgidmap` (package
 `uidmap`), a subordinate range, and a delegated cgroup subtree. The `.deb` and `.rpm` packages depend on `crun` and `uidmap` (or `shadow-utils`)
-(`xtask/src/pkg_install.rs`).
+(`crates/xtask/src/pkg_install.rs`, `crates/xtask/src/pkg_linux.rs`).
 
 ## 7. Concurrency and recovery
 
