@@ -126,9 +126,10 @@ the flag once the release before the one being made was made with the facts. The
 the verb once, for its own platform, between the identity check of `kbf` and its package,
 for the same `--binary` path the job packages.
 
-The build jobs check out at the default shallow depth, so until that changes the facts say
-`seq: 0` (unknown; see `seq` below). The bundle `kbf-installer deploy --bundle` reads holds
-`kbf` and `kbf-daemon` tarballs and their attestations and refuses any other entry: the
+The build jobs check out the full history (`fetch-depth: 0`, which the workflow lint holds
+for every job that records the facts), so the facts carry the real `seq` (see `seq` below);
+a shallow local build still says `seq: 0`. The bundle `kbf-installer deploy --bundle` reads
+holds `kbf` and `kbf-daemon` tarballs and their attestations and refuses any other entry: the
 facts file is not packed into a bundle, and a packer that adds it needs a reader that accepts
 it installed first (the deploy order of `seq`, below).
 
@@ -184,10 +185,10 @@ sorted by name.
   It is `0` when the build could not count them (a shallow checkout, which holds only part
   of the history, or a source archive with no git), and nothing is newer than `0`: a build
   that cannot count is never ranked above another. A build before this field prints none.
-  `artifacts.yml` checks out at the default shallow depth, so the assets it builds print
-  `seq: 0` until it checks out with `fetch-depth: 0`; no package is ranked by `seq` before
-  that. The strict reader of this line in `kbf-installer` (`deny_unknown_fields`) accepts
-  `seq` from this change on: an installer older than that refuses a kbf that prints it
+  The build jobs of `artifacts.yml` check out with `fetch-depth: 0`, so the assets they
+  build print the real count; a shallow local build still prints `seq: 0`. The strict
+  reader of this line in `kbf-installer` (`deny_unknown_fields`) accepts `seq` from this
+  change on: an installer older than that refuses a kbf that prints it
   (`version-unreadable`), so the installer package that reads `seq` ships before the kbf
   that prints it.
 - `state_schema`: the schema version of the SQLite state file the binary creates and

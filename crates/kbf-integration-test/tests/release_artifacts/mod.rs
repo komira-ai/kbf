@@ -36,7 +36,9 @@
 //!   built.
 //! - **The `kbf` says what it is.** Every build job runs `cargo xtask release
 //!   version-facts` on the `kbf` it built, once, between that check and the package, and
-//!   `dist` gets `kbf-<commit>-<platform>.version.json` (the rules are `facts`').
+//!   `dist` gets `kbf-<commit>-<platform>.version.json` (the rules are `facts`'). Such a job
+//!   checks out with `fetch-depth: 0`: a shallow clone cannot count the commits, so `seq`
+//!   would be 0.
 //! - **The installer's package.** Each Linux job builds the `kbf-installer` deb and makes it
 //!   an asset (`cargo xtask pkg-asset`, [`PACKAGES`]), and no other job does. In that job
 //!   `pkg-trust` and `pkg-asset` both take the branch the package trusts and is attested
@@ -902,6 +904,10 @@ mod rules {
         )
     }
 
+    /// The checkout step of a build job: the whole history, so the build can count its `seq`.
+    const CHECKOUT: &str =
+        "      - uses: actions/checkout@abc\n        with:\n          fetch-depth: 0\n";
+
     /// A workflow of the shape the rules read, meeting every one.
     fn good() -> String {
         let mut w = String::from(
@@ -917,6 +923,7 @@ mod rules {
                 ));
             }
             w.push_str("    steps:\n");
+            w.push_str(CHECKOUT);
             let platform = *job;
             let mine: Vec<&str> = ASSETS
                 .iter()
@@ -1750,9 +1757,9 @@ mod rules {
                 "no PKG_SOURCE_REF",
                 broken(
                     &format!(
-                        "    env:\n      {PKG_SOURCE_REF}: {PKG_SOURCE_REF_EXPR}\n    steps:\n      - name: Sign kbf\n"
+                        "    env:\n      {PKG_SOURCE_REF}: {PKG_SOURCE_REF_EXPR}\n    steps:\n{CHECKOUT}      - name: Sign kbf\n"
                     ),
-                    "    steps:\n      - name: Sign kbf\n",
+                    &format!("    steps:\n{CHECKOUT}      - name: Sign kbf\n"),
                 ),
                 "the job `darwin-arm64` has PKG_SOURCE_REF: (none)",
             ),

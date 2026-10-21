@@ -7,6 +7,9 @@
 //!
 //! [`rules`] reads the workflow and names a build job that:
 //!
+//! - runs `cargo xtask release version-facts` without checking out with `fetch-depth: 0`
+//!   (the build counts `seq` from the history it has, and a shallow clone gives 0, so two
+//!   different commits would tie and the age check would refuse the update);
 //! - does not run `cargo xtask release version-facts` exactly once;
 //! - runs it for another binary than `kbf`, another commit than `"$GITHUB_SHA"`, another
 //!   platform than the job's own or another directory than `dist` (the one it uploads);
@@ -42,6 +45,12 @@ pub fn rules(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
     for job in BUILD_JOBS {
         let steps = workflows::job_steps(workflow, job)?;
         let runs = recorded(&steps);
+        // The facts carry `seq`, which the build counts from the history it can see.
+        if !runs.is_empty() && !full_history(&steps) {
+            out.push(format!(
+                "`{job}` records the facts of kbf but does not check out with `fetch-depth: 0`: a shallow clone cannot count the commits, so `seq` is 0"
+            ));
+        }
         let [(at, step, words)] = runs.as_slice() else {
             out.push(format!(
                 "`{job}` runs `release version-facts` {} times, not once: the facts of its kbf are recorded exactly once",
@@ -103,6 +112,14 @@ pub fn rules(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the job checks out its repository with the whole history.
+fn full_history(steps: &[workflows::Step]) -> bool {
+    steps
+        .iter()
+        .filter(|s| s.uses.as_deref().is_some_and(|u| u.starts_with("actions/checkout@")))
+        .any(|s| s.with.iter().any(|(k, v)| k == "fetch-depth" && v == "0"))
+}
+
 /// The `--binary` of a line that packages the `kbf`.
 fn packaged_kbf(line: &str) -> Option<&str> {
     let words = args(line, "cargo xtask package ")?;
@@ -130,11 +147,22 @@ mod tests {
         format!("      - run: {command}\n")
     }
 
-    /// A workflow of the three build jobs, each with the steps `steps(job)` gives.
+    /// A checkout step with the whole history.
+    const FULL: &str =
+        "      - uses: actions/checkout@abc\n        with:\n          fetch-depth: 0\n";
+
+    /// A workflow of the three build jobs, each checking out the whole history and then
+    /// running the steps `steps(job)` gives.
     fn workflow(steps: impl Fn(&str) -> Vec<String>) -> String {
+        workflow_checking_out(FULL, steps)
+    }
+
+    /// As [`workflow`], with `checkout` as the first step of every job (none when empty).
+    fn workflow_checking_out(checkout: &str, steps: impl Fn(&str) -> Vec<String>) -> String {
         let mut w = String::from("on: push\njobs:\n");
         for job in BUILD_JOBS {
             w.push_str(&format!("  {job}:\n    runs-on: ubuntu-24.04\n    steps:\n"));
+            w.push_str(checkout);
             for step in steps(job) {
                 w.push_str(&step);
             }
@@ -182,6 +210,35 @@ mod tests {
         // Catches: a rule that misreads a correct job (quoted words, a path with a
         // directory part), so every real change is refused.
         assert_eq!(found(&workflow(good)), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_build_job_with_a_shallow_checkout_is_named_once() {
+        // Catches: a build job that checks out the default shallow depth (or a partial
+        // one, or no checkout at all) while recording the facts: its kbf counts no
+        // commits, `seq` is 0 in the facts, and the age check refuses every update once the
+        // store holds them. Mutant: `full_history` always true. One defect, one problem.
+        let shallow =
+            "      - uses: actions/checkout@abc\n        with:\n          persist-credentials: false\n";
+        let partial =
+            "      - uses: actions/checkout@abc\n        with:\n          fetch-depth: 1\n";
+        for checkout in [shallow, partial, ""] {
+            let w = workflow_checking_out(checkout, good);
+            let got = found(&w);
+            assert_eq!(got.len(), 3, "one per build job: {got:#?}");
+            assert!(got[0].starts_with("`darwin-arm64` records the facts of kbf but does not"));
+            assert!(got[0].contains("`fetch-depth: 0`"));
+        }
+        // Only the job that is shallow is named, and only once.
+        let one = format!(
+            "on: push\njobs:\n  darwin-arm64:\n    runs-on: x\n    steps:\n{shallow}{}  linux-x86_64:\n    runs-on: x\n    steps:\n{FULL}{}  linux-arm64:\n    runs-on: x\n    steps:\n{FULL}{}",
+            good("darwin-arm64").concat(),
+            good("linux-x86_64").concat(),
+            good("linux-arm64").concat(),
+        );
+        let got = found(&one);
+        assert_eq!(got.len(), 1, "{got:#?}");
+        assert!(got[0].starts_with("`darwin-arm64` "), "{got:#?}");
     }
 
     #[test]
