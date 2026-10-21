@@ -515,7 +515,7 @@ metadata directory.
 `kbf.slice`, from templates compiled into the binary
 (`crates/kbf-deploy/templates/linux/`) and a settings file (`config.example` documents
 each key; an unknown or repeated key is refused). They are described, with every rule
-`check-units` applies, in [kbf-modes.md](kbf-modes.md). The converged form of these
+`check-units` applies, in [kbf-units.md](kbf-units.md). The converged form of these
 verbs (no `--mode`: four files for MinIO, `kbf-server` and `kbf-daemon`, with
 `--restart-minio` and `--uninstall`) is gone; the units above remain the hand-written
 example of that layout. A node that still runs `kbf-server.service` and
@@ -627,7 +627,7 @@ backup.
   every daemon unit in `docs/deploy/`.
 - `kbf-deploy`'s tests (`src/linux/tests.rs`) refuse each bad setting and check that an
   unset key takes the default `config.example` shows. The mode verbs' rules and host
-  verbs are tested as [kbf-modes.md](kbf-modes.md) says; the swap verb's tests
+  verbs are tested as [kbf-units.md](kbf-units.md) says; the swap verb's tests
   (`src/linux/swap_tests.rs`) apply each plan into a scratch directory with the tools
   played by a fake, check what landed, and require a re-run to plan nothing; each
   missing prerequisite is a row that must be refused with its own refusal.

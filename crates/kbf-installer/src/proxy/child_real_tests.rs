@@ -61,6 +61,30 @@ fn terminate_is_sigterm_and_the_exit_is_reaped_and_clears_the_record() {
     assert!(rig.child.terminate(&ident).is_err());
 }
 
+/// Catches an `await_exit` that returns before the exit (the slot would still be taken), one
+/// that reports a live process gone when its limit passes, and one that leaves the zombie or
+/// the record: a live child is still there at the limit, and after SIGTERM the wait ends
+/// with it gone, reaped and unrecorded.
+#[test]
+fn await_exit_ends_with_the_exit_and_not_at_the_limit() {
+    let rig = rig("child-real-await");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("spawn");
+    let _stop = Cleanup(&rig.child, vec![ident.clone()]);
+    assert!(!rig.child.await_exit(&ident, Duration::from_millis(10)));
+    assert!(rig.child.recorded(Slot::A).is_some());
+    rig.child.terminate(&ident).expect("signal");
+    assert!(rig.child.await_exit(&ident, Duration::from_secs(60)));
+    assert!(!alive(ident.pid), "reaped, not a zombie");
+    assert_eq!(rig.child.recorded(Slot::A), None);
+    assert!(
+        rig.child.await_exit(&ident, Duration::ZERO),
+        "a process this port does not hold is gone for it"
+    );
+}
+
 /// Catches a child that reports no exit code, or the wrong one.
 #[test]
 fn a_child_that_exits_reports_its_status() {

@@ -78,7 +78,8 @@ impl From<CommitId> for String {
 
 /// The hash of a release set: the SHA-256 of the `SHA256SUMS` file's bytes, as 64
 /// lower-case hex characters. [`SetHash::of_sums`] is its only definition; `cargo xtask`
-/// and the bake evaluator both call it, so the two cannot differ.
+/// calls it, and so will the gamma verdict's producer (Planned, `kbf-cicd.md` section 7),
+/// so the two cannot differ.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct SetHash(String);
@@ -165,7 +166,8 @@ impl Floor {
     }
 }
 
-/// The bake's minimum-load numbers (section 7): a bake with no usage is not a pass.
+/// The bake's minimum-load numbers, a field of the verdict record: a bake with no usage is
+/// not a pass. What produces a verdict is Planned (`kbf-cicd.md` section 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MinLoad {
     /// Executed actions.
@@ -217,7 +219,7 @@ pub struct Header {
     pub commit: CommitId,
     /// The release set under test.
     pub set_hash: SetHash,
-    /// The CI run, or the evaluator's own id.
+    /// The CI run, or the verdict producer's own id.
     pub run_id: String,
     /// The attempt of this run id (1 for the first).
     pub attempt: u32,
@@ -235,7 +237,7 @@ pub struct ResultDoc {
     pub commit: CommitId,
     /// The release set under test.
     pub set_hash: SetHash,
-    /// The CI run, or the evaluator's own id.
+    /// The CI run, or the verdict producer's own id.
     pub run_id: String,
     /// The attempt of this run id.
     pub attempt: u32,

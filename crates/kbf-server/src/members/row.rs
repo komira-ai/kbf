@@ -11,6 +11,7 @@ use prost::Message as _;
 use super::MembershipError;
 use super::handoff::Fill;
 use crate::storage_health::{Debts, Report, Reported, Writes};
+use crate::vitals::{StoredVitals, Vitals};
 use crate::worker::named_protocol;
 
 /// A stored member row: the member as the map will hold it, its boot counter, the newest
@@ -93,6 +94,10 @@ pub(super) struct StoredReport {
     /// The map generation the node held when it reported.
     #[prost(uint64, tag = "6")]
     generation: u64,
+    /// The write tier's health; absent from a row written before the field existed, and
+    /// from a node that sent none.
+    #[prost(message, optional, tag = "7")]
+    vitals: Option<StoredVitals>,
 }
 
 impl From<&Report> for StoredReport {
@@ -106,6 +111,7 @@ impl From<&Report> for StoredReport {
             writes_known,
             open_writes,
             generation: report.said.generation,
+            vitals: (report.said.vitals != Vitals::NONE).then(|| report.said.vitals.into()),
         }
     }
 }
@@ -117,6 +123,7 @@ impl From<&StoredReport> for Report {
                 debts: Debts::from_wire(stored.known, stored.debts),
                 writes: Writes::from_wire(stored.writes_known, stored.open_writes),
                 generation: stored.generation,
+                vitals: stored.vitals.map_or(Vitals::NONE, Vitals::from),
             },
             at: StoreTime::from_duration(Duration::from_nanos(stored.at_nanos)),
         }

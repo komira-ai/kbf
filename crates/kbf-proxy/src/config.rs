@@ -189,9 +189,18 @@ pub struct ProxyConfig {
     /// 5 s margin).
     #[serde(default = "default_hold_s")]
     pub hold_max_s: u64,
+    /// Serve the read-only web UI at `/ui` (default `true`). The UI is open: it asks for no
+    /// certificate and no token, and only GET and HEAD reach it. `false` makes `/ui` a 404 at
+    /// the proxy.
+    #[serde(default = "default_ui")]
+    pub ui: bool,
     /// Limits.
     #[serde(default)]
     pub limits: Limits,
+}
+
+const fn default_ui() -> bool {
+    true
 }
 
 /// Reads `listen`. The error names the key and never the value, as the rest of the file's
@@ -366,6 +375,23 @@ base_port = 18000
             PathBuf::from("/run/kbf-proxy/proxy-auth")
         );
         assert_eq!(c.state_dir, PathBuf::from("/var/lib/kbf-proxy"));
+    }
+
+    /// The UI is on unless the table says `ui = false`, and the key is read as a boolean.
+    ///
+    /// Kills: a default of off; the key ignored; a non-boolean accepted.
+    #[test]
+    fn the_ui_is_on_by_default_and_ui_false_turns_it_off() {
+        assert!(ProxyConfig::from_toml_str(MIN).expect("valid").ui);
+        let on = format!("ui = true\n{MIN}");
+        assert!(ProxyConfig::from_toml_str(&on).expect("valid").ui);
+        let off = format!("ui = false\n{MIN}");
+        assert!(!ProxyConfig::from_toml_str(&off).expect("valid").ui);
+        let word = format!("ui = \"no\"\n{MIN}");
+        assert!(matches!(
+            ProxyConfig::from_toml_str(&word),
+            Err(ConfigError::Parse(_))
+        ));
     }
 
     const HEAD: &str = r#"

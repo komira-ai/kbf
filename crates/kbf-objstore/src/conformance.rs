@@ -412,7 +412,7 @@ async fn list_pagination<S: ObjectStore>(
     // Shares the text `<prefix>list` but not `<prefix>list/`: must not be listed.
     put(store, w, &key(prefix, "list-outside")?, &pattern(1, 0)).await?;
 
-    let (seen, pages) = list_from(store, &dir, None, LIST_PAGE, usize::MAX).await?;
+    let (seen, _pages) = list_from(store, &dir, None, LIST_PAGE, usize::MAX).await?;
     let keys: Vec<&ObjectKey> = seen.iter().map(|o| &o.key).collect();
     ensure!(
         keys.windows(2).all(|w| w[0] < w[1]),
@@ -425,11 +425,8 @@ async fn list_pagination<S: ObjectStore>(
         missing.is_empty() && extra.is_empty(),
         "listing {dir:?} in pages of {LIST_PAGE}: missing {missing:?}, unexpected {extra:?} (sizes included)"
     );
-    let min_pages = LIST_OBJECTS.div_ceil(usize::from(LIST_PAGE));
-    ensure!(
-        pages >= min_pages,
-        "{LIST_OBJECTS} keys came in {pages} pages of at most {LIST_PAGE}"
-    );
+    // `list_from` fails on a page larger than asked, so every key having come in pages
+    // of at most `LIST_PAGE` already means at least `ceil(LIST_OBJECTS / LIST_PAGE)` pages.
     Ok(Outcome::Passed)
 }
 

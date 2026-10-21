@@ -7,7 +7,7 @@ use std::process::Command;
 use crate::Error;
 
 /// Runs `git -C <repo> <args>`: its stdout, or the error holding what it printed on stderr.
-fn git(repo: &Path, args: &[&str]) -> Result<String, Error> {
+pub(super) fn git(repo: &Path, args: &[&str]) -> Result<String, Error> {
     let out = git_output(repo, args)?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -20,7 +20,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, Error> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, Error> {
+pub(super) fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, Error> {
     Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -75,16 +75,29 @@ pub fn read_tag(repo: &Path, tag: &str) -> Result<Tag, Error> {
 
 /// Whether `commit` is `main_ref` or an ancestor of it.
 pub fn on_main(repo: &Path, commit: &str, main_ref: &str) -> Result<bool, Error> {
-    let out = git_output(repo, &["merge-base", "--is-ancestor", commit, main_ref])?;
+    is_ancestor(repo, commit, main_ref)
+}
+
+/// Whether `ancestor` is `descendant` or reachable from it.
+pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool, Error> {
+    let out = git_output(repo, &["merge-base", "--is-ancestor", ancestor, descendant])?;
     match out.status.code() {
         Some(0) => Ok(true),
         // 1 is "not an ancestor"; anything else (an unknown ref) is an error, not a no.
         Some(1) => Ok(false),
         _ => Err(Error::Failed(format!(
-            "git merge-base --is-ancestor {commit} {main_ref}: {}",
+            "git merge-base --is-ancestor {ancestor} {descendant}: {}",
             String::from_utf8_lossy(&out.stderr).trim_end()
         ))),
     }
+}
+
+/// The commit tag `tag` names, in full.
+pub fn commit_of(repo: &Path, tag: &str) -> Result<String, Error> {
+    let peeled = format!("refs/tags/{tag}^{{commit}}");
+    Ok(git(repo, &["rev-parse", "--verify", &peeled])?
+        .trim_end()
+        .to_owned())
 }
 
 /// The `v*` tags, oldest version first.

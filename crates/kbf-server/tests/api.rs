@@ -319,7 +319,7 @@ async fn get_nodes_lists_each_nodes_newest_software() {
               "needs_attention": [],
               "update": unsupported,
               "placement": { "state": "serving" },
-              "phase": { "state": "serving" } },
+              "phase": { "state": "serving" }, "lease_count": 0, "booked": { "cpu_millis": 0, "memory_bytes": 0, "gpus": 0, "vms": 0 } },
             { "node_id": "mac-1", "connected": true, "protocol": 1, "software": {
                 "os_name": "macOS", "os_version": "15.1", "os_build": "24B83",
                 "kernel": "", "daemon_version": "0.1.0",
@@ -334,12 +334,12 @@ async fn get_nodes_lists_each_nodes_newest_software() {
               "needs_attention": [NOT_READY],
               "update": unsupported,
               "placement": { "state": "serving" },
-              "phase": { "state": "serving" } },
+              "phase": { "state": "serving" }, "lease_count": 0, "booked": { "cpu_millis": 0, "memory_bytes": 0, "gpus": 0, "vms": 0 } },
             { "node_id": "old-1", "connected": true, "protocol": 1, "software": null,
               "needs_attention": [],
               "update": unsupported,
               "placement": { "state": "serving" },
-              "phase": { "state": "serving" } },
+              "phase": { "state": "serving" }, "lease_count": 0, "booked": { "cpu_millis": 0, "memory_bytes": 0, "gpus": 0, "vms": 0 } },
         ], "oldest_protocol": 1, "protocol_unknown": 0 })
     );
 
@@ -654,7 +654,7 @@ async fn cordon_drain_and_uncordon_over_http() {
         assert!(body["error"].is_string(), "{body}");
     }
     let (code, _) = http(api, "GET", "/v1/nodes/linux-1:cordon", "").await;
-    assert_eq!(code, 405, "a write is a POST");
+    assert_eq!(code, 404, "a read of a write's path is no node");
 
     let first = Job::new("first", &[]);
     let second = Job::new("second", &[]);

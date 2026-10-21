@@ -32,14 +32,17 @@ route stays local, and the last column says why.
 Every row is one method and one path. A router `.route(` call that serves two methods has a row
 per method; a custom method (`:cordon`) has a row per verb. The sources of the router are
 `crates/kbf-server/src/{api,release/http,storage_health,health,metrics,http_blobs,
-http_invocations,http_history,enroll/api,managed/http}.rs` and `frontend.rs`, where they are merged.
+http_invocations,http_sched,http_history,enroll/api,managed/http,ui_mount}.rs` and `frontend.rs`, where they are merged.
 
 ### Cluster
 
 | Verb | Method and route | Status | Gate |
 |---|---|---|---|
 | cluster status (nodes, software, placement) | `GET /v1/nodes` | [F] | open |
+| one node (capacity, booked, free, leases) | `GET /v1/nodes/{node}` | [F] | open |
 | list members of the storage map | `GET /v1/members` | [F] | open |
+| leases the scheduler holds (paged, by node) | `GET /v1/leases` | [F] | open |
+| the queue: depth, ages, why work waits | `GET /v1/queue` | [F] | open |
 | cordon a node | `POST /v1/nodes/{node}:cordon` | [F] | write |
 | drain a node | `POST /v1/nodes/{node}:drain` | [F] | write |
 | uncordon a node | `POST /v1/nodes/{node}:uncordon` | [F] | write |
@@ -123,6 +126,7 @@ route on this branch: all three are out of scope of the object-store series (Q5)
 | its artifacts | `GET /v1/invocations/{id}/artifacts` | [F] | policy |
 | its logs | `GET /v1/invocations/{id}/logs` | [F] | policy |
 | its metrics | `GET /v1/invocations/{id}/metrics` | [F] | policy |
+| its failed actions, with reasons, commands and log tails | `GET /v1/invocations/{id}/failures` | [F] | policy |
 | list invocations | `GET /v1/invocations` | [F] | policy |
 | list shapes | `GET /v1/shapes` | [F] | policy |
 | list tests | `GET /v1/tests` | [F] | policy |
@@ -135,12 +139,24 @@ route on this branch: all three are out of scope of the object-store series (Q5)
 | runs of an action digest | `GET /v1/actions/{digest}/runs` | [V] #891 | policy |
 | runs on a node in a window | `GET /v1/runs` | [V] #891 | policy |
 
+### The web UI
+
+The pages of `kbf-ui`, read-only HTML under `/ui` ([api.md](../api.md#get-ui-the-web-ui)); on by
+default, `--ui=false` turns them off. Open: no gate, whatever the REAPI policy says.
+
+| Verb | Method and route | Status | Gate |
+|---|---|---|---|
+| the Overview page | `GET /ui` | [F] | none (open) |
+| the same, with a trailing slash | `GET /ui/` | [F] | none (open) |
+| every other page and the stylesheet (`/ui/builds`, `/ui/builds/{id}`, `/ui/updates`, `/ui/leases`, `/ui/queue`, `/ui/static/kbf.css`) | `GET /ui/{*rest}` | [F] | none (open) |
+
 ### Health
 
 | Verb | Method and route | Status | Gate |
 |---|---|---|---|
 | liveness | `GET /healthz` | [F] | none |
 | readiness | `GET /readyz` | [F] | none |
+| farm summary (ready, nodes by state, queue, leases, storage) | `GET /v1/health` | [F] | open |
 | metrics | `GET /metrics` | [F] | none |
 
 The Mac device manager is a separate service, not the operator API (`crates/kbf-mdm`: `GET

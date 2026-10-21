@@ -4,11 +4,12 @@
 //! service user's word).
 //!
 //! The real sources are [`CgroupLeases`] (Linux: the lease cgroups of the daemon's
-//! `actions/` cgroup) and [`PoolLeases`] (macOS: the processes of the lease-user pool,
-//! which launchd runs a lease's jobs as). `run` chooses by the service it restarts
-//! ([`for_restart`]): a mode's systemd unit gets [`CgroupLeases`]; a launchd label still
-//! gets [`NotWired`] (nothing configures the pool), which says it cannot tell, and an
-//! activation is refused (fail closed). A frontend's unit holds no leases, so its count would
+//! `actions/` cgroup), [`MacLeases`] (a Mac whose daemon runs as its own account: the
+//! daemon's keeper processes and lease directories) and [`PoolLeases`] (the processes of a
+//! lease-user pool, not yet chosen by [`for_restart`]). `run` chooses by the service it
+//! restarts ([`for_restart`]): a mode's systemd unit gets [`CgroupLeases`]; a launchd label
+//! gets [`MacLeases`], which says it cannot tell wherever it could be blind, and an
+//! activation is then refused (fail closed). A frontend's unit holds no leases, so its count would
 //! always read idle: [`frontend_unit`] names it, and the helper refuses a node activation
 //! that would restart it.
 
@@ -19,7 +20,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::cli::Mode;
+use crate::helper::mac_leases::MacLeases;
 use crate::helper::restart::Restart;
+use crate::layout::Layout;
 use crate::run::{Runner, Spawn};
 use crate::setup::plan::mode_units;
 
@@ -27,6 +30,12 @@ use crate::setup::plan::mode_units;
 pub trait LeaseSource {
     /// The count, or why it cannot be told.
     fn live(&self) -> Result<usize, String>;
+
+    /// [`LeaseSource::live`], with a note for the log when the source let the check through
+    /// on a judgment rather than on an idle host. The default has none.
+    fn live_noted(&self) -> Result<(usize, Option<String>), String> {
+        self.live().map(|live| (live, None))
+    }
 }
 
 /// The prefix of a lease's cgroup, `kbf-lease-<term>-<seq>` (kbf-driver-container).
@@ -145,8 +154,16 @@ impl LeaseSource for PoolLeases<'_> {
     }
 }
 
-/// The lease source of the service `restart` restarts, on a host whose cgroup2 mount is at
-/// `cgroup_root` ([`CGROUP_ROOT`] under the host root).
+/// Where the lease sources look on this host.
+#[derive(Clone, Debug)]
+pub struct LeaseHost {
+    /// The cgroup2 mount ([`CGROUP_ROOT`] under the host root).
+    pub cgroup_root: PathBuf,
+    /// The host's layout: where `kbf.toml` is and what the host root is.
+    pub layout: Layout,
+}
+
+/// The lease source of the service `restart` restarts, on `host`.
 ///
 /// - A systemd unit of a `kbf` mode gets [`CgroupLeases`] of that unit, which fails closed
 ///   while the unit's cgroup does not exist. The units are the ones `setup` enables
@@ -156,17 +173,20 @@ impl LeaseSource for PoolLeases<'_> {
 /// - Any other unit gets a source that cannot tell, whatever cgroup the unit has: the leases
 ///   of a unit that is no mode's are not the daemon's, so a count read from it would be
 ///   "idle" by accident.
-/// - A launchd label gets [`NotWired`]: nothing configures the lease-user pool
-///   (`first_uid`, `users`) that [`PoolLeases`] needs, so a Mac cannot take an activation.
-pub fn for_restart(restart: &Restart, cgroup_root: &Path) -> Box<dyn LeaseSource> {
+/// - A launchd label gets [`MacLeases`], the source of a daemon that runs as its own
+///   account (no lease-user pool); an empty label names no service and cannot tell.
+pub fn for_restart(restart: &Restart, host: &LeaseHost) -> Box<dyn LeaseSource> {
     match restart {
         Restart::Systemd(unit) if is_mode_unit(unit) => {
-            Box::new(CgroupLeases::of_unit(cgroup_root, unit))
+            Box::new(CgroupLeases::of_unit(&host.cgroup_root, unit))
         }
         Restart::Systemd(unit) => Box::new(CannotTell(format!(
             "{unit:?} is no unit of any mode of kbf, so its leases are not known"
         ))),
-        Restart::Launchd(_) => Box::new(NotWired),
+        Restart::Launchd(label) if label.is_empty() => {
+            Box::new(CannotTell("no launchd label names the service".to_owned()))
+        }
+        Restart::Launchd(_) => Box::new(MacLeases::on_host(host.layout.clone())),
     }
 }
 

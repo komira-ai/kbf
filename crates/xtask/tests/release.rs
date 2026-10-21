@@ -832,7 +832,75 @@ fn publish(root: &Path, defect: Option<&str>) -> (Option<i32>, String, String) {
     publish_set(root, &sha_of(&sums), defect)
 }
 
+/// What `release notes` would have written, as the tests' notes file.
+const NOTES: &str = "# v0.1.0\n\n## Before you click\n\n### Not reversible\n\n- meta_log raised from 3 \
+                     (v0.0.9) to 4\n\n## Commits since v0.0.9\n\n- abc1234 a change\n";
+
+/// Writes [`NOTES`] to `<root>/notes.md` and returns the path.
+fn notes_file(root: &Path) -> PathBuf {
+    let path = root.join("notes.md");
+    std::fs::write(&path, NOTES).expect("notes");
+    path
+}
+
+/// Adds to the fake's API the release tags `tags` (one page) and the compare of the
+/// highest, `TAG`, with `commit`.
+fn tags_standing(root: &Path, tags: &[&str], top: &str, status: &str) {
+    let path = root.join("gh/gh-api.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
+    let mut map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&text).expect("gh-api.json");
+    let refs: Vec<serde_json::Value> = tags
+        .iter()
+        .map(|t| serde_json::json!({ "ref": format!("refs/tags/{t}") }))
+        .collect();
+    map.insert(
+        format!("repos/{REPO}/git/matching-refs/tags/v?per_page=100&page=1"),
+        serde_json::Value::Array(refs),
+    );
+    map.insert(
+        format!("repos/{REPO}/compare/{top}...{COMMIT}"),
+        serde_json::json!({ "status": status }),
+    );
+    std::fs::write(path, serde_json::Value::Object(map).to_string()).expect("gh-api.json");
+}
+
 fn publish_set(root: &Path, set_hash: &str, defect: Option<&str>) -> (Option<i32>, String, String) {
+    publish_tag(root, TAG, set_hash, defect)
+}
+
+fn publish_tag(
+    root: &Path,
+    tag: &str,
+    set_hash: &str,
+    defect: Option<&str>,
+) -> (Option<i32>, String, String) {
+    publish_with(root, tag, set_hash, &notes_file(root), defect)
+}
+
+fn publish_notes(
+    root: &Path,
+    set_hash: &str,
+    notes: &Path,
+    defect: Option<&str>,
+) -> (Option<i32>, String, String) {
+    publish_with(root, TAG, set_hash, notes, defect)
+}
+
+fn publish_with(
+    root: &Path,
+    tag: &str,
+    set_hash: &str,
+    notes: &Path,
+    defect: Option<&str>,
+) -> (Option<i32>, String, String) {
+    // Rule S reads the release tags: `TAG` is the highest and names `COMMIT`, unless the
+    // test has said otherwise.
+    if !std::fs::read_to_string(root.join("gh/gh-api.json"))
+        .is_ok_and(|t| t.contains("matching-refs"))
+    {
+        tags_standing(root, &[TAG], TAG, "identical");
+    }
     let dist = root.join("dist");
     let run = RUN.to_string();
     xtask(
@@ -844,13 +912,15 @@ fn publish_set(root: &Path, set_hash: &str, defect: Option<&str>) -> (Option<i32
             "--repo",
             REPO,
             "--tag",
-            TAG,
+            tag,
             "--commit",
             COMMIT,
             "--run-id",
             &run,
             "--set-hash",
             set_hash,
+            "--notes-file",
+            s(notes),
         ],
         defect,
     )
@@ -914,10 +984,7 @@ fn publish_creates_the_release_with_every_verified_file() {
         )),
         "{create}"
     );
-    assert!(
-        create.contains(&format!("/actions/runs/{RUN})")),
-        "{create}"
-    );
+    assert!(args.contains(&format!("/actions/runs/{RUN})")), "{args}");
     // The notes span lines of the log; the verify command is one of them.
     assert!(
         args.contains(&format!(
@@ -938,6 +1005,98 @@ fn publish_creates_the_release_with_every_verified_file() {
         )),
         "{args}"
     );
+}
+
+#[test]
+fn publish_makes_the_notes_file_the_start_of_the_release_body() {
+    // Catches: a release whose body is not the generated notes (the reviewer approved
+    // notes that nobody published), or whose notes are cut, reflowed or followed by
+    // nothing: the body is the file verbatim, then how to verify the files.
+    let root = scratch("publish-body");
+    dist(&root, COMMIT);
+    let (code, _, err) = publish(&root, None);
+    assert_eq!(code, Some(0), "{err}");
+    let args = gh_args(&root);
+    let create = args.split("\nrelease create").last().expect("a create");
+    let body = create.split_once(" --notes ").expect("--notes").1;
+    assert!(
+        body.starts_with(&format!(
+            "{}\n## The files\n\nThe files run {RUN} of artifacts.yml built and attested",
+            NOTES.trim_end()
+        )),
+        "{body}"
+    );
+    assert!(
+        body.contains("Verify an asset before use"),
+        "the verification instructions are gone: {body}"
+    );
+}
+
+#[test]
+fn publish_requires_the_notes_file() {
+    // Catches: `--notes-file` made optional (a release with a fixed body again) and a
+    // missing, empty or unreadable file read as no notes. None may reach GitHub.
+    let root = scratch("publish-no-notes");
+    dist(&root, COMMIT);
+    let sums = std::fs::read_to_string(root.join("dist/SHA256SUMS")).unwrap();
+    let dist_dir = root.join("dist");
+    let run = RUN.to_string();
+    let (code, _, err) = xtask(
+        &root,
+        &[
+            "release",
+            "publish",
+            s(&dist_dir),
+            "--repo",
+            REPO,
+            "--tag",
+            TAG,
+            "--commit",
+            COMMIT,
+            "--run-id",
+            &run,
+            "--set-hash",
+            &sha_of(&sums),
+        ],
+        None,
+    );
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("--notes-file"), "{err}");
+    let gone = root.join("gone.md");
+    let (code, _, err) = publish_notes(&root, &sha_of(&sums), &gone, None);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("gone.md"), "{err}");
+    for blank in ["", " \n\n"] {
+        let empty = root.join("empty.md");
+        std::fs::write(&empty, blank).unwrap();
+        let (code, _, err) = publish_notes(&root, &sha_of(&sums), &empty, None);
+        assert_eq!(code, Some(1), "{err}");
+        assert!(err.contains("is empty"), "{err}");
+    }
+    assert_eq!(
+        gh_args(&root),
+        "",
+        "GitHub was asked about a release with no notes"
+    );
+    assert_eq!(released(&root), vec![], "a release was made");
+}
+
+#[test]
+fn publish_refuses_a_body_github_would_cut() {
+    // Catches: a body over GitHub's 125 000 characters, which `gh` would fail on after
+    // the checks, or which would be cut.
+    let root = scratch("publish-long-notes");
+    dist(&root, COMMIT);
+    let sums = std::fs::read_to_string(root.join("dist/SHA256SUMS")).unwrap();
+    let long = root.join("long.md");
+    std::fs::write(&long, "x".repeat(125_000)).unwrap();
+    let (code, _, err) = publish_notes(&root, &sha_of(&sums), &long, None);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("GitHub takes 125000"), "{err}");
+    assert_eq!(gh_args(&root), "", "GitHub was asked");
+    std::fs::write(&long, "x".repeat(100_000)).unwrap();
+    let (code, _, err) = publish_notes(&root, &sha_of(&sums), &long, None);
+    assert_eq!(code, Some(0), "{err}");
 }
 
 #[test]
@@ -1123,6 +1282,83 @@ fn publish_refuses_files_that_fail_the_check_before_asking_github() {
     assert_eq!(code, Some(1));
     assert!(err.contains("not an asset of"), "{err}");
     assert_eq!(gh_args(&root), "");
+}
+
+#[test]
+fn publish_refuses_a_commit_a_newer_release_supersedes_before_any_write() {
+    // Catches: Rule S missing from publish, or accepting `behind` (the commit is an
+    // ancestor of the highest tag: a re-run of an old run would publish over a newer
+    // release), `diverged`, or a compare GitHub cannot answer.
+    for status in ["behind", "diverged", "weird"] {
+        let root = scratch("publish-superseded");
+        dist(&root, COMMIT);
+        tags_standing(&root, &[TAG, "v0.2.0"], "v0.2.0", status);
+        let (code, out, err) = publish(&root, None);
+        assert_eq!(code, Some(1), "{status}: {out}");
+        assert!(
+            err.contains(&format!(
+                "superseded: the highest release tag is v0.2.0 and {COMMIT} is not at or \
+                 after it (compare says {status})"
+            )),
+            "{status}: {err}"
+        );
+        let args = gh_args(&root);
+        assert!(!args.contains("release create"), "{status}: {args}");
+        assert!(!args.contains("release upload"), "{status}: {args}");
+        assert!(!args.contains("releases/tags"), "{status}: {args}");
+        assert_eq!(released(&root), vec![], "{status}");
+    }
+}
+
+#[test]
+fn publish_goes_on_when_the_highest_tag_is_an_ancestor_of_the_commit() {
+    // Control for the test above: the highest tag is older than the commit (`ahead`),
+    // and a repository with no release tag at all is not superseded by one.
+    for (tags, top, status) in [
+        (vec!["v0.0.9"], "v0.0.9", "ahead"),
+        (vec![], TAG, "identical"),
+        (vec![TAG, "v0.1.0-rc1", "latest"], TAG, "identical"),
+    ] {
+        let root = scratch("publish-ahead");
+        dist(&root, COMMIT);
+        tags_standing(&root, &tags, top, status);
+        let (code, _, err) = publish(&root, None);
+        assert_eq!(code, Some(0), "{status}: {err}");
+        assert_eq!(released(&root), verified(&root));
+    }
+}
+
+#[test]
+fn publish_refuses_a_tag_that_is_not_above_the_highest_before_any_write() {
+    // Catches: Rule S comparing only the commit with the highest tag, so a caller could
+    // publish `--tag v0.0.1` for an ahead commit while v0.0.5 exists; a tag equal to the
+    // highest that does not name this commit; a lower tag when the highest names it; a
+    // tag that is no release tag. A re-run (the highest tag names this commit and is
+    // `--tag`) is the control, and it is in `a_rerun_changes_nothing`.
+    for (top, status, tag) in [
+        ("v0.0.5", "ahead", "v0.0.1"),
+        ("v0.0.5", "ahead", "v0.0.5"),
+        ("v0.0.5", "ahead", "latest"),
+        ("v0.0.5", "identical", "v0.0.1"),
+    ] {
+        let root = scratch("publish-low-tag");
+        let dist = dist(&root, COMMIT);
+        tags_standing(&root, &[top], top, status);
+        let sums = std::fs::read_to_string(dist.join("SHA256SUMS")).expect("sums");
+        let (code, out, err) = publish_tag(&root, tag, &sha_of(&sums), None);
+        assert_eq!(code, Some(1), "{tag} {status}: {out}");
+        assert!(
+            err.contains(&format!(
+                "--tag {tag} is no release above the highest release tag {top}"
+            )),
+            "{tag} {status}: {err}"
+        );
+        let args = gh_args(&root);
+        assert!(!args.contains("release create"), "{tag}: {args}");
+        assert!(!args.contains("release upload"), "{tag}: {args}");
+        assert!(!args.contains("releases/tags"), "{tag}: {args}");
+        assert_eq!(released(&root), vec![], "{tag}");
+    }
 }
 
 #[test]

@@ -6,9 +6,9 @@
 //! `frontend_update` calls it too, with no components: the source is the installer's own.
 //!
 //! The real fetcher is [`fetcher_real::RealFetcher`](super::fetcher_real::RealFetcher): the
-//! unprivileged fetch child and the verify pipeline behind this trait. The binary does not
-//! build one yet; until it does it uses [`NotWired`], which refuses, so an activation of a
-//! commit that is not installed is refused with that reason and nothing is fetched.
+//! unprivileged fetch child and the verify pipeline behind this trait, which the binary has
+//! built for each fetch by [`fetcher_host::HostFetcher`](super::fetcher_host::HostFetcher).
+//! [`NotWired`] is the fetcher of a build that has none: it refuses, and nothing is fetched.
 
 use kbf_update::{Facts, Locator};
 

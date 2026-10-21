@@ -286,6 +286,11 @@ impl Child for Rig {
         (!live).then_some(0)
     }
 
+    /// A process of the rig is gone the moment it is ended: there is nothing to wait for.
+    fn await_exit(&self, ident: &ProcIdent, _limit: Duration) -> bool {
+        self.exited(ident).is_some()
+    }
+
     fn terminate(&self, ident: &ProcIdent) -> Result<(), PortError> {
         self.end(ident, "terminate");
         if self.st().knobs.terminate_err {

@@ -7,8 +7,8 @@ import { Refused, Tools, main } from './steps';
 const root = path.resolve(__dirname, '..');
 const tools: Tools = {
   capture: (cmd, args, cwd) => execFileSync(cmd, args, { cwd: cwd ?? root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
-  stream: (cmd, args, cwd) => {
-    execFileSync(cmd, args, { cwd: cwd ?? root, stdio: 'inherit' });
+  stream: (cmd, args, opts) => {
+    execFileSync(cmd, args, { cwd: opts?.cwd ?? root, input: opts?.input, stdio: opts?.input === undefined ? 'inherit' : ['pipe', 'inherit', 'inherit'] });
   },
   log: (line) => console.log(line),
   mkScratch: () => fs.mkdtempSync(path.join(os.tmpdir(), 'kbf-upload-')),

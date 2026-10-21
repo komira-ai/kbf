@@ -1011,3 +1011,63 @@ fn the_partial_directory_is_made_whole_and_removed_when_dropped() {
     drop(partial);
     assert!(!path.exists());
 }
+
+/// A file whose every number differs from the next's and from the defaults, so a value read
+/// from the wrong field cannot pass as the right one.
+fn tuned() -> InstallerToml {
+    InstallerToml {
+        max_component_bytes: 7_000_001,
+        min_protocol: 4,
+        min_generation: 9,
+        fetch_timeout_s: 1234,
+        min_activation_interval_s: 77,
+        confirm_window_s: 301,
+        ..InstallerToml::default()
+    }
+}
+
+/// A host's policy is its `installer.toml`'s component cap and `min_protocol` floor with the
+/// installer's own supported numbers, binary cap and timeouts: written out whole, so a number
+/// taken from another field (`min_generation`, `fetch_timeout_s`), the floor lost, or the
+/// supported numbers replaced by anything but [`supported`] fails.
+///
+/// Mutants planted: `min_protocol` read from `min_generation`; `max_component_bytes` from
+/// `fetch_timeout_s`; `supported` replaced by the test policy's 10/10/10.
+#[test]
+fn a_policy_is_the_installer_tomls_caps_and_floor_over_the_installers_own_numbers() {
+    let want = Policy {
+        max_component_bytes: 7_000_001,
+        max_binary_bytes: MAX_BINARY,
+        min_protocol: 4,
+        supported: Supported {
+            protocol: 1,
+            min_protocol: 1,
+            state_schema: u64::from(kbf_state::postgres::schema::latest()),
+        },
+        timeouts: Timeouts::DEFAULT,
+    };
+    assert_eq!(Policy::of(&tuned()), want);
+    // The defaults of an empty file: no floor, the 512 MiB cap.
+    let plain = Policy::of(&InstallerToml::default());
+    assert_eq!(
+        (plain.min_protocol, plain.max_component_bytes),
+        (0, 512 << 20)
+    );
+}
+
+/// The numbers this installer understands are the first protocol and the schema it embeds:
+/// a release that declares a protocol above 1 is `installer_too_old` until the installer is
+/// changed on purpose (decision D3), and the schema is the database client's own newest, not
+/// a copy. `kbf-cli`'s test pins them against what the server declares.
+///
+/// Mutants planted: `protocol` 2; `state_schema` 0.
+#[test]
+fn the_supported_numbers_are_protocol_one_and_the_embedded_schema() {
+    let s = supported();
+    assert_eq!((s.protocol, s.min_protocol), (1, 1));
+    assert_eq!(
+        s.state_schema,
+        u64::from(kbf_state::postgres::schema::latest())
+    );
+    assert!(s.state_schema > 0, "this build embeds a migration");
+}

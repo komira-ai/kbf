@@ -2,7 +2,7 @@
 //!
 //! The attest job names each tarball and its SBOM by hand, one `actions/attest-sbom`
 //! step per tarball (in the attest job of its platform group), and runs only on a push to
-//! `main` or `feature/arch-v2`; the verify job after it refuses
+//! `main`; the verify job after it refuses
 //! a tarball with no SBOM attestation (`cargo xtask verify-assets attestations`). So a
 //! binary added to a build job's `Package` steps without its attest step passes every
 //! pull request check and turns `main` red. [`unattested`] reads both lists from the

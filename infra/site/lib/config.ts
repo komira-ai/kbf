@@ -8,8 +8,14 @@ export const DEFAULT_DOMAIN = 'kbf.dev';
 export const GITHUB_OIDC_HOST = 'token.actions.githubusercontent.com';
 export const OIDC_AUDIENCE = 'sts.amazonaws.com';
 
+/**
+ * The role trusts the environment `prod-site`, NOT `prod`. `prod` carries the one required reviewer (the release's single
+ * approval click, on the `publish` job); `prod-site` has no reviewer, admits only `v*` tags, and its job `needs` the approved
+ * one. Pinning the role to `prod-site` keeps the approved `publish` job (contents: write) from ever assuming it.
+ */
+export const APPROVAL_ENVIRONMENT = 'prod';
+export const GITHUB_ENVIRONMENT = 'prod-site';
 /** The workflow the role trusts. It is a reusable workflow: job_workflow_ref names the called file, not the caller. */
-export const GITHUB_ENVIRONMENT = 'prod';
 export const PUBLISH_WORKFLOW = '.github/workflows/site-publish.yml';
 export const WORKFLOW_REF = 'refs/heads/main';
 
@@ -68,8 +74,8 @@ export function siteConfig(get: (key: string) => unknown): SiteConfig {
   return { ...base, repo, repoId, ownerId };
 }
 
-/** sub = repo:<owner>@<ownerId>/<name>@<repoId>:environment:prod:job_workflow_ref:<repo>/<file>@<ref> */
-export function oidcSubject(c: SiteConfig): string {
+/** sub = repo:<owner>@<ownerId>/<name>@<repoId>:environment:prod-site:job_workflow_ref:<repo>/<file>@<ref> */
+export function oidcSubject(c: Pick<SiteConfig, 'repo' | 'repoId' | 'ownerId'>): string {
   const [owner, name] = c.repo.split('/');
   return (
     `repo:${owner}@${c.ownerId}/${name}@${c.repoId}` +
