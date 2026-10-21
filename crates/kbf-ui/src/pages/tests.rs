@@ -13,16 +13,34 @@ fn page(fake: &Fake, path: &str) -> (u16, String) {
     (a.status(), body(&a))
 }
 
+/// Catches: the Overview reading a route, missing a link to a page, or the lookup left
+/// at the prefix (the form of Builds moved to `/ui/builds`, so `/ui` has none).
+#[test]
+fn overview_links_the_pages_and_reads_nothing() {
+    let fake = farm();
+    for path in ["/ui", "/ui/"] {
+        let (status, html) = page(&fake, path);
+        assert_eq!(status, 200);
+        assert!(html.contains("<title>Overview - kbf</title>"), "{html}");
+        for link in ["/ui/builds", "/ui/updates"] {
+            assert!(html.contains(&format!("<a href=\"{link}\">")), "{html}");
+        }
+        assert!(!html.contains("<form"), "{html}");
+        assert!(html.contains("Nothing: this page read no route."), "{html}");
+    }
+    assert!(fake.seen().is_empty());
+}
+
 /// Catches: the lookup form missing, a read made without an id, the footer not
 /// saying nothing was read.
 #[test]
 fn builds_without_an_id_shows_the_form_and_reads_nothing() {
     let fake = farm();
-    for path in ["/ui", "/ui?id="] {
+    for path in ["/ui/builds", "/ui/builds?id="] {
         let (status, html) = page(&fake, path);
         assert_eq!(status, 200);
         assert!(
-            html.contains("<form method=\"get\" action=\"/ui\""),
+            html.contains("<form method=\"get\" action=\"/ui/builds\""),
             "{html}"
         );
         assert!(html.contains("Nothing: this page read no route."), "{html}");
@@ -43,7 +61,7 @@ fn builds_without_an_id_shows_the_form_and_reads_nothing() {
 #[test]
 fn builds_with_an_id_shows_its_summary() {
     let fake = farm();
-    let (status, html) = page(&fake, &format!("/ui?id={ID}"));
+    let (status, html) = page(&fake, &format!("/ui/builds?id={ID}"));
     assert_eq!(status, 200, "{html}");
     assert!(
         html.contains("<a href=\"/ui/builds/build-1\">build-1</a>"),
@@ -96,13 +114,13 @@ fn builds_with_an_unknown_id_or_no_api_says_so() {
             r#"{"error": "no_record", "id": "gone", "records_since": "2026-10-11T09:00:00.000000Z"}"#,
         )
         .down("/v1/invocations/down");
-    let (status, html) = page(&fake, "/ui?id=gone");
+    let (status, html) = page(&fake, "/ui/builds?id=gone");
     assert_eq!(status, 404);
     assert!(
         html.contains("records are held since 2026-10-11T09:00:00.000000Z"),
         "{html}"
     );
-    let (status, html) = page(&fake, "/ui?id=down");
+    let (status, html) = page(&fake, "/ui/builds?id=down");
     assert_eq!(status, 502);
     assert!(html.contains("connection refused"), "{html}");
 }
@@ -114,12 +132,16 @@ fn builds_with_an_unknown_id_or_no_api_says_so() {
 #[test]
 fn builds_with_a_dot_id_names_no_build_and_reads_nothing() {
     let fake = farm();
-    for path in ["/ui?id=..", "/ui?id=.", "/ui?id=%2E%2E"] {
+    for path in [
+        "/ui/builds?id=..",
+        "/ui/builds?id=.",
+        "/ui/builds?id=%2E%2E",
+    ] {
         let (status, html) = page(&fake, path);
         assert_eq!(status, 404, "{path}: {html}");
         assert!(!html.contains("problem bug"), "{path}: {html}");
         assert!(
-            html.contains("<form method=\"get\" action=\"/ui\""),
+            html.contains("<form method=\"get\" action=\"/ui/builds\""),
             "{path}: {html}"
         );
         assert!(html.contains("names no build"), "{path}: {html}");
@@ -500,14 +522,14 @@ fn summary_tool_and_state() {
         inv["tool_version"] = version;
         inv["rows_capped"] = json!(capped);
         let fake = Fake::default().json(&base, &inv);
-        let (_, html) = page(&fake, &format!("/ui?id={ID}"));
+        let (_, html) = page(&fake, &format!("/ui/builds?id={ID}"));
         assert!(html.contains(&format!("<dd>{want_tool}</dd>")), "{html}");
         assert!(html.contains(&format!("<dd>{want_state}</dd>")), "{html}");
     }
     let mut inv = invocation(ID);
     inv["complete"] = json!(false);
     let fake = Fake::default().json(&base, &inv);
-    let (_, html) = page(&fake, &format!("/ui?id={ID}"));
+    let (_, html) = page(&fake, &format!("/ui/builds?id={ID}"));
     assert!(html.contains("<dd>idle</dd>"), "{html}");
 }
 

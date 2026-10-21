@@ -34,7 +34,7 @@
 //!   `attested_bundles`);
 //! - the artifacts workflow no longer building the pinned release set (`kbf` for
 //!   three platforms, `kbf-deploy` for macOS too), signing and attesting only on pushes
-//!   to `main` and `feature/arch-v2`, checking `kbf --version --json` (on the binary
+//!   to `main`, checking `kbf --version --json` (on the binary
 //!   built, and again on the packaged tarball with `build-commit check-asset`), signing and
 //!   `darwin-asset`-checking every macOS binary, or docs/artifacts.md describing
 //!   another set (module `release_artifacts`);
@@ -668,11 +668,10 @@ mod selection {
         assert!(signs_provenance_on_main(&format!("{cond}{step}")));
         assert!(!signs_provenance_on_main(step));
         assert!(!signs_provenance_on_main(&cond));
-        // The main-only condition of before the development branch was attested no
-        // longer names the signer.
-        let main_only =
-            "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n";
-        assert!(!signs_provenance_on_main(&format!("{main_only}{step}")));
+        // The condition of the time the development branch `feature/arch-v2` was attested
+        // too no longer names the signer.
+        let two_branches = "    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}\n";
+        assert!(!signs_provenance_on_main(&format!("{two_branches}{step}")));
     }
 
     #[test]
@@ -913,6 +912,26 @@ fn every_test_that_starts_kbf_gives_it_a_config_of_its_own_or_is_a_listed_allowa
     assert_eq!(
         kbf_spawns::ALLOWANCE.len(),
         17,
+        "the allowance only shrinks"
+    );
+}
+
+#[test]
+fn no_test_uses_the_hosts_real_kbf_directories() {
+    // Catches: a test or harness file that opens, lists or runs a path under the host's
+    // `/etc/kbf` or `/var/lib/kbf-installer`, so it passes or fails by what the box it runs
+    // on has installed (rules, allowance and planted trees in `kbf_spawns/mod.rs`). The
+    // allowance is pinned at its count, so it cannot grow without this line changing.
+    let root = repo_root();
+    let files = listed_files(&root);
+    let read = |f: &str| {
+        read_bytes(&root.join(f)).map(|b| String::from_utf8(b).expect("UTF-8 Rust source"))
+    };
+    let problems = kbf_spawns::scan_host_paths(&files, read, kbf_spawns::HOST_PATH_ALLOWANCE);
+    assert!(problems.is_empty(), "host paths:\n{}", problems.join("\n"));
+    assert_eq!(
+        kbf_spawns::HOST_PATH_ALLOWANCE.len(),
+        1,
         "the allowance only shrinks"
     );
 }

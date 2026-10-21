@@ -1416,6 +1416,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-blackbox"
+version = "0.1.0"
+dependencies = [
+ "kbf-harness",
+ "kbf-proto",
+ "kbf-testkit",
+ "kbf-transfer",
+ "prost",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "kbf-ca"
 version = "0.1.0"
 dependencies = [
@@ -2234,6 +2247,7 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "hex",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
