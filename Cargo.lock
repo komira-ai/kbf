@@ -1568,10 +1568,16 @@ dependencies = [
 name = "kbf-daemon-test"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "kbf-daemon",
+ "kbf-deploy",
+ "kbf-front",
  "kbf-harness",
  "kbf-proto",
  "kbf-testkit",
  "kbf-transfer",
+ "prost",
+ "rcgen",
  "rustix",
  "tokio",
  "tonic",

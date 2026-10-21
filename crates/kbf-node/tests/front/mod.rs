@@ -241,20 +241,21 @@ impl Front {
     /// its digest. Only for the tests of how the daemon ends a user's shell command and
     /// the background job it starts (the shell's `$$` and `$!` name the processes).
     pub fn user_shell(&self, script: &str) -> Digest {
+        self.action(&["/bin/sh", "-c", script])
+    }
+
+    /// Stores an action that runs `arguments` (the program first, run as given: no
+    /// shell) with `PATH=/usr/bin:/bin`, in an empty input root; returns its digest.
+    pub fn action(&self, arguments: &[&str]) -> Digest {
         self.runtime.block_on(async {
-            let channel = Endpoint::from_shared(format!("http://{}", self.cas))
-                .expect("endpoint")
-                .connect()
-                .await
-                .expect("connect to the CAS");
-            let cas = Transfers::over(channel, TransferConfig::default());
+            let cas = self.transfers().await;
             let put = |bytes: Vec<u8>| {
                 let cas = &cas;
                 async move { cas.put(bytes).await.expect("upload") }
             };
             let root = put(Directory::default().encode_to_vec()).await;
             let command = Command {
-                arguments: ["/bin/sh", "-c", script].map(str::to_owned).to_vec(),
+                arguments: arguments.iter().map(|a| (*a).to_owned()).collect(),
                 environment_variables: vec![EnvironmentVariable {
                     name: "PATH".to_owned(),
                     value: "/usr/bin:/bin".to_owned(),
@@ -269,5 +270,28 @@ impl Front {
             };
             put(action.encode_to_vec()).await
         })
+    }
+
+    /// The bytes of the blob `digest` names in the CAS, such as the stdout of a lease
+    /// that has ended; empty when the digest is absent (an action that wrote nothing).
+    #[allow(dead_code)]
+    pub fn blob(&self, digest: Option<&Digest>) -> Vec<u8> {
+        let Some(digest) = digest.filter(|d| d.size_bytes > 0) else {
+            return Vec::new();
+        };
+        self.runtime.block_on(async {
+            let cas = self.transfers().await;
+            cas.get(digest).await.expect("the blob is in the CAS")
+        })
+    }
+
+    /// A client of the plain-text CAS.
+    async fn transfers(&self) -> Transfers {
+        let channel = Endpoint::from_shared(format!("http://{}", self.cas))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect to the CAS");
+        Transfers::over(channel, TransferConfig::default())
     }
 }
