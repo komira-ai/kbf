@@ -569,7 +569,7 @@ fn refuses_tag(name: &str, more: Vec<(String, Value)>, why: &str) {
 #[test]
 fn a_tag_that_is_not_annotated_or_not_a_commit_or_not_there_is_refused() {
     // Catches: a lightweight tag taken as a release (its ref names the commit, so the tag
-    // has no verdict to read), a tag object that names a tree taken for a commit, and a ref
+    // has no audit record to read), a tag object that names a tree taken for a commit, and a ref
     // or a tag object GitHub does not have taken for "no previous release".
     let ref_path = format!("repos/{REPO}/git/ref/tags/{TAG}");
     let tag_path = format!("repos/{REPO}/git/tags/{OBJ}");

@@ -17,7 +17,7 @@
 //! With one, and only for that tag:
 //!
 //! 1. the tag is resolved: its ref names a tag object (a lightweight tag is refused: a
-//!    release tag carries its verdict in its message) and that names a commit. The scan
+//!    release tag carries its audit record in its message) and that names a commit. The scan
 //!    compared names; this commit is compared again and must itself be a strict ancestor of
 //!    N, so a branch of the tag's name, or a tag made since the scan, cannot stand in;
 //! 2. the release of that tag must exist. A tag with no release is an error, not a step back
@@ -135,7 +135,7 @@ fn tag_commit(gh: &Path, repo: &str, tag: &str) -> Result<String, Error> {
     let found = must_api(gh, &format!("repos/{repo}/git/ref/tags/{tag}"))?;
     let (Some("tag"), Some(object)) = object_of(&found) else {
         return Err(Error::Failed(format!(
-            "{tag} is not an annotated tag: a release tag is one, and carries its verdict"
+            "{tag} is not an annotated tag: a release tag is one, and carries its audit record"
         )));
     };
     let annotation = must_api(gh, &format!("repos/{repo}/git/tags/{object}"))?;
