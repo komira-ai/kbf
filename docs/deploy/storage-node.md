@@ -618,7 +618,7 @@ backup.
 
 ## What the tests check
 
-- `crates/kbf-it/tests/deploy_units.rs` runs `kbf-server`'s flag parser over the
+- `crates/kbf-integration-test/tests/deploy_units.rs` runs `kbf-server`'s flag parser over the
   `ExecStart=` of every server unit in `docs/deploy/`, checks that the planned flag
   above is still refused, that the worked example adds up and matches the converged
   daemon unit's `--actions-memory-max-gib`, and that the units keep the

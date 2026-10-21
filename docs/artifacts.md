@@ -31,7 +31,7 @@ macOS runner pool. Adding it to an open pull request starts a run.
 added to a pull request therefore starts a whole `artifacts` run, which replaces the pull
 request's earlier run: add labels together, before the run you want to keep. `native-macos`
 and `pkg-macos` run in `beta.yml` on every push and never on a pull request; that is pinned
-by `crates/kbf-it/tests/release_artifacts`.
+by `crates/kbf-integration-test/tests/release_artifacts`.
 
 ## What is built
 
@@ -68,7 +68,7 @@ The packages are the two Linux jobs' debs and the macOS job's `.pkg`:
 | `kbf-installer-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
 | `kbf-installer-<commit>-darwin-arm64.pkg` | the `darwin-arm64` job (`macos-15`, `cargo xtask pkg build`) | the `kbf-installer` of the tarball of the same name, its LaunchDaemon property list, the pinned darwin `gh` and a trust directory |
 
-The set above is pinned: `crates/kbf-it/tests/release_artifacts` fails a pull request
+The set above is pinned: `crates/kbf-integration-test/tests/release_artifacts` fails a pull request
 that drops one of these files from the workflow, packages one that is not listed, or
 leaves this table describing another set.
 
@@ -185,7 +185,7 @@ never released.
 Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write`, and only
 under the exact `if:` that limits it to a push to `main` (the
 `verify-*` jobs run under the same one). The workflow lint
-(`crates/kbf-it/tests/workflows`) refuses those scopes in any other job, and in one
+(`crates/kbf-integration-test/tests/workflows`) refuses those scopes in any other job, and in one
 whose `if:` is any other spelling, so no pull request or merge-queue run holds a token
 that can sign an attestation. No repository code runs in
 an `attest-*` job and nothing is built there: it holds those scopes for the pinned signing
@@ -194,10 +194,10 @@ SHA, and that lint refuses one that is not.
 
 The attest job of a platform group names each tarball of the group and its SBOM, one `actions/attest-sbom` step per
 tarball, and runs only on a push to one of those two branches. So that a binary added to a build job cannot reach
-`main` without its step, the repository lint (`crates/kbf-it/tests/attested_assets`)
+`main` without its step, the repository lint (`crates/kbf-integration-test/tests/attested_assets`)
 reads the workflow's `cargo xtask package` lines and its attest steps on every pull
 request, and refuses a packaged tarball with no step pairing it with its own SBOM, or a
-step for a tarball no job packages. The lint `crates/kbf-it/tests/attested_bundles` does
+step for a tarball no job packages. The lint `crates/kbf-integration-test/tests/attested_bundles` does
 the same for the bundles: a packaged tarball with no provenance step of its own, no step
 that names its bundle, or a bundle that is not uploaded, downloaded by the verify job and
 by the release workflow, and required by `release locate`, is named in the pull request. It
@@ -477,7 +477,7 @@ whose required reviewer approves it.
 The workflow can also be run by hand (`workflow_dispatch`) with a commit SHA and the
 annotated tag to check. Only `verify` runs then: every check above, and nothing is
 published (`publish` runs only for a pushed tag, and only `publish` holds a write scope).
-`crates/kbf-it/tests/release_workflow` holds the file to this: the verdict step, the
+`crates/kbf-integration-test/tests/release_workflow` holds the file to this: the verdict step, the
 `prod` environment, a `v*` tag push and a dispatch as the only triggers (no pull request),
 pinned actions and an empty top-level `permissions`. On every pull request
 into `main`, CI asks GitHub the same on-`main` question for the pull request's base

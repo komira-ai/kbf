@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use kbf_it::m2::{IMAGE, has_interpreter};
+use kbf_integration_test::m2::{IMAGE, has_interpreter};
 use kbf_testkit::dir::TestDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-cell");

@@ -72,7 +72,7 @@ pub struct M1Args {
     #[arg(long)]
     pub bin_dir: PathBuf,
     /// The directory holding the sample projects `bazel/` and `buck2/`
-    /// (`crates/kbf-it/m1`). Each is built in a copy under `--work`.
+    /// (`crates/kbf-integration-test/m1`). Each is built in a copy under `--work`.
     #[arg(long)]
     pub projects: PathBuf,
     /// The cell's directory: certificates, the API token, the projects' copies, the

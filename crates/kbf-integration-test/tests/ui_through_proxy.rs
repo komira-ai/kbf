@@ -92,7 +92,8 @@ impl Rig {
             &format!("ui-through-proxy-{name}"),
         );
         let base = free_base();
-        let pki = kbf_it::pki::write(&dir.path().join("pki"), "ui-test").expect("certificates");
+        let pki = kbf_integration_test::pki::write(&dir.path().join("pki"), "ui-test")
+            .expect("certificates");
         private(
             &dir.path().join("operator.token"),
             OPERATOR_TOKEN.as_bytes(),

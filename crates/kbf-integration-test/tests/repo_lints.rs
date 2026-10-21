@@ -12,7 +12,7 @@
 //! - a text file carrying a non-documentation IPv4 address, an absolute home path, a
 //!   citation of an unpublished design document by its sections (the IETF numbers
 //!   pass) or a git conflict marker, and a file holding a NUL byte whose extension is
-//!   not on the binary allow list (rules in `kbf_it::hygiene`);
+//!   not on the binary allow list (rules in `kbf_integration_test::hygiene`);
 //! - a workflow `run:` step with shell logic (no row can list one); a shell, Python,
 //!   awk, sed, Perl or Ruby file, or a production `sh -c` in `crates/*/src/`, that
 //!   `tools/interpreter_budget.tsv` does not list (by path, never by size); test code
@@ -163,9 +163,9 @@ enum TextFile {
 }
 
 fn check_text_file(f: &str, bytes: &[u8]) -> TextFile {
-    match kbf_it::hygiene::decode(f, bytes) {
+    match kbf_integration_test::hygiene::decode(f, bytes) {
         Ok(Some(text)) => TextFile::Scanned(
-            kbf_it::hygiene::scan(&text)
+            kbf_integration_test::hygiene::scan(&text)
                 .iter()
                 .map(|p| format!("{f}: {p}"))
                 .collect(),

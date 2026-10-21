@@ -216,7 +216,7 @@ Page to route to contract test, every built route included:
 
 ### 7.3 Layer 3: black-box through the real proxy
 
-Reuses `kbf-it`'s `proxy_support` (proxy at library level, real `kbf` frontend children from this test binary, test PKI, `reqwest`). It needs no service unless history is under test: then Postgres is the CI service container pinned by digest (`KBF_TEST_POSTGRES_URL`), history objects are a `file://` directory (single frontend; accepted today), and the test is `#[ignore]`d like the other Postgres tests. Linux hosted CI only; macOS developers run Layers 1 and 2 and the service-free part of Layer 3. Budget: 5 minutes. Ports are ephemeral, PKI validity is long, and every wait is a poll with a deadline, never a sleep.
+Reuses `kbf-integration-test`'s `proxy_support` (proxy at library level, real `kbf` frontend children from this test binary, test PKI, `reqwest`). It needs no service unless history is under test: then Postgres is the CI service container pinned by digest (`KBF_TEST_POSTGRES_URL`), history objects are a `file://` directory (single frontend; accepted today), and the test is `#[ignore]`d like the other Postgres tests. Linux hosted CI only; macOS developers run Layers 1 and 2 and the service-free part of Layer 3. Budget: 5 minutes. Ports are ephemeral, PKI validity is long, and every wait is a poll with a deadline, never a sleep.
 
 **Minimum for R-T1 (the gate):** `/ui` served with no client certificate and no token, by default (no `--ui` flag); `/ui` 404 with `--ui=false`; h1 and h2 both served; POST, OPTIONS and HEAD behave (405, 405, served); the built security headers of 5.3 present on a page (the proxy's 503 page and the not-built headers join when their unit lands); no token, proxy secret or `x-kbf-*` reflected in a page; the existing gates unchanged through the proxy: a write route and an operator `/v1` route without the operator token are refused, a `daemon` or `storage` certificate cannot use the REAPI class beyond what it could before; HTML uploaded as a blob comes back as an attachment (headers built in R2b, checked here through the proxy).
 
@@ -226,7 +226,7 @@ Reuses `kbf-it`'s `proxy_support` (proxy at library level, real `kbf` frontend c
 
 ### 7.4 CI placement
 
-Layers 1 and 2 run in the normal PR check. Layer 3 runs in the PR check for a change to `kbf-ui`, `kbf-proxy`, `kbf-server`, `kbf-installer`, `kbf-it` or the API types, with a cheap smoke subset (`/ui` open by default, `--ui=false` 404, write route refused) on every PR; the full suite always runs in the beta pipeline. Postgres is the metadata store everywhere history is used; the SQLite phases in `ui-data.md` are rewritten to Postgres only (R0, with the `ui-data.md` follow-up).
+Layers 1 and 2 run in the normal PR check. Layer 3 runs in the PR check for a change to `kbf-ui`, `kbf-proxy`, `kbf-server`, `kbf-installer`, `kbf-integration-test` or the API types, with a cheap smoke subset (`/ui` open by default, `--ui=false` 404, write route refused) on every PR; the full suite always runs in the beta pipeline. Postgres is the metadata store everywhere history is used; the SQLite phases in `ui-data.md` are rewritten to Postgres only (R0, with the `ui-data.md` follow-up).
 
 ### 7.5 No browser tests in v1
 

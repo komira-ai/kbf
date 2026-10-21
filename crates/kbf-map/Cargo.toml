@@ -10,7 +10,7 @@ publish.workspace = true
 # The storage map and the rendezvous hashing over it (docs/design/architecture-v2.md,
 # sections 6 and 8). Pure: it depends on the digest type and a fixed-key hash only, so the
 # frontend, storage, the daemon and the transfer engine can all use it
-# (crates/kbf-it/tests/layering.rs).
+# (crates/kbf-integration-test/tests/layering.rs).
 [dependencies]
 kbf-types.workspace = true
 siphasher.workspace = true

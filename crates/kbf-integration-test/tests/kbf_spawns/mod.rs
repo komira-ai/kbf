@@ -20,7 +20,7 @@
 pub const FLAGGED: &[&str] = &[
     "crates/kbf-cli/tests/storage_process.rs",
     "crates/kbf-harness/src/farm.rs",
-    "crates/kbf-it/tests/proxy_support/mod.rs",
+    "crates/kbf-integration-test/tests/proxy_support/mod.rs",
 ];
 
 /// Test files that start `kbf` with no settings file of their own: the process tests of
@@ -50,7 +50,7 @@ pub const ALLOWANCE: &[&str] = &[
 const FLAG_CALL: &str = "config::flag(";
 
 /// The directory of this rule's own planted sources, which name the markers.
-const OWN: &str = "crates/kbf-it/tests/kbf_spawns/";
+const OWN: &str = "crates/kbf-integration-test/tests/kbf_spawns/";
 
 /// Whether `path` is test code the rule reads: a file under a crate's `tests/`, or the
 /// harness and test kit sources (which start `kbf` for tests), except this rule's own.

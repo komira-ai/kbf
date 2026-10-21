@@ -1,4 +1,4 @@
-//! `kbf-cell`: the M1 and M2 integration harnesses (see the `kbf_it` library docs).
+//! `kbf-cell`: the M1 and M2 integration harnesses (see the `kbf_integration_test` library docs).
 //!
 //! Exit codes: 0 done (or the check passed), 1 the check failed, 2 the command could
 //! not run.
@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use kbf_it::summary::{Tool, check_logs};
+use kbf_integration_test::summary::{Tool, check_logs};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -28,16 +28,16 @@ enum Cli {
     },
     /// Runs the test-only daemon (local runtime, no isolation) until SIGINT.
     #[cfg(target_os = "linux")]
-    Daemon(kbf_it::daemon::DaemonArgs),
+    Daemon(kbf_integration_test::daemon::DaemonArgs),
     /// Runs the M1 exit test: a cell, the sample projects built twice each, a lease
-    /// drained in flight (the `kbf_it::m1` docs say what is checked).
+    /// drained in flight (the `kbf_integration_test::m1` docs say what is checked).
     #[cfg(target_os = "linux")]
-    M1(kbf_it::m1::M1Args),
+    M1(kbf_integration_test::m1::M1Args),
     /// Runs the M2 exit test: buck2 through the server to a container-driver daemon in
     /// a Delegate=yes unit, two builds, a memory kill's rerun, a lease in a container
-    /// and a daemon killed mid-lease (the `kbf_it::m2` docs say what is checked).
+    /// and a daemon killed mid-lease (the `kbf_integration_test::m2` docs say what is checked).
     #[cfg(target_os = "linux")]
-    M2(kbf_it::m2::M2Args),
+    M2(kbf_integration_test::m2::M2Args),
     /// Checks a build and its rebuild after a clean: all remote, then all cache hits.
     Check {
         #[arg(long, value_enum)]
@@ -53,7 +53,7 @@ enum Cli {
 
 fn main() -> ExitCode {
     match Cli::parse() {
-        Cli::Pki { dir, node_id } => match kbf_it::pki::write(&dir, &node_id) {
+        Cli::Pki { dir, node_id } => match kbf_integration_test::pki::write(&dir, &node_id) {
             Ok(files) => {
                 println!("{files:?}");
                 ExitCode::SUCCESS
@@ -63,9 +63,9 @@ fn main() -> ExitCode {
         #[cfg(target_os = "linux")]
         Cli::Daemon(args) => daemon(args),
         #[cfg(target_os = "linux")]
-        Cli::M1(args) => cell(kbf_it::m1::run(&args)),
+        Cli::M1(args) => cell(kbf_integration_test::m1::run(&args)),
         #[cfg(target_os = "linux")]
-        Cli::M2(args) => cell(kbf_it::m2::run(&args)),
+        Cli::M2(args) => cell(kbf_integration_test::m2::run(&args)),
         Cli::Check {
             tool,
             first,
@@ -91,7 +91,7 @@ fn main() -> ExitCode {
 
 /// The exit status of a cell test, its error on stderr.
 #[cfg(target_os = "linux")]
-fn cell(result: Result<(), kbf_it::CellError>) -> ExitCode {
+fn cell(result: Result<(), kbf_integration_test::CellError>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -102,7 +102,7 @@ fn cell(result: Result<(), kbf_it::CellError>) -> ExitCode {
 }
 
 #[cfg(target_os = "linux")]
-fn daemon(args: kbf_it::daemon::DaemonArgs) -> ExitCode {
+fn daemon(args: kbf_integration_test::daemon::DaemonArgs) -> ExitCode {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
@@ -114,12 +114,12 @@ fn daemon(args: kbf_it::daemon::DaemonArgs) -> ExitCode {
 
 /// Runs the daemon until SIGINT.
 #[cfg(target_os = "linux")]
-fn serve(args: kbf_it::daemon::DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn serve(args: kbf_integration_test::daemon::DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = async {
         // Without a handler the process cannot stop cleanly; it still stops.
         let _ = tokio::signal::ctrl_c().await;
     };
-    tokio::runtime::Runtime::new()?.block_on(kbf_it::daemon::run(args, shutdown))?;
+    tokio::runtime::Runtime::new()?.block_on(kbf_integration_test::daemon::run(args, shutdown))?;
     Ok(())
 }
 

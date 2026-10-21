@@ -948,7 +948,7 @@ Changes by crate (rough sizes, tests included):
 | `kbf-caps`, `kbf-front` | membership comparison; new exact and set keys, `probe.*`; `kbf-node` refused from clients | ~300 |
 | `kbf-alert` | rollout held, client gate waiting, node not back, certificate, token and catalogue expiry, Mac awaiting a signed erase | ~200 |
 | `kbf-driver-native` | the bare-metal whole-machine runtime: lease users through `kbf-mac-session`, GUI session, cleanup | ~1,500 |
-| `kbf-sim`, `kbf-it` | tests below | ~1,000 |
+| `kbf-sim`, `kbf-integration-test` | tests below | ~1,000 |
 
 Tests, each with the planted mutant that must turn it red (the security tests are in
 S10):

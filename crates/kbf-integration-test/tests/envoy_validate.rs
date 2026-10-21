@@ -17,7 +17,7 @@ use std::process::Command;
 
 use kbf_installer::envoy::{BoxSettings, SUPPORTED, check, check_installed, render};
 use kbf_installer::run::SystemRunner;
-use kbf_it::pki;
+use kbf_integration_test::pki;
 use kbf_testkit::dir::TestDir;
 
 /// The pinned Envoy binary CI fetched.

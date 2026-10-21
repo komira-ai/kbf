@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use kbf_installer::envoy::{BoxSettings, Instance as InstancePorts, check, render};
-use kbf_it::pki::{self, PkiFiles};
+use kbf_integration_test::pki::{self, PkiFiles};
 use kbf_proto::google::longrunning::Operation;
 use kbf_proto::reapi::execution_client::ExecutionClient;
 use kbf_proto::reapi::{ExecuteRequest, WaitExecutionRequest};

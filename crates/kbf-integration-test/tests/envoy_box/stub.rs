@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use futures::Stream;
 use kbf_installer::envoy::Instance as Ports;
-use kbf_it::pki::PkiFiles;
+use kbf_integration_test::pki::PkiFiles;
 use kbf_proto::google::longrunning::Operation;
 use kbf_proto::grpc::health::v1::health_check_response::ServingStatus;
 use kbf_proto::grpc::health::v1::health_server::{Health, HealthServer};

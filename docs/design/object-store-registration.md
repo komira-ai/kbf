@@ -307,7 +307,7 @@ and applies the keys. When the open is deferred, `cold_store` and the node's ref
 | the node | keys never on disk, in argv or in the environment; a scan of the temp dir and the arguments |
 | the state database, the audit rows, `Debug` output | never hold the secret |
 | a sentinel scan that passes vacuously | each scan first asserts the sentinel **is** in the secret file, then that it is nowhere else |
-| the daemon wire | `Welcome`, `MapUpdate`, `Session` and the daemon heartbeat carry no store field; the daemon crates link no object-store client **[F: `crates/kbf-it/tests/layering.rs`, `crates/kbf-proto/tests/daemon_wire.rs`]** |
+| the daemon wire | `Welcome`, `MapUpdate`, `Session` and the daemon heartbeat carry no store field; the daemon crates link no object-store client **[F: `crates/kbf-integration-test/tests/layering.rs`, `crates/kbf-proto/tests/daemon_wire.rs`]** |
 
 ## 10. The probe is a request from the frontend to an operator's endpoint
 
@@ -441,7 +441,7 @@ meets the coverage gate (`coverage-floors`).
 | E | the node applies at start: fetch, probe, open, report, identity guard | D |
 | F | `GET /v1/denied` only: the backup route was dropped with SQLite (#1094) | |
 | G1 | thin `kbf cluster` verbs for these routes | C, F |
-| G2 | end-to-end failure scenarios in `kbf-it` | E |
+| G2 | end-to-end failure scenarios in `kbf-integration-test` | E |
 
 The drift guard (every route of the operator router appears in `docs/api.md` and in
 [operator-verbs.md](operator-verbs.md), method and path) is the test

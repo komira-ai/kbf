@@ -538,7 +538,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     let signal = unit.get_in("Service", "KillSignal").map(trim);
     if mode == "daemon" {
         // The default of `--drain-deadline-secs` (kbf-node, `Cli::drain_deadline_secs`);
-        // kbf-it does not depend on kbf-node, so the number is repeated here.
+        // kbf-integration-test does not depend on kbf-node, so the number is repeated here.
         const DRAIN_DEADLINE_SECS: u64 = 600;
         match timeout.map(|t| t.parse::<u64>()) {
             Some(Ok(secs)) if secs > DRAIN_DEADLINE_SECS => {}

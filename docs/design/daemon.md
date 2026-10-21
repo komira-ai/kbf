@@ -673,10 +673,10 @@ makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
 
 ### End to end (the M2 test)
 
-The `m2-container` CI job (`kbf-cell m2`, `crates/kbf-it/src/m2.rs`) runs the driver
+The `m2-container` CI job (`kbf-cell m2`, `crates/kbf-integration-test/src/m2.rs`) runs the driver
 behind the real server and a real client, on a hosted x86_64 runner.
 It pulls distroless `base-debian12` by its linux/amd64 manifest digest (the sample's
-`crates/kbf-it/m2/buck2/.buckconfig` names the same image as `container_image`, which
+`crates/kbf-integration-test/m2/buck2/.buckconfig` names the same image as `container_image`, which
 its execution platform passes on as `container-image`), starts one `kbf-server` and one
 `kbf-daemon --driver container --image <the sample's image>` as a `Delegate=yes` system
 service with `--actions-memory-max-gib 8` (the daemon fetches and unpacks the image before

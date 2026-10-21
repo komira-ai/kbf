@@ -1,5 +1,5 @@
 # The M2 sample project for buck2: built remote-only against kbf-server and the
-# container driver (`kbf-cell m2`, crates/kbf-it/src/m2.rs, starts both). No prelude:
+# container driver (`kbf-cell m2`, crates/kbf-integration-test/src/m2.rs, starts both). No prelude:
 # the rules are in this project.
 [cells]
   root = .

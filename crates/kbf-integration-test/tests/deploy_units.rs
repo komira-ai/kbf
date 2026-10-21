@@ -1,4 +1,4 @@
-//! The example units in `docs/deploy/*.md` against the code (`kbf_it::deploy_units`
+//! The example units in `docs/deploy/*.md` against the code (`kbf_integration_test::deploy_units`
 //! reads them).
 //!
 //! Catches:
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser as _;
 use clap::error::ErrorKind;
-use kbf_it::deploy_units::{Unit, fenced, table_after, units};
+use kbf_integration_test::deploy_units::{Unit, fenced, table_after, units};
 use kbf_server::Args;
 
 /// The binaries a unit may start: this test parses `kbf-server`'s flags, `kbf-node`'s

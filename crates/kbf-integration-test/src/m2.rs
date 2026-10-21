@@ -120,7 +120,7 @@ pub struct M2Args {
     /// The directory holding the built `kbf-server`, `kbf-daemon` and `kbf-m2-act`.
     #[arg(long)]
     pub bin_dir: PathBuf,
-    /// The sample project (`crates/kbf-it/m2/buck2`). It is built in a copy under
+    /// The sample project (`crates/kbf-integration-test/m2/buck2`). It is built in a copy under
     /// `--work`.
     #[arg(long)]
     pub project: PathBuf,
