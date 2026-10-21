@@ -45,6 +45,28 @@ use sigv4::{EMPTY_SHA256, Request, Signer, Utc};
 /// How long [`S3Store::wait_answering`] waits between attempts.
 pub const WAIT_RETRY: Duration = Duration::from_millis(250);
 
+/// How many times a ranged read is sent again after its transport failed (not timed
+/// out): a connection the store, or the path to it, closed after the request went out
+/// ("connection closed before message completed") says nothing of the next one, and a
+/// pooled connection closed while idle fails this way. A read is idempotent. Three
+/// sends in all.
+pub const READ_RETRIES: u32 = 2;
+
+/// The wait before the first resend of a read; each resend waits twice the one before.
+const READ_RETRY_WAIT: Duration = Duration::from_millis(50);
+
+/// Whether a failed read may be sent again: it failed in transport and not by running
+/// out of time (a store that is `request_timeout` slow stays slow, and a resend would
+/// multiply the wait of a read that cannot succeed).
+fn is_retryable(e: &ObjectStoreError) -> bool {
+    match e {
+        ObjectStoreError::Transport(cause) => cause
+            .downcast_ref::<reqwest::Error>()
+            .is_none_or(|r| !r.is_timeout()),
+        _ => false,
+    }
+}
+
 /// An access key pair. `Debug` never shows the secret.
 #[derive(Clone)]
 pub struct Credentials {
@@ -324,6 +346,52 @@ impl S3Store {
     }
 }
 
+/// One ranged read, sent once.
+impl S3Store {
+    async fn get_range_once(
+        &self,
+        key: &ObjectKey,
+        range: ByteRange,
+    ) -> Result<Bytes, ObjectStoreError> {
+        let header = format!("bytes={}-{}", range.offset(), range.last());
+        let resp = self
+            .conn
+            .send(
+                Method::GET,
+                Some(key),
+                &[],
+                vec![("range", header)],
+                Bytes::new(),
+            )
+            .await?;
+        match resp.status() {
+            StatusCode::PARTIAL_CONTENT => {}
+            StatusCode::OK => {
+                return Err(ObjectStoreError::Protocol(format!(
+                    "ranged read of {key} {range:?} answered 200: the store ignored Range"
+                )));
+            }
+            StatusCode::NOT_FOUND => return Err(ObjectStoreError::NotFound(key.clone())),
+            StatusCode::RANGE_NOT_SATISFIABLE => {
+                return Err(ObjectStoreError::InvalidRange {
+                    key: key.clone(),
+                    range,
+                });
+            }
+            _ => return Err(failure(resp).await),
+        }
+        let content_range = resp
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = resp.bytes().await.map_err(transport)?;
+        check_partial(content_range.as_deref(), range, body.len())
+            .map_err(|why| ObjectStoreError::Protocol(format!("ranged read of {key}: {why}")))?;
+        Ok(body)
+    }
+}
+
 impl ObjectStore for S3Store {
     fn capabilities(&self) -> Capabilities {
         self.conn.capabilities
@@ -387,42 +455,18 @@ impl ObjectStore for S3Store {
         key: &ObjectKey,
         range: ByteRange,
     ) -> Result<Bytes, ObjectStoreError> {
-        let header = format!("bytes={}-{}", range.offset(), range.last());
-        let resp = self
-            .conn
-            .send(
-                Method::GET,
-                Some(key),
-                &[],
-                vec![("range", header)],
-                Bytes::new(),
-            )
-            .await?;
-        match resp.status() {
-            StatusCode::PARTIAL_CONTENT => {}
-            StatusCode::OK => {
-                return Err(ObjectStoreError::Protocol(format!(
-                    "ranged read of {key} {range:?} answered 200: the store ignored Range"
-                )));
+        let mut wait = READ_RETRY_WAIT;
+        for _ in 0..READ_RETRIES {
+            match self.get_range_once(key, range).await {
+                Err(e) if is_retryable(&e) => {
+                    tracing::debug!(%key, error = %e, "ranged read failed in transport; sending it again");
+                    tokio::time::sleep(wait).await;
+                    wait *= 2;
+                }
+                answer => return answer,
             }
-            StatusCode::NOT_FOUND => return Err(ObjectStoreError::NotFound(key.clone())),
-            StatusCode::RANGE_NOT_SATISFIABLE => {
-                return Err(ObjectStoreError::InvalidRange {
-                    key: key.clone(),
-                    range,
-                });
-            }
-            _ => return Err(failure(resp).await),
         }
-        let content_range = resp
-            .headers()
-            .get(CONTENT_RANGE)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let body = resp.bytes().await.map_err(transport)?;
-        check_partial(content_range.as_deref(), range, body.len())
-            .map_err(|why| ObjectStoreError::Protocol(format!("ranged read of {key}: {why}")))?;
-        Ok(body)
+        self.get_range_once(key, range).await
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
