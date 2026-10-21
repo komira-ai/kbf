@@ -60,8 +60,8 @@ the network keep their gates. Put the port behind your network boundary (a VPN, 
 subnet or a firewall rule), as you would for any page that shows build logs. If a build
 prints a secret into a log, the UI shows it.
 
-Every `/ui` answer carries a `Content-Security-Policy` that loads nothing but the page's
-own stylesheet, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
+Every `/ui` answer carries a `Content-Security-Policy` of `default-src 'none'` with styles
+and images from the page's own origin only (no page uses an image), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
 `Cache-Control: no-store`.
 
 ## The per-client read bound
