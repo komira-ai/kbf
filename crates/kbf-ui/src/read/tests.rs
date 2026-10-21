@@ -282,3 +282,92 @@ fn the_default_ranged_read_cuts_the_whole_answer_to_the_range() {
     let e = block_on(down.get_range("/v1/doc", 0, 1)).expect_err("down");
     assert_eq!(e.0, "connection refused");
 }
+
+/// Catches: the default `get_suffix` showing more than was asked for, the wrong end, or
+/// losing the size. A `200` is answered as the server answers `bytes=-n`: `206` with the
+/// last `n` bytes and a `Content-Range` naming the whole (`n` clamped to the size), `416`
+/// with the size for an `n` of zero, an empty `200` as it is, any other status untouched.
+/// Mutants: the front kept instead of the end; `n` not clamped (a panic on a short log);
+/// the first byte of the range off by one; the `n == 0` branch dropped; the header
+/// dropped; the status check dropped.
+#[test]
+fn the_default_suffix_read_cuts_the_whole_answer_to_its_end() {
+    let fetched = |status: u16, body: &str| Fetched {
+        status,
+        body: body.as_bytes().to_vec(),
+        headers: vec![("x-other".to_owned(), "kept?".to_owned())],
+    };
+    let suffix =
+        |plain: &Plain, n: u64| block_on(plain.get_suffix("/v1/doc", n)).expect("an answer");
+    let content_range = |f: &Fetched| {
+        f.headers
+            .iter()
+            .find(|(k, _)| k == "content-range")
+            .map(|(_, v)| v.clone())
+    };
+
+    let plain = Plain(Ok(fetched(200, "abcdefghij")));
+    let got = suffix(&plain, 3);
+    assert_eq!((got.status, got.body.as_slice()), (206, &b"hij"[..]));
+    assert_eq!(content_range(&got).as_deref(), Some("bytes 7-9/10"));
+    let got = suffix(&plain, 99);
+    assert_eq!((got.status, got.body.len()), (206, 10));
+    assert_eq!(content_range(&got).as_deref(), Some("bytes 0-9/10"));
+    let got = suffix(&plain, 1);
+    assert_eq!(got.body, b"j");
+    assert_eq!(content_range(&got).as_deref(), Some("bytes 9-9/10"));
+    let got = suffix(&plain, 0);
+    assert_eq!((got.status, got.body.is_empty()), (416, true));
+    assert_eq!(content_range(&got).as_deref(), Some("bytes */10"));
+
+    let empty = suffix(&Plain(Ok(fetched(200, ""))), 5);
+    assert_eq!((empty.status, empty.body.is_empty()), (200, true));
+    let refused = suffix(&Plain(Ok(fetched(404, "no"))), 5);
+    assert_eq!((refused.status, refused.body.as_slice()), (404, &b"no"[..]));
+    assert_eq!(content_range(&refused), None);
+
+    let down = Plain(Err("connection refused".to_owned()));
+    let e = block_on(down.get_suffix("/v1/doc", 1)).expect_err("down");
+    assert_eq!(e.0, "connection refused");
+}
+
+/// Catches: a suffix read that is not read as the server answers it, and one that
+/// reaches the source as a span or a plain read. A `206` is its bytes with the size from
+/// `Content-Range`, a `416` has no bytes and the size, a `200` is the whole and its length
+/// the size, any other status the error; an undeclared URL is refused unsent. Mutants:
+/// `suffix` asking for a span (`Ask::Span`); the `416` body kept; a refusal read as bytes.
+#[test]
+fn a_suffix_read_is_asked_as_a_suffix_and_read_as_the_server_answers_it() {
+    let ask = |fake: &Fake| block_on(Reader::new(fake, &PAGE).suffix("/v1/doc", 9));
+    let part = Fake::default().with_headers(
+        "/v1/doc",
+        206,
+        &[("content-range", "bytes 91-99/100")],
+        "abc",
+    );
+    let got = ask(&part).expect("a slice");
+    assert_eq!((got.bytes.as_slice(), got.total), (&b"abc"[..], Some(100)));
+    assert_eq!(part.suffixes(), [("/v1/doc".to_owned(), 9)]);
+    assert!(part.ranges().is_empty());
+
+    let none = Fake::default().with_headers(
+        "/v1/doc",
+        416,
+        &[("Content-Range", "bytes */0")],
+        "not sent",
+    );
+    let got = ask(&none).expect("a slice");
+    assert_eq!((got.bytes.is_empty(), got.total), (true, Some(0)));
+
+    let whole = Fake::default().with("/v1/doc", 200, "abcd");
+    let got = ask(&whole).expect("a slice");
+    assert_eq!((got.bytes.as_slice(), got.total), (&b"abcd"[..], Some(4)));
+
+    let busy = Fake::default().with("/v1/doc", 503, r#"{"error": "busy"}"#);
+    assert_eq!(ask(&busy).expect_err("refused").status(), 503);
+
+    let fake = Fake::default();
+    let e = block_on(Reader::new(&fake, &PAGE).suffix("/v1/other", 9)).expect_err("refused");
+    assert!(e.is_page_bug(), "{e}");
+    assert!(fake.seen().is_empty() && fake.suffixes().is_empty());
+}

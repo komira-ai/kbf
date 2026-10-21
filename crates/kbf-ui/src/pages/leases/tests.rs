@@ -72,7 +72,7 @@ fn every_lease_shows_its_fields_in_a_labelled_table() {
     assert!(html.contains("<td>2 min 0 s</td>"), "{html}");
     assert!(html.contains("<td>1 min 1 s</td>"), "{html}");
     assert!(!html.contains("Next page"), "{html}");
-    assert_eq!(fake.seen(), ["/v1/leases"]);
+    assert_eq!(fake.seen(), ["/v1/leases", "/v1/health"]);
 }
 
 /// Catches: the filter left out or not filled in with the current node, a node typed
@@ -85,7 +85,7 @@ fn the_node_filter_is_forwarded_and_an_empty_one_is_not() {
     let fake = sched_farm();
     let (status, html) = page(&fake, "/ui/leases?node=node-a&stray=1");
     assert_eq!(status, 200, "{html}");
-    assert_eq!(fake.seen(), ["/v1/leases?node=node-a"]);
+    assert_eq!(fake.seen(), ["/v1/leases?node=node-a", "/v1/health"]);
     assert!(
         html.contains("2 leases on this page for node node-a."),
         "{html}"
@@ -106,7 +106,7 @@ fn the_node_filter_is_forwarded_and_an_empty_one_is_not() {
 
     let fake = sched_farm();
     let (_, html) = page(&fake, "/ui/leases?node=");
-    assert_eq!(fake.seen(), ["/v1/leases"]);
+    assert_eq!(fake.seen(), ["/v1/leases", "/v1/health"]);
     assert!(html.contains("value=\"\""), "{html}");
     assert!(!html.contains("All nodes"), "{html}");
 }
@@ -140,8 +140,10 @@ fn the_next_page_is_the_apis_link_on_this_page() {
         "/ui/leases?node=node-a&page_size=2&page_token=1792.1.00ff%2Bgg",
     );
     assert_eq!(status, 200);
+    // The last read is the banner's; the one before it is the leases.
+    let seen = fake.seen();
     assert_eq!(
-        fake.seen().last().map(String::as_str),
+        seen.iter().rev().nth(1).map(String::as_str),
         Some("/v1/leases?node=node-a&page_size=2&page_token=1792.1.00ff%2Bgg")
     );
 
