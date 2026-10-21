@@ -65,6 +65,11 @@
 //!   changed; the files it lacks are uploaded. A re-run therefore creates no second
 //!   release and replaces no asset. It refuses first when the highest release tag is not
 //!   at `--commit` or an ancestor of it ([`tags::superseded`]).
+//! - `release bump-internal --version <v> --sha <sha> --internal-repo <owner/repo> --submodule
+//!   <name> [--repo <owner/repo>] [--workdir <dir>] [--gh <program>] [--git <program>]`
+//!   ([`bump`]): after the release is published, a pull request in the internal repository
+//!   that moves its submodule to `--sha`, with auto-merge on, if the tag `v<v>` names `--sha`
+//!   and the submodule is not already at or beyond it. The token is `GH_TOKEN`.
 //! - `release tag --repo <owner/repo> --sha <sha> --tag <tag> --message-file <file>
 //!   [--tagger <login>] [--output <file>] [--gh <program>]` ([`tag`]): the annotated tag
 //!   `--tag` at `--sha` through the GitHub API, create-only, after the same stale-run
@@ -74,6 +79,7 @@
 //!   --beta-run <id> --artifacts-run <id> --out <file> [...]` ([`verdict_write`]): the
 //!   verdict document the tag's message carries, for the stage [`verdict::GATE_STAGE`].
 
+pub mod bump;
 pub mod gates;
 mod git;
 pub mod identity;

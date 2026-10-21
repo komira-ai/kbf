@@ -56,7 +56,7 @@
 //!   attestations` and `release check` hold a directory to one bundle per tarball,
 //!   each that tarball's (its one subject is the tarball's digest); `verify-assets
 //!   attestations` also has `gh` verify each tarball against its bundle.
-//! - `release {locate,main-control,check,verdict,offer,notes,plan,identity,previous,publish}` ([`release`]): a GitHub release of
+//! - `release {locate,main-control,check,verdict,offer,notes,plan,identity,previous,publish,bump-internal}` ([`release`]): a GitHub release of
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
@@ -628,6 +628,9 @@ enum ReleaseVerb {
     /// What a push would release: the next version, the push's class, and the freeze and
     /// superseded refusals. Writes nothing but `--output`.
     Plan(release::plan::PlanArgs),
+    /// Open the pull request in the internal repository that moves its submodule to the
+    /// released commit, with auto-merge on (the token is `GH_TOKEN`).
+    BumpInternal(release::bump::BumpArgs),
     /// Create the annotated release tag at `--sha` through the GitHub API: create-only,
     /// after the stale-run guards; a tag that exists is reused only when it is the same.
     Tag(release::tag::TagArgs),
@@ -1113,6 +1116,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::Release(ReleaseVerb::Offer(args)) => release::offer::run(&args),
         Verb::Release(ReleaseVerb::Gates(args)) => release::gates::run(&args),
         Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
+        Verb::Release(ReleaseVerb::BumpInternal(args)) => release::bump::run(&args),
         Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
         Verb::Release(ReleaseVerb::VersionFacts(args)) => version_facts::run(&args),
         Verb::Release(ReleaseVerb::VerdictWrite(args)) => {
