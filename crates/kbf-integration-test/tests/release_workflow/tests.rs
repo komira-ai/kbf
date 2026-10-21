@@ -1180,3 +1180,71 @@ fn a_comment_naming_the_key_is_not_a_read_of_it() {
     );
     assert_eq!(problems(&text).expect("read"), Vec::<String>::new());
 }
+
+#[test]
+fn the_files_are_checked_for_signer_repository_commit_and_sums_in_verify_and_notes() {
+    // Catches: an attestation check that accepts another signing workflow, another
+    // repository or commit, or a set whose sums were never run. Mutants: in each of verify
+    // and notes, `--workflow-ref` pointed at ci.yml, `--repo` at another repository,
+    // `--commit` at a fixed sha, the `sha256sum` step replaced by `true`.
+    let flags = [
+        (
+            "dist --repo \"$GITHUB_REPOSITORY\" --workflow-ref \"$GITHUB_REPOSITORY/.github/workflows/artifacts.yml\"",
+            "dist --repo \"$GITHUB_REPOSITORY\" --workflow-ref \"$GITHUB_REPOSITORY/.github/workflows/ci.yml\"",
+            "`--workflow-ref",
+        ),
+        (
+            "attestations dist --repo \"$GITHUB_REPOSITORY\"",
+            "attestations dist --repo komira-ai/other",
+            "`--repo",
+        ),
+        (
+            "--commit \"$COMMIT\" --trusted-root",
+            "--commit 0000000000000000000000000000000000000000 --trusted-root",
+            "`--commit",
+        ),
+    ];
+    for job in ["verify", "notes"] {
+        for (from, to, want) in flags {
+            red(&plant(job, from, to), want);
+        }
+        red(
+            &plant(
+                job,
+                "        working-directory: dist\n        run: sha256sum --check --strict SHA256SUMS",
+                "        working-directory: dist\n        run: true",
+            ),
+            &format!("the job `{job}` does not check the files against SHA256SUMS"),
+        );
+    }
+}
+
+#[test]
+fn only_verify_downloads_from_another_run() {
+    // Catches: tag, notes or publish taking files from a run `verify` never checked.
+    // Mutants: a `run-id` on the `release-assets` download of tag, of notes and of publish.
+    for job in ["tag", "notes", "publish"] {
+        let found = plant(
+            job,
+            "          name: release-assets\n",
+            "          name: release-assets\n          run-id: 1\n",
+        );
+        red(&found, &format!("a download of `{job}` names a `run-id`"));
+    }
+}
+
+#[test]
+fn the_gates_job_outlasts_its_own_wait() {
+    // Catches: the job killed at its timeout before the 3-hour wait for the gates reports.
+    // Mutant: `timeout-minutes: 180`, then 20.
+    for m in ["180", "20"] {
+        red(
+            &plant(
+                "gates",
+                "timeout-minutes: 200",
+                &format!("timeout-minutes: {m}"),
+            ),
+            "the job `gates` has no `timeout-minutes` above 180",
+        );
+    }
+}

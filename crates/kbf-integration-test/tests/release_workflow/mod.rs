@@ -252,6 +252,8 @@ pub fn problems(release: &str) -> Result<Vec<String>, String> {
     checkouts(release, &mut out)?;
     gates_job(release, &mut out)?;
     plan_job(release, &mut out)?;
+    downloads_of_this_run(release, &mut out)?;
+    gates_outlast_wait(release, &mut out);
     verify_job(release, &mut out)?;
     tag_job(release, &mut out)?;
     notes_job(release, &mut out)?;
@@ -579,6 +581,66 @@ fn env_is(job: &str, step: &workflows::Step, key: &str, want: &str, out: &mut Ve
     }
 }
 
+/// The signer an attestation must come from: the workflow that builds the artifacts.
+const SIGNER: &str = "$GITHUB_REPOSITORY/.github/workflows/artifacts.yml";
+
+/// `job` verifies the attestations as a deployment does (this repository, the artifacts
+/// workflow as signer, this commit) and checks the sums by `sha256sum` before it does.
+fn files_are_checked(job: &str, steps: &[workflows::Step], out: &mut Vec<String>) {
+    if let Some((_, _, words)) = command(steps, "cargo xtask verify-assets attestations ") {
+        let verb = "cargo xtask verify-assets attestations";
+        flag_is(&words, verb, "--repo", "$GITHUB_REPOSITORY", out);
+        flag_is(&words, verb, "--workflow-ref", SIGNER, out);
+        flag_is(&words, verb, "--commit", "$COMMIT", out);
+    }
+    let sums = steps.iter().any(|s| {
+        !s.conditional
+            && s.run
+                .as_deref()
+                .is_some_and(|r| r.trim() == "sha256sum --check --strict SHA256SUMS")
+    });
+    if !sums {
+        out.push(format!(
+            "the job `{job}` does not check the files against SHA256SUMS"
+        ));
+    }
+}
+
+/// Only `verify` reads a run other than this one's: every later job takes the files `verify`
+/// uploaded, which it checked.
+fn downloads_of_this_run(release: &str, out: &mut Vec<String>) -> Result<(), String> {
+    for rule in &RULES {
+        if rule.job == "verify" {
+            continue;
+        }
+        let steps = workflows::job_steps(release, rule.job)?;
+        if steps
+            .iter()
+            .any(|s| uses(s, "actions/download-artifact@") && input(s, "run-id").is_some())
+        {
+            out.push(format!("a download of `{}` names a `run-id`: only `verify` reads another run, the rest take what it verified", rule.job));
+        }
+    }
+    Ok(())
+}
+
+/// A job that waits for the gates outlasts the wait: `gates` gives up after this many
+/// minutes (`release gates --timeout-s` is 3 hours), so its own timeout is longer.
+const GATES_GIVE_UP_MINUTES: u32 = 180;
+
+fn gates_outlast_wait(release: &str, out: &mut Vec<String>) {
+    let minutes = job_text(release, "gates").lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("timeout-minutes:")?
+            .trim()
+            .parse::<u32>()
+            .ok()
+    });
+    if minutes.is_none_or(|m| m <= GATES_GIVE_UP_MINUTES) {
+        out.push(format!("the job `gates` has no `timeout-minutes` above {GATES_GIVE_UP_MINUTES}: the job would be killed before the wait for the gates gives up"));
+    }
+}
+
 fn gates_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     let steps = workflows::job_steps(release, "gates")?;
     let verb = "cargo xtask release gates";
@@ -677,6 +739,7 @@ fn verify_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             "the job `verify` does not verify the attestations after `release check`".to_owned(),
         );
     }
+    files_are_checked(job, &steps, out);
     let upload = steps.iter().position(|s| {
         uses(s, "actions/upload-artifact@")
             && input(s, NAME_KEY) == Some(ASSETS_ARTIFACT)
@@ -1002,6 +1065,7 @@ fn notes_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             out.push(format!("the notes written to `{file}` are not uploaded, in a step after, as the artifact `{NOTES_ARTIFACT}`"));
         }
     }
+    files_are_checked(job, &steps, out);
     identities(&steps, out);
     version_facts(&steps, out);
     Ok(())

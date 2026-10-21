@@ -49,8 +49,9 @@ permissions: {}
 
 # One release at a time across the repository, none cancelled: every push shares the one group
 # `release-push` (a second push waits for the first; a third pending one replaces the second
-# while it waits, as GitHub keeps one pending run per group). A dry run by hand publishes
-# nothing, so each has its own group and never holds a release.
+# while it waits, as GitHub keeps one pending run per group; `plan` diffs each push from its own
+# `before`, so a replaced code push is released with the next code push, not by a docs-only one).
+# A dry run by hand publishes nothing, so each has its own group and never holds a release.
 concurrency:
   group: release-${{ github.event_name == 'push' && 'push' || github.run_id }}
   cancel-in-progress: false
