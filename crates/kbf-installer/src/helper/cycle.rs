@@ -17,6 +17,7 @@ use crate::activate::{self, Activated, Arm, Confirmed, Expiry};
 use crate::layout::{self, Layout, Platform};
 use crate::release::{self, ReleaseError};
 use crate::spool::{Entry, read_capped};
+use crate::stage;
 use crate::state::{self, Locked, State, StateError};
 use kbf_host::plan::Mode;
 use kbf_host::{Exec, HostPath, Perms, Step};
@@ -189,11 +190,20 @@ impl<E: Exec> Helper<E> {
         Ok(state::read_unlocked(&self.host)?.unwrap_or_default())
     }
 
-    /// Run once at start: make the links agree with the state after an interrupted verb.
-    /// A link that moved means the service may still run the old release: restart it.
+    /// Run once at start: remove the scratch a killed stage left in `work/`, and make the
+    /// links agree with the state after an interrupted verb. A link that moved means the
+    /// service may still run the old release: restart it.
+    ///
+    /// The sweep is made here and only here, under the lock: this process is not staging
+    /// yet, and a pass must not sweep, since `setup` stages the first release in a process
+    /// of its own. A sweep that fails is a refusal like the repair's, and the start goes on
+    /// (the repair's refusal, if it has one, is the one shown).
     pub fn recover(&mut self) -> Result<(), HelperError> {
         let mut memory = self.load()?;
         let runs_frontend = host_mode::frontend_host(&self.host).is_ok();
+        if let Err(e) = self.sweep_scratch() {
+            refuse(&mut memory, &e.to_string());
+        }
         match activate::reconcile(&mut self.exec, &self.host, &mut self.log) {
             // A frontend host owes the unit a restart only for a node swap on trial: the
             // proxy owns the frontend's children, and reads `installed_commit` itself. `|`,
@@ -205,6 +215,13 @@ impl<E: Exec> Helper<E> {
             Err(e) => refuse(&mut memory, &e.to_string()),
         }
         self.save(&memory)
+    }
+
+    /// [`stage::sweep_work`] under the lock, which is let go before this returns (the repair
+    /// that follows takes it again).
+    fn sweep_scratch(&self) -> Result<(), ReleaseError> {
+        let lock = Locked::acquire(&self.host)?;
+        stage::sweep_work(&self.host, &lock)
     }
 
     /// One pass. `now` is seconds since the epoch.

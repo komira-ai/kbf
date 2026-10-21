@@ -432,18 +432,23 @@ fn unique() -> String {
 /// and renaming it left behind. Called with the lock held, so no run is making one.
 fn sweep_stages(host: &Layout) -> Result<(), ReleaseError> {
     let dir = host.join(&host.releases());
-    let items = match fs::read_dir(&dir) {
+    sweep_dir(&dir, |name| name.starts_with(layout::STAGE_PREFIX))
+}
+
+/// Remove the entries of `dir` whose names `doomed` picks, and nothing else: a directory
+/// with all it holds, any other entry by itself. The type of an entry is its own, so a link
+/// is removed and never followed, here or inside a directory removed. A `dir` that is not
+/// there has none. The caller holds the lock, so no run is making one of them.
+pub(crate) fn sweep_dir(dir: &Path, doomed: fn(&str) -> bool) -> Result<(), ReleaseError> {
+    let items = match fs::read_dir(dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        listed => listed.map_err(read_failed(&dir))?,
+        listed => listed.map_err(read_failed(dir))?,
     };
     for item in items {
-        let item = item.map_err(read_failed(&dir))?;
+        let item = item.map_err(read_failed(dir))?;
         let path = item.path();
-        if !item
-            .file_name()
-            .to_string_lossy()
-            .starts_with(layout::STAGE_PREFIX)
-        {
+        let name = item.file_name().to_string_lossy().into_owned();
+        if !doomed(name.as_str()) {
             continue;
         }
         let gone = if item.file_type().map_err(read_failed(&path))?.is_dir() {

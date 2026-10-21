@@ -148,3 +148,41 @@ fn a_work_directory_that_cannot_be_listed_is_a_refusal_not_a_failed_start() {
     assert!(memory.contains("refused"), "{memory}");
     assert!(memory.contains("/work: "), "{memory}");
 }
+
+/// Catches a start that dies when the lock cannot be taken (a directory stands where the
+/// lock file belongs): the sweep, like the repair after it, is a refusal, and the start
+/// goes on.
+///
+/// Not red on main: the repair fails the same way there, so this does not tell the sweep's
+/// refusal from the repair's. It is the one test that reaches the sweep's own lock error.
+#[test]
+fn a_lock_that_cannot_be_taken_is_a_refusal_not_a_failed_start() {
+    let mut rig = Rig::new("sweep-no-lock");
+    let lock = rig.root.join("run/kbf-installer/lock");
+    fs::remove_file(&lock).expect("the lock file");
+    fs::create_dir(&lock).expect("a directory where the lock file belongs");
+    rig.helper.recover().expect("the start goes on");
+    let path = rig.root.join("var/lib/kbf-installer/helper.json");
+    let memory = fs::read_to_string(path).expect("memory");
+    assert!(memory.contains("cannot lock"), "{memory}");
+}
+
+/// Catches a sweep made in a pass. A stage takes no lock, and `setup` stages the first
+/// release in a process of its own, so a sweep at every pass could remove the scratch of a
+/// stage that is running. Only the start of `run`, before this process stages anything,
+/// sweeps: a directory that appears after it is left by the passes.
+///
+/// Not red on main (nothing sweeps there): it pins the choice of where the sweep is made.
+///
+/// Mutant it is meant to catch (reasoned, not run): the sweep called from `cycle` (red: the
+/// directory is gone after the pass).
+#[test]
+fn a_pass_never_sweeps_what_a_stage_of_another_process_may_be_using() {
+    let mut rig = Rig::new("sweep-start-only");
+    rig.helper.recover().expect("run's start");
+    let live = work_dir(&rig).join(format!("{B}.partial"));
+    fs::create_dir_all(live.join("dl")).expect("a live stage's directory");
+    rig.cycle(T0);
+    rig.cycle(T0 + 3);
+    assert!(live.join("dl").is_dir(), "a pass removed it");
+}

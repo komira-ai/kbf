@@ -50,7 +50,8 @@
 //! Every external step is bounded: `gh` 120 s, unpacking 120 s, the probe 10 s
 //! ([`Timeouts`]); a program is killed with its whole process group. The scratch
 //! directories (`work/<commit>.partial/` and `work/<commit>.check/`) are root's and go
-//! whatever the outcome.
+//! whatever the outcome, unless the process is killed first (a crash, the OOM killer, a
+//! reboot): then `run` removes what is left when it starts ([`sweep_work`]).
 //!
 //! A refusal carries the contract's stable word ([`Refusal::word`]).
 
@@ -75,8 +76,10 @@ use crate::helper::leases::LeaseSource;
 use crate::installer_toml::InstallerToml;
 use crate::layout::{Layout, Platform};
 use crate::refusal::{ArchiveFault, FactsFault, Refusal, TrustFault, VersionFault, WHAT_PROBE};
+use crate::release::{ReleaseError, sweep_dir};
 use crate::run::{Runner, Spawn};
 use crate::settings::Settings;
+use crate::state::Locked;
 
 /// The marker written into a release directory once every check has passed.
 pub const VERIFIED: &str = "VERIFIED";
@@ -137,10 +140,12 @@ pub struct Partial {
 }
 
 impl Partial {
-    /// Make the directory and `dl/` in it, owned by `owner`. A directory already there
-    /// is a crashed stage's, which `run` sweeps at its start: it is refused, not reused.
+    /// Make the directory and `dl/` in it, owned by `owner`. A directory already there is
+    /// not this call's: it is a stage's that was killed, which `run` removes when it starts
+    /// ([`sweep_work`]), or one that is running now. It is refused here, never reused or
+    /// removed.
     pub fn create(host: &Layout, commit: &CommitId, owner: Owner) -> Result<Partial, Refusal> {
-        let dir = work_path(host, commit, "partial")?;
+        let dir = work_path(host, commit, PARTIAL)?;
         // Only a directory made here is removed on drop: a refused stale one is not ours.
         make_dir(&dir, 0o755, owner)?;
         let made = Partial { dir };
@@ -164,13 +169,39 @@ impl Drop for Partial {
     }
 }
 
-/// `work/<commit>.<suffix>`, with `work/` made when it is missing.
+/// The suffixes of a stage's scratch directories in `work/`: `<commit>.partial` (the
+/// download, then the release being made) and `<commit>.check` (the checks' own).
+const PARTIAL: &str = ".partial";
+const CHECK: &str = ".check";
+
+/// `work/<commit><suffix>`, with `work/` made when it is missing.
 fn work_path(host: &Layout, commit: &CommitId, suffix: &str) -> Result<PathBuf, Refusal> {
     let work = host.join(&host.work_dir());
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true).mode(0o755);
     builder.create(&work).map_err(work_err(&work))?;
-    Ok(work.join(format!("{commit}.{suffix}")))
+    Ok(work.join(format!("{commit}{suffix}")))
+}
+
+/// Remove every `work/*.partial` and `work/*.check`: the scratch of a stage that was killed
+/// before it could remove it (a crash, the OOM killer, a reboot, `SIGKILL`), which
+/// [`Partial::create`] refuses for ever. Nothing else in `work/` is touched, and a link is
+/// removed, never followed ([`sweep_dir`], the sweep the operator's verbs make of
+/// `releases/.stage-*`).
+///
+/// `lock` is the installer lock, held: it shows that no verb of the operator is at work. It
+/// does not keep a stage out, since a stage takes no lock, so the caller must know that none
+/// is running. `run` calls this once, before its first pass, when nothing of this process
+/// is staging; the one stage it cannot see is another process's (`setup` fetching the first
+/// release), which is why a pass never sweeps.
+pub fn sweep_work(host: &Layout, _lock: &Locked) -> Result<(), ReleaseError> {
+    let work = host.join(&host.work_dir());
+    sweep_dir(&work, is_scratch)
+}
+
+/// Whether `name` is one of a stage's scratch directories.
+fn is_scratch(name: &str) -> bool {
+    name.ends_with(PARTIAL) || name.ends_with(CHECK)
 }
 
 fn make_dir(dir: &Path, mode: u32, owner: Owner) -> Result<(), Refusal> {
@@ -428,7 +459,7 @@ impl Scratch {
         settings: &Settings,
         owner: Owner,
     ) -> Result<Scratch, Refusal> {
-        let dir = work_path(host, commit, "check")?;
+        let dir = work_path(host, commit, CHECK)?;
         // A check directory left by a crash is ours alone to remove.
         let _ = fs::remove_dir_all(&dir);
         let made = Scratch { dir };
