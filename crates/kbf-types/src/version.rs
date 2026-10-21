@@ -40,12 +40,14 @@ impl VersionFault {
     }
 }
 
-/// What `--version --json` prints. A field this type does not name is refused, and so is
-/// one named twice or a required one missing. `platform` (the installer derives it from
-/// the binary's header), `admin_protocol`, `meta_log` and `seq` (builds before them lack
-/// them) may be absent and are then `None`; `meta_log: None` means not reversible.
+/// What `--version --json` prints. A field this type does not name is ignored: a newer kbf
+/// adds fields, and an installer that refused them would be unable to stage any build after
+/// it (adding `seq` did that). A field named twice, a required one missing and a wrong type
+/// are still refused (serde's derive rejects a repeated known field). `platform` (the
+/// installer derives it from the binary's header), `admin_protocol`, `meta_log` and `seq`
+/// (builds before them lack them) may be absent and are then `None`; `meta_log: None` means
+/// not reversible.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Version {
     /// The version of the admin calls between a proxy and the frontend processes it
     /// starts. `None` for a build that predates the field.
@@ -73,8 +75,8 @@ pub struct Version {
 }
 
 impl Version {
-    /// The object a binary printed, strictly: at most [`VERSION_CAP`] bytes, one JSON
-    /// object of the fields above and nothing after it.
+    /// The object a binary printed: at most [`VERSION_CAP`] bytes, one JSON object holding
+    /// the fields above (others are ignored) and nothing after it.
     ///
     /// # Errors
     /// [`VersionFault::Oversize`] or [`VersionFault::Unreadable`].
@@ -123,11 +125,11 @@ mod tests {
 
     /// Catches a field of the object read wrongly or an optional one required: the fields
     /// are read by name, builds before `admin_protocol`, `meta_log` and `seq` omit them
-    /// (unknown, not refused), and a missing required field, a field of the wrong type, a
-    /// field the contract does not list, one named twice, text that is not JSON and
-    /// anything after the object are refused.
+    /// (unknown, not refused), and a missing required field, a field of the wrong type, one
+    /// named twice, text that is not JSON and anything after the object are refused.
     ///
-    /// Mutant seen red: `deny_unknown_fields` dropped (the extra field is then accepted).
+    /// Mutant to plant: the `seq` field's `#[serde(default)]` dropped (an older build is
+    /// then refused).
     #[test]
     fn the_version_object_is_read_by_its_fields() {
         let v = Version::parse(json(COMMIT, "release").as_bytes()).expect("parses");
@@ -157,11 +159,9 @@ mod tests {
             Version::parse(said.as_bytes()).expect("parses").platform,
             Some("linux-arm64".to_owned())
         );
-        let more = json(COMMIT, "release").replace('}', ",\"future\":true}");
         let twice = json(COMMIT, "release").replace('}', ",\"protocol\":4}");
         let after = format!("{}{{}}", json(COMMIT, "release"));
         for bad in [
-            more.as_str(),
             twice.as_str(),
             after.as_str(),
             r#"{"commit":"abc"}"#,
@@ -174,13 +174,69 @@ mod tests {
         }
     }
 
-    /// Catches the `seq` that `kbf --version --json` prints refused as a field the contract
-    /// does not list, and a `seq` read as something else than the number: 0 ("could not
-    /// count") is a value, not an absent field.
+    /// Catches an installer that strands on a field a newer kbf adds to `--version --json`: a
+    /// field this `Version` does not name is ignored and the named fields still parse. Adding
+    /// `seq` was refused by every installer built before it; the next field must not be.
+    /// Nested values (an object, an array) in an unknown field are skipped too.
     ///
-    /// Mutant to plant: the `seq` field dropped from `Version`.
+    /// Mutant seen red: `deny_unknown_fields` on `Version` (the extra field is then refused).
+    #[test]
+    fn the_version_object_ignores_a_field_it_does_not_know() {
+        let shape = json(COMMIT, "release");
+        for extra in [
+            ",\"future\":true}",
+            ",\"future\":{\"a\":[1,2,{\"b\":null}]},\"other\":\"x\"}",
+        ] {
+            let said = shape.replace('}', extra);
+            let v = Version::parse(said.as_bytes()).expect("an unknown field is ignored");
+            assert_eq!(v.commit, COMMIT[..12], "{said}");
+            assert_eq!((v.protocol, v.min_protocol, v.state_schema), (4, 3, 7));
+            assert_eq!((v.admin_protocol, v.meta_log), (Some(1), Some(4)));
+            assert_eq!(v.profile, "release");
+            assert_eq!(v.version, "0.1.0");
+        }
+    }
+
+    /// Catches a tolerant reader that stopped checking what it does name: a known field named
+    /// twice is refused (also with an unknown field present), and so is a missing required
+    /// one.
+    ///
+    /// Mutant to plant: a hand-written reader that keeps the last of two equal keys (the
+    /// second `commit` then wins and the object is accepted).
+    #[test]
+    fn a_tolerant_version_object_still_refuses_a_repeated_or_missing_field() {
+        let shape = json(COMMIT, "release");
+        let twice = shape.replace('}', ",\"future\":1,\"commit\":\"0123456789ab\"}");
+        let err = Version::parse(twice.as_bytes()).expect_err("commit twice");
+        assert_eq!(err.code(), "version-unreadable");
+        assert!(err.to_string().contains("duplicate field"), "{err}");
+        for required in [
+            "commit",
+            "min_protocol",
+            "profile",
+            "protocol",
+            "state_schema",
+            "version",
+        ] {
+            let mut object: serde_json::Value =
+                serde_json::from_str(&shape).expect("fixture is JSON");
+            object["future"] = serde_json::Value::Bool(true);
+            object.as_object_mut().expect("an object").remove(required);
+            let err = Version::parse(object.to_string().as_bytes()).expect_err(required);
+            assert_eq!(err.code(), "version-unreadable", "{required}");
+        }
+    }
+
+    /// Catches the `seq` that `kbf --version --json` prints (the number of commits behind the
+    /// build) not being read, and a `seq` that is read as something else than the number: 0
+    /// ("could not count") is a value, not an absent field. Both real shapes parse: the one
+    /// a build before `seq` printed and the one a build after prints.
+    ///
+    /// Mutant to plant: the `seq` field dropped from `Version` (the value is then lost).
     #[test]
     fn the_version_object_may_carry_seq() {
+        let before = Version::parse(json(COMMIT, "release").as_bytes()).expect("pre-seq");
+        assert_eq!(before.seq, None);
         let said = json(COMMIT, "release").replace('}', ",\"seq\":812}");
         let v = Version::parse(said.as_bytes()).expect("a build with a seq parses");
         assert_eq!(v.seq, Some(812));

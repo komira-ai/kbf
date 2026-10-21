@@ -104,6 +104,18 @@ mod tests {
         assert_eq!(of(&named), Ok(want));
     }
 
+    /// Catches the store refusing a release because its report carries a field this server's
+    /// `Version` does not name (a newer kbf adds fields): the facts are the same with or
+    /// without it. A malformed or contradicting document is still refused (the test below).
+    ///
+    /// Mutant seen red: `deny_unknown_fields` on `kbf_types::Version`.
+    #[test]
+    fn a_field_a_newer_kbf_adds_does_not_change_the_facts() {
+        let plain = of(&doc(|d| d)).expect("plain");
+        let newer = doc(|d| d.replace('}', ",\"future\":{\"a\":[1,2]}}"));
+        assert_eq!(of(&newer), Ok(plain));
+    }
+
     /// Catches a document taken that the store or the node must not take, each with its own
     /// reason: text that is not a report, another commit, another platform, a debug build,
     /// zeros, a number past 32 bits and a minimum above the protocol. A minimum equal to
