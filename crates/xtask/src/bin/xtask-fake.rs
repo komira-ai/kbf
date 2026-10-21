@@ -223,6 +223,15 @@ fn cargo(argv0: &str, args: &[String]) -> ExitCode {
     // in the working directory is what cargo-deny printed (JSON lines, on stderr), and
     // `deny-exit` (default 0) its exit status.
     if args.first().is_some_and(|a| a == "deny") {
+        // The real cargo-deny takes `--format` and the other options before `check`;
+        // `check` takes only the names of the checks.
+        let after_check = args.iter().skip_while(|a| *a != "check").skip(1);
+        if let Some(flag) = after_check.clone().find(|a| a.starts_with('-')) {
+            eprintln!(
+                "error: unexpected argument '{flag}' found\n\nUsage: cargo-deny check <WHICH>..."
+            );
+            return ExitCode::from(2);
+        }
         eprint!(
             "{}",
             std::fs::read_to_string("deny-stderr").expect("deny-stderr")

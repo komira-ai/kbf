@@ -112,6 +112,41 @@ fn failure(r: Result<Vec<String>, Error>) -> String {
     }
 }
 
+/// What the real cargo-deny 0.20.2 printed on stderr (`--format json`) for this
+/// repository's lock file when it held a `time` and a `smallvec` with advisories, and for a
+/// clean one.
+const REAL_ADVISORIES: &str = include_str!("fixtures/cargo-deny-0.20.2-advisories.stderr");
+const REAL_CLEAN: &str = include_str!("fixtures/cargo-deny-0.20.2-clean.stderr");
+
+// Catches: a parser written against the documented shape rather than the real output: the
+// version taken from the wrong place, the summary line mistaken for a diagnostic.
+#[test]
+fn parse_reads_the_real_cargo_deny_output() {
+    let run = DenyRun {
+        code: Some(1),
+        stderr: REAL_ADVISORIES.to_owned(),
+    };
+    let got: Vec<(String, String, String)> = parse(&run)
+        .expect("parse")
+        .into_iter()
+        .map(|a| (a.id, a.krate, a.version))
+        .collect();
+    let want = [
+        ("RUSTSEC-2020-0071", "time", "0.1.43"),
+        ("RUSTSEC-2021-0003", "smallvec", "0.6.13"),
+    ];
+    let want: Vec<_> = want
+        .iter()
+        .map(|t| (t.0.into(), t.1.into(), t.2.into()))
+        .collect();
+    assert_eq!(got, want);
+    let clean = DenyRun {
+        code: Some(0),
+        stderr: REAL_CLEAN.to_owned(),
+    };
+    assert_eq!(parse(&clean).expect("parse"), []);
+}
+
 // Catches: a run with nothing to report that creates an issue, or touches one.
 #[test]
 fn no_advisories_and_no_issue_does_nothing() {

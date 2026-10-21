@@ -100,8 +100,8 @@ fn cargo_deny_runs_the_advisories_check_in_json() {
     let args = std::fs::read_to_string(f.root.join("target/debug/cargo-args")).expect("args");
     assert_eq!(
         args,
-        "deny --log-level warn --manifest-path ./Cargo.toml --all-features check advisories \
-         --format json\n"
+        "deny --log-level warn --format json --manifest-path ./Cargo.toml --all-features check \
+         advisories\n"
     );
 }
 

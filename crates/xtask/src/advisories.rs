@@ -6,9 +6,10 @@
 //! open pull request for something none of them did. `.github/workflows/advisories.yml` runs
 //! this verb daily and on every push to `main` instead.
 //!
-//! The verb runs `cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features
-//! check advisories --format json` in the repository root and reads what it prints. With
-//! `--format json` cargo-deny (0.20.2, the version `ci.yml` pins) writes to **stderr**, one
+//! The verb runs `cargo deny --log-level warn --format json --manifest-path ./Cargo.toml
+//! --all-features check advisories` in the repository root and reads what it prints.
+//! `--format` is an option of cargo-deny itself, so it comes before `check`: after it
+//! cargo-deny exits 2 with "unexpected argument '--format'". With `--format json` cargo-deny (0.20.2, the version `ci.yml` pins) writes to **stderr**, one
 //! JSON object per line, and nothing to stdout:
 //!
 //! - `{"type":"diagnostic","fields":{"code":"vulnerability","severity":"error","message":
@@ -19,6 +20,7 @@
 //!   version of the crate in our lock file is only in `graphs`. A yanked crate
 //!   (`deny.toml` sets `yanked = "deny"`) has `"code":"yanked"` and no `advisory`: it is
 //!   listed too, under the id `yanked`, so moving the check out of the gate loses nothing;
+//! - `{"type":"summary","fields":{"advisories":{"errors":N,...}}}`: the last line; ignored;
 //! - `{"type":"log","fields":{"level":"ERROR","message":"...","timestamp":"..."}}`: cargo-deny's
 //!   own log. An `ERROR` one is a tool failure (a database that could not be fetched, a
 //!   `deny.toml` that does not parse).
@@ -60,18 +62,18 @@ pub const TITLE: &str = "Security advisories in kbf's dependencies";
 pub const LABEL: &str = "security";
 
 /// What follows `cargo` for the check: the arguments `ci.yml` gave `cargo deny`, narrowed to
-/// the advisories and in JSON.
+/// the advisories and in JSON (`--format` is cargo-deny's own option: before `check`).
 pub const DENY_ARGS: [&str; 10] = [
     "deny",
     "--log-level",
     "warn",
+    "--format",
+    "json",
     "--manifest-path",
     "./Cargo.toml",
     "--all-features",
     "check",
     "advisories",
-    "--format",
-    "json",
 ];
 
 /// Issues GitHub lists per page (its maximum).
