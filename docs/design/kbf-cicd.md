@@ -21,8 +21,8 @@ deploy is itself a test (no build failed because a connection was dropped). Plan
 a generic monitoring library) then comes from the operator's real usage over the metrics the gamma farm emits (section 7);
 nothing produces that verdict today.
 
-A commit with a gamma verdict can be published: **prod** is the existing attested-artifact release (tag, files, notes), gated
-in GitHub on the verdict. **Rollback** is the updater walking back through the same mechanism it walked forward with: the
+**prod** is the existing attested-artifact release (tag, files, notes), gated in GitHub on the runs of `ci`, `beta` and
+`artifacts` and the checks of the files (section 8.1); no verdict document gates it. **Rollback** is the updater walking back through the same mechanism it walked forward with: the
 desired commit is set to the older release under a higher generation.
 
 ```
@@ -32,7 +32,7 @@ desired commit is set to the older release under a higher generation.
                           gamma: operator's farm, pull updater, deploy-as-test
                                                   │ Planned: verdict from a monitoring library
                                                   v
-                                 verdict ──> prod: tag, attested files, notes
+                         (audit only) ──> prod: tag, attested files, notes
           any gate red ──> rollback: desired = the old commit, higher generation
 ```
 
@@ -133,7 +133,7 @@ result = "release.json"
 
 The lint refuses a workflow job that names a stage not in the file, an `actions` stage with no job, a `pull_request` trigger
 on any of these workflows, an unpinned `uses:`, and `id-token: write` anywhere but `attest`. `runs = "operator"` stages have
-no job; the lint instead checks that `release.yml` verifies the verdict (section 8).
+no job.
 
 ## 3. The artifact every stage consumes
 
@@ -469,39 +469,39 @@ fails its gate, never passes it, and a producer failure is never a pass.
 
 Prod is `release.yml`, extended. **[F]** today: a pushed `v*` tag on a commit on main whose `artifacts.yml` push run exists;
 the `verify` job checks the sums and every attestation; the `publish` job, the only one with `contents: write`, attaches the
-already-built files and is idempotent, in the `prod` environment; a dispatch with a commit is a dry-run verify. The verdict
-check and the notes (items 1 to 3) are built. It has no dependency on any earlier stage.
+already-built files and is idempotent, in the `prod` environment; a dispatch with a commit is a dry-run verify. The tag check
+and the notes (items 1 to 3) are built. It has no dependency on any earlier stage.
 
 The additions:
 
-1. **A verdict check in `verify`.** (The verdict's producer is Planned, section 7: until it exists, or this check changes, no
-   tag passes `verify`.) This is a release-process check in GitHub; it is **not host-update trust** (hosts never
-   read the tag or the verdict, and verify only the artifact attestation). The tag is an annotated git tag on main whose
-   message carries the gamma verdict (`gamma-verdict.json`). `verify` checks that the verdict names this commit, this set
-   hash and this tag, that every gate is green, that it records a finished bake of at least 24 hours (the check `xtask release verify` makes), and that nothing was waived without
-   a recorded waiver. A tag with no verdict, or a red one, fails `verify`. **No signing key**: who may push a `v*` tag is
+1. **No verdict gates the release (CEO ruling).** Release gating is `release gates` (the `ci`, `beta` and `artifacts` push runs
+   green for the commit) and `release verify` in the `verify` job: the attestations and the release set, and the tag (annotated,
+   on main, naming this commit). This is a release-process check in GitHub; it is **not host-update trust** (hosts never read
+   the tag, and verify only the artifact attestation). Nothing judges a verdict document: the annotated tag's message carries
+   the **Beta record** `release verdict-write` wrote (commit, set hash, tag, the run ids), as an audit record. A tag with no
+   record, or one that says it failed, passes `verify` the same. The gamma farm's build check is its own workflow
+   (`gamma.yml`) and does not gate the release. **No signing key**: who may push a `v*` tag is
    limited by the tag-protection ruleset on main (M19), and the `publish` job is gated by the `prod` environment's
    required reviewer (item 2). A signing key would add key custody without adding protection beyond those two.
 2. **A `prod` environment with a required reviewer**, as kci's prod, on the `publish` job. **One approval per release:** the
    kbf.dev deploy job (the only one with `id-token: write`) `needs` `publish` and runs in a second environment, `prod-site`,
    which has no reviewer and admits `v*` tags only; the AWS role trusts `prod-site`, so the approved `publish` job (which
    holds `contents: write`) cannot assume it. Details and the held setup: `infra/site/README.md`.
-   **The first release (CEO ruling):** no gamma farm exists yet, so the first tag carries a hand-written verdict with the CEO's
-   recorded `min-load` waiver. `verify` is not changed or skipped for it.
-3. **Release notes**: generated from the commits between the previous release and this one, plus the gamma verdict's summary
-   (the bake length, load and gate values the verdict records) and a list of anything that is not reversible (section 8.3). Notes are an artifact of
+   **The first release:** it needs no verdict and no waiver; `verify` is not changed or skipped for it.
+3. **Release notes**: generated from the commits between the previous release and this one, plus the Beta record's summary
+   (the gate values, as information) and a list of anything that is not reversible (section 8.3). Notes are an artifact of
    the `verify` job, so a dry run shows them before anyone approves, and they are the body of the GitHub release
    (`release publish --notes-file`, followed by how to verify the files). They open with "Before you click": what is not
-   reversible, the waivers and the verdict in a line. The not-reversible list is computed by `verify` alone (the verdict's
-   own `not_reversible` lines are not read, and nothing is taken from the gamma side): `kbf --version --json` of this release and of the previous stable release, each run (`release identity`)
+   reversible, the waivers and the record in a line (or that the tag carries none). The not-reversible list is computed by `verify` alone (the record's
+   own `not_reversible` lines are not read): `kbf --version --json` of this release and of the previous stable release, each run (`release identity`)
    only from a tarball whose attestation `verify` has already checked, compared with `kbf_gate::reversible` (`meta_log`;
    unknown is not reversible) and for a changed or unstated `protocol`. A first release has nothing to go back to. If a
    previous release exists and its identity cannot be read, the notes are not written (fail closed). Migrations are not
-   listed: no machine-readable source exists, and none is taken from the verdict.
+   listed: no machine-readable source exists, and none is taken from the record.
 4. **Nothing is pushed to farms.** After `publish` the release is the attested files on the GitHub release. A farm that runs
    the public release finds them through its frontend's release poller, and its operator sets the desired commit (section 6).
 
-Prod publishes the bytes gamma ran. If anything is rebuilt, `verify` fails: the set hash is the only thing it accepts.
+Prod publishes the bytes the build attested. If anything is rebuilt, `verify` fails: the set hash is the only thing it accepts.
 
 ### 8.2 Rollback
 
@@ -598,7 +598,7 @@ one issue with one done criterion. "Blocked by" names open pull requests or othe
 | M9 | Gamma verdict producer: Planned, on a generic monitoring library over the gamma farm's metrics (the bake evaluator was removed) | an absent metric fails; a producer failure is never a pass | M10, M13 |  #950 |
 | M10 | Metric: failed actions by failure class | counter present, labelled by class | |  #951 |
 | M11 | Metric: Execute errors by cause | client abort distinguished from dropped | |  #952 |
-| M12 | Release workflow: verdict check on the release tag (commit, set hash and tag bound; no signing key), approval environment, notes | a tag with no verdict, a red one, or a verdict naming another commit, set or tag fails `verify` | M7, M9, M19 |  #953 |
+| M12 | Release workflow: tag check (the tag names the commit, on main; no signing key; no verdict gates), approval environment, notes | a tag naming another commit or off main fails `verify`; a tag with no record, or a failed one, passes | M7, M9, M19 |  #953 |
 | M13 | Metrics: process boot counter and membership-state gauge | both exported; gates read them | |  #954 |
 | M14 | Metric: `FindMissingBlobs` latency histogram | histogram exported; latency gate added | |  #955 |
 | M15 | Updater walk-back: automatic desired-commit set on a red hard gate, mid-roll behaviour, not-reversible flags (B10, B11) | B10 and B11 green | M6, M7 |  #956 |
@@ -627,7 +627,7 @@ dependencies of every "0 failed actions" gate).
 3. **Where the bytes live for gamma.** Decided with the pull updater (#927): the frontend's release store and disk release
    index hold the bytes, filled by its release poller from the GitHub release; there is no feed to host. Whether gamma
    should keep working when GitHub is unreachable is answered by that store (a release already stored is deployable).
-4. **Verdict channel. Decided: the release tag's message, unsigned.** The verdict travels in the annotated `v*` tag on main;
+4. **Record channel. Decided: the release tag's message, unsigned.** The Beta record (audit only; nothing gates on it) travels in the annotated `v*` tag on main;
    the tag-protection ruleset limits who can push it and the `prod` environment reviewer gates `publish`. No signing key
    (it would add custody with no new protection).
 5. **Does the operator's farm need to be the only gamma?** One farm's usage can be too thin to be a canary. Planned: the

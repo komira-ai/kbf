@@ -8,7 +8,7 @@
 //! non-blank line above is `` `/etc/systemd/system/<file>`: ``. An `ini` block without
 //! that line is an error, so an example cannot escape the check by losing its name.
 //!
-//! Each unit body is read with `kbf_deploy::unit`, the parser `kbf-deploy linux
+//! Each unit body is read with `kbf_unitfile`, the parser `kbf-deploy linux
 //! check-units` reads rendered units with, so the docs and the deploy tool agree on
 //! what a unit says.
 //!
@@ -18,7 +18,7 @@
 
 use std::fmt;
 
-use kbf_deploy::unit::{self, UnitFile};
+use kbf_unitfile::UnitFile;
 
 /// Sample values for the placeholders the deploy docs use in an `ExecStart=`.
 pub const PLACEHOLDERS: &[(&str, &str)] = &[
@@ -37,7 +37,7 @@ pub struct Unit {
     pub path: String,
     /// The `## ` heading the unit sits under (`""` before the first).
     pub section: String,
-    /// The unit file in the block, read by `kbf_deploy::unit`.
+    /// The unit file in the block, read by `kbf_unitfile`.
     pub file: UnitFile,
 }
 
@@ -65,7 +65,7 @@ pub enum UnitError {
     /// A placeholder [`PLACEHOLDERS`] does not have.
     Placeholder(String),
     /// A unit body (its `ini` block at this line) that is not a unit file.
-    Body(usize, unit::UnitError),
+    Body(usize, kbf_unitfile::UnitError),
 }
 
 impl fmt::Display for UnitError {
@@ -214,7 +214,7 @@ ExecStart=/usr/local/bin/b \\
     #[test]
     fn units_are_named_split_into_directives_and_placed_under_their_section() {
         // Catches: a unit read without its path or section, or its body not handed whole
-        // to the unit parser (`kbf_deploy::unit` tests the parsing itself).
+        // to the unit parser (`kbf_unitfile` tests the parsing itself).
         let units = units(DOC).expect("units");
         assert_eq!(units.len(), 2);
         assert_eq!(units[0].path, "/etc/systemd/system/a.slice");
