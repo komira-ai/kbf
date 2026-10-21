@@ -7,6 +7,7 @@
 //! Every test that starts a `kbf` gives it the flag [`flag`] returns.
 
 use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
@@ -21,13 +22,24 @@ pub const FILE: &str = "kbf.toml";
 /// If the file cannot be written (a test cannot go on without it).
 #[must_use]
 pub fn flag(dir: &Path) -> String {
+    flag_with(dir, "")
+}
+
+/// [`flag`] with `text` in the file: the settings of a child that is started from a
+/// `kbf.toml` instead of from flags (the farm's processes, `kbf-harness`).
+///
+/// # Panics
+/// If the file cannot be written (a test cannot go on without it).
+#[must_use]
+pub fn flag_with(dir: &Path, text: &str) -> String {
     let path = dir.join(FILE);
-    OpenOptions::new()
+    let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(&path)
-        .expect("write the empty kbf.toml");
+        .expect("write the kbf.toml");
+    file.write_all(text.as_bytes()).expect("write the kbf.toml");
     format!("--config={}", path.display())
 }

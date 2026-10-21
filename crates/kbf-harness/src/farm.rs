@@ -1,29 +1,28 @@
 //! The farm of real `kbf` processes: a frontend, `storage_nodes` storage nodes (each
 //! with a daemon in the same process, or storage alone) and `daemons` plain daemons, on
 //! loopback addresses of their own,
-//! each started from the flags `kbf-deploy` renders into its unit
-//! (`kbf_deploy::linux::modes::render`, the `ExecStart=` line, nothing written by hand),
-//! under certificates of the rows the farm's certificate table has.
+//! each started as the packaged unit starts `kbf` (`kbf --mode=<mode> --config <kbf.toml>`,
+//! [`crate::units`]) with a `kbf.toml` of its own that the harness writes, under
+//! certificates of the rows the farm's certificate table has.
 //!
-//! A role starts only from its rendered unit line, and the [`Farm`] keeps that line, so
+//! A role starts only from that command line and file, and the [`Farm`] keeps the line, so
 //! [`Farm::restart`] runs the identical command and a test that changes the line
-//! (a rolling update) changes it in one place. The deviations from the rendered units
-//! are listed in [`Farm::start`].
+//! (a rolling update) changes it in one place. The deviations from the packaged units'
+//! settings are listed in [`Farm::start`].
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kbf_ca::verify_cert::Row;
-use kbf_deploy::linux::Mode;
 use kbf_testkit::dir::TestDir;
 
 use crate::api;
 use crate::interrupt::Interrupt;
-use crate::node_support::{cgroup_tree, crun, files_holding, id_files, image_path, oci_runtime};
+use crate::node_support::{crun, files_holding, image_path};
 use crate::pki::Pki;
 use crate::ports::{Claim, Ports};
 use crate::procs::{HANG, Proc, Spec, after, field};
-use crate::units::{Rendered, config, rendered};
+use crate::units::{self, Container, Settings, Unit, Wiring};
 
 pub use crate::topology::{
     Bins, Driver, FarmError, Limits, NodeMode, ProcRecord, Role, Topology, daemon_id, node_id,
@@ -36,6 +35,8 @@ pub const API_TOKEN: &str = "rehearsal-api-token-of-32-or-more-visible-chars";
 struct Member {
     role: Role,
     spec: Spec,
+    /// The settings of its `kbf.toml`, as flags (empty for a process the farm only supervises).
+    flags: Vec<String>,
     root: PathBuf,
     proc: Proc,
     generation: usize,
@@ -43,16 +44,6 @@ struct Member {
     /// SIGKILLed by the harness: [`Farm::wait`] does not take its exit for a crash.
     killed: bool,
     past: Vec<ProcRecord>,
-}
-
-/// The ports the processes are told.
-struct Wiring {
-    reapi: u16,
-    /// The frontend's worker listener.
-    worker: u16,
-    api: u16,
-    /// The storage URL the frontend dials: node 1's.
-    storage_url: String,
 }
 
 /// The running farm.
@@ -100,42 +91,6 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// The settings of one process: its own address, node id, directories under `root` and
-/// storage port, and the farm's wiring. The frontend is one name for every dialler
-/// (`KBF_FRONTEND_NAME`), not the process's own (`KBF_HOST_NAME`).
-fn settings(
-    root: &Path,
-    host: &str,
-    node_id: &str,
-    storage_port: u16,
-    worker_port: u16,
-    wiring: &Wiring,
-    image: &str,
-) -> kbf_deploy::linux::LinuxConfig {
-    let at = |name: &str| root.join(name).display().to_string();
-    config(&[
-        ("KBF_HOST_NAME", host.to_owned()),
-        ("KBF_FRONTEND_NAME", "localhost".to_owned()),
-        ("KBF_LISTEN_ADDRESS", host.to_owned()),
-        ("KBF_NODE_ID", node_id.to_owned()),
-        // Actions get RAM less the reserved shares: 10 GiB, over the 4 GiB an action asks by default.
-        ("KBF_RAM_GIB", "16".to_owned()),
-        ("MINIO_RESERVATION_GIB", "1".to_owned()),
-        ("KBF_SERVER_RESERVATION_GIB", "1".to_owned()),
-        ("KBF_OS_HEADROOM_GIB", "4".to_owned()),
-        ("KBF_STORAGE_URL", wiring.storage_url.clone()),
-        ("KBF_REAPI_PORT", wiring.reapi.to_string()),
-        ("KBF_WORKER_PORT", worker_port.to_string()),
-        ("KBF_API_PORT", wiring.api.to_string()),
-        ("KBF_STORAGE_PORT", storage_port.to_string()),
-        ("KBF_ETC", at("etc")),
-        ("KBF_DATA_DIR", at("data")),
-        ("KBF_META_DIR", at("meta")),
-        ("KBF_HOT_DIR", at("hot")),
-        ("KBF_IMAGES", image.to_owned()),
-    ])
-}
-
 /// The directories a process's unit expects to exist (the installer makes them on a
 /// host).
 fn make_dirs(root: &Path) -> PathBuf {
@@ -167,21 +122,17 @@ pub fn control_socket(dir: &Path) -> PathBuf {
     std::env::temp_dir().join(format!("kbf-farm-{:x}.sock", path_tag(dir)))
 }
 
-/// The frontend's `--default-platform` on a test box: every node is this host, whatever
-/// its architecture. The unit's default (`linux/x86_64`) leaves an action that names no
-/// architecture with no worker on an aarch64 host.
-const ONE_HOST_PLATFORM: &str = "--default-platform=none";
-
 impl Farm {
-    /// Renders the units and starts a process from each, then waits for each process's
+    /// Writes each process's `kbf.toml` and starts a process from it, then waits for each process's
     /// start line. `dir` holds every process's directories (and must be fresh); `logs`
     /// their output.
     ///
-    /// The flags a test box cannot take as rendered, and what each is changed to:
+    /// The settings a test box cannot take as the packaged units' defaults have them, and
+    /// what each is changed to:
     /// - the nodes' `--cold-store=s3://...` (no MinIO here) is a `file://` directory;
     /// - a `kbf storage` node (which has no daemon half) is given `--frontend` and
-    ///   `--advertise-addr`, which its unit does not render (the storage-and-daemon
-    ///   unit renders them), so that it registers with the frontend, and with the
+    ///   `--advertise-addr`, which its unit does not set (the storage-and-daemon
+    ///   unit sets them), so that it registers with the frontend, and with the
     ///   frontend;
     /// - with [`Driver::StandInContainer`], `--driver=container` stays, over the stand-in
     ///   `crun`: `--oci-runtime=` names it (the unit names `/usr/bin/crun`), the id tools
@@ -194,7 +145,7 @@ impl Farm {
     ///   is systemd's, and a scratch path is too long for a socket's);
     /// - the topology's [`Limits`] and overrides are set on top.
     ///
-    /// Every other flag is the unit's.
+    /// Every other setting is the unit's.
     ///
     /// Call it from a thread that lives as long as the farm (the main thread, a test's own): the
     /// kernel kills a process when the thread that started it ends ([`crate::procs::Proc::start`]), so a
@@ -205,8 +156,8 @@ impl Farm {
     /// A process that exits, or does not print its start line within [`HANG`].
     ///
     /// # Panics
-    /// When the box cannot be set up (a certificate `verify-cert` refuses, a config
-    /// `kbf-deploy` refuses): a defect of the harness.
+    /// When the box cannot be set up (a certificate `verify-cert` refuses, a setting a
+    /// mode does not take): a defect of the harness.
     pub fn start(logs: &Path, dir: &Path, bins: &Bins, topo: &Topology) -> Result<Self, FarmError> {
         std::fs::create_dir_all(logs).expect("logs");
         let native = topo.driver == Driver::Native;
@@ -257,15 +208,6 @@ impl Farm {
             claim: Some((claim, ports.clone())),
             scratch: None,
         };
-        let overrides = |role: Role, unit: Rendered| {
-            let flags: Vec<String> = topo
-                .overrides
-                .iter()
-                .filter(|(r, _)| *r == role)
-                .flat_map(|(_, f)| f.iter().cloned())
-                .collect();
-            unit.set(&flags)
-        };
         let fake = || {
             bins.fake_crun
                 .as_ref()
@@ -288,7 +230,7 @@ impl Farm {
             bare
         };
 
-        // The frontend: its unit as rendered, a state directory made.
+        // The frontend: its unit as packaged, a state directory made.
         let root = dir.join("frontend");
         let etc = root.join("etc");
         make_dirs(&root);
@@ -299,31 +241,19 @@ impl Farm {
         let token = etc.join("api-token");
         crate::pki::write_private(&token, format!("{API_TOKEN}\n").as_bytes());
         farm.ca = std::fs::read(etc.join("ca.pem")).expect("ca");
-        let cfg = settings(
-            &root,
-            &loopback(0),
-            "frontend-1",
-            spare,
-            wiring.worker,
-            &wiring,
-            "",
-        );
-        let unit = rendered(&cfg, uid, Mode::Frontend);
         let socket = control_socket(dir);
         let _ = std::fs::remove_file(&socket);
-        let control = format!("--handover-socket={}", socket.display());
+        let loopback0 = loopback(0);
+        let place = Settings {
+            root: &root,
+            host: &loopback0,
+            node_id: "frontend-1",
+            storage_port: spare,
+            wiring: &wiring,
+            image: "",
+        };
+        let unit = units::frontend(&place, uid, &socket, topo);
         farm.socket = Some(socket);
-        // The unit's state store is the host's Postgres and it has no control socket (kbf
-        // refuses the two together); the box has no Postgres, so the farm gives the frontend
-        // a SQLite file and its socket.
-        let state = format!("--state-store=sqlite://{}/state/state.db", root.display());
-        let unit = overrides(
-            Role::Frontend,
-            unit.replace(&[state])
-                .set(&[ONE_HOST_PLATFORM.to_owned()])
-                .append(&[control])
-                .set(&topo.limits.frontend),
-        );
         farm.launch(&bins.kbf, Role::Frontend, &root, unit, None);
         let line = farm.start_line(Role::Frontend, "kbf-frontend ")?;
         farm.reapi = field(&line, "reapi=").to_owned();
@@ -345,28 +275,16 @@ impl Farm {
             } else {
                 stand_in(&mut farm, &bin)
             };
-            let cfg = settings(&root, &host, id, *port, wiring.worker, &wiring, &bare);
-            let cold = format!("--cold-store=file://{}", root.join("cold").display());
-            let mode = match topo.node_mode {
-                NodeMode::Storage => Mode::Storage,
-                NodeMode::StorageAndDaemon => Mode::StorageAndDaemon,
+            let place = Settings {
+                root: &root,
+                host: &host,
+                node_id: id,
+                storage_port: *port,
+                wiring: &wiring,
+                image: &bare,
             };
-            // No unit renders `--metrics-listen`: the storage node's route for the
-            // scraper, on a port of the harness's own.
-            let scrape = format!("--metrics-listen=127.0.0.1:{}", metrics[i]);
-            let unit = rendered(&cfg, uid, mode).replace(&[cold]).append(&[scrape]);
-            let unit = if native {
-                // The `kbf storage` unit renders no registration flags (only the
-                // storage-and-daemon unit does), so a storage node of it is a farm of one
-                // member that no frontend lists: these two make it join as the other does.
-                unit.append(&[
-                    format!("--frontend=https://localhost:{}", wiring.worker),
-                    format!("--advertise-addr={host}:{port}"),
-                ])
-            } else {
-                Self::driven(unit, topo.driver)
-            };
-            let unit = overrides(Role::Node(i + 1), unit.set(&topo.limits.node));
+            let container = (!native).then(|| Container::planted(&bin, &root));
+            let unit = units::node((&place, uid), i + 1, metrics[i], topo, container.as_ref());
             farm.launch(
                 &bins.kbf,
                 Role::Node(i + 1),
@@ -384,10 +302,16 @@ impl Farm {
             pki.write_ca(&etc);
             pki.issue(&etc, "node", Row::Daemon, &[&id]);
             let bare = stand_in(&mut farm, &bin);
-            let cfg = settings(&root, &host, &id, spare, wiring.worker, &wiring, &bare);
-            let unit = Self::driven(rendered(&cfg, uid, Mode::Daemon), topo.driver)
-                .set(&topo.limits.daemon);
-            let unit = overrides(Role::Daemon(d), unit);
+            let place = Settings {
+                root: &root,
+                host: &host,
+                node_id: &id,
+                storage_port: spare,
+                wiring: &wiring,
+                image: &bare,
+            };
+            let container = (!native).then(|| Container::planted(&bin, &root));
+            let unit = units::daemon((&place, uid), d, topo, container.as_ref());
             farm.launch(
                 &bins.kbf,
                 Role::Daemon(d),
@@ -428,7 +352,7 @@ impl Farm {
         };
         for (role, spec) in specs {
             let root = spec.cwd.clone();
-            farm.launch_spec(role, &root, spec);
+            farm.launch_spec(role, &root, spec, Vec::new());
         }
         farm
     }
@@ -448,50 +372,33 @@ impl Farm {
         self
     }
 
-    /// `unit` for `driver`: the container driver is the unit's own; the native driver
-    /// replaces it (and the container-only `--image`, which the example settings leave out).
-    fn driven(unit: Rendered, driver: Driver) -> Rendered {
-        match driver {
-            Driver::StandInContainer => unit,
-            Driver::Native => unit.replace(&["--driver=native".to_owned()]),
-        }
-    }
-
-    /// Starts the process for `unit`; those with a `bin` (the container driver's) get
-    /// the unit's `--oci-runtime` made the stand-in `crun`, the id tools on `PATH`, and the
-    /// planted cgroup tree and id files.
-    fn launch(&mut self, kbf: &Path, role: Role, root: &Path, unit: Rendered, bin: Option<&Path>) {
-        let (unit, cwd, mut env) = match bin {
-            Some(bin) => {
-                let mut flags = cgroup_tree(bin);
-                flags.push(format!("--id-files={}", id_files(root).display()));
-                let env = vec![("PATH".to_owned(), image_path(bin))];
-                // The rendered unit names `/usr/bin/crun`: this box's is the stand-in,
-                // which finds its state beside the link it was run through.
-                let runtime = [oci_runtime(bin)];
-                (unit.replace(&runtime).append(&flags), bin, env)
-            }
-            None => (unit, root, Vec::new()),
+    /// Starts the process for `unit`: its `kbf.toml` written beside the process's other
+    /// files (in `root`) and named by `--config`, so that the child never reads the
+    /// host's /etc/kbf/kbf.toml, which `kbf` reads when it is given no `--config`. Those
+    /// with a `bin` (the container driver's) run in it, with the id tools on `PATH`.
+    fn launch(&mut self, kbf: &Path, role: Role, root: &Path, unit: Unit, bin: Option<&Path>) {
+        let (cwd, mut env) = match bin {
+            Some(bin) => (bin, vec![("PATH".to_owned(), image_path(bin))]),
+            None => (root, Vec::new()),
         };
-        // Every child reads a settings file of the harness's own (empty), never the host's
-        // /etc/kbf/kbf.toml, which `kbf` reads when it is given no `--config`.
-        let unit = unit.append(&[kbf_testkit::config::flag(root)]);
+        let config = kbf_testkit::config::flag_with(root, &unit.toml());
         env.extend(unit.env.iter().cloned());
         let spec = Spec {
             name: role.to_string(),
             program: kbf.to_owned(),
-            argv: unit.argv,
+            argv: unit.argv(config),
             env,
             cwd: cwd.to_owned(),
         };
-        self.launch_spec(role, root, spec);
+        self.launch_spec(role, root, spec, unit.flags());
     }
 
-    fn launch_spec(&mut self, role: Role, root: &Path, spec: Spec) {
+    fn launch_spec(&mut self, role: Role, root: &Path, spec: Spec, flags: Vec<String>) {
         let proc = Proc::start(&spec, &self.logs, 0);
         self.members.push(Member {
             role,
             spec,
+            flags,
             root: root.to_owned(),
             proc,
             generation: 0,
@@ -521,10 +428,16 @@ impl Farm {
         self.members.iter().map(|m| m.role).collect()
     }
 
-    /// The command line a role runs: the rendered unit's, as it was started.
+    /// The command line a role runs, as it was started: `--mode=<mode> --config=<kbf.toml>`.
     #[must_use]
     pub fn spec(&self, role: Role) -> &Spec {
         &self.member(role).spec
+    }
+
+    /// The settings in the `kbf.toml` of a role, as flags (`--key=value`), by key.
+    #[must_use]
+    pub fn flags(&self, role: Role) -> &[String] {
+        &self.member(role).flags
     }
 
     /// Waits for `ready`, failing at once with every process's output if one exits, and
@@ -670,7 +583,7 @@ impl Farm {
         status
     }
 
-    /// Starts `role` again from the identical command line (the rendered unit's, as kept
+    /// Starts `role` again from the identical command line (the unit's, as kept
     /// in the farm), its output in files of the next generation. The role must have
     /// ended ([`Farm::kill`] or [`Farm::term`]).
     ///
