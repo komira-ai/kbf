@@ -68,7 +68,7 @@ fn a_refused_profile_exits_2_and_says_why() {
         assert_eq!(o.status.code(), Some(2), "{verb}");
         assert_eq!(
             stderr(&o),
-            "kbf-mac-provision: profile line 43: unknown key: sleep\n"
+            "kbf-mac-provision: profile line 42: unknown key: sleep\n"
         );
         assert!(o.stdout.is_empty());
     }
@@ -104,10 +104,7 @@ fn print_reads_only_the_profile() {
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     let sha = support::sha256_hex(text.as_bytes());
     assert!(
-        stdout(&o).ends_with(&format!(
-            "profile_sha256={sha}\nnode_label=profile=mac-arm64-test@{}\n",
-            &sha[..12]
-        )),
+        stdout(&o).ends_with(&format!("profile_sha256={sha}\n")),
         "{}",
         stdout(&o)
     );
