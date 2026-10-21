@@ -854,6 +854,7 @@ fn the_deploy_and_the_api_share_their_types() {
         old: Some(crate::proxy::api::model::OldChild::default()),
         new: Some(crate::proxy::api::model::NewChild::default()),
         failure: Some(failure(FailedStep::Confirm, "x")),
+        source: kbf_update::Source::Staged,
     };
     let text = serde_json::to_string(&whole).unwrap();
     assert_eq!(serde_json::from_str::<StatusBody>(&text).unwrap(), whole);

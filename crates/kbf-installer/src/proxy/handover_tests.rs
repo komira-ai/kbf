@@ -78,6 +78,7 @@ fn request(request_id: &str) -> UpdateRequest {
         request_id: request_id.to_owned(),
         nodes: false,
         rollback: false,
+        source: kbf_update::Source::Fetch,
     }
 }
 
@@ -111,7 +112,13 @@ fn each_seam_is_bound_to_its_own_place() {
     let cfg = config("bound");
     write_idle_status(&cfg);
     Idempotency::open(&cfg.state_dir)
-        .insert("saved-before", &c(B), false, false)
+        .insert(
+            "saved-before",
+            &c(B),
+            false,
+            false,
+            kbf_update::Source::Fetch,
+        )
         .expect("a saved request");
 
     let mut seams = parts(&cfg).expect("the seams");

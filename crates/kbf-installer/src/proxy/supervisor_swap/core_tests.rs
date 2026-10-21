@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hyper::StatusCode;
+use kbf_update::Source;
 
 use super::rig::Rig;
 use super::{ExpandOnlyDefault, SwapSupervisor};
@@ -33,13 +34,8 @@ impl StatusReader for Status {
 #[derive(Clone, Default)]
 struct Orders(Arc<Mutex<Vec<Locator>>>);
 
-impl OrderWriter for Orders {
-    fn write(
-        &mut self,
-        verb: Verb,
-        commit: &CommitId,
-        window_s: u32,
-    ) -> Result<Locator, OrderError> {
+impl Orders {
+    fn push(&self, verb: Verb, commit: &CommitId, window_s: u32, source: Source) -> Locator {
         let mut written = self.0.lock().unwrap();
         let n = written.len() as u64 + 1;
         let locator = Locator {
@@ -49,9 +45,30 @@ impl OrderWriter for Orders {
             verb,
             commit: commit.clone(),
             window_s,
+            source,
         };
         written.push(locator.clone());
-        Ok(locator)
+        locator
+    }
+}
+
+impl OrderWriter for Orders {
+    fn write(
+        &mut self,
+        verb: Verb,
+        commit: &CommitId,
+        window_s: u32,
+    ) -> Result<Locator, OrderError> {
+        Ok(self.push(verb, commit, window_s, Source::Fetch))
+    }
+
+    fn write_update(
+        &mut self,
+        commit: &CommitId,
+        window_s: u32,
+        source: Source,
+    ) -> Result<Locator, OrderError> {
+        Ok(self.push(Verb::FrontendUpdate, commit, window_s, source))
     }
 }
 
@@ -125,6 +142,7 @@ fn request() -> UpdateRequest {
         request_id: "req-1".into(),
         nodes: true,
         rollback: false,
+        source: Source::Fetch,
     }
 }
 

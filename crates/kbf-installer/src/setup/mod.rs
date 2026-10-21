@@ -32,8 +32,10 @@
 //!   reloads systemd or restarts the socket: it says that is needed.
 //! - `--release-source bundled` writes `release_source = "bundled"` and fetches nothing: it
 //!   takes no `--release-url` and no `--commit`. The first release is the one the package
-//!   carries ([`backend::Releases::install_seed`]), verified as a fetched one is; a host with a
-//!   release already installs nothing. The keys a source has of its own
+//!   carries ([`backend::Releases::install_seed`]), verified as a fetched one is, and the floor on
+//!   `seq` starts at its `seq`; a host with a release already installs nothing, and is refused
+//!   unless the `kbf` that runs on it declares the relay (`kbf --version --json`), before
+//!   anything is written. The keys a source has of its own
 //!   (`--release-ca`, the frontend snapshot flags) are checked and written, never read
 //!   ([`release_keys`]); the flags decide them, so a run for another source leaves none behind.
 //! - `kbf.toml` is written after every file a unit needs, and the units after it.
@@ -253,6 +255,12 @@ fn node_role(mode: Mode) -> Option<&'static str> {
     }
 }
 
+/// Why `bundled` is refused on a host whose running `kbf` declares no relay.
+const NO_RELAY: &str = "release_source = bundled needs the kbf that runs on this host to tell \
+                        the frontend what the package carries and that the host fetches nothing, \
+                        and the one that runs declares no relay in `kbf --version --json`: \
+                        update kbf by the usual path first, then run setup again";
+
 /// Whether a release is installed: `releases/current` is there (a link counts).
 fn released(exec: &dyn Exec, layout: &Layout) -> Result<bool, SetupError> {
     present(exec, &layout.current())
@@ -356,6 +364,16 @@ pub fn run(
     }
     let valid = raw.validate(os.platform()).map_err(SetupError::Invalid)?;
     let mut ctx = plan::context(os, valid.mode)?;
+    // A host that fetches nothing is told so to the frontend by the `kbf` that runs on it, or the
+    // frontend orders it a fetch the installer can only refuse. A host with a release has such a
+    // `kbf`, and it must relay; a host with none installs the package's, which is this build's.
+    // This comes before anything is written, a dry run included.
+    if valid.source == Source::Bundled
+        && released(&*exec, &ctx.layout)?
+        && !backend.releases.running_relays()?
+    {
+        return Err(SetupError::Unsupported(NO_RELAY.to_owned()));
+    }
     let journalled = migrated_units(backend, ctx.platform)?;
     ctx.kit_adopted = backend.migrations.kit_adopted()?;
     let shadows = if ctx.platform == Platform::Linux {

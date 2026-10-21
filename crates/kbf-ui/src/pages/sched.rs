@@ -9,6 +9,7 @@
 use form_urlencoded::Serializer;
 use serde::Deserialize;
 
+use super::started::Started;
 use crate::html::{Href, Html, attr};
 
 /// `GET /v1/leases`.
@@ -112,14 +113,16 @@ pub(crate) fn node_link(h: &mut Html, node: &str) {
     h.link(&node_leases(node), node);
 }
 
-/// The note both pages carry: the scheduler's state is memory only.
-pub(crate) fn memory_note(h: &mut Html) {
+/// The banner both pages carry: the scheduler's state is memory only, and when the
+/// server started.
+pub(crate) fn memory_note(h: &mut Html, started: &Started) {
     h.el("p", &[attr("class", "hint")], |h| {
         h.text(
             "The scheduler holds this in memory: after a restart or a handover it is empty \
              until the daemons reconnect, so an empty page is not by itself an outage.",
         );
     });
+    super::started::note(h, started);
 }
 
 /// A digest or an id, set in code.

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::cli::{self, FrontendConfig, Host, current_uid, platform_of};
+use crate::layout::{Layout, Platform};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef\n";
 
@@ -796,4 +797,79 @@ fn an_offer_on_standard_input_is_judged_before_the_farm_is_asked() {
     fs::write(&settings, "RUN_AS_UID=0\n").unwrap();
     let (code, out, err) = go(&[(&release, b"tarball"), ("offer.json", offer.as_slice())]);
     assert_eq!((code, out.as_str()), (2, ""), "{err}");
+}
+
+/// Writes `content` as the host's `installer.toml`, where the deploy reads it.
+fn installer_toml(rig: &Rig, content: impl AsRef<[u8]>) {
+    let base = kbf_host::Root::new(&rig.dir).unwrap();
+    let layout = Layout::new(base, Platform::current());
+    let file = layout.join(&layout.installer_toml());
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, content).unwrap();
+}
+
+/// Catches a host taken for bundled that is not, and one that is not noticed: only a settings
+/// file that is text, is TOML and says `release_source = "bundled"` makes a bundled host. A root
+/// that is not absolute, no file, a file that is not text, not TOML, says another source or a
+/// value that is not a word, and one whose `bundled` is past the size the installer reads,
+/// are each not bundled here (the installer refuses a bad file where it reads it).
+///
+/// Mutants planted: any `release_source` taken for bundled; the size cap dropped; a file that
+/// cannot be parsed taken for bundled.
+#[test]
+fn only_a_settings_file_that_says_bundled_makes_a_bundled_host() {
+    let rig = Rig::new("is-bundled");
+    assert!(!cli::is_bundled(std::path::Path::new("not/absolute")));
+    assert!(!cli::is_bundled(&rig.dir));
+    let mut past_the_cap = vec![b'#'; 70_000];
+    past_the_cap.extend_from_slice(b"\nrelease_source = \"bundled\"\n");
+    let cases: [(&[u8], bool); 7] = [
+        (b"release_source = \"bundled\"\n", true),
+        (b"release_source = \"frontend\"\n", false),
+        (b"release_source = 3\n", false),
+        (b"confirm_window_s = 600\n", false),
+        (b"= = =\n", false),
+        (&[0xff, 0xfe, 0xfd], false),
+        (&past_the_cap, false),
+    ];
+    for (content, want) in cases {
+        installer_toml(&rig, content);
+        let text = String::from_utf8_lossy(&content[..content.len().min(40)]).into_owned();
+        assert_eq!(cli::is_bundled(&rig.dir), want, "{text}");
+    }
+}
+
+/// Catches a deploy on a host that fetches nothing going on to read its bundle: a deploy can
+/// only fetch, and a bundled host refuses a fetch at the installer, after the bundle was
+/// uploaded and the proxy asked. The refusal is exit 3 with a reason of its own, as the one
+/// step of the summary, before the bundle on standard input is looked at (a bundle that is not
+/// a tar would be a usage error if it were read) and before the proxy is asked (it is not
+/// there). A host that fetches from a URL, or whose settings cannot be read, is not refused.
+///
+/// Mutants planted: the check after the upload; any `release_source` refused; an unreadable
+/// `installer.toml` refused.
+#[test]
+fn a_deploy_on_a_bundled_host_is_refused_before_the_bundle_is_read() {
+    let rig = Rig::new("bundled");
+    installer_toml(&rig, "release_source = \"bundled\"\n");
+    let (code, out, err) = rig.go(&["--bundle", "-"], b"not a tar", false);
+    assert_eq!(code, 3, "{out} {err}");
+    let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(line["reason"], "source_refused");
+    assert_eq!(line["steps"].as_array().unwrap().len(), 1, "{out}");
+    let detail = line["detail"].as_str().unwrap();
+    assert!(detail.contains("bundled"), "{detail}");
+
+    let url = "release_source = \"url\"\nrelease_url = \"https://releases.example.com/kbf\"\n";
+    installer_toml(&rig, url);
+    let (code, out, _) = rig.go(&["--bundle", "-"], b"not a tar", false);
+    let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_ne!(line["reason"], "source_refused", "{out}");
+    assert_ne!(code, 3, "{out}");
+
+    installer_toml(&rig, "this is not toml = = =\n");
+    let (code, out, _) = rig.go(&["--bundle", "-"], b"not a tar", false);
+    let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_ne!(line["reason"], "source_refused", "{out}");
+    assert_ne!(code, 3, "{out}");
 }

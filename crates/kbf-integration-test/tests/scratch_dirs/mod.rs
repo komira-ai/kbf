@@ -62,6 +62,11 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         1,
         "product code: the offer verb's scratch, removed once the plan is made whatever its result",
     ),
+    (
+        "crates/xtask/src/release/fetch_previous.rs",
+        1,
+        "product code: the fetch-previous verb's scratch, removed after the run whatever its result",
+    ),
 ];
 
 /// The scanned text of a file: its comment lines (a doc line that names the pattern) are blank.

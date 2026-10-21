@@ -27,5 +27,19 @@ rustix = { workspace = true, features = ["fs", "process"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 tonic = { workspace = true, features = ["tls-ring"] }
 
+# The Mac legs (tests/mac_pool_spike, macOS only): a real `kbf daemon --driver native` as
+# root behind the fake front kbf-node's tests share (`kbf-node/tests/front`, included by
+# path: it names the daemon's CAS trait, the front's in-memory cache and the worker
+# protocol), and the node certificates it needs (made with rcgen, checked by `kbf-deploy`'s
+# `verify-cert`). Only a macOS build of the tests takes them.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+futures.workspace = true
+kbf-daemon.workspace = true
+kbf-deploy.workspace = true
+kbf-front.workspace = true
+prost.workspace = true
+rcgen.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "sync"] }
+
 [lints]
 workspace = true

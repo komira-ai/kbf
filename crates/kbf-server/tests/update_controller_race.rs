@@ -16,7 +16,7 @@ use std::sync::{Arc, Barrier, Mutex, PoisonError};
 use kbf_map::MemberId;
 use kbf_server::update::{
     Alert, Controller, ControllerError, HoldReason, HostPhase, HostRecord, HostRow, OrderId,
-    Policy, Release, RowError, Rows, SlotClass, Stored, Transport, TransportError,
+    Policy, Release, RowError, Rows, SlotClass, Source, Stored, Transport, TransportError,
 };
 use kbf_state::{
     Changes, Commit, CommitStats, Conflict, Fenced, Revision, ScanPage, ScanRange, Store,
@@ -619,6 +619,7 @@ fn a_claim_that_loses_the_race_for_a_place_reads_again_and_a_full_class_refuses_
                     boot_before: None,
                 },
                 commit: Release::new(NEW),
+                source: Source::Fetch,
             };
             let absent = Stored {
                 value: HostRow::unstarted(),
@@ -695,6 +696,7 @@ fn a_place_claimed_again_since_the_look_is_not_freed_by_the_release_the_look_dec
             boot_before: None,
         },
         commit: Release::new(NEW),
+        source: Source::Fetch,
     };
     let absent = Stored {
         value: HostRow::unstarted(),

@@ -4,8 +4,8 @@
 //! and the cycle holds the order to two rules before anything is fetched, made or told:
 //!
 //! - it names the seed's commit, all 40 digits;
-//! - the seed's `seq` is strictly above the floor in `seq_floor`, and a host with no floor
-//!   admits nothing.
+//! - the seed's `seq` is strictly above the floor in `seq_floor` (caught up with the release
+//!   that runs first), and a host with no floor admits nothing.
 //!
 //! Both refuse with the word `commit_or_ref`, say which rule, and leave the host as it was; the
 //! order is acted on, so the floor of orders moves. The rules are asked after a node
@@ -43,9 +43,13 @@ pub(super) fn refusal_of(id: u64, e: FetchError) -> String {
 impl<E: Exec> Helper<E> {
     /// The seed this host's package carries, if an order for `commit` may use it: the
     /// manifest read through the fetcher, the order naming the seed's commit and the seed's
-    /// `seq` above the floor ([`seed::admit`]).
-    pub(super) fn admitted_seed(&self, commit: &CommitId) -> Result<SeedFacts, FetchError> {
+    /// `seq` above the floor ([`seed::admit`]). The floor is caught up with the release that
+    /// runs first, and the order is refused if that cannot be done: the file may be behind (an
+    /// operator's own `confirm`, a crash between a confirm and its raise), and a package older
+    /// than the release that runs must not be admitted over it.
+    pub(super) fn admitted_seed(&mut self, commit: &CommitId) -> Result<SeedFacts, FetchError> {
         let seed = self.fetcher.seed()?;
+        self.catch_up().map_err(FetchError::Unavailable)?;
         let floor = seed::read_floor(&self.host)?;
         seed::admit(&seed, commit, floor)?;
         Ok(seed)

@@ -655,6 +655,27 @@ fn a_frontend_that_reverts_is_gate_f_red() {
     assert_eq!((row.verdict, row.measured), (Verdict::Red, Some(1.0)));
 }
 
+/// Proves a frontend that was swapped and then failed at the order for the nodes is not a
+/// reverted frontend for gate F: the new release serves, and F reads 0 beside a deploy that is
+/// red for the refusal (exit 3, reason `nodes_refused`). Catches F reading every failed
+/// frontend update as a revert.
+///
+/// Mutant planted: the step not looked at (the row is red with 1).
+#[test]
+fn a_frontend_that_failed_at_the_order_for_the_nodes_is_not_gate_f_red() {
+    let mut f = farm(two_nodes());
+    f.frontend_fate = FrontendFate::NodesRefused;
+    let (s, doc) = run_gated(&f, "frontend-nodes-refused");
+    assert_eq!(
+        (s.exit, s.reason.as_str()),
+        (3, "nodes_refused"),
+        "{}",
+        s.line()
+    );
+    let row = gate(&doc, name::AUTO_REVERT);
+    assert_eq!((row.verdict, row.measured), (Verdict::Green, Some(0.0)));
+}
+
 // ---- the document ------------------------------------------------------------------
 
 /// Proves a failed deploy still writes `FINISHED`: the document is red, finished, and says

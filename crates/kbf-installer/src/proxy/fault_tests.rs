@@ -838,6 +838,7 @@ fn the_fake_root_records_a_frontend_update_order() {
         verb: Verb::FrontendUpdate,
         commit: c(B),
         window_s: 60,
+        source: Source::Fetch,
     };
     w.ports()
         .orders

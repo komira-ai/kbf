@@ -22,6 +22,11 @@
 //!   membership cannot be read (`storage_unavailable` then says why).
 //!   `under_replicated_blobs` is `null` while unknown, never zero.
 //!
+//! - `started_unix_ms` and `uptime_ms`: when this route was made (the server's start, or
+//!   its frontend's after a swap: when the in-memory state below began to fill), as wall
+//!   clock milliseconds since the Unix epoch, and the milliseconds since by the monotonic
+//!   clock, so a clock step never shows in `uptime_ms`.
+//!
 //! In memory, like `GET /v1/nodes`: after a restart `nodes`, `queue` and `leases` count
 //! only what has reconnected since. Not included: the update state and the history
 //! store's counters, which this route's sources do not reach.
@@ -29,6 +34,7 @@
 //! Open, like the other reads of this listener: it names no secret.
 
 use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::State;
@@ -51,9 +57,33 @@ struct Sources {
     checks: Arc<Checks>,
     farm: Arc<Farm>,
     members: Option<Arc<Members>>,
+    started: Started,
 }
 
-/// `GET /v1/health` over these sources.
+/// When this route was made: the server's start, or its frontend's after a swap, which is
+/// when the in-memory state it reports began to fill.
+#[derive(Clone, Copy, Debug)]
+struct Started {
+    /// Wall clock, milliseconds since the Unix epoch.
+    unix_ms: u64,
+    /// The monotonic reading `uptime_ms` counts from, so a clock step never shows.
+    at: Instant,
+}
+
+impl Started {
+    /// Now.
+    fn now() -> Self {
+        let unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        Self {
+            unix_ms,
+            at: Instant::now(),
+        }
+    }
+}
+
+/// `GET /v1/health` over these sources; the start it reports is the moment of this call.
 pub fn route(checks: Arc<Checks>, farm: Arc<Farm>, members: Option<Arc<Members>>) -> Router {
     Router::new()
         .route(HEALTH, get(health))
@@ -61,6 +91,7 @@ pub fn route(checks: Arc<Checks>, farm: Arc<Farm>, members: Option<Arc<Members>>
             checks,
             farm,
             members,
+            started: Started::now(),
         }))
 }
 
@@ -84,6 +115,8 @@ async fn health(State(sources): State<Arc<Sources>>) -> Response {
         },
         "leases": leases,
         "storage": storage,
+        "started_unix_ms": sources.started.unix_ms,
+        "uptime_ms": u64::try_from(sources.started.at.elapsed().as_millis()).unwrap_or(u64::MAX),
     });
     if let Some(why) = unavailable {
         body["storage_unavailable"] = why.into();

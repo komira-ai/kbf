@@ -200,6 +200,8 @@ Options:
           The operator token the API takes: a file of mode 0600 or 0400. `setup` writes it here [default: /etc/kbf/api-token]
       --nodes
           Have the new frontend update the nodes once it has baked. Without it only the frontend is swapped
+      --source <SOURCE>
+          Where the release comes from: `fetch` (from the source the installer is configured with, as every update has) or `staged` (the release this host's package carries). `staged` takes no `--nodes` yet [default: fetch]
       --request-id <REQUEST_ID>
           Names this update to the API, so a run repeated after a lost connection is the same update. Random when not given
       --handover-timeout-s <HANDOVER_TIMEOUT_S>

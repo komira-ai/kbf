@@ -1480,6 +1480,7 @@ dependencies = [
  "clap",
  "futures",
  "kbf-all-in-one",
+ "kbf-ca",
  "kbf-cas-conformance",
  "kbf-daemon",
  "kbf-deploy",
@@ -1498,6 +1499,7 @@ dependencies = [
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
+ "kbf-unitfile",
  "postgres",
  "prost",
  "rcgen",
@@ -1568,10 +1570,16 @@ dependencies = [
 name = "kbf-daemon-test"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "kbf-daemon",
+ "kbf-deploy",
+ "kbf-front",
  "kbf-harness",
  "kbf-proto",
  "kbf-testkit",
  "kbf-transfer",
+ "prost",
+ "rcgen",
  "rustix",
  "tokio",
  "tonic",
@@ -1586,12 +1594,14 @@ dependencies = [
  "flate2",
  "hex",
  "httparse",
+ "kbf-ca",
  "kbf-host",
  "kbf-installer",
  "kbf-mdm",
  "kbf-state",
  "kbf-testkit",
  "kbf-types",
+ "kbf-unitfile",
  "plist",
  "rcgen",
  "rusqlite",
@@ -1777,12 +1787,14 @@ dependencies = [
  "clap",
  "flate2",
  "futures",
+ "kbf-ca",
  "kbf-deploy",
  "kbf-integration-test",
  "kbf-proto",
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
+ "kbf-unitfile",
  "libc",
  "prost",
  "prost-types",
@@ -1926,6 +1938,8 @@ dependencies = [
  "kbf-threads",
  "kbf-transfer",
  "kbf-types",
+ "kbf-unitfile",
+ "libc",
  "proc-macro2",
  "prost",
  "rcgen",
@@ -2088,7 +2102,6 @@ dependencies = [
  "clap",
  "futures",
  "kbf-daemon",
- "kbf-deploy",
  "kbf-driver-container",
  "kbf-driver-native",
  "kbf-front",
@@ -2541,6 +2554,13 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "kbf-unitfile"
+version = "0.1.0"
+dependencies = [
  "thiserror",
 ]
 

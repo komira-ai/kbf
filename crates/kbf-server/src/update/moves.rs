@@ -22,9 +22,9 @@ pub(super) fn decide(
 }
 
 /// The row after `moved`, made at `now` in the run `desired`: the phase and the fields the
-/// move names. A host that enters `Selected` from elsewhere takes the generation and commit
-/// of the run that starts it; every other move keeps them, so a host finishes the run that
-/// began it.
+/// move names. A host that enters `Selected` from elsewhere takes the generation, commit and
+/// source of the run that starts it; every other move keeps them, so a host finishes the run
+/// that began it, from the source that run named, whatever `desired` says by then.
 pub(super) fn next_row(
     old: &HostRow,
     moved: &Transition,
@@ -53,6 +53,7 @@ pub(super) fn next_row(
         } else {
             old.commit.clone()
         },
+        source: if began { desired.source } else { old.source },
     }
 }
 

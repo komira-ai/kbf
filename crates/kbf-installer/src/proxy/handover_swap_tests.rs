@@ -82,6 +82,7 @@ fn spec(update_id: &str) -> UpdateSpec {
         to: c(B),
         nodes: false,
         rollback: false,
+        source: kbf_update::Source::Fetch,
         facts: StagedFacts {
             commit: c(B),
             protocol: 7,
@@ -96,6 +97,7 @@ fn spec(update_id: &str) -> UpdateSpec {
             verb: Verb::FrontendUpdate,
             commit: c(B),
             window_s: 900,
+            source: kbf_update::Source::Fetch,
         },
     }
 }
@@ -496,6 +498,7 @@ fn the_first_status_after_the_fill_reads_the_update_an_earlier_process_recorded(
         to: c(B),
         nodes: false,
         rollback: false,
+        source: kbf_update::Source::Fetch,
         old_slot: Slot::A,
         timing: Timing::frontend(),
     };

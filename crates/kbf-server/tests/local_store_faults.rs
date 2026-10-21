@@ -48,6 +48,11 @@ impl Storage for Faulty {
         self.fail()
     }
 
+    /// Holds nothing in RAM: durable is present.
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        self.find_missing(digests)
+    }
+
     fn read_blob<'a>(&'a self, _digest: &'a Digest) -> Answer<'a, Bytes> {
         self.fail()
     }

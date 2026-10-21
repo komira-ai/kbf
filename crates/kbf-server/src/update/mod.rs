@@ -66,7 +66,7 @@ pub use command::{Alert, Command, GiveBack, HoldReason, Severity, SlotOp};
 pub use controller::Controller;
 pub use facts::{
     DaemonLoad, Facts, Generation, HelperReport, HelperStatus, HostFacts, HostKind, HostRecord,
-    MemberFacts, Observations, OrderId, Platform, PlatformClass, Release, SlotView, Work,
+    MemberFacts, Observations, OrderId, Platform, PlatformClass, Release, SlotView, Source, Work,
 };
 pub use gate::{GateFail, GateMode, storage_gate};
 pub use node_step::{HostPhase, Transition, step};

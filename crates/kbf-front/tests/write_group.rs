@@ -183,20 +183,20 @@ async fn no_caller_returns_before_its_segment_commits() {
     put_entered.await.expect("the PUT arrives");
     for (call, b) in calls.iter().zip(&blobs) {
         assert!(!call.is_finished(), "a caller returned during the PUT");
-        assert!(!cache.is_durable(&b.digest()).await.expect("durable"));
+        assert!(!cache.is_complete(&b.digest()).await.expect("complete"));
     }
     put_release.send(()).expect("release the PUT");
     commit_entered.await.expect("the commit arrives");
     for (call, b) in calls.iter().zip(&blobs) {
         assert!(!call.is_finished(), "a caller returned before the commit");
-        assert!(!cache.is_durable(&b.digest()).await.expect("durable"));
+        assert!(!cache.is_complete(&b.digest()).await.expect("complete"));
     }
     commit_release.send(()).expect("release the commit");
     for call in calls {
         call.await.expect("join").expect("store");
     }
     for b in &blobs {
-        assert!(cache.is_durable(&b.digest()).await.expect("durable"));
+        assert!(cache.is_complete(&b.digest()).await.expect("complete"));
     }
     assert_eq!(cache.meta().batches(), [8]);
     assert_audit_clean(&cache);

@@ -107,6 +107,7 @@ fn order(id: u64, epoch: u64, verb: Verb, commit: &str) -> UpdateOrder {
         commit: commit.to_owned(),
         window_s: 600,
         generation: 3,
+        source: 0,
     }
 }
 

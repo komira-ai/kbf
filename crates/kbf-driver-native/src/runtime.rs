@@ -337,6 +337,7 @@ impl<C: Cas> NativeRuntime<C> {
         cas: &C::Lease,
         work: &Work,
         dir: &Path,
+        private: bool,
     ) -> Result<Prepared, RuntimeError> {
         let action: Action = fetch_message(cas, &work.action_digest)
             .await
@@ -364,7 +365,9 @@ impl<C: Cas> NativeRuntime<C> {
         let developer_dir = xcode::developer_dir(&self.xcodes(), &action, &command)?;
         let simulator = simulator::request_of(&action, &command)?;
 
-        tokio::fs::create_dir(dir).await.map_err(failed(dir))?;
+        crate::slots::make_lease_dir(dir, private)
+            .await
+            .map_err(failed(dir))?;
         let lease = tokio::fs::canonicalize(dir).await.map_err(failed(dir))?;
         let root = dir.join("root");
         tokio::fs::create_dir(&root).await.map_err(failed(&root))?;
@@ -671,8 +674,9 @@ impl<C: Cas> NativeRuntime<C> {
         }
         // A kill during prepare (a long input fetch) stops it at once; the clean
         // removes whatever was written.
+        let private = runner.private_lease();
         let mut prepared = tokio::select! {
-            prepared = self.prepare(&cas, work, dir) => prepared?,
+            prepared = self.prepare(&cas, work, dir, private) => prepared?,
             Ok(by) = &mut *stop => {
                 *killer = Some(by);
                 return Err(RuntimeError::Killed);

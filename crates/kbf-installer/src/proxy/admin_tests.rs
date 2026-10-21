@@ -21,7 +21,7 @@ use crate::testkit::{A as COMMIT_A, B as COMMIT_B, c};
 
 use super::admin::{Admin, AdminError, Deadlines, OFFER_PAUSE};
 use super::child_http::{Headers, HttpError};
-use super::model::{OpenCounts, RoleInfo, RoleState, Slot};
+use super::model::{DesiredError, OpenCounts, RoleInfo, RoleState, Slot, Source};
 use super::ports::ChildAdmin;
 
 /// What the proxy puts on a call to a child, and the operator's token.
@@ -1493,6 +1493,162 @@ fn a_token_that_cannot_be_used_stops_the_offer_before_it_is_sent() {
     assert!(rig.b.untouched());
 }
 
+// ----- the source and the verdict of the order for the nodes -----
+
+#[test]
+fn the_order_for_the_nodes_names_its_source_only_when_it_is_not_a_fetch() {
+    // Catches: a fetch whose body has a key more than it has ever had (a child from before
+    // `source` refuses it); a staged order whose body does not say so (the child would take
+    // it for a fetch). The fixture child takes the commit alone and answers any other body
+    // with a 400, so its own answer is forced.
+    let rig = Rig::new();
+    rig.b.force(
+        "/v1/update/desired",
+        Reply::json(200, json!({"generation": 3})),
+    );
+    let admin: &dyn ChildAdmin = &rig.admin;
+    let staged = admin.post_desired(Slot::B, &offered(), Source::Staged);
+    assert_eq!(staged, Ok(()));
+    let fetch = admin.post_desired(Slot::B, &offered(), Source::Fetch);
+    assert_eq!(fetch, Ok(()));
+    let seen = rig.b.operator_port.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(
+        seen[0].body,
+        format!(r#"{{"commit":"{COMMIT_B}","source":"staged"}}"#).into_bytes()
+    );
+    assert_eq!(
+        seen[1].body,
+        format!(r#"{{"commit":"{COMMIT_B}"}}"#).into_bytes()
+    );
+}
+
+fn refused_for_good(code: &str, why: &str) -> Result<(), DesiredError> {
+    Err(DesiredError::Refused {
+        code: code.to_owned(),
+        why: why.to_owned(),
+    })
+}
+
+fn unreached(why: &str) -> Result<(), DesiredError> {
+    Err(DesiredError::Unreached(why.to_owned()))
+}
+
+/// The order got no answer to go by, whatever the words.
+fn was_not_answered(got: &Result<(), DesiredError>) -> bool {
+    matches!(got, Err(DesiredError::Unreached(_)))
+}
+
+#[test]
+fn the_order_for_the_nodes_is_told_by_what_the_child_answered() {
+    // Catches: a refusal for good that the swap would send again until its time ran out (a
+    // 4xx, a 409 with a code), or one that loses the child's own code on the way; an answer
+    // that only says "again" (the child is busy, failed, or a proxy in the way) taken for a
+    // refusal, which would end an update the next try lands.
+    let rig = Rig::new();
+    let admin: &dyn ChildAdmin = &rig.admin;
+    let cases = [
+        (
+            Reply::json(200, json!({"generation": 3})),
+            Ok(()),
+            "an answer that lands",
+        ),
+        (
+            Reply::json(400, json!({"error": "bad body"})),
+            refused_for_good("http_400", "bad body"),
+            "a 400 without a code",
+        ),
+        (
+            Reply::text(404, ""),
+            refused_for_good("http_404", "the child answered 404"),
+            "a 404 with no body",
+        ),
+        (
+            Reply::json(409, json!({"error": "older", "code": "older"})),
+            refused_for_good("older", "older"),
+            "a 409 with its code",
+        ),
+        (
+            Reply::json(409, json!({"error": "no", "code": "not_own"})),
+            refused_for_good("not_own", "no"),
+            "a 409 that is not the child's own",
+        ),
+        (
+            Reply::text(409, ""),
+            refused_for_good("http_409", "the child answered 409"),
+            "a 409 with no body",
+        ),
+        (
+            Reply::json(422, json!({"error": "z"})),
+            refused_for_good("http_422", "z"),
+            "a 422",
+        ),
+        (
+            Reply::json(429, json!({"error": "slow down"})),
+            unreached("slow down"),
+            "a 429",
+        ),
+        (
+            Reply::json(500, json!({"error": "boom"})),
+            unreached("boom"),
+            "a 500",
+        ),
+        (
+            Reply::text(502, ""),
+            unreached("the child answered 502"),
+            "a 502 with no body",
+        ),
+    ];
+    for (reply, want, what) in cases {
+        rig.b.force("/v1/update/desired", reply);
+        let got = admin.post_desired(Slot::B, &offered(), Source::Fetch);
+        assert_eq!(got, want, "{what}");
+    }
+}
+
+#[test]
+fn a_child_that_stays_busy_or_cannot_be_reached_is_not_a_refusal() {
+    // Catches: the busy answer that outlasts the three tries (`503`) and an offer that never
+    // got to the child (a closed port, a token that cannot be read) told as the child's
+    // refusal: neither says anything of the order, and the swap sends it again.
+    let rig = Rig::new();
+    rig.b.force(
+        "/v1/update/desired",
+        Reply::json(
+            503,
+            json!({"error": "the update rows are busy: send it again"}),
+        ),
+    );
+    let busy = rig.admin.post_desired(Slot::B, &offered(), Source::Fetch);
+    assert_eq!(busy, unreached("the update rows are busy: send it again"));
+
+    let gone = client(
+        &rig.a,
+        &rig.b,
+        secret(),
+        || Err(io::ErrorKind::NotFound.into()),
+        short(2000, 2000),
+    );
+    let sent = rig.b.operator_port.seen().len();
+    let got = gone.post_desired(Slot::B, &offered(), Source::Fetch);
+    assert!(was_not_answered(&got), "{got:?}");
+    assert_eq!(rig.b.operator_port.seen().len(), sent, "nothing was sent");
+
+    let closed = {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.local_addr().unwrap()
+    };
+    let nobody = Admin::new(
+        move |_| closed,
+        move |_| closed,
+        secret(),
+        || Ok(TOKEN.as_bytes().to_vec()),
+        short(2000, 2000),
+    );
+    let got = nobody.post_desired(Slot::B, &offered(), Source::Fetch);
+    assert!(was_not_answered(&got), "{got:?}");
+}
+
 // ----- through the trait -----
 
 #[test]
@@ -1510,7 +1666,9 @@ fn through_the_trait_every_call_returns_its_value_and_errors_become_text() {
             open_sessions: 1
         })
     );
-    admin.post_desired(Slot::B, &offered()).unwrap();
+    admin
+        .post_desired(Slot::B, &offered(), Source::Fetch)
+        .unwrap();
     admin.quiesce(Slot::A).unwrap();
     admin.takeover(Slot::B, Duration::from_secs(10)).unwrap();
     admin.stand_down(Slot::A).unwrap();

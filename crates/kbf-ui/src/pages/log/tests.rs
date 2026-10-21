@@ -3,7 +3,7 @@
 
 use serde_json::json;
 
-use super::{LOG_SHOWN_BYTES, printable, without_split_char};
+use super::{LOG_SHOWN_BYTES, printable, without_split_char, without_split_start};
 use crate::tests::{Fake, ID, RUN_ID, action, action_digest, body, farm, render, stderr_blob};
 
 /// The cap, as a length.
@@ -14,16 +14,39 @@ fn route(stream: &str) -> String {
     format!("/v1/runs/{RUN_ID}/logs/{stream}")
 }
 
-/// A read API whose `stderr` of `RUN_ID` answers `206` with `bytes` of a log of `total`.
+/// A read API whose `stderr` of `RUN_ID` answers `206` with `bytes`, the first of a log
+/// of `total` (what a `bytes=0-N` range gets).
 fn partial(bytes: impl Into<Vec<u8>>, total: usize) -> Fake {
     let bytes = bytes.into();
     let range = format!("bytes 0-{}/{total}", bytes.len().saturating_sub(1));
     Fake::default().with_headers(&route("stderr"), 206, &[("Content-Range", &range)], bytes)
 }
 
+/// A read API whose `stderr` of `RUN_ID` answers `206` with `bytes`, the last of a log of
+/// `total` (what a `bytes=-N` range gets).
+fn tail(bytes: impl Into<Vec<u8>>, total: usize) -> Fake {
+    let bytes = bytes.into();
+    let range = format!(
+        "bytes {}-{}/{total}",
+        total - bytes.len(),
+        total.saturating_sub(1)
+    );
+    Fake::default().with_headers(&route("stderr"), 206, &[("Content-Range", &range)], bytes)
+}
+
 fn page(fake: &Fake, stream: &str) -> (u16, String) {
-    let a = render(fake, &format!("/ui/runs/{RUN_ID}/logs/{stream}"));
+    page_at(fake, stream, "")
+}
+
+/// The page of `stream` with `query` (with its `?`, or empty).
+fn page_at(fake: &Fake, stream: &str, query: &str) -> (u16, String) {
+    let a = render(fake, &format!("/ui/runs/{RUN_ID}/logs/{stream}{query}"));
     (a.status(), body(&a))
+}
+
+/// The link that shows the other end of the log.
+fn other_end(query: &str, words: &str) -> String {
+    format!("<a href=\"/ui/runs/{RUN_ID}/logs/stderr{query}\">{words}</a>")
 }
 
 /// What the `<pre>` of a page holds, as written.
@@ -36,22 +59,33 @@ fn pre(html: &str) -> &str {
 /// Catches (hostile fixture): a log that runs on the page or draws it. Markup in a log
 /// shown as markup; a control character, an escape sequence, a bidirectional override or
 /// a C1 control written raw; bytes that are not UTF-8 dropped, or the page refused. A log
-/// is also read with exactly one `Range` of the first MiB. Mutants: `printable` returning
-/// its text unchanged; the C0 arm dropped; the bidi arm dropped; the DEL arm dropped; the
-/// range not sent (the `range` call replaced by a plain read).
+/// is also read with exactly one `Range`: the last MiB by default, the first with
+/// `?from=start`. Mutants: `printable` returning its text unchanged; the C0 arm dropped;
+/// the bidi arm dropped; the DEL arm dropped; the range not sent (the `suffix` call
+/// replaced by a plain read); the default the head.
 #[test]
 fn a_hostile_log_is_shown_as_inert_text_and_read_with_one_range() {
     let log =
         b"<script>alert(1)</script>\x1b[31mred\x00\x07\x7f \xe2\x80\xaeevil\xc2\x85 end\xff\xfe\n";
-    let fake = partial(log.to_vec(), log.len());
+    let fake = tail(log.to_vec(), log.len());
     let (status, html) = page(&fake, "stderr");
     assert_eq!(status, 200, "{html}");
     assert_eq!(
-        fake.ranges(),
+        fake.suffixes(),
+        [(route("stderr"), LOG_SHOWN_BYTES)],
+        "one suffix read of the last MiB"
+    );
+    assert!(fake.ranges().is_empty(), "no span read");
+    assert_eq!(fake.seen(), [route("stderr")], "and nothing else");
+    let head = partial(log.to_vec(), log.len());
+    let (status, _) = page_at(&head, "stderr", "?from=start");
+    assert_eq!(status, 200);
+    assert_eq!(
+        head.ranges(),
         [(route("stderr"), 0, LOG_SHOWN_BYTES - 1)],
         "one ranged read of the first MiB"
     );
-    assert_eq!(fake.seen(), [route("stderr")], "and nothing else");
+    assert!(head.suffixes().is_empty(), "no suffix read");
     assert!(!html.contains("<script"), "{html}");
     let shown = pre(&html);
     assert!(
@@ -78,60 +112,158 @@ fn a_hostile_log_is_shown_as_inert_text_and_read_with_one_range() {
 
 /// Catches: a cut log shown as the whole one, a whole log shown as cut, no way to the
 /// rest, or a download link that is not the route. The cut is `total > shown`: a log of
-/// exactly the cap is whole. Mutants: `more` always false; always true; `>` written `>=`;
-/// the link dropped.
+/// exactly the cap is whole. The notice names the end that is shown (the last MiB by
+/// default, the first with `?from=start`) and links the other end, which is the page
+/// itself or its `?from=start`; a whole log links neither. Mutants: `more` always false;
+/// always true; `>` written `>=`; the link dropped; the words for the ends swapped; the
+/// other end's link pointing at the page's own end.
 #[test]
-fn a_log_longer_than_the_range_says_so_and_links_the_download() {
+fn a_log_longer_than_the_range_says_which_end_it_shows_and_links_the_other() {
     let link = format!("<a href=\"{}\">Download the whole log</a>", route("stderr"));
-    let fake = partial(vec![b'a'; CAP], 3_000_000);
+    let fake = tail(vec![b'a'; CAP], 3_000_000);
     let (status, html) = page(&fake, "stderr");
     assert_eq!(status, 200);
     assert!(
-        html.contains("Cut: only the first 1.0 MiB of the log is shown."),
+        html.contains("Cut: only the last 1.0 MiB of the log is shown. "),
         "{}",
         &html[..html.len().min(3000)]
     );
+    assert!(html.contains(&other_end("?from=start", "Show the start of the log")));
+    assert!(!html.contains("Show the end of the log"), "{html}");
     assert!(html.contains("<dd>2.9 MiB</dd>"), "the size is the whole's");
     assert!(html.contains(&link));
     assert_eq!(pre(&html).len(), CAP);
 
-    let exact = partial(vec![b'a'; CAP], CAP);
-    let (_, html) = page(&exact, "stderr");
-    assert!(!html.contains("Cut:"), "a log of exactly the cap is whole");
+    let fake = partial(vec![b'a'; CAP], 3_000_000);
+    let (status, html) = page_at(&fake, "stderr", "?from=start");
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Cut: only the first 1.0 MiB of the log is shown. "),
+        "{}",
+        &html[..html.len().min(3000)]
+    );
+    assert!(html.contains(&other_end("", "Show the end of the log")));
+    assert!(!html.contains("Show the start of the log"), "{html}");
     assert!(html.contains(&link));
 
-    let small = partial("short\n", 6);
+    for (fake, query) in [
+        (tail(vec![b'a'; CAP], CAP), ""),
+        (partial(vec![b'a'; CAP], CAP), "?from=start"),
+    ] {
+        let (_, html) = page_at(&fake, "stderr", query);
+        assert!(!html.contains("Cut:"), "a log of exactly the cap is whole");
+        assert!(!html.contains("Show the "), "{html}");
+        assert!(html.contains(&link));
+    }
+
+    let small = tail("short\n", 6);
     let (_, html) = page(&small, "stderr");
     assert!(!html.contains("Cut:"));
     assert_eq!(pre(&html), "short\n");
     assert!(html.contains("<dd>6 B</dd>"), "{html}");
 }
 
+/// Catches: the end of the log taken from anything but `from=start` exactly: `from=end`,
+/// an unknown value, an empty one and a hostile one are the default tail, the first of
+/// two values counts, and a value is never written to the page. Mutants: the match
+/// arm for `start` always taken; the default the head; the value echoed.
+#[test]
+fn only_from_start_asks_for_the_head() {
+    let hostile = "?from=%3Cscript%3Ealert(1)%3C%2Fscript%3E";
+    for query in [
+        "",
+        "?from=end",
+        "?from=",
+        "?from=START",
+        "?other=start",
+        "?from=end&from=start",
+        hostile,
+    ] {
+        let fake = tail("x", 1);
+        let (status, html) = page_at(&fake, "stderr", query);
+        assert_eq!(status, 200, "{query}");
+        assert_eq!(fake.suffixes().len(), 1, "{query} is the tail");
+        assert!(fake.ranges().is_empty(), "{query}");
+        assert!(!html.contains("<script>alert"), "{query}: {html}");
+    }
+    for query in ["?from=start", "?from=start&from=end", "?x=1&from=start"] {
+        let fake = partial("x", 1);
+        let (status, _) = page_at(&fake, "stderr", query);
+        assert_eq!(status, 200, "{query}");
+        assert_eq!(fake.ranges().len(), 1, "{query} is the head");
+        assert!(fake.suffixes().is_empty(), "{query}");
+    }
+}
+
 /// Catches: a cut inside a code point shown as a replacement character the log does not
-/// hold, or a real invalid byte dropped with it. Mutants: the cut not trimmed; the trim
-/// applied to a log that is whole.
+/// hold, or a real invalid byte dropped with it: at the END of a head window and at the
+/// START of a tail window (the euro sign, three bytes, cut after one and after two of
+/// them). Mutants: the cut not trimmed; the trim applied to a log that is whole; the tail
+/// trimmed at its end, or the head at its start.
 #[test]
 fn a_cut_inside_a_code_point_drops_the_part_and_a_whole_log_does_not() {
     let mut cut = vec![b'a'; CAP - 2];
     cut.extend_from_slice(&[0xe2, 0x82]);
-    let (_, html) = page(&partial(cut, CAP + 100), "stderr");
+    let (_, html) = page_at(&partial(cut, CAP + 100), "stderr", "?from=start");
     let shown = pre(&html);
     assert!(!shown.contains('\u{fffd}'), "{}", shown.len());
     assert_eq!(shown.len(), CAP - 2);
 
-    let (_, html) = page(&partial(b"ab\xe2\x82".to_vec(), 4), "stderr");
+    // A tail window that starts with the last one or two bytes of a code point.
+    for split in [&[0x82, 0xac][..], &[0xac][..]] {
+        let mut cut = split.to_vec();
+        cut.extend_from_slice(&vec![b'b'; CAP - split.len()]);
+        let (_, html) = page(&tail(cut, CAP + 100), "stderr");
+        let shown = pre(&html);
+        assert!(!shown.contains('\u{fffd}'), "{split:x?}: {}", shown.len());
+        assert_eq!(shown.len(), CAP - split.len(), "{split:x?}");
+    }
+    // A tail window that ends with an incomplete sequence is the log's own: shown.
+    let mut end = vec![b'b'; CAP - 1];
+    end.push(0xe2);
+    let (_, html) = page(&tail(end, CAP + 100), "stderr");
+    assert!(pre(&html).ends_with('\u{fffd}'), "the log's own bad byte");
+    // A head window that starts with a continuation byte is the log's own: shown.
+    let (_, html) = page_at(
+        &partial(b"\xac b".to_vec(), CAP + 100),
+        "stderr",
+        "?from=start",
+    );
+    assert!(pre(&html).starts_with('\u{fffd}'), "the log's own bad byte");
+
+    let (_, html) = page_at(&partial(b"ab\xe2\x82".to_vec(), 4), "stderr", "?from=start");
     assert_eq!(pre(&html), "ab\u{fffd}", "a whole log's bad end is shown");
+    let (_, html) = page(&tail(b"\x82\xacab".to_vec(), 4), "stderr");
+    assert_eq!(
+        pre(&html),
+        "\u{fffd}\u{fffd}ab",
+        "a whole log's bad start is shown"
+    );
 }
 
 /// Catches: a source that ignored the range (a `200` with the whole log) shown whole: the
-/// page reads no more than it asked for even then. Mutant: the body not truncated.
+/// page reads no more than it asked for even then, and keeps the end that was asked for:
+/// the last MiB by default (the 10 bytes before it are not shown), the first with
+/// `?from=start`. Mutants: the body not truncated; a tail cut from its front; a head cut
+/// from its back.
 #[test]
-fn a_range_the_source_ignored_is_cut_to_the_cap() {
-    let whole = vec![b'a'; CAP + 10];
-    let fake = Fake::default().with(&route("stderr"), 200, whole);
+fn a_range_the_source_ignored_is_cut_to_the_cap_from_the_end_asked_for() {
+    let mut whole = vec![b'x'; 10];
+    whole.extend_from_slice(&vec![b'a'; CAP]);
+    let fake = Fake::default().with(&route("stderr"), 200, whole.clone());
     let (status, html) = page(&fake, "stderr");
     assert_eq!(status, 200);
     assert_eq!(pre(&html).len(), CAP);
+    assert!(!pre(&html).contains('x'), "the tail is the end of the log");
+    assert!(html.contains("Cut: only the last 1.0 MiB"), "cut says so");
+
+    let (status, html) = page_at(&fake, "stderr", "?from=start");
+    assert_eq!(status, 200);
+    assert_eq!(pre(&html).len(), CAP);
+    assert!(
+        pre(&html).starts_with("xxxxxxxxxxaa"),
+        "the head is the start"
+    );
     assert!(html.contains("Cut: only the first 1.0 MiB"), "cut says so");
 }
 
@@ -324,5 +456,29 @@ fn only_a_trailing_incomplete_sequence_is_dropped() {
     ];
     for (given, want) in cases {
         assert_eq!(without_split_char(given), want, "{given:?}");
+    }
+}
+
+/// Catches: a leading continuation byte kept (a replacement character the log does not
+/// hold), a lead byte or an ASCII byte dropped, or more than the three bytes that can
+/// belong to one code point dropped. Mutants: `take(3)` written `take(4)` or `take(2)`;
+/// the range edges moved by one; the run not stopped at the first other byte.
+#[test]
+fn only_a_leading_run_of_up_to_three_continuation_bytes_is_dropped() {
+    let cases: [(&[u8], &[u8]); 11] = [
+        (b"", b""),
+        (b"abc", b"abc"),
+        (b"\xacabc", b"abc"),
+        (b"\x82\xacabc", b"abc"),
+        (b"\x80\x80\xbfabc", b"abc"),
+        (b"\x80\x80\x80\x80abc", b"\x80abc"),
+        (b"\x7fabc", b"\x7fabc"),
+        (b"\xc0abc", b"\xc0abc"),
+        (b"\xe2\x82\xac", b"\xe2\x82\xac"),
+        (b"\x82a\xac", b"a\xac"),
+        (b"\xac\xac", b""),
+    ];
+    for (given, want) in cases {
+        assert_eq!(without_split_start(given), want, "{given:?}");
     }
 }

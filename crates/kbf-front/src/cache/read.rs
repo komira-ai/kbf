@@ -43,6 +43,9 @@ pub const MAX_DECODED_BLOB_BYTES: u64 = 64 << 20;
 
 /// Where the next window of a read comes from.
 enum Source {
+    /// Bytes held in RAM, whole ([`Cache::held`](super::Cache)): the blob is not read from
+    /// anywhere.
+    Held(Bytes),
     /// This server's write tier.
     Tier(Arc<Staging>),
     /// The store. A missing or damaged object is marked unreachable only if the blob
@@ -99,6 +102,12 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             read.done = true;
             return Ok(read);
         }
+        // Held first, then the index (`held` module docs).
+        let held = self.held.get(digest);
+        self.between_steps().await;
+        if let Some(bytes) = held {
+            return Ok(self.held_read(digest, bytes, from, to));
+        }
         let answer = self
             .touched(|s| (s.blob(digest), s.touch_for([digest])))
             .await?;
@@ -109,6 +118,36 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 location,
                 staged_on,
             } => self.located(digest, location, staged_on, from, to),
+        }
+    }
+
+    /// A read of bytes `[from, to)` of the held blob `digest`, whose whole bytes are
+    /// `bytes`. They are hashed as any blob's windows are, and no object is used.
+    pub(super) fn held_read(
+        &self,
+        digest: &Digest,
+        bytes: Bytes,
+        from: u64,
+        to: u64,
+    ) -> BlobRead<M, O> {
+        BlobRead {
+            writer: Arc::clone(&self.writer),
+            digest: *digest,
+            // Nowhere: a held blob has no object, and nothing reads `location` of a read
+            // whose source is `Source::Held`.
+            location: Location {
+                store: StoreId::CONFIGURED,
+                object: ObjectId::of(self.writer.names_as, 0),
+                offset: 0,
+            },
+            staged_on: None,
+            source: Source::Held(bytes),
+            from,
+            to,
+            at: 0,
+            hasher: RecordHasher::new(),
+            handed: false,
+            done: false,
         }
     }
 
@@ -192,7 +231,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 impl<M: MetaLog, O: ObjectStore> BlobRead<M, O> {
     /// Every byte the read hands over, gathered: one window's bytes as they are, more
     /// joined.
-    async fn gather(mut self) -> Result<Bytes, CacheError> {
+    pub(super) async fn gather(mut self) -> Result<Bytes, CacheError> {
         let Some(first) = self.next().await.transpose()? else {
             return Ok(Bytes::new());
         };
@@ -266,6 +305,10 @@ impl<M: MetaLog, O: ObjectStore> BlobRead<M, O> {
     /// `len` bytes of the blob from its byte `start`.
     async fn window(&mut self, start: u64, len: u64) -> Result<Bytes, CacheError> {
         let Location { object, offset, .. } = self.location;
+        if let Source::Held(bytes) = &self.source {
+            // The whole blob is in memory; `len` bytes from `start` are within it.
+            return Ok(bytes.slice(start as usize..(start + len) as usize));
+        }
         if let Source::Tier(staging) = &self.source {
             let tier = Arc::clone(&staging.tier);
             let n = usize::try_from(len).unwrap_or(usize::MAX);
@@ -329,7 +372,9 @@ impl<M: MetaLog, O: ObjectStore> BlobRead<M, O> {
                 let _ = staging.tier.discard(object);
                 marked
             }
-            Source::Tier(_) => Ok(()),
+            // Nothing to mark: a held blob has no object, and a flushed copy on the tier is
+            // not the only one.
+            Source::Tier(_) | Source::Held(_) => Ok(()),
             Source::Store => {
                 let mark = self.staged_on.is_none();
                 self.mark(UnreachableReason::Corrupt, mark).await.map(drop)

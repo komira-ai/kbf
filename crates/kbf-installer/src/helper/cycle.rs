@@ -9,7 +9,10 @@
 //! the restart is recorded as owed before it is tried, so a crash anywhere leaves a state the
 //! next pass completes. An order may name the release the host's package carries instead of
 //! one to fetch (`source = staged`, `staged.rs`): it is held to the package's manifest and to
-//! a floor on its `seq`, and then goes through the same fetcher, pipeline and swap.
+//! a floor on its `seq`, and then goes through the same fetcher, pipeline and swap. At the end
+//! of a pass the helper looks at the package and the source and tells the frontend what it
+//! found, and keeps the floor up with what the host has confirmed (`notice.rs`); the status
+//! says it, nothing else moves.
 
 use std::io::Write;
 use std::time::Duration;
@@ -26,8 +29,10 @@ use kbf_host::{Exec, HostPath, Perms, Step};
 use kbf_update::{Facts, Source};
 
 mod frontend;
+mod notice;
 mod staged;
 
+use self::notice::Notice;
 use self::staged::{Held, refusal_of};
 use crate::database::SchemaStep;
 use crate::helper::fetcher::{Fetcher, InstalledRelease};
@@ -90,6 +95,8 @@ pub struct Helper<E: Exec> {
     procs: Box<dyn Procs>,
     /// A swap was confirmed in this pass: the release it replaced may now be collected.
     gc_due: bool,
+    /// What the helper remembers of the package and the source between passes (`notice.rs`).
+    notice: Notice,
 }
 
 fn memory_path(host: &Layout) -> HostPath {
@@ -117,6 +124,7 @@ impl<E: Exec> Helper<E> {
             leases,
             procs,
             gc_due: false,
+            notice: Notice::default(),
         }
     }
 
@@ -240,11 +248,16 @@ impl<E: Exec> Helper<E> {
     /// One pass. `now` is seconds since the epoch.
     pub fn cycle(&mut self, now: u64) -> Result<(), HelperError> {
         let mut memory = self.load()?;
+        self.notice.stamp(&mut memory);
         self.restart_if_owed(&mut memory)?;
         self.expire(now, &mut memory)?;
         self.orders(now, &mut memory)?;
         self.restart_if_owed(&mut memory)?;
         self.collect();
+        // What the orders came to is told before the look, which reads the package in full the
+        // first time and may run `gh`; the write is skipped when the second report is the same.
+        self.report(&memory)?;
+        self.notice_package(now, &mut memory);
         self.report(&memory)
     }
 
@@ -447,11 +460,18 @@ impl<E: Exec> Helper<E> {
             Kind::Frontend(_) => "floor: ",
             Kind::Node => "",
         };
+        // The proxy blames a refusal on its update by the order's id alone, so only its own
+        // kinds of order are named: the node's ids are another counter's.
+        let named = |o: &Order| match kind_of(o, &state, frontend_host) {
+            Kind::Frontend(_) => Some(o.id),
+            Kind::Node => None,
+        };
         match parsed {
             // A frontend order on a host that runs no frontend: refused, and like any
             // refusal of a record it does not move a floor.
-            Ok(o) if !frontend_host && o.verb == Verb::FrontendUpdate => refuse(
+            Ok(o) if !frontend_host && o.verb == Verb::FrontendUpdate => refuse_order(
                 memory,
+                named(&o),
                 &format!(
                     "denied: order {}: this host runs no frontend (frontend_update is refused): {}",
                     o.id,
@@ -462,8 +482,9 @@ impl<E: Exec> Helper<E> {
                 if floor(&o, memory).0 != 0
                     && o.epoch > floor(&o, memory).0.saturating_add(order::MAX_EPOCH_JUMP) =>
             {
-                refuse(
+                refuse_order(
                     memory,
+                    named(&o),
                     &format!(
                         "{}order {} is from epoch {}, more than {} above the last acted on ({}): \
                          not acted on",
@@ -476,8 +497,9 @@ impl<E: Exec> Helper<E> {
                 );
             }
             Ok(o) if o.epoch < floor(&o, memory).0 => {
-                refuse(
+                refuse_order(
                     memory,
+                    named(&o),
                     &format!(
                         "{}order {} is from epoch {}, older than the last acted on ({})",
                         word(&o),
@@ -504,6 +526,9 @@ impl<E: Exec> Helper<E> {
                     }
                 }
                 memory.last_acted_id = o.id;
+                // Every way of acting on an order sets the event, so a refusal here is this
+                // order's: the proxy that wrote it can tell it from an older one by the id.
+                memory.refused_order_id = named(&o).filter(|_| memory.event == Event::Refused);
             }
             // Not acknowledged: a garbage file must not move the floor.
             Err(why) => refuse(memory, &format!("order file {name}: {why}")),
@@ -550,6 +575,9 @@ impl<E: Exec> Helper<E> {
                     memory.last_activation_at = now;
                 }
                 self.gc_due |= done.kept;
+                if done.kept {
+                    self.raise_floor();
+                }
             }
             Err(why) => {
                 refuse(memory, &why);
@@ -884,9 +912,19 @@ fn platform_prefix(host: &Layout) -> &'static str {
     }
 }
 
+/// Record a refusal that is no order's (a record that could not be read, a restart that failed,
+/// the spool crowded): it names none.
 fn refuse(memory: &mut Memory, why: &str) {
     memory.event = Event::Refused;
     memory.refusal = why.to_owned();
+    memory.refused_order_id = None;
+}
+
+/// Record the refusal of an order, named by `id` when it is one of the proxy's, so that whoever
+/// wrote the order can tell its refusal from an older one.
+fn refuse_order(memory: &mut Memory, id: Option<u64>, why: &str) {
+    refuse(memory, why);
+    memory.refused_order_id = id;
 }
 
 fn release_err(e: &ReleaseError) -> String {

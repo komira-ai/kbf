@@ -72,6 +72,15 @@ message UpdateOrder {
     // Go back to the previous release.
     VERB_REVERT = 3;
   }
+  // Where the release comes from. UNSPECIFIED (a frontend that predates the field) and FETCH
+  // both mean the installer fetches it, as every order has meant: unlike Verb, zero is valid.
+  // A sender writes the field only for STAGED (the release the host's package carries). A
+  // node refuses a number it does not know, and STAGED on CONFIRM or REVERT.
+  enum Source {
+    SOURCE_UNSPECIFIED = 0;
+    SOURCE_FETCH = 1;
+    SOURCE_STAGED = 2;
+  }
   // Strictly increasing; a host ignores an order it has already acknowledged.
   uint64 order_id = 1;
   // The epoch `Welcome` named, so an order from before a frontend restart is not replayed.
@@ -86,6 +95,7 @@ message UpdateOrder {
   // acted on, so a replayed or reordered order of an older desired state cannot undo a
   // newer one. 0 when a frontend predates the field.
   uint64 generation = 6;
+  Source source = 7;
 }
 
 // What a host reports about its update, resent on every change. Its own message of the
@@ -103,6 +113,24 @@ message UpdateStatus {
     STATE_REFUSED = 7;
     // The host takes no update by itself (no helper or not enabled).
     STATE_MANUAL = 8;
+  }
+  // A release the host's package carries, which its installer has found whole.
+  message Available {
+    // The commit: 40 lowercase hex digits.
+    string commit = 1;
+    // The number of commits behind it: puts two builds of one branch in order.
+    uint64 seq = 2;
+  }
+  // Where the host's installer fetches the releases it installs from.
+  enum ReleaseSource {
+    // The installer does not say (it predates the field).
+    RELEASE_SOURCE_UNSPECIFIED = 0;
+    // An https file server.
+    RELEASE_SOURCE_URL = 1;
+    // The frontend's release store.
+    RELEASE_SOURCE_FRONTEND = 2;
+    // Nothing: the release is the one the host's package carries.
+    RELEASE_SOURCE_BUNDLED = 3;
   }
   // The process's own build commit: 12 hex digits, or `unknown`.
   string running_commit = 1;
@@ -124,6 +152,14 @@ message UpdateStatus {
   uint32 staged_protocol = 9;
   uint32 staged_min_protocol = 10;
   uint32 staged_state_schema = 11;
+  // The release the host's package carries, when the host's installer has found it whole
+  // (its digests and its build attestation, checked offline) and newer than any release the
+  // host has confirmed. Unset when there is none, or when the installer predates the field. A
+  // report, not an offer: nothing here asks the host to do anything.
+  Available available = 12;
+  // Where the host's installer fetches releases from: a host that fetches nothing cannot
+  // carry out an order that does.
+  ReleaseSource release_source = 13;
 }
 
 message FetchRequest {

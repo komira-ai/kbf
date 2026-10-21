@@ -201,12 +201,22 @@ Each is a named entry in the summary's `steps`, with its duration.
      POST looks the same.
    - **Only `done` is success.** Any earlier phase is an update still going on. `failed` and
      `rolled_back` are failures (exit 1, `frontend_failed`, `frontend_rolled_back`) whose
-     detail and `frontend.failure` carry the step and the reason the API gave. A status that
-     cannot be had right now is asked for again; a `200` that is not an update status stops
-     the deploy (`api_error`). The deadline names the phase the update was in
+     detail and `frontend.failure` carry the step and the reason the API gave. One `failed`
+     at step `nodes` is different: the new frontend was swapped and serves, and the order for
+     the nodes did not land. If the new frontend answered and refused it, the deploy exits 3
+     (`nodes_refused`: the same order fails the same way); if it never answered in the time
+     the proxy allows, exit 1 (`nodes_unreached`). Either way the detail says the nodes were
+     not told, and running the same command again does not tell them: the frontend already
+     runs the commit (`same_commit` below), so `update` exits 0 and a repeated `deploy` waits
+     for nodes that are never offered it. Gate F does not read it as a reverted frontend. A
+     status that cannot be had right now is asked for again; a `200` that is not an update
+     status stops the deploy (`api_error`). The deadline names the phase the update was in
      (`frontend_timeout`).
    - **Answers to the POST that end the deploy:** `409 incompatible` is a refusal (exit 3);
-     `422` (the release is not complete for the platform) is a refusal (`release_incomplete`);
+     `409 source_refused` (the host fetches nothing, or the source does not fit the request)
+     and `422 not_staged` (the host's package carries no such release) are refusals under
+     their own words (exit 3); any other `422` (the release is not complete for the platform)
+     is a refusal (`release_incomplete`);
      `409 update_open`, `old_child_draining`, `installer_busy` or any other `409` is busy (exit 4);
      `409 state_lost`, `request_id_reused`, `request_id_retired` and any other status are
      failures (`api_error`). `409 same_commit` (the frontend already runs the commit) is no
@@ -300,10 +310,13 @@ own. A caller that still sends `--order` gets exit 2.
 
 0 deployed and all post checks green, or a plan. 1 failed (`node_not_confirmed`,
 `node_offline`, `nodes_not_offered`, `frontend_failed`, `frontend_rolled_back`,
-`frontend_timeout`, `postcheck_failed`, `upload_failed`, `api_error`). 2 usage or missing
-prerequisite (no token file, not root with `--apply`, bad bundle, a CA file with no
-certificate, no random source). 3 refused (`release_incomplete`, `incompatible`,
-`upload_conflict`, `node_platform_unknown`, `check_failed`, `no_nodes`). 4 busy (lock held,
+`frontend_timeout`, `nodes_unreached`, `postcheck_failed`, `upload_failed`, `api_error`). 2
+usage or missing prerequisite (no token file, not root with `--apply`, bad bundle, a CA file
+with no certificate, no random source). 3 refused (`release_incomplete`, `incompatible`,
+`source_refused`, `not_staged`, `nodes_refused`, `upload_conflict`, `node_platform_unknown`,
+`check_failed`, `no_nodes`). A `deploy` on a host whose `installer.toml` says
+`release_source = "bundled"` ends first, with `source_refused`, before the bundle is read: it
+can only fetch, and such a host fetches nothing. 4 busy (lock held,
 `frontend_busy`). 5 needs an operator: the CAS smoke did not run (`smoke_skipped`). A skipped
 check never reads as a pass.
 

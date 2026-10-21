@@ -31,6 +31,7 @@ impl ContentAddressableStorage for StorageService {
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
         self.guard(&request, Endpoint::FindMissing)?;
         self.check_map(generation::requested(&request)?).await?;
+        let durable = generation::durable_only(&request)?;
         let request = request.into_inner();
         if request.blob_digests.len() > MAX_FIND_MISSING_DIGESTS {
             return Err(Status::invalid_argument(format!(
@@ -46,7 +47,11 @@ impl ContentAddressableStorage for StorageService {
             .map(|d| wire::digest(Some(d)))
             .collect::<Result<Vec<_>, _>>()?;
         let catching_up = self.catching_up();
-        let missing = self.storage.find_missing(&digests).await?;
+        let missing = if durable {
+            self.storage.find_durable(&digests).await?
+        } else {
+            self.storage.find_missing(&digests).await?
+        };
         if let Some(status) = catch_up::missing_gap(catching_up, missing.len(), digests.len()) {
             return Err(status);
         }

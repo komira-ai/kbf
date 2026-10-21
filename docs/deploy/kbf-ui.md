@@ -53,7 +53,8 @@ Everything the pages read is shown **unredacted** to whoever reaches the port:
 - the build list, each build's actions, targets, and failed-action command arguments and
   environment names;
 - the end of each failed action's stdout and stderr, each attempt's logs on the Log page
-  (the first 1 MiB, with a note when it is cut), and a link that downloads the whole log;
+  (the last 1 MiB, or the first with `?from=start`, with a note when it is cut), and a link
+  that downloads the whole log;
 - node names, software versions, capacity, leases and the queue, and storage members and
   their health.
 
@@ -67,8 +68,14 @@ Every `/ui` answer carries a `Content-Security-Policy` of `default-src 'none'` w
 and images from the page's own origin only (no page uses an image), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
 `Cache-Control: no-store`, `Cross-Origin-Resource-Policy: same-origin`,
 `Cross-Origin-Opener-Policy: same-origin` and a `Permissions-Policy` that denies the powerful
-browser features. The proxy adds no HSTS header and puts none of these on its own pages
-(its 503 handover page).
+browser features. The proxy leaves a forwarded answer's headers as the server set them. The answers the proxy
+makes itself (the 503 handover page during a frontend swap, 404, 405, 401, the probes) carry
+a stricter set: `Content-Security-Policy: default-src 'none'; frame-ancestors 'none';
+base-uri 'none'; form-action 'none'`, `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`, `Cache-Control: no-store` and
+`Cross-Origin-Resource-Policy: same-origin`. Nothing sets HSTS: a farm often serves a
+private-CA or self-signed certificate, and HSTS would stop a browser from proceeding past
+the certificate warning to the UI.
 
 ## The per-client read bound
 
@@ -99,9 +106,12 @@ Overview, Nodes and Node; any other value or parameter is a `400`.
 | Leases | `/ui/leases` | What the scheduler holds now: node, phase, age, operation, platform and QoS; filter `?node=` |
 | Queue | `/ui/queue` | Depth, oldest age, the queue per platform and QoS, and why operations wait or are kept off nodes |
 | Storage | `/ui/storage` | Under-replicated blobs, each member's state, repair debts and open writes, and its write-tier flush backlog |
-| Log | `/ui/runs/{run_id}/logs/{stream}` | One run's log (`stdout`, `stderr` or `result`) as escaped text, the first 1 MiB, with a note when it is cut and a link that downloads the whole log; reached from the Action page |
+| Log | `/ui/runs/{run_id}/logs/{stream}` | One run's log (`stdout`, `stderr` or `result`) as escaped text, the last 1 MiB (`?from=start` for the first), with a note that names the end shown when it is cut, a link to the other end and a link that downloads the whole log; reached from the Action page |
 | Updates | `/ui/updates` | The desired release, the releases, and each host's update state; the command that sets the release is shown as text only |
 
 Nodes, leases and the queue live in the server's memory: after a restart or a frontend
-swap they are empty until the daemons reconnect, and the pages say so. A value the server
+swap they are empty until the daemons reconnect, and the pages say so, with the time the
+server started and how long it has run (`started_unix_ms` and `uptime_ms` of
+`GET /v1/health`; a page says the time is not known when the server does not send it).
+A value the server
 does not know is shown as "unknown" or "not measured", never as zero.

@@ -5,7 +5,7 @@ crate has no library and no binary, and every dependency is a dev-dependency. A 
 the real `kbf` processes through `kbf-harness` and talks to them as a deployer's client would
 (REAPI); it links no `kbf-server` or `kbf-node` code. One crate per component under test,
 named for it (`kbf-all-in-one-test` is the all-in-one farm's). The Mac legs go here as more
-test targets.
+test targets (the first: `tests/mac_pool_spike`, below).
 
 ## No residue, no cross-action data access (T018)
 
@@ -109,6 +109,31 @@ not written yet must `unimplemented!("mac leg: ...")`, so a missing leg is loud.
 binary), then `cargo test -p kbf-daemon-test --test isolation`. Each test starts its own farm
 (ports and directories are the farm's own, nothing is shared between tests), so tests may
 run side by side; process scans are keyed on the test's farm directory.
+
+### The Mac spike (`tests/mac_pool_spike`, M0 of the Mac legs)
+
+A root-only, macOS-only test target that asserts NOTHING about isolation. It makes two pool
+users `kbf-pool-0` and `kbf-pool-1` with `dscl` (uids from 790, the primary group id the first
+uid, as `Pool::provisioned` mandates), starts the real `kbf daemon --driver native
+--pool-users 2 --pool-first-uid 790` as root behind the fake front kbf-cli's
+`tests/macos_daemon.rs` uses, runs actions through it, and writes every fact as a `SPIKE` line
+(`grep '^SPIKE'` reads the log back; the last block, `SPIKE summary`, answers the questions):
+does `launchctl asuser` work for `dscl`-made users, does `user/<uid>` exist with nobody logged
+in, does a root daemon with a pool start on the runner, did the action run as a pool uid, do
+`security`, `pbcopy`, `pbpaste` and `defaults` work for that user headless (one lease per
+program, run by the daemon and, without daemon and sandbox, by `launchctl asuser`), did the
+lease directory appear while the action ran and is it gone after the `Result`, what two
+leases at once look like, and how long each step takes. It fails only when the harness did not
+run (users not made, no `Hello`, a lease without a `Result`).
+
+It must run as root and never touches a provisioned pool: every record it makes carries a
+mark in its `Comment`, a run first removes the marked leftovers of an earlier run, and it
+refuses to start when a `kbf-pool-<n>` user, a user at one of its uids or a group at its
+group id is not its own. Run it with `cargo build -p kbf-cli --bin kbf --locked`, then
+`cargo xtask sudo-test -p kbf-daemon-test --test mac_pool_spike -- --test-threads=1
+--nocapture`. It runs in beta.yml's `native-macos` job (after the pool tests of
+`kbf-driver-native`) and, by hand on a branch, as the `pool-spike` job of
+`spike-slot-reach.yml`.
 
 ## How to add a test
 

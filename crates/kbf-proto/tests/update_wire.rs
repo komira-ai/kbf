@@ -14,8 +14,8 @@
 //!   `DaemonMessage`, 8 and 9 of `ServerMessage`;
 //! - an enum value renumbered, or a service renamed (the path a client dials).
 
-use kbf_proto::update::update_order::Verb;
-use kbf_proto::update::update_status::State;
+use kbf_proto::update::update_order::{Source as OrderSource, Verb};
+use kbf_proto::update::update_status::{Available, ReleaseSource, State};
 use kbf_proto::update::{
     Component, DescribeRequest, FetchChunk, FetchRequest, ReleaseComponent, ReleaseDescription,
     UpdateOffer, UpdateOrder, UpdateStatus, release_service_server::ReleaseServiceServer,
@@ -95,6 +95,19 @@ const STATUS: &[&str] = &[
     "5001",
     // staged_state_schema = 4
     "5804",
+];
+
+/// The two fields a host adds when its package carries a seed, in the order they follow the
+/// others: `available`, then `release_source`.
+const PACKAGE: &[&str] = &[
+    // available: tag 12, length 0x2d = 45
+    "622d",
+    // available.commit
+    "0a2830313233343536373839616263646566303132333435363738396162636465663031323334353637",
+    // available.seq = 812
+    "10ac06",
+    // release_source = RELEASE_SOURCE_BUNDLED
+    "6803",
 ];
 
 const FETCH_REQUEST: &[&str] = &[
@@ -192,6 +205,7 @@ fn order() -> UpdateOrder {
         commit: COMMIT.to_owned(),
         window_s: 900,
         generation: 11,
+        source: 0,
     }
 }
 
@@ -208,6 +222,8 @@ fn status() -> UpdateStatus {
         staged_protocol: 2,
         staged_min_protocol: 1,
         staged_state_schema: 4,
+        available: None,
+        release_source: ReleaseSource::Unspecified.into(),
     }
 }
 
@@ -232,9 +248,63 @@ fn order_bytes() {
     golden(&order(), &bytes(ORDER));
 }
 
+/// Catches `source` renumbered off field 7 (tag `0x38`), `FETCH` and `STAGED` swapped, and a
+/// number the node does not know refused at decode instead of by the node (it must survive as
+/// the number it is). An unset source writing nothing is pinned by `order_bytes`.
+#[test]
+fn a_staged_order_is_field_7_and_an_explicit_fetch_is_1() {
+    let staged = UpdateOrder {
+        source: OrderSource::Staged.into(),
+        ..order()
+    };
+    golden(&staged, &bytes(&[ORDER, &["3802"][..]].concat()));
+    let fetch = UpdateOrder {
+        source: OrderSource::Fetch.into(),
+        ..UpdateOrder::default()
+    };
+    golden(&fetch, &bytes(&["3801"]));
+    let unknown = UpdateOrder::decode(&bytes(&["3809"])[..]).expect("decodes");
+    assert_eq!(unknown.source, 9);
+}
+
 #[test]
 fn status_bytes() {
     golden(&status(), &bytes(STATUS));
+}
+
+/// Catches a renumbered or retyped `available` (field 12, a message of the commit and a
+/// two-byte varint `seq`) or `release_source` (field 13, an enum), the enum's `bundled`
+/// renumbered, and either written before a field of a lower number. A host that reports
+/// neither writes neither (`defaults_are_not_written`), so an older frontend reads the rest.
+#[test]
+fn status_reports_the_package_and_the_source() {
+    let package = UpdateStatus {
+        available: Some(Available {
+            commit: COMMIT.to_owned(),
+            seq: 812,
+        }),
+        release_source: ReleaseSource::Bundled.into(),
+        ..UpdateStatus::default()
+    };
+    golden(&package, &bytes(PACKAGE));
+    let full = UpdateStatus {
+        available: package.available.clone(),
+        release_source: package.release_source,
+        ..status()
+    };
+    let mut want = bytes(STATUS);
+    want.extend(bytes(PACKAGE));
+    golden(&full, &want);
+    // The other sources are the numbers the enum says.
+    let numbers = [
+        (ReleaseSource::Unspecified, 0),
+        (ReleaseSource::Url, 1),
+        (ReleaseSource::Frontend, 2),
+        (ReleaseSource::Bundled, 3),
+    ];
+    for (source, number) in numbers {
+        assert_eq!(source as i32, number);
+    }
 }
 
 #[test]
@@ -354,8 +424,16 @@ fn enum_numbers_are_pinned() {
     ] {
         assert_eq!(state as i32, n);
     }
+    for (source, n) in [
+        (OrderSource::Unspecified, 0),
+        (OrderSource::Fetch, 1),
+        (OrderSource::Staged, 2),
+    ] {
+        assert_eq!(source as i32, n);
+    }
     assert!(State::try_from(9).is_err());
     assert!(Verb::try_from(4).is_err());
+    assert!(OrderSource::try_from(3).is_err());
 }
 
 /// Catches a service renamed: the name is the path every host dials.

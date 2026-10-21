@@ -1122,7 +1122,8 @@ says which in `ready`.
              "quarantined": 0, "disconnected": 1 },
   "queue": { "depth": 3, "oldest_age_ms": 41200 },
   "leases": 7,
-  "storage": { "members_active": 3, "members_total": 3, "under_replicated_blobs": 0 } }
+  "storage": { "members_active": 3, "members_total": 3, "under_replicated_blobs": 0 },
+  "started_unix_ms": 1792584000000, "uptime_ms": 86400000 }
 ```
 
 | Field | Same value as |
@@ -1132,6 +1133,7 @@ says which in `ready`.
 | `queue.depth`, `queue.oldest_age_ms` | `depth` and `oldest_age_ms` of `GET /v1/queue`, both read from one scheduler snapshot (`depth` is also `queued_operations` of `GET /v1/frontend/drain`). `oldest_age_ms` is how long the longest-waiting operation has waited, in milliseconds, and `null` only when nothing waits |
 | `leases` | the sum of `lease_count` of `GET /v1/nodes` |
 | `storage` | `members_active`, `members_total` and `under_replicated_blobs` of `GET /v1/storage` (`null` while unknown, never zero); `storage` is `null` when this server keeps no storage members, and when the membership cannot be read, with `storage_unavailable` saying why |
+| `started_unix_ms`, `uptime_ms` | when the server started, as milliseconds since the Unix epoch on its wall clock, and the milliseconds since then by its monotonic clock (so a clock step does not change `uptime_ms`). A frontend swap starts a new frontend, and with it a new `started_unix_ms`: it is when the in-memory state below began to fill |
 
 In memory like `GET /v1/nodes`: after a restart or a frontend swap `nodes`, `queue` and
 `leases` count only what has reconnected since. The update state and the history store's
@@ -1795,7 +1797,10 @@ there is nothing to mount it on.
   `Cross-Origin-Opener-Policy: same-origin` and a `Permissions-Policy` denying every
   powerful feature (camera, microphone, geolocation, usb, serial, hid, bluetooth,
   payment, display capture, clipboard, midi, xr, and the rest of its list) with an
-  empty allowlist. No `Strict-Transport-Security`: TLS ends at the proxy.
+  empty allowlist. No `Strict-Transport-Security`, deliberately: a farm often serves a
+  private-CA or self-signed certificate, and HSTS would stop a browser from proceeding
+  past its warning. The proxy's own answers (503 handover page, 404, 405, 401) carry a
+  stricter set; see `docs/deploy/kbf-ui.md`.
 - **Bounds.** Each caller has at most 4 reads open at once on `/ui`, and 4 on the read
   routes the pages use (`/v1/blobs`, `/v1/invocations` and below, `/v1/runs` and the history
   routes, `/v1/update/hosts`): the fifth is `429` with `Retry-After: 1`, before its handler
