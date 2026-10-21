@@ -229,6 +229,9 @@ fn the_harness_runs_and_the_runner_is_measured() {
         );
     }
     session.welcome();
+    // The reader task acknowledges every heartbeat for the rest of the run, so a long
+    // action does not make the daemon fence itself.
+    session.keep_acknowledging();
     run(
         "daemon-process",
         "/bin/ps",
@@ -669,6 +672,15 @@ impl Leases<'_> {
                     .map(|l| format!("{l}\n"))
                     .collect();
                 lines("at-once", "ps", &acts, 6);
+                let dirs = run_quiet(
+                    "/bin/ls",
+                    &[
+                        "-ldn",
+                        &leases.join(format!("lease-1-{first}")).to_string_lossy(),
+                        &leases.join(format!("lease-1-{second}")).to_string_lossy(),
+                    ],
+                );
+                lines("at-once", "lease-dirs", &dirs.stdout, 4);
                 let _ = std::fs::write(&go, "");
             }
             if let Some(Message::Result(result)) = self.session.next(Duration::from_millis(100)) {
