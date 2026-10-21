@@ -307,6 +307,7 @@ async fn a_blob_moving_from_the_set_to_the_index_between_the_steps_is_never_miss
     for reader in Reader::ALL {
         let moving = blob(14, 200);
         let cache = draining_between_the_steps(&moving);
+        assert!(format!("{cache:?}").contains("BetweenHook"));
         assert!(reader.finds(&cache, &moving).await, "{reader:?} missed it");
     }
 }
