@@ -15,6 +15,8 @@
 //! - [`release`]: the `install`, `stage`, `rollback` and `gc` verbs.
 //! - [`activate`]: the swap on trial: `activate`, `confirm`, `revert`, the start check
 //!   and the expiry, and the repair of the links after an interrupted verb.
+//! - [`meta_log`]: the node's metadata log, saved at a release's first start and put back when
+//!   the host goes back to the release that ran before (an older binary refuses a raised log).
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //!

@@ -104,8 +104,10 @@ pub enum Restored {
 /// storage node in `[storage] meta_dir`, which defaults to `meta` in `[dirs] state` (default
 /// `/var/lib/kbf`), as the node's enrollment reads it.
 pub fn dir(host: &Layout) -> Result<Option<PathBuf>, MetaLogError> {
-    let Some(table) = host_mode::read_table(host).map_err(MetaLogError::Dir)? else {
-        return Ok(None);
+    let table = match host_mode::read_table(host) {
+        Ok(Some(table)) => table,
+        Ok(None) => return Ok(None),
+        Err(why) => return Err(MetaLogError::Dir(why)),
     };
     let get = |t: &str, k: &str| {
         table
@@ -140,12 +142,23 @@ pub(crate) fn backup_of(host: &Layout, holder: &CommitId) -> PathBuf {
 /// The release a copy was made for, `None` when there is no copy.
 fn read_for(backup: &Path) -> Result<Option<CommitId>, MetaLogError> {
     let file = backup.join(FOR);
-    match fs::read_to_string(&file) {
-        Ok(text) => CommitId::new(text.trim_end())
-            .map(Some)
-            .map_err(|_| MetaLogError::For(file)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(io_at(&file)(e)),
+    if look(&file)?.is_none() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&file).map_err(io_at(&file))?;
+    CommitId::new(text.trim_end())
+        .map(Some)
+        .map_err(|_| MetaLogError::For(file))
+}
+
+/// What is at `path`, not following a link; `None` when nothing is.
+fn look(path: &Path) -> Result<Option<fs::Metadata>, MetaLogError> {
+    match fs::symlink_metadata(path) {
+        Ok(found) => Ok(Some(found)),
+        Err(e) => match e.kind() {
+            io::ErrorKind::NotFound => Ok(None),
+            _ => Err(io_at(path)(e)),
+        },
     }
 }
 
@@ -155,8 +168,9 @@ fn read_for(backup: &Path) -> Result<Option<CommitId>, MetaLogError> {
 /// for another release is put back first (it is still owed), and then replaced. Every other
 /// release's copy is removed.
 pub fn save(host: &Layout, holder: &CommitId, next: &CommitId) -> Result<Saved, MetaLogError> {
-    let Some(meta) = dir(host)? else {
-        return Ok(Saved::NoLog);
+    let meta = match dir(host)? {
+        Some(meta) => meta,
+        None => return Ok(Saved::NoLog),
     };
     let backup = backup_of(host, holder);
     match read_for(&backup)? {
@@ -186,12 +200,15 @@ pub fn restore_owed(host: &Layout, current: &CommitId) -> Result<Restored, MetaL
     let Some(from) = read_for(&backup)? else {
         return Ok(Restored::Nothing);
     };
-    let Some(meta) = dir(host)? else {
-        return Err(MetaLogError::Dir(format!(
-            "{} holds a copy of the metadata log and {} names none",
-            host.release_dir(current),
-            host.kbf_toml()
-        )));
+    let meta = match dir(host)? {
+        Some(meta) => meta,
+        None => {
+            return Err(MetaLogError::Dir(format!(
+                "{} holds a copy of the metadata log and {} names none",
+                host.release_dir(current),
+                host.kbf_toml()
+            )));
+        }
     };
     Ok(if put_back(&meta, &backup)? {
         Restored::Put { from }
@@ -207,11 +224,10 @@ fn build(meta: &Path, tmp: &Path, next: &CommitId) -> Result<(), MetaLogError> {
     let mut out = File::create(&file).map_err(io_at(&file))?;
     io::Write::write_all(&mut out, format!("{next}\n").as_bytes()).map_err(io_at(&file))?;
     out.sync_all().map_err(io_at(&file))?;
-    match fs::symlink_metadata(meta) {
-        Ok(m) if m.is_dir() => copy_tree(meta, &tmp.join(LOG))?,
-        Ok(_) => return Err(MetaLogError::Kind(meta.to_owned())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(io_at(meta)(e)),
+    match look(meta)?.map(|found| found.is_dir()) {
+        Some(true) => copy_tree(meta, &tmp.join(LOG))?,
+        Some(false) => return Err(MetaLogError::Kind(meta.to_owned())),
+        None => {}
     }
     sync_dir(tmp)
 }
@@ -223,20 +239,12 @@ fn put_back(meta: &Path, backup: &Path) -> Result<bool, MetaLogError> {
     let log = backup.join(LOG);
     let changed = !same(meta, &log).map_err(io_at(meta))?;
     if changed {
-        let wanted = match fs::symlink_metadata(&log) {
-            Ok(m) => Some(m),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(io_at(&log)(e)),
-        };
-        match fs::symlink_metadata(meta) {
-            Ok(m) if m.is_dir() => empty(meta)?,
-            Ok(_) => return Err(MetaLogError::Kind(meta.to_owned())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                if wanted.is_some() {
-                    fs::create_dir_all(meta).map_err(io_at(meta))?;
-                }
-            }
-            Err(e) => return Err(io_at(meta)(e)),
+        let wanted = look(&log)?;
+        match look(meta)?.map(|found| found.is_dir()) {
+            Some(true) => empty(meta)?,
+            Some(false) => return Err(MetaLogError::Kind(meta.to_owned())),
+            // Not there while the copy differs from nothing: the copy has a log.
+            None => fs::create_dir_all(meta).map_err(io_at(meta))?,
         }
         if let Some(wanted) = wanted {
             copy_children(&log, meta)?;
@@ -266,9 +274,9 @@ fn prune(host: &Layout, keep: &CommitId) -> Result<(), MetaLogError> {
 }
 
 fn remove_if_there(path: &Path) -> Result<(), MetaLogError> {
-    match fs::remove_dir_all(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        other => other.map_err(io_at(path)),
+    match look(path)? {
+        Some(_) => fs::remove_dir_all(path).map_err(io_at(path)),
+        None => Ok(()),
     }
 }
 
@@ -344,13 +352,14 @@ fn same(a: &Path, b: &Path) -> io::Result<bool> {
     for name in left {
         let (x, y) = (a.join(&name), b.join(&name));
         let (mx, my) = (fs::symlink_metadata(&x)?, fs::symlink_metadata(&y)?);
-        let alike = match (mx.is_dir(), my.is_dir()) {
-            (true, true) => same(&x, &y)?,
-            (false, false) => {
-                mx.is_file() && my.is_file() && mx.len() == my.len() && same_bytes(&x, &y)?
-            }
-            _ => false,
-        };
+        // A copy holds files and directories only, so equal kinds that are not directories are
+        // files.
+        let alike = mx.file_type() == my.file_type()
+            && if mx.is_dir() {
+                same(&x, &y)?
+            } else {
+                same_bytes(&x, &y)?
+            };
         if !alike {
             return Ok(false);
         }
@@ -359,13 +368,13 @@ fn same(a: &Path, b: &Path) -> io::Result<bool> {
 }
 
 fn names(dir: &Path) -> io::Result<Vec<std::ffi::OsString>> {
-    let items = match fs::read_dir(dir) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        listed => listed?,
-    };
-    let mut names = items
-        .map(|i| i.map(|i| i.file_name()))
-        .collect::<io::Result<Vec<_>>>()?;
+    if !fs::exists(dir)? {
+        return Ok(Vec::new());
+    }
+    let mut names = Vec::new();
+    for item in fs::read_dir(dir)? {
+        names.push(item?.file_name());
+    }
     names.sort();
     Ok(names)
 }
@@ -375,7 +384,8 @@ fn same_bytes(a: &Path, b: &Path) -> io::Result<bool> {
     let (mut bx, mut by) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
     loop {
         let n = read_full(&mut x, &mut bx)?;
-        if n != read_full(&mut y, &mut by)? || bx[..n] != by[..n] {
+        let m = read_full(&mut y, &mut by)?;
+        if n != m || bx[..n] != by[..n] {
             return Ok(false);
         }
         if n == 0 {

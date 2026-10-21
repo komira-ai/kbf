@@ -59,6 +59,8 @@ fn rig(name: &str) -> Rig {
     rig.put("RECORD", OLD, 0o640);
     rig.put("raft/segment-1", b"entry one\nentry two\n", 0o600);
     rig.put("raft/LOCK", b"", 0o600);
+    // Longer than the buffer the comparison reads with.
+    rig.put("raft/big", &vec![7u8; 150_000], 0o600);
     rig
 }
 
@@ -623,7 +625,7 @@ fn a_copy_that_cannot_be_read_or_placed_is_refused() {
 /// compared.
 #[test]
 fn a_log_that_differs_in_bytes_kind_or_name_is_put_back() {
-    for change in 0..4 {
+    for change in 0..5 {
         let rig = rig(&format!("differs-{change}"));
         save(&rig.layout, &c(A), &c(B)).expect("save");
         let raft = rig.log().join("raft");
@@ -638,10 +640,12 @@ fn a_log_that_differs_in_bytes_kind_or_name_is_put_back() {
             // A name more.
             2 => fs::write(raft.join("extra"), b"").expect("w"),
             // A directory made a file.
-            _ => {
+            3 => {
                 fs::remove_dir_all(&raft).expect("rm");
                 fs::write(&raft, b"x").expect("w");
             }
+            // A file cut short, past the buffer.
+            _ => fs::write(raft.join("big"), vec![7u8; 140_000]).expect("w"),
         }
         assert!(
             matches!(
@@ -656,4 +660,84 @@ fn a_log_that_differs_in_bytes_kind_or_name_is_put_back() {
             b"entry one\nentry two\n"
         );
     }
+}
+
+/// Catches a start check that assumes a state: a host with none (nothing installed yet) has no
+/// release that could hold a copy, and the start goes on.
+///
+/// Mutant planted: the missing release unwrapped.
+#[test]
+fn a_host_with_no_state_has_nothing_to_put_back() {
+    let mut rig = rig("empty");
+    // No state and no link: a link with no state is a lost state.
+    let installer = rig.exec.root.join("var/lib/kbf-installer");
+    fs::remove_file(installer.join("releases/current")).expect("rm");
+    fs::remove_file(installer.join("state.json")).expect("rm");
+    assert_eq!(rig.boot(1_000), Boot::Nothing);
+}
+
+/// Catches a first release saved against nothing: a swap with no release before it (a host
+/// that had none current) has no older binary to go back to and no log to keep for it.
+///
+/// Mutant planted: a copy made in the directory of the release itself.
+#[test]
+fn a_swap_with_no_older_release_saves_nothing() {
+    let mut rig = rig("first-release");
+    Locked::acquire(&rig.layout)
+        .expect("lock")
+        .write(&State::default())
+        .expect("state");
+    rig.activate_b();
+    assert_eq!(rig.state().pending_confirm.expect("pending").previous, None);
+    assert_eq!(
+        rig.boot(1_100),
+        Boot::Start {
+            starts_left: Some(2)
+        }
+    );
+    for release in [A, B, C] {
+        assert!(!rig.backup(release).exists(), "{release}");
+    }
+    assert_eq!(refusal(&rig.layout), None);
+}
+
+/// Catches a restore that takes a link for the log's directory: a log that was replaced by a
+/// link is refused, not emptied through the link.
+///
+/// Mutant planted: the log's kind not checked before it is emptied.
+#[test]
+fn a_log_that_became_a_link_is_not_emptied() {
+    let rig = rig("linked");
+    save(&rig.layout, &c(A), &c(B)).expect("save");
+    let elsewhere = rig.exec.root.join("var/lib/elsewhere");
+    fs::create_dir_all(&elsewhere).expect("dir");
+    fs::write(elsewhere.join("keep"), b"mine").expect("file");
+    fs::remove_dir_all(rig.log()).expect("rm");
+    symlink(&elsewhere, rig.log()).expect("link");
+    assert!(matches!(
+        restore_owed(&rig.layout, &c(A)),
+        Err(MetaLogError::Kind(_))
+    ));
+    assert_eq!(fs::read(elsewhere.join("keep")).expect("kept"), b"mine");
+    assert!(
+        rig.backup(A).exists(),
+        "the copy stays until it is put back"
+    );
+}
+
+/// Catches a release directory that cannot be looked into taken for a release with no copy: a
+/// start would then go on to run an older binary on a raised log. It is an error naming the
+/// path.
+///
+/// Mutant planted: any error looking for the copy taken for its absence.
+#[test]
+fn a_copy_that_cannot_be_looked_for_is_an_error_not_an_absent_one() {
+    let rig = rig("not-a-dir");
+    let release = rig.exec.root.join("var/lib/kbf-installer/releases").join(C);
+    fs::remove_dir_all(&release).expect("rm");
+    fs::write(&release, b"a file where the release belongs").expect("file");
+    let why = restore_owed(&rig.layout, &c(C))
+        .expect_err("an error")
+        .to_string();
+    assert!(why.contains(C), "{why}");
 }
