@@ -200,6 +200,16 @@ fn the_build_list_is_optional_and_honest() {
         "the health is still shown"
     );
 
+    // A farm with no history answers the list as an unknown route: say so, name the flag.
+    let off = Fake::default()
+        .json("/v1/health", &health_doc())
+        .with(LATEST_URL, 404, "");
+    let (status, html) = page(&off, "/ui");
+    assert_eq!(status, 200, "{html}");
+    assert!(html.contains("History is off on this farm"), "{html}");
+    assert!(html.contains("--history-objects"), "{html}");
+    assert!(!html.contains("not available"), "{html}");
+
     let (status, html) = page(&farm_with(&health_doc()), "/ui");
     assert_eq!(status, 200);
     assert!(html.contains("The farm has recorded no build."), "{html}");

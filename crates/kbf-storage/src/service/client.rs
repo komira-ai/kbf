@@ -29,7 +29,9 @@ use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::{Code, Request, Response, Status};
 
-use super::{MAP_GENERATION_HEADER, MAX_MESSAGE_BYTES, UNOWNED_HEADER, wire};
+use super::{
+    DURABLE_HEADER, DURABLE_ONLY, MAP_GENERATION_HEADER, MAX_MESSAGE_BYTES, UNOWNED_HEADER, wire,
+};
 use crate::{ActionEntry, Answer, PutStream, ReadStream, Storage, StorageError, in_flight};
 
 /// The largest message of a `Write`'s data.
@@ -232,28 +234,45 @@ fn record_to_proto(record: &ActionRecord) -> Record {
 /// The most [`RemoteStorage::read_blob`] allocates before the first byte arrives.
 const READ_BLOB_PREALLOCATE: u64 = 64 << 20;
 
+impl RemoteStorage {
+    /// `FindMissingBlobs` for `digests`, marked [`DURABLE_HEADER`] when `durable`.
+    async fn ask_missing(
+        &self,
+        digests: &[Digest],
+        durable: bool,
+    ) -> Result<Vec<Digest>, StorageError> {
+        let request = FindMissingBlobsRequest {
+            instance_name: String::new(),
+            blob_digests: digests.iter().map(wire::to_proto).collect(),
+            digest_function: 0,
+        };
+        let mut request = self.tag(request);
+        if durable {
+            request
+                .metadata_mut()
+                .insert(DURABLE_HEADER, MetadataValue::from_static(DURABLE_ONLY));
+        }
+        let mut client = ContentAddressableStorageClient::new(self.channel.clone())
+            .max_decoding_message_size(MAX_MESSAGE_BYTES);
+        let response = client.find_missing_blobs(request).await.map_err(other)?;
+        response
+            .into_inner()
+            .missing_blob_digests
+            .iter()
+            .map(|d| wire::digest(Some(d)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(other)
+    }
+}
+
 impl Storage for RemoteStorage {
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
-        Box::pin(async move {
-            let request = FindMissingBlobsRequest {
-                instance_name: String::new(),
-                blob_digests: digests.iter().map(wire::to_proto).collect(),
-                digest_function: 0,
-            };
-            let mut client = ContentAddressableStorageClient::new(self.channel.clone())
-                .max_decoding_message_size(MAX_MESSAGE_BYTES);
-            let response = client
-                .find_missing_blobs(self.tag(request))
-                .await
-                .map_err(other)?;
-            response
-                .into_inner()
-                .missing_blob_digests
-                .iter()
-                .map(|d| wire::digest(Some(d)))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(other)
-        })
+        Box::pin(self.ask_missing(digests, false))
+    }
+
+    /// Asks with [`DURABLE_HEADER`]: the node answers from its index alone.
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(self.ask_missing(digests, true))
     }
 
     /// The whole blob, collected from the stream of [`Storage::read_range`]; its length

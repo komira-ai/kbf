@@ -249,12 +249,11 @@ fn releases(h: &mut Html, desired: Option<&Desired>, releases: &[Release]) {
     });
 }
 
-/// The component a release platform needs to be complete: linux `kbf`, darwin
-/// `kbf-daemon`.
+/// The component a release platform needs to be complete: `kbf` on linux and darwin alike
+/// (`ReleasePlatform::components`; a Mac runs `kbf --mode=daemon`, no darwin `kbf-daemon` is
+/// built).
 fn release_component(platform: &str) -> &'static str {
-    if platform.starts_with("darwin") {
-        "kbf-daemon"
-    } else if platform.starts_with("linux") {
+    if platform.starts_with("darwin") || platform.starts_with("linux") {
         "kbf"
     } else {
         "unknown platform"
@@ -266,7 +265,7 @@ fn release_component(platform: &str) -> &'static str {
 fn node_platform(node: &Node) -> Option<(&'static str, &'static str)> {
     let os = node.software.as_ref()?.os_name.to_ascii_lowercase();
     Some(if matches!(os.as_str(), "macos" | "darwin") {
-        ("darwin", "kbf-daemon")
+        ("darwin", "kbf")
     } else {
         ("linux", "kbf")
     })
@@ -435,7 +434,7 @@ fn command(h: &mut Html, desired: Option<&Desired>) {
 }
 
 /// `ms` since the Unix epoch as an RFC 3339 UTC time.
-fn rfc3339(ms: u64) -> String {
+pub(super) fn rfc3339(ms: u64) -> String {
     let secs = ms / 1000;
     let (days, rem) = (secs / 86_400, secs % 86_400);
     // Civil date from days since 1970-01-01 (proleptic Gregorian; Hinnant's algorithm).

@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use hyper::StatusCode;
+use kbf_update::Source;
 
 use super::idempotency::{Entry, Idempotency, Waiting};
 use super::model::{
@@ -222,6 +223,7 @@ struct Staging {
     to: CommitId,
     nodes: bool,
     rollback: bool,
+    source: Source,
     order: Locator,
     phase: Phase,
     since: u64,
@@ -236,6 +238,7 @@ struct Ended {
     phase: Phase,
     since: u64,
     failure: Option<Failure>,
+    source: Source,
 }
 
 enum Active {
@@ -299,6 +302,7 @@ impl Core {
             to: entry.commit,
             nodes: entry.nodes,
             rollback: entry.rollback,
+            source: entry.source,
             order: waiting.order,
             phase: Phase::Accepted,
             since: waiting.since_s,
@@ -330,11 +334,19 @@ impl Core {
         if let Some(entry) = self.parts.requests.get(&req.request_id).cloned() {
             return self.replay(&entry, &req);
         }
+        // A new request only: a retry is judged by its id first (`request_id_reused`).
+        source_fits(&req)?;
         let status = self.preflight(&req)?;
         let entry = self
             .parts
             .requests
-            .insert(&req.request_id, &req.commit, req.nodes, req.rollback)
+            .insert(
+                &req.request_id,
+                &req.commit,
+                req.nodes,
+                req.rollback,
+                req.source,
+            )
             .map_err(|e| ApiError::unavailable("state_unwritable", e.to_string()))?;
         self.parts.hook.at(CrashPoint::AfterRequestSaved)?;
         self.launch(&entry, status.installed_commit)
@@ -342,7 +354,9 @@ impl Core {
 
     /// A request id seen before: the same update, whatever it has become.
     fn replay(&mut self, entry: &Entry, req: &UpdateRequest) -> Result<Reply, Fault> {
-        if (&entry.commit, entry.nodes, entry.rollback) != (&req.commit, req.nodes, req.rollback) {
+        let kept = (&entry.commit, entry.nodes, entry.rollback, entry.source);
+        let asked = (&req.commit, req.nodes, req.rollback, req.source);
+        if kept != asked {
             return Err(ApiError::conflict(
                 "request_id_reused",
                 "this request_id was used for a different request",
@@ -397,6 +411,7 @@ impl Core {
                 "this commit is already running",
             ));
         }
+        source_allowed(req, &status)?;
         match self.parts.compat.check(&req.commit, None) {
             Compat::Compatible => {}
             Compat::Incompatible { rule } => {
@@ -434,11 +449,7 @@ impl Core {
         let order = self
             .parts
             .orders
-            .write(
-                Verb::FrontendUpdate,
-                &entry.commit,
-                self.parts.config.window_s,
-            )
+            .write_update(&entry.commit, self.parts.config.window_s, entry.source)
             .map_err(|e| ApiError::unavailable("order_unwritable", e.to_string()))?;
         let since = self.parts.clock.wall_s();
         let deadline_s = since.saturating_add(self.parts.config.staging_deadline.secs());
@@ -455,6 +466,7 @@ impl Core {
             to: entry.commit.clone(),
             nodes: entry.nodes,
             rollback: entry.rollback,
+            source: entry.source,
             order,
             phase: Phase::Accepted,
             since,
@@ -568,6 +580,7 @@ impl Core {
                     to: st.to.clone(),
                     nodes: st.nodes,
                     rollback: st.rollback,
+                    source: st.source,
                     facts: facts.clone(),
                     order: st.order.clone(),
                 };
@@ -642,6 +655,7 @@ impl Core {
             phase,
             since: self.parts.clock.wall_s(),
             failure,
+            source: st.source,
         }))
     }
 
@@ -662,6 +676,7 @@ impl Core {
             old: None,
             new: None,
             failure: None,
+            source: Source::Fetch,
         };
         match &self.active {
             Active::Staging(s) => {
@@ -671,6 +686,7 @@ impl Core {
                 body.phase = Some(s.phase);
                 body.since = Some(s.since);
                 body.rollback_blocked_reason = Some(RollbackBlocked::NotSwitched);
+                body.source = s.source;
             }
             Active::Ended(e) => {
                 body.update_id = Some(e.update_id.clone());
@@ -679,6 +695,7 @@ impl Core {
                 body.phase = Some(e.phase);
                 body.since = Some(e.since);
                 body.failure = e.failure.clone();
+                body.source = e.source;
             }
             _ => {
                 if let Some(u) = self.parts.supervisor.status().update {
@@ -802,6 +819,67 @@ fn fill_from_supervisor(body: &mut StatusBody, u: RunningUpdate) {
     body.old = u.old;
     body.new = Some(u.new);
     body.failure = u.failure;
+    body.source = u.source;
+}
+
+/// What a request that takes its release from the host's package cannot also ask for, whatever
+/// the host is: a rollback goes back to a release the host fetched (the package carries only
+/// the newest), and the nodes cannot yet take a release from the host's package.
+fn source_fits(req: &UpdateRequest) -> Result<(), ApiError> {
+    if req.source.is_fetch() {
+        return Ok(());
+    }
+    if req.rollback {
+        return Err(ApiError::conflict(
+            "source_refused",
+            "a rollback goes back to a release the host fetched, not to its package's",
+        ));
+    }
+    if req.nodes {
+        return Err(ApiError::conflict(
+            "source_refused",
+            "a staged update does not update the nodes yet: ask for the frontend only",
+        ));
+    }
+    Ok(())
+}
+
+/// The release a request asks for can come from where it says, on this host. A host that fetches
+/// nothing is not told to fetch, and a package is asked only for the release it says it carries
+/// (`available` in `status.json`, which the installer withholds until it has found the release
+/// whole and newer than any the host confirmed).
+fn source_allowed(req: &UpdateRequest, status: &InstallerStatus) -> Result<(), ApiError> {
+    if req.source.is_fetch() {
+        if status.release_source.as_deref() == Some("bundled") {
+            return Err(ApiError::conflict(
+                "source_refused",
+                "this host fetches nothing (release_source is bundled): ask for source staged, \
+                 or roll back with kbf-installer rollback on the host",
+            ));
+        }
+        return Ok(());
+    }
+    let carried = status.available.as_ref().map(|a| &a.commit);
+    if carried == Some(&req.commit) {
+        return Ok(());
+    }
+    let said = match carried {
+        Some(have) => {
+            let (have, want) = (short(have), short(&req.commit));
+            format!("this host's package carries {have}, not {want}")
+        }
+        None => "this host's package carries nothing to order yet".to_owned(),
+    };
+    Err(ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "not_staged",
+        said,
+    ))
+}
+
+/// The first twelve digits of a commit, for a message.
+fn short(commit: &CommitId) -> &str {
+    &commit.as_str()[..12]
 }
 
 fn valid_request_id(id: &str) -> Result<(), ApiError> {

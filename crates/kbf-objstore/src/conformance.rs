@@ -561,7 +561,10 @@ async fn footer_reads<S: ObjectStore>(store: &S, w: &Written, prefix: &KeyPrefix
         let mut index = Vec::new();
         for r in 0..records {
             let blob = pattern(100 + r, name.len() as u8 + r as u8);
-            let digest = writer.push(&blob).map_err(|e| format!("{name}: {e}"))?;
+            // At most 109 bytes into an empty 1 MiB segment: `push` cannot refuse.
+            let digest = writer
+                .push(&blob)
+                .expect("a small blob fits an empty segment");
             index.push((digest, (k.clone(), offset)));
             offset += blob.len() as u64;
         }

@@ -7,14 +7,15 @@
 //! (`ConditionPathExists=`), on `kbf-installer boot-check` and on `kbf <mode> --check`
 //! (both `ExecStartPre=`; `ExecCondition=` would skip a failed check silently).
 //! kbf-deploy's rule modules are private to it, so the rules are restated here over the
-//! same unit parser (`kbf_deploy::unit`), each with the defect it catches, and `MUTANTS`
+//! same unit parser (`kbf_unitfile`), each with the defect it catches, and `MUTANTS`
 //! plants one defect per rule in a copy of the real file and requires that rule to name
 //! it. `every_rule_has_a_mutant` fails when a rule is added with no mutant, so no rule
 //! can be one that cannot fail.
 //!
 //! Catches:
 //! - a unit missing a rule of `check-units` that its mode needs (`restart`, `stop`,
-//!   `delegate`, `handover`, `credential`, user, slice, `LimitNOFILE`), each named below;
+//!   `delegate`, `handover`, `credential`, `caps`, `swap`, `oom`, `cpuset`, user, slice,
+//!   `LimitNOFILE`), each named below;
 //! - a unit that runs a program outside the installer's tree (`/var/lib/kbf-installer/`),
 //!   another mode than its name, a `--config` or any flag the contract does not give it;
 //! - kbf-installer's own unit running anything but `run`, or gating its start on a step that is
@@ -33,7 +34,7 @@
 
 use std::path::{Path, PathBuf};
 
-use kbf_deploy::unit::{UnitFile, comments_in_continuations};
+use kbf_unitfile::{UnitFile, comments_in_continuations};
 
 /// The proxy's two units: `kbf-proxy.socket` and `kbf-proxy.service`.
 #[path = "package_units/proxy.rs"]
@@ -84,7 +85,7 @@ const RUNTIME: [&str; 8] = [
 ];
 
 /// The rules, by the tag a violation starts with.
-const RULES: [&str; 33] = [
+const RULES: [&str; 36] = [
     "install",
     "network",
     "positional",
@@ -110,6 +111,9 @@ const RULES: [&str; 33] = [
     "handover",
     "conflicts",
     "swap",
+    "caps",
+    "oom",
+    "cpuset",
     "envoy",
     "memory",
     "reload",
@@ -233,6 +237,21 @@ fn violations(name: &str, text: &str) -> Vec<String> {
                 "memory",
                 "kbf.slice sets MemoryMin=, a per-host value".into(),
             );
+        }
+        // Catches a slice that disables a controller below it (check-units rule
+        // `delegate`; a slice cannot delegate) or narrows the CPUs or NUMA nodes of
+        // every unit in it (`cpuset`; the node's own set is a per-host drop-in, never
+        // this static file).
+        if unit
+            .get("DisableControllers")
+            .is_some_and(|x| !trim(x).is_empty())
+        {
+            v("delegate", "kbf.slice sets DisableControllers=".into());
+        }
+        for key in ["AllowedCPUs", "AllowedMemoryNodes"] {
+            if unit.get(key).is_some_and(|x| !trim(x).is_empty()) {
+                v("cpuset", format!("kbf.slice sets {key}="));
+            }
         }
         return out;
     }
@@ -586,6 +605,40 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         }
     }
 
+    // Catches a limit on a build node's own unit (check-units rules `caps` and `swap`):
+    // its leases live in the unit's cgroup, so the builds are capped by the daemon's
+    // actions/memory.max alone and a limit here would cap the supervisor with them; and
+    // a MemorySwapMax= would turn the daemon's swap watch into an OOM kill of the unit
+    // that holds every lease. An empty value is unset, as systemd reads it.
+    if matches!(mode, "daemon" | "storage-and-daemon" | "all-in-one") {
+        for key in ["MemoryMax", "MemoryHigh", "CPUQuota", "AllowedCPUs"] {
+            if unit.get(key).is_some_and(|x| !trim(x).is_empty()) {
+                v("caps", format!("sets {key}= on a build node's unit"));
+            }
+        }
+        if unit
+            .get("MemorySwapMax")
+            .is_some_and(|x| !trim(x).is_empty())
+        {
+            v("swap", "a build node sets MemorySwapMax=".into());
+        }
+        // Catches a build node whose OOM score is not below 0, the build containers'
+        // score (check-units rule `oom`): a host-wide OOM kills the highest score
+        // first, so a lease must die before the daemon that holds them.
+        match unit
+            .get("OOMScoreAdjust")
+            .map(trim)
+            .filter(|x| !x.is_empty())
+        {
+            None => v("oom", "no OOMScoreAdjust= (it defaults to 0)".into()),
+            Some(x) => match x.parse::<i64>() {
+                Ok(n) if n < 0 => {}
+                Ok(_) => v("oom", format!("OOMScoreAdjust={x} is not below 0")),
+                Err(_) => v("oom", format!("OOMScoreAdjust={x} is not an integer")),
+            },
+        }
+    }
+
     // Catches a storage node or frontend that may swap (it would slow every build at once).
     if matches!(mode, "frontend" | "storage")
         && unit.get_in("Service", "MemorySwapMax").map(trim) != Some("0")
@@ -862,15 +915,12 @@ fn modes_in<'a>(files: &[&'a str]) -> Vec<&'a str> {
     m
 }
 
-/// Catches the units drifting from the mode table of kbf-deploy: the modes the package
+/// Catches the units drifting from the mode table of kbf-cli (`names::MODES`): the modes the package
 /// ships are exactly the five `kbf --mode=` takes (there is no `node` mode), each as
 /// `kbf-<mode>.service`; an extra or a missing mode unit is not that set.
 #[test]
 fn the_kbf_modes_are_exactly_the_five() {
-    let mut want: Vec<&str> = kbf_deploy::linux::Mode::ALL
-        .iter()
-        .map(|m| m.name())
-        .collect();
+    let mut want: Vec<&str> = kbf_cli::names::MODES.iter().map(|m| m.name).collect();
     want.sort_unstable();
     assert_eq!(want.len(), 5);
     assert_eq!(modes_in(&FILES), want);
@@ -887,10 +937,10 @@ fn the_kbf_modes_are_exactly_the_five() {
 }
 
 /// Catches the per-instance block of the frontend going missing from the template: the
-/// two instances of kbf-deploy's `FRONTEND_INSTANCES` run the same line through `%i`.
+/// two instances of `kbf frontend handover` (`kbf_cli::handover::INSTANCES`) run the same line through `%i`.
 #[test]
 fn the_frontend_template_serves_both_instances_through_the_specifier() {
-    assert_eq!(kbf_deploy::linux::modes::FRONTEND_INSTANCES, ["a", "b"]);
+    assert_eq!(kbf_cli::handover::INSTANCES, ["a", "b"]);
     let text = read("kbf-frontend@.service");
     let unit = UnitFile::parse(&text).expect("parses");
     assert_eq!(unit.get_in("Install", "DefaultInstance"), Some("a"));
@@ -1080,6 +1130,79 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "MemorySwapMax=0",
         "MemorySwapMax=1G",
         "swap",
+    ),
+    (
+        "kbf-daemon.service",
+        "OOMScoreAdjust=-900",
+        "OOMScoreAdjust=-900\nMemorySwapMax=0",
+        "swap",
+    ),
+    (
+        "kbf-all-in-one.service",
+        "OOMScoreAdjust=-925",
+        "OOMScoreAdjust=-925\nMemorySwapMax=0",
+        "swap",
+    ),
+    (
+        "kbf-daemon.service",
+        "OOMScoreAdjust=-900",
+        "OOMScoreAdjust=-900\nMemoryMax=64G",
+        "caps",
+    ),
+    (
+        "kbf-storage-and-daemon.service",
+        "OOMScoreAdjust=-925",
+        "OOMScoreAdjust=-925\nMemoryHigh=64G",
+        "caps",
+    ),
+    (
+        "kbf-all-in-one.service",
+        "OOMScoreAdjust=-925",
+        "OOMScoreAdjust=-925\nCPUQuota=400%",
+        "caps",
+    ),
+    (
+        "kbf-daemon.service",
+        "OOMScoreAdjust=-900",
+        "OOMScoreAdjust=-900\nAllowedCPUs=0-3",
+        "caps",
+    ),
+    (
+        "kbf-daemon.service",
+        "OOMScoreAdjust=-900",
+        "OOMScoreAdjust=0",
+        "oom",
+    ),
+    (
+        "kbf-storage-and-daemon.service",
+        "OOMScoreAdjust=-925",
+        "OOMScoreAdjust=100",
+        "oom",
+    ),
+    (
+        "kbf-all-in-one.service",
+        "OOMScoreAdjust=-925",
+        "OOMScoreAdjust=high",
+        "oom",
+    ),
+    ("kbf-daemon.service", "OOMScoreAdjust=-900\n", "", "oom"),
+    (
+        "kbf.slice",
+        "[Slice]\n",
+        "[Slice]\nDisableControllers=cpuset\n",
+        "delegate",
+    ),
+    (
+        "kbf.slice",
+        "[Slice]\n",
+        "[Slice]\nAllowedCPUs=0-3\n",
+        "cpuset",
+    ),
+    (
+        "kbf.slice",
+        "[Slice]\n",
+        "[Slice]\nAllowedMemoryNodes=0\n",
+        "cpuset",
     ),
     (
         "kbf-storage.service",

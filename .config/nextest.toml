@@ -29,8 +29,8 @@ test-group = 'mac-provision-scratch'
 # runner: 77 of 8960 tests, 70 percent of the run's test time (the 5 GiB blob test alone
 # is 898 s). A test that needs a service (Postgres, S3, crun, root, macOS) is `#[ignore]`d
 # and so is in neither run; the other jobs of beta.yml run those.
-# The black-box crate kbf-all-in-one-test (T009, crates/kbf-all-in-one-test/README.md) is excluded whole by
-# `package(kbf-all-in-one-test)` below: it is a beta suite, and runs in the full run only.
+# The black-box crates kbf-all-in-one-test and kbf-daemon-test (T009, their README.md files) are
+# excluded whole by `package(...)` below: they are beta suites, and run in the full run only.
 #
 # To regenerate: take the `nextest-junit` artifact of a beta.yml run (junit.xml, written by
 # `[profile.default.junit]` below), list the `testcase`s with a `time` of 10 or more, and
@@ -46,8 +46,9 @@ not (
   | (binary_id(=kbf-all-in-one::memory) & (test(=a_2_gib_output_streams_onto_the_tier_in_bounded_memory) | test(=a_2_gib_remote_upload_is_written_through_to_the_tier_in_bounded_memory) | test(=without_a_tier_a_256_mib_output_streams_to_the_store_in_bounded_memory)))
   | (binary_id(=kbf-all-in-one::one_read) & (test(=with_a_tier_a_file_over_1_gib_is_read_once) | test(=without_a_tier_a_file_over_1_gib_is_read_once) | test(=a_blob_over_5_gib_is_not_refused_for_its_size)))
   | package(kbf-all-in-one-test)
+  | package(kbf-daemon-test)
   | (binary_id(=kbf-cli::all_in_one) & test(=an_input_is_on_the_nodes_disk_once))
-  | (binary_id(=kbf-cli::rehearsal_in_a_box) & (test(=a_killed_storage_node_loses_no_blob) | test(=a_loaded_node_restarts_planned_down_and_loses_no_action) | test(=three_storage_nodes_run_an_action)))
+  | (binary_id(=kbf-cli::rehearsal_in_a_box) & (test(=a_killed_storage_node_loses_no_blob) | test(=three_storage_nodes_run_an_action)))
   | (binary_id(=kbf-cli::storage_and_daemon) & test(=storage_and_daemon_runs_an_action_over_its_own_storage))
   | (binary_id(=kbf-daemon::member_wiring) & test(=a_daemon_half_behind_its_node_is_told_so_by_its_own_node))
   | (binary_id(=kbf-driver-container::fake_crun) & test(=no_round_of_a_dropped_run_races_the_clean))
@@ -62,6 +63,7 @@ not (
   | (binary_id(=kbf-installer::binary) & test(=a_verb_that_finds_the_lock_held_ends_busy))
   | (binary_id(=kbf-integration-test::m1) & (test(=a_daemon_that_does_not_join_fails) | test(=a_server_that_does_not_start_fails)))
   | (binary_id(=kbf-integration-test::m2) & (test(=a_container_left_behind_fails) | test(=a_daemon_that_does_not_join_fails_with_its_last_line) | test(=a_lease_directory_left_behind_fails) | test(=a_lease_never_rerun_fails) | test(=a_lease_rerun_late_fails) | test(=a_server_that_does_not_start_fails)))
+  | (binary_id(=kbf-integration-test::planned_restart) & test(=a_loaded_node_restarts_planned_down_and_loses_no_action))
   | (binary_id(=kbf-integration-test::repo_lints) & test(=every_interpreter_file_workflow_script_and_shell_spawn_is_in_the_budget))
   | (binary_id(=kbf-raft::sim) & (test(=a_crash_at_every_boundary_recovers) | test(=raft_is_safe_and_live_over_seeds)))
   | (binary_id(=kbf-sched::f3_fleet) & test(=f3_swarm))

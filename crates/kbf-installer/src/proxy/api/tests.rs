@@ -758,18 +758,26 @@ fn status_json_written_by_the_installer_parses() {
             min_protocol: 3,
             state_schema: 7,
         }),
+        release_source: Some("bundled"),
+        available: Some(crate::seed::Available {
+            commit: c(B),
+            seq: 812,
+        }),
         ..Memory::default()
     };
     let path = rig.dir.join("status.json");
     std::fs::write(&path, render(&state, &memory)).unwrap();
     let read = JsonFileStatus::new(&path).read().expect("parses");
+    assert_eq!(read.release_source.as_deref(), Some("bundled"));
+    let seed = read.available.clone().expect("the seed is told");
+    assert_eq!((seed.commit, seed.seq), (c(B), 812));
     assert_eq!(read.installed_commit, Some(c(A)));
     assert_eq!(read.staged_commit, Some(c(B)));
     assert_eq!(read.state, InstallerState::Refused);
     assert_eq!((read.refusal_word(), read.acked_order_id), ("hash", 12));
     assert_eq!(
         read.refused_order_id, None,
-        "the root half does not name the order a refusal answers yet, so no refusal is attributed"
+        "this memory names no order, so the status names none and no refusal is attributed"
     );
     assert_eq!(
         read.staged_facts()

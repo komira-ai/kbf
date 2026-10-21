@@ -15,7 +15,7 @@ use kbf_testkit::dir::TestDir;
 use kbf_types::ReleasePlatform;
 use xtask::Error;
 use xtask::release::stage_offer::{
-    MAX_ATTESTATION, MAX_OFFER, MAX_SUMS, MAX_TARBALL, build_bundle, version_json,
+    MAX_ATTESTATION, MAX_FACTS, MAX_OFFER, MAX_SUMS, MAX_TARBALL, build_bundle, version_json,
 };
 
 mod support;
@@ -35,12 +35,15 @@ fn scratch(name: &str) -> TestDir {
     TestDir::under(root, name)
 }
 
-/// The release files `build_bundle` reads: `SHA256SUMS`, and for each component of each
-/// platform its tarball and the bundle beside it, each holding bytes that name it.
+/// The release files `build_bundle` reads: `SHA256SUMS`, and for each platform its version
+/// facts, and for each component of it the tarball and the bundle beside it, each holding
+/// bytes that name it.
 fn release_dir(name: &str) -> TestDir {
     let dir = scratch(name);
     std::fs::write(dir.join("SHA256SUMS"), b"the sums\n").expect("sums");
     for platform in ReleasePlatform::ALL {
+        let facts = format!("kbf-{SHA}-{platform}.version.json");
+        std::fs::write(dir.join(&facts), format!("{facts} bytes")).expect("facts");
         for component in platform.components() {
             let tarball = format!("{component}-{SHA}-{platform}.tar.gz");
             std::fs::write(dir.join(&tarball), format!("{tarball} bytes")).expect("tarball");
@@ -55,6 +58,7 @@ fn release_dir(name: &str) -> TestDir {
 fn expected_names() -> Vec<String> {
     let mut names = vec!["SHA256SUMS".to_owned(), "offer.json".to_owned()];
     for platform in ReleasePlatform::ALL {
+        names.push(format!("kbf-{SHA}-{platform}.version.json"));
         for component in platform.components() {
             let tarball = format!("{component}-{SHA}-{platform}.tar.gz");
             names.push(tarball.clone());
@@ -69,8 +73,10 @@ fn the_caps_and_the_platform_and_component_lists_are_the_installers() {
     // Catches: a cap that differs from the installer's reader (a bundle the reader refuses,
     // found at a deploy), a platform the installer's store does not know, or a platform it
     // knows that a release is never staged for, and a component it does not take.
+    // Mutant it catches: `MAX_FACTS` here set to a value other than the installer's.
     assert_eq!(MAX_TARBALL, installer::MAX_TARBALL);
     assert_eq!(MAX_ATTESTATION, installer::MAX_ATTESTATION);
+    assert_eq!(MAX_FACTS, installer::MAX_FACTS);
     assert_eq!(MAX_SUMS, installer::MAX_SUMS);
     assert_eq!(MAX_OFFER, installer_offer::MAX_OFFER);
     let all = ReleasePlatform::ALL;
@@ -91,11 +97,15 @@ fn the_caps_and_the_platform_and_component_lists_are_the_installers() {
 }
 
 #[test]
-fn the_bundle_is_the_sums_the_offer_and_each_tarball_with_its_attestation_in_that_order() {
-    // Catches: SHA256SUMS or the offer left out or out of place, a tarball without its
-    // attestation or with another's (each bundle's bytes name its own tarball), an SBOM or a
-    // bundle under its release name in the tar, a header that holds a time, an owner or a
-    // mode that can differ from run to run, and an entry order that follows the directory's.
+fn the_bundle_is_the_sums_the_offer_and_each_platforms_facts_and_tarballs_in_that_order() {
+    // Catches: SHA256SUMS or the offer left out or out of place, a platform's version facts
+    // left out, changed or taken from another platform's file (each file's bytes name it), a
+    // tarball without its attestation or with another's (each bundle's bytes name its own
+    // tarball), an SBOM or a bundle under its release name in the tar, a header that holds a
+    // time, an owner or a mode that can differ from run to run, and an entry order that
+    // follows the directory's.
+    // Mutant it catches: a platform's facts entry left out of `build_bundle`, or put after
+    // its tarballs.
     let dir = release_dir("layout");
     let bytes = build_bundle(&dir, SHA, &ReleasePlatform::ALL, OFFER).expect("a bundle");
     let entries = entries_of(&bytes);
@@ -121,18 +131,21 @@ fn the_bundle_is_the_sums_the_offer_and_each_tarball_with_its_attestation_in_tha
 
 #[test]
 fn only_the_platforms_given_are_in_the_bundle() {
-    // Catches: every platform packed whatever the offer found complete: the Mac, which the
-    // release builds a `kbf` and no `kbf-daemon` for, must not be asked for.
+    // Catches: every platform packed whatever the offer found complete: a platform the offer
+    // left out has files the release may not hold, and the host would be handed them.
+    // Mutant it catches: the facts of every platform read, not those of the platforms given.
     let dir = release_dir("subset");
     let linux = [ReleasePlatform::LinuxArm64];
     let bytes = build_bundle(&dir, SHA, &linux, OFFER).expect("a bundle");
     let entries = entries_of(&bytes);
     let names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
+    let facts = format!("kbf-{SHA}-linux-arm64.version.json");
     let tarball = format!("kbf-{SHA}-linux-arm64.tar.gz");
     let attestation = format!("{tarball}.attestation");
     let want = [
         "SHA256SUMS",
         "offer.json",
+        facts.as_str(),
         tarball.as_str(),
         attestation.as_str(),
     ];
@@ -171,6 +184,7 @@ fn a_file_larger_than_the_installer_takes_is_refused_and_one_at_the_cap_is_not()
     // Catches: no cap (a bundle the installer's reader refuses after the job has run its
     // checks), a cap off by one either way, and a tarball read before its size is judged
     // (the one here is a hole of 512 MiB and a byte).
+    // Mutant it catches: the facts cap unchecked, or checked with `>=` in place of `>`.
     let sums = "SHA256SUMS";
     built("sums-at", sums, MAX_SUMS, 1).expect("SHA256SUMS at the cap");
     let over = MAX_SUMS + 1;
@@ -188,6 +202,12 @@ fn a_file_larger_than_the_installer_takes_is_refused_and_one_at_the_cap_is_not()
     let why = refused(built("tar-over", &tarball, over, 1));
     assert!(why.contains(&tarball), "{why}");
 
+    let facts = format!("kbf-{SHA}-linux-x86_64.version.json");
+    built("facts-at", &facts, MAX_FACTS, 1).expect("facts at the cap");
+    let over = MAX_FACTS + 1;
+    let why = refused(built("facts-over", &facts, over, 1));
+    assert!(why.contains(&facts), "{why}");
+
     let cap = MAX_OFFER as usize;
     built("offer-at", sums, 9, cap).expect("an offer at the cap");
     let why = refused(built("offer-over", sums, 9, cap + 1));
@@ -197,13 +217,20 @@ fn a_file_larger_than_the_installer_takes_is_refused_and_one_at_the_cap_is_not()
 #[test]
 fn a_file_the_release_lacks_is_an_error_that_names_it() {
     // Catches: a missing attestation left out of the bundle instead of failing it (the
-    // installer would take a tarball with none and refuse it at the host).
-    let dir = release_dir("missing");
-    let name = format!("kbf-{SHA}-linux-arm64.tar.gz.sigstore.json");
-    std::fs::remove_file(dir.join(&name)).expect("remove");
-    let made = build_bundle(&dir, SHA, &ReleasePlatform::ALL, OFFER);
-    let why = made.expect_err("a refusal").to_string();
-    assert!(why.contains(&name), "{why}");
+    // installer would take a tarball with none and refuse it at the host), and missing
+    // version facts left out (the store would keep the platform and never offer it).
+    // Mutant it catches: a missing facts file skipped in place of failing the bundle.
+    let gone = [
+        format!("kbf-{SHA}-linux-arm64.tar.gz.sigstore.json"),
+        format!("kbf-{SHA}-linux-arm64.version.json"),
+    ];
+    for (n, name) in gone.iter().enumerate() {
+        let dir = release_dir(&format!("missing-{n}"));
+        std::fs::remove_file(dir.join(name)).expect("remove");
+        let made = build_bundle(&dir, SHA, &ReleasePlatform::ALL, OFFER);
+        let why = made.expect_err("a refusal").to_string();
+        assert!(why.contains(name), "{why}");
+    }
 }
 
 /// A `kbf` in `dir` that answers `json` to `--version --json`, free to run.

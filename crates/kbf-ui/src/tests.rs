@@ -11,8 +11,8 @@ use futures::executor::block_on;
 use serde_json::{Value, json};
 
 use crate::pages::{
-    ACTION, BUILD, BUILDS, LEASES, NODE, NODES, OVERVIEW, PAGES, QUEUE, STORAGE, TARGET, TARGETS,
-    UPDATES, sched_farm,
+    ACTION, BUILD, BUILDS, LEASES, LOG, NODE, NODES, OVERVIEW, PAGES, QUEUE, STORAGE, TARGET,
+    TARGETS, UPDATES, sched_farm,
 };
 use crate::read::Page;
 use crate::{Answer, CONTENT_SECURITY_POLICY, Fetched, Source, SourceError, respond};
@@ -22,6 +22,10 @@ use crate::{Answer, CONTENT_SECURITY_POLICY, Fetched, Source, SourceError, respo
 pub(crate) struct Fake {
     answers: BTreeMap<String, Result<Fetched, String>>,
     seen: Mutex<Vec<String>>,
+    /// The ranges asked, as `(url, first, last)`.
+    ranges: Mutex<Vec<(String, u64, u64)>>,
+    /// The suffix ranges asked, as `(url, n)`.
+    suffixes: Mutex<Vec<(String, u64)>>,
 }
 
 impl Fake {
@@ -67,6 +71,16 @@ impl Fake {
         self.seen.lock().expect("not poisoned").clone()
     }
 
+    /// Every range asked, `(url, first, last)`, in order.
+    pub(crate) fn ranges(&self) -> Vec<(String, u64, u64)> {
+        self.ranges.lock().expect("not poisoned").clone()
+    }
+
+    /// Every suffix range asked, `(url, n)`, in order.
+    pub(crate) fn suffixes(&self) -> Vec<(String, u64)> {
+        self.suffixes.lock().expect("not poisoned").clone()
+    }
+
     /// Forgets the URLs asked so far.
     pub(crate) fn forget_seen(&self) {
         self.seen.lock().expect("not poisoned").clear();
@@ -74,6 +88,35 @@ impl Fake {
 }
 
 impl Source for Fake {
+    /// Asked for a suffix: the table's answer is what a server sends for it, and the
+    /// suffix is remembered.
+    fn get_suffix(
+        &self,
+        url: &str,
+        n: u64,
+    ) -> impl Future<Output = Result<Fetched, SourceError>> + Send {
+        self.suffixes
+            .lock()
+            .expect("not poisoned")
+            .push((url.to_owned(), n));
+        self.get(url)
+    }
+
+    /// Asked with a range: the table's answer is what a server sends for that range
+    /// (a `206` with its `Content-Range`, or a `200`), and the range is remembered.
+    fn get_range(
+        &self,
+        url: &str,
+        first: u64,
+        last: u64,
+    ) -> impl Future<Output = Result<Fetched, SourceError>> + Send {
+        self.ranges
+            .lock()
+            .expect("not poisoned")
+            .push((url.to_owned(), first, last));
+        self.get(url)
+    }
+
     fn get(&self, url: &str) -> impl Future<Output = Result<Fetched, SourceError>> + Send {
         self.seen.lock().expect("not poisoned").push(url.to_owned());
         let answer = self.answers.get(url).cloned().unwrap_or_else(|| {
@@ -295,7 +338,16 @@ pub(crate) fn farm() -> Fake {
             &json!({"invocations": [], "partial": true}),
         )
         .with(&stderr_href, 200, STDERR)
+        .with_headers(
+            &format!("/v1/runs/{RUN_ID}/logs/stderr"),
+            206,
+            &[("Content-Range", &format!("bytes 0-{}/{}", STDERR.len() - 1, STDERR.len()))],
+            STDERR,
+        )
 }
+
+/// A run's id in history.
+pub(crate) const RUN_ID: &str = "0a0b0c0d0e0f0a0b0c0d0e0f";
 
 /// The answer of `/actions/{digest}` for `retried()`.
 fn retried_action() -> Value {
@@ -478,8 +530,19 @@ pub(crate) fn health_doc() -> Value {
             "quarantined": 1, "disconnected": 6},
         "queue": {"depth": 9, "oldest_age_ms": null},
         "leases": 13,
-        "storage": {"members_active": 2, "members_total": 3, "under_replicated_blobs": null}})
+        "storage": {"members_active": 2, "members_total": 3, "under_replicated_blobs": null},
+        "started_unix_ms": STARTED_MS, "uptime_ms": UPTIME_MS})
 }
+
+/// When the fixture server started, 2026-10-21T08:30:15Z.
+pub(crate) const STARTED_MS: u64 = 1_792_571_415_000;
+
+/// How long the fixture server had run: 2 h 5 min.
+pub(crate) const UPTIME_MS: u64 = 7_500_000;
+
+/// What the banner says of the fixture server's start.
+pub(crate) const STARTED_SAYS: &str =
+    "This server started at 2026-10-21T08:30:15Z, 2 h 5 min ago by its own clock.";
 
 /// A build of `GET /v1/invocations`.
 pub(crate) fn latest_build(id: &str) -> Value {
@@ -688,6 +751,13 @@ fn contract_table() -> Vec<(&'static Page, Vec<String>)> {
                 action_page(),
                 // A succeeded action: its log is read from the blob route.
                 format!("/ui/builds/{ID}/actions/{}", digest('b', 10)),
+            ],
+        ),
+        (
+            &LOG,
+            vec![
+                format!("/ui/runs/{RUN_ID}/logs/stderr"),
+                format!("/ui/runs/{RUN_ID}/logs/stderr?from=start"),
             ],
         ),
         (&NODES, vec!["/ui/nodes".to_owned()]),

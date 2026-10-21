@@ -1,19 +1,26 @@
 //! `release notes`: the notes of a release, from the commits since the previous release
-//! and the gamma verdict that was checked (docs/design/kbf-cicd.md, section 8.1, item 3).
-//! A dry run shows them as an artifact of the verify job before anyone approves.
+//! and the Beta record the tag carries, shown as information
+//! (docs/design/kbf-cicd.md, section 8.1, item 3). A dry run shows them as an artifact of
+//! the verify job. What is not reversible comes from the two builds, never from the record.
+//! The record is audit only: a tag without one, or with one that failed, gets notes all the
+//! same, which say so.
 
 use std::path::Path;
 
-use kbf_gate::{Floor, ResultDoc, Verdict, reversible};
+use kbf_gate::{ResultDoc, Verdict, reversible};
 use serde_json::Value;
 
 use super::git;
 use super::offer::{identity_of, whole_field};
-use super::verdict::{Subject, bake_secs, verify};
+use super::verify::{Subject, verify};
 use crate::Error;
 
 /// Commits listed at most; the rest are counted.
 const MAX_COMMITS: usize = 200;
+
+/// The sentence a first release adds: no earlier build says which version fields hosts know.
+const FIRST_RELEASE_INSTALLER: &str = "Hosts running an untagged earlier build: upgrade \
+    kbf-installer before staging (older installers may refuse this build's version output).";
 
 /// The `kbf --version --json` of the release being made and of the one before it, which
 /// the caller ran from attested tarballs only.
@@ -42,8 +49,9 @@ pub fn previous_release(repo: &Path, tag: &str, commit: &str) -> Result<Option<S
     Ok(None)
 }
 
-/// The notes of `s`: refused, like `release verdict`, when the verdict does not pass, and
-/// when what is not reversible cannot be determined (fail closed).
+/// The notes of `s`: refused, like `release verify`, when the tag or the commit is not the
+/// release's, and when what is not reversible cannot be determined (fail closed). The tag's
+/// record is shown and never judged.
 pub fn notes(s: &Subject, ids: &Identities) -> Result<String, Error> {
     let verified = verify(s)?;
     let since = previous_release(s.repo_dir, s.tag, s.commit)?;
@@ -70,7 +78,7 @@ pub fn notes(s: &Subject, ids: &Identities) -> Result<String, Error> {
     let found = irreversible(since.as_deref(), &current, previous.as_ref())?;
     let commits = git::commits(s.repo_dir, since.as_deref(), s.commit)?;
     Ok(render(
-        &verified.doc,
+        verified.record.as_ref(),
         s.tag,
         since.as_deref(),
         &commits,
@@ -86,9 +94,9 @@ fn irreversible(
     previous: Option<&Value>,
 ) -> Result<Vec<String>, Error> {
     let (Some(since), Some(previous)) = (since, previous) else {
-        return Ok(vec![
-            "first release: there is no earlier release to go back to".to_owned(),
-        ]);
+        return Ok(vec![format!(
+            "first release: there is no earlier release to go back to. {FIRST_RELEASE_INSTALLER}"
+        )]);
     };
     let field = |v: &Value, key: &str| whole_field(v, key).map_err(Error::Failed);
     let mut found = Vec::new();
@@ -117,7 +125,42 @@ fn irreversible(
              changed (docs/design/kbf-cicd.md, section 8.3)"
         )),
     }
+    found.extend(installer_line(current, previous));
     Ok(found)
+}
+
+/// The line telling operators to upgrade kbf-installer first: the current build's version
+/// output has top-level keys the previous build's lacks, which installers built before
+/// the current release may refuse. A previous output that is not an object has unknown
+/// keys: fail closed, the line is given. No line when the keys are a subset.
+fn installer_line(current: &Value, previous: &Value) -> Option<String> {
+    let short = current["commit"].as_str().unwrap_or_default();
+    let head = "Upgrade kbf-installer on every host before staging this release";
+    let tail = format!("which installers built before {short} may refuse");
+    let Some(current) = current.as_object() else {
+        return Some(format!(
+            "{head}: its version output is not an object, {tail}"
+        ));
+    };
+    let Some(previous) = previous.as_object() else {
+        return Some(format!(
+            "{head}: the previous release's version output keys are unknown, so the keys this \
+             release adds are unknown, {tail}"
+        ));
+    };
+    let mut added: Vec<&str> = current
+        .keys()
+        .filter(|k| !previous.contains_key(*k))
+        .map(String::as_str)
+        .collect();
+    added.sort_unstable();
+    if added.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{head}: its version output adds {}, {tail}",
+        added.join(", ")
+    ))
 }
 
 fn section(out: &mut String, heading: &str, items: &[String], none: &str) {
@@ -130,36 +173,27 @@ fn section(out: &mut String, heading: &str, items: &[String], none: &str) {
     }
 }
 
-fn floor(name: &str, f: Floor) -> String {
-    format!("{name} {} (needs {})", f.measured, f.required)
-}
-
-/// `bake: 24h 00m`. A verified verdict has a finished, forward bake, so this always
-/// yields a line.
-fn bake_line(doc: &ResultDoc) -> Option<String> {
-    bake_secs(doc)
-        .flatten()
-        .map(|secs| format!("bake: {}h {:02}m", secs / 3600, secs % 3600 / 60))
-}
-
-/// The verdict in one line, for the top of the notes.
+/// The record in one line, for the top of the notes. It says what the record states, not
+/// that the release is good: nothing gates on it.
 fn summary(doc: &ResultDoc) -> String {
     let warned = doc
         .gates
         .iter()
         .filter(|g| g.verdict == Verdict::Warn)
         .count();
-    let mut parts: Vec<String> = bake_line(doc).into_iter().collect();
-    parts.push(format!("{} gate(s), {warned} warning(s)", doc.gates.len()));
     format!(
-        "green for the set it names; {}; detail under Gamma verdict",
-        parts.join(", ")
+        "status {:?}; {} gate(s), {warned} warning(s); detail under {:?} record (audit only, \
+         nothing gates on it)",
+        doc.status,
+        doc.gates.len(),
+        doc.stage
     )
 }
 
-/// The notes for a verified `doc`. What the approver must read before the click comes first.
+/// The notes for the release whose tag carries `record`, if any. What the approver must
+/// read before the click comes first.
 fn render(
-    doc: &ResultDoc,
+    record: Option<&ResultDoc>,
     tag: &str,
     since: Option<&str>,
     commits: &[String],
@@ -176,9 +210,9 @@ fn render(
         "Nothing in this release is flagged as not reversible: the metadata log and the wire \
          protocol are the previous release's.",
     );
-    let waivers: Vec<String> = doc
-        .waivers
-        .iter()
+    let waivers: Vec<String> = record
+        .into_iter()
+        .flat_map(|doc| &doc.waivers)
         .map(|w| format!("{} waived by {}: {}", w.what, w.by, w.reason))
         .collect();
     section(
@@ -187,7 +221,11 @@ fn render(
         &waivers,
         "No gate or condition is waived.",
     );
-    section(&mut out, "### Verdict", &[summary(doc)], "");
+    let line = record.map_or_else(
+        || "the tag carries no readable Beta record (nothing gates on it)".to_owned(),
+        summary,
+    );
+    section(&mut out, "### Record", &[line], "");
     let shown: Vec<String> = commits.iter().take(MAX_COMMITS).cloned().collect();
     let title = match since {
         Some(prev) => format!("## Commits since {prev}"),
@@ -198,16 +236,10 @@ fn render(
         out.push_str(&format!("- and {} more\n", commits.len() - MAX_COMMITS));
     }
 
-    let mut gamma = Vec::new();
-    gamma.extend(bake_line(doc));
-    gamma.extend(doc.load.map(|l| {
-        format!(
-            "load: {}, {}, {}",
-            floor("actions", l.actions),
-            floor("builds", l.builds),
-            floor("hours", l.hours)
-        )
-    }));
+    let Some(doc) = record else {
+        return out;
+    };
+    let mut detail = Vec::new();
     for g in &doc.gates {
         let measured = g.measured.map_or("absent".to_owned(), |m| m.to_string());
         let mark = if g.verdict == Verdict::Warn {
@@ -215,14 +247,16 @@ fn render(
         } else {
             ""
         };
-        gamma.push(format!("gate {}: {measured}{mark}", g.name));
+        detail.push(format!("gate {}: {measured}{mark}", g.name));
     }
     for w in &doc.waivers {
-        gamma.push(format!("waived {} by {}: {}", w.what, w.by, w.reason));
+        detail.push(format!("waived {} by {}: {}", w.what, w.by, w.reason));
     }
-    section(&mut out, "## Gamma verdict", &gamma, "No detail recorded.");
+    let title = format!("## {:?} record", doc.stage);
+    section(&mut out, &title, &detail, "No detail recorded.");
     out.push_str(&format!(
-        "\n## Gamma escapes\n\n{} scenario(s) only gamma found.\n",
+        "\n## {:?} escapes\n\n{} scenario(s) only gamma found.\n",
+        doc.stage,
         doc.escapes.len()
     ));
     for e in &doc.escapes {
@@ -235,4 +269,39 @@ fn render(
         "No release is withdrawn.",
     );
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::installer_line;
+
+    #[test]
+    fn an_unreadable_previous_output_gives_the_line_saying_its_keys_are_unknown() {
+        // Catches: fail-open, an unknown previous read as "nothing added".
+        let cur = json!({"commit": "abcdef012345", "seq": 1});
+        for prev in [json!(null), json!("text"), json!([1])] {
+            let line = installer_line(&cur, &prev).unwrap();
+            assert!(line.starts_with("Upgrade kbf-installer on every host before staging"));
+            assert!(line.contains("keys are unknown"), "{line}");
+            assert!(
+                line.contains("built before abcdef012345 may refuse"),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn added_keys_are_listed_sorted_and_a_subset_gives_no_line() {
+        let prev = json!({"commit": "x", "profile": "r", "gone": 1});
+        let cur = json!({"commit": "abcdef012345", "profile": "r", "zeta": 1, "seq": 2});
+        assert_eq!(
+            installer_line(&cur, &prev).unwrap(),
+            "Upgrade kbf-installer on every host before staging this release: its version \
+             output adds seq, zeta, which installers built before abcdef012345 may refuse"
+        );
+        assert_eq!(installer_line(&prev, &prev), None);
+        assert_eq!(installer_line(&json!({"commit": "x"}), &prev), None);
+    }
 }

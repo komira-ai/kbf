@@ -2,7 +2,6 @@
 //! serving mutual TLS under certificates of role `storage` (a chain admits no other), each
 //! behind a switch the test can cut, holding maps the test publishes.
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,9 +9,8 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
 use kbf_store::FaultFs;
+use kbf_testkit::switch::Switch;
 use kbf_types::Digest;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::task::{AbortHandle, JoinHandle};
 use tonic::transport::Channel;
 
 use crate::Storage;
@@ -21,63 +19,6 @@ use crate::replicate::{Chain, ChainConfig, MapSource, Peers};
 use crate::service::tests::fake::{Mem, patterned, serve_routes, sha};
 use crate::service::tests::roles::Pki;
 use crate::service::{Admission, Config, RemoteStorage, StorageService};
-
-/// A TCP forwarder in front of a node: `cut` closes every connection through it and
-/// drops new ones until `restore`, which is how a node dies and comes back.
-pub(crate) struct Switch {
-    pub addr: SocketAddr,
-    up: Arc<AtomicBool>,
-    connections: Arc<Mutex<Vec<AbortHandle>>>,
-    _accept: JoinHandle<()>,
-}
-
-impl Switch {
-    async fn start(target: SocketAddr) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("address");
-        let up = Arc::new(AtomicBool::new(true));
-        let connections: Arc<Mutex<Vec<AbortHandle>>> = Arc::default();
-        let accept = {
-            let (up, connections) = (Arc::clone(&up), Arc::clone(&connections));
-            tokio::spawn(async move {
-                loop {
-                    let Ok((mut inbound, _)) = listener.accept().await else {
-                        continue;
-                    };
-                    if !up.load(Ordering::SeqCst) {
-                        continue;
-                    }
-                    let Ok(mut outbound) = TcpStream::connect(target).await else {
-                        continue;
-                    };
-                    let copy = tokio::spawn(async move {
-                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
-                    });
-                    connections.lock().expect("lock").push(copy.abort_handle());
-                }
-            })
-        };
-        Self {
-            addr,
-            up,
-            connections,
-            _accept: accept,
-        }
-    }
-
-    /// The node is gone: its connections close, new ones are dropped.
-    pub(crate) fn cut(&self) {
-        self.up.store(false, Ordering::SeqCst);
-        for connection in self.connections.lock().expect("lock").drain(..) {
-            connection.abort();
-        }
-    }
-
-    /// The node is back.
-    pub(crate) fn restore(&self) {
-        self.up.store(true, Ordering::SeqCst);
-    }
-}
 
 /// What a node holds of the map: its member id and the map the test last gave it.
 pub(crate) struct NodeMap {

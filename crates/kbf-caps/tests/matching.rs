@@ -155,17 +155,52 @@ fn a_request_names_one_xcode() {
     );
 }
 
-/// Catches: an arch mismatch ignored, and labels compared loosely.
+/// Catches: an arch mismatch ignored.
 #[test]
-fn arch_and_labels_are_exact() {
-    let mut n = ampere();
-    n.exact.insert("label.rack".to_owned(), "r1".to_owned());
-    assert!(req(&[("arch", "arm64"), ("label.rack", "r1")]).matches(&n));
+fn arch_is_exact() {
+    let n = ampere();
+    assert!(req(&[("arch", "arm64")]).matches(&n));
     assert_eq!(
         req(&[("arch", "x86_64")]).unmet(&n),
         [Unmet::Arch { want: Arch::X86_64 }]
     );
-    assert!(!req(&[("label.rack", "r2")]).matches(&n));
+}
+
+/// Catches: a `label.<k>` request key read again (node labels are removed: a request that
+/// names one is refused, not dropped, also when a stored request is parsed on replay), and
+/// a node report from an older daemon that still carries one refused instead of read with
+/// the entry skipped (a Hello during the roll must not drop the node). Each spelling: any
+/// key, in any case, and the bare prefix.
+#[test]
+fn a_label_key_is_unknown_in_a_request_and_skipped_in_a_report() {
+    for key in [
+        "label.rack",
+        "label.pool",
+        "Label.rack",
+        "LABEL.x",
+        "label.",
+        "label",
+    ] {
+        assert_eq!(
+            Request::parse([("arch", "arm64"), (key, "r1")]),
+            Err(RequestError::UnknownKey(key.to_owned())),
+            "{key}"
+        );
+    }
+    let node = NodeCaps::from_report([
+        ("arch", "arm64"),
+        ("os", "macos"),
+        ("label.rack", "r1"),
+        ("label.pool", "darwin-sized"),
+    ])
+    .expect("an older daemon's report is read");
+    assert!(
+        node.exact.keys().all(|key| !key.starts_with("label")),
+        "{:?}",
+        node.exact
+    );
+    assert_eq!(node.exact.get("os").map(String::as_str), Some("macos"));
+    assert!(req(&[("arch", "arm64"), ("os", "macos")]).matches(&node));
 }
 
 /// Catches: an unknown key or bad value silently ignored (the action would run
@@ -177,10 +212,6 @@ fn parse_rejects_what_it_cannot_compare() {
     assert_eq!(
         err(&[("isa", "x86-64-v3")]),
         RequestError::UnknownKey("isa".to_owned())
-    );
-    assert_eq!(
-        err(&[("label.", "x")]),
-        RequestError::UnknownKey("label.".to_owned())
     );
     for (k, v) in [
         ("isa_level", "x86-64-v9"),
@@ -226,7 +257,6 @@ fn a_request_is_written_as_the_properties_it_parses_from() {
     let image = format!("base@sha256:{}", "ab".repeat(32));
     let given = [
         ("vm.image", image.as_str()),
-        ("label.rack", "r1"),
         ("os", "linux"),
         ("mem_gib", "8"),
         ("cpus", "4"),
@@ -246,7 +276,6 @@ fn a_request_is_written_as_the_properties_it_parses_from() {
         ("cpu.feature", "avx2"),
         ("cpus", "4"),
         ("mem_gib", "8"),
-        ("label.rack", "r1"),
         ("os", "linux"),
         ("vm.image", image.as_str()),
         ("xcode", "16C5032a"),

@@ -2,19 +2,20 @@
 //! and checked by its own offer check (`deploy --offer - --bundle -`): the join of the two
 //! crates, which neither crate's tests can see. A name-list check inside xtask cannot catch
 //! a bundle the installer refuses (the release's `.sigstore.json` names, an SBOM, no
-//! `SHA256SUMS`), and the installer's tests build their bundles by hand.
+//! `SHA256SUMS`, version facts the sums do not name), and the installer's tests build their
+//! bundles by hand.
 //!
-//! The reader of the installer this tree is built from takes no `offer.json` entry (the
-//! host side that does lands with its own change), so each case leaves that entry out of
-//! the tar and gives the check the offer as the document it is. The entry is the stager's
-//! own and is pinned by its tests (`crates/xtask/tests/release_stage_offer.rs`).
+//! The offer is read back out of the bundle as a deploy reads it, by `from_bundle` on the
+//! reader's `offer.json` entry, never by a parser of this file's own. The stager's bytes for
+//! it are pinned by its tests (`crates/xtask/tests/release_stage_offer.rs`); here the offer is
+//! a document written beside the release files, put in the bundle by `build_bundle`.
 
 use std::io::Read;
 use std::path::Path;
 
 use kbf_installer::CommitId;
-use kbf_installer::deploy::bundle::{Bundle, read_bundle};
-use kbf_installer::deploy::offer::{Probe, ProbeFault, check_bundle, read};
+use kbf_installer::deploy::bundle::{Bundle, FACTS, read_bundle};
+use kbf_installer::deploy::offer::{Probe, ProbeFault, check_bundle, from_bundle, read};
 use kbf_testkit::dir::TestDir;
 use kbf_types::ReleasePlatform;
 use sha2::{Digest, Sha256};
@@ -29,13 +30,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// The files of a release of `SHA` as `release publish` leaves them, in a directory of its
-/// own: for each component of each platform its tarball, SBOM and bundle, and the
-/// `SHA256SUMS` over the tarballs and SBOMs. The offer for them is beside, as `OFFER_DOC`.
+/// own: for each platform the version facts of its `kbf`, and for each component of it the
+/// tarball, SBOM and bundle, and the `SHA256SUMS` over the tarballs, SBOMs and facts. The
+/// offer for them is beside, as `OFFER_DOC`.
 fn release_dir(name: &str) -> TestDir {
     let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stage-offer-bundle");
     let dir = TestDir::under(root, name);
     let mut lines = Vec::new();
     for platform in ReleasePlatform::ALL {
+        let facts = format!("kbf-{SHA}-{platform}.version.json");
+        let facts_bytes = format!("the facts of {facts}");
+        std::fs::write(dir.join(&facts), &facts_bytes).expect("facts");
+        let line = format!("{}  {facts}\n", sha256_hex(facts_bytes.as_bytes()));
+        lines.push(line);
         for component in platform.components() {
             let stem = format!("{component}-{SHA}-{platform}");
             let tarball = format!("{stem}.tar.gz");
@@ -97,14 +104,18 @@ fn tar_of(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
     tar.into_inner().expect("the tar")
 }
 
-/// The entries of the bundle the stager makes for the release in `dir`, less `offer.json`.
+/// The entries of the bundle the stager makes for the release in `dir`, `offer.json` among
+/// them: the offer is the document beside the release files.
 fn staged(dir: &Path) -> Vec<(String, Vec<u8>)> {
     let offer = std::fs::read(dir.join(OFFER_DOC)).expect("offer");
     let bundle = build_bundle(dir, SHA, &ReleasePlatform::ALL, &offer).expect("a bundle");
-    let mut entries = entries_of(&bundle);
-    assert_eq!(entries[1].0, "offer.json");
-    entries.remove(1);
-    entries
+    entries_of(&bundle)
+}
+
+/// The bytes of the entry named `name`, to edit.
+fn bytes_of<'a>(entries: &'a mut [(String, Vec<u8>)], name: &str) -> &'a mut Vec<u8> {
+    let at = entries.iter().position(|(n, _)| n == name);
+    &mut entries[at.expect("the entry")].1
 }
 
 /// A probe that finds the staged `kbf` to say what the offer says: the join is the bundle's
@@ -128,13 +139,17 @@ fn read_entries(entries: &[(String, Vec<u8>)]) -> Result<Bundle, String> {
     read_bundle(&tar_of(entries)[..], &commit)
 }
 
-/// The installer's verdict on the bundle of `entries` for the offer in `dir`, on a host of
-/// linux-x86_64: `ok`, or its reader's refusal, or the code and detail of its offer check.
-fn verdict(dir: &Path, entries: &[(String, Vec<u8>)]) -> String {
-    let doc = read(&dir.join(OFFER_DOC)).expect("an offer the installer accepts");
+/// The installer's verdict on the bundle of `entries`, on a host of linux-x86_64: `ok`, or its
+/// reader's refusal, or the code and detail of its refusal of the offer it carries or of its
+/// offer check. The offer is the bundle's own, as `deploy --offer -` reads it.
+fn verdict(entries: &[(String, Vec<u8>)]) -> String {
     let bundle = match read_entries(entries) {
         Ok(bundle) => bundle,
         Err(why) => return format!("reader: {why}"),
+    };
+    let doc = match from_bundle(bundle.offer.as_deref()) {
+        Ok(doc) => doc,
+        Err((code, why)) => return format!("{code}: {why}"),
     };
     let commit = CommitId::new(SHA).expect("a commit");
     let probe = Says(doc.meta_log);
@@ -149,50 +164,105 @@ fn the_bundle_the_stager_makes_is_read_and_accepted_by_the_installer() {
     // Catches: a bundle the installer refuses: the release's `.sigstore.json` names kept
     // for the attestations, an SBOM or a bundle in the tar, no `SHA256SUMS` (the offer's set
     // could not be checked), a copy of `SHA256SUMS` that is not the release's, a tarball
-    // under another name, or a platform or component the installer's store does not take.
+    // under another name, a platform or component the installer's store does not take,
+    // version facts under a name the reader does not know or that the sums do not list, an
+    // `offer.json` the reader does not take or `from_bundle` does not read as the offer
+    // (the document written to `out/`).
+    // Mutants it catches: the facts left out of the tar (nine entries are read, and every
+    // platform has its facts); `offer.json` renamed or left out; the facts named like
+    // tarballs.
     let dir = release_dir("accept");
     let entries = staged(&dir);
-    assert_eq!(verdict(&dir, &entries), "ok");
+    assert_eq!(verdict(&entries), "ok");
     let bundle = read_entries(&entries).expect("the installer reads it");
-    assert_eq!(bundle.entries.len(), 6);
+    assert_eq!(bundle.entries.len(), 9);
     let sums = std::fs::read(dir.join("SHA256SUMS")).expect("sums");
     assert_eq!(bundle.sums, Some(sums));
+    let from_file = read(&dir.join(OFFER_DOC)).expect("an offer the installer accepts");
+    let from_tar = from_bundle(bundle.offer.as_deref()).expect("the bundle's own offer");
+    assert_eq!(from_tar, from_file);
+    let facts: Vec<&str> = bundle
+        .entries
+        .iter()
+        .filter(|e| e.name == FACTS)
+        .map(|e| e.platform.as_str())
+        .collect();
+    assert_eq!(facts, ["linux-x86_64", "linux-arm64", "darwin-arm64"]);
+    let file = format!("kbf-{SHA}-linux-x86_64.version.json");
+    let released = std::fs::read(dir.join(file)).expect("the release's facts");
+    assert_eq!(bundle.entries[0].bytes, released);
 }
 
 #[test]
 fn a_bundle_without_the_sums_is_refused_by_the_offer_check() {
     // Catches: the stager leaving SHA256SUMS out: this is the shape it would have then.
+    // Mutant it catches: `check_bundle` letting a bundle with no `SHA256SUMS` through (the
+    // refusal of a missing set removed). The stager's own omission is the accept test's.
     let dir = release_dir("no-sums");
     let mut entries = staged(&dir);
     entries.retain(|(name, _)| name != "SHA256SUMS");
-    let said = verdict(&dir, &entries);
+    let said = verdict(&entries);
     assert!(said.starts_with("offer_set_unverified:"), "{said}");
+}
+
+#[test]
+fn a_bundle_without_its_offer_is_refused_as_having_none() {
+    // Catches: the stager leaving `offer.json` out of the tar, so that `deploy --offer -`
+    // has no offer to check; the reader takes the bundle, and `from_bundle` says so.
+    // Mutant it catches: `from_bundle(None)` returning an offer. The stager's own omission is
+    // the accept test's.
+    let dir = release_dir("no-offer");
+    let mut entries = staged(&dir);
+    entries.retain(|(name, _)| name != "offer.json");
+    let said = verdict(&entries);
+    assert!(said.starts_with("offer_missing:"), "{said}");
 }
 
 #[test]
 fn sums_that_are_not_the_offers_set_are_refused_by_the_offer_check() {
     // Catches: a copy of SHA256SUMS that differs from the release's by a byte.
+    // Mutant it catches: the comparison of the sums' set hash with the offer's removed from
+    // `check_bundle`.
     let dir = release_dir("edited-sums");
     let mut entries = staged(&dir);
-    entries[0].1.push(b'\n');
-    let said = verdict(&dir, &entries);
+    bytes_of(&mut entries, "SHA256SUMS").push(b'\n');
+    let said = verdict(&entries);
     assert!(said.starts_with("offer_set_mismatch:"), "{said}");
 }
 
 #[test]
 fn a_tarball_that_is_not_the_sums_file_is_refused_by_the_offer_check() {
     // Catches: a tarball in the bundle that is not the one the release set names.
+    // Mutant it catches: the comparison of each entry's digest with its line of the sums
+    // removed from `check_bundle`.
     let dir = release_dir("edited-tarball");
     let mut entries = staged(&dir);
-    entries[1].1.push(b'!');
-    let said = verdict(&dir, &entries);
+    bytes_of(&mut entries, &format!("kbf-{SHA}-linux-x86_64.tar.gz")).push(b'!');
+    let said = verdict(&entries);
     assert!(said.starts_with("offer_file_mismatch:"), "{said}");
+}
+
+#[test]
+fn version_facts_that_are_not_the_sums_file_are_refused_by_the_offer_check() {
+    // Catches: facts in the bundle that are not the release's (the store would take them and
+    // make a node's offer from them), and an installer that checks the tarballs and lets the
+    // facts through; the refusal names the facts file.
+    // Mutant it catches: the installer's offer check passing the facts entries over.
+    let dir = release_dir("edited-facts");
+    let mut entries = staged(&dir);
+    let facts = format!("kbf-{SHA}-linux-arm64.version.json");
+    bytes_of(&mut entries, &facts).push(b'!');
+    let said = verdict(&entries);
+    assert!(said.starts_with("offer_file_mismatch:"), "{said}");
+    assert!(said.contains(&facts), "{said}");
 }
 
 #[test]
 fn an_entry_under_the_releases_own_name_or_an_sbom_is_refused_by_the_reader() {
     // Catches: the attestation left under the release's name for it (`.sigstore.json`) and
-    // an SBOM in the tar: the reader takes `.attestation` and tarballs only.
+    // an SBOM in the tar: the reader takes `.attestation`, tarballs and version facts only.
+    // Mutant it catches: the `.attestation` rename skipped (the `expect` below finds none).
+    // The reader taking an SBOM entry is caught by the second half.
     let dir = release_dir("odd-names");
     let entries = staged(&dir);
     let mut renamed = entries.clone();
@@ -200,14 +270,14 @@ fn an_entry_under_the_releases_own_name_or_an_sbom_is_refused_by_the_reader() {
     let at = renamed.iter().position(|(n, _)| *n == name);
     renamed[at.expect("the attestation")].0 = name.replace(".attestation", ".sigstore.json");
     let refusal = "not <name>-<commit>-<platform>.tar.gz";
-    let said = verdict(&dir, &renamed);
+    let said = verdict(&renamed);
     assert!(said.starts_with("reader:"), "{said}");
     assert!(said.contains(refusal), "{said}");
 
     let mut with_sbom = entries.clone();
     let sbom = format!("kbf-{SHA}-linux-x86_64.cdx.json");
     with_sbom.push((sbom, b"{}".to_vec()));
-    let said = verdict(&dir, &with_sbom);
+    let said = verdict(&with_sbom);
     assert!(said.starts_with("reader:"), "{said}");
     assert!(said.contains(refusal), "{said}");
 }

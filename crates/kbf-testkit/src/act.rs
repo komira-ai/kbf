@@ -90,7 +90,7 @@ use std::time::{Duration, Instant};
 
 use rustix::process::Signal;
 
-use crate::probe::{self, Probe};
+use crate::act_probe::{self as probe, Probe};
 use crate::{Error, create, failed, number, read, write_line};
 
 /// The base name a link to a test binary that expands
@@ -243,7 +243,7 @@ pub(crate) enum Step<'a> {
         out: &'a str,
         paths: Vec<&'a str>,
     },
-    /// One of the probes of [`crate::probe`].
+    /// One of the probes of [`crate::act_probe`].
     Probe(Probe<'a>),
 }
 

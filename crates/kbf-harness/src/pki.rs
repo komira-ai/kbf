@@ -1,13 +1,13 @@
 //! The farm's certificate authority and the certificates a rehearsal's processes hold,
 //! made as the farm's issuer makes them: one per row of the certificate table, each
-//! checked by `kbf-deploy linux verify-cert`'s own function before a process reads it, so
+//! checked by `kbf_ca::verify_cert`, the check a deployed node makes, before a process reads it, so
 //! a certificate that a deployed node would be refused never reaches the farm.
 
 use std::net::IpAddr;
 use std::path::Path;
 use std::time::SystemTime;
 
-use kbf_deploy::linux::verify_cert::{CLIENT_AUTH, ROLE_URI_PREFIX, Row, verify};
+use kbf_ca::verify_cert::{CLIENT_AUTH, ROLE_URI_PREFIX, Row, verify};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose as Eku, IsCa,
     KeyPair, KeyUsagePurpose, SanType,

@@ -7,7 +7,12 @@
 //! fetches the release (if it is not installed) before it owes a restart or moves a link, so
 //! a refused or failed fetch changes nothing. The links move before the service restarts and
 //! the restart is recorded as owed before it is tried, so a crash anywhere leaves a state the
-//! next pass completes.
+//! next pass completes. An order may name the release the host's package carries instead of
+//! one to fetch (`source = staged`, `staged.rs`): it is held to the package's manifest and to
+//! a floor on its `seq`, and then goes through the same fetcher, pipeline and swap. At the end
+//! of a pass the helper looks at the package and the source and tells the frontend what it
+//! found, and keeps the floor up with what the host has confirmed (`notice.rs`); the status
+//! says it, nothing else moves.
 
 use std::io::Write;
 use std::time::Duration;
@@ -21,11 +26,16 @@ use crate::stage;
 use crate::state::{self, Locked, State, StateError};
 use kbf_host::plan::Mode;
 use kbf_host::{Exec, HostPath, Perms, Step};
+use kbf_update::{Facts, Source};
 
 mod frontend;
+mod notice;
+mod staged;
 
+use self::notice::Notice;
+use self::staged::{Held, refusal_of};
 use crate::database::SchemaStep;
-use crate::helper::fetcher::{Fetcher, InstalledRelease, ReleaseLocator};
+use crate::helper::fetcher::{Fetcher, InstalledRelease};
 use crate::helper::host_mode;
 use crate::helper::leases::{self, LeaseSource};
 use crate::helper::memory::{Event, Memory, StagedFacts};
@@ -85,6 +95,8 @@ pub struct Helper<E: Exec> {
     procs: Box<dyn Procs>,
     /// A swap was confirmed in this pass: the release it replaced may now be collected.
     gc_due: bool,
+    /// What the helper remembers of the package and the source between passes (`notice.rs`).
+    notice: Notice,
 }
 
 fn memory_path(host: &Layout) -> HostPath {
@@ -112,6 +124,7 @@ impl<E: Exec> Helper<E> {
             leases,
             procs,
             gc_due: false,
+            notice: Notice::default(),
         }
     }
 
@@ -235,11 +248,16 @@ impl<E: Exec> Helper<E> {
     /// One pass. `now` is seconds since the epoch.
     pub fn cycle(&mut self, now: u64) -> Result<(), HelperError> {
         let mut memory = self.load()?;
+        self.notice.stamp(&mut memory);
         self.restart_if_owed(&mut memory)?;
         self.expire(now, &mut memory)?;
         self.orders(now, &mut memory)?;
         self.restart_if_owed(&mut memory)?;
         self.collect();
+        // What the orders came to is told before the look, which reads the package in full the
+        // first time and may run `gh`; the write is skipped when the second report is the same.
+        self.report(&memory)?;
+        self.notice_package(now, &mut memory);
         self.report(&memory)
     }
 
@@ -442,11 +460,18 @@ impl<E: Exec> Helper<E> {
             Kind::Frontend(_) => "floor: ",
             Kind::Node => "",
         };
+        // The proxy blames a refusal on its update by the order's id alone, so only its own
+        // kinds of order are named: the node's ids are another counter's.
+        let named = |o: &Order| match kind_of(o, &state, frontend_host) {
+            Kind::Frontend(_) => Some(o.id),
+            Kind::Node => None,
+        };
         match parsed {
             // A frontend order on a host that runs no frontend: refused, and like any
             // refusal of a record it does not move a floor.
-            Ok(o) if !frontend_host && o.verb == Verb::FrontendUpdate => refuse(
+            Ok(o) if !frontend_host && o.verb == Verb::FrontendUpdate => refuse_order(
                 memory,
+                named(&o),
                 &format!(
                     "denied: order {}: this host runs no frontend (frontend_update is refused): {}",
                     o.id,
@@ -457,8 +482,9 @@ impl<E: Exec> Helper<E> {
                 if floor(&o, memory).0 != 0
                     && o.epoch > floor(&o, memory).0.saturating_add(order::MAX_EPOCH_JUMP) =>
             {
-                refuse(
+                refuse_order(
                     memory,
+                    named(&o),
                     &format!(
                         "{}order {} is from epoch {}, more than {} above the last acted on ({}): \
                          not acted on",
@@ -471,8 +497,9 @@ impl<E: Exec> Helper<E> {
                 );
             }
             Ok(o) if o.epoch < floor(&o, memory).0 => {
-                refuse(
+                refuse_order(
                     memory,
+                    named(&o),
                     &format!(
                         "{}order {} is from epoch {}, older than the last acted on ({})",
                         word(&o),
@@ -499,6 +526,9 @@ impl<E: Exec> Helper<E> {
                     }
                 }
                 memory.last_acted_id = o.id;
+                // Every way of acting on an order sets the event, so a refusal here is this
+                // order's: the proxy that wrote it can tell it from an older one by the id.
+                memory.refused_order_id = named(&o).filter(|_| memory.event == Event::Refused);
             }
             // Not acknowledged: a garbage file must not move the floor.
             Err(why) => refuse(memory, &format!("order file {name}: {why}")),
@@ -545,6 +575,9 @@ impl<E: Exec> Helper<E> {
                     memory.last_activation_at = now;
                 }
                 self.gc_due |= done.kept;
+                if done.kept {
+                    self.raise_floor();
+                }
             }
             Err(why) => {
                 refuse(memory, &why);
@@ -573,29 +606,12 @@ impl<E: Exec> Helper<E> {
                  frontend_update, and an activate would restart it"
             ));
         }
-        // Fail closed: an activation without the release's claims is not taken.
-        let Some(claims) = &order.claims else {
-            return Err(format!(
-                "order {id}: an activation carries no release claims"
-            ));
+        // An activation that fetches claims the release it expects; a staged one claims none,
+        // since the package's manifest says what its release is.
+        let claims = match order.source {
+            Source::Fetch => Some(self.vet_claims(order)?),
+            Source::Staged => None,
         };
-        // `kbf` is the one component a release of either platform carries that an order may
-        // name (a Mac is given no `kbf-daemon`).
-        let prefix = platform_prefix(&self.host);
-        let needs = ["kbf"].as_slice();
-        if !claims.platform.starts_with(prefix) {
-            return Err(format!(
-                "order {id} is for platform {:?}, not this host's ({prefix}*)",
-                claims.platform
-            ));
-        }
-        let mut names: Vec<&str> = claims.components.iter().map(|c| c.name.as_str()).collect();
-        names.sort_unstable();
-        if names != needs {
-            return Err(format!(
-                "order {id} names components {names:?}; this platform needs exactly {needs:?}"
-            ));
-        }
         // One confirm window at a time, never two timers. The same order again (a pass
         // that died after the swap) is the repeat `activate` recognises.
         let this = format!("{}-{}", order.epoch, order.id);
@@ -631,22 +647,33 @@ impl<E: Exec> Helper<E> {
                 now - last
             ));
         }
-        // A directory on the host is not proof: the fetcher verifies the release whether it
-        // pulls it or finds it.
-        let rec = ReleaseLocator {
-            commit: order.commit.clone(),
-            components: claims.components.clone(),
+        // A staged order is held to the rules of the seed now: after the shortcut above (a
+        // repeat of the order for the running release is not a refusal that holds the run),
+        // before anything is done.
+        let held = match claims {
+            Some(claims) => Held::Claims(claims),
+            None => {
+                let seed = self.admitted_seed(&order.commit);
+                Held::Seed(seed.map_err(|e| refusal_of(id, e))?)
+            }
         };
-        // The node is told a fetch is under way; it may take minutes.
+        // The node is told a fetch is under way; it may take minutes. A directory on the host
+        // is not proof: the fetcher verifies the release whether it pulls it or finds it.
         memory.fetching = true;
         self.report(memory).map_err(|e| e.to_string())?;
-        let fetched = self.fetcher.fetch_activation(&rec, &claims.facts());
+        let fetched = self.fetch_held(&order.commit, &held);
         memory.fetching = false;
-        let got = fetched.map_err(|e| format!("order {id}: {e}"))?;
+        let got = fetched.map_err(|e| refusal_of(id, e))?;
         // What the fetched binary declared must be what the order expected, before a link
         // moves: a release that is attested but is another build than the one ordered is
-        // refused.
-        if let Err(why) = matches_claims(&got, order, claims) {
+        // refused. A staged order expects what the manifest said when it was admitted, and
+        // the package must still say it.
+        let checked = match &held {
+            Held::Claims(claims) => matches_facts(&got, &order.commit, &claims.facts()),
+            Held::Seed(seed) => matches_facts(&got, &order.commit, &seed.facts)
+                .and_then(|()| self.seed_unchanged(seed)),
+        };
+        if let Err(why) = checked {
             return Err(format!(
                 "order {id}: the fetched release is not the one ordered: {why}"
             ));
@@ -654,6 +681,34 @@ impl<E: Exec> Helper<E> {
         memory.staged = Some(facts(&got));
         memory.staged_profile = Some(got.profile.clone());
         Ok(())
+    }
+
+    /// An activation that fetches carries the release's claims, complete and for this host:
+    /// fail closed without them. `kbf` is the one component a release of either platform
+    /// carries that an order may name (a Mac is given no `kbf-daemon`).
+    fn vet_claims<'o>(&self, order: &'o Order) -> Result<&'o Claims, String> {
+        let id = order.id;
+        let Some(claims) = &order.claims else {
+            return Err(format!(
+                "order {id}: an activation carries no release claims"
+            ));
+        };
+        let prefix = platform_prefix(&self.host);
+        let needs = ["kbf"].as_slice();
+        if !claims.platform.starts_with(prefix) {
+            return Err(format!(
+                "order {id} is for platform {:?}, not this host's ({prefix}*)",
+                claims.platform
+            ));
+        }
+        let mut names: Vec<&str> = claims.components.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        if names != needs {
+            return Err(format!(
+                "order {id} names components {names:?}; this platform needs exactly {needs:?}"
+            ));
+        }
+        Ok(claims)
     }
 
     fn arm(&self, order: &Order) -> Arm {
@@ -857,9 +912,19 @@ fn platform_prefix(host: &Layout) -> &'static str {
     }
 }
 
+/// Record a refusal that is no order's (a record that could not be read, a restart that failed,
+/// the spool crowded): it names none.
 fn refuse(memory: &mut Memory, why: &str) {
     memory.event = Event::Refused;
     memory.refusal = why.to_owned();
+    memory.refused_order_id = None;
+}
+
+/// Record the refusal of an order, named by `id` when it is one of the proxy's, so that whoever
+/// wrote the order can tell its refusal from an older one.
+fn refuse_order(memory: &mut Memory, id: Option<u64>, why: &str) {
+    refuse(memory, why);
+    memory.refused_order_id = id;
 }
 
 fn release_err(e: &ReleaseError) -> String {
@@ -873,9 +938,10 @@ fn short(c: &Option<CommitId>) -> String {
         .unwrap_or_default()
 }
 
-/// Whether the release the fetcher installed is the one the order named and expected.
-fn matches_claims(got: &InstalledRelease, order: &Order, claims: &Claims) -> Result<(), String> {
-    if got.commit != order.commit {
+/// Whether the release the fetcher installed is the one the order named (`commit`) and
+/// expected (`want`).
+fn matches_facts(got: &InstalledRelease, commit: &CommitId, want: &Facts) -> Result<(), String> {
+    if got.commit != *commit {
         return Err(format!("it is commit {}", got.commit.as_str()));
     }
     let same = (
@@ -885,11 +951,11 @@ fn matches_claims(got: &InstalledRelease, order: &Order, claims: &Claims) -> Res
         got.state_schema,
         &got.profile,
     ) == (
-        &claims.platform,
-        claims.protocol,
-        claims.min_protocol,
-        claims.state_schema,
-        &claims.profile,
+        &want.platform,
+        want.protocol,
+        want.min_protocol,
+        want.state_schema,
+        &want.profile,
     );
     if same {
         Ok(())
@@ -902,11 +968,11 @@ fn matches_claims(got: &InstalledRelease, order: &Order, claims: &Claims) -> Res
             got.min_protocol,
             got.state_schema,
             got.profile,
-            claims.platform,
-            claims.protocol,
-            claims.min_protocol,
-            claims.state_schema,
-            claims.profile
+            want.platform,
+            want.protocol,
+            want.min_protocol,
+            want.state_schema,
+            want.profile
         ))
     }
 }

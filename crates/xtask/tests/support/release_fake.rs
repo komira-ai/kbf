@@ -259,7 +259,23 @@ impl Fx {
     /// `releases/<tag>/`: for each of `assets`, `(stem, tarball)` with the stem
     /// `<binary>-<commit>-<platform>`, the tarball with its SBOM and bundle, and the
     /// `SHA256SUMS`; and the artifacts workflow's attestations of them, in its `attested`.
+    /// It holds no version facts: a release made before the build jobs recorded them
+    /// ([`Fx::publish_with_facts`]).
     pub fn publish(&self, tag: &str, commit: &str, assets: &[(String, Vec<u8>)]) {
+        self.publish_with_facts(tag, commit, assets, &[]);
+    }
+
+    /// [`Fx::publish`], and for each of `facts`, `(stem, bytes)` with the stem of a `kbf`
+    /// tarball of `assets`, the file `<stem>.version.json` holding `bytes`, listed in the
+    /// `SHA256SUMS` and attested for build provenance alone, as `release version-facts` and
+    /// the artifacts workflow leave it.
+    pub fn publish_with_facts(
+        &self,
+        tag: &str,
+        commit: &str,
+        assets: &[(String, Vec<u8>)],
+        facts: &[(String, Vec<u8>)],
+    ) {
         let dir = self.root.join("gh/releases").join(tag);
         std::fs::create_dir_all(&dir).expect("release dir");
         let signed = format!(
@@ -283,6 +299,12 @@ impl Fx {
             attested.push_str(&format!("{tgz_sha} {signed} --predicate-type {SBOM}\n"));
             lines.push((tgz_sha, format!("{stem}.tar.gz")));
             lines.push((sbom_sha, format!("{stem}.cdx.json")));
+        }
+        for (stem, bytes) in facts {
+            let sha = sha_of(bytes);
+            std::fs::write(dir.join(format!("{stem}.version.json")), bytes).expect("facts");
+            attested.push_str(&format!("{sha} {signed}\n"));
+            lines.push((sha, format!("{stem}.version.json")));
         }
         lines.sort_by(|a, b| a.1.cmp(&b.1));
         let sums: String = lines.iter().map(|(s, n)| format!("{s}  {n}\n")).collect();

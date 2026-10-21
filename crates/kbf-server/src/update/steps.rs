@@ -63,7 +63,9 @@ impl Ctx<'_> {
         }
     }
 
-    /// The helper reverted or refused: the run is held (steps 6 to 9).
+    /// The helper reverted or refused: the run is held (steps 6 to 9). A refusal here is a
+    /// revert that could not run; step 6 reads the refusal of its own order first
+    /// ([`activating`]).
     fn helper_failed(&self) -> Option<Transition> {
         match self.obs.report() {
             Some(HelperStatus::Reverted) => {
@@ -314,6 +316,11 @@ fn gated(ctx: &Ctx<'_>) -> Transition {
 /// Step 6: the helper reports the flip, naming this update's order. A daemon-only host also
 /// waits for its daemon to be back at the target, which stands in for step 7.
 fn activating(ctx: &Ctx<'_>) -> Transition {
+    // The helper refused this step's order, so it flipped nothing: not a revert that could
+    // not run. A refusal that names another order is no report ([`Observations::report`]).
+    if ctx.obs.report() == Some(HelperStatus::Refused) {
+        return Transition::hold(HoldReason::ActivateRefused, Vec::new());
+    }
     if let Some(held) = ctx.helper_failed() {
         return held;
     }

@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use kbf_map::MemberId;
 use kbf_server::update::{
     Alert, Controller, ControllerError, FactsSource, FarmView, GiveBack, HoldReason, HostPhase,
-    HostRecord, HostRow, OrderId, Policy, PolicyError, Release, SlotClass, SourceError, Stored,
-    Transport, TransportError, WaitReason,
+    HostRecord, HostRow, OrderId, Policy, PolicyError, Release, SlotClass, Source, SourceError,
+    Stored, Transport, TransportError, WaitReason,
 };
 use kbf_state::{Cond, Txn};
 use kbf_types::{FarmTime, WorkerId};
@@ -490,6 +490,38 @@ fn a_host_finishes_the_offer_that_began_it_and_is_then_walked_back() {
     assert_eq!(rig.phase("s2"), HostPhase::Pending);
 }
 
+/// Catches: a host's source read from the run that is desired now instead of the run that
+/// began it, and a host walked back under a new run that keeps the old run's source. `s1`
+/// begins under a staged offer of `v2` and is past the activate order when a rollback is
+/// offered as a fetch. Its row still says staged when it restarts, though the desired run
+/// is a fetch by then; when the rollback walks it back it begins again and takes the
+/// rollback's source.
+///
+/// Mutants: `next_row` copying the source from `desired` on every move (the row reads fetch
+/// at the restart); `next_row` never copying it (the row reads fetch at the activate order,
+/// under a staged offer); `next_row` keeping the old row's source when a host begins again
+/// (the walked-back row reads staged).
+#[test]
+fn a_host_keeps_its_runs_source_and_takes_the_next_runs_when_walked_back() {
+    let mut rig = Rig::new(Backing::Fake, "source", &spec(2, 0, 0), Policy::default());
+    rig.offer_from(NEW, Source::Staged);
+    rig.until("the activate order", 200, |r| {
+        r.phase("s1") == HostPhase::Activating
+    });
+    assert_eq!(row_of(&rig.rows, "s1").source, Source::Staged);
+    let back = rig.offer(OLD);
+    rig.until("the restart", 300, |r| {
+        r.phase("s1") == HostPhase::RejoiningStorage
+    });
+    assert_eq!(row_of(&rig.rows, "s1").source, Source::Staged);
+    rig.world.lock().new_run();
+    rig.until("s1 walked back", 3_000, |r| {
+        let row = row_of(&r.rows, "s1");
+        row.record.phase == HostPhase::Done && row.record.generation == back
+    });
+    assert_eq!(row_of(&rig.rows, "s1").source, Source::Fetch);
+}
+
 /// Catches: a host that has done nothing irreversible activating a release that a newer
 /// offer has replaced. `d1` is busy (a lease of 600 s), forced after the idle wait, and
 /// waiting for its lease when `v3` is offered. It is given back at the next look: uncordoned,
@@ -549,6 +581,7 @@ fn a_claim_for_a_full_class_draws_no_order_id() {
             boot_before: None,
         },
         commit: Release::new(NEW),
+        source: Source::Fetch,
     };
     let absent = Stored {
         value: HostRow::unstarted(),
@@ -684,6 +717,7 @@ fn a_host_the_farm_does_not_show_at_the_restart_still_gets_the_orders_of_its_row
             boot_before: None,
         },
         commit: Release::new(NEW),
+        source: Source::Fetch,
     };
     let absent = Stored {
         value: HostRow::unstarted(),

@@ -1,0 +1,45 @@
+[package]
+name = "kbf-daemon-test"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# T009/T018's black-box suites of the daemon (no residue after real builds, no cross-action
+# data access), tests only: see README.md. No library target and no binary of its own; the
+# farm's processes are found beside the test binary (`kbf_harness::stand_in`). Everything is
+# a dev-dependency, so nothing here is linked into a shipped binary.
+
+[dev-dependencies]
+# The farm of real `kbf` processes, started from the units `kbf-deploy` renders, and the
+# REAPI client of its frontend (`kbf_harness::reapi`).
+kbf-harness.workspace = true
+# The REAPI response a test reads (tests/isolation).
+kbf-proto.workspace = true
+# The act steps the stand-in `crun` runs through this test binary, a scratch directory, and
+# the platform-neutral probes and node seam (`kbf_testkit::probe`, `::node_view`).
+kbf-testkit.workspace = true
+# The CAS the REAPI helpers upload through, and the digest of a cached input's contents.
+kbf-transfer.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tonic = { workspace = true, features = ["tls-ring"] }
+
+# The Mac legs (tests/mac_pool_spike, macOS only): a real `kbf daemon --driver native` as
+# root behind the fake front kbf-node's tests share (`kbf-node/tests/front`, included by
+# path: it names the daemon's CAS trait, the front's in-memory cache and the worker
+# protocol), and the node certificates it needs (made with rcgen, checked by `kbf-deploy`'s
+# `verify-cert`). Only a macOS build of the tests takes them.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+futures.workspace = true
+kbf-daemon.workspace = true
+kbf-deploy.workspace = true
+kbf-front.workspace = true
+prost.workspace = true
+rcgen.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "sync"] }
+
+[lints]
+workspace = true

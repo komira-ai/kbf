@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::CommitId;
 
+/// Where the release of an update or an order comes from. It is `kbf-update`'s word for it,
+/// named here so that everything that carries it spells it once.
+pub use kbf_update::Source;
+
 /// One of the two child positions of a frontend host. The proxy keeps its children at
 /// fixed loopback offsets per slot; a slot holds at most one process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -78,6 +82,9 @@ pub enum Step {
     Rollback,
     Restart,
     Confirm,
+    /// The new frontend would not take the order for the nodes (step 9): it refused it for
+    /// good, or never answered. The frontend itself was swapped and keeps serving.
+    Nodes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,7 +237,8 @@ pub enum Verb {
 }
 
 /// An order to the root half (Q1): a locator only, `{order_id, epoch, generation, verb,
-/// commit, window_s}`. Nothing in it is a path or a URL.
+/// commit, window_s}` and, for an order that is not a fetch, `source`. Nothing in it is a path
+/// or a URL.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Locator {
     pub order_id: u64,
@@ -239,6 +247,11 @@ pub struct Locator {
     pub verb: Verb,
     pub commit: CommitId,
     pub window_s: u32,
+    /// Where the release comes from. Left out of the bytes when it is `fetch`, which is what a
+    /// locator without the key means, so the locator of an order that fetches is the six keys it
+    /// has always been.
+    #[serde(default, skip_serializing_if = "Source::is_fetch")]
+    pub source: Source,
 }
 
 /// An operator request that arrives while an update runs.
@@ -268,6 +281,9 @@ pub struct Timing {
     pub poll: Duration,
     /// How often a short wait (quiesce, takeover resolving) looks again.
     pub tick: Duration,
+    /// How long the new frontend that does not answer is offered the order for the nodes again
+    /// (step 9), one `poll` apart, before the update ends `failed` at `nodes`.
+    pub desired_within: Duration,
 }
 
 impl Timing {
@@ -283,6 +299,7 @@ impl Timing {
             confirm_backoff_max: Duration::from_secs(30),
             poll: Duration::from_secs(1),
             tick: Duration::from_millis(100),
+            desired_within: Duration::from_secs(300),
         }
     }
 
@@ -306,6 +323,8 @@ pub struct Plan {
     pub nodes: bool,
     /// The downgrade flag of the API; recorded, not acted on here.
     pub rollback: bool,
+    /// Where the release came from; the order for the nodes (step 9) names the same.
+    pub source: Source,
     /// The slot that serves now.
     pub old_slot: Slot,
     pub timing: Timing,
@@ -323,6 +342,7 @@ impl Plan {
             to: intent.to.clone(),
             nodes: intent.nodes,
             rollback: intent.rollback,
+            source: intent.source,
             old_slot: intent.old_slot,
             timing,
         }
@@ -346,6 +366,11 @@ pub struct Intent {
     pub to: CommitId,
     pub nodes: bool,
     pub rollback: bool,
+    /// Where the release came from. Left out of `update.json` when it is `fetch`, so the file
+    /// of an update that fetches is the one every build has written, and a file without the
+    /// key reads as `fetch`.
+    #[serde(default, skip_serializing_if = "Source::is_fetch")]
+    pub source: Source,
     pub phase: Phase,
     pub phase_started: u64,
     pub bake_started: Option<u64>,
@@ -378,6 +403,7 @@ impl Intent {
             to: plan.to.clone(),
             nodes: plan.nodes,
             rollback: plan.rollback,
+            source: plan.source,
             phase: Phase::Staged,
             phase_started: now,
             bake_started: None,
@@ -430,3 +456,25 @@ pub enum CrashPoint {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct PortError(pub String);
+
+/// Why the order for the nodes (step 9) did not land. The swap offers it again after the one
+/// kind and gives up on the other.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DesiredError {
+    /// The child answered and will not take this order however often it is sent: `code` is
+    /// the one the child gave (`not_own`, `older`, ...) or, if it gave none, `http_` and the
+    /// status.
+    #[error("{code}: {why}")]
+    Refused { code: String, why: String },
+    /// There is no answer to go by: the child was not reached, did not answer in time, or
+    /// answered that it is busy or failed. Sending the same order again is the same offer.
+    #[error("{0}")]
+    Unreached(String),
+}
+
+impl DesiredError {
+    /// Whether the order got no answer to go by, so that sending it again is the same offer.
+    pub fn is_unreached(&self) -> bool {
+        matches!(self, DesiredError::Unreached(_))
+    }
+}

@@ -82,7 +82,7 @@ async fn assert_absent(cache: &FaultyCache, b: &TestBlob) {
         cache.find_missing(&[b.digest]).await.expect("find"),
         vec![b.digest]
     );
-    assert!(!cache.is_durable(&b.digest).await.expect("durable"));
+    assert!(!cache.is_complete(&b.digest).await.expect("complete"));
     assert!(matches!(
         cache.read_blob(&b.digest).await,
         Err(CacheError::NotFound(_))

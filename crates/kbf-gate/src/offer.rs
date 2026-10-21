@@ -66,8 +66,8 @@ pub struct OfferDoc {
     pub commit: CommitId,
     /// The release set offered: the hash of its `SHA256SUMS`.
     pub set_hash: SetHash,
-    /// The platforms found complete in the release (tarball, SBOM and bundle), by the
-    /// names assets use (`linux-x86_64`, ...), sorted.
+    /// The platforms found complete in the release (tarball, SBOM, bundle and version facts),
+    /// by the names assets use (`linux-x86_64`, ...), sorted.
     pub platforms: Vec<String>,
     /// The beta evidence.
     pub beta: Beta,

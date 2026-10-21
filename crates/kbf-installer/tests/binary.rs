@@ -123,6 +123,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
             state_schema: 3,
             profile: "release".to_owned(),
         }),
+        source: kbf_update::Source::Fetch,
     };
     fs::write(
         host.join(&host.orders_dir()).join(record.file_name()),
@@ -560,4 +561,25 @@ fn the_operators_verbs_end_by_the_state_error_they_met() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Catches a source that is neither `fetch` nor `staged` getting past the command line:
+/// `update --source` is read by clap, so any other word is a usage error (exit 2) before the
+/// verb reads a token or sends a request, and the message names the flag.
+///
+/// Mutant planted: the parser reading any word as `fetch`.
+#[test]
+fn update_takes_no_source_but_fetch_or_staged() {
+    let commit = "a".repeat(40);
+    for word in ["bogus", "Staged", ""] {
+        let out = Command::new(BIN)
+            .args(["update", "--commit", commit.as_str(), "--frontend"])
+            .args(["--api", "127.0.0.1:1", "--source", word])
+            .output()
+            .expect("runs");
+        assert_eq!(out.status.code(), Some(2), "{word:?}");
+        assert!(out.stdout.is_empty(), "{word:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("--source"), "{word:?}: {err}");
+    }
 }

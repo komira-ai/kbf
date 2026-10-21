@@ -38,6 +38,7 @@ fn spec(id: &str) -> UpdateSpec {
         to: c(B),
         nodes: true,
         rollback: false,
+        source: kbf_update::Source::Fetch,
         facts: StagedFacts {
             commit: c(B),
             protocol: 7,
@@ -52,6 +53,7 @@ fn spec(id: &str) -> UpdateSpec {
             verb: Verb::FrontendUpdate,
             commit: c(B),
             window_s: 900,
+            source: kbf_update::Source::Fetch,
         },
     }
 }

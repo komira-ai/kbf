@@ -124,10 +124,15 @@ pub enum HoldReason {
     /// The helper reverted the node itself (the window expired, the binary kept dying, or
     /// the confirm was lost).
     Reverted,
-    /// The helper could not revert: the previous release is missing.
+    /// The helper could not revert after the flip (steps 7 to 9): the previous release is
+    /// missing.
     RevertRefused,
     /// The node is updated and confirmed but placement still has it cordoned.
     StillCordoned,
+    /// The helper reported the activate order of this update refused (step 6). The run is
+    /// held with the cordon kept, like the other holds after the order. The refusal text is
+    /// in the helper's status.
+    ActivateRefused,
 }
 
 impl HoldReason {
@@ -146,7 +151,8 @@ impl HoldReason {
             | Self::RepairWait
             | Self::ConfirmStalled
             | Self::Reverted
-            | Self::StillCordoned => Severity::Warn,
+            | Self::StillCordoned
+            | Self::ActivateRefused => Severity::Warn,
         }
     }
 
@@ -166,7 +172,8 @@ impl HoldReason {
             | Self::RepairWait
             | Self::ConfirmStalled
             | Self::Reverted
-            | Self::RevertRefused => true,
+            | Self::RevertRefused
+            | Self::ActivateRefused => true,
         }
     }
 }

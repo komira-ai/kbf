@@ -14,7 +14,7 @@
 //! | `resume` | `POST /v1/admin/resume` | admin | [`Deadlines::call`] |
 //! | `ready` | `GET /readyz` | operator | [`Deadlines::call`] |
 //! | `open_counts` | `GET /v1/admin/role` (`open_streams`, `open_sessions`) | admin | [`Deadlines::call`] |
-//! | `post_desired` | `POST /v1/update/desired {"commit": ...}` | operator | [`Deadlines::call`], all tries together |
+//! | `post_desired` | `POST /v1/update/desired {"commit": ..., "source": "staged"}` (no `source` for a fetch) | operator | [`Deadlines::call`], all tries together |
 //!
 //! Each method is in the trait and, with a typed error, as `try_<name>`; the trait flattens
 //! [`AdminError`] to the text of a [`PortError`], which is all the swap keeps.
@@ -79,7 +79,13 @@
 //! gates of the operator API: the secret the caller supplies as headers, the operator token
 //! (read from its source on every call, so a rotated token is used) as `Authorization:
 //! Bearer`, and `Content-Type: application/json`; never `Origin`. The body is the commit
-//! alone. A `409` is [`AdminError::NotOwn`] when its body says `"code": "not_own"` (a commit
+//! alone, and for a source that is not a fetch the source after it (`"source":"staged"`): a
+//! fetch is the body every build has sent. The trait method reads the answer for the swap
+//! (`desired_verdict`): a `2xx` landed it; a `429`, a `5xx`, a token that cannot be read and
+//! a call that got no answer are [`DesiredError::Unreached`] and the swap sends the order
+//! again; any other status is the child's refusal ([`DesiredError::Refused`], with the `code`
+//! the child gave or `http_` and the status), which the swap does not send again. A `409` is
+//! [`AdminError::NotOwn`] when its body says `"code": "not_own"` (a commit
 //! other than the child's own build, which needs a rollback flag this body does not
 //! carry), and [`AdminError::Conflict`] otherwise. The child's answer today has no `code`,
 //! only an `error` text, so today every `409` is a [`AdminError::Conflict`]; the code is
@@ -111,13 +117,16 @@ use std::net::SocketAddr;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use kbf_update::Source;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::CommitId;
 
 use super::child_http::{Client, Headers, HttpError, Limits, Response};
-use super::model::{OpenCounts, PortError, Readiness, RoleInfo, RoleState, Slot, Timing};
+use super::model::{
+    DesiredError, OpenCounts, PortError, Readiness, RoleInfo, RoleState, Slot, Timing,
+};
 use super::ports::ChildAdmin;
 
 /// The `admin_protocol` this client reads. Every `role` answer says its own.
@@ -421,9 +430,7 @@ impl Admin {
     }
 
     pub fn try_post_desired(&self, slot: Slot, commit: &CommitId) -> Result<(), AdminError> {
-        let headers = self.write_headers()?;
-        let body = format!("{{\"commit\":\"{}\"}}", commit.as_str());
-        let answer = self.send_offer((self.operator)(slot), &headers, body.as_bytes())?;
+        let answer = self.post_offer(slot, commit, Source::Fetch)?;
         match answer.status {
             409 if reason(&answer.body).code.as_deref() == Some(NOT_OWN) => {
                 Err(AdminError::NotOwn {
@@ -432,6 +439,18 @@ impl Admin {
             }
             _ => judge("post_desired", answer).map(drop),
         }
+    }
+
+    /// The order for the nodes, sent: the child's answer whatever it says, or why none was had.
+    fn post_offer(
+        &self,
+        slot: Slot,
+        commit: &CommitId,
+        source: Source,
+    ) -> Result<Response, AdminError> {
+        let headers = self.write_headers()?;
+        let body = desired_body(commit, source);
+        self.send_offer((self.operator)(slot), &headers, body.as_bytes())
     }
 
     /// The answer to the offer. A `503` is sent again after a pause, up to `OFFER_TRIES` times
@@ -531,9 +550,51 @@ impl ChildAdmin for Admin {
         self.try_open_counts(slot).map_err(PortError::from)
     }
 
-    fn post_desired(&self, slot: Slot, commit: &CommitId) -> Result<(), PortError> {
-        self.try_post_desired(slot, commit).map_err(PortError::from)
+    fn post_desired(
+        &self,
+        slot: Slot,
+        commit: &CommitId,
+        source: Source,
+    ) -> Result<(), DesiredError> {
+        match self.post_offer(slot, commit, source) {
+            Ok(answer) => desired_verdict(&answer),
+            Err(e) => Err(DesiredError::Unreached(e.to_string())),
+        }
     }
+}
+
+/// The body of the order for the nodes: the commit, and the source after it when it is not a
+/// fetch. A fetch is the body every build has sent, so a child from before `source` takes it.
+fn desired_body(commit: &CommitId, source: Source) -> String {
+    let head = format!("{{\"commit\":\"{}\"", commit.as_str());
+    if source.is_fetch() {
+        format!("{head}}}")
+    } else {
+        format!("{head},\"source\":\"{}\"}}", source.name())
+    }
+}
+
+/// What the child's answer to the order for the nodes says of it. A `2xx` landed it. A `429` or
+/// a `5xx` says nothing of the order (the child is busy, failed, or something in the way did):
+/// sending the same order again is the same offer. Any other status is the child answering that
+/// it will not take this order, and it is the same answer next time; the code is the one the
+/// child gave, or `http_` and the status when it gave none.
+fn desired_verdict(answer: &Response) -> Result<(), DesiredError> {
+    let status = answer.status;
+    if (200..=299).contains(&status) {
+        return Ok(());
+    }
+    let said = reason(&answer.body);
+    let why = if said.error.is_empty() {
+        format!("the child answered {status}")
+    } else {
+        said.error
+    };
+    if status == 429 || (500..=599).contains(&status) {
+        return Err(DesiredError::Unreached(why));
+    }
+    let code = said.code.map_or_else(|| format!("http_{status}"), clip);
+    Err(DesiredError::Refused { code, why })
 }
 
 fn limits(deadline: Duration) -> Limits {

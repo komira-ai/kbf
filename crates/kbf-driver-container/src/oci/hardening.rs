@@ -20,8 +20,9 @@
 //!   architectures. The result is a plain OCI `linux.seccomp` section. One edit differs
 //!   from upstream: four `personality` entries that also allow `ADDR_NO_RANDOMIZE`
 //!   (see their `comment` in the profile).
-//! - **Also set:** `noNewPrivileges`, `oom_score_adj` 0, a private cgroup namespace, and
-//!   `/sys/fs/cgroup` read-only (`spec`).
+//! - **Also set:** `oom_score_adj` 0, a private cgroup namespace, and `/sys/fs/cgroup`
+//!   read-only (`spec`). `noNewPrivileges` is false for an action (`spec`) and true for a
+//!   helper container (`helper`).
 //!
 //! Left out, on purpose: the `net.ipv4.ping_group_range` and
 //! `net.ipv4.ip_unprivileged_port_start` sysctls (an action has loopback only) and the

@@ -21,7 +21,7 @@ use crate::helper::fetcher::fake::FakeFetcher;
 use crate::helper::leases::fake::FakeLeases;
 use crate::helper::restart::Restart;
 use crate::helper::service::fake::ServiceRecorder;
-use kbf_update::{Facts, Locator, OrderRecord, Verb};
+use kbf_update::{Facts, Locator, OrderRecord, Source, Verb};
 
 const UNIT: &str = "kbf.service";
 const T0: u64 = 1_800_000_000;
@@ -169,6 +169,7 @@ impl World {
                 state_schema: 3,
                 profile: "release".to_owned(),
             }),
+            source: Source::Fetch,
         };
         fs::write(
             self.root

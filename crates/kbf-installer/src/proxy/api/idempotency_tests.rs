@@ -1,6 +1,9 @@
 use super::idempotency::{Idempotency, KEEP, Waiting, write_atomic};
-use crate::proxy::model::{Locator, Verb};
+use crate::proxy::model::{Locator, Source, Verb};
 use crate::testkit::{A, B, c};
+
+/// The source of every update these tests make unless one says otherwise.
+const FETCH: Source = Source::Fetch;
 
 fn waiting(commit: &str, deadline_s: u64) -> Waiting {
     Waiting {
@@ -12,6 +15,7 @@ fn waiting(commit: &str, deadline_s: u64) -> Waiting {
             verb: Verb::FrontendUpdate,
             commit: c(commit),
             window_s: 900,
+            source: FETCH,
         },
         since_s: deadline_s - 900,
         deadline_s,
@@ -23,12 +27,12 @@ fn an_entry_is_on_disk_when_insert_returns_and_ids_never_repeat() {
     let dir = kbf_host::testkit::scratch("u8a-idem-disk");
     let mut map = Idempotency::open(&dir);
     assert!(!map.lost());
-    let first = map.insert("r1", &c(A), true, false).unwrap();
+    let first = map.insert("r1", &c(A), true, false, FETCH).unwrap();
     assert!(!first.started);
     let reopened = Idempotency::open(&dir);
     assert_eq!(reopened.get("r1"), Some(&first));
     let mut reopened = reopened;
-    let second = reopened.insert("r2", &c(B), false, true).unwrap();
+    let second = reopened.insert("r2", &c(B), false, true, FETCH).unwrap();
     assert_ne!(first.update_id, second.update_id);
     assert_eq!(Idempotency::open(&dir).get("r2"), Some(&second));
     assert_eq!(Idempotency::open(&dir).get("r3"), None);
@@ -38,7 +42,7 @@ fn an_entry_is_on_disk_when_insert_returns_and_ids_never_repeat() {
 fn started_is_remembered_with_what_the_update_waits_for() {
     let dir = kbf_host::testkit::scratch("u8a-idem-started");
     let mut map = Idempotency::open(&dir);
-    map.insert("r1", &c(A), true, false).unwrap();
+    map.insert("r1", &c(A), true, false, FETCH).unwrap();
     assert!(
         map.waiting().is_none(),
         "an accepted request waits for nothing"
@@ -59,7 +63,7 @@ fn an_update_stops_waiting_durably_and_only_when_it_did() {
     let state = dir.join("state");
     std::fs::create_dir(&state).unwrap();
     let mut map = Idempotency::open(&state);
-    map.insert("r1", &c(A), true, false).unwrap();
+    map.insert("r1", &c(A), true, false, FETCH).unwrap();
     map.mark_started("r1", waiting(B, 5_000)).unwrap();
     map.finish_waiting("unknown").unwrap();
     assert!(
@@ -79,8 +83,8 @@ fn an_update_stops_waiting_durably_and_only_when_it_did() {
 fn a_new_wait_ends_the_wait_that_could_not_be_saved_as_over() {
     let dir = kbf_host::testkit::scratch("u8a-idem-one-wait");
     let mut map = Idempotency::open(&dir);
-    map.insert("r1", &c(A), true, false).unwrap();
-    map.insert("r2", &c(B), true, false).unwrap();
+    map.insert("r1", &c(A), true, false, FETCH).unwrap();
+    map.insert("r2", &c(B), true, false, FETCH).unwrap();
     map.mark_started("r1", waiting(A, 5_000)).unwrap();
     map.mark_started("r2", waiting(B, 9_000)).unwrap();
     let reopened = Idempotency::open(&dir);
@@ -110,7 +114,8 @@ fn only_the_newest_entries_are_kept_but_ids_keep_counting() {
     let dir = kbf_host::testkit::scratch("u8a-idem-keep");
     let mut map = Idempotency::open(&dir);
     for i in 0..KEEP + 6 {
-        map.insert(&format!("r{i}"), &c(A), true, false).unwrap();
+        map.insert(&format!("r{i}"), &c(A), true, false, FETCH)
+            .unwrap();
     }
     let map = Idempotency::open(&dir);
     assert_eq!(map.get("r0"), None);
@@ -145,11 +150,11 @@ fn a_file_that_does_not_parse_is_lost_not_empty() {
 fn a_temporary_file_from_a_crash_is_ignored_and_replaced() {
     let dir = kbf_host::testkit::scratch("u8a-idem-tmp");
     let mut map = Idempotency::open(&dir);
-    map.insert("r1", &c(A), true, false).unwrap();
+    map.insert("r1", &c(A), true, false, FETCH).unwrap();
     std::fs::write(dir.join(".requests.json.tmp"), b"half a wri").unwrap();
     let mut map = Idempotency::open(&dir);
     assert!(!map.lost() && map.get("r1").is_some());
-    map.insert("r2", &c(B), true, false).unwrap();
+    map.insert("r2", &c(B), true, false, FETCH).unwrap();
     assert!(Idempotency::open(&dir).get("r2").is_some());
 }
 

@@ -1480,6 +1480,7 @@ dependencies = [
  "clap",
  "futures",
  "kbf-all-in-one",
+ "kbf-ca",
  "kbf-cas-conformance",
  "kbf-daemon",
  "kbf-deploy",
@@ -1498,6 +1499,7 @@ dependencies = [
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
+ "kbf-unitfile",
  "postgres",
  "prost",
  "rcgen",
@@ -1565,6 +1567,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-daemon-test"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "kbf-daemon",
+ "kbf-deploy",
+ "kbf-front",
+ "kbf-harness",
+ "kbf-proto",
+ "kbf-testkit",
+ "kbf-transfer",
+ "prost",
+ "rcgen",
+ "rustix",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "kbf-deploy"
 version = "0.1.0"
 dependencies = [
@@ -1573,12 +1594,14 @@ dependencies = [
  "flate2",
  "hex",
  "httparse",
+ "kbf-ca",
  "kbf-host",
  "kbf-installer",
  "kbf-mdm",
  "kbf-state",
  "kbf-testkit",
  "kbf-types",
+ "kbf-unitfile",
  "plist",
  "rcgen",
  "rusqlite",
@@ -1709,6 +1732,7 @@ dependencies = [
  "http-body",
  "kbf-auth",
  "kbf-caps",
+ "kbf-front",
  "kbf-invocation",
  "kbf-map",
  "kbf-meta",
@@ -1763,12 +1787,13 @@ dependencies = [
  "clap",
  "flate2",
  "futures",
- "kbf-deploy",
+ "kbf-ca",
  "kbf-integration-test",
  "kbf-proto",
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
+ "kbf-unitfile",
  "libc",
  "prost",
  "prost-types",
@@ -1779,6 +1804,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "toml",
  "tonic",
 ]
 
@@ -1837,6 +1863,7 @@ name = "kbf-installer"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "bytes",
  "clap",
  "flate2",
@@ -1850,6 +1877,7 @@ dependencies = [
  "kbf-gate",
  "kbf-host",
  "kbf-installer",
+ "kbf-oidc",
  "kbf-proto",
  "kbf-proxy",
  "kbf-state",
@@ -1892,12 +1920,13 @@ dependencies = [
  "kbf-auth",
  "kbf-cli",
  "kbf-daemon",
- "kbf-deploy",
  "kbf-front",
+ "kbf-harness",
  "kbf-host",
  "kbf-installer",
  "kbf-map",
  "kbf-objstore",
+ "kbf-oidc",
  "kbf-proto",
  "kbf-proxy",
  "kbf-sched",
@@ -1908,6 +1937,8 @@ dependencies = [
  "kbf-threads",
  "kbf-transfer",
  "kbf-types",
+ "kbf-unitfile",
+ "libc",
  "proc-macro2",
  "prost",
  "rcgen",
@@ -2071,7 +2102,6 @@ dependencies = [
  "clap",
  "futures",
  "kbf-daemon",
- "kbf-deploy",
  "kbf-driver-container",
  "kbf-driver-native",
  "kbf-front",
@@ -2118,6 +2148,29 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kbf-oidc"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "ring",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "toml",
  "tracing",
 ]
 
@@ -2179,6 +2232,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "kbf-oidc",
  "kbf-peer",
  "kbf-tls",
  "loom",
@@ -2194,6 +2248,7 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2391,6 +2446,7 @@ dependencies = [
  "kbf-proto",
  "kbf-segments",
  "kbf-store",
+ "kbf-testkit",
  "kbf-tls",
  "kbf-types",
  "rcgen",
@@ -2415,6 +2471,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rustix",
+ "tokio",
 ]
 
 [[package]]
@@ -2497,6 +2554,13 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "kbf-unitfile"
+version = "0.1.0"
+dependencies = [
  "thiserror",
 ]
 

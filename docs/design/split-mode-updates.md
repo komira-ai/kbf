@@ -1,6 +1,6 @@
 # Updating a split-mode farm without failing a build
 
-Status: design for the sequence. The pull updater it relies on is partly built: `kbf-installer` (merged), `kbf-update` (the node's client, #908) and
+Status: design for the sequence. (`kbf-deploy envoy render|check|apply`, named below, is retired: kbf runs no Envoy since the no-Envoy ruling, and the frontend is fronted by kbf-proxy.) The pull updater it relies on is partly built: `kbf-installer` (merged), `kbf-update` (the node's client, #908) and
 `kbf-installer run` (the root helper, #929) are built or in review; the controller, the node gates, the Envoy switch and the poller are not.
 Planned-down (#914) is built. It is read against `feature/arch-v2` and these pull requests, fetched
 when this was written: #857, #879 and #887 (the frontend handover, open, stacked), #803 (the rollout state machine, open), #886
@@ -588,13 +588,14 @@ attempts; T1 measures it. An `Execute` queued because capacity is short keeps it
 | Node, step 3 leases do not end | uncordon at the limit, `Pending` | |
 | Step 4 or 5 gate fails | undo planned-down, uncordon, `Pending` or `Held` | |
 | Step 6 binary exits at once | boot counter reverts before the Nth start; `Held` | journal |
+| Step 6 the helper refuses the activate order | `Held` (`ActivateRefused`), node stays cordoned, warn-level alert; no restart was started | read the refusal in the helper's status |
 | Step 6/7 starts, never registers | window expires, helper reverts, `REVERTED`, `Held` | |
 | Step 7 stays `CatchingUp` | wait while rebuild progresses; a failed rebuild retries with back-off (**[F]** #860); past the rebuild limit `Held`, node stays cordoned, the other owner serves | decide |
 | Step 8 debt does not settle | `Held`, cordoned, no revert | look at the other owner |
 | A second member goes `Down` unplanned | the controller stops at once, restarts nothing; blobs owned by both are `UNAVAILABLE` until one returns | bring it back first |
 | Restart deadline passes | `Held`, alert; the dwell may start re-replication | |
 | Confirm lost | the timer fires; node returns to N; `Held` | |
-| Revert fails (previous missing) | node stays as is, cordoned, `REFUSED`, page-level alert | manual path |
+| Revert fails after the flip, steps 7 to 9 (previous missing) | node stays as is, cordoned, `REFUSED`, page-level alert | manual path |
 | Controller (frontend) dies mid-run | on start it reads `update/host/<id>` and resumes; the cordon row persists | |
 | Frontend host loses power | everything on it fails; cold start; running actions are re-sent after the epoch | accepted: one frontend is a scheduling single point of failure |
 
@@ -674,7 +675,7 @@ That document owns `update/release/<commit>/<platform>/<name>`, `update/desired 
 - `update/host/<id> {phase, order_id, generation, since, boot_before}`: what the controller resumes from; `boot_before` is the node's boot counter before the step, which the rejoin check compares with the registered one;
 - `update/policy {auto_nodes (bool), auto_frontend (bool), paused (bool), idle_wait, min_serving, max_hosts_out (default 1), new_work_only_to_updated, mac_force_after, accept_failing_builds}`
   (`pull-updates.md`'s `update/auto {enabled}` is `auto_nodes`);
-- `update/available/<commit>` from the poller: proposals and preflight results, metadata only.
+- `update/available/<commit>` from the poller: proposals and preflight results, metadata only. Not built: the release facts an offer carries are the release store's per-platform version facts document (`pull-updates.md` 6.2).
 
 The release store on disk is the source of truth for bytes; the `update/release/...` rows are metadata over it and are rebuilt
 from the disk index if lost (`pull-updates.md` 6.2).

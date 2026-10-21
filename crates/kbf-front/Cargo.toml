@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# `testkit`: the test seams other crates' tests (and this one's, through the
+# dev-dependency on itself) set on a `Cache`, such as `Cache::with_drain_hook`. Off in
+# every build that is not a test build.
+[features]
+testkit = []
+
 [dependencies]
 base64.workspace = true
 bytes.workspace = true
@@ -36,6 +42,7 @@ tower-layer.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+kbf-front = { workspace = true, features = ["testkit"] }
 # The loopback S3 service (`s3::fake`) the large-blob tests flush to.
 kbf-objstore = { workspace = true, features = ["testkit"] }
 # The REAPI service definitions, read from kbf-proto's vendored files, so the

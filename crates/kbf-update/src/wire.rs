@@ -4,10 +4,14 @@
 //! so the session never fails on one.
 
 use kbf_proto::update as wire;
+use kbf_proto::update::update_order::Source as WireOrderSource;
 use kbf_proto::update::update_order::Verb as WireVerb;
+use kbf_proto::update::update_status::ReleaseSource as WireSource;
 use kbf_proto::update::update_status::State as WireState;
 
-use crate::types::{Component, Expected, Offer, Order, State, Status, Verb};
+use crate::types::{
+    Available, Component, Expected, Offer, Order, ReleaseSource, Source, State, Status, Verb,
+};
 
 impl From<wire::Component> for Component {
     fn from(c: wire::Component) -> Self {
@@ -45,6 +49,14 @@ impl From<wire::UpdateOrder> for Order {
             Ok(WireVerb::Revert) => Some(Verb::Revert),
             Ok(WireVerb::Unspecified) | Err(_) => None,
         };
+        // The deliberate exception to the verb rule above: zero is a fetch, what every sender
+        // that predates the field means. A number this build does not know is refused by the
+        // client.
+        let source = match WireOrderSource::try_from(o.source) {
+            Ok(WireOrderSource::Unspecified | WireOrderSource::Fetch) => Some(Source::Fetch),
+            Ok(WireOrderSource::Staged) => Some(Source::Staged),
+            Err(_) => None,
+        };
         Self {
             order_id: o.order_id,
             epoch: o.epoch,
@@ -52,6 +64,7 @@ impl From<wire::UpdateOrder> for Order {
             verb,
             commit: o.commit,
             window_s: o.window_s,
+            source,
         }
     }
 }
@@ -71,6 +84,26 @@ impl From<State> for WireState {
     }
 }
 
+impl From<&Available> for wire::update_status::Available {
+    fn from(a: &Available) -> Self {
+        Self {
+            commit: a.commit.clone(),
+            seq: a.seq,
+        }
+    }
+}
+
+impl From<ReleaseSource> for WireSource {
+    fn from(source: ReleaseSource) -> Self {
+        match source {
+            ReleaseSource::Unreported => Self::Unspecified,
+            ReleaseSource::Url => Self::Url,
+            ReleaseSource::Frontend => Self::Frontend,
+            ReleaseSource::Bundled => Self::Bundled,
+        }
+    }
+}
+
 impl From<&Status> for wire::UpdateStatus {
     fn from(s: &Status) -> Self {
         let staged = s.staged.unwrap_or_default();
@@ -86,6 +119,8 @@ impl From<&Status> for wire::UpdateStatus {
             staged_protocol: staged.protocol,
             staged_min_protocol: staged.min_protocol,
             staged_state_schema: staged.state_schema,
+            available: s.available.as_ref().map(Into::into),
+            release_source: WireSource::from(s.release_source).into(),
         }
     }
 }
@@ -93,7 +128,7 @@ impl From<&Status> for wire::UpdateStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Staged;
+    use crate::types::{Available, ReleaseSource, Source, Staged};
 
     /// Catches a field of an offer lost or moved on the way in (every field is given a
     /// different value, so a swap shows).
@@ -150,6 +185,7 @@ mod tests {
                 verb,
                 commit: "e".repeat(40),
                 window_s: 600,
+                ..Default::default()
             })
         };
         assert_eq!(order(1).verb, Some(Verb::Activate));
@@ -161,6 +197,26 @@ mod tests {
         assert_eq!((o.order_id, o.epoch, o.window_s), (4, 5, 600));
         assert_eq!(o.generation, 6, "the generation is carried to the record");
         assert_eq!(o.commit, "e".repeat(40));
+    }
+
+    /// Catches a source mapped to another, an unset source taken for a refusal (what every
+    /// sender that predates the field writes is a fetch), and a number this build does not
+    /// know taken for one it does.
+    #[test]
+    fn an_order_maps_its_source() {
+        let source = |n: i32| {
+            let message = wire::UpdateOrder {
+                source: n,
+                ..Default::default()
+            };
+            Order::from(message).source
+        };
+        assert_eq!(source(0), Some(Source::Fetch));
+        assert_eq!(source(1), Some(Source::Fetch));
+        assert_eq!(source(2), Some(Source::Staged));
+        assert_eq!(source(3), None);
+        assert_eq!(source(99), None);
+        assert_eq!(source(-1), None);
     }
 
     /// Catches a state sent as another, a missing value sent as something but empty or 0,
@@ -213,9 +269,22 @@ mod tests {
                 min_protocol: 2,
                 state_schema: 5,
             }),
+            available: Some(Available {
+                commit: "3".repeat(40),
+                seq: 812,
+            }),
+            release_source: ReleaseSource::Bundled,
             gated: true,
         };
         let message = wire::UpdateStatus::from(&full);
+        let seed = message.available.clone().expect("a seed is reported");
+        assert_eq!((seed.commit, seed.seq), ("3".repeat(40), 812));
+        assert_eq!(
+            message.release_source,
+            wire::update_status::ReleaseSource::Bundled as i32
+        );
+        assert_eq!(bare.available, None, "no seed, nothing reported");
+        assert_eq!(bare.release_source, 0, "no source, nothing reported");
         assert_eq!(message.installed_commit, "1".repeat(40));
         assert_eq!(message.staged_commit, "2".repeat(40));
         assert_eq!(message.refusal, "why");
@@ -230,5 +299,26 @@ mod tests {
             ),
             (3, 2, 5)
         );
+    }
+
+    /// Catches a source sent as another, and a source the installer did not report sent as
+    /// one it did.
+    #[test]
+    fn every_release_source_maps_to_its_own_wire_value() {
+        use wire::update_status::ReleaseSource as Wire;
+        let table = [
+            (ReleaseSource::Unreported, Wire::Unspecified),
+            (ReleaseSource::Url, Wire::Url),
+            (ReleaseSource::Frontend, Wire::Frontend),
+            (ReleaseSource::Bundled, Wire::Bundled),
+        ];
+        for (source, expected) in table {
+            let status = Status {
+                release_source: source,
+                ..Status::manual("0123456789ab")
+            };
+            let message = wire::UpdateStatus::from(&status);
+            assert_eq!(message.release_source, expected as i32, "{source:?}");
+        }
     }
 }

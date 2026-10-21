@@ -93,6 +93,8 @@ jobs:
     stage: beta
   - job: beta.yml#m1-cell
     stage: beta
+  - job: beta.yml#cross-version
+    stage: beta
   - job: gamma.yml#offer
     stage: gamma
   - job: gamma.yml#deploy

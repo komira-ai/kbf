@@ -19,12 +19,14 @@ use std::time::Duration;
 
 use kbf_map::{MemberId, MemberState};
 use kbf_types::{FarmTime, WorkerId};
+use serde::{Deserialize, Serialize};
 
 use super::command::Command;
 use super::gate::{GateFail, GateMode, storage_gate};
 use super::node_step::HostPhase;
 use super::policy::Policy;
 use super::slot::{Slot, SlotClass};
+use crate::update_status::ReleaseSource;
 
 /// A release, by whatever the controller compares: a commit or a software-set digest.
 /// Only equality is defined, so a rollback is another target and never "an older one".
@@ -43,6 +45,19 @@ impl Release {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Where the release of a run comes from. The same two words as `kbf_update::Source`, which
+/// this crate's library does not depend on. The default is [`Source::Fetch`], what every run
+/// has meant so far, so a row that names no source is a fetch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    /// The hosts pull the release from the source their installer is configured with.
+    #[default]
+    Fetch,
+    /// The hosts use the release their installer's package carries.
+    Staged,
 }
 
 /// The generation of a run (`update/desired`): it grows with every change of the desired
@@ -162,7 +177,9 @@ pub enum HelperStatus {
     Confirmed,
     /// `REVERTED`: the helper put the previous release back (it did so itself).
     Reverted,
-    /// `REFUSED`: a revert that could not run, because the previous release is missing.
+    /// `REFUSED`: the helper refused the order. At step 6 that is the activate order itself,
+    /// before any flip. At steps 7 to 9 it is a revert that could not run, because the
+    /// previous release is missing.
     Refused,
 }
 
@@ -290,6 +307,16 @@ impl MemberFacts {
     }
 }
 
+/// A release the host's package carries, which its installer has found whole.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AvailableFact {
+    /// The release: a full commit (40 lowercase hex digits), so it compares equal to a target
+    /// that is a full commit.
+    pub commit: Release,
+    /// The number of commits behind it: puts two builds of one branch in order.
+    pub seq: u64,
+}
+
 /// One host as the controller sees it now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostFacts {
@@ -305,6 +332,14 @@ pub struct HostFacts {
     pub member: Option<MemberId>,
     /// The release it runs, as it reported it; `None` if it has not.
     pub release: Option<Release>,
+    /// The release its package carries, when its installer has found it whole; `None` if it
+    /// reports none, if its installer predates the field, or if it reports a commit that is
+    /// not 40 lowercase hex digits.
+    pub available: Option<AvailableFact>,
+    /// Where its installer fetches releases from; [`ReleaseSource::Unreported`] if it does not
+    /// say or sent a number this build does not know (an installer that predates the field, or
+    /// no report at all).
+    pub release_source: ReleaseSource,
     /// Whether its daemon stream is open.
     pub connected: bool,
     /// Whether placement has it cordoned; `None` if unknown.

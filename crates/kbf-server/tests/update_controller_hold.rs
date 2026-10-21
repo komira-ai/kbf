@@ -19,14 +19,16 @@ mod support;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use kbf_map::MemberState;
+use kbf_map::{MemberId, MemberState};
 use kbf_server::update::{
-    Alert, Controller, ControllerError, Generation, GiveBack, HelperStatus, HoldReason, HostPhase,
-    HostRecord, HostRow, OrderId, Policy, Release, RowError, SlotClass, Stored, Tick,
+    Alert, Controller, ControllerError, Generation, GiveBack, HelperReport, HelperStatus,
+    HoldReason, HostPhase, HostRecord, HostRow, OrderId, Policy, Release, RowError, SlotClass,
+    Source, Stored, Tick, Transport, TransportError,
 };
 use kbf_state::{Fenced, Store, StoreError};
+use kbf_types::WorkerId;
 use support::harness::{Backing, Rig, Seen, row_of, spied};
-use support::world::{Gave, Inner, Spec};
+use support::world::{Gave, Given, Inner, Spec, World};
 use support::{NEW, id};
 
 fn spec(storage: u64, linux: u64, macs: u64) -> Spec {
@@ -319,6 +321,7 @@ fn held_row(rig: &Rig, generation: Generation, reason: HoldReason) -> HostRow {
             boot_before: None,
         },
         commit: Release::new(NEW),
+        source: Source::Fetch,
     }
 }
 
@@ -338,7 +341,8 @@ fn held(rig: &Rig, reason: HoldReason) {
 
 /// Catches: a held run whose cordon is not kept, or kept when it must not be. Placement
 /// loses the cordon of a held host (a frontend restarted, an operator): a hold that keeps it
-/// (the activation stalled; the helper reverts the node itself) orders it again, once, and
+/// (the activation stalled; an activate order the helper refused; the helper reverts the
+/// node itself) orders it again, once, and
 /// the host is cordoned; a hold that does not (the node was put back when a second member
 /// went down, and the confirmed node's uncordon is what did not take) is left uncordoned.
 /// The row is unchanged either way: the order is given without a write.
@@ -347,6 +351,7 @@ fn a_held_host_keeps_the_cordon_only_when_the_hold_does() {
     for (reason, keeps) in [
         (HoldReason::ActivateStalled, true),
         (HoldReason::RevertRefused, true),
+        (HoldReason::ActivateRefused, true),
         (HoldReason::SecondMemberDown, false),
         (HoldReason::StillCordoned, false),
     ] {
@@ -410,4 +415,148 @@ fn a_fenced_controller_does_not_order_a_cordon_again() {
     let w = rig.world.lock();
     assert_eq!(w.given.len(), before, "a fenced controller gave an order");
     assert!(!w.host("d1").cordoned);
+}
+
+/// A transport whose helper refuses the activate order: nothing is flipped, and the helper's
+/// status says `REFUSED` for the order given, or, when `stale`, for the order before it (a
+/// status left over from an earlier update). Every other order goes to the farm.
+struct Refusing {
+    inner: Box<dyn Transport>,
+    world: World,
+    stale: bool,
+}
+
+impl Transport for Refusing {
+    fn cordon(&mut self, host: &WorkerId) -> Result<(), TransportError> {
+        self.inner.cordon(host)
+    }
+
+    fn uncordon(&mut self, host: &WorkerId) -> Result<(), TransportError> {
+        self.inner.uncordon(host)
+    }
+
+    fn mark_down(&mut self, host: &WorkerId, member: MemberId) -> Result<(), TransportError> {
+        self.inner.mark_down(host, member)
+    }
+
+    fn undown(&mut self, host: &WorkerId, member: MemberId) -> Result<(), TransportError> {
+        self.inner.undown(host, member)
+    }
+
+    fn activate(
+        &mut self,
+        host: &WorkerId,
+        order: OrderId,
+        release: &Release,
+    ) -> Result<(), TransportError> {
+        let back = u64::from(self.stale);
+        let named = OrderId::new(order.epoch, order.seq.saturating_sub(back));
+        let mut w = self.world.lock();
+        let at = w.host_index(host.as_str());
+        w.hosts[at].helper = Some(HelperReport {
+            order: named,
+            status: HelperStatus::Refused,
+        });
+        let given = Given {
+            at: w.now,
+            host: host.as_str().to_owned(),
+            order: Gave::Activate(order, release.as_str().to_owned()),
+        };
+        w.given.push(given);
+        Ok(())
+    }
+
+    fn confirm(
+        &mut self,
+        host: &WorkerId,
+        order: OrderId,
+        release: &Release,
+    ) -> Result<(), TransportError> {
+        self.inner.confirm(host, order, release)
+    }
+
+    fn alert(&mut self, host: &WorkerId, alert: &Alert) -> Result<(), TransportError> {
+        self.inner.alert(host, alert)
+    }
+}
+
+/// A run of one daemon-only host whose helper refuses the activate order, looked at until the
+/// order has been given. The rig's own tick is not used: it fails the test at a held run.
+fn refused_rig(label: &str, stale: bool) -> Rig {
+    let mut rig = Rig::new(Backing::Fake, label, &spec(0, 1, 0), Policy::default());
+    let refusing = Refusing {
+        inner: rig.world.transport(),
+        world: rig.world.clone(),
+        stale,
+    };
+    let store = rig.cell.store();
+    rig.controller = Controller::new(store, rig.epoch, Box::new(refusing), rig.world.source());
+    rig.offer(NEW);
+    let mut looks = 0;
+    while rig.world.lock().activations().is_empty() {
+        assert!(looks < 400, "{label}: no activate order in {looks} looks");
+        look(&mut rig).expect("a look");
+        looks += 1;
+    }
+    rig
+}
+
+/// Catches: an installer that refused the activate order read as a revert that could not run
+/// (a page for a host that was never touched), or waited on until the activate limit. The
+/// helper answers the order with `REFUSED` and flips nothing: the next look holds the host as
+/// `ActivateRefused`, once, with the row naming the order the refusal names, the cordon and
+/// the place kept, and no restart.
+///
+/// Mutants: step 6 still reporting `RevertRefused`; a refusal left waiting until
+/// `ActivateStalled`.
+#[test]
+fn an_installer_that_refuses_the_activate_order_holds_the_host_as_refused() {
+    let mut rig = refused_rig("refused", false);
+    for _ in 0..3 {
+        look(&mut rig).expect("a look");
+    }
+    let reason = HoldReason::ActivateRefused;
+    assert_eq!(rig.phase("d1"), HostPhase::Held { reason });
+    let order = row_of(&rig.rows, "d1").record.order;
+    let w = rig.world.lock();
+    let named = w.host("d1").helper.map(|report| report.order);
+    assert_eq!(named, Some(order), "the refusal names the row's order");
+    let revert = Alert::Held(HoldReason::RevertRefused);
+    assert_eq!(alerts(&w, "d1", &Alert::Held(reason)), 1);
+    assert_eq!(alerts(&w, "d1", &revert), 0);
+    assert!(w.host("d1").cordoned, "the hold keeps the cordon");
+    assert_eq!(w.host("d1").activations, 0, "nothing was restarted");
+    drop(w);
+    assert!(rig.rows.slot().unwrap().value.holds(&id("d1")));
+}
+
+/// Catches: a refusal that names an order the row does not hold (the helper's status of an
+/// earlier update) holding the host. It is no answer to this order: the host waits for the
+/// helper and is held for the stall at the activate limit, never for a refusal.
+///
+/// Mutant: the order not compared (a refusal of any order is read).
+#[test]
+fn a_refusal_of_an_earlier_order_is_held_for_the_stall_and_not_for_a_refusal() {
+    let mut rig = refused_rig("stale", true);
+    let w = rig.world.lock();
+    let order = w.activations()[0].1;
+    let named = w.host("d1").helper.map(|report| report.order);
+    drop(w);
+    assert_ne!(named, Some(order), "the refusal names an earlier order");
+    let limit = Policy::default().activate_limit.as_secs();
+    let stalled = HostPhase::Held {
+        reason: HoldReason::ActivateStalled,
+    };
+    let mut waited = 0;
+    while rig.phase("d1") != stalled {
+        assert_eq!(rig.phase("d1"), HostPhase::Activating, "at {waited} s");
+        assert!(waited <= limit, "not held {waited} s after the order");
+        look(&mut rig).expect("a look");
+        waited += 1;
+    }
+    let w = rig.world.lock();
+    let refused = Alert::Held(HoldReason::ActivateRefused);
+    let stall = Alert::Held(HoldReason::ActivateStalled);
+    assert_eq!(alerts(&w, "d1", &refused), 0);
+    assert_eq!(alerts(&w, "d1", &stall), 1);
 }

@@ -46,19 +46,22 @@ fn gone(pid: i32) -> bool {
     })
 }
 
-/// The control socket the process `pid` (the frontend) was told, from its command line.
+/// The control socket the process `pid` (the frontend) was told: the `handover-socket` of
+/// the `kbf.toml` its command line names with `--config=`.
 fn handover_socket(pid: rustix::process::Pid) -> PathBuf {
     let cmdline = std::fs::read(format!("/proc/{}/cmdline", pid.as_raw_nonzero()))
         .expect("the frontend's command line");
-    cmdline
+    let config = cmdline
         .split(|b| *b == 0)
-        .filter_map(|word| {
-            std::str::from_utf8(word)
-                .ok()?
-                .strip_prefix("--handover-socket=")
-        })
+        .filter_map(|word| std::str::from_utf8(word).ok()?.strip_prefix("--config="))
         .map(PathBuf::from)
         .next()
+        .expect("a settings file");
+    let text = std::fs::read_to_string(&config).expect("the frontend's kbf.toml");
+    let table: toml::Table = text.parse().expect("TOML");
+    table["handover"]["handover-socket"]
+        .as_str()
+        .map(PathBuf::from)
         .expect("a control socket")
 }
 

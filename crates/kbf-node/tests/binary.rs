@@ -224,7 +224,6 @@ fn base(dir: &Path) -> Vec<String> {
         format!("--key={}", dir.join("node.key").display()),
         "--node-id=node-1".to_owned(),
         "--reconnect-ms=50".to_owned(),
-        "--label=pool=darwin-sized".to_owned(),
     ]
 }
 
@@ -471,6 +470,32 @@ fn a_pause_threshold_that_is_no_percentage_is_a_usage_error() {
             stderr.contains("--memory-pressure-pause-percent") && stderr.contains(bad),
             "{bad}: {stderr}"
         );
+    }
+}
+
+/// A node label is no flag of the daemon (node labels are removed: placement uses what
+/// the node reports): `--label` in either spelling is a usage error (exit 2) naming the
+/// flag, and the daemon never reaches its first connection attempt.
+///
+/// Catches: `--label` accepted again and reported as `label.<key>` entries in the node
+/// report, or silently ignored.
+#[test]
+fn the_label_flag_is_a_usage_error() {
+    let dir = tls("label-gone");
+    for label in [&["--label=pool=darwin-sized"][..], &["--label", "pool=x"]] {
+        let log = dir.join("label.log");
+        let mut child = Command::new(BIN)
+            .args(base(&dir))
+            .arg("--driver=fake")
+            .args(label)
+            .stderr(std::fs::File::create(&log).expect("stderr file"))
+            .spawn_guarded()
+            .expect("spawn");
+        let status = refused_within(&mut child, "--label", &log);
+        let stderr = read(&log);
+        assert_eq!(status.code(), Some(2), "{label:?}: {stderr}");
+        assert!(stderr.contains("--label"), "{label:?}: {stderr}");
+        assert!(!stderr.contains(FIRST_ATTEMPT), "{label:?}: {stderr}");
     }
 }
 

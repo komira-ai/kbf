@@ -6,9 +6,9 @@
 //! that keep a long silent `Execute` alive, and why each is not Envoy's default, are
 //! the comments below and the rules of [`super::check`].
 //!
-//! The bytes are fixed: the same settings always give the same files, and the files are
-//! the ones `kbf-deploy envoy render --topology box` wrote for the same numbers (the
-//! golden in `tests/golden/envoy/box` is that tool's output, byte for byte).
+//! The bytes are fixed: the same settings always give the same files, and the golden in
+//! `tests/golden/envoy/box` pins them (it began as the output of the retired
+//! `kbf-deploy envoy render --topology box`, byte for byte).
 
 use super::config::{BoxSettings, Instance, SettingsError};
 use super::json::Json;

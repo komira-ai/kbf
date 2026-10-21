@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::routing::get;
 use tower_service::Service;
 
@@ -20,6 +20,19 @@ fn api() -> Router {
         .route("/v1/invocations", get(|| async { "{\"invocations\": []}" }))
         .route("/v1/thing", get(|| async { "{\"n\": 1}" }))
         .route("/v1/big", get(|| async { "x".repeat(1000) }))
+        // Answers with the `Range` header it was sent, as a `206`; a plain read is `200`.
+        .route(
+            "/v1/range",
+            get(|headers: HeaderMap| async move {
+                match headers.get(RANGE) {
+                    Some(range) => (
+                        StatusCode::PARTIAL_CONTENT,
+                        String::from_utf8_lossy(range.as_bytes()).into_owned(),
+                    ),
+                    None => (StatusCode::OK, "no range".to_owned()),
+                }
+            }),
+        )
         .route(
             "/v1/who",
             get(|peer: Caller| async move { format!("{} {:?}", peer.addr, peer.trust) }),
@@ -85,6 +98,35 @@ async fn the_source_asks_a_route_as_the_lowest_trust_and_bounds_the_answer() {
     assert_eq!(roomy.get("/v1/big").await.expect("answer").body.len(), 1000);
 }
 
+/// Catches: a ranged read that sends no `Range` header (the route would send the whole
+/// log, read up to the bound), or one with the bounds swapped or exclusive (the route reads
+/// both ends inclusive); a plain read that sends one. Mutants: `get_range` calling `ask`
+/// with `None`; `last` written as `last + 1`.
+#[tokio::test]
+async fn a_ranged_read_sends_a_range_header_and_a_plain_read_sends_none() {
+    let source = InProcess::new(api());
+    let ranged = source.get_range("/v1/range", 0, 1_048_575).await;
+    let ranged = ranged.expect("an answer");
+    assert_eq!(ranged.status, 206);
+    assert_eq!(ranged.body, b"bytes=0-1048575");
+    let plain = source.get("/v1/range").await.expect("an answer");
+    assert_eq!(plain.body, b"no range");
+}
+
+/// Catches: a suffix read that sends no `Range` header (the Log page would read the head
+/// of a log, or all of it, when it asked for the end), or sends the span form
+/// `bytes=n-n`, or a bound that is not the one asked for. Mutants: `get_suffix` calling
+/// `ask` with `None`; the `-` dropped from the header; `get_suffix` delegating to
+/// `get_range`.
+#[tokio::test]
+async fn a_suffix_read_sends_a_suffix_range_header() {
+    let source = InProcess::new(api());
+    let got = source.get_suffix("/v1/range", 1_048_576).await;
+    let got = got.expect("an answer");
+    assert_eq!(got.status, 206);
+    assert_eq!(got.body, b"bytes=-1048576");
+}
+
 /// Catches: a method other than `GET` and `HEAD` served, or answered without the security
 /// headers (mutants: `post`, `any` for `get`; the `secure` layer dropped or placed inside
 /// the limit); `HEAD` refused or sent with a body.
@@ -145,6 +187,34 @@ fn assert_headers(response: &Response, what: &str) {
     assert_eq!(h["x-content-type-options"], "nosniff", "{what}");
     assert_eq!(h["referrer-policy"], "no-referrer", "{what}");
     assert_eq!(h["cache-control"], "no-store", "{what}");
+    assert_eq!(h["cross-origin-resource-policy"], "same-origin", "{what}");
+    assert_eq!(h["cross-origin-opener-policy"], "same-origin", "{what}");
+    let policy = h["permissions-policy"].to_str().expect("ASCII");
+    let denied: Vec<&str> = policy.split(", ").collect();
+    for feature in [
+        "camera",
+        "microphone",
+        "geolocation",
+        "usb",
+        "serial",
+        "hid",
+        "bluetooth",
+        "payment",
+        "display-capture",
+        "clipboard-read",
+        "midi",
+        "xr-spatial-tracking",
+    ] {
+        assert!(
+            denied.contains(&format!("{feature}=()").as_str()),
+            "{what}: {feature} is not denied in {policy}"
+        );
+    }
+    assert!(
+        denied.iter().all(|d| d.ends_with("=()")),
+        "{what}: a feature is allowed to someone in {policy}"
+    );
+    assert!(!h.contains_key("strict-transport-security"), "{what}");
 }
 
 /// Catches: the security headers on a page but not on the stylesheet, a page the UI does

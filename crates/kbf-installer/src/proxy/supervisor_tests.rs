@@ -274,7 +274,12 @@ impl ChildAdmin for ScriptAdmin<'_> {
         unreachable!("the boot never counts")
     }
 
-    fn post_desired(&self, _: Slot, _: &CommitId) -> Result<(), PortError> {
+    fn post_desired(
+        &self,
+        _: Slot,
+        _: &CommitId,
+        _: kbf_update::Source,
+    ) -> Result<(), crate::proxy::model::DesiredError> {
         unreachable!("the boot never posts a desired release")
     }
 }

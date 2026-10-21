@@ -1,5 +1,5 @@
 use super::*;
-use crate::fixtures::{COMMIT, OTHER, elf, macho, version_json};
+use crate::fixtures::{elf, macho};
 
 /// Catches a header read as the wrong kind or CPU: ELF and Mach-O, for both CPUs each,
 /// are told apart; and what only looks like one is `Other`: a 32-bit ELF, a big-endian
@@ -86,118 +86,24 @@ fn the_kinds_print_for_an_operator() {
     );
 }
 
-/// Catches `--version --json` read loosely: the six fields are read (and `platform`, which
-/// a build may add), and a missing field, a field of the wrong type, a field the contract
-/// does not list, one named twice, text that is not JSON and anything after the object
-/// are refused.
+/// Catches a build that predates `relay` taken for one that relays, a level below the one
+/// `bundled` needs taken for it, and a comparison off by one at the boundary. (That the field
+/// is read at all is `kbf-types`'s test.)
 ///
-/// Mutant seen red: `deny_unknown_fields` dropped (the extra field is then accepted).
+/// Mutants to plant: `relays` true for any declared level; `>=` made `>`.
 #[test]
-fn the_version_object_is_read_by_its_fields() {
-    let v = Version::parse(version_json(COMMIT, "release").as_bytes()).expect("parses");
-    assert_eq!(
-        v,
-        Version {
-            admin_protocol: Some(1),
-            meta_log: Some(4),
-            commit: COMMIT[..12].to_owned(),
-            min_protocol: 3,
-            protocol: 4,
-            profile: "release".to_owned(),
-            seq: None,
-            state_schema: 7,
-            version: "0.1.0".to_owned(),
-            platform: None,
-        }
-    );
-    // A build before `admin_protocol`, `meta_log` and `seq` omits them: unknown, not refused.
-    let old = r#"{"commit":"0123456789ab","min_protocol":3,"profile":"release","protocol":4,"state_schema":7,"version":"0.1.0"}"#;
-    let old = Version::parse(old.as_bytes()).expect("an older build parses");
-    assert_eq!(
-        (old.admin_protocol, old.meta_log, old.seq),
-        (None, None, None)
-    );
-    let said = version_json(COMMIT, "release").replace('}', ",\"platform\":\"linux-arm64\"}");
-    assert_eq!(
-        Version::parse(said.as_bytes()).expect("parses").platform,
-        Some("linux-arm64".to_owned())
-    );
-    let more = version_json(COMMIT, "release").replace('}', ",\"future\":true}");
-    let twice = version_json(COMMIT, "release").replace('}', ",\"protocol\":4}");
-    let after = format!("{}{{}}", version_json(COMMIT, "release"));
-    for bad in [
-        more.as_str(),
-        twice.as_str(),
-        after.as_str(),
-        r#"{"commit":"abc"}"#,
-        "kbf 0.1.0",
-        "",
-        &version_json(COMMIT, "release").replace("\"protocol\":4", "\"protocol\":\"4\""),
-    ] {
-        let err = Version::parse(bad.as_bytes()).expect_err(bad);
-        assert_eq!(err.code(), "version-unreadable", "{bad}");
-    }
-}
-
-/// Catches the `seq` that `kbf --version --json` prints (the number of commits behind the
-/// build) refused as a field the contract does not list, which would refuse every release
-/// built from the day the field was added, and a `seq` that is read as something else than
-/// the number: 0 ("could not count") is a value, not an absent field.
-///
-/// Mutant to plant: the `seq` field dropped from `Version` (the object is then refused).
-#[test]
-fn the_version_object_may_carry_seq() {
-    let said = version_json(COMMIT, "release").replace('}', ",\"seq\":812}");
-    let v = Version::parse(said.as_bytes()).expect("a build with a seq parses");
-    assert_eq!(v.seq, Some(812));
-    let zero = version_json(COMMIT, "release").replace('}', ",\"seq\":0}");
-    let v = Version::parse(zero.as_bytes()).expect("a build that could not count parses");
-    assert_eq!(v.seq, Some(0));
-    let text = version_json(COMMIT, "release").replace('}', ",\"seq\":\"812\"}");
-    let err = Version::parse(text.as_bytes()).expect_err("a seq that is text");
-    assert_eq!(err.code(), "version-unreadable");
-}
-
-/// Catches an unbounded read of what a not yet trusted binary prints: more than 4 KiB is
-/// refused whatever it holds, and exactly 4 KiB of valid JSON (padded with spaces) is read.
-///
-/// Mutant seen red: the length check dropped.
-#[test]
-fn a_version_object_is_read_up_to_four_kib() {
-    let json = version_json(COMMIT, "release");
-    let fits = format!("{json}{}", " ".repeat(VERSION_CAP - json.len()));
-    assert_eq!(fits.len(), VERSION_CAP);
-    Version::parse(fits.as_bytes()).expect("4 KiB fits");
-    let big = format!("{fits} ");
-    assert_eq!(
-        Version::parse(big.as_bytes()).expect_err("over").code(),
-        "version-oversize"
-    );
-}
-
-/// Catches each check of a version being skipped: the commit (the first 12 digits of the
-/// offered one) and the profile (a debug build is not a release). Each is its own refusal.
-///
-/// Mutants seen red: the commit comparison dropped; the profile comparison dropped.
-#[test]
-fn a_version_must_name_the_commit_and_be_a_release_build() {
-    let commit = CommitId::new(COMMIT).expect("commit");
-    let release = Version::parse(version_json(COMMIT, "release").as_bytes()).expect("parses");
-    release.check(&commit).expect("the release of the commit");
-
-    let other = Version::parse(version_json(OTHER, "release").as_bytes()).expect("parses");
-    let err = other.check(&commit).expect_err("another commit");
-    assert_eq!(err.code(), "version-commit");
-    assert_eq!(
-        err.to_string(),
+fn bundled_needs_a_build_that_relays_far_enough() {
+    let shape = |relay: &str| {
         format!(
-            "it says commit {}, and the release is {}",
-            &OTHER[..12],
-            &COMMIT[..12]
+            "{{\"commit\":\"0123456789ab\",\"min_protocol\":3,\"profile\":\"release\",\
+             \"protocol\":4,\"state_schema\":7,\"version\":\"0.1.0\"{relay}}}"
         )
-    );
-
-    let debug = Version::parse(version_json(COMMIT, "debug").as_bytes()).expect("parses");
-    let err = debug.check(&commit).expect_err("debug");
-    assert_eq!(err.code(), "version-profile");
+    };
+    let before = Version::parse(shape("").as_bytes()).expect("a pre-relay build parses");
+    assert!(!relays(&before));
+    for (level, expected) in [(0, false), (RELAY_NEEDED, true), (RELAY_NEEDED + 1, true)] {
+        let said = shape(&format!(",\"relay\":{level}"));
+        let v = Version::parse(said.as_bytes()).expect("a build with a relay level parses");
+        assert_eq!(relays(&v), expected, "{level}");
+    }
 }

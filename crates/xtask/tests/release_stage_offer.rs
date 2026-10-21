@@ -1,11 +1,13 @@
 //! `cargo xtask release stage-offer` as the offer job runs it, with `xtask-fake` as `gh`. The
 //! fake is GitHub (`support/release_fake.rs`): the release of N (`SHA`, tag `TAG`) is what
 //! `release publish` leaves, and the release before it (`PREV`, `PREV_TAG`) is N-1. The
-//! `kbf` of a release is the fake itself, answering what the test put in its trailer.
+//! `kbf` of a release is the fake itself, answering what the test put in its trailer, and the
+//! version facts of each `kbf` are the bytes it prints (the release before N may predate them).
 
 use std::path::{Path, PathBuf};
 
 use kbf_gate::{Beta, OfferDoc, SetHash, Target};
+use kbf_installer::deploy::offer::from_bundle;
 use serde_json::{Value, json};
 use xtask::package::tarball;
 use xtask::release::stage_offer::{BUNDLE_FILE, OFFER_FILE, WAIVER_OPERATOR, waiver_reason};
@@ -31,28 +33,72 @@ const GOLDEN: &str = concat!(
     "stage-offer.txt"
 );
 
-/// `(stem, tarball)` of `binary` of `commit` for `platform`: bytes that tell which one it is.
-fn plain(binary: &str, platform: &str, commit: &str) -> (String, Vec<u8>) {
-    let bytes = format!("{binary} of {commit} for {platform}\n");
-    let tgz = tarball(binary, bytes.as_bytes()).expect("tarball");
-    (format!("{binary}-{commit}-{platform}"), tgz)
+/// A tarball of a release: the `stem` of its name (`<binary>-<commit>-<platform>`), the tarball,
+/// and the version facts the build job kept of the `kbf` in it (none for another binary, and
+/// for a release made before the facts).
+struct Asset {
+    stem: String,
+    tgz: Vec<u8>,
+    facts: Option<Vec<u8>>,
 }
 
-/// `(stem, tarball)` of the `kbf` of `commit` for `platform` that runs: the fake, which
-/// answers `json` to `--version --json`.
-fn runnable(platform: &str, commit: &str, json: &str) -> (String, Vec<u8>) {
+/// `binary` of `commit` for `platform`, with no facts: bytes that tell which one it is.
+fn plain(binary: &str, platform: &str, commit: &str) -> Asset {
+    let bytes = format!("{binary} of {commit} for {platform}\n");
+    let tgz = tarball(binary, bytes.as_bytes()).expect("tarball");
+    let stem = format!("{binary}-{commit}-{platform}");
+    Asset {
+        stem,
+        tgz,
+        facts: None,
+    }
+}
+
+/// What the `kbf` of `commit` for `platform` prints for `--version --json`, as the facts of a
+/// `kbf` that is never run: its own for each platform.
+fn says(platform: &str, commit: &str) -> String {
+    format!(
+        "{{\"commit\":\"{}\",\"meta_log\":4,\"platform\":\"{platform}\",\"profile\":\"release\",\
+         \"protocol\":1}}\n",
+        &commit[..12]
+    )
+}
+
+/// The `kbf` of `commit` for `platform`, which is never run, with its facts.
+fn plain_kbf(platform: &str, commit: &str) -> Asset {
+    let mut asset = plain("kbf", platform, commit);
+    asset.facts = Some(says(platform, commit).into_bytes());
+    asset
+}
+
+/// What a fake `kbf` told to answer `json` prints: the answer, without the `tamper <name>`
+/// line that makes it change a file first.
+fn printed(json: &str) -> String {
+    let asked = json
+        .strip_prefix("tamper ")
+        .and_then(|t| t.split_once('\n'));
+    asked.map_or(json, |(_, answer)| answer).to_owned()
+}
+
+/// The `kbf` of `commit` for `platform` that runs: the fake, which answers `json` to
+/// `--version --json`, and whose facts are that answer.
+fn runnable(platform: &str, commit: &str, json: &str) -> Asset {
     let tgz = tarball("kbf", &kbf_bytes(&commit[..12], json)).expect("tarball");
-    (format!("kbf-{commit}-{platform}"), tgz)
+    Asset {
+        stem: format!("kbf-{commit}-{platform}"),
+        tgz,
+        facts: Some(printed(json).into_bytes()),
+    }
 }
 
 /// The assets of N as the artifacts workflow builds them: the `kbf` of linux-x86_64, which
 /// answers `json`, and the others, which do not run (the `kbf` of linux-arm64 and of the Mac,
-/// and a `kbf-installer`): no `kbf-daemon` for the Mac, as the workflow builds none.
-fn standard(json: &str) -> Vec<(String, Vec<u8>)> {
+/// and a `kbf-installer`): a Mac runs its `kbf`, and the workflow builds no `kbf-daemon` for it.
+fn standard(json: &str) -> Vec<Asset> {
     vec![
         runnable("linux-x86_64", SHA, json),
-        plain("kbf", "linux-arm64", SHA),
-        plain("kbf", "darwin-arm64", SHA),
+        plain_kbf("linux-arm64", SHA),
+        plain_kbf("darwin-arm64", SHA),
         plain("kbf-installer", "linux-x86_64", SHA),
     ]
 }
@@ -65,6 +111,8 @@ enum Prev<'a> {
     /// `PREV_TAG` is a release of `PREV` whose `kbf` answers the first for linux-x86_64 and
     /// the second for linux-arm64.
     Released(&'a str, &'a str),
+    /// [`Prev::Released`], made before the build jobs recorded version facts: it has none.
+    Predating(&'a str, &'a str),
     /// `PREV_TAG` is a tag with no release.
     Unreleased,
 }
@@ -74,13 +122,13 @@ fn fx(name: &str) -> Fx {
 }
 
 /// A world where N is released with `assets`, and `prev` is the release before it.
-fn world(name: &str, assets: Vec<(String, Vec<u8>)>, prev: Prev) -> Fx {
+fn world(name: &str, assets: Vec<Asset>, prev: Prev) -> Fx {
     let f = fx(name);
     let mut tags = vec![(TAG, "identical")];
     let mut more = tag_answers(TAG, SHA);
     match prev {
         Prev::Nothing => {}
-        Prev::Released(..) => {
+        Prev::Released(..) | Prev::Predating(..) => {
             tags.push((PREV_TAG, "ahead"));
             more.extend(found(PREV_TAG, PREV, SHA));
         }
@@ -90,14 +138,19 @@ fn world(name: &str, assets: Vec<(String, Vec<u8>)>, prev: Prev) -> Fx {
         }
     }
     f.github_for(SHA, &tags, more);
-    f.publish(TAG, SHA, &assets);
-    if let Prev::Released(x86_64, arm64) = prev {
-        let before = [
+    f.publish_assets(TAG, SHA, &assets);
+    if let Prev::Released(x86_64, arm64) | Prev::Predating(x86_64, arm64) = prev {
+        let mut before = [
             runnable("linux-x86_64", PREV, x86_64),
             runnable("linux-arm64", PREV, arm64),
-            plain("kbf", "darwin-arm64", PREV),
+            plain_kbf("darwin-arm64", PREV),
         ];
-        f.publish(PREV_TAG, PREV, &before);
+        if matches!(prev, Prev::Predating(..)) {
+            for asset in &mut before {
+                asset.facts = None;
+            }
+        }
+        f.publish_assets(PREV_TAG, PREV, &before);
     }
     f
 }
@@ -119,6 +172,20 @@ fn args_for<'a>(sha: &'a str, out: &'a Path, runner: Option<&'a str>) -> Vec<&'a
 }
 
 impl Fx {
+    /// The release `tag` of `commit` with `assets`: their tarballs, and the version facts of
+    /// those that have them.
+    fn publish_assets(&self, tag: &str, commit: &str, assets: &[Asset]) {
+        let tarballs: Vec<(String, Vec<u8>)> = assets
+            .iter()
+            .map(|a| (a.stem.clone(), a.tgz.clone()))
+            .collect();
+        let facts: Vec<(String, Vec<u8>)> = assets
+            .iter()
+            .filter_map(|a| a.facts.clone().map(|f| (a.stem.clone(), f)))
+            .collect();
+        self.publish_with_facts(tag, commit, &tarballs, &facts);
+    }
+
     /// Where the verb stages the offer.
     fn out(&self) -> PathBuf {
         self.root.join("out")
@@ -211,11 +278,16 @@ fn a_released_commit_is_staged_as_the_golden_has_it() {
     // Catches: a changed output (the workflow reads these keys), an offer for another stage
     // or another waiver than the fixed one (golden), a reason that does not name the tag,
     // a bundle whose entries are not those the installer reads (SHA256SUMS first, then the
-    // offer, then each platform's `kbf` with its attestation, in the order of the platform
-    // list, with no SBOM and no `kbf-installer`), an attestation under the name of another
-    // tarball, a changed copy of SHA256SUMS, a header that is not fixed, a Mac with no
-    // `kbf-daemon` in the offer, an offer that names a set other than the bundle's, a
-    // `created` that is not the clock's, and output that replaces the file's earlier lines.
+    // offer, then each platform's version facts and `kbf` with its attestation, in the order
+    // of the platform list, with no SBOM and no `kbf-installer`), version facts left out of
+    // the bundle or changed (the installer uploads them for the store to make a node's offer
+    // from), an attestation under the name of another tarball, a changed copy of SHA256SUMS,
+    // a header that is not fixed, a Mac left out of the offer (its `kbf` is what it runs), an
+    // offer that names a set other than the bundle's, an `offer.json` in the bundle that the
+    // installer's `from_bundle` does not read as the offer written to `out/`, a `created`
+    // that is not the clock's, and output that replaces the file's earlier lines.
+    // Mutants it catches: the facts not appended to the bundle (or appended after the
+    // tarballs); the Mac dropped from the platforms; `offer.json` appended under another name.
     let f = released("golden");
     let output = f.root.join("github-output");
     std::fs::write(&output, "earlier=line\n").expect("output");
@@ -224,9 +296,7 @@ fn a_released_commit_is_staged_as_the_golden_has_it() {
     let after = kbf_gate::system_clock();
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(names_in(&f.out()), [BUNDLE_FILE, OFFER_FILE]);
-    let daemon = format!("kbf-daemon-{SHA}-darwin-arm64.tar.gz");
-    assert!(err.contains(&daemon), "{err}");
-    assert!(err.contains("is not in SHA256SUMS"), "{err}");
+    assert!(!err.contains("left out of the offer"), "{err}");
 
     let doc = f.offer();
     let made = doc.created;
@@ -252,7 +322,13 @@ fn a_released_commit_is_staged_as_the_golden_has_it() {
     assert_eq!(doc.set_hash, SetHash::of_sums(&sums.bytes));
     let offer_bytes = std::fs::read(f.out().join(OFFER_FILE)).expect("offer.json");
     assert_eq!(entry(&entries, OFFER_FILE).bytes, offer_bytes);
-    for platform in ["linux-x86_64", "linux-arm64"] {
+    // The offer as a deploy reads it from the bundle (`--offer -`).
+    let stored = entry(&entries, OFFER_FILE).bytes.as_slice();
+    let in_bundle = from_bundle(Some(stored)).expect("an offer the installer reads");
+    assert_eq!(in_bundle, doc);
+    for platform in ["linux-x86_64", "linux-arm64", "darwin-arm64"] {
+        let facts = format!("kbf-{SHA}-{platform}.version.json");
+        assert_eq!(entry(&entries, &facts).bytes, release(&facts), "{facts}");
         let name = format!("kbf-{SHA}-{platform}.tar.gz");
         let packed = entry(&entries, &name);
         assert_eq!(packed.bytes, release(&name), "{name}");
@@ -334,7 +410,7 @@ fn refuses_tag(name: &str, more: Vec<(String, Value)>, why: &str) {
 #[test]
 fn a_tag_that_is_not_annotated_or_names_another_commit_or_is_not_there_is_an_error() {
     // Catches: the tag taken on the word of the compare alone (it says `identical` in every
-    // case here): a lightweight tag, which carries no verdict; an annotated tag whose object
+    // case here): a lightweight tag, which carries no audit record; an annotated tag whose object
     // names another commit; a tag GitHub does not list a ref for.
     let ref_path = format!("repos/{REPO}/git/ref/tags/{TAG}");
     let to_commit = json!({ "object": { "type": "commit", "sha": SHA } });
@@ -381,18 +457,79 @@ fn damage_bundle_commit(f: &Fx) {
     std::fs::write(bundle, bundle_json(&sha, &bundle_flags(PREV))).expect("write");
 }
 
+/// The version facts of the linux-arm64 `kbf` are other bytes than the sums list.
+fn damage_facts_sum(f: &Fx) {
+    let name = format!("kbf-{SHA}-linux-arm64.version.json");
+    std::fs::write(f.asset(&name), b"{\"meta_log\":9}\n").expect("write");
+}
+
+/// No attestation of the version facts of the linux-arm64 `kbf` is stored (the other
+/// attestations are).
+fn damage_facts_unattested(f: &Fx) {
+    let name = format!("kbf-{SHA}-linux-arm64.version.json");
+    let sha = sha_of(&std::fs::read(f.asset(&name)).expect("facts"));
+    let store = f.root.join("gh/attested");
+    let text = std::fs::read_to_string(&store).expect("attested");
+    let kept: String = text
+        .lines()
+        .filter(|l| !l.starts_with(&sha))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&store, kept).expect("write");
+}
+
 #[test]
 fn a_release_that_does_not_verify_is_refused_before_any_of_it_runs() {
     // Catches: the `kbf` taken out and run before the release is verified, or from the files
     // as they were downloaded, or never verified: the runner's `kbf` fails when it runs, so
-    // each refusal below would be that failure instead of its own. Each damage is to the
-    // linux-arm64 tarball, which is not the one run.
+    // each refusal below would be that failure instead of its own. Each damage is to a file of
+    // linux-arm64, which is not the tarball run. The version facts are bundled for the store
+    // to make a node's offer from, so they are held to their line of SHA256SUMS and to the
+    // artifacts workflow's attestation as a tarball is.
+    // Mutants it catches (each red at its own line): the `kbf` run before `check`; `check`
+    // skipped; `artifacts` skipped; the facts left out of the digest comparison of the sums
+    // (facts-sum); the facts left out of the attestation check (facts-unattested).
     refuses_damaged("sum", damage_sum, "does not match its line");
     refuses_damaged("no-bundle", damage_no_bundle, "no provenance bundle");
     let unattested = "no build provenance attestation signed by";
     refuses_damaged("unattested", damage_unattested, unattested);
     let wrong_commit = "tar.gz.sigstore.json does not verify";
     refuses_damaged("bundle-commit", damage_bundle_commit, wrong_commit);
+    refuses_damaged("facts-sum", damage_facts_sum, "does not match its line");
+    refuses_damaged("facts-unattested", damage_facts_unattested, unattested);
+}
+
+#[test]
+fn a_kbf_tarball_without_its_version_facts_is_refused_before_any_of_it_runs() {
+    // Catches: `release check` made with the facts waived for the release being offered (the
+    // waiver is for the release before): a platform whose facts the build job did not keep
+    // would be bundled without them, and the store would keep it and never offer it to a node.
+    // The runner's `kbf` fails when it runs, so the refusal is not that failure.
+    // Mutant it catches: `Pairing::Waived` in place of `Pairing::Required` in `stage_release`.
+    let mut assets = standard("fail\n");
+    assets[1].facts = None;
+    let f = world("no-facts", assets, Prev::Nothing);
+    let ran = f.run(&[], None);
+    let ran_kbf = ran.2.contains("--version --json");
+    assert!(!ran_kbf, "the kbf ran: {}", ran.2);
+    let facts = format!("kbf-{SHA}-linux-arm64.version.json");
+    f.assert_refused(ran, &format!("its version facts {facts} are not listed"));
+}
+
+#[test]
+fn version_facts_that_are_not_what_the_runners_kbf_prints_are_refused() {
+    // Catches: facts in the bundle of another build than the one whose `meta_log` the offer
+    // states (the facts are what a node's offer is made from, the offer's number is read from
+    // the run): the facts of linux-x86_64 say a `meta_log` of 5 where its `kbf` prints 4, and
+    // are listed, hashed and attested as they should be, so only the comparison with the run
+    // can refuse them. The same release with the facts it prints is staged by the other tests.
+    // Mutant it catches: the comparison of the facts with the run removed.
+    let mut assets = standard(&identity(SHA, 4));
+    assets[0].facts = Some(identity(SHA, 5).into_bytes());
+    let f = world("facts-differ", assets, Prev::Nothing);
+    let ran = f.run(&[], None);
+    let what = format!("kbf-{SHA}-linux-x86_64.version.json is not what the kbf in ");
+    f.assert_refused(ran, &what);
 }
 
 #[test]
@@ -500,38 +637,95 @@ fn a_release_file_a_kbf_changed_while_it_ran_is_refused_not_bundled() {
     assert!(f.tmp_is_empty(), "the scratch directory was left");
 }
 
+/// The names of the entries of the bundle that are the files of `platform`.
+fn of_platform(names: &[String], platform: &str) -> Vec<String> {
+    let suffix = format!("-{platform}");
+    names
+        .iter()
+        .filter(|n| n.contains(&suffix))
+        .cloned()
+        .collect()
+}
+
 #[test]
-fn a_mac_with_a_kbf_daemon_is_served_and_a_release_that_completes_no_platform_is_refused() {
-    // Catches: a Mac left out when the release has its `kbf-daemon` (and its tarball and
-    // attestation missing from the bundle, last in the platform list), and a release that
-    // completes no platform offered all the same: the only tarball here is a `kbf` for the
-    // Mac, which a Mac does not run.
-    let mut assets = standard(&identity(SHA, 4));
-    assets.push(plain("kbf-daemon", "darwin-arm64", SHA));
-    let f = world("daemon", assets, Prev::Nothing);
+fn a_platform_the_release_does_not_complete_is_left_out_and_printed_not_an_error() {
+    // Catches: a platform the release has no tarball of staged all the same (its files missing
+    // from the bundle, which would fail the run, or named in the offer), and a platform left
+    // out without a word: here the release has no `kbf` for the Mac, which a Mac runs, though
+    // it holds the `kbf-installer` of linux-x86_64. The Mac is the last of the platform list.
+    // Mutants it catches: all platforms handed to the bundle and the offer; the `skipped` list
+    // not printed.
+    let assets = vec![
+        runnable("linux-x86_64", SHA, &identity(SHA, 4)),
+        plain_kbf("linux-arm64", SHA),
+        plain("kbf-installer", "linux-x86_64", SHA),
+    ];
+    let f = world("no-mac", assets, Prev::Nothing);
     let (code, out, err) = f.run(&[], None);
     assert_eq!(code, Some(0), "{err}");
-    assert!(!out.contains("platform-skipped"), "{out}");
-    let doc = f.offer();
-    let platforms = ["darwin-arm64", "linux-arm64", "linux-x86_64"];
-    assert_eq!(doc.platforms, platforms);
+    assert_eq!(value(&out, "platform-skipped"), "darwin-arm64");
+    let left_out = "left out of the offer: platform darwin-arm64: no tarball of";
+    assert!(err.contains(left_out), "{err}");
+    assert_eq!(f.offer().platforms, ["linux-arm64", "linux-x86_64"]);
     let names = f.bundle_names();
-    let tail = &names[names.len() - 2..];
-    let daemon = format!("kbf-daemon-{SHA}-darwin-arm64.tar.gz");
-    let last = [daemon.clone(), format!("{daemon}.attestation")];
-    assert_eq!(tail, last);
+    assert!(of_platform(&names, "darwin-arm64").is_empty(), "{names:?}");
+    assert_eq!(of_platform(&names, "linux-arm64").len(), 3, "{names:?}");
+}
 
-    let assets = vec![runnable("darwin-arm64", SHA, &identity(SHA, 4))];
+/// The SBOM of the linux-x86_64 `kbf` is gone from the release and from its `SHA256SUMS`.
+fn damage_no_sbom(f: &Fx) {
+    let sbom = format!("kbf-{SHA}-linux-x86_64.cdx.json");
+    std::fs::remove_file(f.asset(&sbom)).expect("remove");
+    let sums = f.asset("SHA256SUMS");
+    let text = std::fs::read_to_string(&sums).expect("sums");
+    let kept: String = text
+        .lines()
+        .filter(|l| !l.ends_with(&sbom))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&sums, kept).expect("write");
+}
+
+#[test]
+fn a_release_that_completes_no_platform_is_refused() {
+    // Catches: a release that completes no platform offered all the same. The only `kbf` is
+    // the runner's, and its SBOM is gone from the release (and from its sums, so the release
+    // still checks), so no platform has a `kbf`, its SBOM, its bundle and its facts; the
+    // refusal lists what each platform lacks. Nothing is written.
+    // Mutant it catches: the `complete.is_empty()` refusal removed (an offer for no platform).
+    let assets = vec![runnable("linux-x86_64", SHA, &identity(SHA, 4))];
     let f = world("none", assets, Prev::Nothing);
-    let ran = f.run_with(Some("darwin-arm64"), &[], None);
-    assert!(ran.2.contains(&daemon), "{}", ran.2);
-    f.assert_refused(ran, "platform linux-x86_64: no tarball of");
+    damage_no_sbom(&f);
+    let ran = f.run(&[], None);
+    let no_tarball = "platform darwin-arm64: no tarball of";
+    assert!(ran.2.contains(no_tarball), "{}", ran.2);
+    f.assert_refused(ran, "platform linux-x86_64: kbf-");
+}
+
+#[test]
+fn a_release_before_that_predates_the_version_facts_is_still_the_previous_release() {
+    // Catches: the facts required of the release before (it is held to what the build jobs of
+    // its day did: none recorded them), which would refuse every offer made while the release
+    // before is one of those; and a previous release whose `kbf` is not run when it has no
+    // facts. N-1 here has none, and its `meta_log` is read from its run: 5 against N's 4.
+    // Mutant it catches: `Pairing::Required` in place of `Pairing::Waived` in `fetch_previous`.
+    let answer = identity(PREV, 5);
+    let assets = standard(&identity(SHA, 4));
+    let f = world("prev-predates", assets, Prev::Predating(&answer, &answer));
+    let (code, out, err) = f.run(&[], None);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(value(&out, "previous-source"), "release");
+    assert_eq!(value(&out, "reversible"), "true");
+    assert_eq!(f.offer().previous_meta_log, Some(5));
 }
 
 #[test]
 fn the_kbf_that_runs_is_the_runner_platforms_own() {
     // Catches: the same platform's `kbf` run on every runner: linux-x86_64's says meta_log 4
-    // and linux-arm64's says 7.
+    // and linux-arm64's says 7. Also the same platform's facts compared with the run: each
+    // platform's facts are what its own `kbf` prints, so the other's would be refused.
+    // Mutants it catches: the runner's `kbf` taken from the first platform's tarball; the
+    // facts compared with the first platform's whatever the runner's.
     for (platform, want) in [("linux-x86_64", 4), ("linux-arm64", 7)] {
         let mut assets = standard(&identity(SHA, 4));
         assets[1] = runnable("linux-arm64", SHA, &identity(SHA, 7));
@@ -546,13 +740,18 @@ fn the_kbf_that_runs_is_the_runner_platforms_own() {
 fn a_runner_platform_the_release_has_no_kbf_for_is_an_error() {
     // Catches: a tarball that is not there, or one with no `kbf` in it, read as a binary to
     // run (or skipped, and the offer made from a build that never ran).
+    // Mutant it catches: a runner platform with no tarball, or none with a `kbf`, skipped.
     let assets = vec![runnable("linux-x86_64", SHA, &identity(SHA, 4))];
     let f = world("no-tarball", assets, Prev::Nothing);
     let ran = f.run_with(Some("linux-arm64"), &[], None);
     f.assert_refused(ran, &format!("kbf-{SHA}-linux-arm64.tar.gz"));
 
     let other = tarball("other", b"not a kbf").expect("tarball");
-    let assets = vec![(format!("kbf-{SHA}-linux-x86_64"), other)];
+    let assets = vec![Asset {
+        stem: format!("kbf-{SHA}-linux-x86_64"),
+        tgz: other,
+        facts: Some(says("linux-x86_64", SHA).into_bytes()),
+    }];
     let f = world("no-entry", assets, Prev::Nothing);
     let ran = f.run(&[], None);
     f.assert_refused(ran, "holds no kbf");
@@ -564,6 +763,7 @@ fn without_a_runner_platform_the_hosts_own_is_used() {
     // Catches: a default that is not this host's platform: each platform's `kbf` runs here
     // and says a `meta_log` of its own (4 for linux-x86_64, 7 for linux-arm64, 9 for the
     // Mac), so a host mapped to another platform is found by the offer's.
+    // Mutant it catches: the host's architecture mapped to the other Linux platform.
     let assets = vec![
         runnable("linux-x86_64", SHA, &identity(SHA, 4)),
         runnable("linux-arm64", SHA, &identity(SHA, 7)),

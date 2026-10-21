@@ -90,6 +90,7 @@ fn spec(update_id: &str, from: Option<&str>, to: &str) -> UpdateSpec {
         to: c(to),
         nodes: true,
         rollback: false,
+        source: kbf_update::Source::Fetch,
         facts: StagedFacts {
             commit: c(to),
             protocol: 7,
@@ -104,6 +105,7 @@ fn spec(update_id: &str, from: Option<&str>, to: &str) -> UpdateSpec {
             verb: Verb::FrontendUpdate,
             commit: c(to),
             window_s: 900,
+            source: kbf_update::Source::Fetch,
         },
     }
 }
@@ -193,6 +195,32 @@ fn an_update_goes_through_every_phase_in_the_order_of_the_design() {
     assert_eq!(status.running, Some(c(B)));
     assert!(update.old.is_none(), "nothing drains after the end");
     assert!(h.deaths.lock().unwrap().is_empty());
+}
+
+/// Catches a source that stops at the supervisor: the update it was given is `staged`, so the
+/// record in `update.json` says so (a restarted proxy has no other source to read), the status
+/// reads it from that record, and the order for the nodes names it.
+///
+/// Mutants planted: the plan built with source `fetch`; the status always `fetch`.
+#[test]
+fn the_source_of_an_update_is_kept_in_its_record_and_named_in_the_order_for_the_nodes() {
+    let mut h = harness("sw-source");
+    let staged = UpdateSpec {
+        source: kbf_update::Source::Staged,
+        ..spec("u1", Some(A), B)
+    };
+    h.sup.start(&staged).unwrap();
+    assert!(h.sup.wait_closed(WAIT));
+    assert_eq!(last_intent(&h.rig).source, kbf_update::Source::Staged);
+    let update = h.sup.status().update.expect("the update");
+    assert_eq!(update.source, kbf_update::Source::Staged);
+    assert!(h.rig.log().contains(&format!("admin:desired B {B} staged")));
+
+    let mut h = harness("sw-source-fetch");
+    h.sup.start(&spec("u1", Some(A), B)).unwrap();
+    assert!(h.sup.wait_closed(WAIT));
+    assert_eq!(last_intent(&h.rig).source, kbf_update::Source::Fetch);
+    assert!(h.rig.log().contains(&format!("admin:desired B {B}")));
 }
 
 #[test]
@@ -497,6 +525,7 @@ fn intent(phase: Phase, failure: Option<Step>) -> Intent {
         to: c(B),
         nodes: true,
         rollback: false,
+        source: kbf_update::Source::Fetch,
         old_slot: Slot::A,
         timing: quick(),
     };
@@ -519,6 +548,9 @@ fn the_slot_that_serves_after_an_update_follows_how_it_ended() {
     for (step, serves) in [
         (Step::Confirm, new),
         (Step::Rollback, new),
+        // The order for the nodes is sent after the switch and the confirm: the new child
+        // serves, whether or not the nodes were told.
+        (Step::Nodes, new),
         (Step::Switch, old),
         (Step::Migrate, old),
         (Step::Abort, old),

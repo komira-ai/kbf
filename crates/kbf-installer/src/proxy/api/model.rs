@@ -2,6 +2,7 @@
 //! rules it applies itself. Phases, steps, slots, failures, order locators and staged facts
 //! are the swap's: [`crate::proxy::model`].
 
+use kbf_update::Source;
 use serde::{Deserialize, Serialize};
 
 use crate::CommitId;
@@ -30,6 +31,11 @@ pub struct NewChild {
 /// The body of `POST /v1/update/frontend`. Unknown fields are refused. The `deploy` verb is
 /// the client: it builds the body from this type and reads the answer as [`StatusBody`], so
 /// the two ends cannot name a field differently.
+///
+/// `source` is written only when it is `staged`, and a body that names `fetch` is read as one
+/// that names nothing. A proxy that is still running the code of a build before `source`
+/// refuses a body with a key it does not know, so a client that always wrote it could not
+/// update a frontend by fetching until that proxy restarted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateRequest {
@@ -39,6 +45,8 @@ pub struct UpdateRequest {
     pub nodes: bool,
     #[serde(default)]
     pub rollback: bool,
+    #[serde(default, skip_serializing_if = "Source::is_fetch")]
+    pub source: Source,
 }
 
 fn yes() -> bool {
@@ -70,6 +78,9 @@ pub struct StatusBody {
     pub old: Option<OldChild>,
     pub new: Option<NewChild>,
     pub failure: Option<Failure>,
+    /// Where the update's release comes from; left out for a fetch, as in the request.
+    #[serde(default, skip_serializing_if = "Source::is_fetch")]
+    pub source: Source,
 }
 
 /// Why `rollback` is refused (FP section 4: "after switched while the old child lives

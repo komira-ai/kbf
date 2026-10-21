@@ -23,7 +23,9 @@
 //!   exactly [`RELEASE_TAG_PUSH_ONLY`]. So no pull request or merge-queue run holds a
 //!   token that can sign an attestation, every attestation this repository signs names
 //!   `refs/heads/main`, and only a pushed `v*` tag runs a job that can create a release
-//!   (or push to the repository);
+//!   (or push to the repository), and `issues` ([`ISSUE_SCOPES`]), which may be `write`
+//!   only in a job whose `if:` is exactly [`ISSUES_MAIN_ONLY`] (the advisories workflow
+//!   keeps one issue; no pull request run holds a token that can write issues);
 //! - a job calls a reusable workflow that is not one of this repository's linted
 //!   workflow files (its runners are not in a file this lint read);
 //! - a step's `uses:` is not pinned to a full 40-character commit SHA followed on the
@@ -164,6 +166,15 @@ const RELEASE_SCOPES: &[&str] = &["contents"];
 /// The one `if:` spelling under which a job may hold [`RELEASE_SCOPES`] for writing.
 const RELEASE_TAG_PUSH_ONLY: &str =
     "${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}";
+
+/// Token scopes a job may set to `write` when it runs only on `main`'s ref: the issues
+/// API, which the advisories workflow uses to open, update and close its one issue.
+const ISSUE_SCOPES: &[&str] = &["issues"];
+
+/// The one `if:` spelling under which a job may hold [`ISSUE_SCOPES`] for writing: a run
+/// whose ref is `main` (a scheduled run, a push to `main`, a manual run of `main`). A pull
+/// request run's ref is `refs/pull/<n>/merge`, never this.
+const ISSUES_MAIN_ONLY: &str = "${{ github.ref == 'refs/heads/main' }}";
 
 /// Triggers that run with the base repository's secrets and token on behalf of code
 /// or events from outside it. (`workflow_run` is the same, and is allowed in the one shape
@@ -653,8 +664,9 @@ impl Lint<'_> {
 
     /// A job may narrow its token to `read` or `none` scopes; it may not widen it, but
     /// for [`SIGNING_SCOPES`] set to `write` in a job whose `if:` (`condition`) is
-    /// exactly [`SIGNING_PUSH_ONLY`], and [`RELEASE_SCOPES`] set to `write` in one whose
-    /// `if:` is exactly [`RELEASE_TAG_PUSH_ONLY`]. Scope names and levels are compared
+    /// exactly [`SIGNING_PUSH_ONLY`], [`RELEASE_SCOPES`] set to `write` in one whose
+    /// `if:` is exactly [`RELEASE_TAG_PUSH_ONLY`], and [`ISSUE_SCOPES`] in one whose `if:`
+    /// is exactly [`ISSUES_MAIN_ONLY`]. Scope names and levels are compared
     /// exactly, so another spelling is refused (the safe side).
     fn job_permissions(&mut self, p: &Node, condition: Option<&str>) {
         let Value::Map(scopes) = &p.value else {
@@ -674,6 +686,8 @@ impl Lint<'_> {
                 Some(SIGNING_PUSH_ONLY)
             } else if RELEASE_SCOPES.contains(&name) {
                 Some(RELEASE_TAG_PUSH_ONLY)
+            } else if ISSUE_SCOPES.contains(&name) {
+                Some(ISSUES_MAIN_ONLY)
             } else {
                 None
             };

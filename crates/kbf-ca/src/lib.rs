@@ -32,6 +32,7 @@ mod keyfile;
 mod policy;
 mod serial;
 mod signer;
+pub mod verify_cert;
 
 pub use authority::{Authority, Issued, NodeCert, Rotation};
 pub use bundle::Bundle;

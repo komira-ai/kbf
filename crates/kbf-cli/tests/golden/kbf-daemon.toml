@@ -84,8 +84,6 @@ reconnect-ms = 1000
 # cert = "CERT"
 # PEM file of this daemon's private key
 # key = "KEY"
-# A node label, `key=value`, reported as `label.<key>`; repeatable. A Mac in komira's pool runs with `--label pool=darwin-sized`
-# label = []
 # A stable name for this node, unique within the cell
 # node-id = "NODE_ID"
 # A kbf-server worker listener to connect to, as an `https://host:port` URL; repeatable, or several separated by commas. The host may be a DNS name with a record per server: every round of attempts resolves it again and tries each address. The daemon never stops trying (see `--reconnect-max-ms`)
