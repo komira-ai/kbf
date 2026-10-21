@@ -391,6 +391,19 @@ impl HostFacts {
         self.connected && self.release.as_ref() == Some(target)
     }
 
+    /// The release its package carries, if it reports one ([`HostFacts::available`]).
+    #[must_use]
+    pub fn packaged(&self) -> Option<&Release> {
+        self.available.as_ref().map(|have| &have.commit)
+    }
+
+    /// Whether its package carries `target`: the whole name of one equals the whole name of
+    /// the other, so a prefix of the commit is not the release.
+    #[must_use]
+    pub fn carries(&self, target: &Release) -> bool {
+        self.packaged() == Some(target)
+    }
+
     /// Whether it can take work now, as the capacity floor counts it: connected, placement
     /// shows it uncordoned (unknown is not), and its record says it is not in a step. The
     /// record counts as well as placement because placement lags a cordon that was ordered.
@@ -416,6 +429,10 @@ pub struct Facts {
     /// The release the run drives every host to. A rollback is the same run with the old
     /// release here: hosts are compared with `==`, never ordered.
     pub target: Release,
+    /// Where `target` comes from. The picker reads the source of `update/desired`; the node
+    /// step reads the source of the run that started the host ([`super::HostRow::source`]),
+    /// as it reads that run's commit for `target`, so a host keeps its run's source.
+    pub source: Source,
     /// The generation of the run (`update/desired`).
     pub generation: Generation,
     /// The id the next order will carry: greater than every id issued so far. The

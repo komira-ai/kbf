@@ -8,6 +8,17 @@
 //! reports the new release; a `Held` host is none, and holds the run. A rollback is the
 //! same run with another target and a higher generation, compared with `==`, never ordered.
 //!
+//! **Source.** A run names where its release comes from ([`Source`]), and a candidate the
+//! source cannot reach is skipped, not dropped: it stays in the answer, so a run whose every
+//! candidate is skipped says [`WaitReason::NoneEligible`] and never that there is nothing to
+//! update. A *staged* run orders a host only if the release its package carries
+//! ([`HostFacts::available`]) is the target, whole name to whole name ([`Skip::NotAvailable`]);
+//! a host whose installer reports no packages at all is [`Skip::InstallerTooOld`], read first.
+//! A *fetch* run skips a host that fetches nothing ([`Skip::Bundled`]) and orders every other,
+//! one that does not say included. The gate runs on the candidates before they are split by
+//! place, so a skipped host takes no room and, while some place is free, is named rather than
+//! hidden behind a full one. When every place is full the answer is the blocker, as before.
+//!
 //! **Places.** Storage-and-daemon hosts start one at a time (section 2.1). Daemon-only hosts
 //! and Macs may be in a step together, up to [`Policy::max_hosts_out`] (section 2.6). The two
 //! are separate budgets ([`super::Slot`]), and the answer is the set of hosts to start in
@@ -48,11 +59,12 @@ use std::collections::BTreeSet;
 
 use kbf_types::{FarmTime, WorkerId};
 
-use super::facts::{Facts, HostFacts, Platform, PlatformClass};
+use super::facts::{Facts, HostFacts, Platform, PlatformClass, Release, Source};
 use super::gate::{GateFail, GateMode, storage_gate};
 use super::node_step::HostPhase;
 use super::policy::Policy;
 use super::slot::SlotClass;
+use crate::update_status::ReleaseSource;
 
 /// The picker's answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +142,19 @@ pub enum Skip {
     Deferred,
     /// Every place of its kind is held (one for storage hosts, `max_hosts_out` for the rest).
     NoRoom,
+    /// A staged run, and the release its package carries is not the target: `has` is the
+    /// release it reports, `None` if it reports none. The run waits for the package.
+    NotAvailable {
+        /// What its package carries.
+        has: Option<Release>,
+    },
+    /// A staged run, and its installer does not say where it fetches from, so it is one that
+    /// predates the report of packages (or sent a number this build does not know): it could
+    /// carry the target and not show it. Told apart from [`Skip::NotAvailable`], which a
+    /// host that reports packages and carries none is.
+    InstallerTooOld,
+    /// A fetch run, and the host's installer fetches nothing: its release is its package's.
+    Bundled,
 }
 
 /// A candidate that may be picked.
@@ -240,13 +265,14 @@ pub fn pick(facts: &Facts, policy: &Policy, now: FarmTime) -> Pick {
             WaitReason::ReleaseUnknown(unknown)
         });
     }
+    let (candidates, mut skipped) = reachable(facts, candidates);
+    if candidates.is_empty() {
+        return wait(WaitReason::NoneEligible(skipped));
+    }
     let (open, blocked): (Vec<_>, Vec<_>) = candidates
         .into_iter()
         .partition(|h| out.room(h.slot_class(), policy) > 0);
-    let mut skipped: Vec<(WorkerId, Skip)> = blocked
-        .iter()
-        .map(|h| (h.id.clone(), Skip::NoRoom))
-        .collect();
+    skipped.extend(blocked.iter().map(|h| (h.id.clone(), Skip::NoRoom)));
     if open.is_empty() {
         let class = blocked
             .first()
@@ -298,6 +324,47 @@ pub fn pick(facts: &Facts, policy: &Policy, now: FarmTime) -> Pick {
             // Only deferred hosts are left: eligible, not idle, and not to be forced again.
             skipped.extend(eligible.iter().map(|e| (e.host.id.clone(), Skip::Deferred)));
             wait(WaitReason::NoneEligible(skipped))
+        }
+    }
+}
+
+/// Splits `candidates` by the run's source: the hosts it can reach, and the others with the
+/// reason each is skipped. A skipped host is returned, not dropped, so the caller can say
+/// that every candidate was skipped.
+fn reachable<'a>(
+    facts: &Facts,
+    candidates: Vec<&'a HostFacts>,
+) -> (Vec<&'a HostFacts>, Vec<(WorkerId, Skip)>) {
+    let mut reached = Vec::new();
+    let mut skipped = Vec::new();
+    for host in candidates {
+        match source_skip(facts, host) {
+            None => reached.push(host),
+            Some(skip) => skipped.push((host.id.clone(), skip)),
+        }
+    }
+    (reached, skipped)
+}
+
+/// Why the run's source cannot reach `host`, if it cannot. A staged run needs the host's
+/// package to carry the target; a host whose installer reports no packages is told apart
+/// first, because it shows no package whether it has one or not. A fetch run needs a host that
+/// fetches, which only a bundled one does not: one that does not say is ordered as before.
+fn source_skip(facts: &Facts, host: &HostFacts) -> Option<Skip> {
+    match facts.source {
+        Source::Fetch => {
+            let bundled = host.release_source == ReleaseSource::Bundled;
+            bundled.then_some(Skip::Bundled)
+        }
+        Source::Staged => {
+            if host.release_source == ReleaseSource::Unreported {
+                Some(Skip::InstallerTooOld)
+            } else if host.carries(&facts.target) {
+                None
+            } else {
+                let has = host.packaged().cloned();
+                Some(Skip::NotAvailable { has })
+            }
         }
     }
 }
