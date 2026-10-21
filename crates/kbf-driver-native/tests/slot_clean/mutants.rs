@@ -13,7 +13,7 @@ use super::freshness;
 use crate::support::slot_rows::covered_by;
 
 /// The rows [`freshness`] must find with `skip`'s step of the clean skipped and the
-/// check blind: the rows the table gives the step ([`covered_by`]), but for two steps the
+/// check blind: the rows the table gives the step ([`covered_by`]), but for three steps the
 /// lease's end has done before the clean runs. `None` is "not asserted"; `Some` is
 /// asserted.
 ///
@@ -23,12 +23,17 @@ use crate::support::slot_rows::covered_by;
 ///   cannot see that step skipped; the test pins that (no row red), to be changed to the
 ///   table's rows when a row plants what only the clean's kill can end.
 /// - [`Step::Bootout`]: the same reasoning says the `agent` rows are gone before the
-///   clean's bootout (the plist in the home is the home wipe's row, not this step's),
-///   but no Mac run has shown it, so what is red is printed and not asserted. After the
-///   first run: assert the rows it showed (an empty set if none, as for the kill).
+///   clean's bootout (the plist in the home is the home wipe's row, not this step's).
+///   The first Mac run (spike-slot-reach run 39645223554) showed no red row, but a
+///   bootout that leaves nothing behind is also what a flaky observation looks like, so
+///   what is red is printed and not asserted.
+/// - [`Step::Images`]: the same run showed the `image` row green with the detach skipped,
+///   and `hdiutil info` listed no image: the lease's end (the bootout or the kill of the
+///   process that attached it) had detached a user's disk image already. Printed, not
+///   asserted, for the same reason as the kill and the bootout.
 fn expected_red(skip: Step) -> Option<BTreeSet<String>> {
     match skip {
-        Step::Bootout => None,
+        Step::Bootout | Step::Images => None,
         Step::Kill => Some(BTreeSet::new()),
         _ => Some(
             covered_by(skip)
@@ -83,9 +88,10 @@ async fn mutant_turns_red(skip: Step) {
 /// asserted. Like the kill, the bootout has run once already when the clean starts (the
 /// lease's end is `uid::end`: bootout, then kill), so the lease's KeepAlive jobs, one
 /// labelled like launchd's own, are probably gone before the clean's bootout and the
-/// agent rows stay green; no run on a Mac has shown it, so nothing about the rows is
-/// asserted. Asserts only that the scenario ran (`Fresh::assert_ran`). Run it on a Mac (the `slot-clean-mutants` job of
-/// `spike-slot-reach.yml`), then assert what the log shows.
+/// agent rows stay green; the first Mac run (spike-slot-reach run 39645223554) showed no
+/// red row, and nothing about the rows is asserted. Asserts only that the scenario ran
+/// (`Fresh::assert_ran`). Run it on a Mac (the `slot-clean-mutants` job of
+/// `spike-slot-reach.yml`) to see the observation.
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
 async fn skipping_the_bootout_is_observed_not_asserted_because_the_lease_end_booted_out_first() {
@@ -109,11 +115,15 @@ async fn skipping_the_kill_turns_no_row_red_because_the_lease_end_killed_first()
     mutant_turns_red(Step::Kill).await;
 }
 
-/// Mutant test: the image detach skipped turns `image` red. Catches a detach that does
-/// nothing (the next lease would see the disk image the last one attached).
+/// Mutant observation: the image detach skipped, which rows turn red is printed and not
+/// asserted. On the first Mac run (spike-slot-reach run 39645223554, job
+/// `slot-clean-mutants`) the `image` row stayed green with the step skipped and
+/// `hdiutil info` listed no image: the lease's end (`uid::end`, the bootout then the kill
+/// of the process that attached the image) had detached it before the clean ran, as for
+/// the kill and the bootout. Asserts only that the scenario ran (`Fresh::assert_ran`).
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
-async fn skipping_the_image_detach_turns_the_image_row_red() {
+async fn skipping_the_image_detach_is_observed_not_asserted_because_the_lease_end_detached_first() {
     mutant_turns_red(Step::Images).await;
 }
 

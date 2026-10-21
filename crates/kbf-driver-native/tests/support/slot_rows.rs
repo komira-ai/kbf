@@ -63,8 +63,10 @@ pub const ROWS: [(&str, &str); 18] = [
 /// the loaded job is [`Step::Bootout`]'s, the plist in the home [`Step::Home`]'s).
 /// On a Mac the lease's end has run a bootout and a kill before the clean, so the real
 /// mutant tests assert that no row is red for [`Step::Kill`], and assert nothing for
-/// [`Step::Bootout`] yet (`tests/slot_clean/mutants.rs`); the entries are the clean's
-/// claim, not what those tests see.
+/// [`Step::Bootout`] or [`Step::Images`] (the Mac run 39645223554 saw no red row for
+/// either; a user's disk image is detached by the lease's end too)
+/// (`tests/slot_clean/mutants.rs`); the entries are the clean's claim, not what those
+/// tests see.
 ///
 /// Every step has an entry (the array's length is [`STEPS`](kbf_driver_native::slots::clean::STEPS)'s).
 ///
