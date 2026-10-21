@@ -1,6 +1,11 @@
-//! `release verdict`: the check that a `v*` tag carries a gamma verdict for exactly the
-//! files being released (docs/design/kbf-cicd.md, section 8.1). The verdict is the tag
-//! message, unsigned: who may push a tag is the tag ruleset's business, not this check's.
+//! `release verdict`: the check that a `v*` tag carries a verdict of the gate stage
+//! ([`GATE_STAGE`]) for exactly the files being released (docs/design/kbf-cicd.md, section
+//! 8.1). The verdict is the tag message, unsigned: who may push a tag is the tag ruleset's
+//! business, not this check's.
+//!
+//! The stage decides what a verdict must record. Gamma: a finished bake of at least
+//! [`MIN_BAKE_SECS`] and a met load (or a [`LOAD_WAIVER`]). Anything else: no bake and no
+//! load, because a document that claims a bake the stage never ran is not carried along.
 
 use std::path::Path;
 
@@ -34,6 +39,8 @@ pub struct Subject<'a> {
     pub dir: &'a Path,
     /// The ref of main in `repo_dir`.
     pub main_ref: &'a str,
+    /// The stage the verdict must be for: [`GATE_STAGE`] (a test may judge another).
+    pub stage: Stage,
 }
 
 /// A verdict that passed every check.
@@ -102,14 +109,34 @@ pub(super) fn bake_secs(doc: &ResultDoc) -> Option<Option<u64>> {
     Some(bake.end?.checked_sub(bake.start))
 }
 
+/// What is wrong with the bake a Gamma verdict records.
+fn bake_problems(doc: &ResultDoc) -> Vec<String> {
+    let mut problems = Vec::new();
+    match bake_secs(doc) {
+        Some(Some(secs)) if secs >= MIN_BAKE_SECS => {}
+        Some(Some(secs)) => problems.push(format!(
+            "the bake lasted {secs} s, less than {MIN_BAKE_SECS} s (24 h)"
+        )),
+        Some(None) => problems.push("the bake ends before it starts".to_owned()),
+        None => problems.push("the verdict records no finished bake".to_owned()),
+    }
+    let load_met = doc.load.is_some_and(|l| l.met());
+    if !load_met && !doc.waivers.iter().any(|w| w.what == LOAD_WAIVER) {
+        problems.push(format!(
+            "the bake's minimum load was not met and no `{LOAD_WAIVER}` waiver is recorded"
+        ));
+    }
+    problems
+}
+
 /// What is wrong with a parsed verdict for this release. The parser has already refused a
 /// green status over a red or missing gate, so green status is the whole gate check here.
 fn judge(doc: &ResultDoc, s: &Subject, set_hash: &SetHash) -> Vec<String> {
     let mut problems = Vec::new();
-    if doc.stage != Stage::Gamma {
+    if doc.stage != s.stage {
         problems.push(format!(
-            "the verdict is for stage {:?}, not Gamma",
-            doc.stage
+            "the verdict is for stage {:?}, not {:?}",
+            doc.stage, s.stage
         ));
     }
     if !doc.passed() {
@@ -137,18 +164,12 @@ fn judge(doc: &ResultDoc, s: &Subject, set_hash: &SetHash) -> Vec<String> {
             s.tag
         ));
     }
-    match bake_secs(doc) {
-        Some(Some(secs)) if secs >= MIN_BAKE_SECS => {}
-        Some(Some(secs)) => problems.push(format!(
-            "the bake lasted {secs} s, less than {MIN_BAKE_SECS} s (24 h)"
-        )),
-        Some(None) => problems.push("the bake ends before it starts".to_owned()),
-        None => problems.push("the verdict records no finished bake".to_owned()),
-    }
-    let load_met = doc.load.is_some_and(|l| l.met());
-    if !load_met && !doc.waivers.iter().any(|w| w.what == LOAD_WAIVER) {
+    if s.stage == Stage::Gamma {
+        problems.extend(bake_problems(doc));
+    } else if doc.bake.is_some() || doc.load.is_some() {
         problems.push(format!(
-            "the bake's minimum load was not met and no `{LOAD_WAIVER}` waiver is recorded"
+            "the verdict is for stage {:?} and records a bake or a load: only Gamma has a bake",
+            s.stage
         ));
     }
     problems

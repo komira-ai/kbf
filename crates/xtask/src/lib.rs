@@ -592,7 +592,7 @@ enum ReleaseVerb {
         /// The artifacts workflow run that built and attested the files.
         #[arg(long)]
         run_id: u64,
-        /// The set hash the gamma verdict names, as `release verdict` printed it.
+        /// The set hash the verdict names, as `release verdict` printed it.
         #[arg(long)]
         set_hash: String,
         /// The release's notes (`release notes --out`): the release body, followed by how
@@ -603,8 +603,8 @@ enum ReleaseVerb {
         #[arg(long, default_value = "gh")]
         gh: PathBuf,
     },
-    /// The tag's message is a green gamma verdict for this tag, commit and set, after a bake
-    /// of 24 hours or more. Prints `set-hash=<hex>`.
+    /// The tag's message is a green verdict of the gate stage for this tag, commit and set
+    /// (a Gamma one after a bake of 24 hours or more). Prints `set-hash=<hex>`.
     Verdict {
         #[command(flatten)]
         subject: SubjectArgs,
@@ -615,6 +615,9 @@ enum ReleaseVerb {
     /// The checks that make a commit offerable to a farm; writes `offer.json`, sets
     /// nothing on any farm.
     Offer(release::offer::OfferArgs),
+    /// Wait for the push runs of ci, beta and artifacts for `--sha` on `--branch` and
+    /// require all three to succeed; print their run ids. Only reads.
+    Gates(release::gates::GatesArgs),
     /// What a push would release: the next version, the push's class, and the freeze and
     /// superseded refusals. Writes nothing but `--output`.
     Plan(release::plan::PlanArgs),
@@ -698,6 +701,7 @@ impl SubjectArgs {
             commit: &self.commit,
             dir: &self.dir,
             main_ref: &self.main_ref,
+            stage: release::verdict::GATE_STAGE,
         }
     }
 }
@@ -1089,8 +1093,9 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             }
             Ok(vec![
                 format!(
-                    "tag {}: a green gamma verdict for {} and set {}",
+                    "tag {}: a green {:?} verdict for {} and set {}",
                     subject.tag,
+                    verified.doc.stage,
                     subject.commit,
                     verified.set_hash.as_str()
                 ),
@@ -1098,6 +1103,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             ])
         }
         Verb::Release(ReleaseVerb::Offer(args)) => release::offer::run(&args),
+        Verb::Release(ReleaseVerb::Gates(args)) => release::gates::run(&args),
         Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
         Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
         Verb::Release(ReleaseVerb::VersionFacts(args)) => version_facts::run(&args),

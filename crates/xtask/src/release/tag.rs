@@ -276,7 +276,7 @@ fn settle(w: &Want) -> Result<bool, Error> {
 }
 
 /// Whether `repo` is `<owner>/<name>`, each part of `[A-Za-z0-9._-]` and neither `.` nor `..`.
-fn is_repo(repo: &str) -> bool {
+pub(super) fn is_repo(repo: &str) -> bool {
     let part = |p: &str| {
         !matches!(p, "" | "." | "..")
             && p.bytes()
