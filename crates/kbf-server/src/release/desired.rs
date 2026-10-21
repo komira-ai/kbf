@@ -44,7 +44,7 @@ use serde_json::json;
 use super::key::Commit;
 use super::store::ReleaseStore;
 use super::target_seq::AgeCheck;
-use crate::api::{error, json, operator_gate};
+use crate::api::{error, error_coded, json, operator_gate};
 use crate::farm::Farm;
 use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
@@ -299,7 +299,10 @@ async fn set_desired(
     };
     match aged {
         Ok(Ok(())) => {}
-        Ok(Err(refused)) => return error(StatusCode::CONFLICT, &refused.to_string()),
+        Ok(Err(refused)) => {
+            let code = refused.refusal.code();
+            return error_coded(StatusCode::CONFLICT, &refused.to_string(), code);
+        }
         Err(e) => return store_failed(&e),
     }
     // The wall clock: the controller counts its waits from this, across restarts.

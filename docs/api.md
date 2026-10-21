@@ -1991,7 +1991,8 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
   allowed), or when the server's `seq` is known and the target's is not (`seq_unknown`: a
   release stored before `seq` was recorded). A server built where commits could not be counted
   (`seq` 0) does not apply R4. The release store does not record `seq` yet, so today R4 allows
-  every offer.
+  every offer. The answer is `{"error": "<code>: ...", "code": "older" | "seq_tie" | "seq_unknown"}`;
+  the other `409`s of this route have no `code`.
   `"rollback": true` (optional, default false) skips this check and no other: the release
   must still be complete, and `expect_generation` still applies.
 - `POST /v1/update/pause` and `POST /v1/update/resume` (the write gates, no body) set `paused` of the policy

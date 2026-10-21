@@ -345,3 +345,42 @@ async fn a_rollback_skips_the_age_check_and_only_that() {
 async fn rig_older() -> Rig {
     rig(OWN_SEQ, Some(&[(OTHER, TargetSeq::Seq(499))])).await
 }
+
+/// Catches: a refusal a program cannot tell from the others (no `code`), a code that is not
+/// the refusal's, and a `code` on the conflicts that are not R4's.
+#[tokio::test]
+async fn an_r4_refusal_carries_its_stable_code_and_no_other_conflict_does() {
+    let table = [
+        (TargetSeq::Seq(499), "older"),
+        (SEQ_500, "seq_tie"),
+        (TargetSeq::Missing, "seq_unknown"),
+    ];
+    for (answer, code) in table {
+        let rig = rig(OWN_SEQ, Some(&[(OTHER, answer)])).await;
+        let (status, body) = offer(&rig, &json!({"commit": OTHER})).await;
+        let body: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["code"], code, "{body}");
+        assert!(
+            body["error"].as_str().is_some_and(|e| e.starts_with(code)),
+            "{body}"
+        );
+    }
+    let rig = rig(
+        OWN_SEQ,
+        Some(&[
+            (NO_PLATFORM, TargetSeq::Seq(1)),
+            (OTHER, TargetSeq::Seq(501)),
+        ]),
+    )
+    .await;
+    for body in [
+        json!({"commit": NO_PLATFORM}),
+        json!({"commit": OTHER, "expect_generation": 7}),
+    ] {
+        let (status, text) = offer(&rig, &body).await;
+        let text: Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(status, 409, "{text}");
+        assert!(text.get("code").is_none(), "{text}");
+    }
+}
