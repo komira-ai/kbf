@@ -1013,6 +1013,36 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "restart-exit",
     ),
     (
+        "kbf-frontend.service",
+        "\nTimeoutStopSec=infinity\n",
+        "\nTimeoutStopSec=90\n",
+        "stop",
+    ),
+    (
+        "kbf-frontend.service",
+        "\nKillSignal=SIGTERM\n",
+        "\nKillSignal=SIGKILL\n",
+        "stop",
+    ),
+    (
+        "kbf-frontend.service",
+        "\nType=notify\n",
+        "\nType=simple\n",
+        "notify",
+    ),
+    (
+        "kbf-frontend.service",
+        "\nNotifyAccess=main\n",
+        "\nNotifyAccess=none\n",
+        "notify",
+    ),
+    (
+        "kbf-frontend.service",
+        "\nTimeoutStartSec=120\n",
+        "\nTimeoutStartSec=60\n",
+        "notify",
+    ),
+    (
         "kbf-daemon.service",
         "\nTimeoutStopSec=660\n",
         "\nTimeoutStopSec=infinity\n",

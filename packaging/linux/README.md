@@ -95,8 +95,7 @@ Two call sites, one way to build: both go through `pkg-config` and `pkg-build`.
   serves every mode. `--unit` and `--launchd-label` still name the service by hand. The unit has
   no `ExecStartPre=`: the contract's `check` is not built, and a stub would fail every start.
 - Each mode unit runs `/var/lib/kbf-installer/releases/current/kbf`, the link the installer
-  creates and flips (`layout.rs`), after `kbf-installer boot-check`. The frontend template
-  runs its `slots/%i` link.
+  creates and flips (`layout.rs`), after `kbf-installer boot-check`.
 - `crates/kbf-integration-test/tests/package_installer_verbs.rs` parses every `kbf-installer` command line of
   these units, and of the macOS property list, with the binary's own parser and refuses a verb that
   is not built; it also holds the exec path to the layout's.
