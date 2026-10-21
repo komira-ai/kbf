@@ -74,7 +74,8 @@ kbf-oidc = { workspace = true, features = ["testkit"] }
 kbf-state = { workspace = true, features = ["test-support"] }
 kbf-storage.workspace = true
 kbf-types.workspace = true
-# The Envoy render the real-Envoy tests (tests/envoy_box, tests/envoy_check.rs) run.
+# The Envoy render the real-Envoy tests (tests/envoy_box, tests/envoy_validate.rs) run, and
+# the names tests/envoy_check.rs compares with the server's.
 kbf-installer.workspace = true
 kbf-proto.workspace = true
 kbf-proxy.workspace = true
