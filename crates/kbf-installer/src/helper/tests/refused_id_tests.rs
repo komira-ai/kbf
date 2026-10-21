@@ -65,3 +65,28 @@ fn a_refused_node_order_names_itself_and_a_refusal_with_no_order_names_none() {
     assert_eq!(status["state"], "refused");
     assert!(status.get("refused_order_id").is_none(), "{status}");
 }
+
+/// Catches the refusals made before an order is acted on (its epoch is older than the last
+/// acted on, or jumps too far above it) naming no order: they are the order's refusals too,
+/// and the update that wrote it would wait out its staging deadline for them.
+///
+/// Mutants planted: the id left out of the older-epoch refusal; left out of the jump refusal.
+#[test]
+fn an_order_refused_for_its_epoch_names_itself() {
+    let mut rig = Rig::frontend("refused-id-epoch");
+    rig.put(&rig.rec(9, 2, 1, Verb::FrontendUpdate, B));
+    rig.cycle(T0);
+    assert_eq!(rig.state().staged, Some(c(B)));
+
+    rig.put(&rig.rec(10, 1, 1, Verb::FrontendUpdate, B));
+    rig.cycle(T0 + 3);
+    let status = rig.status();
+    assert_eq!(status["state"], "refused");
+    assert_eq!(status["refused_order_id"], 10);
+
+    rig.put(&rig.rec(11, 100_000, 1, Verb::FrontendUpdate, B));
+    rig.cycle(T0 + 6);
+    let status = rig.status();
+    assert_eq!(status["state"], "refused");
+    assert_eq!(status["refused_order_id"], 11);
+}
