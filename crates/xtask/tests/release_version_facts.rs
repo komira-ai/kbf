@@ -282,6 +282,19 @@ fn a_binary_that_is_missing_or_cannot_be_started_is_refused() {
 }
 
 #[test]
+fn an_out_that_is_a_file_is_refused_and_left_alone() {
+    // Catches: a directory that cannot be made taken as made (the facts would go nowhere
+    // or the error be lost), and the file in the way touched.
+    let f = fx("out-is-a-file", &says(COMMIT, "release"));
+    std::fs::write(&f.out, "in the way").expect("a file");
+    let (code, _, err) = run(&f, COMMIT, PLATFORM);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("create "), "{err}");
+    let kept = std::fs::read_to_string(&f.out).expect("file");
+    assert_eq!(kept, "in the way");
+}
+
+#[test]
 fn it_replaces_nothing_and_lists_nothing_twice() {
     // Catches: a second run that replaces the facts or lists them twice; a file in the way
     // that the sums do not list replaced. Mutants: `create_new` replaced by a plain write;
