@@ -328,7 +328,7 @@ fn an_untrusted_gh_is_refused_before_it_runs() {
 fn only_a_plain_branch_ref_is_a_source_ref() {
     for ok in [
         "refs/heads/main",
-        "refs/heads/feature/arch-v2",
+        "refs/heads/team/topic-2",
         "refs/heads/release_1.2",
     ] {
         assert_eq!(SourceRef::new(ok).expect(ok).as_str(), ok);

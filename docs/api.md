@@ -182,6 +182,8 @@ placement, and, after the list, the oldest protocol version among them:
 | `software.container_images` | the container images the node was pinned to (`kbf-daemon --image`, container driver), as `docker://<repo>@sha256:<digest>`, sorted: each was in its image store, as one architecture's manifest, when the daemon started (a daemon that finds one missing does not start). Status only: no work is placed by image. Empty when none is pinned, on a Mac, and from a daemon that predates it |
 | `update` | where its update is: `{"state", "up_to_date", "availability"}` and nothing more (the commits and the refusal text are on [`GET /v1/update/hosts`](#get-v1updatehosts)). `state` is the host's step state from its newest `UpdateStatus` (`idle`, `fetching`, `staged`, `activated_unconfirmed`, `confirmed`, `reverted`, `refused`, `manual`, or `unknown` for a state this server does not know), `null` unless `availability` is `ok`. `availability`: `unsupported` if the node never sent an `UpdateStatus` (never shown as idle), `unavailable` if it sent one but its newest stream is closed or has not sent its own yet (a restarted daemon is not judged by its previous process), `ok` otherwise. `up_to_date` is `true` or `false` against the desired commit of `GET /v1/update`, and `null` whenever the server cannot judge: no desired release (or no `--state-store`, or a row that cannot be read), a host that is not `ok`, or a running commit that is not a hex prefix of 12 digits or more |
 | `needs_attention` | what an operator must do on the node, one line per item: today each installed Xcode that is not ready, as `Xcode <build> (<app>) installed but not ready: <reason>; fix: <command>`. An Xcode `not_surveyed` keeps the item the same app had in the node's previous status (as when a restarted daemon sends its first status), until a survey reports it; one with no previous item has none. The server also logs each item once at `WARN` (target `kbf_server::attention`) when it appears, and at `INFO` when a status reports it gone (its Xcode ready, changed or removed); a status that repeats an item, or lists its Xcode `not_surveyed`, logs nothing. An item is the same while its Xcode's app, build, state and fix are, so a reason that changes alone is shown here but not logged again. The previous status is kept in the server's memory: after a server restart, each item is logged again when its node reports it; kbf has no alert delivery yet (issue #189) |
+| `lease_count` | how many leases it holds now (granted or running), the number of entries of `GET /v1/nodes/{id}`'s `leases`. In memory like the rest: after a server restart it is 0 until the daemon's leases are granted again |
+| `booked` | what those leases book of its capacity: `{"cpu_millis", "memory_bytes", "gpus", "vms"}`, CPU in thousandths of a core, memory in bytes. A record of the leases' limits, not a measurement of use |
 | `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term, the Raft term under the Raft metadata log: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
 
@@ -192,6 +194,36 @@ that have registered since. `oldest_protocol` and `protocol_unknown` describe th
 no more. The check that a release may stop accepting the oldest version
 ([design/frontend-proxy.md](design/frontend-proxy.md) section 9, rule R1) reads them; it is
 not made by this server.
+
+## `GET /v1/nodes/{id}`
+
+One node: every field of its entry in `GET /v1/nodes`, and three more, a read open like
+the list:
+
+```json
+{ "node_id": "linux-1", "connected": true, "protocol": 1, "software": null,
+  "needs_attention": [], "placement": { "state": "serving" }, "phase": { "state": "serving" },
+  "update": { "state": null, "up_to_date": null, "availability": "unsupported" },
+  "lease_count": 1,
+  "booked": { "cpu_millis": 1000, "memory_bytes": 1073741824, "gpus": 0, "vms": 0 },
+  "capacity": { "cpu_millis": 8000, "memory_bytes": 17179869184, "gpus": 0, "vms": 0 },
+  "free": { "cpu_millis": 7000, "memory_bytes": 16106127360, "gpus": 0, "vms": 0 },
+  "leases": ["117399224320012061.42"] }
+```
+
+| Field | Meaning |
+|---|---|
+| `capacity` | what the node's newest `Hello` said it can run at once |
+| `free` | `capacity` less `booked` on each axis, never below zero |
+| `leases` | the leases it holds, as `term.seq`, in lease order |
+
+`{id}` is the node id as `POST /v1/nodes/{node}:cordon` takes it, percent-encoded as one
+path segment. `404` with `{"error": "no_node"}` for a node that has not registered since
+this server started, and for an id that ends in `:cordon`, `:drain` or `:uncordon`: that
+is a write's path, and a read of it is never a node (an id that holds another colon,
+`host:8080`, is read as it is). A path below the node (`/v1/nodes/{id}/...`) is `404`.
+The node's recent failed runs are not here: they are `GET /v1/runs?node=` with
+`--history-objects`.
 
 ## `GET /v1/members`
 
@@ -432,6 +464,11 @@ are the frontend's, so a denied storage node can still register and beat through
 that predates them. A frontend that predates the list copies it forward in the map
 unchanged.
 
+## `GET /v1/leases` and `GET /v1/queue`
+
+The leases the scheduler holds and the operations waiting for one: open reads, in memory,
+unredacted. Written up in [api-scheduler.md](api-scheduler.md).
+
 ## `GET /v1/frontend/drain` and `POST /v1/frontend/drain`
 
 Draining the frontend itself, for a rollout that restarts it (the nodes are drained
@@ -480,7 +517,7 @@ the drain, and the unit templates in `kbf-deploy` set it.
 --frontend --token-file F` and `kbf cluster undrain <node> --token-file F` (the API's
 `:uncordon`). It prints the answer's JSON, exits 0 on a 2xx and 1 otherwise, and takes
 `--api` for the listener (default `127.0.0.1:8982`). A frontend drain has no undrain:
-restart it. `kbf cluster member <id> --state active|draining --token-file F` calls
+restart it. `kbf cluster member <id> --state active|draining|planned-down [--for-secs N] --token-file F` calls
 `POST /v1/members/{id}`, and `kbf cluster denied --token-file F` calls `GET /v1/denied`.
 `kbf cluster object-store ...` calls the `/v1/object-stores/...` routes (below).
 
@@ -719,8 +756,12 @@ no registered member.
 { "members_total": 3, "members_active": 3, "not_active": [], "silent": [],
   "unreported": [], "debts_total": 3, "under_replicated_blobs": 3,
   "reasons": ["3 blobs owed"],
-  "nodes": [ { "id": 1, "state": "active", "planned_down": false, "repair_debts": 3, "open_writes": 0, "generation": 12 },
-             { "id": 2, "state": "active", "planned_down": false, "repair_debts": 0, "open_writes": null, "generation": 12 } ] }
+  "nodes": [ { "id": 1, "state": "active", "planned_down": false, "repair_debts": 3, "open_writes": 0, "generation": 12,
+               "unflushed_bytes": 1048576, "unflushed_blocks": 2, "oldest_unflushed_ms": 4200,
+               "budget_bytes": 107374182400, "used_bytes": 2097152, "flush_failures": 0, "flush_conflicts": 0 },
+             { "id": 2, "state": "active", "planned_down": false, "repair_debts": 0, "open_writes": null, "generation": 12,
+               "unflushed_bytes": null, "unflushed_blocks": null, "oldest_unflushed_ms": null,
+               "budget_bytes": null, "used_bytes": null, "flush_failures": null, "flush_conflicts": null } ] }
 ```
 
 - `under_replicated_blobs`: the number, or `null` while unknown. A gate treats `null` as
@@ -744,6 +785,15 @@ no registered member.
   rollout only when every other member is `ACTIVE` and fresh, no copy is owed anywhere, and
   the node itself reports no open write from a map at least as new as the one that stopped
   routing writes to it (`Members::node_idle`, in-process, with the reasons).
+- The write-tier health of each node, from its heartbeat (read-only; no decision depends on
+  it): `unflushed_bytes` and `unflushed_blocks` (acknowledged data on the node's local disk
+  not yet in the cold store: what losing the disk would take), `oldest_unflushed_ms` (the
+  age of the oldest such block, 0 with none), `budget_bytes` and `used_bytes` (the tier's
+  budget and the bytes counted against it), and `flush_failures` and `flush_conflicts`
+  (counts since the node started). Each is `null` when the report is stale, when the node
+  has not heartbeated since it registered, when it has no write tier, or when it is an older
+  build that does not send it; `null` is unknown, never zero, and a real `0` is shown as
+  `0`. A value above 2^53 - 1 is not a count: it is shown as `null`.
 
 The number is as old as the newest heartbeat. A copy owed since then is not in it, so
 whoever acts on a zero keeps new writes away from the node first (drains it), then reads
@@ -1059,6 +1109,34 @@ otherwise; the body lists each failing check and why:
 `version` and `commit` are those of `GET /v1/nodes`' `server` field. Each `/readyz`
 makes one read of the store, so poll it at the interval the front needs, not faster.
 
+## `GET /v1/health`
+
+The one-screen answer to "is the farm healthy": the values other routes report, composed
+so a reader does not add them up. A read, open like `GET /v1/nodes`; it names no secret.
+It answers `200` whether or not the server is ready (`/readyz` stays the probe), and
+says which in `ready`.
+
+```json
+{ "ready": true, "failing": [],
+  "nodes": { "total": 5, "serving": 2, "cordoned": 1, "draining": 1, "drained": 0,
+             "quarantined": 0, "disconnected": 1 },
+  "queue": { "depth": 3, "oldest_age_ms": null },
+  "leases": 7,
+  "storage": { "members_active": 3, "members_total": 3, "under_replicated_blobs": 0 } }
+```
+
+| Field | Same value as |
+|---|---|
+| `ready`, `failing` | `GET /readyz`: the same evaluation, `failing` as `[{"check", "reason"}]` |
+| `nodes` | the list of `GET /v1/nodes`, each node counted once, in the first of these that holds: `disconnected` (`connected` is false), `quarantined` (`phase.state`), then `placement.state`: `cordoned`, `draining` (a drain running, or paused at its deadline), `drained`, or `serving`. `total` is the number of nodes listed and the sum of the six |
+| `queue.depth` | `queued_operations` of `GET /v1/frontend/drain`. `queue.oldest_age_ms` is `null`: the scheduler does not report the age of its oldest operation yet |
+| `leases` | the sum of `lease_count` of `GET /v1/nodes` |
+| `storage` | `members_active`, `members_total` and `under_replicated_blobs` of `GET /v1/storage` (`null` while unknown, never zero); `storage` is `null` when this server keeps no storage members, and when the membership cannot be read, with `storage_unavailable` saying why |
+
+In memory like `GET /v1/nodes`: after a restart or a frontend swap `nodes`, `queue` and
+`leases` count only what has reconnected since. The update state and the history store's
+counters are not in this answer.
+
 ## `grpc.health.v1` on the REAPI listener
 
 For a proxy that health-checks its backends over gRPC (Envoy's `grpc_health_check`, a
@@ -1278,6 +1356,7 @@ route.
 | Route | Answers |
 |---|---|
 | `GET /v1/invocations/{id}` | the invocation: its header fields and counters, links to the routes below, its slowest actions and its phase totals |
+| `GET /v1/invocations/{id}/failures` | the invocation, and a page of the actions that failed (an OK status with a non-zero exit, a failed status, a timeout, a refusal), each with its reason, attempts, command and the end of its logs ([below](#the-failures-view)) |
 | `GET /v1/invocations/{id}/actions` | a page of its action rows, in the order first seen; `?outcome=ok\|failed\|timed_out\|refused`, `?how=cache_hit\|cache_hit_execute\|joined\|ran`, `?requeue_reason=<reason>`, `?memory_kill=none\|own_limit\|node_pressure`; `?sort=wall_ms\|execution_ms\|queue_ms\|input_fetch_ms\|output_upload_ms`, longest first |
 | `GET /v1/invocations/{id}/actions/{digest}` | one action's row, with the outputs, stdout, stderr and usage copied into it, and whether each blob is still held |
 | `GET /v1/invocations/{id}/artifacts` | a page of the outputs of its actions, in row order |
@@ -1540,10 +1619,39 @@ row held them when a page passed it: an action still running then is not listed 
 it ends (read its row, or start again). On `/logs`, rows added after the failed ones
 ran out are listed with the rest, failed or not.
 
+### The failures view
+
+`GET /v1/invocations/{id}/failures` answers `{"invocation": {...}, "failures": [...]}` and,
+unless it is the last page, `next_page_token` and `next_page`. `invocation` is the
+invocation's own answer, its `links` including `failures`. `failures` lists, in the order
+the farm first saw them (never grouped by kind), every action row whose outcome is not OK
+with exit code 0; an action still in flight is not listed, and one that passed after a
+rerun is not a failure (its reruns are in its `attempts`). It takes `?page_size=`
+(20 by default, 1 to 100) and `?page_token=`, and no filter. Each failure holds:
+
+| Field | Meaning |
+|---|---|
+| `action`, `href`, `instance`, `target`, `mnemonic` | as on `/actions` |
+| `outcome` | as on `/actions`: `{"ok": {"exit_code": 1}}`, `{"failed": {"code", "message"}}`, `{"timed_out": {}}` or `{"refused": {"reason"}}` |
+| `failure` | the last attempt's failure class (`timeout`, `infra`, `invalid`, `out_of_memory`, `node_memory_pressure`, `missing_input`, `lost`) with the daemon's reason text, `{"class", "reason"}`; `null` when the last attempt did not end in a failure (a run that exited non-zero, a refusal) |
+| `attempts` | every lease, as on `/actions` |
+| `command` | `{"arguments", "environment_names", "working_directory", "platform", "timeout_micros", "output_paths", "truncated"}`, read when the page is answered from the Action and Command blobs. **Unredacted**: arguments are shown as the build sent them. Environment variables are names only, never values. `platform` is the Action's properties, or the Command's when the Action names none; `timeout_micros` is `null` when the Action sets none; `truncated` says strings were dropped from the end (output paths, then names, then arguments) to keep them within 64 KiB. `null` when a blob is not held, was never uploaded or is over 1 MiB |
+| `command_available` | whether `command` is there |
+| `stdout`, `stderr` | `null` when the result has none; else the blob object of `/actions` (`digest`, `available`, `href`) with `bytes` (the log's size), `tail` (the last 16 KiB, invalid UTF-8 replaced, a cut inside a character dropped), `tail_bytes` (the bytes the tail shows) and `truncated` (the log is longer than the tail). When there is no tail, `tail` is `null` and `tail_omitted` says why: `not_held` (the CAS does not hold the blob), `too_large` (over 64 MiB), `unreadable` (the read failed or took over 10 s) or `blobs_off` |
+| `outputs`, `outputs_truncated`, `usage` | as on `/actions/{digest}` |
+
+The command and the log tails are read from the CAS only when the policy names a
+`blobs.getAuthorizer` (the start line says ` blobs=on`): without it they are not read
+and each `tail_omitted` is `blobs_off`, so the page shows nothing the blob route would
+refuse. The body writes `<`, `>` and `&` as `<`, `>` and `&` (a JSON
+parser reads the same text back), and is sent as `application/json` with
+`X-Content-Type-Options: nosniff`, because arguments, targets and logs are text the
+build chose.
+
 | Code | When |
 |---|---|
 | `200` | the answer |
-| `400` | a parameter the route does not take, one given twice, a `page_size` outside 1 to 1000, a filter value not listed above, or a page token that does not decode, was made for another route or another filter, or names a position past the rows |
+| `400` | a parameter the route does not take, one given twice, a `page_size` outside 1 to 1000 (1 to 100 on `/failures`), a filter value not listed above, or a page token that does not decode, was made for another route or another filter, or names a position past the rows |
 | `401` | the policy's `authenticationPolicy` refuses the request |
 | `403` | `invocations.getAuthorizer` refuses one of the invocation's instance names: each one its calls used and each one a row holds, on every route |
 | `404` | the routes are off: `{"error": "<why>", "off": "invocations"}`; no such record is held (never made, removed at the memory bound, or lost at a restart; with `--history-objects`, and not in history either), a page token's included even if a record has been made since under the same key: `{"error": "no_record", "id": "<id>", "records_since": "<time>"}` (below); no such route, `{id}` is not an id or `<id>~<n>`, or no row for the action: `{"error": "<why>"}` |

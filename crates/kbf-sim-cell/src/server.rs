@@ -36,12 +36,11 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::num::NonZeroU64;
-use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures::FutureExt as _;
 use kbf_daemon::FENCE_AFTER;
 use kbf_front::{Described, MetaLog};
 use kbf_log::FarmLogId;
@@ -236,14 +235,9 @@ struct Up {
 
 /// Polls `future` once: the metadata log answers without waiting.
 fn ready<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    match future
-        .as_mut()
-        .poll(&mut Context::from_waker(Waker::noop()))
-    {
-        Poll::Ready(v) => v,
-        Poll::Pending => unreachable!("the metadata log answers without waiting"),
-    }
+    future
+        .now_or_never()
+        .expect("the metadata log answers without waiting")
 }
 
 /// A new log's id draw that draws `id`.
@@ -654,13 +648,19 @@ impl Up {
     /// process sent its `Start`.
     fn holder(&self, lease: LeaseId, worker: &WorkerId) -> Option<Sent> {
         let sent = self.machine.sent(lease)?;
-        let current = matches!(
-            self.sched.state(sent.operation)?,
-            OpState::Leased { lease: held, worker: holder, committed: true }
-                | OpState::Running { lease: held, worker: holder }
-                if *held == lease && holder == worker
-        );
-        current.then_some(sent)
+        let (held, holder) = match self.sched.state(sent.operation)? {
+            OpState::Leased {
+                lease: held,
+                worker: holder,
+                committed: true,
+            }
+            | OpState::Running {
+                lease: held,
+                worker: holder,
+            } => (*held, holder),
+            _ => return None,
+        };
+        ((held, holder) == (lease, worker)).then_some(sent)
     }
 
     fn report(
@@ -877,12 +877,15 @@ impl StateMachine for Server {
 }
 
 #[cfg(test)]
+mod protocol_tests;
+
+#[cfg(test)]
 mod tests {
     use kbf_server::raft_log::RECORD;
 
     use super::*;
 
-    fn input(at: u64, event: Event<Msg>) -> NodeInput<Msg> {
+    pub(super) fn input(at: u64, event: Event<Msg>) -> NodeInput<Msg> {
         NodeInput {
             now: FarmTime::from_millis(at),
             entropy: 9,
@@ -890,7 +893,7 @@ mod tests {
         }
     }
 
-    fn server(faults: Vec<(FarmTime, ServerFault)>) -> Server {
+    pub(super) fn server(faults: Vec<(FarmTime, ServerFault)>) -> Server {
         let plan = ServerPlan {
             faults,
             down_for: Duration::from_secs(3),
@@ -982,7 +985,8 @@ mod tests {
         for tag in T_FAULT + 2..T_FAULT + 5 {
             s.apply(input(1_600, Event::Timer { tag }));
         }
-        assert!(s.up.is_none() && s.armed.is_none());
+        assert!(s.up.is_none());
+        assert!(s.armed.is_none());
         assert_eq!(restarts(&mut s), 0);
     }
 }
