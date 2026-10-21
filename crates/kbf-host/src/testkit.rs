@@ -157,6 +157,16 @@ impl Exec for FakeExec {
             Step::Remove { path } => {
                 self.entries.remove(path);
             }
+            // The entry and everything under it (a path is under `path` when it starts with
+            // `path/`, so `/a/bc` is not under `/a/b`); what is not there is an error, as on
+            // the host.
+            Step::RemoveTree { path } => {
+                if self.entries.remove(path).is_none() {
+                    return Err(io::Error::from(io::ErrorKind::NotFound));
+                }
+                let below = format!("{path}/");
+                self.entries.retain(|p, _| !p.as_str().starts_with(&below));
+            }
             Step::Run(cmd) => {
                 crate::exec::succeeded(cmd, (self.answer)(cmd)?)?;
             }

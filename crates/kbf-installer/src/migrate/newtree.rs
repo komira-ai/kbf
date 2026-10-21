@@ -18,7 +18,7 @@ use crate::CommitId;
 use crate::layout::{self, Layout};
 use crate::stage::VERIFIED;
 
-const JOURNAL: &str = "migration.json";
+pub(super) const JOURNAL: &str = "migration.json";
 const FILE_CAP: u64 = 1 << 20;
 /// What ends the name of the directory a release is copied into (the installer's stage
 /// names are `.stage-<commit>.<rand>`; the migration's `<rand>` is `adopt`).
