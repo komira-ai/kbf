@@ -4,8 +4,8 @@
 //!
 //! - **One offer per complete platform.** A platform is offered only when the store holds
 //!   every component it needs, attested ([`kbf_types::ReleasePlatform::components`]), for
-//!   the desired commit. An offer carries those components and no others (a Linux host is
-//!   not told about `kbf-daemon`), each with its digest, its size and the attestation bytes
+//!   the desired commit. An offer carries those components and no others (no host is told
+//!   about `kbf-daemon`), each with its digest, its size and the attestation bytes
 //!   as stored.
 //! - **Level-triggered.** [`Offers::start`] looks at the row and the store every `every`
 //!   and publishes a new [`Table`] when it differs from the last. A session holds a

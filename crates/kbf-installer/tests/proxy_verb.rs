@@ -133,7 +133,9 @@ fn run(args: &[&str], path: &Path) -> Output {
 
 /// Catches `--check` that binds, or that passes a bad table: exit 0 for a valid one with
 /// nothing printed, exit 2 and the path and reason on standard error for one with no
-/// `[proxy]` table and for one with an unknown key; and a missing file is exit 2 too.
+/// `[proxy]` table, for one with an unknown key and for a bad value of a key the verb reads;
+/// and a missing file is exit 2 too. A key the verb does not read, however wrong its value,
+/// is not its business: that is exit 0 (the next test).
 #[test]
 fn check_is_exit_0_for_a_valid_table_and_2_for_every_refusal() {
     let good = config("check-ok", TABLE);
@@ -143,12 +145,12 @@ fn check_is_exit_0_for_a_valid_table_and_2_for_every_refusal() {
 
     for (name, text, want) in [
         ("check-none", "min_generation = 1\n", "no [proxy] table"),
-        // A valid `[proxy]` next to a bad key of the rest of the file: `--check` is the
-        // whole file's check, as the verb's own load is, not the proxy table's alone.
+        // A valid `[proxy]` next to a bad value of a key the verb reads: `--check` is the
+        // verb's own load, not the proxy table's alone.
         (
             "check-other-key",
-            &format!("min_generation = \"x\"\n{TABLE}"),
-            "line 1: invalid type: string (the text is not shown)",
+            &format!("confirm_window_s = \"x\"\n{TABLE}"),
+            "invalid type: string (the text is not shown)",
         ),
         (
             "check-typo",
@@ -167,6 +169,28 @@ fn check_is_exit_0_for_a_valid_table_and_2_for_every_refusal() {
     }
     let out = run(&["--check"], &good.with_file_name("missing.toml"));
     assert_eq!(out.status.code(), Some(2));
+}
+
+/// Catches `--check` that reads the whole file closed: a key the verb does not read (a
+/// `min_generation` of the wrong type, a source a later build wrote) beside a valid `[proxy]`
+/// is exit 0 with nothing printed, as the verb's own load is, so a host a later setup wrote
+/// for can still run its proxy.
+///
+/// Mutant to plant: `loaded_from` back on `InstallerToml::parse` (red: exit 2).
+#[test]
+fn check_ignores_keys_the_verb_does_not_read() {
+    for (name, extra) in [
+        ("check-generation", "min_generation = \"x\"\n"),
+        ("check-source", "release_source = \"mirror-pull\"\n"),
+    ] {
+        let path = config(name, &format!("{extra}{TABLE}"));
+        let out = run(&["--check"], &path);
+        assert_eq!(out.status.code(), Some(0), "{name}: {out:?}");
+        assert!(
+            out.stdout.is_empty() && out.stderr.is_empty(),
+            "{name}: {out:?}"
+        );
+    }
 }
 
 /// Catches a proxy that starts on a host with no database: the start migrates before it runs

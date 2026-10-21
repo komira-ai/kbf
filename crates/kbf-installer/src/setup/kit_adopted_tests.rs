@@ -191,6 +191,7 @@ fn raw() -> Raw {
         token_file: Some("/root/kbf.token".to_owned()),
         release_source: None,
         release_url: None,
+        release: Default::default(),
         min_generation: None,
         commit: None,
         database: None,

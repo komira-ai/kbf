@@ -31,6 +31,10 @@
 //!   attested on, and the built deb as the release asset
 //!   `kbf-installer-<commit>-<platform>.deb`, refused unless it holds the binary of the
 //!   attested tarball and trusts the branch it is attested for.
+//! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf-installer` package
+//!   carries, in the one form a deb and an rpm put in the same order, and the most a package
+//!   that carries a kbf release may weigh. `pkg-config` and `pkg-asset` take them up with
+//!   the release.
 //! - `pkg-macos-asset` and `pkg-macos-install-test` ([`pkg_macos_asset`],
 //!   [`pkg_macos_install`]): the Mac `.pkg` as the release asset
 //!   `kbf-installer-<commit>-darwin-arm64.pkg`, refused unless it holds the attested
@@ -52,6 +56,12 @@
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
+//! - `release version-facts --binary <kbf> --commit <sha> --platform <p> --out <dir>`
+//!   ([`version_facts`]): the `kbf` just built, run with `--version --json`, and what it
+//!   printed kept unchanged as the release asset `kbf-<commit>-<platform>.version.json`
+//!   with its line in `SHA256SUMS.<platform>`. The release set holds it for every `kbf`
+//!   tarball (`verify-assets sums`, `release check`), because only a runner of a platform
+//!   can run its binary.
 //! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
 //!   unit.
@@ -87,11 +97,14 @@ pub mod pkg_linux;
 pub mod pkg_macos_asset;
 #[cfg(target_os = "macos")]
 pub mod pkg_macos_install;
+pub mod pkg_size;
 pub mod pkg_trust;
+pub mod pkg_version;
 pub mod proxy_loom;
 pub mod release;
 pub mod sudo_test;
 pub mod sums;
+pub mod version_facts;
 
 /// Why a verb failed.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -557,6 +570,11 @@ enum ReleaseVerb {
         /// The commit the assets were built from, a full SHA.
         #[arg(long)]
         commit: String,
+        /// Do not require the version facts of each `kbf` tarball: for the release made
+        /// before the build jobs recorded them (the previous release, read by the first
+        /// release that has them). Facts without their tarball are still refused.
+        #[arg(long)]
+        without_version_facts: bool,
     },
     /// Create release `--tag` with every file of `<dir>`, or add the files it lacks;
     /// an asset it holds must be one of them, byte for byte.
@@ -605,6 +623,10 @@ enum ReleaseVerb {
     Tag(release::tag::TagArgs),
     /// Write the verdict document a release tag carries as its message.
     VerdictWrite(release::verdict_write::WriteArgs),
+    /// Run the `kbf` just built with `--version --json` and keep what it printed as the
+    /// release asset `kbf-<commit>-<platform>.version.json`, refused unless it is the
+    /// release build of `--commit`.
+    VersionFacts(version_facts::Args),
     /// The same checks, then write the release's notes.
     Notes {
         #[command(flatten)]
@@ -1040,7 +1062,18 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         }) => Ok(vec![release::main_control(
             &gh, &repo, &on_main, &off_main,
         )?]),
-        Verb::Release(ReleaseVerb::Check { dir, commit }) => release::check(&dir, &commit),
+        Verb::Release(ReleaseVerb::Check {
+            dir,
+            commit,
+            without_version_facts,
+        }) => {
+            let pairing = if without_version_facts {
+                version_facts::Pairing::Waived
+            } else {
+                version_facts::Pairing::Required
+            };
+            release::check(&dir, &commit, pairing)
+        }
         Verb::Release(ReleaseVerb::Verdict { subject, output }) => {
             let verified = release::verdict::verify(&subject.subject())?;
             let line = format!("set-hash={}", verified.set_hash.as_str());
@@ -1067,6 +1100,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::Release(ReleaseVerb::Offer(args)) => release::offer::run(&args),
         Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
         Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
+        Verb::Release(ReleaseVerb::VersionFacts(args)) => version_facts::run(&args),
         Verb::Release(ReleaseVerb::VerdictWrite(args)) => {
             release::verdict_write::run(&args, release::verdict::GATE_STAGE)
         }

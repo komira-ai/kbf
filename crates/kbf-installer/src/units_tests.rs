@@ -125,3 +125,31 @@ fn the_macos_job_files_run_programs_under_the_macos_layout() {
     let bin = line.split('"').nth(1).expect("a literal");
     assert_eq!(bin, format!("{}/kbf", layout.current()));
 }
+
+/// Catches the release store's components for a platform not naming the binary that platform
+/// runs: the Mac's job runs `releases/current/kbf` (kbf-mac-provision's `KBF_BIN`), so a Mac
+/// release must hold `kbf` and the store's `ReleasePlatform::components()` must name exactly
+/// it; a Linux host's `kbf` is the layout's `RELEASE_BINARY` too. (The Mac's was `kbf-daemon`:
+/// a roll fetched a file the job never runs, and the order check refused it.)
+#[test]
+fn the_components_of_each_platform_are_the_binary_its_host_runs() {
+    let layout = Layout::new(Root::host(), Platform::MacOs);
+    let source = fs::read_to_string(repo_file("crates/kbf-mac-provision/src/launchd.rs"))
+        .expect("launchd.rs");
+    let line = source
+        .lines()
+        .find(|l| l.starts_with("pub const KBF_BIN"))
+        .expect("KBF_BIN");
+    let bin = line.split('"').nth(1).expect("a literal");
+    let run = bin
+        .strip_prefix(&format!("{}/", layout.current()))
+        .expect("under current");
+    assert_eq!(run, crate::layout::RELEASE_BINARY);
+    for platform in kbf_types::ReleasePlatform::ALL {
+        assert_eq!(
+            platform.components(),
+            [run],
+            "{platform}: a release holds the one binary the host's job runs"
+        );
+    }
+}
