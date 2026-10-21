@@ -3,6 +3,7 @@
 //! kept there).
 
 use crate::CommitId;
+use crate::seed::Available;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -66,4 +67,13 @@ pub struct Memory {
     /// leave it set).
     #[serde(skip)]
     pub fetching: bool,
+    /// The seed the host's package carries, when the run loop has found it whole and above the
+    /// floor of `seq`: what `status.json` tells the frontend it can order. Re-derived every
+    /// pass and never stored, so a crash cannot leave one that is no longer true.
+    #[serde(skip)]
+    pub available: Option<Available>,
+    /// The word `installer.toml` holds for `release_source` (`url`, `frontend`, `bundled`),
+    /// when it could be read. Never stored, for the same reason.
+    #[serde(skip)]
+    pub release_source: Option<&'static str>,
 }

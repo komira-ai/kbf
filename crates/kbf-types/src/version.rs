@@ -44,8 +44,8 @@ impl VersionFault {
 /// adds fields, and an installer that refused them would be unable to stage any build after
 /// it (adding `seq` did that). A field named twice, a required one missing and a wrong type
 /// are still refused (serde's derive rejects a repeated known field). `platform` (the
-/// installer derives it from the binary's header), `admin_protocol`, `meta_log` and `seq`
-/// (builds before them lack them) may be absent and are then `None`; `meta_log: None` means
+/// installer derives it from the binary's header), `admin_protocol`, `meta_log`, `relay` and
+/// `seq` (builds before them lack them) may be absent and are then `None`; `meta_log: None` means
 /// not reversible.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Version {
@@ -62,6 +62,12 @@ pub struct Version {
     pub min_protocol: u64,
     pub protocol: u64,
     pub profile: String,
+    /// How far this build carries what the installer reports to the frontend: at least 1 when
+    /// it reads `available` and `release_source` from `status.json` and sends them on. `None`
+    /// for a build that predates the field, which relays nothing of the sort. The level a
+    /// host needs is the installer's (`kbf_installer::binary::RELAY_NEEDED`), not this type's.
+    #[serde(default)]
+    pub relay: Option<u64>,
     /// The number of commits behind the build's commit, which puts two builds of one branch
     /// in order; 0 when the build could not count them (a shallow checkout), which is below
     /// every counted build. `None` for a build that predates the field.
@@ -142,6 +148,7 @@ mod tests {
                 min_protocol: 3,
                 protocol: 4,
                 profile: "release".to_owned(),
+                relay: None,
                 seq: None,
                 state_schema: 7,
                 version: "0.1.0".to_owned(),
@@ -245,6 +252,25 @@ mod tests {
         assert_eq!(v.seq, Some(0));
         let text = json(COMMIT, "release").replace('}', ",\"seq\":\"812\"}");
         let err = Version::parse(text.as_bytes()).expect_err("a seq that is text");
+        assert_eq!(err.code(), "version-unreadable");
+    }
+
+    /// Catches the `relay` that `kbf --version --json` prints (how far the build relays what
+    /// the installer reports) not being read, a build that predates it refused instead of
+    /// read as `None`, and a level that is text accepted.
+    ///
+    /// Mutant to plant: the `relay` field dropped from `Version` (the value is then lost).
+    #[test]
+    fn the_version_object_may_carry_a_relay_level() {
+        let before = Version::parse(json(COMMIT, "release").as_bytes()).expect("pre-relay");
+        assert_eq!(before.relay, None);
+        for level in [0, 1, 2] {
+            let said = json(COMMIT, "release").replace('}', &format!(",\"relay\":{level}}}"));
+            let v = Version::parse(said.as_bytes()).expect("a build with a relay level parses");
+            assert_eq!(v.relay, Some(level));
+        }
+        let text = json(COMMIT, "release").replace('}', ",\"relay\":\"1\"}");
+        let err = Version::parse(text.as_bytes()).expect_err("a relay that is text");
         assert_eq!(err.code(), "version-unreadable");
     }
 

@@ -51,7 +51,7 @@ pub struct TagArgs {
     /// The tag to make, `v<MAJOR>.<MINOR>.<PATCH>` (`release plan`'s `tag=`).
     #[arg(long)]
     pub tag: String,
-    /// The tag's message, the verdict `release verdict-write` wrote.
+    /// The tag's message, the Beta record `release verdict-write` wrote.
     #[arg(long)]
     pub message_file: PathBuf,
     /// The login the tagger of a tag that already exists must have.
@@ -305,7 +305,7 @@ pub fn run(a: &TagArgs) -> Result<Vec<String>, Error> {
         .map_err(Error::spawn(format!("read {}", a.message_file.display())))?;
     if message.trim().is_empty() {
         return Err(Error::Usage(format!(
-            "--message-file {} is empty: a release tag carries its verdict",
+            "--message-file {} is empty: a release tag carries its Beta record",
             a.message_file.display()
         )));
     }
