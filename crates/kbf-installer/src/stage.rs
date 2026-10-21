@@ -488,6 +488,30 @@ impl Drop for Scratch {
     }
 }
 
+/// The attestation bundle `text` of the component `name`, written into the checks' scratch
+/// directory (where the unprivileged user can read it, 0644); its path. A bundle over
+/// [`BUNDLE_CAP`] is refused.
+fn put_bundle(scratch: &Scratch, name: &str, text: &str) -> Result<PathBuf, Refusal> {
+    let bytes = text.as_bytes();
+    if bytes.len() as u64 > BUNDLE_CAP {
+        return Err(Refusal::Size {
+            name: format!("{name} attestation"),
+            want: BUNDLE_CAP,
+            got: bytes.len() as u64,
+            max: BUNDLE_CAP,
+        });
+    }
+    let bundle = scratch.dir.join(format!("{name}.bundle.jsonl"));
+    let mut out = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&bundle)
+        .map_err(work_err(&bundle))?;
+    out.write_all(bytes).map_err(work_err(&bundle))?;
+    Ok(bundle)
+}
+
 impl Pipeline<'_> {
     fn gh(&self) -> GhCheck {
         let mut gh = GhCheck::pinned(self.host, self.settings);
@@ -538,24 +562,7 @@ impl Pipeline<'_> {
         received: &Received,
         commit: &CommitId,
     ) -> Result<SourceRef, Refusal> {
-        let bundle_bytes = locator.attestation.as_bytes();
-        if bundle_bytes.len() as u64 > BUNDLE_CAP {
-            return Err(Refusal::Size {
-                name: format!("{} attestation", locator.name),
-                want: BUNDLE_CAP,
-                got: bundle_bytes.len() as u64,
-                max: BUNDLE_CAP,
-            });
-        }
-        let bundle = scratch.dir.join(format!("{}.bundle.jsonl", locator.name));
-        let mut out = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(&bundle)
-            .map_err(work_err(&bundle))?;
-        out.write_all(bundle_bytes).map_err(work_err(&bundle))?;
-        drop(out);
+        let bundle = put_bundle(scratch, &locator.name, &locator.attestation)?;
 
         let link = scratch.dir.join(format!("{}.tar.gz", locator.name));
         let file = open_owned(&received.tarball, self.owner)?;
@@ -568,6 +575,28 @@ impl Pipeline<'_> {
             runner: self.runner,
         };
         gh.verify(&tools, &scratch.gh(), &link, &bundle, commit)
+            .map(|verified| verified.source_ref)
+    }
+
+    /// Step 3 alone, for a tarball that is where the unprivileged user can read it already (the
+    /// package's own copy: nothing is copied, linked or changed) and a bundle given as text.
+    /// This is the run loop's look at a seed: it installs nothing and unpacks nothing. A scratch
+    /// directory is made for `gh`, and gone when this returns.
+    pub(crate) fn attest_in_place(
+        &self,
+        commit: &CommitId,
+        name: &str,
+        tarball: &Path,
+        bundle: &str,
+    ) -> Result<SourceRef, Refusal> {
+        let gh = self.gh();
+        let scratch = Scratch::make(self.host, commit, self.settings, self.owner)?;
+        let bundle = put_bundle(&scratch, name, bundle)?;
+        let tools = Tools {
+            trust: self.trust,
+            runner: self.runner,
+        };
+        gh.verify(&tools, &scratch.gh(), tarball, &bundle, commit)
             .map(|verified| verified.source_ref)
     }
 
@@ -629,7 +658,7 @@ impl Pipeline<'_> {
     }
 
     /// `<binary> --version --json`, as the unprivileged user, strictly read.
-    fn probe(&self, binary: &Path, name: &str, cwd: &Path) -> Result<Version, Refusal> {
+    pub(crate) fn probe(&self, binary: &Path, name: &str, cwd: &Path) -> Result<Version, Refusal> {
         let spawn = Spawn {
             program: binary.to_owned(),
             args: vec!["--version".into(), "--json".into()],
@@ -857,7 +886,7 @@ fn open_owned(path: &Path, owner: Owner) -> Result<File, Refusal> {
     Ok(file)
 }
 
-fn sha256_of(mut file: File) -> io::Result<String> {
+pub(crate) fn sha256_of(mut file: File) -> io::Result<String> {
     let mut hash = Sha256::new();
     let mut buf = vec![0; 64 * 1024];
     loop {

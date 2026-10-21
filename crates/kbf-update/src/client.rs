@@ -206,8 +206,8 @@ impl Core {
             offered_generation: self.seen,
             helper_present: self.helper != Helper::Missing,
             staged: report.and_then(|r| r.staged_facts),
-            available: None,
-            release_source: ReleaseSource::Unreported,
+            available: report.and_then(|r| r.available.clone()),
+            release_source: report.map_or(ReleaseSource::Unreported, |r| r.release_source),
             gated: self.gate.is_some(),
         }
     }

@@ -18,7 +18,8 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::layout::Layout;
-use crate::state::StateError;
+use crate::seed;
+use crate::state::{self, Locked, StateError};
 
 /// Why the floor could not be raised.
 #[derive(Debug, thiserror::Error)]
@@ -37,7 +38,15 @@ pub enum FloorError {
 /// # Errors
 /// The lock cannot be taken, the file is there and cannot be read as one number (it is not
 /// replaced), or the new file cannot be written.
-pub fn raise(_host: &Layout, to: u64) -> Result<u64, FloorError> {
+pub fn raise(host: &Layout, to: u64) -> Result<u64, FloorError> {
+    let _lock = Locked::acquire(host)?;
+    let now = seed::read_floor(host).map_err(|e| FloorError::Unreadable(e.to_string()))?;
+    if let Some(floor) = now.filter(|floor| *floor >= to) {
+        return Ok(floor);
+    }
+    let path = host.join(&host.seq_floor());
+    state::replace(&path, format!("{to}\n").as_bytes())
+        .map_err(|source| FloorError::Write { path, source })?;
     Ok(to)
 }
 

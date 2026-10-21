@@ -5,9 +5,12 @@
 
 use kbf_proto::update as wire;
 use kbf_proto::update::update_order::Verb as WireVerb;
+use kbf_proto::update::update_status::ReleaseSource as WireSource;
 use kbf_proto::update::update_status::State as WireState;
 
-use crate::types::{Component, Expected, Offer, Order, State, Status, Verb};
+use crate::types::{
+    Available, Component, Expected, Offer, Order, ReleaseSource, State, Status, Verb,
+};
 
 impl From<wire::Component> for Component {
     fn from(c: wire::Component) -> Self {
@@ -71,6 +74,26 @@ impl From<State> for WireState {
     }
 }
 
+impl From<&Available> for wire::update_status::Available {
+    fn from(a: &Available) -> Self {
+        Self {
+            commit: a.commit.clone(),
+            seq: a.seq,
+        }
+    }
+}
+
+impl From<ReleaseSource> for WireSource {
+    fn from(source: ReleaseSource) -> Self {
+        match source {
+            ReleaseSource::Unreported => Self::Unspecified,
+            ReleaseSource::Url => Self::Url,
+            ReleaseSource::Frontend => Self::Frontend,
+            ReleaseSource::Bundled => Self::Bundled,
+        }
+    }
+}
+
 impl From<&Status> for wire::UpdateStatus {
     fn from(s: &Status) -> Self {
         let staged = s.staged.unwrap_or_default();
@@ -86,8 +109,8 @@ impl From<&Status> for wire::UpdateStatus {
             staged_protocol: staged.protocol,
             staged_min_protocol: staged.min_protocol,
             staged_state_schema: staged.state_schema,
-            available: None,
-            release_source: 0,
+            available: s.available.as_ref().map(Into::into),
+            release_source: WireSource::from(s.release_source).into(),
         }
     }
 }

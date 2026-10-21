@@ -9,7 +9,10 @@
 //! the restart is recorded as owed before it is tried, so a crash anywhere leaves a state the
 //! next pass completes. An order may name the release the host's package carries instead of
 //! one to fetch (`source = staged`, `staged.rs`): it is held to the package's manifest and to
-//! a floor on its `seq`, and then goes through the same fetcher, pipeline and swap.
+//! a floor on its `seq`, and then goes through the same fetcher, pipeline and swap. At the end
+//! of a pass the helper looks at the package and the source and tells the frontend what it
+//! found, and keeps the floor up with what the host has confirmed (`notice.rs`); the status
+//! says it, nothing else moves.
 
 use std::io::Write;
 use std::time::Duration;
@@ -26,8 +29,10 @@ use kbf_host::{Exec, HostPath, Perms, Step};
 use kbf_update::{Facts, Source};
 
 mod frontend;
+mod notice;
 mod staged;
 
+use self::notice::Notice;
 use self::staged::{Held, refusal_of};
 use crate::database::SchemaStep;
 use crate::helper::fetcher::{Fetcher, InstalledRelease};
@@ -90,6 +95,8 @@ pub struct Helper<E: Exec> {
     procs: Box<dyn Procs>,
     /// A swap was confirmed in this pass: the release it replaced may now be collected.
     gc_due: bool,
+    /// What the helper remembers of the package and the source between passes (`notice.rs`).
+    notice: Notice,
 }
 
 fn memory_path(host: &Layout) -> HostPath {
@@ -117,6 +124,7 @@ impl<E: Exec> Helper<E> {
             leases,
             procs,
             gc_due: false,
+            notice: Notice::default(),
         }
     }
 
@@ -240,11 +248,13 @@ impl<E: Exec> Helper<E> {
     /// One pass. `now` is seconds since the epoch.
     pub fn cycle(&mut self, now: u64) -> Result<(), HelperError> {
         let mut memory = self.load()?;
+        self.notice.stamp(&mut memory);
         self.restart_if_owed(&mut memory)?;
         self.expire(now, &mut memory)?;
         self.orders(now, &mut memory)?;
         self.restart_if_owed(&mut memory)?;
         self.collect();
+        self.notice_package(&mut memory);
         self.report(&memory)
     }
 
@@ -550,6 +560,9 @@ impl<E: Exec> Helper<E> {
                     memory.last_activation_at = now;
                 }
                 self.gc_due |= done.kept;
+                if done.kept {
+                    self.raise_floor();
+                }
             }
             Err(why) => {
                 refuse(memory, &why);

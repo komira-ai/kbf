@@ -122,6 +122,11 @@ fn parse(bytes: &[u8]) -> Result<Report, String> {
             ));
         }
     }
+    if let Some(seed) = &raw.available
+        && !is_hex(&seed.commit, 40)
+    {
+        return Err("status.json: available.commit is not 40 lowercase hex digits".to_owned());
+    }
     Ok(Report {
         installed: raw.installed_commit,
         previous: raw.previous_commit,
@@ -134,8 +139,14 @@ fn parse(bytes: &[u8]) -> Result<Report, String> {
             min_protocol: s.min_protocol,
             state_schema: s.state_schema,
         }),
-        available: None,
-        release_source: ReleaseSource::Unreported,
+        available: raw.available.map(|a| Available {
+            commit: a.commit,
+            seq: a.seq,
+        }),
+        release_source: raw
+            .release_source
+            .as_deref()
+            .map_or(ReleaseSource::Unreported, ReleaseSource::from_word),
     })
 }
 

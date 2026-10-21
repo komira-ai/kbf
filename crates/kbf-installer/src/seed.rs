@@ -25,9 +25,16 @@
 //! [`SeedFetcher`](crate::helper::fetcher_seed::SeedFetcher)'s.
 //!
 //! The floor is the root-owned file `seq_floor` beside `state.json`: one decimal number, the
-//! highest `seq` that is not allowed: a seed's `seq` must be strictly above it. The installer
-//! only reads it, and a host with none refuses every staged order (fail closed). `setup`
-//! installs the first release before any floor exists, so it asks none of the seed.
+//! highest `seq` that is not allowed: a seed's `seq` must be strictly above it. A host with none
+//! refuses every staged order (fail closed). [`crate::seq_floor`] writes it: it starts at the
+//! `seq` of the release that runs and rises when a swap is confirmed. `setup` installs the first
+//! release before any floor exists, so it asks none of the seed.
+//!
+//! Between orders the run loop looks at the seed
+//! ([`Fetcher::look`](crate::helper::fetcher::Fetcher::look)) and tells the frontend,
+//! in `status.json`, the seed it would take an order for ([`Available`]): the package's files
+//! whole and attested, and the `seq` above the floor, by the same rule an order meets
+//! ([`above_floor`]). It is a report: nothing is installed, staged or moved by it.
 
 use std::io;
 
@@ -88,7 +95,8 @@ pub struct SeedFacts {
 /// What `status.json` says of a seed the run loop has found whole and above the floor: the
 /// release an operator can order by its commit. Nothing more is told of it (its facts are the
 /// installer's to check at the order).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Available {
     pub commit: CommitId,
     pub seq: u64,
@@ -220,23 +228,24 @@ pub fn admit(seed: &SeedFacts, commit: &CommitId, floor: Option<u64>) -> Result<
             seed.commit
         )));
     }
-    match floor {
-        Some(floor) if seed.seq > floor => Ok(()),
-        Some(floor) => Err(refuse(format!(
-            "seq_floor: seed seq {} is not above {floor}",
-            seed.seq
-        ))),
-        None => Err(refuse(NO_FLOOR.to_owned())),
-    }
+    above_floor(seed.seq, floor).map_err(refuse)
 }
 
 /// Why a host with no floor admits no seed.
 const NO_FLOOR: &str = "seq_floor: no floor is recorded yet, so no seed is above it";
 
 /// Whether a seed of `seq` is above `floor`: the rule [`admit`] applies at an order and the
-/// run loop applies before it tells a seed is available.
-pub fn above_floor(_seq: u64, _floor: Option<u64>) -> Result<(), String> {
-    Ok(())
+/// run loop applies before it tells a seed is available, so that what is announced is what an
+/// order would be taken on. A host with no floor has none to be above.
+///
+/// # Errors
+/// The rule, in the words an operator reads.
+pub fn above_floor(seq: u64, floor: Option<u64>) -> Result<(), String> {
+    match floor {
+        Some(floor) if seq > floor => Ok(()),
+        Some(floor) => Err(format!("seq_floor: seed seq {seq} is not above {floor}")),
+        None => Err(NO_FLOOR.to_owned()),
+    }
 }
 
 #[cfg(test)]

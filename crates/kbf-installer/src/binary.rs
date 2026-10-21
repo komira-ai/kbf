@@ -5,7 +5,7 @@
 //! file for another platform is refused before anything executes it. The version is what
 //! `kbf --version --json` prints (crates/kbf-cli/src/version.rs): `commit` (the first 12
 //! hex digits), `min_protocol`, `protocol`, `profile`, `state_schema` and `version`, and
-//! `admin_protocol`, `meta_log` and `seq` when the build has them.
+//! `admin_protocol`, `meta_log`, `relay` and `seq` when the build has them.
 //! It is a consistency check on a file the attestation already vouches for, not trust.
 
 use std::fmt;

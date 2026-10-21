@@ -368,7 +368,7 @@ struct OnDisk<'a> {
 
 /// Write `bytes` to a new file beside `path` (mode 0600: root's alone), sync it, rename it over `path` and sync
 /// the directory.
-fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let name = path
         .file_name()
         .expect("a state file has a name")

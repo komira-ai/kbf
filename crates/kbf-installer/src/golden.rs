@@ -9,9 +9,8 @@ use crate::record::{
     ActivationId, Component, Expected, OrderRecord, OrderVerb, Sha256Hex, TargetPlatform,
 };
 use crate::state_v2::{Floor, Instance, PendingConfirm, SCHEMA as STATE_SCHEMA, StateV2, Unacked};
-use crate::status_v2::{
-    Phase, ProbeFacts, Refusal, RefusalNote, SCHEMA as STATUS_SCHEMA, StagedFacts, StatusV2,
-};
+use crate::seed::Available;
+use crate::status_v2::{Envoy, Phase, SCHEMA as STATUS_SCHEMA, StagedFacts, StatusV2};
 use crate::testkit::{A, B, C, c};
 
 pub const ORDER_ACTIVATE: &str = include_str!("../testdata/golden/order_activate.json");
@@ -133,33 +132,33 @@ pub fn state() -> StateV2 {
     }
 }
 
+/// The host the golden `status.json` describes: running A with C before it, B staged and
+/// refused, a source that fetches nothing and a package that carries a seed of B.
 pub fn status() -> StatusV2 {
     StatusV2 {
         schema: STATUS_SCHEMA,
         installed_commit: Some(commit(A)),
         previous_commit: Some(commit(C)),
         staged_commit: Some(commit(B)),
-        state: Phase::ActivatedUnconfirmed,
-        refusal: Some(RefusalNote {
-            word: Refusal::Attestation,
-            reason: "no valid attestation for kbf at commit 0123456789ab".to_owned(),
-        }),
+        state: Phase::Refused,
+        refusal: "attestation: no valid attestation for kbf at commit 0123456789ab".to_owned(),
         acked_order_id: 41,
         staged: Some(StagedFacts {
             protocol: 12,
             min_protocol: 11,
             state_schema: 4,
+            profile: Some("release".to_owned()),
         }),
-        probe: Some(ProbeFacts {
+        envoy: Envoy {
+            current: None,
+            previous: None,
+        },
+        release_source: Some("bundled".to_owned()),
+        available: Some(Available {
             commit: commit(B),
-            platform: "linux-x86_64".to_owned(),
-            protocol: 12,
-            min_protocol: 11,
-            state_schema: 4,
-            profile: "release".to_owned(),
+            seq: 812,
         }),
-        trust_days_left: Some(120),
-        unverified: vec![commit(C)],
+        unverified: Vec::new(),
     }
 }
 

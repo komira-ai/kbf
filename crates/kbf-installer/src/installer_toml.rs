@@ -91,6 +91,18 @@ pub enum Source {
     Bundled,
 }
 
+impl Source {
+    /// The word `release_source` holds for this source in the file, which `status.json` tells
+    /// the frontend.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Source::Frontend => "frontend",
+            Source::Url(_) => "url",
+            Source::Bundled => "bundled",
+        }
+    }
+}
+
 /// The frontend's worker listener and the CA that authenticates it, as `setup` saw them: a
 /// snapshot, taken once, because the root half cannot take its source from the service user's
 /// directory. The CA is meant to be a copy that root owns; whether it is, and whether it still

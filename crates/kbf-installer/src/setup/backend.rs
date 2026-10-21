@@ -16,6 +16,9 @@ use crate::database::{Database, SchemaOps};
 use crate::helper::fetcher::{FetchError, Fetcher, ReleaseLocator};
 use crate::layout::Layout;
 use crate::migrate::{self, MigrateError, Unit};
+use crate::release::ReleaseError;
+use crate::seq_floor::{self, FloorError};
+use crate::state;
 
 /// The installer's one downloader, as `setup` uses it: fetch the release for `commit` from the
 /// source `installer.toml` names (setup has written it by then), verify it as an update is
@@ -96,10 +99,32 @@ impl<E: Exec> Releases for Fetching<'_, E> {
     }
 
     fn install_seed(&self) -> Result<CommitId, SetupError> {
-        let commit = self.fetcher.seed()?.commit;
-        self.install(&commit, Source::Staged)?;
-        Ok(commit)
+        let seed = self.fetcher.seed()?;
+        self.install(&seed.commit, Source::Staged)?;
+        // The package's release is the release that runs now, so the floor starts at its `seq`:
+        // no package at or below it is a seed above the floor. The release stands if the file
+        // cannot be written; the run loop writes it once the cause is gone.
+        let kept = seq_floor::raise(&self.layout, seed.seq);
+        kept.map_err(floor_not_kept)?;
+        Ok(seed.commit)
     }
+
+    fn running_relays(&self) -> Result<bool, SetupError> {
+        let state = state::read_unlocked(&self.layout).map_err(ReleaseError::from)?;
+        let Some(current) = state.and_then(|state| state.current) else {
+            return Ok(false);
+        };
+        Ok(self.fetcher.probe(&current)?.relays())
+    }
+}
+
+/// The first release is installed and current; only its floor could not be written, which is the
+/// operator's to put right (the run loop writes it once they have).
+fn floor_not_kept(e: FloorError) -> SetupError {
+    SetupError::NeedsOperator(format!(
+        "the package's release is installed and current, but its floor on seq cannot be kept: \
+         {e}; once that is fixed `kbf-installer run` keeps it"
+    ))
 }
 
 /// Where the state database is reached from.
