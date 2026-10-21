@@ -12,6 +12,11 @@ fn file(host: &Layout) -> PathBuf {
     host.join(&host.seq_floor())
 }
 
+/// What the floor file holds.
+fn held(host: &Layout) -> String {
+    fs::read_to_string(file(host)).expect("a file")
+}
+
 /// A raise makes the file (one decimal number, a line end, root's alone), a raise to a number
 /// that is not above the floor leaves it as it is, and a higher one replaces it; each answers
 /// with the floor after it.
@@ -25,15 +30,15 @@ fn file(host: &Layout) -> PathBuf {
 fn a_raise_makes_the_floor_and_never_lowers_it() {
     let (host, _) = host_root("floor-raise");
     assert_eq!(raise(&host, 40).expect("made"), 40);
-    assert_eq!(fs::read_to_string(file(&host)).expect("a file"), "40\n");
-    let mode = fs::metadata(file(&host)).expect("meta").permissions().mode();
-    assert_eq!(mode & 0o777, 0o600);
+    assert_eq!(held(&host), "40\n");
+    let meta = fs::metadata(file(&host)).expect("meta");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
     for lower in [39, 40] {
         assert_eq!(raise(&host, lower).expect("kept"), 40, "{lower}");
-        assert_eq!(fs::read_to_string(file(&host)).expect("a file"), "40\n");
+        assert_eq!(held(&host), "40\n", "{lower}");
     }
     assert_eq!(raise(&host, 41).expect("raised"), 41);
-    assert_eq!(fs::read_to_string(file(&host)).expect("a file"), "41\n");
+    assert_eq!(held(&host), "41\n");
 }
 
 /// A floor that is there and is not one number is not replaced: the raise refuses, saying so,
@@ -47,21 +52,17 @@ fn a_raise_makes_the_floor_and_never_lowers_it() {
 fn a_floor_that_cannot_be_read_is_left_alone() {
     let (host, _) = host_root("floor-unreadable");
     fs::create_dir(file(&host)).expect("a directory where the file goes");
-    let got = raise(&host, 40);
-    assert!(
-        matches!(&got, Err(FloorError::Unreadable(why)) if why.contains("cannot be read")),
-        "{got:?}"
-    );
+    let err = raise(&host, 40).expect_err("unreadable");
+    assert!(matches!(err, FloorError::Unreadable(_)), "{err:?}");
+    assert!(err.to_string().contains("cannot be read"), "{err}");
     assert!(file(&host).is_dir());
 
     let (host, _) = host_root("floor-text");
     fs::write(file(&host), "forty\n").expect("text");
-    let got = raise(&host, 40);
-    assert!(
-        matches!(&got, Err(FloorError::Unreadable(why)) if why.contains("is not one number")),
-        "{got:?}"
-    );
-    assert_eq!(fs::read_to_string(file(&host)).expect("a file"), "forty\n");
+    let err = raise(&host, 40).expect_err("unreadable");
+    assert!(matches!(err, FloorError::Unreadable(_)), "{err:?}");
+    assert!(err.to_string().contains("is not one number"), "{err}");
+    assert_eq!(held(&host), "forty\n");
 }
 
 /// A raise that cannot write its new file says so and leaves no floor behind, and one that

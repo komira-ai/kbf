@@ -120,7 +120,8 @@ fn an_upgrade_is_noticed_and_the_pass_moves_nothing() {
         state,
         "state.json is what it was, byte for byte"
     );
-    assert_eq!(listing(&rig.layout.join(&rig.layout.releases())), releases);
+    let after = listing(&rig.layout.join(&rig.layout.releases()));
+    assert_eq!(after, releases);
     assert_eq!(rig.current(), Some(c(A)));
     assert_eq!(rig.state().staged, None);
     assert_eq!(rig.restarts(), 0);
@@ -279,28 +280,30 @@ fn the_floor_rises_at_a_confirm_not_at_a_swap_and_a_rollback_leaves_it() {
     rig.cycle(T0 + 5);
     assert_eq!(rig.current(), Some(c(B)), "{}", rig.refusal());
     assert!(rig.state().pending_confirm.is_some());
-    assert_eq!(seeded.floor_text(), line(EARLIER_SEQ), "a swap on trial raises nothing");
+    let on_trial = seeded.floor_text();
+    assert_eq!(on_trial, line(EARLIER_SEQ), "a trial raises nothing");
 
     rig.first_start(B, T0 + 6);
     rig.order(6, Verb::Confirm, B);
     rig.cycle(T0 + 8);
     assert!(rig.state().pending_confirm.is_none());
     assert_eq!(seeded.floor_text(), line(SEQ));
-    let status = rig.status();
-    assert!(status.get("available").is_none(), "the seed is the release that runs");
+    let told = rig.status().get("available").is_some();
+    assert!(!told, "the seed is the release that runs");
 
     let layout = rig.layout.clone();
     let lock = Locked::acquire(&layout).expect("lock");
     let state = lock.read().expect("reads").expect("there");
     let mut out = Vec::<u8>::new();
-    activate::rollback_in(rig.helper.exec_mut(), &layout, &lock, state, &mut out)
-        .expect("rolled back");
+    let rolled = activate::rollback_in(rig.helper.exec_mut(), &layout, &lock, state, &mut out);
+    rolled.expect("rolled back");
     drop(lock);
     rig.cycle(T0 + 20);
     assert_eq!(rig.current(), Some(c(A)));
-    assert_eq!(seeded.floor_text(), line(SEQ), "a rollback leaves the floor");
-    let status = rig.status();
-    assert!(status.get("available").is_none(), "the seed rolled back from stays unorderable");
+    let after = seeded.floor_text();
+    assert_eq!(after, line(SEQ), "a rollback leaves the floor");
+    let told = rig.status().get("available").is_some();
+    assert!(!told, "the seed rolled back from stays unorderable");
 }
 
 /// The frontend's flip raises the floor and its staging does not: a staged seed leaves the
@@ -322,7 +325,8 @@ fn a_frontend_flip_raises_the_floor_and_staging_does_not() {
     rig.put(&staged(&rig, 9, Verb::FrontendUpdate, B));
     rig.cycle(T0 + 5);
     assert_eq!(rig.state().staged, Some(c(B)), "{}", rig.refusal());
-    assert_eq!(seeded.floor_text(), line(EARLIER_SEQ), "staging raises nothing");
+    let staged_floor = seeded.floor_text();
+    assert_eq!(staged_floor, line(EARLIER_SEQ), "staging raises nothing");
 
     rig.order(10, Verb::Confirm, B);
     rig.cycle(T0 + 10);
@@ -401,7 +405,9 @@ fn a_release_that_cannot_be_asked_is_asked_again_and_the_trouble_is_said_once() 
         facts: seeded.facts(),
     });
     let broken = "it prints no JSON".to_owned();
-    rig.fetcher.versions.lock().expect("lock").insert(c(A), broken);
+    let mut versions = rig.fetcher.versions.lock().expect("lock");
+    versions.insert(c(A), broken);
+    drop(versions);
     rig.cycle(T0);
     rig.cycle(T0 + 5);
     assert_eq!(seeded.floor_text(), None);
@@ -427,10 +433,8 @@ fn a_floor_that_cannot_be_read_withholds_the_announcement_and_is_said() {
     rig.cycle(T0);
     assert!(rig.status().get("available").is_none());
     let log = said(&mut rig);
-    assert!(
-        log.starts_with("package: ") && log.contains("cannot be read"),
-        "{log}"
-    );
+    assert!(log.starts_with("package: "), "{log}");
+    assert!(log.contains("cannot be read"), "{log}");
     assert!(rig.layout.join(&rig.layout.seq_floor()).is_dir());
 }
 
@@ -455,7 +459,8 @@ fn a_floor_that_cannot_be_raised_after_a_confirm_is_said_and_the_confirm_stands(
     let _ = said(&mut rig);
     rig.order(6, Verb::Confirm, B);
     rig.cycle(T0 + 3);
-    assert!(rig.state().pending_confirm.is_none(), "the confirm stands");
+    let pending = rig.state().pending_confirm;
+    assert!(pending.is_none(), "the confirm stands");
     assert_eq!(rig.current(), Some(c(B)));
     let log = said(&mut rig);
     assert!(log.contains("cannot be read"), "{log}");
@@ -485,6 +490,40 @@ fn a_package_without_a_seed_says_nothing_and_the_floor_is_kept_all_the_same() {
     assert_eq!(said(&mut rig), "");
     assert_eq!(gh_runs(&calls), 0);
     assert_eq!(seeded.floor_text(), line(EARLIER_SEQ));
+}
+
+/// A package upgrade that replaces the seed (a newer manifest, tarball and binary under the
+/// same directory) is noticed at the next pass: the new manifest's digest is not the one the
+/// old seed was found by, so the package is checked again and the new `seq` is told. Nothing
+/// of the host's state is touched by the upgrade or by noticing it.
+///
+/// Catches a seed announced for ever as the first one found (the cache keyed by anything but
+/// the manifest's digest), and an upgrade that writes the state.
+///
+/// Mutants to plant: the cache returned whatever the digest; the new seed announced without
+/// being checked (red on the second runner's `gh` runs).
+#[test]
+fn a_package_upgrade_is_noticed_at_the_next_pass_and_touches_no_state() {
+    let (mut rig, mut seeded, _) = noticing("notice-upgrade", |_| {});
+    let state = state_bytes(&rig);
+    rig.cycle(T0);
+    assert_eq!(rig.status()["available"]["seq"], SEQ);
+
+    let newer = SEQ + 30;
+    seeded.manifest["seq"] = serde_json::json!(newer);
+    let old = format!("\"seq\":{SEQ},");
+    let new = format!("\"seq\":{newer},");
+    seeded.probe = seeded.probe.replace(&old, &new);
+    let runner = seeded.runner();
+    let calls = runner.log();
+    let mut fetcher = seeded.fetcher();
+    fetcher.runner = Box::new(runner);
+    rig.helper.set_fetcher(Box::new(fetcher));
+    rig.cycle(T0 + 5);
+    assert_eq!(rig.status()["available"]["seq"], newer);
+    assert_eq!(gh_runs(&calls), 1, "the new manifest is checked");
+    assert_eq!(state_bytes(&rig), state, "state.json is what it was");
+    assert_eq!(rig.current(), Some(c(A)));
 }
 
 /// The host fetcher tells the source `installer.toml` names, and the seed is announced on a

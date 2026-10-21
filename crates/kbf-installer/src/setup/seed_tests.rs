@@ -233,11 +233,16 @@ fn bundled_is_refused_beside_a_kbf_that_does_not_relay_before_anything_is_writte
             let mut exec = released(host(), Platform::Linux);
             let got = beside(&mut exec, false, &bundled(mode), options);
             let err = got.expect_err("refused");
-            assert!(matches!(err, SetupError::Unsupported(_)), "{mode:?}: {err:?}");
+            assert!(
+                matches!(err, SetupError::Unsupported(_)),
+                "{mode:?}: {err:?}"
+            );
             assert!(err.to_string().contains("relay"), "{mode:?}: {err}");
             assert_eq!((err.exit(), err.code()), (Exit::Usage, "unsupported"));
-            assert!(!exec.entries.contains_key(&hp(INSTALLER_TOML)), "{mode:?}");
-            assert!(!exec.entries.contains_key(&hp(KBF_TOML)), "{mode:?}");
+            let written = exec.entries.contains_key(&hp(INSTALLER_TOML));
+            assert!(!written, "{mode:?}: installer.toml is written");
+            let written = exec.entries.contains_key(&hp(KBF_TOML));
+            assert!(!written, "{mode:?}: kbf.toml is written");
             assert_eq!(cmds(&exec), Vec::<String>::new(), "{mode:?}");
         }
     }

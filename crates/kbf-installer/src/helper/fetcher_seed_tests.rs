@@ -637,7 +637,7 @@ fn a_whole_seed_is_found_once_per_manifest_and_installs_nothing() {
     fetcher.runner = Box::new(runner);
 
     let noticed = fetcher.look(None);
-    assert_eq!(noticed.source, None, "a seed fetcher reads no installer.toml");
+    assert_eq!(noticed.source, None, "it reads no installer.toml");
     let found = noticed.seed.expect("looks").expect("a seed");
     let manifest = serde_json::to_vec(&seeded.manifest).expect("json");
     assert_eq!(found.digest, sha(&manifest));
@@ -655,7 +655,7 @@ fn a_whole_seed_is_found_once_per_manifest_and_installs_nothing() {
 
     let again = fetcher.look(Some(&found)).seed.expect("looks");
     assert_eq!(again, Some(found.clone()));
-    assert_eq!(gh_runs(&calls), 1, "the same manifest is not checked again");
+    assert_eq!(gh_runs(&calls), 1, "the same manifest is not checked");
 
     let stale = crate::seed::Looked {
         digest: "of another manifest".to_owned(),

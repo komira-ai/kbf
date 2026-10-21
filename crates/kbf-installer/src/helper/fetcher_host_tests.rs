@@ -458,7 +458,8 @@ fn the_host_fetcher_looks_at_the_package_and_reports_the_source_the_file_names()
     let fetcher = HostFetcher::new(layout, path(FILE), || Err(reason.to_owned()));
     let noticed = fetcher.look(None);
     assert_eq!(noticed.source, None);
-    assert_eq!(noticed.seed, Err(FetchError::Unavailable(reason.to_owned())));
+    let unavailable = FetchError::Unavailable(reason.to_owned());
+    assert_eq!(noticed.seed, Err(unavailable));
 }
 
 /// An installed release is asked its version through the host fetcher on every kind of host,

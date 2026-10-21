@@ -8,8 +8,8 @@ use crate::installer_toml::{FrontendPull, InstallerToml, Source};
 use crate::record::{
     ActivationId, Component, Expected, OrderRecord, OrderVerb, Sha256Hex, TargetPlatform,
 };
-use crate::state_v2::{Floor, Instance, PendingConfirm, SCHEMA as STATE_SCHEMA, StateV2, Unacked};
 use crate::seed::Available;
+use crate::state_v2::{Floor, Instance, PendingConfirm, SCHEMA as STATE_SCHEMA, StateV2, Unacked};
 use crate::status_v2::{Envoy, Phase, SCHEMA as STATUS_SCHEMA, StagedFacts, StatusV2};
 use crate::testkit::{A, B, C, c};
 

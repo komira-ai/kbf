@@ -60,7 +60,9 @@ fn the_installer_parses_what_kbf_prints() {
 fn the_build_declares_the_relay_its_installer_needs() {
     let parsed = Version::parse(kbf_cli::version::line().as_bytes()).expect("parses");
     assert!(parsed.relays(), "{parsed:?}");
-    assert!(kbf_cli::version::RELAY >= kbf_installer::binary::RELAY_NEEDED);
+    let declared = kbf_cli::version::RELAY;
+    let needed = kbf_installer::binary::RELAY_NEEDED;
+    assert!(declared >= needed, "declares {declared}, needs {needed}");
 }
 
 /// The installer refuses a release that declares a `protocol`, `min_protocol` or

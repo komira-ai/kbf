@@ -234,7 +234,11 @@ impl Seeded {
         FakeRunner::new(move |spawn| {
             if spawn.program.file_name().is_none_or(|n| n != "gh") {
                 let ours = spawn.program.to_string_lossy().contains(commit.as_str());
-                let said = if ours { probe.as_str() } else { earlier.as_str() };
+                let said = if ours {
+                    probe.as_str()
+                } else {
+                    earlier.as_str()
+                };
                 return Ok(ran(0, said, ""));
             }
             let at = spawn
