@@ -832,6 +832,17 @@ fn publish(root: &Path, defect: Option<&str>) -> (Option<i32>, String, String) {
     publish_set(root, &sha_of(&sums), defect)
 }
 
+/// What `release notes` would have written, as the tests' notes file.
+const NOTES: &str = "# v0.1.0\n\n## Before you click\n\n### Not reversible\n\n- meta_log raised from 3 \
+                     (v0.0.9) to 4\n\n## Commits since v0.0.9\n\n- abc1234 a change\n";
+
+/// Writes [`NOTES`] to `<root>/notes.md` and returns the path.
+fn notes_file(root: &Path) -> PathBuf {
+    let path = root.join("notes.md");
+    std::fs::write(&path, NOTES).expect("notes");
+    path
+}
+
 /// Adds to the fake's API the release tags `tags` (one page) and the compare of the
 /// highest, `TAG`, with `commit`.
 fn tags_standing(root: &Path, tags: &[&str], top: &str, status: &str) {
@@ -864,6 +875,25 @@ fn publish_tag(
     set_hash: &str,
     defect: Option<&str>,
 ) -> (Option<i32>, String, String) {
+    publish_with(root, tag, set_hash, &notes_file(root), defect)
+}
+
+fn publish_notes(
+    root: &Path,
+    set_hash: &str,
+    notes: &Path,
+    defect: Option<&str>,
+) -> (Option<i32>, String, String) {
+    publish_with(root, TAG, set_hash, notes, defect)
+}
+
+fn publish_with(
+    root: &Path,
+    tag: &str,
+    set_hash: &str,
+    notes: &Path,
+    defect: Option<&str>,
+) -> (Option<i32>, String, String) {
     // Rule S reads the release tags: `TAG` is the highest and names `COMMIT`, unless the
     // test has said otherwise.
     if !std::fs::read_to_string(root.join("gh/gh-api.json"))
@@ -889,6 +919,8 @@ fn publish_tag(
             &run,
             "--set-hash",
             set_hash,
+            "--notes-file",
+            s(notes),
         ],
         defect,
     )
@@ -952,10 +984,7 @@ fn publish_creates_the_release_with_every_verified_file() {
         )),
         "{create}"
     );
-    assert!(
-        create.contains(&format!("/actions/runs/{RUN})")),
-        "{create}"
-    );
+    assert!(args.contains(&format!("/actions/runs/{RUN})")), "{args}");
     // The notes span lines of the log; the verify command is one of them.
     assert!(
         args.contains(&format!(
@@ -976,6 +1005,98 @@ fn publish_creates_the_release_with_every_verified_file() {
         )),
         "{args}"
     );
+}
+
+#[test]
+fn publish_makes_the_notes_file_the_start_of_the_release_body() {
+    // Catches: a release whose body is not the generated notes (the reviewer approved
+    // notes that nobody published), or whose notes are cut, reflowed or followed by
+    // nothing: the body is the file verbatim, then how to verify the files.
+    let root = scratch("publish-body");
+    dist(&root, COMMIT);
+    let (code, _, err) = publish(&root, None);
+    assert_eq!(code, Some(0), "{err}");
+    let args = gh_args(&root);
+    let create = args.split("\nrelease create").last().expect("a create");
+    let body = create.split_once(" --notes ").expect("--notes").1;
+    assert!(
+        body.starts_with(&format!(
+            "{}\n## The files\n\nThe files run {RUN} of artifacts.yml built and attested",
+            NOTES.trim_end()
+        )),
+        "{body}"
+    );
+    assert!(
+        body.contains("Verify an asset before use"),
+        "the verification instructions are gone: {body}"
+    );
+}
+
+#[test]
+fn publish_requires_the_notes_file() {
+    // Catches: `--notes-file` made optional (a release with a fixed body again) and a
+    // missing, empty or unreadable file read as no notes. None may reach GitHub.
+    let root = scratch("publish-no-notes");
+    dist(&root, COMMIT);
+    let sums = std::fs::read_to_string(root.join("dist/SHA256SUMS")).unwrap();
+    let dist_dir = root.join("dist");
+    let run = RUN.to_string();
+    let (code, _, err) = xtask(
+        &root,
+        &[
+            "release",
+            "publish",
+            s(&dist_dir),
+            "--repo",
+            REPO,
+            "--tag",
+            TAG,
+            "--commit",
+            COMMIT,
+            "--run-id",
+            &run,
+            "--set-hash",
+            &sha_of(&sums),
+        ],
+        None,
+    );
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("--notes-file"), "{err}");
+    let gone = root.join("gone.md");
+    let (code, _, err) = publish_notes(&root, &sha_of(&sums), &gone, None);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("gone.md"), "{err}");
+    for blank in ["", " \n\n"] {
+        let empty = root.join("empty.md");
+        std::fs::write(&empty, blank).unwrap();
+        let (code, _, err) = publish_notes(&root, &sha_of(&sums), &empty, None);
+        assert_eq!(code, Some(1), "{err}");
+        assert!(err.contains("is empty"), "{err}");
+    }
+    assert_eq!(
+        gh_args(&root),
+        "",
+        "GitHub was asked about a release with no notes"
+    );
+    assert_eq!(released(&root), vec![], "a release was made");
+}
+
+#[test]
+fn publish_refuses_a_body_github_would_cut() {
+    // Catches: a body over GitHub's 125 000 characters, which `gh` would fail on after
+    // the checks, or which would be cut.
+    let root = scratch("publish-long-notes");
+    dist(&root, COMMIT);
+    let sums = std::fs::read_to_string(root.join("dist/SHA256SUMS")).unwrap();
+    let long = root.join("long.md");
+    std::fs::write(&long, "x".repeat(125_000)).unwrap();
+    let (code, _, err) = publish_notes(&root, &sha_of(&sums), &long, None);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("GitHub takes 125000"), "{err}");
+    assert_eq!(gh_args(&root), "", "GitHub was asked");
+    std::fs::write(&long, "x".repeat(100_000)).unwrap();
+    let (code, _, err) = publish_notes(&root, &sha_of(&sums), &long, None);
+    assert_eq!(code, Some(0), "{err}");
 }
 
 #[test]

@@ -21,6 +21,7 @@ use crate::helper::cycle::{Config, Helper};
 use crate::helper::fetcher::fake::FakeFetcher;
 use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, NotWired, ReleaseLocator};
 use crate::helper::leases::fake::FakeLeases;
+use crate::helper::mac_leases::tests::{MacHost, reply_pids};
 use crate::helper::memory::{Event, Memory};
 use crate::helper::order::{Order, Verb as OrderVerb};
 use crate::helper::restart::Restart;
@@ -494,6 +495,73 @@ fn an_activation_is_refused_before_the_fetch_during_a_trial_or_with_leases_live(
     rig.order(6, Verb::Revert, A);
     rig.cycle(T0 + 3);
     assert!(!rig.refusal().contains("leases"), "{}", rig.refusal());
+}
+
+/// A macOS helper whose lease source is the real Mac source over a scripted host: the
+/// source's own `setup` plays the host (processes, directories), the rig the helper's.
+fn mac_rig(name: &str, setup: impl FnOnce(&mut MacHost)) -> Rig {
+    let mut rig = Rig::on(name, Platform::MacOs);
+    let mut host = MacHost::new(name);
+    setup(&mut host);
+    rig.helper.set_leases(Box::new(host.source()));
+    rig
+}
+
+/// Catches the Mac source not wired into the cycle: with a keeper running on the Mac an
+/// activation is refused with the live count, before any fetch, and the release stays; with
+/// the host idle the same order is fetched and swapped; a Mac that cannot tell (no
+/// `sandbox-exec`) refuses with the reason; and when only a stale directory remains with no
+/// daemon running the activation goes through and the pass logs which directory it let by.
+///
+/// Mutants seen red: the keepers ignored; the `sandbox-exec` check dropped; the lease note not logged
+/// by the cycle; the note naming no directory.
+#[test]
+fn a_mac_activation_follows_the_mac_lease_source() {
+    let mut rig = mac_rig("mac-keeper", |h| h.keepers(reply_pids("412\n")));
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(rig.fetcher.count(), 0);
+    assert_eq!(rig.current(), Some(c(A)));
+    assert!(
+        rig.refusal().contains("1 leases are live"),
+        "{}",
+        rig.refusal()
+    );
+
+    let mut rig = mac_rig("mac-idle", |_| {});
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(rig.current(), Some(c(B)));
+    assert_eq!(rig.restarts(), 1);
+
+    let mut rig = mac_rig("mac-blind", |h| h.without_sandbox());
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(rig.fetcher.count(), 0);
+    assert!(
+        rig.refusal()
+            .contains("cannot tell whether leases are live: ")
+            && rig.refusal().contains("sandbox-exec"),
+        "{}",
+        rig.refusal()
+    );
+
+    let mut rig = mac_rig("mac-stale", |h| {
+        h.no_daemon();
+        h.dir("lease-3-7");
+    });
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(rig.current(), Some(c(B)));
+    let mut log = Vec::new();
+    rig.helper.drain_log(&mut log);
+    let log = String::from_utf8(log).expect("text");
+    assert!(
+        log.contains(
+            "leases: /Volumes/kbf/data/leases/lease-3-7 remains and no kbf daemon is running"
+        ),
+        "{log}"
+    );
 }
 
 /// Catches an unreadable lease source being read as "none": the installer refuses, and

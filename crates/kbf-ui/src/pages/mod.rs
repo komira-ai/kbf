@@ -11,6 +11,9 @@ use crate::{Answer, PREFIX, Source};
 
 mod action;
 mod build;
+mod leases;
+mod queue;
+mod sched;
 mod updates;
 
 pub(crate) use action::action;
@@ -19,6 +22,16 @@ pub(crate) use action::{ACTION, LOG_SHOWN_MAX_BYTES};
 #[cfg(test)]
 pub(crate) use build::BUILD;
 pub(crate) use build::build;
+#[cfg(test)]
+pub(crate) use leases::LEASES;
+use leases::LEASES_PATH;
+pub(crate) use leases::leases;
+#[cfg(test)]
+pub(crate) use queue::QUEUE;
+use queue::QUEUE_PATH;
+pub(crate) use queue::queue;
+#[cfg(test)]
+pub(crate) use sched::fixtures::sched_farm;
 #[cfg(test)]
 pub(crate) use updates::UPDATES;
 use updates::UPDATES_PATH;
@@ -42,7 +55,9 @@ pub(crate) const BUILDS: Page = Page {
 
 /// Every page, for the contract test.
 #[cfg(test)]
-pub(crate) const PAGES: [&Page; 5] = [&OVERVIEW, &BUILDS, &BUILD, &ACTION, &UPDATES];
+pub(crate) const PAGES: [&Page; 7] = [
+    &OVERVIEW, &BUILDS, &BUILD, &ACTION, &UPDATES, &LEASES, &QUEUE,
+];
 
 /// What a path segment keeps unencoded: RFC 3986's unreserved characters.
 const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
@@ -131,7 +146,12 @@ pub(crate) fn overview() -> Answer {
             );
         });
         h.el("ul", &[], |h| {
-            for (path, label) in [(BUILDS_PATH, "Builds"), (UPDATES_PATH, "Updates")] {
+            for (path, label) in [
+                (BUILDS_PATH, "Builds"),
+                (UPDATES_PATH, "Updates"),
+                (LEASES_PATH, "Leases"),
+                (QUEUE_PATH, "Queue"),
+            ] {
                 let href = Href::root_relative(path).expect("a page's path is root-relative");
                 h.el("li", &[], |h| {
                     h.link(&href, label);

@@ -847,7 +847,8 @@ fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
 /// until a lease source was wired): the helper `run` builds reads the lease cgroups of the
 /// unit it restarts, below the host root's `/sys/fs/cgroup`, so a populated lease of
 /// `kbf-daemon.service` is one live lease. A unit that never ran (no cgroup), a unit of no
-/// mode and a launchd label each cannot tell, with the reason: the activation is refused
+/// mode and a launchd label (the Mac source, which looks under the host root for
+/// `sandbox-exec`) each cannot tell, with the reason: the activation is refused
 /// (fail closed), and `run` itself still starts for them.
 ///
 /// Mutants seen red: `leases::NotWired` left in `build_helper` (the daemon's lease reads as
@@ -875,8 +876,9 @@ fn run_builds_a_helper_whose_lease_source_reads_the_restarted_units_cgroup() {
     assert!(err.contains("no such cgroup"), "{err}");
     let err = source(&["--unit", "kbf.service"]).expect_err("no mode's unit");
     assert!(err.contains("is no unit of any mode"), "{err}");
-    let err = source(&["--launchd-label", "com.example.kbf"]).expect_err("not wired");
-    assert!(err.contains("no lease source wired"), "{err}");
+    let err = source(&["--launchd-label", "com.example.kbf"]).expect_err("a Mac source");
+    assert!(err.contains("sandbox-exec"), "{err}");
+    assert!(!err.contains("no lease source wired"), "{err}");
 }
 
 /// Catches `run --installer-config` reading the config under a host root that is not an

@@ -14,7 +14,8 @@
 //! - Every write goes through a temporary file and a rename, so a reader sees the old
 //!   document or the new one, never half of one.
 //! - [`SetHash`] is the one definition of a release set's hash: the SHA-256 of the
-//!   `SHA256SUMS` bytes. `cargo xtask` and the evaluator both call it.
+//!   `SHA256SUMS` bytes. `cargo xtask` calls it, and so will the gamma verdict's producer
+//!   (Planned).
 //!
 //! - [`OfferDoc`] is `offer.json`: what a passed offer records for the deploy that follows.
 //!
