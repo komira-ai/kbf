@@ -91,10 +91,11 @@ impl<E: Exec> Helper<E> {
     }
 
     /// After a swap was confirmed: bring the floor up to the release that runs now. A failure
-    /// is said at once and the confirm stands; the next pass tries again.
+    /// is said at once and the confirm stands; the next pass tries again. Whatever this step
+    /// says to the log begins `package: `.
     pub(super) fn raise_floor(&mut self) {
         if let Err(why) = self.synced_floor() {
-            let _ = writeln!(self.log, "{why}");
+            let _ = writeln!(self.log, "package: {why}");
         }
     }
 

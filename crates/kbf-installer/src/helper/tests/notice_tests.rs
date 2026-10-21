@@ -73,11 +73,17 @@ fn gh_runs(calls: &Calls) -> usize {
     calls.borrow().iter().filter(is_gh).count()
 }
 
-/// What the helper has written to its log since the last time, which `run` sends to the journal.
+/// What the helper has said about the package to its log since the last time (the lines
+/// `run` sends to the journal that begin `package: `; the log holds the steps of the verbs
+/// too, which are not this test's).
 fn said(rig: &mut Rig) -> String {
     let mut out = Vec::new();
     rig.helper.drain_log(&mut out);
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8_lossy(&out)
+        .lines()
+        .filter(|line| line.starts_with("package: "))
+        .map(|line| format!("{line}\n"))
+        .collect()
 }
 
 /// What `kbf --version --json` prints for a release of `commit` that declares `seq`.

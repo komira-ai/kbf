@@ -192,7 +192,8 @@ pub(crate) mod fake {
         /// What each installed release prints for `--version --json`, by commit; a commit with
         /// no entry cannot be asked.
         pub versions: Arc<Mutex<BTreeMap<CommitId, String>>>,
-        /// The commits `probe` was asked about, in order.
+        /// The commits `probe` was asked about and had something to say of (a commit in
+        /// `versions`), in order.
         pub probes: Arc<Mutex<Vec<CommitId>>>,
     }
 
@@ -280,9 +281,9 @@ pub(crate) mod fake {
         }
 
         fn probe(&self, commit: &CommitId) -> Result<Version, FetchError> {
-            self.probes.lock().expect("lock").push(commit.clone());
             let said = self.versions.lock().expect("lock").get(commit).cloned();
             let said = said.ok_or(FetchError::NotWired)?;
+            self.probes.lock().expect("lock").push(commit.clone());
             Version::parse(said.as_bytes()).map_err(|e| FetchError::Unavailable(e.to_string()))
         }
     }
