@@ -76,6 +76,8 @@ pub mod api_client;
 pub mod blobs;
 #[cfg(test)]
 mod build_commit;
+#[doc(hidden)]
+pub mod build_seq;
 pub mod cold_apply;
 pub mod config;
 pub mod drain;
@@ -178,6 +180,14 @@ pub use worker::WorkerService;
 /// had no git checkout. `build.rs` embeds it (`src/build_commit.rs` has the rule,
 /// including the CI-only `KBF_BUILD_COMMIT_OVERRIDE`).
 pub const BUILD_COMMIT: &str = env!("KBF_BUILD_COMMIT");
+
+/// The number of commits behind the commit the server was built from (`git rev-list --count
+/// HEAD`), or 0 when the build could not count them (a shallow clone, no git): the rule is
+/// `src/build_seq.rs`, and nothing is newer than 0. `kbf --version --json` prints it as `seq`.
+pub const BUILD_SEQ: u64 = match u64::from_str_radix(env!("KBF_BUILD_SEQ"), 10) {
+    Ok(seq) => seq,
+    Err(_) => build_seq::UNKNOWN,
+};
 
 /// The server's version as it reports it in `--version`, the start line and the
 /// `server` field of `GET /v1/nodes`: the package version, `+`, and [`BUILD_COMMIT`].

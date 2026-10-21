@@ -42,6 +42,7 @@
 //! matched on its lower-cased spelling; a host that matches no member is never started and `FarmFacts::unlinked`
 //! says why.
 
+pub mod age;
 mod codec;
 mod command;
 mod controller;
