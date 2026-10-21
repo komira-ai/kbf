@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::time::SystemTime;
 
-use kbf_deploy::linux::verify_cert::{CLIENT_AUTH, ROLE_URI_PREFIX, Row, verify};
+use kbf_ca::verify_cert::{CLIENT_AUTH, ROLE_URI_PREFIX, Row, verify};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose as Eku, IsCa,
     KeyPair, KeyUsagePurpose, SanType,

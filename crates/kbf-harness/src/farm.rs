@@ -13,8 +13,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use kbf_ca::verify_cert::Row;
 use kbf_deploy::linux::Mode;
-use kbf_deploy::linux::verify_cert::Row;
 use kbf_testkit::dir::TestDir;
 
 use crate::api;
