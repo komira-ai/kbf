@@ -49,8 +49,8 @@
 //! anyway, so the artifacts workflow can check `kbf` as it checks `kbf-server`.
 //!
 //! `kbf --version --json` ([`version`]) prints one JSON object on one line naming the
-//! commit, the build profile, the protocol versions and the state schema, so a host can
-//! check what it runs.
+//! commit and the number of commits behind it, the build profile, the protocol versions and
+//! the state schema, so a host can check what it runs.
 //!
 //! And `kbf frontend handover` ([`handover`]): starts the idle instance of the frontend's
 //! systemd template (`kbf-frontend@a`, `kbf-frontend@b`) while the other serves, so the

@@ -11,6 +11,7 @@
 //! ahead of another by its `seq`.
 
 use std::path::Path;
+use std::process::Command;
 
 /// The `seq` of a build that could not count its commits.
 pub const UNKNOWN: u64 = 0;
@@ -18,13 +19,31 @@ pub const UNKNOWN: u64 = 0;
 /// The count to embed. `shallow` is what `git rev-parse --is-shallow-repository` printed
 /// (`None` when it failed, as it does in a git older than 2.15) and `count` what `git rev-list
 /// --count HEAD` printed (`None` when it failed: not a repository, or no commit yet).
-pub fn choose(_shallow: Option<&str>, _count: Option<&str>) -> u64 {
-    UNKNOWN
+pub fn choose(shallow: Option<&str>, count: Option<&str>) -> u64 {
+    match (shallow, count) {
+        (Some("false"), Some(count)) => count.parse().unwrap_or(UNKNOWN),
+        _ => UNKNOWN,
+    }
+}
+
+/// `git -C dir args`: its trimmed stdout, if it ran and succeeded.
+pub fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|text| text.trim().to_owned())
 }
 
 /// The `seq` of the checkout at `dir`.
-pub fn from_git(_dir: &Path) -> u64 {
-    UNKNOWN
+pub fn from_git(dir: &Path) -> u64 {
+    let shallow = git(dir, &["rev-parse", "--is-shallow-repository"]);
+    let count = git(dir, &["rev-list", "--count", "HEAD"]);
+    choose(shallow.as_deref(), count.as_deref())
 }
 
 #[cfg(test)]

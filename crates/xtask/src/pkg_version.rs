@@ -22,9 +22,8 @@
 //! This module only names the version. `pkg-config` and `pkg-asset` use it when the package
 //! carries a release; until then they keep the version of the installer binary.
 //! `tests/pkg_version.rs` holds the two orders to the algorithms of dpkg and rpm.
-#![allow(dead_code)]
 
-use crate::Error;
+use crate::{Error, build_commit};
 
 /// The part every build shares: the major and minor of the workspace version.
 pub const SERIES: &str = concat!(
@@ -36,6 +35,17 @@ pub const SERIES: &str = concat!(
 /// The most letters and digits of a ref a version holds.
 pub const WORD_MAX: usize = 24;
 
+/// The ref of `main`, as `GITHUB_REF` spells it.
+const MAIN_REF: &str = "refs/heads/main";
+
+/// What `GITHUB_REF` of a branch starts with.
+const HEADS: &str = "refs/heads/";
+
+const SEQ_ZERO: &str = "seq is 0: the checkout is shallow or has no git history, so the build \
+                        cannot be put in order (check out with fetch-depth: 0)";
+
+const RUN_ZERO: &str = "run number is 0: a CI run is numbered from 1";
+
 /// Which stream of builds a package belongs to.
 enum Channel {
     /// A build of `main`.
@@ -44,9 +54,35 @@ enum Channel {
     Other(String),
 }
 
+/// The channel of the build of `git_ref` (`GITHUB_REF`), or why it has none.
+fn channel_of(git_ref: &str) -> Result<Channel, String> {
+    if git_ref == MAIN_REF {
+        return Ok(Channel::Main);
+    }
+    if !git_ref.starts_with("refs/") {
+        return Err(format!(
+            "ref {git_ref:?} is not a full ref (GITHUB_REF: refs/heads/<branch>)"
+        ));
+    }
+    let name = git_ref.strip_prefix(HEADS).unwrap_or(git_ref);
+    let word: String = name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .take(WORD_MAX)
+        .collect();
+    if word.is_empty() {
+        return Err(format!(
+            "ref {git_ref:?} has no letter or digit to name the build by"
+        ));
+    }
+    Ok(Channel::Other(word))
+}
+
 /// The version of one build of the package.
 pub struct PackageVersion {
     seq: u64,
+    /// The first 12 hex digits of the commit.
     commit: String,
     run: u64,
     channel: Channel,
@@ -60,27 +96,52 @@ impl PackageVersion {
     /// [`Error::Refused`] with every reason the build cannot be put in order: a `seq` or `run`
     /// of 0, a `commit` that is not 12 to 40 lowercase hex digits, a ref that is not a full
     /// ref or has no letter or digit to name it by.
-    pub fn new(seq: u64, commit: &str, run: u64, _git_ref: &str) -> Result<Self, Error> {
-        Ok(PackageVersion {
-            seq,
-            commit: commit.to_owned(),
-            run,
-            channel: Channel::Main,
-        })
+    pub fn new(seq: u64, commit: &str, run: u64, git_ref: &str) -> Result<Self, Error> {
+        let mut problems = Vec::new();
+        if seq == 0 {
+            problems.push(SEQ_ZERO.to_owned());
+        }
+        if !build_commit::is_commit(commit) {
+            problems.push(format!("commit {commit:?} is not 12 to 40 hex digits"));
+        }
+        if run == 0 {
+            problems.push(RUN_ZERO.to_owned());
+        }
+        let channel = channel_of(git_ref);
+        if let Err(why) = &channel {
+            problems.push(why.clone());
+        }
+        match channel {
+            Ok(channel) if problems.is_empty() => Ok(PackageVersion {
+                seq,
+                commit: commit[..12].to_owned(),
+                run,
+                channel,
+            }),
+            _ => Err(Error::Refused(problems)),
+        }
     }
 
-    /// The version of the deb.
+    /// `0.1.<seq>`, and `~<ref>` after it for a build of a ref other than `main`.
+    fn core(&self) -> String {
+        match &self.channel {
+            Channel::Main => format!("{SERIES}.{}", self.seq),
+            Channel::Other(word) => format!("{SERIES}.{}~{word}", self.seq),
+        }
+    }
+
+    /// The version of the deb: `0.1.<seq>+g<sha12>-<run>`.
     pub fn deb(&self) -> String {
-        String::new()
+        format!("{}+g{}-{}", self.core(), self.commit, self.run)
     }
 
-    /// The Version of the rpm.
+    /// The Version of the rpm: `0.1.<seq>`.
     pub fn rpm_version(&self) -> String {
-        String::new()
+        self.core()
     }
 
-    /// The Release of the rpm.
+    /// The Release of the rpm: `<run>.g<sha12>`.
     pub fn rpm_release(&self) -> String {
-        String::new()
+        format!("{}.g{}", self.run, self.commit)
     }
 }
