@@ -193,10 +193,13 @@ export function github(t: Tools, o: Options): void {
   const ids = repoIds(t, repo); // read-only; refuses a --repo that is not the repository's exact name
   const reviewer = reviewerId(t, o.reviewer!);
   const act = (args: string[], input?: string) => {
-    const shown = input === undefined ? args : [...args, '--input', '-', `<<< ${shellQuote(input)}`];
+    // A body goes to gh's stdin, and gh reads stdin only when told to: `--input -` must be on the argv it runs with,
+    // not only on the line shown (without it gh sends no body and GitHub applies its defaults).
+    const run = input === undefined ? args : [...args, '--input', '-'];
+    const shown = input === undefined ? run : [...run, `<<< ${shellQuote(input)}`];
     if (o.apply) {
       t.log(`+ gh ${shown.join(' ')}`);
-      t.stream('gh', args, { input });
+      t.stream('gh', run, { input });
     } else t.log(`DRY-RUN: gh ${shown.join(' ')}`);
   };
   if (!o.apply) t.log('# dry run: nothing is executed. Re-run with --apply to act.');

@@ -155,6 +155,19 @@ describe('dry run', () => {
     expect(streamed[4].args.join(' ')).toContain('environments/prod-site/deployment-branch-policies -f name=v* -f type=tag');
     expect(streamed[5].args.join(' ')).toContain('oidc/customization/sub');
   });
+  // Catches: a body piped to gh's stdin without `--input -` on its argv. gh then never reads stdin and sends the
+  // request with no body, so the PUT of an environment creates it with GitHub's defaults (admins may bypass, no
+  // reviewer, no branch policy) and the branch-policy POSTs after it fail with 404. The dry-run line showed
+  // `--input -`, so only the argv the command is really run with proves it. Mutant seen red: `--input -` left
+  // out of what act() streams (the code as it was when the first real --apply failed).
+  test('every gh call that is given a body also reads it: --input - is on the argv it runs with', () => {
+    const f = fake(answers(NOTHING));
+    main([...GH, '--apply'], f.t);
+    const withBody = f.calls.filter((c) => c.kind === 'stream' && c.input !== undefined);
+    expect(withBody.length).toBe(2); // the two environment PUTs
+    for (const c of withBody) expect(c.args.slice(-2)).toEqual(['--input', '-']);
+    for (const c of f.calls.filter((x) => x.kind === 'stream' && x.input === undefined)) expect(c.args).not.toContain('--input');
+  });
   test('github --apply is idempotent: with everything present only the (idempotent) sub template is written', () => {
     const f = fake(answers());
     main([...GH, '--apply'], f.t);
