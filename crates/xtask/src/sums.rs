@@ -12,9 +12,11 @@
 //!   job summary).
 //! - `verify-assets sums <dir>` ([`verify_sums`]): `<dir>/SHA256SUMS` lists every other
 //!   file in `<dir>` (but the provenance bundles, which are made after the sums and so
-//!   cannot be listed: [`crate::bundles`]), each once, and each matches its line.
-//!   Control: a copy of the first tarball with its last byte flipped must not match
-//!   that line, so a check that accepts anything fails instead of passing.
+//!   cannot be listed: [`crate::bundles`]), each once, and each matches its line, and
+//!   every listed `kbf` tarball has its version facts listed too
+//!   ([`version_facts::facts_of`]). Control: a copy of the first tarball with its last byte
+//!   flipped must not match that line, so a check that accepts anything fails instead of
+//!   passing.
 //! - `verify-assets attestations <dir> --repo <owner/repo> --workflow-ref <ref> --commit
 //!   <sha> [--source-ref refs/heads/<branch>] [--trusted-root <file>] [--gh <program>]`
 //!   ([`verify_attestations`]): every listed tarball and SBOM has build provenance
@@ -24,7 +26,8 @@
 //!   the same workflow: the `gh attestation verify` commands docs/artifacts.md gives.
 //!   A `.deb` or `.pkg` (the `kbf-installer` package, [`crate::pkg_asset`], [`crate::pkg_macos_asset`]) is listed and verified
 //!   like a tarball except that it has no SBOM attestation: build provenance and its own
-//!   bundle.
+//!   bundle. The version facts of a `kbf` ([`crate::version_facts`]) are verified like an
+//!   SBOM: build provenance, and nothing else.
 //!   First, before `gh` is run, `<dir>` holds exactly one bundle per listed tarball and
 //!   no other, each the bundle of that tarball ([`bundles::pairing`]). Every tarball
 //!   also verifies against its own bundle, as a host's installer does it (`--bundle`,
@@ -50,6 +53,7 @@ use crate::build_commit::full_commit;
 use crate::bundles;
 use crate::fetch::Sha256;
 use crate::package::{Platform, read, write_new};
+use crate::version_facts;
 
 /// The file name of the merged sums file.
 pub const SUMS: &str = "SHA256SUMS";
@@ -255,6 +259,19 @@ pub fn verify_sums(dir: &Path, digest: fn(&[u8]) -> Sha256) -> Result<String, Er
     for name in &present {
         if !lines.iter().any(|l| &l.name == name) {
             problems.push(format!("not listed in {SUMS}: {name}"));
+        }
+    }
+    // The facts a `kbf` states of itself are part of its release: the tarball of `kbf`
+    // does not go without them.
+    for l in &lines {
+        let Some(facts) = version_facts::facts_of(&l.name) else {
+            continue;
+        };
+        if !lines.iter().any(|m| m.name == facts) {
+            problems.push(format!(
+                "{}: its version facts {facts} are not listed in {SUMS}",
+                l.name
+            ));
         }
     }
     if !problems.is_empty() {
@@ -533,12 +550,13 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
             a.require(&file, workflow, None)?;
             a.require_bundle(dir, &l.name, workflow)?;
             printed.push(format!("verified: {} (provenance, bundle)", l.name));
-        } else if l.name.ends_with(".cdx.json") {
+        } else if l.name.ends_with(".cdx.json") || l.name.ends_with(version_facts::SUFFIX) {
+            // An SBOM and the version facts of a `kbf` have build provenance only.
             a.require(&file, workflow, None)?;
             printed.push(format!("verified: {} (provenance)", l.name));
         } else {
             return Err(Error::Failed(format!(
-                "{SUMS} lists {}, neither a tarball, a package nor an SBOM",
+                "{SUMS} lists {}, neither a tarball, a package, an SBOM nor version facts",
                 l.name
             )));
         }

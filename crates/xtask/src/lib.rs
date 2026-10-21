@@ -56,6 +56,12 @@
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
+//! - `release version-facts --binary <kbf> --commit <sha> --platform <p> --out <dir>`
+//!   ([`version_facts`]): the `kbf` just built, run with `--version --json`, and what it
+//!   printed kept unchanged as the release asset `kbf-<commit>-<platform>.version.json`
+//!   with its line in `SHA256SUMS.<platform>`. The release set holds it for every `kbf`
+//!   tarball (`verify-assets sums`, `release check`), because only a runner of a platform
+//!   can run its binary.
 //! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
 //!   unit.

@@ -97,6 +97,29 @@ sums assemble`), and checks every file against it (`cargo xtask verify-assets su
 every file listed once, each matching, and a copy of the first tarball with one byte
 flipped not matching).
 
+The `kbf` tarball of each platform has a third file beside it, `kbf-<commit>-<platform>.version.json`:
+the exact bytes `kbf --version --json` printed when the job that built the `kbf` ran it
+(below). A node's offer and the age check of a release need what the `kbf` of each platform
+says of itself (`meta_log`, the protocols, `seq`), nothing on the frontend records it, and
+only a runner of the platform can run its binary: a Linux runner cannot run the macOS
+`kbf`. Each build job therefore runs `cargo xtask release version-facts --binary
+target/<target>/release/kbf --commit "$GITHUB_SHA" --platform <platform> --out dist` after
+the `kbf` is built (on macOS, signed) and its identity is checked, and before it is
+packaged. The verb runs `kbf --version --json` as the installer runs a staged binary: by
+absolute path, with an empty environment (the runner's tokens are not passed to it), no
+standard input and a limit of 10 seconds, and reads what it printed with the installer's
+own strict reader (`kbf_installer::binary::Version`: at most 4096 bytes and exactly the
+fields below). It refuses, and writes nothing, unless the binary exited 0 and says it is
+the `release` build of `$GITHUB_SHA`; the file is those bytes unchanged, never a document
+read and written again. The file is listed in the job's `SHA256SUMS.<platform>` like a
+tarball, so the one `SHA256SUMS`, the build provenance, the verification and the release
+carry it. It has no SBOM and no bundle of its own. The set is closed over it:
+`verify-assets sums` (so `release check`, `release publish` and `release offer`) refuses a
+listed `kbf` tarball whose `kbf-<commit>-<platform>.version.json` is not listed, and
+`release check` takes that name and no other `.version.json`. The workflow lint
+(`crates/kbf-integration-test/tests/release_artifacts`) names a build job that does not run
+the verb once, for its own platform, between the identity check of `kbf` and its package.
+
 `kbf-server`, `kbf` and `kbf-installer` embed the first 12 characters of the commit they
 were built from (`kbf` through the server library it links), and `--version` prints
 `<binary> <package version>+<commit>` (so do the server's start line and the `server`
@@ -435,7 +458,8 @@ themselves do not expire with the artifacts.
 A release is the files a push run of `artifacts.yml` on `main` left for one commit,
 attached unchanged to a GitHub release
 ([`.github/workflows/release.yml`](../.github/workflows/release.yml)). Nothing is
-rebuilt. Its assets are every tarball and SBOM in the table above, for that commit, their
+rebuilt. Its assets are every tarball and SBOM in the table above, for that commit, the
+`kbf-<commit>-<platform>.version.json` of each platform, their
 `SHA256SUMS`, and the provenance bundle of each tarball, `<tarball>.sigstore.json`, beside
 it.
 
@@ -456,7 +480,8 @@ nothing is published) when:
   the bundles; they expire after 90 days, so a release is cut within 90 days of the
   commit);
 - a file does not match `SHA256SUMS` (`sha256sum --check --strict`), a file is not
-  listed in it, or a listed file is not `<binary>-<commit>-<platform>`;
+  listed in it, a `kbf` tarball's `kbf-<commit>-<platform>.version.json` is not listed,
+  or a listed file is not `<binary>-<commit>-<platform>` (or that version file);
 - a tarball has no bundle, or a bundle file belongs to no listed tarball, is not exactly
   one bundle of at most 256 KiB, or does not have its tarball's digest as its one subject
   (`cargo xtask release check`);

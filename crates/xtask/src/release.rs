@@ -14,8 +14,10 @@
 //!   with the base commit and the pull request's merge commit, so a check that accepts
 //!   every commit (or none) fails there instead of at a release.
 //! - `release check <dir> --commit <sha>` ([`check`]): `<dir>` passes `verify-assets
-//!   sums`, every file `SHA256SUMS` lists is `<binary>-<sha>-<platform>.tar.gz` or
-//!   `.cdx.json`: the assets of that commit and no other, and each tarball has exactly
+//!   sums` (so each `kbf` tarball has its version facts listed), every file `SHA256SUMS`
+//!   lists is `<binary>-<sha>-<platform>.tar.gz` or `.cdx.json`, or `kbf`'s
+//!   `kbf-<sha>-<platform>.version.json` ([`crate::version_facts`]): the assets of that
+//!   commit and no other, and each tarball has exactly
 //!   one provenance bundle, `<tarball>.sigstore.json`, whose one subject is that
 //!   tarball's digest ([`bundles`]), and no bundle is there for anything else.
 //! - `release verdict <dir> --repo-dir <checkout> --tag <tag> --commit <sha> [--main-ref
@@ -86,6 +88,7 @@ use crate::bundles;
 use crate::fetch::Sha256;
 use crate::package::{Platform, read};
 use crate::sums::{self, SUMS};
+use crate::version_facts;
 
 /// The branch a released commit must be on.
 pub const MAIN: &str = "main";
@@ -240,8 +243,11 @@ pub fn main_control(gh: &Path, repo: &str, on: &str, off: &str) -> Result<String
 /// Whether `name` is an asset of `commit`: `<binary>-<commit>-<platform>` and
 /// `.tar.gz`, `.cdx.json`, `.deb` or `.pkg` (the packages; nfpm's own `kbf-installer_<version>_
 /// <arch>.deb` and `pkg build`'s `kbf-installer-<version>-macos-arm64.pkg` name no commit and are
-/// not one).
+/// not one), or the version facts of `kbf` for a platform ([`version_facts::is_facts_of`]).
 fn is_asset_of(name: &str, commit: &str) -> bool {
+    if version_facts::is_facts_of(name, commit) {
+        return true;
+    }
     let stem = name
         .strip_suffix(".tar.gz")
         .or_else(|| name.strip_suffix(".cdx.json"))
