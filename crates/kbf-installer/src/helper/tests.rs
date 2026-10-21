@@ -1891,6 +1891,7 @@ fn the_same_activation_again_while_on_trial_is_a_repeat() {
     assert_eq!(rig.left(), 0);
 }
 
+mod components_tests;
 mod frontend_tests;
 mod pipeline_fetcher_tests;
 mod staged_tests;

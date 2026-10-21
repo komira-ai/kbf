@@ -419,25 +419,19 @@ async fn offers_follow_the_desired_release_and_a_platforms_completeness() {
 
     // The Mac's platform of A: a tarball first, then its attestation.
     front
-        .put(
-            A,
-            "darwin-arm64",
-            "kbf-daemon",
-            &tarball(A, "kbf-daemon"),
-            false,
-        )
+        .put(A, "darwin-arm64", "kbf", &tarball(A, "kbf"), false)
         .await;
     assert!(
         offer_within(&mut mac, QUIET).await.is_none(),
         "not attested yet"
     );
-    front.attest(A, "darwin-arm64", "kbf-daemon").await;
+    front.attest(A, "darwin-arm64", "kbf").await;
     let offered = offer(&mut mac).await;
     assert_eq!(
         (offered.generation, offered.platform.as_str()),
         (3, "darwin-arm64")
     );
-    assert_eq!(offered.components[0].name, "kbf-daemon");
+    assert_eq!(offered.components[0].name, "kbf");
     assert!(
         offer_within(&mut one, QUIET).await.is_none(),
         "Linux is told nothing of it"
