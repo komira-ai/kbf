@@ -172,7 +172,14 @@ fn a_tolerant_version_object_still_refuses_a_repeated_or_missing_field() {
     let err = Version::parse(twice.as_bytes()).expect_err("commit twice");
     assert_eq!(err.code(), "version-unreadable");
     assert!(err.to_string().contains("duplicate field"), "{err}");
-    for required in ["commit", "min_protocol", "profile", "protocol", "state_schema", "version"] {
+    for required in [
+        "commit",
+        "min_protocol",
+        "profile",
+        "protocol",
+        "state_schema",
+        "version",
+    ] {
         let mut object: serde_json::Value = serde_json::from_str(&shape).expect("fixture is JSON");
         object["future"] = serde_json::Value::Bool(true);
         object.as_object_mut().expect("an object").remove(required);
