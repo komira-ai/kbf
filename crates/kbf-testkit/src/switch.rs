@@ -27,7 +27,8 @@ impl Switch {
             tokio::spawn(async move {
                 loop {
                     // A loopback listener's accept fails only when the process is out of
-                    // descriptors, which ends the test that hit it.
+                    // descriptors. The panic ends only this accept task: a later connect is then
+                    // refused or hangs, so the test that hit it fails there.
                     let (mut inbound, _) = listener.accept().await.expect("accept");
                     if !up.load(Ordering::SeqCst) {
                         continue;
@@ -118,8 +119,10 @@ mod tests {
     }
 
     /// A server that is not there: the switch accepts, cannot reach it and drops the
-    /// connection, so nothing comes back. Catches a forwarder that panics or hangs the
-    /// caller when its target is down.
+    /// connection, so nothing comes back. Catches a forwarder that hangs the caller when its
+    /// target is down (for example one that keeps the inbound stream open). A forwarder
+    /// that panics is not caught: the panic unwinds the task and drops the inbound stream,
+    /// so the client still sees the connection close.
     #[tokio::test]
     async fn a_dead_target_drops_the_connection() {
         let dead = {

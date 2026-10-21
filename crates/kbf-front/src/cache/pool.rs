@@ -106,7 +106,8 @@ impl PoolConfig {
 }
 
 /// A test's callback at the pool's drain step ([`Cache::with_drain_hook`]): given the
-/// digests of a batch whose `PutStaged` is applied, before the batch is answered.
+/// digests of a batch whose `PutStaged` is applied, before the batch is answered. It runs
+/// only on the batched pool path, not on the single-blob `put_staged` path.
 #[cfg(feature = "testkit")]
 pub type DrainHook = Arc<dyn Fn(&[Digest]) + Send + Sync>;
 
