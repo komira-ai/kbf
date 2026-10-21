@@ -12,7 +12,8 @@
 //! - its `commit` is the commit being deployed, and it is neither older than the allowed
 //!   age nor dated in the future beyond clock skew (`created`);
 //! - the bundle carries the release set's `SHA256SUMS`, whose hash is the offer's
-//!   `set_hash`, and every tarball in the bundle is the file that sums name;
+//!   `set_hash`, and every tarball, and every platform's version facts, in the bundle is the
+//!   file that sums name;
 //! - the `kbf` of the host's own platform in the bundle is attested (offline, by the
 //!   installer's pinned `gh` and trust root, the flags the stage uses), and then, run as
 //!   the unprivileged user, names the offer's `meta_log` in `--version --json` (a mismatch refuses, and so does
@@ -47,7 +48,7 @@ use std::time::Duration;
 use kbf_gate::{DocError, OfferDoc, SetHash, Target, reversible};
 use sha2::{Digest, Sha256};
 
-use super::bundle::{Bundle, Entry};
+use super::bundle::{Bundle, Entry, FACTS};
 use super::summary::OfferRecord;
 use super::{smoke, why};
 use crate::CommitId;
@@ -239,8 +240,12 @@ pub(super) fn check_header(
     Ok(())
 }
 
-/// The file name a tarball has in the release (and in `SHA256SUMS`).
+/// The file name a bundle entry has in the release (and in `SHA256SUMS`): a tarball's, or, for
+/// a platform's version facts, `kbf-<commit>-<platform>.version.json`.
 fn asset_name(entry: &Entry, commit: &CommitId) -> String {
+    if entry.name == FACTS {
+        return format!("kbf-{commit}-{}.version.json", entry.platform);
+    }
     format!("{}-{commit}-{}.tar.gz", entry.name, entry.platform)
 }
 
@@ -278,8 +283,9 @@ pub(super) fn parse_sums(sums: &[u8]) -> Result<BTreeMap<String, String>, String
     Ok(out)
 }
 
-/// The checks that need the bundle: its `SHA256SUMS` is the offer's set, each tarball is
-/// the file the sums name, and the host's `kbf` names the offer's `meta_log`.
+/// The checks that need the bundle: its `SHA256SUMS` is the offer's set, each tarball and each
+/// version facts file is the file the sums name, and the host's `kbf` names the offer's
+/// `meta_log`.
 pub(super) fn check_bundle(
     doc: &OfferDoc,
     bundle: &Bundle,
