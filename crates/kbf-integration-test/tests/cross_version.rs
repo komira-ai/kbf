@@ -7,12 +7,11 @@
 //! directory's `facts.json` is what its fake `kbf --version --json` prints, and the fake
 //! server accepts the range that file states, as a build does. The fake server is a real
 //! gRPC `Worker` over mutual TLS and a small HTTP answer for `GET /v1/nodes`; the fake
-//! daemon only logs `welcomed`. Each fake appends its call to `<dir>/calls` and plants
+//! daemon only logs `welcomed` (or the defect's log line) and runs on. Each fake appends its call to `<dir>/calls` and plants
 //! the defect `KBF_XV_FAKE_DEFECT` names, if it is one of its own.
 //!
 //! The real builds are checked by the `cross-version` job of beta.yml (the whole pair of an
-//! earlier release and the tip, both ways); `the_tip_runs_against_itself` below is the
-//! same run by hand.
+//! earlier release and the tip, both ways).
 
 #![cfg(target_os = "linux")]
 
@@ -212,6 +211,11 @@ mod fake {
                 "server-no-api" => (worker.to_string(), String::new()),
                 _ => (worker.to_string(), format!(" api={api_address}")),
             };
+            if defect() == "server-ignores" {
+                eprintln!(
+                    "\x1b[33m WARN\x1b[0m kbf_server::worker: an empty daemon message ignored"
+                );
+            }
             println!("kbf-server 0.0.0+fake reapi=127.0.0.1:0 worker={reported}{api_word}");
             std::io::stdout().flush().expect("flush");
             tokio::spawn(answer_nodes(api, nodes_body()));
@@ -341,7 +345,33 @@ mod fake {
             eprintln!("the fake kbf-daemon was given {args:?}");
             return 3;
         }
+        if defect() == "daemon-refused" {
+            // As the real daemon logs a Welcome it cannot take: its own range, not the facts'.
+            eprintln!(
+                "\x1b[33m WARN\x1b[0m kbf_daemon: session ended server={server} \
+                 reason=protocol: server speaks protocol version 1, this daemon 2 to 2"
+            );
+            return 5;
+        }
         eprintln!("\x1b[32m INFO\x1b[0m kbf_daemon: welcomed server={server}");
+        match defect().as_str() {
+            "daemon-gap" => {
+                eprintln!("\x1b[33m WARN\x1b[0m kbf_daemon: heartbeat gap: no acknowledgement");
+            }
+            "daemon-session-ends" => {
+                eprintln!(
+                    "\x1b[33m WARN\x1b[0m kbf_daemon: session ended server={server} reason=x"
+                );
+            }
+            "daemon-ignores" => {
+                eprintln!("\x1b[33m WARN\x1b[0m kbf_daemon: an empty server message ignored");
+            }
+            "daemon-dies" => {
+                std::thread::sleep(Duration::from_millis(300));
+                return 6;
+            }
+            _ => {}
+        }
         hang()
     }
 }
@@ -494,6 +524,13 @@ impl Cell {
     /// The daemon's build speaks protocols from `min` (its `kbf`'s `min_protocol`).
     fn daemon_min(self, min: u32, protocol: u32) -> Self {
         let text = facts(DAEMON_COMMIT, min, protocol);
+        std::fs::write(self.daemon_dir.join("facts.json"), text).expect("facts.json");
+        self
+    }
+
+    /// The daemon's build states `min..=protocol` and state schema `schema`.
+    fn daemon_numbers(self, min: u32, protocol: u32, schema: u32) -> Self {
+        let text = facts_with_schema(DAEMON_COMMIT, min, protocol, schema);
         std::fs::write(self.daemon_dir.join("facts.json"), text).expect("facts.json");
         self
     }
@@ -1037,34 +1074,114 @@ fn a_wait_of_zero_is_refused() {
     assert!(run.calls.is_empty(), "{:?}", run.calls);
 }
 
-/// The self-test on the real tip, by hand: `kbf-cell cross-version` with the directory of
-/// the built `kbf`, `kbf-server` and `kbf-daemon` as both. Build them first (`cargo build
-/// -p kbf-server -p kbf-node -p kbf-cli -p kbf-integration-test --bins`). The `cross-version` job
-/// of beta.yml runs the tip against release N instead; this is the run that needs no second
-/// build, and shows the harness works on the tip before a push.
+/// The installer-first rule for the daemon's build, the direction the server's numbers do
+/// not reach: the server is at the installer's level, and the daemon (a rolling upgrade's
+/// newer daemon against an older frontend, the old installer still on the host) declares
+/// one number past it. Each of the three numbers alone must fail the run, naming
+/// `kbf-daemon` and not `kbf-server`, before anything starts. Catches a loop over the
+/// builds that leaves the daemon's out.
 #[test]
-#[ignore = "needs the built kbf, kbf-server and kbf-daemon beside kbf-cell"]
-fn the_tip_runs_against_itself() {
-    let bin = std::path::Path::new(BIN)
-        .parent()
-        .expect("the binaries' directory");
-    let out = Command::new(BIN)
-        .arg("cross-version")
-        .arg("--server-dir")
-        .arg(bin)
-        .arg("--daemon-dir")
-        .arg(bin)
-        .arg("--installer-dir")
-        .arg(bin)
-        .arg("--work")
-        .arg(scratch("tip"))
-        .output()
-        .expect("start kbf-cell");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+fn an_installer_older_than_the_daemon_it_stages_fails_before_anything_starts() {
+    // (name, server, daemon (min, protocol, schema), installer, the number named)
+    for (name, daemon, installer, number) in [
+        ("protocol", (1, 2, 3), (1, 1, 3), "protocol 2"),
+        ("min", (2, 2, 3), (1, 2, 3), "min_protocol 2"),
+        ("schema", (1, 1, 4), (1, 1, 3), "state_schema 4"),
+    ] {
+        // The server is the installer's level in the first and third; in the second the
+        // daemon's min_protocol 2 needs a server that speaks 2, so the installer does too.
+        let server = (installer.0, installer.1, installer.2);
+        let cell = Cell::new_with_schema(name, server, 1)
+            .daemon_numbers(daemon.0, daemon.1, daemon.2)
+            .installer(installer.0, installer.1, installer.2);
+        let run = cell.run();
+        fails(
+            &run,
+            1,
+            &[
+                number,
+                "the installer of build aaaaaaaaaaaa cannot stage the kbf-daemon of build fedcba987654",
+                "update the installer before the kbf",
+            ],
+        );
+        assert!(
+            !run.text.contains("kbf-server of build"),
+            "{name}: {}",
+            run.text
+        );
+        assert_eq!(run.started(), ["kbf", "kbf", "kbf"], "{name}: {}", run.text);
+    }
+}
+
+/// The session after `Welcome`: a daemon that is welcomed and then logs what a daemon
+/// logs when its heartbeats are not acknowledged, when its session ends, or when a message
+/// of the server's does not parse, or a server that logs the same of the daemon's, fails
+/// the run naming the log; a daemon that is welcomed and then exits fails it too. Catches
+/// a run that stops at `welcomed` (a heartbeat or acknowledgement whose shape changed
+/// without a version bump passes the handshake and shows only here).
+#[test]
+fn a_session_that_does_not_carry_heartbeats_fails_the_run() {
+    for (defect, needle) in [
+        ("daemon-gap", "heartbeat gap"),
+        ("daemon-session-ends", "session ended"),
+        ("daemon-ignores", "empty server message"),
+        ("server-ignores", "empty daemon message"),
+        ("daemon-dies", "exited"),
+    ] {
+        let run = Cell::new(defect, (1, 1), 1, defect).run();
+        fails(&run, 1, &[needle]);
+        assert!(
+            !run.text.contains("heartbeats of 250 ms, all acknowledged"),
+            "{defect}: {}",
+            run.text
+        );
+        assert!(
+            !run.text.contains("lists cell-node-1"),
+            "{defect}: {}",
+            run.text
+        );
+    }
+}
+
+/// The server is asked for a heartbeat every 250 ms, and the session is held for eight of
+/// them before the node is listed. Catches the default 5 s interval (the hold would then
+/// see no beat) and a hold that is skipped (the run would take under the eight intervals).
+#[test]
+fn a_passing_run_holds_the_session_for_eight_heartbeats() {
+    let run = Cell::new("held", (1, 1), 1, "").run();
+    assert!(run.ok(), "{}", run.text);
+    assert!(
+        run.text
+            .contains("OK: the session carried 8 heartbeats of 250 ms, all acknowledged"),
+        "{}",
+        run.text
     );
-    println!("{text}");
-    assert!(out.status.success(), "{text}");
+    let server = run
+        .ran()
+        .into_iter()
+        .find(|c| c.starts_with("kbf-server\t"));
+    let server = server.expect("the server ran");
+    assert!(server.contains("--heartbeat-interval-ms 250"), "{server}");
+    assert!(
+        run.elapsed >= Duration::from_millis(2000),
+        "{:?}",
+        run.elapsed
+    );
+}
+
+/// A daemon that refuses the server's Welcome says why in its log, and the facts (the
+/// server's constants, since `kbf --version --json` cannot know the daemon's own) call the
+/// pair compatible. The failure must carry the daemon's `reason=` instead of only "did not
+/// log welcomed". Catches an error that drops the log.
+#[test]
+fn a_daemon_that_refuses_the_welcome_has_its_reason_in_the_failure() {
+    let run = Cell::new("refused", (1, 1), 1, "daemon-refused").run();
+    fails(
+        &run,
+        1,
+        &[
+            "kbf-daemon exited",
+            "the daemon's log: protocol: server speaks protocol version 1, this daemon 2 to 2",
+        ],
+    );
 }

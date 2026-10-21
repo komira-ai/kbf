@@ -53,7 +53,13 @@
 //!    is protocol 0, which the wire reads as "not named" and any server refuses: that
 //!    edge is then not exercised, and the run says so;
 //! 4. `kbf-daemon --driver fake` is started with the cell's certificates and logs
-//!    `welcomed`, before it exits, within `--wait`;
+//!    `welcomed`, before it exits, within `--wait`. If it does not, the failure carries the
+//!    `reason=` of the daemon's own log (the numbers in the facts are the server's);
+//!    then the session is held for eight heartbeat intervals (`--heartbeat-interval-ms
+//!    250` on the server) with the daemon running, and neither log may say a heartbeat
+//!    went unacknowledged, the session ended, or a message did not parse. That is the
+//!    worker protocol past `Welcome` as far as the heartbeat and its acknowledgement; no
+//!    work is offered, so `Start` and `Result` are not exercised;
 //! 5. `GET /v1/nodes` lists the daemon's node connected and, when the entry carries a
 //!    `protocol`, that is the daemon's. A server that lists none (one that predates the
 //!    field) is noted, not failed.
@@ -88,6 +94,20 @@ const NODE_ID: &str = "cell-node-1";
 const LOOPBACK: &str = "127.0.0.1:0";
 /// How many lines of each log a failed run prints.
 const TAIL: usize = 60;
+/// The heartbeat interval, in milliseconds, the server asks daemons for (`--heartbeat-interval-ms`;
+/// the default is 5 s).
+const HEARTBEAT_MS: u64 = 250;
+/// How many heartbeat intervals the session is held for after the daemon is welcomed.
+const BEATS_HELD: u32 = 8;
+/// What the daemon or the server logs when the session is not carrying the heartbeats: the daemon
+/// when none is acknowledged for two intervals, or when its session ends; either side when a
+/// message of the other's does not parse as one it knows (a shape change without a version bump).
+const BROKEN_SESSION: [&str; 4] = [
+    "heartbeat gap",
+    "session ended",
+    "empty daemon message",
+    "empty server message",
+];
 
 /// `kbf-cell cross-version` flags.
 #[derive(Clone, Debug, clap::Args)]
@@ -315,6 +335,14 @@ fn refusal_problem(answer: &Answer, version: u32) -> Option<String> {
     }
 }
 
+/// The reason a daemon's log gives for ending a session: the text from the last
+/// `reason=` on, with what it says after (`protocol: server speaks ...`).
+fn refusal(log: &str) -> Option<String> {
+    let line = plain(log);
+    let said = line.lines().rev().find_map(|l| l.split_once("reason="));
+    said.map(|(_, reason)| reason.trim().to_owned())
+}
+
 /// `error` and its sources, `: `-joined (tonic's transport errors say only "transport
 /// error" by themselves).
 fn causes(error: &dyn std::error::Error) -> String {
@@ -471,7 +499,8 @@ impl Cell {
         let pki = pki.or_broken(&"the certificates")?;
         let (_server, addresses) = self.start_server(&pki)?;
         self.probe(&server, &daemon, &pki, &addresses.worker)?;
-        let _daemon = self.start_daemon(&pki, &addresses.worker)?;
+        let mut daemon_process = self.start_daemon(&pki, &addresses.worker)?;
+        self.hold_session(&mut daemon_process)?;
         self.node_listed(&addresses.api, daemon.protocol.min(server.protocol))
     }
 
@@ -564,6 +593,7 @@ impl Cell {
             .args(["--listen", LOOPBACK])
             .args(["--worker-listen", LOOPBACK])
             .args(["--api-listen", LOOPBACK])
+            .args(["--heartbeat-interval-ms", &HEARTBEAT_MS.to_string()])
             .arg("--cold-store")
             .arg(format!(
                 "file://{}",
@@ -672,9 +702,52 @@ impl Cell {
             .stderr(self.log_file("daemon.err")?);
         let mut process = Process::spawn(daemon, "kbf-daemon")?;
         let err = self.logs.join("daemon.err");
-        self.await_line(&mut process, &err, "welcomed", "kbf-daemon")?;
+        if let Err(error) = self.await_line(&mut process, &err, "welcomed", "kbf-daemon") {
+            // The daemon says why it refused a Welcome (`reason=` of its log), which the
+            // facts, being the server's constants, cannot.
+            let reason = refusal(&read(&err).unwrap_or_default());
+            return Err(match (error, reason) {
+                (CellError::Failed(what), Some(reason)) => {
+                    CellError::Failed(format!("{what}; the daemon's log: {reason}"))
+                }
+                (error, _) => error,
+            });
+        }
         println!("OK: kbf-daemon was welcomed by kbf-server");
         Ok(process)
+    }
+
+    /// Step 4b: the welcomed session carries heartbeats. The server asks for one every
+    /// `HEARTBEAT_MS`; the session is held for `BEATS_HELD` of them, and the daemon must
+    /// stay up and neither log a gap in the acknowledgements nor that it ended the
+    /// session; neither log may say a message of the other did not parse. This is the
+    /// worker protocol past `Hello` and `Welcome` to its second kind of message and its
+    /// acknowledgement; no work is offered, so `Start`, `Result` and the rest are not.
+    fn hold_session(&self, daemon: &mut Process) -> Result<(), CellError> {
+        let held = Duration::from_millis(HEARTBEAT_MS) * BEATS_HELD;
+        let until = Instant::now() + held;
+        while Instant::now() < until {
+            let exited = daemon.wait_within(Duration::ZERO)?;
+            let status = exited.map_or_else(String::new, |s| s.to_string());
+            let why = format!("kbf-daemon exited ({status}) while its session was held");
+            ensure(exited.is_none(), why)?;
+            std::thread::sleep(POLL);
+        }
+        for log in ["daemon.err", "server.err"] {
+            let text = plain(&read(&self.logs.join(log))?);
+            let broken = text
+                .lines()
+                .find(|l| BROKEN_SESSION.iter().any(|b| l.contains(b)));
+            let why = format!(
+                "the session did not carry {BEATS_HELD} heartbeats of {HEARTBEAT_MS} ms: {log} says {:?}",
+                broken.unwrap_or_default()
+            );
+            ensure(broken.is_none(), why)?;
+        }
+        println!(
+            "OK: the session carried {BEATS_HELD} heartbeats of {HEARTBEAT_MS} ms, all acknowledged"
+        );
+        Ok(())
     }
 
     /// Step 5: the operator API at `api` lists the daemon's node.
