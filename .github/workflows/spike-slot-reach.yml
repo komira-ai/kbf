@@ -1,17 +1,10 @@
-# What a pool action reaches of another slot (T026 M0): two pool users, two leases under the
-# driver's slot profile and a control with no sandbox, each cross-slot attempt recorded as a
-# `REACH` row (crates/kbf-driver-native/tests/slot_reach.rs). It asserts nothing about the
-# profile, only that the harness ran; the table in the log is the measurement the profile
-# change (M1) is decided on. The same test runs in beta.yml's native-macos job after a push
-# to main; this workflow runs it by hand on a branch first, so a probe change is measured
-# before it merges. A pull request does not run it (a pull request runs the fast gate of
-# ci.yml only; the macOS pool is small).
-#
-# The second job, `pool-spike`, is M0 of the Mac legs of the isolation suites (T018,
-# crates/kbf-daemon-test/tests/mac_pool_spike): the real daemon with a pool of two users as
-# root behind a fake front, and what the runner does for them (`launchctl asuser`, the
-# `user/<uid>` domain without a login, `security`, `pbcopy`, the lease directory), each fact a
-# `SPIKE` line. Also in beta.yml's native-macos job; here it runs by hand on a branch first.
+# Clean-state spike (branch spike/mac-pool-clean-state only; this file is not for main).
+# What a pool user can leave behind, what the clean removes, what proves it gone: the
+# plants and probes of crates/kbf-driver-native/tests/clean_state_spike, one job per slice
+# of the rows so the slices run on separate hosted Macs. It prints CELL / ASSERT / CLEAN /
+# WIPE / SNAPDIFF / BUILD* lines and asserts only that the harness ran and left no user
+# behind. By hand only (workflow_dispatch); dispatch once per push, because
+# `cancel-in-progress` ends a run when a second one starts on the branch.
 name: spike-slot-reach
 
 on:
@@ -24,9 +17,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  slot-reach:
+  cs-channels-1:
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
@@ -36,12 +29,12 @@ jobs:
       - run: sw_vers
       - run: uname -m
       - run: rustup toolchain install
-      - name: Cross-slot reach of a pool action, sandboxed and not (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test slot_reach -- --test-threads=1 --nocapture
+      - name: channels_1 (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture channels_1
 
-  pool-spike:
+  cs-channels-2:
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
@@ -51,25 +44,12 @@ jobs:
       - run: sw_vers
       - run: uname -m
       - run: rustup toolchain install
-      # The daemon the test starts is found beside the test binary.
-      - run: cargo build -p kbf-cli --bin kbf --locked
-      - name: What the runner does for a root daemon with a pool of two users (root, real users)
-        run: cargo xtask sudo-test -p kbf-daemon-test --test mac_pool_spike -- --test-threads=1 --nocapture
+      - name: channels_2 (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture channels_2
 
-  # How a Mac behaves with a pool of 100 and of 1000 users (a measurement spike for the pool
-  # and reset design): as root on a hosted Mac, make the users `kbf-scale-<i>` in the uid
-  # block 61000 to 62023, time their creation, the first `getpwnam` that sees each, the
-  # pool's per-user check and opendirectoryd lookups before and after, time one full reset
-  # (`Slot::release`) for a sample of 20, and remove every user, home and /var/folders entry
-  # made, whatever the result (crates/kbf-driver-native/tests/pool_scale_spike). The log
-  # carries `MEASURE` lines and a closing `SUMMARY`; the test asserts only that the harness
-  # ran and left nothing behind. It makes up to 1000 real users and takes most of an hour,
-  # so it has a limit of its own. This workflow's `cancel-in-progress: true` would cancel a
-  # run in its clean-up when a second dispatch starts on the branch; do not dispatch it
-  # twice.
-  pool-scale:
+  cs-channels-3:
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
@@ -79,18 +59,18 @@ jobs:
       - run: sw_vers
       - run: uname -m
       - run: rustup toolchain install
-      - name: Pool of 100 then 1000 hidden users, and one full reset for 20 (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test pool_scale_spike -- --test-threads=1 --nocapture
+      - name: Remote Login for the sshd row (printed; the row says what happened)
+        run: |
+          sudo systemsetup -getremotelogin || true
+          sudo systemsetup -setremotelogin on || true
+          sudo launchctl enable system/com.openssh.sshd || true
+          sudo systemsetup -getremotelogin || true
+      - name: channels_3 (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture channels_3
 
-  # M2 of the Mac legs (crates/kbf-driver-native/tests/slot_clean.rs): the freshness
-  # scenario of the slot clean, and the mutant tests that run it with one step of the
-  # clean skipped and print which rows turn red. By hand on a branch, so what the mutants
-  # show on a Mac (the bootout's and the image detach's rows are printed, not asserted) is
-  # measured before the branch merges. The same command as the native-macos job of
-  # beta.yml runs after a push to main.
-  slot-clean-mutants:
+  cs-channels-4:
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
@@ -100,5 +80,65 @@ jobs:
       - run: sw_vers
       - run: uname -m
       - run: rustup toolchain install
-      - name: The slot clean and its mutants, on real users (root)
-        run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture
+      - name: channels_4 (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture channels_4
+
+  cs-wipe-1:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: wipe_1 (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture wipe_1
+
+  cs-wipe-2:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: wipe_2 (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture wipe_2
+
+  cs-wipe-3:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: wipe_3 (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture wipe_3
+
+  cs-baseline:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: baseline_and_builds (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture baseline_and_builds
