@@ -51,7 +51,7 @@ pub enum Verb {
         #[arg(long, default_value = "/", value_parser = absolute)]
         root: String,
     },
-    /// The resolved profile, its SHA-256 and the node label.
+    /// The resolved profile, and its SHA-256.
     Print {
         /// The profile file.
         #[arg(long)]
