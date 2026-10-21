@@ -69,6 +69,7 @@ impl UpdateHandler for Api {
                     old: None,
                     new: None,
                     failure: None,
+                    source: Source::Fetch,
                 };
                 UpdateReply::json(200, serde_json::to_vec(&status).expect("json"))
             }
