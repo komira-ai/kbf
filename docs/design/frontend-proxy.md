@@ -98,7 +98,55 @@ Phases: `accepted, fetching, verifying, staged, preflight, starting, ready, hold
 - **Staging deadline (decided).** An accepted update that the installer has not staged within 15 minutes of the order being written ends `failed` with `failure{step: stage, reason: timeout}`, and the proxy writes a `revert` for that commit, so a stage the root half may still perform is dropped and the next `frontend_update` is not refused `frontend_busy`. The deadline is configurable, from 1 s to just under the 1800 s an order lives in the spool, and a fetch under way does not move it. A release found staged is used however late. If the `revert` cannot be written the update stays open and the write is tried again. A refusal ends an update with its own word only when `status.json` names the order it answers; any other end of the wait is this deadline.
 - **One state machine, one actor.** All API calls go through a single mutex or actor. Test: fire `POST`, `abort` and `rollback` at once.
 - **State of record (decided).** Facts come from two sources: the installer boundary (`orders/`, `status.json`) for fetch, verify and `installed_commit`, and the Postgres generation holder plus `GET role` for who is active. The store wins any disagreement. Intent comes from one small file, `update.json` in the proxy state dir (`/var/lib/kbf-proxy/`, `kbf:kbf` 0700), written by temp, fsync, rename on every phase change. It holds `update_id`, `request_id`, `from`, `to`, `nodes`, `rollback`, `phase`, `phase_started_wall`, `bake_started_wall`, `nodes_posted`, `old_slot`, `new_slot` and the last 64 `request_id -> update_id` pairs. On restart the proxy reads it, checks it against the facts, and resumes at its phase. If it is missing or corrupt the proxy refuses new updates (`409 state_lost`), leaves both children as the generation holder says, and shows the status red. Test a kill between fsync and the 202.
-- **Auth.** Now: the **operator token**, the same one that guards the operator API (`Authorization: Bearer`, constant-time compare). `setup` creates it as `/etc/kbf/operator.token` (32 random bytes hex, root:kbf 0640, only on frontend and all-in-one hosts, never overwritten); `installer.toml` key `operator_token_file` points at it and the proxy reads it as group `kbf`. Worker and storage paths use mTLS (section 3); Buck2 auth is separate (`buck2_auth`), rate limited before any hashing, never in a query string or a log. Remote trigger: GitHub OIDC (#1088) replaces it for non-local callers. The check sits behind one internal function so that swap is local. I have not read #1088, so nothing more is fixed here.
+- **Auth.** Now: the **operator token**, the same one that guards the operator API (`Authorization: Bearer`, constant-time compare). `setup` creates it as `/etc/kbf/operator.token` (32 random bytes hex, root:kbf 0640, only on frontend and all-in-one hosts, never overwritten); `installer.toml` key `operator_token_file` points at it and the proxy reads it as group `kbf`. Worker and storage paths use mTLS (section 3); Buck2 auth is separate (`buck2_auth`), rate limited before any hashing, never in a query string or a log. Remote trigger: GitHub OIDC (#1088, `kbf-oidc`) is a second credential for exactly two calls, `POST /v1/update/desired` and `POST /v1/update/frontend`, and only when `[proxy] remote_operator_file` names an allow-list (off by default; section 4a). It sits behind the one function: `Security::authorize_call` tries the operator token first and looks at an OIDC token only for those two calls.
+
+### 4a. Remote trigger by GitHub OIDC (#1088)
+
+Off unless `[proxy] remote_operator_file` points at a TOML file with a `[remote_operator]` table. There is no other listener: the proxy's one public port serves it, so TLS, the connection limits and the failure limit are the proxy's. TLS is not made mandatory by this; the issuer's keys are fetched over https from the issuer named in the allow-list (the host's root certificates).
+
+A request is admitted by OIDC only if all hold: the method and path are exactly `POST /v1/update/desired` or `POST /v1/update/frontend` with no query string (every other path, including `abort`, `rollback`, `force-retire`, `pause`, `resume` and every `GET`, needs the operator token); the address has not presented too many wrong credentials (the `FailureLimit` of section 3, which a refused token counts against); the bearer is a compact JWS and not the operator token; and `kbf-oidc` accepts it. The token is spent by the first request that passes the verifier, whatever the update API then says.
+
+Where the call goes is where the operator's goes. `/v1/update/frontend` is the update handler of section 4 as it is. `/v1/update/desired` is forwarded to the active child's operator listener with `Authorization: Bearer <operator token>` in place of the OIDC token (the child's write gate takes the operator token and nothing else, and the OIDC token goes no further than the proxy). A key outage at the issuer is 503; every other refusal is 401 with no reason in the body, and a log line with the reason name (never a claim value).
+
+Claims the verifier requires, in the order it checks them (`crates/kbf-oidc/src/lib.rs` is the authority):
+
+| claim | must be | set by |
+|---|---|---|
+| header `alg` | `RS256`; no `jku`, `x5u`, `jwk`, `x5c`, `crit`, `zip`; a `kid` that names a key of the issuer's JWKS (RSA, 2048 bits or more) | fixed |
+| signature | holds under that key | fixed |
+| `iss` | exactly `issuer` (`https://`, no trailing slash; the keys are discovered under it) | `issuer` (required) |
+| `aud` | exactly `audience`, as a string or a one-element array | `audience` (required) |
+| `exp`, `nbf`, `iat` | now within 60 s leeway; `exp - iat` at most `max_token_lifetime_secs` (default 600, at most 3600) | `max_token_lifetime_secs` |
+| `repository_id` | exactly the digits | `repository_id` (required) |
+| `repository` | exactly, if the file names it | `repository` |
+| `job_workflow_ref` | one of the list, each `owner/repo/.github/workflows/<file>@<ref>` | `job_workflow_ref` (required, at least one) |
+| `ref` | one of `refs`, if any are listed | `refs` |
+| `environment` | one of `environments`, if any are listed; when both lists are given both must match | `environments` (`refs` or `environments` is required) |
+| `event_name` | one of `event_names` (default `push`, `workflow_dispatch`; never a `pull_request*` event) | `event_names` |
+| `runner_environment` | exactly (default `github-hosted`) | `runner_environment` |
+| `jti` | present, at most 256 bytes, not seen before (remembered until `exp` plus 60 s; a full memory of 10,000 refuses new tokens) | fixed |
+
+The issuer's keys are fetched on the first token and again when a token names an unknown `kid` (at most every 30 s), and a key set older than one hour is fetched again by the next token, so a key the issuer withdrew stops verifying within the hour. If that fetch fails the keys held stay in use (an issuer outage does not stop deploys; the cost is that a withdrawn key is trusted until a fetch succeeds), and a failed first fetch is a 503. A token whose key is held never waits for a fetch that is under way.
+
+Example, the gamma deploy (`gamma.yml`, which runs from a `workflow_run` of the release workflow on main, so its token's `event_name` is `workflow_run`). `/etc/kbf/remote-ci.toml`:
+
+```toml
+[remote_operator]
+issuer = "https://token.actions.githubusercontent.com"
+audience = "<the audience the job asks for>"
+repository_id = "<numeric id of komira-ai/kbf>"
+repository = "komira-ai/kbf"
+job_workflow_ref = ["komira-ai/kbf/.github/workflows/gamma.yml@refs/heads/main"]
+environments = ["gamma"]
+event_names = ["workflow_run"]
+# runner_environment: the default, github-hosted
+```
+
+The ref pin stays meaningful for a `workflow_run` job: GitHub runs it from the copy of the workflow on the default branch, so `job_workflow_ref` names `@refs/heads/main` whatever branch triggered the release run, and a copy of `gamma.yml` on another branch is a different `job_workflow_ref` and is refused. `pull_request_target` (fork code with secrets) is not in `event_names` and the file is refused if it lists any `pull_request*` event.
+
+Listing `workflow_run` trusts the workflow's own guard. The token says only that `gamma.yml` on main ran from some `workflow_run`. It does not say which event started the upstream release run, so the proxy cannot check that. `gamma.yml`'s `if:` requires the upstream run to be a `push` to main of this repository; that condition is what keeps a run started any other way from deploying. Today the gamma deploy calls `kbf-installer deploy --offer` over ssh and presents no token, so this file is the form for when it moves to OIDC. That switch also needs `id-token: write` on the deploy job, which kbf's workflow lint allows only in the attest jobs, so a lint change goes with it.
+
+`sub` is not matched: its form is GitHub's to change, and `repository_id` with `job_workflow_ref` say the same exactly. There is no `setup` flag for the key yet: write `remote_operator_file = "/etc/kbf/remote-ci.toml"` under `[proxy]` by hand (a `setup` rerun keeps it: the key is read and written back with the rest of `installer.toml`); `kbf-installer proxy --check` reads the file. A CI job asks for the token with audience `audience` (`ACTIONS_ID_TOKEN_REQUEST_URL` with `&audience=`) and sends it as `Authorization: Bearer`; a repeated `POST /v1/update/frontend` carries the same `request_id`, as with the operator token.
 
 ## 5. Swap sequence (frontend host)
 
@@ -260,7 +308,7 @@ Owners are left blank. Order: U0, then U1/U2, U3a and the farm cutover, then U4a
 | U7b | `kbf-installer`: real child control and adoption, units, socket, postinst marker, all-in-one stop/hold/start, `frontend_update`/`confirm`/`revert` orders. | U7a, U4b, P1, P2, P4, P5, P7, P8 | Soak (below) and an all-in-one swap with 200 held streams fed to the new child. |
 | U7c | Deletions: `EnvoyCheck`, the `Type=notify` handshake, `kbf-cli/src/handover.rs`, relay-to-successor in `kbf-server`, leftovers in `kbf-front`. Rewrites `frontend/handover.rs` and `frontend_drain.rs`. | U7b, #1091 | Grep and `cargo tree` show none remain; server tests pass. |
 | U8a | `kbf-installer`: update API actor, operator-token auth, idempotency, status, rate limits, routes behind traits. | U4b (types only) | Auth matrix; 409 and 422; idempotent `request_id`; concurrent call test. |
-| U8b | `kbf-installer`: wire U8a to `orders/`, `status.json` and the proxy; `force-retire`; OIDC seam (#1088 later). | U8a, U7b, P1, P2, P4 | End to end on fake children and a fixture spool. |
+| U8b | `kbf-installer`: wire U8a to `orders/`, `status.json` and the proxy; `force-retire`; OIDC seam (#1088: `kbf-oidc`, section 4a). | U8a, U7b, P1, P2, P4 | End to end on fake children and a fixture spool. |
 | U9 | R1 and R4 gates, controller generation gate, member-map floor fix, `deploy` default, cross-version test. | U2, U8 | Planted `min_protocol` raise red; two controllers without the gate red. |
 | U3b | Delete SQLite, `STATE_FILE`, baton, `Store::demote`. | farm on Postgres | `rusqlite` gone from `cargo tree`. |
 | U12 | Docs: `frontend-handover.md`, `aio-handover.md`, `kbf-installer.md`, `split-mode-updates.md`, `architecture-v2.md`, `kbf-units.md`, `kbf-modes.md`. | all | Wording matches code. |
@@ -281,7 +329,7 @@ Owners are left blank. Order: U0, then U1/U2, U3a and the farm cutover, then U4a
 | #1047 gamma `deploy` | Change. Targets the proxy route, frontend-first, no `--order`. Stacked on #1039: read it first. |
 | #1083 `migrate` | Change. Becomes the first-crossing stop and start on a fresh Postgres; no state copy. |
 | #1091 drop Envoy unit | Keep, but blocked until U4b to U7b land, or a host has no front door. Mark it so nobody merges it. |
-| #1088 GitHub OIDC | Keep. Becomes the remote trigger credential for the update API (U8 seam). |
+| #1088 GitHub OIDC | Keep, reworked on this seam: `kbf-oidc` plus `remote_operator_file` in the proxy, for the two update calls only (section 4a). It no longer adds a `kbf-server` listener or a Kubernetes design. |
 | Merged #937, #930, #984, #1042 | Drain endpoint and `done/` follower stay. Baton, `EnvoyCheck`, the +10 block and `kbf-cli frontend handover` are deleted (U7, U3b). |
 
 ## 14. Open questions
