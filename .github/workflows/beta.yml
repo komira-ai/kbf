@@ -556,6 +556,10 @@ jobs:
       # (tests/slot_clean.rs). One test at a time: they make users at free uids.
       - run: cargo xtask sudo-test -p kbf-driver-native --test slots -- --test-threads=1 --nocapture
       - run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture
+      # What an action as a pool user reaches of another slot (files, loopback TCP, Unix
+      # sockets, the process table), measured and printed, not asserted, with and without
+      # the sandbox (crates/kbf-driver-native/tests/slot_reach.rs).
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_reach -- --test-threads=1 --nocapture
       # The per-binary entitlement allow list (tools/ci/darwin-entitlements.txt): the
       # kbf-vmm stub signed by `cargo xtask sign-darwin` with the virtualization
       # entitlement, kbf with none, both accepted by `darwin-asset`, and every
