@@ -60,21 +60,18 @@ pub fn daemon_args(_profile: &Profile) -> Vec<String> {
 
 /// The node's `kbf.toml`, which `apply` writes at [`NODE_CONFIG`] and `kbf --mode=daemon
 /// --config` reads: the mode, and the flags the profile carries (the native driver, the
-/// server and the CAS URL, the CA, certificate and key paths, the node id, the data
-/// directory and the labels), one TOML table per flag group, a key per flag long name. The
+/// server and the CAS URL, the CA, certificate and key paths, the node id and the data
+/// directory), one TOML table per flag group, a key per flag long name. The
 /// tables are the ones of `GROUPS` in kbf-cli's `config.rs` (`identity` and `daemon`);
 /// `tests/node_config.rs` loads the file with that crate's loader. A flag that may repeat
-/// (`driver`, `label`) is an array. No value needs TOML escaping: the profile's patterns
+/// (`driver`) is an array. The file has no `label` key: node labels are removed, and the
+/// daemon that follows this tool refuses the key. No value needs TOML escaping: the profile's patterns
 /// admit no `"`, `\` or control character.
 pub fn render_config(profile: &Profile) -> String {
     let strings = |items: &[&str]| {
         let quoted: Vec<String> = items.iter().map(|i| format!("\"{i}\"")).collect();
         format!("[{}]", quoted.join(", "))
     };
-    let node_label = profile.node_label();
-    let labels: Vec<&str> = std::iter::once(node_label.as_str())
-        .chain(profile.labels.iter().map(String::as_str))
-        .collect();
     let mut out = String::from(concat!(
         "# Written by kbf-mac-provision from its profile; `apply` puts it back if it is edited.\n",
         "# One table per flag group, one key per flag long name (kbf-cli, config.rs).\n",
@@ -91,7 +88,6 @@ pub fn render_config(profile: &Profile) -> String {
     ] {
         out.push_str(&format!("{key} = \"{}\"\n", profile.get(value)));
     }
-    out.push_str(&format!("label = {}\n", strings(&labels)));
     out.push_str("\n[daemon]\n");
     out.push_str(&format!("driver = {}\n", strings(&["native"])));
     out.push_str(&format!("data-dir = \"{}\"\n", profile.get("kbf_data_dir")));
