@@ -314,14 +314,15 @@ impl Slot {
     }
 
     /// Makes the lease directory `dir`, and everything in it, the slot user's (no link
-    /// followed), so the action can write its inputs, outputs and own directories.
+    /// followed), so the action can write its inputs, outputs and own directories, and
+    /// the directory itself the user's alone (0700, [`super::LEASE_DIR_MODE`]).
     ///
     /// # Errors
     /// An entry could not be read or given to the user.
     pub async fn hand_over(&self, dir: &Path) -> Result<(), RuntimeError> {
         let (uid, gid) = (self.ready().user.uid, self.ready().user.gid);
         let path = dir.to_owned();
-        let handed = tokio::task::spawn_blocking(move || chown_tree(&path, uid, gid)).await;
+        let handed = tokio::task::spawn_blocking(move || super::hand_tree(&path, uid, gid)).await;
         handed
             .map_err(io::Error::other)
             .and_then(|done| done)
@@ -584,20 +585,6 @@ fn passwd(uid: u32) -> io::Result<(String, PathBuf)> {
         name.to_string_lossy().into_owned(),
         PathBuf::from(OsStr::from_bytes(dir.to_bytes())),
     ))
-}
-
-/// Gives `root` and everything under it to `uid`:`gid`, never following a link.
-fn chown_tree(root: &Path, uid: u32, gid: u32) -> io::Result<()> {
-    let mut pending: Vec<PathBuf> = vec![root.to_owned()];
-    while let Some(path) = pending.pop() {
-        std::os::unix::fs::lchown(&path, Some(uid), Some(gid))?;
-        if std::fs::symlink_metadata(&path)?.is_dir() {
-            for entry in std::fs::read_dir(&path)? {
-                pending.push(entry?.path());
-            }
-        }
-    }
-    Ok(())
 }
 
 fn lock(free: &Mutex<BTreeSet<usize>>) -> std::sync::MutexGuard<'_, BTreeSet<usize>> {
