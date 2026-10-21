@@ -4,7 +4,7 @@
 use kbf_map::MemberId;
 use tonic::{Request, Status};
 
-use super::{MAP_GENERATION_HEADER, UNOWNED_HEADER};
+use super::{DURABLE_HEADER, DURABLE_ONLY, MAP_GENERATION_HEADER, UNOWNED_HEADER};
 use crate::replicate::LEG_HEADER;
 
 /// The generation `request` was routed by: the decimal in its `kbf-map-generation`
@@ -55,4 +55,22 @@ pub(super) fn leg<T>(request: &Request<T>) -> Result<Option<MemberId>, Status> {
         .and_then(|text| text.parse().ok())
         .map(|id| Some(MemberId(id)))
         .ok_or_else(|| Status::invalid_argument(format!("{LEG_HEADER} is not a member id")))
+}
+
+/// Whether `request` asks for the durable answer ([`DURABLE_HEADER`]).
+///
+/// # Errors
+/// INVALID_ARGUMENT if the entry has any value but `only`: a caller that asked a question
+/// this node does not know is not answered the plain one.
+pub(super) fn durable_only<T>(request: &Request<T>) -> Result<bool, Status> {
+    let Some(value) = request.metadata().get(DURABLE_HEADER) else {
+        return Ok(false);
+    };
+    if value.to_str().is_ok_and(|text| text == DURABLE_ONLY) {
+        Ok(true)
+    } else {
+        Err(Status::invalid_argument(format!(
+            "{DURABLE_HEADER} must be {DURABLE_ONLY}"
+        )))
+    }
 }

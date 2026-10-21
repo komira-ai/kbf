@@ -5,7 +5,7 @@
 //! that lie back to back in one segment are read with one range GET, and up to
 //! [`BATCH_READS_IN_FLIGHT`] GETs run at once.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -47,14 +47,35 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self,
         digests: &[Digest],
     ) -> Result<BTreeMap<Digest, Result<Bytes, CacheError>>, CacheError> {
+        // Held first, then the index for the rest (`held` module docs). A held blob is
+        // read from RAM, whole and hashed as any read is.
+        let unheld = self.held.unheld(digests);
+        let held: Vec<(Digest, Bytes)> = if unheld.len() == digests.len() {
+            Vec::new()
+        } else {
+            digests
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter_map(|d| self.held.get(d).map(|bytes| (*d, bytes)))
+                .collect()
+        };
+        self.between_steps().await;
         let answers = self
             .touched(|s| {
                 let answers: BTreeMap<Digest, BlobAnswer> =
-                    digests.iter().map(|d| (*d, s.blob(d))).collect();
-                (answers, s.touch_for(digests))
+                    unheld.iter().map(|d| (*d, s.blob(d))).collect();
+                (answers, s.touch_for(&*unheld))
             })
             .await?;
         let mut out = BTreeMap::new();
+        for (digest, bytes) in held {
+            let read = self
+                .held_read(&digest, bytes, 0, digest.size_bytes)
+                .gather()
+                .await;
+            out.insert(digest, read);
+        }
         let mut held: BTreeMap<(StoreId, ObjectId), BTreeMap<u64, Digest>> = BTreeMap::new();
         let mut staged = Vec::new();
         for (digest, answer) in answers {
