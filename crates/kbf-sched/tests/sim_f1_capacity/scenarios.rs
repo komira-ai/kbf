@@ -37,14 +37,17 @@ fn cut(rng: &mut SimRng, total: u64, parts: u64) -> Vec<u64> {
 
 /// F1.1 exact packing: one to three equal workers, each filled at second 0 by requests
 /// whose sizes sum to its capacity exactly on every axis, and one request of one more
-/// unit on one axis (a millicore, a byte, or a GPU). Every piece is granted in the
-/// first round and fills its worker exactly; the extra unit waits and is granted at
-/// the first release that frees its axis, not before.
+/// unit on one axis (a millicore or a GPU; a byte of memory is not booked against the
+/// worker, so it is not one of them). The same cut serves every worker, a piece for
+/// each worker before the next piece: placement takes the least loaded worker, so it
+/// gives each worker one copy of every piece (it does not pack unequal pieces). Every
+/// piece is granted in the first round and fills its worker exactly; the extra unit
+/// waits and is granted at the first release that frees its axis, not before.
 #[derive(Debug, Default)]
 pub struct ExactPacking {
     workers: u64,
     extra: Option<(WaiterId, usize)>,
-    /// Per piece: its worker index, its axes and when it ends.
+    /// Per piece: the number of its copy (one per worker), its axes and when it ends.
     pieces: Vec<(WaiterId, usize, [u64; 3], u64)>,
     pub full_at_start: u64,
     pub extra_on_axis: [u64; 3],
@@ -70,16 +73,19 @@ impl Scenario for ExactPacking {
             return;
         }
         let mut key = 0;
-        for i in 0..self.workers {
-            let cap = w.fleet[usize::try_from(i).unwrap()].capacity;
-            let parts = rng.between(2, 6);
-            let cpu = cut(rng, cap.cpu_millis, parts);
-            let mem = cut(rng, cap.memory_bytes, parts);
-            let mut gpus = vec![0; usize::try_from(parts).unwrap()];
-            for _ in 0..cap.gpus {
-                gpus[usize::try_from(rng.below(parts)).unwrap()] += 1;
-            }
-            for p in 0..usize::try_from(parts).unwrap() {
+        // One cut of the capacity, a piece for every worker before the next piece: placement
+        // takes the least loaded worker, which is the next one that has not got this piece
+        // yet, so each worker ends with the whole cut.
+        let cap = w.fleet[0].capacity;
+        let parts = rng.between(2, 6);
+        let cpu = cut(rng, cap.cpu_millis, parts);
+        let mem = cut(rng, cap.memory_bytes, parts);
+        let mut gpus = vec![0; usize::try_from(parts).unwrap()];
+        for _ in 0..cap.gpus {
+            gpus[usize::try_from(rng.below(parts)).unwrap()] += 1;
+        }
+        for p in 0..usize::try_from(parts).unwrap() {
+            for i in 0..self.workers {
                 let res = Resources::new(cpu[p], mem[p]).with_gpus(gpus[p]);
                 let secs = rng.between(100, 200);
                 let waiter = w.submit(request(key, Qos::Ci, res, ANY), secs);
@@ -90,7 +96,7 @@ impl Scenario for ExactPacking {
             }
         }
         let gpus = w.fleet[0].capacity.gpus;
-        let axis = usize::try_from(rng.below(if gpus > 0 { 3 } else { 2 })).unwrap();
+        let axis = if gpus > 0 && rng.below(2) == 1 { 2 } else { 0 };
         let mut one = [0; 3];
         one[axis] = 1;
         let res = Resources::new(one[0], one[1]).with_gpus(one[2]);
@@ -161,15 +167,20 @@ impl Scenario for ExactPacking {
 
 // F1.2 ---------------------------------------------------------------------------------
 
-/// F1.2 each axis full on its own: a pool of equal workers (16 cores, 32 GiB) fed a
+/// F1.2 CPU is the one axis that fills: a pool of equal workers (16 cores, 32 GiB) fed a
 /// random mix of CPU-heavy (6 cores, 2 GiB) and memory-heavy (1 core, 12 GiB) requests
-/// faster than it runs them. The sweep must see a worker full on memory with CPU free
-/// while a memory-heavy request waits, and the other way round; I6 and I11 hold that
-/// neither goes there.
+/// faster than it runs them. The sweep must see a worker full on CPU with memory free
+/// while a CPU-heavy request waits, and a worker whose memory limits add up to more than
+/// its memory take more work; a memory-heavy request never waits while a worker has a
+/// core free. I6 and I11 hold that nothing is placed beside what does not fit.
 #[derive(Debug, Default)]
 pub struct EachAxis {
+    /// A worker's memory limits summed past its memory, with a core free and a
+    /// memory-heavy request waiting: never.
     pub memory_full_cpu_free: u64,
     pub cpu_full_memory_free: u64,
+    /// Workers seen with memory limits summing past their memory.
+    pub memory_over_capacity: u64,
 }
 
 const CPU_HEAVY: Resources = Resources::new(6_000, 2 * GIB);
@@ -206,7 +217,8 @@ impl Scenario for EachAxis {
         let waits = |r: Resources| queued.contains(&[r.cpu_millis, r.memory_bytes, r.gpus]);
         for spec in &w.fleet {
             let (booked, cap) = w.check.room(&spec.name);
-            let free = [cap[0] - booked[0], cap[1] - booked[1]];
+            let free = [cap[0] - booked[0], cap[1].saturating_sub(booked[1])];
+            self.memory_over_capacity += u64::from(booked[1] > cap[1]);
             if free[1] < MEMORY_HEAVY.memory_bytes
                 && free[0] >= MEMORY_HEAVY.cpu_millis
                 && waits(MEMORY_HEAVY)
@@ -470,7 +482,7 @@ impl Scenario for QosOrder {
 /// F1.5 a large request behind small ones: two or three 64-core workers filled with
 /// one-core requests, then a 64-core request, then a steady stream of one-core requests
 /// at about the rate the fleet frees cores. Today the small ones take each freed core
-/// and the large one waits while they keep coming (first fit holds nothing back; a wait
+/// and the large one waits while they keep coming (placement holds nothing back; a wait
 /// bound is planned); it runs once they stop (L1).
 #[derive(Debug, Default)]
 pub struct LargeBehindSmall {
@@ -551,7 +563,7 @@ impl Scenario for LargeBehindSmall {
 
 /// F1.6 `batch` under steady `interactive`: `batch` requests of two to four cores queued
 /// at the start, and one-core `interactive` requests arriving faster than the fleet runs
-/// them. Every interactive request is no larger than any batch one, so first fit gives
+/// them. Every interactive request is no larger than any batch one, so placement gives
 /// every freed core to interactive work while some waits: no batch operation is granted
 /// in a round that ends with interactive work queued. Batch runs once the stream stops
 /// and its backlog drains (L1). Fair turns and preemption are planned.

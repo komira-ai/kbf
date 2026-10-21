@@ -5,12 +5,13 @@
 //!                          --mc PATH [--key-file PATH [--key-owner USER]] [--remove] [--apply]
 //! kbf-deploy minio nodeport --kubectl PATH --kubeconfig PATH [--context NAME]
 //!                           --namespace NS --service NAME --node-port N [--remove] [--apply]
-//! kbf-deploy linux render-units --config FILE --out DIR [--kbf-uid UID]
-//! kbf-deploy linux check-units --config FILE --dir DIR [--installable]
-//! kbf-deploy linux install-units --config FILE [--bin-dir DIR] [--restart-minio] [--apply]
-//! kbf-deploy linux install-units --config FILE --uninstall [--apply]
-//! kbf-deploy linux image-pull --config FILE [--image REF]... [--platform OS/ARCH] [--apply]
+//! kbf-deploy linux render-units --config FILE --out DIR --mode MODE [--kbf-uid UID]
+//! kbf-deploy linux check-units --config FILE --dir DIR --mode MODE [--installable]
+//! kbf-deploy linux install-units --config FILE --mode MODE [--bin-dir DIR] [--apply]
 //! kbf-deploy linux swap --config FILE [--kubelet-allows-swap] [--remove] [--apply]
+//! kbf-deploy linux meta-backup --meta-dir DIR [--hot-dir DIR] --out FILE [--metrics URL]
+//!                              [--unit NAME] [--ready-secs N] [--apply]
+//! kbf-deploy linux meta-verify --archive FILE --into DIR
 //! kbf-deploy mdm fetch --dir DIR [--only TOOL]... [--apply]
 //! kbf-deploy mdm install --config FILE --bin-dir DIR [--apply]
 //! kbf-deploy mdm install --config FILE --uninstall [--apply]
@@ -33,6 +34,7 @@
 //!                                 [--s3-env-file FILE] [--apply]
 //! kbf-deploy pilot server-install --config FILE --uninstall [--apply]
 //! kbf-deploy pilot buckconfig --config FILE --worktree DIR [--remove] [--apply]
+//! kbf-deploy log (--log-dir DIR | --hot-store DIR) [--lines N]
 //! ```
 //!
 //! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
@@ -40,10 +42,12 @@
 //! 0 done (or nothing to do) or 1 refused or failed. `linux render-units` and
 //! `check-units` only write into or read the directory they are given, and exit 0 done,
 //! 1 a check found a broken rule, or 2 refused (a bad setting or file, printed as
-//! `REFUSED: ...` on stderr). `linux install-units`, `image-pull` and `swap` change the
+//! `REFUSED: ...` on stderr). `linux install-units` and `swap` change the
 //! host as root, plan by default as the `minio` subcommands do, and exit 0 done (or
 //! nothing to do), 1 a step or the check after an apply failed (`FAIL ...`), or 2
-//! refused (`REFUSED: ...` on stderr). `envoy render` only writes into the directory
+//! refused (`REFUSED: ...` on stderr). `linux meta-backup` and `meta-verify` exit 0
+//! done, 1 a failure after the stop (the unit restarted) or an archive that does not
+//! verify (`FAIL ...` on stderr), or 2 refused ([`crate::linux::meta`]). `envoy render` only writes into the directory
 //! it is given, and exits 0 done or 2 refused (`REFUSED: ...` on stderr); `envoy check`
 //! only reads, and exits 0 every check passed, 1 a check failed (`FAIL <check>: ...` on
 //! stdout) or 2 refused. `envoy apply` reads the cluster and has it validate the render in
@@ -58,6 +62,10 @@
 //! subcommands do, and exit 0 done (or nothing to do), 1 a step failed or kbf-server
 //! never reported ready after its start, or 2 refused (`REFUSED: ...` on stderr)
 //! ([`crate::pilot`]).
+//! `log` only reads: it prints the last `--lines` (default 100) lines of a kbf-server's
+//! durable log, across `kbf-server.log` and its rotated files, oldest first, and exits 0,
+//! or 2 refused (`REFUSED: ...` on stderr: no such directory, or no log in it)
+//! ([`crate::log`]).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
 //! `MINIO_ROOT_PASSWORD` in the environment (secrets are never flags: argv is
 //! world-readable).
@@ -73,11 +81,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
-use kbf_types::ImageRef;
 
 use crate::envoy;
 use crate::https::Client;
-use crate::linux::{self, HostError, LinuxConfig, images, install, swap};
+use crate::linux::{self, HostError, LinuxConfig, install_mode, meta, swap};
+use crate::log;
 use crate::mdm::dep::{Dep, Serial};
 use crate::mdm::erase::{self, EraseArgs, Made};
 use crate::mdm::fetch::Fetch;
@@ -107,10 +115,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Kit {
+    /// The host side of a commit-confirm deploy: the releases under the installer's tree
+    /// (/var/lib/kbf-installer on Linux) and the state.
+    #[command(subcommand)]
+    Host(crate::host::Host),
     /// A MinIO for kbf: its buckets and key, and a NodePort for its S3 port.
     #[command(subcommand)]
     Minio(Minio),
-    /// A converged Linux storage node: MinIO, kbf-server and kbf-daemon.
+    /// A Linux node: the systemd unit of one kbf mode, and the build swapfile.
     #[command(subcommand)]
     Linux(Linux),
     /// An Apple MDM on one Linux host: NanoHUB, the SCEP server, NanoDEP and an HTTPS
@@ -125,6 +137,9 @@ enum Kit {
     /// one worktree at it.
     #[command(subcommand)]
     Pilot(pilot::cli::Pilot),
+    /// The last lines of a kbf-server's durable log, across its rotated files, oldest
+    /// first. Only reads.
+    Log(log::LogArgs),
 }
 
 #[derive(Subcommand)]
@@ -176,7 +191,7 @@ enum Envoy {
 
 #[derive(Subcommand)]
 enum Linux {
-    /// Render the node's four systemd files into a directory.
+    /// Render kbf.slice and the unit of one mode of the one kbf binary into a directory.
     RenderUnits {
         /// The kit's settings, KEY=VALUE lines.
         #[arg(long)]
@@ -184,10 +199,13 @@ enum Linux {
         /// Where to write the files, laid out as under /etc/systemd/system.
         #[arg(long)]
         out: PathBuf,
-        /// The kbf user's uid (the daemon's XDG_RUNTIME_DIR); without it the daemon's
-        /// unit keeps `<kbf uid>`, which `check-units --installable` refuses.
+        /// The kbf user's uid (the daemon's XDG_RUNTIME_DIR); without it a unit that
+        /// runs builds keeps `<kbf uid>`, which `check-units --installable` refuses.
         #[arg(long)]
         kbf_uid: Option<u32>,
+        /// The mode whose unit is rendered.
+        #[arg(long, value_enum)]
+        mode: linux::Mode,
     },
     /// Check rendered units against the host's priorities.
     CheckUnits {
@@ -200,41 +218,35 @@ enum Linux {
         /// Also refuse a `<...>` placeholder.
         #[arg(long)]
         installable: bool,
+        /// The mode whose unit is checked.
+        #[arg(long, value_enum)]
+        mode: linux::Mode,
     },
-    /// Install the binaries and units, and start kbf-server and kbf-daemon (as root).
+    /// Install kbf.slice and the unit of one mode of the one kbf binary, and start it
+    /// (as root).
     InstallUnits {
         /// The kit's settings, KEY=VALUE lines.
         #[arg(long)]
         config: PathBuf,
-        /// Where new kbf-server and kbf-daemon binaries are; without it the installed
-        /// ones stay.
+        /// Where the new kbf is; without it the installed one stays.
         #[arg(long, value_parser = HostPath::new)]
         bin_dir: Option<HostPath>,
-        /// Also restart MinIO, so its new priorities take effect now.
-        #[arg(long)]
-        restart_minio: bool,
-        /// Roll back: stop the services and move the four files aside.
-        #[arg(long, conflicts_with_all = ["bin_dir", "restart_minio"])]
-        uninstall: bool,
+        /// The mode whose unit is installed.
+        #[arg(long, value_enum)]
+        mode: linux::Mode,
         /// Carry the plan out.
         #[arg(long)]
         apply: bool,
     },
-    /// Pull the pinned images into the kbf user's Podman store, as that user (as root).
-    ImagePull {
-        /// The kit's settings, KEY=VALUE lines.
-        #[arg(long)]
-        config: PathBuf,
-        /// An image instead of KBF_IMAGES (repeat for more): <repo>@sha256:<digest>.
-        #[arg(long, value_parser = linux::config::image)]
-        image: Vec<ImageRef>,
-        /// The platform each image must be built for.
-        #[arg(long, default_value = linux::images::PLATFORM)]
-        platform: String,
-        /// Carry the plan out.
-        #[arg(long)]
-        apply: bool,
-    },
+    /// Back up kbf-server's metadata log in a brief stop (as root): one tar file with
+    /// a sha256 manifest; prints the downtime.
+    MetaBackup(meta::cli::BackupArgs),
+    /// Extract a meta-backup archive into an empty directory and check every file.
+    MetaVerify(meta::cli::VerifyArgs),
+    /// Check, read only, that a certificate is its row of the farm's certificate table:
+    /// its one role, its extended key usage and its chain to the CA. The frontend's
+    /// REAPI certificate is not the farm CA's and is no row.
+    VerifyCert(linux::verify_cert::VerifyArgs),
     /// Make, activate and list the build swapfile (as root).
     Swap {
         /// The kit's settings, KEY=VALUE lines.
@@ -509,11 +521,13 @@ pub fn run<E: Exec>(
         }
     };
     let result = match cli.kit {
+        Kit::Host(h) => return crate::host::run(h, out, err),
         Kit::Minio(Minio::Buckets(a)) => minio_buckets(a, exec, env, out),
         Kit::Minio(Minio::Nodeport(a)) => minio_nodeport(a, exec, out),
         Kit::Linux(l) => return linux_kit(l, exec, out, err),
         Kit::Mdm(m) => return mdm_kit(m, exec, out, err),
         Kit::Envoy(e) => return envoy_kit(e, exec, out, err),
+        Kit::Log(a) => return log::run(&a, out, err),
         Kit::Pilot(p) => {
             return pilot::cli::run(p, exec, env, out, err, &pilot::cli::sleep_a_second);
         }
@@ -539,58 +553,43 @@ fn linux_kit<E: Exec>(
             config,
             out: dir,
             kbf_uid,
-        } => linux::render_units(&config, &dir, kbf_uid).map(|line| (vec![line], 0)),
+            mode,
+        } => linux::render_mode_unit(&config, &dir, kbf_uid, mode).map(|line| (vec![line], 0)),
         Linux::CheckUnits {
             config,
             dir,
             installable,
-        } => linux::check_units(&config, &dir, installable).map(|report| {
+            mode,
+        } => linux::check_mode_unit(exec, &config, &dir, mode, installable).map(|report| {
             let code = u8::from(!report.failures.is_empty());
             let mut lines: Vec<String> = report.failures.iter().map(ToString::to_string).collect();
+            lines.extend(report.notes);
             lines.push(report.summary);
             (lines, code)
         }),
         Linux::InstallUnits {
             config,
             bin_dir,
-            restart_minio,
-            uninstall,
+            mode: unit_mode,
             apply,
         } => {
             let done = LinuxConfig::load(&config)
                 .map_err(HostError::from)
                 .and_then(|config| {
-                    if uninstall {
-                        install::run_uninstall(exec, &config, &stamp(), mode(apply), &mut out)
-                    } else {
-                        let a = install::Install {
-                            config,
-                            bin_dir,
-                            restart_minio,
-                        };
-                        install::run(exec, &a, mode(apply), &mut out)
-                    }
-                });
-            return host_verb(done, err);
-        }
-        Linux::ImagePull {
-            config,
-            image,
-            platform,
-            apply,
-        } => {
-            let done = LinuxConfig::load(&config)
-                .map_err(HostError::from)
-                .and_then(|config| {
-                    let a = images::Pull {
+                    let a = install_mode::InstallMode {
                         config,
-                        images: image,
-                        platform,
+                        mode: unit_mode,
+                        bin_dir,
                     };
-                    images::run(exec, &a, mode(apply), &mut out)
+                    install_mode::run(exec, &a, mode(apply), &mut out)
                 });
             return host_verb(done, err);
         }
+        Linux::MetaBackup(a) => {
+            return meta::cli::backup(a, exec, &meta::metrics::http_get, out, err);
+        }
+        Linux::MetaVerify(a) => return meta::cli::verify(&a, out, err),
+        Linux::VerifyCert(a) => return linux::verify_cert::cli(&a, out, err),
         Linux::Swap {
             config,
             kubelet_allows_swap,
@@ -844,17 +843,12 @@ fn envoy_apply<E: Exec>(
     envoy::apply::run(exec, &args, mode, &mut out)
 }
 
-/// A host-changing `linux` verb's exit: 0 done, 1 a step failed (or the check after
-/// an apply did), 2 refused.
+/// A host-changing `linux` verb's exit: 0 done, 1 a step failed, 2 refused.
 fn host_verb(done: Result<(), HostError>, err: &mut dyn Write) -> ExitCode {
     match done {
         Ok(()) => ExitCode::SUCCESS,
         Err(e @ HostError::Deploy(kbf_host::HostError::Step { .. })) => {
             let _ = writeln!(err, "kbf-deploy: {e}");
-            ExitCode::FAILURE
-        }
-        Err(e @ HostError::AfterApply(_)) => {
-            let _ = writeln!(err, "FAIL {e}");
             ExitCode::FAILURE
         }
         Err(e) => {
@@ -864,8 +858,8 @@ fn host_verb(done: Result<(), HostError>, err: &mut dyn Write) -> ExitCode {
     }
 }
 
-/// The directory name `install-units --uninstall` moves the files into: seconds since
-/// the Unix epoch.
+/// The directory name `mdm install --uninstall` and `pilot server-install --uninstall`
+/// move the files into: seconds since the Unix epoch.
 pub(crate) fn stamp() -> String {
     stamp_secs().to_string()
 }

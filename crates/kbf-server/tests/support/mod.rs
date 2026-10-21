@@ -6,7 +6,6 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::ops::Deref;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -31,7 +30,8 @@ use kbf_proto::worker::{
 };
 use kbf_server::token::ApiToken;
 use kbf_server::{
-    Api, Bound, Listeners, RaftMetaLog, ServeError, bind_server, bind_server_with_api,
+    Api, Bound, Listeners, MemoryLadder, RaftMetaLog, ServeError, StreamLimits,
+    bind_server_with_map,
 };
 use kbf_store::FaultFs;
 use prost::Message;
@@ -184,6 +184,8 @@ pub struct Cell {
     stopped: Option<oneshot::Receiver<()>>,
     /// The server's invocation records.
     pub recorder: kbf_front::Recorder,
+    /// The server's frontend drain.
+    pub drain: Arc<kbf_server::Drain>,
     client: Client,
 }
 
@@ -210,6 +212,13 @@ pub struct Client {
     channel: Channel,
 }
 
+/// The memory ladder of every cell but [`Cell::start_with_ladder`]'s: 1, 2 and 4 GiB,
+/// so an action that names no size books 1 GiB and a test node of 1 to 4 GiB runs it.
+/// (The server's default is 4, 16 and 32 GiB.)
+pub fn small_ladder() -> MemoryLadder {
+    MemoryLadder::from_gib(&[1, 2, 4]).expect("a ladder")
+}
+
 /// The bearer token of a cell's operator API ([`Cell::start_with_api`]).
 pub const API_TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
 
@@ -223,15 +232,138 @@ impl Cell {
         Self::start_with(wait, kbf_sched::FINISHED_RETENTION).await
     }
 
+    /// A cell that gives an action naming no OS or architecture `default_platform`, as
+    /// `--default-platform` sets it. (The other cells give it none, so that a test of
+    /// the platform match sees the match.)
+    pub async fn start_with_default_platform(default_platform: kbf_front::DefaultPlatform) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve_with_map(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+            None,
+            None,
+            default_platform,
+        )
+        .await
+    }
+
+    /// A cell that books and climbs `ladder`, as `--memory-ladder-gib` sets it. The
+    /// other cells book 1 GiB first ([`small_ladder`]), so the small nodes of these
+    /// tests can run an action that names no size.
+    pub async fn start_with_ladder(ladder: MemoryLadder) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            ladder,
+            StreamLimits::DEFAULT,
+        )
+        .await
+    }
+
+    /// A cell whose listeners allow `streams` HTTP/2 streams per connection
+    /// (`--reapi-max-streams`, `--worker-max-streams`).
+    pub async fn start_with_streams(streams: StreamLimits) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            streams,
+        )
+        .await
+    }
+
+    /// A cell that sends its daemons the storage map `map` holds.
+    pub async fn start_with_map(map: Arc<dyn kbf_mapsync::MapSource>) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve_with_map(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+            Some(map),
+            None,
+            kbf_front::DefaultPlatform::NONE,
+        )
+        .await
+    }
+
+    /// A cell whose scheduler keeps its state in `state` (and writes the build history it
+    /// names, if any), and that serves the operator API without a token: its `/metrics`
+    /// is at [`Cell::api`].
+    pub async fn start_with_state(state: kbf_server::StateStore) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let api = Api {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            token: None,
+            local_cache: None,
+            releases: None,
+            poll: None,
+        };
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve_with_map(
+            cache,
+            store,
+            Some(api),
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+            None,
+            Some(state),
+            kbf_front::DefaultPlatform::NONE,
+        )
+        .await
+    }
+
     /// A cell whose scheduler refuses queued work no live worker can run after `wait`,
     /// and keeps a finished operation for `retention`.
     pub async fn start_with(wait: Duration, retention: Duration) -> Self {
         let store = SharedStore::new();
         let cache = Self::cold_cache(&store, None).await;
-        Self::serve(cache, store, None, None, wait, retention).await
+        Self::serve(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+        )
+        .await
     }
 
-    /// A cell whose metadata is a Raft log ([`RaftMetaLog`], as `--meta-log=raft`) in
+    /// A cell whose metadata is a Raft log ([`RaftMetaLog`], as `kbf-server` runs it) in
     /// an in-memory raft directory, which [`Cell::cold_restart`] carries over as a
     /// process restart leaves it. Objects go under `kbf/<log id>/`.
     pub async fn start_raft() -> Self {
@@ -239,7 +371,17 @@ impl Cell {
         let dir = FaultFs::new();
         let cache = Self::cold_cache(&store, Some(&dir)).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(cache, store, None, Some(dir), wait, retention).await
+        Self::serve(
+            cache,
+            store,
+            None,
+            Some(dir),
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+        )
+        .await
     }
 
     /// The Raft log of a cell started with [`Cell::start_raft`].
@@ -253,10 +395,23 @@ impl Cell {
         let api = Api {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: Some(api_token()),
+            local_cache: None,
+            releases: None,
+            poll: None,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let cache = Self::cold_cache(&store, None).await;
-        Self::serve(cache, store, Some(api), None, wait, retention).await
+        Self::serve(
+            cache,
+            store,
+            Some(api),
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+        )
+        .await
     }
 
     /// A new server over this cell's store and its in-memory action cache and CAS
@@ -271,7 +426,17 @@ impl Cell {
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let (cache, store) = (Arc::clone(&self.cache), self.store.clone());
         let dir = self.raft_dir.clone();
-        Self::serve(cache, store, self.api_config.clone(), dir, wait, retention).await
+        Self::serve(
+            cache,
+            store,
+            self.api_config.clone(),
+            dir,
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+        )
+        .await
     }
 
     /// Stops this server, waits until its runtime and every task on it are gone (each
@@ -279,12 +444,12 @@ impl Cell {
     /// one over the same bucket, as a restart of the `kbf-server` binary does: a new
     /// `Cache` with a new, empty metadata log (so an empty CAS index and action
     /// cache), a fresh scheduler (no daemon, no cordon, no drain, nothing queued), and
-    /// its objects written under a key prefix no earlier start used, as `--store=s3`
+    /// its objects written under a key prefix no earlier start used, as an S3 cold store
     /// does. The objects earlier starts wrote stay in the bucket. The operator API, if
     /// this cell has one, listens again on a new port.
     ///
     /// A cell started with [`Cell::start_raft`] reopens its Raft log from the raft
-    /// directory as the old process left it (`--meta-log=raft`), so the CAS index and
+    /// directory as the old process left it (the Raft metadata log), so the CAS index and
     /// the action cache are kept, and writes under the log's prefix in a new epoch.
     pub async fn cold_restart(mut self) -> Self {
         let stop = self.stop.take().expect("the server is running");
@@ -300,7 +465,17 @@ impl Cell {
         let dir = dir.map(|d| d.restart());
         let cache = Self::cold_cache(&store, dir.as_ref()).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(cache, store, api_config, dir, wait, retention).await
+        Self::serve(
+            cache,
+            store,
+            api_config,
+            dir,
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+        )
+        .await
     }
 
     /// A new cache over `store` and a writer epoch it allocates. Without `raft_dir`:
@@ -337,6 +512,7 @@ impl Cell {
         Arc::new(cache.expect("open the cache"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn serve(
         cache: Arc<Cache<GateLog, SharedStore>>,
         store: SharedStore,
@@ -344,6 +520,39 @@ impl Cell {
         raft_dir: Option<FaultFs>,
         wait: Duration,
         retention: Duration,
+        ladder: MemoryLadder,
+        streams: StreamLimits,
+    ) -> Self {
+        Self::serve_with_map(
+            cache,
+            store,
+            api_config,
+            raft_dir,
+            wait,
+            retention,
+            ladder,
+            streams,
+            None,
+            None,
+            kbf_front::DefaultPlatform::NONE,
+        )
+        .await
+    }
+
+    /// [`Cell::serve`], sending its daemons the storage map `map` holds if given.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_with_map(
+        cache: Arc<Cache<GateLog, SharedStore>>,
+        store: SharedStore,
+        api_config: Option<Api>,
+        raft_dir: Option<FaultFs>,
+        wait: Duration,
+        retention: Duration,
+        ladder: MemoryLadder,
+        streams: StreamLimits,
+        map: Option<Arc<dyn kbf_mapsync::MapSource>>,
+        state: Option<kbf_server::StateStore>,
+        default_platform: kbf_front::DefaultPlatform,
     ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -354,11 +563,15 @@ impl Cell {
             hello_wait: HELLO_WAIT,
             tick: Duration::from_millis(50),
             unservable_wait: wait,
+            default_platform,
+            memory_ladder: ladder,
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
+            streams: kbf_server::StreamTiming::default(),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
             invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
             segments: kbf_front::SegmentsConfig::DEFAULT,
+            stream_limits: streams,
         };
         let (stop, stop_rx) = oneshot::channel::<()>();
         let (stopped_tx, stopped) = oneshot::channel::<()>();
@@ -378,23 +591,22 @@ impl Cell {
                     let shutdown = async move {
                         let _ = stop_rx.await;
                     };
-                    match server_api {
-                        None => {
-                            let bound = bind_server(server_cache, listeners, shutdown);
-                            run(bound.expect("bind"), bound_tx).await;
-                        }
-                        Some(api) => {
-                            let bound =
-                                bind_server_with_api(server_cache, listeners, Some(api), shutdown);
-                            run(bound.expect("bind"), bound_tx).await;
-                        }
-                    }
+                    let bound = bind_server_with_map(
+                        server_cache,
+                        listeners,
+                        server_api,
+                        kbf_auth::Policy::allow_all(),
+                        state,
+                        map,
+                        shutdown,
+                    );
+                    run(bound.expect("bind"), bound_tx).await;
                 });
                 drop(runtime);
                 let _ = stopped_tx.send(());
             })
             .expect("a server thread");
-        let (reapi, worker, api, recorder) = bound_rx.await.expect("the server binds");
+        let (reapi, worker, api, recorder, drain) = bound_rx.await.expect("the server binds");
         Self {
             cache,
             store,
@@ -404,23 +616,35 @@ impl Cell {
             stop: Some(stop),
             stopped: Some(stopped),
             recorder,
+            drain,
             client: Client::connect(reapi, worker).await,
         }
     }
 }
 
+/// What a started server tells the test: its REAPI, worker and operator API addresses,
+/// its invocation records and its frontend drain.
+type Started = (
+    SocketAddr,
+    SocketAddr,
+    Option<SocketAddr>,
+    kbf_front::Recorder,
+    Arc<kbf_server::Drain>,
+);
+
 /// Says where `bound` listens on `addresses`, then serves it until it stops.
 async fn run(
     bound: Bound<impl Future<Output = Result<(), ServeError>>>,
-    addresses: oneshot::Sender<(
-        SocketAddr,
-        SocketAddr,
-        Option<SocketAddr>,
-        kbf_front::Recorder,
-    )>,
+    addresses: oneshot::Sender<Started>,
 ) {
     let recorder = bound.recorder.clone();
-    let _ = addresses.send((bound.reapi, bound.worker, bound.api, recorder));
+    let _ = addresses.send((
+        bound.reapi,
+        bound.worker,
+        bound.api,
+        recorder,
+        Arc::clone(&bound.drain),
+    ));
     bound.serving.await.expect("serve");
 }
 
@@ -428,11 +652,8 @@ async fn run(
 /// this call.
 fn api_token() -> ApiToken {
     use std::os::unix::fs::PermissionsExt;
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-cell");
-    std::fs::create_dir_all(&dir).expect("a token directory");
-    let path = dir.join(format!("token-{}-{n}", std::process::id()));
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-cell");
+    let path = dir.join("token");
     std::fs::write(&path, format!("{API_TOKEN}\n")).expect("write the token");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     ApiToken::from_file(&path).expect("a usable token")
@@ -629,6 +850,8 @@ pub struct FakeDaemon {
     seq: u64,
     /// The lease epoch the Welcome named (0 before it).
     pub epoch: u64,
+    /// The storage map the Welcome carried.
+    pub map: Option<kbf_proto::kbf::map::v1::Map>,
 }
 
 impl FakeDaemon {
@@ -656,6 +879,7 @@ impl FakeDaemon {
                 assert_eq!(w.protocol_version, 1);
                 assert_eq!(w.heartbeat_interval_ms, INTERVAL.as_millis() as u64);
                 d.epoch = w.epoch;
+                d.map = w.map;
                 Ok(d)
             }
             other => panic!("expected Welcome, got {other:?}"),
@@ -685,6 +909,7 @@ impl FakeDaemon {
             kept: VecDeque::new(),
             seq: 0,
             epoch: 0,
+            map: None,
         })
     }
 
@@ -741,6 +966,17 @@ impl FakeDaemon {
             }
             self.kept.push_back(m);
         }
+    }
+
+    /// The generation of the next `MapUpdate`, within `within`.
+    pub async fn map_update_within(&mut self, within: Duration) -> Option<u64> {
+        self.expect_within(within, |m| match m {
+            server_message::Message::MapUpdate(u) => {
+                Some(u.map.as_ref().map_or(0, |m| m.generation))
+            }
+            _ => None,
+        })
+        .await
     }
 
     pub async fn expect<T>(
@@ -863,6 +1099,26 @@ pub fn ran(lease: Option<LeaseId>, result: &ActionResult) -> kbf_proto::worker::
         action_digest: None,
         memory_kill: 0,
         lost: 0,
+    }
+}
+
+/// Reports `result(lease)` for `first` and for each rerun the farm's budget allows
+/// (`1 + FARM_RERUNS` runs in all, each `Start` taken from `daemon`): a run the farm
+/// could not do is run again, so only the last report finishes the operation.
+pub async fn report_every_run(
+    daemon: &mut FakeDaemon,
+    first: Start,
+    result: impl Fn(Option<LeaseId>) -> kbf_proto::worker::Result,
+) {
+    let mut start = first;
+    for run in 0..=kbf_sched::FARM_RERUNS {
+        assert!(
+            daemon.report(result(start.lease_id)).await.accepted,
+            "run {run}"
+        );
+        if run < kbf_sched::FARM_RERUNS {
+            start = daemon.start().await;
+        }
     }
 }
 

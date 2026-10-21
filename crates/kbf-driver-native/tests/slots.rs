@@ -25,7 +25,7 @@ use kbf_daemon::Runtime as _;
 use kbf_daemon::uid;
 use kbf_driver_native::slots::{Pool, SlotUser};
 use kbf_driver_native::{NativeConfig, NativeRuntime};
-use support::pool::{GID, Scratch, Users, config, ids_of, sleeper};
+use support::pool::{GID, Scratch, Users, config, ids_of, sleeper, slot_report};
 use support::{MemoryCas, PROMPT, Spec, stdout};
 
 /// The variable that turns [`keeper_daemon`] into the daemon [`the_keeper_ends_the_slot_when_the_daemon_dies`]
@@ -160,7 +160,13 @@ async fn an_action_ends_with_every_process_of_its_uid_and_nothing_else() {
         !setuid_lives,
         "the setuid sleep {setuid_pid} outlived its lease"
     );
-    assert_eq!(first.exit_code, 0, "{out}");
+    assert_eq!(
+        first.exit_code,
+        0,
+        "{out}{}\n{}",
+        support::stderr(&cas, &first),
+        slot_report(std::slice::from_ref(mine))
+    );
     let [sleeper, id, tmpdir, manager] = lines[..] else {
         panic!("the action printed {out:?}");
     };
@@ -226,7 +232,10 @@ fn the_keeper_ends_the_slot_when_the_daemon_dies() {
         }
         if Instant::now() > give_up || daemon.try_wait().expect("wait").is_some() {
             let _ = daemon.kill();
-            panic!("the daemon's lease never started its sleeper");
+            panic!(
+                "the daemon's lease never started its sleeper\n{}",
+                slot_report(std::slice::from_ref(user))
+            );
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -343,7 +352,12 @@ echo "T=$(cat "${t}kbf-ci-same") H=$(cat "$h/kbf-ci-same") D=$(defaults read kbf
         let result = result.expect("ran");
         let out = stdout(&cas, &result);
         let err = support::stderr(&cas, &result);
-        assert_eq!(result.exit_code, 0, "lease {v}: {out}{err}");
+        assert_eq!(
+            result.exit_code,
+            0,
+            "lease {v}: {out}{err}\n{}",
+            slot_report(&users.0)
+        );
         assert_eq!(
             out,
             format!("T={v} H={v} D={v} K={v}\n"),
@@ -398,7 +412,8 @@ async fn with_every_slot_held_a_lease_waits_and_a_kill_ends_the_wait() {
         while !root(1).join("held").exists() {
             assert!(
                 Instant::now() < give_up,
-                "the first lease never held its slot"
+                "the first lease never held its slot\n{}",
+                slot_report(std::slice::from_ref(user))
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -428,7 +443,14 @@ async fn with_every_slot_held_a_lease_waits_and_a_kill_ends_the_wait() {
     let (first, (killed, took, waited, third)) =
         tokio::join!(support::run(&rt, &cas, 1, &hold), rest);
     let first = first.expect("the first lease ran");
-    assert_eq!(first.exit_code, 0, "{}", stdout(&cas, &first));
+    assert_eq!(
+        first.exit_code,
+        0,
+        "{}{}\n{}",
+        stdout(&cas, &first),
+        support::stderr(&cas, &first),
+        slot_report(std::slice::from_ref(user))
+    );
     assert!(
         matches!(killed, Err(kbf_daemon::RuntimeError::Killed)),
         "the lease killed while it waited for a slot ended {killed:?}"
@@ -463,4 +485,66 @@ fn the_start_ends_every_process_of_every_slot() {
     drop(rt);
     assert!(before, "the slot user's sleep {pid} did not start");
     assert!(!after, "the slot user's sleep {pid} outlived the start");
+}
+
+/// Catches a refusal the operator cannot see, for an action that runs as a slot
+/// user (issue #184): a slot user's write outside its lease, home and `/var/folders`
+/// entry (`/var/tmp` is open to every user, so only the sandbox refuses it) fails the
+/// action, and its stderr must end with the sandbox's report of the refusal: the
+/// operation and the path. The action stays up a second after the write, so the poll
+/// of the slot's uid sees the shell whose pid the log names.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slots"]
+#[tokio::test]
+async fn a_slot_users_denied_write_is_named_in_its_stderr() {
+    assert_root();
+    let scratch = Scratch::new("denials");
+    let users = Users::new("denials", 1);
+    let cas = Arc::new(MemoryCas::default());
+    let mut config = config(&scratch, users.pool());
+    config.poll = Duration::from_millis(50);
+    let record = Arc::new(std::sync::Mutex::new(Vec::new()));
+    config.denial_record = Some(Arc::clone(&record));
+    let rt = NativeRuntime::new(config, Arc::clone(&cas)).expect("runtime");
+    let name = format!("kbf-denied-{}", std::process::id());
+    let target = format!("/var/tmp/{name}");
+    let script = format!("echo x > {target} ; /bin/sleep 1 ; exit 1");
+    let result = lease(&rt, &cas, 1, &Spec::sh(&script)).await;
+    let _ = std::fs::remove_file(&target);
+    let text = support::stderr(&cas, &result);
+    assert_eq!(result.exit_code, 1, "{text}");
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("kbf:   ") && l.contains(&name))
+        .unwrap_or_else(|| {
+            // What the driver asked and why nothing counted (its node-log record), and
+            // what the log holds for the name or the driver's predicate over a short and
+            // a long window, to tell a predicate that misses the line from a window that
+            // misses it from a line that is only late.
+            let ask = |what: &str, last: &str, predicate: &str| {
+                let out = Command::new("/usr/bin/log")
+                    .args(["show", "--last", last, "--style", "compact", "--predicate"])
+                    .arg(predicate)
+                    .output()
+                    .map_or_else(
+                        |e| e.to_string(),
+                        |o| String::from_utf8_lossy(&o.stdout).into_owned(),
+                    );
+                let hits: Vec<&str> = out.lines().filter(|l| l.contains(&name)).collect();
+                format!("{what}: {} line(s) name it: {hits:?}\n", hits.len())
+            };
+            let named = format!("eventMessage CONTAINS \"{name}\"");
+            let held = [
+                ask("A driver predicate, 5m", "5m", kbf_driver_native::denials::PREDICATE),
+                ask("B name, 30s", "30s", &named),
+                ask("C driver predicate, 30s", "30s", kbf_driver_native::denials::PREDICATE),
+                ask("D name, 5m", "5m", &named),
+            ]
+            .concat();
+            let record = record.lock().expect("record").join("\n");
+            panic!(
+                "no denial names {name} (slot uid {}): {text}\nthe driver's record:\n{record}\nthe log, asked after the run:\n{held}",
+                users.0[0].uid
+            )
+        });
+    assert!(line.contains("file-write-create"), "{line}");
 }

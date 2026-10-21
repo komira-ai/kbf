@@ -48,7 +48,7 @@ pub fn usage_of(result: &ActionResult) -> Option<ResourceUsage> {
 }
 
 /// How a measured process ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Exited {
     /// The exit status, or 128 plus the signal number for a process a signal ended
     /// (the shell's convention).
@@ -142,6 +142,7 @@ impl Child {
                     peak_memory_bytes: u64::try_from(usage.ru_maxrss).unwrap_or(0) * 1024,
                     wall_micros: u64::try_from(self.started.elapsed().as_micros())
                         .unwrap_or(u64::MAX),
+                    cgroup: None,
                 },
             })),
         }
@@ -218,6 +219,7 @@ mod tests {
             cpu_system_micros: 2,
             peak_memory_bytes: 3,
             wall_micros: 4,
+            cgroup: None,
         };
         let other = Any {
             type_url: "type.googleapis.com/other".to_owned(),

@@ -7,32 +7,29 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The worker daemon binary. It lives apart from the `kbf-daemon` library because it
+# The worker daemon: the `kbf_node` library (the flags, the driver set-up, the serve loop)
+# and the thin `kbf-daemon` binary over it. It lives apart from the `kbf-daemon` library because it
 # names the drivers, and the drivers depend on that library.
 [[bin]]
 name = "kbf-daemon"
 path = "src/main.rs"
-
-# A stand-in `podman` for tests/binary.rs (the container driver's start-up checks).
-# Not shipped: the release jobs package the kbf-daemon binary alone.
-[[bin]]
-name = "kbf-podman-stub"
-path = "src/bin/kbf-podman-stub.rs"
-test = false
 
 [dependencies]
 clap.workspace = true
 kbf-daemon.workspace = true
 kbf-driver-native.workspace = true
 kbf-outputs.workspace = true
+kbf-threads.workspace = true
 kbf-transfer.workspace = true
 kbf-types.workspace = true
+kbf-update.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# The container driver runs rootless Podman under cgroup v2, and builds on Linux only.
+# The container driver runs rootless `crun` under cgroup v2, and builds on Linux only.
 [target.'cfg(target_os = "linux")'.dependencies]
 kbf-driver-container.workspace = true
 
@@ -40,7 +37,8 @@ kbf-driver-container.workspace = true
 futures.workspace = true
 # The deploy docs' unit reader and the rendered deploy units (src/deploy_doc_tests.rs).
 kbf-deploy.workspace = true
-kbf-it.workspace = true
+kbf-integration-test.workspace = true
+kbf-map.workspace = true
 kbf-types.workspace = true
 # The CAS the restart test's daemon reads its action from (tests/binary.rs).
 kbf-front.workspace = true
@@ -51,6 +49,8 @@ libc.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 serde_json.workspace = true
+# A layer tar for the `__unpack-layers` helper test (tests/binary/cache.rs).
+tar.workspace = true
 # What the unit tests give the daemon to run: kbf-testkit's act verbs and its fake
 # xcrun, xcodebuild and sandbox-exec, through links to the test binary.
 kbf-testkit.workspace = true

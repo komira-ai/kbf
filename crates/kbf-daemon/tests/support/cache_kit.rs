@@ -56,6 +56,16 @@ impl CountingCas {
             .sum()
     }
 
+    /// Reads of Directory messages, all digests together.
+    pub fn directory_reads(&self) -> u64 {
+        let directories = lock(&self.directories);
+        lock(&self.reads)
+            .iter()
+            .filter(|(d, _)| directories.contains(*d))
+            .map(|(_, n)| n)
+            .sum()
+    }
+
     /// Bytes of file blobs returned.
     pub fn file_bytes(&self) -> u64 {
         self.bytes.load(Ordering::SeqCst)
@@ -239,6 +249,26 @@ impl Gates {
         gates
     }
 
+    /// Waits, at most 30 seconds, until the background thread finished its start-up
+    /// (the snapshot and the drain to the budget) and stands at [`Point::PassStarts`]:
+    /// from then on it does nothing until the cache is stopped. Only on [`Gates::new`].
+    /// A test that changes what the budget leaves the entries calls this first, or the
+    /// start-up drain may run beside its own `evict` and take half of the evictions.
+    pub fn wait_started(&self) {
+        let state = lock(&self.state);
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(30), |s| {
+                !s.reached.iter().any(|p| p == "PassStarts")
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            !timeout.timed_out(),
+            "the background thread never started; points: {:?}",
+            state.reached
+        );
+    }
+
     /// Gates with no hold: the background thread runs as in a daemon.
     pub fn running() -> Arc<Self> {
         Arc::new(Self::default())
@@ -308,8 +338,8 @@ impl Hooks for Gates {
 }
 
 /// A test's cache configuration: the cache in `dir/cache`, leases under `dir/leases`,
-/// `max_bytes`, no pause in a pass, snapshots and passes far apart, `hooks`, a fake
-/// clock at `clock`.
+/// `max_bytes`, no pause in a pass, snapshots, passes and room checks far apart,
+/// `hooks`, a fake clock at `clock`.
 pub fn config(dir: &Path, max_bytes: u64, hooks: Arc<Gates>, clock: &FakeClock) -> CacheConfig {
     let cache = dir.join("cache");
     std::fs::create_dir_all(&cache).expect("cache dir");
@@ -318,6 +348,7 @@ pub fn config(dir: &Path, max_bytes: u64, hooks: Arc<Gates>, clock: &FakeClock) 
     config.pass_pace = Duration::ZERO;
     config.snapshot_every = Duration::from_secs(3600);
     config.pass_every = Duration::from_secs(3600);
+    config.room_every = Duration::from_secs(3600);
     config.hooks = hooks;
     config.clock = clock.clock();
     config

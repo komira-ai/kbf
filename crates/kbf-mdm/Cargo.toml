@@ -40,6 +40,8 @@ tracing-subscriber.workspace = true
 x509-parser.workspace = true
 
 [dev-dependencies]
+# Loopback ports nothing can take (kbf_testkit::port).
+kbf-testkit.workspace = true
 axum = { workspace = true, features = ["http1", "tokio"] }
 # The Mac's verifier of the admin grant, so tests/mac_session_verifies.rs checks the
 # gate's grants against it directly.

@@ -105,6 +105,16 @@ impl Resources {
         Self { vms, ..self }
     }
 
+    /// `self` with no memory: the vector admission compares an action's request on, since
+    /// an action's memory is the limit it first runs under, not a booking.
+    #[must_use]
+    pub const fn without_memory(self) -> Self {
+        Self {
+            memory_bytes: 0,
+            ..self
+        }
+    }
+
     /// Whether `request` fits in `self` on every axis.
     #[must_use]
     pub const fn fits(&self, request: &Self) -> bool {
@@ -154,6 +164,8 @@ pub enum Failure {
     /// The action ran past its timeout.
     Timeout,
     /// The farm failed the action (a kernel OOM, a lost container), not the action itself.
+    /// The scheduler runs it again, preferring another node, while its farm reruns
+    /// last; an operation that finishes with it has used them up.
     Infra,
     /// The action itself cannot run as written (an image named by tag, an output that
     /// is also an input): the client's error, answered INVALID_ARGUMENT. Running it
@@ -209,6 +221,9 @@ pub enum FarmFault {
     NodeMemoryPressure,
     /// The farm lost it.
     Lost(LostWhy),
+    /// The farm could not run it ([`Failure::Infra`]): the daemon's driver failed
+    /// before or around the action, not the action itself.
+    Infra,
 }
 
 impl fmt::Display for FarmFault {
@@ -219,6 +234,7 @@ impl fmt::Display for FarmFault {
                  (node memory pressure)",
             ),
             Self::Lost(why) => why.fmt(f),
+            Self::Infra => f.write_str("the farm could not run the action (infra failure)"),
         }
     }
 }
@@ -382,20 +398,22 @@ mod tests {
     use super::*;
 
     /// Catches two farm faults that read the same to a caller (a restarted daemon
-    /// taken for a fence, or either for a busy node's kill), and a lost run that does
-    /// not read as its cause.
+    /// taken for a fence, or either for a busy node's kill, or any for an infra
+    /// failure), and a lost run that does not read as its cause.
     #[test]
     fn each_farm_fault_reads_differently() {
         let all = [
             FarmFault::NodeMemoryPressure,
             FarmFault::Lost(LostWhy::DaemonRestarted),
             FarmFault::Lost(LostWhy::Fenced),
+            FarmFault::Infra,
         ];
         let text: Vec<String> = all.iter().map(ToString::to_string).collect();
         assert!(text[0].contains("node memory pressure"), "{}", text[0]);
         assert_eq!(text[1], "the daemon restarted while the action ran");
         assert_eq!(text[2], LostWhy::Fenced.to_string());
         assert!(text[2].contains("fenced"), "{}", text[2]);
+        assert!(text[3].contains("infra"), "{}", text[3]);
         for (i, a) in text.iter().enumerate() {
             for b in &text[i + 1..] {
                 assert_ne!(a, b);
@@ -411,6 +429,16 @@ mod tests {
         assert!(free.fits(&Resources::new(4_000, 8 << 30)));
         assert!(!free.fits(&Resources::new(4_001, 1)));
         assert!(!free.fits(&Resources::new(1, (8 << 30) + 1)));
+    }
+
+    /// Catches: `without_memory` that zeroes another axis, or leaves the memory.
+    #[test]
+    fn without_memory_zeroes_only_memory() {
+        let r = Resources::new(2_000, 4 << 30).with_gpus(1).with_vms(2);
+        assert_eq!(
+            r.without_memory(),
+            Resources::new(2_000, 0).with_gpus(1).with_vms(2)
+        );
     }
 
     /// Catches: a fit test that ignores GPUs, which would place a GPU action on a node
@@ -488,5 +516,17 @@ mod tests {
                 .gpus,
             u64::MAX
         );
+    }
+
+    /// Catches: ids that print as the bare number (an operation unreadable in a log next
+    /// to a waiter or a lease), or a worker whose name is changed on the way in or out.
+    #[test]
+    fn operations_and_workers_print_as_their_names() {
+        assert_eq!(OperationId(0).to_string(), "op-0");
+        assert_eq!(OperationId(4_000).to_string(), "op-4000");
+        let worker = WorkerId::new("node-07");
+        assert_eq!(worker.as_str(), "node-07");
+        assert_eq!(worker.to_string(), "node-07");
+        assert_ne!(worker, WorkerId::new("node-7"));
     }
 }

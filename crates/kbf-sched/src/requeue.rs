@@ -59,6 +59,24 @@ pub enum RequeueReason {
     Restarted,
     /// The worker reported that the farm lost the run (`why`); it runs again.
     Lost(LostWhy),
+    /// The worker reported that the farm could not run the action
+    /// ([`kbf_types::Failure::Infra`]); it runs again.
+    Infra,
+}
+
+impl RequeueReason {
+    /// Whether the give-up is a lost lease: the node was silent, the daemon was
+    /// replaced, restarted or reconnected without the lease. They count toward the cap
+    /// on lost leases ([`crate::LOSS_REQUEUES`]). The ones a worker reports, the memory
+    /// ladder's, a switch of the GUI session and a `Start` that never arrived have
+    /// budgets of their own.
+    #[must_use]
+    pub const fn is_loss(&self) -> bool {
+        matches!(
+            self,
+            Self::Silent | Self::Replaced | Self::Reconnected | Self::Restarted
+        )
+    }
 }
 
 impl fmt::Display for RequeueReason {
@@ -92,6 +110,7 @@ impl fmt::Display for RequeueReason {
                 "the daemon restarted, and its successor killed the run before registering"
             }
             Self::Lost(why) => return write!(f, "the farm lost the run ({why}); it runs again"),
+            Self::Infra => "the farm could not run the action (infra failure); it runs again",
         })
     }
 }
@@ -137,6 +156,7 @@ mod tests {
             RequeueReason::Restarted,
             RequeueReason::Lost(LostWhy::Fenced),
             RequeueReason::Lost(LostWhy::DaemonRestarted),
+            RequeueReason::Infra,
         ];
         let text: Vec<String> = all.iter().map(ToString::to_string).collect();
         for (i, a) in text.iter().enumerate() {
@@ -160,6 +180,32 @@ mod tests {
         );
         assert!(text[8].contains("fenced"), "{}", text[8]);
         assert!(text[9].contains("daemon restarted while"), "{}", text[9]);
+    }
+
+    /// Catches: a reason that counts toward the cap on lost leases though its own
+    /// budget already bounds it (a worker's report, the memory ladder, a GUI session
+    /// switch, a `Start` that never arrived), and a lost lease left out of the count.
+    #[test]
+    fn only_lost_leases_count_toward_the_cap() {
+        let lost = [
+            RequeueReason::Silent,
+            RequeueReason::Replaced,
+            RequeueReason::Reconnected,
+            RequeueReason::Restarted,
+        ];
+        let budgeted = [
+            RequeueReason::NotStarted,
+            RequeueReason::SessionSwitch,
+            RequeueReason::OutOfMemory {
+                booked: 1 << 30,
+                raised: 2 << 30,
+            },
+            RequeueReason::NodeMemoryPressure,
+            RequeueReason::Lost(LostWhy::Fenced),
+            RequeueReason::Infra,
+        ];
+        assert!(lost.iter().all(RequeueReason::is_loss));
+        assert!(!budgeted.iter().any(RequeueReason::is_loss));
     }
 
     /// Catches: a size shown in bytes, or rounded to a whole GiB it is not (an operator

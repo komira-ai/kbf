@@ -7,8 +7,8 @@ use common::{
     ANY_INDEX, DAY, EPOCH, digest, in_segment, mark, mark_at, mark_missing, meta, object, put, tick,
 };
 use kbf_meta::{
-    Applied, BlobAnswer, BlobWrite, Command, Epoch, Generation, Location, LossMark, MetaState,
-    ObjectId, Retention, StoreId, UnallocatedEpoch, UnreachableReason,
+    Applied, BlobAnswer, BlobWrite, Command, Epoch, ForeignWriter, Generation, Location, LossMark,
+    MetaState, ObjectId, Retention, StoreId, UnreachableReason,
 };
 
 fn alloc(m: &mut MetaState) -> Epoch {
@@ -62,7 +62,7 @@ fn objects_of_an_unallocated_epoch_are_refused_and_change_nothing() {
                 location: at_epoch(1, 1),
             }
         ),
-        Applied::Blob(Err(UnallocatedEpoch(ObjectId::new(Epoch::new(1), 1))))
+        Applied::Blob(Err(ForeignWriter(ObjectId::new(Epoch::new(1), 1))))
     );
     assert_eq!(fresh, before);
 
@@ -70,7 +70,7 @@ fn objects_of_an_unallocated_epoch_are_refused_and_change_nothing() {
     let before = m.clone();
     for epoch in [0, EPOCH.get() + 1, u64::MAX] {
         let location = at_epoch(epoch, 3);
-        let refused = Err(UnallocatedEpoch(location.object));
+        let refused = Err(ForeignWriter(location.object));
         assert_eq!(
             m.execute(
                 ANY_INDEX,
@@ -121,7 +121,7 @@ fn put_blobs_with_one_unallocated_location_records_nothing() {
             (digest(3), bad),
         ]),
     );
-    assert_eq!(applied, Applied::Blobs(Err(UnallocatedEpoch(bad.object))));
+    assert_eq!(applied, Applied::Blobs(Err(ForeignWriter(bad.object))));
     assert_eq!(m, before);
     assert_eq!(m.blob_count(), 0);
 }
@@ -338,4 +338,32 @@ fn a_delayed_object_reachable_leaves_a_newer_mark() {
             "{name}"
         );
     }
+}
+
+/// Catches: a loss count that does not rise when an object newly becomes unreachable (a
+/// front that remembers "these blobs are held" would never learn the blobs are not), one
+/// that rises on a mark that changes no answer (a repeat, or a higher reason: every read
+/// of a flaky store would end every remembered verification), one that rises or falls on
+/// a clear, and one that does not rise again when a cleared object is lost again.
+#[test]
+fn the_loss_count_rises_when_an_object_newly_becomes_unreachable_and_only_then() {
+    let mut m = meta();
+    assert_eq!(m.losses(), 0);
+    mark_at(&mut m, 5, 1, UnreachableReason::Missing);
+    assert_eq!(m.losses(), 1, "a first mark");
+    mark_at(&mut m, 9, 1, UnreachableReason::Missing);
+    mark_at(&mut m, 12, 1, UnreachableReason::Corrupt);
+    assert_eq!(
+        m.losses(),
+        1,
+        "a repeat and a higher reason change no answer"
+    );
+    mark_at(&mut m, 14, 2, UnreachableReason::Missing);
+    assert_eq!(m.losses(), 2, "another object");
+    reachable(&mut m, 1, Generation::new(12));
+    assert_eq!(m.losses(), 2, "a clear loses nothing");
+    reachable(&mut m, 1, Generation::new(12));
+    assert_eq!(m.losses(), 2, "a clear of a clear");
+    mark_at(&mut m, 20, 1, UnreachableReason::Missing);
+    assert_eq!(m.losses(), 3, "lost again after a clear");
 }

@@ -2,6 +2,8 @@
 //! (I10) and resource arithmetic. The arithmetic is written here, not taken from
 //! `kbf-types`, so that a defect planted in `Resources` is not shared by the reference.
 
+use std::cmp::Ordering;
+
 use kbf_caps::NodeCaps;
 use kbf_types::{ControlRecord, Effect, Resources};
 
@@ -11,6 +13,63 @@ pub fn fits(room: Resources, request: Resources) -> bool {
         && request.memory_bytes <= room.memory_bytes
         && request.gpus <= room.gpus
         && request.vms <= room.vms
+}
+
+/// Whether `request` is an action at the whole host's memory of a worker of `capacity`
+/// (the last step of the memory ladder): it runs alone on the node.
+pub fn exclusive(capacity: Resources, request: Resources) -> bool {
+    request.memory_bytes > 0 && request.memory_bytes >= capacity.memory_bytes
+}
+
+/// Whether an action `request` can be placed on a worker of `capacity` that has `booked`
+/// booked in `leases` leases, `whole` of them being one that holds the node alone. An
+/// action's memory is the limit it first runs under, not a booking: only the worker's
+/// memory capacity bounds it, besides the whole host running alone.
+pub fn room(
+    capacity: Resources,
+    booked: Resources,
+    whole: bool,
+    leases: usize,
+    request: Resources,
+) -> bool {
+    !whole
+        && request.cpu_millis <= capacity.cpu_millis.saturating_sub(booked.cpu_millis)
+        && request.gpus <= capacity.gpus.saturating_sub(booked.gpus)
+        && request.vms <= capacity.vms.saturating_sub(booked.vms)
+        && request.memory_bytes <= capacity.memory_bytes
+        && (!exclusive(capacity, request) || leases == 0)
+}
+
+/// The larger of the CPU and memory shares of `capacity` that `booked` is, as a fraction
+/// `(numerator, denominator)`; an axis with no capacity counts as 0. Integers, written
+/// here and not taken from the scheduler, so a defect in its ranking is not shared.
+fn dominant(capacity: Resources, booked: Resources) -> (u128, u128) {
+    let mut best = (0, 1);
+    for (b, c) in [
+        (booked.cpu_millis, capacity.cpu_millis),
+        (booked.memory_bytes, capacity.memory_bytes),
+    ] {
+        if c > 0 && u128::from(b) * best.1 > best.0 * u128::from(c) {
+            best = (u128::from(b), u128::from(c));
+        }
+    }
+    best
+}
+
+/// How placement ranks two workers, each as its capacity, what its holdings book and how
+/// many leases they are: the lesser share first, then the fewer leases. `Less` is the
+/// better place. A tie is left to the caller: the first by name.
+pub fn by_load(a: (Resources, Resources, usize), b: (Resources, Resources, usize)) -> Ordering {
+    let (x, y) = (dominant(a.0, a.1), dominant(b.0, b.1));
+    (x.0 * y.1).cmp(&(y.0 * x.1)).then(a.2.cmp(&b.2))
+}
+
+/// Whether `booked` is within `capacity` on every axis but memory, which is not booked
+/// against it.
+pub fn within(capacity: Resources, booked: Resources) -> bool {
+    booked.cpu_millis <= capacity.cpu_millis
+        && booked.gpus <= capacity.gpus
+        && booked.vms <= capacity.vms
 }
 
 /// `a + b` on every axis.

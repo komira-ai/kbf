@@ -1,13 +1,15 @@
 //! The worker's input cache (`docs/design/worker-cache.md#6-the-cache`): a
 //! content-addressed directory of read-only files on the node's disk, which the
-//! container driver hard-links into each lease's input root, kept across restarts.
+//! container driver hard-links into each lease's input root (the native driver on
+//! macOS clones them, [`LinkMode::Clone`]), kept across restarts.
 //!
 //! - **One owner.** [`Cache::open`] takes an exclusive `flock` on `<dir>/lock` before
 //!   it touches anything else; a second daemon is refused ([`Disabled::Locked`]) and
 //!   runs uncached. The lock file is never unlinked.
-//! - **Inserts** are fetched and hashed into `tmp/`, made read-only (0444, 0555 for an
+//! - **Inserts** are fetched and hashed into `tmp/` (a file there is removed whoever
+//!   drops it before the rename: a failed fill, a lease killed during its fetch), made read-only (0444, 0555 for an
 //!   executable) with the fixed mtime [`FIXED_MTIME`], and renamed into `blobs/` with
-//!   `RENAME_NOREPLACE` (`fill`). Nothing under `blobs/` is ever opened for writing.
+//!   `RENAME_NOREPLACE` (`RENAME_EXCL` on macOS; `fill`). Nothing under `blobs/` is ever opened for writing.
 //! - **The index** of keys, sizes and last uses is in memory and saved whole to
 //!   `index.snap` (`index`): right after load, every [`CacheConfig::snapshot_every`],
 //!   after each adopt pass, and at [`Cache::stop`]. A bad snapshot is discarded and
@@ -17,9 +19,18 @@
 //! - **Every entry is re-hashed** the first time a lease uses it after a start, and
 //!   stat-checked on every hit (`verify`).
 //!
+//! - **One cache with local storage** ([`CacheConfig::local`]): on a node whose local
+//!   storage shares the disk (`all-in-one`), this directory and index are the node's
+//!   only local copies of blobs (`kbf_storage::local_cache`), and the budget counts
+//!   local storage's bytes beside the entries: eviction makes room for both, after
+//!   each insert and, since local storage grows without the cache's knowing, at least
+//!   every [`CacheConfig::room_every`] on the background thread.
+//!
 //! The cache never fails a lease that would run without it: an I/O error in the cache
-//! hands the lease the fetched bytes to write itself, as without a cache.
+//! leaves the lease to write the blob itself, as without a cache.
 
+#[cfg(target_os = "macos")]
+mod clone;
 mod evict;
 mod fill;
 mod index;
@@ -29,7 +40,6 @@ mod pass;
 mod verify;
 
 use std::collections::{BTreeSet, HashMap};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -37,6 +47,7 @@ use std::time::{Duration, Instant};
 
 pub use fill::InputStats;
 pub use index::Discarded;
+pub use kbf_storage::local_cache::LocalCache;
 pub use layout::{FIXED_MTIME, Key};
 
 use crate::cas::CasError;
@@ -81,8 +92,9 @@ pub trait Hooks: Send + Sync {
     fn at(&self, point: Point<'_>);
 }
 
-/// How the cache makes a hard link (`std::fs::hard_link`): a test gives one that fails
-/// as a full link count or another filesystem would.
+/// How the cache places an entry at a lease's name: a hard link (`std::fs::hard_link`)
+/// on Linux, a `clonefile` on macOS ([`LinkMode::Clone`]). A test gives one that fails
+/// as a full link count or another filesystem would, or (in clone mode) one that copies.
 pub type LinkFn = dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync;
 
 /// The hooks of a daemon: none.
@@ -96,16 +108,16 @@ impl Hooks for NoHooks {
 /// How a cache is opened and run.
 #[derive(Clone)]
 pub struct CacheConfig {
-    /// `--cache-dir`: the directory the cache owns. It must exist.
+    /// `<--data-dir>/cache`: the directory the cache owns. It must exist.
     pub dir: PathBuf,
     /// The lease scratch directory, whose filesystem the cache should share.
     pub scratch: PathBuf,
-    /// `--cache-max-bytes`: the most bytes of entries kept.
+    /// The most bytes of entries kept (sized from the data directory's filesystem).
     pub max_bytes: u64,
-    /// `--cache-min-free-bytes`: below this much free space on the filesystem,
+    /// Below this much free space on the filesystem,
     /// entries no lease links are evicted. 0 is no floor.
     pub min_free_bytes: u64,
-    /// `--cache-link-concurrency`: how many files of a lease are linked or filled at
+    /// How many files of a lease are linked or filled at
     /// once.
     pub link_concurrency: usize,
     /// How often the index is saved.
@@ -116,17 +128,34 @@ pub struct CacheConfig {
     pub pass_pace: Duration,
     pub clock: Clock,
     pub hooks: Arc<dyn Hooks>,
-    /// Links a lease's name to an entry, or to another name of the lease.
+    /// Places a lease's name from an entry (a hard link, or a clone in
+    /// [`LinkMode::Clone`]); in hard-link mode also links one name of the lease to
+    /// another.
     pub link: Arc<LinkFn>,
+    /// How leases get cached files; `None` asks the platform ([`LinkMode::Clone`] on
+    /// macOS, [`LinkMode::Hardlink`] elsewhere). A cache on another filesystem than the
+    /// scratch directory is [`LinkMode::Copy`] whatever this says.
+    pub link_mode: Option<LinkMode>,
     /// The most links an entry may have; `None` asks the filesystem
     /// (`pathconf(_PC_LINK_MAX)`).
     pub link_max: Option<u64>,
+    /// The node's one cache, when its local storage shares this disk (`all-in-one`):
+    /// the cache reports its entries' bytes to it, and its budget counts local
+    /// storage's bytes too ([`CacheConfig::max_bytes`] is then what both may hold).
+    /// `None` elsewhere: the budget is the entries'.
+    pub local: Option<Arc<LocalCache>>,
+    /// With [`CacheConfig::local`], how often the background thread looks whether
+    /// local storage grew past what the budget leaves it, and evicts if so: local
+    /// storage grows without the cache's knowing (uploads), so the evictions after each
+    /// insert are not enough on a node that only uploads.
+    pub room_every: Duration,
 }
 
 impl CacheConfig {
     /// A cache in `dir` for leases under `scratch`, at most `max_bytes`: no free-space
     /// floor, 64 links at once, a snapshot every 5 minutes, a pass a day at one
-    /// directory a second, the system clock, no hooks.
+    /// directory a second, room for local storage made within a second, the system
+    /// clock, no hooks.
     #[must_use]
     pub fn new(dir: PathBuf, scratch: PathBuf, max_bytes: u64) -> Self {
         Self {
@@ -140,10 +169,36 @@ impl CacheConfig {
             pass_pace: Duration::from_secs(1),
             clock: system_clock(),
             hooks: Arc::new(NoHooks),
-            link: Arc::new(|from: &Path, to: &Path| std::fs::hard_link(from, to)),
+            link: Arc::new(place_link),
+            link_mode: None,
             link_max: None,
+            local: None,
+            room_every: Duration::from_secs(1),
         }
     }
+}
+
+/// What a second input cache on one node's one cache warns: the first is the one counted.
+const UNCOUNTED: &str =
+    "cache: the node's one cache has another input cache; this one is not counted";
+
+/// How leases get cached files unless a test says otherwise.
+#[cfg(target_os = "macos")]
+const PLATFORM_LINK_MODE: LinkMode = LinkMode::Clone;
+#[cfg(not(target_os = "macos"))]
+const PLATFORM_LINK_MODE: LinkMode = LinkMode::Hardlink;
+
+/// The platform's way to place an entry at a lease's name: a clone on macOS (APFS
+/// copy-on-write: the new file is its own inode, so a write to it never reaches the
+/// entry), a hard link elsewhere.
+#[cfg(target_os = "macos")]
+fn place_link(from: &Path, to: &Path) -> std::io::Result<()> {
+    clone::clone_file(from, to)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn place_link(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(from, to)
 }
 
 /// Why the daemon runs uncached (`cache_disabled_reason`). The daemon warns and serves
@@ -161,15 +216,13 @@ pub enum Disabled {
         "lease-name: a cache directory named kbf-lease-* or lease-* is removed by lease sweeps"
     )]
     LeaseName,
-    /// `--cache-dir` without `--cache-max-bytes`.
-    #[error("no-budget: --cache-dir needs --cache-max-bytes")]
+    /// The data directory's filesystem has no room for a cache once it keeps its floor
+    /// free.
+    #[error("no-budget: the data directory's filesystem is too small for a cache")]
     NoBudget,
     /// The Linux native driver: actions run as the cache's owner and could write it.
     #[error("native-same-uid: native actions run as the daemon's user and could write the cache")]
     NativeSameUid,
-    /// Podman's storage is not one the cache's overlay checks passed on.
-    #[error("graph-driver: {0}")]
-    GraphDriver(String),
 }
 
 impl Disabled {
@@ -182,7 +235,6 @@ impl Disabled {
             Self::LeaseName => "lease-name",
             Self::NoBudget => "no-budget",
             Self::NativeSameUid => "native-same-uid",
-            Self::GraphDriver(_) => "graph-driver",
         }
     }
 }
@@ -192,6 +244,11 @@ impl Disabled {
 pub enum LinkMode {
     /// A hard link to the entry.
     Hardlink,
+    /// A copy-on-write clone of the entry (`clonefile` on macOS): every name of the
+    /// lease is its own inode, writable as an input is without a cache, and costs no
+    /// bytes until it is written. Never a link, so an action that writes an input
+    /// cannot change the entry.
+    Clone,
     /// A copy of the entry: the cache is on another filesystem than the scratch
     /// directory. It still saves the network fetch.
     Copy,
@@ -201,6 +258,7 @@ impl std::fmt::Display for LinkMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Hardlink => "hardlink",
+            Self::Clone => "clone",
             Self::Copy => "copy",
         })
     }
@@ -211,6 +269,9 @@ impl std::fmt::Display for LinkMode {
 pub struct CacheStats {
     /// Bytes and entries in the index.
     pub bytes: u64,
+    /// Local storage's bytes the budget counts beside the entries (one cache,
+    /// [`CacheConfig::local`]); 0 without one.
+    pub storage_bytes: u64,
     pub entries: u64,
     pub evictions: u64,
     /// Entries that failed their lazy re-hash or their stat check.
@@ -290,7 +351,7 @@ struct Inner {
     blobs: PathBuf,
     tmp: PathBuf,
     /// Holds the exclusive flock while the cache is open.
-    _lock: File,
+    _lock: layout::DirLock,
     link_mode: LinkMode,
     link_max: u64,
     uid: u32,
@@ -298,6 +359,8 @@ struct Inner {
     counters: Counters,
     /// Names the temporary files of fills.
     next_tmp: AtomicU64,
+    /// Local storage alone fills the budget (warned once until it no longer does).
+    storage_over: std::sync::atomic::AtomicBool,
     /// Held while a snapshot is written: one writer of `index.snap.tmp` at a time.
     snapshotting: Mutex<()>,
     index_discarded: Option<Discarded>,
@@ -337,7 +400,7 @@ impl Cache {
             tracing::warn!("cache: index snapshot discarded ({why}); starting empty");
         }
         let link_mode = if opened.same_filesystem {
-            LinkMode::Hardlink
+            config.link_mode.unwrap_or(PLATFORM_LINK_MODE)
         } else {
             let dir = config.dir.display();
             tracing::warn!("cache: {dir} is not on the scratch filesystem; leases get copies");
@@ -359,6 +422,7 @@ impl Cache {
             }),
             counters: Counters::default(),
             next_tmp: AtomicU64::new(0),
+            storage_over: std::sync::atomic::AtomicBool::new(false),
             snapshotting: Mutex::new(()),
             index_discarded: discarded,
             index_load_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -366,6 +430,17 @@ impl Cache {
             thread: Mutex::new(None),
             config,
         });
+        if let Some(local) = &inner.config.local {
+            let entries = Arc::downgrade(&inner);
+            let read = move || {
+                entries
+                    .upgrade()
+                    .map_or(0, |inner| inner.state().index.total())
+            };
+            if !local.attach_inputs(Box::new(read)) {
+                tracing::warn!("{UNCOUNTED}");
+            }
+        }
         let background = Arc::clone(&inner);
         // Without its thread (the system refused one) the cache still serves; the
         // timed snapshots, the drain at start and the passes are what is lost.
@@ -376,7 +451,7 @@ impl Cache {
         Ok(Arc::new(Self { inner }))
     }
 
-    /// The directory the cache owns (`--cache-dir`).
+    /// The directory the cache owns (`<--data-dir>/cache`).
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.inner.config.dir
@@ -405,11 +480,15 @@ impl Cache {
     pub fn stats(&self) -> CacheStats {
         let inner = &*self.inner;
         let state = inner.state();
+        let entries = state.index.len() as u64;
         let c = &inner.counters;
         let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let bytes = state.index.total();
+        drop(state);
         CacheStats {
-            bytes: state.index.total(),
-            entries: state.index.len() as u64,
+            bytes,
+            storage_bytes: inner.storage_bytes(),
+            entries,
             evictions: get(&c.evictions),
             verify_failures: get(&c.verify_failures),
             floor_unreachable: get(&c.floor_unreachable),
@@ -525,6 +604,20 @@ impl Inner {
         (self.config.clock)()
     }
 
+    /// Local storage's bytes on this disk, which the budget counts ([`CacheConfig::local`]).
+    fn storage_bytes(&self) -> u64 {
+        self.config
+            .local
+            .as_ref()
+            .map_or(0, |local| local.storage_bytes())
+    }
+
+    /// A new name in `tmp/` for a fill, removed when dropped.
+    fn next_tmp(&self) -> fill::TmpFile {
+        let n = self.next_tmp.fetch_add(1, Ordering::Relaxed);
+        fill::TmpFile::new(self.tmp.join(n.to_string()))
+    }
+
     fn path_of(&self, key: &Key) -> PathBuf {
         self.blobs.join(key.prefix()).join(key.name())
     }
@@ -576,8 +669,32 @@ impl Inner {
         }
     }
 
-    /// Waits up to `wait`; whether the cache was stopped.
+    /// Waits up to `wait`; whether the cache was stopped. With one cache
+    /// ([`CacheConfig::local`]), every [`CacheConfig::room_every`] of the wait it evicts
+    /// if the entries and local storage's bytes are over the budget.
     fn wait_stopped(&self, wait: Duration) -> bool {
+        let until = Instant::now() + wait;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            let Some(local) = &self.config.local else {
+                return self.wait_for_stop(left);
+            };
+            if self.wait_for_stop(left.min(self.config.room_every)) {
+                return true;
+            }
+            if left.is_zero() {
+                return false;
+            }
+            // Local storage's bytes read before the state's lock is taken, as `evict` does.
+            let budget = self.budget_of(local.storage_bytes());
+            if self.state().index.total() > budget {
+                self.evict();
+            }
+        }
+    }
+
+    /// Waits up to `wait` for a stop; whether the cache was stopped.
+    fn wait_for_stop(&self, wait: Duration) -> bool {
         let (stopped, wake) = &self.stopped;
         let guard = lock(stopped);
         let (guard, _) = wake

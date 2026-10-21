@@ -89,22 +89,12 @@ fn unlink_all_but_directories(dir: &OwnedFd) -> std::io::Result<Vec<OsString>> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
-
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     /// A fresh scratch directory for one unit test, beside the test binary.
-    fn scratch(name: &str) -> PathBuf {
-        let exe = std::env::current_exe().expect("test binary");
-        let dir = exe
-            .parent()
-            .expect("deps directory")
-            .join("kbf-driver-container-unit")
-            .join(name);
-        let _ = remove_tree(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
-        dir
+    fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+        crate::unit_dir(&format!("remove-{name}"))
     }
 
     /// Makes `levels` directories nested in `dir` (`d/d/.../d`), by descriptor (the
@@ -152,7 +142,7 @@ mod tests {
 
     /// Catches an entry the daemon's user cannot remove (its directory is not
     /// writable) being skipped, or reported as success: the removal fails, so the
-    /// clean step falls back to `podman unshare`.
+    /// clean step falls back to a helper container.
     #[test]
     fn an_entry_that_cannot_be_unlinked_fails_the_removal() {
         let dir = scratch("remove-readonly");

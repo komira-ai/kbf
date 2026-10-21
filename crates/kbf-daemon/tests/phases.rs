@@ -59,18 +59,22 @@ impl Farm {
             worker: SocketAddr::from(([127, 0, 0, 1], 0)),
             reapi_tls: None,
             worker_tls: Some(WorkerTls {
-                server: pki.server_tls(),
+                server: pki.worker_tls(),
                 deny_list: None,
             }),
             heartbeat_interval: Duration::from_millis(100),
             hello_wait: Duration::from_secs(2),
             tick: Duration::from_millis(50),
             unservable_wait: Duration::from_secs(300),
+            default_platform: kbf_front::DefaultPlatform::NONE,
+            memory_ladder: kbf_server::MemoryLadder::default(),
             finished_retention: Duration::from_secs(60),
             shutdown_timeout: Duration::from_secs(10),
+            streams: kbf_server::StreamTiming::default(),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
             invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
             segments: kbf_front::SegmentsConfig::DEFAULT,
+            stream_limits: kbf_server::StreamLimits::DEFAULT,
         };
         let bound = bind_server(Arc::clone(&cache), listeners, pending()).expect("bind");
         let (reapi_addr, worker_addr) = (bound.reapi, bound.worker);
@@ -346,8 +350,21 @@ async fn a_lease_accounts_for_its_time_and_its_transfers() {
             "outputs_ms",
             "output_files",
             "output_dirs",
+            // Appended after the existing keys; `-` here, the local runtime having no
+            // lease cgroup.
+            "cpu_usage_us",
+            "cpu_user_us",
+            "cpu_system_us",
+            "cpu_periods",
+            "cpu_throttled",
+            "throttled_us",
+            "mem_peak",
+            "parallelism",
+            "numa_bytes",
+            "numa_spread",
         ]
     );
+    assert!(line.ends_with(" cpu_usage_us=- cpu_user_us=- cpu_system_us=- cpu_periods=- cpu_throttled=- throttled_us=- mem_peak=- parallelism=- numa_bytes=- numa_spread=-"), "{line}");
     assert!(line.contains(&format!(" run_ms={run} ")), "{line}");
 }
 

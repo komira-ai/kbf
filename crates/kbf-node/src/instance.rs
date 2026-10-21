@@ -1,5 +1,5 @@
 //! The daemon process's claim on its scratch directory (issue #22): the file
-//! `<--scratch>/daemon-instance` holds the instance id of the daemon process that runs
+//! `<--data-dir>/leases/daemon-instance` holds the instance id of the daemon process that runs
 //! there, so the next one can name it in its `Hello` as its predecessor.
 //!
 //! The claim is what lets the server give up the predecessor's leases at once: the

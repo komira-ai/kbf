@@ -5,23 +5,40 @@
 //! Served on the worker listener only, behind its admission (kbf-server wraps this
 //! service as it wraps the blob services); this type authorizes nothing itself.
 //!
-//! - **Begin** checks every footer, refuses an upload over
-//!   `--segment-upload-max-bytes` or [`MAX_UPLOAD_RECORDS`], and then is admitted for
-//!   its whole length by [`Cache::admit`] (`--write-bytes-in-flight`, the bound
-//!   ByteStream and batch uploads share), waiting (never refusing) while it is spent.
-//!   Ranges are held in memory until the commit.
+//! - **Begin** checks every footer and refuses an upload over [`MAX_UPLOAD_RECORDS`].
+//!   With a write tier, each segment's records get a range of their own on it, written
+//!   as they arrive; a segment the tier has no room for (or every segment, without a
+//!   tier) is held in memory until the commit. Such a segment may not hold a record
+//!   over [`MAX_UNSTAGED_BLOB_BYTES`]: `Begin` answers FAILED_PRECONDITION
+//!   ([`unstaged_refusal`](crate::unstaged_refusal)), and the client sends the
+//!   upload's records blob by blob through ByteStream, whose `Write` streams a large
+//!   blob to the store. No record is refused for its size. The bytes held in memory may not pass
+//!   `--segment-upload-max-bytes`, and are admitted by [`Cache::admit`]
+//!   (`--write-bytes-in-flight`, the bound ByteStream and batch uploads share), waiting
+//!   (never refusing) while it is spent. An upload whose records all go to the tier
+//!   holds none, whatever its size.
 //! - **PutRange** writes a range of one segment's records. Once Commit was called,
-//!   every PutRange is refused, so the bytes checked are the bytes stored.
+//!   every PutRange is refused, so the bytes received are the bytes stored.
+//!   *Without a write tier* the range also hashes (SHA-256 and CRC-32C) what it
+//!   completed or extended before it answers: each record's hash advances over the
+//!   bytes received unbroken from its start, whichever order the ranges come in, on
+//!   the cache's hashing pool (`--cpu-threads`, blocking pool, off the runtime
+//!   workers), and a record that does not hash to its digest is refused at once, since
+//!   the PUT is the only copy. *With a write tier* nothing is hashed here: the daemon's
+//!   digests are trusted when the upload is acknowledged, and the flusher checks every
+//!   record before the PUT (`docs/design/write-path.md`, section 6.7).
 //! - **Commit** runs in a task of its own, detached from the call and the connection,
-//!   until it has indexed or failed: every record's SHA-256 is checked, each segment
-//!   gets a footer built here (the daemon's CRC-32C values never reach the store). With a
-//!   write tier attached, each segment is staged on it as a block of its own (its records
-//!   synced to the tier's disk, one `PutStaged` for its blobs): the Commit is answered
-//!   without an object-store PUT, and the flusher PUTs the object later. A segment the
-//!   tier does not take (at its budget, a disk error before the commit) is PUT and read
-//!   back as a grouped segment is (a `--write-puts-in-flight` slot, the PUT retried
-//!   under a new key), and one `PutBlobs` commits the records of every PUT segment. A
-//!   second Commit waits for the first and returns its answer.
+//!   until it has indexed or failed. It refuses a record not wholly received (and, with
+//!   no tier, one not hashed to its digest) and never waits for any hashing of its own.
+//!   With a write tier attached, each segment is staged on it as a block of its own
+//!   (its records synced to the tier's disk, one `PutStaged` for its blobs): the Commit
+//!   is answered without an object-store PUT, and the flusher PUTs the object later,
+//!   with a footer it builds from its own hashing. A segment the tier does not take (at
+//!   its budget, a disk error before the commit) is hashed then, if it was not, and PUT
+//!   and read back as a grouped segment is (a `--write-puts-in-flight` slot, the PUT
+//!   retried under a new key) with a footer built here (the daemon's CRC-32C values
+//!   never reach the store), and one `PutBlobs` commits the records of every PUT
+//!   segment. A second Commit waits for the first and returns its answer.
 //! - **ReadRange** is served from the write tier while the object is staged on it (or
 //!   has a flushed copy there), else from the store.
 //! - An upload belongs to the connection that began it ([`Connections`]). When that
@@ -33,11 +50,12 @@ mod connection;
 mod upload;
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use kbf_meta::{Epoch, ObjectId};
+use kbf_meta::{Epoch, LegacyWriter, NodeWriter, ObjectId, Writer};
 use kbf_objstore::ObjectStore;
 use kbf_proto::worker::segments_server::Segments;
 use kbf_proto::worker::{
@@ -45,16 +63,18 @@ use kbf_proto::worker::{
     LocateResponse, ObjectRef, PutRangeRequest, PutRangeResponse, ReadRangeRequest,
     ReadRangeResponse,
 };
+use kbf_segments::RecordHasher;
+use kbf_storage::service::{OpenWrite, OpenWrites};
 use kbf_types::Digest;
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tonic::{Request, Response, Status};
 
 pub use self::connection::{Connection, Connections, Tracked};
-use self::upload::{Declared, Put, Receiving, declare};
-use crate::cache::{Admitted, BuiltSegment, Cache};
+use self::upload::{Declared, Held, Put, Receiving, TierWrites, advance, declare};
+use crate::cache::{Admitted, BuiltSegment, Cache, TierRange};
 use crate::meta_log::MetaLog;
-use crate::{MAX_BLOB_BYTES, wire};
+use crate::{MAX_UNSTAGED_BLOB_BYTES, unstaged_refusal, wire};
 
 /// The most records one upload may hold: bounds `Begin`'s message (16,384 entries of
 /// 52 bytes, about 850 KiB) and the upload's one `PutBlobs`.
@@ -63,15 +83,19 @@ pub const MAX_UPLOAD_RECORDS: usize = 16_384;
 /// The most bytes one `PutRange` or `ReadRange` carries.
 pub const MAX_RANGE_BYTES: u64 = 4 << 20;
 
-/// The smallest `--segment-upload-max-bytes`: one record of [`MAX_BLOB_BYTES`] and its
-/// footer, with room to spare, so any legal blob can be uploaded.
-pub const MIN_SEGMENT_UPLOAD_BYTES: u64 = MAX_BLOB_BYTES + (1 << 20);
+/// The smallest `--segment-upload-max-bytes`, the most bytes one upload may hold in
+/// memory: 33 MiB, a daemon's upload of small files (32 MiB,
+/// `kbf_transfer::SEGMENT_UPLOAD_BYTES`) with room to spare. No record held in memory
+/// is over [`MAX_UNSTAGED_BLOB_BYTES`], and records written to the write tier as they
+/// arrive are not held, so an upload of any size can be admitted.
+pub const MIN_SEGMENT_UPLOAD_BYTES: u64 = 33 << 20;
 
 /// The `--segment-upload-*` flags of the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentsConfig {
-    /// The most bytes one upload may declare (`--segment-upload-max-bytes`). The
-    /// memory uploads in progress hold together is bounded by the cache's
+    /// The most bytes one upload may hold in memory (`--segment-upload-max-bytes`):
+    /// its segments that are not written to the write tier as they arrive. The memory
+    /// uploads in progress hold together is bounded by the cache's
     /// `--write-bytes-in-flight` ([`Cache::admit`]), which `kbf-server` refuses to
     /// start below this cap, so a legal `Begin` is always admitted.
     pub max_bytes: u64,
@@ -111,6 +135,8 @@ struct Shared<M, O> {
     waiting: AtomicUsize,
     next: AtomicU64,
     uploads: Mutex<HashMap<u64, Arc<Upload>>>,
+    /// What counts the uploads as open writes, if the node reports them.
+    open_writes: Option<OpenWrites>,
 }
 
 #[derive(Debug)]
@@ -128,6 +154,10 @@ enum Phase {
     Receiving {
         segments: Vec<Receiving>,
         _admitted: Admitted,
+        /// The upload counted as an open write on its node: from `Begin` until the commit
+        /// that was started for it ends (it is moved into that detached task) or it is
+        /// dropped.
+        _open: Option<OpenWrite>,
     },
     Committing,
     /// Committed or failed; the answer is in [`Upload::done`].
@@ -176,6 +206,31 @@ impl Upload {
         }
     }
 
+    /// The next step of the check of record `i` of segment `index` ([`Receiving::next`]);
+    /// `None` when the upload is no longer receiving (a hash job outlived its upload),
+    /// which ends that record's check.
+    fn check_next(
+        &self,
+        index: usize,
+        i: usize,
+        finished: Option<(RecordHasher, usize)>,
+    ) -> Option<Held> {
+        match &mut *lock(&self.phase) {
+            Phase::Receiving { segments, .. } => {
+                segments[index].next(&self.declared[index], i, finished)
+            }
+            _ => None,
+        }
+    }
+
+    /// The refusal of segment `index`, if a record of it did not hash to its digest.
+    fn refusal_at(&self, index: usize) -> Option<Status> {
+        match &*lock(&self.phase) {
+            Phase::Receiving { segments, .. } => segments[index].refusal(),
+            _ => None,
+        }
+    }
+
     /// Drops the upload, freeing its buffers and admission even if a call still holds it,
     /// unless a commit of it is running: decided under the phase lock, so a Commit
     /// cannot start between the check and the drop.
@@ -189,8 +244,36 @@ impl Upload {
     }
 }
 
-/// Checks every received segment against what `Begin` declared ([`Receiving::check`]),
-/// on the blocking pool: hashing up to a gigabyte must not hold a runtime thread. A
+/// Writes the range of `bytes` at `offset`, which `put` recorded, to the write tier,
+/// off the runtime, and answers `writes` whether it did (if not, the range is forgotten
+/// at the next `PutRange` or `Commit`, so it can be sent again, and the call fails
+/// UNAVAILABLE). Nothing of the range is held once this answers.
+async fn write_to_tier(
+    range: Arc<TierRange>,
+    writes: Arc<TierWrites>,
+    offset: u64,
+    bytes: Vec<u8>,
+) -> Result<(), Status> {
+    let written = tokio::task::spawn_blocking(move || range.write(offset, &bytes))
+        .await
+        .map_err(shown)
+        .and_then(|written| written.map_err(shown));
+    writes.done(offset, written.is_ok());
+    written.map_err(|why| {
+        Status::unavailable(format!(
+            "the write tier did not take the range at {offset}: {why}"
+        ))
+    })
+}
+
+/// `e` as a message.
+fn shown(e: impl std::fmt::Display) -> String {
+    e.to_string()
+}
+
+/// Builds every received segment from what `Begin` declared and `PutRange` checked
+/// ([`Receiving::check`]), on the blocking pool: copying footers must not hold a runtime
+/// thread. A
 /// check that panicked answers INTERNAL, so the upload's Commits are still answered.
 async fn check_all(
     upload: Arc<Upload>,
@@ -221,8 +304,22 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
                 waiting: AtomicUsize::new(0),
                 next: AtomicU64::new(1),
                 uploads: Mutex::new(HashMap::new()),
+                open_writes: None,
             }),
         }
+    }
+
+    /// The service counting each upload in `open_writes` from its `Begin` until its commit
+    /// ends or it is dropped, so a node that reports its open writes does not report none
+    /// while a daemon is uploading. Call before the service is cloned or served.
+    ///
+    /// # Panics
+    /// If the service has been cloned.
+    #[must_use]
+    pub fn with_open_writes(mut self, open_writes: OpenWrites) -> Self {
+        let shared = Arc::get_mut(&mut self.shared).expect("set before the service is cloned");
+        shared.open_writes = Some(open_writes);
+        self
     }
 
     /// How many `Begin` calls are waiting for admission now: what a test watches to
@@ -240,7 +337,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
 
     /// The upload `id`, if the caller's connection owns it.
     fn upload<T>(&self, request: &Request<T>, id: u64) -> Result<Arc<Upload>, Status> {
-        let caller = self.shared.connections.of(request.remote_addr());
+        let caller = self.shared.connections.of(kbf_tls::remote_addr(request));
         let upload = lock(&self.shared.uploads).get(&id).cloned();
         upload
             .filter(|u| u.owner.as_ref().map(Connection::id) == caller.as_ref().map(Connection::id))
@@ -289,12 +386,13 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
         upload: Arc<Upload>,
         segments: Vec<Receiving>,
         admitted: Admitted,
+        _open: Option<OpenWrite>,
     ) {
-        let checked = check_all(Arc::clone(&upload), segments).await;
-        let answer = match checked {
-            Ok(built) => cache.store_upload(built).await.map_err(Status::from),
-            Err(refused) => Err(refused),
-        };
+        let answer = async {
+            let built = check_all(Arc::clone(&upload), segments).await?;
+            cache.store_upload(built).await.map_err(Status::from)
+        }
+        .await;
         drop(admitted);
         *lock(&upload.phase) = Phase::Done;
         upload.touch();
@@ -308,32 +406,70 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
         &self,
         request: Request<BeginRequest>,
     ) -> Result<Response<BeginResponse>, Status> {
-        let owner = self.shared.connections.of(request.remote_addr());
+        // Counted from the call, so a refused or cancelled Begin gives it back.
+        let open = self.shared.open_writes.as_ref().map(OpenWrites::begin);
+        let owner = self.shared.connections.of(kbf_tls::remote_addr(&request));
         let segments: Vec<(u64, &[u8])> = request
             .get_ref()
             .segments
             .iter()
             .map(|s| (s.length, s.footer.as_slice()))
             .collect();
-        let (declared, total, records) = declare(&segments, MAX_BLOB_BYTES)?;
-        let cap = self.shared.config.max_bytes;
-        if total > cap {
-            return Err(Status::invalid_argument(format!(
-                "an upload of {total} bytes is over the {cap}-byte cap (--segment-upload-max-bytes)"
-            )));
-        }
+        let (declared, records) = declare(&segments)?;
         if records > MAX_UPLOAD_RECORDS {
             return Err(Status::invalid_argument(format!(
                 "an upload of {records} records is over the {MAX_UPLOAD_RECORDS}-record limit"
             )));
         }
-        // `total <= cap <= --write-bytes-in-flight` (kbf-server refuses to start
+        // With a write tier the daemon's digests are trusted here and checked by the
+        // flusher before the PUT; without one, the only copy is the PUT, so each record
+        // is hashed as its bytes arrive. With one, each segment's records are written
+        // to a range of their own on it as they arrive, if it has room (else held here).
+        let trusted = self.shared.cache.write_tier().is_some();
+        let mut ranges = Vec::with_capacity(declared.len());
+        let mut held = 0u64;
+        for d in &declared {
+            let range = if trusted & (d.records_len > 0) {
+                self.shared.cache.reserve_range(d.records_len).await
+            } else {
+                None
+            };
+            if range.is_none() {
+                // A record held in memory until the commit must be small: memory is
+                // bounded per file. A larger one, with no tier to write it to, is sent
+                // by ByteStream instead, which streams it to the store: the client
+                // falls back to that at this answer.
+                let large = d
+                    .entries
+                    .iter()
+                    .find(|e| e.digest.size_bytes > MAX_UNSTAGED_BLOB_BYTES);
+                if let Some(large) = large {
+                    return Err(Status::failed_precondition(unstaged_refusal(
+                        &large.digest.to_string(),
+                    )));
+                }
+                held = held.saturating_add(d.length);
+            }
+            ranges.push(range);
+        }
+        let cap = self.shared.config.max_bytes;
+        if held > cap {
+            return Err(Status::invalid_argument(format!(
+                "an upload that holds {held} bytes in memory is over the {cap}-byte cap \
+                 (--segment-upload-max-bytes)"
+            )));
+        }
+        // `held <= cap <= --write-bytes-in-flight` (kbf-server refuses to start
         // otherwise), so this always ends.
         let admitted = {
             let _waiting = Waiting::enter(&self.shared.waiting);
-            self.shared.cache.admit(total).await
+            self.shared.cache.admit(held).await
         };
-        let segments = declared.iter().map(Receiving::new).collect();
+        let segments: Vec<Receiving> = declared
+            .iter()
+            .zip(ranges)
+            .map(|(d, range)| Receiving::new(d, trusted, range))
+            .collect();
         let (done, _) = watch::channel(None);
         let upload = Arc::new(Upload {
             owner,
@@ -341,6 +477,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             phase: Mutex::new(Phase::Receiving {
                 segments,
                 _admitted: admitted,
+                _open: open,
             }),
             last_call: Mutex::new(Instant::now()),
             done,
@@ -373,20 +510,47 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
         let declared = upload.declared.get(index).ok_or_else(|| {
             Status::invalid_argument(format!("no segment {segment} in the upload"))
         })?;
-        let mut phase = lock(&upload.phase);
-        match &mut *phase {
-            Phase::Receiving { segments, .. } => {
-                let put = segments[index].put(declared.records_len, offset, &bytes)?;
-                if put == Put::Resent {
-                    tracing::debug!(segment, offset, "resent range acknowledged, not written");
+        let (claimed, to_tier) = {
+            let mut phase = lock(&upload.phase);
+            match &mut *phase {
+                Phase::Receiving { segments, .. } => {
+                    let (put, claimed) = segments[index].put(declared, offset, &bytes)?;
+                    if put == Put::Resent {
+                        tracing::debug!(segment, offset, "resent range acknowledged, not written");
+                    }
+                    let to_tier = (put == Put::Written).then(|| segments[index].tier());
+                    (claimed, to_tier.flatten())
                 }
-                Ok(Response::new(PutRangeResponse {}))
+                Phase::Committing | Phase::Done => {
+                    return Err(Status::failed_precondition(
+                        "the upload is committing; ranges are no longer accepted",
+                    ));
+                }
+                Phase::Dropped => return Err(Status::not_found("the upload was dropped")),
             }
-            Phase::Committing | Phase::Done => Err(Status::failed_precondition(
-                "the upload is committing; ranges are no longer accepted",
-            )),
-            Phase::Dropped => Err(Status::not_found("the upload was dropped")),
+        };
+        if let Some((range, writes)) = to_tier {
+            write_to_tier(range, writes, offset, bytes).await?;
         }
+        if !claimed.is_empty() {
+            // Hash what this range completed or extended, here and now, beside the
+            // other ranges' own: the commit then has nothing left to hash. The task
+            // records its results itself, so a call cancelled meanwhile leaves no
+            // record claimed forever.
+            let task = Arc::clone(&upload);
+            self.shared
+                .cache
+                .hashing()
+                .run(Box::new(move || {
+                    advance(&claimed, |i, finished| task.check_next(index, i, finished));
+                }))
+                .await?;
+            // A mismatch is refused at once; the upload cannot commit.
+            if let Some(refused) = upload.refusal_at(index) {
+                return Err(refused);
+            }
+        }
+        Ok(Response::new(PutRangeResponse {}))
     }
 
     async fn commit(
@@ -397,7 +561,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
         upload.touch();
         {
             let mut phase = lock(&upload.phase);
-            if let Phase::Receiving { segments, .. } = &*phase {
+            if let Phase::Receiving { segments, .. } = &mut *phase {
+                segments.iter_mut().for_each(Receiving::forget_failed);
                 let missing = segments
                     .iter()
                     .zip(&upload.declared)
@@ -408,17 +573,22 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                         "record {digest} was not wholly received"
                     )));
                 }
+                if let Some(refused) = segments.iter().find_map(Receiving::not_ready) {
+                    return Err(refused);
+                }
             }
             match std::mem::replace(&mut *phase, Phase::Committing) {
                 Phase::Receiving {
                     segments,
                     _admitted: admitted,
+                    _open: open,
                 } => {
                     tokio::spawn(Self::commit_task(
                         Arc::clone(&self.shared.cache),
                         Arc::clone(&upload),
                         segments,
                         admitted,
+                        open,
                     ));
                 }
                 Phase::Dropped => {
@@ -451,10 +621,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             .zip(found)
             .map(|(digest, location)| BlobLocation {
                 digest: Some(wire::digest_to_proto(digest)),
-                object: location.map(|l| ObjectRef {
-                    epoch: l.object.epoch().get(),
-                    seq: l.object.seq(),
-                }),
+                object: location.map(|l| object_ref(l.object)),
                 offset: location.map_or(0, |l| l.offset),
             })
             .collect();
@@ -476,7 +643,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             )));
         }
         let object = object.ok_or_else(|| Status::invalid_argument("no object named"))?;
-        let id = ObjectId::new(Epoch::new(object.epoch), object.seq);
+        let id = object_id(&object)?;
         match self
             .shared
             .cache
@@ -487,11 +654,57 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                 bytes: bytes.to_vec(),
             })),
             None => Err(Status::not_found(format!(
-                "object {}/{} holds no {length} bytes at {offset}",
-                object.epoch, object.seq
+                "object {id} holds no {length} bytes at {offset}"
             ))),
         }
     }
+}
+
+/// `object` on the wire: an epoch writer's with `member`, `boot` and `log` zero, a node
+/// writer's with `epoch` and `log` zero, another log's epoch writer's with `member` and
+/// `boot` zero.
+fn object_ref(object: ObjectId) -> ObjectRef {
+    let (epoch, member, boot, log) = match object.writer() {
+        Writer::Epoch(e) => (e.get(), 0, 0, 0),
+        Writer::Node(n) => (0, n.member().get(), n.boot().get(), 0),
+        Writer::Legacy(l) => (l.epoch().get(), 0, 0, l.log().get()),
+    };
+    ObjectRef {
+        epoch,
+        seq: object.seq(),
+        member,
+        boot,
+        log,
+    }
+}
+
+/// The object `object` names: an epoch writer's when `member`, `boot` and `log` are all
+/// zero, a node writer's when `epoch` and `log` are zero and `member` and `boot` are not,
+/// another log's epoch writer's when `member` and `boot` are zero and `epoch` and `log`
+/// are not.
+///
+/// # Errors
+/// INVALID_ARGUMENT for any other combination.
+fn object_id(object: &ObjectRef) -> Result<ObjectId, Status> {
+    let writer = match (
+        object.epoch,
+        NonZeroU64::new(object.member),
+        NonZeroU64::new(object.boot),
+        NonZeroU64::new(object.log),
+    ) {
+        (epoch, None, None, None) => Writer::Epoch(Epoch::new(epoch)),
+        (0, Some(member), Some(boot), None) => Writer::Node(NodeWriter::new(member, boot)),
+        (epoch, None, None, Some(log)) if epoch != 0 => {
+            Writer::Legacy(LegacyWriter::new(log, Epoch::new(epoch)))
+        }
+        _ => {
+            return Err(Status::invalid_argument(
+                "an object names an epoch alone, a member and a boot alone, or a log and an \
+                 epoch alone",
+            ));
+        }
+    };
+    Ok(ObjectId::of(writer, object.seq))
 }
 
 #[cfg(test)]

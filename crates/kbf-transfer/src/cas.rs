@@ -11,6 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use futures::{Stream, StreamExt as _};
 use kbf_proto::reapi::Digest;
 use kbf_types::LeaseId;
@@ -18,6 +19,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::config::DEFAULT_IN_FLIGHT;
+use crate::source::Record;
 use crate::spool::Spool;
 
 /// The most bytes one ByteStream `WriteRequest` carries by default
@@ -47,7 +49,15 @@ pub enum CasError {
     Write(String, String),
 }
 
-/// A content-addressed blob store, SHA-256 only.
+/// A content-addressed blob store, SHA-256 only: the daemon's data plane.
+///
+/// Everything a daemon does with the farm's blobs goes through this trait (finding which
+/// are missing, storing an action's outputs, reading inputs whole or into a file), and
+/// nothing else of the server's store is reachable from the daemon's runtimes, which
+/// are generic over it. [`crate::Transfers`] is the implementation that speaks gRPC to a
+/// server; another that calls a store in the same process must pass the same checks,
+/// which live in `kbf-cas-conformance` (generic over the implementation, run against
+/// `Transfers` there).
 pub trait Cas: Send + Sync + 'static {
     /// What one lease reads and writes through: [`crate::Scope`] for the transfer
     /// engine, which counts the lease's transfers and logs them when it is dropped;
@@ -127,13 +137,35 @@ pub trait Cas: Send + Sync + 'static {
         std::future::ready(digests.to_vec())
     }
 
-    /// Stores every blob `spool` holds and returns once all are durable: an action's
-    /// outputs, gathered by a walk that stored them into the spool. The transfer engine
-    /// sends the ones the server lacks as whole segments (`crate::segments`), and blob
-    /// by blob when the server cannot take segments; this default stores each one with
-    /// [`Cas::put`], [`Cas::in_flight`] at a time.
+    /// Stores every blob `records` name and returns once all are durable: an action's
+    /// outputs, hashed once by a walk that kept where each one's bytes are. The transfer
+    /// engine asks which the server lacks, reads those from their sources as it sends
+    /// them as whole segments (`crate::segments`), and sends blob by blob when the
+    /// server cannot take segments; a file that is no longer the one the walk hashed
+    /// fails the call with [`CasError::Read`], and bytes that no longer hash to their
+    /// digest are refused by the server. This default stores each one with
+    /// [`Cas::put`] or [`Cas::put_chunks`], [`Cas::in_flight`] at a time.
+    fn put_records(
+        &self,
+        records: Vec<Record>,
+    ) -> impl Future<Output = Result<(), CasError>> + Send {
+        async move { crate::segments::put_each(self, records).await }
+    }
+
+    /// Stores every blob `spool` holds, as [`Cas::put_records`] does.
     fn put_spool(&self, spool: Arc<Spool>) -> impl Future<Output = Result<(), CasError>> + Send {
-        async move { crate::segments::put_each(self, &spool).await }
+        async move { self.put_records(spool.outgoing()).await }
+    }
+
+    /// Where a walk that reads output files to hash them hands each file's bytes as it
+    /// reads them, so the store takes them in that same read: the in-process data plane,
+    /// whose store is in this process. A file whose bytes were taken is stored when the
+    /// intake is finished ([`Intake::finish`]), not sent again with
+    /// [`Cas::put_records`]. `None`, this default, for a store that reads each file
+    /// itself when it sends it, from the [`Record`]'s source (the transfer engine,
+    /// which sends only the files the server answered missing).
+    fn intake(&self) -> Option<Arc<dyn Intake>> {
+        None
     }
 
     /// How many requests this store runs at once, for the whole process. A caller that
@@ -181,13 +213,48 @@ impl<C: Cas> Cas for Arc<C> {
         C::missing(self, digests)
     }
 
-    fn put_spool(&self, spool: Arc<Spool>) -> impl Future<Output = Result<(), CasError>> + Send {
-        C::put_spool(self, spool)
+    fn put_records(
+        &self,
+        records: Vec<Record>,
+    ) -> impl Future<Output = Result<(), CasError>> + Send {
+        C::put_records(self, records)
+    }
+
+    fn intake(&self) -> Option<Arc<dyn Intake>> {
+        C::intake(self)
     }
 
     fn in_flight(&self) -> usize {
         C::in_flight(self)
     }
+}
+
+/// A store's side of a walk that reads each file once ([`Cas::intake`]): one per walk,
+/// shared by the threads that hash.
+pub trait Intake: Send + Sync {
+    /// A file of `size` bytes (its size when it was opened) about to be read, its
+    /// chunks handed over as they are read; `None` when the store does not take it (a
+    /// file larger than it can hold), which then goes to [`Cas::put_records`] as any
+    /// other. Called on a hashing thread.
+    fn file(&self, size: u64) -> Option<Box<dyn IntakeFile>>;
+
+    /// Stores every file finished so far whose blob the store lacks, and returns once
+    /// all are durable: after it, none of them needs [`Cas::put_records`]. The first
+    /// failure is the answer.
+    fn finish(&self) -> BoxFuture<'_, Result<(), CasError>>;
+}
+
+/// One file on its way into an [`Intake`]. Dropped unfinished (the file did not fit,
+/// changed, or could not be read), it stores nothing.
+pub trait IntakeFile: Send {
+    /// The next `chunk` of the file's bytes, as read: the caller's buffer, reused for
+    /// the next chunk.
+    fn write(&mut self, chunk: &[u8]);
+
+    /// Every chunk was written, and together they hash to `digest` and CRC-32C
+    /// `crc32c`. May wait for the store to take earlier files first. Called on a
+    /// hashing thread.
+    fn finish(self: Box<Self>, digest: kbf_types::Digest, crc32c: u32);
 }
 
 /// A blob's bytes on their way to [`Cas::put_chunks`], one chunk at a time.

@@ -16,14 +16,15 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_front::{Cache, Connections, SegmentsConfig, SegmentsService};
+use kbf_front::{Cache, CacheError, Connections, SegmentsConfig, SegmentsService};
+use kbf_meta::BlobAnswer;
 use kbf_objstore::{Capabilities, KeyPrefix};
 use kbf_proto::worker::segments_server::Segments;
 use kbf_proto::worker::{
     BeginRequest, CommitRequest, ObjectRef, PutRangeRequest, ReadRangeRequest, UploadSegment,
 };
 use kbf_segments::layout::encode_footer;
-use kbf_segments::{Footer, IndexEntry, SegmentWriter};
+use kbf_segments::{Footer, IndexEntry, SegmentReader, SegmentWriter};
 use kbf_types::Digest;
 use support::{Farm, TestBlob, TierCache, blobs, later, start};
 use tonic::{Code, Request, Status};
@@ -106,6 +107,27 @@ async fn upload(service: &Service, segs: &[Seg]) -> Result<Vec<String>, Status> 
         .collect())
 }
 
+/// `s` with the first byte of `blob`'s record changed after its footer was made: what a
+/// daemon with a bad disk or a bug would send under a digest it computed earlier.
+fn altered(s: &Seg, blob: &TestBlob) -> (Seg, usize) {
+    let whole = [s.records.as_slice(), s.footer.as_slice()].concat();
+    let footer = Footer::parse(&whole, s.length).expect("footer");
+    let entry = footer
+        .entries()
+        .iter()
+        .find(|e| e.digest == blob.digest)
+        .expect("the blob is in the segment");
+    let at = usize::try_from(entry.offset).expect("offset");
+    let mut records = s.records.clone();
+    records[at] ^= 0xff;
+    let seg = Seg {
+        records,
+        footer: s.footer.clone(),
+        length: s.length,
+    };
+    (seg, at)
+}
+
 /// Every blob of `blobs` is present, and read back whole: by `FindMissing`, by the
 /// batch read, and as the daemon does, from `Locate` and `ReadRange`.
 async fn assert_readable(cache: &TierCache, service: &Service, blobs: &[TestBlob]) {
@@ -122,9 +144,9 @@ async fn assert_readable(cache: &TierCache, service: &Service, blobs: &[TestBlob
         .locations;
     for (b, at) in blobs.iter().zip(located) {
         assert_eq!(read[&b.digest].as_ref().expect("batch read"), &b.bytes);
-        let ObjectRef { epoch, seq } = at.object.expect("located");
+        let object = at.object.expect("located");
         let range = ReadRangeRequest {
-            object: Some(ObjectRef { epoch, seq }),
+            object: Some(object),
             offset: at.offset,
             length: b.bytes.len() as u64,
         };
@@ -295,7 +317,11 @@ async fn a_range_of_an_object_nobody_holds_is_not_found() {
     let farm = Farm::new(Capabilities::default());
     let (_cache, service) = serve(farm.start(GIB).await);
     let range = ReadRangeRequest {
-        object: Some(ObjectRef { epoch: 1, seq: 999 }),
+        object: Some(ObjectRef {
+            epoch: 1,
+            seq: 999,
+            ..ObjectRef::default()
+        }),
         offset: 0,
         length: 16,
     };
@@ -348,4 +374,285 @@ async fn a_range_the_tier_does_not_hold_is_answered_by_the_store_or_refused() {
         whole.expect("range").into_inner().bytes,
         all[0].bytes.as_ref()
     );
+}
+
+/// Catches: a tier-mode upload that hashes on the acknowledgement's path (the server
+/// refusing a corrupt record at `PutRange` or `Commit`, the cost the flusher exists to
+/// take off it), a flusher that PUTs the corrupt record, one that loses the sound
+/// records of the same segment, a drop nobody counts, and a bad digest that stays
+/// present. One record of three is altered after `Begin`: the upload is acknowledged;
+/// the flush drops the bad record (counted, unavailable), stages the two sound ones
+/// again and PUTs them on the next round, with a store object that holds neither the
+/// bad digest nor its bytes; a new upload of the good bytes heals it.
+#[tokio::test]
+async fn a_corrupt_record_is_acknowledged_and_caught_at_the_flush() {
+    let farm = Farm::new(Capabilities::default());
+    let (cache, service) = serve(farm.start(GIB).await);
+    let all = blobs(1, 3, 4096);
+    let good = seg(&all);
+    let (sent, at) = altered(&good, &all[1]);
+    let committed = upload(&service, std::slice::from_ref(&sent))
+        .await
+        .expect("acknowledged: nothing is hashed on the way");
+    assert_eq!(committed.len(), 3);
+    assert_eq!(counter(&cache, "kbf_tier_flush_digest_mismatch_total"), "0");
+    let object = farm.log.object_of(&all[1].digest);
+    assert!(farm.store.put_keys().is_empty());
+
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(
+        (&round.corrupt, &round.dropped, &round.flushed),
+        (&vec![object], &vec![all[1].digest], &vec![])
+    );
+    assert!(
+        farm.store.put_keys().is_empty(),
+        "the bad record is not PUT"
+    );
+    assert_eq!(counter(&cache, "kbf_tier_flush_digest_mismatch_total"), "1");
+    assert_eq!(farm.log.answer(&all[1].digest), BlobAnswer::Unavailable);
+    let sound = [all[0].clone(), all[2].clone()];
+    assert_readable(&cache, &service, &sound).await;
+    let digests: Vec<Digest> = all.iter().map(|b| b.digest).collect();
+    assert_eq!(
+        cache.find_missing(&digests).await.expect("find"),
+        [all[1].digest]
+    );
+
+    let again = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(again.flushed.len(), 1, "{again:?}");
+    let puts = farm.store.put_keys();
+    assert_eq!(puts.len(), 1, "one object, the sound records");
+    let stored = farm
+        .store
+        .stored(&support::key(&cache, again.flushed[0]))
+        .await
+        .expect("stored");
+    let reader = SegmentReader::open(&stored).expect("a segment");
+    for b in &sound {
+        assert_eq!(reader.get(&b.digest).expect("get"), Some(&b.bytes[..]));
+    }
+    assert_eq!(reader.get(&all[1].digest).expect("absent"), None);
+    let bad_record = &sent.records[at..at + 4096];
+    assert!(
+        !stored.windows(4096).any(|w| w == bad_record),
+        "the corrupt record's bytes reached the store"
+    );
+    assert_readable(&cache, &service, &sound).await;
+
+    upload(&service, &[seg(&all[1..2])]).await.expect("healed");
+    assert_readable(&cache, &service, &all).await;
+}
+
+/// Catches: a corrupt record read back from the tier before its flush and served (the
+/// server verifies the block it reads), and one that is then flushed anyway. The read
+/// is refused, its object is marked corrupt and the flusher has nothing left to do.
+#[tokio::test]
+async fn a_corrupt_staged_record_is_not_served_before_the_flush() {
+    let farm = Farm::new(Capabilities::default());
+    let (cache, service) = serve(farm.start(GIB).await);
+    let all = blobs(1, 2, 4096);
+    let (sent, _) = altered(&seg(&all), &all[0]);
+    upload(&service, &[sent]).await.expect("acknowledged");
+    let object = farm.log.object_of(&all[0].digest);
+    let read = cache.read_blob(&all[0].digest).await;
+    assert!(matches!(read, Err(CacheError::Unreachable(_))), "{read:?}");
+    assert_eq!(
+        farm.log.unreachable(object),
+        Some(kbf_meta::UnreachableReason::Corrupt)
+    );
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round, kbf_front::FlushRound::default());
+    assert!(farm.store.put_keys().is_empty());
+}
+
+/// Catches: a segment the tier does not take PUT unverified (the corrupt record in the
+/// object store), a daemon's false CRC-32C copied into the stored footer, and a
+/// refusal that is not the client's (INVALID_ARGUMENT). The tier is smaller than the
+/// segment: an altered record is refused with nothing PUT, and a segment whose footer
+/// declared false CRC-32Cs is stored with true ones.
+#[tokio::test]
+async fn a_segment_the_tier_does_not_take_is_hashed_before_its_put() {
+    let farm = Farm::new(Capabilities::default());
+    let (cache, service) = serve(farm.start(1000).await);
+    let all = blobs(1, 2, 4096);
+    let good = seg(&all);
+    let (sent, _) = altered(&good, &all[0]);
+    let refused = upload(&service, &[sent]).await;
+    let refused = refused.expect_err("a corrupt record on the direct path");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+    assert!(farm.store.put_keys().is_empty(), "nothing PUT");
+    assert_eq!(counter(&cache, "kbf_write_tier_full_total"), "1");
+    let digests: Vec<Digest> = all.iter().map(|b| b.digest).collect();
+    assert_eq!(cache.find_missing(&digests).await.expect("find"), digests);
+
+    let whole = [good.records.as_slice(), good.footer.as_slice()].concat();
+    let parsed = Footer::parse(&whole, good.length).expect("footer");
+    let lying: Vec<IndexEntry> = parsed
+        .entries()
+        .iter()
+        .map(|e| IndexEntry {
+            crc32c: 0xdead_beef,
+            ..*e
+        })
+        .collect();
+    let lie = Seg {
+        footer: encode_footer(parsed.records_len(), &lying),
+        ..good
+    };
+    upload(&service, &[lie]).await.expect("committed");
+    assert_eq!(farm.store.put_keys().len(), 1);
+    let object = farm.log.object_of(&all[0].digest);
+    let stored = farm
+        .store
+        .stored(&support::key(&cache, object))
+        .await
+        .expect("stored");
+    let reader = SegmentReader::open(&stored).expect("a segment");
+    for b in &all {
+        assert_eq!(
+            reader.get(&b.digest).expect("crc checked"),
+            Some(&b.bytes[..])
+        );
+    }
+}
+
+/// Catches a large record held whole in memory when the write tier has no room for it
+/// (mutant: the whole-body fallback kept for it), or refused for its size (mutant: the
+/// refusal restored): at the tier's budget, a `Begin` declaring a record one byte over
+/// `MAX_UNSTAGED_BLOB_BYTES` is answered FAILED_PRECONDITION, at which the client sends
+/// it by ByteStream; one declaring records of at most that size is admitted (held in
+/// memory, as before).
+#[tokio::test]
+async fn a_large_record_a_full_tier_cannot_take_is_sent_to_bytestream() {
+    let farm = Farm::new(Capabilities::default());
+    let (_cache, service) = serve(farm.start(10_000).await);
+    let over = kbf_front::MAX_UNSTAGED_BLOB_BYTES + 1;
+    let entry = kbf_segments::IndexEntry {
+        digest: Digest::new(kbf_types::DigestFunction::Sha256, [5; 32], over),
+        offset: 0,
+        crc32c: 0,
+    };
+    let large = UploadSegment {
+        length: over + kbf_segments::layout::footer_len(1),
+        footer: kbf_segments::layout::encode_footer(over, &[entry]),
+    };
+    let refused = service
+        .begin(tonic::Request::new(BeginRequest {
+            segments: vec![large],
+        }))
+        .await
+        .expect_err("sent to ByteStream");
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
+    assert!(
+        refused.message().contains("send it by a ByteStream Write")
+            && refused.message().contains("16777216"),
+        "{refused:?}"
+    );
+    let all = blobs(1, 2, 4096);
+    upload(&service, &[seg(&all)]).await.expect("small records");
+}
+
+/// Catches a range the write tier failed to write taken for received (the commit would
+/// stage bytes that are not there), or a failed write that cannot be sent again: with
+/// the tier's write failing once, the `PutRange` fails UNAVAILABLE and the commit
+/// refuses the record as not wholly received; the same range sent again to a new upload
+/// is written and the upload commits, its blobs read back.
+#[tokio::test]
+async fn a_range_the_tier_failed_to_write_is_not_received() {
+    let farm = Farm::new(Capabilities::default());
+    let (cache, service) = serve(farm.start(GIB).await);
+    let all = blobs(1, 2, 4096);
+    let s = seg(&all);
+    let begin = || BeginRequest {
+        segments: vec![UploadSegment {
+            length: s.length,
+            footer: s.footer.clone(),
+        }],
+    };
+    let upload = service
+        .begin(Request::new(begin()))
+        .await
+        .expect("begun")
+        .into_inner()
+        .upload;
+    let open = format!("{service:?}");
+    assert!(
+        open.contains("TierRange"),
+        "the records go to the tier: {open}"
+    );
+    // The next filesystem call is the range's write.
+    farm.fs.fail_at(farm.fs.ops(), kbf_store::Fault::Error);
+    let put = PutRangeRequest {
+        upload,
+        segment: 0,
+        offset: 0,
+        bytes: s.records.clone(),
+    };
+    let failed = service
+        .put_range(Request::new(put))
+        .await
+        .expect_err("not written");
+    assert_eq!(failed.code(), Code::Unavailable, "{failed:?}");
+    assert!(failed.message().contains("write tier"), "{failed:?}");
+    let refused = service
+        .commit(Request::new(CommitRequest { upload }))
+        .await
+        .expect_err("nothing received");
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
+    upload_and_read(&cache, &service, &all, &[s]).await;
+}
+
+/// Uploads `segs` and checks every one of `all` reads back.
+async fn upload_and_read(cache: &TierCache, service: &Service, all: &[TestBlob], segs: &[Seg]) {
+    upload(service, segs).await.expect("committed");
+    for b in all {
+        assert_eq!(cache.read_blob(&b.digest).await.expect("read"), b.bytes);
+    }
+}
+
+/// Catches a segment that found no room on the tier at `Begin` PUT at its commit even
+/// though the tier has room by then: the first upload fills the tier, the second's
+/// `Begin` gets no range (its records are held in memory), a flush frees the tier, and
+/// the second's commit stages its segment, with no PUT of its own.
+#[tokio::test]
+async fn a_segment_with_no_room_at_begin_is_staged_at_commit_once_there_is() {
+    let farm = Farm::new(Capabilities::default());
+    let (cache, service) = serve(farm.start(10_000).await);
+    let first = blobs(1, 2, 4096);
+    upload(&service, &[seg(&first)])
+        .await
+        .expect("first upload");
+    let second = blobs(3, 1, 4096);
+    let s = seg(&second);
+    let begin = BeginRequest {
+        segments: vec![UploadSegment {
+            length: s.length,
+            footer: s.footer.clone(),
+        }],
+    };
+    let id = service
+        .begin(Request::new(begin))
+        .await
+        .expect("begin")
+        .into_inner()
+        .upload;
+    let put = PutRangeRequest {
+        upload: id,
+        segment: 0,
+        offset: 0,
+        bytes: s.records.clone(),
+    };
+    service.put_range(Request::new(put)).await.expect("range");
+    let round = cache.flush_tier(later()).await.expect("flush");
+    assert_eq!(round.flushed.len(), 1, "{round:?}");
+    let commit = service.commit(Request::new(CommitRequest { upload: id }));
+    commit.await.expect("committed");
+    let (_, staged_on) = farm.log.located(&second[0].digest);
+    assert_eq!(staged_on, cache.tier_id(), "staged at the commit");
+    assert_eq!(
+        farm.store.put_keys().len(),
+        1,
+        "only the first upload's flush"
+    );
+    assert_readable(&cache, &service, &second).await;
 }

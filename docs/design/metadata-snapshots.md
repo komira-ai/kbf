@@ -1,6 +1,6 @@
 # Metadata snapshots: the encoding, compaction and starting from a snapshot
 
-The single-voter metadata log (`--meta-log=raft`) keeps every entry it has ever
+The single-voter metadata log (the Raft metadata log) keeps every entry it has ever
 committed. It writes no snapshot and never compacts, and a raft directory that holds a
 snapshot is refused at start. This document designs the missing piece. It covers:
 

@@ -5,11 +5,14 @@
 //! values they carry are in this crate ([`FarmBatch`], [`Report`], [`Takeover`],
 //! [`Checkpoint`], [`MachineVersion`]).
 //!
-//! [`encode`] and [`decode`] take the log's committed [`Format`]: [`Format::V1`], or
+//! [`encode`] and [`decode`] take the log's committed [`Format`]: [`Format::V1`];
 //! [`Format::V2`], which adds the write tier's metadata commands
-//! (docs/design/write-path.md, section 6.5). Any other format is refused on both sides,
-//! and so is a tier command under format 1, so a binary never writes or reads an
-//! encoding the log does not allow.
+//! (docs/design/write-path.md, section 6.5); [`Format::V3`], which adds
+//! `EvictObjects`; or [`Format::V4`], which adds node writers (`SetWriter`, and object
+//! ids naming a storage node's member and boot) and the commands of a rebuild of the
+//! index; or [`Format::V5`], which adds `ReseatStaged`. Any other format is refused on both sides, and so is a command under a format
+//! before the one it joined, so a binary never writes or reads an encoding the log does
+//! not allow.
 //!
 //! Decoding is strict, because every replica must apply the same value or none:
 //! - an enum value that is unspecified (zero) or unnamed is an error, never a default;
@@ -54,6 +57,18 @@ impl Format {
     /// `SealStaged`, `ObjectFlushed` and `FlushConflict`.
     pub const V2: Self = Self(2);
 
+    /// Format 2 plus `EvictObjects`.
+    pub const V3: Self = Self(3);
+
+    /// Format 3 plus node writers: `SetWriter`, and an object id that names a
+    /// registered storage node's member and boot instead of an epoch, in any command;
+    /// and the commands of a rebuild of the index (`AdoptSegment`, `RebuildProgress`,
+    /// `RebuildDone`).
+    pub const V4: Self = Self(4);
+
+    /// Format 4 plus `ReseatStaged`.
+    pub const V5: Self = Self(5);
+
     /// Format number `n`, which may not be one this binary supports.
     #[must_use]
     pub const fn new(n: u32) -> Self {
@@ -64,6 +79,11 @@ impl Format {
     #[must_use]
     pub const fn get(self) -> u32 {
         self.0
+    }
+
+    /// Whether this binary writes and reads the format.
+    const fn known(self) -> bool {
+        matches!(self, Self::V1 | Self::V2 | Self::V3 | Self::V4 | Self::V5)
     }
 }
 
@@ -136,7 +156,9 @@ pub enum EncodeError {
     /// This binary does not write the format.
     #[error("log format {} is not supported", .0.get())]
     Format(Format),
-    /// The command is not part of the format (a tier command under format 1).
+    /// The command is not part of the format (a tier command under format 1,
+    /// `EvictObjects` under format 1 or 2, `SetWriter` or a node writer's object before
+    /// format 4).
     #[error("the command is not part of log format {}", .0.get())]
     Command(Format),
     /// A digest names a hash function the format has no value for.
@@ -182,6 +204,10 @@ pub enum DecodeError {
         /// The length found.
         len: usize,
     },
+    /// An object id names both an epoch and a node writer, or a node writer with a zero
+    /// member or boot.
+    #[error("{0} names no writer: an epoch alone, or a member and a boot alone")]
+    Writer(&'static str),
     /// A store id does not fit in 16 bits.
     #[error("Location.store {0} does not fit in 16 bits")]
     Store(u32),
@@ -204,11 +230,11 @@ pub enum DecodeError {
 
 /// Encodes `command` under `format`.
 pub fn encode(format: Format, command: &LogCommand) -> Result<Vec<u8>, EncodeError> {
-    if format != Format::V1 && format != Format::V2 {
+    if !format.known() {
         return Err(EncodeError::Format(format));
     }
     let command = match command {
-        LogCommand::Meta(c) if format == Format::V1 && meta::since_v2(c) => {
+        LogCommand::Meta(c) if !meta::takes(format, c) => {
             return Err(EncodeError::Command(format));
         }
         LogCommand::Meta(c) => P::Meta(meta::to_proto(c)?),
@@ -232,7 +258,7 @@ pub fn encode(format: Format, command: &LogCommand) -> Result<Vec<u8>, EncodeErr
 
 /// Decodes an entry's payload under `format`.
 pub fn decode(format: Format, bytes: &[u8]) -> Result<LogCommand, DecodeError> {
-    if format != Format::V1 && format != Format::V2 {
+    if !format.known() {
         return Err(DecodeError::Format(format));
     }
     let command = match proto::LogCommand::decode(bytes)?.command {
@@ -252,11 +278,12 @@ pub fn decode(format: Format, bytes: &[u8]) -> Result<LogCommand, DecodeError> {
         }
         None => return Err(DecodeError::UnknownCommand("LogCommand")),
     };
-    // A format-1 reader knows no tier command: it refuses one as an older binary does,
-    // which sees an unset `oneof`.
+    // A reader refuses a command its format does not take (a tier command under format
+    // 1, `EvictObjects` under format 1 or 2, a node writer before format 4) as an older
+    // binary does, which sees an unset `oneof` (or, for a node writer's object, fields
+    // it does not know, so bytes that are not canonical).
     if let LogCommand::Meta(c) = &command
-        && format == Format::V1
-        && meta::since_v2(c)
+        && !meta::takes(format, c)
     {
         return Err(DecodeError::UnknownCommand("MetaCommand"));
     }

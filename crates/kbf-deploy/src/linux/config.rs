@@ -5,6 +5,7 @@ use std::path::Path;
 
 use kbf_types::{ImageError, ImageRef};
 
+use super::modes::Mode;
 use crate::config::{Config, ConfigError};
 use kbf_host::{HostPath, PathError};
 
@@ -16,6 +17,7 @@ pub const KEYS: &[&str] = &[
     "KBF_REAPI_PORT",
     "KBF_WORKER_PORT",
     "KBF_API_PORT",
+    "KBF_STORAGE_PORT",
     "KBF_RAM_GIB",
     "MINIO_RESERVATION_GIB",
     "KBF_SERVER_RESERVATION_GIB",
@@ -24,9 +26,10 @@ pub const KEYS: &[&str] = &[
     "MINIO_UNIT",
     "MINIO_S3_ENDPOINT",
     "KBF_S3_BUCKET",
-    "KBF_META_LOG",
-    "KBF_RAFT_DIR",
-    "KBF_SCRATCH_DIR",
+    "KBF_S3_PREFIX",
+    "KBF_META_DIR",
+    "KBF_HOT_DIR",
+    "KBF_DATA_DIR",
     "KBF_IMAGES",
     "KBF_USER",
     "KBF_SERVER_USER",
@@ -34,19 +37,56 @@ pub const KEYS: &[&str] = &[
     "KBF_BIN_DIR",
     "KBF_SWAP_FILE",
     "KBF_SWAP_SIZE",
+    "KBF_FRONTEND_NAME",
+    "KBF_STORAGE_URL",
+    "KBF_REAPI_CERT",
+    "KBF_REAPI_KEY",
+    "KBF_API_TOKEN_FILE",
+    "KBF_STATE_STORE",
+    "KBF_RESERVE_CPUS",
+    "KBF_LEASE_PLACEMENT",
 ];
+
+/// The `@MINIO_S3_ENDPOINT@` value of a unit when `MINIO_S3_ENDPOINT` is not set: the
+/// host's own MinIO. (`--mode storage` refuses to render without the setting.)
+pub const LOOPBACK_MINIO: &str = "http://127.0.0.1:9000";
+
+/// The `@KBF_STATE_STORE@` value of the frontend's unit when `KBF_STATE_STORE` is not set:
+/// the database `kbf` on the host's own Postgres, by its socket (kbf's own default for the
+/// all-in-one).
+pub const LOCAL_POSTGRES: &str = "postgres:///kbf?host=/run/postgresql";
+
+/// Where a daemon puts each lease among the node's CPUs: kbf-daemon's `--lease-placement`
+/// values, a closed set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeasePlacement {
+    /// Any CPU the daemon may use.
+    None,
+    /// One NUMA node per lease (needs `cpuset` delegated).
+    NumaNode,
+}
+
+impl LeasePlacement {
+    /// The flag's value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LeasePlacement::None => "none",
+            LeasePlacement::NumaNode => "numa-node",
+        }
+    }
+
+    fn parse(value: &str) -> Option<LeasePlacement> {
+        match value {
+            "none" => Some(LeasePlacement::None),
+            "numa-node" => Some(LeasePlacement::NumaNode),
+            _ => None,
+        }
+    }
+}
 
 /// The least RAM, in GiB, left to the kernel, systemd and the daemon.
 const MIN_OS_HEADROOM_GIB: u64 = 4;
-
-/// How kbf-server keeps its metadata.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MetaLog {
-    /// A single-voter Raft log on local disk (`--meta-log=raft --raft-dir=...`).
-    Raft,
-    /// The index in memory (no `--meta-log` flag).
-    Memory,
-}
 
 /// The settings, checked.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +97,8 @@ pub struct LinuxConfig {
     pub reapi_port: u16,
     pub worker_port: u16,
     pub api_port: u16,
+    /// `kbf storage`'s `--storage-listen` port, on `KBF_LISTEN_ADDRESS`.
+    pub storage_port: u16,
     pub ram_gib: u64,
     pub minio_reservation_gib: u64,
     pub server_reservation_gib: u64,
@@ -64,15 +106,25 @@ pub struct LinuxConfig {
     pub daemon_memory_min_mib: u64,
     /// RAM minus what MinIO, kbf-server and the OS keep: the daemon's
     /// `--actions-memory-max-gib` (docs/deploy/storage-node.md, "Memory on a converged
-    /// host"). At least 1.
+    /// host", a node that runs the storage half beside its builds). At least 1.
     pub actions_gib: u64,
     pub minio_unit: String,
-    pub minio_s3_endpoint: String,
+    /// The S3 endpoint of the bucket, when `MINIO_S3_ENDPOINT` is set. Unset, a
+    /// unit that names the endpoint gets the host's own MinIO ([`LOOPBACK_MINIO`]);
+    /// `--mode storage` refuses without it ([`LinuxConfig::for_mode`]).
+    pub minio_s3_endpoint: Option<String>,
     pub s3_bucket: String,
-    pub meta_log: MetaLog,
-    pub raft_dir: HostPath,
-    pub scratch_dir: HostPath,
-    /// The pinned images, in podman's bare `<repo>@sha256:<digest>` form.
+    /// The key prefix in the bucket, empty (kbf's own default, `kbf/`) or `a/b/` with a
+    /// trailing `/`. A fresh prefix is a fresh cold store beside the old one.
+    pub s3_prefix: String,
+    /// kbf-server's `--meta-dir`: its metadata log, a single-voter Raft log.
+    pub meta_dir: HostPath,
+    /// `kbf storage`'s `--hot-store` directory: the SSD tier in front of the cold store.
+    /// Defaults to `<data_dir>/hot`.
+    pub hot_dir: HostPath,
+    /// kbf-daemon's `--data-dir`: lease directories, the input cache and the trees.
+    pub data_dir: HostPath,
+    /// The pinned images, in the bare `<repo>@sha256:<digest>` form (no `docker://`).
     pub images: Vec<ImageRef>,
     pub user: String,
     pub server_user: String,
@@ -80,6 +132,28 @@ pub struct LinuxConfig {
     pub bin_dir: HostPath,
     pub swap_file: HostPath,
     pub swap_size: String,
+    /// The one name daemons and storage nodes dial for the frontend (`--server`,
+    /// `--frontend`): `KBF_FRONTEND_NAME`, else `KBF_HOST_NAME` (a frontend on this host).
+    /// `host_name` stays the node's own identity.
+    pub frontend_name: String,
+    /// The frontend's `--storage`: an `https://` URL of a storage node; only the
+    /// frontend unit uses it.
+    pub storage_url: Option<String>,
+    /// The REAPI listener's certificate chain and key (`--reapi-tls-cert`, `--reapi-tls-key`):
+    /// a certificate the farm's CA did not issue, such as a `tailscale cert` pair, so the
+    /// file names are the host's to choose.
+    pub reapi_cert: HostPath,
+    pub reapi_key: HostPath,
+    /// The operator API's bearer token (`--api-token-file`): a file the operator puts
+    /// there, the server user's alone. install-units never makes it.
+    pub api_token_file: HostPath,
+    /// The frontend's `--state-store`: a `postgres://` URI without a password. The database
+    /// and its schema are kbf-installer's.
+    pub state_store: String,
+    /// The daemon's `--reserve-cpus`; none leaves kbf's default.
+    pub reserve_cpus: Option<u64>,
+    /// The daemon's `--lease-placement`; none leaves kbf's default.
+    pub lease_placement: Option<LeasePlacement>,
 }
 
 /// Why the settings were refused.
@@ -91,6 +165,18 @@ pub enum LinuxError {
     Chars { key: &'static str, value: String },
     #[error("{key} must be a whole number, not '{value}'")]
     NotNumber { key: &'static str, value: String },
+    #[error("KBF_LEASE_PLACEMENT={0}: must be none or numa-node")]
+    Placement(String),
+    /// The state store's URI is not one the frontend's unit can carry. It never holds the
+    /// value: a mistyped one may carry a password.
+    #[error("KBF_STATE_STORE: {0}")]
+    StateStore(&'static str),
+    #[error("KBF_S3_PREFIX={value}: {why}")]
+    S3Prefix { value: String, why: &'static str },
+    #[error(
+        "KBF_STORAGE_URL={0}: must be an https:// URL, the frontend's mutual TLS to a storage node"
+    )]
+    StorageUrl(String),
     #[error("{key} must be a port number from 1 to 65535, not '{value}'")]
     NotPort { key: &'static str, value: String },
     #[error("{key}: {source}")]
@@ -102,8 +188,18 @@ pub enum LinuxError {
     AnyAddress(String),
     #[error("MINIO_UNIT={0} is not a .service unit name")]
     MinioUnit(String),
-    #[error("KBF_META_LOG={0}: raft or memory")]
-    MetaLog(String),
+    #[error("{a} and {b} are both {port}: each listener of a host needs its own port")]
+    SamePort {
+        a: &'static str,
+        b: &'static str,
+        port: u16,
+    },
+    #[error("{key} must be set for --mode {mode}: {why}")]
+    Required {
+        key: &'static str,
+        mode: &'static str,
+        why: &'static str,
+    },
     #[error("KBF_OS_HEADROOM_GIB={0}: keep at least {MIN_OS_HEADROOM_GIB} GiB for the OS")]
     Headroom(u64),
     #[error(
@@ -117,7 +213,7 @@ pub enum LinuxError {
         left: i128,
     },
     #[error(
-        "image '{0}': write the bare <repo>@sha256:<digest> (podman's form); render-units adds docker:// for kbf-daemon"
+        "image '{0}': write the bare <repo>@sha256:<digest>; render-units adds docker:// for kbf-daemon"
     )]
     ImageScheme(String),
     #[error(transparent)]
@@ -137,6 +233,11 @@ impl LinuxConfig {
 
     fn from_config(c: &Config) -> Result<LinuxConfig, LinuxError> {
         for &key in KEYS {
+            // The state store has its own check: a URI holds `?` and `&`, and a refusal of it
+            // must not echo a password.
+            if key == "KBF_STATE_STORE" {
+                continue;
+            }
             if let Some(value) = c.get(key) {
                 plain(key, value)?;
             }
@@ -165,11 +266,6 @@ impl LinuxConfig {
         {
             return Err(LinuxError::MinioUnit(minio_unit));
         }
-        let meta_log = match or("KBF_META_LOG", "raft").as_str() {
-            "raft" => MetaLog::Raft,
-            "memory" => MetaLog::Memory,
-            other => return Err(LinuxError::MetaLog(other.to_owned())),
-        };
         let ram_gib = whole("KBF_RAM_GIB", c.require("KBF_RAM_GIB")?)?;
         let minio = number("MINIO_RESERVATION_GIB", "32")?;
         let server = number("KBF_SERVER_RESERVATION_GIB", "16")?;
@@ -193,13 +289,54 @@ impl LinuxConfig {
             .split_whitespace()
             .map(image)
             .collect::<Result<_, _>>()?;
+        let ports = [
+            ("KBF_REAPI_PORT", port("KBF_REAPI_PORT", "8980")?),
+            ("KBF_WORKER_PORT", port("KBF_WORKER_PORT", "8981")?),
+            ("KBF_API_PORT", port("KBF_API_PORT", "8982")?),
+            ("KBF_STORAGE_PORT", port("KBF_STORAGE_PORT", "8983")?),
+        ];
+        for (i, &(a, p)) in ports.iter().enumerate() {
+            if let Some(&(b, _)) = ports[i + 1..].iter().find(|(_, q)| *q == p) {
+                return Err(LinuxError::SamePort { a, b, port: p });
+            }
+        }
+        let [reapi_port, worker_port, api_port, storage_port] = ports.map(|(_, p)| p);
+        let etc = path("KBF_ETC", "/etc/kbf")?;
+        let host_name = c.require("KBF_HOST_NAME")?.to_owned();
+        let lease_placement = match or("KBF_LEASE_PLACEMENT", "").as_str() {
+            "" => None,
+            v => Some(LeasePlacement::parse(v).ok_or_else(|| LinuxError::Placement(v.to_owned()))?),
+        };
+        let reserve_cpus = match or("KBF_RESERVE_CPUS", "").as_str() {
+            "" => None,
+            v => Some(whole("KBF_RESERVE_CPUS", v)?),
+        };
+        let storage_url = match or("KBF_STORAGE_URL", "").as_str() {
+            "" => None,
+            v if v.strip_prefix("https://").is_some_and(|h| !h.is_empty()) => Some(v.to_owned()),
+            v => return Err(LinuxError::StorageUrl(v.to_owned())),
+        };
+        // The hot store defaults beside the daemon's data: the same filesystem (the one
+        // cache) and a path the unit's user can reach, which `/var/lib/kbf-server` (the
+        // frontend account's, 0700) is not for the units that run as `KBF_USER`.
+        let data_dir = path("KBF_DATA_DIR", "/var/lib/kbf")?;
         Ok(LinuxConfig {
-            host_name: c.require("KBF_HOST_NAME")?.to_owned(),
+            frontend_name: or("KBF_FRONTEND_NAME", &host_name),
+            storage_url,
+            reapi_cert: path("KBF_REAPI_CERT", &format!("{etc}/reapi.pem"))?,
+            reapi_key: path("KBF_REAPI_KEY", &format!("{etc}/reapi.key"))?,
+            api_token_file: path("KBF_API_TOKEN_FILE", &format!("{etc}/api-token"))?,
+            state_store: state_store(&or("KBF_STATE_STORE", LOCAL_POSTGRES))?,
+            reserve_cpus,
+            lease_placement,
+            s3_prefix: s3_prefix(&or("KBF_S3_PREFIX", ""))?,
+            host_name,
             listen_address,
             node_id: c.require("KBF_NODE_ID")?.to_owned(),
-            reapi_port: port("KBF_REAPI_PORT", "8980")?,
-            worker_port: port("KBF_WORKER_PORT", "8981")?,
-            api_port: port("KBF_API_PORT", "8982")?,
+            reapi_port,
+            worker_port,
+            api_port,
+            storage_port,
             ram_gib,
             minio_reservation_gib: minio,
             server_reservation_gib: server,
@@ -207,19 +344,47 @@ impl LinuxConfig {
             daemon_memory_min_mib: number("KBF_DAEMON_MEMORY_MIN_MIB", "256")?,
             actions_gib,
             minio_unit,
-            minio_s3_endpoint: or("MINIO_S3_ENDPOINT", "http://127.0.0.1:9000"),
+            minio_s3_endpoint: c
+                .get("MINIO_S3_ENDPOINT")
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned),
             s3_bucket: or("KBF_S3_BUCKET", "kbf-cas"),
-            meta_log,
-            raft_dir: path("KBF_RAFT_DIR", "/var/lib/kbf-server/raft")?,
-            scratch_dir: path("KBF_SCRATCH_DIR", "/var/lib/kbf/leases")?,
+            meta_dir: path("KBF_META_DIR", "/var/lib/kbf-server/raft")?,
+            hot_dir: path("KBF_HOT_DIR", &format!("{data_dir}/hot"))?,
+            data_dir,
             images,
             user: or("KBF_USER", "kbf"),
             server_user: or("KBF_SERVER_USER", "kbf-server"),
-            etc: path("KBF_ETC", "/etc/kbf")?,
+            etc,
             bin_dir: path("KBF_BIN_DIR", "/usr/local/bin")?,
             swap_file: path("KBF_SWAP_FILE", "/swapfile")?,
             swap_size: or("KBF_SWAP_SIZE", "128G"),
         })
+    }
+
+    /// Refuse settings that leave out a key `mode`'s unit needs: `MINIO_S3_ENDPOINT` for
+    /// `storage`, whose cold store is a bucket on MinIO elsewhere (the host's own MinIO,
+    /// the default of [`LOOPBACK_MINIO`], is a guess there).
+    ///
+    /// # Errors
+    /// [`LinuxError::Required`] for the first key left out.
+    pub fn for_mode(&self, mode: Mode) -> Result<&LinuxConfig, LinuxError> {
+        if mode == Mode::Frontend && self.storage_url.is_none() {
+            return Err(LinuxError::Required {
+                key: "KBF_STORAGE_URL",
+                mode: mode.name(),
+                why: "`kbf frontend` requires --storage, a storage node's https:// URL",
+            });
+        }
+        if mode == Mode::Storage && self.minio_s3_endpoint.is_none() {
+            return Err(LinuxError::Required {
+                key: "MINIO_S3_ENDPOINT",
+                mode: mode.name(),
+                why: "the storage node's cold store is the bucket at that endpoint, and no \
+                      MinIO runs beside it to default to",
+            });
+        }
+        Ok(self)
     }
 
     /// The listen address as the host part of a `host:port`: an IPv6 literal goes in
@@ -231,6 +396,37 @@ impl LinuxConfig {
             self.listen_address.clone()
         }
     }
+}
+
+/// A `KBF_S3_PREFIX`, as the path of the cold store's URI: empty, or `a/b/` with the
+/// trailing `/` added. Plain segments only (letters, digits, `. _ -`): no empty, `.` or
+/// `..` segment, no leading `/`.
+fn s3_prefix(value: &str) -> Result<String, LinuxError> {
+    let refuse = |why| {
+        Err(LinuxError::S3Prefix {
+            value: value.to_owned(),
+            why,
+        })
+    };
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if value.starts_with('/') {
+        return refuse("write it without a leading /");
+    }
+    let body = value.strip_suffix('/').unwrap_or(value);
+    for segment in body.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return refuse("no empty, . or .. segment");
+        }
+        if !segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        {
+            return refuse("only letters, digits and . _ - between the slashes");
+        }
+    }
+    Ok(format!("{body}/"))
 }
 
 /// Refuse a value a rendered unit cannot carry as written: only letters, digits, spaces
@@ -245,6 +441,38 @@ fn plain(key: &'static str, value: &str) -> Result<(), LinuxError> {
     } else {
         Err(LinuxError::Chars {
             key,
+            value: value.to_owned(),
+        })
+    }
+}
+
+/// `KBF_STATE_STORE`: a Postgres URI that carries no password and nothing a unit line
+/// cannot (a space, `$` or `%`, which systemd expands, a `;` or a quote). It is judged
+/// before its characters so that a refusal never repeats a password.
+fn state_store(value: &str) -> Result<String, LinuxError> {
+    let postgres = ["postgres://", "postgresql://"].iter().any(|scheme| {
+        value
+            .strip_prefix(scheme)
+            .is_some_and(|rest| !rest.is_empty())
+    });
+    if !postgres {
+        return Err(LinuxError::StateStore(
+            "must be a postgres:// URI: SQLite is dropped for the frontend",
+        ));
+    }
+    if super::stores::has_password(value) {
+        return Err(LinuxError::StateStore(
+            "carries a password: kbf refuses one (its command line is readable by every user on the node); give a socket or a passwordless URI",
+        ));
+    }
+    let ok = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._:/=,+@-?&".contains(c));
+    if ok {
+        Ok(value.to_owned())
+    } else {
+        Err(LinuxError::Chars {
+            key: "KBF_STATE_STORE",
             value: value.to_owned(),
         })
     }
@@ -272,7 +500,7 @@ fn port(key: &'static str, value: &str) -> Result<u16, LinuxError> {
         })
 }
 
-/// A `KBF_IMAGES` entry: podman's bare `<repo>@sha256:<digest>`, which must pass
+/// A `KBF_IMAGES` entry: the bare `<repo>@sha256:<digest>`, which must pass
 /// kbf-daemon's own `--image` parser once `docker://` is put in front.
 pub fn image(entry: &str) -> Result<ImageRef, LinuxError> {
     if entry.starts_with("docker://") {

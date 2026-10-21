@@ -6,23 +6,32 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::future;
 use kbf_meta::{
     ActionAnswer, ActionRecord, ActionWriteError, Applied, BlobAnswer, Closure, Collected, Command,
-    Epoch, Location, MetaState, ObjectId, Retention, Role, StoreId, Touch, UnreachableReason,
+    Epoch, MetaState, NodeWriter, ObjectId, Retention, Role, StaleWriter, Touch, UnreachableReason,
+    Writer as ObjectWriter,
 };
 use kbf_objstore::{
-    ByteRange, Capabilities, KeyError, KeyPrefix, MemoryStore, ObjectKey, ObjectStore,
-    ObjectStoreError,
+    Capabilities, KeyError, KeyPrefix, MemoryStore, ObjectKey, ObjectStore, ObjectStoreError,
 };
 use kbf_proto::reapi;
 use kbf_segments::{MAX_SEGMENT_BYTES, SegmentError, WriteError};
+use kbf_storage::flush::FlushGate;
 use kbf_types::{Digest, FarmTime};
 use prost::Message;
 use tonic::Status;
 
+use crate::closure;
+use crate::input_tree::{Horizon, InputTreeConfig, InputTrees};
 use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};
 use crate::metrics::CacheMetrics;
-use crate::{MAX_BLOB_BYTES, wire};
+
+/// The most [`ObjectStore::may_hold`] checks one action-cache hit keeps in flight. A
+/// hit needs one check per stored object its entry names; over a local store each is
+/// a blocking-pool hop plus an open and a header read, so they run side by side.
+/// At most 30, the most `futures::future::join_all` joins in place.
+pub const HIT_CHECKS_IN_FLIGHT: usize = 16;
 
 /// Why a cache operation failed. [`Status`] has a `From` for it, so a service answers
 /// with the right gRPC code. Cloned, so one segment's failure answers every blob in it.
@@ -68,6 +77,14 @@ pub enum CacheError {
     /// An object key could not be built.
     #[error("object key: {0}")]
     Key(#[from] KeyError),
+    /// The metadata log has set this node writer, or a later boot of its member,
+    /// already ([`Cache::open_node`]): two processes would name the same keys.
+    #[error(transparent)]
+    StaleWriter(#[from] StaleWriter),
+    /// A streamed upload sent no chunk for `--write-pool-stream-idle`, so the write pool
+    /// freed its writer. The client may send the blob again: UNAVAILABLE.
+    #[error("{0}")]
+    Stalled(String),
     /// The cache's own records disagree (a segment read back without a blob just
     /// packed into it, an index entry with no readable range, a log answering with
     /// the wrong outcome). A bug or a broken backend, never the client's fault.
@@ -99,11 +116,13 @@ impl From<CacheError> for Status {
             | CacheError::Unreachable(_)
             | CacheError::Meta(_)
             | CacheError::Store(_)
-            | CacheError::Segment(_)
-            | CacheError::Tier(_)
+            | CacheError::Stalled(_)
+            | CacheError::Tier(_) => Status::unavailable(message),
+            CacheError::Segment(_)
             | CacheError::Pack(_)
-            | CacheError::Key(_) => Status::unavailable(message),
-            CacheError::Internal(_) => Status::internal(message),
+            | CacheError::Key(_)
+            | CacheError::StaleWriter(_)
+            | CacheError::Internal(_) => Status::internal(message),
         }
     }
 }
@@ -150,7 +169,7 @@ impl VerifiedBlob {
 
 /// Whether `d` is the empty blob, which every cache holds: it is reported present and
 /// reads as no bytes whether or not anyone uploaded it.
-fn is_empty_blob(d: &Digest) -> bool {
+pub(crate) fn is_empty_blob(d: &Digest) -> bool {
     d.size_bytes == 0 && *d == kbf_segments::sha256(&[])
 }
 
@@ -176,6 +195,18 @@ pub struct Cache<M, O> {
     group: Arc<Group>,
     touches: Arc<Touches>,
     segment_limit: u64,
+    trees: Arc<InputTrees>,
+    /// The runtime the cache was made on, which a record stream to the store runs its
+    /// upload on; `None` for a cache made outside one.
+    runtime: Option<tokio::runtime::Handle>,
+    /// Which digests this node flushes ([`Cache::with_flush_gate`]); none: all.
+    gate: Option<Arc<dyn FlushGate>>,
+    /// How many writers the write pool has and how many blobs may wait for one
+    /// ([`Cache::with_write_pool`]).
+    pool_config: PoolConfig,
+    /// The write pool, started with the first blob a tier takes; `None` inside if it
+    /// cannot run (no runtime).
+    pool: std::sync::OnceLock<Option<WritePool>>,
 }
 
 impl<M, O> Drop for Cache<M, O> {
@@ -185,7 +216,7 @@ impl<M, O> Drop for Cache<M, O> {
 }
 
 impl Cache<MemoryMetaLog, MemoryStore> {
-    /// The single-process cache (`--store=memory`): the default retention
+    /// The single-process cache (for tests): the default retention
     /// (`docs/design/storage.md#retention-and-touches`), an in-memory index and an
     /// in-memory bucket.
     #[must_use]
@@ -210,15 +241,86 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// Writes under an epoch `meta` never allocated are refused by the index
     /// ([`CacheError::Internal`]); two caches given one epoch would name the same keys.
     /// Uploads are grouped and bounded as [`WriteConfig::DEFAULT`] says
-    /// ([`Cache::with_writes`]).
+    /// ([`Cache::with_writes`]). A node writer's objects, if the index names any, are
+    /// read under `prefix` too ([`ObjectKeys::under`]).
     #[must_use]
     pub fn new(meta: M, objects: O, prefix: KeyPrefix, epoch: Epoch) -> Self {
+        Self::new_as(
+            meta,
+            objects,
+            ObjectKeys::under(prefix),
+            ObjectWriter::Epoch(epoch),
+        )
+    }
+
+    /// A cache over `meta` and `objects` that names its objects as `writer`, under
+    /// `keys`. `meta` must take puts of `writer` (an epoch it allocated for this cache
+    /// alone, or the node writer it has current: [`Cache::open`], [`Cache::open_node`]).
+    #[must_use]
+    pub fn new_as(meta: M, objects: O, keys: ObjectKeys, writer: ObjectWriter) -> Self {
         Self {
-            writer: Arc::new(Writer::new(meta, objects, prefix, epoch)),
+            writer: Arc::new(Writer::new(meta, objects, keys, writer)),
             group: Arc::new(Group::new(WriteConfig::DEFAULT)),
             touches: Arc::new(Touches::new(TouchConfig::DEFAULT)),
             segment_limit: MAX_SEGMENT_BYTES,
+            trees: Arc::new(InputTrees::new(InputTreeConfig::DEFAULT)),
+            runtime: tokio::runtime::Handle::try_current().ok(),
+            gate: None,
+            pool_config: PoolConfig::DEFAULT,
+            pool: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The same cache, with the write pool sized as `config` says instead of
+    /// [`PoolConfig::DEFAULT`]: the blobs of ByteStream and storage writes are appended to
+    /// the write tier by `config.writers` writers, at most `config.queue` waiting for one.
+    /// Call it before the cache stores anything.
+    #[must_use]
+    pub fn with_write_pool(mut self, config: PoolConfig) -> Self {
+        self.pool_config = config;
+        self
+    }
+
+    /// The same cache, flushing only the staged objects that hold a digest `gate` says
+    /// this node flushes (one flusher per digest, `kbf_storage::flush`). A sealed object
+    /// of digests the node does not flush stays staged, whole, off the flusher's queue.
+    /// Without a gate every sealed object is flushed.
+    #[must_use]
+    pub fn with_flush_gate(mut self, gate: Arc<dyn FlushGate>) -> Self {
+        self.writer.born.judge_by(Arc::clone(&gate));
+        self.gate = Some(gate);
+        self
+    }
+
+    /// The same cache, remembering input trees as `config` says instead of
+    /// [`InputTreeConfig::DEFAULT`] ([`Cache::missing_inputs`]). Call it before the
+    /// cache serves an Execute.
+    #[must_use]
+    pub fn with_input_trees(mut self, config: InputTreeConfig) -> Self {
+        self.trees = Arc::new(InputTrees::new(config));
+        self
+    }
+
+    /// How many decoded directories the input check keeps, and what they cost in bytes.
+    pub fn input_tree_cache(&self) -> (usize, u64) {
+        (self.trees.len(), self.trees.bytes())
+    }
+
+    pub(crate) fn input_trees(&self) -> &InputTrees {
+        &self.trees
+    }
+
+    /// The farm time now, the farm time until which a blob reported held now stays
+    /// held (now plus the retention's `min_ttl`), and the count of objects lost so far.
+    pub(crate) async fn retention_horizon(&self) -> Result<Horizon, CacheError> {
+        Ok(self
+            .writer
+            .query(|s| Horizon {
+                now: s.now(),
+                until: s.now().saturating_add(s.retention().min_ttl),
+                losses: s.losses(),
+            })
+            .await?)
     }
 
     /// The same cache, packing segments of at most `limit` bytes, footer included,
@@ -250,15 +352,57 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// # Errors
     /// The metadata log is unavailable.
     pub async fn open(meta: M, objects: O, prefix: KeyPrefix) -> Result<Self, CacheError> {
+        Self::open_under(meta, objects, ObjectKeys::under(prefix)).await
+    }
+
+    /// [`Cache::open`] with each kind of key under its own prefix: the epoch writer's
+    /// objects under `keys.legacy`, a node writer's (written by an earlier start that
+    /// registered) read under `keys.root`.
+    ///
+    /// # Errors
+    /// The metadata log is unavailable.
+    pub async fn open_under(meta: M, objects: O, keys: ObjectKeys) -> Result<Self, CacheError> {
         match meta.commit(Command::AllocEpoch).await? {
-            Applied::Epoch(epoch) => Ok(Self::new(meta, objects, prefix, epoch)),
+            Applied::Epoch(epoch) => Ok(Self::new_as(
+                meta,
+                objects,
+                keys,
+                ObjectWriter::Epoch(epoch),
+            )),
             other => Err(unexpected(&other)),
         }
     }
 
-    /// The writer epoch this cache names its objects in.
-    pub fn epoch(&self) -> Epoch {
-        self.writer.epoch
+    /// A registered storage node's cache over `meta` and `objects`: it commits
+    /// [`Command::SetWriter`] for `writer` (the member id and boot counter its
+    /// registration was given) and names every object it writes as that writer, under
+    /// `keys.root`, with no writer epoch. The log must take format 4.
+    ///
+    /// # Errors
+    /// [`CacheError::StaleWriter`] if the log has set this boot of the member, or a
+    /// later one, already; the metadata log is unavailable or does not take the
+    /// command.
+    pub async fn open_node(
+        meta: M,
+        objects: O,
+        keys: ObjectKeys,
+        writer: NodeWriter,
+    ) -> Result<Self, CacheError> {
+        match meta.commit(Command::SetWriter(writer)).await? {
+            Applied::Writer(Ok(())) => Ok(Self::new_as(
+                meta,
+                objects,
+                keys,
+                ObjectWriter::Node(writer),
+            )),
+            Applied::Writer(Err(stale)) => Err(stale.into()),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// The writer this cache names its objects as.
+    pub fn writer(&self) -> ObjectWriter {
+        self.writer.names_as
     }
 
     /// The metadata log.
@@ -276,13 +420,13 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self.writer.metrics
     }
 
-    /// The prefix every key this cache writes starts with.
+    /// The prefix of an epoch writer's keys ([`ObjectKeys::legacy`]).
     pub fn prefix(&self) -> &KeyPrefix {
-        &self.writer.prefix
+        &self.writer.keys.legacy
     }
 
-    /// The key of object `id` in the store: `<prefix>cas/<epoch>/<seq>`, each as 16
-    /// lowercase hex digits.
+    /// The key of object `id` in the store ([`ObjectKeys::key`]): `<legacy>cas/<epoch>/<seq>`
+    /// or `<root>cas/<member>/<boot>/<seq>`, each as 16 lowercase hex digits.
     ///
     /// # Errors
     /// [`CacheError::Key`] if the prefix and id do not form a valid key.
@@ -324,12 +468,13 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// # Errors
     /// The metadata log is unavailable; never a partial answer.
     pub async fn find_missing(&self, digests: &[Digest]) -> Result<Vec<Digest>, CacheError> {
-        let missing = self
+        let (missing, objects) = self
             .touched(|s| {
                 let found = s.find_missing(digests);
-                (found.missing, found.touch)
+                ((found.missing, found.objects), found.touch)
             })
             .await?;
+        self.used(objects);
         Ok(missing.into_iter().filter(|d| !is_empty_blob(d)).collect())
     }
 
@@ -375,10 +520,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// durable.
     ///
     /// # Errors
-    /// [`CacheError::Invalid`], before anything is stored, if any blob is larger than
-    /// [`MAX_BLOB_BYTES`]: the cache holds none, which its readers rely on. The store or
-    /// the metadata log failed for some blob (the first such blob's error); that blob
-    /// was not reported present.
+    /// The store or the metadata log failed for some blob (the first such blob's
+    /// error); that blob was not reported present.
     pub async fn store_blobs(&self, blobs: Vec<VerifiedBlob>) -> Result<(), CacheError> {
         self.store_admitted(blobs, Admitted::default()).await
     }
@@ -409,32 +552,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Ok(held)
     }
 
-    /// Reads a whole blob, verified against its digest, after touching it.
-    ///
-    /// # Errors
-    /// [`CacheError::NotFound`] only if the blob is not held;
-    /// [`CacheError::Unreachable`] if it is held but cannot be read.
-    pub async fn read_blob(&self, digest: &Digest) -> Result<Bytes, CacheError> {
-        if is_empty_blob(digest) {
-            return Ok(Bytes::new());
-        }
-        let answer = self
-            .touched(|s| (s.blob(digest), s.touch_for([digest])))
-            .await?;
-        match answer {
-            BlobAnswer::Absent => Err(CacheError::NotFound(*digest)),
-            BlobAnswer::Unavailable => Err(CacheError::Unreachable(*digest)),
-            BlobAnswer::Present {
-                location,
-                staged_on,
-            } => self.fetch_answer(digest, location, staged_on).await,
-        }
-    }
-
     /// Answers `GetActionResult`: the result, and the digest of the ActionResult blob
     /// it was read from, if the entry passes the closure check (its result blob and
-    /// every blob it needs present and reachable) and the result blob reads back;
-    /// `None` (a miss, so the action runs again) otherwise.
+    /// every blob it needs present and reachable), the store may still hold every
+    /// object those blobs are in, and the result blob reads back; `None` (a miss, so
+    /// the action runs again) otherwise.
     ///
     /// # Errors
     /// The metadata log or the store is unavailable.
@@ -442,26 +564,48 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self,
         action: &Digest,
     ) -> Result<Option<(Digest, reapi::ActionResult)>, CacheError> {
+        Ok(self
+            .action_entry(action)
+            .await?
+            .map(|(digest, result, _)| (digest, result)))
+    }
+
+    /// [`Cache::action_result`], and the entry's closure (the blobs it needs besides its
+    /// result blob), read in the same step as the hit so the two agree.
+    ///
+    /// # Errors
+    /// The metadata log or the store is unavailable.
+    pub async fn action_entry(
+        &self,
+        action: &Digest,
+    ) -> Result<Option<(Digest, reapi::ActionResult, Vec<Digest>)>, CacheError> {
         let answer = self
             .touched(|s| match s.action(action) {
-                ActionAnswer::Hit { result, touch } => (Ok(result), touch),
+                ActionAnswer::Hit { result, touch } => (
+                    Ok((result, s.stored_objects(action), s.action_closure(action))),
+                    touch,
+                ),
                 ActionAnswer::Miss(miss) => (Err(miss), Touch::default()),
             })
             .await?;
-        let result = match answer {
-            Ok(result) => result,
+        let (result, objects, closure) = match answer {
+            Ok(hit) => hit,
             Err(miss) => {
                 tracing::debug!(%action, ?miss, "action cache miss");
                 return Ok(None);
             }
         };
+        self.used(objects.iter().copied());
+        if !self.store_may_hold(action, objects).await? {
+            return Ok(None);
+        }
         let bytes = match self.read_blob(&result).await {
             Ok(bytes) => bytes,
             Err(CacheError::NotFound(_) | CacheError::Unreachable(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
         match reapi::ActionResult::decode(bytes) {
-            Ok(r) => Ok(Some((result, r))),
+            Ok(r) => Ok(Some((result, r, closure))),
             Err(e) => {
                 tracing::warn!(%action, %result, error = %e, "stored ActionResult does not decode");
                 Ok(None)
@@ -500,23 +644,15 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// never reaches the action cache.
     ///
     /// # Errors
-    /// [`CacheError::ActionWrite`] naming the first blob of the closure that is not
-    /// held; a missing tree, a malformed result, or an unavailable store or log.
+    /// [`CacheError::ActionWrite`] naming every blob of the closure that is not held
+    /// (FAILED_PRECONDITION when any is absent); a missing tree, a malformed result, or
+    /// an unavailable store or log.
     pub async fn prepare_action_result(
         &self,
         result: &reapi::ActionResult,
     ) -> Result<ActionRecord, CacheError> {
         let closure = self.closure_of(result).await?;
-        let lack = self
-            .writer
-            .query(|s| {
-                closure.iter().find_map(|d| match s.blob(d) {
-                    BlobAnswer::Present { .. } => None,
-                    BlobAnswer::Absent => Some(ActionWriteError::Absent(*d)),
-                    BlobAnswer::Unavailable => Some(ActionWriteError::Unreachable(*d)),
-                })
-            })
-            .await?;
+        let lack = self.writer.query(|s| s.lacking(closure.iter())).await?;
         if let Some(lack) = lack {
             return Err(lack.into());
         }
@@ -555,38 +691,12 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         }
     }
 
-    /// Every blob an `ActionResult` needs besides itself. The empty blob is left out:
-    /// it is always present.
-    ///
-    /// An output directory's `root_directory_digest`, when set, is required as well, so
-    /// a hit never names a root `Directory` a client cannot fetch. REAPI does not make
-    /// the server hold that blob; here the writer (the daemon) must upload it with the
-    /// tree, or the entry is refused as absent.
+    /// Every blob an `ActionResult` needs besides itself ([`crate::closure`]), reading
+    /// each output directory's tree from this cache.
     async fn closure_of(&self, result: &reapi::ActionResult) -> Result<Closure, CacheError> {
-        let mut closure = Closure::new();
-        for file in &result.output_files {
-            insert(&mut closure, proto_digest(file.digest.as_ref())?);
-        }
-        for d in [&result.stdout_digest, &result.stderr_digest]
-            .into_iter()
-            .flatten()
-        {
-            insert(&mut closure, proto_digest(Some(d))?);
-        }
-        for dir in &result.output_directories {
-            let tree_digest = proto_digest(dir.tree_digest.as_ref())?;
-            insert(&mut closure, tree_digest);
-            if let Some(root) = &dir.root_directory_digest {
-                insert(&mut closure, proto_digest(Some(root))?);
-            }
-            let tree = reapi::Tree::decode(self.read_blob(&tree_digest).await?).map_err(|e| {
-                CacheError::Invalid(format!("output tree {tree_digest} does not decode: {e}"))
-            })?;
-            for directory in tree.root.iter().chain(&tree.children) {
-                for file in &directory.files {
-                    insert(&mut closure, proto_digest(file.digest.as_ref())?);
-                }
-            }
+        let (mut closure, trees) = closure::direct(result)?;
+        for tree in trees {
+            closure::add_tree(&mut closure, &tree, self.read_blob(&tree).await?)?;
         }
         Ok(closure)
     }
@@ -608,60 +718,60 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Ok(answer)
     }
 
-    /// Reads `digest`'s bytes at `location` from the store and checks them. An object
-    /// the store does not have is marked unreachable as [`UnreachableReason::Missing`],
-    /// one whose bytes are wrong as [`UnreachableReason::Corrupt`].
-    async fn fetch(&self, digest: &Digest, location: Location) -> Result<Bytes, CacheError> {
-        self.fetch_from_store(digest, location, true).await
-    }
-
-    /// [`Cache::fetch`], marking the object only if `mark`: a reader never marks an
-    /// object that was staged when its query ran, because the store does not hold it
-    /// yet (design section 6.1.5).
-    async fn fetch_from_store(
+    /// Whether the store may still hold each of `objects`, the stored objects an
+    /// action-cache hit on `action` needs ([`ObjectStore::may_hold`]: a local store
+    /// checks its files, a remote one answers yes). Each object the store does not hold
+    /// is marked unreachable as missing, so the hit becomes a miss and FindMissing
+    /// reports the blobs of every lost object, rather than the client being sent to
+    /// download bytes no one has. A failed check fails the call only when no object was
+    /// found gone: one that was makes the answer a miss either way.
+    ///
+    /// The checks run in groups of [`HIT_CHECKS_IN_FLIGHT`], each group joined whole,
+    /// so every check runs to its answer. A group this small is joined in place, with
+    /// no task per check, so a store that answers at once pays next to nothing for
+    /// the fan-out.
+    async fn store_may_hold(
         &self,
-        digest: &Digest,
-        location: Location,
-        mark: bool,
-    ) -> Result<Bytes, CacheError> {
-        let Location {
-            store,
-            object,
-            offset,
-        } = location;
-        if store != StoreId::CONFIGURED {
-            return Err(CacheError::Internal(format!(
-                "blob {digest} is in store {}, and this cache has only store {}",
-                store.get(),
-                StoreId::CONFIGURED.get()
-            )));
+        action: &Digest,
+        objects: BTreeSet<ObjectId>,
+    ) -> Result<bool, CacheError> {
+        let mut keys = Vec::with_capacity(objects.len());
+        for object in objects {
+            keys.push((object, self.object_key(object)?));
         }
-        let key = self.object_key(object)?;
-        let range = ByteRange::new(offset, digest.size_bytes).ok_or_else(|| {
-            CacheError::Internal(format!("blob {digest} has no readable range at {offset}"))
-        })?;
-        let bytes = match self.writer.get_range(&key, range).await {
-            Ok(bytes) => bytes,
-            Err(e @ (ObjectStoreError::NotFound(_) | ObjectStoreError::InvalidRange { .. })) => {
-                tracing::error!(%digest, %key, error = %e, mark, "held blob missing from the store");
-                if mark {
-                    self.mark_unreachable(object, UnreachableReason::Missing)
-                        .await?;
+        let store = &self.writer.objects;
+        let mut answers = Vec::with_capacity(keys.len());
+        for group in keys.chunks(HIT_CHECKS_IN_FLIGHT) {
+            if let [(_, key)] = group {
+                answers.push(store.may_hold(key).await);
+            } else {
+                let checks = group.iter().map(|(_, key)| store.may_hold(key));
+                answers.extend(future::join_all(checks).await);
+            }
+        }
+        let mut missing = Vec::new();
+        let mut failed = None;
+        for ((object, key), held) in keys.iter().zip(answers) {
+            match held {
+                Ok(true) => {}
+                Ok(false) => missing.push((*object, key)),
+                Err(e) => {
+                    failed.get_or_insert(e);
                 }
-                return Err(CacheError::Unreachable(*digest));
             }
-            Err(e) => return Err(e.into()),
-        };
-        // Digest equality includes the length, so a short read fails here too.
-        if kbf_segments::sha256(&bytes) != *digest {
-            tracing::error!(%digest, %key, mark, "stored bytes fail their digest");
-            if mark {
-                self.mark_unreachable(object, UnreachableReason::Corrupt)
-                    .await?;
-            }
-            return Err(CacheError::Unreachable(*digest));
         }
-        Ok(bytes)
+        if missing.is_empty() {
+            return failed.map_or(Ok(true), |e| Err(e.into()));
+        }
+        if let Some(e) = failed {
+            tracing::warn!(%action, error = %e, "a store check failed on a hit that is a miss anyway");
+        }
+        for (object, key) in missing {
+            tracing::error!(%action, %key, "an object an action-cache hit needs is gone from the store: a miss");
+            self.mark_unreachable(object, UnreachableReason::Missing)
+                .await?;
+        }
+        Ok(false)
     }
 
     async fn mark_unreachable(
@@ -669,40 +779,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         object: ObjectId,
         reason: UnreachableReason,
     ) -> Result<(), CacheError> {
-        match self
-            .writer
-            .commit(Command::ObjectUnreachable { object, reason })
-            .await?
-        {
-            Applied::Marked(Ok(())) => Ok(()),
-            Applied::Marked(Err(e)) => Err(CacheError::Internal(e.to_string())),
-            other => Err(unexpected(&other)),
-        }
+        self.writer.mark_unreachable(object, reason).await
     }
-}
-
-fn insert(closure: &mut Closure, digest: Digest) {
-    if !is_empty_blob(&digest) {
-        closure.insert(digest);
-    }
-}
-
-fn proto_digest(d: Option<&reapi::Digest>) -> Result<Digest, CacheError> {
-    wire::digest(d).map_err(|s| CacheError::Invalid(s.message().to_owned()))
 }
 
 /// A [`MetaLog`] answered a command with the outcome of a different one: a broken log.
-/// [`CacheError::Invalid`] naming the first of `blobs` larger than [`MAX_BLOB_BYTES`].
-fn refuse_oversized(blobs: &[VerifiedBlob]) -> Result<(), CacheError> {
-    match blobs.iter().find(|b| b.digest.size_bytes > MAX_BLOB_BYTES) {
-        Some(blob) => Err(CacheError::Invalid(format!(
-            "{} is larger than the largest blob this cache accepts ({MAX_BLOB_BYTES} bytes)",
-            blob.digest
-        ))),
-        None => Ok(()),
-    }
-}
-
 fn unexpected(applied: &Applied) -> CacheError {
     CacheError::Internal(format!(
         "metadata log answered with an unexpected outcome {applied:?}"
@@ -710,23 +791,47 @@ fn unexpected(applied: &Applied) -> CacheError {
 }
 
 mod batch;
+mod clear;
+mod consistency;
+mod direct;
+mod evict;
 mod flush;
+mod losses;
+mod pool;
+mod read;
+mod rebuild;
+mod stream;
+mod stream_store;
+mod tail;
 mod tier;
 mod touches;
 mod upload;
+mod verify;
 mod write_group;
 
 pub use batch::BATCH_READS_IN_FLIGHT;
-pub use flush::{FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound};
-pub use tier::{TierStartError, TierStartup};
+pub use clear::FlushReport;
+pub use consistency::{
+    EVICT_BATCH, EvictReady, HeldObject, NEEDS_V3, PASS_OPENS_PER_SEC, PassReport,
+};
+pub use evict::{EVICT_EVERY, EVICT_GRACE, EvictRound};
+pub use flush::{
+    FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
+};
+pub use losses::Losses;
+use pool::WritePool;
+pub use pool::{BATCH_BLOBS, BATCH_BYTES, BUFFERED_BLOB_BYTES, PoolConfig};
+pub use read::{BlobRead, MAX_DECODED_BLOB_BYTES, READ_WINDOW_BYTES};
+pub use rebuild::{ADOPT_RECORDS, RebuildConfig, RebuildReport};
+pub(crate) use stream::TierRange;
+pub use stream::{RecordStream, StreamedRecord};
+pub use tail::{TailReport, TailState};
+pub use tier::{TierHealth, TierStartError, TierStartup};
 pub use touches::TouchConfig;
 use touches::Touches;
 pub(crate) use upload::BuiltSegment;
 pub use write_group::{
-    Admitted, CONNECTION_WINDOW_BYTES, MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS, PUT_BACKOFF,
-    PUT_BACKOFF_FACTOR, STREAM_WINDOW_BYTES, WriteConfig,
+    Admitted, DEFAULT_REAPI_STREAMS, DEFAULT_WORKER_STREAMS, MAX_ADMISSION_BYTES, ObjectKeys,
+    PUT_BACKOFF, PUT_BACKOFF_FACTOR, STREAM_WINDOW_BYTES, WriteConfig,
 };
 use write_group::{Group, Writer};
-
-#[cfg(test)]
-mod tests;

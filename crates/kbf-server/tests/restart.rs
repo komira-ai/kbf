@@ -9,7 +9,7 @@
 //! still hold an operation name of the process before a restart and call
 //! `WaitExecution` with it on the next one.
 //!
-//! Under `--meta-log=raft` ([`Cell::start_raft`], restarted with [`Cell::cold_restart`])
+//! With the Raft metadata log ([`Cell::start_raft`], restarted with [`Cell::cold_restart`])
 //! `Welcome` names the log id as the lease epoch, the same at every start, so the
 //! daemon keeps its old runs across a restart; the lease term, the Raft term of each
 //! start, is what keeps their results from being taken for the new process's leases.
@@ -235,7 +235,7 @@ fn raft_term(cell: &Cell) -> u64 {
 /// Catches a `Welcome` under the Raft log that does not name the log id as the lease
 /// epoch: one that names the Raft term (it rises at every start's election, so a daemon
 /// would kill the runs of its leases at every restart), or a new `process_term` per
-/// start, as `--meta-log=memory` does. Two starts over one raft directory must name
+/// start, as the in-memory metadata log does. Two starts over one raft directory must name
 /// the same epoch, the log id, which is not 0 (a daemon reads 0 as "no epoch named").
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_start_over_one_raft_log_names_the_log_id_as_the_lease_epoch() {

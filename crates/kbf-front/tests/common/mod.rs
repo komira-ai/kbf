@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use kbf_auth::{AuthenticateLayer, Policy};
+use kbf_auth::{AuthenticateLayer, Authorizers, Policy};
 use kbf_front::{
     Cache, Closing, Dispatch, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog, MetaLogError,
     RequestMetadataLayer,
@@ -110,6 +110,75 @@ impl Farm {
         Self::serve(|cache| kbf_front::routes_with_execution(cache, dispatch, closing)).await
     }
 
+    /// The cache services and `Execution` over `dispatch`, whose streams end when
+    /// `closing`'s closer closes and are re-sent at every tick of `progress`.
+    pub async fn with_execution_progress<D: Dispatch>(
+        dispatch: Arc<D>,
+        closing: Closing,
+        progress: kbf_front::Progress,
+    ) -> Self {
+        let routes = |cache| {
+            kbf_front::routes_recorded(
+                cache,
+                dispatch,
+                closing,
+                progress,
+                Arc::new(Authorizers::allow_all()),
+                &kbf_front::Recorder::off(),
+                kbf_front::Defaults {
+                    memory: kbf_front::DEFAULT_RESOURCES.memory_bytes,
+                    platform: kbf_front::DefaultPlatform::NONE,
+                },
+            )
+        };
+        Self::serve(routes).await
+    }
+
+    /// The cache services and `Execution` over `dispatch` (streams never closed),
+    /// where an action that names no memory size books `default_memory` bytes.
+    pub async fn with_default_memory<D: Dispatch>(dispatch: Arc<D>, default_memory: u64) -> Self {
+        let (_, closing) = kbf_front::closing();
+        let routes = |cache| {
+            kbf_front::routes_recorded(
+                cache,
+                dispatch,
+                closing,
+                kbf_front::Progress::off(),
+                Arc::new(Authorizers::allow_all()),
+                &kbf_front::Recorder::off(),
+                kbf_front::Defaults {
+                    memory: default_memory,
+                    platform: kbf_front::DefaultPlatform::NONE,
+                },
+            )
+        };
+        Self::serve(routes).await
+    }
+
+    /// The cache services and `Execution` over `dispatch` (streams never closed),
+    /// where an action that names no OS or architecture gets `platform`.
+    pub async fn with_default_platform<D: Dispatch>(
+        dispatch: Arc<D>,
+        platform: kbf_front::DefaultPlatform,
+    ) -> Self {
+        let (_, closing) = kbf_front::closing();
+        let routes = |cache| {
+            kbf_front::routes_recorded(
+                cache,
+                dispatch,
+                closing,
+                kbf_front::Progress::off(),
+                Arc::new(Authorizers::allow_all()),
+                &kbf_front::Recorder::off(),
+                kbf_front::Defaults {
+                    memory: kbf_front::DEFAULT_RESOURCES.memory_bytes,
+                    platform,
+                },
+            )
+        };
+        Self::serve(routes).await
+    }
+
     /// The cache services and `Execution` over `dispatch` (streams never closed),
     /// served as kbf-server serves its REAPI listener under `policy`: its
     /// authenticator as a layer in front of every call, its authorizers in the
@@ -171,6 +240,11 @@ impl Farm {
             .await
             .expect("connect");
         Self { cache, channel }
+    }
+
+    /// A channel to this farm's listener.
+    pub fn channel(&self) -> Channel {
+        self.channel.clone()
     }
 
     pub fn caps(&self) -> CapabilitiesClient<Channel> {

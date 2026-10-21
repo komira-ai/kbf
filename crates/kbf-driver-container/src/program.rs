@@ -4,27 +4,26 @@
 //! its environment is the `Command`'s alone. A program the OCI runtime cannot find or
 //! execute there would be the same on every node, so it is the `Command`'s fault
 //! (docs/design/failure-classes.md, 6.7): answered as the action's result, exit 127
-//! (not found) or 126 (found, not an executable file), as a shell and `podman run`
-//! answer, with kbf's message on stderr before Podman's own words. A non-zero exit is
-//! never cached.
+//! (not found) or 126 (found, not an executable file), as a shell answers, with kbf's
+//! message on stderr before `crun`'s own words. A non-zero exit is never cached.
 //!
-//! Only crun's own report of its program lookup counts (crun 1.14, under the nodes'
-//! Podman 4.9): ``executable file `<argv[0]>` not found in $PATH`` for any `ENOENT`,
-//! and `open executable: ` for a file it may not execute or that is not a regular
-//! file. Podman's wrapping does not count: it calls every runtime "No such file or
-//! directory" "a command that was not found" (a missing mount source among them) and
-//! every "Operation not permitted" "OCI permission denied" (a cgroup it may not write),
-//! which are the farm's. Neither does a report from any other runtime: that start
-//! stays the farm's failure, with Podman's words in it.
+//! The container's first process is the init (`oci::init`), which looks the program up
+//! and reports a failure to start it in `crun`'s words: ``executable file `<argv[0]>` not
+//! found in $PATH`` for any `ENOENT`, and `open executable: ` for a file it may not
+//! execute or that is not a regular file. Only the init's report counts. `crun` itself
+//! only ever starts the init, so anything `crun` reports (a failed exec of the init, a
+//! missing mount source, a cgroup it may not write) is the farm's: that start stays the
+//! farm's failure, with the words in it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use kbf_daemon::RuntimeError;
 
-use crate::podman::{ContainerSpec, EXEC_ROOT};
+use crate::container::{ContainerSpec, EXEC_ROOT};
+use crate::oci::init::DEST as INIT;
 use crate::runtime::failed;
 
-/// How much of `podman start`'s stderr is read back when the container did not run.
+/// How much of the runtime's words are read back when the container did not run.
 const SAID_MAX: u64 = 64 << 10;
 
 /// Why the container could not start the action's program.
@@ -35,7 +34,7 @@ pub(crate) enum Unstartable {
 }
 
 impl Unstartable {
-    /// What the action answers: the shell's and `podman run`'s exit codes.
+    /// What the action answers: the shell's exit codes.
     pub(crate) fn exit_code(self) -> i32 {
         match self {
             Self::NotFound => 127,
@@ -44,8 +43,8 @@ impl Unstartable {
     }
 }
 
-/// What crun's report in `said` (`podman start`'s stderr, for a container that did not
-/// run) says of `program`, if it is a report of the program lookup.
+/// What crun's report in `said` (for a container that did not run) says of `program`, if
+/// it is a report of the program lookup.
 pub(crate) fn classify(program: &str, said: &str) -> Option<Unstartable> {
     if said.contains(&format!("executable file `{program}` not found in $PATH")) {
         Some(Unstartable::NotFound)
@@ -85,62 +84,161 @@ pub(crate) fn message(
     format!("kbf: the action's program `{program}` {what} {place}")
 }
 
-/// What `podman start` wrote to `stderr` (its own words: the container did not run),
-/// at most [`SAID_MAX`] bytes of it.
-pub(crate) async fn said(stderr: &Path) -> std::io::Result<String> {
+/// Where `crun`'s own words about a container that did not run are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Said {
+    /// `crun`'s JSON log, which the words are read from.
+    source: PathBuf,
+    /// The action's stderr file, which a lookup report is rewritten into.
+    stderr: PathBuf,
+    /// What the container's init wrote when it could not start the program
+    /// (`oci::init`), if there is such a file: read as `crun`'s words are, in the same
+    /// words.
+    report: Option<PathBuf>,
+}
+
+impl Said {
+    /// The error records of `crun`'s `--log` file `log`, as `crun: <message>`; the
+    /// action's own stderr stays `stderr`.
+    pub(crate) fn crun(log: &Path, stderr: &Path) -> Self {
+        Self {
+            source: log.to_owned(),
+            stderr: stderr.to_owned(),
+            report: None,
+        }
+    }
+
+    /// The same, and the init's report `file` read after the log. It need not exist: the
+    /// init writes it only when the program cannot be started.
+    pub(crate) fn with_report(mut self, file: &Path) -> Self {
+        self.report = Some(file.to_owned());
+        self
+    }
+
+    /// At most [`SAID_MAX`] bytes of the log, as its error records, then the init's
+    /// report, if any, in the same words. A log that is not there is an error, unless a
+    /// report is configured: the words of the init alone then answer.
+    pub(crate) async fn read(&self) -> std::io::Result<String> {
+        let mut words = self.read_log().await?;
+        let init = self.read_init().await?;
+        if !words.is_empty() && !init.is_empty() {
+            words.push_str("; ");
+        }
+        words.push_str(&init);
+        Ok(words)
+    }
+
+    /// `crun`'s own error records.
+    async fn read_log(&self) -> std::io::Result<String> {
+        let log = match (read_capped(&self.source).await, &self.report) {
+            (Err(e), Some(_)) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            (read, _) => read?,
+        };
+        Ok(crun_words(&String::from_utf8_lossy(&log)))
+    }
+
+    /// The init's report alone, in `crun`'s words; empty without one.
+    async fn read_init(&self) -> std::io::Result<String> {
+        let Some(file) = &self.report else {
+            return Ok(String::new());
+        };
+        let report = match read_capped(file).await {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            read => read?,
+        };
+        Ok(init_words(&String::from_utf8_lossy(&report)))
+    }
+}
+
+/// At most [`SAID_MAX`] bytes of the file at `path`.
+async fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
     use tokio::io::AsyncReadExt as _;
     let mut bytes = Vec::new();
-    tokio::fs::File::open(stderr)
+    tokio::fs::File::open(path)
         .await?
         .take(SAID_MAX)
         .read_to_end(&mut bytes)
         .await?;
-    Ok(String::from_utf8_lossy(&bytes).trim().to_owned())
+    Ok(bytes)
 }
 
-/// Whether `podman start`'s report in `stderr` is crun's exec of the program failing
-/// with `ETXTBSY` (`exec container process `<program>`: Text file busy`): a file
-/// still open for writing somewhere when it was executed. With the input cache that
-/// can be a fill's descriptor a forked child held for a moment
+/// The error records of a `crun --log-format=json` log, as `crun: <message>` joined by
+/// `; `. A line that is not a JSON record, and a record of another level, are left out.
+pub(crate) fn crun_words(log: &str) -> String {
+    log.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|record| record["level"] == "error" || record["level"] == "fatal")
+        .filter_map(|record| record["msg"].as_str().map(|msg| format!("crun: {msg}")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The lines of the container init's report, as `crun: <message>` joined by `; `: the
+/// messages are `crun`'s own words for the same failures (`init/kbf_init.rs`), so
+/// [`classify`] reads both.
+pub(crate) fn init_words(report: &str) -> String {
+    report
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| format!("crun: {line}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Whether the report is crun's exec of the program failing with `ETXTBSY`
+/// (`exec container process `<program>`: Text file busy`): a file still open for
+/// writing somewhere when it was executed. With the input cache that can be a fill's
+/// descriptor a forked child held for a moment
 /// (`docs/design/worker-cache.md#64-concurrency-and-fills`), so the driver starts the
 /// container once more. A report that cannot be read is not one.
-pub(crate) async fn text_file_busy(stderr: &Path) -> bool {
-    said(stderr)
+pub(crate) async fn text_file_busy(said: &Said) -> bool {
+    said.read()
         .await
         .is_ok_and(|said| said.contains("Text file busy"))
 }
 
-/// A container `podman start` did not run to an exit (Podman's `state` for it): the
+/// A container that did not run to an exit (the runtime's `state` for it): the
 /// action's exit 127 or 126 when crun reports it cannot find or execute the program,
-/// with kbf's message and Podman's words as its stderr; otherwise the farm's failure,
-/// naming what Podman said.
+/// with kbf's message and the runtime's words as its stderr; otherwise the farm's
+/// failure, naming what the runtime said, or that it said nothing.
 pub(crate) async fn not_run(
     spec: &ContainerSpec,
-    stderr: &Path,
+    said: &Said,
     state: &str,
 ) -> Result<i32, RuntimeError> {
-    match answer(spec, stderr).await.map_err(|e| failed(stderr, &e))? {
+    match answer(spec, said)
+        .await
+        .map_err(|e| failed(&said.source, &e))?
+    {
         Ok(why) => Ok(why.exit_code()),
-        Err(said) => Err(RuntimeError::Failed(format!(
-            "the container did not run to an exit: podman reports {state:?}; podman start: {said}"
+        Err(words) => Err(RuntimeError::Failed(format!(
+            "the container did not run to an exit: crun reports {state:?}; crun log: {words}"
         ))),
     }
 }
 
-/// Reads what `podman start` said into `stderr` and, when crun reports its lookup of
-/// the program, rewrites it as the action's stderr: why, or Podman's words if not.
-async fn answer(
-    spec: &ContainerSpec,
-    stderr: &Path,
-) -> std::io::Result<Result<Unstartable, String>> {
-    let said = said(stderr).await?;
+/// Reads what was said and, when the container's init reports its lookup of the program,
+/// rewrites it as the action's stderr: why, or all the words if not. `crun` itself only
+/// ever starts the init, so what `crun` says about an exec is about the init: the
+/// node's, however it is worded, and never read as the action's.
+async fn answer(spec: &ContainerSpec, said: &Said) -> std::io::Result<Result<Unstartable, String>> {
     let program = spec.argv.first().map_or("", String::as_str);
-    let Some(why) = classify(program, &said) else {
-        return Ok(Err(said));
+    let init = said.read_init().await?;
+    let log = said.read_log().await?;
+    let Some(why) = classify(program, &init).filter(|_| log.is_empty()) else {
+        let words = said.read().await?;
+        return Ok(Err(if log.is_empty() {
+            words
+        } else {
+            format!(
+                "{words} (crun starts only the container's init, {INIT}, so an exec it reports failing is the init's: the scratch directory mounted noexec, or a bad binary)"
+            )
+        }));
     };
+    let words = init;
     let message = message(why, program, &spec.env, &spec.working_directory);
     tracing::info!(container = %spec.name, "{message}");
-    tokio::fs::write(stderr, format!("{message}\npodman start: {said}\n")).await?;
+    tokio::fs::write(&said.stderr, format!("{message}\ncrun log: {words}\n")).await?;
     Ok(Ok(why))
 }
 
@@ -152,8 +250,8 @@ mod tests {
         `env` not found in $PATH: No such file or directory: OCI runtime attempted to invoke \
         a command that was not found";
 
-    /// Catches a lookup report for another program taken for this one's, Podman's
-    /// wrapping taken for crun's report (a mount source it could not find, a cgroup
+    /// Catches a lookup report for another program taken for this one's, another
+    /// report of crun's taken for the lookup (a mount source it could not find, a cgroup
     /// file it may not write: the farm's), and the two kinds swapped.
     #[test]
     fn only_crun_reporting_the_lookup_counts() {
@@ -174,15 +272,20 @@ mod tests {
         assert_eq!(Unstartable::NotExecutable.exit_code(), 126);
     }
 
-    /// Catches a Podman report the driver cannot read back taken for anything but the
-    /// farm's failure, naming the file.
+    /// Catches a log the driver cannot read back taken for anything but the farm's
+    /// failure, naming the file.
     #[tokio::test]
     async fn a_report_that_cannot_be_read_is_the_farms() {
-        let stderr = Path::new("/nonexistent/kbf-lease/stderr");
-        let outcome = not_run(&crate::podman::tests::spec(), stderr, "created 0").await;
+        let log = Path::new("/nonexistent/kbf-lease/crun.log");
+        let outcome = not_run(
+            &crate::container::tests::spec(),
+            &Said::crun(log, Path::new("/nonexistent/kbf-lease/stderr")),
+            "exited 1",
+        )
+        .await;
         assert_eq!(
             format!("{outcome:?}"),
-            "Err(Failed(\"/nonexistent/kbf-lease/stderr: No such file or directory (os error 2)\"))"
+            "Err(Failed(\"/nonexistent/kbf-lease/crun.log: No such file or directory (os error 2)\"))"
         );
     }
 
@@ -208,5 +311,206 @@ mod tests {
              (image and input root, working directory /kbf/root/pkg)"
         );
         assert!(message(Unstartable::NotFound, "/x", &[], "").ends_with("directory /kbf/root)"));
+    }
+
+    fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+        crate::unit_dir(&format!("program-{name}"))
+    }
+
+    const LOG: &str = concat!(
+        r#"{"level":"warning","msg":"cgroup v1 is deprecated","time":"2026-10-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"level":"error","msg":"executable file `env` not found in $PATH: No such file or directory","time":"2026-10-01T00:00:01Z"}"#,
+        "\n",
+        "not json at all\n",
+        r#"{"level":"fatal","msg":"open executable: Permission denied","time":"2026-10-01T00:00:02Z"}"#,
+        "\n",
+    );
+
+    /// Catches a warning taken for a failure (a lease with a warning in crun's log is not
+    /// a runtime failure), an error record lost, a line that is not a record breaking
+    /// the rest, and the words not matching what the lookup classifier reads.
+    #[test]
+    fn crun_words_are_its_error_records() {
+        let words = crun_words(LOG);
+        assert_eq!(
+            words,
+            "crun: executable file `env` not found in $PATH: No such file or directory; \
+             crun: open executable: Permission denied"
+        );
+        assert_eq!(crun_words(""), "");
+        assert_eq!(crun_words("{\"level\":\"warning\",\"msg\":\"x\"}\n"), "");
+        assert_eq!(classify("env", &words), Some(Unstartable::NotFound));
+    }
+
+    /// Catches the OCI path reading the action's stderr instead of the init's report,
+    /// losing the rewrite of the lookup report into the action's stderr, the message
+    /// naming the wrong runtime, and (the point of the init) `crun`'s own words about an
+    /// exec, which are about the init and the node's: a lookup-shaped record in
+    /// `crun`'s log is the farm's failure, with a hint naming the init.
+    #[tokio::test]
+    async fn the_inits_lookup_report_becomes_the_actions_exit_127() {
+        let dir = scratch("init-lookup");
+        let (log, report, stderr) = (dir.join("crun.log"), dir.join("report"), dir.join("stderr"));
+        std::fs::write(&log, "").expect("log");
+        std::fs::write(
+            &report,
+            "executable file `env` not found in $PATH: No such file or directory\n",
+        )
+        .expect("report");
+        std::fs::write(&stderr, b"the action's own words\n").expect("stderr");
+        let mut spec = crate::container::tests::spec();
+        spec.argv = vec!["env".to_owned()];
+        let said = Said::crun(&log, &stderr).with_report(&report);
+        assert_eq!(not_run(&spec, &said, "exited 127").await.expect("127"), 127);
+        let written = std::fs::read_to_string(&stderr).expect("stderr");
+        assert!(
+            written.starts_with("kbf: the action's program `env` was not found"),
+            "{written}"
+        );
+        assert!(
+            written.contains("\ncrun log: crun: executable file `env`"),
+            "{written}"
+        );
+
+        // `crun` reporting an exec failure is about the init: the farm's, never the
+        // action's, whatever the words (a noexec scratch mount says `open executable`).
+        for said_by_crun in [
+            LOG,
+            r#"{"level":"error","msg":"open executable: Permission denied"}"#,
+        ] {
+            std::fs::write(&log, said_by_crun).expect("log");
+            std::fs::write(&report, "").expect("no report");
+            let farm = not_run(&spec, &said, "exited 1").await;
+            let why = farm.expect_err("the farm's failure").to_string();
+            assert!(why.contains("crun log: crun: "), "{why}");
+            assert!(
+                why.contains("crun starts only the container's init, /dev/kbf-init"),
+                "{why}"
+            );
+        }
+
+        // The init's own sandbox step failing: not a lookup, the farm's, words kept.
+        std::fs::write(&log, "").expect("log");
+        std::fs::write(
+            &report,
+            "kbf-init: prctl(PR_SET_DUMPABLE) failed: Operation not permitted\n",
+        )
+        .expect("report");
+        let why = not_run(&spec, &said, "exited 126")
+            .await
+            .expect_err("farm")
+            .to_string();
+        assert!(
+            why.contains("kbf-init: prctl(PR_SET_DUMPABLE) failed"),
+            "{why}"
+        );
+        assert!(!why.contains("crun starts only"), "{why}");
+
+        // Not a lookup report: the farm's failure, naming crun.
+        spec.argv = vec!["other".to_owned()];
+        std::fs::write(&report, "").expect("report");
+        std::fs::write(
+            &log,
+            r#"{"level":"error","msg":"mount `/x` to `/kbf/root`: No such file or directory"}"#,
+        )
+        .expect("log");
+        let farm = not_run(&spec, &said, "exited 1").await;
+        let why = farm.expect_err("the farm's failure").to_string();
+        assert!(
+            why.contains("crun reports \"exited 1\"; crun log: crun: mount `/x`"),
+            "{why}"
+        );
+        assert!(!text_file_busy(&said).await);
+        std::fs::write(
+            &log,
+            r#"{"level":"error","msg":"exec container process `/kbf/root/t`: Text file busy"}"#,
+        )
+        .expect("log");
+        assert!(text_file_busy(&said).await);
+    }
+
+    /// Catches the init's report being read as anything but `crun`'s words for the same
+    /// failure (the classifier must serve both), lost behind the log's own words, or a
+    /// missing file (no report: the init writes one only on failure) an error.
+    #[tokio::test]
+    async fn the_inits_report_is_read_after_the_log_in_cruns_words() {
+        assert_eq!(init_words(""), "");
+        assert_eq!(
+            init_words(
+                "open executable: Permission denied\n\nexec container process `x`: Text file busy\n"
+            ),
+            "crun: open executable: Permission denied; \
+             crun: exec container process `x`: Text file busy"
+        );
+        let dir = scratch("init-report");
+        let (log, report, stderr) = (dir.join("crun.log"), dir.join("report"), dir.join("stderr"));
+        let said = Said::crun(&log, &stderr).with_report(&report);
+        std::fs::write(&log, "").expect("log");
+        assert_eq!(said.read().await.expect("no report file"), "");
+        std::fs::write(
+            &report,
+            "executable file `env` not found in $PATH: No such file or directory\n",
+        )
+        .expect("report");
+        assert_eq!(
+            said.read().await.expect("report"),
+            "crun: executable file `env` not found in $PATH: No such file or directory"
+        );
+        // The log's words alone, when the init said nothing.
+        std::fs::write(&log, LOG).expect("log");
+        std::fs::write(&report, "").expect("empty report");
+        assert_eq!(said.read().await.expect("log only"), crun_words(LOG));
+        std::fs::write(
+            &report,
+            "executable file `env` not found in $PATH: No such file or directory\n",
+        )
+        .expect("report");
+        let both = said.read().await.expect("both");
+        assert!(both.starts_with("crun: executable file `env` not found in $PATH: No such file or directory; crun: open executable"), "{both}");
+        assert!(both.ends_with("directory"), "{both}");
+        // The report alone answers when crun left no log; without a report configured the
+        // missing log is still an error.
+        std::fs::remove_file(&log).expect("remove log");
+        assert!(said.read().await.is_ok());
+        assert!(Said::crun(&log, &stderr).read().await.is_err());
+        // Only a missing file is excused: one that cannot be read (a directory opens, and
+        // fails to be read) is an error, the log's or the report's.
+        let by_dir = Said::crun(&dir, &stderr).with_report(&report);
+        assert!(by_dir.read().await.is_err(), "an unreadable log");
+        let unreadable = Said::crun(&dir.join("crun.log"), &stderr).with_report(&dir);
+        assert!(unreadable.read().await.is_err(), "an unreadable report");
+        // The classifier reads the init's words as `crun`'s.
+        let mut spec = crate::container::tests::spec();
+        spec.argv = vec!["env".to_owned()];
+        std::fs::write(&stderr, b"").expect("stderr");
+        assert_eq!(not_run(&spec, &said, "exited 127").await.expect("127"), 127);
+    }
+
+    /// Catches a report that opens but cannot be read, and a rewritten stderr that cannot
+    /// be written, passed over as if nothing happened: each is the farm's failure, naming
+    /// the file (a directory opens, and fails to be read or written).
+    #[tokio::test]
+    async fn a_report_read_or_rewrite_that_fails_is_the_farms() {
+        let dir = scratch("io-fails");
+        let mut spec = crate::container::tests::spec();
+        spec.argv = vec!["env".to_owned()];
+
+        let unreadable = not_run(&spec, &Said::crun(&dir, &dir.join("stderr")), "exited 1").await;
+        let why = unreadable.expect_err("unreadable").to_string();
+        assert!(why.contains(&format!("{}: ", dir.display())), "{why}");
+
+        let log = dir.join("crun.log");
+        std::fs::write(&log, "").expect("log");
+        let report = dir.join("report");
+        std::fs::write(
+            &report,
+            "executable file `env` not found in $PATH: No such file\n",
+        )
+        .expect("report");
+        let said = Said::crun(&log, &dir).with_report(&report);
+        let unwritable = not_run(&spec, &said, "exited 1").await;
+        let why = unwritable.expect_err("unwritable").to_string();
+        assert!(why.contains(&format!("{}: ", log.display())), "{why}");
     }
 }

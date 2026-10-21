@@ -292,10 +292,12 @@ fn frames_carry_their_length_and_bad_lengths_are_refused() {
     write_frame(&mut Vec::new(), &max).expect("a frame of exactly MAX_FRAME is allowed");
 }
 
-/// Hands out its bytes one at a time, after an interruption, then fails.
+/// Hands out its bytes one at a time, after an interruption, then fails (or, when
+/// `eof`, ends cleanly).
 struct Flaky {
     bytes: Vec<u8>,
     interrupted: bool,
+    eof: bool,
 }
 
 impl Read for Flaky {
@@ -305,7 +307,11 @@ impl Read for Flaky {
             return Err(io::ErrorKind::Interrupted.into());
         }
         if self.bytes.is_empty() {
-            return Err(io::ErrorKind::TimedOut.into());
+            return if self.eof {
+                Ok(0)
+            } else {
+                Err(io::ErrorKind::TimedOut.into())
+            };
         }
         buf[0] = self.bytes.remove(0);
         Ok(1)
@@ -319,11 +325,13 @@ fn reads_retry_interruptions_and_report_errors_inside_a_frame() {
     let mut whole = Flaky {
         bytes: bytes("00000001 03"),
         interrupted: false,
+        eof: false,
     };
     assert_eq!(read_frame(&mut whole).expect("read"), vec![KILL]);
     let mut cut = Flaky {
         bytes: bytes("00000002 03"),
         interrupted: false,
+        eof: false,
     };
     assert!(
         matches!(read_frame(&mut cut), Err(WireError::Io(e)) if e.kind() == io::ErrorKind::TimedOut)
@@ -331,6 +339,32 @@ fn reads_retry_interruptions_and_report_errors_inside_a_frame() {
     let mut cut_length = Flaky {
         bytes: bytes("0000"),
         interrupted: true,
+        eof: false,
     };
     assert!(matches!(read_frame(&mut cut_length), Err(WireError::Io(_))));
+}
+
+/// Catches the end of a stream read wrong through a reader that also gets interrupted:
+/// a stream that ends before a frame is `Closed`, one that ends inside the length or
+/// the frame is `Truncated` (not a clean close), and a length of 0 or over `MAX_FRAME`
+/// is refused before a buffer is allocated. The reader is the one the retry test uses,
+/// so that this and that test cover `read_frame` for one type between them.
+#[test]
+fn a_reader_that_ends_is_closed_before_a_frame_and_truncated_inside_one() {
+    let read = |bytes: Vec<u8>| {
+        read_frame(&mut Flaky {
+            bytes,
+            interrupted: false,
+            eof: true,
+        })
+    };
+    assert!(matches!(read(Vec::new()), Err(WireError::Closed)));
+    assert!(matches!(read(bytes("0000")), Err(WireError::Truncated)));
+    assert!(matches!(
+        read(bytes("00000002 03")),
+        Err(WireError::Truncated)
+    ));
+    assert!(matches!(read(bytes("00000000")), Err(WireError::Length(0))));
+    let over = (MAX_FRAME + 1).to_be_bytes().to_vec();
+    assert!(matches!(read(over), Err(WireError::Length(n)) if n == MAX_FRAME + 1));
 }

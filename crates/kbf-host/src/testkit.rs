@@ -18,7 +18,7 @@ use crate::trust::Untrusted;
 pub type Answer = Box<dyn Fn(&Cmd) -> io::Result<Output>>;
 
 /// A host made of a map from path to entry. Every step `apply` is given is pushed to
-/// `log` first, and every query to `queries`; file, directory, removal and capture
+/// `log` first, and every query to `queries`; file, directory, link, removal and capture
 /// steps then change the map, so a plan made after an apply sees the result. Commands
 /// get their output from `answer` (an error there is a tool that cannot start); a
 /// [`Step::Run`] or [`Step::Capture`] whose answer is a non-zero exit fails.
@@ -95,7 +95,7 @@ impl Exec for FakeExec {
                 owner,
                 len: 0,
             },
-            Entry::Other => Meta {
+            Entry::Link { .. } | Entry::Other => Meta {
                 kind: Kind::Other,
                 perms: Perms::new(0o777),
                 owner: RUNNER,
@@ -139,8 +139,33 @@ impl Exec for FakeExec {
                 };
                 self.entries.insert(path.clone(), entry);
             }
+            // As the host does: a file or directory at `path` is refused, never replaced.
+            Step::Symlink { path, target } => match self.entries.get(path) {
+                None | Some(Entry::Link { .. }) => {
+                    let entry = Entry::Link {
+                        target: target.clone(),
+                    };
+                    self.entries.insert(path.clone(), entry);
+                }
+                Some(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("{path} is not a symbolic link; refusing to replace it"),
+                    ));
+                }
+            },
             Step::Remove { path } => {
                 self.entries.remove(path);
+            }
+            // The entry and everything under it (a path is under `path` when it starts with
+            // `path/`, so `/a/bc` is not under `/a/b`); what is not there is an error, as on
+            // the host.
+            Step::RemoveTree { path } => {
+                if self.entries.remove(path).is_none() {
+                    return Err(io::Error::from(io::ErrorKind::NotFound));
+                }
+                let below = format!("{path}/");
+                self.entries.retain(|p, _| !p.as_str().starts_with(&below));
             }
             Step::Run(cmd) => {
                 crate::exec::succeeded(cmd, (self.answer)(cmd)?)?;
@@ -176,22 +201,28 @@ impl Exec for FakeExec {
     }
 }
 
-/// A fresh, empty directory for one test: `<target>/tmp/kbf-host/<name>`. Every crate
-/// that uses it shares that directory, so `name` must be unique among them.
+/// A fresh, empty directory for one test: `<target>/tmp/kbf-host/<pid>/<name>`. `name`
+/// must be unique among the tests of one process; the process id keeps it apart from
+/// other processes of the same target, which `cargo nextest` runs one per test and
+/// which would otherwise empty each other's directory.
 pub fn scratch(name: &str) -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let target = exe
         .ancestors()
         .nth(3)
         .expect("<target>/<profile>/deps/<test binary>");
-    let dir = target.join("tmp").join("kbf-host").join(name);
+    let dir = target
+        .join("tmp")
+        .join("kbf-host")
+        .join(std::process::id().to_string())
+        .join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("make the scratch directory");
     dir
 }
 
 /// A real file system under a scratch root, with commands played by the test: `inspect`,
-/// `stat` and the file, directory and removal steps go to a [`HostExec`] on `root`;
+/// `stat` and the file, directory, link and removal steps go to a [`HostExec`] on `root`;
 /// every query and command step is recorded and answered by `answer`, which may change
 /// files under the root as the tool would. It reports `euid` and trusts the running
 /// binary, so a root plan applies as the test's own user. A capture's output is not

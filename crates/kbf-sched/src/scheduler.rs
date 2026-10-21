@@ -2,10 +2,20 @@
 
 mod fault;
 mod give_up;
+pub(crate) mod loss;
 pub(crate) mod memory;
+mod outage;
 mod phase;
+mod recover;
+mod snapshot;
 mod state;
+mod view;
 
+pub use recover::{Fate, Recovered, RecoveredLease};
+pub use snapshot::{
+    Avoided, LeasePhase, LeaseView, MAX_AVOIDED, QueueGroup, QueueView, Snapshot, WaitingGroup,
+    platform_label,
+};
 pub use state::OpState;
 
 use std::cmp::Reverse;
@@ -19,12 +29,13 @@ use kbf_types::{
     ResultRecord, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 
-use crate::cordon::{Cordon, Cordons};
+use crate::cordon::Cordons;
 use crate::fence::{HANDOVER_GRACE, LEASE_GRACE};
 use crate::input::{DaemonInstance, Event, Input, Request};
+use crate::load::Load;
 use crate::requeue::{Requeue, RequeueReason};
 use crate::servable::{Servable, Verdict};
-use memory::MemoryState;
+use memory::{MemoryLadder, MemoryState};
 
 /// At most this many leases are granted per [`Event::Tick`] (one log flush per round).
 pub const PLACEMENT_ROUND: usize = 256;
@@ -63,6 +74,9 @@ struct Operation {
     /// A result from the current holding has been proposed; later reports for it are
     /// duplicates.
     result_proposed: bool,
+    /// The proposed result is the farm's give-up of a silent, replaced or never-started
+    /// lease past its budget ([`Scheduler::give_up_charged`]), not a worker's.
+    gave_up: bool,
     /// While queued: since when, and why, no live worker can run it. `None` while one
     /// can.
     unservable: Option<Unservable>,
@@ -72,6 +86,14 @@ struct Operation {
     /// The workers those runs ended on: placement prefers any other (see
     /// [`Servable::fit`]).
     avoid: BTreeSet<WorkerId>,
+    /// Its leases given up as not started ([`memory::NOT_STARTED_RERUNS`]).
+    not_started: u32,
+    /// Its leases lost ([`RequeueReason::is_loss`]), counted toward the cap
+    /// ([`Scheduler::with_loss_requeues`]).
+    losses: u32,
+    /// When it last entered the queue: its submission, or the give-up of its lease
+    /// ([`Scheduler::queue_snapshot`] ages the queue from it).
+    queued_at: FarmTime,
 }
 
 /// A queued operation no live worker can run: since when, why, and whether the wait
@@ -96,6 +118,9 @@ struct Held {
     /// When and to which session its `Start` was emitted; `None` until its grant is
     /// committed.
     start_sent: Option<StartSent>,
+    /// When the grant was made (proposed), and when the worker reported it started.
+    granted_at: FarmTime,
+    started_at: Option<FarmTime>,
 }
 
 /// When a `Start` was emitted, and the worker session and daemon process it was sent to.
@@ -146,6 +171,11 @@ impl Worker {
         self.capacity.saturating_sub(self.booked)
     }
 
+    /// How loaded it is: what placement ranks the workers that have room by.
+    pub(crate) fn load(&self) -> Load {
+        Load::new(self.booked, self.capacity, self.leases)
+    }
+
     pub(crate) fn alive(&self, now: FarmTime) -> bool {
         now < self.last_heard.saturating_add(LEASE_GRACE)
     }
@@ -156,16 +186,35 @@ impl Worker {
         self.phase.switching() == Some(lease) && now < self.switch_ends
     }
 
+    /// Whether `request`, an action or a VM, is at the whole host's memory (the last step
+    /// of the memory ladder, which the cap is): it runs with no other lease on the node,
+    /// and none is placed beside it, as a whole-machine lease does. A request for no
+    /// memory is not.
+    pub(crate) fn exclusive(&self, request: &Request) -> bool {
+        request.resources.memory_bytes > 0
+            && request.resources.memory_bytes >= self.capacity.memory_bytes
+    }
+
     /// Whether `request` can be placed on it now, platform and kind aside: an action
-    /// if no whole-machine lease holds it and its free room holds the request; a
+    /// if no whole-machine lease holds it, its free CPUs, GPUs and VM slots hold the
+    /// request, and its memory capacity is at least the request's memory; a
     /// whole-machine lease if it holds no lease and its capacity holds the request. A
     /// request for an iOS device also needs a free device that satisfies it
     /// ([`Worker::free_device`]).
     pub(crate) fn has_room(&self, request: &Request) -> bool {
         let room = match request.kind {
             LeaseKind::WholeMachine => self.leases == 0 && self.capacity.fits(&request.resources),
+            // An action's memory is the cgroup limit it first runs under, not a booking:
+            // what other leases hold of the node's memory never keeps it out. The node
+            // bounds how many run at once by CPUs (its lease count), and its memory
+            // pressure backstop pauses starts. The limit must still be one the node can
+            // give. The one limit that is not a share is the whole host ([`Worker::exclusive`]):
+            // that action runs alone.
             LeaseKind::Action | LeaseKind::Vm => {
-                !self.whole && self.free().fits(&request.resources)
+                !self.whole
+                    && self.free().fits(&request.resources.without_memory())
+                    && request.resources.memory_bytes <= self.capacity.memory_bytes
+                    && (!self.exclusive(request) || self.leases == 0)
             }
         };
         room && (!request.needs.wants_device() || self.free_device(&request.needs).is_some())
@@ -232,6 +281,19 @@ pub struct Scheduler {
     /// kills ([`memory`]). Boxed: most schedulers hold none, and the scheduler is
     /// moved by value.
     memory: Box<MemoryState>,
+    /// The rungs of an action's memory booking ([`memory`]).
+    ladder: MemoryLadder,
+    /// Workers a recovered scheduler holds leases for that have not registered yet, and
+    /// until when they may take to ([`Scheduler::recover`]).
+    awaited: BTreeMap<WorkerId, FarmTime>,
+    /// The state store refused a write and has not taken one since
+    /// ([`Scheduler::store_unavailable`]).
+    store_down: bool,
+    /// Until when no lease is given up, after the store returned
+    /// ([`Scheduler::store_available`]).
+    grace_until: FarmTime,
+    /// How many lost leases refuse an operation ([`Scheduler::with_loss_requeues`]).
+    loss_cap: u32,
 }
 
 impl Scheduler {
@@ -255,6 +317,11 @@ impl Scheduler {
             requeues: None,
             reservations: BTreeMap::new(),
             memory: Box::default(),
+            ladder: MemoryLadder::default(),
+            awaited: BTreeMap::new(),
+            store_down: false,
+            grace_until: FarmTime::default(),
+            loss_cap: u32::MAX,
         }
     }
 
@@ -297,125 +364,6 @@ impl Scheduler {
     pub const fn with_unservable_wait(mut self, wait: Duration) -> Self {
         self.unservable_wait = wait;
         self
-    }
-
-    /// Why no live worker can run `operation` now, while it is queued and none can.
-    #[must_use]
-    pub fn waiting(&self, operation: OperationId) -> Option<&str> {
-        let op = self.ops.get(&operation)?;
-        op.unservable.as_ref().map(|u| u.reason.as_str())
-    }
-
-    /// Where `operation` is, if it exists: it was submitted, and is unfinished or
-    /// finished less than the finished retention ago.
-    #[must_use]
-    pub fn state(&self, operation: OperationId) -> Option<&OpState> {
-        self.ops.get(&operation).map(|op| &op.state)
-    }
-
-    /// The runs of `operation` that ended as the farm's fault, oldest first; `None` once
-    /// the scheduler no longer holds it.
-    #[must_use]
-    pub fn farm_runs(&self, operation: OperationId) -> Option<&[FarmRun]> {
-        self.ops.get(&operation).map(|op| op.farm_runs.as_slice())
-    }
-
-    /// The operation in flight that a submission of `request` would join: its
-    /// running twin, if `request` may join one.
-    #[must_use]
-    pub fn twin(&self, request: &Request) -> Option<OperationId> {
-        if !request.joinable() {
-            return None;
-        }
-        self.in_flight.get(&request.key).copied()
-    }
-
-    /// The id the next operation that joins no twin gets.
-    #[must_use]
-    pub const fn next_operation(&self) -> OperationId {
-        OperationId(self.next_op)
-    }
-
-    /// The waiters attached to `operation`, in attach order.
-    #[must_use]
-    pub fn waiters(&self, operation: OperationId) -> Option<&[WaiterId]> {
-        self.ops.get(&operation).map(|op| op.waiters.as_slice())
-    }
-
-    /// The QoS level `operation` is queued at (raised when a more urgent caller joins).
-    #[must_use]
-    pub fn qos(&self, operation: OperationId) -> Option<&Qos> {
-        self.ops.get(&operation).map(|op| &op.request.qos)
-    }
-
-    /// Queued operations in the order placement will consider them.
-    pub fn queued(&self) -> impl Iterator<Item = OperationId> + '_ {
-        self.queue.iter().map(|(_, id)| *id)
-    }
-
-    /// Whether `worker` is cordoned, and where its drain is; `None` while placement
-    /// may use it.
-    #[must_use]
-    pub fn cordon(&self, worker: &WorkerId) -> Option<&Cordon> {
-        self.cordons.get(worker)
-    }
-
-    /// The leases `worker` holds (granted or running), in lease order.
-    #[must_use]
-    pub fn leases_on(&self, worker: &WorkerId) -> Vec<LeaseId> {
-        self.held
-            .iter()
-            .filter(|(_, h)| {
-                self.ops[&h.operation]
-                    .state
-                    .holding()
-                    .is_some_and(|(_, w)| w == worker)
-            })
-            .map(|(lease, _)| *lease)
-            .collect()
-    }
-
-    /// What `worker`'s newest `Hello` says it is doing ([`Event::Phase`]), if it is
-    /// registered.
-    #[must_use]
-    pub fn phase(&self, worker: &WorkerId) -> Option<&NodePhase> {
-        self.workers.get(worker).map(|w| &w.phase)
-    }
-
-    /// The worker queued whole-machine `operation` holds while it waits for it to empty,
-    /// if any.
-    #[must_use]
-    pub fn reservation(&self, operation: OperationId) -> Option<&WorkerId> {
-        self.reservations.get(&operation)
-    }
-
-    /// What is booked on `worker`, if it is registered.
-    #[must_use]
-    pub fn booked(&self, worker: &WorkerId) -> Option<Resources> {
-        self.workers.get(worker).map(|w| w.booked)
-    }
-
-    /// The leases in `running` (a heartbeat's running set) that this scheduler granted
-    /// and no longer holds on `worker`: given up, granted elsewhere, or finished. Their
-    /// results can no longer be accepted, so a run of one is wasted, and a run of one
-    /// whose operation was granted again runs beside the retry. The caller cancels
-    /// them. A lease of another term is never named: this scheduler does not know
-    /// whether a newer leader granted it.
-    pub fn not_held<'a>(
-        &'a self,
-        worker: &'a WorkerId,
-        running: &'a [LeaseId],
-    ) -> impl Iterator<Item = LeaseId> + 'a {
-        running.iter().copied().filter(move |lease| {
-            let granted = lease.term == self.term && lease.seq < self.next_seq;
-            let held_here = self.held.get(lease).is_some_and(|held| {
-                self.ops[&held.operation]
-                    .state
-                    .holding()
-                    .is_some_and(|(_, w)| w == worker)
-            });
-            granted && !held_here
-        })
     }
 
     /// Drops every finished operation kept for the finished retention or longer. A
@@ -476,9 +424,13 @@ impl Scheduler {
                 state: OpState::Queued,
                 committed_lease: None,
                 result_proposed: false,
+                gave_up: false,
                 unservable: None,
                 farm_runs: Vec::new(),
+                not_started: 0,
+                losses: 0,
                 avoid: BTreeSet::new(),
+                queued_at: self.now,
             },
         );
         Vec::new()
@@ -495,12 +447,15 @@ impl Scheduler {
                 if let Some(device) = &held.device {
                     w.devices.remove(device);
                 }
-                if op.request.kind == LeaseKind::WholeMachine {
+                // A whole-machine lease, or an action at the whole host's memory, is
+                // the node's only lease.
+                if w.leases == 0 {
                     w.whole = false;
                 }
             }
         }
         op.result_proposed = false;
+        op.gave_up = false;
     }
 
     /// Releases `operation`'s holding and puts it back in the queue, recording why.
@@ -522,14 +477,22 @@ impl Scheduler {
             .ops
             .get_mut(&id)
             .expect("held leases name live operations");
+        // Only an operation that holds a lease is requeued, so every call is a give-up.
+        op.losses += u32::from(reason.is_loss());
         op.state = OpState::Queued;
+        op.queued_at = self.now;
         self.queue.insert((Reverse(op.request.qos.clone()), id));
     }
 
-    /// One placement round. Each queued operation, most urgent first, goes to the first
-    /// live worker (in name order) that serves its lease kind, satisfies its platform
-    /// and has room for it, up to [`PLACEMENT_ROUND`] grants. An action has room where
-    /// its whole request vector is free and no whole-machine lease is held; a
+    /// One placement round. Each queued operation, most urgent first, goes to the least
+    /// loaded live worker that serves its lease kind, satisfies its platform and has room
+    /// for it, up to [`PLACEMENT_ROUND`] grants: the one with the least booked, as a
+    /// share of its capacity (the larger of its CPU and memory shares), then the fewest
+    /// leases, then the first by name ([`Worker::load`]), so work spreads over the farm
+    /// instead of filling one worker after another. An action has room where its CPUs,
+    /// GPUs and VM slots are free and no whole-machine lease is held; its memory is only
+    /// checked against the worker's, never against what other leases hold
+    /// ([`Worker::has_room`]), though what they hold ranks the workers; a
     /// whole-machine lease only on a worker that holds no lease, and it books all of it.
     ///
     /// A whole-machine operation that fits nowhere holds one worker that could run it
@@ -537,7 +500,10 @@ impl Scheduler {
     /// leases): no operation after it in queue order (less urgent, or as urgent and
     /// younger) is placed there, so the worker empties as its leases end. Work before
     /// it in queue order still is, so a reservation never holds back more urgent work.
-    /// It lasts while the operation is queued and the worker could run it.
+    /// It lasts while the operation is queued and the worker could run it. No other
+    /// operation holds a worker: an action at a worker's whole memory (the last step of
+    /// the memory ladder) waits until some worker has no lease, and under sustained
+    /// spread load that wait can be long, since nothing reserves a worker for it.
     ///
     /// Every queued operation is also checked against what live workers could ever give
     /// it: one that no live worker satisfies, or that is larger than every one that
@@ -545,6 +511,11 @@ impl Scheduler {
     /// refused once it has waited so for the unservable wait. Its refusal is committed
     /// first and leaves the queue at once, so nothing places it meanwhile.
     fn place(&mut self, effects: &mut Vec<Effect>) {
+        // A grant the store cannot take is useless, and a refusal as much.
+        if self.store_down {
+            return;
+        }
+        self.refuse_lost(effects);
         let now = self.now;
         let mut servable = Servable::new(&self.workers, &self.cordons, now);
         let mut placed = Vec::new();
@@ -603,6 +574,8 @@ impl Scheduler {
                     booked,
                     device,
                     start_sent: None,
+                    granted_at: self.now,
+                    started_at: None,
                 },
             );
             effects.push(Effect::Commit(ControlRecord::Lease(LeaseGrant {
@@ -754,6 +727,9 @@ impl Scheduler {
                 lease,
                 worker: worker.clone(),
             };
+            if let Some(held) = self.held.get_mut(&lease) {
+                held.started_at = Some(self.now);
+            }
         }
     }
 
@@ -795,6 +771,13 @@ impl Scheduler {
         }
         if let Outcome::Failed(Failure::Lost(why)) = record.outcome
             && self.rerun_after_lost(record, why)
+        {
+            return Vec::new();
+        }
+        // The scheduler's own give-up for a lease that never started is not a run to charge.
+        if record.outcome == Outcome::Failed(Failure::Infra)
+            && !self.ops[&id].gave_up
+            && self.rerun_after_infra(record)
         {
             return Vec::new();
         }
@@ -862,25 +845,24 @@ impl StateMachine for Scheduler {
                         w.session += 1;
                     }
                     None => {
-                        self.workers.insert(
-                            worker,
-                            Worker {
-                                capacity,
-                                caps,
-                                booked: Resources::default(),
-                                leases: 0,
-                                whole: false,
-                                devices: BTreeSet::new(),
-                                last_heard: now,
-                                session: 0,
-                                instance,
-                                process: 0,
-                                handover_ends: FarmTime::default(),
-                                stopped_process: None,
-                                phase: NodePhase::Serving,
-                                switch_ends: FarmTime::default(),
-                            },
-                        );
+                        let mut fresh = Worker {
+                            capacity,
+                            caps,
+                            booked: Resources::default(),
+                            leases: 0,
+                            whole: false,
+                            devices: BTreeSet::new(),
+                            last_heard: now,
+                            session: 0,
+                            instance,
+                            process: 0,
+                            handover_ends: FarmTime::default(),
+                            stopped_process: None,
+                            phase: NodePhase::Serving,
+                            switch_ends: FarmTime::default(),
+                        };
+                        self.adopt(&worker, &mut fresh);
+                        self.workers.insert(worker, fresh);
                     }
                 }
                 Vec::new()
@@ -926,7 +908,7 @@ impl StateMachine for Scheduler {
             } => self.report(operation, lease, outcome),
             Event::Tick => {
                 let mut effects = Vec::new();
-                self.expire();
+                effects.extend(self.expire());
                 self.place(&mut effects);
                 effects
             }

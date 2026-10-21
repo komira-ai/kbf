@@ -69,7 +69,7 @@ There is no other build system in this repository.
 
 ## No new shell or Python
 
-kbf's tooling is Rust. The repository lints (`cargo test -p kbf-it --test
+kbf's tooling is Rust. The repository lints (`cargo test -p kbf-integration-test --test
 repo_lints`) refuse a workflow `run:` step with shell logic (more than one line, a
 pipe, `&&`, `;`, `$(`, a backtick, `if`, `for` or `while`) outright: a step is one
 command, and anything more is a `cargo xtask` verb or a flag of the program the
@@ -103,19 +103,57 @@ cargo-cyclonedx, Bazel, buck2) is pinned in the workflow by URL and SHA-256 and
 installed by `cargo xtask fetch`, which refuses a download whose SHA-256 differs
 before it unpacks or writes anything.
 
-The target is 100% line and branch coverage for every crate, so a pull
-request fully covers the code it adds or changes. The `coverage` job measures
-line and branch coverage per crate and checks it against
-[coverage-baseline](coverage-baseline), which records how many lines and
-branches of each crate no test runs. The job fails when either count rises.
-That is what it enforces, and it is slightly weaker than the target: a pull
-request that leaves some new code uncovered still passes if it also covers at
-least as many lines or branches that were uncovered before. Reviewers hold the
-rest of the target. The job also fails when a count falls below the file's
-(`BASELINE LOOSER THAN MEASURED`) and when a crate is missing from the file, so
-the file always equals the measurement and never keeps slack for a later change
-to spend. In either case copy `coverage-baseline.measured` from the job's
-`coverage` artifact over `coverage-baseline` in the same pull request.
+The pull-request gate is 99.00% of lines and 99.00% of branches in every crate,
+measured on the fast tests (the `pr` profile of `.config/nextest.toml`) by the
+`test` job. The target is 100%, and reviewers hold the rest: a pull request
+covers the code it adds or changes.
+
+The job runs `kbf-coverage` against [coverage-floors](coverage-floors) and fails
+a crate whose line or branch coverage is under its threshold: 99.00%, or, for a
+crate the file lists, the floor listed for that metric. The comparison is exact
+(`hit * 10000 >= percent * found`, in integers), a metric with nothing to
+measure (a crate with no branches) passes, and a crate at 98.99% fails. A floor
+is the crate's coverage when the file was written, floored to hundredths of a
+percent; each crate listed has an open issue to reach 99%.
+
+A floor may only rise:
+
+- When coverage improves, `kbf-coverage raise` lifts the floors to the
+  measurement and drops a floor once its metric reaches 99%. The job prints
+  the floors that can rise and the command, and does not fail for them:
+
+  ```sh
+  cargo run -p kbf-coverage -- raise --lcov <lcov.info> --root .
+  ```
+
+  Commit the rewritten file. `raise` never adds a floor and never lowers one.
+  Without CI, `<lcov.info>` is a `cargo llvm-cov --branch --lcov` run with
+  the job's toolchain and flags (see `.github/workflows/ci.yml`), and a relative
+  `--root` is resolved against the working directory.
+- On a pull request, the job's last step runs `kbf-coverage no-lowering` against
+  the base's file and fails when any threshold is lower there: a lowered floor,
+  and a floor added for a crate or metric that had none (adding a line lowers its
+  threshold from 99.00%). A crate under 99% is fixed with tests. A crate that
+  reaches 99% on both metrics loses its line (removing a floor raises the
+  threshold).
+- A floor with nothing to measure fails (`FLOOR BUT NOTHING MEASURED`): a crate
+  whose tests stopped being instrumented would otherwise pass its floor. The
+  gate cannot see that for a crate with no floor, which has no record in the
+  tracefile when it has no instrumented test target (a library with
+  `[lib] test = false`); give the crate a test target.
+
+The gate does not see code that the report leaves out; reviewers hold these until
+repository lints refuse them:
+
+- A crate moved outside `crates/` (listed in the workspace's `exclude` and
+  kept as a `path` dependency) is no longer a workspace crate: it stops being
+  measured. The workspace has no `exclude` today.
+- `cargo llvm-cov`'s default pattern ignores every file in a directory named
+  `tests`, `examples` or `benches`, wherever it sits: a module directory
+  `src/**/tests/`, or a file in such a directory that `src` includes (for
+  example with `#[path]`), is not measured.
+- A binary target with `test = false`, `#[cfg(not(coverage))]` and
+  `#[coverage(off)]` keep code out of the report.
 
 Changes under `.github/workflows/` will need a review from the code owners
 listed in [.github/CODEOWNERS](.github/CODEOWNERS). That rule is a placeholder

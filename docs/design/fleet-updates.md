@@ -112,7 +112,7 @@ not a capability key: a request naming it is refused once unknown keys are refus
 | `kbf-node` | pin a lease to one node, for qualification (section 4.2). The front refuses it from every client with `INVALID_ARGUMENT`: no REAPI caller can send it. The rollout driver submits qualification work to the scheduler directly, as a new internal submitter, so no client role is needed for it. | this document |
 
 **Re-detection is planned.** Today detection runs once, at daemon start
-(`crates/kbf-node/src/main.rs`), except the native driver's Xcodes: it asks them again
+(`crates/kbf-node/src/lib.rs`), except the native driver's Xcodes: it asks them again
 every few minutes, and a change resends `Hello` and `NodeStatus` mid-stream
 (`crates/kbf-driver-native/src/xcode_watch.rs`, issue #164). Noticing a changed report by its hash is listed as
 planned in [capabilities.md](capabilities.md#planned). This design adds:
@@ -608,7 +608,7 @@ open-core (7.6).
   signature; the set pins which snapshot and kernel (S3.1).
 - `kbf-updater apply` runs a full upgrade against the snapshot, then reboots only if
   `/run/reboot-required` exists.
-- Podman fit: cgroup v2 only; the profile's drop-in on `user@.service` delegates
+- Rootless `crun` fit: cgroup v2 only; the profile's drop-in on `user@.service` delegates
   `cpu cpuset io memory pids`, and the post-update gate rechecks it
   ([rootless cgroup v2](https://rootlesscontaine.rs/getting-started/common/cgroup2/))
   **[V]**.
@@ -948,7 +948,7 @@ Changes by crate (rough sizes, tests included):
 | `kbf-caps`, `kbf-front` | membership comparison; new exact and set keys, `probe.*`; `kbf-node` refused from clients | ~300 |
 | `kbf-alert` | rollout held, client gate waiting, node not back, certificate, token and catalogue expiry, Mac awaiting a signed erase | ~200 |
 | `kbf-driver-native` | the bare-metal whole-machine runtime: lease users through `kbf-mac-session`, GUI session, cleanup | ~1,500 |
-| `kbf-sim`, `kbf-it` | tests below | ~1,000 |
+| `kbf-sim`, `kbf-integration-test` | tests below | ~1,000 |
 
 Tests, each with the planted mutant that must turn it red (the security tests are in
 S10):

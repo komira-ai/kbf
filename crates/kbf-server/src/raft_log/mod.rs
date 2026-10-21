@@ -1,4 +1,4 @@
-//! `--meta-log=raft`: the metadata log as a single-voter Raft log on the local disk
+//! The metadata log (`--meta-dir`) as a single-voter Raft log on the local disk
 //! (docs/design/ha.md, section 16, PR 5).
 //!
 //! [`RaftMetaLog`] implements the front's [`MetaLog`] over a [`kbf_raft::Host`] whose
@@ -35,12 +35,16 @@
 //! - **Farm time** continues from the committed one: at open the log takes the
 //!   applied farm time as its base, and [`RaftMetaLog::now`] is the base plus the time
 //!   since the open, so it never goes back across restarts. A task commits
-//!   `Tick(now)` every [`TICK`] while the log is open. A tick is a proposal, which
+//!   `Tick(now)` every [`TICK`] while the log is open, the first one [`TICK`] after
+//!   the open. A tick is a proposal, which
 //!   only a leader may make.
 //! - **Machine version.** A new log is at [`MachineVersion::V1`], whose entries are
 //!   format 1. [`RaftMetaLog::raise_machine_version`] commits a `MachineVersion`
 //!   entry; every entry after it is in the new version's format, so a log raised to
-//!   [`MachineVersion::V2`] takes the write tier's commands. A start replays the raise
+//!   [`MachineVersion::V2`] takes the write tier's commands, and one raised to
+//!   [`MachineVersion::V3`] takes `EvictObjects` too, and one raised to
+//!   [`MachineVersion::V4`] node writers (`SetWriter`, and objects named by a storage
+//!   node's member and boot), and one raised to [`MachineVersion::V5`] `ReseatStaged`. A start replays the raise
 //!   with the log. A binary that does not run the version (any older one) refuses the
 //!   log at that entry. A raise commits alone, under the host's lock; a batch is
 //!   encoded under that lock too, in the format committed when it commits, so no
@@ -48,6 +52,11 @@
 //!   refused alone while the rest of its batch commits.
 //! - **A storage error** stops the log for the life of the process: every later
 //!   commit is refused `Unavailable`.
+//! - **Dropping the log** stops its tick task, waits for a batch the committer is
+//!   writing, and refuses every later one `Unavailable`, so nothing reaches the raft
+//!   directory once the drop returns and the directory can be opened again in the
+//!   same process (kbf#651), also while a child that another thread forked has not
+//!   exec'd yet (the lock is unlocked, not only closed).
 //!
 //! Not yet: snapshots (the metadata state has no snapshot encoding, so the log is
 //! never compacted, and a directory holding a snapshot is refused), more than one
@@ -57,10 +66,12 @@ mod machine;
 mod recorded;
 
 use std::fmt::{self, Display};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::num::NonZeroU64;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
@@ -83,10 +94,15 @@ use self::machine::MetaMachine;
 pub use self::machine::NoSnapshots;
 pub use self::recorded::{RECORD, RECORD_TMP};
 
-/// The highest machine version this binary runs: [`MachineVersion::V2`], the write
-/// tier's commands. A log stays at the version it was raised to; a new one starts at
-/// [`MachineVersion::V1`].
-pub const RUNS: MachineVersion = MachineVersion::V2;
+/// The file in the raft directory that [`RaftMetaLog::open_dir`] holds an exclusive
+/// lock on (`flock`) while the log is open, so a second server started on the same
+/// directory is refused.
+pub const LOCK: &str = "log.lock";
+
+/// The highest machine version this binary runs: [`MachineVersion::V5`], the write
+/// tier's commands, `EvictObjects`, node writers (`SetWriter`) and `ReseatStaged`. A log
+/// stays at the version it was raised to; a new one starts at [`MachineVersion::V1`].
+pub const RUNS: MachineVersion = MachineVersion::V5;
 
 /// How often the log commits farm time.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -128,6 +144,18 @@ pub enum RaftLogError {
     /// The single voter's membership was refused.
     #[error("raft membership: {0}")]
     Membership(#[from] ConfigError),
+    /// Another open log holds the raft directory's [`LOCK`] (a second server started
+    /// on the same `--meta-dir`), or the lock could not be taken.
+    #[error(
+        "raft dir {}: could not lock {LOCK}; is another kbf-server using it? ({source})",
+        .dir.display()
+    )]
+    Locked {
+        /// The raft directory.
+        dir: PathBuf,
+        /// Why the lock was not taken.
+        source: io::Error,
+    },
     /// The host stopped while the log opened.
     #[error("raft log: {0}")]
     Host(#[from] HostError<StoreError>),
@@ -160,10 +188,15 @@ pub enum RaftLogError {
 }
 
 /// The metadata log as a single-voter Raft log in one directory (see the module
-/// docs). Dropping it stops its tick task.
+/// docs). Dropping it stops its tick task and waits for a commit being written (one
+/// sync at most); a commit queued after that is refused.
 pub struct RaftMetaLog<F: Fs = StdFs> {
     shared: Arc<Shared<F>>,
     ticker: AbortHandle,
+    /// The raft directory's [`LOCK`], held while the log is open (logs opened with
+    /// [`RaftMetaLog::open_dir`]); released when the log is dropped, after its handle
+    /// on the store (fields drop in order).
+    lock: Option<DirLock>,
 }
 
 struct Shared<F: Fs> {
@@ -181,20 +214,65 @@ struct Shared<F: Fs> {
     opened: Instant,
     /// The `Bootstrap` entries applied by the time the log opened.
     bootstraps: usize,
+    /// Set when the log is dropped: a batch that takes `host` after it is refused.
+    closed: AtomicBool,
 }
 
 impl RaftMetaLog<StdFs> {
     /// Opens the log in `dir` (created if missing), creating a new one with a random
-    /// id if the directory is empty. Objects go under `<prefix_root><log id>/`.
+    /// id if the directory is empty. Objects go under `<prefix_root><log id>/`. The
+    /// directory's [`LOCK`] is taken before anything in it is read, and held until the
+    /// log is dropped.
     ///
     /// # Errors
-    /// As [`RaftMetaLog::open`].
+    /// [`RaftLogError::Locked`] if another open log holds the directory; otherwise as
+    /// [`RaftMetaLog::open`].
     pub async fn open_dir(
         dir: &Path,
         retention: Retention,
         prefix_root: &str,
     ) -> Result<Self, RaftLogError> {
-        Self::open(StdFs::new(dir)?, retention, prefix_root, random_log_id).await
+        let fs = StdFs::new(dir)?;
+        let lock = lock_dir(dir)?;
+        let mut log = Self::open(fs, retention, prefix_root, random_log_id).await?;
+        log.lock = Some(lock);
+        Ok(log)
+    }
+}
+
+/// `dir`'s [`LOCK`], created if missing, with an exclusive `flock` on it, released when
+/// the returned [`DirLock`] is dropped or the process exits.
+fn lock_dir(dir: &Path) -> Result<DirLock, RaftLogError> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(LOCK))?;
+    match file.try_lock() {
+        Ok(()) => Ok(DirLock(file)),
+        Err(e) => Err(RaftLogError::Locked {
+            dir: dir.to_owned(),
+            source: io::Error::from(e),
+        }),
+    }
+}
+
+/// A raft directory's [`LOCK`] file with its `flock` held.
+///
+/// An `flock` belongs to the open file description, not to the descriptor, and a
+/// description lives until every copy of the descriptor is closed. A process forked
+/// while the lock is held (any spawn of a child by another thread of this process)
+/// carries a copy until it execs, so closing the file would leave the directory locked
+/// for as long as that takes. Dropping unlocks first, which no copy outlives, so the
+/// directory can be opened again once the drop returns (the promise of [`RaftMetaLog`]'s
+/// drop).
+#[derive(Debug)]
+struct DirLock(File);
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        // An error leaves the close that follows to release the lock, as before.
+        let _ = self.0.unlock();
     }
 }
 
@@ -253,7 +331,8 @@ where
             }
         };
         let prefix = KeyPrefix::new(format!("{prefix_root}{log_id}/"))?;
-        let (store, _) = Store::open(fs, Options::default())?;
+        // One read of the directory for both the store and the host (kbf#689).
+        let (store, stored) = Store::open(fs, Options::default())?;
         let config = Config {
             id: ME,
             membership: Membership::new([ME], [])?,
@@ -261,7 +340,7 @@ where
             heartbeat_ticks: 1,
             max_entries_per_append: 1,
         };
-        let mut host = Host::open(config, store, NoTransport, machine, 0)?;
+        let mut host = Host::open_stored(config, store, stored, NoTransport, machine, 0)?;
         // A single voter elects itself within two election timeouts; winning commits
         // the term's blank entry, which applies every entry before it.
         while host.core().role() != Role::Leader {
@@ -296,9 +375,14 @@ where
             log_id,
             prefix,
             opened: Instant::now(),
+            closed: AtomicBool::new(false),
         });
         let ticker = tokio::spawn(tick_every(Arc::downgrade(&shared))).abort_handle();
-        Ok(Self { shared, ticker })
+        Ok(Self {
+            shared,
+            ticker,
+            lock: None,
+        })
     }
 
     /// Raises the log's machine version to `to` by committing a `MachineVersion`
@@ -374,6 +458,13 @@ impl<F: Fs> RaftMetaLog<F> {
         self.shared.lock().machine().version()
     }
 
+    /// How many servers vote in the log's cell: its Raft membership's voters. One
+    /// for every log this version opens.
+    #[must_use]
+    pub fn voters(&self) -> usize {
+        self.shared.lock().core().membership().voters().count()
+    }
+
     /// How many `Bootstrap` entries the log held when it opened, the one it may have
     /// just committed included. One for every log this version writes.
     #[must_use]
@@ -392,8 +483,13 @@ impl<F: Fs> fmt::Debug for RaftMetaLog<F> {
 }
 
 impl<F: Fs> Drop for RaftMetaLog<F> {
+    /// A committer runs on the blocking pool and outlives this handle: the batch it
+    /// is writing holds `host`, so taking `host` here waits for that batch, and every
+    /// batch that takes `host` after `closed` is set is refused.
     fn drop(&mut self) {
         self.ticker.abort();
+        self.shared.closed.store(true, Ordering::SeqCst);
+        drop(self.shared.lock());
     }
 }
 
@@ -528,13 +624,16 @@ where
             })
             .collect();
         let count = entries.len();
-        let proposed: Vec<Answer> = match host.propose_batch(entries) {
+        // Checked under `host`, which the drop takes after setting `closed`.
+        let batch = still_open(&self.closed)
+            .and_then(|()| host.propose_batch(entries).map_err(unavailable));
+        let proposed: Vec<Answer> = match batch {
             Ok(first) => (first.0..)
                 .take(count)
                 .map(|index| host.machine_mut().take_answer(LogIndex(index)))
                 .map(|answer| answer.ok_or(MetaLogError::Unavailable(NOT_APPLIED.to_owned())))
                 .collect(),
-            Err(e) => vec![Err(unavailable(e)); count],
+            Err(e) => vec![Err(e); count],
         };
         let mut proposed = proposed.into_iter();
         encoded
@@ -556,11 +655,22 @@ where
 
 const NOT_APPLIED: &str = "the metadata log did not apply its own proposal";
 
+const CLOSED: &str = "the metadata log was closed";
+
 const NOT_ANSWERED: &str = "the metadata log's committer stopped without answering";
 
 /// A log error as the front sees it: the leader could not answer.
 fn unavailable(e: impl Display) -> MetaLogError {
     MetaLogError::Unavailable(format!("the metadata log: {e}"))
+}
+
+/// `Unavailable` once the log has been dropped.
+fn still_open(closed: &AtomicBool) -> Result<(), MetaLogError> {
+    if closed.load(Ordering::SeqCst) {
+        Err(MetaLogError::Unavailable(CLOSED.to_owned()))
+    } else {
+        Ok(())
+    }
 }
 
 /// The machine's decode failure, if an entry stopped it.
@@ -573,14 +683,16 @@ fn decoded(machine: &MetaMachine) -> Result<(), RaftLogError> {
     })
 }
 
-/// Commits farm time every [`TICK`] for as long as the log is open. An error is
-/// dropped: it has stopped the log, and the next commit reports it.
+/// Commits farm time every [`TICK`] for as long as the log is open, the first one
+/// [`TICK`] after the open: at the open, farm time is the base the log just applied,
+/// so a tick then would commit nothing new. An error is dropped: it has stopped the
+/// log, and the next commit reports it.
 async fn tick_every<F>(shared: Weak<Shared<F>>)
 where
     F: Fs + Send + 'static,
     F::File: Send + 'static,
 {
-    let mut every = tokio::time::interval(TICK);
+    let mut every = tokio::time::interval_at(Instant::now() + TICK, TICK);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         every.tick().await;

@@ -1,0 +1,87 @@
+# cargo-nextest's configuration (CI: .github/workflows/ci.yml runs the fast `pr` profile,
+# beta.yml the whole run). nextest runs every test in a process of its own, and test
+# binaries side by side, one thread per core. A test binary
+# whose tests share state on disk across tests, which `cargo test` kept in one process, is
+# run one test at a time: a test group, not a global limit.
+[test-groups]
+# The tests of one binary build one release tree under target/tmp, once per process
+# (crates/xtask/tests/install_sh.rs, `RELEASE`); concurrent processes would build it over
+# each other.
+install-sh-fixture = { max-threads = 1 }
+# `scratch()` numbers its directories by a counter of the process, so two tests that share a
+# name share a directory (crates/kbf-mac-provision/tests/support/mod.rs).
+mac-provision-scratch = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(xtask) & binary(install_sh)'
+test-group = 'install-sh-fixture'
+
+[[profile.default.overrides]]
+filter = 'package(kbf-mac-provision)'
+test-group = 'mac-provision-scratch'
+
+# The pull-request profile (`cargo nextest run --profile pr`, and `cargo llvm-cov nextest
+# --profile pr`): the fast gate. A pull request runs every test except the slow ones named
+# below; the push to main runs them all, with the default profile
+# (.github/workflows/beta.yml, job test-x86).
+#
+# The slow set is every test that took 10 seconds or more in the full run on a hosted x86
+# runner: 77 of 8960 tests, 70 percent of the run's test time (the 5 GiB blob test alone
+# is 898 s). A test that needs a service (Postgres, S3, crun, root, macOS) is `#[ignore]`d
+# and so is in neither run; the other jobs of beta.yml run those.
+# The black-box crate kbf-all-in-one-test (T009, crates/kbf-all-in-one-test/README.md) is excluded whole by
+# `package(kbf-all-in-one-test)` below: it is a beta suite, and runs in the full run only.
+#
+# To regenerate: take the `nextest-junit` artifact of a beta.yml run (junit.xml, written by
+# `[profile.default.junit]` below), list the `testcase`s with a `time` of 10 or more, and
+# write each as `binary_id(=<package or package::test file>) & test(=<name>)`. A test that
+# grows slow and is not listed makes the fast gate slower, not wrong; a listed name that no
+# longer exists excludes nothing. A test is also listed, whatever its time, when it needs more
+# disk than a hosted runner reliably has free (one_read's 5 GiB blob test writes about 13 GB):
+# keep such entries when regenerating from the timings.
+[profile.pr]
+default-filter = '''
+not (
+  (binary_id(=kbf-all-in-one) & test(=plane::tests::put_chunks_streams_a_large_blob_and_stores_a_small_one))
+  | (binary_id(=kbf-all-in-one::memory) & (test(=a_2_gib_output_streams_onto_the_tier_in_bounded_memory) | test(=a_2_gib_remote_upload_is_written_through_to_the_tier_in_bounded_memory) | test(=without_a_tier_a_256_mib_output_streams_to_the_store_in_bounded_memory)))
+  | (binary_id(=kbf-all-in-one::one_read) & (test(=with_a_tier_a_file_over_1_gib_is_read_once) | test(=without_a_tier_a_file_over_1_gib_is_read_once) | test(=a_blob_over_5_gib_is_not_refused_for_its_size)))
+  | package(kbf-all-in-one-test)
+  | (binary_id(=kbf-cli::all_in_one) & test(=an_input_is_on_the_nodes_disk_once))
+  | (binary_id(=kbf-cli::rehearsal_in_a_box) & (test(=a_killed_storage_node_loses_no_blob) | test(=a_loaded_node_restarts_planned_down_and_loses_no_action) | test(=three_storage_nodes_run_an_action)))
+  | (binary_id(=kbf-cli::storage_and_daemon) & test(=storage_and_daemon_runs_an_action_over_its_own_storage))
+  | (binary_id(=kbf-daemon::member_wiring) & test(=a_daemon_half_behind_its_node_is_told_so_by_its_own_node))
+  | (binary_id(=kbf-driver-container::fake_crun) & test(=no_round_of_a_dropped_run_races_the_clean))
+  | (binary_id(=kbf-driver-container::memory) & (test(=a_2_gib_file_is_hashed_and_read_back_in_bounded_memory) | test(=a_2_gib_output_goes_to_an_intake_in_bounded_memory) | test(=a_stdout_past_its_limit_is_refused_in_bounded_memory)))
+  | (binary_id(=kbf-driver-container::restart) & test(=no_round_of_kill_and_restart_races_the_removal))
+  | (binary_id(=kbf-driver-container::walk_cost) & test(=a_tree_of_fifteen_thousand_files_is_walked_in_bounded_time))
+  | (binary_id(=kbf-driver-native) & (test(=xcode::tests::every_installed_xcode_is_reported_with_its_state) | test(=xcode::tests::every_xcode_that_answers_is_found) | test(=xcode::tests::warm_looks_up_every_tool_for_every_xcode_sandboxed)))
+  | (binary_id(=kbf-front::large_blobs) & (test(=a_blob_over_5_gib_round_trips_through_the_tier_a_multipart_flush_and_a_read) | test(=a_large_bytestream_read_holds_a_window_not_the_blob) | test(=a_large_bytestream_write_holds_a_part_not_the_blob) | test(=a_large_flush_holds_a_part_not_the_block) | test(=a_large_write_with_a_tier_lands_on_the_tier_first)))
+  | (binary_id(=kbf-front::proxy) & test(=the_proxy_imposes_no_size_cap))
+  | (binary_id(=kbf-front::write_group) & test(=fifteen_thousand_concurrent_writes_fill_segments_in_turn))
+  | (binary_id(=kbf-history::history) & test(=list::list_reads_a_bounded_range_not_the_whole_instance))
+  | (binary_id(=kbf-installer::binary) & test(=a_verb_that_finds_the_lock_held_ends_busy))
+  | (binary_id(=kbf-integration-test::m1) & (test(=a_daemon_that_does_not_join_fails) | test(=a_server_that_does_not_start_fails)))
+  | (binary_id(=kbf-integration-test::m2) & (test(=a_container_left_behind_fails) | test(=a_daemon_that_does_not_join_fails_with_its_last_line) | test(=a_lease_directory_left_behind_fails) | test(=a_lease_never_rerun_fails) | test(=a_lease_rerun_late_fails) | test(=a_server_that_does_not_start_fails)))
+  | (binary_id(=kbf-integration-test::repo_lints) & test(=every_interpreter_file_workflow_script_and_shell_spawn_is_in_the_budget))
+  | (binary_id(=kbf-raft::sim) & (test(=a_crash_at_every_boundary_recovers) | test(=raft_is_safe_and_live_over_seeds)))
+  | (binary_id(=kbf-sched::f3_fleet) & test(=f3_swarm))
+  | (binary_id(=kbf-sched::f4_fleet) & (test(=f4_1_steady_state) | test(=f4_2_churn) | test(=f4_3_mass_reconnect) | test(=f4_4_operator_storm)))
+  | (binary_id(=kbf-sched::sim_cordon) & test(=cordon_and_drain_hold_over_seeds))
+  | (binary_id(=kbf-sched::sim_f2_failures) & test(=f2_13_leases_of_other_terms_are_never_cancelled))
+  | (binary_id(=kbf-sched::sim_whole_machine) & test(=whole_machine_leases_are_not_starved_by_a_stream_of_actions))
+  | (binary_id(=kbf-server::restart) & (test(=a_lease_under_the_raft_log_carries_the_raft_term) | test(=a_restart_over_the_raft_log_does_not_answer_the_old_operation_names) | test(=a_restart_over_the_raft_log_refuses_the_old_process_s_results)))
+  | (binary_id(=kbf-server::update_sim) & (test(=a_run_and_its_rollback_end_the_same_way_on_a_sqlite_file) | test(=a_run_and_its_rollback_end_with_every_host_walked_under_lagging_facts)))
+  | (binary_id(=kbf-server::worker_blobs) & test(=concurrent_writes_on_the_worker_listener_all_finish_under_the_bound))
+  | (binary_id(=kbf-server::write_admission) & (test(=concurrent_writes_stay_under_the_bytes_in_flight) | test(=more_waiting_writes_than_a_fixed_window_holds_all_finish)))
+  | (binary_id(=kbf-sim-cell::cell) & (test(=calm_seeds_keep_every_property) | test(=restart_seeds_keep_properties_1_2_5_6_7) | test(=whole_process_seeds_keep_every_property_and_rerun_what_the_kill_cut)))
+  | (binary_id(=kbf-sim-cell::write_path) & (test(=a_lost_store_ack_times_out_and_leaves_an_orphan_not_a_hole) | test(=a_slow_store_keeps_every_property) | test(=a_store_outage_of_hours_never_acks_an_unstored_blob) | test(=a_store_outage_of_minutes_never_acks_an_unstored_blob) | test(=crashes_on_the_write_path_leave_nothing_half_indexed) | test(=every_write_path_crash_point_leaves_nothing_half_indexed) | test(=store_errors_index_nothing_they_failed)))
+  | (binary_id(=kbf-sim-cell::write_tier) & (test(=a_bad_block_is_marked_corrupt_and_never_flushed) | test(=a_full_disk_sends_writes_direct_and_loses_nothing) | test(=a_store_outage_fills_the_tier_then_pushes_back) | test(=every_tier_crash_point_keeps_every_property) | test(=eviction_racing_a_read_falls_back_to_the_store) | test(=tier_crash_seeds_keep_every_property)))
+  | (binary_id(=kbf-transfer::engine) & (test(=reads::a_read_into_a_file_it_cannot_write_is_a_write_error) | test(=segments::a_failed_upload_keeps_the_ones_committed_before_it) | test(=segments::uploads_of_one_spool_are_in_flight_together)))
+  | (binary_id(=xtask::check_asset) & test(=check_asset_refuses_a_binary_that_names_another_commit_or_a_debug_build))
+  | (binary_id(=xtask::pkg) & test(=pkg_build_writes_the_package_and_names_its_sum_and_is_the_same_twice))
+)
+'''
+
+# Kept as an artifact of the full run so the slow list above can be regenerated from it.
+[profile.default.junit]
+path = "junit.xml"

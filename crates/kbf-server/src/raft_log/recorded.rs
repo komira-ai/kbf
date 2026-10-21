@@ -23,14 +23,17 @@ pub const RECORD_TMP: &str = "log-record.tmp";
 const HEADER: &str = "kbf raft log record 1\nlog_id ";
 const MEMBERS: &str = "server 1\nvoters 1\n";
 
-/// The recorded log id, or `None` for a directory that holds nothing yet. A leftover
-/// [`RECORD_TMP`] (a create that died before its rename) is removed first.
+/// The recorded log id, or `None` for a directory that holds nothing yet besides
+/// [`super::LOCK`]. A leftover [`RECORD_TMP`] (a create that died before its rename)
+/// is removed first.
 ///
 /// # Errors
 /// [`RaftLogError::NotEmpty`] if the directory holds files but no record,
 /// [`RaftLogError::Record`] if the record does not parse, and [`RaftLogError::Io`].
 pub fn read<F: Fs>(fs: &F) -> Result<Option<FarmLogId>, RaftLogError> {
     let mut names = fs.list()?;
+    // The lock `open_dir` holds is not part of the log.
+    names.retain(|n| n != super::LOCK);
     if names.iter().any(|n| n == RECORD_TMP) {
         fs.remove(RECORD_TMP)?;
         names.retain(|n| n != RECORD_TMP);

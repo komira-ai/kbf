@@ -7,22 +7,38 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# `testkit`: `s3::fake`, an S3 service on loopback that keeps multipart uploads, for
+# other crates' tests (and this one's, through the dev-dependency on itself).
+testkit = ["tokio/net", "tokio/io-util", "tokio/sync"]
+
 [dependencies]
 base64.workspace = true
 bytes.workspace = true
+# The stream of footers (`footers`).
+futures.workspace = true
 hex.workspace = true
 hmac.workspace = true
+# The segment footer format, read back by `footers`.
+kbf-segments.workspace = true
+# `Digest`, the key of a segment's index.
+kbf-types.workspace = true
+# The free-space floor and the filesystem numbers (`disk`), shared with the daemon.
+kbf-threads.workspace = true
 md-5.workspace = true
 reqwest.workspace = true
 roxmltree.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["rt", "time"] }
+tracing.workspace = true
 
 [dev-dependencies]
+# Loopback ports nothing can take (kbf_testkit::port).
+kbf-testkit.workspace = true
 clap.workspace = true
-futures.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "io-util", "rt-multi-thread"] }
+kbf-objstore = { workspace = true, features = ["testkit"] }
+tokio = { workspace = true, features = ["macros", "net", "io-util", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true

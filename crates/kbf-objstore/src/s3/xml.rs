@@ -1,7 +1,9 @@
-//! The S3 XML bodies kbf reads: `ListBucketResult` (ListObjectsV2) and `Error`.
+//! The S3 XML bodies kbf reads: `ListBucketResult` (ListObjectsV2), `Error`, and the
+//! answers of a multipart upload; and the one it writes, `CompleteMultipartUpload`.
 
 use roxmltree::{Document, Node};
 
+use crate::types::Token;
 use crate::{ListPage, ListToken, ObjectInfo, ObjectKey, ObjectStoreError};
 
 /// The code and message of an S3 `<Error>` body; empty when the body is not one (a HEAD
@@ -44,11 +46,74 @@ pub(crate) fn list_page(body: &[u8]) -> Result<ListPage, ObjectStoreError> {
         Some(other) => return Err(bad(format!("<IsTruncated> is {other:?}"))),
     };
     let next = match (truncated, child_text(root, "NextContinuationToken")) {
-        (true, Some(t)) if !t.is_empty() => Some(ListToken(t.to_owned())),
+        (true, Some(t)) if !t.is_empty() => Some(ListToken(Token::Continue(t.to_owned()))),
         (true, _) => return Err(bad("truncated without <NextContinuationToken>".into())),
         (false, _) => None,
     };
     Ok(ListPage { objects, next })
+}
+
+/// The `UploadId` of a CreateMultipartUpload answer.
+pub(crate) fn upload_id(body: &[u8]) -> Result<String, ObjectStoreError> {
+    let bad =
+        |what: String| ObjectStoreError::Protocol(format!("CreateMultipartUpload answer: {what}"));
+    let text = std::str::from_utf8(body).map_err(|e| bad(e.to_string()))?;
+    let doc = Document::parse(text).map_err(|e| bad(e.to_string()))?;
+    let root = doc.root_element();
+    if root.tag_name().name() != "InitiateMultipartUploadResult" {
+        return Err(bad(format!("root element is <{}>", root.tag_name().name())));
+    }
+    match child_text(root, "UploadId") {
+        Some(id) if !id.is_empty() => Ok(id.to_owned()),
+        _ => Err(bad("no <UploadId>".into())),
+    }
+}
+
+/// The body of CompleteMultipartUpload: each part's number and ETag, in order.
+pub(crate) fn complete_request(etags: &[String]) -> String {
+    let mut out =
+        String::from("<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    for (i, etag) in etags.iter().enumerate() {
+        out.push_str(&format!(
+            "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+            i + 1,
+            escape(etag)
+        ));
+    }
+    out.push_str("</CompleteMultipartUpload>");
+    out
+}
+
+/// A CompleteMultipartUpload answer of 200: success only if it is a
+/// `CompleteMultipartUploadResult`. S3 answers 200 and then an `<Error>` when the
+/// completion fails after the answer started.
+pub(crate) fn complete_answer(body: &[u8]) -> Result<(), ObjectStoreError> {
+    let text = std::str::from_utf8(body).unwrap_or_default();
+    let root = Document::parse(text)
+        .ok()
+        .map(|doc| doc.root_element().tag_name().name().to_owned());
+    match root.as_deref() {
+        Some("CompleteMultipartUploadResult") => Ok(()),
+        Some("Error") => {
+            let (code, message) = error_code_message(body);
+            Err(ObjectStoreError::Service {
+                status: 200,
+                code,
+                message,
+            })
+        }
+        _ => Err(ObjectStoreError::Protocol(format!(
+            "CompleteMultipartUpload answered 200 with {:?}",
+            text.chars().take(200).collect::<String>()
+        ))),
+    }
+}
+
+/// `text` with the characters XML gives meaning to escaped.
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Whether `node` is an element named `name`, in any namespace.
@@ -80,7 +145,7 @@ mod tests {
              <Contents><Key>p/b</Key><Size>0</Size></Contents></ListBucketResult>"
         );
         let page = list_page(body.as_bytes()).unwrap();
-        assert_eq!(page.next, Some(ListToken("tok/+=".into())));
+        assert_eq!(page.next, Some(ListToken(Token::Continue("tok/+=".into()))));
         let got: Vec<_> = page
             .objects
             .iter()
@@ -110,6 +175,45 @@ mod tests {
         assert!(list_page(b"not xml").is_err());
     }
 
+    /// Catches: an upload id lost or taken from the wrong element (every part would be
+    /// sent to an upload that does not exist), a completion that names parts out of
+    /// order or unescaped, and a 200 completion whose body is an `<Error>` taken for
+    /// success (an object reported written that the store does not hold).
+    #[test]
+    fn multipart_bodies() {
+        let created = format!(
+            "<?xml version=\"1.0\"?><InitiateMultipartUploadResult {NS}><Bucket>b</Bucket>\
+             <Key>k</Key><UploadId>abc.def-1</UploadId></InitiateMultipartUploadResult>"
+        );
+        assert_eq!(upload_id(created.as_bytes()).unwrap(), "abc.def-1");
+        assert!(upload_id(b"<InitiateMultipartUploadResult/>").is_err());
+        let empty =
+            b"<InitiateMultipartUploadResult><UploadId></UploadId></InitiateMultipartUploadResult>";
+        assert!(upload_id(empty).is_err(), "an empty upload id");
+        assert!(upload_id(b"\xff\xfe").is_err(), "not UTF-8");
+        assert!(upload_id(b"<unclosed").is_err(), "not XML");
+        assert!(upload_id(b"<Error><UploadId>x</UploadId></Error>").is_err());
+        let body = complete_request(&["\"a1\"".into(), "b&2".into()]);
+        assert!(
+            body.contains(
+                "<Part><PartNumber>1</PartNumber><ETag>\"a1\"</ETag></Part>\
+                 <Part><PartNumber>2</PartNumber><ETag>b&amp;2</ETag></Part>"
+            ),
+            "{body}"
+        );
+        let done = format!(
+            "<CompleteMultipartUploadResult {NS}><ETag>\"x-2\"</ETag></CompleteMultipartUploadResult>"
+        );
+        assert!(complete_answer(done.as_bytes()).is_ok());
+        let late = b"<Error><Code>InternalError</Code><Message>m</Message></Error>";
+        let late = complete_answer(late).err().map(|e| e.to_string());
+        assert_eq!(late.as_deref(), Some("store answered 200 InternalError: m"));
+        assert!(matches!(
+            complete_answer(b""),
+            Err(ObjectStoreError::Protocol(_))
+        ));
+    }
+
     /// Catches: an error body read without its code, which callers match on.
     #[test]
     fn error_body() {
@@ -123,5 +227,71 @@ mod tests {
             )
         );
         assert_eq!(error_code_message(b""), (String::new(), String::new()));
+    }
+
+    /// Catches: a non-UTF-8 error body that panics or leaks lossy bytes into the code
+    /// (callers match on the code), and prose from a proxy dropped instead of kept (up
+    /// to 200 characters) as the message an operator reads.
+    #[test]
+    fn error_body_that_is_not_xml_keeps_its_prose_and_not_utf8_gives_nothing() {
+        assert_eq!(
+            error_code_message(b"\xff\xfe"),
+            (String::new(), String::new())
+        );
+        let prose = "x".repeat(300);
+        let (code, message) = error_code_message(prose.as_bytes());
+        assert_eq!(code, "");
+        assert_eq!(message, "x".repeat(200));
+    }
+
+    /// Catches: a listing entry with a bad size, a bad `IsTruncated`, a key kbf would
+    /// refuse, or an empty continuation token taken as a page (a listing that never
+    /// advances), each accepted instead of refused as a protocol error.
+    #[test]
+    fn listing_answers_that_break_the_contract_are_protocol_errors() {
+        let why_bytes = |body: &[u8]| {
+            let err = list_page(body).unwrap_err();
+            assert!(matches!(err, ObjectStoreError::Protocol(_)), "{err:?}");
+            err.to_string()
+        };
+        let why = |body: &str| why_bytes(body.as_bytes());
+        assert!(why("<ListBucketResult><Contents><Key>a</Key><Size>x</Size></Contents></ListBucketResult>")
+            .contains("a: missing or bad <Size>"));
+        assert!(
+            why("<ListBucketResult><Contents><Key>a</Key></Contents></ListBucketResult>")
+                .contains("missing or bad <Size>")
+        );
+        assert!(
+            why("<ListBucketResult><Contents><Size>1</Size></Contents></ListBucketResult>")
+                .contains("<Contents> without <Key>")
+        );
+        assert!(why("<ListBucketResult><Contents><Key></Key><Size>1</Size></Contents></ListBucketResult>")
+            .contains("listed key"));
+        assert!(
+            why("<ListBucketResult><IsTruncated>maybe</IsTruncated></ListBucketResult>")
+                .contains("<IsTruncated> is \"maybe\"")
+        );
+        assert!(
+            why("<ListBucketResult><IsTruncated>true</IsTruncated>\
+             <NextContinuationToken></NextContinuationToken></ListBucketResult>")
+            .contains("truncated without <NextContinuationToken>")
+        );
+        assert!(why("<Other/>").contains("root element is <Other>"));
+        assert!(why_bytes(b"\xff").contains("ListObjectsV2 answer:"));
+    }
+
+    /// Catches: a pretty-printed answer (whitespace text between elements) whose text
+    /// nodes are taken for elements, so a key or the token is read from the wrong node.
+    #[test]
+    fn a_pretty_printed_listing_reads_the_same_as_a_compact_one() {
+        let body = "<ListBucketResult>\n  <IsTruncated>true</IsTruncated>\n  \
+                    <NextContinuationToken>t</NextContinuationToken>\n  \
+                    <Contents>\n    <Key>p/a</Key>\n    <Size>7</Size>\n  </Contents>\n\
+                    </ListBucketResult>";
+        let page = list_page(body.as_bytes()).unwrap();
+        assert_eq!(page.next, Some(ListToken(Token::Continue("t".into()))));
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.objects[0].key.as_str(), "p/a");
+        assert_eq!(page.objects[0].size, 7);
     }
 }

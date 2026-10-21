@@ -1,17 +1,16 @@
-//! [`PodmanRuntime`]: one action, one fresh rootless Podman container, never reused.
+//! [`ContainerRuntime`]: one action, one fresh rootless `crun` container, never reused.
 //!
 //! Each lease goes through the six driver steps
 //! (`docs/design/daemon.md#the-container-driver`):
 //! 1. **prepare:** fetch the Action and Command, check the image and paths, write the
 //!    input root into the lease's scratch directory, move each input an output names
 //!    into the overlay's upper directory, give the overlay's directories to the
-//!    container's root (a subordinate id, see `podman::create_args`), make the lease
-//!    cgroup;
-//! 2. **start:** `podman create`, then `podman start --attach`;
+//!    container's root (a subordinate id, see `oci::helper`), make the lease cgroup;
+//! 2. **start:** write the bundle, then `crun run` on a thread of its own;
 //! 3. **watch:** wait for the exit, the timeout, [`Runtime::kill`], or a lease that
 //!    keeps pressing its own memory cap into swap ([`SwapKill`]), which the driver
 //!    kills and reports as out of memory;
-//! 4. **collect:** the exit code from Podman's record (a container crun could not
+//! 4. **collect:** the exit code from `crun run`'s status (a container crun could not
 //!    start because the program is not there or not executable is the action's exit
 //!    127 or 126, see `program`), an OOM kill and whose limit caused it from the lease
 //!    cgroup's `memory.events`; the overlay's directories back to the daemon's user;
@@ -21,41 +20,47 @@
 //!
 //! Cleaning runs on every path out of `run`: success, failure, timeout and kill. If the
 //! daemon drops the `run` future instead (its task is cancelled), the lease's `Drop`
-//! cleans up, blocking, before the future is gone. Either way the clean first makes
-//! sure `podman start` has exited and been reaped, so nothing the driver started is
+//! cleans up, blocking, before the future is gone. Either way the clean first kills the
+//! lease cgroup and makes sure `crun run` has exited, so nothing the driver started is
 //! left running while it removes the lease. A clean that fails turns the lease into a
 //! failure: a dirty node must be loud. The clean in `Drop` blocks the thread that drops
-//! the run, usually a runtime worker: at worst about five seconds for `podman start` to
-//! be reaped, five more for the lease cgroup to empty, then `podman rm` (and `podman
-//! unshare rm` for files the container still owns), which nothing here bounds.
+//! the run, usually a runtime worker: at worst about five seconds for `crun run` to end,
+//! five more for the lease cgroup to empty, then `crun delete --force` (and a helper
+//! container for files the container's ids still own), which nothing here bounds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use kbf_daemon::cache::{Cache, CacheConfig, Disabled, InputStats};
+use kbf_daemon::cache::{Cache, CacheConfig, InputStats};
 use kbf_daemon::cas::{Cas, CasError};
+use kbf_daemon::cpu_pool::{CpuPool, DEFAULT_CPU_THREADS};
+use kbf_daemon::trees::{TreeConfig, TreeLease, Trees};
 use kbf_daemon::{Runtime, RuntimeError, Work, upload_within};
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata, Platform};
+use kbf_proto::worker::ResourceUsage;
 use kbf_types::LeaseId;
 use prost_types::Timestamp;
-use tokio::process::Child;
 use tokio::sync::oneshot;
 
 use crate::cgroup::{LeaseCgroup, SwapKill, memory_max, presses_into_swap};
-use crate::image::{
-    ImageCheckError, ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind,
+use crate::cgroup_usage::{NUMA_EVERY, NumaSample, resource_usage};
+use crate::container::{
+    CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, Dirs, Ended, LEASE_PREFIX,
 };
+use crate::image::{ImageCheckError, ImageRef, PROPERTY};
+use crate::input_phases::{InputPhases, millis};
 use crate::keeper::Keeper;
+use crate::numa::{Pin, Placement, Placer};
+use crate::oci::{Oci, OciConfig};
 use crate::outputs::{OutputLimits, collect_log};
-use crate::podman::{
-    CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, Ended, LEASE_PREFIX, Podman,
-};
 use crate::program;
 use crate::remove::remove_tree;
+use crate::running::Running;
 use crate::tree::{
-    TreeError, check_relative, collect, fetch_message, materialize, materialize_cached,
+    TreeError, check_relative, collect, fetch_message, materialize_cached, materialize_phased,
     output_paths, prepare_outputs, refuse_hidden_working_directory,
 };
 
@@ -66,9 +71,9 @@ pub const KIND: &str = "action";
 
 /// Where and how the driver runs containers.
 #[derive(Clone, Debug)]
-pub struct PodmanConfig {
-    /// The `podman` program.
-    pub podman: PathBuf,
+pub struct ContainerConfig {
+    /// `crun` and the id files the containers' ids are read from (`--oci-runtime`).
+    pub oci: OciConfig,
     /// The directory each lease's scratch directory is made in.
     pub scratch: PathBuf,
     /// Where the cgroup v2 filesystem is mounted.
@@ -89,26 +94,33 @@ pub struct PodmanConfig {
     pub limits: ContainerLimits,
     /// When a lease at its own memory cap that keeps pushing into swap is killed.
     pub swap_kill: SwapKill,
-    /// Whose containers these are: each is labelled `kbf.owner=<owner>`
-    /// ([`crate::podman::OWNER_LABEL`]), and at start the runtime removes every
-    /// container so labelled. The daemon passes its node id. Two runtimes that share a
-    /// Podman store need two owners, or each start removes the other's containers.
-    pub owner: String,
-    /// The node's input cache, if it has one (`--cache-dir`). Without it, a lease's
+    /// How often the lease cgroup's `memory.numa_stat` is read while the action runs
+    /// (measurement only: nothing decides on it). Tests make it short.
+    pub numa_every: Duration,
+    /// The node's input cache, if it has one (`<--data-dir>/cache`). Without it, a lease's
     /// input files are its own copies, as before the cache.
     pub cache: Option<CacheUse>,
+    /// The threads that hash an action's output files (`--cpu-threads`), shared by every
+    /// lease.
+    pub cpu: CpuPool,
+    /// Places each lease on one NUMA node (`--lease-placement=numa-node`); `None` leaves
+    /// them on any CPU the daemon may use.
+    pub placer: Option<Arc<Placer>>,
 }
 
 /// The node's input cache as the driver is given it: not opened yet.
-/// [`PodmanRuntime::new`] opens it once Podman's storage passed the cache's checks, so
-/// on storage they refuse, the cache directory is never touched.
+/// [`ContainerRuntime::new`] opens it, and runs uncached, after a warning, if it cannot.
 #[derive(Clone)]
 pub struct CacheUse {
     pub config: CacheConfig,
-    /// The `kbf-daemon` binary, run under `podman unshare` in its `__chown-dirs` mode
+    /// The `kbf-daemon` binary, run in a helper container in its `__chown-dirs` mode
     /// ([`crate::chown_dirs`]) to give the input root's directories, not its files, to
     /// the container's root and back.
     pub helper: PathBuf,
+    /// The node's shared read-only trees (`<--data-dir>/trees`), if it has them: large
+    /// Directory nodes of an input root are built once and mounted read-only, not
+    /// linked file by file. Opened with the cache; needs it.
+    pub trees: Option<TreeConfig>,
 }
 
 impl std::fmt::Debug for CacheUse {
@@ -125,18 +137,20 @@ impl std::fmt::Debug for CacheUse {
 struct Cached {
     cache: Arc<Cache>,
     helper: PathBuf,
+    /// The shared trees, if the node has a store.
+    trees: Option<Trees>,
 }
 
-impl PodmanConfig {
-    /// A configuration for `owner`'s containers with `podman` from `PATH`, cgroup v2 at
+impl ContainerConfig {
+    /// A configuration for containers run by `crun`, cgroup v2 at
     /// `/sys/fs/cgroup`, a one hour default timeout, a five second kill grace,
     /// the default [`OutputLimits`], [`kbf_daemon::UPLOAD_DEADLINE`],
     /// [`ContainerLimits::DEFAULT`] and
-    /// [`SwapKill::DEFAULT`].
+    /// [`SwapKill::DEFAULT`], and no NUMA placement.
     #[must_use]
-    pub fn new(scratch: PathBuf, cgroup_parent: String, owner: String) -> Self {
+    pub fn new(scratch: PathBuf, cgroup_parent: String) -> Self {
         Self {
-            podman: PathBuf::from("podman"),
+            oci: OciConfig::default(),
             scratch,
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             cgroup_parent,
@@ -146,8 +160,10 @@ impl PodmanConfig {
             upload_deadline: kbf_daemon::UPLOAD_DEADLINE,
             limits: ContainerLimits::DEFAULT,
             swap_kill: SwapKill::DEFAULT,
-            owner,
+            numa_every: NUMA_EVERY,
             cache: None,
+            cpu: CpuPool::new(DEFAULT_CPU_THREADS),
+            placer: None,
         }
     }
 
@@ -160,9 +176,6 @@ impl PodmanConfig {
         if !self.cgroup_parent.starts_with('/') {
             return Err(ConfigError::CgroupParent(self.cgroup_parent.clone()));
         }
-        if self.owner.is_empty() {
-            return Err(ConfigError::Owner);
-        }
         let limits = self.limits;
         for (name, value) in [
             ("pids", limits.pids),
@@ -170,8 +183,8 @@ impl PodmanConfig {
             ("nofile", limits.nofile),
             ("nproc", limits.nproc),
         ] {
-            // Podman reads a pids limit of 0 as "unlimited", and a 0 for the others
-            // would leave nothing to run with.
+            // A pids limit of 0 would leave nothing to run with, and so would a 0 for
+            // the others.
             if value == 0 {
                 return Err(ConfigError::Limit(name));
             }
@@ -180,22 +193,20 @@ impl PodmanConfig {
     }
 }
 
-/// Why a [`PodmanConfig`] cannot be used.
+/// Why a [`ContainerConfig`] cannot be used.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
-    /// Podman's `--volume` syntax separates fields with `:` and options with `,`.
+    /// An overlay mount's options separate fields with `,` and lower directories with `:`.
     #[error("scratch directory {0:?} must be absolute and contain no ':' or ','")]
     Scratch(PathBuf),
     #[error("cgroup parent {0:?} must start with '/'")]
     CgroupParent(String),
-    #[error("the container owner must not be empty")]
-    Owner,
     /// One of the [`ContainerLimits`], by name, is 0.
     #[error("the container {0} limit must be at least 1")]
     Limit(&'static str),
 }
 
-/// Why a [`PodmanRuntime`] does not start.
+/// Why a [`ContainerRuntime`] does not start.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum StartError {
     #[error(transparent)]
@@ -204,9 +215,12 @@ pub enum StartError {
     /// could run a lease's work beside its leftover container.
     #[error("removing what a previous daemon left: {0}")]
     Sweep(String),
+    /// `crun` cannot run containers on this node.
+    #[error("the container runtime: {0}")]
+    Oci(String),
 }
 
-/// How long the clean waits for a `podman start` it has sent `SIGKILL` to exit, and how
+/// How long the clean waits for a `crun run` to end once its cgroup is killed, and how
 /// often it looks. A killed process exits once it leaves the system call it is in.
 const REAP_LIMIT: Duration = Duration::from_secs(5);
 const REAP_PAUSE: Duration = Duration::from_millis(2);
@@ -214,22 +228,25 @@ const REAP_PAUSE: Duration = Duration::from_millis(2);
 /// A killer waiting for a lease's work to stop.
 type Stop = oneshot::Sender<()>;
 
-/// A prepared lease: what `podman create` needs and what collecting needs.
+/// A prepared lease: what the bundle needs and what collecting needs.
 struct Prepared {
     spec: ContainerSpec,
     outputs: Vec<String>,
     timeout: Duration,
 }
 
-/// Runs `action` leases in rootless Podman.
+/// Runs `action` leases in rootless `crun` containers.
 #[derive(Debug)]
-pub struct PodmanRuntime<C> {
-    config: PodmanConfig,
-    podman: Podman,
+pub struct ContainerRuntime<C> {
+    config: ContainerConfig,
+    engine: Arc<Oci>,
     cas: Arc<C>,
     stops: Mutex<BTreeMap<LeaseId, oneshot::Sender<Stop>>>,
-    /// The image store's per-image directories, asked of Podman once.
-    images: tokio::sync::OnceCell<PathBuf>,
+    /// What leases that ended without a result counted, until the daemon takes it
+    /// ([`Runtime::failed_usage`]).
+    failed: Mutex<BTreeMap<LeaseId, ResourceUsage>>,
+    /// Samples of `memory.numa_stat` that held memory, over every lease.
+    numa_samples: Arc<AtomicU64>,
     /// The input cache leases link from, if the node has one and it could be used.
     cache: Option<Cached>,
     /// What the last lease's inputs cost, with the cache (a test's counter; each
@@ -237,32 +254,33 @@ pub struct PodmanRuntime<C> {
     last_inputs: Mutex<Option<InputStats>>,
 }
 
-impl<C: Cas> PodmanRuntime<C> {
+impl<C: Cas> ContainerRuntime<C> {
     /// A runtime that reads and writes blobs through `cas`. Before it returns, so
-    /// before the daemon says `Hello`, it removes what a previous daemon of the same
-    /// owner left: every container labelled as the owner's (killing what still runs in
-    /// it), and every lease scratch directory, each with its lease cgroup. Blocking.
+    /// before the daemon says `Hello`, it removes what a previous daemon left: every
+    /// lease scratch directory (killing what still runs in it), each with its container
+    /// and lease cgroup. Blocking.
     ///
     /// # Errors
-    /// The configuration is unusable, or a leftover could not be listed or removed.
-    /// With a cache, it then asks Podman for its graph driver, and opens the cache
-    /// only on storage the cache's overlay checks passed on (the kernel's `overlay`,
-    /// without a `mount_program` such as fuse-overlayfs). On other storage, or when the
-    /// cache cannot be opened, it warns and runs uncached.
-    pub fn new(config: PodmanConfig, cas: Arc<C>) -> Result<Self, StartError> {
+    /// The configuration is unusable, `crun` cannot run containers on this node, or a
+    /// leftover could not be removed. When the cache cannot be opened it warns and runs
+    /// uncached.
+    pub fn new(config: ContainerConfig, cas: Arc<C>) -> Result<Self, StartError> {
         config.check()?;
+        let engine = Oci::new(&config.oci, &config.scratch, &config.cgroup_parent)
+            .map_err(|e| StartError::Oci(e.to_string()))?;
         let mut runtime = Self {
-            podman: Podman::new(config.podman.clone()),
+            engine,
             config,
             cas,
             stops: Mutex::new(BTreeMap::new()),
-            images: tokio::sync::OnceCell::new(),
+            failed: Mutex::new(BTreeMap::new()),
+            numa_samples: Arc::new(AtomicU64::new(0)),
             cache: None,
             last_inputs: Mutex::new(None),
         };
-        sweep(&runtime.podman, &runtime.config).map_err(StartError::Sweep)?;
+        sweep(&runtime.engine, &runtime.config).map_err(StartError::Sweep)?;
         if let Some(given) = runtime.config.cache.clone() {
-            runtime.cache = open_cache(&runtime.podman, given);
+            runtime.cache = open_cache(given);
         }
         Ok(runtime)
     }
@@ -271,6 +289,15 @@ impl<C: Cas> PodmanRuntime<C> {
     #[must_use]
     pub fn cached(&self) -> bool {
         self.cache.is_some()
+    }
+
+    /// What the node's tree store has done, if it has one.
+    #[must_use]
+    pub fn tree_stats(&self) -> Option<kbf_daemon::trees::TreeStats> {
+        let cached = self.cache.as_ref();
+        cached
+            .and_then(|c| c.trees.as_ref())
+            .map(|t| t.store().stats())
     }
 
     /// What the last lease's inputs cost through the cache, if a lease used it.
@@ -282,18 +309,31 @@ impl<C: Cas> PodmanRuntime<C> {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// How many readings of a lease cgroup's `memory.numa_stat`, taken while an action
+    /// ran or when it ended, held memory (a test waits on it to know the sampler ran).
+    #[must_use]
+    pub fn numa_samples(&self) -> u64 {
+        self.numa_samples.load(Ordering::Acquire)
+    }
+
+    fn failed(&self) -> MutexGuard<'_, BTreeMap<LeaseId, ResourceUsage>> {
+        // Each update is one map operation, so the map is consistent after a panic.
+        self.failed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn stops(&self) -> MutexGuard<'_, BTreeMap<LeaseId, oneshot::Sender<Stop>>> {
         // Each update is one map operation, so the map is consistent after a panic.
         self.stops.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Step 1: everything up to `podman create`, through the lease's `cas`.
+    /// Step 1: everything up to writing the bundle, through the lease's `cas`.
     async fn prepare(
         &self,
         cas: &C::Lease,
         work: &Work,
         lease: &mut Lease,
     ) -> Result<Prepared, RuntimeError> {
+        let (mut phases, started) = (InputPhases::default(), Instant::now());
         let action: Action = fetch_message(cas, &work.action_digest)
             .await
             .map_err(tree_error)?;
@@ -304,6 +344,7 @@ impl<C: Cas> PodmanRuntime<C> {
         let command: Command = fetch_message(cas, command_digest)
             .await
             .map_err(tree_error)?;
+        phases.action_ms = millis(started);
         let input_root = action
             .input_root_digest
             .as_ref()
@@ -318,7 +359,9 @@ impl<C: Cas> PodmanRuntime<C> {
         let outputs = output_paths(&command).map_err(tree_error)?;
         let timeout = timeout_of(&action, self.config.default_timeout)?;
 
+        let started = Instant::now();
         self.check_image(&image).await?;
+        phases.image_ms = millis(started);
 
         let root = lease.dir.join("root");
         let upper = lease.dir.join("upper");
@@ -328,22 +371,58 @@ impl<C: Cas> PodmanRuntime<C> {
                 .await
                 .map_err(|e| failed(dir, &e))?;
         }
+        let mut shared = Vec::new();
         match &self.cache {
             Some(cache) => {
                 let private = private_paths(&command.working_directory, &outputs);
-                let stats = materialize_cached(cas, &cache.cache, input_root, &root, &private)
-                    .await
-                    .map_err(tree_error)?;
-                tracing::info!(lease = %lease.name, "inputs: {stats}");
+                let stats = match &cache.trees {
+                    Some(trees) => {
+                        let inputs = trees
+                            .materialize(
+                                cas,
+                                &cache.cache,
+                                input_root,
+                                &root,
+                                &private,
+                                &command.working_directory,
+                            )
+                            .await
+                            .map_err(|e| tree_error(e.into()))?;
+                        let shown = format!(
+                            "{} trees={} tree_files={} trees_built={}",
+                            inputs.stats,
+                            inputs.mounts.len(),
+                            inputs.tree_files,
+                            inputs.trees_built
+                        );
+                        tracing::info!(lease = %lease.name, "inputs: {shown}");
+                        (phases.write, phases.trees_built) = (inputs.phases, inputs.trees_built);
+                        shared = inputs.mounts;
+                        lease.trees = inputs.trees;
+                        inputs.stats
+                    }
+                    None => {
+                        let (stats, write) =
+                            materialize_cached(cas, &cache.cache, input_root, &root, &private)
+                                .await
+                                .map_err(tree_error)?;
+                        tracing::info!(lease = %lease.name, "inputs: {stats}");
+                        phases.write = write;
+                        stats
+                    }
+                };
                 *self
                     .last_inputs
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = Some(stats);
             }
-            None => materialize(cas, input_root, &root)
-                .await
-                .map_err(tree_error)?,
+            None => {
+                phases.write = materialize_phased(cas, input_root, &root)
+                    .await
+                    .map_err(tree_error)?;
+            }
         }
+        let started = Instant::now();
         // The driver makes the working directory in the upper layer, which would hide
         // an input symlink or file of that name: refused rather than run elsewhere.
         refuse_hidden_working_directory(&root, &command.working_directory)
@@ -354,25 +433,37 @@ impl<C: Cas> PodmanRuntime<C> {
         prepare_outputs(&root, &upper, &command.working_directory, &outputs)
             .await
             .map_err(tree_error)?;
-        // The container's root is a subordinate id (`--userns=nomap`), which may write
+        phases.prep_ms = millis(started);
+        let started = Instant::now();
+        // The container's root is a subordinate id of the daemon's user, which may write
         // only under directories it owns.
-        self.give_overlay(CONTAINER_OWNER, &root, &upper, &overlay_work)
+        self.give_overlay(CONTAINER_OWNER, &lease.dir, &root, &upper, &overlay_work)
             .await?;
+        phases.chown_ms = millis(started);
+        let started = Instant::now();
         // `actions/`'s own OOM count before the lease, to say afterwards whether its
         // limit killed the lease.
         lease.backstop_ooms = lease.cgroup.parent_ooms().ok();
         // The keeper, before anything runs in the cgroup: it kills the cgroup if the
         // daemon dies.
         let kill = lease.cgroup.dir().join("cgroup.kill");
-        let keeper = (lease.cgroup.create(work.resources))
+        let placement = (self.config.placer.as_ref()).map(|placer| {
+            placer.place_lease(work.resources.cpu_millis, work.resources.memory_bytes)
+        });
+        phases.numa_node = placement.as_ref().map(Placement::spot);
+        lease.pin = placement.and_then(Placement::into_pin);
+        let keeper = (lease.cgroup.create(work.resources, lease.pin.as_ref()))
             .and_then(|()| Keeper::watch(&kill))
             .map_err(|e| failed(lease.cgroup.dir(), &e))?;
         lease.keeper = Some(keeper);
+        phases.cgroup_ms = millis(started);
+        tracing::info!(lease = %lease.name, "inputs phases: {phases}");
 
         let spec = ContainerSpec {
             name: lease.name.clone(),
-            owner: self.config.owner.clone(),
             image: image.to_string(),
+            image_digest: image.digest().to_owned(),
+            dir: lease.dir.clone(),
             cgroup_parent: lease.cgroup.name().to_owned(),
             input_root: root,
             upper,
@@ -385,6 +476,7 @@ impl<C: Cas> PodmanRuntime<C> {
                 .collect(),
             argv: command.arguments.clone(),
             limits: self.config.limits,
+            shared,
         };
         Ok(Prepared {
             spec,
@@ -409,8 +501,7 @@ impl<C: Cas> PodmanRuntime<C> {
         // The lease's own view of the CAS, for its transfer counters.
         let cas = &self.cas.lease(&work.lease_id);
         // A kill during prepare (a long input fetch) stops it at once: dropping the
-        // future drops any Podman query with it (`kill_on_drop`), and the clean step
-        // removes whatever was written.
+        // future stops it, and the clean step removes whatever was written.
         let Prepared {
             spec,
             outputs,
@@ -423,11 +514,15 @@ impl<C: Cas> PodmanRuntime<C> {
             }
         };
         clock.input_fetch_completed_timestamp = now();
-        // Execution counts from `podman create`: making the container is part of
+        // Execution counts from writing the bundle: making the container is part of
         // running the command in one.
         clock.execution_start_timestamp = now();
+        // What the lease cgroup's NUMA split is while the action runs, and the usage
+        // read at its end (`cgroup_usage`): `run` reads it too when the lease fails.
+        lease.ran = Some(Instant::now());
+        lease.numa = NumaSample::counting(Arc::clone(&self.numa_samples));
         lease.created = true;
-        self.podman
+        self.engine
             .create(&spec)
             .await
             .map_err(RuntimeError::Failed)?;
@@ -444,18 +539,18 @@ impl<C: Cas> PodmanRuntime<C> {
             let stderr =
                 std::fs::File::create(&stderr_path).map_err(|e| failed(&stderr_path, &e))?;
             let start = self
-                .podman
-                .start(&lease.name, stdout, stderr)
+                .engine
+                .start(&spec, stdout, stderr)
                 .map_err(RuntimeError::Failed)?;
-            // The lease owns `podman start` from here, so a dropped run's clean reaps it.
+            // The lease owns the `crun run` from here, so a dropped run's clean reaps it.
             let child = lease.start.insert(start);
 
             tokio::select! {
-                // `podman start`'s own status is not the action's: Podman's record, read
-                // below, is. An error waiting for it is not trusted either way, since
-                // `ended` fails the lease unless that record says the container exited, or crun
-                // reports it could not start the program (`program::not_run`).
-                _ = child.wait() => {}
+                // `crun run`'s status is the container's. An error waiting for it is not
+                // trusted either way, since `ended` fails the lease unless the run said
+                // the container exited, or crun reports it could not start the program
+                // (`program::not_run`).
+                () = child.wait() => {}
                 () = tokio::time::sleep(timeout) => {
                     self.stop_container(&lease.name, &lease.cgroup, child).await;
                     return Err(self.timed_out(cas, &lease.name, &stdout_path, &stderr_path).await);
@@ -465,6 +560,8 @@ impl<C: Cas> PodmanRuntime<C> {
                     self.stop_container(&lease.name, &lease.cgroup, child).await;
                     return Err(RuntimeError::Killed);
                 }
+                // Never ends: it samples while the others are waited for.
+                () = lease.numa.watch(lease.cgroup.dir(), self.config.numa_every) => {}
                 (now, own) = presses_into_swap(&lease.cgroup, cap, threshold, swap_kill.every) => {
                     let limit = cap.unwrap_or(0);
                     let why = format!(
@@ -482,12 +579,12 @@ impl<C: Cas> PodmanRuntime<C> {
                 }
             }
 
-            let ended = self.podman.ended(&lease.name).await;
+            let ended = self.engine.ended(&spec, child).await;
             // An exec that failed with ETXTBSY (`program::text_file_busy`) is started once
             // more: the write descriptor that caused it is gone by now.
             if started == 1
                 && matches!(ended, Ok(Ended::NotRun(_)))
-                && program::text_file_busy(&stderr_path).await
+                && program::text_file_busy(&self.engine.said(&spec, &stderr_path)).await
             {
                 tracing::warn!(lease = %lease.name, "exec found the program busy (ETXTBSY); again");
                 continue;
@@ -495,9 +592,9 @@ impl<C: Cas> PodmanRuntime<C> {
             break ended;
         };
         // SIGKILL (137): whether the kernel's OOM killer did it, and for whose limit,
-        // is read from the lease cgroup, not from Podman. The same is read when Podman
-        // recorded no exit or could not be asked: the lease cgroup's counters do not
-        // depend on Podman's record, so a kill they show is reported as one.
+        // is read from the lease cgroup, not from `crun`. The same is read when `crun`
+        // reported no exit or could not be asked: the lease cgroup's counters do not
+        // depend on `crun`'s report, so a kill they show is reported as one.
         if matches!(ended, Ok(Ended::Exited(137) | Ended::NotRun(_)) | Err(_)) {
             match lease.cgroup.oom_outcome(cap, lease.backstop_ooms) {
                 Ok(Some(kill)) => return Err(kill),
@@ -505,21 +602,28 @@ impl<C: Cas> PodmanRuntime<C> {
                 Err(e) if ended == Ok(Ended::Exited(137)) => {
                     return Err(failed(lease.cgroup.dir(), &e));
                 }
-                // No exit code either: what Podman said is the one to report.
+                // No exit code either: what `crun` said is the one to report.
                 Err(_) => {}
             }
         }
         let exit_code = match ended.map_err(RuntimeError::Failed)? {
             Ended::Exited(code) => code,
-            Ended::NotRun(state) => program::not_run(&spec, &stderr_path, &state).await?,
+            Ended::NotRun(state) => {
+                program::not_run(&spec, &self.engine.said(&spec, &stderr_path), &state).await?
+            }
         };
         clock.execution_completed_timestamp = now();
+        // What the lease cgroup counted, while it still exists (clean removes it). The
+        // result carries it beside the four numbers every runtime reports.
+        let usage = lease.usage();
+        clock.auxiliary_metadata = usage.iter().map(ResourceUsage::to_any).collect();
         // The upload counts from the chown, which makes the outputs readable to it.
         clock.output_upload_start_timestamp = now();
         // The container has exited: hand its files back to the daemon's user, so an
         // output the action left unreadable to others is still read, as its owner.
         self.give_overlay(
             DAEMON_OWNER,
+            &spec.dir,
             &spec.input_root,
             &spec.upper,
             &spec.overlay_work,
@@ -530,12 +634,12 @@ impl<C: Cas> PodmanRuntime<C> {
             ..ActionResult::default()
         };
         let upload = async {
-            // The outputs the server lacks go through a spool in the lease's scratch
-            // directory (the daemon's, outside the container) as whole segments.
+            // Each output file is hashed once, then sent from where it is as whole
+            // segments.
             collect(
                 cas,
                 &spec.upper,
-                &lease.dir,
+                &self.config.cpu,
                 &spec.working_directory,
                 &outputs,
                 self.config.outputs,
@@ -559,70 +663,47 @@ impl<C: Cas> PodmanRuntime<C> {
         Ok(result)
     }
 
-    /// Gives the overlay's directories to `owner`. Without the cache, everything under
-    /// them. With it, only the input root's directories: its files are links to the
-    /// cache's entries, which must stay the daemon's (unmapped in the container, so
-    /// the action cannot write them); the upper and work directories hold only the
-    /// lease's own files.
+    /// Gives the overlay's directories to `owner` (`Oci::give`). Without the cache,
+    /// everything under them. With it, only the input root's directories: its files are
+    /// links to the cache's entries, which must stay the daemon's (unmapped in the
+    /// container, so the action cannot write them); the upper and work directories hold
+    /// only the lease's own files.
     async fn give_overlay(
         &self,
         owner: &str,
+        lease: &Path,
         root: &Path,
         upper: &Path,
         work: &Path,
     ) -> Result<(), RuntimeError> {
-        let given = match &self.cache {
-            Some(cache) => {
-                let dirs = self.podman.chown_dirs(&cache.helper, owner, root).await;
-                match dirs {
-                    Ok(()) => self.podman.chown(owner, &[upper, work]).await,
-                    Err(e) => Err(e),
-                }
-            }
-            None => self.podman.chown(owner, &[root, upper, work]).await,
+        let dirs = Dirs {
+            lease,
+            root,
+            upper,
+            work,
+            helper: self.cache.as_ref().map(|cache| cache.helper.as_path()),
         };
-        given.map_err(RuntimeError::Failed)
+        self.engine
+            .give(owner, &dirs)
+            .await
+            .map_err(RuntimeError::Failed)
     }
 
-    /// Checks that this node's image store holds `image` and that its digest names one
-    /// image, not an index: by reading the manifest the store keeps under that digest.
+    /// Checks that this node can run `image`, as [`ContainerRuntime::check_pinned`] does,
+    /// and tells a refused image from a failure.
     async fn check_image(&self, image: &ImageRef) -> Result<(), RuntimeError> {
         self.check_pinned(image).await.map_err(|e| match e {
             ImageCheckError::Index(_) => RuntimeError::Invalid(e.to_string()),
-            ImageCheckError::Missing(_) | ImageCheckError::Failed(_) => {
-                RuntimeError::Failed(e.to_string())
-            }
+            ImageCheckError::Failed(_) => RuntimeError::Failed(e.to_string()),
         })
     }
 
-    /// Checks, as each lease's prepare step does, that this node's image store holds
-    /// `image` and that its digest names one architecture's manifest, not an index. The
-    /// daemon checks each image it is pinned to (`--image`) once at start with it.
+    /// Checks, as each lease's prepare step does, that this node can run `image` and that
+    /// its digest names one architecture's manifest, not an index: that it is unpacked,
+    /// which fetches and unpacks it the first time. The daemon checks each image it is
+    /// pinned to (`--image`) once at start with it.
     pub async fn check_pinned(&self, image: &ImageRef) -> Result<(), ImageCheckError> {
-        let Some(id) = self
-            .podman
-            .image_id(&image.to_string())
-            .await
-            .map_err(ImageCheckError::Failed)?
-        else {
-            return Err(ImageCheckError::Missing(image.clone()));
-        };
-        let images = self
-            .images
-            .get_or_try_init(|| self.podman.images_dir())
-            .await
-            .map_err(ImageCheckError::Failed)?;
-        let path = images.join(&id).join(manifest_file(image.digest()));
-        let bytes = tokio::fs::read(&path).await.map_err(|e| {
-            ImageCheckError::Failed(format!(
-                "the image store holds no manifest {} for image {id}: {e}",
-                image.digest()
-            ))
-        })?;
-        match manifest_kind(&bytes, image.digest()).map_err(ImageCheckError::Failed)? {
-            ManifestKind::Image => Ok(()),
-            ManifestKind::Index => Err(ImageCheckError::Index(image.clone())),
-        }
+        self.engine.check_pinned(image).await
     }
 
     /// [`RuntimeError::TimedOut`] with what the stopped action wrote to stdout and
@@ -649,9 +730,9 @@ impl<C: Cas> PodmanRuntime<C> {
     }
 
     /// The swap watch's kill: `cgroup.kill` at once (the lease is over its cap, so no
-    /// grace), then the grace period for Podman to notice. Returns once `podman start`
+    /// grace), then the grace period for `crun` to notice. Returns once `crun run`
     /// has ended.
-    async fn kill_container(&self, name: &str, cgroup: &LeaseCgroup, child: &mut Child) {
+    async fn kill_container(&self, name: &str, cgroup: &LeaseCgroup, child: &mut Running) {
         if let Err(e) = cgroup.kill() {
             tracing::warn!(lease = %name, "cgroup.kill: {e}");
         }
@@ -660,15 +741,15 @@ impl<C: Cas> PodmanRuntime<C> {
             .is_err()
         {
             // The container is removed by force in the clean step either way.
-            let _ = child.kill().await;
+            child.force().await;
         }
     }
 
     /// The kill path: SIGTERM, the grace period, `cgroup.kill`, then the
-    /// grace period again for Podman to notice. Returns once `podman start` has ended.
-    async fn stop_container(&self, name: &str, cgroup: &LeaseCgroup, child: &mut Child) {
+    /// grace period again for `crun` to notice. Returns once `crun run` has ended.
+    async fn stop_container(&self, name: &str, cgroup: &LeaseCgroup, child: &mut Running) {
         let grace = self.config.kill_grace;
-        if let Err(e) = self.podman.signal(name, "TERM").await {
+        if let Err(e) = self.engine.terminate(name).await {
             tracing::warn!(lease = %name, "SIGTERM: {e}");
         }
         if tokio::time::timeout(grace, child.wait()).await.is_ok() {
@@ -680,12 +761,12 @@ impl<C: Cas> PodmanRuntime<C> {
         }
         if tokio::time::timeout(grace, child.wait()).await.is_err() {
             // The container is removed by force in the clean step either way.
-            let _ = child.kill().await;
+            child.force().await;
         }
     }
 }
 
-impl<C: Cas> Runtime for PodmanRuntime<C> {
+impl<C: Cas> Runtime for ContainerRuntime<C> {
     fn driver(&self) -> &'static str {
         DRIVER
     }
@@ -697,15 +778,31 @@ impl<C: Cas> Runtime for PodmanRuntime<C> {
     async fn run(&self, work: Work) -> Result<ActionResult, RuntimeError> {
         let (stop_tx, mut stop) = oneshot::channel();
         let _registered = Registered::new(self, work.lease_id, stop_tx);
-        let mut lease = Lease::new(&self.podman, &self.config, work.lease_id);
+        let mut lease = Lease::new(&self.engine, &self.config, work.lease_id);
         let mut killer = None;
         let outcome = self
             .attempt(&work, &mut lease, &mut stop, &mut killer)
             .await;
+        // A lease that ended without a result (timed out, killed, out of memory) is
+        // measured too, before the clean removes its cgroup; the daemon asks for it
+        // (`Runtime::failed_usage`).
+        let measured = if outcome.is_err() {
+            lease.usage()
+        } else {
+            None
+        };
         let cleaned = lease.clean().await;
         // A kill that arrived after the work ended still waits for the clean.
         if let Some(by) = killer.or_else(|| stop.try_recv().ok()) {
             let _ = by.send(());
+        }
+        let measured = match (&outcome, &cleaned) {
+            // A clean that fails turns a result into an error: its usage is still told.
+            (Ok(result), Err(_)) => ResourceUsage::in_result(result),
+            _ => measured,
+        };
+        if let Some(usage) = measured {
+            self.failed().insert(work.lease_id, usage);
         }
         match (outcome, cleaned) {
             (Ok(_), Err(why)) => Err(RuntimeError::Failed(format!("clean: {why}"))),
@@ -715,6 +812,10 @@ impl<C: Cas> Runtime for PodmanRuntime<C> {
             }
             (outcome, Ok(())) => outcome,
         }
+    }
+
+    fn failed_usage(&self, lease_id: LeaseId) -> Option<ResourceUsage> {
+        self.failed().remove(&lease_id)
     }
 
     async fn kill(&self, lease_id: LeaseId) {
@@ -732,12 +833,12 @@ impl<C: Cas> Runtime for PodmanRuntime<C> {
 
 /// A lease's entry in the kill table, removed when its run ends or is dropped.
 struct Registered<'a, C> {
-    runtime: &'a PodmanRuntime<C>,
+    runtime: &'a ContainerRuntime<C>,
     id: LeaseId,
 }
 
 impl<'a, C: Cas> Registered<'a, C> {
-    fn new(runtime: &'a PodmanRuntime<C>, id: LeaseId, stop: oneshot::Sender<Stop>) -> Self {
+    fn new(runtime: &'a ContainerRuntime<C>, id: LeaseId, stop: oneshot::Sender<Stop>) -> Self {
         runtime.stops().insert(id, stop);
         Self { runtime, id }
     }
@@ -753,27 +854,23 @@ impl<C> Drop for Registered<'_, C> {
     }
 }
 
-/// Removes every lease a previous daemon of `config`'s owner left: the union of the
-/// owner's containers and the lease scratch directories, each removed as a lease's
-/// clean removes it (`cgroup.kill`, `podman rm --force`, the lease cgroup, the scratch
-/// directory). Blocking.
-fn sweep(podman: &Podman, config: &PodmanConfig) -> Result<(), String> {
-    let mut names: BTreeSet<String> = podman.owned(&config.owner)?.into_iter().collect();
-    match std::fs::read_dir(&config.scratch) {
-        Ok(entries) => names.extend(
-            entries
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|name| name.starts_with(LEASE_PREFIX)),
-        ),
-        // Absent until the first lease.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("{}: {e}", config.scratch.display())),
-    }
+/// Removes every lease a previous daemon left: each lease scratch directory, removed as
+/// a lease's clean removes it (`cgroup.kill`, `crun delete --force`, the lease cgroup,
+/// the scratch directory). A lease's `crun` state is inside its scratch directory, so
+/// the directories are the whole list. Blocking.
+fn sweep(engine: &Arc<Oci>, config: &ContainerConfig) -> Result<(), String> {
+    // The scratch directory exists: `Oci::new` made it.
+    let entries = std::fs::read_dir(&config.scratch)
+        .map_err(|e| format!("{}: {e}", config.scratch.display()))?;
+    let names: BTreeSet<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(LEASE_PREFIX))
+        .collect();
     let mut errors = Vec::new();
     for name in names {
         tracing::warn!(lease = %name, "removing a lease a previous daemon left");
-        let mut lease = Lease::named(podman, config, name);
+        let mut lease = Lease::named(engine, config, name);
         lease.created = true;
         if let Err(why) = lease.clean_blocking() {
             errors.push(why);
@@ -789,7 +886,7 @@ fn sweep(podman: &Podman, config: &PodmanConfig) -> Result<(), String> {
 /// What one lease leaves on the node, and how to remove it.
 #[derive(Debug)]
 struct Lease {
-    podman: Podman,
+    engine: Arc<Oci>,
     /// `kbf-lease-<term>-<seq>`: the container's name and the lease cgroup's.
     name: String,
     /// The scratch directory.
@@ -799,28 +896,37 @@ struct Lease {
     backstop_ooms: Option<u64>,
     /// Whether a container may exist.
     created: bool,
-    /// `podman start --attach`, once started. Reaped before anything is removed.
-    start: Option<Child>,
+    /// The `crun run`, once started. Reaped before anything is removed.
+    start: Option<Running>,
     /// Kills the lease cgroup if the daemon dies, once the cgroup is made. Removed
     /// last, once the lease is cleaned.
     keeper: Option<Keeper>,
+    /// The shared trees the container mounts, pinned until the lease is gone.
+    trees: Vec<TreeLease>,
+    /// The NUMA node the lease is placed on, with `--lease-placement=numa-node`. Dropped
+    /// with the lease, which gives the node its load back.
+    pin: Option<Pin>,
     /// Whether cleaning is still owed.
     armed: bool,
+    /// When the container was about to be created, once the lease got that far.
+    ran: Option<Instant>,
+    /// The NUMA split sampled while the action ran.
+    numa: NumaSample,
 }
 
 impl Lease {
-    fn new(podman: &Podman, config: &PodmanConfig, id: LeaseId) -> Self {
+    fn new(engine: &Arc<Oci>, config: &ContainerConfig, id: LeaseId) -> Self {
         Self::named(
-            podman,
+            engine,
             config,
             format!("{LEASE_PREFIX}{}-{}", id.term, id.seq),
         )
     }
 
     /// The lease named `name` (`kbf-lease-<term>-<seq>`), nothing of it created yet.
-    fn named(podman: &Podman, config: &PodmanConfig, name: String) -> Self {
+    fn named(engine: &Arc<Oci>, config: &ContainerConfig, name: String) -> Self {
         Self {
-            podman: podman.clone(),
+            engine: engine.clone(),
             dir: config.scratch.join(&name),
             cgroup: LeaseCgroup::at(&config.cgroup_root, &config.cgroup_parent, &name),
             backstop_ooms: None,
@@ -828,8 +934,21 @@ impl Lease {
             created: false,
             start: None,
             keeper: None,
+            trees: Vec::new(),
+            pin: None,
             armed: true,
+            ran: None,
+            numa: NumaSample::default(),
         }
+    }
+
+    /// What the lease cgroup counted so far, with its best NUMA sample: `None` for a
+    /// lease that never got to run its container. Read once (it takes the samples);
+    /// the cgroup must still exist.
+    fn usage(&mut self) -> Option<ResourceUsage> {
+        let ran = self.ran?;
+        let cgroup = std::mem::take(&mut self.numa).finish(self.cgroup.dir());
+        Some(resource_usage(cgroup, ran.elapsed()))
     }
 
     /// Steps 5 and 6, off the async threads.
@@ -845,17 +964,20 @@ impl Lease {
     fn clean_blocking(&mut self) -> Result<(), String> {
         self.armed = false;
         let mut errors = Vec::new();
-        // First, `podman start`: a dropped run has not waited for it, and until it has
-        // exited it may still start the container's processes or write into the lease.
+        // First, `crun run`: a dropped run has not waited for it, and until it has exited
+        // it may still start the container's processes or write into the lease. It ends
+        // when its container does, which nothing else here stops: the cgroup is killed
+        // first.
         if let Some(mut start) = self.start.take() {
-            errors.extend(reap(&mut start, REAP_LIMIT, REAP_PAUSE).err());
+            let _ = self.cgroup.kill();
+            errors.extend(start.reap(REAP_LIMIT, REAP_PAUSE).err());
         }
         if self.created {
             // Kill whatever runs in the lease first: a run dropped mid-start leaves
-            // `crun create` in the container's cgroup, and `podman rm --force` returns
+            // `crun create` in the container's cgroup, and `crun delete --force` returns
             // without waiting for it, so the cgroup stays busy.
             let _ = self.cgroup.kill();
-            if let Err(e) = self.podman.remove_blocking(&self.name) {
+            if let Err(e) = self.engine.remove(&self.name) {
                 errors.push(e);
             }
         }
@@ -869,9 +991,9 @@ impl Lease {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             // Files still owned by the container's ids (a lease that ended before
             // collect handed them back: a timeout, a kill, a failure), or with no
-            // permissions left, can only be removed inside Podman's user namespace.
+            // permissions left, can only be removed inside the container's user namespace.
             Err(first) => {
-                if let Err(e) = self.podman.unshare_remove_blocking(&self.dir) {
+                if let Err(e) = self.engine.remove_dir(&self.dir) {
                     errors.push(format!("remove {}: {first}; {e}", self.dir.display()));
                 }
             }
@@ -901,41 +1023,6 @@ impl Drop for Lease {
     }
 }
 
-/// Kills `child` unless it has exited, and waits at most `limit` for it to exit and be
-/// reaped. Blocking, without the async runtime: a dropped run's clean runs inside `Drop`.
-fn reap(child: &mut Child, limit: Duration, pause: Duration) -> Result<(), String> {
-    // Killed only while `try_wait` says it is unreaped: until then its pid can name no
-    // other process. `try_wait`, not the kill's result, then says when it is gone.
-    // PID reuse: once `try_wait` has reaped the child, tokio's `Child` is done and
-    // `start_kill` sends nothing, so no signal reaches a process that took the pid
-    // after. Keep this on `Child`; a raw pid (`kill(2)`, `waitpid`) loses that.
-    if child.try_wait().map_err(wait_failed)?.is_none() {
-        let _ = child.start_kill();
-    }
-    wait_exited(&mut || child.try_wait(), limit, pause)
-}
-
-fn wait_failed(error: std::io::Error) -> String {
-    format!("wait for podman start: {error}")
-}
-
-/// Calls `try_wait` every `pause` until it reports an exit, fails, or `limit` has passed.
-fn wait_exited(
-    try_wait: &mut dyn FnMut() -> std::io::Result<Option<std::process::ExitStatus>>,
-    limit: Duration,
-    pause: Duration,
-) -> Result<(), String> {
-    let deadline = Instant::now() + limit;
-    loop {
-        match try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(pause),
-            Ok(None) => return Err(format!("podman start still runs {limit:?} after SIGKILL")),
-            Err(e) => return Err(wait_failed(e)),
-        }
-    }
-}
-
 /// The input paths that must be the lease's own copies, never links to the cache:
 /// each output path, seen from the input root (`working_directory/output`). An input
 /// there is moved into the overlay's upper directory, which the container's root
@@ -953,18 +1040,21 @@ fn private_paths(working_directory: &str, outputs: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The cache `given` opened, once Podman's storage passed the cache's checks; `None`,
-/// after a warning, when it did not or the cache cannot be opened. Blocking.
-fn open_cache(podman: &Podman, given: CacheUse) -> Option<Cached> {
+/// The cache `given` opened; `None`, after a warning, when it cannot be opened. Blocking.
+fn open_cache(given: CacheUse) -> Option<Cached> {
     let shown = given.config.dir.display().to_string();
-    let opened = cache_usable(podman).and_then(|()| Cache::open(given.config));
-    match opened {
+    match Cache::open(given.config) {
         Ok(cache) => {
             let stats = cache.stats();
             let (bytes, entries, mode) = (stats.bytes, stats.entries, cache.link_mode());
             tracing::info!("cache: {shown}: {bytes} bytes in {entries} entries, link mode {mode}");
             let helper = given.helper;
-            Some(Cached { cache, helper })
+            let trees = given.trees.and_then(open_trees);
+            Some(Cached {
+                cache,
+                helper,
+                trees,
+            })
         }
         Err(why) => {
             let reason = why.reason();
@@ -974,15 +1064,29 @@ fn open_cache(podman: &Podman, given: CacheUse) -> Option<Cached> {
     }
 }
 
-/// Whether Podman's storage is one the cache's overlay checks passed on: the kernel's
-/// `overlay` graph driver, with no `mount_program` (fuse-overlayfs) in its options.
-/// Blocking.
-fn cache_usable(podman: &Podman) -> Result<(), Disabled> {
-    let (driver, options) = podman.graph_driver().map_err(Disabled::GraphDriver)?;
-    if driver != "overlay" || options.get("overlay.mount_program").is_some() {
-        return Err(Disabled::GraphDriver(format!("{driver} {options}")));
+/// The tree store `config` names; `None`, after a warning, when it cannot be opened:
+/// leases then link every file, as without trees. Blocking.
+fn open_trees(config: TreeConfig) -> Option<Trees> {
+    let shown = config.dir.display().to_string();
+    let (min_files, max_mounts) = (config.min_files, config.max_mounts);
+    if shown.contains([':', ',']) {
+        tracing::warn!("trees: off ({shown}): ':' or ',' in the path");
+        return None;
     }
-    Ok(())
+    match Trees::open(config) {
+        Ok(trees) => {
+            let held = trees.store().stats();
+            let (count, bytes) = (held.trees, held.bytes);
+            // One line each: a macro's later lines are not run while its level is off.
+            tracing::info!("trees: {shown}: {count} trees, {bytes} bytes");
+            tracing::info!("trees: min_files={min_files} max_mounts={max_mounts}");
+            Some(trees)
+        }
+        Err(e) => {
+            tracing::warn!("trees: off ({shown}): {e}; leases link every file");
+            None
+        }
+    }
 }
 
 /// The wall clock now, as `ExecutedActionMetadata` holds it.

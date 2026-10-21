@@ -1,0 +1,4 @@
+node_modules/
+cdk.out/
+# cdk caches the hosted-zone lookup here, and it contains the account id
+cdk.context.json

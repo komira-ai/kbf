@@ -2,7 +2,7 @@
 //!
 //! The front never holds [`MetaState`] itself: it commits [`Command`]s and asks
 //! queries through a [`MetaLog`]. [`MemoryMetaLog`] is one state behind a lock in this
-//! process (`--meta-log=memory`). `kbf-server`'s `RaftMetaLog` (`--meta-log=raft`)
+//! process (for tests; `kbf-server` has no flag for it). `kbf-server`'s `RaftMetaLog` (the metadata log `kbf-server` runs)
 //! implements the same trait over a single-voter Raft log: `commit` proposes the
 //! command and resolves once it has applied, and `query` reads the state this server
 //! has applied, which for a single voter is the committed state. The front's code is
@@ -60,7 +60,7 @@ pub struct Leadership {
 
 /// The single-process metadata log: one [`MetaState`] behind a lock, every command
 /// applied in the order it arrives, at the next index of a log that exists only in
-/// memory. For `--store=memory` and tests; it never fails.
+/// memory. For tests; it never fails.
 #[derive(Debug)]
 pub struct MemoryMetaLog {
     state: Mutex<Applier>,

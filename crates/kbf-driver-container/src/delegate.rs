@@ -24,30 +24,50 @@
 //!    memory all leases together may use, so the rest of the node stays for what else
 //!    runs on it.
 //!
+//! [`limit_cpus`] then writes `actions/cpu.max`: the leases' CPUs, which is the CPUs the
+//! daemon may use minus `--reserve-cpus`. It is a bandwidth limit on all leases together,
+//! not pinning; the daemon and the server keep the rest.
+//!
 //! A daemon whose own cgroup is already a `supervisor` leaf (a second start in the same
 //! unit, without the unit restarting) works on its parent; the steps find their work
 //! done. [`adopt`] is the other way in: an `actions/` cgroup someone else set up
 //! (`--cgroup-parent`), checked and not changed but for `memory.max` when given.
 //!
+//! [`enable_cpuset`] is for `--lease-placement=numa-node` alone: it enables `+cpuset` in
+//! `actions/` and its parent, where the three above do not.
+//!
 //! [`capacity`] reads what `actions/` may use: the lowest `memory.max` on the path
 //! from `actions/` up to the root (so a unit's own `MemoryMax=` counts), and the CPUs
-//! in the nearest `cpuset.cpus.effective`. The daemon lowers its node report's `cpus`
+//! in the nearest `cpuset.cpus.effective`, lowered by the lowest `cpu.max` quota on the
+//! path (so a unit's `CPUQuota=` counts). The daemon lowers its node report's `cpus`
 //! and `mem_gib` to them.
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use kbf_daemon::Capacity;
 
+use crate::numa::CpuSet;
+
 /// The controllers enabled for the delegated cgroup's children and for `actions/`'s.
 const CONTROLLERS: [&str; 3] = ["cpu", "memory", "pids"];
+/// The period of the `cpu.max` written for the leases, in microseconds (the kernel's
+/// default).
+const CPU_PERIOD_US: u64 = 100_000;
 /// The leaf the daemon's processes move into.
 pub const SUPERVISOR: &str = "supervisor";
 /// The cgroup every lease cgroup is made under.
 pub const ACTIONS: &str = "actions";
-/// How many times the processes are listed and moved again when one appeared after the
-/// listing (enabling controllers then fails with EBUSY).
-const MOVE_TRIES: u32 = 20;
+/// The first pause before the processes are listed and moved again when enabling
+/// controllers fails with EBUSY (a process appeared after the listing, or a thread
+/// that has begun to exit still counts as in the cgroup); each pause doubles up to
+/// [`MOVE_PAUSE_MAX`].
+const MOVE_PAUSE_FIRST: Duration = Duration::from_millis(1);
+/// The longest pause between two tries.
+const MOVE_PAUSE_MAX: Duration = Duration::from_millis(50);
+/// How long, in pauses, the set-up lists and moves again before it gives up.
+const MOVE_PAUSE_TOTAL: Duration = Duration::from_secs(5);
 /// Where the kernel names the cgroups of this process.
 pub const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
 
@@ -133,6 +153,8 @@ pub(crate) trait CgroupFs {
     fn writable(&self, cgroup: &str) -> io::Result<()>;
     /// The path of `file` in `cgroup`, for messages.
     fn path(&self, cgroup: &str, file: &str) -> PathBuf;
+    /// Waits `how_long` (the tests record it instead).
+    fn pause(&self, how_long: Duration);
 }
 
 /// The cgroup v2 filesystem mounted at a directory.
@@ -154,6 +176,10 @@ impl CgroupFs for Mount<'_> {
     fn writable(&self, cgroup: &str) -> io::Result<()> {
         rustix::fs::access(self.path(cgroup, ""), rustix::fs::Access::WRITE_OK)
             .map_err(io::Error::from)
+    }
+
+    fn pause(&self, how_long: Duration) {
+        std::thread::sleep(how_long);
     }
 
     fn path(&self, cgroup: &str, file: &str) -> PathBuf {
@@ -212,6 +238,86 @@ pub fn capacity(mount: &Path, actions: &str) -> Result<Capacity, DelegateError> 
     capacity_in(&Mount(mount), actions)
 }
 
+/// Limits the leases under `actions` to `cpus` CPUs together (`actions/cpu.max`), the
+/// leases' share of the node after `--reserve-cpus`. A bandwidth limit, not pinning: the
+/// leases run on any CPU, and all of them together are throttled to `cpus` CPUs of time.
+///
+/// # Errors
+/// `cpu.max` could not be written (the `cpu` controller is not enabled in `actions`).
+pub fn limit_cpus(mount: &Path, actions: &str, cpus: u64) -> Result<(), DelegateError> {
+    limit_cpus_in(&Mount(mount), actions, cpus)
+}
+
+pub(crate) fn limit_cpus_in(
+    fs: &dyn CgroupFs,
+    actions: &str,
+    cpus: u64,
+) -> Result<(), DelegateError> {
+    let quota = cpus.max(1).saturating_mul(CPU_PERIOD_US);
+    fs.write(actions, "cpu.max", &format!("{quota} {CPU_PERIOD_US}"))
+        .map_err(io_err(fs, "write", actions, "cpu.max"))
+}
+
+/// Enables `cpuset` for the leases under `actions` (`--lease-placement=numa-node`): in
+/// its parent's `cgroup.subtree_control`, so `actions/` has the cpuset files, and in
+/// `actions/`'s own, so each lease cgroup has them. Returns the CPUs `actions/` may use
+/// (`cpuset.cpus.effective`), `None` where the kernel shows none.
+///
+/// Under a systemd unit with `Delegate=yes` the unit is offered `cpuset` with the other
+/// controllers; a user manager (`user@.service`) offers only `memory pids` unless a
+/// drop-in names more.
+///
+/// # Errors
+/// The parent does not offer `cpuset` (the message names the fix), or a controller list
+/// could not be written (the parent holds a process, or the user may not write it).
+pub fn enable_cpuset(mount: &Path, actions: &str) -> Result<Option<CpuSet>, DelegateError> {
+    enable_cpuset_in(&Mount(mount), actions)
+}
+
+pub(crate) fn enable_cpuset_in(
+    fs: &dyn CgroupFs,
+    actions: &str,
+) -> Result<Option<CpuSet>, DelegateError> {
+    let up = match actions.rsplit_once('/') {
+        Some(("", _)) | None => "/",
+        Some((parent, _)) => parent,
+    };
+    let offered = read(fs, up, "cgroup.controllers")?;
+    if !offered.split_whitespace().any(|c| c == "cpuset") {
+        return Err(DelegateError::Controllers {
+            cgroup: up.to_owned(),
+            what: "does not offer",
+            missing: vec!["cpuset"],
+            listed: offered.trim().to_owned(),
+            fix: "--lease-placement=numa-node needs it: the daemon's unit needs Delegate=yes \
+                  (or Delegate=cpu cpuset memory pids), and a user manager needs a drop-in \
+                  that delegates cpuset"
+                .to_owned(),
+        });
+    }
+    for cgroup in [up, actions] {
+        let enabled = read(fs, cgroup, "cgroup.subtree_control")?;
+        if !enabled.split_whitespace().any(|c| c == "cpuset") {
+            fs.write(cgroup, "cgroup.subtree_control", "+cpuset")
+                .map_err(io_err(
+                    fs,
+                    "enable cpuset in",
+                    cgroup,
+                    "cgroup.subtree_control",
+                ))?;
+        }
+    }
+    let Some(text) = read_if_there(fs, actions, "cpuset.cpus.effective")? else {
+        return Ok(None);
+    };
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    text.parse::<CpuSet>()
+        .map(Some)
+        .map_err(|e: String| invalid(fs, actions, "cpuset.cpus.effective", &e))
+}
+
 pub(crate) fn delegate_in(
     fs: &dyn CgroupFs,
     proc_self_cgroup: &str,
@@ -244,7 +350,8 @@ pub(crate) fn delegate_in(
 
     let supervisor = child(root, SUPERVISOR);
     make(fs, &supervisor)?;
-    let mut tries = 0;
+    let mut pause = MOVE_PAUSE_FIRST;
+    let mut waited = Duration::ZERO;
     loop {
         for pid in read(fs, root, "cgroup.procs")?.split_whitespace() {
             match fs.write(&supervisor, "cgroup.procs", pid) {
@@ -259,9 +366,14 @@ pub(crate) fn delegate_in(
             }
         }
         match enable(fs, root) {
-            // A process appeared in `root` after the listing.
-            Err(e) if e.kind() == io::ErrorKind::ResourceBusy && tries + 1 < MOVE_TRIES => {
-                tries += 1;
+            // A process appeared in `root` after the listing, or a thread that has
+            // begun to exit is still counted there: the kernel skips it when it moves
+            // a process and `cgroup.procs` does not list it, but `root` stays populated
+            // until the exit ends. Wait, then list and move again.
+            Err(e) if e.kind() == io::ErrorKind::ResourceBusy && waited < MOVE_PAUSE_TOTAL => {
+                fs.pause(pause);
+                waited += pause;
+                pause = (pause * 2).min(MOVE_PAUSE_MAX);
             }
             other => {
                 break other.map_err(io_err(
@@ -353,6 +465,8 @@ pub(crate) fn adopt_in(
 
 pub(crate) fn capacity_in(fs: &dyn CgroupFs, actions: &str) -> Result<Capacity, DelegateError> {
     let mut capacity = Capacity::default();
+    // The lowest `cpu.max` quota on the path, in CPUs.
+    let mut quota: Option<u64> = None;
     let mut cgroup = actions;
     loop {
         if let Some(text) = read_if_there(fs, cgroup, "memory.max")? {
@@ -373,7 +487,16 @@ pub(crate) fn capacity_in(fs: &dyn CgroupFs, actions: &str) -> Result<Capacity, 
             })?;
             capacity.cpus = Some(cpus);
         }
+        if let Some(text) = read_if_there(fs, cgroup, "cpu.max")?
+            && let Some(cpus) =
+                quota_cpus(text.trim()).map_err(|reason| invalid(fs, cgroup, "cpu.max", &reason))?
+        {
+            quota = Some(quota.map_or(cpus, |q: u64| q.min(cpus)));
+        }
         if cgroup == "/" {
+            if let Some(quota) = quota {
+                capacity.cpus = Some(capacity.cpus.map_or(quota, |c| c.min(quota)));
+            }
             return Ok(capacity);
         }
         cgroup = match cgroup.rsplit_once('/') {
@@ -381,6 +504,25 @@ pub(crate) fn capacity_in(fs: &dyn CgroupFs, actions: &str) -> Result<Capacity, 
             Some((parent, _)) => parent,
         };
     }
+}
+
+/// The CPUs a `cpu.max` (`<quota|max> <period>`) allows, rounded down but at least 1;
+/// `None` for `max`.
+fn quota_cpus(text: &str) -> Result<Option<u64>, String> {
+    let (quota, period) = text.split_once(' ').unwrap_or((text, "100000"));
+    if quota == "max" {
+        return Ok(None);
+    }
+    let number = |part: &str| {
+        part.trim()
+            .parse::<u64>()
+            .map_err(|e| format!("{text:?}: {e}"))
+    };
+    let (quota, period) = (number(quota)?, number(period)?);
+    if period == 0 {
+        return Err(format!("{text:?}: a period of 0"));
+    }
+    Ok(Some((quota / period).max(1)))
 }
 
 /// The number of CPUs in a kernel CPU list (`0-3,8,10-11`).

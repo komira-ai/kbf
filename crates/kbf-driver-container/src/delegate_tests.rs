@@ -10,11 +10,13 @@
 //!   moving a process that has ended is ESRCH;
 //! - `memory.max` and `memory.min` exist only where the parent enables `memory`, and
 //!   not at the root;
+//!   `cpu.max` only where the parent enables `cpu`, and not at the root;
 //!   `cpuset.cpus.effective` only where the parent enables `cpuset`, and at the root;
 //! - making a cgroup in one this process may not write is EACCES.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use super::*;
 
@@ -46,6 +48,13 @@ struct Fake {
     denied: Vec<String>,
     /// Whether [`Fake::late`] comes back after each move: a cgroup that never empties.
     respawn: bool,
+    /// An exiting thread: the cgroup stays populated while `cgroup.procs` lists nothing
+    /// (the kernel skips a task that has begun exit when it moves a process, and the
+    /// task leaves its cgroup only at the end of exit). Enabling controllers in the
+    /// cgroup is EBUSY this many more times, then works.
+    exiting: RefCell<Option<(String, u32)>>,
+    /// Every pause asked for; none is waited.
+    pauses: RefCell<Vec<Duration>>,
 }
 
 fn parent(cgroup: &str) -> &str {
@@ -109,6 +118,7 @@ impl Fake {
             "memory.max" | "memory.min" => {
                 cgroup != "/" && self.controllers(cgroup).iter().any(|c| c == "memory")
             }
+            "cpu.max" => cgroup != "/" && self.controllers(cgroup).iter().any(|c| c == "cpu"),
             "cpuset.cpus.effective" => {
                 cgroup == "/" || self.controllers(cgroup).iter().any(|c| c == "cpuset")
             }
@@ -169,6 +179,7 @@ impl CgroupFs for Fake {
                 Ok(value.unwrap_or_else(|| match file {
                     "memory.max" => "max\n".into(),
                     "memory.min" => "0\n".into(),
+                    "cpu.max" => "max 100000\n".into(),
                     _ => String::new(),
                 }))
             }
@@ -213,7 +224,14 @@ impl CgroupFs for Fake {
                         .procs
                         .push(pid);
                 }
-                if cgroup != "/" && !self.procs(cgroup).is_empty() {
+                let exiting = match self.exiting.borrow_mut().as_mut() {
+                    Some((at, left)) if at == cgroup && *left > 0 => {
+                        *left -= 1;
+                        true
+                    }
+                    _ => false,
+                };
+                if exiting || (cgroup != "/" && !self.procs(cgroup).is_empty()) {
                     return Err(errno(rustix::io::Errno::BUSY));
                 }
                 let offered = self.controllers(cgroup);
@@ -263,6 +281,10 @@ impl CgroupFs for Fake {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         Ok(())
+    }
+
+    fn pause(&self, how_long: Duration) {
+        self.pauses.borrow_mut().push(how_long);
     }
 
     fn path(&self, cgroup: &str, file: &str) -> PathBuf {
@@ -494,6 +516,28 @@ fn hosts_and_units_that_cannot_delegate_are_refused_with_the_fix() {
     );
 }
 
+/// Catches the set-up giving up on a cgroup that is still populated by a thread that
+/// has begun to exit: `cgroup.procs` lists nothing, the kernel answers EBUSY until the
+/// thread has left, and that takes longer than a fixed number of immediate tries (a
+/// test binary's second test thread ends as the daemon's set-up starts).
+#[test]
+fn a_cgroup_held_by_an_exiting_thread_is_waited_for() {
+    let fake = Fake::host(UNIT, "cpu memory pids", &[41]);
+    *fake.exiting.borrow_mut() = Some((UNIT.into(), 25));
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    assert_eq!(fake.procs(UNIT), Vec::<u32>::new());
+    assert!(!fake.enabled(UNIT).is_empty(), "{:?}", fake.log());
+    // One pause per refusal, none before the first try.
+    assert_eq!(fake.pauses.borrow().len(), 25);
+}
+
+/// Catches the real mount's pause being a different call than the fake's: it returns
+/// (a zero pause), so the set-up on a real host waits through the same method.
+#[test]
+fn the_mounts_pause_returns() {
+    Mount(Path::new("/sys/fs/cgroup")).pause(Duration::ZERO);
+}
+
 /// Catches a failed move or enable read as done (leases would then fail making their
 /// cgroups), and a cgroup that never empties retried forever: each is an error naming
 /// the file, after a bounded number of tries.
@@ -526,8 +570,14 @@ fn a_move_or_enable_that_fails_stops_the_start() {
         err.contains(&format!("enable controllers in /sys/fs/cgroup{UNIT}")),
         "{err}"
     );
+    // Every refusal was followed by a pause and a new listing and move (the process
+    // that appeared is moved on the next try), until the pauses add up to the bound.
+    let pauses = busy.pauses.borrow();
     let moves = busy.log().iter().filter(|l| l.ends_with("<- 43")).count();
-    assert_eq!(moves, MOVE_TRIES as usize - 1, "{:?}", busy.log());
+    assert_eq!(moves, pauses.len(), "{:?}", busy.log());
+    assert!(pauses.iter().sum::<Duration>() >= MOVE_PAUSE_TOTAL);
+    assert!(pauses.windows(2).all(|w| w[0] <= w[1]));
+    assert!(pauses.iter().all(|p| *p <= MOVE_PAUSE_MAX));
 }
 
 /// Catches `--cgroup-parent` taken without a check (every lease would fail making its
@@ -651,4 +701,161 @@ fn cpu_lists_are_counted() {
     assert_eq!(count_cpus("0-3,8,10-11"), Some(7));
     assert_eq!(count_cpus("3-1"), None);
     assert_eq!(count_cpus("a"), None);
+}
+
+/// Catches `--reserve-cpus` not reaching the kernel: `actions/cpu.max` is the leases'
+/// CPUs in the kernel's `<quota> <period>` form (72 CPUs is 7200000 of 100000, a quota
+/// of CPUs and not of microseconds), written to `actions/` and nowhere else, never a
+/// quota of 0 (a cgroup that never runs), and a failed write names the file.
+#[test]
+fn the_leases_cpus_are_written_to_the_actions_cgroup() {
+    let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41]);
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    let before = fake.log().len();
+    limit_cpus_in(&fake, ACTIONS_CG, 72).expect("limited");
+    assert_eq!(
+        fake.log()[before..],
+        [format!("{ACTIONS_CG}/cpu.max <- 7200000 100000")]
+    );
+    limit_cpus_in(&fake, ACTIONS_CG, 0).expect("limited");
+    assert_eq!(
+        read(&fake, ACTIONS_CG, "cpu.max").expect("read"),
+        "100000 100000"
+    );
+
+    // A file the daemon may not write is an error that names it.
+    let mut denied = Fake::host(UNIT, "cpu memory pids", &[41]);
+    delegate_in(&denied, SELF, MIN, None).expect("delegated");
+    denied.denied = vec![format!("{ACTIONS_CG}/cpu.max")];
+    let err = limit_cpus_in(&denied, ACTIONS_CG, 4)
+        .expect_err("denied")
+        .to_string();
+    assert!(err.contains("write") && err.contains("cpu.max"), "{err}");
+}
+
+/// Catches the capacity ignoring `cpu.max`: the lowest quota on the path counts (a
+/// unit's `CPUQuota=` as well as ours), `max` is no limit, a quota is rounded down but
+/// is at least 1 CPU, a quota above the cpuset does not raise it, and junk is an error.
+#[test]
+fn capacity_counts_the_lowest_cpu_quota() {
+    let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41]);
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    fake.set("/", "cpuset.cpus.effective", "0-87\n");
+    limit_cpus_in(&fake, ACTIONS_CG, 72).expect("limited");
+    let cpus = |fake: &Fake| capacity_in(fake, ACTIONS_CG).expect("read").cpus;
+    assert_eq!(cpus(&fake), Some(72));
+    // The unit's own CPUQuota=, lower: it counts.
+    fake.set(UNIT, "cpu.max", "3500000 100000\n");
+    assert_eq!(cpus(&fake), Some(35));
+    // Less than a CPU is one; max is no limit above.
+    fake.set(UNIT, "cpu.max", "max 100000\n");
+    fake.set(ACTIONS_CG, "cpu.max", "50000 100000\n");
+    assert_eq!(cpus(&fake), Some(1));
+    // A quota above the cpuset does not raise it.
+    fake.set(ACTIONS_CG, "cpu.max", "9000000 100000\n");
+    fake.set("/system.slice", "cpuset.cpus.effective", "0-3\n");
+    assert_eq!(cpus(&fake), Some(4));
+    // Only a quota: no cpuset anywhere.
+    let only = Fake::host(UNIT, "cpu memory pids", &[41]);
+    delegate_in(&only, SELF, MIN, None).expect("delegated");
+    assert_eq!(cpus(&only), None);
+    limit_cpus_in(&only, ACTIONS_CG, 6).expect("limited");
+    assert_eq!(cpus(&only), Some(6));
+    only.set(ACTIONS_CG, "cpu.max", "lots 100000");
+    let err = capacity_in(&only, ACTIONS_CG)
+        .expect_err("junk")
+        .to_string();
+    assert!(err.contains("cpu.max"), "{err}");
+}
+
+/// Catches a quota read as CPUs without its period, a period of 0 dividing, and `max`
+/// read as a number.
+#[test]
+fn a_cpu_max_is_counted_in_cpus() {
+    assert_eq!(quota_cpus("max 100000"), Ok(None));
+    assert_eq!(quota_cpus("max"), Ok(None));
+    assert_eq!(quota_cpus("200000 100000"), Ok(Some(2)));
+    assert_eq!(quota_cpus("400000 200000"), Ok(Some(2)));
+    assert_eq!(quota_cpus("250000 100000"), Ok(Some(2)));
+    assert_eq!(quota_cpus("1000 100000"), Ok(Some(1)));
+    assert_eq!(quota_cpus("300000"), Ok(Some(3)));
+    assert!(quota_cpus("100000 0").is_err());
+    assert!(quota_cpus("x 100000").is_err());
+}
+
+/// Catches `--lease-placement=numa-node` enabling `cpuset` in the wrong order or place
+/// (in `actions/` before its parent is ENOENT on a real host; in the parent alone leaves
+/// the lease cgroups without cpuset files), writing what is already enabled, and
+/// reporting the CPUs `actions/` may use (what the placer restricts the nodes to).
+#[test]
+fn cpuset_is_enabled_in_the_parent_then_in_actions_and_the_cpus_are_returned() {
+    let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41]);
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    fake.set(ACTIONS_CG, "cpuset.cpus.effective", "0-21,44-65\n");
+    let before = fake.log().len();
+    let cpus = enable_cpuset_in(&fake, ACTIONS_CG).expect("enabled");
+    assert_eq!(cpus.expect("cpus").to_string(), "0-21,44-65");
+    assert_eq!(
+        fake.log()[before..],
+        [
+            format!("{UNIT}/cgroup.subtree_control <- +cpuset"),
+            format!("{ACTIONS_CG}/cgroup.subtree_control <- +cpuset"),
+        ]
+    );
+    assert_eq!(
+        fake.enabled(ACTIONS_CG),
+        ["cpu", "memory", "pids", "cpuset"]
+    );
+    // Again: nothing left to write.
+    let before = fake.log().len();
+    enable_cpuset_in(&fake, ACTIONS_CG).expect("enabled");
+    assert_eq!(fake.log().len(), before);
+}
+
+/// Catches a unit that is not offered `cpuset` (a user manager without the drop-in)
+/// accepted, and the fix missing from the message; nothing is written.
+#[test]
+fn a_unit_without_cpuset_is_refused_with_the_fix() {
+    let fake = Fake::host(UNIT, "cpu memory pids", &[41]);
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    let before = fake.log().len();
+    let error = enable_cpuset_in(&fake, ACTIONS_CG).expect_err("refused");
+    let text = error.to_string();
+    assert!(
+        text.contains(UNIT) && text.contains("does not offer cpuset") && text.contains("Delegate="),
+        "{text}"
+    );
+    assert_eq!(fake.log().len(), before);
+}
+
+/// Catches a `cpuset.cpus.effective` that is empty taken for a list of no CPU, and one
+/// that does not parse taken for none: the first says nothing is known (the placer then
+/// keeps every node), the second fails with the file's path.
+#[test]
+fn an_empty_or_unreadable_effective_cpuset_is_told_apart() {
+    let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41]);
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    assert_eq!(enable_cpuset_in(&fake, ACTIONS_CG).expect("enabled"), None);
+    fake.set(ACTIONS_CG, "cpuset.cpus.effective", "0-x\n");
+    let error = enable_cpuset_in(&fake, ACTIONS_CG).expect_err("unparsed");
+    assert!(
+        error.to_string().contains("cpuset.cpus.effective"),
+        "{error}"
+    );
+}
+
+/// Catches an `actions` cgroup made directly under the root (`--cgroup-parent=/actions`)
+/// failing on its parent: the root is the parent, already enabling `cpuset`.
+#[test]
+fn an_actions_cgroup_under_the_root_has_the_root_as_its_parent() {
+    let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41]);
+    fake.mkdir("/actions").expect("made");
+    enable_cpuset_in(&fake, "/actions").expect("enabled");
+    assert_eq!(
+        fake.log(),
+        [
+            "mkdir /actions",
+            "/actions/cgroup.subtree_control <- +cpuset"
+        ]
+    );
 }

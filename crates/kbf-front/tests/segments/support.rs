@@ -23,6 +23,7 @@ use kbf_proto::worker::{
 };
 use kbf_segments::layout::{encode_footer, footer_len};
 use kbf_segments::{Footer, IndexEntry, SegmentWriter};
+use kbf_storage::service::OpenWrites;
 use kbf_types::{Digest, DigestFunction};
 use tokio::sync::{Notify, Semaphore};
 use tonic::Status;
@@ -95,6 +96,34 @@ pub fn declared_only(length: u64) -> UploadSegment {
     }
 }
 
+/// A segment of `length` bytes declared but never sent, its records area cut into
+/// records of at most `kbf_front::MAX_UNSTAGED_BLOB_BYTES`: what a server without a
+/// write tier may hold in memory.
+pub fn declared_small(length: u64) -> UploadSegment {
+    let most = kbf_front::MAX_UNSTAGED_BLOB_BYTES;
+    let mut n = 1;
+    while (length - footer_len(n)).div_ceil(most) > n {
+        n += 1;
+    }
+    let records_len = length - footer_len(n);
+    let entries: Vec<IndexEntry> = (0..n)
+        .map(|i| {
+            let offset = i * most;
+            let mut hash = [9; 32];
+            hash[..8].copy_from_slice(&i.to_be_bytes());
+            IndexEntry {
+                digest: Digest::new(DigestFunction::Sha256, hash, most.min(records_len - offset)),
+                offset,
+                crc32c: 0,
+            }
+        })
+        .collect();
+    UploadSegment {
+        length,
+        footer: encode_footer(records_len, &entries),
+    }
+}
+
 /// A segment declared but never sent: `n` one-byte records with distinct digests
 /// whose first byte is `tag`.
 pub fn declared_records(n: u32, tag: u8) -> UploadSegment {
@@ -125,22 +154,39 @@ pub async fn put_all(
     chunk: usize,
     reverse: bool,
 ) {
+    if let Some(refused) = try_put_all(client, upload, segment, s, chunk, reverse).await {
+        panic!("put range: {refused:?}");
+    }
+}
+
+/// As [`put_all`], stopping at the first range the server refuses and returning why.
+pub async fn try_put_all(
+    client: &mut SegmentsClient<Channel>,
+    upload: u64,
+    segment: usize,
+    s: &Seg,
+    chunk: usize,
+    reverse: bool,
+) -> Option<tonic::Status> {
     let mut starts: Vec<usize> = (0..s.records.len()).step_by(chunk).collect();
     if reverse {
         starts.reverse();
     }
     for start in starts {
         let end = s.records.len().min(start + chunk);
-        client
+        let sent = client
             .put_range(PutRangeRequest {
                 upload,
                 segment: u32::try_from(segment).expect("segment"),
                 offset: start as u64,
                 bytes: s.records[start..end].to_vec(),
             })
-            .await
-            .expect("put range");
+            .await;
+        if let Err(refused) = sent {
+            return Some(refused);
+        }
     }
+    None
 }
 
 /// A memory bucket whose PUTs can be held at a gate, or fail.
@@ -301,6 +347,15 @@ impl Front {
 
     /// As [`Front::start`], with the cache's uploads bounded as `writes` says.
     pub async fn start_with(config: SegmentsConfig, writes: WriteConfig) -> Self {
+        Self::start_counted(config, writes, None).await
+    }
+
+    /// As [`Front::start_with`], the service counting its uploads in `open` if given.
+    pub async fn start_counted(
+        config: SegmentsConfig,
+        writes: WriteConfig,
+        open: Option<OpenWrites>,
+    ) -> Self {
         let store = GatedStore::new();
         let meta = MemoryMetaLog::new(Retention::default());
         let cache = Arc::new(
@@ -311,6 +366,10 @@ impl Front {
         );
         let connections = Connections::new();
         let service = SegmentsService::new(Arc::clone(&cache), config, connections.clone());
+        let service = match open {
+            Some(open) => service.with_open_writes(open),
+            None => service,
+        };
         let incoming = TcpIncoming::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
         let addr = incoming.local_addr().expect("addr");
         let incoming = incoming.map(move |accepted| accepted.map(|s| connections.track(s)));

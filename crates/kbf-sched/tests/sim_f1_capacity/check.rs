@@ -2,8 +2,9 @@
 //! checked after every input (catalog section 4, `docs/design/simulation.md`).
 //!
 //! The shadow is written from the scheduler's contract, not from its code: it keeps
-//! its own queue, bookings, leases and dedup map, and its own reference first fit and
-//! unservable verdict, and compares the scheduler's effects and public state with them
+//! its own queue, bookings, leases and dedup map, and its own reference placement (the
+//! least loaded worker with room) and unservable verdict, and compares the scheduler's
+//! effects and public state with them
 //! after each input. Nothing here calls `Resources::fits` or `saturating_sub`: a
 //! mutant there must not also bend the reference.
 //!
@@ -17,8 +18,11 @@
 //! but F1 feeds none, so F1 does not exercise them. Not checked here: I9 (drain states)
 //! and I12 (no daemon model in the in-process world).
 //!
-//! I6 is checked per axis the request uses: a grant is allowed when, on every axis on
-//! which the request is not zero, what is booked plus the request fits the capacity.
+//! I6 is checked per axis the request uses: a grant is allowed when, on the CPU and GPU
+//! axes on which the request is not zero, what is booked plus the request fits the
+//! capacity. Memory is not booked against a worker (an action's memory is the limit it
+//! first runs under): the request needs a worker with that much memory, and an action
+//! at a worker's whole memory runs alone on it.
 //! A capacity that shrank below the bookings on one axis does not keep a request that
 //! books nothing on that axis away (a CPU-only action may go to a node whose GPUs
 //! shrank below its GPU bookings: it makes nothing worse).
@@ -26,7 +30,7 @@
 //! This file is local to the F1 family for now; it is written to move unchanged to the
 //! shared `tests/sim/check.rs` the catalog plans once the other families land theirs.
 
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet};
 
 use kbf_caps::NodeCaps;
@@ -73,15 +77,61 @@ fn sub(a: Axes, b: Axes) -> Axes {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-/// Whether `request` may be booked on a worker of `capacity` that has `booked`: on
-/// every axis the request uses, the sum fits.
-fn fits_beside(capacity: Axes, booked: Axes, request: Axes) -> bool {
-    (0..3).all(|i| request[i] == 0 || booked[i] + request[i] <= capacity[i])
+/// What a worker holds, as far as placement goes.
+#[derive(Clone, Copy, Debug)]
+struct Room {
+    booked: Axes,
+    leases: u64,
+    /// A lease holds the node alone: an action at its whole memory.
+    whole: bool,
+}
+
+/// Whether `request` is an action at the whole host's memory of a worker of `capacity`
+/// (the last step of the memory ladder): it runs alone on the node.
+fn exclusive(capacity: Axes, request: Axes) -> bool {
+    request[1] > 0 && request[1] >= capacity[1]
+}
+
+/// Whether `request` may be placed on a worker of `capacity` that holds `room`: on the
+/// CPU and GPU axes, if the request uses them, the sum fits. Memory is not booked
+/// against the capacity (an action's memory is the limit it first runs under): the
+/// request needs only a node with that much memory, and the whole host runs alone.
+fn fits_beside(capacity: Axes, room: Room, request: Axes) -> bool {
+    !room.whole
+        && [0, 2]
+            .iter()
+            .all(|&i| request[i] == 0 || room.booked[i] + request[i] <= capacity[i])
+        && request[1] <= capacity[1]
+        && (!exclusive(capacity, request) || room.leases == 0)
 }
 
 /// Whether `request` fits in a whole `capacity`.
 fn fits_whole(capacity: Axes, request: Axes) -> bool {
     (0..3).all(|i| request[i] <= capacity[i])
+}
+
+/// The larger of the CPU and memory shares of `capacity` that `booked` is, as a fraction
+/// `(numerator, denominator)`; an axis with no capacity counts as 0. Integers, written
+/// here and not taken from the scheduler, so a defect in its ranking is not shared.
+fn dominant(capacity: Axes, booked: Axes) -> (u128, u128) {
+    let mut best = (0, 1);
+    for axis in [0, 1] {
+        let (b, c) = (u128::from(booked[axis]), u128::from(capacity[axis]));
+        if c > 0 && b * best.1 > best.0 * c {
+            best = (b, c);
+        }
+    }
+    best
+}
+
+/// How placement ranks two workers, each as its capacity and what it holds: the lesser
+/// share first, then the fewer leases. `Less` is the better place. A tie is left to the
+/// caller: the first by name.
+fn by_load(a: (Axes, Room), b: (Axes, Room)) -> Ordering {
+    let (x, y) = (dominant(a.0, a.1.booked), dominant(b.0, b.1.booked));
+    (x.0 * y.1)
+        .cmp(&(y.0 * x.1))
+        .then(a.1.leases.cmp(&b.1.leases))
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +141,8 @@ struct ShadowWorker {
     last_heard: u64,
     session: u64,
     booked: Axes,
+    leases: u64,
+    whole: bool,
     /// Per interned platform request: whether `caps` satisfy it.
     matches: BTreeMap<usize, bool>,
 }
@@ -359,6 +411,10 @@ impl Checker {
             let res = op.resources;
             let w = self.workers.get_mut(&worker).expect("registered");
             w.booked = sub(w.booked, res);
+            w.leases -= 1;
+            if w.leases == 0 {
+                w.whole = false;
+            }
             self.held.remove(&lease);
             self.touched_workers.insert(worker);
         }
@@ -406,6 +462,8 @@ impl Checker {
                         last_heard: now,
                         session: 0,
                         booked: [0; 3],
+                        leases: 0,
+                        whole: false,
                         matches: BTreeMap::new(),
                     });
                 entry.capacity = axes(*capacity);

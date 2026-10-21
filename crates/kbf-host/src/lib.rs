@@ -1,17 +1,17 @@
-//! `kbf-host`: the one way kbf changes a host. `kbf-deploy`'s kits and `kbf-updater`'s
-//! applier both build a [`Plan`] and carry it out with [`execute`].
+//! `kbf-host`: the one way kbf changes a host. `kbf-deploy`'s kits and `kbf-installer`'s
+//! host verbs both build a [`Plan`] and carry it out with [`execute`].
 //!
 //! A caller asks the host what is there and builds a [`Plan`] of [`Step`]s that brings
 //! the host to what it wants. By default [`execute`] prints each step as
 //! `DRY-RUN: <step>` and changes nothing; with [`Mode::Apply`] it prints `+ <step>` and
 //! does it, stopping at the first failure. A plan made again after it was applied has no
-//! file or directory steps.
+//! file, directory or link steps.
 //!
 //! - [`path`]: [`HostPath`], an absolute path with no `..`, joined to a [`Root`] (`/` on
 //!   a host, a scratch directory in tests).
 //! - [`step`]: the steps, and the line each prints, which never shows file contents,
 //!   environment values, a command's input or a captured output.
-//! - [`plan`]: [`Planner`], which adds a file or directory step only when the host
+//! - [`plan`]: [`Planner`], which adds a file, directory or link step only when the host
 //!   differs (and says whether it did), and [`execute`], with its guards: a
 //!   [`RunAs::Root`] plan applies only as root, a [`RunAs::User`] plan never as root,
 //!   and applying as root first checks that the running binary and every directory

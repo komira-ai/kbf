@@ -26,11 +26,7 @@ fn declared_segment() -> (Vec<Declared>, Vec<u8>) {
     let bytes = writer.finish();
     let footer = Footer::parse(&bytes, bytes.len() as u64).expect("footer");
     let records_len = usize::try_from(footer.records_len()).expect("len");
-    let (declared, _, _) = declare(
-        &[(bytes.len() as u64, &bytes[records_len..])],
-        MAX_BLOB_BYTES,
-    )
-    .expect("declare");
+    let (declared, _) = declare(&[(bytes.len() as u64, &bytes[records_len..])]).expect("declare");
     (declared, bytes[..records_len].to_vec())
 }
 
@@ -40,11 +36,12 @@ fn declared_segment() -> (Vec<Declared>, Vec<u8>) {
 #[tokio::test]
 async fn the_check_builds_each_received_segment() {
     let (declared, records) = declared_segment();
-    let mut received = Receiving::new(&declared[0]);
-    let put = received
-        .put(declared[0].records_len, 0, &records)
-        .expect("put");
+    let mut received = Receiving::new(&declared[0], false, None);
+    let (put, claimed) = received.put(&declared[0], 0, &records).expect("put");
     assert_eq!(put, Put::Written);
+    advance(&claimed, |i, finished| {
+        received.next(&declared[0], i, finished)
+    });
     let want: Vec<Digest> = declared[0].entries.iter().map(|e| e.digest).collect();
     let built = check_all(committing(declared), vec![received])
         .await
@@ -67,7 +64,7 @@ async fn a_check_that_panics_answers_internal() {
         records_len: 0,
         entries: Vec::new(),
     };
-    let received = Receiving::new(&nothing);
+    let received = Receiving::new(&nothing, false, None);
     let failed = check_all(committing(declared), vec![received])
         .await
         .expect_err("a panicked check");
@@ -76,4 +73,77 @@ async fn a_check_that_panics_answers_internal() {
         failed.message().starts_with("checking an upload failed: "),
         "{failed:?}"
     );
+}
+
+/// Catches a hash job that, finishing after its upload was committed, answered or
+/// dropped, still touched the records (`check_next` and `refusal_at` must see nothing
+/// then): on a receiving upload a corrupt record is found and refused; on a committing,
+/// a done and a dropped one both answer `None`.
+#[test]
+fn a_job_outliving_its_receiving_upload_sees_nothing() {
+    let (declared, records) = declared_segment();
+    let upload = committing(declared);
+    let mut bad = records;
+    bad[1] ^= 1;
+    let mut received = Receiving::new(&upload.declared[0], false, None);
+    let (_, claimed) = received.put(&upload.declared[0], 0, &bad).expect("put");
+    *lock(&upload.phase) = Phase::Receiving {
+        segments: vec![received],
+        _admitted: Admitted::nothing(),
+        _open: None,
+    };
+    assert!(upload.refusal_at(0).is_none());
+    advance(&claimed, |i, finished| upload.check_next(0, i, finished));
+    let refused = upload.refusal_at(0).expect("the corrupt record is refused");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    for phase in [Phase::Committing, Phase::Done, Phase::Dropped] {
+        *lock(&upload.phase) = phase;
+        assert!(upload.refusal_at(0).is_none());
+        assert!(upload.check_next(0, 0, None).is_none());
+    }
+}
+
+/// Catches: an object ref that drops a node writer's member or boot on the wire (a
+/// daemon would read another object, or an epoch writer's), or a read that takes a ref
+/// naming two writers, or half a node, as one of them.
+#[test]
+fn object_refs_name_one_writer_or_are_refused() {
+    let n = |v| NonZeroU64::new(v).expect("not zero");
+    for id in [
+        ObjectId::new(Epoch::new(3), 4),
+        ObjectId::of(Writer::Node(NodeWriter::new(n(7), n(2))), 9),
+        ObjectId::of(Writer::Legacy(LegacyWriter::new(n(5), Epoch::new(3))), 9),
+    ] {
+        assert_eq!(object_id(&object_ref(id)).ok(), Some(id), "{id}");
+    }
+    let node = object_ref(ObjectId::of(Writer::Node(NodeWriter::new(n(7), n(2))), 9));
+    assert_eq!((node.epoch, node.member, node.boot, node.seq), (0, 7, 2, 9));
+    let other = object_ref(ObjectId::of(
+        Writer::Legacy(LegacyWriter::new(n(5), Epoch::new(3))),
+        9,
+    ));
+    assert_eq!(
+        (other.epoch, other.member, other.boot, other.log, other.seq),
+        (3, 0, 0, 5, 9)
+    );
+    for (epoch, member, boot, log) in [
+        (3, 7, 2, 0),
+        (0, 7, 0, 0),
+        (0, 0, 2, 0),
+        (3, 0, 2, 0),
+        (0, 0, 0, 5),
+        (3, 7, 0, 5),
+        (0, 7, 2, 5),
+        (3, 7, 2, 5),
+    ] {
+        let bad = ObjectRef {
+            epoch,
+            seq: 1,
+            member,
+            boot,
+            log,
+        };
+        let refused = object_id(&bad).err().map(|s| s.code());
+        assert_eq!(refused, Some(Code::InvalidArgument), "{bad:?}");
+    }
 }

@@ -132,7 +132,10 @@ pub(crate) fn write_resource(name: &str) -> Result<Resource, Status> {
 
 /// Parses `{sha256/}{hash}/{size}` from the segments after `blobs`, returning the
 /// digest and the segments left over.
-fn blob_digest<'a>(name: &str, parts: &'a [&'a str]) -> Result<(Digest, &'a [&'a str]), Status> {
+pub(crate) fn blob_digest<'a>(
+    name: &str,
+    parts: &'a [&'a str],
+) -> Result<(Digest, &'a [&'a str]), Status> {
     let parts = match parts.first() {
         Some(&SHA256_NAME) => &parts[1..],
         _ => parts,
@@ -145,7 +148,7 @@ fn blob_digest<'a>(name: &str, parts: &'a [&'a str]) -> Result<(Digest, &'a [&'a
     Ok((digest, rest))
 }
 
-fn bad_resource(name: &str, why: &str) -> Status {
+pub(crate) fn bad_resource(name: &str, why: &str) -> Status {
     Status::invalid_argument(format!("resource name {name:?}: {why}"))
 }
 
@@ -154,6 +157,21 @@ mod tests {
     use super::*;
 
     const HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// Catches: a digest function check that refuses the unset value or SHA-256 (every
+    /// REAPI client leaves it unset), or accepts another function, which this cache
+    /// would then read as SHA-256.
+    #[test]
+    fn only_an_unset_or_sha256_digest_function_is_accepted() {
+        let value = |v: reapi::digest_function::Value| v as i32;
+        assert!(check_digest_function(value(reapi::digest_function::Value::Unknown)).is_ok());
+        assert!(check_digest_function(value(reapi::digest_function::Value::Sha256)).is_ok());
+        let refused = check_digest_function(value(reapi::digest_function::Value::Sha1));
+        assert_eq!(
+            refused.expect_err("sha1").code(),
+            tonic::Code::InvalidArgument
+        );
+    }
 
     /// Catches: a parser that misreads the instance name (which authorization checks),
     /// the optional digest function segment or the trailing upload metadata, which

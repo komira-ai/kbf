@@ -3,19 +3,20 @@
 mod support;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use kbf_caps::NodeCaps;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_objstore::MemoryStore;
+use kbf_proto::update::UpdateStatus;
+use kbf_proto::update::update_status::State;
 use kbf_proto::worker::{NodeStatus, ServerMessage, XcodeState, XcodeStatus, daemon_message};
 use kbf_server::api::{DRAIN_DEADLINE, Write, write_request};
 use kbf_server::farm::NodeAction;
 use kbf_server::fleet::SoftwareView;
+use kbf_server::proxy_auth::Caller;
 use kbf_server::token::ApiToken;
 use kbf_server::{
     Api, BUILD_COMMIT, Farm, Listeners, SERVER_VERSION, ServeError, bind_server_with_api,
@@ -57,21 +58,19 @@ impl Server {
 /// The token the test servers' writes need.
 const TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
 
-/// A token file holding `content`, mode 0600, unique to this call.
-fn token_file(content: &str) -> PathBuf {
+/// A token file holding `content`, mode 0600, in a directory of its own, read at once
+/// (the directory is removed when this returns).
+fn token_from(content: &str) -> ApiToken {
     use std::os::unix::fs::PermissionsExt;
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-api");
-    std::fs::create_dir_all(&dir).expect("a token directory");
-    let path = dir.join(format!("token-{}-{n}", std::process::id()));
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-api-token");
+    let path = dir.join("token");
     std::fs::write(&path, content).expect("write the token");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-    path
+    ApiToken::from_file(&path).expect("a usable token")
 }
 
 fn token() -> ApiToken {
-    ApiToken::from_file(&token_file(&format!("{TOKEN}\n"))).expect("a usable token")
+    token_from(&format!("{TOKEN}\n"))
 }
 
 fn start() -> Server {
@@ -88,11 +87,15 @@ fn listeners() -> Listeners {
         hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        default_platform: kbf_front::DefaultPlatform::NONE,
+        memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
+        streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
 
@@ -105,6 +108,9 @@ fn start_with(token: Option<ApiToken>) -> Server {
     let api = Api {
         listen: loopback(),
         token,
+        local_cache: None,
+        releases: None,
+        poll: None,
     };
     let bound = bind_server_with_api(cache(), listeners, Some(api), shutdown).expect("bind");
     let (reapi, worker, api) = (
@@ -247,7 +253,10 @@ const NOT_READY: &str = "Xcode 16B40 (/Applications/Xcode_16.1.app) installed bu
 /// of `null`, an older status kept over a newer one, a node still listed as connected
 /// after its stream ended, an installed Xcode that is not ready missing from
 /// `xcodes` or from `needs_attention` (issue #164), and a node's pinned container
-/// images (`NodeStatus.container_images`) not listed as `software.container_images`.
+/// images (`NodeStatus.container_images`) not listed as `software.container_images`;
+/// a node's `protocol` other than the version its `Hello` named, through the real worker
+/// service, and an envelope without `oldest_protocol` and `protocol_unknown` at its top
+/// level.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_nodes_lists_each_nodes_newest_software() {
     let server = start();
@@ -259,7 +268,8 @@ async fn get_nodes_lists_each_nodes_newest_software() {
     );
     assert_eq!(
         nodes(api).await,
-        json!({ "server": this_build, "nodes": [] })
+        json!({ "server": this_build, "nodes": [],
+                "oldest_protocol": null, "protocol_unknown": 0 })
     );
 
     let before = now_ms();
@@ -296,18 +306,21 @@ async fn get_nodes_lists_each_nodes_newest_software() {
             );
         }
     }
+    // None of these daemons sent an `UpdateStatus`: never idle, and no verdict.
+    let unsupported = json!({ "state": null, "up_to_date": null, "availability": "unsupported" });
     assert_eq!(
         got,
         json!({ "server": this_build, "nodes": [
-            { "node_id": "linux-1", "connected": true, "software": {
+            { "node_id": "linux-1", "connected": true, "protocol": 1, "software": {
                 "os_name": "Ubuntu", "os_version": "24.04", "os_build": "",
                 "kernel": "6.8.0-45-generic", "daemon_version": "0.1.0",
                 "xcode_builds": [], "xcodes": [],
                 "container_images": [LINUX_IMAGE] },
               "needs_attention": [],
+              "update": unsupported,
               "placement": { "state": "serving" },
-              "phase": { "state": "serving" } },
-            { "node_id": "mac-1", "connected": true, "software": {
+              "phase": { "state": "serving" }, "lease_count": 0, "booked": { "cpu_millis": 0, "memory_bytes": 0, "gpus": 0, "vms": 0 } },
+            { "node_id": "mac-1", "connected": true, "protocol": 1, "software": {
                 "os_name": "macOS", "os_version": "15.1", "os_build": "24B83",
                 "kernel": "", "daemon_version": "0.1.0",
                 "xcode_builds": ["16C5032a"],
@@ -319,13 +332,15 @@ async fn get_nodes_lists_each_nodes_newest_software() {
                       "state": "ready", "reason": "", "fix": "" } ],
                 "container_images": [] },
               "needs_attention": [NOT_READY],
+              "update": unsupported,
               "placement": { "state": "serving" },
-              "phase": { "state": "serving" } },
-            { "node_id": "old-1", "connected": true, "software": null,
+              "phase": { "state": "serving" }, "lease_count": 0, "booked": { "cpu_millis": 0, "memory_bytes": 0, "gpus": 0, "vms": 0 } },
+            { "node_id": "old-1", "connected": true, "protocol": 1, "software": null,
               "needs_attention": [],
+              "update": unsupported,
               "placement": { "state": "serving" },
-              "phase": { "state": "serving" } },
-        ] })
+              "phase": { "state": "serving" }, "lease_count": 0, "booked": { "cpu_millis": 0, "memory_bytes": 0, "gpus": 0, "vms": 0 } },
+        ], "oldest_protocol": 1, "protocol_unknown": 0 })
     );
 
     linux.send(daemon_message::Message::NodeStatus(linux_status(
@@ -356,15 +371,22 @@ async fn an_api_address_in_use_is_refused() {
         hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        default_platform: kbf_front::DefaultPlatform::NONE,
+        memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
+        streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     let api = Api {
         listen: addr,
         token: None,
+        local_cache: None,
+        releases: None,
+        poll: None,
     };
     let refused = bind_server_with_api(cache(), listeners, Some(api), std::future::pending());
     let Err(ServeError::Bind { addr: at, .. }) = refused else {
@@ -374,7 +396,7 @@ async fn an_api_address_in_use_is_refused() {
 }
 
 fn register(
-    farm: &Farm<MemoryMetaLog, MemoryStore>,
+    farm: &Farm,
     node: &str,
 ) -> (
     kbf_server::farm::StreamId,
@@ -423,6 +445,48 @@ async fn a_status_from_a_replaced_stream_is_ignored() {
     );
 }
 
+fn update_status(running: &str, state: State) -> UpdateStatus {
+    UpdateStatus {
+        running_commit: running.to_owned(),
+        state: state as i32,
+        ..UpdateStatus::default()
+    }
+}
+
+/// Catches (`pull-updates.md` 6.4: ignored from a replaced stream exactly as `NodeStatus`
+/// is): an `UpdateStatus` from a replaced stream overwriting the newest stream's (a host
+/// that restarted onto a new release would be shown as running the old one, and judged
+/// out of date), one kept for a node that never registered, and the answer to "was it
+/// kept" being wrong. The newest stream's report is the one the detail lists, live.
+///
+/// Mutants seen red: the stream check dropped (the old stream's report wins); the
+/// report kept for an unregistered node (a ghost host listed).
+#[tokio::test]
+async fn an_update_status_from_a_replaced_stream_is_ignored() {
+    let farm = Farm::new(
+        cache(),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
+    let node = WorkerId::new("linux-1");
+    let (old, _old_rx) = register(&farm, "linux-1");
+    let (new, _new_rx) = register(&farm, "linux-1");
+    assert!(farm.update_status(&node, new, update_status("bbbbbbbbbbbb", State::Idle)));
+    assert!(
+        !farm.update_status(&node, old, update_status("aaaaaaaaaaaa", State::Refused)),
+        "a replaced stream's report was kept"
+    );
+    let ghost = WorkerId::new("ghost");
+    assert!(!farm.update_status(&ghost, new, update_status("cccccccccccc", State::Idle)));
+    let hosts = farm.update_hosts();
+    assert_eq!(hosts.len(), 1, "{hosts:?}");
+    let host = serde_json::to_value(&hosts[0]).expect("json");
+    assert_eq!(host["node_id"], "linux-1");
+    assert_eq!(host["running_commit"], "bbbbbbbbbbbb");
+    assert_eq!(host["state"], "idle");
+    assert_eq!(host["availability"], "ok");
+}
+
 /// Catches: `connected` read from something other than the stream's response side
 /// (a node whose stream is gone listed as connected).
 #[tokio::test]
@@ -451,7 +515,7 @@ async fn two_nodes_whose_streams_ended_before_one_read_are_both_disconnected() {
     );
     let (_, first) = register(&farm, "linux-1");
     let (_, second) = register(&farm, "linux-2");
-    let connected = |farm: &Farm<MemoryMetaLog, MemoryStore>| {
+    let connected = |farm: &Farm| {
         let mut nodes: Vec<(String, bool)> = farm
             .nodes()
             .nodes
@@ -590,7 +654,7 @@ async fn cordon_drain_and_uncordon_over_http() {
         assert!(body["error"].is_string(), "{body}");
     }
     let (code, _) = http(api, "GET", "/v1/nodes/linux-1:cordon", "").await;
-    assert_eq!(code, 405, "a write is a POST");
+    assert_eq!(code, 404, "a read of a write's path is no node");
 
     let first = Job::new("first", &[]);
     let second = Job::new("second", &[]);
@@ -672,9 +736,9 @@ fn writes_are_accepted_only_from_loopback() {
     let token = token();
     let headers = headers(&[("authorization", &format!("Bearer {TOKEN}")), JSON]);
     let write = |peer: &str, target: &'static str, body: &'static [u8]| {
-        let peer: SocketAddr = peer.parse().expect("an address");
+        let peer = Caller::direct(peer.parse().expect("an address"));
         let request = Write {
-            peer,
+            peer: &peer,
             headers: &headers,
             target,
             body,
@@ -734,8 +798,9 @@ fn a_write_passes_every_gate_or_is_refused() {
     let bearer = format!("Bearer {TOKEN}");
     let check = |token: Option<&ApiToken>, pairs: &[(&str, &str)]| {
         let headers = headers(pairs);
+        let peer = Caller::direct("127.0.0.1:4000".parse().expect("an address"));
         let request = Write {
-            peer: "127.0.0.1:4000".parse().expect("an address"),
+            peer: &peer,
             headers: &headers,
             target: "mac-1:cordon",
             body: b"",

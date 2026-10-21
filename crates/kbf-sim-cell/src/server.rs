@@ -1,4 +1,4 @@
-//! The simulated server: `kbf-server --meta-log=raft` on a fault-injecting disk.
+//! The simulated server: `kbf-server`'s Raft metadata log on a fault-injecting disk.
 //!
 //! - **Metadata** is a [`RaftMetaLog`] over the server's [`FaultFs`], opened as the
 //!   server opens it (a new log's id drawn from the seed). Its futures never wait: each
@@ -36,14 +36,13 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::num::NonZeroU64;
-use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures::FutureExt as _;
 use kbf_daemon::FENCE_AFTER;
-use kbf_front::MetaLog;
+use kbf_front::{Described, MetaLog};
 use kbf_log::FarmLogId;
 use kbf_meta::{
     ActionAnswer, ActionRecord, Applied, Closure, Command, Epoch, MetaState, ObjectId, Retention,
@@ -51,7 +50,8 @@ use kbf_meta::{
 };
 use kbf_sched::{DaemonInstance, Event as SchedEvent, Input, OpState, Request, Scheduler};
 use kbf_server::RaftMetaLog;
-use kbf_server::machine::{FarmMachine, Sent, Waiter};
+use kbf_server::action_usage::Subject;
+use kbf_server::machine::{FarmMachine, Platform, Sent, Waiter};
 use kbf_server::stamp::Stamp;
 use kbf_sim::{Event, NodeId, NodeInput, Output};
 use kbf_store::{Fault, FaultFs};
@@ -159,6 +159,9 @@ pub struct Seen {
     pub cuts: Vec<Cut>,
     /// What the local write tier did.
     pub tier: TierSeen,
+    /// Each action started, and the runs of the server's process ([`Seen::starts`])
+    /// that started it.
+    pub started: BTreeMap<Digest, BTreeSet<u64>>,
 }
 
 /// A `PutBlob` commit a crash cut part-way through ([`StorePoint::InCommit`]).
@@ -232,14 +235,9 @@ struct Up {
 
 /// Polls `future` once: the metadata log answers without waiting.
 fn ready<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    match future
-        .as_mut()
-        .poll(&mut Context::from_waker(Waker::noop()))
-    {
-        Poll::Ready(v) => v,
-        Poll::Pending => unreachable!("the metadata log answers without waiting"),
-    }
+    future
+        .now_or_never()
+        .expect("the metadata log answers without waiting")
 }
 
 /// A new log's id draw that draws `id`.
@@ -307,6 +305,13 @@ impl Server {
 
     pub(crate) fn take_outputs(&mut self) -> Vec<Output<Msg>> {
         std::mem::take(&mut self.out)
+    }
+
+    /// Whether the server's process is running (its log open, or stopped and
+    /// answering reads).
+    #[must_use]
+    pub fn is_up(&self) -> bool {
+        self.up.is_some()
     }
 
     /// The applied metadata state, while the server is up.
@@ -538,6 +543,9 @@ impl Up {
 
     fn start_lease(&mut self, now: FarmTime, start: &StartLease, cx: &mut Cx<'_>) {
         let worker = &start.worker;
+        let process = cx.seen.starts;
+        let runs = cx.seen.started.entry(start.key.action).or_default();
+        runs.insert(process);
         let stream = self.streams.get(worker).copied().unwrap_or_default();
         cx.send(
             NodeId::from(worker.as_str()),
@@ -640,13 +648,19 @@ impl Up {
     /// process sent its `Start`.
     fn holder(&self, lease: LeaseId, worker: &WorkerId) -> Option<Sent> {
         let sent = self.machine.sent(lease)?;
-        let current = matches!(
-            self.sched.state(sent.operation)?,
-            OpState::Leased { lease: held, worker: holder, committed: true }
-                | OpState::Running { lease: held, worker: holder }
-                if *held == lease && holder == worker
-        );
-        current.then_some(sent)
+        let (held, holder) = match self.sched.state(sent.operation)? {
+            OpState::Leased {
+                lease: held,
+                worker: holder,
+                committed: true,
+            }
+            | OpState::Running {
+                lease: held,
+                worker: holder,
+            } => (*held, holder),
+            _ => return None,
+        };
+        ((held, holder) == (lease, worker)).then_some(sent)
     }
 
     fn report(
@@ -730,6 +744,10 @@ impl Up {
             kind: LeaseKind::Action,
             do_not_cache: false,
             queued: wall(now),
+            // The simulation's actions have no `Command`: the `action usage:` line is not
+            // what it checks.
+            usage: Subject::of(Described::default()).0,
+            platform: Platform::of(&request(action).needs),
         });
         self.callers.insert(waiter, from.clone());
         let event = SchedEvent::Submit {
@@ -859,12 +877,15 @@ impl StateMachine for Server {
 }
 
 #[cfg(test)]
+mod protocol_tests;
+
+#[cfg(test)]
 mod tests {
     use kbf_server::raft_log::RECORD;
 
     use super::*;
 
-    fn input(at: u64, event: Event<Msg>) -> NodeInput<Msg> {
+    pub(super) fn input(at: u64, event: Event<Msg>) -> NodeInput<Msg> {
         NodeInput {
             now: FarmTime::from_millis(at),
             entropy: 9,
@@ -872,7 +893,7 @@ mod tests {
         }
     }
 
-    fn server(faults: Vec<(FarmTime, ServerFault)>) -> Server {
+    pub(super) fn server(faults: Vec<(FarmTime, ServerFault)>) -> Server {
         let plan = ServerPlan {
             faults,
             down_for: Duration::from_secs(3),
@@ -964,7 +985,8 @@ mod tests {
         for tag in T_FAULT + 2..T_FAULT + 5 {
             s.apply(input(1_600, Event::Timer { tag }));
         }
-        assert!(s.up.is_none() && s.armed.is_none());
+        assert!(s.up.is_none());
+        assert!(s.armed.is_none());
         assert_eq!(restarts(&mut s), 0);
     }
 }

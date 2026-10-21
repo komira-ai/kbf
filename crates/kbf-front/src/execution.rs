@@ -30,18 +30,33 @@
 //! forgotten, waiting on it is NOT_FOUND, and the client's next Execute is answered
 //! from the action cache (or runs the action again, if its result was not cached).
 //!
-//! When the server is going away ([`Closer::close`]), every open Execute and
-//! WaitExecution stream that is not done ends UNAVAILABLE, which REAPI clients retry
-//! (issue #168); one opened after that ends UNAVAILABLE after its first operation. A
-//! WaitExecution on an operation kept finished is answered even then: its first
-//! operation is the done one, and the stream ends there.
+//! **Draining** ([`Closer::drain`], on SIGTERM): a new Execute is refused UNAVAILABLE,
+//! which Buck2 retries when it opens the call (up to 5 attempts, so the next try can
+//! land on another frontend), and every open Execute and WaitExecution stream stays
+//! open until its action is done. Buck2 does not recover a stream that breaks after
+//! it started: it never calls WaitExecution and never sends the Execute again, so an
+//! action whose stream is cut fails as `remote_call_error`. Ending a stream UNAVAILABLE
+//! is therefore a last resort, not a retry (kbf#791).
+//!
+//! **Progress** ([`progress`]): every open stream is sent its operation again, same
+//! name, `done` false, its current stage, once per progress interval, so a load
+//! balancer or proxy that counts idle time in data frames never cuts a stream whose
+//! action is long.
+//!
+//! When the drain runs out of time ([`Closer::close`]), every open Execute and
+//! WaitExecution stream that is not done ends UNAVAILABLE (a client that retries
+//! sees it; Buck2 fails the action); a WaitExecution opened after that ends UNAVAILABLE
+//! after its first operation. A WaitExecution on an operation kept finished is answered even
+//! then: its first operation is the done one, and the stream ends there.
 //!
 //! What v0 sends to the scheduler: QoS `ci` for every call (the `x-kbf-qos` header is
 //! not read yet), and every action is hermetic, so it may be joined (a `networked`
 //! property does not exist yet). The lease kind is the platform's `kbf-lease` value,
 //! `action` when absent; any other value than `action` or `whole_machine` is
-//! INVALID_ARGUMENT. The booking is one core and 1 GiB ([`DEFAULT_RESOURCES`]; learned
-//! sizes come with the estimator), or the whole cores of `kbf-book-cpus` and the GiB of
+//! INVALID_ARGUMENT. The booking of an `action` is one core and 4 GiB by default
+//! ([`DEFAULT_RESOURCES`], the first rung of the scheduler's memory ladder, which the
+//! server sets with [`ExecutionService::with_default_memory`]; learned sizes come with
+//! the estimator), or the whole cores of `kbf-book-cpus` and the GiB of
 //! `kbf-book-mem-gib` where the platform names them: a value that is not a whole number
 //! of at least 1, or that overflows the booking, is INVALID_ARGUMENT, and so is either
 //! key on a `whole_machine` lease (the scheduler books the whole worker for one). The
@@ -65,39 +80,50 @@
 //! (`kbf_caps::property_name`): `GPU`, `Kbf-Lease` and `osfamily` are `gpu`,
 //! `kbf-lease` and `OSFamily`, never ignored. One name sent in two spellings is
 //! INVALID_ARGUMENT.
+//!
+//! **When the platform is refused.** As early as it is known, before any input blob is
+//! read: an Action that carries a platform is checked right after it is decoded (so a bad
+//! platform beside missing blobs is INVALID_ARGUMENT or FAILED_PRECONDITION for the
+//! platform, not MISSING), and a Command's platform as soon as the Command is read. An
+//! Execute the action cache answers is checked too: when the CAS holds the action (and its
+//! Command), a refused platform is an error instead of the cached result. An action the
+//! CAS does not hold, or that does not decode, is answered from the cache.
 
-use std::collections::{BTreeSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{Stream, stream};
 use kbf_auth::{Authorizers, authorize};
 use kbf_caps::FromPlatformError;
-use kbf_objstore::ObjectStore;
 use kbf_proto::google::longrunning::{Operation, operation};
 use kbf_proto::google::rpc::{
     self, ErrorInfo, PreconditionFailure, precondition_failure::Violation,
 };
 use kbf_proto::reapi::execution_server::Execution;
 use kbf_proto::reapi::{
-    self, Action, Command, Directory, ExecuteOperationMetadata, ExecuteRequest, ExecuteResponse,
+    self, Action, Command, ExecuteOperationMetadata, ExecuteRequest, ExecuteResponse,
     ExecutedActionMetadata, WaitExecutionRequest, execution_stage,
 };
 use kbf_sched::Request;
+use kbf_storage::StorageError;
 use kbf_types::{ActionKey, Digest, LeaseKind, Platform, Qos, Resources};
 use prost::Message;
 use prost_types::Any;
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tonic::{Code, Request as GrpcRequest, Response, Status};
 use tracing::Instrument as _;
 
 use kbf_auth::AuthenticationMetadata;
 use kbf_invocation::{CallKind, ExecuteAnswer};
 
-use crate::cache::{Cache, CacheError};
-use crate::meta_log::MetaLog;
-use crate::recorder::{ExecuteCall, Recorder, listing};
+use crate::backend::Backend;
+use crate::default_platform::{DefaultPlatform, Quiet};
+use crate::described::Described;
+use crate::metrics::{CacheMetrics, OpenExecute};
+use crate::recorder::{ActionLabel, ExecuteCall, Recorder, listing};
 use crate::request_metadata::CallMetadata;
 use crate::wire;
 
@@ -123,9 +149,15 @@ pub const NO_WORKER_REASON: &str = "NO_WORKER_CAN_RUN";
 /// The `ErrorInfo.domain` of kbf's errors.
 pub const ERROR_DOMAIN: &str = "kbf";
 
-/// What v0 books for an action that names no size: one core and 1 GiB, plus the GPUs
-/// its `gpu` property asks for. `kbf-book-cpus` and `kbf-book-mem-gib` replace either.
-pub const DEFAULT_RESOURCES: Resources = Resources::new(1_000, 1 << 30);
+/// What v0 books for an action that names no size: one core and 4 GiB, the first rung
+/// of the scheduler's default memory ladder, plus the GPUs its `gpu` property asks
+/// for. `kbf-book-cpus` and `kbf-book-mem-gib` replace either, and the server's first
+/// rung ([`ExecutionService::with_default_memory`]) replaces the memory.
+pub const DEFAULT_RESOURCES: Resources = Resources::new(1_000, 4 << 30);
+
+/// The least worker a lease of a kind other than `action` may run on: one core and
+/// 1 GiB. A `whole_machine` lease books the whole worker whatever this says.
+const LEAST_WORKER: Resources = Resources::new(1_000, 1 << 30);
 
 /// One execution the front hands to the scheduler.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,6 +168,9 @@ pub struct Submission {
     /// The call to record, with a recorder on and an invocation id: the dispatcher
     /// sends its [`ExecuteCall::answered`] events before it queues the request.
     pub call: Option<ExecuteCall>,
+    /// The action's argv, output paths and client label, for the server's `action
+    /// usage:` line only ([`Described`]).
+    pub described: Described,
 }
 
 /// Where an operation is, as its callers see it.
@@ -199,47 +234,236 @@ pub trait Dispatch: Send + Sync + 'static {
     fn wait(&self, name: &str) -> Option<Ticket>;
 }
 
+/// Where the server is on its way out, as the `Execution` service sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    /// Serving.
+    Open,
+    /// No new Execute; open streams run to their end.
+    Draining,
+    /// Open streams that are not done end UNAVAILABLE.
+    Closed,
+}
+
 /// Tells the `Execution` service the server is going away: see [`closing`].
 #[derive(Debug)]
-pub struct Closer(watch::Sender<bool>);
+pub struct Closer(watch::Sender<Phase>);
 
 impl Closer {
+    /// Refuses every new Execute UNAVAILABLE from now on. Open streams are not
+    /// touched: they run until their action is done (or [`Closer::close`]).
+    pub fn drain(&self) {
+        self.0.send_if_modified(|phase| {
+            let open = *phase == Phase::Open;
+            if open {
+                *phase = Phase::Draining;
+            }
+            open
+        });
+    }
+
+    /// Takes new Execute calls again after [`Closer::drain`]. Does nothing once the
+    /// closer has closed. Returns whether it undid a drain.
+    pub fn undrain(&self) -> bool {
+        self.0.send_if_modified(|phase| {
+            let draining = *phase == Phase::Draining;
+            if draining {
+                *phase = Phase::Open;
+            }
+            draining
+        })
+    }
+
     /// Ends every open Execute and WaitExecution stream that is not done UNAVAILABLE,
-    /// and every one opened from now on after its first operation.
+    /// and every one opened from now on after its first operation. Also drains.
     pub fn close(&self) {
-        self.0.send_replace(true);
+        self.0.send_replace(Phase::Closed);
     }
 }
 
 /// The `Execution` service's side of a [`Closer`]. A stream ends when its closer
 /// closes; if the closer is dropped without closing, it never does.
 #[derive(Clone, Debug)]
-pub struct Closing(watch::Receiver<bool>);
+pub struct Closing(watch::Receiver<Phase>);
 
 impl Closing {
     /// Completes once the closer has closed; never, if it is dropped first.
-    async fn closed(&mut self) {
-        if self.0.wait_for(|closed| *closed).await.is_err() {
+    pub(crate) async fn closed(&mut self) {
+        let dropped = self
+            .0
+            .wait_for(|phase| *phase == Phase::Closed)
+            .await
+            .is_err();
+        if dropped {
             std::future::pending::<()>().await;
         }
+    }
+
+    /// Whether the closer has begun to drain or has closed.
+    #[must_use]
+    pub fn draining(&self) -> bool {
+        *self.0.borrow() != Phase::Open
     }
 }
 
 /// A [`Closer`] and the [`Closing`] to hand the `Execution` service.
 #[must_use]
 pub fn closing() -> (Closer, Closing) {
-    let (closer, closing) = watch::channel(false);
+    let (closer, closing) = watch::channel(Phase::Open);
     (Closer(closer), Closing(closing))
 }
 
-/// The `Execution` service over a [`Cache`] and a [`Dispatch`].
+/// Drives the shared progress tick: see [`progress`].
 #[derive(Debug)]
-pub struct ExecutionService<M, O, D> {
-    cache: Arc<Cache<M, O>>,
+pub struct ProgressTicker {
+    every: Duration,
+    tick: watch::Sender<u64>,
+}
+
+impl ProgressTicker {
+    /// Ticks every interval, for as long as it is polled; never, for a zero interval.
+    /// One timer serves every open stream, however many: a stream holds a receiver and
+    /// wakes once per tick.
+    pub async fn run(self) {
+        if self.every.is_zero() {
+            std::future::pending::<()>().await;
+        }
+        let mut interval = tokio::time::interval_at(Instant::now() + self.every, self.every);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            self.tick.send_modify(|n| *n = n.wrapping_add(1));
+        }
+    }
+}
+
+/// The `Execution` service's side of a [`ProgressTicker`]: each tick makes every open
+/// stream send its operation again.
+#[derive(Clone, Debug)]
+pub struct Progress(watch::Receiver<u64>);
+
+impl Progress {
+    /// A `Progress` that never ticks (streams send only the stage changes).
+    #[must_use]
+    pub fn off() -> Self {
+        Self(watch::channel(0).1)
+    }
+
+    /// Completes at the next tick; never, if there is no ticker (or it is dropped).
+    pub(crate) async fn tick(&mut self) {
+        if self.0.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// A ticker that fires every `every` once run, and the [`Progress`] to hand the
+/// `Execution` service ([`ExecutionService::with_progress`]). A zero `every` is no
+/// progress: the ticker never fires.
+#[must_use]
+pub fn progress(every: Duration) -> (ProgressTicker, Progress) {
+    let (tick, rx) = watch::channel(0);
+    (ProgressTicker { every, tick }, Progress(rx))
+}
+
+/// An Execute that spends this long before its first stream item is logged at `WARN`.
+pub const PRESUBMIT_WARN: Duration = Duration::from_secs(10);
+
+/// One Execute's time before its first stream item, from the handler's start: observed
+/// in `kbf_execute_presubmit_seconds` when dropped, whether the call answered, failed
+/// or was dropped by its caller (a stalled call the client gave up on is the one the
+/// operator needs to see), and logged at `WARN` when it took [`PRESUBMIT_WARN`] or more.
+struct Presubmit<'a> {
+    metrics: &'a CacheMetrics,
+    started: Instant,
+    /// What the call is about, once its request is read; empty before (a call denied or
+    /// dropped while authorizing).
+    action: String,
+    instance: String,
+    invocation: String,
+    walk: Duration,
+    submit: Duration,
+    dir_reads: u64,
+    /// Of a walk over a store: Directories skipped as verified, the time reading
+    /// Directories and the time asking about files, the FindMissing calls and the files.
+    dirs_skipped: u64,
+    /// With the content cache: Directories taken without a read, and the cached ones
+    /// put to FindMissing.
+    dir_cache_hits: u64,
+    dirs_present_checked: u64,
+    dirs: Duration,
+    files: Duration,
+    file_asks: u64,
+    files_checked: u64,
+    _in_flight: crate::metrics::Raised<'a>,
+}
+
+impl<'a> Presubmit<'a> {
+    fn begin(metrics: &'a CacheMetrics) -> Self {
+        Self {
+            metrics,
+            started: Instant::now(),
+            action: String::new(),
+            instance: String::new(),
+            invocation: String::new(),
+            walk: Duration::ZERO,
+            submit: Duration::ZERO,
+            dir_reads: 0,
+            dirs_skipped: 0,
+            dir_cache_hits: 0,
+            dirs_present_checked: 0,
+            dirs: Duration::ZERO,
+            files: Duration::ZERO,
+            file_asks: 0,
+            files_checked: 0,
+            _in_flight: metrics.execute_presubmit_in_flight.raise(),
+        }
+    }
+}
+
+impl Drop for Presubmit<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        self.metrics.execute_presubmit.observe_duration(elapsed);
+        if elapsed < PRESUBMIT_WARN {
+            return;
+        }
+        tracing::warn!(
+            action = %self.action,
+            instance = %self.instance,
+            invocation = %self.invocation,
+            presubmit_ms = elapsed.as_millis(),
+            walk_ms = self.walk.as_millis(),
+            submit_ms = self.submit.as_millis(),
+            dir_reads = self.dir_reads,
+            dirs_skipped = self.dirs_skipped,
+            dir_cache_hits = self.dir_cache_hits,
+            dirs_present_checked = self.dirs_present_checked,
+            dirs_ms = self.dirs.as_millis(),
+            files_ms = self.files.as_millis(),
+            file_asks = self.file_asks,
+            files_checked = self.files_checked,
+            "Execute spent {PRESUBMIT_WARN:?} or more before its first operation"
+        );
+    }
+}
+
+/// The `Execution` service over a [`Backend`] (a cache, or a storage node) and a
+/// [`Dispatch`].
+#[derive(Debug)]
+pub struct ExecutionService<D> {
+    cache: Backend,
     dispatch: Arc<D>,
     closing: Closing,
+    progress: Progress,
     authorizers: Arc<Authorizers>,
     recorder: Recorder,
+    /// The memory an `action` that names no size books, in bytes.
+    default_memory: u64,
+    /// The OS and architecture of an `action` that names neither.
+    default_platform: DefaultPlatform,
+    /// Holds the log lines of [`Self::default_platform`] to a few a minute.
+    defaulted_log: Quiet,
 }
 
 /// The gRPC path of Execute, as calls are logged.
@@ -248,23 +472,52 @@ const EXECUTE: &str = "/build.bazel.remote.execution.v2.Execution/Execute";
 /// The gRPC path of WaitExecution, as calls are logged.
 const WAIT_EXECUTION: &str = "/build.bazel.remote.execution.v2.Execution/WaitExecution";
 
-impl<M, O, D> ExecutionService<M, O, D> {
-    /// The service over `cache` and `dispatch`, whose streams end when `closing` does,
-    /// each call authorized by `authorizers`.
+impl<D> ExecutionService<D> {
+    /// The service over `cache` (a cache or a [`Backend`]) and `dispatch`, whose
+    /// streams end when `closing` does, each call authorized by `authorizers`.
     #[must_use]
-    pub const fn with_authorizers(
-        cache: Arc<Cache<M, O>>,
+    pub fn with_authorizers(
+        cache: impl Into<Backend>,
         dispatch: Arc<D>,
         closing: Closing,
         authorizers: Arc<Authorizers>,
     ) -> Self {
         Self {
-            cache,
+            cache: cache.into(),
             dispatch,
             closing,
+            progress: Progress::off(),
             authorizers,
             recorder: Recorder::off(),
+            default_memory: DEFAULT_RESOURCES.memory_bytes,
+            default_platform: DefaultPlatform::NONE,
+            defaulted_log: Quiet::default(),
         }
+    }
+
+    /// This service, giving an `action` that names no OS, no architecture and no ISA
+    /// level (and asks for nothing only a Mac reports) the OS and architecture of
+    /// `platform` (instead of none): placement only, the digest is the client's.
+    #[must_use]
+    pub const fn with_default_platform(mut self, platform: DefaultPlatform) -> Self {
+        self.default_platform = platform;
+        self
+    }
+
+    /// This service, booking `bytes` of memory for an `action` that names no size
+    /// (instead of [`DEFAULT_RESOURCES`]): the first rung of the scheduler's ladder.
+    #[must_use]
+    pub const fn with_default_memory(mut self, bytes: u64) -> Self {
+        self.default_memory = bytes;
+        self
+    }
+
+    /// This service, each open stream sent its operation again at every tick of
+    /// `progress`.
+    #[must_use]
+    pub fn with_progress(mut self, progress: Progress) -> Self {
+        self.progress = progress;
+        self
     }
 
     /// This service, each Execute that carries an invocation id sent to `recorder`:
@@ -281,10 +534,8 @@ impl<M, O, D> ExecutionService<M, O, D> {
 pub type OperationStream = Pin<Box<dyn Stream<Item = Result<Operation, Status>> + Send>>;
 
 #[tonic::async_trait]
-impl<M, O, D> Execution for ExecutionService<M, O, D>
+impl<D> Execution for ExecutionService<D>
 where
-    M: MetaLog,
-    O: ObjectStore + 'static,
     D: Dispatch,
 {
     type ExecuteStream = OperationStream;
@@ -294,6 +545,15 @@ where
         &self,
         request: GrpcRequest<ExecuteRequest>,
     ) -> Result<Response<OperationStream>, Status> {
+        if self.closing.draining() {
+            return Err(Status::unavailable(
+                "the server is draining and takes no new Execute; try again (Buck2 retries \
+                 this, and the next attempt can reach another frontend)",
+            ));
+        }
+        let mut window = Presubmit::begin(self.cache.metrics());
+        let open = self.cache.metrics().execute.execute();
+        self.cache.metrics().execute.started.add(1);
         let caller = kbf_auth::metadata(&request);
         let call = crate::request_metadata::call_metadata(&request);
         let request = request.into_inner();
@@ -305,7 +565,7 @@ where
             caller = %caller.public_display(),
             invocation = call.invocation_display()
         );
-        self.execute_authorized(request, &call, &caller)
+        self.execute_authorized(request, &call, &caller, &mut window, open)
             .instrument(span)
             .await
     }
@@ -324,25 +584,38 @@ where
         };
         let execute = &*self.authorizers.execute;
         authorize(execute, &caller, WAIT_EXECUTION, &ticket.instance).await?;
-        Ok(Response::new(operations(ticket, self.closing.clone())))
+        let open = self.cache.metrics().execute.wait();
+        Ok(Response::new(operations(
+            ticket,
+            self.closing.clone(),
+            self.progress.clone(),
+            open,
+        )))
     }
 }
 
-impl<M, O, D> ExecutionService<M, O, D>
+impl<D> ExecutionService<D>
 where
-    M: MetaLog,
-    O: ObjectStore + 'static,
     D: Dispatch,
 {
-    /// Execute, once authorized: an action-cache hit, or the operation's stream.
+    /// Execute, once authorized: an action-cache hit, or the operation's stream. `open`
+    /// is the call's metrics guard (started before authorization); it ends with the
+    /// call on an error or a cache hit, and with the stream otherwise.
     async fn execute_authorized(
         &self,
         request: ExecuteRequest,
         metadata: &CallMetadata,
         caller: &AuthenticationMetadata,
+        window: &mut Presubmit<'_>,
+        mut open: OpenExecute,
     ) -> Result<Response<OperationStream>, Status> {
         wire::check_digest_function(request.digest_function)?;
         let action = wire::digest(request.action_digest.as_ref())?;
+        window.action = action.to_string();
+        window.instance.clone_from(&request.instance_name);
+        metadata
+            .invocation_display()
+            .clone_into(&mut window.invocation);
         if !request.skip_cache_lookup
             && let Some((stored, result)) = self.cache.action_result(&action).await?
         {
@@ -351,6 +624,8 @@ where
                 action.hash_hex(),
                 action.size_bytes
             );
+            // A result is not an excuse for a platform kbf refuses.
+            self.refuse_platform_of(&action).await?;
             tracing::debug!(%action, "answered from the action cache");
             let instance = &request.instance_name;
             self.recorder
@@ -358,7 +633,7 @@ where
                     action,
                     answer: ExecuteAnswer::Cached {
                         name: name.clone(),
-                        result: Box::new(listing(stored, &result)),
+                        result: Box::new(listing(Some(stored), &result)),
                     },
                 });
             let done = operation(
@@ -367,29 +642,42 @@ where
                 &Stage::Done(Finished::Ran(Box::new(result))),
                 true,
             );
+            open.ok();
             return Ok(Response::new(Box::pin(stream::iter([Ok(done)]))));
         }
         let instance = request.instance_name;
-        let (mut submission, command) = self.submission(instance.clone(), action).await?;
+        let (mut submission, command) = self.submission(instance.clone(), action, window).await?;
         submission.call =
             ExecuteCall::new(&self.recorder, metadata, caller, &instance, action, command);
-        let ticket = self.dispatch.submit(submission)?;
+        submission.described.label = ActionLabel::sent(metadata);
+        let submitting = Instant::now();
+        open.dispatching();
+        let submitted = self.dispatch.submit(submission);
+        open.dispatched(submitted.is_ok());
+        window.submit = submitting.elapsed();
+        self.cache
+            .metrics()
+            .execute_submit
+            .observe_duration(window.submit);
+        let ticket = submitted?;
         tracing::debug!(%action, operation = %ticket.name, "submitted");
-        Ok(Response::new(operations(ticket, self.closing.clone())))
+        Ok(Response::new(operations(
+            ticket,
+            self.closing.clone(),
+            self.progress.clone(),
+            open,
+        )))
     }
 }
 
-impl<M, O, D> ExecutionService<M, O, D>
-where
-    M: MetaLog,
-    O: ObjectStore,
-{
+impl<D> ExecutionService<D> {
     /// Reads the action and checks its inputs are all held; the scheduler's request,
     /// with no call to record yet, and the Command digest the action names.
     async fn submission(
         &self,
         instance: String,
         action: Digest,
+        window: &mut Presubmit<'_>,
     ) -> Result<(Submission, Digest), Status> {
         let Some(bytes) = self.read_input(&action).await? else {
             return Err(missing(&[action]));
@@ -397,6 +685,12 @@ where
         let decoded = Action::decode(bytes).map_err(|e| {
             Status::invalid_argument(format!("action {action} does not decode: {e}"))
         })?;
+        // A platform the Action carries is refused before anything else is read.
+        let own = if platform(&decoded, None).is_some() {
+            Some(self.place(&decoded, None)?)
+        } else {
+            None
+        };
         let command_digest = required(decoded.command_digest.as_ref(), "command_digest")?;
         let root = required(decoded.input_root_digest.as_ref(), "input_root_digest")?;
 
@@ -410,60 +704,163 @@ where
                 None
             }
         };
-        absent.extend(self.missing_inputs(root).await?);
+        // And a Command's, as soon as the Command is read: before the input tree is walked.
+        let placed = match own {
+            Some(placed) => placed,
+            None => self.place(&decoded, command.as_ref())?,
+        };
+        let walking = Instant::now();
+        let walked = self.cache.walk_inputs(root).await;
+        window.walk = walking.elapsed();
+        self.cache
+            .metrics()
+            .execute_walk
+            .observe_duration(window.walk);
+        let walked = walked?;
+        window.dir_reads += walked.dirs_read;
+        window.dirs_skipped += walked.dirs_skipped;
+        window.dir_cache_hits += walked.dir_cache_hits;
+        window.dirs_present_checked += walked.dirs_present_checked;
+        window.dirs += walked.dirs_time;
+        window.files += walked.files_time;
+        window.file_asks += walked.file_asks;
+        window.files_checked += walked.files_checked;
+        self.observe_phases(&walked);
+        absent.extend(walked.absent);
         if !absent.is_empty() {
+            tracing::warn!(
+                %action,
+                count = absent.len(),
+                first = %absent
+                    .iter()
+                    .take(REFUSED_LOGGED)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "execute refused: input blob(s) are not in the CAS"
+            );
             return Err(missing(&absent));
         }
 
-        let platform = properties(platform(&decoded, command.as_ref()))?;
-        let kind = lease_kind(&platform)?;
-        let booked = booking(&platform, kind)?;
-        let needs = needs(&platform)?;
-        let gpus = mac_gpus(kind, gpus(&platform)?, &needs)?;
-        device_kind(kind, &needs)?;
+        let Placed {
+            kind,
+            booked,
+            needs,
+            defaulted,
+        } = placed;
+        if defaulted {
+            self.log_defaulted(&action);
+        }
         let submission = Submission {
             request: Request {
                 key: ActionKey { instance, action },
                 qos: Qos::Ci,
                 kind,
-                resources: booked.with_gpus(gpus),
+                resources: booked,
                 hermetic: true,
                 do_not_cache: decoded.do_not_cache,
                 needs,
             },
             call: None,
+            // The Command is here: an absent one returned MISSING above.
+            described: command.map(Described::of).unwrap_or_default(),
         };
         Ok((submission, command_digest))
     }
 
-    /// Every blob of the input tree under `root` that is not held: directories that
-    /// cannot be read, and files FindMissingBlobs reports.
-    async fn missing_inputs(&self, root: Digest) -> Result<Vec<Digest>, Status> {
-        let mut absent = Vec::new();
-        let mut files = BTreeSet::new();
-        let mut seen = BTreeSet::from([root]);
-        let mut queue = VecDeque::from([root]);
-        while let Some(digest) = queue.pop_front() {
-            let Some(bytes) = self.read_input(&digest).await? else {
-                absent.push(digest);
-                continue;
-            };
-            let directory = Directory::decode(bytes).map_err(|e| {
-                Status::invalid_argument(format!("input directory {digest} does not decode: {e}"))
-            })?;
-            for file in &directory.files {
-                files.insert(wire::digest(file.digest.as_ref())?);
-            }
-            for child in &directory.directories {
-                let child = wire::digest(child.digest.as_ref())?;
-                if seen.insert(child) {
-                    queue.push_back(child);
-                }
-            }
+    /// What the platform of an action asks of the scheduler, or the status that refuses
+    /// it: INVALID_ARGUMENT for a malformed platform, FAILED_PRECONDITION for one no
+    /// daemon can run. Reads nothing: it runs before any input of the action is read,
+    /// and for a cached result too ([`Self::refuse_platform_of`]).
+    fn place(&self, action: &Action, command: Option<&Command>) -> Result<Placed, Status> {
+        let platform = properties(platform(action, command))?;
+        let kind = lease_kind(&platform)?;
+        let booked = booking(&platform, kind, self.default_memory)?;
+        let asked = needs(&platform)?;
+        let (needs, defaulted) = match self.default_platform.apply(&asked) {
+            Some(placed) => (placed, true),
+            None => (asked, false),
+        };
+        let gpus = mac_gpus(kind, gpus(&platform)?, &needs)?;
+        device_kind(kind, &needs)?;
+        Ok(Placed {
+            kind,
+            booked: booked.with_gpus(gpus),
+            needs,
+            defaulted,
+        })
+    }
+
+    /// Logs, at most a few a minute, that the default platform placed `action`
+    /// ([`DefaultPlatform::apply`]). Placement only: the action's digest is the client's.
+    fn log_defaulted(&self, action: &Digest) {
+        if let Some(held_back) = self.defaulted_log.turn() {
+            tracing::info!(
+                %action,
+                default_platform = %self.default_platform,
+                held_back,
+                "platform defaulted: the action named no OS and no architecture"
+            );
         }
-        let files: Vec<Digest> = files.into_iter().collect();
-        absent.extend(self.cache.find_missing(&files).await?);
-        Ok(absent)
+    }
+
+    /// Refuses, for an Execute the action cache answers, the platform of the action that
+    /// cached result is for, if the action and its Command are in the CAS: the Action's
+    /// platform, else the Command's, as an Execute that ran would have read it. An action
+    /// or Command the CAS does not hold, or that does not decode, is not refused here (an
+    /// Execute that runs says so); a store that fails is the call's error.
+    async fn refuse_platform_of(&self, action: &Digest) -> Result<(), Status> {
+        let Some(decoded) = self.held::<Action>(action).await? else {
+            return Ok(());
+        };
+        let command = match decoded
+            .command_digest
+            .as_ref()
+            .map(|d| wire::digest(Some(d)))
+        {
+            Some(Ok(digest)) if platform(&decoded, None).is_none() => {
+                self.held::<Command>(&digest).await?
+            }
+            _ => None,
+        };
+        self.place(&decoded, command.as_ref()).map(drop)
+    }
+
+    /// The message `digest` names, if the CAS holds it and it decodes.
+    async fn held<T: prost::Message + Default>(
+        &self,
+        digest: &Digest,
+    ) -> Result<Option<T>, Status> {
+        Ok(self
+            .read_input(digest)
+            .await?
+            .and_then(|bytes| T::decode(bytes).ok()))
+    }
+
+    /// The phases of a walk over a store in the metrics (a walk by the in-process cache
+    /// has none to report: its figures are zero and it counts its own).
+    fn observe_phases(&self, walked: &crate::input_tree::Walked) {
+        let m = self.cache.metrics();
+        m.execute_walk_dirs_read.add(walked.dirs_read);
+        m.execute_walk_dirs_skipped.add(walked.dirs_skipped);
+        m.execute_walk_file_asks.add(walked.file_asks);
+        m.execute_walk_files_checked.add(walked.files_checked);
+        for took in &walked.read_times {
+            m.execute_walk_dir_read.observe_duration(*took);
+        }
+        m.execute_dir_cache_hits.add(walked.dir_cache_hits);
+        m.execute_dir_cache_misses.add(walked.dir_cache_misses);
+        m.execute_dir_cache_merged.add(walked.dir_cache_merged);
+        m.execute_dir_cache_evictions.add(walked.dir_cache_evicted);
+        m.execute_dir_cache_present_checked
+            .add(walked.dirs_present_checked);
+        if walked.phased {
+            m.execute_dir_cache_bytes.set(walked.dir_cache_bytes);
+        }
+        if walked.phased {
+            m.execute_walk_dirs.observe_duration(walked.dirs_time);
+            m.execute_walk_files.observe_duration(walked.files_time);
+        }
     }
 
     /// A blob's bytes, or `None` if it is not held. Anything else (unreachable, store
@@ -471,10 +868,20 @@ where
     async fn read_input(&self, digest: &Digest) -> Result<Option<Bytes>, Status> {
         match self.cache.read_blob(digest).await {
             Ok(bytes) => Ok(Some(bytes)),
-            Err(CacheError::NotFound(_)) => Ok(None),
+            Err(StorageError::NotFound(_)) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// What an action's platform asks of the scheduler ([`ExecutionService::place`]).
+struct Placed {
+    kind: LeaseKind,
+    /// The resources to book, GPUs included.
+    booked: Resources,
+    needs: kbf_caps::Request,
+    /// Whether the default platform completed `needs`.
+    defaulted: bool,
 }
 
 /// The action's platform. REAPI 2.2 moved it into the `Action`; older clients set it
@@ -551,13 +958,18 @@ fn mac_gpus(kind: LeaseKind, gpus: u64, needs: &kbf_caps::Request) -> Result<u64
     Ok(0)
 }
 
-/// What the lease books: [`DEFAULT_RESOURCES`], with `kbf-book-cpus` whole cores and
+/// What the lease books: one core and `default_memory` bytes for an `action` (the least
+/// worker, [`LEAST_WORKER`], for another kind), with `kbf-book-cpus` whole cores and
 /// `kbf-book-mem-gib` GiB in place of the default where the platform names them, or
 /// INVALID_ARGUMENT for a value that is not a whole number of at least 1 in plain
 /// digits ([`starts_plain`]), one too large to book, or either key on a `whole_machine`
 /// lease.
-fn booking(platform: &Platform, kind: LeaseKind) -> Result<Resources, Status> {
-    let mut booked = DEFAULT_RESOURCES;
+fn booking(platform: &Platform, kind: LeaseKind, default_memory: u64) -> Result<Resources, Status> {
+    let mut booked = if kind == LeaseKind::Action {
+        Resources::new(DEFAULT_RESOURCES.cpu_millis, default_memory)
+    } else {
+        LEAST_WORKER
+    };
     for (key, unit, slot) in [
         (BOOK_CPUS_KEY, 1_000, &mut booked.cpu_millis),
         (BOOK_MEM_GIB_KEY, 1 << 30, &mut booked.memory_bytes),
@@ -640,6 +1052,9 @@ fn lease_kind(platform: &Platform) -> Result<LeaseKind, Status> {
         })
 }
 
+/// How many of the digests an Execute refused for missing inputs a log line names.
+const REFUSED_LOGGED: usize = 5;
+
 /// FAILED_PRECONDITION with one `MISSING` violation per blob, as REAPI asks.
 fn missing(digests: &[Digest]) -> Status {
     let status = missing_status(digests);
@@ -686,7 +1101,7 @@ fn any(type_name: &str, value: Vec<u8>) -> Any {
 }
 
 /// The operation `name` at `stage`.
-fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool) -> Operation {
+pub(crate) fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool) -> Operation {
     let mut partial = None;
     let (value, result) = match stage {
         Stage::Queued => (execution_stage::Value::Queued, None),
@@ -752,19 +1167,28 @@ fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool) -> Operat
 /// The operation as its stage changes: the stage now, then each change, ending after
 /// the done operation. A stage that stops changing before it is done (the operation was
 /// abandoned), or `closing` closing first (the server is going away), ends the stream
-/// UNAVAILABLE. A change already there is sent before a close is noticed.
-fn operations(ticket: Ticket, closing: Closing) -> OperationStream {
+/// UNAVAILABLE. A change already there is sent before a close is noticed. At every tick
+/// of `progress` the operation is sent again at its current stage. `open` (the call's
+/// metrics guard) is dropped with the stream, and told of each stage read.
+fn operations(
+    ticket: Ticket,
+    closing: Closing,
+    progress: Progress,
+    mut open: OpenExecute,
+) -> OperationStream {
+    // Before the first item is read, so a stream the client has not yet polled is open.
+    open.streaming();
     let Ticket {
         name,
         action,
         stage,
         ..
     } = ticket;
-    let state = Some((stage, closing, true));
+    let state = Some((stage, closing, progress, open, true));
     Box::pin(stream::unfold(state, move |state| {
         let name = name.clone();
         async move {
-            let (mut stage, mut closing, first) = state?;
+            let (mut stage, mut closing, mut progress, mut open, first) = state?;
             if !first {
                 let gone = tokio::select! {
                     biased;
@@ -774,14 +1198,21 @@ fn operations(ticket: Ticket, closing: Closing) -> OperationStream {
                     () = closing.closed() => Some(format!(
                         "the server is shutting down; operation {name} ends here, Execute it again"
                     )),
+                    () = progress.tick() => None,
                 };
                 if let Some(why) = gone {
                     return Some((Err(Status::unavailable(why)), None));
                 }
             }
             let now = stage.borrow_and_update().clone();
-            let next = (!matches!(now, Stage::Done(_))).then_some((stage, closing, false));
+            let done = matches!(now, Stage::Done(_));
+            open.update(matches!(now, Stage::Queued | Stage::Waiting(_)), done);
+            let next = (!done).then_some((stage, closing, progress, open, false));
             Some((Ok(operation(&name, &action, &now, false)), next))
         }
     }))
 }
+
+#[cfg(test)]
+#[path = "execution_progress_tests.rs"]
+mod progress_tests;

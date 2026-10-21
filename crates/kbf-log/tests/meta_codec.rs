@@ -221,7 +221,8 @@ fn every_variant_has_its_golden_bytes() {
 
 /// Every format-1 `Command` variant is listed in the golden set, so a variant added to
 /// `kbf_meta::Command` without golden bytes fails here (the match is exhaustive). The
-/// format-2 tier commands have theirs in `tier_codec.rs`.
+/// format-2 tier commands have theirs in `tier_codec.rs`, format 3's `EvictObjects` in
+/// `evict_codec.rs`, format 4's `SetWriter` in `writer_codec.rs`.
 #[test]
 fn the_golden_set_names_every_variant() {
     let mut seen = [false; 9];
@@ -240,7 +241,13 @@ fn the_golden_set_names_every_variant() {
             | Command::PutStaged { .. }
             | Command::SealStaged { .. }
             | Command::ObjectFlushed { .. }
-            | Command::FlushConflict { .. } => panic!("a format-2 command in format 1's set"),
+            | Command::FlushConflict { .. }
+            | Command::EvictObjects { .. }
+            | Command::SetWriter(_)
+            | Command::AdoptSegment { .. }
+            | Command::RebuildProgress { .. }
+            | Command::RebuildDone
+            | Command::ReseatStaged { .. } => panic!("a later format's command in format 1's set"),
         };
         seen[i] = true;
     }
@@ -379,7 +386,11 @@ fn pd(n: u8) -> proto::Digest {
 }
 
 fn pobject() -> Option<proto::ObjectId> {
-    Some(proto::ObjectId { epoch: 1, seq: 2 })
+    Some(proto::ObjectId {
+        epoch: 1,
+        seq: 2,
+        ..proto::ObjectId::default()
+    })
 }
 
 fn put_action(role: i32, function: i32) -> proto::meta_command::Command {
@@ -623,16 +634,26 @@ fn malformed_values_are_refused() {
 /// Catches: an encoder or decoder that ignores the committed format, so a binary would
 /// write or read an encoding the log does not allow.
 #[test]
-fn only_formats_1_and_2_are_written_or_read() {
+fn only_formats_1_to_5_are_written_or_read() {
     let entry = LogCommand::Meta(Command::Collect);
     let bytes = encode(Format::V1, &entry).expect("format 1");
-    for format in [Format::new(0), Format::new(3), Format::new(u32::MAX)] {
+    for format in [Format::new(0), Format::new(6), Format::new(u32::MAX)] {
         assert_eq!(encode(format, &entry), Err(EncodeError::Format(format)));
         assert_eq!(decode(format, &bytes), Err(DecodeError::Format(format)));
     }
-    assert_eq!((Format::V1.get(), Format::V2.get()), (1, 2));
-    assert_eq!(decode(Format::new(1), &bytes), Ok(entry.clone()));
-    assert_eq!(decode(Format::new(2), &bytes), Ok(entry));
+    assert_eq!(
+        (
+            Format::V1.get(),
+            Format::V2.get(),
+            Format::V3.get(),
+            Format::V4.get(),
+            Format::V5.get()
+        ),
+        (1, 2, 3, 4, 5)
+    );
+    for n in 1..=5 {
+        assert_eq!(decode(Format::new(n), &bytes), Ok(entry.clone()), "{n}");
+    }
 }
 
 /// Catches: a decoder that accepts bytes `encode` would not write, so one value would

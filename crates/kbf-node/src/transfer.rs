@@ -5,7 +5,9 @@
 //! writes blobs through the same one, so the in-flight limit and the byte budget hold
 //! for the whole process, over one HTTP/2 connection to `--cas`.
 
-use kbf_transfer::{DEFAULT_IN_FLIGHT, DEFAULT_SEGMENT_STREAMS, TransferConfig, Transfers};
+use kbf_transfer::{
+    DEFAULT_IN_FLIGHT, DEFAULT_SEGMENT_STREAMS, DEFAULT_SEGMENT_UPLOADS, TransferConfig, Transfers,
+};
 use tonic::transport::Endpoint;
 
 use super::{Cli, Error};
@@ -47,6 +49,12 @@ pub(crate) struct TransferArgs {
     /// of a segment-range read.
     #[arg(long, default_value_t = DEFAULT_SEGMENT_STREAMS as u64, value_parser = clap::value_parser!(u64).range(1..))]
     pub segment_upload_streams: u64,
+    /// How many segment uploads of one action's outputs are in flight at once: the
+    /// server checks and stages one upload while the next are sending
+    /// (`docs/design/write-path.md`, section 4.1). Their `PutRange` calls still take
+    /// permits of `--transfer-in-flight`'s uploads' share.
+    #[arg(long, default_value_t = DEFAULT_SEGMENT_UPLOADS as u64, value_parser = clap::value_parser!(u64).range(1..))]
+    pub segment_uploads_in_flight: u64,
 }
 
 impl TransferArgs {
@@ -62,13 +70,14 @@ impl TransferArgs {
             stream_window_bytes: self.transfer_stream_window_bytes,
             retries: self.transfer_retries,
             segment_streams: size(self.segment_upload_streams),
+            segment_uploads: size(self.segment_uploads_in_flight),
         }
     }
 }
 
-/// The engine over the blob service `--cas` names, over mutual TLS with the daemon's
-/// own TLS files and the daemon's HTTP/2 keepalive. Connects on first use.
-pub(crate) fn engine(cli: &Cli) -> Result<Transfers, Error> {
+/// The endpoint of the blob service `--cas` names, over mutual TLS with the daemon's own
+/// TLS files and the daemon's HTTP/2 keepalive. Nothing connects until it is used.
+pub(crate) fn endpoint(cli: &Cli) -> Result<Endpoint, Error> {
     let url = cli
         .cas
         .clone()
@@ -82,10 +91,12 @@ pub(crate) fn engine(cli: &Cli) -> Result<Transfers, Error> {
     }
     let config = DaemonConfig::from_args(&cli.daemon);
     let endpoint = Endpoint::from_shared(url)?.tls_config(config.tls.load()?)?;
-    Ok(Transfers::new(
-        config.keep_alive.apply(endpoint),
-        cli.transfer.config(),
-    ))
+    Ok(config.keep_alive.apply(endpoint))
+}
+
+/// The engine over the blob service `--cas` names ([`endpoint`]). Connects on first use.
+pub(crate) fn engine(cli: &Cli) -> Result<Transfers, Error> {
+    Ok(Transfers::new(endpoint(cli)?, cli.transfer.config()))
 }
 
 #[cfg(test)]
@@ -127,6 +138,7 @@ mod tests {
             "--transfer-stream-window-bytes=100000",
             "--transfer-retries=5",
             "--segment-upload-streams=9",
+            "--segment-uploads-in-flight=6",
         ])
         .expect("flags");
         let expected = TransferConfig {
@@ -138,6 +150,7 @@ mod tests {
             stream_window_bytes: 100_000,
             retries: 5,
             segment_streams: 9,
+            segment_uploads: 6,
         };
         assert_eq!(cli.transfer.config(), expected);
         for refused in [
@@ -145,6 +158,7 @@ mod tests {
             "--transfer-chunk-bytes=0",
             "--transfer-stream-window-bytes=100",
             "--segment-upload-streams=0",
+            "--segment-uploads-in-flight=0",
         ] {
             assert!(parse(&[refused]).is_err(), "{refused} accepted");
         }
@@ -169,9 +183,165 @@ mod tests {
             "--cas=https://127.0.0.1:1".to_owned(),
         ])
         .expect("flags");
-        let mut node = Node::default();
-        let first = node.transfers(&cli).expect("engine");
-        let second = node.transfers(&cli).expect("engine");
+        let mut node = Node::new(Box::new(super::super::remote));
+        let first = node.plane(&cli).expect("engine");
+        let second = node.plane(&cli).expect("engine");
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// Catches the farm's data plane (`kbf-daemon`'s `start`) not being built from the
+    /// daemon's flags: it is made once and shared by every runtime like the engine, and
+    /// TLS files that cannot be read fail the start rather than the first storage call.
+    #[tokio::test]
+    async fn the_farm_plane_is_one_per_process_and_needs_readable_tls_files() {
+        let dir = super::super::tests::scratch("transfer-farm");
+        super::super::tests::tls_files(&dir);
+        let at = |name: &str| format!("{}", dir.join(name).display());
+        let cli = |ca: &str| {
+            Cli::try_parse_from([
+                "kbf-daemon".to_owned(),
+                "--server=https://front:7070".to_owned(),
+                format!("--ca-cert={ca}"),
+                format!("--cert={}", at("node.pem")),
+                format!("--key={}", at("node.key")),
+                "--node-id=n1".to_owned(),
+                "--driver=native".to_owned(),
+                "--cas=https://127.0.0.1:1".to_owned(),
+            ])
+            .expect("flags")
+        };
+        let maps = Arc::new(kbf_daemon::MapHolder::new());
+        let held = Arc::clone(&maps);
+        let mut node = Node::new(Box::new(move |cli| {
+            super::super::farm(cli, &held, kbf_daemon::Liveness::default()).map(|(plane, _)| plane)
+        }));
+        let cli_ok = cli(&at("ca.pem"));
+        let first = node.plane(&cli_ok).expect("farm plane");
+        let second = node.plane(&cli_ok).expect("farm plane");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let held = Arc::clone(&maps);
+        let mut unreadable = Node::new(Box::new(move |cli| {
+            super::super::farm(cli, &held, kbf_daemon::Liveness::default()).map(|(plane, _)| plane)
+        }));
+        let why = unreadable
+            .plane(&cli(&at("no-such-ca.pem")))
+            .err()
+            .expect("no CA file")
+            .to_string();
+        assert!(why.contains("no-such-ca.pem"), "{why}");
+    }
+
+    /// Catches the storage-and-daemon plane (`kbf-daemon`'s `start_member`) not being built
+    /// from the daemon's flags: TLS files that cannot be read fail the start rather than the
+    /// first call to another member.
+    #[tokio::test]
+    async fn the_member_plane_needs_readable_tls_files() {
+        let dir = super::super::tests::scratch("transfer-member");
+        super::super::tests::tls_files(&dir);
+        let at = |name: &str| format!("{}", dir.join(name).display());
+        let cli = |ca: &str| {
+            Cli::try_parse_from([
+                "kbf-daemon".to_owned(),
+                "--server=https://front:7070".to_owned(),
+                format!("--ca-cert={ca}"),
+                format!("--cert={}", at("node.pem")),
+                format!("--key={}", at("node.key")),
+                "--node-id=n1".to_owned(),
+                "--driver=native".to_owned(),
+                format!("--data-dir={}", dir.display()),
+                format!("--xcode-apps={}", dir.join("Applications").display()),
+            ])
+            .expect("flags")
+        };
+        let argv = [
+            "storage".to_owned(),
+            "--storage-listen=127.0.0.1:0".to_owned(),
+            format!("--cold-store=file://{}", dir.join("cold").display()),
+            format!("--meta-dir={}", dir.join("meta").display()),
+        ];
+        let matches = kbf_server::storage_node::command().get_matches_from(argv);
+        let flags = kbf_server::storage_node::parse(&matches).expect("the storage flags");
+        let half = kbf_server::storage_half::start(&flags, || Ok(std::future::pending::<()>()))
+            .await
+            .expect("the storage half starts");
+        let local = kbf_daemon::LocalMember::new(half.addr.to_string(), half.in_process());
+        // `start_member` builds the plane when the native driver is set up, on a thread of
+        // its own: dropping the daemon's runtime in the test's would panic.
+        let start = |ca: String, local: kbf_daemon::LocalMember| {
+            let cli = cli(&ca);
+            tokio::task::spawn_blocking(move || {
+                super::super::start_member(&cli, local)
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+        };
+        start(at("ca.pem"), local.clone())
+            .await
+            .expect("joined")
+            .expect("the member plane");
+        let why = start(at("no-such-ca.pem"), local)
+            .await
+            .expect("joined")
+            .expect_err("no CA file");
+        assert!(why.contains("no-such-ca.pem"), "{why}");
+    }
+
+    /// Catches `start_member` trying its own member's address among the storage network
+    /// checks (it is served in-process, and its listener may not be up when the first map
+    /// arrives): a map whose only member is this process's, at an address nothing answers,
+    /// must not end the daemon.
+    #[tokio::test]
+    async fn the_member_daemon_does_not_probe_itself() {
+        use kbf_map::{Map, Member, MemberId, MemberState, Rule};
+
+        let dir = super::super::tests::scratch("transfer-member-reach");
+        super::super::tests::tls_files(&dir);
+        let at = |name: &str| format!("{}", dir.join(name).display());
+        let cli = Cli::try_parse_from([
+            "kbf-daemon".to_owned(),
+            "--server=https://front:7070".to_owned(),
+            format!("--ca-cert={}", at("ca.pem")),
+            format!("--cert={}", at("node.pem")),
+            format!("--key={}", at("node.key")),
+            "--node-id=n1".to_owned(),
+            "--driver=native".to_owned(),
+            format!("--data-dir={}", dir.display()),
+            format!("--xcode-apps={}", dir.join("Applications").display()),
+        ])
+        .expect("flags");
+        let argv = [
+            "storage".to_owned(),
+            "--storage-listen=127.0.0.1:0".to_owned(),
+            format!("--cold-store=file://{}", dir.join("cold").display()),
+            format!("--meta-dir={}", dir.join("meta").display()),
+        ];
+        let matches = kbf_server::storage_node::command().get_matches_from(argv);
+        let flags = kbf_server::storage_node::parse(&matches).expect("the storage flags");
+        let half = kbf_server::storage_half::start(&flags, || Ok(std::future::pending::<()>()))
+            .await
+            .expect("the storage half starts");
+        // A low port nothing listens on: refused at once, were it tried.
+        let own = "127.0.0.1:1".to_owned();
+        let local = kbf_daemon::LocalMember::new(own.clone(), half.in_process());
+        let served = tokio::task::spawn_blocking(move || {
+            let node = super::super::start_member(&cli, local).expect("starts");
+            let member = Member {
+                id: MemberId(1),
+                addr: own,
+                zone: String::new(),
+                weight: 1,
+                state: MemberState::Active,
+                boot: 1,
+            };
+            let map = Map::new(1, vec![member], Rule::Rendezvous, 1, 0, Vec::new());
+            let maps = Arc::clone(&node.reach.as_ref().expect("armed").maps);
+            assert!(maps.offer(map.expect("a map")));
+            let served = node.serve_until(async {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            });
+            assert!(served.is_ok(), "{served:?}");
+        });
+        served.await.expect("its own member is not tried");
     }
 }

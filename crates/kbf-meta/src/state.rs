@@ -2,17 +2,23 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::iter;
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 use kbf_types::{Digest, Effect, FarmTime, StateMachine};
 
 use crate::model::{
     ActionAnswer, ActionRecord, BlobAnswer, Epoch, FindMissing, Generation, Location, LossMark,
-    Miss, ObjectId, Retention, Role, Touch, UnreachableReason,
+    Miss, NodeWriter, ObjectId, Retention, Role, Touch, UnreachableReason, Writer,
 };
 use crate::tier::{ServerId, StagedObject, StagedPut, TierError, TierId};
 
+mod evict;
+mod lost;
+mod rebuild;
 mod staged;
+
+pub use rebuild::{AdoptRefused, Adopted, Rebuild};
 
 /// One committed change to the metadata state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,7 +29,8 @@ pub enum Command {
     /// ([`Applied::Epoch`]). A writer takes one before it names any object.
     AllocEpoch,
     /// Records that `digest`'s bytes are durable at `location`. Counts as a touch.
-    /// Refused if the location's object names an epoch never allocated.
+    /// Refused unless the location's object is one this log's writers may put
+    /// ([`ForeignWriter`]): of an allocated epoch, or of the current node writer.
     PutBlob {
         /// The blob.
         digest: Digest,
@@ -32,7 +39,7 @@ pub enum Command {
     },
     /// Records several blobs at once, as one [`Command::PutBlob`] each in order (a
     /// digest listed twice is a duplicate of its first copy). All or nothing: if any
-    /// location names an epoch never allocated, none is recorded.
+    /// location is refused as [`Command::PutBlob`] refuses it, none is recorded.
     PutBlobs(Vec<(Digest, Location)>),
     /// Writes the action-cache entry for `action`, replacing any earlier one.
     PutAction {
@@ -48,7 +55,7 @@ pub enum Command {
     /// A read could not use this object, for `reason`. An object already marked
     /// [`UnreachableReason::Corrupt`] stays corrupt. The mark's [`Generation`] becomes
     /// the log index of this entry, whether or not the reason rose. Refused if the
-    /// object names an epoch never allocated.
+    /// object's writer is not one this log knows ([`ForeignWriter`]).
     ObjectUnreachable {
         /// The object.
         object: ObjectId,
@@ -58,7 +65,7 @@ pub enum Command {
     /// The object is reachable again: its mark is cleared, whatever its reason, if the
     /// mark's generation is still `generation`. A mark stamped since (a newer
     /// [`Command::ObjectUnreachable`]) is kept, and so is the state: the command is then
-    /// a no-op. Refused if the object names an epoch never allocated.
+    /// a no-op. Refused if the object's writer is not one this log knows.
     ObjectReachable {
         /// The object.
         object: ObjectId,
@@ -106,11 +113,81 @@ pub enum Command {
         object: ObjectId,
     },
     /// The store holds different bytes under a sealed object's key: the object stays
-    /// staged and is read from its block, and the flusher stops retrying it.
+    /// staged and is read from its block. Builds before [`Command::ReseatStaged`]
+    /// committed it and never retried the object; a build that has the reseat commits no
+    /// new one and moves an object in this state.
     FlushConflict {
         /// The object.
         object: ObjectId,
     },
+    /// Moves a sealed (or conflicting) staged object's records to another object, in one
+    /// step (write-path.md, section 6.4; format 5). The store holds another object under
+    /// `from`'s key, so its records are staged again under a key of their own: `to` is
+    /// the new object, synced on `tier`, with every record of `from` that is still
+    /// indexed there. Each such blob's index entry moves to `to` (nothing is marked
+    /// unreachable or counted as lost, and the blob is never unavailable), `to` is
+    /// marked staged on `tier` as [`Command::PutStaged`] does it (or, with `stored`, is
+    /// an object the store already holds, and is not staged), the flush order follows
+    /// (every object that waited for `from` waits for `to`, and `to` waits for whatever
+    /// `from` did), and `from` leaves the table. Refused, changing nothing, if `from`
+    /// is not staged on `tier` or still open, if `to` fails the checks of a
+    /// [`Command::PutStaged`] or is staged already, or if a blob indexed at `from` is
+    /// not listed in `to`. A retry of a command that applied is a no-op.
+    ReseatStaged {
+        /// The tier `from` is staged on and `to` was synced on.
+        tier: TierId,
+        /// The object whose key holds another object.
+        from: ObjectId,
+        /// The new object and its records.
+        to: StagedPut,
+        /// `to` is in the store already: it is indexed there and not staged.
+        stored: bool,
+    },
+    /// The store no longer holds `objects`, or is about to delete them: forget what
+    /// they held. Every blob whose current location is in one of them leaves the
+    /// index, then every action-cache entry whose result or closure names a removed
+    /// blob. A blob that healed into another object stays. The objects' unreachable
+    /// marks are cleared, and [`MetaState::losses`] rises once per object that held a
+    /// blob. A staged object is skipped whole: its only copy is its block, not the
+    /// store. An object nothing names changes nothing, so a retry is a no-op.
+    EvictObjects {
+        /// The objects.
+        objects: BTreeSet<ObjectId>,
+    },
+    /// Makes `writer` the current node writer: from now on a put of a node object
+    /// ([`Command::PutBlob`], [`Command::PutBlobs`], [`Command::PutStaged`]) must name
+    /// it, and every other command may name an object of it or of an earlier boot of a
+    /// member set before. Refused if the log has set the same member at this boot or a
+    /// later one ([`StaleWriter`]), so no two processes ever put under one writer. An
+    /// epoch writer's puts are not affected.
+    SetWriter(NodeWriter),
+    /// Indexes the records of a segment the store holds that this log did not write
+    /// (a rebuild of the index from the segments' footers): each `(digest, offset)` of
+    /// `entries` is recorded at `Location { store: CONFIGURED, object, offset }`
+    /// **only if the digest is not indexed**: an entry already held, at a reachable
+    /// object or not, is kept as it is, so a blob written while the rebuild ran is never
+    /// replaced. Adopted entries count as a touch at the farm time they are applied.
+    /// Afterwards the log takes commands naming `object`'s writer
+    /// ([`Command::ObjectUnreachable`] on a read that fails, [`Command::EvictObjects`]).
+    /// Refused ([`AdoptRefused`]) for an object of the current node writer, whose
+    /// objects its own puts index, and for an object of an epoch this log never
+    /// allocated, which a later [`Command::AllocEpoch`] would name again. Format 4.
+    AdoptSegment {
+        /// The segment object.
+        object: ObjectId,
+        /// Its records: digest and offset in the segment.
+        entries: Vec<(Digest, u64)>,
+    },
+    /// The rebuild of the index has handled every object up to and including the one
+    /// whose key is `after`, in key order: a restart resumes after it. A key not after
+    /// the one held, or one after the rebuild is done, changes nothing. Format 4.
+    RebuildProgress {
+        /// The last object key handled.
+        after: String,
+    },
+    /// The rebuild of the index is complete: the index names every object the store
+    /// held when it started. Never undone; a log that has it does not rebuild. Format 4.
+    RebuildDone,
 }
 
 /// What applying a [`Command`] did.
@@ -121,9 +198,9 @@ pub enum Applied {
     /// [`Command::AllocEpoch`]: the new epoch.
     Epoch(Epoch),
     /// [`Command::PutBlob`].
-    Blob(Result<BlobWrite, UnallocatedEpoch>),
+    Blob(Result<BlobWrite, ForeignWriter>),
     /// [`Command::PutBlobs`]: one outcome per blob, in order.
-    Blobs(Result<Vec<BlobWrite>, UnallocatedEpoch>),
+    Blobs(Result<Vec<BlobWrite>, ForeignWriter>),
     /// [`Command::PutAction`].
     Action(Result<(), ActionWriteError>),
     /// [`Command::Touch`]: the entries that were not held when the touch applied (a
@@ -134,14 +211,23 @@ pub enum Applied {
         lost: Touch,
     },
     /// [`Command::ObjectUnreachable`] or [`Command::ObjectReachable`].
-    Marked(Result<(), UnallocatedEpoch>),
+    Marked(Result<(), ForeignWriter>),
     /// [`Command::Collect`].
     Collected(Collected),
     /// [`Command::PutStaged`]: one outcome per blob, object by object, in order.
     Staged(Result<Vec<BlobWrite>, TierError>),
     /// [`Command::AddTier`], [`Command::SealStaged`], [`Command::ObjectFlushed`] or
-    /// [`Command::FlushConflict`].
+    /// [`Command::FlushConflict`] or [`Command::ReseatStaged`].
     Tier(Result<(), TierError>),
+    /// [`Command::EvictObjects`].
+    Evicted(Evicted),
+    /// [`Command::SetWriter`].
+    Writer(Result<(), StaleWriter>),
+    /// [`Command::AdoptSegment`].
+    Adopted(Result<Adopted, AdoptRefused>),
+    /// [`Command::RebuildProgress`] or [`Command::RebuildDone`]: the rebuild's state after
+    /// the command.
+    Rebuild(Rebuild),
 }
 
 /// What a [`Command::PutBlob`] did.
@@ -172,25 +258,57 @@ pub struct Collected {
     pub actions: Vec<Digest>,
 }
 
-/// A command named an object whose epoch was never allocated: a writer that skipped
-/// [`Command::AllocEpoch`], or one whose epoch came from another log. The command
-/// changes nothing.
+/// What a [`Command::EvictObjects`] removed, each list in digest order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Evicted {
+    /// Blobs removed from the index.
+    pub blobs: Vec<Digest>,
+    /// Action-cache entries removed, because they needed a removed blob.
+    pub actions: Vec<Digest>,
+}
+
+/// A command named an object of a writer this log does not take for it, and changes
+/// nothing: an epoch never allocated (a writer that skipped [`Command::AllocEpoch`], or
+/// one whose epoch came from another log), a node writer never set
+/// ([`Command::SetWriter`]), or, for a put, a node writer that is not the current one
+/// (an earlier boot, or another member). Another writer's objects enter the index only
+/// by a command that adopts them, never by a put.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("object {0} names an epoch that was never allocated")]
-pub struct UnallocatedEpoch(pub ObjectId);
+#[error("object {0} is not of a writer this log takes for the command")]
+pub struct ForeignWriter(pub ObjectId);
+
+/// A [`Command::SetWriter`] named a member at a boot the log has set already or one
+/// before it: a process registered earlier, or a state store that handed out a boot
+/// again. The command changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("member {} boot {} is not after boot {current}, the latest set", .writer.member(), .writer.boot())]
+pub struct StaleWriter {
+    /// The writer refused.
+    pub writer: NodeWriter,
+    /// The member's latest boot set.
+    pub current: NonZeroU64,
+}
 
 /// Why an action-cache write was refused. A refused write changes nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ActionWriteError {
     /// Only daemons write the action cache.
     #[error("action-cache writes are accepted only from a daemon")]
     NotDaemon,
-    /// A blob the entry needs is not held: the outputs must be stored first.
-    #[error("action-cache entry needs blob {0}, which is not held")]
-    Absent(Digest),
-    /// A blob the entry needs is held at an unreachable object.
-    #[error("action-cache entry needs blob {0}, whose object is unreachable")]
-    Unreachable(Digest),
+    /// Every blob the entry needs that is not held, the result's first, then the
+    /// closure's in digest order; never empty. The outputs must be stored first.
+    #[error("action-cache entry needs blobs that are not held: {}", listed(.0))]
+    Absent(Vec<Digest>),
+    /// Every blob the entry needs that is held at an unreachable object, in the same
+    /// order; never empty. Only when none is absent.
+    #[error("action-cache entry needs blobs whose objects are unreachable: {}", listed(.0))]
+    Unreachable(Vec<Digest>),
+}
+
+/// `digests`, comma-separated, for an error message.
+fn listed(digests: &[Digest]) -> String {
+    let named: Vec<String> = digests.iter().map(ToString::to_string).collect();
+    named.join(", ")
 }
 
 /// A blob an action-cache entry needs that the closure check did not find usable.
@@ -227,7 +345,25 @@ pub struct MetaState {
     blobs: BTreeMap<Digest, BlobEntry>,
     actions: BTreeMap<Digest, ActionEntry>,
     unreachable: BTreeMap<ObjectId, LossMark>,
+    /// How many times an object went from reachable to marked unreachable.
+    losses: u64,
+    /// Objects marked unreachable while they were staged, each with how many index
+    /// entries are at it: those blobs' only copy was the object's block on a write
+    /// tier, so they are lost ([`MetaState::lost_blobs`]). An object leaves when its
+    /// last entry does, or when its mark is cleared.
+    lost: BTreeMap<ObjectId, u64>,
+    /// How many blobs were ever marked lost ([`MetaState::blob_losses`]).
+    blob_losses: u64,
     next_epoch: u64,
+    /// Each member [`Command::SetWriter`] named, with the latest boot it set.
+    node_boots: BTreeMap<NonZeroU64, NonZeroU64>,
+    /// Writers whose objects [`Command::AdoptSegment`] indexed: known to the log from
+    /// then on, though it never allocated or set them.
+    adopted_writers: BTreeSet<Writer>,
+    /// How far the rebuild of the index is ([`MetaState::rebuild`]).
+    rebuild: Rebuild,
+    /// The node writer set last: the only one a put of a node object may name.
+    current_writer: Option<NodeWriter>,
     /// Each server's current tier.
     tiers: BTreeMap<ServerId, TierId>,
     /// Tiers a server replaced; never registered again.
@@ -250,7 +386,14 @@ impl MetaState {
             blobs: BTreeMap::new(),
             actions: BTreeMap::new(),
             unreachable: BTreeMap::new(),
+            losses: 0,
+            lost: BTreeMap::new(),
+            blob_losses: 0,
             next_epoch: 1,
+            node_boots: BTreeMap::new(),
+            adopted_writers: BTreeSet::new(),
+            rebuild: Rebuild::default(),
+            current_writer: None,
             tiers: BTreeMap::new(),
             retired_tiers: BTreeSet::new(),
             staged: BTreeMap::new(),
@@ -288,6 +431,22 @@ impl MetaState {
         self.unreachable.get(&object).map(|mark| mark.reason)
     }
 
+    /// How many times an object has newly become unreachable: a
+    /// [`Command::ObjectUnreachable`] on an object with no mark counts, and so does one
+    /// after a [`Command::ObjectReachable`] cleared it. A mark that only raises the
+    /// reason or restamps the generation does not count, nor does a clear. It never
+    /// falls.
+    ///
+    /// A blob held in the object answered present until the mark and answers
+    /// unreachable after it, so anything remembered about "these blobs are held" that
+    /// was recorded when this count was lower may be wrong. Whoever adds a command that
+    /// takes held blobs away before their retention ends must count it here:
+    /// [`Command::EvictObjects`] counts each object it took a blob from.
+    #[must_use]
+    pub const fn losses(&self) -> u64 {
+        self.losses
+    }
+
     /// `object`'s loss mark, or `None` if it is not marked. A prober reads the
     /// generation here before it probes the store, and names it in the
     /// [`Command::ObjectReachable`] it sends.
@@ -312,7 +471,7 @@ impl MetaState {
                 Applied::Epoch(epoch)
             }
             Command::PutBlob { digest, location } => Applied::Blob(
-                self.allocated(location.object)
+                self.writable(location.object)
                     .map(|()| self.put_blob(digest, location)),
             ),
             Command::PutBlobs(blobs) => Applied::Blobs(self.put_blobs(blobs)),
@@ -325,25 +484,30 @@ impl MetaState {
                 lost: self.touch(touch),
             },
             Command::ObjectUnreachable { object, reason } => {
-                Applied::Marked(self.allocated(object).map(|()| {
+                Applied::Marked(self.known(object).map(|()| {
                     let generation = Generation::new(index);
+                    if !self.unreachable.contains_key(&object) {
+                        self.losses += 1;
+                    }
                     let mark = self
                         .unreachable
                         .entry(object)
                         .or_insert(LossMark { reason, generation });
                     mark.reason = mark.reason.max(reason);
                     mark.generation = generation;
+                    self.mark_lost(object);
                     self.unstage(object);
                 }))
             }
             Command::ObjectReachable { object, generation } => {
-                Applied::Marked(self.allocated(object).map(|()| {
+                Applied::Marked(self.known(object).map(|()| {
                     if self
                         .unreachable
                         .get(&object)
                         .is_some_and(|mark| mark.generation == generation)
                     {
                         self.unreachable.remove(&object);
+                        self.lost.remove(&object);
                     }
                 }))
             }
@@ -353,6 +517,19 @@ impl MetaState {
             Command::SealStaged { object } => Applied::Tier(self.seal_staged(object)),
             Command::ObjectFlushed { object } => Applied::Tier(self.object_flushed(object)),
             Command::FlushConflict { object } => Applied::Tier(self.flush_conflict(object)),
+            Command::ReseatStaged {
+                tier,
+                from,
+                to,
+                stored,
+            } => Applied::Tier(self.reseat_staged(tier, from, to, stored)),
+            Command::EvictObjects { objects } => Applied::Evicted(self.evict_objects(&objects)),
+            Command::SetWriter(writer) => Applied::Writer(self.set_writer(writer)),
+            Command::AdoptSegment { object, entries } => {
+                Applied::Adopted(self.adopt_segment(object, entries))
+            }
+            Command::RebuildProgress { after } => Applied::Rebuild(self.rebuild_progress(after)),
+            Command::RebuildDone => Applied::Rebuild(self.rebuild_done()),
         }
     }
 
@@ -391,14 +568,20 @@ impl MetaState {
     /// or present-and-touched; none is omitted.
     #[must_use]
     pub fn find_missing(&self, digests: &[Digest]) -> FindMissing {
-        let missing = digests
-            .iter()
-            .filter(|d| !matches!(self.blob(d), BlobAnswer::Present { .. }))
-            .copied()
-            .collect();
+        let mut missing = Vec::new();
+        let mut objects = BTreeSet::new();
+        for digest in digests {
+            match self.blob(digest) {
+                BlobAnswer::Present { location, .. } => {
+                    objects.insert(location.object);
+                }
+                BlobAnswer::Unavailable | BlobAnswer::Absent => missing.push(*digest),
+            }
+        }
         FindMissing {
             missing,
             touch: self.touch_for(digests),
+            objects,
         }
     }
 
@@ -429,6 +612,36 @@ impl MetaState {
         }
     }
 
+    /// The closure of `action`'s entry (the blobs it needs besides its result blob), in
+    /// digest order; empty without an entry. Not a hit check: [`State::action`] is.
+    #[must_use]
+    pub fn action_closure(&self, action: &Digest) -> Vec<Digest> {
+        self.actions
+            .get(action)
+            .map(|e| e.record.closure.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// The objects in the store that hold the blobs `action`'s entry needs (its result
+    /// blob and closure), each once: a reader checks the store still has them before it
+    /// serves a hit. A blob staged on a tier is left out (the store does not hold it
+    /// yet), as is one not present. Empty without an entry.
+    #[must_use]
+    pub fn stored_objects(&self, action: &Digest) -> BTreeSet<ObjectId> {
+        self.actions
+            .get(action)
+            .into_iter()
+            .flat_map(|e| iter::once(&e.record.result).chain(e.record.closure.iter()))
+            .filter_map(|d| match self.blob(d) {
+                BlobAnswer::Present {
+                    location,
+                    staged_on: None,
+                } => Some(location.object),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The closure check: the first needed blob that is not present and reachable.
     fn closure_check<'a>(&self, needed: impl Iterator<Item = &'a Digest>) -> Result<(), Lack> {
         for digest in needed {
@@ -441,21 +654,84 @@ impl MetaState {
         Ok(())
     }
 
-    /// Whether `object`'s epoch was allocated.
-    fn allocated(&self, object: ObjectId) -> Result<(), UnallocatedEpoch> {
-        let epoch = object.epoch().get();
-        if epoch == 0 || epoch >= self.next_epoch {
-            return Err(UnallocatedEpoch(object));
+    /// The write-time closure check: every blob of `needed` that is not present and
+    /// reachable, as the refusal of an action-cache write names them
+    /// ([`ActionWriteError::Absent`] if any is absent, else
+    /// [`ActionWriteError::Unreachable`]); `None` if every one is.
+    #[must_use]
+    pub fn lacking<'a>(
+        &self,
+        needed: impl Iterator<Item = &'a Digest>,
+    ) -> Option<ActionWriteError> {
+        let (mut absent, mut unreachable) = (Vec::new(), Vec::new());
+        for digest in needed {
+            match self.blob(digest) {
+                BlobAnswer::Present { .. } => {}
+                BlobAnswer::Unavailable => unreachable.push(*digest),
+                BlobAnswer::Absent => absent.push(*digest),
+            }
         }
+        if !absent.is_empty() {
+            Some(ActionWriteError::Absent(absent))
+        } else if !unreachable.is_empty() {
+            Some(ActionWriteError::Unreachable(unreachable))
+        } else {
+            None
+        }
+    }
+
+    /// The node writer every put of a node object must name, once one is set.
+    #[must_use]
+    pub const fn current_writer(&self) -> Option<NodeWriter> {
+        self.current_writer
+    }
+
+    /// Whether this log knows `object`'s writer: an epoch it allocated, a member it
+    /// set at the object's boot or a later one, or a writer whose objects it adopted.
+    fn known(&self, object: ObjectId) -> Result<(), ForeignWriter> {
+        let by_rule = match object.writer() {
+            Writer::Epoch(epoch) => epoch.get() != 0 && epoch.get() < self.next_epoch,
+            Writer::Node(node) => self
+                .node_boots
+                .get(&node.member())
+                .is_some_and(|latest| node.boot() <= *latest),
+            Writer::Legacy(_) => false,
+        };
+        let known = by_rule || self.adopted_writers.contains(&object.writer());
+        if known {
+            Ok(())
+        } else {
+            Err(ForeignWriter(object))
+        }
+    }
+
+    /// Whether a put may name `object`: one of an allocated epoch, or of the current
+    /// node writer.
+    fn writable(&self, object: ObjectId) -> Result<(), ForeignWriter> {
+        match object.writer() {
+            Writer::Epoch(_) => self.known(object),
+            Writer::Node(node) if self.current_writer == Some(node) => Ok(()),
+            Writer::Node(_) | Writer::Legacy(_) => Err(ForeignWriter(object)),
+        }
+    }
+
+    fn set_writer(&mut self, writer: NodeWriter) -> Result<(), StaleWriter> {
+        if let Some(current) = self.node_boots.get(&writer.member()).copied()
+            && writer.boot() <= current
+        {
+            return Err(StaleWriter { writer, current });
+        }
+        self.node_boots.insert(writer.member(), writer.boot());
+        self.current_writer = Some(writer);
         Ok(())
     }
 
     fn put_blobs(
         &mut self,
         blobs: Vec<(Digest, Location)>,
-    ) -> Result<Vec<BlobWrite>, UnallocatedEpoch> {
+    ) -> Result<Vec<BlobWrite>, ForeignWriter> {
         for (_, location) in &blobs {
-            self.allocated(location.object)?;
+            self.writable(location.object)?;
         }
         Ok(blobs
             .into_iter()
@@ -477,6 +753,7 @@ impl MetaState {
             BlobAnswer::Unavailable => {
                 let replaced = entry.location;
                 entry.location = location;
+                self.entry_left(replaced.object);
                 BlobWrite::Healed { replaced }
             }
         }
@@ -491,11 +768,11 @@ impl MetaState {
         if role != Role::Daemon {
             return Err(ActionWriteError::NotDaemon);
         }
-        self.closure_check(iter::once(&record.result).chain(record.closure.iter()))
-            .map_err(|lack| match lack {
-                Lack::Absent(d) => ActionWriteError::Absent(d),
-                Lack::Unreachable(d) => ActionWriteError::Unreachable(d),
-            })?;
+        if let Some(lacking) = self.lacking(iter::once(&record.result).chain(record.closure.iter()))
+        {
+            return Err(lacking);
+        }
+        self.order_flush(&record.result, record.closure.iter());
         self.actions.insert(
             action,
             ActionEntry {
@@ -539,6 +816,7 @@ impl MetaState {
             .collect();
         for digest in dead {
             if let Some(entry) = self.blobs.remove(&digest) {
+                self.entry_left(entry.location.object);
                 collected.blobs.push((digest, entry.location));
             }
         }

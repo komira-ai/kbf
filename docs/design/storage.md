@@ -46,8 +46,10 @@ Bytes never enter the metadata layer; the object store never decides anything.
 - the next writer epoch.
 
 It changes only through `Command`s applied in order: `Tick`, `AllocEpoch`, `PutBlob`,
-`PutBlobs`, `PutAction`, `Touch`, `ObjectUnreachable`, `ObjectReachable`, `Collect`.
-Reads are queries against the committed state.
+`PutBlobs`, `PutAction`, `Touch`, `ObjectUnreachable`, `ObjectReachable`, `Collect`;
+the write tier's `AddTier`, `PutStaged`, `SealStaged`, `ObjectFlushed`,
+`FlushConflict` (log format 2, [write-path.md](write-path.md) section 6.5); and
+`EvictObjects` (log format 3). Reads are queries against the committed state.
 
 An object id is a writer epoch and a sequence number. `AllocEpoch` returns an epoch
 greater than every one before it; a cache takes one when it opens (`Cache::open`) and
@@ -59,9 +61,9 @@ location in any other store fails `INTERNAL`.
 
 The front reaches it only through the `MetaLog` trait: `commit` a command and get back
 what applying it did, or run a read-only `query`. `MemoryMetaLog` is one state behind a
-lock in the server process. `RaftMetaLog` (`--meta-log=raft`, in
+lock in the server process. `RaftMetaLog` (in
 `kbf-server/src/raft_log`) exists today as a **single-voter** Raft log on the local
-disk in `--raft-dir`, and needs `--store=s3`: `commit` encodes the command, proposes
+disk in `--meta-dir` (or `<hot store>/meta`), which is what the binary always runs: `commit` encodes the command, proposes
 it, syncs it, applies it and only then answers. Commits are grouped: commands that
 arrive while a sync is in progress are written together and made durable by the next
 single sync, and each is answered after it; a lone command is committed at once. The
@@ -99,6 +101,16 @@ and the result blob and every closure blob are `Present`. Any other state is a m
 The same check guards writes: `PutAction` is refused unless its role is `Daemon` and
 every blob in the record is present and reachable. Clients cannot reach this path at
 all; `UpdateActionResult` answers `PERMISSION_DENIED` before reading the request.
+
+The router does not repeat the check blob by blob. What a FindMissing showed present at
+an owner is remembered per (blob, owner), shared by every action, for a short time to
+live and within an entry bound (least recently used out first). An entry is trusted only
+while the owner's map generation and published boot (`Member.boot`) are those it was
+verified under: a restarted owner may have lost blobs it held only in RAM, so a new boot
+drops its entries even when the generation did not move, and a caller on an older map
+neither reads nor adds. An owner whose boot is 0 (unknown, a node from before the field)
+is never remembered, because without a boot a restart cannot be told: every check asks
+it.
 
 ### Retention and touches
 
@@ -145,9 +157,21 @@ collection removed it first.
 `Collect` removes every expired blob and action entry and returns what it removed,
 with the location of each blob's bytes, so their space can be accounted as dead.
 
-Today, under `--meta-log=raft`, the server commits a `Tick` every second while the log
+`EvictObjects { objects }` forgets objects the store no longer holds, whatever their
+retention: every blob whose current location is in one of them leaves the index (a
+blob healed into another object stays), then every action entry whose result or
+closure names a removed blob. It clears the objects' unreachable marks, skips staged
+objects (their only copy is a block on a tier), and raises the loss count once per
+object that held a blob, which the input-tree skip cache reads. It is one scan of the
+index and one of the action cache, on the log's apply path. It is log format 3
+(`kbf_log::Format::V3`, machine version 3, `MetaCommand` field 15): a format-1 or
+format-2 log refuses it on encode and decode. Under a `file://` cold store the start-up pass
+commits it for index entries with no file behind them, and the evictor for the objects
+it evicts ([Eviction under disk pressure](#eviction-under-disk-pressure)).
+
+Today, under the Raft metadata log, the server commits a `Tick` every second while the log
 is open (`raft_log::TICK`), so the metadata's farm time advances and continues across
-restarts. Under `--meta-log=memory` nothing advances it, and the index is lost at
+restarts. Under the in-memory metadata log (tests only) nothing advances it, and the index is lost at
 restart. In neither mode does the server run `Collect`, so nothing expires while it
 runs. **Planned**: collection runs on a schedule.
 
@@ -174,7 +198,7 @@ store:
    upload with a blob in it is acknowledged after that; a segment that fails answers
    its own blobs with its error and no others.
 
-Uploads are admitted under `--write-bytes-in-flight` (2 GiB) before they buffer, and
+Uploads are admitted under `--write-bytes-in-flight` (2 GiB) for what they hold in memory, and
 at most `--write-puts-in-flight` (4) segment PUTs run at once.
 
 **Planned** ([write-path.md](write-path.md)): daemon uploads of an action's outputs as
@@ -188,17 +212,27 @@ So a blob is never reported present before its bytes are durable in the store.
 are verified, become durable, and only then is the write acknowledged. There is no
 partial resume; a broken stream starts again from 0. `QueryWriteStatus` reports a
 blob's full size once it is durable and 0 before, never bytes a live stream has merely
-buffered. An upload of a blob already durable is answered at once. Until chunked
-uploads exist, a ByteStream write is held in memory until verified, so blobs over
-1 GiB (`MAX_BLOB_BYTES`) are refused before any byte is buffered. Batch calls carry at
+buffered. An upload of a blob already durable is answered at once. No blob is too
+large: a ByteStream write of at most 16 MiB (`MAX_UNSTAGED_BLOB_BYTES`) is held in
+memory until verified; a larger one is handed to the store as its messages arrive (a
+multipart upload on S3), hashed as it passes, and the object is completed only if the
+bytes hash to the digest (else it is aborted, nothing stored). A ByteStream read is
+served in windows of 8 MiB (`READ_WINDOW_BYTES`), each hashed, the last sent only once
+the digest checked. Batch calls carry at
 most 16 MiB of blob data (`MAX_BATCH_TOTAL_BYTES`; the gRPC message limit is 17 MiB).
 
 Object keys are `<prefix>cas/<epoch>/<seq>`, each as 16 lowercase hex digits. Two
 caches over one metadata log hold different epochs, so they never name the same key.
-Under `--meta-log=memory` the metadata is in memory and starts again from epoch 1 at
-every start, so with `--store=s3` each server start writes under its own prefix (the
+A storage node registered with a frontend (`kbf storage --frontend`) names its objects
+by the member id and boot counter its registration was given instead:
+`<root>cas/<member>/<boot>/<seq>`, where `<root>` is the prefix without the log id. The
+state store hands each boot out once, so the keys stay apart across a wiped metadata
+directory too; the node's log is at machine version 4 and has the writer set
+(`SetWriter`), and takes a put of no other node writer's object. Both layouts are read. An object the log never put (an old server's, under another log id; another node's; an earlier boot's) enters the index only when a rebuild adopts it from its footer (`AdoptSegment`); an epoch of another log is named with that log's id.
+Under the in-memory metadata log (tests only) the metadata is in memory and starts again from epoch 1 at
+every start, so with an S3 cold store each server start writes under its own prefix (the
 configured prefix plus the start time), and keys never collide across restarts. Under
-`--meta-log=raft` the epochs are committed in the Raft log, so every start writes
+the Raft metadata log the epochs are committed in the Raft log, so every start writes
 under the one prefix the log committed (the configured prefix plus the log id) in an
 epoch no earlier start used.
 
@@ -223,6 +257,46 @@ its neighbours, whose bytes checked, are served.
 `GetActionResult` runs the closure check, touches what it serves, then reads and decodes
 the stored `ActionResult`. A result blob that cannot be read or decoded is a miss.
 Outputs are never inlined into the response.
+
+### Input tree check
+
+Execute's input check (`Cache::missing_inputs`) walks the input root `Directory` and
+reports every blob under it that is not held. Two memories, in the server's RAM, derived
+from the metadata and never in the log (a restart starts both empty), keep a build from
+paying for the same toolchain on every action:
+
+- **Decoded directories**, by digest: the file and subdirectory digests of each
+  Directory read. A digest names its content, so an entry is never stale. A least
+  recently used cache bounded by `--input-tree-cache-entries` and
+  `--input-tree-cache-bytes`.
+- **A verified-until farm time per directory.** A check that finds a directory and
+  everything under it held, having touched every blob it relied on, records
+  `until = now + min_ttl`, with `now` read before the check's first report. A touched
+  blob is held for at least `min_ttl` from the report ([Retention and
+  touches](#retention-and-touches)), so until then a later check skips the directory
+  without reading or asking. At or after `until` it checks again and touches again. A
+  directory resting on a skipped subtree takes the earlier of the two times. The
+  guarantee is the process's own: it rests on touches pending in this server, which a
+  collection commits before it collects, and a restart forgets both memories together.
+  With more than one server, a server's pending touches are not seen by a collection
+  another server runs; the skip is then right only while no other server collects (none
+  does today), and the touches would have to reach the leader first.
+- **The loss count it was verified at.** Retention does not cover an object marked
+  unreachable (a read found it gone or damaged): its blobs answer unreachable, and
+  FindMissingBlobs lists them, long before `until`. The metadata state counts the objects
+  that newly became unreachable; a verification records the count its check began at, and
+  a skip needs the same count when the request begins. One new mark therefore sends the
+  next check of each tree through the full walk once, from the decoded directories (no
+  store read; every blob touched and asked about), which records the new count. No
+  index from objects to the trees they hold is kept. A single flight is shared only
+  between requests that began at the same count.
+
+Subdirectories are checked concurrently, with at most
+`--input-tree-reads-in-flight` store reads at once across all requests. A directory
+being checked for one request is waited for, not checked again, by any other that reaches
+it. A directory whose blob is gone is reported, and nothing under it is looked at.
+`kbf_execute_dir_reads_total` and `kbf_input_*` in `docs/api.md#get-metrics` count what
+was read, taken from memory, skipped, and joined.
 
 ## Segments
 
@@ -268,6 +342,7 @@ addresses one bucket.
 | `capabilities()` | what the store claims beyond the base contract |
 | `put_new(key, body, retain_until)` | write an immutable object, optionally under a retention date |
 | `get_range(key, range)` | read the bytes of a range that exist; a range starting past the end is an error |
+| `may_hold(key)` | `false` only if the store knows, without a request, that it lacks the key (a local store); others answer `true` and a read finds out. Asked before an action-cache hit is served |
 | `delete(key)` | delete; deleting an absent key succeeds, so a retry is safe |
 | `list(prefix, after, max_keys)` | one page of keys, ascending; for rebuilds and sweeps only |
 
@@ -287,17 +362,76 @@ normalisation between kbf and a store can turn one key into another.
 
 - `MemoryStore`: in memory; the executable form of the contract and the store tests
   use.
+- `FsStore` (`kbf-server --cold-store=file:///dir`): a directory on the local disk, for a farm on
+  one host without an S3 service. One file per object under `objects/<hh>/<h>`, `<h>`
+  the SHA-256 of the key in hex and `<hh>` its first two digits; the file is a header
+  naming the key, then the object's bytes. A write goes to a file in `tmp/`, synced,
+  then linked under its final name (a link never replaces a name, so the store has
+  conditional writes and of two writers of one key exactly one succeeds), and the
+  directory synced before the write is answered; a crash leaves at most a file in
+  `tmp/`, which the next open removes. A read checks the header names the key asked
+  for; a file too short for its header (or empty) is no object, read as `NotFound`;
+  the bytes are checked by the cache, as from any store. Nothing reads the objects at
+  open. `may_hold` (a stat and a header read, no hashing) answers whether a key's
+  object is there; the cache asks it for every object an action-cache hit needs and
+  turns the hit into a miss if one is gone (stores that would need a request answer
+  yes without one). A write that would leave less free space than the store's floor
+  (by default 5% of the file system, at least 1 GiB) is refused and wakes the
+  evictor ([Eviction under disk pressure](#eviction-under-disk-pressure)); the store
+  itself deletes nothing. The directory is locked while a store is open on it. No
+  Object Lock.
 - `S3Store`: the S3 REST API with path-style addressing and SigV4 signing of every
   payload. A ranged read answered with anything but the exact range is refused. On a
   store with Object Lock, delete names the exact object version, so a retained object
-  is refused rather than hidden behind a delete marker. Not built yet: TLS endpoints and
-  multipart upload (one PUT carries up to 5 GiB; segments are at most 128 MiB).
+  is refused rather than hidden behind a delete marker. `put_stream` of an object over
+  16 MiB (`MULTIPART_THRESHOLD`) is a multipart upload, a part at a time (16 MiB parts,
+  or the least whole MiB that fits the object in 10,000 parts, at most 5 GiB, so the
+  largest object is about 48.8 TiB; a larger one is refused `Unsupported` before a byte
+  is sent: the only size ceiling on any path), aborted on any failure,
+  so no incomplete upload is left behind (a bucket lifecycle rule is the backstop for a
+  crash). Not built yet: TLS endpoints.
 
 **Conformance suite.** `kbf_objstore::conformance::run` checks a store's base contract
 (round trip, ranged reads at the boundaries, a missing key, idempotent delete, list
 paging) and every capability it claims. A backend is trusted only once it passes. CI
-runs the suite against the in-memory store and against MinIO and RustFS containers,
-each with a plain bucket and an Object Lock bucket.
+runs the suite against the in-memory store, the local-directory store, and MinIO and
+RustFS containers, each with a plain bucket and an Object Lock bucket.
+
+## Eviction under disk pressure
+
+A `file://` cold store is the store of record: nothing sits behind the directory, so
+what is evicted is gone, not fetched from elsewhere. The client finds out the way it
+finds out about any lost blob: `FindMissingBlobs` reports it missing and the client
+uploads it again, or an action-cache entry that needed it is gone and the action runs
+again.
+
+Eviction is the disk-pressure trigger of the planned collection
+([Planned](#planned)), for the one store that has a disk to fill:
+
+- **When.** The store's floor is `kbf_threads::disk::keep_free` (`Floor::KeepFree`,
+  the rule every evicting farm directory keeps): 5% of the file system, at least 1 GiB. A write that would
+  leave less free is refused and wakes the evictor; it also looks every 10 seconds
+  (`EVICT_EVERY`) once the start-up pass is done. While less than twice the floor is
+  free, a round (`Cache::evict_round`) frees the shortfall to twice the floor.
+- **What.** The least recently used objects, until their lengths cover the shortfall.
+  Use is counted per object in the cache, in memory: a `FindMissingBlobs` answer that
+  reports one of its blobs present, a read of one of its blobs (whether the store or a
+  tier's copy serves it), an action-cache hit that needs it, and its write. Counting in
+  the store would miss most of them: FindMissing never reads the store, and the write
+  tier's flushed copies and the workers' input caches serve repeated reads without it.
+  The count is lost at a restart; the start-up pass seeds it with the objects it kept,
+  which rank before every object used since, oldest file first.
+- **What not.** An object used in the last 60 seconds (`EVICT_GRACE`), and a staged
+  object (its only copy is on a tier). The window stands in for collection's condemn
+  delay: one server writes the directory (its lock), so a use is seen by the same
+  process that would evict, and a touch within the window keeps the object. Under
+  pressure eviction cuts `min_ttl` short: the window is all a blob reported present is
+  promised.
+- **How.** `EvictObjects` for the chosen objects first, in batches, then a delete of
+  each file. A crash between the two leaves files no index entry names, and the next
+  start-up pass deletes them. The pass's sweep is by epoch, never by age: a file of an
+  earlier writer epoch that the index does not name is an orphan; a file of the
+  current epoch is kept whatever its age, since its commit may still be coming.
 
 ## Capabilities
 
@@ -343,7 +477,9 @@ capabilities.
 - **Garbage collection.** Collection marks space dead; a segment is deleted only when no
   entry uses it, through a condemn step with a delay during which any touch revives it.
   Sparse segments are compacted. A periodic sweep removes orphan objects by comparing
-  the bucket with farm state, never by age alone.
+  the bucket with farm state, never by age alone. Under a `file://` cold store, eviction under
+  disk pressure and the start-up pass's sweep are built
+  ([above](#eviction-under-disk-pressure)).
 - **Pins.** Named retention roots (for example a failure's logs) that collection never
   removes until unpinned.
 - **Several stores.** Each location names a store id, bucket and key, so reads follow

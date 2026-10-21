@@ -75,7 +75,7 @@ fn row(r: &ActionRow, base: WallTime) -> proto::Action {
         operation: r.operation.clone().unwrap_or_default(),
         attempts: r.attempts.iter().map(|a| attempt(a, base)).collect(),
         outcome: r.outcome.as_ref().map(outcome),
-        result: listing.map(|l| digest(l.result)),
+        result: listing.and_then(|l| l.result).map(digest),
         command: r.command.map(digest),
         outputs: listing
             .map(|l| {
@@ -145,6 +145,7 @@ fn requeue(r: RequeueReason) -> proto::Requeue {
         RequeueReason::Restarted => (P::Restarted, 0, 0),
         RequeueReason::Lost(LostWhy::DaemonRestarted) => (P::LostDaemonRestarted, 0, 0),
         RequeueReason::Lost(LostWhy::Fenced) => (P::LostFenced, 0, 0),
+        RequeueReason::Infra => (P::Infra, 0, 0),
     };
     proto::Requeue {
         reason: reason.into(),

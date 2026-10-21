@@ -51,11 +51,15 @@ impl Server {
             hello_wait: Duration::from_secs(5),
             tick: Duration::from_millis(50),
             unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+            default_platform: kbf_front::DefaultPlatform::NONE,
+            memory_ladder: kbf_server::MemoryLadder::default(),
             finished_retention: kbf_sched::FINISHED_RETENTION,
             shutdown_timeout: Duration::from_secs(10),
+            streams: kbf_server::StreamTiming::default(),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
             invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
             segments: kbf_front::SegmentsConfig::DEFAULT,
+            stream_limits: kbf_server::StreamLimits::DEFAULT,
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let shutdown = async move {
@@ -64,6 +68,9 @@ impl Server {
         let api = Api {
             listen: loopback(),
             token: None,
+            local_cache: None,
+            releases: None,
+            poll: None,
         };
         let bound =
             bind_server_with_policy(Arc::clone(&cache), listeners, Some(api), policy, shutdown)
@@ -587,21 +594,18 @@ async fn a_refused_caller_learns_nothing_and_touches_nothing() {
     server.stop().await;
 }
 
-/// Catches: a digest that claims more bytes than the largest blob the cache accepts
-/// answered `503` ("try again", which can never succeed) or read anyway, or a size
-/// too large for a permit count (2^33) panicking: both are `404` with the reason.
+/// Catches: a large digest not held answered `503` ("try again", which can never
+/// succeed), or a size too large for a permit count (2^33) panicking: both are `404`
+/// with the reason.
 #[tokio::test]
-async fn a_digest_larger_than_any_blob_is_404() {
+async fn a_large_digest_not_held_is_404() {
     let server = Server::with(OPEN);
-    for size in [kbf_front::MAX_BLOB_BYTES + 1, 1 << 33] {
+    for size in [(5 << 30) + 1, 1 << 33] {
         let digest = Digest::new(kbf_types::DigestFunction::Sha256, [9; 32], size);
         let answer = server.get(&path(&digest), "").await;
         assert_eq!(answer.code, 404, "{size}: {}", answer.head);
         let body = String::from_utf8_lossy(&answer.body);
-        assert!(
-            body.contains("larger than the largest blob"),
-            "{size}: {body}"
-        );
+        assert!(body.contains("is not in the cache"), "{size}: {body}");
     }
     server.stop().await;
 }

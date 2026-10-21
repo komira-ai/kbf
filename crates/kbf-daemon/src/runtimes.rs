@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use kbf_proto::reapi::ActionResult;
+use kbf_proto::worker::ResourceUsage;
 use kbf_types::{LeaseId, LeaseKind};
 
 use crate::runtime::{Runtime, RuntimeError, Work};
@@ -23,6 +24,7 @@ pub(crate) trait AnyRuntime: Send + Sync {
     fn driver(&self) -> &'static str;
     fn serves(&self, kind: &str) -> bool;
     fn run(&self, work: Work) -> Boxed<'_, Result<ActionResult, RuntimeError>>;
+    fn failed_usage(&self, lease_id: LeaseId) -> Option<ResourceUsage>;
     fn kill(&self, lease_id: LeaseId) -> Boxed<'_, ()>;
 }
 
@@ -37,6 +39,10 @@ impl<R: Runtime> AnyRuntime for R {
 
     fn run(&self, work: Work) -> Boxed<'_, Result<ActionResult, RuntimeError>> {
         Box::pin(Runtime::run(self, work))
+    }
+
+    fn failed_usage(&self, lease_id: LeaseId) -> Option<ResourceUsage> {
+        Runtime::failed_usage(self, lease_id)
     }
 
     fn kill(&self, lease_id: LeaseId) -> Boxed<'_, ()> {

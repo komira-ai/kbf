@@ -15,9 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use kbf_meta::{
-    Applied, Command, Location, ObjectId, ServerId, StagedPut, TierId, UnreachableReason,
-};
+use kbf_meta::{Applied, Command, ObjectId, ServerId, StagedPut, TierId, UnreachableReason};
 use kbf_objstore::ObjectStore;
 use kbf_segments::{Footer, IndexEntry};
 use kbf_store::Fs;
@@ -26,10 +24,11 @@ use kbf_tier::{
 };
 use kbf_types::Digest;
 
+use super::flush::RESEAT_ATTEMPTS;
 use super::write_group::Writer;
 use super::{Cache, CacheError, unexpected};
 use crate::meta_log::MetaLog;
-use crate::metrics::TierCounters;
+use crate::metrics::{CacheMetrics, TierCounters};
 
 /// The tier a cache stages its writes on, what it counted, and the flusher's retries.
 pub(super) struct Staging {
@@ -93,13 +92,24 @@ impl Staging {
     }
 }
 
-/// What a local read found.
-enum Local {
-    Read(Bytes),
-    /// The bytes are there but fail their digest.
-    Damaged,
-    /// No local copy (never staged here, flushed and evicted, or unreadable).
-    Absent,
+/// The attached write tier's health ([`Cache::tier_health`]): the numbers of its metric
+/// families that a heartbeat carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TierHealth {
+    /// The tier's budget.
+    pub budget_bytes: u64,
+    /// The bytes counted against it.
+    pub used_bytes: u64,
+    /// Committed bytes of every block not yet flushed.
+    pub unflushed_bytes: u64,
+    /// The blocks holding them.
+    pub unflushed_blocks: u64,
+    /// The age of the oldest such block; `None` when there is none.
+    pub oldest_unflushed: Option<Duration>,
+    /// Flush attempts that failed, since the start.
+    pub flush_failures: u64,
+    /// Objects whose key in the store held another object, since the start.
+    pub flush_conflicts: u64,
 }
 
 /// What [`Cache::attach_tier`] found and did at this start.
@@ -108,9 +118,9 @@ pub struct TierStartup {
     /// The tier this server stages on now.
     pub tier: TierId,
     /// Whether this start registered it (`AddTier`): a directory used for the first
-    /// time, or the one after `--write-tier-abandon`.
+    /// time, or the one after `--hot-store-abandon`.
     pub registered: bool,
-    /// The objects `--write-tier-abandon` marked unreachable as missing.
+    /// The objects `--hot-store-abandon` marked unreachable as missing.
     pub abandoned: Vec<ObjectId>,
     /// What the disk layer's open found and did. Its `lost` objects are marked
     /// unreachable as missing by the time this is returned.
@@ -127,8 +137,8 @@ pub enum TierStartError {
     /// flag must not destroy the index.
     #[error(transparent)]
     Tier(#[from] TierError),
-    /// `--write-tier-abandon` names a tier that is not this server's.
-    #[error("--write-tier-abandon names {named}, but this server's tier is {}", current.map_or_else(|| "none".to_owned(), |t| t.to_string()))]
+    /// `--hot-store-abandon` names a tier that is not this server's.
+    #[error("--hot-store-abandon names {named}, but this server's tier is {}", current.map_or_else(|| "none".to_owned(), |t| t.to_string()))]
     AbandonOther {
         /// The tier the flag names.
         named: TierId,
@@ -145,7 +155,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     ///    staged there is marked unreachable as missing (its blobs answer
     ///    `Unavailable` until re-uploaded), and a new tier is registered.
     /// 2. The tier is the registered one, or, for a server without one, a new id: this
-    ///    start's writer epoch, which no tier was ever registered under.
+    ///    start's writer epoch, or a fresh epoch for a node writer, which no tier was
+    ///    ever registered under.
     /// 3. The disk layer opens the directory against the committed staged table
     ///    ([`Tier::open`]): the `TIER` check (a wrong or missing `TIER` while objects
     ///    are staged refuses the start), each staged block cut to its committed length,
@@ -196,7 +207,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             tracing::warn!(%named, objects = abandoned.len(), "write tier abandoned");
             current = None;
         }
-        let tier = current.unwrap_or_else(|| TierId::new(self.writer.epoch.get()));
+        let tier = match current {
+            Some(tier) => tier,
+            None => self.new_tier_id().await?,
+        };
         let snapshot = self
             .writer
             .query(StagedSnapshot::of)
@@ -204,7 +218,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             .map_err(CacheError::from)?;
         let start = TierStart {
             tier,
-            epoch: self.writer.epoch,
+            writer: self.writer.names_as,
             options,
         };
         let (opened, recovery) = Tier::open(fs, start, &snapshot, self.seq_source())?;
@@ -221,7 +235,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 .await?;
         }
         // A cache takes one tier: attached before it stores anything, and only once.
-        let _ = self.writer.tier.set(Staging::new(Arc::new(opened), tier));
+        let _ = self
+            .writer
+            .tier
+            .set(Arc::new(Staging::new(Arc::new(opened), tier)));
         let startup = TierStartup {
             tier,
             registered: current.is_none(),
@@ -229,6 +246,24 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             recovery,
         };
         Ok((self, startup))
+    }
+
+    /// The id of a tier this log never registered: an epoch writer's own epoch, which no
+    /// tier was registered under before. A node writer has no epoch, so it allocates one
+    /// for the id alone (never for an object): every tier id the log registered was
+    /// drawn as an epoch, so a fresh one is new.
+    async fn new_tier_id(&self) -> Result<TierId, CacheError> {
+        match self.writer.names_as {
+            kbf_meta::Writer::Epoch(epoch) => Ok(TierId::new(epoch.get())),
+            // A cache never names its objects as another log's epoch; were it to, it has no
+            // epoch of its own, as a node has none.
+            kbf_meta::Writer::Node(_) | kbf_meta::Writer::Legacy(_) => {
+                match self.writer.commit(Command::AllocEpoch).await? {
+                    Applied::Epoch(epoch) => Ok(TierId::new(epoch.get())),
+                    other => Err(unexpected(&other)),
+                }
+            }
+        }
     }
 
     /// The tier this cache stages on, if one is attached.
@@ -241,12 +276,32 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         self.writer.tier.get().map(|s| &*s.tier)
     }
 
+    /// What the attached tier says of its health now, for a storage node's heartbeat;
+    /// `None` with no tier attached.
+    #[must_use]
+    pub fn tier_health(&self) -> Option<TierHealth> {
+        let staging = self.writer.tier.get()?;
+        let usage = staging.tier.usage();
+        let unflushed = staging.tier.unflushed(Instant::now());
+        Some(TierHealth {
+            budget_bytes: usage.budget,
+            used_bytes: usage.used,
+            unflushed_bytes: unflushed.bytes,
+            unflushed_blocks: unflushed.blocks,
+            oldest_unflushed: unflushed.oldest,
+            flush_failures: staging.counters.flush_failures.get(),
+            flush_conflicts: staging.counters.conflicts.get(),
+        })
+    }
+
     /// Every metric family: [`CacheMetrics::render`](crate::metrics::CacheMetrics::render),
     /// then, with a tier attached, the tier's (its counters, its budget and usage, and
     /// the unflushed bytes and oldest unflushed block's age, measured now).
     #[must_use]
     pub fn render_metrics(&self) -> String {
         let mut out = self.writer.metrics.render();
+        // The process's, not this cache's: what every request in the process holds.
+        kbf_storage::in_flight::render(&mut out);
         if let Some(staging) = self.writer.tier.get() {
             let usage = staging.tier.usage();
             let unflushed = staging.tier.unflushed(Instant::now());
@@ -262,40 +317,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Box::new(move || seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 
-    /// Reads `digest` at `location` as the index answered it: from this server's tier
-    /// when the object is staged on it, or has a flushed copy here, else from the
-    /// store. An object staged when the query ran is never marked unreachable by a
-    /// read that does not find it in the store (it is not there yet); a staged record
-    /// that fails its digest on the local disk marks it corrupt (the local copy is the
-    /// only one): its block first takes no more ranges (a `PutStaged` into a marked
-    /// object is refused), and once the mark committed a sealed block is deleted (one
-    /// still sealing is left to the next start's sweep). A blob staged on another
-    /// server's tier is not read here.
-    pub(super) async fn fetch_answer(
-        &self,
-        digest: &Digest,
-        location: Location,
-        staged_on: Option<TierId>,
-    ) -> Result<Bytes, CacheError> {
-        if let Some(staging) = self.writer.tier.get()
-            && staged_on.is_none_or(|t| t == staging.id)
-        {
-            match self.read_local(staging, digest, location).await {
-                Local::Read(bytes) => return Ok(bytes),
-                Local::Damaged if staged_on.is_some() => {
-                    staging.tier.close(location.object);
-                    self.mark_unreachable(location.object, UnreachableReason::Corrupt)
-                        .await?;
-                    let _ = staging.tier.discard(location.object);
-                    return Err(CacheError::Unreachable(*digest));
-                }
-                Local::Damaged | Local::Absent => {}
-            }
-        }
-        self.fetch_from_store(digest, location, staged_on.is_none())
-            .await
-    }
-
     /// `len` bytes of `object` from `offset` on this tier (a staged block's committed
     /// bytes, or a flushed copy), unchecked; `None` when there is no tier or it does
     /// not hold the whole range, and the caller reads the store.
@@ -308,33 +329,15 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let staging = self.writer.tier.get()?;
         let tier = Arc::clone(&staging.tier);
         let len = usize::try_from(len).unwrap_or(usize::MAX);
-        let read = blocking(Box::new(move || tier.read(object, offset, len))).await;
+        let read = blocking(
+            self.metrics(),
+            Box::new(move || tier.read(object, offset, len)),
+        )
+        .await;
         read.ok().map(|bytes| {
             staging.counters.local_reads.add(1);
             Bytes::from(bytes)
         })
-    }
-
-    /// `digest`'s record from the tier's block or flushed copy, checked.
-    async fn read_local(&self, staging: &Staging, digest: &Digest, at: Location) -> Local {
-        let len = usize::try_from(digest.size_bytes).unwrap_or(usize::MAX);
-        let tier = Arc::clone(&staging.tier);
-        let read = blocking(Box::new(move || tier.read(at.object, at.offset, len))).await;
-        match read {
-            Ok(bytes) if kbf_segments::sha256(&bytes) == *digest => {
-                staging.counters.local_reads.add(1);
-                Local::Read(Bytes::from(bytes))
-            }
-            Ok(_) => {
-                tracing::error!(%digest, object = %at.object, "a record on the write tier fails its digest");
-                Local::Damaged
-            }
-            Err(TierError::UnknownBlock(_)) => Local::Absent,
-            Err(e) => {
-                tracing::warn!(%digest, error = %e, "write tier read failed; reading the store");
-                Local::Absent
-            }
-        }
     }
 }
 
@@ -358,15 +361,18 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
         let records = body.slice(..usize::try_from(footer.records_len()).unwrap_or(body.len()));
         let len = records.len() as u64;
         let tier = Arc::clone(&staging.tier);
-        let synced = blocking(Box::new(move || {
-            let reservation = if own {
-                tier.reserve_upload(len)?
-            } else {
-                tier.reserve_group(len, Instant::now())?
-            };
-            tier.write(&reservation, 0, &records)?;
-            tier.sync(reservation).map_err(|unsynced| unsynced.error)
-        }))
+        let synced = blocking(
+            &self.metrics,
+            Box::new(move || {
+                let reservation = if own {
+                    tier.reserve_upload(len)?
+                } else {
+                    tier.reserve_group(len, Instant::now())?
+                };
+                tier.write(&reservation, 0, &records)?;
+                tier.sync(reservation).map_err(|unsynced| unsynced.error)
+            }),
+        )
         .await;
         let synced = match synced {
             Ok(synced) => synced,
@@ -377,11 +383,31 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
             }
         };
         let at = |e: &IndexEntry| (e.digest, synced.offset() + e.offset);
+        let blobs = footer.entries().iter().map(at).collect();
+        self.put_staged(staging, synced, blobs, own).await?;
+        Ok(true)
+    }
+
+    /// Commits one `PutStaged` for `blobs` (each at its offset in the block) in the
+    /// synced range `synced`, sealing its block with the commit when `seal` (a block
+    /// of its own), and answers the range committed.
+    ///
+    /// # Errors
+    ///
+    /// The commit failed. The range is answered as failed unless the committed state
+    /// shows the commit applied anyway (`answer_lost_put`).
+    pub(super) async fn put_staged(
+        &self,
+        staging: &Staging,
+        synced: Synced,
+        blobs: Vec<(Digest, u64)>,
+        seal: bool,
+    ) -> Result<(), CacheError> {
         let put = StagedPut {
             object: synced.object(),
             end: synced.end(),
-            seal: own,
-            blobs: footer.entries().iter().map(at).collect(),
+            seal,
+            blobs,
         };
         let command = Command::PutStaged {
             tier: staging.id,
@@ -396,12 +422,76 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
         };
         match applied {
             Applied::Staged(Ok(_)) => {
+                self.born.note(synced.object());
                 staging.tier.committed(synced);
                 staging.counters.staged.add(1);
-                Ok(true)
+                Ok(())
             }
             other => Err(unexpected(&other)),
         }
+    }
+
+    /// Commits one `ReseatStaged` that moves the records of `from` (staged here, its key
+    /// held by another object) to the synced range `synced`, which holds them, sealed,
+    /// and answers the range committed.
+    ///
+    /// # Errors
+    ///
+    /// The commit was refused or failed [`RESEAT_ATTEMPTS`] times. Nothing changed:
+    /// `from` is staged as it was, and the range is answered as failed (its block
+    /// removed) unless the committed state shows the commit applied anyway.
+    pub(super) async fn reseat_staged(
+        &self,
+        staging: &Staging,
+        synced: Synced,
+        blobs: Vec<(Digest, u64)>,
+        from: ObjectId,
+    ) -> Result<(), CacheError> {
+        let put = StagedPut {
+            object: synced.object(),
+            end: synced.end(),
+            seal: true,
+            blobs,
+        };
+        match self.reseat(staging.id, from, put, false).await {
+            Ok(()) => {
+                self.born.carry(from, synced.object());
+                staging.tier.committed(synced);
+                staging.counters.staged.add(1);
+                Ok(())
+            }
+            Err(e) => {
+                self.answer_lost_put(staging, synced).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Commits a `ReseatStaged` of `from` to `to` (in the store when `stored`), tried
+    /// up to [`RESEAT_ATTEMPTS`] times when the log cannot answer: the command is a
+    /// no-op when it applied already. A refusal (or any other answer) is not tried again.
+    pub(super) async fn reseat(
+        &self,
+        tier: TierId,
+        from: ObjectId,
+        to: StagedPut,
+        stored: bool,
+    ) -> Result<(), CacheError> {
+        let command = Command::ReseatStaged {
+            tier,
+            from,
+            to,
+            stored,
+        };
+        let mut failed = None;
+        for _ in 0..RESEAT_ATTEMPTS {
+            match self.commit(command.clone()).await {
+                Ok(Applied::Tier(Ok(()))) => return Ok(()),
+                Ok(other) => return Err(unexpected(&other)),
+                Err(e) => failed = Some(e),
+            }
+        }
+        Err(failed.map_or_else(|| CacheError::Internal("no attempt".to_owned()), Into::into))
     }
 
     /// Answers a range whose `PutStaged` commit failed. A log can apply a command and
@@ -425,18 +515,32 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
 
 /// Runs a tier call on the blocking pool: the tier's file I/O (creates, writes,
 /// `fdatasync`, reads of up to a segment) must not hold a runtime thread. A call that
-/// panicked is a failed call.
+/// panicked is a failed call. The call is counted while it is queued or running
+/// (`kbf_tier_in_flight`), and its wait for a pool thread and its whole time are
+/// observed, so a pool that is full shows as wait, not as a slow disk.
 pub(super) async fn blocking<T: Send + 'static>(
+    metrics: &CacheMetrics,
     call: Box<dyn FnOnce() -> Result<T, TierError> + Send>,
 ) -> Result<T, TierError> {
-    let joined = tokio::task::spawn_blocking(call).await;
-    joined.unwrap_or_else(|e| {
-        Err(TierError::Io {
+    let _in_flight = metrics.tier_in_flight.raise();
+    let handed = Instant::now();
+    let joined = tokio::task::spawn_blocking(move || {
+        let waited = handed.elapsed();
+        (waited, call())
+    })
+    .await;
+    metrics.tier_call.since(handed);
+    match joined {
+        Ok((waited, answer)) => {
+            metrics.tier_wait.observe_duration(waited);
+            answer
+        }
+        Err(e) => Err(TierError::Io {
             op: "run",
             name: "a write tier call".to_owned(),
             source: std::io::Error::other(e.to_string()),
-        })
-    })
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -447,12 +551,127 @@ mod tests {
     /// tearing down the caller, instead of failing that one call.
     #[tokio::test]
     async fn a_tier_call_that_panics_is_a_failed_call() {
-        let ok = blocking::<u8>(Box::new(|| Ok(7))).await;
+        let metrics = CacheMetrics::default();
+        let ok = blocking::<u8>(&metrics, Box::new(|| Ok(7))).await;
         assert!(matches!(ok, Ok(7)), "{ok:?}");
-        let panicked = blocking::<u8>(Box::new(|| panic!("a tier call panicked"))).await;
+        let panicked = blocking::<u8>(&metrics, Box::new(|| panic!("a tier call panicked"))).await;
         assert!(
             matches!(panicked, Err(TierError::Io { op: "run", .. })),
             "{panicked:?}"
         );
+    }
+
+    /// Catches: a blocking pool that is full showing as a slow disk, or not at all: the
+    /// second call waits for the only pool thread while the first holds it, so it counts
+    /// as in flight (the gauge reads 2: one running, one queued) and its wait is at least
+    /// the time the first was held after the second was queued (not 0), observed by
+    /// `kbf_tier_wait_seconds`; the gauge is back to 0 after. A wait taken from the
+    /// closure's end instead of its start (the first call's wait would then cover the
+    /// whole time it is held, not the instant before it starts), or a gauge raised
+    /// inside the closure (it would read 1, not 2, while one call waits), is caught.
+    ///
+    /// Ordering comes from channels, not from sleeps: the first call signals that it
+    /// holds the pool thread and blocks until released; the test queues the second only
+    /// then, and releases the first only once the gauge shows both calls. The second is
+    /// held too, so that after the first finishes `kbf_tier_wait_seconds` holds the
+    /// first call's wait alone. The clock readings are one lower bound (the second's
+    /// wait covers the hold), which a slow runner can only enlarge, and one upper
+    /// bound that no runner can break: the first's wait cannot exceed the time the
+    /// test itself spent until the first call signalled that it started.
+    #[test]
+    fn a_call_waiting_for_a_pool_thread_is_counted_and_its_wait_observed() {
+        const HOLD: Duration = Duration::from_millis(100);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let metrics = Arc::new(CacheMetrics::default());
+        runtime.block_on(async {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (release_second_tx, release_second_rx) = std::sync::mpsc::channel::<()>();
+            let began = Instant::now();
+            let first = {
+                let metrics = Arc::clone(&metrics);
+                tokio::spawn(async move {
+                    blocking(
+                        &metrics,
+                        Box::new(move || {
+                            started_tx.send(()).expect("the test is waiting");
+                            release_rx.recv().expect("the test releases the call");
+                            Ok(1_u8)
+                        }),
+                    )
+                    .await
+                })
+            };
+            // The first call holds the only pool thread; only now may the second be queued.
+            started_rx.await.expect("the first call started");
+            let startup = began.elapsed();
+            let go = Arc::new(tokio::sync::Notify::new());
+            let second = {
+                let metrics = Arc::clone(&metrics);
+                let go = Arc::clone(&go);
+                tokio::spawn(async move {
+                    go.notified().await;
+                    blocking(
+                        &metrics,
+                        Box::new(move || {
+                            release_second_rx
+                                .recv()
+                                .expect("the test releases the call");
+                            Ok(2_u8)
+                        }),
+                    )
+                    .await
+                })
+            };
+            // The gauge counts a queued call: it reaches 2 with the first still held.
+            // The second is released from inside the wait, so the first look at the
+            // gauge always sees 1 (the first call raised it before it signalled, and
+            // nothing lowers it until the test releases that call): the loop body and
+            // both outcomes of its test run on every execution, whatever the
+            // scheduling. The 60 s is a hang guard only: a regression fails here
+            // instead of hanging.
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while metrics.tier_in_flight.get() != 2 {
+                    go.notify_one();
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("one running and one queued call reach the gauge");
+            assert_eq!(
+                metrics.tier_wait.count(),
+                0,
+                "neither call has run to its end"
+            );
+            // Keep the pool thread for HOLD after the second is queued, then free it.
+            tokio::time::sleep(HOLD).await;
+            release_tx.send(()).expect("the first call is waiting");
+            assert!(matches!(first.await.expect("joined"), Ok(1)));
+            // Only the first call's wait is observed so far (the second is held on the
+            // pool thread; its wait is observed when it ends). The first was handed to
+            // the pool after `began` and started before the test saw its signal, so its
+            // wait cannot exceed `startup`; taken from the closure's end it would cover
+            // the whole hold and be at least HOLD.
+            assert_eq!(metrics.tier_wait.count(), 1, "the second is still held");
+            let first_wait = Duration::from_nanos(metrics.tier_wait.sum());
+            assert!(first_wait <= startup, "{first_wait:?} > {startup:?}");
+            release_second_tx
+                .send(())
+                .expect("the second call is waiting");
+            assert!(matches!(second.await.expect("joined"), Ok(2)));
+        });
+        assert_eq!(metrics.tier_in_flight.get(), 0);
+        assert_eq!(metrics.tier_wait.count(), 2);
+        assert_eq!(metrics.tier_call.count(), 2);
+        // The second waited at least HOLD (the first was held that long after the
+        // second was queued) and the first's wait was only `startup`. A slower runner
+        // only adds to the second's wait.
+        let waited = Duration::from_nanos(metrics.tier_wait.sum());
+        assert!(waited >= HOLD / 2, "{waited:?}");
     }
 }

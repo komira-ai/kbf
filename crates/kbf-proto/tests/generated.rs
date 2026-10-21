@@ -182,6 +182,12 @@ fn worker_messages_round_trip() {
         cpu_system_micros: 2,
         peak_memory_bytes: 3,
         wall_micros: 4,
+        cgroup: Some(worker::CgroupUsage {
+            cpu_usage_micros: Some(5),
+            cpu_throttled_periods: Some(0),
+            numa: vec![worker::NumaNodeBytes { node: 1, bytes: 6 }],
+            ..worker::CgroupUsage::default()
+        }),
     };
     let back = worker::ResourceUsage::decode(usage.encode_to_vec().as_slice()).expect("decode");
     assert_eq!(back, usage);

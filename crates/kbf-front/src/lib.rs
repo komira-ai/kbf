@@ -25,6 +25,16 @@
 //!   running twin before anything is queued
 //!   (`ARCHITECTURE.md#executing-an-action`).
 //!
+//! **The proxy.** [`Proxy`] answers a client's CAS, ByteStream and action-cache calls from
+//! storage nodes instead of the cache ([`routes_proxied`]; `kbf-server --storage`):
+//! ByteStream as a raw HTTP/2 pass-through that never holds a blob, the rest at the
+//! tonic level. See the `proxy` module for what it keeps and what it does not do yet.
+//!
+//! **The backend.** Execute reads the store through a [`Backend`], a cache in this
+//! process, a storage node ([`Backend::remote`]) or the storage nodes of a map
+//! ([`Backend::routed`]); `kbf frontend` runs the last two and holds no cache at all.
+//! The map is a [`Routed`], shared with the proxy ([`Owners::routed`]).
+//!
 //! **Authorization.** Every service asks a `kbf_auth` authorizer before it serves a
 //! call ([`routes_with_authorizers`]; which call asks which is on each service and in
 //! `docs/reapi-auth.md`). The caller is whoever the server's authentication layer
@@ -42,16 +52,29 @@
 //! never waits: a full channel drops the event and marks its record incomplete.
 
 mod action_cache;
+mod backend;
 mod bytestream;
 mod cache;
 mod capabilities;
 mod cas;
+mod closure;
+mod cpu;
+mod default_platform;
+mod described;
+mod dir_cache;
 mod execution;
+mod finished_row;
+mod input_tree;
+mod input_walk;
 mod meta_log;
 pub mod metrics;
+mod proxy;
 mod recorder;
+mod relay;
 mod request_metadata;
+mod routed;
 mod segments;
+mod storage;
 mod wire;
 
 use std::sync::Arc;
@@ -66,40 +89,56 @@ use kbf_proto::reapi::execution_server::ExecutionServer;
 use tonic::service::Routes;
 
 pub use crate::action_cache::ActionCacheService;
+pub use crate::backend::Backend;
 pub use crate::bytestream::ByteStreamService;
+pub use crate::cache::HIT_CHECKS_IN_FLIGHT;
 pub use crate::cache::{
-    Admitted, BATCH_READS_IN_FLIGHT, CONNECTION_WINDOW_BYTES, Cache, CacheError,
-    FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound, MAX_ADMISSION_BYTES,
-    MAX_CONCURRENT_STREAMS, PUT_BACKOFF, PUT_BACKOFF_FACTOR, STREAM_WINDOW_BYTES, TierStartError,
-    TierStartup, TouchConfig, VerifiedBlob, WriteConfig,
+    ADOPT_RECORDS, Admitted, BATCH_BLOBS, BATCH_BYTES, BATCH_READS_IN_FLIGHT, BUFFERED_BLOB_BYTES,
+    BlobRead, Cache, CacheError, DEFAULT_REAPI_STREAMS, DEFAULT_WORKER_STREAMS, EVICT_BATCH,
+    EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound, FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX,
+    FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushReport, FlushRound, HeldObject, Losses,
+    MAX_ADMISSION_BYTES, MAX_DECODED_BLOB_BYTES, NEEDS_V3, ObjectKeys, PASS_OPENS_PER_SEC,
+    PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, PoolConfig, READ_WINDOW_BYTES, RebuildConfig,
+    RebuildReport, RecordStream, STREAM_WINDOW_BYTES, StreamedRecord, TailReport, TailState,
+    TierHealth, TierStartError, TierStartup, TouchConfig, VerifiedBlob, WriteConfig,
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
+pub use crate::default_platform::{BadDefaultPlatform, DefaultPlatform};
+pub use crate::described::Described;
 pub use crate::execution::{
     BOOK_CPUS_KEY, BOOK_MEM_GIB_KEY, Closer, Closing, DEFAULT_RESOURCES, Dispatch, ERROR_DOMAIN,
     ExecutionService, Finished, GPU_KEY, LEASE_KIND_KEY, LEASE_KINDS, NO_WORKER_REASON,
-    OperationStream, Stage, Submission, Ticket, closing, missing_status,
+    OperationStream, Progress, ProgressTicker, Stage, Submission, Ticket, closing, missing_status,
+    progress,
 };
+pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
+pub use crate::proxy::{Direction, Meter, Method, Owner, Owners, Proxy};
 pub use crate::recorder::{
-    DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording, listing, owner,
-    wall_now,
+    ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,
+    Tap, listing, owner, wall_now,
 };
+pub use crate::relay::{Handed, Relay, Successor};
+
 pub use crate::request_metadata::{
     CallMetadata, HEADER as REQUEST_METADATA_HEADER, Invalid, InvocationId, MAX_HEADER_BYTES,
     MAX_ID_BYTES, MAX_TEXT_BYTES, Read, ReadRequestMetadata, RequestMetadataLayer, Text,
     call_metadata,
 };
+pub use crate::routed::{Channels, Routed};
 pub use crate::segments::{
     Connection, Connections, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, MIN_SEGMENT_UPLOAD_BYTES,
     SegmentsConfig, SegmentsService, Tracked,
 };
+pub use crate::storage::CacheStorage;
 
 /// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,
 /// advertised in the capabilities. Larger blobs go through ByteStream. A request is
 /// decoded whole before its handler runs, so one stream may hold up to
-/// [`MAX_MESSAGE_BYTES`] (17 MiB) of decode buffer: 200 concurrent streams bound the
-/// decode memory at about 3.4 GiB, which `--write-bytes-in-flight` does not cover
+/// [`MAX_MESSAGE_BYTES`] (17 MiB) of decode buffer: the decode memory is that times the
+/// streams a connection may open (`--reapi-max-streams`, `--worker-max-streams`), about
+/// 3.4 GiB for 200, which `--write-bytes-in-flight` does not cover
 /// (`docs/design/write-path.md`).
 pub const MAX_BATCH_TOTAL_BYTES: usize = 16 << 20;
 
@@ -107,15 +146,42 @@ pub const MAX_BATCH_TOTAL_BYTES: usize = 16 << 20;
 /// for the digests and statuses around it.
 pub const MAX_MESSAGE_BYTES: usize = MAX_BATCH_TOTAL_BYTES + (1 << 20);
 
-/// The largest blob the cache accepts. A ByteStream Write is held in memory until it
-/// is verified, so without a cap a client could make the front buffer whatever size
-/// its resource name claims. Chunked uploads (planned,
-/// `docs/design/storage.md#segments`) come later and will stream larger blobs instead;
-/// until then anything bigger is refused before a byte is buffered.
-pub const MAX_BLOB_BYTES: u64 = 1 << 30;
+/// No blob is too large for the cache, on any path, and none is held whole in memory
+/// past [`MAX_UNSTAGED_BLOB_BYTES`]: a ByteStream `Write` of a larger blob is handed to
+/// the store as it arrives (a multipart upload on S3), a segment upload's large records
+/// and the in-process plane's large outputs are written to the write tier as they
+/// arrive, the tier's flusher reads a block in pieces, and every read of a blob is
+/// served in windows of [`READ_WINDOW_BYTES`]. A digest's size is an `i64`, so no blob
+/// is over `i64::MAX` bytes; sizes are added as `u64`, saturating.
+///
+/// The largest blob a daemon's data plane holds in memory on its way into the cache:
+/// 16 MiB. A larger one is never held whole: with a write tier that has room for it, it
+/// is written onto the tier as it arrives (a segment upload's range, the in-process
+/// plane's stream); without one, or when the tier is full, it is streamed to the object
+/// store as it arrives (a ByteStream `Write`, the in-process plane's
+/// `Cache::store_streamed_claimed`). A segment upload that would have to hold one in
+/// memory until its commit is answered FAILED_PRECONDITION at `Begin`
+/// ([`unstaged_refusal`]), and the daemon sends its records by ByteStream instead. No
+/// blob is refused for its size. 16 MiB is where the write group already writes a blob
+/// as a segment of its own (`--write-own-segment-bytes`), four PutRange messages, and
+/// well under the 32 MiB upload a daemon batches small files into, so small outputs
+/// keep the in-memory path unchanged.
+pub const MAX_UNSTAGED_BLOB_BYTES: u64 = 16 << 20;
 
-/// The most data in one ByteStream `ReadResponse`.
-pub const READ_CHUNK_BYTES: usize = 1 << 20;
+/// Why a segment upload holding the blob `blob` (its digest), over
+/// [`MAX_UNSTAGED_BLOB_BYTES`], is not taken: no write tier has room for it, and it is
+/// not held in memory instead. The blob itself is stored by a ByteStream `Write`.
+#[must_use]
+pub fn unstaged_refusal(blob: &str) -> String {
+    format!(
+        "{blob} is over {MAX_UNSTAGED_BLOB_BYTES} bytes and no write tier has room for it: \
+         send it by a ByteStream Write, which streams it to the object store"
+    )
+}
+
+/// The most data in one ByteStream `ReadResponse`, and in one chunk of a ranged storage
+/// read.
+pub const READ_CHUNK_BYTES: usize = kbf_storage::READ_CHUNK_BYTES;
 
 /// The four cache services over `cache`, ready for a tonic server. Every call is
 /// allowed.
@@ -135,7 +201,8 @@ where
 
 /// The cache services and `Execution` over `cache` and `dispatch`, with capabilities
 /// that advertise execution. Open Execute and WaitExecution streams end UNAVAILABLE
-/// when `closing`'s [`Closer`] closes. Every call is allowed.
+/// when `closing`'s [`Closer`] closes; a drain refuses new Execute calls and leaves the
+/// open ones. Every call is allowed.
 pub fn routes_with_execution<M, O, D>(
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
@@ -162,17 +229,42 @@ where
     O: ObjectStore + 'static,
     D: Dispatch,
 {
-    routes_recorded(cache, dispatch, closing, authorizers, &Recorder::off())
+    routes_recorded(
+        cache,
+        dispatch,
+        closing,
+        Progress::off(),
+        authorizers,
+        &Recorder::off(),
+        Defaults {
+            memory: DEFAULT_RESOURCES.memory_bytes,
+            platform: DefaultPlatform::NONE,
+        },
+    )
+}
+
+/// What an `action` that names less than the farm needs is given.
+#[derive(Clone, Copy, Debug)]
+pub struct Defaults {
+    /// The memory an `action` that names no size books, in bytes
+    /// ([`ExecutionService::with_default_memory`]).
+    pub memory: u64,
+    /// The OS and architecture of an `action` that names neither
+    /// ([`ExecutionService::with_default_platform`]).
+    pub platform: DefaultPlatform,
 }
 
 /// [`routes_with_authorizers`], each call that carries an invocation id sent to
-/// `recorder`.
+/// `recorder`, open streams re-sent at each tick of `progress`, and an `action` given
+/// `defaults` where it names no memory size, OS or architecture.
 pub fn routes_recorded<M, O, D>(
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
     closing: Closing,
+    progress: Progress,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
+    defaults: Defaults,
 ) -> Routes
 where
     M: MetaLog,
@@ -186,12 +278,136 @@ where
             closing,
             Arc::clone(&authorizers),
         )
-        .recording(recorder.clone()),
+        .recording(recorder.clone())
+        .with_progress(progress)
+        .with_default_memory(defaults.memory)
+        .with_default_platform(defaults.platform),
     )
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let capabilities = CapabilitiesService::new(true, Arc::clone(&authorizers));
     cache_routes(cache, capabilities, &authorizers, recorder).add_service(execution)
+}
+
+/// What keeps open Execute streams going: the drain that ends them and the tick that
+/// re-sends them while their action waits.
+pub struct OpenStreams {
+    /// Ends the streams when closed ([`closing`]).
+    pub closing: Closing,
+    /// Re-sends each at every tick ([`progress`]).
+    pub progress: Progress,
+}
+
+/// [`routes_recorded`] with the client's CAS, ByteStream and action-cache calls answered
+/// by the storage nodes of `proxy` ([`Proxy`]), and `Execution` over `backend`: a cache
+/// in this process (`kbf-server --storage`, which still holds one) or a storage node
+/// ([`Backend::remote`], which is what `kbf frontend` runs).
+pub fn routes_proxied<D>(
+    proxy: &Proxy,
+    backend: impl Into<Backend>,
+    dispatch: Arc<D>,
+    streams: OpenStreams,
+    authorizers: Arc<Authorizers>,
+    recorder: &Recorder,
+    defaults: Defaults,
+) -> Routes
+where
+    D: Dispatch,
+{
+    proxied(
+        proxy,
+        backend.into(),
+        dispatch,
+        streams,
+        authorizers,
+        recorder,
+        defaults,
+        |execution, _, _| execution,
+    )
+}
+
+/// What a frontend that may hand its roles to a successor forwards its `Execute` and
+/// `WaitExecution` calls with once it has ([`Relay`]).
+pub struct Relaying {
+    /// Whether the frontend has handed its roles over.
+    pub farm: Arc<dyn Handed>,
+    /// The successor's channel, named when the successor says who it is.
+    pub successor: Successor,
+    /// How often a relay that fell back to the state store looks in it.
+    pub follow_every: std::time::Duration,
+}
+
+/// [`routes_proxied`] with the `Execution` service behind a [`Relay`]: calls are the
+/// wrapped service's until `relaying.farm` has handed over, and the successor's after.
+#[allow(clippy::too_many_arguments)] // `routes_proxied`'s seven, and the relay's.
+pub fn routes_relayed<D>(
+    proxy: &Proxy,
+    backend: impl Into<Backend>,
+    dispatch: Arc<D>,
+    streams: OpenStreams,
+    authorizers: Arc<Authorizers>,
+    recorder: &Recorder,
+    defaults: Defaults,
+    relaying: Relaying,
+) -> Routes
+where
+    D: Dispatch,
+{
+    let backend = backend.into();
+    let counted = backend.clone();
+    proxied(
+        proxy,
+        backend,
+        dispatch,
+        streams,
+        authorizers,
+        recorder,
+        defaults,
+        move |execution, closing, progress| {
+            let streams = OpenStreams { closing, progress };
+            Relay::new(execution, relaying.farm, relaying.successor, counted)
+                .with_streams(streams)
+                .following_every(relaying.follow_every)
+        },
+    )
+}
+
+/// The routes of [`routes_proxied`], the `Execution` service made by `wrap` from the
+/// service and the two halves of the open streams' wiring.
+#[allow(clippy::too_many_arguments)] // `routes_proxied`'s seven, and the wrap.
+fn proxied<D, E>(
+    proxy: &Proxy,
+    backend: Backend,
+    dispatch: Arc<D>,
+    streams: OpenStreams,
+    authorizers: Arc<Authorizers>,
+    recorder: &Recorder,
+    defaults: Defaults,
+    wrap: impl FnOnce(ExecutionService<D>, Closing, Progress) -> E,
+) -> Routes
+where
+    D: Dispatch,
+    E: kbf_proto::reapi::execution_server::Execution,
+{
+    let OpenStreams { closing, progress } = streams;
+    let service = ExecutionService::with_authorizers(
+        backend,
+        dispatch,
+        closing.clone(),
+        Arc::clone(&authorizers),
+    )
+    .recording(recorder.clone())
+    .with_progress(progress.clone())
+    .with_default_memory(defaults.memory)
+    .with_default_platform(defaults.platform);
+    let execution = ExecutionServer::new(wrap(service, closing, progress))
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let capabilities = CapabilitiesService::new(true, authorizers);
+    proxy
+        .routes()
+        .add_service(CapabilitiesServer::new(capabilities))
+        .add_service(execution)
 }
 
 fn cache_routes<M, O>(

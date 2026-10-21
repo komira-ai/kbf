@@ -26,6 +26,8 @@
 //! - a tier command whose second apply changes the staged table: a `PutStaged` that
 //!   lists a digest again or moves an offset, an `ObjectFlushed` that restamps the time
 //!   the object left, an `AddTier` that retires the tier it registered.
+//! - an `EvictObjects` whose second apply changes anything: one that counts a loss for
+//!   every object it names rather than for each that held a blob.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -134,7 +136,7 @@ fn forwardable(rng: &mut Rng, state: &MetaState) -> Command {
     if rng.one_in(3) {
         return tier_command(rng);
     }
-    match rng.below(7) {
+    match rng.below(8) {
         0 => Command::AllocEpoch,
         1 => Command::PutBlob {
             digest: digest(rng),
@@ -164,6 +166,9 @@ fn forwardable(rng: &mut Rng, state: &MetaState) -> Command {
         5 => Command::ObjectUnreachable {
             object: object(rng),
             reason: reason(rng),
+        },
+        6 => Command::EvictObjects {
+            objects: (0..rng.below(3)).map(|_| object(rng)).collect(),
         },
         _ => {
             let object = object(rng);
@@ -264,6 +269,8 @@ struct Seen {
     tier_accepted: u32,
     /// Second applies of a `PutStaged` accepted on a sealed object: a retry.
     staged_repeats: u32,
+    /// `EvictObjects` whose first apply removed a blob.
+    evicted: u32,
 }
 
 /// The second apply of a command: what it was, at which index, how it applied, and the
@@ -364,7 +371,9 @@ fn a_forwarded_command_applied_twice_equals_once_but_for_generations_and_next_ep
 
         let i = last + 1;
         let mut once = base.clone();
-        once.execute(i, command.clone());
+        if let Applied::Evicted(e) = once.execute(i, command.clone()) {
+            seen.evicted += u32::from(!e.blobs.is_empty());
+        }
 
         let j = i + 1 + rng.below(5);
         let mut twice = once.clone();
@@ -409,13 +418,14 @@ fn a_forwarded_command_applied_twice_equals_once_but_for_generations_and_next_ep
     // retry (which a stamp-only-on-rise mutant leaves at i) included.
     let counts = format!(
         "restamped {}, same reason {}, epochs {}, touched later {}, tier accepted {}, \
-         staged repeats {}",
+         staged repeats {}, evicted {}",
         seen.restamped,
         seen.restamped_same_reason,
         seen.epochs,
         seen.touched_later,
         seen.tier_accepted,
-        seen.staged_repeats
+        seen.staged_repeats,
+        seen.evicted
     );
     assert!(
         seen.restamped.min(seen.epochs).min(seen.touched_later) > 200,
@@ -424,4 +434,5 @@ fn a_forwarded_command_applied_twice_equals_once_but_for_generations_and_next_ep
     assert!(seen.restamped_same_reason > 100, "{counts}");
     assert!(seen.tier_accepted > 200, "{counts}");
     assert!(seen.staged_repeats > 30, "{counts}");
+    assert!(seen.evicted > 50, "{counts}");
 }

@@ -537,7 +537,7 @@ fn answer(
 }
 
 /// `text`, or its first `bytes` bytes (backed off to a character boundary) and `...`.
-fn cut(text: &str, bytes: usize) -> String {
+pub(crate) fn cut(text: &str, bytes: usize) -> String {
     if text.len() <= bytes {
         return text.to_owned();
     }
@@ -782,3 +782,7 @@ pub fn developer_dir(
 #[cfg(test)]
 #[path = "xcode_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "xcode_edge_tests.rs"]
+mod edge_tests;

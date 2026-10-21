@@ -157,7 +157,7 @@ its order, with the deadline, both uid filters and the one retry of the check.
 - **Restart.** SIGKILL the daemon mid-lease, restart it: start-up cleans every slot before
   `Hello`.
 
-**Step 5. The macOS worker cache, root-owned, with hard links (C2).** Behind `--cache-dir`,
+**Step 5. The macOS worker cache, root-owned, with hard links (C2).** Behind the data directory's `cache/` (`--data-dir`),
 which stays unset on farm Macs until U7's corpus run is clean. `worker-cache.md` row C2 moves
 from `clonefile` to `linkat` on the dedicated volume; inputs that miss are written root-owned
 and read-only; directories are made by the daemon and owned by the slot; output-named inputs

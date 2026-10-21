@@ -1,0 +1,22 @@
+[package]
+name = "kbf-threads"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+rustix = { workspace = true, features = ["fs"] }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Scratch directories the tests own (kbf_testkit::dir).
+kbf-testkit.workspace = true
+
+[lints]
+workspace = true

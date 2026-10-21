@@ -15,8 +15,11 @@
 //! - [`connect`]: which server to try next, and the wait between rounds of attempts;
 //!   the daemon never stops trying.
 //! - [`report`]: the node report and its hash.
+//! - [`reach`]: the start-up check that the storage members answer a connect.
 //! - [`status`]: the node's software status (OS, kernel, daemon, Xcodes).
 //! - [`driver_watch`]: the driver's report channel, one part per source that feeds it.
+//! - [`cpu_pool`]: [`CpuPool`], the threads (`--cpu-threads`) for work that keeps a core
+//!   busy, such as hashing outputs.
 //! - [`runtime`]: the runtime trait and [`FakeRuntime`], which runs nothing.
 //! - [`runtimes`]: [`Runtimes`], the daemon's runtimes, at most one per lease kind.
 //! - [`phases`]: where each lease's time went, logged when it ends (`lease phases:`)
@@ -39,29 +42,42 @@
 //! crate, so a binary here naming them would be a cycle Cargo refuses. It never offers
 //! [`LocalRuntime`], which isolates nothing.
 
-#[cfg(target_os = "linux")]
+mod acks;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod cache;
 pub mod cas;
 pub mod clock;
 pub mod config;
 pub mod connect;
 mod contact;
+pub mod cpu_pool;
 mod daemon;
 pub mod driver_watch;
 pub mod keeper;
 mod lease;
+mod lease_panic;
 #[cfg(target_os = "linux")]
 mod local;
+mod map;
+#[cfg(target_os = "linux")]
+pub mod numa;
 pub mod phases;
+mod plane;
+pub mod pressure;
+pub mod reach;
 pub mod report;
 pub mod runtime;
 pub mod runtimes;
 pub mod status;
 pub mod tree;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod trees;
 #[cfg(target_os = "macos")]
 pub mod uid;
+mod update_link;
 #[cfg(target_os = "linux")]
 pub mod usage;
+mod welcome;
 mod window;
 
 /// The daemon's version as it reports it (`daemon_version` in `Hello` and
@@ -70,18 +86,30 @@ mod window;
 /// checkout (issue #170). `build.rs` embeds the commit.
 pub const DAEMON_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT"));
 
+/// The commit this build is from (12 hex digits, or `unknown`): the `+` part of
+/// [`DAEMON_VERSION`], and what the update client reports as the commit running.
+pub const BUILD_COMMIT: &str = env!("KBF_BUILD_COMMIT");
+
 pub use cas::{Cas, CasError};
 pub use clock::{Clock, Moment, SystemClock};
-pub use config::{Args, DaemonConfig, FENCE_AFTER, KeepAlive, RECHECK_EVERY, TlsFiles};
+pub use config::{
+    Args, DaemonConfig, FENCE_AFTER, KeepAlive, MAX_UNACKED, RECHECK_EVERY, TlsFiles,
+};
 pub use contact::{Acked, Contact};
+pub use cpu_pool::CpuPool;
 pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError, superseded};
 pub use driver_watch::{DriverPart, DriverWatch};
+pub use kbf_mapsync::MapHolder;
+pub use kbf_route::Liveness;
 #[cfg(target_os = "linux")]
 pub use local::{LOCAL_DRIVER, LocalRuntime};
+pub use map::{HeldMaps, REFETCH_WITHIN};
+pub use plane::{FarmCas, FarmLease, LocalMember, StorageNodes, member_cas, storage_nodes};
 pub use report::{Capacity, NodeReport};
 pub use runtime::{FakeRuntime, Runtime, RuntimeError, UPLOAD_DEADLINE, Work, upload_within};
 pub use runtimes::{KindServedTwice, Runtimes};
 pub use status::DriverReport;
+pub use update_link::UpdateLink;
 
 // The unit tests run this test binary as kbf-testkit's `kbf-act` (src/usage.rs).
 #[cfg(test)]

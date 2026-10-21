@@ -24,8 +24,9 @@ use kbf_driver_native::{NativeConfig, NativeRuntime, procs};
 use kbf_proto::reapi::command::EnvironmentVariable;
 use kbf_proto::reapi::platform::Property;
 use kbf_proto::reapi::{
-    Action, ActionResult, Command, Digest, Directory, FileNode, Platform, Tree,
+    Action, ActionResult, Command, Digest, Directory, DirectoryNode, FileNode, Platform, Tree,
 };
+use kbf_testkit::dir::TestDir;
 use kbf_types::{LeaseId, Resources};
 use prost::Message;
 
@@ -39,6 +40,8 @@ pub struct MemoryCas {
     pub delay: Option<Duration>,
     /// Every put fails as an unreachable CAS would.
     pub refuse_puts: bool,
+    /// The digests `get` was asked for, by label, with how often.
+    pub reads: Mutex<BTreeMap<String, u64>>,
 }
 
 impl MemoryCas {
@@ -56,6 +59,12 @@ impl MemoryCas {
             .unwrap_or_else(|| panic!("blob {} is stored", label(digest)))
     }
 
+    /// How many times `get` was asked for `digest`.
+    pub fn reads_of(&self, digest: &Digest) -> u64 {
+        let reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
+        reads.get(&label(digest)).copied().unwrap_or(0)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Vec<u8>>> {
         self.blobs.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -69,6 +78,9 @@ impl Cas for MemoryCas {
     }
 
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
+        *(self.reads.lock().unwrap_or_else(PoisonError::into_inner))
+            .entry(label(digest))
+            .or_default() += 1;
         if let Some(delay) = self.delay {
             tokio::time::sleep(delay).await;
         }
@@ -94,8 +106,18 @@ impl Cas for MemoryCas {
 pub fn act() -> PathBuf {
     static LINK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     LINK.get_or_init(|| {
-        let link = scratch("act").join(kbf_testkit::act::NAME);
-        kbf_testkit::act::link_self(&link).expect("link");
+        // One directory for every run of this binary (a link that lives as long as the
+        // process cannot be a `TestDir`): remade by rename, so no run leaves another.
+        let exe = std::env::current_exe().expect("test binary");
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join("kbf-driver-native-act")
+            .join(exe.file_name().expect("a file name"));
+        std::fs::create_dir_all(&dir).expect("act directory");
+        let link = dir.join(kbf_testkit::act::NAME);
+        let made = dir.join(format!(".act-{}", std::process::id()));
+        let _ = std::fs::remove_file(&made);
+        kbf_testkit::act::link_self(&made).expect("link");
+        std::fs::rename(&made, &link).expect("place the link");
         link
     })
     .clone()
@@ -163,19 +185,7 @@ impl Spec {
 
     /// Stores the action in `cas` and returns its digest.
     pub fn store(&self, cas: &MemoryCas) -> Digest {
-        let root = Directory {
-            files: self
-                .inputs
-                .iter()
-                .map(|(name, bytes)| FileNode {
-                    name: name.clone(),
-                    digest: Some(cas.insert(bytes.clone())),
-                    is_executable: true,
-                    ..FileNode::default()
-                })
-                .collect(),
-            ..Directory::default()
-        };
+        let root = directory_of(cas, &self.inputs);
         let command = Command {
             arguments: self.argv.clone(),
             environment_variables: self
@@ -213,17 +223,75 @@ impl Spec {
     }
 }
 
-/// A fresh scratch directory for one test, under Cargo's per-target temporary
-/// directory.
-pub fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-driver-native")
-        .join(format!("{name}-{}", std::process::id()));
-    if std::fs::symlink_metadata(&dir).is_ok() {
-        kbf_outputs::remove_tree(&dir).expect("clear old scratch");
+/// The Directory of `inputs` (every file executable): a name with `/` is in the
+/// subdirectory it names, stored in `cas` as well.
+fn directory_of(cas: &MemoryCas, inputs: &[(String, Vec<u8>)]) -> Directory {
+    let mut files = Vec::new();
+    let mut below: BTreeMap<&str, Vec<(String, Vec<u8>)>> = BTreeMap::new();
+    for (name, bytes) in inputs {
+        match name.split_once('/') {
+            None => files.push(FileNode {
+                name: name.clone(),
+                digest: Some(cas.insert(bytes.clone())),
+                is_executable: true,
+                ..FileNode::default()
+            }),
+            Some((dir, rest)) => below
+                .entry(dir)
+                .or_default()
+                .push((rest.to_owned(), bytes.clone())),
+        }
     }
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+    let directories = below
+        .into_iter()
+        .map(|(name, inner)| DirectoryNode {
+            name: name.to_owned(),
+            digest: Some(cas.insert(directory_of(cas, &inner).encode_to_vec())),
+        })
+        .collect();
+    Directory {
+        files,
+        directories,
+        ..Directory::default()
+    }
+}
+
+/// A scratch directory a test owns: a [`TestDir`] that, when the test passed, is first
+/// removed with the driver's own tree removal (it opens a directory a test closed, and
+/// does not recurse once per level). Declare it before anything that runs in it, so
+/// those are gone first.
+#[derive(Debug)]
+pub struct Scratch(TestDir);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // After a panic the `TestDir` keeps or removes the directory: a second panic
+        // while unwinding would abort the process.
+        if !std::thread::panicking() && std::fs::symlink_metadata(self.0.path()).is_ok() {
+            kbf_outputs::remove_tree(self.0.path()).expect("remove scratch");
+        }
+    }
+}
+
+/// A fresh scratch directory for one test, under Cargo's per-target temporary
+/// directory, removed when it is dropped.
+pub fn scratch(name: &str) -> Scratch {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kbf-driver-native");
+    Scratch(TestDir::under(root, name))
 }
 
 /// A configuration for tests: a fast poll, everything else the default. Also turns on
@@ -313,12 +381,14 @@ pub fn no_leases(config: &NativeConfig) -> bool {
     let runs = config.scratch.join("runs");
     // The output spools' directory: its files are unlinked as soon as they are made.
     let spool = config.scratch.join("spool");
+    // The directory a start's simulator sweep runs `simctl` in, kept once made.
+    let sweep = config.scratch.join("simulator-sweep");
     let others = std::fs::read_dir(&config.scratch)
         .expect("scratch root")
         .filter(|entry| {
-            entry
-                .as_ref()
-                .map_or(true, |e| e.path() != runs && e.path() != spool)
+            entry.as_ref().map_or(true, |e| {
+                e.path() != runs && e.path() != spool && e.path() != sweep
+            })
         })
         .count();
     others == 0 && empty(&runs) && empty(&spool)

@@ -394,7 +394,7 @@ fn a_reported_failure_fails_the_operation() {
 /// Catches: placement that checks CPU but not memory (or the reverse), bookings that
 /// are not added up, and a worker silent for G still offered new work.
 #[test]
-fn first_fit_books_cpu_and_memory_on_live_workers() {
+fn placement_books_cpu_and_memory_on_live_workers() {
     let mut h = Harness::new();
     // `a` has CPU to spare but too little memory; `b` has both.
     h.worker("a", 16_000, GIB / 2);
@@ -417,6 +417,90 @@ fn first_fit_books_cpu_and_memory_on_live_workers() {
     h.heartbeat("c");
     let [g3] = h.tick().try_into().unwrap();
     assert_eq!(g3.worker, w("c"));
+}
+
+/// A request for one core and `memory` bytes, number `n`.
+fn sized(n: u8, memory: u64) -> Request {
+    Request {
+        resources: Resources::new(1_000, memory),
+        ..request(n)
+    }
+}
+
+/// Catches: an action's memory booked against the node's memory, so that a node whose
+/// cores and lease count allow 80 actions runs only floor(175 / 4) = 43 when each is
+/// first run under a 4 GiB limit. The limit is not a booking: the node takes work up to
+/// its CPUs whatever the limits add up to, and the sum is only recorded.
+#[test]
+fn memory_limits_summing_past_the_node_do_not_keep_actions_out() {
+    let mut h = Harness::new();
+    h.worker("a", 80_000, 175 * GIB);
+    for n in 0..100 {
+        h.submit(u64::from(n), sized(n, 4 * GIB));
+    }
+    let grants = h.tick();
+    assert_eq!(grants.len(), 80, "one per core, not one per 4 GiB of 175");
+    assert_eq!(
+        h.s.booked(&w("a")),
+        Some(Resources::new(80_000, 320 * GIB)),
+        "the limits sum to more than the node's memory"
+    );
+    assert_eq!(h.s.queued().count(), 20);
+    // A lease that ends opens its core, and only its core.
+    h.commit_and_start(&grants[0]);
+    h.finish(&grants[0], ok(0));
+    assert_eq!(h.tick().len(), 1);
+}
+
+/// Catches: a limit larger than the node's memory placed on it (an action that asks for
+/// more than the node has would run under a limit it can never reach), and a node
+/// skipped for a limit it has the memory for.
+#[test]
+fn an_action_goes_only_to_a_node_with_the_memory_of_its_limit() {
+    let mut h = Harness::new();
+    h.worker("a", 8_000, 8 * GIB);
+    h.worker("b", 8_000, 64 * GIB);
+    h.submit(1, sized(1, 16 * GIB));
+    let [g1] = h.tick().try_into().unwrap();
+    assert_eq!(g1.worker, w("b"), "a has 8 GiB, the limit is 16");
+    h.submit(2, sized(2, 8 * GIB));
+    let [g2] = h.tick().try_into().unwrap();
+    assert_eq!(g2.worker, w("a"), "8 GiB is the whole of a, and a is empty");
+}
+
+/// Catches: the last step of the memory ladder (a limit of the node's whole memory) run
+/// beside other leases, which the booking of all its memory used to prevent and which
+/// must hold now that memory is not booked: it waits for a node with no lease, nothing
+/// else is placed on the node while it runs, and the node is open again when it ends.
+#[test]
+fn an_action_at_the_whole_node_memory_runs_alone() {
+    let mut h = Harness::new();
+    h.worker("a", 8_000, 16 * GIB);
+    h.submit(1, sized(1, GIB));
+    let [small] = h.tick().try_into().unwrap();
+    h.commit_and_start(&small);
+    h.submit(2, sized(2, 16 * GIB));
+    assert!(h.tick().is_empty(), "placed beside a running lease");
+    h.finish(&small, ok(1));
+    let [whole] = h.tick().try_into().unwrap();
+    assert_eq!(whole.operation, OperationId(1));
+    h.commit_and_start(&whole);
+    h.submit(3, sized(3, GIB));
+    assert!(h.tick().is_empty(), "placed beside the whole node's lease");
+    h.finish(&whole, ok(2));
+    let [after] = h.tick().try_into().unwrap();
+    assert_eq!(after.operation, OperationId(2));
+}
+
+/// Catches: a request for no memory read as the whole of a node that reports none, which
+/// would run it alone.
+#[test]
+fn a_request_for_no_memory_is_not_the_whole_node() {
+    let mut h = Harness::new();
+    h.worker("a", 2_000, 0);
+    h.submit(1, sized(1, 0));
+    h.submit(2, sized(2, 0));
+    assert_eq!(h.tick().len(), 2);
 }
 
 /// Catches: dedup that joins across instance names (another namespace's work answered
@@ -774,7 +858,7 @@ fn a_capacity_change_counts_as_hearing_from_the_worker() {
 fn not_held_names_the_listed_leases_given_up_on_the_worker() {
     let mut h = Harness::new();
     h.worker("a", 1_000, GIB);
-    h.worker("b", 1_000, GIB);
+    h.worker("b", 2_000, 2 * GIB);
     h.submit(1, request(1));
     h.submit(2, request(2));
     let [on_a, on_b] = h.tick().try_into().unwrap();
@@ -794,11 +878,16 @@ fn not_held_names_the_listed_leases_given_up_on_the_worker() {
     h.at_secs(61).heartbeat("a");
     h.heartbeat_running("b", &[on_b.lease]);
     assert_eq!(not_held(&h, "a", &[on_a.lease]), [on_a.lease]);
+    // Given up as not started, `a` is avoided: the retry goes to `b`, which has room.
     let [retry] = h.tick().try_into().unwrap();
-    assert_eq!(retry.worker, w("a"));
-    assert_eq!(not_held(&h, "a", &[on_a.lease, retry.lease]), [on_a.lease]);
+    assert_eq!(retry.worker, w("b"));
+    assert_eq!(
+        not_held(&h, "a", &[on_a.lease, retry.lease]),
+        [on_a.lease, retry.lease]
+    );
+    assert_eq!(not_held(&h, "b", &[on_a.lease, retry.lease]), [on_a.lease]);
     h.commit_and_start(&retry);
-    assert_eq!(not_held(&h, "a", &[on_a.lease, retry.lease]), [on_a.lease]);
+    assert_eq!(not_held(&h, "b", &[on_a.lease, retry.lease]), [on_a.lease]);
 
     // A finished operation's lease is held nowhere.
     h.finish(&on_b, ok(2));
@@ -814,6 +903,28 @@ fn run_one(h: &mut Harness, waiter: u64, n: u8) -> LeaseGrant {
     h.commit_and_start(&grant);
     h.finish(&grant, ok(n));
     grant
+}
+
+/// Catches: a list of unfinished operations that includes a finished one (a successor
+/// process would follow results already given) or leaves out a queued or running one
+/// (a caller left with no answer).
+///
+/// Three operations: one finished, one running, one queued behind it on a node with
+/// room for one.
+#[test]
+fn unfinished_lists_the_operations_not_done_and_no_other() {
+    let mut h = Harness::new();
+    h.worker("a", 1_000, GIB);
+    let done = run_one(&mut h, 0, 0);
+    h.submit(1, request(1));
+    let [running] = h.tick().try_into().unwrap();
+    h.commit_and_start(&running);
+    h.submit(2, request(2));
+    assert!(h.s.state(done.operation).is_some_and(OpState::is_done));
+    assert_eq!(
+        h.s.unfinished().collect::<Vec<_>>(),
+        [running.operation, OperationId(2)]
+    );
 }
 
 /// Catches (issue #165): finished operations kept forever, so the scheduler's memory

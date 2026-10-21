@@ -1,4 +1,5 @@
-//! One placement round, checked against the reference first fit and verdict.
+//! One placement round, checked against the reference placement (the least loaded worker
+//! with room) and verdict.
 
 use super::*;
 
@@ -26,7 +27,9 @@ impl Checker {
         let mut matching: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         let mut verdicts: BTreeMap<(usize, Resources), Verdict> = BTreeMap::new();
         let mut no_room: BTreeSet<(usize, Resources)> = BTreeSet::new();
-        let mut extra: BTreeMap<usize, Resources> = BTreeMap::new();
+        // What this round has placed on each worker so far: its bookings, how many leases,
+        // and whether one holds the node alone.
+        let mut extra: BTreeMap<usize, (Resources, usize, bool)> = BTreeMap::new();
         let mut grants: Vec<(OperationId, WorkerId)> = Vec::new();
         let mut notes: Vec<(OperationId, Verdict)> = Vec::new();
         let mut room_short = false;
@@ -35,26 +38,64 @@ impl Checker {
             let class = (op.needs, op.request.resources);
             let needs = &self.needs[op.needs];
             let mut placed = false;
-            if grants.len() < PLACEMENT_ROUND && !no_room.contains(&class) {
-                let m = matching.entry(op.needs).or_insert_with(|| {
-                    (0..live.len())
-                        .filter(|&i| needs.matches(&self.workers[live[i]].caps))
-                        .collect()
-                });
-                let fit = m.iter().copied().find(|i| {
-                    let w = &self.workers[live[*i]];
-                    let booked = add(w.booked, extra.get(i).copied().unwrap_or_default());
-                    fits(sub(w.capacity, booked), op.request.resources)
-                });
+            // An operation with farm runs avoids their workers while another could run
+            // it, so its fit is its own, not its class's.
+            let avoids = !op.avoid.is_empty();
+            let m = matching.entry(op.needs).or_insert_with(|| {
+                (0..live.len())
+                    .filter(|&i| needs.matches(&self.workers[live[i]].caps))
+                    .collect()
+            });
+            let avoided = |i: usize| op.avoid.contains(live[i]);
+            let elsewhere = m
+                .iter()
+                .copied()
+                .any(|i| !avoided(i) && fits(self.workers[live[i]].capacity, op.request.resources));
+            // What worker `i` holds now: its bookings, how many leases, and whether one
+            // holds it alone.
+            let held_on = |extra: &BTreeMap<usize, (Resources, usize, bool)>, i: usize| {
+                let w = &self.workers[live[i]];
+                let (more, leases, whole) = extra.get(&i).copied().unwrap_or_default();
+                (
+                    add(w.booked, more),
+                    w.leases.len() + leases,
+                    w.whole || whole,
+                )
+            };
+            if grants.len() < PLACEMENT_ROUND && (avoids || !no_room.contains(&class)) {
+                // The least loaded worker with room; of equals, the first by name.
+                let fit = m
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        let (booked, leases, whole) = held_on(&extra, i);
+                        room(
+                            self.workers[live[i]].capacity,
+                            booked,
+                            whole,
+                            leases,
+                            op.request.resources,
+                        ) && !(elsewhere && avoided(i))
+                    })
+                    .min_by(|&a, &b| {
+                        let load = |i: usize| {
+                            let (booked, leases, _) = held_on(&extra, i);
+                            (self.workers[live[i]].capacity, booked, leases)
+                        };
+                        by_load(load(a), load(b))
+                    });
                 match fit {
                     Some(i) => {
+                        let alone = exclusive(self.workers[live[i]].capacity, op.request.resources);
                         let e = extra.entry(i).or_default();
-                        *e = add(*e, op.request.resources);
+                        *e = (add(e.0, op.request.resources), e.1 + 1, e.2 || alone);
                         grants.push((id, live[i].clone()));
                         placed = true;
                     }
                     None => {
-                        no_room.insert(class);
+                        if !avoids {
+                            no_room.insert(class);
+                        }
                     }
                 }
             }
@@ -96,8 +137,8 @@ impl Checker {
             }
         }
 
-        // Grants: the explicit invariants first, then the reference first fit.
-        let mut booked_now: BTreeMap<WorkerId, Resources> = BTreeMap::new();
+        // Grants: the explicit invariants first, then the reference placement.
+        let mut booked_now: BTreeMap<WorkerId, (Resources, usize, bool)> = BTreeMap::new();
         for g in &granted {
             if self.next_seq != g.lease.seq || g.lease.term != TERM {
                 self.violated(
@@ -110,14 +151,24 @@ impl Checker {
                 self.violated("I7", format!("{g:?} to an unregistered worker"));
             };
             let op = self.op(g.operation);
-            let booked = booked_now.entry(g.worker.clone()).or_insert(w.booked);
-            *booked = add(*booked, op.request.resources);
-            if !fits(w.capacity, *booked) {
+            let held =
+                booked_now
+                    .entry(g.worker.clone())
+                    .or_insert((w.booked, w.leases.len(), w.whole));
+            if !room(w.capacity, held.0, held.2, held.1, op.request.resources) {
                 self.violated(
                     "I6",
-                    format!("{g:?} books {booked:?} on capacity {:?}", w.capacity),
+                    format!(
+                        "{g:?} placed beside {:?} booked ({} leases, alone: {}) on capacity {:?}",
+                        held.0, held.1, held.2, w.capacity
+                    ),
                 );
             }
+            *held = (
+                add(held.0, op.request.resources),
+                held.1 + 1,
+                held.2 || exclusive(w.capacity, op.request.resources),
+            );
             if !w.alive(now) || !self.needs[op.needs].matches(&w.caps) {
                 self.violated(
                     "I7",
@@ -135,7 +186,7 @@ impl Checker {
         if got != grants {
             self.violated(
                 "I11",
-                format!("placement differs from the reference first fit\n  expected {grants:?}\n  got      {got:?}"),
+                format!("placement differs from the reference\n  expected {grants:?}\n  got      {got:?}"),
             );
         }
 
@@ -213,6 +264,7 @@ impl Checker {
             let resources = self.op(*id).request.resources;
             let w = self.workers.get_mut(&g.worker).expect("checked");
             w.booked = add(w.booked, resources);
+            w.whole |= exclusive(w.capacity, resources);
             w.leases.insert(g.lease);
             self.touched_workers.insert(g.worker.clone());
             let qos = self.op(*id).request.qos.clone();

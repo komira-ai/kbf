@@ -1,12 +1,16 @@
-//! One placement round, checked against a reference first fit and the reference
-//! unservable verdict: I1, I6, I7 and I8 for each grant, I10 and L2 for waiting reasons
-//! and refusals, I11 for the round.
+//! One placement round, checked against a reference placement (each operation to the
+//! least loaded worker with room) and the reference unservable verdict: I1, I6, I7 and
+//! I8 for each grant, I10 and L2 for waiting reasons and refusals, I11 for the round.
 
 use std::collections::BTreeMap;
 
 use kbf_types::{ControlRecord, Effect, LeaseId, OperationId, WorkerId};
 
-use super::{Axes, Checker, Held, State, add, fits_beside, fits_whole, queue_key};
+use std::cmp::Ordering;
+
+use super::{
+    Checker, Held, Room, State, add, by_load, exclusive, fits_beside, fits_whole, queue_key,
+};
 
 /// At most this many grants per round: the catalog's number, written here rather than
 /// read from `kbf_sched::PLACEMENT_ROUND`, so that a change to the constant is caught.
@@ -52,7 +56,7 @@ impl Checker {
     }
 
     /// One placement round (a tick after its expiry, or an uncordon): the grants must
-    /// be the reference first fit's, in order; waiting reasons and refusals must agree
+    /// be the reference placement's, in order; waiting reasons and refusals must agree
     /// with the reference verdict and the unservable wait.
     pub(super) fn round(&mut self, effects: &[Effect]) {
         self.stats.rounds += 1;
@@ -63,9 +67,17 @@ impl Checker {
             .filter(|n| self.live(n) && !self.cordoned.contains(*n))
             .cloned()
             .collect();
-        let mut booked: BTreeMap<WorkerId, Axes> = names
+        let mut booked: BTreeMap<WorkerId, Room> = names
             .iter()
-            .map(|n| (n.clone(), self.workers[n].booked))
+            .map(|n| {
+                let w = &self.workers[n];
+                let room = Room {
+                    booked: w.booked,
+                    leases: w.leases,
+                    whole: w.whole,
+                };
+                (n.clone(), room)
+            })
             .collect();
         let mut expected = Vec::new();
         let mut verdicts = Vec::new();
@@ -73,24 +85,33 @@ impl Checker {
         for &id in &order {
             let (need, res) = (self.ops[&id].need, self.ops[&id].resources);
             if expected.len() < ROUND {
-                let mut placed = None;
+                // The least loaded worker with room; of equals, the first by name.
+                let mut placed: Option<&WorkerId> = None;
                 for name in &names {
                     let cap = self.workers[name].capacity;
                     if fits_beside(cap, booked[name], res) && self.matches(need, name) {
-                        placed = Some(name.clone());
-                        break;
+                        let better = placed.is_none_or(|best| {
+                            let load = |n: &WorkerId| (self.workers[n].capacity, booked[n]);
+                            by_load(load(name), load(best)) == Ordering::Less
+                        });
+                        if better {
+                            placed = Some(name);
+                        }
                     }
                     if fits_whole(cap, res)
                         && !fits_beside(cap, booked[name], res)
-                        && (0..3).any(|i| booked[name][i] > cap[i])
+                        && [0, 2].iter().any(|&i| booked[name].booked[i] > cap[i])
                         && self.matches(need, name)
                     {
                         self.stats.overbooked_skips += 1;
                     }
                 }
-                if let Some(name) = placed {
+                if let Some(name) = placed.cloned() {
+                    let cap = self.workers[&name].capacity;
                     let b = booked.get_mut(&name).expect("live");
-                    *b = add(*b, res);
+                    b.booked = add(b.booked, res);
+                    b.leases += 1;
+                    b.whole |= exclusive(cap, res);
                     expected.push((id, name));
                     verdicts.push((id, Verdict::Servable));
                     continue;
@@ -214,8 +235,13 @@ impl Checker {
                     &format!("{} granted to unregistered {}", g.lease, g.worker),
                 );
             };
+            let room = Room {
+                booked: w.booked,
+                leases: w.leases,
+                whole: w.whole,
+            };
             let (cap, booked, res, need) = (w.capacity, w.booked, op.resources, op.need);
-            self.ensure(fits_beside(cap, booked, res), "I6", || {
+            self.ensure(fits_beside(cap, room, res), "I6", || {
                 format!(
                     "{} of {} ({res:?}) to {} with {booked:?} booked of {cap:?}",
                     g.lease, g.operation, g.worker
@@ -249,7 +275,7 @@ impl Checker {
                 .position(|(a, b)| a != b)
                 .unwrap_or(got.len().min(expected.len()));
             let what = format!(
-                "the round granted {} leases, the reference first fit {}; first difference \
+                "the round granted {} leases, the reference placement {}; first difference \
                  at #{first}: got {:?}, want {:?}",
                 got.len(),
                 expected.len(),
@@ -273,7 +299,9 @@ impl Checker {
         op.told = None;
         op.since = None;
         let w = self.workers.get_mut(worker).expect("registered");
+        w.whole |= exclusive(w.capacity, op.resources);
         w.booked = add(w.booked, op.resources);
+        w.leases += 1;
         self.held.insert(
             lease,
             Held {

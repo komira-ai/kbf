@@ -22,7 +22,11 @@ an action runs under. The messages are in [worker-protocol.md](worker-protocol.m
 
 The daemon is configured by flags only: `--server` (an `https://` URL; repeatable, or
 several separated by commas), `--ca-cert`, `--cert`, `--key`, `--tls-server-name`,
-`--node-id`, `--runtime`, `--reconnect-ms` and `--reconnect-max-ms`.
+`--node-id`, `--runtime`, `--reconnect-ms` and `--reconnect-max-ms`. How long a silent
+storage node is waited on is set by `--storage-dial-timeout-ms`,
+`--storage-ping-interval-ms` and `--storage-ping-timeout-ms` (10000 each; none is zero or
+over 3600000, one hour, and the ping timeout is at most the interval); a daemon with one of them wrong does not
+start.
 The certificate must name `--node-id` as its one DNS subjectAltName, or the server
 refuses the session (see
 [worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list)).
@@ -140,10 +144,10 @@ requeues their leases elsewhere after the handover grace.
   ends the keeper with the rest, so it needs no dismissal. It counts toward the
   lease's memory.
 - **Container driver.** The keeper starts once the lease cgroup is made, before
-  `podman create`, in a process group of its own. At end-of-file it writes the lease
+  the bundle is written, in a process group of its own. At end-of-file it writes the lease
   cgroup's `cgroup.kill`, which kills every process in the lease, the container's
   among them, and again every second for 30 seconds, while the file exists: a
-  `podman start` the dead daemon left in flight can still put the container's first
+  `crun run` the dead daemon left in flight can still put the container's first
   process in the lease after the first write. The container, the lease cgroup and the
   scratch directory stay, with nothing running in them, until the sweep. The daemon
   removes the keeper (SIGKILL, then it reaps it) once the lease is cleaned.
@@ -171,18 +175,16 @@ requeues their leases elsewhere after the handover grace.
   directory (a symlink, or a directory others may write) is removed, never emptied
   through; the daemon's own is emptied after the kill, through the descriptor it
   checked, and what the sweep moves aside goes in through that descriptor too.
-- **Container driver.** Every container is created with the label
-  `kbf.owner=<node id>`. At start the driver removes each lease it finds, among the
-  containers so labelled and the lease scratch directories, as a lease's clean does
-  (`cgroup.kill`, `podman rm --force`, the lease cgroup, the scratch directory). A
-  leftover that cannot be listed or removed stops the daemon from starting.
+- **Container driver.** A lease's `crun` state is inside its scratch directory. At
+  start the driver removes each lease scratch directory it finds, as a lease's clean
+  does (`cgroup.kill`, `crun delete --force`, the lease cgroup, the scratch directory).
+  A leftover that cannot be removed stops the daemon from starting.
 
 So when a restarted daemon says `Hello`, nothing a previous daemon on the node started
-under the same scratch directory (and, for containers, the same node id and Podman
-store) still runs, and the leases its first heartbeat leaves out, which the scheduler
+under the same scratch directory still runs, and the leases its first heartbeat leaves out, which the scheduler
 requeues once the handover grace has passed, do not run twice. That is also why the
 restarted daemon may say so: once every runtime is built, the `kbf-daemon` binary
-names the previous daemon process, whose id it finds in `<--scratch>/daemon-instance`,
+names the previous daemon process, whose id it finds in `<--data-dir>/leases/daemon-instance`,
 as `Hello.predecessor_instance_id`, and writes its own id there for the next one. The
 server then requeues those leases at once, not after the grace, if the previous
 stream has closed (issue #22; [scheduler.md](scheduler.md#reconciling-with-what-workers-say-they-run)). The grace alone would
@@ -202,7 +204,7 @@ guaranteed:
   (`AbandonProcessGroup` false, the default; true stops even that), and has no
   setting that reaches an action leading a group of its own, so on a Mac the shipped
   plist's `KeepAlive` restart is the line after the keeper.
-- **Container: a `podman start` that outlasts the keeper's 30 seconds** of kills, and
+- **Container: a `crun run` that outlasts the keeper's 30 seconds** of kills, and
   puts the container's process in the lease after the last one.
 - **Native: a process that left the group** (`setsid`): the keeper does not reach it,
   and once its parent has exited (the keeper's kill of the group may be what ends the
@@ -266,8 +268,8 @@ others in the order given. Two that serve the same kind refuse to start (`contai
 `native` and `fake` all serve `action`); a Mac runs `--driver native --driver
 native-whole-machine`.
 
-- **`PodmanRuntime`** (`kbf-driver-container`, driver `container`, Linux only): the
-  runtime for Linux farm nodes, below. The binary requires `--scratch` and `--cas`, and
+- **`ContainerRuntime`** (`kbf-driver-container`, driver `container`, Linux only): the
+  runtime for Linux farm nodes, below. The binary requires `--data-dir` and `--cas`, and
   checks the daemon user's subordinate ids before it starts. It then sets up the cgroup
   its systemd unit delegates (`Delegate=yes`): it moves its processes into a
   `supervisor/` leaf, writes its `memory.min` from `--supervisor-memory-min-mib`
@@ -278,7 +280,21 @@ native-whole-machine`.
   controllers or the cgroup is not writable. `--cgroup-parent` names an `actions/`
   cgroup set up by someone else instead (checked, not changed). The node reports at most
   what `actions/` may use: `mem_gib` is the lower of MemTotal and the lowest
-  `memory.max` above the leases, `cpus` the nearest `cpuset.cpus.effective`.
+  `memory.max` above the leases, `cpus` the lower of the nearest
+  `cpuset.cpus.effective` and the lowest `cpu.max` quota on the path. The daemon writes
+  `actions/cpu.max` itself: the CPUs it may use minus `--reserve-cpus` (default 8).
+  `--lease-placement=numa-node` (default `none`, which pins nothing) puts each lease on
+  one NUMA node: the lease cgroup gets that node's CPUs (`cpuset.cpus`) and memory node
+  (`cpuset.mems`), and the container's cgroup inherits both. The node is the one with
+  the least CPU booked by running leases, the lowest id on a tie; the lease's
+  `inputs phases:` line ends with `numa_node=N`. A lease that asks for all the memory the
+  node reports, or for more than any one node holds, is unpinned: it gets every CPU and
+  memory node the daemon may use, books no node, and its line ends `numa_node=all`. It
+  enables `cpuset` in `actions/` and
+  its parent (the start fails, naming the fix, when the unit is not offered it) and
+  runs as `none`, logged once, on a host with fewer than two NUMA nodes that hold CPUs.
+  It changes neither admission nor `--reserve-cpus`, a quota that removes no CPU from a
+  node.
   [docs/deploy/linux-build-host.md](../deploy/linux-build-host.md) has the systemd
   units and the host's swap and memory headroom.
 - **`NativeRuntime`** (`kbf-driver-native`, driver `native`): each action as plain
@@ -289,7 +305,7 @@ native-whole-machine`.
   only): each `whole_machine` lease as a throwaway user in that user's GUI session,
   through the root helper `kbf-mac-session`
   ([fleet-updates.md](fleet-updates.md#101-no-gpu-in-vms)). The binary requires
-  `--scratch` (its files go in `<scratch>/whole-machine`) and `--cas`, and refuses to
+  `--data-dir` (its files go in `<scratch>/whole-machine`) and `--cas`, and refuses to
   start when nothing serves `--mac-session-socket`. It hands the daemon its phase
   (`Daemon::with_phase`), which every `Hello` carries
   ([worker-protocol.md](worker-protocol.md#node-phases)): the session switch restarts
@@ -307,8 +323,12 @@ native-whole-machine`.
 
 ## The container driver
 
-`PodmanRuntime` runs each `action` lease in a fresh rootless Podman container that is
-never reused. Each lease goes through six steps.
+**kbf runs containers with `crun` only**, run directly from a bundle the driver writes
+(below): a launch takes milliseconds, and `kbf-daemon` has no flag to choose another
+runtime.
+
+`ContainerRuntime` runs each `action` lease in a fresh rootless container that is never
+reused. Each lease goes through six steps.
 
 1. **Prepare.**
    - Fetch the `Action` and `Command` from the CAS and verify them.
@@ -316,9 +336,11 @@ never reused. Each lease goes through six steps.
      on the `Command` for clients older than REAPI 2.2). It must be
      `docker://<repo>@sha256:<digest>`: a tag is refused, and so is a digest that names
      an image index (a multi-architecture list) rather than one architecture's manifest.
-     The driver tells the two apart by reading the manifest the node's image store
-     keeps under that digest, after checking that its bytes hash to the digest. The image
-     must already be in the node's store; nodes never pull at action time.
+     The driver tells the two apart by fetching the manifest from the image's registry
+     by that digest: its bytes must hash to the digest, and an index is refused. The
+     image is unpacked in the node's image store once per digest, on the first lease
+     that names it or at start for a pinned image (below), and every byte of it was
+     checked against a digest on the way in.
    - Check the `Command`: it must have arguments; the working directory and every output
      path must be relative, without `.`, `..` or empty components.
    - Write the input root into the lease's scratch directory. Every name in a client's
@@ -333,14 +355,15 @@ never reused. Each lease goes through six steps.
      as `INVALID_ARGUMENT`.
    - Give the overlay's directories to the container's root (see User namespaces).
    - Make the lease cgroup (below).
-2. **Start.** `podman create`, then `podman start --attach`, with stdout and stderr
-   written to files in the scratch directory.
+2. **Start.** Write the bundle (`config.json` and the `hosts` and `hostname` files),
+   then `crun run` on a thread of its own, with stdout and stderr written to files in
+   the scratch directory.
 3. **Watch.** Wait for the container to exit, the action's timeout, or `kill`. On a
    timeout, once the container is stopped, store what it wrote to stdout and stderr in
    the CAS, each within the stdio limit; a log past the limit, or one that cannot be
    stored, is left out, and the lease still ends `TimedOut`.
-4. **Collect.** Read the exit code from Podman's record of the container. If it is 137
-   (SIGKILL), or there is none, and the lease cgroup's `memory.events` counts an
+4. **Collect.** Read the exit code from `crun run`'s own status. If it is 137
+   (SIGKILL), or `crun` reported an error and no exit, and the lease cgroup's `memory.events` counts an
    `oom_kill`, the lease fails as out of memory or as killed on a busy node (see
    Cgroups and limits). Otherwise give the overlay's directories back to the daemon's
    user, read the outputs (below) and store stdout and stderr in the CAS.
@@ -350,11 +373,11 @@ never reused. Each lease goes through six steps.
 **Pinned images.** `kbf-daemon --driver container --image docker://<repo>@sha256:<d>`
 (repeatable) names images the node is set up to run. At start, after its cgroup is
 set up and before it connects, the daemon checks each as the prepare step checks a
-lease's image (`PodmanRuntime::check_pinned`): named by digest, in its user's image
-store, and one architecture's manifest. The first that is not stops the daemon with
-exit status 2 and the fix: for a missing image, `podman pull <repo>@sha256:<d>`, to
-run as the daemon's user; for an index digest, to name the per-architecture manifest
-digest. The images are listed, sorted and each once, in the node's `NodeStatus`
+lease's image (`ContainerRuntime::check_pinned`): named by digest, fetched into the node's
+image store if it is not there (from its registry, every byte checked against a digest),
+and one architecture's manifest. The first that cannot be stops the daemon with exit
+status 2 and the reason: a registry that cannot be reached or refuses, a blob that is not
+its digest, or an index digest (name the per-architecture manifest digest). The images are listed, sorted and each once, in the node's `NodeStatus`
 (`container_images`), which `GET /v1/nodes` shows as `software.container_images`. They
 route no work: placement does not match an action's image against them, and an action
 may still name an image the node was not pinned to (it is checked at prepare as
@@ -369,51 +392,184 @@ loud.
 
 | Aspect | Setting |
 |---|---|
-| Network | `--network=none`: loopback only. No action has network today. |
-| Image | by per-architecture manifest digest; `--pull=never` |
-| Entrypoint | the action's argv as a JSON array: the image's `ENTRYPOINT` and `CMD` are ignored and no argument is re-split |
-| Users | `--userns=nomap`: no container uid or gid is the daemon's user (below); `--user=0:0`, the container's root, whatever the image's `USER` |
+| Network | a new network namespace with nothing configured: loopback only. No action has network today. |
+| Image | by per-architecture manifest digest; fetched and unpacked once per digest, never at action time |
+| Process | the action's argv as `process.args`: the image's `ENTRYPOINT` and `CMD` are ignored and no argument is re-split |
+| Users | container ids `0..65535` map to the daemon user's subordinate ids and nothing maps to the daemon user (below); `process.user` is 0:0, the container's root, whatever the image's `USER` |
 | Hostname | `localhost` |
-| Environment | `--unsetenv-all`, then the `Command`'s variables with `--env`: nothing from the image's `ENV`, Podman's defaults (`PATH`, `container`; `TERM` only with a tty, which an action never has) or the node's `containers.conf`. Podman 4.9 still adds `HOSTNAME=localhost` and `HOME` (uid 0's home in the image's `/etc/passwd`) when the `Command` sets neither; both follow from the image digest |
-| Limits | `--pids-limit`, `--shm-size` and `--ulimit` for `nofile` and `nproc` (soft = hard), from `kbf-daemon`'s `--container-pids-limit` (default 8192), `--container-shm-mib` (64), `--container-nofile` (65,536) and `--container-nproc` (32,768). `nproc` counts per user, and every container's root is the same subordinate id, so it bounds the node's actions together |
+| Environment | the `Command`'s variables only (`process.env`): nothing from the image's `ENV` or the node's environment. `HOSTNAME=localhost` and `HOME=/root` are added when the `Command` sets neither; both are the same on every node |
+| Limits | `pids.max`, the `/dev/shm` size and `RLIMIT_NOFILE` and `RLIMIT_NPROC` (soft = hard), from `kbf-daemon`'s `--container-pids-limit` (default 8192), `--container-shm-mib` (64), `--container-nofile` (65,536) and `--container-nproc` (32,768). `nproc` counts per user, and every container's root is the same subordinate id, so it bounds the node's actions together |
 | Working directory | the `Command`'s, under `/kbf/root` |
 | Files | the input root as a read-only overlay lower layer at `/kbf/root`; every write lands in a per-lease upper directory |
-| Cgroup | `--cgroup-parent` set to the lease cgroup, `--cgroup-manager=cgroupfs`, `memory.oom.group=1` |
+| Cgroup | the container's cgroup is `<lease cgroup>/ctr` (`cgroupfs` manager), `memory.oom.group=1` |
 | Timeout | the `Action`'s timeout; one hour when it names none; a negative one is `INVALID_ARGUMENT` |
 
 **Stopping a container** (timeout or kill): SIGTERM, then 5 seconds, then `cgroup.kill`
 on the lease cgroup, then a forced removal in the clean step.
 
+### `crun`, run directly
+
+`kbf-daemon [--oci-runtime=/usr/bin/crun]` runs each action in a fresh rootless sandbox
+made by `crun` directly: nothing else is on the action path, in image handling, in the
+deploy kit or in host setup. `crun` is driven through the `runc` crate
+(containerd/rust-extensions, Apache-2.0) and `config.json` is built with `oci-spec`'s
+typed builders.
+
+Per action: the image is already unpacked (below); a helper container gives the lease's
+directories to the action's root; `config.json`, the `hosts` and `hostname` files are
+written; `crun run` runs the bundle in the foreground; a helper gives the directories
+back; `crun delete --force` closes the lease. That is four `crun` processes.
+
+- **The exit code is `crun run`'s own status** (`128 + n` for a signal), so there is no
+  moment at which the container is stopped but its exit code is not recorded (#658). A
+  non-zero status is the farm's failure rather than the action's only if `crun` wrote an
+  error record to its `--log` (JSON) file; the lookup failures of `program.rs` (exit 127
+  and 126) and `ETXTBSY` are read from that log (`crun: <message>`) and from the init's report
+  (below).
+- **The container's first process is `kbf-init`, not the action** (`init/kbf_init.rs`,
+  built by `crates/kbf-driver-container/build.rs`, embedded in the daemon, installed
+  at `<scratch>/oci-bin/kbf-init` and bound read-only at `/dev/kbf-init`, in the
+  container's own `/dev` tmpfs, so the image is never written to). `process.args` is
+  `/dev/kbf-init -- <argv>`. In a pid namespace pid 1 adopts every orphan, and a pid 1
+  that never waits leaves each one a zombie: a test that kills its process group and
+  asks `kill(-pgid, 0)` is told the group lives (the mopm pilot, `test_proc.zig`). A
+  host's init and Buildbarn's runner reap, so the sandbox must. The init (about 200
+  lines, standard library only, linked statically so it runs in any image whatever its
+  libc) runs the action as its child with `/dev/null` for stdin, passes every signal it
+  can catch to the child, reaps every process that ends, and exits when the child
+  does, with the child's exit code or `128 + n` for signal `n`: the same status
+  `crun run` gave when the action was pid 1, and the kernel ends the rest of the
+  namespace as before. It costs one more process (one pid of `pids.max`, about a
+  megabyte). The action is pid 2 (`$$` shows it), and a signal it sends itself is now
+  delivered (pid 1 ignores signals without a handler). Other options were refused: no
+  OCI or `crun` setting makes a runtime init; a subreaper in the daemon cannot catch
+  the orphans, because they are reparented inside the namespace, to its pid 1.
+  Looking the program up is the init's work now, with `crun`'s rules: a name with a
+  slash as it is (relative to the working directory), a bare name on the `Command`'s
+  `PATH` only (no `PATH`: not found). It cannot start the program: it writes one line in
+  `crun`'s own words to its stdin (a file of the lease, `init-report`, which the
+  driver opens and only the init holds; the program's stdin is `/dev/null`) and exits
+  127 (not found) or 126 (anything else, `ETXTBSY` included), and the driver reads
+  that line where it reads `crun`'s log. The init is not dumpable (`PR_SET_DUMPABLE` 0; the action it execs is
+  dumpable again), so the action, the same user in the same pid namespace, cannot open the report
+  file through `/proc/1/fd/0` to forge a report, or trace the init.
+  The init also closes every descriptor above stderr first and makes SIGCHLD the default again; looks
+  a bare name up with `faccessat(X_OK, AT_EACCESS)` per `PATH` entry, as `crun` does; and treats a step of
+  its own sandbox that fails (`close_range`, the two `prctl`s) as the node's failure (a `kbf-init: ...` line
+  on stderr and in the report, exit 126, the program not started). Only the init's report is read as
+  the action's lookup failure: anything `crun` itself reports about an exec is about the init (a noexec
+  scratch mount, a bad binary) and is the farm's failure, with a message saying so. So everything above about 127, 126 and the
+  `ETXTBSY` retry holds unchanged. Building the daemon needs the C library's static
+  archive (`libc.a`).
+- **Namespaces:** pid, network (new, nothing configured: loopback only; `crun` brings
+  `lo` up), ipc, uts, mount, cgroup and user. Container ids `0..65536` map to the first
+  range of at least 65,536 in the daemon user's `/etc/subuid` and `/etc/subgid`; the
+  daemon user itself is unmapped. `crun` runs `newuidmap` and
+  `newgidmap` for the mapping, so `uidmap` is a node requirement.
+- **Capabilities, masked and read-only paths, seccomp** are those of containers/common
+  v0.57.4, written out (`oci/hardening.rs`): the eleven `default_capabilities` of
+  containers/common v0.57.4 (`CHOWN DAC_OVERRIDE FOWNER FSETID KILL NET_BIND_SERVICE
+  SETFCAP SETGID SETPCAP SETUID SYS_CHROOT`; inheritable and ambient empty), its twelve
+  `DefaultMaskedPaths` and six `DefaultReadOnlyPaths`, and that release's
+  `seccomp.json`, vendored beside the code with its sha256 pinned in a test and resolved
+  for the capability set and the architecture (`includes`/`excludes` of `caps` and
+  `arches`) exactly as containers/common resolves it. `noNewPrivileges` is false, as
+  containers/common's default. Left out: its `net.ipv4.ping_group_range` sysctl and the
+  `gid=5` option of `/dev/pts`.
+- **Cgroups:** the container's cgroup is `<lease cgroup>/ctr`, made by `crun`
+  (`cgroupfs` manager, its default) in the daemon's delegated subtree with
+  `pids.max` and `memory.oom.group=1`; memory and CPU stay on the lease cgroup, so
+  `memory.events` is read as before.
+- **Files.** `/` is the unpacked image, **read-only**; `/kbf/root` is an overlay
+  (`lowerdir` the input root, `upperdir` the lease's upper, options pinned to
+  `userxattr,metacopy=off,redirect_dir=nofollow,index=off,xino=off`); `/tmp`, `/var/tmp`,
+  `/run` and `/root` are directories of the lease on disk (not tmpfs, which would count
+  against the lease's memory); `/etc/hosts` (`localhost` for IPv4 and IPv6), `/etc/hostname` and `/etc/resolv.conf`
+  (`nameserver 127.0.0.1` and `options timeout:1 attempts:1`; nothing listens: a name outside
+  `hosts` fails at once with glibc's `EAI_AGAIN`, as on a worker without a reachable resolver,
+  and musl, which sends on an unconnected socket, waits at most about 2 s) are small read-only
+  files the lease writes. The action runs as uid and gid 1000, subordinate id 1000 of the
+  range, so permission checks are real (a mode-000 file is refused); the lease's writable
+  directories and the overlay are owned by that id while it runs. The image's own
+  `nsswitch.conf` is left as it is (the images the farm names have `hosts: files dns`). Uid 1000 has no passwd entry in most
+  images, so `whoami` and `getpwuid` fail; `HOME=/root` is the action's own writable directory. Image
+  files of mode 0700 or 0600 owned by the image's root are no longer readable by actions (the same
+  as on a worker that runs actions as an unprivileged user). An action that writes to another place in the image fails with `EROFS`. Shared read-only
+  trees (`SharedMount`: a host directory and a destination below `/kbf/root`) are bound
+  read-only after the overlay; the tree store that fills them is the daemon's.
+- **Helper containers** (`oci/helper.rs`) do the work that needs a user namespace with
+  the daemon user as id 0 and the range as ids `1..` (so the action's user, uid 1000, is `1001:1001`), or,
+  for an image's unpack, an action's own mapping. A helper runs one program, never a
+  shell: this daemon's binary in its `__chown-dirs` mode (with `--whole` trees, so the
+  whole hand-over is one process and walks by descriptor, never following a symlink) or
+  its `__unpack-layers` mode, or the node's `find` (to empty a directory the container's
+  ids own), from a read-only bind of the host's `/usr`. `crun` creates the namespaces, so the only
+  AppArmor grant for user namespaces is `crun`'s shipped profile, and the daemon needs
+  none of its own. A helper's cgroup is `<actions parent>/<id>`, named in its config:
+  left to itself `crun` makes one beside the daemon's own, and kills it on removal.
+- **The image store** (`oci/image.rs`, and the `kbf-image` crate): `<scratch>/oci-images/<hex>/rootfs`,
+  keyed by the manifest digest alone and unpacked once per digest, off the action path.
+  The daemon fetches the image itself, anonymously, over https (hyper over rustls, the
+  host's roots; a `Bearer` challenge is answered with a pull token, and a blob's
+  redirect target gets no credentials): the manifest by the pinned digest, which its
+  bytes must hash to, and which must be one image, not an index (a Docker schema 1
+  manifest, a foreign layer and a zstd layer are refused too); then the config and every
+  layer blob, each hashed as it is written and compared with the manifest's digest and
+  size before use (a failed one is deleted), and the image's own platform, when its
+  config states one, must be the node's. Limits bound a wrong pin: 4 MiB of manifest, 128
+  layers, 16 GiB of blobs. One helper container then applies the layers in order with
+  `kbf-daemon __unpack-layers`, in an action's user namespace, so every file is owned by
+  the host id the action sees as the image's own id: `.wh.` whiteouts and `.wh..wh..opq`
+  opaque markers apply to lower layers only, a path is resolved inside the root and never
+  outside it (`..` in an entry is refused, a symlink is followed as a chroot would), the
+  owner is set before the mode (`chown` clears setuid), an id above 65,535 is an error,
+  and device nodes and fifos are skipped. One flight per digest; the blobs and the stage
+  are removed whatever happens. After that a lease costs one `stat`. Tar's extended
+  attributes are not extracted (file capabilities are lost). A node needs egress to the
+  registries of its images (`registry-1.docker.io` for `docker.io`, `gcr.io`, ...).
+- **Node requirements:** `crun`; `newuidmap` and `newgidmap` (package `uidmap`) on the
+  daemon's `PATH`, setuid root or holding file capabilities; one subordinate range of
+  65,536 for the daemon's user; every directory from `/` to `--data-dir` searchable by
+  others (the container's ids are not the daemon user's: `chmod o+x`); kernel overlayfs
+  in a user namespace (5.11 or later); cgroup v2 delegated to the daemon's unit
+  (`Delegate=yes`); and whatever permits unprivileged user namespaces for `crun` (its
+  shipped AppArmor profile on Ubuntu 24.04). The daemon checks the range, the paths, the
+  files and the two id tools at start and refuses to start naming what is wrong.
+  Lingering and `XDG_RUNTIME_DIR` are not needed: `crun` always runs with an explicit
+  `--root` inside the lease.
+- **Per-action overhead.** The stand-in `crun` tests count the processes of a lease
+  (four); what a real node adds is to be measured on a build host: the latency of a helper container (user namespace,
+  `newuidmap`, bind mounts) idle and at 50 to 80 concurrent leases; `crun run` of a
+  trivial action; the overlay mount and the network namespace teardown at concurrency;
+  the one-time unpack; and the kernel's per-user key quota (`kernel.keys.maxkeys`, 200 by
+  default), which each container's session keyring counts against.
+
 ### User namespaces
 
-Rootless Podman's default maps a container's root to the daemon's own uid on the host,
-so an action would run as the daemon's user, kept from what that user can reach (the
-root helpers' sockets, [fleet-updates-security.md](fleet-updates-security.md) S4.3) only
-by the mount and pid namespaces. The driver therefore runs every container with
-`--userns=nomap`: container ids 0, 1, 2 and up map to the daemon user's subordinate ids
-in order, and the daemon's own uid and gid map to nothing.
+A rootless container whose root mapped to the daemon's own uid on the host would run as
+the daemon's user, kept from what that user can reach (the root helpers' sockets,
+[fleet-updates-security.md](fleet-updates-security.md) S4.3) only by the mount and pid
+namespaces. The driver therefore gives every container a user namespace in which
+container ids 0, 1, 2 and up map to the daemon user's subordinate ids in order, and the
+daemon's own uid and gid map to nothing.
 
-- **Not `--userns=auto`.** Rootless, it took 65,535 ids of a standard 65,536-id range for
-  the first container and refused a second while the first existed ("not enough unused
-  IDs in user namespace", Podman 4.9 on the hosted runners), so a node could run one
-  action at a time. With `nomap` every container shares one mapping. Containers stay
-  apart by their mount, pid, ipc and network namespaces, not by uid. A real-Podman test
-  runs a second lease to completion while a first container runs, so a switch back to
-  `auto` fails it.
+- **One mapping for every container.** All containers share it, so a node runs many
+  actions at once from one 65,536-id range. Containers stay apart by their mount, pid,
+  ipc and network namespaces, not by uid.
 - **Who owns the lease's files.** A container cannot write under a directory whose owner
   it does not map: the overlay refuses with `EROFS`. So after writing the input root and
   making the output directories, the driver gives the overlay's lower, upper and work
-  directories to id 1 of Podman's user namespace (the container's root) with
-  `podman unshare chown -hR 1:1`. Once the container has exited, and before reading any
-  output, it gives them back to id 0 there, the daemon's user, so an output the action
-  made `0600` (or a `0700` directory) is read as its owner. `-h` changes a symlink
-  itself and `-R` traverses none, so a link the action left hands nothing over.
+  directories (and the lease's `rw` directory) to id 1 of the helper container's user
+  namespace (the container's root), in one helper that runs the daemon binary's
+  `__chown-dirs` mode. Once the container has exited, and before reading any output, it
+  gives them back to id 0 there, the daemon's user, so an output the action made `0600`
+  (or a `0700` directory) is read as its owner. The walk is by descriptor and changes a
+  symlink itself, so a link the action left hands nothing over.
 - **With the input cache** (`--cache-dir`, [worker-cache.md](worker-cache.md) section
   5.1), the input root's files are hard links to read-only cache entries the daemon's
   user owns, which the container's root must never own. The driver then gives the
-  input root's directories alone to id 1 (and back), with the daemon binary's own
-  `__chown-dirs` mode run under `podman unshare`, and `chown -hR` covers only the upper
-  and work directories. An input an output names is a private copy, never a link. An
+  input root's directories alone to id 1 (and back), and the other directories whole.
+  An input an output names is a private copy, never a link. An
   action that opens a cached input for writing in place gets `EACCES`, and one that
   renames or hard-links one gets `EOVERFLOW` (overlayfs will not copy up a file whose
   owner the container does not map).
@@ -423,8 +579,8 @@ in order, and the daemon's own uid and gid map to nothing.
   clean step's walk of the same tree; nothing bounds either yet.
 - **Cleaning.** A lease that ends before collect (timeout, kill, failure) still has files
   owned by the container's ids. The daemon's user cannot unlink them, so the clean step
-  falls back to `podman unshare rm -rf`, as it does for any file the daemon cannot
-  remove.
+  falls back to a helper container that empties the directory, as it does for any file
+  the daemon cannot remove.
 
 **Node requirement.** The daemon's user needs at least 65,536 subordinate uids in
 `/etc/subuid` and as many gids in `/etc/subgid` (`<user>:<first id>:<count>`), what
@@ -435,8 +591,7 @@ Ids are counted once: a range listed under both the user's name and uid, or two 
 that overlap, count their distinct ids. The check reads the files directly, so a user
 whose ranges only a directory service holds is refused.
 After adding a range (`usermod --add-subuids 100000-165535 --add-subgids
-100000-165535 <user>`), run `podman system migrate` as that user so Podman's user
-namespace is made again with it.
+100000-165535 <user>`), restart the daemon.
 
 ### Cgroups and limits
 
@@ -478,6 +633,20 @@ makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
   The node's backstop is `memory.max` on `actions/`, set from
   `--actions-memory-max-gib` (or by whoever runs the daemon's unit). Nothing is capped
   when no memory was booked.
+- **The memory backstop** (every driver, Linux): while the node's memory stall time is
+  high and it runs a lease, the daemon stops taking new ones. It samples the `some`
+  line's `avg10` of `/proc/pressure/memory` (the percentage of the last 10 seconds in
+  which at least one task waited for memory) every second. When that is above
+  `--memory-pressure-pause-percent` (default 10) and a lease runs, the daemon's
+  `Hello` says `PHASE_MEMORY_PRESSURE` ([worker-protocol.md](worker-protocol.md#node-phases))
+  and the server offers the node nothing; when the stall is at or below the threshold,
+  or the last lease ends, the next `Hello` says serving. Leases that run are not
+  touched. It cannot deadlock: it pauses only while a lease runs, and every lease
+  ends, so a node whose stall comes from outside (another process on the box) still
+  takes one lease at a time. Where the file cannot be read (macOS, a kernel without
+  pressure stall information) the daemon logs that the backstop is off and never
+  pauses. A runtime's own phase (a session switch, a quarantine) comes first. It does
+  not replace the `actions/` limit: that kills, this only stops adding load.
 - **CPU** is compressible: `cpu.weight` = booked millicores / 10, clamped to 1..10000
   (one core is the kernel's default weight of 100). The driver never sets `cpu.max`,
   because throttling distorts wall time.
@@ -486,9 +655,8 @@ makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
     (`RuntimeError::OutOfMemory`, with what the lease held in RAM and swap and its
     cap).
   - A kernel OOM kill is read from the lease cgroup's `memory.events`, which outlives
-    the container, when the action ends with SIGKILL (137), when Podman recorded no
-    exit, or when Podman could not be asked: the counters do not depend on Podman's
-    record. Podman's own OOM flag is not trusted (it reads false when rootless). The
+    the container, when the action ends with SIGKILL (137) or when `crun` reported an
+    error and no exit: the counters do not depend on `crun`'s report. The
     kernel counts an event at the cgroup whose limit caused it and at that cgroup's
     ancestors, so the lease's counters say whose limit it was:
     - `oom_kill` with `oom` and `max` in the lease: the OOM killer ran for the lease's
@@ -505,13 +673,14 @@ makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
 
 ### End to end (the M2 test)
 
-The `m2-container` CI job (`kbf-cell m2`, `crates/kbf-it/src/m2.rs`) runs the driver
+The `m2-container` CI job (`kbf-cell m2`, `crates/kbf-integration-test/src/m2.rs`) runs the driver
 behind the real server and a real client, on a hosted x86_64 runner.
 It pulls distroless `base-debian12` by its linux/amd64 manifest digest (the sample's
-`crates/kbf-it/m2/buck2/.buckconfig` names the same image as `container_image`, which
+`crates/kbf-integration-test/m2/buck2/.buckconfig` names the same image as `container_image`, which
 its execution platform passes on as `container-image`), starts one `kbf-server` and one
-`kbf-daemon --driver container` as a `Delegate=yes` system service with
-`--actions-memory-max-gib 8`, checks the cgroup layout the daemon made in its unit
+`kbf-daemon --driver container --image <the sample's image>` as a `Delegate=yes` system
+service with `--actions-memory-max-gib 8` (the daemon fetches and unpacks the image before
+it says `Hello`; no tool pulls it ahead), checks the cgroup layout the daemon made in its unit
 (`supervisor/` holds the daemon; the unit's cgroup and `actions/` enable `cpu memory
 pids`), and builds the sample project with pinned buck2:
 
@@ -519,12 +688,13 @@ pids`), and builds the sample project with pinned buck2:
   the action cache (the rule `kbf-cell check` applies, as in M1). The image has no
   shell, so each action runs `kbf-m2-act`, a statically linked helper that is an input
   file of the action;
-- `//:hog`, which touches 3 GiB slowly: its first run books the default 1 GiB, presses
+- `//:hog`, which touches 3 GiB slowly: its first run books 1 GiB (the cell's server runs `--memory-ladder-gib 1,2,4`; the
+  default first rung, 4 GiB, would pass the hog's cap), presses
   its 2 GiB cap into swap until the swap watch kills it, and the server's log must
   hold exactly one requeue from 1 GiB to 2 GiB booked, after which it passes;
-- `//:pause` under a fresh salt: while it sleeps, Podman lists exactly one running
-  container labelled with the node id and a `kbf-lease-*` cgroup is under `actions/`;
-  afterwards no labelled container and no lease directory is left;
+- `//:pause` under a fresh salt: while it sleeps, exactly one `crun` container exists
+  (one state directory under `<lease>/crun/` of the daemon's leases) and a `kbf-lease-*`
+  cgroup is under `actions/`; afterwards no container and no lease directory is left;
 - `//:pause` again, with the daemon killed mid-lease and a new one started: the server
   reruns the lease within 10 s of the new daemon's welcome, and the build succeeds on
   the farm.
@@ -590,6 +760,35 @@ When a lease's run ends the daemon logs one INFO line, `lease phases:` and then
 | `inputs_ms`, `run_ms`, `outputs_ms` | the driver's own stamps in the result's `ExecutedActionMetadata`: input fetch, execution, output upload; `-` when the run produced no result. What `lease_ms` holds beyond their sum is the driver's work outside them (making and removing the lease's directories, the container's create and chown) |
 | `output_files`, `output_dirs` | the files and directories the result names at its top level (the files inside an output directory are in the `transfers:` line's `written_blobs`) |
 
+The fields after `output_dirs` are what the lease's own cgroup (v2) counted, read
+when the action ended; each is `-` where it was not measured (a driver without a lease
+cgroup, a kernel without the file: absent is not 0). They are measurement only; nothing
+in scheduling reads them.
+
+| Field | What it is |
+|---|---|
+| `cpu_usage_us`, `cpu_user_us`, `cpu_system_us` | `cpu.stat` `usage_usec`, `user_usec`, `system_usec`: CPU time of every process in the cgroup |
+| `cpu_periods`, `cpu_throttled`, `throttled_us` | `cpu.stat` `nr_periods`, `nr_throttled`, `throttled_usec`: all 0 while the lease has no `cpu.max` quota, which kbf does not set |
+| `mem_peak` | `memory.peak`, bytes |
+| `parallelism` | `cpu_usage_us` over the run's wall time (the container's create to its exit), two decimals: how many CPUs the action kept busy on average |
+| `numa_bytes` | `node:bytes` pairs, comma-separated: `memory.numa_stat` `anon` plus `file` per NUMA node, of the sample that held the most memory (sampled every second while the action runs, `ContainerConfig::numa_every`, and once at its end: the kernel uncharges anonymous memory when the processes exit, so the end alone shows little) |
+| `numa_spread` | the share of that memory not on the node holding most of it, two decimals (0.00 is all on one node) |
+
+The same counters ride in the result, in `ExecutedActionMetadata.auxiliary_metadata`
+as a `kbf.worker.v1.ResourceUsage` whose optional `cgroup` field (`CgroupUsage`) is new;
+a daemon or server that predates it ignores the field.
+
+A lease that ends without a result (timed out, killed, out of memory) has the same
+fields, read from its cgroup before the cgroup is removed (`Runtime::failed_usage`;
+the container driver does it), and carries the `ResourceUsage` in the metadata of the
+`action_result` of its `worker.Result`: the peak memory of an OOM-killed action and the
+CPU of a timed-out one are what the memory ladder needs. A lease killed for memory, its
+own limit or the node's, ends the line with ` oom=1` (no such key otherwise).
+
+At start the daemon logs the host's NUMA layout once (Linux), from
+`/sys/devices/system/node`: `numa layout: nodes=2 cpus=64 node0=0-15,32-47
+node1=16-31,48-63`. `numa_bytes` node numbers are those nodes.
+
 `outputs_ms` includes waiting for the transfer engine's request limit, which every
 lease of the process shares; there is no per-lease busy time.
 
@@ -618,6 +817,104 @@ whole-machine drivers). Past it the upload is dropped, which cancels its calls t
 CAS, and the lease fails with INTERNAL and the reason `the output upload did not finish
 within its deadline of ...: stopped after ...`. Without it, a store that stops
 answering held the lease, and its slot, with no error.
+
+**Hashing the outputs.** The container driver reads each output file once, to hash it:
+SHA-256 for the digest, CRC-32C for the footer of the segment it is sent in. The hashing
+runs on `--cpu-threads` threads of their own (default `max(2, reserve/2)`, 4 with the
+default `--reserve-cpus` of 8; shared by all leases and apart
+from the threads that run actions), one read buffer per thread, and the listing of the
+output tree is one task of the blocking pool, not one per file. The upload then reads the
+files again, in ranges, only to send them (`--segment-uploads-in-flight` uploads at once,
+default 4, within `--transfer-in-flight`'s upload share): nothing is copied to scratch.
+A file that is no longer the one that was hashed (replaced, removed, or its size or times
+changed) fails the lease with a read error naming it. The lease's log line `outputs
+phases` says where the time went: `list_ms`, `hash_ms`, `find_missing_ms`, `upload_ms`.
+
+### The server's `action usage:` line
+
+The server logs one INFO line, `action usage:`, per lease report it takes whose
+`action_result` carries a `ResourceUsage`: an OK run, and a failed one the daemon
+measured, whatever the outcome (for example an out-of-memory kill, each rung of the
+memory ladder included, a timeout, an infrastructure failure, a lost run). It reads the usage before it judges the report, since judging
+drops a killed run's result and cuts a timeout's to its logs
+(`kbf_server::action_usage`). The fields, in this order:
+
+| Field | What it is |
+|---|---|
+| `exit_code` | the exit code the daemon reported for a run it says ended (an OK status); `-` for one it reports failed (killed, timed out, lost: none). It is the run's, not the server's verdict: an OK run whose outputs the server cannot store has its exit code and `outcome=infra` |
+| `mnemonic`, `target_hint` | the `RequestMetadata` the client sent on the Execute (`action_mnemonic`, `target_id`), quoted; `-` when it sent none (buck2 sends neither). A hint only, never a key |
+| `wall_us` and the cgroup fields | the run's wall time and the same cgroup fields as the `lease phases:` line above |
+| `key` | the action's shape key, 16 hex digits (below) |
+| `cfg` | the configuration hash an output path named (`<16 hex>` or `<16 hex>-<16 hex>`); `-` for none (buck2's content-hash paths) |
+| `target`, `target_kind` | the target the action's own `buck-out` paths name (issue #796): `"cell//pkg:name"` from its first output pattern that names one, else from its first program word that does (a test binary buck2 built), and the owner's kind (`target`, `anon` or `bxl`); `-` when they name none (a remotely run test under `buck-out/v2/test/execution/`, run by a program outside `buck-out`). Read from the Command, never from the client |
+| `outcome` | how the scheduler judged the report: `ok`, `oom` (the action's own memory limit), `node-pressure`, `timeout`, `infra`, `invalid`, `missing-input`, `lost-restart`, `lost-fenced` |
+| `lease`, `node` | the lease and the node that ran it: the join to the daemon's `lease phases:` and `transfers:` lines |
+
+The fields keep their order; `target_hint` was called `target` before the derived
+target took that name. A report the server refuses (its lease is no longer
+current) has no line: that is how a **cancelled** lease ends. Its usage is in the
+daemon's `lease phases:` line, which joins on `lease=` to the server's `lease granted`
+line, and that line names the `key` too. A report without a `ResourceUsage` has no line.
+
+**The shape key.** buck2 sends no per-action identity (`action_mnemonic` and
+`target_id` are empty in its `RequestMetadata`), and the action digest changes with
+every input, so the key is read from the `Command`: the program it runs and the paths it
+writes, each made independent of the configuration and of the content hashes buck2 puts
+in paths. One target's action keeps its key across builds and configurations (`cfg`
+tells configurations apart); two actions of one target, or two targets, differ.
+
+- Output paths: under `buck-out/<v>/<root>/` (`art`, `art-anon`, `art-bxl`, and the
+  `gen` kinds of older buck2) the prefix up to the root goes, and with it the hashes
+  buck2 puts where its owner's layout says. A target: the configuration hash after the
+  cell, and the content hash or `output_artifacts` placeholder in the one segment right
+  after its `__<name>__` (a hex directory further down is kept).
+  `buck-out/v2/art/cell/<cfg>/pkg/__t__/t.o`,
+  `buck-out/v2/art/cell/pkg/__t__/output_artifacts/t.o` and
+  `buck-out/v2/gen/cell/pkg/__t__/<content>/t.o` are all `cell/pkg/__t__/t.o`; a
+  dynamic action's `__action__<k>__` stays. A target name may hold a `/` (buck2 writes
+  `//pkg:foo/bar` as `__foo/bar__`): a name runs from a segment that starts with `__` to
+  the first later one that ends with `__`. An anonymous target: the configuration hash
+  glued to its package, and the attributes or content hash right before its
+  `__<name>__` (any segment of hex digits there, whatever its length), also where buck2 glues it to the cell (`art-anon/anon<16 hex>/__t__/o`
+  is `anon/__t__/o`); in content mode buck2 glues the cell to the package, which stays
+  glued (a stable key, but not the configuration-hash form's). A BXL function: the
+  execution-platform hash after the cell (as `cfg`) and the arguments or content hash
+  right after its `__<name>__`
+  (`art-bxl/komira/<16 hex>/tools/build/lint/test_weld.bxl/__check__/<16 hex>/test_weld`
+  is `komira/tools/build/lint/test_weld.bxl/__check__/test_weld`). buck2 writes the
+  BXL hashes unpadded; 13 to 16 hex digits are read as a hash, so the 1 in 65 536 with
+  fewer is kept. Scratch paths (`buck-out/<v>/tmp/`) are left out; any other path is
+  kept as sent. The patterns are sorted and deduplicated (buck2 may send one path as
+  both an output file and an output directory), and `cfg` is the first pattern's that
+  names one. An action with no outputs has only its program in the key, so every such
+  action of one program shares a key.
+- **Known limit: remotely run tests.** buck2 writes a test's outputs under
+  `buck-out/v2/test/execution/<cell>/<16 hex>/<16 hex>/…`; the first hash is of the
+  whole target identifier, configuration included, the second of the test cases run.
+  No segment holds the configuration on its own, so the path is kept as sent: such an
+  action keys once per target, configuration and set of test cases (stable across
+  builds), and its line says `cfg=-`.
+- The program: argv\[0\] (normalized the same way under `buck-out`, its file name when
+  it is another absolute path; an argument file's path, after its `@`, the same way),
+  then, while the last word is a bare program name (no `/` and no `@`: a program looked up on `PATH`, such as
+  `env`, a shell or an interpreter, which may only run the next argument), the next
+  argument that is not a flag or a `NAME=value` assignment, up to three words. A `-c`,
+  or a cluster of single-letter flags ending in `c` (`-euc`), ends it, kept as the last
+  word, so a `-c` script never enters the key (a script after `-e`, as Perl or Node
+  take one, does: `-e` is a shell's flag too, so it is skipped). Any such cluster ends
+  it, a linker's `-lc` too (`cc -lc a.o` is `cc -lc`). A buck2 genrule is
+  `env <shell> <cell>/…/genrule.sh`, a prelude Python tool
+  `<interpreter> <cell>/…/<script>.py`, a tool built in the repository its `buck-out`
+  pattern alone. A bare-name compiler is read the same way (`cc -c a.c` is `cc -c`,
+  `cc -o a.o a.c` is `cc a.o a.c`, `clang @<argsfile> a.c` is `clang @<its pattern>`,
+  `clang @<file name>` for an absolute one). The
+  rule lists no program names.
+- The key is the first 8 bytes of SHA-256 over the tag `kbf-shape-v1`, the program's
+  words and the patterns, each length-prefixed. A change to any rule above changes the
+  tag, so keys of two normalizers never mix. `RequestMetadata` never enters the key.
+
+The first time a process sees a key it logs what the key stands for, once:
+`action shape: key=… program="env bash …" outputs=<n> patterns="<first 8>…"`.
 
 ## Measuring usage
 

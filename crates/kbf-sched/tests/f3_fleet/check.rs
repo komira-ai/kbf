@@ -4,8 +4,9 @@
 //!
 //! The shadow is a reference model, not a copy of the scheduler's state: it keeps its
 //! own cordons and drains, its own bookings, liveness, holdings and queue, computes the
-//! placement round and each queued operation's verdict by first fit over the workers in
-//! name order, and compares what the scheduler did with that.
+//! placement round (each operation to the least loaded worker with room, the first by
+//! name of equals) and each queued operation's verdict, and compares what the scheduler
+//! did with that.
 //!
 //! Checked: I1 (lease ids unique, increasing), I2 (`Start` only for the current,
 //! committed grant), I3 (one holding per operation; `leases_on` is the holdings), I4
@@ -21,7 +22,7 @@
 //! exactly), I10 and L2 (refused exactly
 //! at the tick an unbroken unservable run reaches the wait; work only cordoned workers
 //! could run is never refused; the reason is the last one stated, the wait appended),
-//! I11 (each round's grants are the reference first fit's, in order), I14 (the queue is
+//! I11 (each round's grants are the reference placement's, in order), I14 (the queue is
 //! the queued operations, in urgency then submission order). I12 and I13 belong to the
 //! cell and dedup families (F2, F1): every request here is unique, and no daemon is
 //! modelled. L1 is [`Check::finish`].
@@ -30,16 +31,16 @@
 //! (`tests/sim/check.rs`) lands with F1, written in parallel; this one moves there
 //! once both are in.
 
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_sched::{Cordon, Event, Input, OpState, PLACEMENT_ROUND, Request, Scheduler};
+use kbf_sched::{Cordon, Event, FARM_RERUNS, Input, OpState, PLACEMENT_ROUND, Request, Scheduler};
 use kbf_types::{
-    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseId, OperationId, Outcome,
-    Resources, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime, LeaseId, LostWhy,
+    OperationId, Outcome, Resources, WaiterId, WorkerId,
 };
 
 /// The scheduler's grace G, in milliseconds.
@@ -66,6 +67,55 @@ pub enum Class {
     Unservable,
 }
 
+/// Whether `request` is an action at the whole host's memory of a worker of `capacity`
+/// (the last step of the memory ladder): it runs alone on the node.
+fn exclusive(capacity: Resources, request: Resources) -> bool {
+    request.memory_bytes > 0 && request.memory_bytes >= capacity.memory_bytes
+}
+
+/// Whether an action `request` can be placed on a worker of `capacity` whose holdings
+/// book `booked` in `leases` leases, `whole` saying one holds the node alone. An
+/// action's memory is the limit it first runs under, not a booking: only the worker's
+/// memory capacity bounds it, besides the whole host running alone.
+fn room(
+    capacity: Resources,
+    booked: Resources,
+    whole: bool,
+    leases: usize,
+    request: Resources,
+) -> bool {
+    !whole
+        && request.cpu_millis <= capacity.cpu_millis.saturating_sub(booked.cpu_millis)
+        && request.gpus <= capacity.gpus.saturating_sub(booked.gpus)
+        && request.vms <= capacity.vms.saturating_sub(booked.vms)
+        && request.memory_bytes <= capacity.memory_bytes
+        && (!exclusive(capacity, request) || leases == 0)
+}
+
+/// The larger of the CPU and memory shares of `capacity` that `booked` is, as a fraction
+/// `(numerator, denominator)`; an axis with no capacity counts as 0. Integers, written
+/// here and not taken from the scheduler, so a defect in its ranking is not shared.
+fn dominant(capacity: Resources, booked: Resources) -> (u128, u128) {
+    let mut best = (0, 1);
+    for (b, c) in [
+        (booked.cpu_millis, capacity.cpu_millis),
+        (booked.memory_bytes, capacity.memory_bytes),
+    ] {
+        if c > 0 && u128::from(b) * best.1 > best.0 * u128::from(c) {
+            best = (u128::from(b), u128::from(c));
+        }
+    }
+    best
+}
+
+/// How placement ranks two workers, each as its capacity, what its holdings book and how
+/// many leases they are: the lesser share first, then the fewer leases. `Less` is the
+/// better place. A tie is left to the caller: the first by name.
+fn by_load(a: (Resources, Resources, usize), b: (Resources, Resources, usize)) -> Ordering {
+    let (x, y) = (dominant(a.0, a.1), dominant(b.0, b.1));
+    (x.0 * y.1).cmp(&(y.0 * x.1)).then(a.2.cmp(&b.2))
+}
+
 #[derive(Clone, Debug)]
 struct ShadowWorker {
     caps: NodeCaps,
@@ -90,6 +140,14 @@ struct ShadowOp {
     last_class: Option<Class>,
     /// Since when (ms) its unbroken unservable run lasts.
     since: Option<u64>,
+    /// The workers whose silence ended a sent lease of it: placement prefers others.
+    avoid: BTreeSet<WorkerId>,
+    /// How many sent leases of it ended in silence (the farm budget, which only
+    /// silence spends in F3).
+    charged: u32,
+    /// Its silent worker's lease is the farm budget's last: the scheduler proposed a
+    /// fenced result for it, which answers the operation once committed.
+    silenced: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -100,7 +158,12 @@ struct Holding {
     downs: u64,
     /// The worker was down at the grant: its `Start` is lost.
     lost: bool,
+    /// It holds the node alone: an action at the worker's whole memory when granted.
+    alone: bool,
     committed: bool,
+    /// A worker's result of it was proposed (a silent worker's lease is then given up
+    /// with no charge: that result decides the operation).
+    proposed: bool,
 }
 
 /// What a round must produce, computed before it is fed.
@@ -264,6 +327,9 @@ impl Check {
                         told: None,
                         last_class: None,
                         since: None,
+                        avoid: BTreeSet::new(),
+                        charged: 0,
+                        silenced: false,
                     },
                 );
                 None
@@ -301,7 +367,18 @@ impl Check {
                 }
                 None
             }
-            Event::Committed(_) | Event::Started { .. } | Event::Report { .. } => None,
+            Event::Report {
+                operation, lease, ..
+            } => {
+                if let Some(h) = self.holding.get_mut(operation)
+                    && h.lease == *lease
+                    && h.committed
+                {
+                    h.proposed = true;
+                }
+                None
+            }
+            Event::Committed(_) | Event::Started { .. } => None,
         }
     }
 
@@ -310,17 +387,28 @@ impl Check {
         let expired: Vec<OperationId> = self
             .holding
             .iter()
-            .filter(|(_, h)| !self.live(&h.worker))
+            .filter(|(id, h)| !self.live(&h.worker) && !self.ops[id].silenced)
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
-            self.give_up(id);
+            // A sent lease given up for silence spends the operation's farm budget;
+            // past it the lease is kept until its proposed result is committed.
+            let spent = self.ops[&id].charged >= FARM_RERUNS;
+            if self.holding[&id].committed && !self.holding[&id].proposed && spent {
+                self.charge(id);
+                self.ops.get_mut(&id).expect("known").silenced = true;
+            } else {
+                self.give_up(id);
+            }
         }
     }
 
-    /// The reference round at `now`: first fit in queue order.
+    /// The reference round at `now`: in queue order, each operation to the least loaded
+    /// worker with room.
     fn round(&mut self) -> Round {
-        let mut booked: BTreeMap<WorkerId, Resources> = BTreeMap::new();
+        // Per worker: what its holdings book, how many there are, and whether one holds
+        // the node alone.
+        let mut booked: BTreeMap<WorkerId, (Resources, usize, bool)> = BTreeMap::new();
         let mut queue: Vec<OperationId> = self
             .ops
             .iter()
@@ -329,7 +417,11 @@ impl Check {
             .collect();
         for (id, h) in &self.holding {
             let b = booked.entry(h.worker.clone()).or_default();
-            *b = b.saturating_add(self.ops[id].request.resources);
+            *b = (
+                b.0.saturating_add(self.ops[id].request.resources),
+                b.1 + 1,
+                b.2 || h.alone,
+            );
         }
         queue.sort_by_key(|id| (Reverse(self.ops[id].request.qos.clone()), *id));
         let names: Vec<WorkerId> = self.workers.keys().cloned().collect();
@@ -342,20 +434,42 @@ impl Check {
                     && self.cordons.contains_key(w) == cordoned
                     && request.needs.matches(&s.caps)
             };
-            let fit = names.iter().find(|w| {
-                let free = self.workers[*w]
-                    .capacity
-                    .saturating_sub(booked.get(*w).copied().unwrap_or_default());
-                usable(w, false) && free.fits(&request.resources)
+            // Placement skips the workers of `avoid` while another could run it.
+            let elsewhere = names.iter().any(|w| {
+                usable(w, false)
+                    && !self.ops[&id].avoid.contains(w)
+                    && self.workers[w].capacity.fits(&request.resources)
             });
+            // The least loaded worker with room; of equals, the first by name.
+            let load = |w: &WorkerId| {
+                let (held, leases, _) = booked.get(w).copied().unwrap_or_default();
+                (self.workers[w].capacity, held, leases)
+            };
+            let fit = names
+                .iter()
+                .filter(|w| {
+                    let (held, leases, whole) = booked.get(*w).copied().unwrap_or_default();
+                    usable(w, false)
+                        && room(
+                            self.workers[*w].capacity,
+                            held,
+                            whole,
+                            leases,
+                            request.resources,
+                        )
+                        && !(elsewhere && self.ops[&id].avoid.contains(*w))
+                })
+                .min_by(|a, b| by_load(load(a), load(b)))
+                .filter(|_| round.grants.len() < PLACEMENT_ROUND);
             let class = match fit {
-                Some(w) if round.grants.len() < PLACEMENT_ROUND => {
+                Some(w) => {
+                    let alone = exclusive(self.workers[w].capacity, request.resources);
                     let b = booked.entry(w.clone()).or_default();
-                    *b = b.saturating_add(request.resources);
+                    *b = (b.0.saturating_add(request.resources), b.1 + 1, b.2 || alone);
                     round.grants.push((id, w.clone()));
                     Class::Servable
                 }
-                _ => {
+                None => {
                     let large = |w: &&WorkerId| self.workers[*w].capacity.fits(&request.resources);
                     if names.iter().filter(|w| usable(w, false)).any(|w| large(&w)) {
                         Class::Servable
@@ -422,11 +536,17 @@ impl Check {
                         format!("{g:?} to a worker that is {:?}", self.cordons[&g.worker])
                     });
                     let booked = self.booked_on(&g.worker);
+                    let (leases, whole) = self.holds_on(&g.worker);
                     self.ensure(
-                        w.capacity
-                            .fits(&booked.saturating_add(op.request.resources)),
+                        room(w.capacity, booked, whole, leases, op.request.resources),
                         "I6",
-                        || format!("{g:?}: {booked:?} booked + request exceed {:?}", w.capacity),
+                        || {
+                            format!(
+                                "{g:?}: {booked:?} booked in {leases} leases (alone: {whole}) \
+                                 and the request do not fit {:?}",
+                                w.capacity
+                            )
+                        },
                     );
                     self.newest_grant = Some(g.lease);
                     let (downs, lost) = (w.downs, w.down);
@@ -437,7 +557,9 @@ impl Check {
                             worker: g.worker.clone(),
                             downs,
                             lost,
+                            alone: exclusive(w.capacity, op.request.resources),
                             committed: false,
+                            proposed: false,
                         },
                     );
                     let at = (now, g.worker.clone(), by_uncordon);
@@ -459,6 +581,27 @@ impl Check {
                     refusals.insert(r.operation);
                 }
                 Effect::Commit(ControlRecord::Result(r)) => {
+                    // The proposal of a lease given up past the farm budget (silence
+                    // is predicted at the tick; a replacement shows here). A worker's
+                    // own result is a completion.
+                    if r.outcome
+                        != (Outcome::Completed {
+                            action_result: outcome_of(r.lease),
+                        })
+                    {
+                        let fenced = Outcome::Failed(Failure::Lost(LostWhy::Fenced));
+                        self.ensure(r.outcome == fenced, "I5", || {
+                            format!("{r:?}: the only failure proposed is a give-up's")
+                        });
+                        if !self.ops[&r.operation].silenced {
+                            let charged = self.ops[&r.operation].charged;
+                            self.ensure(charged >= FARM_RERUNS, "I5", || {
+                                format!("{r:?} proposed within the farm budget")
+                            });
+                            self.charge(r.operation);
+                            self.ops.get_mut(&r.operation).expect("known").silenced = true;
+                        }
+                    }
                     let h = self.holding.get(&r.operation);
                     self.ensure(h.is_some_and(|h| h.lease == r.lease), "I5", || {
                         format!("result of {:?} proposed; the holding is {h:?}", r.lease)
@@ -474,12 +617,20 @@ impl Check {
                     });
                 }
                 Effect::Answer(a) => {
-                    let Outcome::Completed { action_result } = a.outcome else {
-                        self.fail("I5", &format!("{a:?}: no run failed"));
-                    };
-                    self.ensure(action_result == outcome_of(a.lease), "I5", || {
-                        format!("{a:?} carries another lease's outcome")
-                    });
+                    if self.ops[&a.operation].silenced {
+                        // Silent past the farm budget: answered as a fenced run.
+                        let fenced = Outcome::Failed(Failure::Lost(LostWhy::Fenced));
+                        self.ensure(a.outcome == fenced, "I5", || {
+                            format!("{a:?}: a silent node's last lease is answered as fenced")
+                        });
+                    } else {
+                        let Outcome::Completed { action_result } = a.outcome else {
+                            self.fail("I5", &format!("{a:?}: no run failed"));
+                        };
+                        self.ensure(action_result == outcome_of(a.lease), "I5", || {
+                            format!("{a:?} carries another lease's outcome")
+                        });
+                    }
                     let newest = self.newest_committed.get(&a.operation);
                     self.ensure(newest == Some(&a.lease), "I5", || {
                         format!("{a:?}: the newest committed grant is {newest:?}")
@@ -553,7 +704,20 @@ impl Check {
         }
     }
 
+    /// Spends one of `id`'s farm runs: its holding's worker is avoided from now on.
+    fn charge(&mut self, id: OperationId) {
+        let worker = self.holding[&id].worker.clone();
+        let op = self.ops.get_mut(&id).expect("known");
+        op.avoid.insert(worker);
+        op.charged += 1;
+    }
+
     fn give_up(&mut self, id: OperationId) {
+        // The fleet's workers register a new process every time and lose a `Start` only
+        // by going down: every sent lease given up is silent or replaced, both charged.
+        if self.holding[&id].committed && !self.holding[&id].proposed {
+            self.charge(id);
+        }
         let h = self.holding.remove(&id).expect("held");
         let downs = self.workers[&h.worker].downs;
         self.ensure(h.lost || downs > h.downs, "I9", || {
@@ -569,6 +733,12 @@ impl Check {
             self.reach("lease of a cordoned worker given up after it went down");
         }
         self.seen.given_up.push((self.now, id, h.worker));
+    }
+
+    /// How many leases `worker` holds, and whether one holds the node alone.
+    fn holds_on(&self, worker: &WorkerId) -> (usize, bool) {
+        let held = self.holding.values().filter(|h| h.worker == *worker);
+        (held.clone().count(), held.clone().any(|h| h.alone))
     }
 
     fn booked_on(&self, worker: &WorkerId) -> Resources {
@@ -604,7 +774,7 @@ impl Check {
     ) {
         self.ensure(grants == round.grants, "I11", || {
             format!(
-                "round granted {grants:?}, first fit gives {:?}",
+                "round granted {grants:?}, the reference places {:?}",
                 round.grants
             )
         });

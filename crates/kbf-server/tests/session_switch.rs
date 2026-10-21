@@ -17,6 +17,9 @@ const MAC: &[(&str, &str)] = &[
     ("drivers", "native-whole-machine"),
 ];
 
+/// An action that books a few cores, so the Mac has room for a second.
+const PLAIN: &[(&str, &str)] = &[];
+
 const WHOLE: &[(&str, &str)] = &[("OSFamily", "macos"), ("kbf-lease", "whole_machine")];
 
 /// The Mac's `Hello` from daemon process `instance`, in `phase`.
@@ -146,6 +149,38 @@ async fn a_quarantined_node_is_offered_nothing_until_it_serves_again() {
     done(&mut ops).await;
 }
 
+/// Catches a node that says it is under memory pressure and is still offered work (the
+/// phase read as serving, or not read at all), a pressure that is taken as a
+/// quarantine (the node would be listed for an operator's attention), and one that
+/// cannot be lifted: once the node reports serving again, the queued work starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_under_memory_pressure_is_offered_nothing_until_it_serves_again() {
+    log();
+    let cell = Cell::start().await;
+    let pressured = Some(NodePhase {
+        phase: Phase::MemoryPressure.into(),
+        lease_id: None,
+        reason: String::new(),
+    });
+    let job = Job::new("waits out the pressure", WHOLE);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let mut daemon = FakeDaemon::connect(cell.worker_addr, mac("one", pressured))
+        .await
+        .expect("registered");
+    daemon.no_work().await;
+
+    let serving = Some(NodePhase {
+        phase: Phase::Serving.into(),
+        ..NodePhase::default()
+    });
+    daemon.send(daemon_message::Message::Hello(mac("one", serving)));
+    let start = daemon.start().await;
+    let result = output(&cell, "ran once the pressure fell", 0).await;
+    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
+    done(&mut ops).await;
+}
+
 /// Catches a preparing phase without its lease that is taken (the server could not
 /// tell which lease to keep): the stream is refused at its first `Hello`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -181,4 +216,38 @@ async fn an_unknown_phase_is_offered_nothing() {
     cell.upload(&job.blobs()).await;
     let _ops = cell.execute(&job.action).await;
     daemon.no_work().await;
+}
+
+/// Catches a draining daemon (it was told to stop and finishes its runs first) that is
+/// still offered work (the phase read as serving: the restart drill's 18 s of
+/// re-placing), or one whose running lease is lost for it: with the node heartbeating
+/// and naming the lease, its Result is accepted, as any lease's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draining_node_is_offered_nothing_and_keeps_its_running_lease() {
+    log();
+    let cell = Cell::start().await;
+    let mut daemon = FakeDaemon::connect(cell.worker_addr, mac("one", None))
+        .await
+        .expect("registered");
+    let first = Job::new("runs through the drain", PLAIN);
+    cell.upload(&first.blobs()).await;
+    let mut ops = cell.execute(&first.action).await;
+    let lease = daemon.start().await.lease_id.expect("a lease id");
+
+    let draining = Some(NodePhase {
+        phase: Phase::Draining.into(),
+        lease_id: None,
+        reason: String::new(),
+    });
+    daemon.send(daemon_message::Message::Hello(mac("one", draining)));
+    assert!(daemon.heartbeat(&[lease]).await);
+    let second = Job::new("waits for another node", PLAIN);
+    cell.upload(&second.blobs()).await;
+    let _later = cell.execute(&second.action).await;
+    daemon.no_work().await;
+    assert!(daemon.heartbeat(&[lease]).await, "the lease is still held");
+
+    let result = output(&cell, "finished while draining", 0).await;
+    assert!(daemon.report(ran(Some(lease), &result)).await.accepted);
+    done(&mut ops).await;
 }

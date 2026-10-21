@@ -7,7 +7,13 @@
 //! on a `FaultFs` (crashed or restarted as a test needs) and a faulty store. Each test's
 //! comment names the defect it is there to catch.
 
+#[path = "write_tier/ac_order.rs"]
+mod ac_order;
 mod common;
+#[path = "write_tier/reads.rs"]
+mod reads;
+#[path = "write_tier/stream.rs"]
+mod stream;
 #[path = "write_tier/support.rs"]
 mod support;
 
@@ -292,10 +298,12 @@ async fn an_own_block_flushed_again_after_a_lost_answer_is_not_a_conflict() {
 }
 
 /// Catches: a key holding another object answered by marking the object corrupt
-/// (reads of good local bytes would stop), by flushing anyway, or by retrying it
-/// forever; and its block evicted.
+/// (the blobs would be dropped, not moved), by flushing anyway, by retrying the same
+/// key forever, or by leaving the object staged (its space is freed only by a flush);
+/// and a block freed before the records are staged again, or the blobs unreadable or
+/// reported missing after the move.
 #[tokio::test]
-async fn a_key_holding_another_object_is_a_conflict_and_the_blobs_stay_local() {
+async fn a_key_holding_another_object_is_a_conflict_and_the_blobs_move_to_a_new_object() {
     let farm = Farm::new(CONDITIONAL);
     let cache = farm.start(GIB).await;
     let blobs = blobs(1, 2, 4096);
@@ -306,8 +314,12 @@ async fn a_key_holding_another_object_is_a_conflict_and_the_blobs_stay_local() {
     farm.store.put_new(&key, other, None).await.expect("put");
     let round = cache.flush_tier(later()).await.expect("round");
     assert_eq!((round.conflicts, round.flushed), (vec![object], vec![]));
-    assert_eq!(farm.log.staged_state(object), Some(StagedState::Conflict));
-    assert_eq!(farm.log.unreachable(object), None);
+    assert_eq!(farm.log.staged_state(object), None);
+    assert_eq!(farm.log.unreachable(object), None, "marked nothing");
+    assert_eq!(farm.log.losses(), (0, 0), "a move is not a loss");
+    assert!(!farm.has_block(object));
+    let moved = farm.log.object_of(&blobs[0].digest);
+    assert_ne!(moved, object);
     for b in &blobs {
         assert_eq!(cache.read_blob(&b.digest).await.expect("read"), b.bytes);
     }
@@ -317,34 +329,27 @@ async fn a_key_holding_another_object_is_a_conflict_and_the_blobs_stay_local() {
         .flush_tier(later() + FLUSH_BACKOFF_MAX)
         .await
         .expect("round");
-    assert_eq!(round, kbf_front::FlushRound::default(), "not retried");
+    assert_eq!(round.flushed, [moved]);
     assert_eq!(
         farm.store.put_keys().len(),
-        2,
-        "the test's PUT and one flush"
+        3,
+        "the test's PUT, the conflicting flush and the new object"
     );
-    assert!(farm.has_block(object));
     let metrics = cache.render_metrics();
     assert!(
         metrics.contains("\nkbf_write_tier_flush_conflicts_total 1\n"),
         "{metrics}"
     );
-    // With the block gone, the store's object under the key is not this one: neither
-    // its short bytes at the first record nor the missing range of the second marks
-    // the staged object.
-    farm.fs.remove(&block_name(object)).expect("remove");
-    for b in &blobs {
-        let read = cache.read_blob(&b.digest).await;
-        assert!(matches!(read, Err(CacheError::Unreachable(_))), "{read:?}");
-    }
-    assert_eq!(farm.log.unreachable(object), None);
 }
 
 /// Catches: a record damaged on the tier's disk flushed to the store (its footer would
-/// carry the CRC of the damaged bytes), and the object left readable; its blobs heal
-/// by a new upload.
+/// carry the CRC of the damaged bytes), the object left readable, a damaged record
+/// that takes its sound neighbours down with it, and a drop nobody sees. The damaged
+/// record is never PUT, counted and dropped (its blob unavailable until a new upload
+/// heals it); the sound record of the same block is staged again as an object of its
+/// own, flushed by the next round, and readable throughout.
 #[tokio::test]
-async fn a_record_damaged_on_the_tier_is_not_flushed_and_its_object_is_corrupt() {
+async fn a_record_damaged_on_the_tier_is_dropped_and_the_sound_one_is_flushed() {
     let farm = Farm::new(Capabilities::default());
     let cache = farm.start(GIB).await;
     let blobs = blobs(1, 2, 4096);
@@ -354,13 +359,117 @@ async fn a_record_damaged_on_the_tier_is_not_flushed_and_its_object_is_corrupt()
     farm.fs.flip(&block_name(at.object), offset);
     let round = cache.flush_tier(later()).await.expect("round");
     assert_eq!((round.corrupt, round.flushed), (vec![at.object], vec![]));
+    assert_eq!(round.dropped, [blobs[1].digest]);
     assert!(farm.store.put_keys().is_empty(), "nothing uploaded");
     assert_eq!(
         farm.log.unreachable(at.object),
         Some(UnreachableReason::Corrupt)
     );
-    assert_eq!(farm.log.answer(&blobs[0].digest), BlobAnswer::Unavailable);
+    assert_eq!(farm.log.answer(&blobs[1].digest), BlobAnswer::Unavailable);
     assert!(!farm.has_block(at.object));
+    let metrics = cache.render_metrics();
+    assert!(
+        metrics.contains("\nkbf_tier_flush_digest_mismatch_total 1\n"),
+        "{metrics}"
+    );
+
+    // The sound record was staged again, in an object of its own, and reads as before.
+    let (now, tier) = farm.log.located(&blobs[0].digest);
+    assert_ne!(now.object, at.object);
+    assert_eq!(tier, cache.tier_id());
+    assert_eq!(
+        cache.read_blob(&blobs[0].digest).await.expect("sound"),
+        blobs[0].bytes
+    );
+    let again = cache.flush_tier(later()).await.expect("round");
+    assert_eq!((again.flushed, again.dropped), (vec![now.object], vec![]));
+    assert_eq!(farm.store.put_keys().len(), 1, "one object, the sound one");
+    let stored = farm
+        .store
+        .stored(&key(&cache, now.object))
+        .await
+        .expect("stored");
+    let reader = kbf_segments::SegmentReader::open(&stored).expect("a segment");
+    assert_eq!(
+        reader.get(&blobs[0].digest).expect("record"),
+        Some(&blobs[0].bytes[..])
+    );
+    assert_eq!(reader.get(&blobs[1].digest).expect("absent"), None);
+    assert_eq!(
+        cache.read_blob(&blobs[0].digest).await.expect("flushed"),
+        blobs[0].bytes
+    );
+
+    cache.store_blobs(verified(&blobs)).await.expect("again");
+    for b in &blobs {
+        assert_eq!(cache.read_blob(&b.digest).await.expect("healed"), b.bytes);
+    }
+}
+
+/// Catches: a block of nothing but damaged records that stages an empty object again
+/// (or fails the round), and a count that is per object instead of per record. Every
+/// record of the block is flipped: both are dropped and counted, nothing is staged
+/// again, nothing is PUT.
+#[tokio::test]
+async fn a_block_of_only_damaged_records_leaves_nothing_behind() {
+    let farm = Farm::new(Capabilities::default());
+    let cache = farm.start(GIB).await;
+    let blobs = blobs(1, 2, 4096);
+    cache.store_blobs(verified(&blobs)).await.expect("stored");
+    let (at, _) = farm.log.located(&blobs[0].digest);
+    for b in &blobs {
+        let (there, _) = farm.log.located(&b.digest);
+        let offset = usize::try_from(there.offset).expect("offset") + 1;
+        farm.fs.flip(&block_name(at.object), offset);
+    }
+    let round = cache.flush_tier(later()).await.expect("round");
+    let mut dropped = round.dropped.clone();
+    dropped.sort();
+    let mut want: Vec<_> = blobs.iter().map(|b| b.digest).collect();
+    want.sort();
+    assert_eq!(dropped, want);
+    assert_eq!(round.corrupt, [at.object]);
+    let metrics = cache.render_metrics();
+    assert!(
+        metrics.contains("\nkbf_tier_flush_digest_mismatch_total 2\n"),
+        "{metrics}"
+    );
+    let again = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(again, kbf_front::FlushRound::default());
+    assert!(farm.store.put_keys().is_empty());
+    for b in &blobs {
+        assert_eq!(farm.log.answer(&b.digest), BlobAnswer::Unavailable);
+    }
+}
+
+/// Catches: a sound record whose new block cannot be committed (the log refuses the
+/// `PutStaged`) that fails the round, retries an object that already left the queue,
+/// or is reported as staged. The damaged record is still dropped and counted, the
+/// object is marked corrupt, and both blobs are unavailable until a new upload heals
+/// them: the failure costs availability, never correctness.
+#[tokio::test]
+async fn a_sound_record_that_cannot_be_staged_again_is_unavailable_until_uploaded() {
+    let farm = Farm::new(Capabilities::default());
+    let cache = farm.start(GIB).await;
+    let blobs = blobs(1, 2, 4096);
+    cache.store_blobs(verified(&blobs)).await.expect("stored");
+    let (at, _) = farm.log.located(&blobs[1].digest);
+    let offset = usize::try_from(at.offset).expect("offset") + 7;
+    farm.fs.flip(&block_name(at.object), offset);
+    farm.log.refuse("put_staged", 1);
+    let round = cache.flush_tier(later()).await.expect("not an error");
+    assert_eq!(
+        (round.corrupt, round.dropped),
+        (vec![at.object], vec![blobs[1].digest])
+    );
+    assert!(round.retrying.is_empty(), "{:?}", round.retrying);
+    assert_eq!(farm.log.applied("put_staged"), 1, "only the first upload");
+    for b in &blobs {
+        assert_eq!(farm.log.answer(&b.digest), BlobAnswer::Unavailable);
+    }
+    let again = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(again, kbf_front::FlushRound::default());
+    assert!(farm.store.put_keys().is_empty());
     cache.store_blobs(verified(&blobs)).await.expect("again");
     for b in &blobs {
         assert_eq!(cache.read_blob(&b.digest).await.expect("healed"), b.bytes);
@@ -464,7 +573,7 @@ async fn flushed_copies_are_evicted_least_recently_read_first() {
 }
 
 /// Catches: a wrong mount or a lost `TIER` file destroying the index (the start must
-/// be refused and change nothing); `--write-tier-abandon` naming another tier
+/// be refused and change nothing); `--hot-store-abandon` naming another tier
 /// accepted; and abandoned blobs answered `NOT_FOUND` or with other bytes instead of
 /// `Unavailable` until a re-upload heals them.
 #[tokio::test]
@@ -920,7 +1029,7 @@ async fn a_log_answering_with_another_commands_outcome_is_an_internal_error() {
         .put_new(&key(&cache, other), taken, None)
         .await
         .expect("put");
-    farm.log.answer_wrong("flush_conflict", 1);
+    farm.log.answer_wrong("reseat_staged", 1);
     let round = cache.flush_tier(later()).await.expect("round");
     assert!(
         round.retrying.contains(&(other, FLUSH_BACKOFF_FIRST)),
@@ -1082,4 +1191,38 @@ async fn concurrent_uploads_share_one_staged_segment() {
     }
     assert!(farm.log.applied("put_staged") < b.len(), "grouped");
     assert!(farm.store.put_keys().is_empty());
+}
+
+/// Catches: a staged object whose key is taken, and whose block is gone, answered from
+/// the store's other object (the wrong bytes) or marked unreachable (N6): neither its
+/// short bytes at the first record nor the missing range of the second marks the staged
+/// object. Both the object not yet flushed and one an earlier build left in conflict.
+#[tokio::test]
+async fn a_staged_object_whose_key_is_taken_and_block_is_gone_is_unreachable_unmarked() {
+    for conflict in [false, true] {
+        let farm = Farm::new(CONDITIONAL);
+        let cache = farm.start(GIB).await;
+        let blobs = blobs(1, 2, 4096);
+        cache.store_blobs(verified(&blobs)).await.expect("stored");
+        let object = farm.log.object_of(&blobs[0].digest);
+        let other = Bytes::from_static(b"some other object under this key");
+        let at = key(&cache, object);
+        farm.store.put_new(&at, other, None).await.expect("put");
+        if conflict {
+            let seal = Command::SealStaged { object };
+            let flagged = Command::FlushConflict { object };
+            assert!(matches!(farm.log.commit(seal), Applied::Tier(Ok(()))));
+            assert!(matches!(farm.log.commit(flagged), Applied::Tier(Ok(()))));
+        }
+        farm.fs.remove(&block_name(object)).expect("remove");
+        for b in &blobs {
+            let read = cache.read_blob(&b.digest).await;
+            assert!(
+                matches!(read, Err(CacheError::Unreachable(_))),
+                "conflict {conflict}: {read:?}"
+            );
+        }
+        assert_eq!(farm.log.unreachable(object), None, "conflict {conflict}");
+        assert_eq!(farm.log.losses(), (0, 0), "conflict {conflict}");
+    }
 }

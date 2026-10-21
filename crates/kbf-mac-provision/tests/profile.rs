@@ -409,7 +409,7 @@ fn an_unknown_key_is_refused() {
     assert_eq!(
         Profile::parse(edited(append("sleep=0")).as_bytes()).unwrap_err(),
         ProfileError::UnknownKey {
-            line: 42,
+            line: 43,
             key: "sleep".into()
         }
     );
@@ -422,7 +422,7 @@ fn a_repeated_key_is_refused() {
     assert_eq!(
         Profile::parse(edited(append("firewall=off")).as_bytes()).unwrap_err(),
         ProfileError::Duplicate {
-            line: 42,
+            line: 43,
             key: "firewall".into()
         }
     );
@@ -469,7 +469,7 @@ fn a_key_with_a_space_or_capital_is_refused() {
         assert_eq!(
             Profile::parse(text.as_bytes()).unwrap_err(),
             ProfileError::UnknownKey {
-                line: 42,
+                line: 43,
                 key: key.into()
             }
         );
@@ -715,10 +715,10 @@ fn every_malformed_pool_volume_or_daemon_setting_is_refused() {
         (
             "root scratch off the volume",
             edited(|l| {
-                set("kbf_scratch", "/private/var/kbf")(l);
+                set("kbf_data_dir", "/private/var/kbf")(l);
                 l.push("daemon_user=root".into());
             }),
-            "kbf_scratch: /private/var/kbf is not on kbf_volume /Volumes/kbf (daemon_user=root)",
+            "kbf_data_dir: /private/var/kbf is not on kbf_volume /Volumes/kbf (daemon_user=root)",
         ),
         (
             "root cache off the volume",
@@ -745,7 +745,7 @@ fn every_malformed_pool_volume_or_daemon_setting_is_refused() {
 #[test]
 fn the_pool_volume_and_daemon_settings_are_accepted_and_printed() {
     let text = edited(|l| {
-        set("kbf_scratch", "/private/var/kbf")(l);
+        set("kbf_data_dir", "/private/var/kbf")(l);
         l.extend(
             [
                 "pool_users=64",
@@ -765,7 +765,7 @@ fn the_pool_volume_and_daemon_settings_are_accepted_and_printed() {
         "{printed}"
     );
     let text = edited(|l| {
-        set("kbf_scratch", "/Volumes/farm/scratch")(l);
+        set("kbf_data_dir", "/Volumes/farm/data")(l);
         l.extend(
             [
                 "pool_users=1",
@@ -782,4 +782,115 @@ fn the_pool_volume_and_daemon_settings_are_accepted_and_printed() {
         l.push("pool_first_uid=600".into());
     });
     assert_eq!(refusal(&below), "accepted", "a pool below lease_uids");
+}
+
+/// The test profile with `kbf_data_dir` spelled with its old name, `kbf_scratch`.
+fn with_old_key() -> String {
+    edited(replace("kbf_data_dir=", "kbf_scratch="))
+}
+
+/// The node's `kbf.toml` without the node label (it holds the profile's SHA-256, which
+/// differs when the file's bytes do).
+fn config_without_node_label(p: &Profile) -> String {
+    kbf_mac_provision::launchd::render_config(p).replace(&p.node_label(), "NODE-LABEL")
+}
+
+/// Catches: the job not running `kbf --mode=daemon --config <kbf.toml>` and nothing
+/// else (a flag after `--config` could not be told from the file's key, and the labels,
+/// the server and the certificates would be set twice), a plist that still names
+/// `kbf-daemon`, the word `node` (removed) back, or the removed `--scratch` and
+/// `--cache-dir` flags.
+#[test]
+fn the_job_runs_the_daemon_mode_with_its_config_and_nothing_else() {
+    let p = Profile::parse(edited(|_| {}).as_bytes()).unwrap();
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    let args = kbf_mac_provision::launchd::daemon_args(&p);
+    assert_eq!(
+        args,
+        [
+            "/usr/local/kbf-installer/releases/current/kbf",
+            "--mode=daemon",
+            "--config",
+            "/usr/local/etc/kbf/kbf.toml",
+        ]
+    );
+    let plist = kbf_mac_provision::launchd::render_plist(&p);
+    for absent in [
+        "<string>node</string>",
+        "--scratch",
+        "--cache-dir",
+        "--cache-",
+        "--tree-",
+        "--server",
+        "--cert",
+        "--data-dir",
+        "--node-id",
+        "--label",
+        "--driver",
+        "current/kbf-daemon",
+    ] {
+        assert!(!plist.contains(absent), "{absent} in\n{plist}");
+    }
+}
+
+/// Catches: the old key `kbf_scratch` refused (a profile written before the rename
+/// would stop provisioning), accepted without a warning, or not treated as
+/// `kbf_data_dir` (the data directory the profile checks would be another key's).
+#[test]
+fn the_old_key_is_accepted_with_a_warning_and_renders_the_same() {
+    let new = Profile::parse(edited(|_| {}).as_bytes()).unwrap();
+    let old = Profile::parse(with_old_key().as_bytes()).unwrap();
+    assert_eq!(old.get("kbf_data_dir"), "/Volumes/kbf/data");
+    assert_eq!(old.warnings.len(), 1, "{:?}", old.warnings);
+    assert!(
+        old.warnings[0].contains("kbf_scratch is deprecated, use kbf_data_dir"),
+        "{}",
+        old.warnings[0]
+    );
+    assert_eq!(
+        config_without_node_label(&old),
+        config_without_node_label(&new)
+    );
+    assert!(!kbf_mac_provision::launchd::render_plist(&old).contains("--scratch"));
+}
+
+/// Catches: a profile with both `kbf_scratch` and `kbf_data_dir` accepted (which one
+/// wins would be a guess), in either order, or refused without naming both keys.
+#[test]
+fn both_the_old_and_the_new_key_are_refused() {
+    let old_after = edited(append("kbf_scratch=/Volumes/kbf/other"));
+    let old_first = edited(|l| {
+        let at = l
+            .iter()
+            .position(|x| x.starts_with("kbf_data_dir="))
+            .unwrap();
+        l.insert(at, "kbf_scratch=/Volumes/kbf/other".to_owned());
+    });
+    for (name, text) in [("old after new", old_after), ("old before new", old_first)] {
+        let said = refusal(&text);
+        assert!(
+            said.contains("kbf_scratch and kbf_data_dir are both set")
+                && said.contains("keep only kbf_data_dir"),
+            "{name}: {said}"
+        );
+    }
+}
+
+/// Catches: the old key given twice reported as anything but a repeated key.
+#[test]
+fn the_old_key_twice_is_a_duplicate() {
+    let text = format!("{}kbf_scratch=/Volumes/kbf/x\n", with_old_key());
+    assert_eq!(
+        refusal(&text),
+        "profile line 43: duplicate key: kbf_scratch"
+    );
+}
+
+/// Catches: a profile with neither key accepted (the daemon would get no data dir).
+#[test]
+fn neither_data_dir_key_is_missing_key() {
+    assert_eq!(
+        refusal(&edited(drop_keys(&["kbf_data_dir"]))),
+        "missing key: kbf_data_dir"
+    );
 }

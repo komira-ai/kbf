@@ -85,7 +85,7 @@ every lease an older leader granted. A single server's leases live and die with 
 process, so each process picks its own term at start: its start time in milliseconds
 on the wall clock, times 2^16, plus 16 random bits (`kbf_server::farm::process_term`).
 A restarted server therefore never grants a lease id its predecessor granted (issue
-[#137](https://github.com/komira-ai/komira-build-farm/issues/137)), and its terms
+[#137](https://github.com/komira-ai/kbf/issues/137)), and its terms
 order after its predecessor's while the wall clock does not step back across the
 restart. The replicated log's term replaces this once it is wired.
 
@@ -177,7 +177,7 @@ stopped. The server logs every change of process on a node. A registration witho
 instance id (a daemon that predates the field) is taken as another process's.
 
 **A proven restart** (issue #22). The daemon binary keeps its instance id in its
-scratch directory (`<--scratch>/daemon-instance`), written only once every runtime has
+scratch directory (`<--data-dir>/leases/daemon-instance`), written only once every runtime has
 been built, so once every driver's start-up sweep has killed the runs the daemon
 before it left there. The next daemon reads the old id before it writes its own, and
 names it in `Hello.predecessor_instance_id`. The server takes the claim when it names
@@ -192,7 +192,7 @@ assumption: the sweep already needs one daemon per scratch directory. What it do
 not cover: a copy of the scratch directory on another machine (a cloned disk) whose
 daemon is cut off from the server, so that its stream has closed while it still runs;
 its self-fenced work then stops within T, but a hermetic run runs on beside the rerun.
-A daemon without `--scratch` (the fake driver) names no predecessor.
+A daemon without `--data-dir` (the fake driver) names no predecessor.
 
 This puts one duty on a daemon: it must list everything it holds in its first heartbeat
 on each new stream, or what it leaves out is requeued at once. Re-adopting work across a
@@ -238,6 +238,11 @@ registration's included, before any placement round:
   the scheduler does not hold there is answered with a `Cancel` by the server
   (`Scheduler::not_held`).
 - `quarantined <why>`: a cleanup failed. The worker takes no lease.
+- `memory_pressure`: the daemon holds a lease and its node's memory stall time is above
+  `--memory-pressure-pause-percent` (default 10; [daemon.md](daemon.md#cgroups-and-limits),
+  "The memory backstop"). The worker takes no new lease until the daemon says
+  `serving` again, and keeps the ones it runs. It is no fault of the node's, and
+  counts as none.
 
 A worker whose phase is not `serving` is held back from placement as a cordoned one
 is: work only it could run waits, naming it and its phase (`mac-1 (quarantined)`),
@@ -275,8 +280,9 @@ What the code does today:
 - Each worker's capacity is read from its node report at registration: `cpus` x 1000
   millicores, `mem_gib` GiB and `gpu` GPUs. The whole machine is offered. So are its
   capabilities (`kbf_caps::NodeCaps`, see [capabilities.md](capabilities.md)).
-- Every action requests one core and 1 GiB (`kbf_front::DEFAULT_RESOURCES`), or the
-  whole cores and GiB its `kbf-book-cpus` and `kbf-book-mem-gib` properties name (see
+- Every action requests one core and 4 GiB, the first rung of the memory ladder
+  (`kbf_front::DEFAULT_RESOURCES`; the server's `--memory-ladder-gib` sets the rung),
+  or the whole cores and GiB its `kbf-book-cpus` and `kbf-book-mem-gib` properties name (see
   [platform-properties.md](../platform-properties.md#kbf-book-cpus-and-kbf-book-mem-gib)),
   its `gpu` count, and what its platform asks of a worker (`Request::needs`). The
   scheduler raises the memory of a new submission to its action key's memory floor,
@@ -285,9 +291,18 @@ What the code does today:
   worker is feasible for it only if its node report lists a driver that serves the
   kind (`container`, `native`, `fake` or `local` for `action`, `native-whole-machine` for
   `whole_machine`; see [capabilities.md](capabilities.md#driver-entries)).
-- A placement round walks the queue in order and gives each operation to the first
-  live, feasible worker, in name order, whose capabilities satisfy its platform and
-  that has room for it. An action has room where its free room (capacity minus
+- A placement round walks the queue in order and gives each operation to the least
+  loaded live, feasible worker whose capabilities satisfy its platform and that has
+  room for it: the one with the least booked as a share of its capacity (the larger of
+  its CPU share and its memory share, each booked over capacity, compared exactly in
+  integers), then the fewest leases, then the first in name order. Work therefore
+  spreads over the farm instead of filling the first worker. The platform and the room
+  are decided first and the load only ranks the workers that pass, so a Mac is never the
+  least loaded worker for Linux work. The memory share counts what leases booked, though
+  admission does not (below), and is not capped at 1: a worker booked past its memory is
+  still more loaded than one booked less. A whole-machine lease, and an action at a
+  worker's whole memory, go only to a worker with no lease, so their candidates tie and
+  the first by name is taken. An action has room where its free room (capacity minus
   bookings) fits the whole request on every axis and no whole-machine lease is held. A
   `whole_machine` lease has room only on a worker that holds no lease and is at least
   its request large; it books the worker's whole capacity, which its `Start` carries.
@@ -299,7 +314,14 @@ What the code does today:
   urgent, or as urgent and younger) is placed there, so that worker empties as its
   leases end; operations before it still are. The hold lasts while the operation is
   queued and the worker could run it (live, not cordoned, feasible). No lease is ever
-  stopped for it. A large `action` request has no such hold yet (issue #169).
+  stopped for it. An `action` holds no worker: one at the whole memory of a worker (the
+  last rung of the memory ladder, which runs alone there) waits until some worker's
+  free memory meets its request, that is, until a worker has no lease. Under sustained
+  spread load that wait can be long, and nothing reserves a worker for it; callers
+  wait. A large `action` request has no such hold either (issue #169), and spreading
+  makes it likelier to wait than first fit did: with eight one-core leases on two
+  workers of eight cores, first fit leaves one worker empty and a six-core action runs
+  at once, while spreading leaves four on each and it waits for cores to free.
 - A request with `ios.device=1` has room only where a device the worker reports
   satisfies every `ios.device.*` attribute of the request and no lease holds it, and
   where the worker holds no other device lease (`DEVICE_LEASES_PER_WORKER` = 1, until
@@ -389,20 +411,33 @@ drivers set it. The server
 turns it into one of two outcomes, and the scheduler decides on the committed result:
 
 - **`Failed(OutOfMemory)`: the action passed its own memory limit.** The operation is
-  queued again with its memory booking doubled, rounded up to whole GiB (at least
-  1 GiB), and never past the **cap**: the memory of the largest node that could run it
-  when the kill is committed, one that is live (cordoned or not), serves its lease
-  kind, satisfies its platform and holds its CPU and GPU request; the node of the
-  killed run always counts. A doubling past the cap books the cap: 1, 2, 4, 8 GiB on
-  a farm whose largest node has 8 GiB. A whole-machine lease doubles what it booked,
-  the node's whole memory, so it next needs a node twice as large. A kill of a run that
-  booked the cap finishes the operation `Failed(OutOfMemory)`: the action needs more
-  memory than any node offers.
+  queued again one rung up a **fixed ladder**, the server's `--memory-ladder-gib`
+  (default `4,16,32`), and after the last rung on a **whole host**. The first booking
+  is the front's: the first rung (4 GiB) for an action that names no memory size, else
+  the GiB its `kbf-book-mem-gib` names, from which the ladder climbs (a 6 GiB ask
+  that is killed books 16 GiB). A kill books the first rung above what the killed run
+  booked, unless that rung is not below the **cap**: the memory of the largest node
+  that could run it when the kill is committed, one that is live (cordoned or not),
+  serves its lease kind, satisfies its platform and holds its CPU and GPU request; the
+  node of the killed run always counts. Then it books the cap, the whole host: with all
+  its memory booked no other lease fits there, so the run has the node to itself while
+  its CPU booking stays what it was. On a farm whose largest node has 24 GiB the rungs
+  are 4, 16 and then 24 GiB (the 32 GiB rung is skipped). A whole-machine lease raises
+  what it booked, the node's whole memory, the same way. A kill of a run that booked
+  the cap finishes the operation `Failed(OutOfMemory)`: the action needs more memory
+  than any node offers. The flag is a list of GiB that ascends strictly and whose
+  rungs are each at least 1; the server refuses another at start. One rung (`8`) is a
+  first booking of 8 GiB and then a whole host. The first booking is not clamped to
+  the farm: where no live node has the first rung's memory, an action that names no
+  size is unservable, as one that names that size would be, and is refused after the
+  unservable wait; a farm of small nodes sets a lower first rung.
 - **The memory floor.** Each raised booking is kept as the memory floor of the
   action's key (instance name and action digest), and a later submission of that key
-  books at least the floor; a floor never falls. The floors live in the scheduler
-  alone, so a server restart forgets them (one more killed run per key), and at most
-  `MEMORY_FLOORS` = 65 536 are kept, the one raised longest ago forgotten first.
+  books at least the floor, so a known-big action starts at the rung that ran it
+  instead of climbing from the first again; a floor never falls. The floors live in
+  the scheduler alone, so a server restart forgets them (one more killed run per key),
+  and at most `MEMORY_FLOORS` = 65 536 are kept, the one raised longest ago forgotten
+  first.
 - **`Failed(NodeMemoryPressure)`: the node killed it while it was under its own
   limit** (a node-wide out-of-memory kill, or the node's backstop). The busy node's
   fault: the node's memory-pressure count (`Scheduler::memory_pressure`) goes up, and
@@ -413,13 +448,14 @@ turns it into one of two outcomes, and the scheduler decides on the committed re
 - **The two budgets do not mix.** A rung of the ladder is not a farm rerun and a farm
   rerun is not a rung, so a long ladder never takes a farm fault's reruns, and farm
   faults never stop the ladder short of the cap. An operation runs at most
-  `1 + ceil(log2(cap / first booking)) + FARM_RERUNS` times. Leases given up for
+  `1 + rungs above its first booking + 1 (the whole host) + FARM_RERUNS` times:
+  `1 + 3 + FARM_RERUNS` for the default ladder. Leases given up for
   silence, replacement without proof, reconnection or not starting count against
   neither.
 - A memory kill committed for a lease the operation no longer holds (it was given up
   and is queued again) changes nothing: no run is recorded and the booking stays.
 - Each rerun is a requeue the server logs with its reason ("passed its memory limit
-  with 1 GiB booked; it runs again with 2 GiB booked"); a busy node's kill is also
+  with 4 GiB booked; it runs again with 16 GiB booked"); a busy node's kill is also
   logged as a warning on the `kbf_server::attention` target with the node's count.
 
 ## Outcomes
@@ -433,7 +469,7 @@ to the scheduler's outcome and to what callers see:
 | `OK`, an output not stored | `Failed(Infra)` | `INTERNAL` | not written |
 | `DEADLINE_EXCEEDED` | `Failed(Timeout)` | `DEADLINE_EXCEEDED`, with the partial stdout and stderr digests the CAS holds, if any | not written |
 | `INVALID_ARGUMENT` | `Failed(Invalid)` | `INVALID_ARGUMENT`, with the daemon's reason | not written |
-| not `OK`, `memory_kill` own limit | `Failed(OutOfMemory)`: run again with double the memory below the cap | at the cap, `FAILED_PRECONDITION`: "kbf: the action needs more memory than any node offers: ...", with an `ErrorInfo` of reason `ACTION_OUT_OF_MEMORY` | not written |
+| not `OK`, `memory_kill` own limit | `Failed(OutOfMemory)`: run again one rung up (4, 16, 32 GiB, a whole host) below the cap | at the cap, `FAILED_PRECONDITION`: "kbf: the action needs more memory than any node offers: ...", with an `ErrorInfo` of reason `ACTION_OUT_OF_MEMORY` | not written |
 | not `OK`, `memory_kill` node pressure | `Failed(NodeMemoryPressure)`: run again with the same memory, from the farm budget | past the budget, `INTERNAL`: "kbf farm fault on <node>: ..." | not written |
 | not `OK`, `lost` set (fenced, or daemon restarted) | `Failed(Lost)`: run again from the farm budget, preferring another node | past the budget, `INTERNAL`: "kbf farm fault on <node>: ...", naming every farm run | not written |
 | `FAILED_PRECONDITION`, every `PreconditionFailure` violation `MISSING` with a `blobs/<hash>/<size>` subject | `Failed(MissingInput)`: answered at once, never run again, no farm rerun spent | `FAILED_PRECONDITION`: "N input blob(s) are not in the CAS", with the `PreconditionFailure` listing each blob as its only detail, as the front answers before queueing; Bazel re-uploads and executes again | not written |

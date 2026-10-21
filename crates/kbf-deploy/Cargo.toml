@@ -8,9 +8,10 @@ repository.workspace = true
 publish.workspace = true
 
 # The deploy tool: its kits as subcommands. A kit that changes a host does it through
-# kbf-host's plan of steps, printed by default and carried out with `--apply`. Five
+# kbf-host's plan of steps, printed by default and carried out with `--apply`. The
 # kits: `minio` (buckets and their key, a NodePort for the S3 port), `linux`
-# (render-units, check-units, and as root install-units, image-pull and swap), `mdm`
+# (render-units, check-units and, as root, install-units, each for one `--mode`, and
+# swap), `mdm`
 # (fetch the pinned upstream archives; as root install the MDM services, the TLS
 # certificate, the push certificate and the enrollment profile, and link NanoDEP to
 # Apple Business Manager; verify them; sign an operator's erase request), `envoy`
@@ -26,6 +27,8 @@ publish.workspace = true
 # base64 encodes the Basic auth of the MDM services' APIs.
 # `mdm erase-request` writes and checks the request with kbf-mdm's own parser and
 # signature check, and reads the security key's public half with ssh-key.
+# `host state-backup` and `host state-restore` work on the SQLite state store's file
+# through kbf-state's own backup, check, lock and restore; time stamps the kept file.
 
 [[bin]]
 name = "kbf-deploy"
@@ -38,7 +41,9 @@ flate2.workspace = true
 hex.workspace = true
 httparse.workspace = true
 kbf-host.workspace = true
+kbf-installer.workspace = true
 kbf-mdm.workspace = true
+kbf-state.workspace = true
 kbf-types.workspace = true
 plist.workspace = true
 rustls.workspace = true
@@ -49,16 +54,24 @@ sha2.workspace = true
 ssh-key.workspace = true
 tar.workspace = true
 thiserror.workspace = true
+time.workspace = true
 x509-parser.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+# Loopback ports nothing can take (kbf_testkit::port).
+kbf-testkit.workspace = true
 kbf-host = { workspace = true, features = ["testkit"] }
+# The scratch host and state the `host` verbs' tests build.
+kbf-installer = { workspace = true, features = ["testkit"] }
 # Security-key signatures made in software, for `mdm erase-request`'s tests.
 kbf-mdm = { workspace = true, features = ["testkit"] }
-# The certificates of the HTTPS servers the `mdm` tests run.
+# The certificates of the HTTPS servers the `mdm` tests run, and the ones
+# `linux verify-cert` is tested against.
 rcgen.workspace = true
 rustix = { workspace = true, features = ["process"] }
+# Databases a state restore must refuse: another application's, a damaged one.
+rusqlite.workspace = true
 
 [lints]
 workspace = true

@@ -171,6 +171,12 @@ fn the_golden_set_names_every_tier_command() {
             | Command::ObjectUnreachable { .. }
             | Command::ObjectReachable { .. }
             | Command::Collect => panic!("{name} is a format-1 command"),
+            Command::EvictObjects { .. } => panic!("{name} is a format-3 command"),
+            Command::SetWriter(_)
+            | Command::AdoptSegment { .. }
+            | Command::RebuildProgress { .. }
+            | Command::RebuildDone => panic!("{name} is a format-4 command"),
+            Command::ReseatStaged { .. } => panic!("{name} is a format-5 command"),
         };
         seen[i] = true;
     }
@@ -363,7 +369,11 @@ fn pd(n: u8) -> proto::Digest {
 }
 
 fn pobject() -> Option<proto::ObjectId> {
-    Some(proto::ObjectId { epoch: 1, seq: 2 })
+    Some(proto::ObjectId {
+        epoch: 1,
+        seq: 2,
+        ..proto::ObjectId::default()
+    })
 }
 
 fn staged(

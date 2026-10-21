@@ -71,7 +71,7 @@ impl CallerCheck for Scripted {
 struct Served {
     host: FakeHost,
     client: Client,
-    dir: PathBuf,
+    dir: kbf_testkit::dir::TestDir,
 }
 
 /// A helper over a fake host, serving on a socket in a scratch directory.
@@ -595,7 +595,7 @@ fn serve_returns_when_accept_fails() {
         let settings = Settings {
             range: UidRange::new(600, 601).unwrap(),
             gid: 20,
-            homes: dir.clone(),
+            homes: dir.to_path_buf(),
             schedules: SweepPlan {
                 named: Vec::new(),
                 owned: Vec::new(),
@@ -675,4 +675,18 @@ fn a_wait_that_fails_is_reported() {
             reason: "waiting for the process: gone".to_owned()
         }
     );
+}
+
+/// Catches: the refusal naming a binary the pinned requirement does not pin (it once
+/// said `kbf-daemon` while the installed binary is `kbf`, run as `kbf daemon`), which
+/// sends an operator hunting for a file that is not installed. Portable, so Linux
+/// runs it; the macOS caller check builds its refusal through the same function.
+#[test]
+fn a_refused_caller_is_told_it_is_not_the_installed_kbf_daemon() {
+    let text = not_the_daemon(&caller(7), "code failed the requirement");
+    assert_eq!(
+        text,
+        "pid 7 version 1 is not the installed `kbf` daemon: code failed the requirement"
+    );
+    assert!(!text.contains("kbf-daemon"), "{text}");
 }

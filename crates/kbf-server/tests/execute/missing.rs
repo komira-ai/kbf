@@ -8,7 +8,7 @@
 //! and coverage counts each generic function by its best-covered instantiation, so the
 //! missing-input path of `Farm::report` must run in the same binary as its other paths.
 
-use crate::support::{Blob, Cell, Job, done, failed, output, response};
+use crate::support::{Blob, Cell, Job, done, failed, output, report_every_run, response};
 use kbf_proto::google::rpc::precondition_failure::Violation;
 use kbf_proto::google::rpc::{self, ErrorInfo, PreconditionFailure};
 use prost::Message;
@@ -131,11 +131,15 @@ async fn another_failed_precondition_stays_the_farms_failure() {
         cell.upload(&job.blobs()).await;
         let mut ops = cell.execute(&job.action).await;
         let start = daemon.start().await;
-        let mut report = failed(start.lease_id, Code::FailedPrecondition);
-        if name == "mixed violations" {
-            report.status.as_mut().expect("a status").details = mixed(&job.input);
-        }
-        assert!(daemon.report(report).await.accepted, "{name}");
+        // The farm's failure is run again, so only the last run answers.
+        report_every_run(&mut daemon, start, |lease| {
+            let mut report = failed(lease, Code::FailedPrecondition);
+            if name == "mixed violations" {
+                report.status.as_mut().expect("a status").details = mixed(&job.input);
+            }
+            report
+        })
+        .await;
         let status = response(&done(&mut ops).await).status.expect("a status");
         assert_eq!(status.code, Code::Internal as i32, "{name}");
         assert_eq!(status.details, Vec::new(), "{name}");

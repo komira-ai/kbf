@@ -4,7 +4,7 @@
 //! dedicated group (never `staff`, which every macOS user is in); the socket itself is
 //! mode 0660. That keeps every other uid out, lease users included. Each connection's
 //! caller is then checked by a [`CallerCheck`] (on macOS: the caller's code signature,
-//! by audit token, against the pinned `kbf-daemon` requirement):
+//! by audit token, against the pinned daemon requirement, the installed `kbf`):
 //!
 //! 1. As soon as the connection is accepted, before a byte is read, the process at the
 //!    other end is identified and checked; a refused caller is told so and its
@@ -58,6 +58,13 @@ impl std::fmt::Display for Caller {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "pid {} version {}", self.pid, self.version)
     }
+}
+
+/// The refusal text for a caller whose code fails the pinned requirement. The
+/// requirement names the installed daemon binary, `kbf` run as `kbf daemon`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn not_the_daemon(caller: &Caller, why: impl std::fmt::Display) -> String {
+    format!("{caller} is not the installed `kbf` daemon: {why}")
 }
 
 /// Decides whether the process on the other end of a connection is the genuine

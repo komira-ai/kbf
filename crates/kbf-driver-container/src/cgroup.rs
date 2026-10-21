@@ -3,10 +3,9 @@
 //!
 //! The daemon owns an `actions/` cgroup in its delegated subtree (`crate::delegate`).
 //! For each lease the driver makes a child with the lease's limits and puts the
-//! container under it (`--cgroup-parent`). The lease cgroup outlives the container, so
+//! container under it (`cgroupsPath`). The lease cgroup outlives the container, so
 //! after the action ends its `memory.events` still says whether the kernel OOM killer
-//! ran inside it, and whose limit made it run: Podman's own `OOMKilled` flag is not
-//! trusted (it reads false rootless; see the hosted-runner spike).
+//! ran inside it, and whose limit made it run.
 //!
 //! Memory (the build-host policy): a hard cap per lease, `memory.max` = booking x 1.5 +
 //! 512 MiB (the native driver's limit), with `memory.oom.group=1` on the lease, so an
@@ -28,13 +27,16 @@ use std::time::Duration;
 use kbf_daemon::RuntimeError;
 use kbf_types::Resources;
 
+use crate::numa::Pin;
+
 /// Controllers the lease hands to the container's cgroup.
 const SUBTREE: &str = "+cpu +memory +pids";
+/// [`SUBTREE`] and `cpuset`, for a lease pinned to a NUMA node.
+const SUBTREE_PINNED: &str = "+cpu +memory +pids +cpuset";
 /// 512 MiB, the cap's headroom above 1.5 x the booking.
 const HEADROOM: u64 = 512 << 20;
 /// How often, and how long apart, removal retries a lease cgroup that is still busy:
-/// a process still exiting, or Podman's exit hook (`podman container cleanup`, which
-/// conmon starts inside the lease) still running.
+/// a process still exiting.
 const REMOVE_TRIES: u32 = 100;
 const REMOVE_PAUSE: Duration = Duration::from_millis(50);
 
@@ -218,8 +220,8 @@ pub(crate) async fn presses_into_swap(
 pub(crate) struct LeaseCgroup {
     /// The directory, under the cgroup filesystem's mount.
     dir: PathBuf,
-    /// The same cgroup as Podman's `--cgroup-parent` names it: relative to the mount,
-    /// starting with `/`.
+    /// The same cgroup as the bundle's `cgroupsPath` parent names it: relative to the
+    /// mount, starting with `/`.
     name: String,
 }
 
@@ -234,9 +236,17 @@ impl LeaseCgroup {
 
     /// Creates the cgroup and sets its limits. A cgroup left half-made is removed by
     /// [`LeaseCgroup::remove`] like a whole one.
-    pub(crate) fn create(&self, resources: Resources) -> io::Result<()> {
+    ///
+    /// With a `pin` (`--lease-placement=numa-node`) the lease also gets `cpuset.cpus` and
+    /// `cpuset.mems`, and hands `cpuset` to the container's cgroup, which inherits both.
+    pub(crate) fn create(&self, resources: Resources, pin: Option<&Pin>) -> io::Result<()> {
         std::fs::create_dir(&self.dir)?;
-        self.write("cgroup.subtree_control", SUBTREE)?;
+        let subtree = if pin.is_some() {
+            SUBTREE_PINNED
+        } else {
+            SUBTREE
+        };
+        self.write("cgroup.subtree_control", subtree)?;
         // Before the container exists, so nothing in the lease ever runs without it.
         self.write("memory.oom.group", "1")?;
         if let Some(max) = memory_max(resources.memory_bytes) {
@@ -245,10 +255,14 @@ impl LeaseCgroup {
         if let Some(weight) = cpu_weight(resources.cpu_millis) {
             self.write("cpu.weight", &weight.to_string())?;
         }
+        if let Some(pin) = pin {
+            self.write("cpuset.cpus", &pin.cpus().to_string())?;
+            self.write("cpuset.mems", &pin.node().to_string())?;
+        }
         Ok(())
     }
 
-    /// The name Podman's `--cgroup-parent` takes.
+    /// The name the bundle's `cgroupsPath` is made under.
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
@@ -486,16 +500,8 @@ mod tests {
     use super::*;
 
     /// A fresh directory beside the test binary (inside the target directory).
-    fn scratch(name: &str) -> PathBuf {
-        let exe = std::env::current_exe().expect("test binary");
-        let dir = exe
-            .parent()
-            .expect("deps directory")
-            .join("kbf-driver-container-unit")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch");
-        dir
+    fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+        crate::unit_dir(&format!("cgroup-{name}"))
     }
 
     fn busy() -> io::Error {
@@ -571,8 +577,8 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotADirectory);
     }
 
-    /// Catches a cgroup that vanishes between its listing and its `rmdir` (Podman
-    /// removing its own cgroup meanwhile) failing the clean. `<dir>/sub/..` lists
+    /// Catches a cgroup that vanishes between its listing and its `rmdir` (the
+    /// runtime removing its own cgroup meanwhile) failing the clean. `<dir>/sub/..` lists
     /// `<dir>`, whose pass removes `sub`; the `rmdir` of `<dir>/sub/..` then finds no
     /// `sub` to walk through (ENOENT), as if the cgroup had gone.
     #[test]
@@ -603,7 +609,7 @@ mod tests {
         let lease = LeaseCgroup::at(&root, "/actions", "kbf-lease-1-1");
         std::fs::create_dir(root.join("actions")).expect("mkdir");
         lease
-            .create(Resources::new(2000, 1 << 30))
+            .create(Resources::new(2000, 1 << 30), None)
             .expect("created");
         let read = |f: &str| std::fs::read_to_string(lease.dir().join(f)).ok();
         assert_eq!(
@@ -616,10 +622,57 @@ mod tests {
         assert_eq!(read("memory.high"), None);
 
         let unbooked = LeaseCgroup::at(&root, "/actions", "kbf-lease-1-2");
-        unbooked.create(Resources::default()).expect("created");
+        unbooked
+            .create(Resources::default(), None)
+            .expect("created");
         let read = |f: &str| std::fs::read_to_string(unbooked.dir().join(f)).ok();
         assert_eq!(read("memory.max"), None);
         assert_eq!(read("memory.oom.group").as_deref(), Some("1"));
+    }
+
+    /// Catches a pinned lease cgroup without its node's CPUs and memory node, without
+    /// `cpuset` handed to the container's cgroup, and an unpinned one that changed: the
+    /// subtree list and the files written stay what they were.
+    #[test]
+    fn a_pinned_cgroup_gets_the_nodes_cpus_and_memory_and_an_unpinned_one_none() {
+        use crate::numa::Placer;
+        let root = scratch("pinned");
+        std::fs::create_dir(root.join("actions")).expect("mkdir");
+        let placer = Placer::new(vec![
+            (0, "0-1,4".parse().expect("cpus")),
+            (1, "2-3,5".parse().expect("cpus")),
+        ])
+        .expect("nodes");
+        let first = placer.place(1000);
+        let second = placer.place(1000);
+        let read = |lease: &LeaseCgroup, f: &str| std::fs::read_to_string(lease.dir().join(f)).ok();
+
+        let one = LeaseCgroup::at(&root, "/actions", "kbf-lease-1-1");
+        one.create(Resources::new(1000, 1 << 30), Some(&first))
+            .expect("created");
+        assert_eq!(read(&one, "cpuset.cpus").as_deref(), Some("0-1,4"));
+        assert_eq!(read(&one, "cpuset.mems").as_deref(), Some("0"));
+        assert_eq!(
+            read(&one, "cgroup.subtree_control").as_deref(),
+            Some("+cpu +memory +pids +cpuset")
+        );
+        assert_eq!(read(&one, "cpu.weight").as_deref(), Some("100"));
+
+        let two = LeaseCgroup::at(&root, "/actions", "kbf-lease-1-2");
+        two.create(Resources::new(1000, 1 << 30), Some(&second))
+            .expect("created");
+        assert_eq!(read(&two, "cpuset.cpus").as_deref(), Some("2-3,5"));
+        assert_eq!(read(&two, "cpuset.mems").as_deref(), Some("1"));
+
+        let none = LeaseCgroup::at(&root, "/actions", "kbf-lease-1-3");
+        none.create(Resources::new(1000, 1 << 30), None)
+            .expect("created");
+        assert_eq!(read(&none, "cpuset.cpus"), None);
+        assert_eq!(read(&none, "cpuset.mems"), None);
+        assert_eq!(
+            read(&none, "cgroup.subtree_control").as_deref(),
+            Some("+cpu +memory +pids")
+        );
     }
 
     fn events(max: u64, oom: u64, oom_kill: u64) -> MemoryEvents {
@@ -694,7 +747,7 @@ mod tests {
         })
     }
 
-    /// Catches the false positive seen on podman-arm (a lease killed as out of memory
+    /// Catches the false positive seen on the real-crun arm job (a lease killed as out of memory
     /// for swap the host put there): the absolute-swap rule. Host reclaim moved
     /// 143265792 bytes of the lease to swap below its cap (`max` 0), a few pages were
     /// read back (143233024), then the lease pressed its cap (`max` 156 to 7205) and

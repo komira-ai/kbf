@@ -14,7 +14,7 @@
 //! L1's bound is each scenario's `horizon`, set with a wide margin (F1.4's is 23,200 s),
 //! not the catalog's "backlog plus G plus one round". Here L1 proves that the work
 //! finishes and that the world quiesces; how soon work is placed is checked by the
-//! reference first fit every round (I11), not by L1.
+//! reference placement every round (I11), not by L1.
 //!
 //! Each scenario also asserts that its sweep
 //! reached the situations it is about, so a check that cannot fail shows up as a
@@ -80,20 +80,22 @@ fn f1_1_exact_packing() {
     assert_eq!(full, 48, "every seed fills its workers exactly at second 0");
     assert!(exact > 0);
     assert!(
-        axes.iter().all(|&n| n > 0),
-        "one unit more on each axis: {axes:?}"
+        axes[0] > 0 && axes[2] > 0 && axes[1] == 0,
+        "one unit more on each axis that is booked: {axes:?}"
     );
 }
 
 #[test]
 fn f1_2_each_axis_full_on_its_own() {
-    let (mut memory, mut cpu) = (0, 0);
+    let (mut memory, mut cpu, mut over) = (0, 0, 0);
     sweep(0..8, EachAxis::default, |s, _| {
         memory += s.memory_full_cpu_free;
         cpu += s.cpu_full_memory_free;
+        over += s.memory_over_capacity;
     });
-    assert!(memory > 0, "no worker was full on memory with CPU free");
+    assert_eq!(memory, 0, "a memory-heavy request waited with a core free");
     assert!(cpu > 0, "no worker was full on CPU with memory free");
+    assert!(over > 0, "no worker's memory limits summed past its memory");
 }
 
 #[test]

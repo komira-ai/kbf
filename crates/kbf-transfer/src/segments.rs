@@ -1,17 +1,22 @@
 //! Segment upload and segment-range reads over `kbf.worker.v1.Segments`
 //! (`docs/design/write-path.md`, sections 4.1 to 4.3).
 //!
-//! **Upload.** The blobs of a [`Spool`] that the server lacks (asked through the
-//! engine's FindMissing queue) are packed, in spool order, into segments of at most
+//! **Upload.** The [`Record`]s the server lacks (asked through the engine's FindMissing
+//! queue) are packed, in the order given, into segments of at most
 //! [`MAX_SEGMENT_BYTES`] (a larger blob is a segment of its own), and the segments
 //! into uploads of at most [`SEGMENT_UPLOAD_BYTES`] and [`MAX_UPLOAD_RECORDS`], both
 //! under the smallest cap a server may run with, so every server admits every upload.
-//! An upload commits or fails whole, and the uploads of a spool go one after another,
-//! so a failed one costs its own blobs, not the ones committed before it.
+//! An upload commits or fails whole, and up to `--segment-uploads-in-flight` of a
+//! set's uploads are in flight together (the server checks and stages one while the
+//! next ones send), so a failed one costs its own blobs, not the ones committed.
 //! Each upload is one `Begin` (the footers), `PutRange` calls of at most
-//! [`MAX_RANGE_BYTES`], `--segment-upload-streams` at once, cut from the spool file,
-//! and one `Commit`. A failed upload is tried once more; then its blobs go one
-//! ByteStream write each. A server that answers UNIMPLEMENTED (one without the
+//! [`MAX_RANGE_BYTES`], `--segment-upload-streams` at once, each read from where the
+//! records' bytes are when it is sent ([`crate::Source`]: nothing is copied first), and one
+//! `Commit`. A failed upload is tried once more; then its blobs go one
+//! ByteStream write each. An upload the server answers FAILED_PRECONDITION (a record
+//! over 16 MiB it has no write tier room for, and does not hold in memory) goes one
+//! ByteStream write each at once: a `Write` of a large blob streams it to the store,
+//! so no blob is refused for its size. A server that answers UNIMPLEMENTED (one without the
 //! service) turns segment upload off for the life of the process, logged once.
 //!
 //! **Reads.** [`Scope::read_located`] asks where blobs are (`Locate`), coalesces blobs
@@ -21,7 +26,6 @@
 //! for the caller to read one by one.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use futures::{StreamExt as _, TryStreamExt as _, future, stream};
@@ -38,7 +42,8 @@ use tonic::{Code, Status};
 
 use crate::cas::{Cas, CasError, Chunks, WRITE_CHUNK_BYTES, label};
 use crate::engine::Scope;
-use crate::spool::{Spool, Spooled, to_proto};
+use crate::source::Record;
+use crate::spool::to_proto;
 use crate::stats::add;
 use crate::wire::MAX_MESSAGE_BYTES;
 
@@ -47,9 +52,8 @@ use crate::wire::MAX_MESSAGE_BYTES;
 /// retried and falls back for at most this much, and the uploads committed before it
 /// stay committed: a cold upload of 14,244 outputs (300 MB) on a store that was busy
 /// lost every blob it had sent to one failed 1 GiB upload. Under kbf-server's smallest
-/// `--segment-upload-max-bytes` (one 1 GiB blob and its footer), so every server admits
-/// it. The server's PUT of a segment of this size is also one a slow store finishes
-/// within `--s3-min-put-rate`.
+/// `--segment-upload-max-bytes` (33 MiB), so every server admits it. The server's PUT of a segment of this size is also one a slow store finishes
+/// within `min-put-rate` of `kbf-server --cold-store`.
 pub const SEGMENT_UPLOAD_BYTES: u64 = 32 << 20;
 
 /// The most records one upload holds: the server's limit.
@@ -61,11 +65,13 @@ pub const MAX_RANGE_BYTES: u64 = 4 << 20;
 /// Blobs of one object closer than this are read with the bytes between them.
 pub const COALESCE_GAP_BYTES: u64 = 1 << 20;
 
-/// One segment of an upload: spooled blobs at consecutive offsets of its record area.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Planned {
-    /// Each blob and its offset in the segment, in spool order.
-    pub records: Vec<(Spooled, u64)>,
+/// One segment of an upload: blobs at consecutive offsets of its record area. Public
+/// so an implementation of the data plane in the server's own process
+/// (`kbf all-in-one`) packs outputs into the segments this engine sends.
+#[derive(Clone, Debug, Default)]
+pub struct Planned {
+    /// Each blob and its offset in the segment, in the order given.
+    pub records: Vec<(Record, u64)>,
     /// The record area's length.
     pub records_len: u64,
 }
@@ -81,9 +87,10 @@ impl Planned {
         self.records_len + footer_len(self.records.len() as u64)
     }
 
-    fn push(&mut self, spooled: Spooled) {
-        self.records.push((spooled, self.records_len));
-        self.records_len += spooled.digest.size_bytes;
+    fn push(&mut self, record: Record) {
+        let at = self.records_len;
+        self.records_len += record.digest.size_bytes;
+        self.records.push((record, at));
     }
 
     /// The footer, built as the server builds its own: sorted by digest.
@@ -91,10 +98,10 @@ impl Planned {
         let mut entries: Vec<IndexEntry> = self
             .records
             .iter()
-            .map(|(s, offset)| IndexEntry {
-                digest: s.digest,
+            .map(|(r, offset)| IndexEntry {
+                digest: r.digest,
                 offset: *offset,
-                crc32c: s.crc32c,
+                crc32c: r.crc32c,
             })
             .collect();
         entries.sort_by_key(|e| e.digest);
@@ -109,21 +116,18 @@ impl Planned {
             .collect()
     }
 
-    /// Where the bytes `start..end` of the record area are in the spool, as
-    /// (spool offset, length) pieces, adjacent pieces joined.
-    pub fn pieces(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
-        let mut pieces: Vec<(u64, u64)> = Vec::new();
-        for (spooled, at) in &self.records {
-            let (from, to) = (*at, at + spooled.digest.size_bytes);
+    /// Where the bytes `start..end` of the record area come from, as (record, offset
+    /// into the record, length) pieces in order. A range of a few megabytes of small
+    /// files has a piece per file.
+    pub fn pieces(&self, start: u64, end: u64) -> Vec<(Record, u64, u64)> {
+        let mut pieces = Vec::new();
+        for (record, at) in &self.records {
+            let (from, to) = (*at, at + record.digest.size_bytes);
             if to <= start || from >= end {
                 continue;
             }
             let (lo, hi) = (from.max(start), to.min(end));
-            let piece = (spooled.offset + (lo - from), hi - lo);
-            match pieces.last_mut() {
-                Some(last) if last.0 + last.1 == piece.0 => last.1 += piece.1,
-                _ => pieces.push(piece),
-            }
+            pieces.push((record.clone(), lo - from, hi - lo));
         }
         pieces
     }
@@ -132,8 +136,9 @@ impl Planned {
 /// Packs `records`, in order, into segments of at most `segment_limit` bytes (a blob
 /// that does not fit an empty one gets a segment of its own) and the segments into
 /// uploads of at most `upload_bytes` and `upload_records`.
-pub(crate) fn plan(
-    records: &[Spooled],
+#[must_use]
+pub fn plan(
+    records: &[Record],
     segment_limit: u64,
     upload_bytes: u64,
     upload_records: usize,
@@ -142,8 +147,8 @@ pub(crate) fn plan(
     let mut upload: Vec<Planned> = Vec::new();
     let (mut closed_len, mut count) = (0u64, 0usize);
     let mut segment = Planned::default();
-    for &spooled in records {
-        let size = spooled.digest.size_bytes;
+    for record in records {
+        let size = record.digest.size_bytes;
         if !segment.records.is_empty() && segment.length_with(size) > segment_limit {
             closed_len += segment.length();
             upload.push(std::mem::take(&mut segment));
@@ -156,7 +161,7 @@ pub(crate) fn plan(
             uploads.push(std::mem::take(&mut upload));
             (closed_len, count) = (0, 0);
         }
-        segment.push(spooled);
+        segment.push(record.clone());
         count += 1;
     }
     if !segment.records.is_empty() {
@@ -173,8 +178,9 @@ pub(crate) fn plan(
 enum Failed {
     /// A call failed.
     Call(Status),
-    /// The spool could not be read: nothing else would work either.
-    Spool(std::io::Error),
+    /// A blob's bytes could not be read, or are no longer the ones that were hashed:
+    /// nothing else would work either.
+    Read(std::io::Error),
 }
 
 /// What [`Scope::read_located`] found: every blob it read and checked, and the
@@ -229,46 +235,51 @@ impl Scope {
         self.inner.wire.segments()
     }
 
-    /// Stores every blob of `spool` the server lacks, as [`Cas::put_spool`] says.
-    pub(crate) async fn upload_spool(&self, spool: Arc<Spool>) -> Result<(), CasError> {
-        let records = spool.records();
+    /// Stores every blob of `records` the server lacks, as [`Cas::put_records`] says.
+    pub(crate) async fn upload_records(&self, records: Vec<Record>) -> Result<(), CasError> {
         let present = future::join_all(
             records
                 .iter()
                 .map(|r| async move { self.present(&to_proto(&r.digest)).await }),
         )
         .await;
-        let missing: Vec<Spooled> = records
+        let missing: Vec<Record> = records
             .into_iter()
             .zip(present)
             .filter_map(|(r, present)| (!present).then_some(r))
             .collect();
-        for upload in plan(
+        let uploads = plan(
             &missing,
             MAX_SEGMENT_BYTES,
             SEGMENT_UPLOAD_BYTES,
             MAX_UPLOAD_RECORDS,
-        ) {
-            self.upload_or_fall_back(&spool, &upload).await?;
-        }
-        Ok(())
+        );
+        // Owned items, as for the ranges below. The first failure stops the rest.
+        stream::iter(uploads)
+            .map(|upload| async move { self.upload_or_fall_back(&upload).await })
+            .buffer_unordered(self.inner.config.segment_uploads.max(1))
+            .try_for_each(|()| future::ready(Ok(())))
+            .await
     }
 
-    /// One upload, tried twice, then blob by blob.
-    async fn upload_or_fall_back(
-        &self,
-        spool: &Arc<Spool>,
-        upload: &[Planned],
-    ) -> Result<(), CasError> {
+    /// One upload, tried twice, then blob by blob; blob by blob at once when the server
+    /// answers FAILED_PRECONDITION (`Begin`: a record too large to hold in memory and
+    /// no write tier with room for it), whose ByteStream `Write` streams a large blob
+    /// to the store.
+    async fn upload_or_fall_back(&self, upload: &[Planned]) -> Result<(), CasError> {
         let inner = &self.inner;
         for attempt in 0..2 {
             if inner.segments_off.load(Ordering::SeqCst) {
                 break;
             }
-            match self.send_upload(spool, upload).await {
+            match self.send_upload(upload).await {
                 Ok(()) => return Ok(()),
-                Err(Failed::Spool(e)) => {
-                    return Err(CasError::Read("spool".to_owned(), e.to_string()));
+                Err(Failed::Read(e)) => {
+                    return Err(CasError::Read("outputs".to_owned(), e.to_string()));
+                }
+                Err(Failed::Call(status)) if status.code() == Code::FailedPrecondition => {
+                    tracing::debug!("segment upload refused: {}; blob by blob", status.message());
+                    break;
                 }
                 Err(Failed::Call(status)) if status.code() == Code::Unimplemented => {
                     // Later uploads see the flag and do not ask; of uploads already in
@@ -282,15 +293,15 @@ impl Scope {
                 }
             }
         }
-        let records: Vec<Spooled> = upload
+        let records: Vec<Record> = upload
             .iter()
-            .flat_map(|s| s.records.iter().map(|(r, _)| *r))
+            .flat_map(|s| s.records.iter().map(|(r, _)| r.clone()))
             .collect();
-        self.send_each(spool, &records).await
+        self.send_each(&records).await
     }
 
     /// One attempt: Begin, every range, Commit.
-    async fn send_upload(&self, spool: &Spool, upload: &[Planned]) -> Result<(), Failed> {
+    async fn send_upload(&self, upload: &[Planned]) -> Result<(), Failed> {
         let mut client = self.segments();
         let begin = BeginRequest {
             segments: upload
@@ -314,7 +325,7 @@ impl Scope {
             ranges.extend(cut.into_iter().map(|(start, end)| (i, start, end)));
         }
         stream::iter(ranges)
-            .map(|(i, start, end)| self.put_range(spool, id, i, &upload[i], start, end))
+            .map(|(i, start, end)| self.put_range(id, i, &upload[i], start, end))
             .buffer_unordered(self.inner.config.segment_streams.max(1))
             .try_for_each(|()| future::ready(Ok(())))
             .await?;
@@ -330,27 +341,28 @@ impl Scope {
         Ok(())
     }
 
-    /// Sends the bytes `start..end` of `segment`'s records, read from the spool.
+    /// Sends the bytes `start..end` of `segment`'s records, read from where they are.
     async fn put_range(
         &self,
-        spool: &Spool,
         upload: u64,
         index: usize,
         segment: &Planned,
         start: u64,
         end: u64,
     ) -> Result<(), Failed> {
-        let mut bytes = Vec::with_capacity(usize::try_from(end - start).unwrap_or(0));
-        for (offset, len) in segment.pieces(start, end) {
-            bytes.extend(spool.read(offset, len).await.map_err(Failed::Spool)?);
-        }
+        // The permit first: a range read into memory waits for one no longer than the
+        // permits allow, so the ranges buffered stay within the uploads' share however
+        // many uploads are in flight.
+        let _permit = self.inner.upload_request().await;
+        let bytes = read_pieces(segment.pieces(start, end), end - start)
+            .await
+            .map_err(Failed::Read)?;
         let request = PutRangeRequest {
             upload,
             segment: u32::try_from(index).unwrap_or(u32::MAX),
             offset: start,
             bytes,
         };
-        let _permit = self.inner.upload_request().await;
         add(&self.counts.write_calls, 1);
         self.segments()
             .put_range(request)
@@ -361,18 +373,18 @@ impl Scope {
 
     /// Sends each of `records` with its own ByteStream write, `--transfer-in-flight`
     /// at a time: the fallback. A blob larger than `--transfer-memory-blob-bytes` is
-    /// streamed from the spool, not read whole.
-    async fn send_each(&self, spool: &Arc<Spool>, records: &[Spooled]) -> Result<(), CasError> {
+    /// streamed from its source, not read whole.
+    async fn send_each(&self, records: &[Record]) -> Result<(), CasError> {
         let memory = self.inner.config.memory_blob_bytes;
         let chunk = self.inner.config.chunk_bytes;
         stream::iter(records.to_vec())
             .map(|r| async move {
                 let digest = to_proto(&r.digest);
                 if r.digest.size_bytes > memory {
-                    let chunks = spool_chunks(Arc::clone(spool), r, chunk);
+                    let chunks = record_chunks(r, chunk);
                     return self.send_chunks(&digest, chunks).await.map(drop);
                 }
-                let bytes = spool.read_record(&r).await?;
+                let bytes = read_record(&r).await?;
                 self.send(&digest, &bytes).await.map(drop)
             })
             .buffer_unordered(self.inner.config.in_flight.max(1))
@@ -477,38 +489,75 @@ pub(crate) fn client(channel: Channel) -> SegmentsClient<Channel> {
         .max_encoding_message_size(MAX_MESSAGE_BYTES)
 }
 
-/// The bytes of the spooled blob `r`, `chunk` bytes at a time, read when asked for.
-pub(crate) fn spool_chunks(spool: Arc<Spool>, r: Spooled, chunk: usize) -> Chunks {
+/// The bytes of the blob `record`, `chunk` bytes at a time, read when asked for.
+pub(crate) fn record_chunks(record: Record, chunk: usize) -> Chunks {
     let chunk = chunk.max(1) as u64;
-    let end = r.offset + r.digest.size_bytes;
-    Box::pin(stream::unfold(r.offset, move |at| {
-        let spool = Arc::clone(&spool);
+    let size = record.digest.size_bytes;
+    Box::pin(stream::unfold(0, move |at| {
+        let record = record.clone();
         async move {
-            if at >= end {
+            if at >= size {
                 return None;
             }
-            let len = chunk.min(end - at);
-            Some((spool.read(at, len).await, at + len))
+            let len = chunk.min(size - at);
+            Some((record.read(at, len).await, at + len))
         }
     }))
 }
 
-/// Stores every blob of `spool` through `cas`'s own [`Cas::put`] (or
-/// [`Cas::put_chunks`] for one over a megabyte, streamed from the spool),
-/// `in_flight` at a time: what [`Cas::put_spool`] does for a store without segment
-/// upload.
-pub(crate) async fn put_each<C: Cas + ?Sized>(cas: &C, spool: &Arc<Spool>) -> Result<(), CasError> {
-    stream::iter(spool.records())
+/// The whole blob `record`, read from its source.
+async fn read_record(record: &Record) -> Result<Vec<u8>, CasError> {
+    let read = record.read(0, record.digest.size_bytes).await;
+    read.map_err(|e| read_error(record, &e))
+}
+
+/// `pieces` of records, read from their sources in one task of the blocking pool into
+/// `total` bytes. A piece that cannot be read, or whose file is no longer the one that
+/// was hashed, fails the whole read, naming its blob.
+///
+/// # Errors
+/// A piece cannot be read, or its file is no longer the one the walk hashed.
+pub async fn read_pieces(pieces: Vec<(Record, u64, u64)>, total: u64) -> std::io::Result<Vec<u8>> {
+    let total = usize::try_from(total).unwrap_or(0);
+    let read = tokio::task::spawn_blocking(move || {
+        let mut bytes = Vec::with_capacity(total);
+        for (record, offset, len) in pieces {
+            let from = bytes.len();
+            bytes.resize(from + usize::try_from(len).unwrap_or(0), 0);
+            let read = record.source.read_at(offset, &mut bytes[from..]);
+            read.map_err(|e| {
+                std::io::Error::other(format!("{}: {e}", label(&to_proto(&record.digest))))
+            })?;
+        }
+        Ok(bytes)
+    })
+    .await;
+    read.map_err(std::io::Error::other)
+        .and_then(std::convert::identity)
+}
+
+fn read_error(record: &Record, e: &std::io::Error) -> CasError {
+    CasError::Read(label(&to_proto(&record.digest)), e.to_string())
+}
+
+/// Stores every blob of `records` through `cas`'s own [`Cas::put`] (or
+/// [`Cas::put_chunks`] for one over a megabyte, streamed from its source),
+/// `in_flight` at a time: what [`Cas::put_records`] does for a store without segment
+/// upload, and what one does with an upload its server refuses for want of a write
+/// tier (`kbf all-in-one`'s plane).
+///
+/// # Errors
+/// The first record that could not be read or stored, or that `cas` stored under
+/// another digest ([`CasError::Corrupt`]).
+pub async fn put_each<C: Cas + ?Sized>(cas: &C, records: Vec<Record>) -> Result<(), CasError> {
+    stream::iter(records)
         .map(|r| async move {
             let digest = to_proto(&r.digest);
             let stored = if r.digest.size_bytes > SPOOL_READ_WHOLE_BYTES {
-                cas.put_chunks(
-                    digest.clone(),
-                    spool_chunks(Arc::clone(spool), r, WRITE_CHUNK_BYTES),
-                )
-                .await?
+                cas.put_chunks(digest.clone(), record_chunks(r, WRITE_CHUNK_BYTES))
+                    .await?
             } else {
-                cas.put(spool.read_record(&r).await?).await?
+                cas.put(read_record(&r).await?).await?
             };
             if stored != digest {
                 return Err(CasError::Corrupt(label(&digest), label(&stored)));
@@ -520,7 +569,7 @@ pub(crate) async fn put_each<C: Cas + ?Sized>(cas: &C, spool: &Arc<Spool>) -> Re
         .await
 }
 
-/// The largest spooled blob [`put_each`] reads whole; a larger one is streamed.
+/// The largest blob [`put_each`] reads whole; a larger one is streamed.
 const SPOOL_READ_WHOLE_BYTES: u64 = 1 << 20;
 
 #[cfg(test)]

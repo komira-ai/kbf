@@ -1,0 +1,96 @@
+# kbf build farm frontend, instance %i: `kbf --mode=frontend`.
+# Static unit: shipped by the kbf-installer package (installed under /usr/lib/systemd/system/),
+# disabled, with no rendering and no @PLACEHOLDER@ in it. It starts only once
+# /etc/kbf/kbf.toml exists (ConditionPathExists=), after kbf-installer's `boot-check` (which
+# counts the starts of a release on trial and reverts a release that spends its budget) and
+# `kbf --mode=<mode> --check` (which prints every missing prerequisite and exits 2). The checks
+# are ExecStartPre=, not ExecCondition=: ExecCondition= skips the start silently on exit 1
+# to 254, and a unit that cannot start must fail where an operator sees it. kbf reads
+# /etc/kbf/kbf.toml itself: no --config. The binary is the release kbf-installer flipped
+# to; only kbf-installer replaces it. Per-host values (MemoryMin=, ports, certificates,
+# the cold store) are kbf.toml's, or a drop-in kbf-installer writes from it.
+#
+# kbf docs/design/frontend-handover.md; architecture-v2.md, sections 1 and 11. A template
+# with two instances, a and b, that run the same command line but for --instance=%i: only
+# one serves at a time. An update starts the idle one while the other still serves: the
+# new process takes the listeners, the state store and the daemons over the control
+# socket, `systemctl start` returns when it has said READY=1, and the old one drains its
+# open builds and exits. --instance=%i puts instance b's listeners ten ports above a's (the
+# block Envoy's box configuration names). Only instance a is enabled (DefaultInstance=a).
+# No `Conflicts=` between the instances: starting one must never stop the other, which is
+# draining (check-units rule `handover`).
+[Unit]
+Description=kbf build farm frontend, instance %i
+Wants=network-online.target
+After=network-online.target
+# A listen address on a VPN or overlay interface can appear after network-online.target
+# (kbf#998). Order the frontend after that interface's own service with a drop-in,
+# /etc/systemd/system/kbf-frontend@.service.d/listen-after.conf, holding After= and
+# Wants= lines; kbf-installer writes it where kbf.toml names such a service. kbf also
+# retries a bind to an address that is not there yet, within its start budget.
+ConditionPathExists=/etc/kbf/kbf.toml
+# A failure that repeats quickly must not use up systemd's start limit (5 starts in 10 s)
+# and leave the frontend down (check-units rule `restart`).
+StartLimitIntervalSec=0
+
+[Service]
+# kbf sends READY=1 (sd_notify) once it serves and its probes pass, so `systemctl start`
+# of the idle instance returns only when it can take the builds. A frontend that cannot
+# take the listeners over fails to start and the one serving is not touched.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=120
+# The control socket's directory, shared by the two instances: it must outlive the
+# instance that stops (RuntimeDirectoryPreserve=yes), or the draining one would take the
+# socket the next handover asks at with it.
+RuntimeDirectory=kbf-frontend
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+# Not the daemon's user: the frontend holds the state store and the operator token. Both
+# instances run as it (the control socket checks the peer's uid). kbf-server, not kbf: the
+# user builds run as must not read the state store, the operator token or the keys.
+User=kbf-server
+Slice=kbf.slice
+# kbf's own state, created for the unit's user by systemd; kbf-installer never touches it.
+# /var/lib/kbf-server, not /var/lib/kbf: this unit runs as kbf-server, and systemd chowns a
+# StateDirectory= to the unit's user, so sharing kbf's would hand it back and forth on a
+# host that runs a kbf unit too. kbf.toml's paths name this directory.
+StateDirectory=kbf-server
+StateDirectoryMode=0750
+# A frontend answering from swap would slow every build at once.
+MemorySwapMax=0
+OOMScoreAdjust=-925
+# systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
+LimitNOFILE=1048576
+CPUWeight=300
+# The listeners, certificates, storage URL and the state store (SQLite, the only backend kbf
+# opens) are kbf.toml's. The instance and the control socket are the unit's: the socket is
+# in the RuntimeDirectory= above (check-units rule `handover`).
+ExecStartPre=+/usr/bin/kbf-installer boot-check
+# The instances run the release their slot points at, not `current`: a crash restart of the
+# serving instance must never pick up a release that is still being handed over to
+# (kbf-installer points slots/<idle> at the new release, then starts that instance; `current`
+# flips only at confirm).
+# `--check` validates kbf.toml and what a restart cannot change (a file, a user, a flag)
+# and exits 2 for those. Anything that can become ready later (a listen address, a peer,
+# a DNS name, a mount) is not refused here: it exits 75 (not ready, restarted), so a check
+# that runs before the bind retry never leaves the unit down for good (kbf#998, #1000).
+ExecStartPre=/var/lib/kbf-installer/slots/%i/kbf --mode=frontend --check
+ExecStart=/var/lib/kbf-installer/slots/%i/kbf --mode=frontend --instance=%i --handover-socket=/run/kbf-frontend/control.sock
+# The instance that handed over drains and exits by itself; kbf drains on SIGTERM too: new
+# Execute calls are refused, open streams run until their action is done (Buck2 does not
+# recover a stream that breaks), with no deadline, then the server exits. A stop that ends
+# sooner fails every build in flight, so systemd sends SIGTERM and never kills it for
+# taking long (check-units rule `stop`).
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
+# After a handover the old instance drains and exits 0 and stays down: Restart=on-failure
+# never restarts a clean exit. A failed start restarts after RestartSec.
+Restart=on-failure
+RestartSec=5
+# Exit 2 is a command line kbf refused (or a config it refused): a restart cannot fix it.
+RestartPreventExitStatus=2
+
+[Install]
+DefaultInstance=a
+WantedBy=multi-user.target

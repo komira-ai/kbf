@@ -1,4 +1,4 @@
-//! The daemon's claim on its scratch directory (issue #22): `<--scratch>/daemon-instance`
+//! The daemon's claim on its scratch directory (issue #22): `<--data-dir>/leases/daemon-instance`
 //! names the daemon process that runs there, so the next one can tell the server which
 //! process's runs its drivers killed before its `Hello`. It is written only once every
 //! runtime has been built (each runs its start-up sweep in its constructor), and never
@@ -21,7 +21,7 @@ fn cli(dir: &Path, extra: &[String]) -> Cli {
         flag("cert", &dir.join("node.pem")),
         flag("key", &dir.join("node.key")),
         "--node-id=node-1".to_owned(),
-        flag("scratch", &dir.join("leases")),
+        flag("data-dir", dir),
     ];
     Cli::try_parse_from(flags.iter().chain(extra)).expect("flags")
 }

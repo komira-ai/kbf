@@ -178,11 +178,8 @@ impl Running {
     pub fn wait(&self) -> io::Result<Reaped> {
         // Without WNOHANG, `wait4` returns only once the leader is reaped, or fails.
         // This process installs no signal handler, so it is never interrupted.
-        loop {
-            if let Some(reaped) = self.reap(0)? {
-                return Ok(reaped);
-            }
-        }
+        self.reap(0)?
+            .ok_or_else(|| io::Error::other("wait4 without WNOHANG returned no child"))
     }
 
     fn reap(&self, flags: libc::c_int) -> io::Result<Option<Reaped>> {
@@ -338,6 +335,26 @@ mod tests {
         assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
     }
 
+    /// Catches a reap that reports a leader still running as ended, or one that ended as
+    /// still running (the agent would stop waiting on a live command, or poll forever):
+    /// `try_reap` is `None` while `sleep` runs, and the signal that ended it once it is
+    /// killed.
+    #[test]
+    fn a_running_leader_is_not_reaped_until_it_ends() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30").process_group(0);
+        #[allow(clippy::zombie_processes)]
+        let child = command.spawn().expect("spawned");
+        let running = Running {
+            pid: libc::pid_t::try_from(child.id()).expect("pid"),
+            started: Instant::now(),
+        };
+        assert_eq!(running.try_reap().expect("polled"), None);
+        running.kill_group();
+        let reaped = running.wait().expect("reaped");
+        assert_eq!(reaped.status, Err(libc::SIGKILL));
+    }
+
     /// Catches a drain that reports an empty group while a member is left (on Linux,
     /// the leader killed but not yet reaped), and one that never notices the group
     /// is gone.
@@ -355,9 +372,10 @@ mod tests {
         // Linux counts a zombie as a member of its group; whether macOS does is not
         // relied on, so there the drain only has to kill.
         let drained = running.drain(Duration::from_millis(50));
-        if cfg!(target_os = "linux") {
-            assert!(!drained, "the unreaped leader is a member");
-        }
+        #[cfg(target_os = "linux")]
+        assert!(!drained, "the unreaped leader is a member");
+        #[cfg(not(target_os = "linux"))]
+        let _ = drained;
         let reaped = running.wait().expect("reaped");
         assert_eq!(reaped.status, Err(libc::SIGKILL));
         assert!(

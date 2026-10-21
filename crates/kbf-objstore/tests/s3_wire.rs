@@ -6,9 +6,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::{StreamExt as _, TryStreamExt as _};
 use kbf_objstore::s3::{Credentials, S3Config, S3Store};
 use kbf_objstore::{
-    ByteRange, Capabilities, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError, PageSize,
+    ByteRange, Capabilities, KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError,
+    PageSize, listing,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -266,6 +268,189 @@ async fn list_sends_the_token_and_reads_the_next_one() {
     );
 }
 
+/// Catches: a listing [`ListToken::after`] a key that does not send it as
+/// `start-after` (S3 would read it as a continuation token and refuse it, or list from
+/// the start), or sends it as well as a continuation token on the pages that follow.
+#[tokio::test]
+async fn list_after_a_key_sends_start_after_then_the_token() {
+    let page = "<ListBucketResult><IsTruncated>true</IsTruncated>\
+                <NextContinuationToken>t2</NextContinuationToken>\
+                <Contents><Key>p/c</Key><Size>1</Size></Contents></ListBucketResult>";
+    let (endpoint, seen) = script(vec![
+        answer("200 OK", &[], page),
+        answer("200 OK", &[], page),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let prefix = KeyPrefix::new("p/").unwrap();
+    let after = ListToken::after(&ObjectKey::new("p/b").unwrap());
+    let first = s
+        .list(&prefix, Some(&after), PageSize::new(3).unwrap())
+        .await
+        .unwrap();
+    s.list(&prefix, first.next.as_ref(), PageSize::new(3).unwrap())
+        .await
+        .unwrap();
+
+    let heads = seen.lock().unwrap();
+    assert!(
+        heads[0].starts_with(
+            "GET /kbf-test?list-type=2&max-keys=3&prefix=p%2F&start-after=p%2Fb HTTP/1.1"
+        ),
+        "{}",
+        heads[0]
+    );
+    assert!(
+        heads[1].starts_with(
+            "GET /kbf-test?continuation-token=t2&list-type=2&max-keys=3&prefix=p%2F HTTP/1.1"
+        ),
+        "{}",
+        heads[1]
+    );
+}
+
+/// Catches: a listing stream over S3 that does not carry the continuation token from
+/// page to page, or stops at a truncated page: two pages, each asked for once, the
+/// second with the first's token, every key in order.
+#[tokio::test]
+async fn the_listing_stream_follows_continuation_tokens() {
+    let first = "<ListBucketResult><IsTruncated>true</IsTruncated>\
+                 <NextContinuationToken>t2</NextContinuationToken>\
+                 <Contents><Key>p/a</Key><Size>1</Size></Contents>\
+                 <Contents><Key>p/b/c</Key><Size>2</Size></Contents></ListBucketResult>";
+    let last = "<ListBucketResult><IsTruncated>false</IsTruncated>\
+                <Contents><Key>p/c</Key><Size>3</Size></Contents></ListBucketResult>";
+    let (endpoint, seen) = script(vec![
+        answer("200 OK", &[], first),
+        answer("200 OK", &[], last),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let prefix = KeyPrefix::new("p/").unwrap();
+    let got: Vec<(String, u64)> = listing::objects(&s, &prefix, None, PageSize::new(2).unwrap())
+        .map_ok(|o| (o.key.as_str().to_owned(), o.size))
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        got,
+        [("p/a".into(), 1), ("p/b/c".into(), 2), ("p/c".into(), 3)]
+    );
+    let heads = seen.lock().unwrap();
+    assert_eq!(heads.len(), 2);
+    assert!(
+        heads[1].starts_with(
+            "GET /kbf-test?continuation-token=t2&list-type=2&max-keys=2&prefix=p%2F HTTP/1.1"
+        ),
+        "{}",
+        heads[1]
+    );
+}
+
+/// Catches: a listing stream resumed [`ListToken::after`] a key over S3 that restarts at
+/// the start of the prefix (no `start-after`), sends the key again with the
+/// continuation token, or believes a server that lists the key itself (an inclusive
+/// `start-after`, which would hand a rebuild a segment twice): the stream sends
+/// `start-after`, then only the token, and yields exactly the keys after the key; a
+/// server answering with the key itself ends the stream with `Protocol`.
+#[tokio::test]
+async fn a_listing_resumed_after_a_key_lists_only_the_rest_over_s3() {
+    let first = "<ListBucketResult><IsTruncated>true</IsTruncated>\
+                 <NextContinuationToken>t2</NextContinuationToken>\
+                 <Contents><Key>p/c</Key><Size>1</Size></Contents>\
+                 <Contents><Key>p/d</Key><Size>2</Size></Contents></ListBucketResult>";
+    let last = "<ListBucketResult><IsTruncated>false</IsTruncated>\
+                <Contents><Key>p/e</Key><Size>3</Size></Contents></ListBucketResult>";
+    let inclusive = "<ListBucketResult><IsTruncated>false</IsTruncated>\
+                     <Contents><Key>p/b</Key><Size>1</Size></Contents>\
+                     <Contents><Key>p/c</Key><Size>1</Size></Contents></ListBucketResult>";
+    let (endpoint, seen) = script(vec![
+        answer("200 OK", &[], first),
+        answer("200 OK", &[], last),
+        answer("200 OK", &[], inclusive),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let prefix = KeyPrefix::new("p/").unwrap();
+    let from = ListToken::after(&ObjectKey::new("p/b").unwrap());
+    let size = PageSize::new(2).unwrap();
+    let got: Vec<String> = listing::objects(&s, &prefix, Some(from.clone()), size)
+        .map_ok(|o| o.key.as_str().to_owned())
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(got, ["p/c", "p/d", "p/e"]);
+    {
+        let heads = seen.lock().unwrap();
+        assert!(
+            heads[0].starts_with(
+                "GET /kbf-test?list-type=2&max-keys=2&prefix=p%2F&start-after=p%2Fb HTTP/1.1"
+            ),
+            "{}",
+            heads[0]
+        );
+        assert!(
+            heads[1].starts_with(
+                "GET /kbf-test?continuation-token=t2&list-type=2&max-keys=2&prefix=p%2F HTTP/1.1"
+            ),
+            "{}",
+            heads[1]
+        );
+    }
+    let refused: Result<Vec<_>, _> = listing::objects(&s, &prefix, Some(from), size)
+        .try_collect()
+        .await;
+    match refused {
+        Err(ObjectStoreError::Protocol(m)) => assert!(m.contains("p/b after p/b"), "{m}"),
+        other => panic!("expected Protocol, got {other:?}"),
+    }
+}
+
+/// Catches: a listing failure mapped to the wrong error, or to an empty page (a rebuild
+/// would take an unreadable bucket for an empty one): an S3 error is `Service` with its
+/// status and code; an answer that is not a ListObjectsV2 result, or that lists a key
+/// kbf cannot name (non-ASCII here: an object kbf did not write), is `Protocol`.
+#[tokio::test]
+async fn listing_failures_are_typed() {
+    let denied = "<Error><Code>AccessDenied</Code><Message>no</Message></Error>";
+    let missing = "<Error><Code>NoSuchBucket</Code><Message>gone</Message></Error>";
+    let foreign = "<ListBucketResult><IsTruncated>false</IsTruncated>\
+                   <Contents><Key>p/caf\u{e9}</Key><Size>1</Size></Contents></ListBucketResult>";
+    let (endpoint, _) = script(vec![
+        answer("403 Forbidden", &[], denied),
+        answer("404 Not Found", &[], missing),
+        answer("200 OK", &[], "<html>not s3</html>"),
+        answer("200 OK", &[], foreign),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let prefix = KeyPrefix::new("p/").unwrap();
+    let mut answers = Vec::new();
+    for _ in 0..4 {
+        answers.push(s.list(&prefix, None, PageSize::MAX).await.unwrap_err());
+    }
+    assert!(
+        matches!(&answers[0], ObjectStoreError::Service { status: 403, code, .. } if code == "AccessDenied"),
+        "{:?}",
+        answers[0]
+    );
+    assert!(
+        matches!(&answers[1], ObjectStoreError::Service { status: 404, code, .. } if code == "NoSuchBucket"),
+        "{:?}",
+        answers[1]
+    );
+    assert!(
+        matches!(&answers[2], ObjectStoreError::Protocol(why) if why.contains("root element is <html>")),
+        "{:?}",
+        answers[2]
+    );
+    assert!(
+        matches!(&answers[3], ObjectStoreError::Protocol(why) if why.contains("listed key") && why.contains('\u{e9}')),
+        "{:?}",
+        answers[3]
+    );
+}
+
 /// Catches: `create_bucket` that does not ask for Object Lock when the store claims it
 /// (a retained put would then fail) or asks when it does not; that takes a bucket this
 /// key pair already owns as an error (setup is not repeatable); or that hides any other
@@ -308,13 +493,26 @@ async fn create_bucket_asks_for_object_lock_and_accepts_its_own_bucket() {
     assert!(!second.contains("object-lock"), "{second}");
 }
 
-/// A loopback port with nothing listening on it (bound, then released).
-async fn free_port() -> std::net::SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap()
+/// A loopback port on which connecting is refused until [`serve_held`] turns it into a
+/// listener: its socket is kept bound, so no other test can take the number meanwhile
+/// (see [`kbf_testkit::port`]).
+fn held_port() -> kbf_testkit::port::Reserved {
+    kbf_testkit::port::Reserved::new()
+}
+
+/// The held port, listening now.
+fn serve_held(held: kbf_testkit::port::Reserved) -> TcpListener {
+    let listener = held.listen();
+    listener.set_nonblocking(true).unwrap();
+    TcpListener::from_std(listener).unwrap()
+}
+
+/// Catches a held port that is free to take (the old bind-and-drop helper): a thief
+/// binding the number succeeds, and the store would be the thief.
+#[test]
+fn a_held_port_cannot_be_taken_by_another_listener() {
+    let held = held_port();
+    assert!(kbf_testkit::port::is_taken(held.addr()));
 }
 
 /// Catches: `wait_answering` returning before the store answers (no wait at all, or a
@@ -324,7 +522,8 @@ async fn free_port() -> std::net::SocketAddr {
 /// the wait must still be running then, and end once a server answers 403.
 #[tokio::test]
 async fn wait_answering_waits_for_a_late_store_and_takes_403_as_an_answer() {
-    let addr = free_port().await;
+    let held = held_port();
+    let addr = held.addr();
     let s = store(format!("http://{addr}"), Capabilities::default());
     let wait = tokio::spawn(async move { s.wait_answering(Duration::from_secs(20)).await });
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -333,7 +532,7 @@ async fn wait_answering_waits_for_a_late_store_and_takes_403_as_an_answer() {
         "the wait ended while nothing listened: {:?}",
         wait.await
     );
-    let listener = TcpListener::bind(addr).await.unwrap();
+    let listener = serve_held(held);
     let server = tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.unwrap();
         let mut chunk = [0u8; 4096];
@@ -357,7 +556,7 @@ async fn wait_answering_waits_for_a_late_store_and_takes_403_as_an_answer() {
 /// never starts, which hangs the CI job until its timeout) or reporting success.
 #[tokio::test]
 async fn wait_answering_gives_up_at_its_deadline() {
-    let addr = free_port().await;
+    let addr = kbf_testkit::port::dead_addr();
     let s = store(format!("http://{addr}"), Capabilities::default());
     let started = std::time::Instant::now();
     // Bounded here, so a wait that ignores its deadline fails this test, not hangs it.
@@ -521,4 +720,225 @@ async fn a_request_without_a_body_gets_only_the_base_timeout() {
         .await
         .unwrap_err();
     assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
+}
+
+/// Catches: a store that reports other capabilities than it was configured with (the
+/// conformance suite and the writer pick their paths from them).
+#[tokio::test]
+async fn a_store_reports_the_capabilities_it_was_configured_with() {
+    let claimed = Capabilities {
+        conditional_put: true,
+        object_lock: false,
+    };
+    let s = store("http://127.0.0.1:9".into(), claimed);
+    assert_eq!(s.capabilities(), claimed);
+}
+
+/// Catches: a retained put on a store that did not claim Object Lock sent anyway (the
+/// retention header silently ignored by a store that cannot honour it, so the object is
+/// deletable while the caller believes it is locked); nothing may reach the wire.
+#[tokio::test]
+async fn a_retained_put_without_object_lock_is_refused_before_the_wire() {
+    let (endpoint, seen) = script(vec![]).await;
+    let s = store(endpoint, Capabilities::default());
+    let until = std::time::UNIX_EPOCH + Duration::from_secs(4_107_542_400);
+    let err = s
+        .put_new(&key(), Bytes::from("abc"), Some(until))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ObjectStoreError::Unsupported("Object Lock retention")),
+        "{err}"
+    );
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// Catches: a 412 on a store with no conditional puts read as "already exists" (it is
+/// a service error: nothing sent a condition, so nothing can have failed one).
+#[tokio::test]
+async fn a_412_on_an_unconditional_put_is_a_service_error() {
+    let (endpoint, _) = script(vec![answer(
+        "412 Precondition Failed",
+        &[],
+        "<Error><Code>PreconditionFailed</Code><Message>m</Message></Error>",
+    )])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let err = s
+        .put_new(&key(), Bytes::from("abc"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ObjectStoreError::Service { status: 412, code, .. } if code == "PreconditionFailed"),
+        "{err}"
+    );
+}
+
+/// Catches: a ranged read that turns an unexpected status (here 500) into data or into
+/// NotFound: it is a `Service` error carrying the status and code.
+#[tokio::test]
+async fn a_ranged_read_failing_with_a_server_error_is_a_service_error() {
+    let (endpoint, _) = script(vec![answer(
+        "500 Internal Server Error",
+        &[],
+        "<Error><Code>InternalError</Code><Message>boom</Message></Error>",
+    )])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let err = s
+        .get_range(&key(), ByteRange::new(0, 4).unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ObjectStoreError::Service { status: 500, code, message } if code == "InternalError" && message == "boom"),
+        "{err}"
+    );
+}
+
+/// Catches: a delete on an Object Lock store whose HEAD failed (here 500) carried on to
+/// a DELETE blind (it may delete the wrong version, or report success for an object the
+/// store refused to describe); the HEAD's error is the answer and no DELETE is sent.
+#[tokio::test]
+async fn a_failed_head_before_a_locked_delete_stops_the_delete() {
+    let (endpoint, seen) = script(vec![answer("500 Internal Server Error", &[], "")]).await;
+    let s = store(
+        endpoint,
+        Capabilities {
+            conditional_put: false,
+            object_lock: true,
+        },
+    );
+    let err = s.delete(&key()).await.unwrap_err();
+    assert!(
+        matches!(err, ObjectStoreError::Service { status: 500, .. }),
+        "{err}"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// Catches: the `null` version id (an unversioned object) or an empty one sent as
+/// `versionId=...`, which S3 refuses; the DELETE must carry no version query then.
+#[tokio::test]
+async fn a_locked_delete_of_a_null_or_empty_version_sends_no_version_id() {
+    let (endpoint, seen) = script(vec![
+        answer("200 OK", &["x-amz-version-id: null"], ""),
+        answer("204 No Content", &[], ""),
+        answer("200 OK", &["x-amz-version-id:"], ""),
+        answer("204 No Content", &[], ""),
+        answer("200 OK", &[], ""),
+        answer("204 No Content", &[], ""),
+    ])
+    .await;
+    let s = store(
+        endpoint,
+        Capabilities {
+            conditional_put: false,
+            object_lock: true,
+        },
+    );
+    for _ in 0..3 {
+        s.delete(&key()).await.unwrap();
+    }
+    let heads = seen.lock().unwrap();
+    for i in [1, 3, 5] {
+        assert!(
+            heads[i].starts_with("DELETE /kbf-test/cas/seg-1 HTTP/1.1"),
+            "{}",
+            heads[i]
+        );
+    }
+}
+
+/// An endpoint nothing listens on: a port that was bound and then released.
+async fn dead_endpoint() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{addr}")
+}
+
+/// Catches: an unreachable store reported as success, as an empty result, or as a
+/// service answer: every operation, with or without Object Lock, fails `Transport`
+/// (the caller retries or fails over on that class, and only on it).
+#[tokio::test]
+async fn every_operation_against_an_unreachable_store_fails_with_transport() {
+    for object_lock in [false, true] {
+        let s = store(
+            dead_endpoint().await,
+            Capabilities {
+                conditional_put: false,
+                object_lock,
+            },
+        );
+        let range = ByteRange::new(0, 4).unwrap();
+        let prefix = KeyPrefix::new("p/").unwrap();
+        let errs = [
+            s.create_bucket().await.unwrap_err(),
+            s.put_new(&key(), Bytes::from("abc"), None)
+                .await
+                .unwrap_err(),
+            s.get_range(&key(), range).await.unwrap_err(),
+            s.delete(&key()).await.unwrap_err(),
+            s.list(&prefix, None, PageSize::MAX).await.unwrap_err(),
+        ];
+        for err in errs {
+            assert!(
+                matches!(&err, ObjectStoreError::Transport(_)),
+                "object_lock {object_lock}: {err}"
+            );
+        }
+    }
+}
+
+/// An answer that promises 50 bytes, sends 3 and closes.
+fn cut_short(status: &str, headers: &[&str]) -> String {
+    let mut s = format!("HTTP/1.1 {status}\r\nconnection: close\r\ncontent-length: 50\r\n");
+    for h in headers {
+        s.push_str(h);
+        s.push_str("\r\n");
+    }
+    s.push_str("\r\nabc");
+    s
+}
+
+/// Catches: a body cut off by the connection closing taken for the bytes (a truncated
+/// listing read as the end of a bucket, a short segment read as the whole): the read
+/// and the listing fail `Transport`.
+#[tokio::test]
+async fn an_answer_cut_short_is_a_transport_error_for_reads_and_listings() {
+    let (endpoint, _) = script(vec![
+        cut_short("206 Partial Content", &["content-range: bytes 0-49/50"]),
+        cut_short("200 OK", &[]),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let err = s
+        .get_range(&key(), ByteRange::new(0, 50).unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
+    let err = s
+        .list(&KeyPrefix::new("p/").unwrap(), None, PageSize::MAX)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
+}
+
+/// Catches: a small streamed write whose body fails still sent (an object stored from a
+/// broken source): the body's own error comes back and nothing reaches the wire.
+#[tokio::test]
+async fn a_small_streamed_write_with_a_failing_body_sends_nothing() {
+    let (endpoint, seen) = script(vec![]).await;
+    let s = store(endpoint, Capabilities::default());
+    let body: kbf_objstore::BodyStream = futures::stream::iter(vec![
+        Ok(Bytes::from("ab")),
+        Err(ObjectStoreError::Body("the source broke".into())),
+    ])
+    .boxed();
+    let err = s.put_stream(&key(), 4, body).await.unwrap_err();
+    assert!(
+        matches!(&err, ObjectStoreError::Body(m) if m == "the source broke"),
+        "{err}"
+    );
+    assert!(seen.lock().unwrap().is_empty());
 }

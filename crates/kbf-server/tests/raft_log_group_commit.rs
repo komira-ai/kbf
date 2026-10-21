@@ -72,7 +72,9 @@ impl Gate {
 }
 
 /// Disarms the gate and lets every sync through when the test ends, red or green, so
-/// the runtime's shutdown does not wait on a held commit forever.
+/// neither the log's drop (which waits for the batch it is writing) nor the runtime's
+/// shutdown waits on a held commit forever. Declared after the log, so it is dropped
+/// before it.
 struct Disarm(Arc<Gate>);
 
 impl Drop for Disarm {
@@ -344,12 +346,12 @@ fn seen(runtime: &Runtime, log: &Log, digest: Digest) -> BlobAnswer {
 fn proposals_made_during_a_sync_share_the_next_sync_and_answer_after_it() {
     let runtime = runtime();
     let (gate, entered) = Gate::new();
-    let _disarm = Disarm(Arc::clone(&gate));
     let fs = GateFs {
         inner: FaultFs::new(),
         gate: Arc::clone(&gate),
     };
     let (log, epoch) = opened(&runtime, fs);
+    let _disarm = Disarm(Arc::clone(&gate));
     let (first_digest, first) = blob(epoch, 0);
     let first = commit_on_a_thread(&runtime, &log, first);
     entered.recv_timeout(PROMPTLY).expect("the first sync");
@@ -392,13 +394,13 @@ fn proposals_made_during_a_sync_share_the_next_sync_and_answer_after_it() {
 fn a_crash_in_a_batch_sync_answers_none_of_it_and_loses_all_of_it() {
     let runtime = runtime();
     let (gate, entered) = Gate::new();
-    let _disarm = Disarm(Arc::clone(&gate));
     let inner = FaultFs::new();
     let fs = GateFs {
         inner: inner.clone(),
         gate: Arc::clone(&gate),
     };
     let (log, epoch) = opened(&runtime, fs);
+    let _disarm = Disarm(Arc::clone(&gate));
     let first = commit_on_a_thread(&runtime, &log, blob(epoch, 0).1);
     entered.recv_timeout(PROMPTLY).expect("the first sync");
 
@@ -446,12 +448,12 @@ fn a_crash_in_a_batch_sync_answers_none_of_it_and_loses_all_of_it() {
 fn proposals_made_at_two_moments_of_a_sync_share_the_next_sync() {
     let runtime = runtime();
     let (gate, entered) = Gate::new();
-    let _disarm = Disarm(Arc::clone(&gate));
     let fs = GateFs {
         inner: FaultFs::new(),
         gate: Arc::clone(&gate),
     };
     let (log, epoch) = opened(&runtime, fs);
+    let _disarm = Disarm(Arc::clone(&gate));
     let first = commit_on_a_thread(&runtime, &log, blob(epoch, 0).1);
     entered.recv_timeout(PROMPTLY).expect("the first sync");
 
@@ -482,12 +484,12 @@ fn proposals_made_at_two_moments_of_a_sync_share_the_next_sync() {
 fn a_panic_in_a_batch_sync_answers_it_unavailable_and_later_commits_still_answer() {
     let runtime = runtime();
     let (gate, entered) = Gate::new();
-    let _disarm = Disarm(Arc::clone(&gate));
     let fs = GateFs {
         inner: FaultFs::new(),
         gate: Arc::clone(&gate),
     };
     let (log, epoch) = opened(&runtime, fs);
+    let _disarm = Disarm(Arc::clone(&gate));
     let first = commit_on_a_thread(&runtime, &log, blob(epoch, 0).1);
     entered.recv_timeout(PROMPTLY).expect("the first sync");
     // The held sync is past the panic check; the next batch's sync panics.
@@ -534,12 +536,12 @@ fn a_panic_in_a_batch_sync_answers_it_unavailable_and_later_commits_still_answer
 fn a_tick_made_while_a_put_blobs_burst_waits_shares_its_next_sync() {
     let runtime = runtime();
     let (gate, entered) = Gate::new();
-    let _disarm = Disarm(Arc::clone(&gate));
     let fs = GateFs {
         inner: FaultFs::new(),
         gate: Arc::clone(&gate),
     };
     let (log, epoch) = opened(&runtime, fs);
+    let _disarm = Disarm(Arc::clone(&gate));
     let first = commit_on_a_thread(&runtime, &log, blob(epoch, 0).1);
     entered.recv_timeout(PROMPTLY).expect("the first sync");
 
@@ -699,13 +701,13 @@ fn tier_of_server_1(runtime: &Runtime, log: &Log) -> Option<TierId> {
 fn a_batch_is_encoded_in_the_format_committed_before_it_and_replays() {
     let runtime = runtime();
     let (gate, entered) = Gate::new();
-    let _disarm = Disarm(Arc::clone(&gate));
     let inner = FaultFs::new();
     let fs = GateFs {
         inner: inner.clone(),
         gate: Arc::clone(&gate),
     };
     let (log, epoch) = opened(&runtime, fs);
+    let _disarm = Disarm(Arc::clone(&gate));
     let (digest_1, put_1) = blob(epoch, 1);
     let before = one_batch(
         &runtime,
@@ -728,7 +730,6 @@ fn a_batch_is_encoded_in_the_format_committed_before_it_and_replays() {
 
     let inner = inner.restart();
     let (gate, entered) = Gate::new();
-    let _disarm_raised = Disarm(Arc::clone(&gate));
     let fs = GateFs {
         inner: inner.clone(),
         gate: Arc::clone(&gate),
@@ -744,6 +745,7 @@ fn a_batch_is_encoded_in_the_format_committed_before_it_and_replays() {
         .expect("a raise");
     gate.arm();
     let log = Arc::new(log);
+    let _disarm_raised = Disarm(Arc::clone(&gate));
     let (digest_2, put_2) = blob(epoch, 2);
     let (digest_3, put_3) = blob(epoch, 3);
     let after = one_batch(

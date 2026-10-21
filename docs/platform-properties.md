@@ -75,6 +75,15 @@ satisfies it for `--unservable-wait-secs` (300 by default; the wait restarts whe
 one does), it fails with `FAILED_PRECONDITION` and that reason. Work larger than every
 worker that satisfies its platform (`gpu=2` where nodes have one) is treated the same.
 
+An action that names no OS, no architecture and no ISA level (an empty platform, or one
+with only properties kbf does not read, such as `pool`) is placed by
+`--default-platform` (`linux/x86_64` by default), so it is never handed to a Mac that
+merely sorts first. The default is not applied to an action that names `OSFamily` or
+`ISA` alone, or asks for `xcode`, an iOS device or a VM image, which only a Mac reports.
+`--default-platform none` applies none. It changes placement only: the action digest and
+the cache key are the client's. Each application is logged with the action digest, at
+most once in ten seconds.
+
 ## `gpu`
 
 `gpu=N` places the action only on a worker with `N` free GPUs, and books those GPUs
@@ -104,7 +113,8 @@ cc_test(
 
 ## `kbf-lease`
 
-An `action` lease (the default) books a share of a worker: one core and 1 GiB, or what
+An `action` lease (the default) books a share of a worker: one core and 4 GiB (the first rung of
+the memory ladder), or what
 `kbf-book-cpus` and `kbf-book-mem-gib` name, plus its `gpu` GPUs. A `whole_machine`
 lease books every core, byte of memory and GPU of its worker, and runs there alone.
 
@@ -134,7 +144,8 @@ placed there. Running leases are never stopped for it.
 
 ## `kbf-book-cpus` and `kbf-book-mem-gib`
 
-Every action books one core and 1 GiB of memory on the worker it runs on, unless it
+Every action books one core and 4 GiB of memory on the worker it runs on (the first
+rung of the server's memory ladder, `--memory-ladder-gib`), unless it
 names a size: `kbf-book-cpus=N` books `N` whole cores, and `kbf-book-mem-gib=N` books
 `N` GiB. `N` is written in plain digits with no leading zero: `+4` and `04` are
 refused, since each would book the same as `4` under a different action digest, and so
@@ -144,7 +155,7 @@ for the lease until the lease ends, as it does for the default booking.
 
 The booking also sets the memory the action may use. The native driver (Macs) kills an
 action whose processes together hold more than 150% of its booked memory plus 512 MiB:
-2 GiB for the default booking, 12.5 GiB for `kbf-book-mem-gib=8`. A large `swiftc` or
+6.5 GiB for the default booking, 12.5 GiB for `kbf-book-mem-gib=8`. A large `swiftc` or
 `ld` step that dies at 2 GiB needs a larger booking. The container driver gives the
 lease the same limit as a hard cap on its RAM (`memory.max`, swap allowed), and its
 CPU weight, from the booking; a lease that keeps pressing that cap while its swap
@@ -152,9 +163,11 @@ keeps rising, and that holds more than 512 MiB or 25% of its booking in swap,
 whichever is more (the node's defaults), is killed as out of memory.
 
 The booking is where an action starts, not always where it runs. When a daemon reports
-that the action passed its own memory limit, the server runs it again with the memory
-booking doubled (1, 2, 4 GiB, ...), up to the largest node that could run it, and
-remembers the raised booking for the action (its instance name and action digest), so
+that the action passed its own memory limit, the server runs it again one rung up a
+fixed ladder, 4, then 16, then 32 GiB, then a whole host (the largest node that could
+run it, so that no other lease shares it; the rungs are the server's
+`--memory-ladder-gib`). A size named here climbs from where it is: a killed 6 GiB ask
+runs again with 16 GiB. The server remembers the raised booking for the action (its instance name and action digest), so
 the next run of the same action starts there; only a kill at the largest node reaches
 the client, as `FAILED_PRECONDITION` saying the action needs more memory than any node
 offers. A node that kills the action under its own memory pressure reruns it with the
@@ -201,7 +214,7 @@ work), whether `xcodebuild -showComponent MetalToolchain` says `Status: installe
 Xcode before 26, which has no `-showComponent` and bundles Metal, passes when `xcrun
 --find metal` does). Every question runs as an action does: under the actions'
 sandbox with the network off (as `network=off` runs one), in a lease directory of the daemon's own
-(`lease-survey` under `--scratch`, removed when the survey ends), with the same
+(`lease-survey` under `--data-dir`, removed when the survey ends), with the same
 writes allowed in the user folders ([below](#what-an-action-on-a-mac-may-write)). One
 for which every question exits 0, each within a minute, is ready and is reported as an
 `xcode` entry of its node report. An Xcode whose licence is not accepted still answers
@@ -286,7 +299,12 @@ that work.
   support) or does not answer within two minutes, the lease fails with `simctl`'s
   reason and the action does not run.
 - **The action** finds the device's UDID in `KBF_SIMULATOR_UDID` (it wins over the
-  Command's environment). The device is made shut down:
+  Command's environment). The driver boots the device and waits until Xcode lists it
+  before the action runs (Xcode's list of devices can change with a boot, and a
+  device that is not listed makes `xcodebuild test -destination` fail after 30 s), so
+  the action finds it booted: `bootstatus -b` returns at once, and `simctl boot` of a
+  booted device fails. A device that does not boot or is not listed in time fails the
+  lease with the reason, and the action does not run:
 
   ```sh
   xcrun simctl bootstatus "$KBF_SIMULATOR_UDID" -b
@@ -387,15 +405,18 @@ without `sandbox-exec` cannot turn the network off and says so in its
 The native driver runs every action on a Mac under `sandbox-exec` with a profile that
 denies every file write outside the action's lease directory and `/dev`. The lease
 directory holds the input root (the working directory and outputs), and the action's
-own home, temporary and cache directories, named by `HOME`, `TMPDIR`,
-`XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`; all of it is removed when the lease
-ends. Three kinds of write in the daemon user's temporary folder
-(`getconf DARWIN_USER_TEMP_DIR`, under `/var/folders`) are allowed too, because macOS
-tools make them there whatever `TMPDIR` says: Foundation's atomic saves (inside
+own home, temporary and cache directories, named by `HOME`, `CFFIXED_USER_HOME`
+(where Foundation's tools, `swift build` and `xcodebuild` among them, take `~` from),
+`TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`; all of it is removed when the
+lease ends. Four kinds of write in the daemon user's temporary and cache folders
+(`getconf DARWIN_USER_TEMP_DIR` and `DARWIN_USER_CACHE_DIR`, under `/var/folders`) are
+allowed too, because macOS tools make them there whatever `TMPDIR` says: Foundation's atomic saves (inside
 `TemporaryItems`, which `swift build` and `xcodebuild` need; the daemon makes that
 folder, and an action cannot remove, rename or replace it), `xcrun`'s cache
 (`xcrun_db`, behind `cc`, `clang` and `swiftc`), and Swift Build's scratch directory
-(`swbuild.tmp.<random>` and what is in it, which `xcodebuild` needs to build an app).
+(`swbuild.tmp.<random>` and what is in it, which `xcodebuild` needs to build an app),
+and the module cache of the Metal compiler (`C/clang/ModuleCache/`, which `xcrun metal`
+uses whatever `CLANG_MODULE_CACHE_PATH` says; the daemon makes the folder).
 The daemon sweeps the first two's leftovers once their last change is an hour from now,
 before or after, never through a symlink; it leaves `swbuild.tmp.*` alone, since a
 long build's can be older than that. Until each lease runs as its own user, leases on one Mac share those names:
@@ -411,13 +432,16 @@ A tool that writes anywhere else (`/tmp`, a path
 under the daemon user's real home, the rest of `/var/folders`) fails, so a build rule
 points such a tool into the lease: `swiftc -module-cache-path`,
 `xcodebuild -derivedDataPath`. `xcodebuild` and SwiftPM find `~` through the user
-database, not `HOME`: `swift build` only warns and goes on without its user-level
-caches, but `xcodebuild` resolving a Swift package fails, because it must write
-`~/Library/Caches/org.swift.swiftpm` (issue #179); `xcodebuild` on a project without
-packages works. Setting `CFFIXED_USER_HOME` to the lease's `HOME` is no way round it:
-`xcodebuild` then has a system service mount its Metal toolchain under that home,
-and the mount, owned by root, keeps the lease directory from being removed, which
-fails the lease (issue #178). Apple's
+database, not `HOME`, so the lease sets `CFFIXED_USER_HOME` to its home too: their
+caches (`~/Library/Caches/org.swift.swiftpm`, issue #179) are then the lease's own.
+`xcodebuild` then has a system service mount the Metal toolchain below that home
+(`Library/Developer/DVTDownloads/MetalToolchain/mounts`), read-only and root-owned, and
+the daemon unmounts every volume at or below a lease directory before it removes the
+directory, at the lease's end and at the next start (issue #178); a mount it cannot
+unmount fails the lease as any directory it cannot remove does. The Metal compiler's
+module cache is shared by the leases of one daemon user (a `.pcm` file one lease
+leaves is read by the next, until each lease has its own user).
+Apple's
 tools that nest a sandbox of their own need it turned off, since macOS refuses a
 sandbox inside a sandbox (`swiftc -disable-sandbox`, `swift build --disable-sandbox`);
 the outer profile still keeps their writes inside the lease.

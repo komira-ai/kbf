@@ -15,7 +15,8 @@ use kbf_proto::worker::{self, Hello, LeaseId, NodePhase, Phase, Start, daemon_me
 use tonic::Code;
 
 use crate::support::{
-    Cell, Client, FakeDaemon, Job, done, failed, hello, hello_on, output, ran, response,
+    Cell, Client, FakeDaemon, Job, done, failed, hello, hello_on, output, ran, report_every_run,
+    response,
 };
 
 /// Well under the handover grace (45 s), and long enough for a rerun to be placed.
@@ -182,7 +183,8 @@ async fn three_lost_runs_answer_internal_naming_the_runs() {
 }
 
 /// Catches a `lost` value this server does not know (from a newer daemon) read as a
-/// lost run: the `Result` is the farm's plain failure, answered INTERNAL at once.
+/// lost run: the `Result` is the farm's plain failure (an infra failure, run again
+/// from the same budget), answered INTERNAL once the budget is used.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_lost_value_is_a_plain_failure() {
     let cell = Cell::start().await;
@@ -191,14 +193,22 @@ async fn an_unknown_lost_value_is_a_plain_failure() {
     cell.upload(&job.blobs()).await;
     let mut ops = cell.execute(&job.action).await;
     let start = daemon.start().await;
-    let unknown = worker::Result {
+    report_every_run(&mut daemon, start, |lease| worker::Result {
         lost: 9,
-        ..failed(start.lease_id, Code::Unavailable)
-    };
-    assert!(daemon.report(unknown).await.accepted);
+        ..failed(lease, Code::Unavailable)
+    })
+    .await;
     let status = response(&done(&mut ops).await).status.expect("a status");
     assert_eq!(status.code, Code::Internal as i32);
-    assert_eq!(status.message, "the farm could not run the action");
+    // A farm failure that is not a lost run: every run is an infra failure.
+    assert!(
+        status.message.contains(
+            "the farm could not run the action (infra failure), and its reruns are used up."
+        ) && status.message.ends_with(
+            "Runs: 3 (node-u, infra failure; node-u, infra failure; node-u, infra failure)."
+        ),
+        "{status:?}"
+    );
     daemon.no_work().await;
 }
 

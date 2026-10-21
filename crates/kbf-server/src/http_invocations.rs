@@ -38,24 +38,28 @@ use kbf_invocation::WallTime;
 use kbf_objstore::ObjectStore;
 use serde_json::Value;
 
-use crate::http_blobs::{error, off, refusal};
+use crate::history::HistoryReads;
+use crate::http_blobs::{ReadBudget, error, off, refusal};
+use crate::http_history::{Durable, Presence, cross_router, run_router};
 
+mod failures;
 mod pages;
 mod views;
 
-use pages::{Bad, Request};
+pub(crate) use pages::{Bad, Request, answer};
 pub use pages::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
+pub(crate) use views::{Draft, blob_href, rfc3339};
 
 /// The call name refusals are logged with.
-const CALL: &str = "GET /v1/invocations";
+pub(crate) const CALL: &str = "GET /v1/invocations";
 
 /// Who may read the build pages: the REAPI policy's authenticator and its
 /// `invocations.getAuthorizer`, and whether the blob route answers.
 #[derive(Clone)]
 pub struct InvocationReaders {
-    authenticator: Arc<dyn Authenticator>,
-    authorizer: Arc<dyn Authorizer>,
-    blobs: bool,
+    pub(crate) authenticator: Arc<dyn Authenticator>,
+    pub(crate) authorizer: Arc<dyn Authorizer>,
+    pub(crate) blobs: bool,
 }
 
 impl InvocationReaders {
@@ -76,31 +80,65 @@ struct PagesState<M, O> {
     recorder: Recorder,
     cache: Arc<Cache<M, O>>,
     readers: Option<InvocationReaders>,
+    /// History to read a record from when the recorder does not hold it; `None` without
+    /// `--history-objects`.
+    durable: Option<Arc<Durable>>,
     /// When the routes were made, with the server: no record is older.
     started: WallTime,
 }
 
 /// The build pages over `recorder`'s records, saying whether each blob is still in
-/// `cache`; with `readers` `None` they answer every request `404`.
+/// `cache`; with `readers` `None` they answer every request `404`. With `history`, a
+/// record the recorder does not hold is read back from it, and `GET /v1/runs/{id}`
+/// answers ([`crate::http_history`]), and its logs, reading under `budget` (the process's
+/// one read budget); without it the routes are what they were.
 pub fn router<M, O>(
     recorder: Recorder,
     cache: Arc<Cache<M, O>>,
     readers: Option<InvocationReaders>,
+    history: Option<Arc<HistoryReads>>,
+    budget: ReadBudget,
 ) -> Router
 where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
+    let durable = history.map(|reads| Arc::new(Durable::new(reads)));
+    let presence: Arc<dyn Presence> = cache.clone();
+    let history = durable.as_ref().map(|d| {
+        run_router(
+            recorder.clone(),
+            readers.clone(),
+            Arc::clone(d),
+            presence,
+            budget,
+        )
+        .merge(cross_router(readers.clone(), Arc::clone(d)))
+    });
     let state = Arc::new(PagesState {
         recorder,
         cache,
         readers,
+        durable,
         started: wall_now(),
     });
-    Router::new()
+    let pages = Router::new()
         .route("/v1/invocations/{id}", get(page::<M, O>))
         .route("/v1/invocations/{id}/{*rest}", get(page::<M, O>))
-        .with_state(state)
+        .with_state(state);
+    match history {
+        Some(history) => pages.merge(history),
+        None => pages,
+    }
+}
+
+/// The `404` of the build pages when the policy does not turn them on.
+pub(crate) fn pages_off() -> Response {
+    off(
+        "invocations",
+        "the build pages are off: the REAPI policy names no invocations.getAuthorizer \
+         and --invocations-open is not given",
+    )
 }
 
 async fn page<M, O>(State(state): State<Arc<PagesState<M, O>>>, parts: Parts) -> Response
@@ -109,11 +147,7 @@ where
     O: ObjectStore + 'static,
 {
     let Some(readers) = &state.readers else {
-        return off(
-            "invocations",
-            "the build pages are off: the REAPI policy names no invocations.getAuthorizer \
-             and --invocations-open is not given",
-        );
+        return pages_off();
     };
     // The later of the server's start and the newest client record removed at the
     // bound: a record last seen after it would still be held.
@@ -121,7 +155,15 @@ where
         .recorder
         .evicted_last_seen()
         .map_or(state.started, |t| t.max(state.started));
-    let draft = match read(readers, &state.recorder, &parts, since).await {
+    let mut draft = match read(
+        readers,
+        &state.recorder,
+        state.durable.as_deref(),
+        &parts,
+        since,
+    )
+    .await
+    {
         Ok(draft) => draft,
         Err(answer) => return answer,
     };
@@ -129,7 +171,13 @@ where
     // An index that does not answer leaves every `available` null: the page is still
     // what the record holds.
     let present = state.cache.present(&digests).await.unwrap_or_default();
-    json(&draft.fill(&present))
+    let reads = std::mem::take(&mut draft.reads);
+    let mut value = draft.fill(&present);
+    if value.get("failures").is_none() {
+        return json(&value);
+    }
+    failures::fill(&state.cache, &mut value, &reads, readers.blobs).await;
+    failures::respond(&value)
 }
 
 /// The answer to one request before its blobs are looked up: the caller
@@ -138,6 +186,7 @@ where
 async fn read(
     readers: &InvocationReaders,
     recorder: &Recorder,
+    durable: Option<&Durable>,
     parts: &Parts,
     since: WallTime,
 ) -> Result<views::Draft, Response> {
@@ -157,7 +206,15 @@ async fn read(
         held = Some((inv.serial(), pages::instance_names(inv)));
     });
     let Some((serial, names)) = held else {
-        return Err(bad_answer(&Bad::Gone, &id, since));
+        // Not held: read back from history when there is any.
+        return match durable {
+            Some(durable) => {
+                durable
+                    .read(readers, &caller, &request, since, wall_now())
+                    .await
+            }
+            None => Err(bad_answer(&Bad::Gone, &id, since)),
+        };
     };
     // Every name must be allowed, each asked as a REAPI call's instance name is (a
     // refusal is logged there; no answer is a refusal too).
@@ -178,7 +235,7 @@ async fn read(
 /// The answer to a request [`pages`] refused; a record that is gone answers with
 /// `{"error": "no_record", "id": <id>, "records_since": <since>}`
 /// (`docs/design/invocations-api.md` 4.10), which no other `404` has.
-fn bad_answer(bad: &Bad, id: &str, since: WallTime) -> Response {
+pub(crate) fn bad_answer(bad: &Bad, id: &str, since: WallTime) -> Response {
     match bad {
         Bad::Gone => {
             let body = serde_json::json!({
@@ -200,7 +257,7 @@ fn bad_answer(bad: &Bad, id: &str, since: WallTime) -> Response {
 }
 
 /// `value` as a JSON body.
-fn json(value: &Value) -> Response {
+pub(crate) fn json(value: &Value) -> Response {
     let body = value.to_string();
     (
         StatusCode::OK,

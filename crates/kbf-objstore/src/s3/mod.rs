@@ -7,14 +7,25 @@
 //! store with Object Lock, so a retained object is refused rather than hidden behind a
 //! delete marker.
 //!
-//! Not built yet: TLS (an `https` endpoint is refused) and multipart upload (a single
-//! PUT carries up to 5 GiB; kbf segments are at most 128 MiB).
+//! [`ObjectStore::put_stream`] of an object over [`MULTIPART_THRESHOLD`] is a multipart
+//! upload (`multipart.rs`): parts of [`part_size`] sent one at a time, each held in
+//! memory only while it is sent, and the upload aborted on any failure.
+//!
+//! Not built yet: TLS (an `https` endpoint is refused).
 
+#[cfg(feature = "testkit")]
+pub mod fake;
+mod multipart;
 mod sigv4;
 mod xml;
 
+pub use multipart::{
+    MAX_PART_BYTES, MAX_PARTS, MIN_PART_BYTES, MULTIPART_THRESHOLD, PART_BYTES, part_size,
+};
+
 use std::fmt;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
@@ -24,8 +35,9 @@ use reqwest::header::{AUTHORIZATION, CONTENT_RANGE};
 use reqwest::{Method, Response, StatusCode, Url};
 use sha2::{Digest, Sha256};
 
+use crate::types::Token;
 use crate::{
-    ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectKey, ObjectStore,
+    BodyStream, ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
 use sigv4::{EMPTY_SHA256, Request, Signer, Utc};
@@ -109,6 +121,13 @@ pub enum S3ConfigError {
 
 /// One S3 bucket.
 pub struct S3Store {
+    /// Shared with a multipart upload's abort, which may run after its write was
+    /// dropped.
+    conn: Arc<Conn>,
+}
+
+/// What every request to the bucket needs: the client, the address, the signing key.
+struct Conn {
     client: reqwest::Client,
     base: Url,
     /// `host[:port]` as the `Host` header carries it.
@@ -124,9 +143,9 @@ pub struct S3Store {
 impl fmt::Debug for S3Store {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("S3Store")
-            .field("base", &self.base.as_str())
-            .field("bucket", &self.bucket)
-            .field("capabilities", &self.capabilities)
+            .field("base", &self.conn.base.as_str())
+            .field("bucket", &self.conn.bucket)
+            .field("capabilities", &self.conn.capabilities)
             .finish_non_exhaustive()
     }
 }
@@ -150,11 +169,9 @@ impl S3Store {
         if base.path() != "/" || base.query().is_some() || base.fragment().is_some() {
             return Err(bad("path-style addressing needs an endpoint with no path"));
         }
-        let host = match (base.host_str(), base.port()) {
-            (Some(h), Some(p)) => format!("{h}:{p}"),
-            (Some(h), None) => h.to_owned(),
-            (None, _) => return Err(bad("no host")),
-        };
+        // An `http` URL always has a host, and the userinfo was refused above, so the
+        // authority is the host with its port, if it is not the scheme's default.
+        let host = base.authority().to_owned();
         if !valid_bucket(&config.bucket) {
             return Err(S3ConfigError::Bucket(config.bucket));
         }
@@ -163,7 +180,7 @@ impl S3Store {
             .timeout(config.request_timeout)
             .build()
             .map_err(S3ConfigError::Client)?;
-        Ok(Self {
+        let conn = Conn {
             client,
             base,
             host,
@@ -173,9 +190,14 @@ impl S3Store {
             capabilities: config.capabilities,
             request_timeout: config.request_timeout,
             min_body_rate: config.min_body_rate,
+        };
+        Ok(Self {
+            conn: Arc::new(conn),
         })
     }
+}
 
+impl Conn {
     /// The limit on a whole request with a `body_len`-byte body.
     fn timeout_for(&self, body_len: usize) -> Duration {
         let Some(rate) = self.min_body_rate else {
@@ -185,56 +207,6 @@ impl S3Store {
         self.request_timeout.saturating_add(Duration::from_nanos(
             u64::try_from(nanos).unwrap_or(u64::MAX),
         ))
-    }
-
-    /// Creates the bucket, with Object Lock if the store claims it. Succeeds if this
-    /// key pair already owns the bucket. For setup and tests; kbf itself never calls it.
-    pub async fn create_bucket(&self) -> Result<(), ObjectStoreError> {
-        let mut headers = Vec::new();
-        if self.capabilities.object_lock {
-            headers.push(("x-amz-bucket-object-lock-enabled", "true".to_owned()));
-        }
-        let resp = self
-            .send(Method::PUT, None, &[], headers, Bytes::new())
-            .await?;
-        match resp.status() {
-            StatusCode::OK => Ok(()),
-            _ => match failure(resp).await {
-                ObjectStoreError::Service { code, .. } if code == "BucketAlreadyOwnedByYou" => {
-                    Ok(())
-                }
-                e => Err(e),
-            },
-        }
-    }
-
-    /// Waits, for at most `within`, until the service answers an HTTP request. Any
-    /// answer counts, whatever its status: a running S3 service answers this unsigned
-    /// `GET /` with an error such as 403. Only a request that fails to complete (refused,
-    /// reset, timed out) is retried, every [`WAIT_RETRY`]. On the deadline it returns
-    /// the last attempt's error. For setup and tests, to wait for a store that is
-    /// starting; kbf itself never calls it.
-    pub async fn wait_answering(&self, within: Duration) -> Result<(), ObjectStoreError> {
-        let deadline = Instant::now() + within;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match self
-                .client
-                .get(self.base.clone())
-                .timeout(left)
-                .send()
-                .await
-            {
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        return Err(transport(e));
-                    }
-                    tokio::time::sleep(left.min(WAIT_RETRY)).await;
-                }
-            }
-        }
     }
 
     /// Signs and sends one request. `key` of `None` addresses the bucket.
@@ -298,9 +270,63 @@ impl S3Store {
     }
 }
 
+impl S3Store {
+    /// Creates the bucket, with Object Lock if the store claims it. Succeeds if this
+    /// key pair already owns the bucket. For setup and tests; kbf itself never calls it.
+    pub async fn create_bucket(&self) -> Result<(), ObjectStoreError> {
+        let mut headers = Vec::new();
+        if self.conn.capabilities.object_lock {
+            headers.push(("x-amz-bucket-object-lock-enabled", "true".to_owned()));
+        }
+        let resp = self
+            .conn
+            .send(Method::PUT, None, &[], headers, Bytes::new())
+            .await?;
+        match resp.status() {
+            StatusCode::OK => Ok(()),
+            _ => match failure(resp).await {
+                ObjectStoreError::Service { code, .. } if code == "BucketAlreadyOwnedByYou" => {
+                    Ok(())
+                }
+                e => Err(e),
+            },
+        }
+    }
+
+    /// Waits, for at most `within`, until the service answers an HTTP request. Any
+    /// answer counts, whatever its status: a running S3 service answers this unsigned
+    /// `GET /` with an error such as 403. Only a request that fails to complete (refused,
+    /// reset, timed out) is retried, every [`WAIT_RETRY`]. On the deadline it returns
+    /// the last attempt's error. For setup and tests, to wait for a store that is
+    /// starting; kbf itself never calls it.
+    pub async fn wait_answering(&self, within: Duration) -> Result<(), ObjectStoreError> {
+        let deadline = Instant::now() + within;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self
+                .conn
+                .client
+                .get(self.conn.base.clone())
+                .timeout(left)
+                .send()
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(transport(e));
+                    }
+                    tokio::time::sleep(left.min(WAIT_RETRY)).await;
+                }
+            }
+        }
+    }
+}
+
 impl ObjectStore for S3Store {
     fn capabilities(&self) -> Capabilities {
-        self.capabilities
+        self.conn.capabilities
     }
 
     async fn put_new(
@@ -310,11 +336,11 @@ impl ObjectStore for S3Store {
         retain_until: Option<SystemTime>,
     ) -> Result<(), ObjectStoreError> {
         let mut headers = Vec::new();
-        if self.capabilities.conditional_put {
+        if self.conn.capabilities.conditional_put {
             headers.push(("if-none-match", "*".to_owned()));
         }
         if let Some(until) = retain_until {
-            if !self.capabilities.object_lock {
+            if !self.conn.capabilities.object_lock {
                 return Err(ObjectStoreError::Unsupported("Object Lock retention"));
             }
             headers.push(("x-amz-object-lock-mode", "COMPLIANCE".to_owned()));
@@ -329,15 +355,31 @@ impl ObjectStore for S3Store {
             ));
         }
         let resp = self
+            .conn
             .send(Method::PUT, Some(key), &[], headers, body)
             .await?;
         match resp.status() {
             StatusCode::OK => Ok(()),
-            StatusCode::PRECONDITION_FAILED if self.capabilities.conditional_put => {
+            StatusCode::PRECONDITION_FAILED if self.conn.capabilities.conditional_put => {
                 Err(ObjectStoreError::AlreadyExists(key.clone()))
             }
             _ => Err(failure(resp).await),
         }
+    }
+
+    /// One PUT for a body of at most [`MULTIPART_THRESHOLD`] bytes, gathered first; a
+    /// multipart upload for a larger one, aborted on any failure.
+    async fn put_stream(
+        &self,
+        key: &ObjectKey,
+        len: u64,
+        body: BodyStream,
+    ) -> Result<(), ObjectStoreError> {
+        if len <= MULTIPART_THRESHOLD {
+            let bytes = crate::gather(body, len).await?;
+            return self.put_new(key, bytes, None).await;
+        }
+        multipart::put(&self.conn, key, len, body).await
     }
 
     async fn get_range(
@@ -347,6 +389,7 @@ impl ObjectStore for S3Store {
     ) -> Result<Bytes, ObjectStoreError> {
         let header = format!("bytes={}-{}", range.offset(), range.last());
         let resp = self
+            .conn
             .send(
                 Method::GET,
                 Some(key),
@@ -384,11 +427,12 @@ impl ObjectStore for S3Store {
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
         let mut query = Vec::new();
-        if self.capabilities.object_lock {
+        if self.conn.capabilities.object_lock {
             // A bucket with Object Lock is versioned: a plain DELETE would succeed by
             // adding a delete marker and keep the bytes. Delete the current version
             // itself, which the store refuses while it is retained.
             let head = self
+                .conn
                 .send(Method::HEAD, Some(key), &[], Vec::new(), Bytes::new())
                 .await?;
             match head.status() {
@@ -406,6 +450,7 @@ impl ObjectStore for S3Store {
             }
         }
         let resp = self
+            .conn
             .send(Method::DELETE, Some(key), &query, Vec::new(), Bytes::new())
             .await?;
         match resp.status() {
@@ -425,10 +470,15 @@ impl ObjectStore for S3Store {
             ("prefix", prefix.as_str().to_owned()),
             ("max-keys", max_keys.get().to_string()),
         ];
-        if let Some(t) = after {
-            query.push(("continuation-token", t.0.clone()));
+        match after.map(|t| &t.0) {
+            Some(Token::Continue(t)) => query.push(("continuation-token", t.clone())),
+            Some(Token::After(key) | Token::Kept { after: key, .. }) => {
+                query.push(("start-after", key.as_str().to_owned()))
+            }
+            None => {}
         }
         let resp = self
+            .conn
             .send(Method::GET, None, &query, Vec::new(), Bytes::new())
             .await?;
         if resp.status() != StatusCode::OK {
@@ -533,16 +583,19 @@ mod tests {
         let mut c = config("http://127.0.0.1:9000", "kbf-test");
         c.request_timeout = Duration::from_secs(60);
         let flat = S3Store::new(c.clone()).unwrap();
-        assert_eq!(flat.timeout_for(128 << 20), Duration::from_secs(60));
+        assert_eq!(flat.conn.timeout_for(128 << 20), Duration::from_secs(60));
         c.min_body_rate = NonZeroU64::new(1 << 20);
         let scaled = S3Store::new(c.clone()).unwrap();
-        assert_eq!(scaled.timeout_for(0), Duration::from_secs(60));
-        assert_eq!(scaled.timeout_for(128 << 20), Duration::from_secs(188));
-        assert_eq!(scaled.timeout_for(512 << 10), Duration::from_millis(60_500));
+        assert_eq!(scaled.conn.timeout_for(0), Duration::from_secs(60));
+        assert_eq!(scaled.conn.timeout_for(128 << 20), Duration::from_secs(188));
+        assert_eq!(
+            scaled.conn.timeout_for(512 << 10),
+            Duration::from_millis(60_500)
+        );
         c.min_body_rate = NonZeroU64::new(1);
         let slowest = S3Store::new(c).unwrap();
         let saturated = Duration::from_secs(60) + Duration::from_nanos(u64::MAX);
-        assert_eq!(slowest.timeout_for(usize::MAX), saturated);
+        assert_eq!(slowest.conn.timeout_for(usize::MAX), saturated);
     }
 
     fn config(endpoint: &str, bucket: &str) -> S3Config {
@@ -568,6 +621,8 @@ mod tests {
             "ftp://127.0.0.1",
             "http://127.0.0.1:9000/base",
             "http://u:p@127.0.0.1:9000",
+            "http://:p@127.0.0.1:9000",
+            "http://127.0.0.1:9000/#frag",
             "http://127.0.0.1:9000/?x=1",
             "127.0.0.1:9000",
         ] {
@@ -594,9 +649,65 @@ mod tests {
     #[test]
     fn debug_hides_the_secret() {
         let text = format!("{:?}", config("http://127.0.0.1", "kbf-cas"));
-        assert!(
-            text.contains("<redacted>") && !text.contains("\"s\""),
-            "{text}"
-        );
+        assert!(text.contains("<redacted>"), "{text}");
+        assert!(!text.contains("\"s\""), "{text}");
+    }
+
+    /// Catches: the store's `Debug` (it is logged) that prints the credentials or leaves
+    /// out which endpoint, bucket and capabilities it addresses.
+    #[test]
+    fn the_store_debug_names_its_bucket_and_hides_its_credentials() {
+        let mut c = config("http://127.0.0.1:9000", "kbf-cas");
+        c.credentials = Credentials::new("AKIDSECRETISH", "hunter2");
+        let text = format!("{:?}", S3Store::new(c).unwrap());
+        assert!(text.starts_with("S3Store {"), "{text}");
+        assert!(text.contains("base: \"http://127.0.0.1:9000/\""), "{text}");
+        assert!(text.contains("bucket: \"kbf-cas\""), "{text}");
+        assert!(text.contains("capabilities:"), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains("AKIDSECRETISH"), "{text}");
+    }
+
+    /// Catches: bucket-name edges: a dot inside, a digit at either end, and the exact
+    /// length limits (3 and 63) refused or accepted wrongly.
+    #[test]
+    fn bucket_names_allow_dots_digits_and_the_length_limits() {
+        for ok in ["kbf.cas1", "1kbf", "kbf1", "abc", &"a".repeat(63)] {
+            assert!(valid_bucket(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "ab",
+            "kbf.cas.",
+            ".kbf",
+            "kbf cas",
+            "kbf/cas",
+            &"a".repeat(64),
+        ] {
+            assert!(!valid_bucket(bad), "{bad}");
+        }
+    }
+
+    /// Catches: a 206 whose Content-Range is malformed in each field, or that names the
+    /// right first byte and wrong last (or inverted) bytes, accepted as the window asked.
+    #[test]
+    fn partial_answers_with_malformed_or_inverted_ranges_are_refused() {
+        for cr in [
+            "items 0-9/10",
+            "bytes 0-9",
+            "bytes 0/10",
+            "bytes a-9/10",
+            "bytes 0-b/10",
+            "bytes 0-9/c",
+        ] {
+            let why = check_partial(Some(cr), r(0, 10), 10).unwrap_err();
+            assert!(why.contains("does not parse"), "{cr}: {why}");
+        }
+        let why = check_partial(Some("bytes 0-4/10"), r(0, 10), 5).unwrap_err();
+        assert!(why.contains("asked for bytes 0-9"), "{why}");
+        let why = check_partial(Some("bytes 5-4/5"), r(5, 1), 0).unwrap_err();
+        assert!(why.contains("asked for bytes 5-5"), "{why}");
+        let why = check_partial(Some("bytes 0-9/10"), r(0, 10), 9).unwrap_err();
+        assert!(why.contains("the body has 9 bytes"), "{why}");
     }
 }
