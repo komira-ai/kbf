@@ -206,6 +206,12 @@ impl Fetcher for HostFetcher {
         }
     }
 
+    /// The word `installer.toml` holds for the source; `None` when the host's parts or the file
+    /// cannot be read.
+    fn source(&self) -> Option<&'static str> {
+        self.assemble_seed().ok().map(|(_, word)| word)
+    }
+
     /// Any installed release is asked, on every kind of host: the seed fetcher has the runner
     /// and the settings, and no source of its own to be denied.
     fn probe(&self, commit: &CommitId) -> Result<Version, FetchError> {
