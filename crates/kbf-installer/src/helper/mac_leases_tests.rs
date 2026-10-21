@@ -609,6 +609,38 @@ fn a_daemon_that_started_before_kbf_toml_changed_cannot_tell() {
     }
 }
 
+/// Catches the file's status-change time (`ctime`) ignored by the start-time check (H2): a
+/// `chmod`, `chown` or a rename into place changes the file without changing its content time,
+/// and a daemon that started before that may have read an older file. Here the content time is
+/// long past and only the status-change time is recent: a daemon that started 200 s before it
+/// cannot be told to use this `kbf.toml`, one that started 995 s after it can.
+///
+/// Mutant seen red: the later of the two times replaced by the modification time alone.
+#[test]
+fn a_kbf_toml_whose_status_changed_after_the_daemon_started_cannot_tell() {
+    for (etime, ok) in [("20:00", false), ("00:05", true)] {
+        let mut rig = MacHost::new("ctime");
+        let file = fs::File::options()
+            .write(true)
+            .open(rig.root.join("usr/local/etc/kbf/kbf.toml"))
+            .expect("open");
+        file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1000))
+            .expect("an old content time");
+        let meta = fs::metadata(rig.root.join("usr/local/etc/kbf/kbf.toml")).expect("meta");
+        assert!(meta.ctime() > meta.mtime() + 1_000_000, "ctime is recent");
+        rig.now = meta.ctime() + 1000;
+        rig.daemon(1, etime, DAEMON);
+        match rig.count() {
+            Ok(0) => assert!(ok, "{etime}: started before the status change"),
+            Err(e) => {
+                assert!(!ok, "{etime}: {e}");
+                assert!(e.contains("changed after the daemon"), "{e}");
+            }
+            other => panic!("{etime}: {other:?}"),
+        }
+    }
+}
+
 /// Catches the stale-directory rule (F1) letting through what it must not. Lease directories
 /// remain and no keeper exists:
 /// - with the daemon positively not running the check allows (count 0), the note names each
