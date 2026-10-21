@@ -114,7 +114,7 @@ jobs:
       contents: read
     # The Envoy release the real-Envoy tests run (CI only: kbf releases pin and fetch no Envoy;
     # Envoy is a prerequisite checked against crates/kbf-installer/src/envoy/version.rs) and
-    # the installer's box render is held to, for Envoy's own validation of both renders
+    # the installer's box render is held to, for Envoy's own validation of the box render
     # and the real-Envoy tests of the box. The sha256 is the release's checksums.txt.asc
     # entry.
     env:
@@ -164,12 +164,6 @@ jobs:
       - run: cargo xtask build-commit stamps "$GITHUB_SHA"
       - name: Fetch Envoy (pinned release, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/envoyproxy/envoy/releases/download/v$ENVOY_VERSION/envoy-$ENVOY_VERSION-linux-x86_64" --sha256 "$ENVOY_SHA256" --out "$RUNNER_TEMP/tools/envoy"
-      # Envoy accepts the envoy kit's render and refuses a control with an unknown
-      # field (crates/kbf-deploy/tests/envoy_validate.rs).
-      - name: Envoy validates the envoy kit's render
-        run: cargo test -p kbf-deploy --test envoy_validate --locked -- --ignored
-        env:
-          KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
       # Envoy accepts the installer's box render and refuses a control with an unknown
       # field (crates/kbf-integration-test/tests/envoy_validate.rs).
       - name: Envoy validates the installer's box render

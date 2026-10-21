@@ -29,10 +29,11 @@ futures.workspace = true
 kbf-deploy.workspace = true
 kbf-daemon.workspace = true
 # `kbf-cell cross-version`'s check that the installer goes first is the installer's own
-# (`stage::understood`); the real-Envoy tests (tests/envoy_box, tests/envoy_check.rs) run its render.
+# (`stage::understood`); the Envoy render the real-Envoy tests (tests/envoy_box,
+# tests/envoy_validate.rs) run, and the names tests/envoy_check.rs compares with the server's.
 kbf-installer.workspace = true
 kbf-objstore.workspace = true
-# The worker protocol's messages and client, for the same probe.
+# The worker protocol's messages and client, for the same probe (and for tests/envoy_check.rs).
 kbf-proto.workspace = true
 kbf-testkit.workspace = true
 kbf-transfer.workspace = true
