@@ -55,7 +55,7 @@ fn the_installer_parses_what_kbf_prints() {
 ///
 /// Catches the two numbers drifting apart (the installer's raised, the build's not).
 ///
-/// Mutant planted: `RELAY_NEEDED` raised to 2 (red on both lines).
+/// Mutant to plant: `RELAY_NEEDED` raised to 2 (red on both assertions).
 #[test]
 fn the_build_declares_the_relay_its_installer_needs() {
     let parsed = Version::parse(kbf_cli::version::line().as_bytes()).expect("parses");

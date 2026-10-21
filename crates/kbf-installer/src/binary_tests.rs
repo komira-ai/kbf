@@ -104,6 +104,7 @@ fn the_version_object_is_read_by_its_fields() {
             min_protocol: 3,
             protocol: 4,
             profile: "release".to_owned(),
+            relay: None,
             seq: None,
             state_schema: 7,
             version: "0.1.0".to_owned(),

@@ -202,7 +202,7 @@ async fn the_helpers_status_maps_to_the_state() {
 /// them stops being read as having them; a seed with a commit that is not 40 hex digits
 /// refuses the whole file, as any other commit does.
 ///
-/// Mutants planted: the keys read and not put in the status; `bundled` read as `url`; an unknown
+/// Mutants to plant: the keys read and not put in the status; `bundled` read as `url`; an unknown
 /// word refused; the commit not checked.
 #[tokio::test]
 async fn the_package_and_the_source_the_helper_reports_reach_the_status() {

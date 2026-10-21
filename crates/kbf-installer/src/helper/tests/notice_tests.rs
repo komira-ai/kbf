@@ -180,9 +180,9 @@ fn a_seed_nobody_has_checked_is_not_announced_and_the_reason_is_said_once() {
     }
 }
 
-/// A package that was half unpacked when it was looked at is looked at again at the next pass,
-/// and announced once it is whole: a failure is not remembered by the manifest's digest. The
-/// complaint is not repeated when the seed is announced.
+/// A package that was half unpacked when it was looked at is looked at again after the minute a
+/// failed look waits, and announced once it is whole: a failure is not remembered by the
+/// manifest's digest. The complaint is not repeated when the seed is announced.
 ///
 /// Catches a package announced never because the first look found it mid-upgrade.
 ///
@@ -199,7 +199,7 @@ fn a_seed_that_becomes_whole_is_announced_at_the_next_pass() {
     assert!(said(&mut rig).contains("package_in_flux"));
     flip(&mut seeded);
     seeded.write_tarball();
-    rig.cycle(T0 + 5);
+    rig.cycle(T0 + 65);
     assert_eq!(
         rig.status()["available"],
         serde_json::json!({"commit": B, "seq": SEQ})
@@ -264,18 +264,96 @@ fn a_farm_ahead_of_the_package_starts_its_floor_at_the_release_that_runs() {
     assert!(!seeded.installed());
 }
 
+/// An order is judged against the floor as it stands once caught up with the release that runs,
+/// not against what the file held at the last pass: the host runs a release that declares 500,
+/// the file still says 100 (a confirm made by the operator since, a crash between a confirm and
+/// the raise, a raise that failed), and the package carries 450. The order for it is refused
+/// for the floor of 500, which the file says afterwards, and nothing is installed.
+///
+/// Catches a downgrade by a staged order in the window before the pass's own catch-up.
+///
+/// Mutant to plant: the catch-up removed from the admission of a staged order (the order is
+/// admitted for 450 over 100 and the seed is installed).
+#[test]
+fn an_order_is_judged_against_a_floor_caught_up_with_the_release_that_runs() {
+    let (mut rig, seeded, _) = noticing("notice-stale-floor", |s| {
+        s.manifest["seq"] = serde_json::json!(450);
+        s.probe = s.probe.replace(&format!("\"seq\":{SEQ},"), "\"seq\":450,");
+        s.set_earlier_seq(500);
+    });
+    seeded.set_floor(100);
+    rig.put(&staged(&rig, 5, Verb::Activate, B));
+    rig.cycle(T0);
+    let want = "commit_or_ref: order 5: seq_floor: seed seq 450 is not above 500";
+    assert_eq!(rig.refusal(), want);
+    assert_eq!(seeded.floor_text(), line(500));
+    assert_eq!(rig.current(), Some(c(A)));
+    assert!(!seeded.installed());
+}
+
+/// The look makes its own scratch directory and touches no other: a `work/<commit>.check` of
+/// the seed's commit, which a stage in another process (`setup`, an operator's verb) may be
+/// using, is there with what it holds after a pass, and the pass's own scratch is gone.
+///
+/// Catches a look that clears a stage's checks from under it, which fails closed but fails.
+///
+/// Mutant to plant: the look made in `work/<commit>.check` (the other directory is removed).
+#[test]
+fn a_look_leaves_the_checks_of_a_stage_alone() {
+    let (mut rig, _, _) = noticing("notice-scratch", |_| {});
+    let work = rig.layout.join(&rig.layout.work_dir());
+    let theirs = work.join(format!("{B}.check"));
+    fs::create_dir_all(theirs.join("gh")).expect("a stage's checks");
+    fs::write(theirs.join("gh/kept"), b"in use").expect("a file of theirs");
+    rig.cycle(T0);
+    let told = rig.status().get("available").is_some();
+    assert!(told, "{}", said(&mut rig));
+    assert_eq!(fs::read(theirs.join("gh/kept")).expect("kept"), b"in use");
+    assert_eq!(listing(&work), vec![format!("{B}.check")]);
+}
+
+/// A package that fails its look is not read in full at every pass: a bundle `gh` refuses is
+/// checked once, not again at the next passes inside the minute, and again after it (the
+/// package may have been repaired), the complaint said once all the same.
+///
+/// Catches a tarball and a `gh` run every five seconds for a package that stays broken, which
+/// holds up the status of the orders behind it.
+///
+/// Mutants to plant: the wait removed (the second pass runs `gh` again); the wait made for ever
+/// (the third pass does not).
+#[test]
+fn a_package_that_fails_its_look_is_looked_at_again_only_after_a_minute() {
+    let (mut rig, _, calls) = noticing("notice-backoff", |s| {
+        s.attested = b"the bundle of another release\n".to_vec();
+    });
+    rig.cycle(T0);
+    assert_eq!(gh_runs(&calls), 1);
+    assert!(said(&mut rig).starts_with("package: fetch: rejected: attestation: "));
+    rig.cycle(T0 + 5);
+    assert_eq!(gh_runs(&calls), 1, "not again at the next pass");
+    rig.cycle(T0 + 59);
+    assert_eq!(gh_runs(&calls), 1, "not before the minute is up");
+    rig.cycle(T0 + 60);
+    assert_eq!(gh_runs(&calls), 2, "again after it");
+    assert_eq!(said(&mut rig), "", "said once");
+    assert!(rig.status().get("available").is_none());
+}
+
 /// The floor rises when a swap is confirmed and not before: a staged swap to the seed leaves
 /// it where it was while the swap is on trial (a trial that is reverted must not burn the seed),
 /// the confirm raises it to the seed's `seq`, after which the seed is not announced (it is the
 /// release that runs), and a rollback to the release before leaves it at the seed's `seq`: the
 /// release just rolled back from stays unorderable.
 ///
-/// Catches a floor raised at the swap, one not raised at the confirm (a seed older than a
-/// confirmed release stays orderable), and one lowered by a rollback.
+/// Catches a floor raised at the swap, one never raised once the swap is confirmed (a seed
+/// older than a confirmed release stays orderable), and one lowered by a rollback.
 ///
-/// Mutants to plant: the raise made when the swap is made; the raise dropped from the confirm
-/// (red on the floor after it); the floor set to the `seq` of the release that runs after a
-/// rollback.
+/// Mutants to plant: the floor caught up while the swap is on trial (red on the floor of the
+/// trial); the raise at the confirm and the catch-up at the end of the pass both removed (red
+/// on the floor after the confirm; either alone leaves this test green, since the other makes
+/// the same floor); the floor set to the `seq` of the release that runs after a rollback. The
+/// raise at the confirm alone is the one
+/// `a_floor_that_cannot_be_raised_after_a_confirm_is_said_and_the_confirm_stands` sees go red.
 #[test]
 fn the_floor_rises_at_a_confirm_not_at_a_swap_and_a_rollback_leaves_it() {
     let (mut rig, seeded, _) = noticing("notice-confirm", |_| {});
@@ -318,8 +396,12 @@ fn the_floor_rises_at_a_confirm_not_at_a_swap_and_a_rollback_leaves_it() {
 /// Catches a floor raised by the stage (a release staged and dropped would burn the seed) and
 /// one the frontend's confirm never raises.
 ///
-/// Mutants to plant: the raise made when the release is staged; the raise dropped from the
-/// frontend's confirm.
+/// Mutants to plant: the floor raised to the `seq` of the release that is staged (red on the
+/// floor after the stage); the raise at the flip and the catch-up at the end of the pass both
+/// removed (red on the floor after the flip). Each of the two alone leaves this test green,
+/// since the other makes the same floor: the raise at the flip alone is the one
+/// `a_floor_that_cannot_be_raised_after_a_flip_is_said_and_the_flip_stands` sees go red (the
+/// failure is said when the flip raises, and the pass's own catch-up says it only once).
 #[test]
 fn a_frontend_flip_raises_the_floor_and_staging_does_not() {
     let mut rig = Rig::frontend("notice-flip");
@@ -449,7 +531,9 @@ fn a_floor_that_cannot_be_read_withholds_the_announcement_and_is_said() {
 ///
 /// Catches a confirm undone, or a failure to raise the floor passed over without a word.
 ///
-/// Mutants to plant: the error of the raise dropped; the confirm refused when the raise fails.
+/// Mutants to plant: the error of the raise dropped; the confirm refused when the raise fails;
+/// the raise dropped from the confirm (nothing is said: the pass's own catch-up has no seed to
+/// complain of, and it is not asked to say what the confirm's raise has).
 #[test]
 fn a_floor_that_cannot_be_raised_after_a_confirm_is_said_and_the_confirm_stands() {
     let mut rig = Rig::new("notice-confirm-floor-dir");
@@ -468,6 +552,33 @@ fn a_floor_that_cannot_be_raised_after_a_confirm_is_said_and_the_confirm_stands(
     let pending = rig.state().pending_confirm;
     assert!(pending.is_none(), "the confirm stands");
     assert_eq!(rig.current(), Some(c(B)));
+    let log = said(&mut rig);
+    assert!(log.contains("cannot be read"), "{log}");
+}
+
+/// The same for the frontend's flip: a floor that cannot be raised is said at once, and the
+/// release stays current.
+///
+/// Catches a flip undone, or a failure to raise the floor passed over without a word.
+///
+/// Mutants to plant: the error of the raise dropped; the flip refused when the raise fails; the
+/// raise dropped from the flip (nothing is said).
+#[test]
+fn a_floor_that_cannot_be_raised_after_a_flip_is_said_and_the_flip_stands() {
+    let mut rig = Rig::frontend("notice-flip-floor-dir");
+    rig.fetcher
+        .versions
+        .lock()
+        .expect("lock")
+        .insert(c(B), declares(B, SEQ));
+    rig.order(9, Verb::FrontendUpdate, B);
+    rig.cycle(T0);
+    assert_eq!(rig.state().staged, Some(c(B)), "{}", rig.refusal());
+    fs::create_dir(rig.layout.join(&rig.layout.seq_floor())).expect("a directory");
+    let _ = said(&mut rig);
+    rig.order(10, Verb::Confirm, B);
+    rig.cycle(T0 + 5);
+    assert_eq!(rig.current(), Some(c(B)), "{}", rig.refusal());
     let log = said(&mut rig);
     assert!(log.contains("cannot be read"), "{log}");
 }
