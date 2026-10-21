@@ -3,7 +3,8 @@
 //! unit, so none owes a restart:
 //!
 //! - `frontend_update{commit}`: the fetcher pulls, verifies and installs the release into
-//!   `releases/<commit>/` (no component list: the source is the installer's own); once the
+//!   `releases/<commit>/` (no component list: the source is the installer's own, or, for an
+//!   order whose source is `staged`, the release the host's package carries); once the
 //!   checks below pass, this half (never the fetcher) makes the state's `staged` name it,
 //!   and its facts go to `status.json` under `staged{}`. No link moves.
 //! - `confirm{commit}`: if `commit` is the staged release and no node swap is on trial,
@@ -94,10 +95,16 @@ impl<E: Exec> Helper<E> {
             .unwrap_or_default();
         // Before anything is fetched: a refused order costs no download.
         activate::check_stageable(&before, &order.commit)?;
+        // The package's release is held to the same rules of the seed as a node's staged
+        // activation, also before anything is done.
+        if order.source == Source::Staged {
+            let admitted = self.admitted_seed(&order.commit);
+            admitted.map_err(|e| Refused::of_fetch(e, order.id))?;
+        }
         let rec = ReleaseLocator {
             commit: order.commit.clone(),
             components: Vec::new(),
-            source: Source::Fetch,
+            source: order.source,
         };
         memory.fetching = true;
         let told = self.report(memory);

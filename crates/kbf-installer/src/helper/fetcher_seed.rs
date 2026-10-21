@@ -18,18 +18,28 @@
 //! fetcher's: the cycle checks the first before it asks, and
 //! [`HostFetcher`](super::fetcher_host::HostFetcher) decides the second.
 
-use kbf_host::exec::Exec;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
+use std::slice;
+
+use kbf_host::exec::{Entry, Exec, Kind};
+use kbf_host::path::HostPath;
 use kbf_host::step::Owner;
-use kbf_update::Facts;
+use kbf_update::{Facts, Locator};
+use sha2::{Digest, Sha256};
 
 use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
-use crate::helper::fetcher_real::Parts;
+use crate::helper::fetcher_real::{Parts, refused};
 use crate::helper::leases::LeaseSource;
 use crate::layout::Layout;
+use crate::refusal::{Refusal, TrustFault};
 use crate::run::Runner;
-use crate::seed::SeedFacts;
+use crate::seed::{COMPONENT, MANIFEST, Manifest, SeedFacts};
 use crate::settings::Settings;
-use crate::stage::Policy;
+use crate::stage::{Fetched, Order, OrderKind, Partial, Pipeline, Policy, Received, Verifier};
+use crate::trust::trusted_chain;
 
 /// Verifies and installs the release the package carries, as of the moment it is asked.
 pub struct SeedFetcher {
@@ -47,6 +57,15 @@ pub struct SeedFetcher {
     /// The first 12 hex digits of the commit this installer was built from, which name its
     /// seed directory.
     pub build: String,
+}
+
+/// A seed read and found consistent with itself.
+struct Open {
+    manifest: Manifest,
+    /// The tarball, which is copied from the disk and not read through the trust executor.
+    tarball: HostPath,
+    /// The attestation bundle's text.
+    bundle: String,
 }
 
 impl SeedFetcher {
@@ -71,24 +90,195 @@ impl SeedFetcher {
             build: build.to_owned(),
         }
     }
+
+    /// The seed directory, its manifest, tarball and bundle, found and consistent: every path
+    /// is root's and not writable by others, the manifest is for this installer's build, and
+    /// the bundle is the one the manifest names. The tarball's bytes are left to the pipeline,
+    /// which holds them to the manifest's digest and size.
+    fn open(&self) -> Result<Open, FetchError> {
+        let build = &self.build;
+        if !is_build_commit(build) {
+            let why = format!(
+                "seed_missing: this installer does not know its build commit ({build:?}), so it knows no seed directory"
+            );
+            return Err(FetchError::Unavailable(why));
+        }
+        self.trusted(&self.host.seed_dir(build), Kind::Dir)?;
+        let manifest = self.read(&self.host.seed_file(build, MANIFEST))?;
+        let manifest = Manifest::parse(&manifest).map_err(|why| mismatch(&why))?;
+        if !manifest.commit.as_str().starts_with(build.as_str()) {
+            return Err(mismatch(&format!(
+                "the manifest is for commit {}, not for this installer's build {build}",
+                manifest.commit
+            )));
+        }
+        let tarball = self.host.seed_file(build, &manifest.tarball_name());
+        self.trusted(&tarball, Kind::File)?;
+        let bundle = self.read(&self.host.seed_file(build, &manifest.bundle_name()))?;
+        if hex::encode(Sha256::digest(&bundle)) != manifest.bundle_sha256.as_str() {
+            return Err(mismatch("the bundle is not the one the manifest names"));
+        }
+        // A bundle that is not text is changed here, and `gh` then refuses it.
+        let bundle = String::from_utf8_lossy(&bundle).into_owned();
+        Ok(Open {
+            manifest,
+            tarball,
+            bundle,
+        })
+    }
+
+    /// `path` and every directory above it are root's and not writable by others. A path that
+    /// is not there is a missing seed, which is the package's fault and not a verdict on a
+    /// release.
+    fn trusted(&self, path: &HostPath, kind: Kind) -> Result<(), FetchError> {
+        trusted_chain(&*self.trust, path, kind).map_err(|r| {
+            if matches!(&r, Refusal::Untrusted { fault: TrustFault::Missing, .. }) {
+                FetchError::Unavailable(format!("seed_missing: {path} is missing"))
+            } else {
+                refused(r)
+            }
+        })
+    }
+
+    /// A small file of the seed, through the trust executor.
+    fn read(&self, path: &HostPath) -> Result<Vec<u8>, FetchError> {
+        let Ok(Some(Entry::File { bytes, .. })) = self.trust.inspect(path) else {
+            let why = format!("seed_missing: {path} is missing, or is not a file");
+            return Err(FetchError::Unavailable(why));
+        };
+        self.trusted(path, Kind::File)?;
+        Ok(bytes)
+    }
+
+    /// The tarball copied into `partial`, where a fetch would have left it, counted and hashed
+    /// as the fetch parent counts and hashes what it brings in. The copy is of at most one byte
+    /// more than the manifest says (the pipeline sees that the file is bigger), and a link in
+    /// the tarball's place is not followed.
+    fn copy(&self, partial: &Partial, seed: &Open) -> Result<Received, FetchError> {
+        let from = self.host.join(&seed.tarball);
+        let to = partial.dl().join(format!("{COMPONENT}.tar.gz"));
+        let size = seed.manifest.tarball_size;
+        let cap = size.min(self.policy.max_component_bytes).saturating_add(1);
+        let copied =
+            read_capped(&from, cap).and_then(|bytes| fs::write(&to, &bytes).map(|()| bytes));
+        let bytes = copied.map_err(|e| {
+            FetchError::Unavailable(format!("seed_missing: {}: {e}", from.display()))
+        })?;
+        Ok(Received {
+            name: COMPONENT.to_owned(),
+            tarball: to,
+            bytes: bytes.len() as u64,
+            sha256: hex::encode(Sha256::digest(&bytes)),
+        })
+    }
+
+    /// The seed through the verify pipeline as an order of `kind`: the order names the seed's
+    /// commit, `expected` (if the caller has facts of its own) are the manifest's, and the
+    /// release is held to the manifest's facts by the pipeline whatever `kind` is.
+    fn pull(
+        &self,
+        kind: OrderKind,
+        rec: &ReleaseLocator,
+        expected: Option<&Facts>,
+    ) -> Result<InstalledRelease, FetchError> {
+        let seed = self.open()?;
+        let facts = seed.manifest.facts();
+        if seed.manifest.commit != rec.commit {
+            return Err(mismatch(&format!(
+                "this host carries {}, not {}",
+                seed.manifest.commit, rec.commit
+            )));
+        }
+        if expected.is_some_and(|e| *e != facts) {
+            return Err(FetchError::Order {
+                word: "facts",
+                why: "the facts the order expects are not the ones the seed's manifest declares"
+                    .to_owned(),
+            });
+        }
+        let partial = Partial::create(&self.host, &rec.commit, self.owner).map_err(refused)?;
+        let received = self.copy(&partial, &seed)?;
+        let locator = Locator {
+            name: COMPONENT.to_owned(),
+            sha256: seed.manifest.tarball_sha256.as_str().to_owned(),
+            size: seed.manifest.tarball_size,
+            attestation: seed.bundle,
+        };
+        let order = Order {
+            kind,
+            commit: &rec.commit,
+            components: slice::from_ref(&locator),
+            expected: Some(&facts),
+        };
+        let pipeline = Pipeline {
+            host: &self.host,
+            settings: &self.settings,
+            policy: self.policy,
+            trust: &*self.trust,
+            runner: &*self.runner,
+            leases: &*self.leases,
+            owner: self.owner,
+        };
+        let fetched = Fetched {
+            partial,
+            files: vec![received],
+        };
+        let staged = pipeline.verify(&order, fetched).map_err(refused)?;
+        let declared = staged.version.seq;
+        if declared != Some(seed.manifest.seq) {
+            return Err(FetchError::Order {
+                word: "facts",
+                why: format!(
+                    "seq: the binary declares {declared:?}, the manifest says {}",
+                    seed.manifest.seq
+                ),
+            });
+        }
+        Ok(staged.installed())
+    }
 }
 
 impl Fetcher for SeedFetcher {
-    fn fetch(&self, _rec: &ReleaseLocator) -> Result<InstalledRelease, FetchError> {
-        Err(FetchError::NotWired)
+    fn fetch(&self, rec: &ReleaseLocator) -> Result<InstalledRelease, FetchError> {
+        self.pull(OrderKind::FrontendUpdate, rec, None)
     }
 
     fn fetch_activation(
         &self,
-        _rec: &ReleaseLocator,
-        _expected: &Facts,
+        rec: &ReleaseLocator,
+        expected: &Facts,
     ) -> Result<InstalledRelease, FetchError> {
-        Err(FetchError::NotWired)
+        self.pull(OrderKind::Activate, rec, Some(expected))
     }
 
     fn seed(&self) -> Result<SeedFacts, FetchError> {
-        Err(FetchError::NotWired)
+        Ok(self.open()?.manifest.seed_facts())
     }
+}
+
+/// A package whose parts do not agree with each other or with this installer: refused under
+/// the word `commit_or_ref`, naming `seed_mismatch`.
+fn mismatch(why: &str) -> FetchError {
+    FetchError::Order {
+        word: "commit_or_ref",
+        why: format!("seed_mismatch: {why}"),
+    }
+}
+
+/// The first 12 hex digits of a commit, as a seed directory is named.
+fn is_build_commit(build: &str) -> bool {
+    build.len() == 12 && build.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Up to `cap` bytes of the file at `path`, which is not opened if it is a link.
+fn read_capped(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut bytes = Vec::new();
+    file.take(cap).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]

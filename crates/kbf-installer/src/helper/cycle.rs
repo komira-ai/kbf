@@ -7,7 +7,9 @@
 //! fetches the release (if it is not installed) before it owes a restart or moves a link, so
 //! a refused or failed fetch changes nothing. The links move before the service restarts and
 //! the restart is recorded as owed before it is tried, so a crash anywhere leaves a state the
-//! next pass completes.
+//! next pass completes. An order may name the release the host's package carries instead of
+//! one to fetch (`source = staged`, `staged.rs`): it is held to the package's manifest and to
+//! a floor on its `seq`, and then goes through the same fetcher, pipeline and swap.
 
 use std::io::Write;
 use std::time::Duration;
@@ -24,9 +26,11 @@ use kbf_host::{Exec, HostPath, Perms, Step};
 use kbf_update::Source;
 
 mod frontend;
+mod staged;
 
+use self::staged::{Held, refusal_of};
 use crate::database::SchemaStep;
-use crate::helper::fetcher::{Fetcher, InstalledRelease, ReleaseLocator};
+use crate::helper::fetcher::{Fetcher, InstalledRelease};
 use crate::helper::host_mode;
 use crate::helper::leases::{self, LeaseSource};
 use crate::helper::memory::{Event, Memory, StagedFacts};
@@ -574,29 +578,12 @@ impl<E: Exec> Helper<E> {
                  frontend_update, and an activate would restart it"
             ));
         }
-        // Fail closed: an activation without the release's claims is not taken.
-        let Some(claims) = &order.claims else {
-            return Err(format!(
-                "order {id}: an activation carries no release claims"
-            ));
+        // An activation that fetches claims the release it expects; a staged one claims none,
+        // since the package's manifest says what its release is.
+        let claims = match order.source {
+            Source::Fetch => Some(self.vet_claims(order)?),
+            Source::Staged => None,
         };
-        // `kbf` is the one component a release of either platform carries that an order may
-        // name (a Mac is given no `kbf-daemon`).
-        let prefix = platform_prefix(&self.host);
-        let needs = ["kbf"].as_slice();
-        if !claims.platform.starts_with(prefix) {
-            return Err(format!(
-                "order {id} is for platform {:?}, not this host's ({prefix}*)",
-                claims.platform
-            ));
-        }
-        let mut names: Vec<&str> = claims.components.iter().map(|c| c.name.as_str()).collect();
-        names.sort_unstable();
-        if names != needs {
-            return Err(format!(
-                "order {id} names components {names:?}; this platform needs exactly {needs:?}"
-            ));
-        }
         // One confirm window at a time, never two timers. The same order again (a pass
         // that died after the swap) is the repeat `activate` recognises.
         let this = format!("{}-{}", order.epoch, order.id);
@@ -632,23 +619,31 @@ impl<E: Exec> Helper<E> {
                 now - last
             ));
         }
+        // A staged order is held to the rules of the seed now: after the shortcut above (a
+        // repeat of the order for the running release is not a refusal that holds the run),
+        // before anything is done.
+        let held = match claims {
+            Some(claims) => Held::Claims(claims),
+            None => {
+                let seed = self.admitted_seed(&order.commit);
+                Held::Seed(seed.map_err(|e| refusal_of(id, e))?)
+            }
+        };
         // A directory on the host is not proof: the fetcher verifies the release whether it
         // pulls it or finds it.
-        let rec = ReleaseLocator {
-            commit: order.commit.clone(),
-            components: claims.components.clone(),
-            source: Source::Fetch,
-        };
         // The node is told a fetch is under way; it may take minutes.
         memory.fetching = true;
         self.report(memory).map_err(|e| e.to_string())?;
-        let fetched = self.fetcher.fetch_activation(&rec, &claims.facts());
+        let fetched = self.fetch_held(&order.commit, &held);
         memory.fetching = false;
-        let got = fetched.map_err(|e| format!("order {id}: {e}"))?;
+        let got = fetched.map_err(|e| refusal_of(id, e))?;
         // What the fetched binary declared must be what the order expected, before a link
         // moves: a release that is attested but is another build than the one ordered is
-        // refused.
-        if let Err(why) = matches_claims(&got, order, claims) {
+        // refused. (A staged order expects what the manifest says, which the fetcher has held
+        // the release to.)
+        if let Held::Claims(claims) = held
+            && let Err(why) = matches_claims(&got, order, claims)
+        {
             return Err(format!(
                 "order {id}: the fetched release is not the one ordered: {why}"
             ));
@@ -656,6 +651,34 @@ impl<E: Exec> Helper<E> {
         memory.staged = Some(facts(&got));
         memory.staged_profile = Some(got.profile.clone());
         Ok(())
+    }
+
+    /// An activation that fetches carries the release's claims, complete and for this host:
+    /// fail closed without them. `kbf` is the one component a release of either platform
+    /// carries that an order may name (a Mac is given no `kbf-daemon`).
+    fn vet_claims<'o>(&self, order: &'o Order) -> Result<&'o Claims, String> {
+        let id = order.id;
+        let Some(claims) = &order.claims else {
+            return Err(format!(
+                "order {id}: an activation carries no release claims"
+            ));
+        };
+        let prefix = platform_prefix(&self.host);
+        let needs = ["kbf"].as_slice();
+        if !claims.platform.starts_with(prefix) {
+            return Err(format!(
+                "order {id} is for platform {:?}, not this host's ({prefix}*)",
+                claims.platform
+            ));
+        }
+        let mut names: Vec<&str> = claims.components.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        if names != needs {
+            return Err(format!(
+                "order {id} names components {names:?}; this platform needs exactly {needs:?}"
+            ));
+        }
+        Ok(claims)
     }
 
     fn arm(&self, order: &Order) -> Arm {

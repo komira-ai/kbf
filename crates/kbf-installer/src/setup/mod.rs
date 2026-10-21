@@ -140,7 +140,7 @@ impl SetupError {
             | SetupError::Token(_)
             | SetupError::Unsupported(_)
             | SetupError::NoUser { .. } => Exit::Usage,
-            SetupError::Fetch(FetchError::Rejected(_)) => Exit::Refused,
+            SetupError::Fetch(FetchError::Rejected(_) | FetchError::Order { .. }) => Exit::Refused,
             SetupError::NeedsOperator(_)
             | SetupError::Unmigrated { .. }
             | SetupError::ShadowUnit { .. } => Exit::NeedsOperator,

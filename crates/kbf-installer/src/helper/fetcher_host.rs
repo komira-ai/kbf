@@ -22,18 +22,31 @@
 //!
 //! Any of them that cannot be had makes the fetch `Unavailable` with the reason, so the cycle
 //! refuses the order (`fetch`) and goes on, and `setup` says why it stopped.
+//!
+//! An order says whether it wants the release fetched from the configured source or the one
+//! the installer's package carries ([`ReleaseLocator::source`]), and this is the one place that
+//! decides it against the configuration, so a caller that did not look, or looked at a file the
+//! next read no longer says, cannot get a fetch the host does not allow:
+//!
+//! - a **fetch** needs a source that fetches. Under `release_source = "bundled"` it is denied
+//!   (`denied`), by the fetcher, before the fetch child is asked for anything;
+//! - a **staged** order takes the package's release on every kind of host, a `bundled` one and
+//!   one with a source of its own alike, and starts no fetch child: the seed fetcher
+//!   ([`SeedFetcher`]) hands the package's files to the same verify pipeline.
 
 use kbf_host::{HostExec, HostPath, Owner};
-use kbf_update::Facts;
+use kbf_update::{Facts, Source as OrderSource};
 
 use crate::fetch::{ChildProgram, Limits, ProgramFault, Source};
 use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
 use crate::helper::fetcher_real::{Parts, RealFetcher};
+use crate::helper::fetcher_seed::SeedFetcher;
 use crate::helper::leases::LeaseSource;
 use crate::installer_toml::{InstallerToml, ReadError, Source as Configured};
 use crate::layout::{Layout, Platform};
 use crate::refusal::Refusal;
 use crate::run::SystemRunner;
+use crate::seed::SeedFacts;
 use crate::settings::{NoCommonRef, Settings};
 use crate::stage::Policy;
 use crate::version;
@@ -105,16 +118,29 @@ impl HostFetcher {
 
     /// The real fetcher for this fetch.
     fn build(&self) -> Result<RealFetcher, FetchError> {
-        self.assemble()
-            .map_err(|e| FetchError::Unavailable(e.to_string()))
+        self.assemble().map_err(FetchError::from)
     }
 
-    fn assemble(&self) -> Result<RealFetcher, NotBuilt> {
+    /// The seed fetcher for this fetch.
+    fn build_seed(&self) -> Result<SeedFetcher, FetchError> {
+        self.assemble_seed().map_err(FetchError::from)
+    }
+
+    /// What either kind of fetch reads of the host, in this order: its parts, `installer.toml`
+    /// and the settings it narrows.
+    fn read(&self) -> Result<(Parts, InstallerToml, Settings), NotBuilt> {
         let parts = (self.parts)().map_err(NotBuilt::Host)?;
         let toml = InstallerToml::read(&*parts.trust, &self.installer_toml)?;
         let settings = Settings::load(&*parts.trust, &self.host)
             .map_err(NotBuilt::Settings)?
             .narrowed_to(&toml.source_refs)?;
+        Ok((parts, toml, settings))
+    }
+
+    /// The fetcher of an order that fetches: the one place the configured source is decided,
+    /// and where `bundled` is denied.
+    fn assemble(&self) -> Result<RealFetcher, NotBuilt> {
+        let (parts, toml, settings) = self.read()?;
         let source = source_of(&toml)?;
         Ok(RealFetcher::new(
             self.host.clone(),
@@ -125,11 +151,23 @@ impl HostFetcher {
             parts,
         ))
     }
+
+    /// The fetcher of an order that takes the package's release. The configured source is not
+    /// asked: a staged order is allowed on every host, and the fetch child is not used.
+    fn assemble_seed(&self) -> Result<SeedFetcher, NotBuilt> {
+        let (parts, toml, settings) = self.read()?;
+        let policy = Policy::of(&toml);
+        let seed = SeedFetcher::new(self.host.clone(), settings, policy, parts, &self.build);
+        Ok(seed)
+    }
 }
 
 impl Fetcher for HostFetcher {
     fn fetch(&self, rec: &ReleaseLocator) -> Result<InstalledRelease, FetchError> {
-        self.build()?.fetch(rec)
+        match rec.source {
+            OrderSource::Fetch => self.build()?.fetch(rec),
+            OrderSource::Staged => self.build_seed()?.fetch(rec),
+        }
     }
 
     fn fetch_activation(
@@ -137,7 +175,14 @@ impl Fetcher for HostFetcher {
         rec: &ReleaseLocator,
         expected: &Facts,
     ) -> Result<InstalledRelease, FetchError> {
-        self.build()?.fetch_activation(rec, expected)
+        match rec.source {
+            OrderSource::Fetch => self.build()?.fetch_activation(rec, expected),
+            OrderSource::Staged => self.build_seed()?.fetch_activation(rec, expected),
+        }
+    }
+
+    fn seed(&self) -> Result<SeedFacts, FetchError> {
+        self.build_seed()?.seed()
     }
 }
 
@@ -155,6 +200,21 @@ enum NotBuilt {
     Refs(#[from] NoCommonRef),
     #[error("{0}")]
     Source(&'static str),
+    /// The host's configuration does not allow what the order asks.
+    #[error("{0}")]
+    Denied(&'static str),
+}
+
+impl From<NotBuilt> for FetchError {
+    fn from(e: NotBuilt) -> FetchError {
+        match e {
+            NotBuilt::Denied(why) => FetchError::Order {
+                word: "denied",
+                why: why.to_owned(),
+            },
+            other => FetchError::Unavailable(other.to_string()),
+        }
+    }
 }
 
 /// The parts of the host `host` itself, with the fetch child `child` and the lease source
@@ -176,11 +236,11 @@ pub fn host_parts(host: &Layout, leases: Box<dyn LeaseSource>, child: ChildProgr
 /// Where `installer.toml` says the bytes come from.
 ///
 /// The `url` source is a base the file validated, with the system's roots. `installer.toml`
-/// can now hold the keys of the other sources (`release_ca`, the frontend snapshot, `bundled`),
-/// and this build reads them without using them, so a source that needs one is refused, with
-/// the reason, rather than built without it: a `url` host with a `release_ca` would otherwise
-/// trust the system's roots where the operator named a CA, the `frontend` has no fetch of its
-/// own yet, and a `bundled` host has no fetcher for the release the package carries.
+/// can now hold the keys of the other sources (`release_ca`, the frontend snapshot), and this
+/// build reads them without using them, so a source that needs one is refused, with the
+/// reason, rather than built without it: a `url` host with a `release_ca` would otherwise
+/// trust the system's roots where the operator named a CA, and the `frontend` has no fetch of
+/// its own yet. A `bundled` host fetches nothing: an order that fetches is denied.
 fn source_of(toml: &InstallerToml) -> Result<Source, NotBuilt> {
     match (&toml.source, &toml.release_ca) {
         (Configured::Url(base), None) => Ok(Source::Url {
@@ -193,8 +253,8 @@ fn source_of(toml: &InstallerToml) -> Result<Source, NotBuilt> {
         (Configured::Frontend, _) => Err(NotBuilt::Source(
             "release_source = \"frontend\": this build cannot fetch from the frontend yet, even with frontend_url, frontend_ca and frontend_ca_sha256 set; use release_source = \"url\"",
         )),
-        (Configured::Bundled, _) => Err(NotBuilt::Source(
-            "release_source = \"bundled\": this build has no bundled fetcher yet, and nothing else is fetched under bundled",
+        (Configured::Bundled, _) => Err(NotBuilt::Denied(
+            "release_source is bundled; source=fetch is refused (use source=staged)",
         )),
     }
 }

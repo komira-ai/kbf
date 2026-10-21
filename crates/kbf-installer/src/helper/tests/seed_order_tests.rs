@@ -179,8 +179,7 @@ fn a_staged_record_with_more_than_a_locator_is_not_an_order() {
         assert!(
             rig.refusal().contains("not an order") && rig.refusal().contains(want),
             "{}: {}",
-            record.order_id,
-            rig.refusal()
+            record.order_id, rig.refusal()
         );
         assert_eq!(rig.status()["acked_order_id"], 0, "{}", record.order_id);
         assert_eq!(rig.left(), 0);
@@ -252,6 +251,45 @@ fn a_staged_order_is_refused_for_another_commit_or_a_seq_not_above_the_floor() {
         assert!(!seeded.installed(), "{what}: nothing was installed");
         assert_eq!(rig.left(), 0, "{what}");
     }
+}
+
+/// A staged order is refused before any work when the host cannot say what its package carries
+/// (no manifest to read) or cannot read its floor (the file is not a file): the refusal says why,
+/// the floor moves, and nothing is fetched or installed. A host that cannot tell is not a host
+/// with no floor.
+///
+/// Catches a floor that cannot be read taken for no floor or for a floor of zero, and a
+/// package that cannot be read taken for one that carries a release.
+///
+/// Mutants planted: the read error of the floor mapped to `None`; the manifest's error ignored.
+#[test]
+fn a_staged_order_is_refused_when_the_package_or_the_floor_cannot_be_read() {
+    let mut rig = Rig::new("seedcyc-no-package");
+    rig.put(&staged(&rig, 5, Verb::Activate, B));
+    rig.cycle(T0);
+    let want = "order 5: fetch: this installer has no release fetcher wired in";
+    assert_eq!(rig.refusal(), want);
+    assert_eq!(rig.status()["acked_order_id"], 5);
+    assert_eq!(rig.fetcher.count(), 0);
+
+    let mut rig = Rig::new("seedcyc-bad-floor");
+    let seeded = Seeded::on(rig.layout.clone(), rig.root.clone(), B);
+    *rig.fetcher.seed.lock().expect("lock") = Some(SeedFacts {
+        commit: c(B),
+        seq: SEQ,
+        facts: seeded.facts(),
+    });
+    fs::create_dir(rig.layout.join(&rig.layout.seq_floor())).expect("a directory");
+    rig.put(&staged(&rig, 5, Verb::Activate, B));
+    rig.cycle(T0);
+    let why = rig.refusal();
+    assert!(
+        why.starts_with("order 5: fetch: seq_floor: ") && why.contains("cannot be read"),
+        "{why}"
+    );
+    assert_eq!(rig.status()["acked_order_id"], 5);
+    assert_eq!(rig.fetcher.count(), 0);
+    assert_eq!(rig.current(), Some(c(A)));
 }
 
 /// A repeated order for the release that is running is idempotent, not a refusal that holds

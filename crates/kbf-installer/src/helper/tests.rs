@@ -1849,6 +1849,7 @@ fn a_swap_that_fails_is_refused_and_moves_nothing() {
         source: Source::Fetch,
     };
     assert!(matches!(NotWired.fetch(&loc), Err(FetchError::NotWired)));
+    assert!(matches!(NotWired.seed(), Err(FetchError::NotWired)));
 }
 
 /// Catches an activation that goes on to fetch while the node cannot be told a fetch is under

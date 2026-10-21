@@ -223,7 +223,10 @@ impl OrderRecord {
     /// the frontend never preflighted is not activated); every other verb carries neither.
     /// A `frontend_update` is a locator like a `confirm`: the root half fetches the commit
     /// from its own source and re-derives every fact, so the record names no file, no
-    /// digest and no claim.
+    /// digest and no claim. An activation whose source is [`Source::Staged`] is a locator
+    /// too (the release is the one the installer's package carries, and its manifest holds the
+    /// facts), and only an `activate` and a `frontend_update` take a source: a `confirm` or a
+    /// `revert` that names one is refused.
     ///
     /// # Errors
     /// The first rule broken.
@@ -231,14 +234,18 @@ impl OrderRecord {
         if !is_hex(&self.commit, 40) {
             return Err(RecordError::Commit(self.commit.clone()));
         }
-        match self.verb {
-            Verb::Activate => {}
-            Verb::Confirm | Verb::Revert | Verb::FrontendUpdate => {
-                if !self.components.is_empty() || self.expected.is_some() {
-                    return Err(RecordError::Unexpected(self.verb.name()));
-                }
-                return Ok(());
+        let locator = match (self.verb, self.source) {
+            (Verb::Activate, Source::Fetch) => false,
+            (Verb::Activate | Verb::FrontendUpdate, _) | (_, Source::Fetch) => true,
+            (Verb::Confirm | Verb::Revert, Source::Staged) => {
+                return Err(RecordError::Unexpected(self.verb.name()));
             }
+        };
+        if locator {
+            if !self.components.is_empty() || self.expected.is_some() {
+                return Err(RecordError::Unexpected(self.verb.name()));
+            }
+            return Ok(());
         }
         if self.components.is_empty() {
             return Err(RecordError::NoComponents);

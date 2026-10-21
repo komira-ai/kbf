@@ -25,9 +25,9 @@
 //! [`SeedFetcher`](crate::helper::fetcher_seed::SeedFetcher)'s.
 //!
 //! The floor is the root-owned file `seq_floor` beside `state.json`: one decimal number, the
-//! lowest `seq` that is not allowed. This change reads it and nothing here writes it, so a
-//! host that has none refuses every staged order (fail closed) until the change that notices
-//! the package gives it one.
+//! lowest `seq` that is not allowed. The installer only reads it, and a host with none refuses
+//! every staged order (fail closed). `setup` installs the first release before any floor
+//! exists, so it asks none of the seed.
 
 use std::io;
 
@@ -171,12 +171,32 @@ pub fn read_floor(host: &Layout) -> Result<Option<u64>, FetchError> {
 /// # Errors
 /// [`FetchError::Order`] under the word `commit_or_ref`, saying which rule.
 pub fn admit(
-    _seed: &SeedFacts,
-    _commit: &CommitId,
-    _floor: Option<u64>,
+    seed: &SeedFacts,
+    commit: &CommitId,
+    floor: Option<u64>,
 ) -> Result<(), FetchError> {
-    Ok(())
+    let refuse = |why: String| FetchError::Order {
+        word: "commit_or_ref",
+        why,
+    };
+    if seed.commit != *commit {
+        return Err(refuse(format!(
+            "seed_mismatch: this host carries {}, not {commit}",
+            seed.commit
+        )));
+    }
+    match floor {
+        Some(floor) if seed.seq > floor => Ok(()),
+        Some(floor) => Err(refuse(format!(
+            "seq_floor: seed seq {} is not above {floor}",
+            seed.seq
+        ))),
+        None => Err(refuse(NO_FLOOR.to_owned())),
+    }
 }
+
+/// Why a host with no floor admits no seed.
+const NO_FLOOR: &str = "seq_floor: no floor is recorded yet, so no seed is above it";
 
 #[cfg(test)]
 #[path = "seed_tests.rs"]
