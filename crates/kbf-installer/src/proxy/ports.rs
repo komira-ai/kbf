@@ -9,11 +9,13 @@
 
 use std::time::Duration;
 
+use kbf_update::Source;
+
 use crate::CommitId;
 
 use super::model::{
-    AdoptError, CrashPoint, Halt, Intent, Locator, OpenCounts, PortError, ProcIdent, Readiness,
-    Request, Retired, RoleInfo, Slot, StagedFacts, Start,
+    AdoptError, CrashPoint, DesiredError, Halt, Intent, Locator, OpenCounts, PortError, ProcIdent,
+    Readiness, Request, Retired, RoleInfo, Slot, StagedFacts, Start,
 };
 
 /// The process side of the children. The proxy starts them as its own processes.
@@ -71,8 +73,15 @@ pub trait ChildAdmin {
     fn open_counts(&self, slot: Slot) -> Result<OpenCounts, PortError>;
 
     /// `POST /v1/update/desired {commit}` on the child's operator port; idempotent
-    /// (FP section 5 step 9).
-    fn post_desired(&self, slot: Slot, commit: &CommitId) -> Result<(), PortError>;
+    /// (FP section 5 step 9). `source` is where the release came from: the body names it
+    /// when it is not a fetch. A child that answered and refused ends the update; one that did
+    /// not answer is asked again ([`DesiredError`]).
+    fn post_desired(
+        &self,
+        slot: Slot,
+        commit: &CommitId,
+        source: Source,
+    ) -> Result<(), DesiredError>;
 }
 
 /// The proxy's routing state for the update: the hold and the per-slot permits. The hold

@@ -19,6 +19,8 @@ use super::{
     Check, Clock, Env, NoCheck, NoSmoke, Options, Smoke, SystemClock, deploy, lock, summary, why,
 };
 use crate::CommitId;
+use crate::installer_toml::MAX_FILE_BYTES;
+use crate::layout::{Layout, Platform};
 
 pub use super::host_config::CONFIG;
 use super::host_config::HostConfig;
@@ -384,6 +386,30 @@ pub(crate) fn read_config(path: &Path, owner: u32, needed: bool) -> Result<HostC
     HostConfig::parse(&text).map_err(|e| format!("config {} {e}", path.display()))
 }
 
+/// Whether the installer's settings under `root` say the host fetches nothing
+/// (`release_source = "bundled"`). A deploy can only fetch, and a bundled host refuses a fetch at
+/// the installer, after the bundle is uploaded; this is read so that the deploy can refuse it
+/// first. The installer is the gate: a file that is missing, too big, not text or not TOML is
+/// not a bundled host here, and a host whose settings are wrong is refused where they are read.
+pub(super) fn is_bundled(root: &Path) -> bool {
+    let Ok(base) = kbf_host::Root::new(root) else {
+        return false;
+    };
+    let layout = Layout::new(base, Platform::current());
+    let Ok(file) = fs::File::open(layout.join(&layout.installer_toml())) else {
+        return false;
+    };
+    let mut text = String::new();
+    let limit = u64::try_from(MAX_FILE_BYTES).unwrap_or(u64::MAX);
+    if file.take(limit).read_to_string(&mut text).is_err() {
+        return false;
+    }
+    let Ok(settings) = toml::from_str::<toml::Table>(&text) else {
+        return false;
+    };
+    settings.get("release_source").and_then(toml::Value::as_str) == Some("bundled")
+}
+
 fn number(name: &str, text: &str) -> Result<u64, String> {
     match text.parse::<u64>() {
         Ok(n) if n > 0 => Ok(n),
@@ -557,10 +583,11 @@ pub(super) fn run(
         let _ = writeln!(err, "kbf-installer deploy: {why}\n{USAGE}");
         Exit::Usage.code()
     };
-    let parsed = match parse(args, via_sudo, host.config_owner) {
+    let mut parsed = match parse(args, via_sudo, host.config_owner) {
         Ok(p) => p,
         Err(why) => return usage(err, &why),
     };
+    parsed.options.bundled = is_bundled(&host.installer_root);
     if parsed.options.apply && !host.root {
         return usage(err, "--apply must run as root");
     }

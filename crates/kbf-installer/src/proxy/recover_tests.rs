@@ -374,6 +374,30 @@ fn a_new_child_that_lost_the_generation_after_it_served_is_retired_not_killed() 
     assert_eq!(w.holders(), vec![Slot::A]);
 }
 
+fn failed_at_nodes(i: &Intent) -> bool {
+    i.failure.as_ref().is_some_and(|f| f.step == Step::Nodes)
+}
+
+/// Catches a restart that sends the order for the nodes again after the child refused it for
+/// good: the refusal is in `update.json`, so the new proxy goes on to drain and retire, and the
+/// update ends `failed` at `nodes` as it would have, with the order sent once in all.
+///
+/// Mutant planted: the restart's `settle` not looking at the recorded failure.
+#[test]
+fn a_restart_after_a_refusal_of_the_order_for_the_nodes_does_not_send_it_again() {
+    let (w, old) = draining_world();
+    w.st.borrow_mut().desired_refused = Some("not_own".to_owned());
+    crash_when(&w, failed_at_nodes);
+    run_to_crash(&w, Mode::Frontend, old);
+    assert_eq!(w.count("admin:desired"), 1);
+    let (end, _) = restart(&w);
+    assert_eq!(end, Ok(Phase::Failed), "{:#?}", w.log());
+    assert_eq!(failed_at(&w), Some(Step::Nodes));
+    assert_eq!(w.count("admin:desired"), 1);
+    assert_eq!(w.holders(), vec![Slot::B]);
+    assert!(w.when("terminate pid 100").is_some(), "old child retired");
+}
+
 fn before_in(w: &World, a: &str, b: &str) {
     let log = w.log();
     let i = log

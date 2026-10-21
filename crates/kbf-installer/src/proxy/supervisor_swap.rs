@@ -377,6 +377,7 @@ impl Supervisor for SwapSupervisor {
             to: spec.to.clone(),
             nodes: spec.nodes,
             rollback: spec.rollback,
+            source: spec.source,
             old_slot: state.active,
             timing: self.config.timing,
         };

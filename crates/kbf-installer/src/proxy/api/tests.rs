@@ -777,7 +777,7 @@ fn status_json_written_by_the_installer_parses() {
     assert_eq!((read.refusal_word(), read.acked_order_id), ("hash", 12));
     assert_eq!(
         read.refused_order_id, None,
-        "the root half does not name the order a refusal answers yet, so no refusal is attributed"
+        "this memory names no order, so the status names none and no refusal is attributed"
     );
     assert_eq!(
         read.staged_facts()

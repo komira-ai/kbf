@@ -392,7 +392,7 @@ fn a_frontend_update_is_a_locator_and_nothing_else() {
 #[test]
 fn what_the_proxy_writes_both_readers_accept_and_what_it_cannot_say_both_refuse() {
     use crate::helper::order::{self, Verb as HelperVerb};
-    use crate::proxy::model::{Locator, Verb as ProxyVerb};
+    use crate::proxy::model::{Locator, Source, Verb as ProxyVerb};
 
     let locator = |verb| Locator {
         order_id: 45,
@@ -401,6 +401,7 @@ fn what_the_proxy_writes_both_readers_accept_and_what_it_cannot_say_both_refuse(
         verb,
         commit: crate::testkit::c(crate::testkit::B),
         window_s: 900,
+        source: Source::Fetch,
     };
     let readers = |bytes: &[u8]| {
         (

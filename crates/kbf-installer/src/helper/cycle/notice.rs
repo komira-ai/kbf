@@ -55,6 +55,10 @@ pub(super) struct Notice {
     /// take them out of it.
     available: Option<Available>,
     source: Option<&'static str>,
+    /// The id of the proxy's order the refusal in the status answers, as the orders of the last
+    /// pass left it: `helper.json` does not hold it (see `Memory::refused_order_id`), so it is
+    /// kept here and put back into `memory` at the start of the next pass.
+    refused: Option<u64>,
     /// What the log was last told about the package, so that a trouble that stays is said once.
     told: String,
     /// The release that runs, as last asked for its `seq` (`None` when it declares none). A
@@ -69,6 +73,7 @@ impl Notice {
     pub(super) fn stamp(&self, memory: &mut Memory) {
         memory.available.clone_from(&self.available);
         memory.release_source = self.source;
+        memory.refused_order_id = self.refused;
     }
 
     /// Whether the last look failed less than [`RETRY_SECS`] before `now`. A clock that
@@ -84,6 +89,7 @@ impl<E: Exec> Helper<E> {
     /// with the release that runs, the seed (if the package carries one) is checked unless the
     /// last look failed a moment ago, and the status that is written next tells what came of it.
     pub(super) fn notice_package(&mut self, now: u64, memory: &mut Memory) {
+        self.notice.refused = memory.refused_order_id;
         let floor = self.synced_floor();
         if !self.notice.held(now) {
             self.look_at_package(now, floor);

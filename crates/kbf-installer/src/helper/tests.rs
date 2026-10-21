@@ -1899,6 +1899,7 @@ mod components_tests;
 mod frontend_tests;
 mod notice_tests;
 mod pipeline_fetcher_tests;
+mod refused_id_tests;
 mod scratch_sweep_tests;
 mod seed_order_tests;
 mod staged_tests;

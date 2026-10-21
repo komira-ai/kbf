@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use bytes::Bytes;
 use hyper::{Request, Response};
+use kbf_update::Source;
 use serde::Deserialize;
 
 use super::model::{NewChild, OldChild, UpdateId};
@@ -22,6 +23,15 @@ pub trait OrderWriter: Send {
         verb: Verb,
         commit: &CommitId,
         window_s: u32,
+    ) -> Result<Locator, OrderError>;
+
+    /// A `frontend_update` for `commit` that takes its release from `source`: the record names
+    /// it unless it is `fetch`, which a record without the key means.
+    fn write_update(
+        &mut self,
+        commit: &CommitId,
+        window_s: u32,
+        source: Source,
     ) -> Result<Locator, OrderError>;
 }
 
@@ -47,10 +57,10 @@ pub struct InstallerStatus {
     /// this cannot say whose refusal `refusal` is: see `refused_order_id`.
     #[serde(default)]
     pub acked_order_id: u64,
-    /// The id of the order that `refusal` answers, when the root half writes it. A refused
-    /// state is an update's own only when this names that update's order; without it (the
-    /// root half writes no such field yet) no refusal is attributed to any update, and an
-    /// order the installer refuses ends at the staging deadline instead.
+    /// The id of the order that `refusal` answers, when it answers one. A refused state is an
+    /// update's own only when this names that update's order; without it (a refusal that is no
+    /// order's, or a root half from before the field) no refusal is attributed to any update,
+    /// and an order the installer refuses ends at the staging deadline instead.
     #[serde(default)]
     pub refused_order_id: Option<u64>,
     #[serde(default)]
@@ -172,6 +182,8 @@ pub struct RunningUpdate {
     /// How many nodes the new child has begun to update.
     pub nodes_updated: u32,
     pub failure: Option<Failure>,
+    /// Where the update's release came from.
+    pub source: Source,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -194,6 +206,8 @@ pub struct UpdateSpec {
     pub to: CommitId,
     pub nodes: bool,
     pub rollback: bool,
+    /// Where the release came from; the order for the nodes names the same.
+    pub source: Source,
     pub facts: StagedFacts,
     pub order: Locator,
 }

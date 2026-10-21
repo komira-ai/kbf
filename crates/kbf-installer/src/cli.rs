@@ -7,6 +7,7 @@
 //! this file is the one that changes.
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use kbf_update::Source;
 
 use crate::CommitId;
 use crate::record::ActivationId;
@@ -200,6 +201,11 @@ pub struct UpdateArgs {
     /// frontend is swapped.
     #[arg(long)]
     pub nodes: bool,
+    /// Where the release comes from: `fetch` (from the source the installer is configured with,
+    /// as every update has) or `staged` (the release this host's package carries). `staged`
+    /// takes no `--nodes` yet.
+    #[arg(long, default_value = "fetch", value_parser = parse_source)]
+    pub source: Source,
     /// Names this update to the API, so a run repeated after a lost connection is the same
     /// update. Random when not given.
     #[arg(long)]
@@ -207,6 +213,15 @@ pub struct UpdateArgs {
     /// How long to wait for the update to end, the new frontend's bake included.
     #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
     pub handover_timeout_s: u64,
+}
+
+/// `--source`: `fetch` or `staged`, nothing else (an unknown word is a usage error).
+fn parse_source(text: &str) -> Result<Source, String> {
+    match text {
+        "fetch" => Ok(Source::Fetch),
+        "staged" => Ok(Source::Staged),
+        _ => Err("a source is fetch or staged".to_owned()),
+    }
 }
 
 #[derive(Args)]

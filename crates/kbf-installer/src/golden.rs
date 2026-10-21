@@ -143,6 +143,7 @@ pub fn status() -> StatusV2 {
         state: Phase::Refused,
         refusal: "attestation: no valid attestation for kbf at commit 0123456789ab".to_owned(),
         acked_order_id: 41,
+        refused_order_id: None,
         staged: Some(StagedFacts {
             protocol: 12,
             min_protocol: 11,

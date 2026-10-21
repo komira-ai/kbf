@@ -49,6 +49,13 @@ pub struct Memory {
     pub event: Event,
     /// Why the last order was refused, or what was reverted.
     pub refusal: String,
+    /// The id of the proxy's order `refusal` answers, when it answers one: what lets the
+    /// frontend proxy tell its own order's refusal from another's. A node's order names none
+    /// (its ids are another counter's). Never stored: `helper.json` is read by builds that
+    /// refuse a key they do not know, so the helper keeps the id from one pass to the next
+    /// itself (`Notice`), and a restarted helper has none.
+    #[serde(skip)]
+    pub refused_order_id: Option<u64>,
     /// When root first saw each record now in the spool, in seconds. A record expires by
     /// this, never by the file's modification time, which its writer sets.
     pub first_seen: BTreeMap<String, u64>,
