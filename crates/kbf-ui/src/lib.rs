@@ -14,9 +14,12 @@
 //!   spacing are CSS custom properties, light and dark by `prefers-color-scheme`, so a
 //!   new look is a new stylesheet.
 //!
-//! The pages, under [`PREFIX`]: `/ui` (Overview: where the pages are; it reads no route
-//! yet), `/ui/builds` (Builds: the recent builds of `GET /v1/invocations`, filtered by
-//! state and instance; with `?id=`, one build's summary from `GET /v1/invocations/{id}`),
+//! The pages, under [`PREFIX`]: `/ui` (Overview: readiness, nodes by state, queue, leases
+//! and storage from `GET /v1/health`, the latest builds from `GET /v1/invocations`),
+//! `/ui/nodes` (Nodes: `GET /v1/nodes`), `/ui/nodes/{id}` (Node: `GET /v1/nodes/{id}`;
+//! Overview, Nodes and Node reload themselves with `?refresh=N`), `/ui/builds` (Builds: the
+//! recent builds of `GET /v1/invocations`, filtered by state and instance; with `?id=`, one
+//! build's summary from `GET /v1/invocations/{id}`),
 //! `/ui/builds/{id}` (Build: the summary, a page of `GET /v1/invocations/{id}/failures`
 //! and a page of `.../actions`), and
 //! `/ui/builds/{id}/actions/{digest}` (Action: `GET /v1/invocations/{id}/actions/
@@ -174,8 +177,10 @@ pub async fn respond<S: Source + Sync>(source: &S, path: &str, query: &str) -> A
         return pages::not_found(path);
     };
     match segments.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [] | [""] => pages::overview(),
+        [] | [""] => pages::overview(source, query).await,
         ["builds"] => pages::builds(source, query).await,
+        ["nodes"] => pages::nodes(source, query).await,
+        ["nodes", id] if !id.is_empty() => pages::node(source, id, query).await,
         ["builds", id] if !id.is_empty() => pages::build(source, id, query).await,
         ["builds", id, "actions", digest] if !id.is_empty() && !digest.is_empty() => {
             pages::action(source, id, digest, query).await
