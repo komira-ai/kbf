@@ -23,6 +23,8 @@
 //! mark, uncordon, free the slot (capacity beats update, section 2.8). From the activate
 //! order on, the host's restart is already running, so *no* failure uncordons it; a
 //! failure holds the run for a person, and the helper reverts the host by its own timer.
+//! A refused activate order ([`HoldReason::ActivateRefused`]) holds the host the same way,
+//! with no restart running and no timer to wait for.
 //! The one deliberate uncordon after the activate order is step 10's. A held node that
 //! should stay cordoned has its cordon ordered again if placement stops showing it
 //! ([`HoldReason::keeps_cordon`]).

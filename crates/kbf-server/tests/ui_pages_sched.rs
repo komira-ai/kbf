@@ -223,7 +223,7 @@ async fn the_leases_page_lists_what_a_daemon_holds_and_pages() {
     assert!(
         api.urls()
             .iter()
-            .all(|u| u == "/v1/leases" || u.starts_with("/v1/leases?")),
+            .all(|u| u == "/v1/health" || u == "/v1/leases" || u.starts_with("/v1/leases?")),
         "{:?}",
         api.urls()
     );
@@ -275,5 +275,13 @@ async fn the_queue_page_shows_work_no_node_can_run() {
     assert!(html.contains("lacks"), "{html}");
     assert!(html.contains("<code>op-"), "{html}");
     assert!(api.all_ok());
-    assert_eq!(api.urls().last().map(String::as_str), Some("/v1/queue"));
+    // The last read is the banner's start time, from the real `/v1/health`, which the page
+    // parsed (a key it names that the route does not send would say it is not known).
+    assert_eq!(
+        api.urls().iter().rev().map(String::as_str).nth(1),
+        Some("/v1/queue")
+    );
+    assert_eq!(api.urls().last().map(String::as_str), Some("/v1/health"));
+    assert!(html.contains("This server started at 20"), "{html}");
+    assert!(!html.contains("is not known"), "{html}");
 }

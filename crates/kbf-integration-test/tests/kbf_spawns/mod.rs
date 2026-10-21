@@ -6,7 +6,7 @@
 //! Every site that starts the binary (`CARGO_BIN_EXE_kbf`, a `bin/kbf` path given to
 //! `Command::new` or a link called `kbf`) in test code is in one of two explicit lists:
 //!
-//! - [`FLAGGED`]: the helpers that add `kbf_testkit::config::flag(..)` to what they start
+//! - [`FLAGGED`]: the helpers that add `kbf_testkit::config::flag(..)` (or `flag_with`) to what they start
 //!   (the harness is handed the binary's path, so it need not name it). The file must still
 //!   call it, so a helper that loses the flag is refused.
 //! - [`ALLOWANCE`]: the files that start `kbf` without it today, listed and counted. The
@@ -47,7 +47,7 @@ pub const ALLOWANCE: &[&str] = &[
 ];
 
 /// The call a [`FLAGGED`] file must keep.
-const FLAG_CALL: &str = "config::flag(";
+const FLAG_CALL: &str = "config::flag";
 
 /// The directory of this rule's own planted sources, which name the markers.
 const OWN: &str = "crates/kbf-integration-test/tests/kbf_spawns/";
@@ -120,7 +120,7 @@ pub fn scan(
             problems.push(format!("`{f}` is on both lists; remove it from ALLOWANCE"));
         } else if !read(f).is_some_and(|t| t.contains(FLAG_CALL)) {
             problems.push(format!(
-                "`{f}` is a flagged helper but no longer calls `{FLAG_CALL}..)` (or is gone); \
+                "`{f}` is a flagged helper but no longer calls `{FLAG_CALL}*(..)` (or is gone); \
                  the child it starts would read the host's /etc/kbf/kbf.toml"
             ));
         }

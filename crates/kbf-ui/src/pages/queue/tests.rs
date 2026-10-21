@@ -88,7 +88,7 @@ fn the_page_shows_depth_groups_reasons_and_avoided_operations() {
     );
     assert!(!html.contains("Showing"), "{html}");
     assert!(html.contains("empty until the daemons reconnect"), "{html}");
-    assert_eq!(fake.seen(), ["/v1/queue"]);
+    assert_eq!(fake.seen(), ["/v1/queue", "/v1/health"]);
 }
 
 /// Catches: an empty queue shown as blank tables or as a guess: the page says nothing is
@@ -192,7 +192,7 @@ fn a_failed_read_keeps_the_apis_status() {
     let fake = sched_farm();
     let (status, _) = page(&fake, "/ui/queue?node=x&page_size=1");
     assert_eq!(status, 200);
-    assert_eq!(fake.seen(), ["/v1/queue"]);
+    assert_eq!(fake.seen(), ["/v1/queue", "/v1/health"]);
 }
 
 /// Catches: the page's routes in the registry: `/ui/queue` served with the page marked as

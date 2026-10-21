@@ -37,6 +37,9 @@ kbf-gate.workspace = true
 # the cap and the strictness (`binary::Version`), and of running a program with an empty
 # environment and a time limit (`run::SystemRunner`).
 kbf-installer.workspace = true
+# The platforms a release is built for and the tarballs a host of each needs
+# (`release stage-offer`): the one list the installer's bundle reader is checked against.
+kbf-types.workspace = true
 lzma-rs.workspace = true
 ruzstd.workspace = true
 # The runner user's uid and gid, and `uname -m`, for `crun-tests`.

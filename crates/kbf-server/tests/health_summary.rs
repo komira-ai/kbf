@@ -314,3 +314,46 @@ async fn storage_is_the_storage_routes_numbers_or_null_and_why() {
     })
     .await;
 }
+
+/// Wall clock now, in milliseconds since the Unix epoch.
+fn unix_ms() -> u64 {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970");
+    u64::try_from(since.as_millis()).expect("fits")
+}
+
+/// Catches: `started_unix_ms` missing, zero, or read from anywhere but the server's start
+/// (it must fall between the moments before and after the server started, and not move
+/// between two reads); `uptime_ms` missing, a constant, counted from the epoch or from
+/// each request (it must grow with the time between two reads, by at least that time,
+/// and never exceed the time since the bracket's start).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_reports_when_the_server_started_and_how_long_it_has_run() {
+    let before = unix_ms();
+    let cell = Cell::start_with_api().await;
+    let after = unix_ms();
+    let api = cell.api.expect("an API address");
+
+    let (code, first) = get(api, "/v1/health").await;
+    assert_eq!(code, 200, "{first}");
+    let started = first["started_unix_ms"].as_u64().expect("a number");
+    assert!(
+        (before..=after).contains(&started),
+        "started {started} is outside the start of the server {before}..={after}: {first}"
+    );
+    let up_first = first["uptime_ms"].as_u64().expect("a number");
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let (_, second) = get(api, "/v1/health").await;
+    assert_eq!(second["started_unix_ms"], first["started_unix_ms"]);
+    let up_second = second["uptime_ms"].as_u64().expect("a number");
+    assert!(
+        up_second >= up_first + 120,
+        "uptime grew from {up_first} to {up_second}, less than the 120 ms slept"
+    );
+    assert!(
+        up_second <= unix_ms() - before,
+        "uptime {up_second} is more than the time since before the start"
+    );
+}

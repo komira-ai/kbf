@@ -15,6 +15,7 @@ use kbf_server::update::{
     HostFacts, HostKind, HostPhase, HostRecord, MemberFacts, OrderId, Platform, PlatformClass,
     Policy, Release, Slot, SlotClass, SlotOp, Transition, step,
 };
+use kbf_server::update_status::ReleaseSource;
 use kbf_types::{FarmTime, WorkerId};
 
 pub mod harness;
@@ -99,6 +100,8 @@ fn host(name: &str, kind: HostKind, platform: Platform, member: Option<u64>) -> 
         platform,
         member: member.map(MemberId),
         release: Some(Release::new(OLD)),
+        available: None,
+        release_source: ReleaseSource::Unreported,
         connected: true,
         cordoned: Some(false),
         load: Some(IDLE),

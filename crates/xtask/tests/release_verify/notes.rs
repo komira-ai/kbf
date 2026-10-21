@@ -255,9 +255,53 @@ fn the_first_release_has_nothing_to_go_back_to() {
     let notes = notes_of(&fx);
     assert!(
         part(&notes, "## Before you click")
-            .contains("- first release: there is no earlier release to go back to\n"),
+            .contains("- first release: there is no earlier release to go back to. Hosts running an untagged earlier build: upgrade kbf-installer before staging (older installers may refuse this build's version output).\n"),
         "{notes}"
     );
+}
+
+/// The notes of a release between identities written as `cur_extra` and `prev_extra`
+/// (extra top-level keys over the commit stamp).
+fn notes_with_keys(name: &str, cur_extra: &[&str], prev_extra: &[&str]) -> String {
+    let id = |commit: &str, extra: &[&str]| {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&identity(commit, Some(3), Some(1))).unwrap();
+        for k in extra {
+            v[*k] = 1.into();
+        }
+        v.to_string()
+    };
+    let fx = with_notes(name, |_| {});
+    let ((code, o, err), out) = notes_run(
+        &fx,
+        &id(RELEASE, cur_extra),
+        Some(&id(&fx.first, prev_extra)),
+    );
+    assert_eq!(code, Some(0), "{o}{err}");
+    std::fs::read_to_string(out).unwrap()
+}
+
+#[test]
+fn a_key_the_previous_version_output_lacks_tells_operators_to_upgrade_the_installer() {
+    // Catches: the line dropped, the keys unsorted or wrong, a subset check inverted
+    // (a removed key then warns, an added one does not).
+    let line = format!(
+        "- Upgrade kbf-installer on every host before staging this release: its version \
+         output adds seq, zeta, which installers built before {} may refuse\n",
+        &RELEASE[..12]
+    );
+    let notes = notes_with_keys("keys-added", &["zeta", "seq"], &["other"]);
+    assert!(
+        part(&notes, "## Before you click").contains(&line),
+        "{notes}"
+    );
+    for (name, cur, prev) in [
+        ("keys-same", &["seq"][..], &["seq"][..]),
+        ("keys-removed", &[][..], &["seq"][..]),
+    ] {
+        let notes = notes_with_keys(name, cur, prev);
+        assert!(!notes.contains("Upgrade kbf-installer"), "{name}: {notes}");
+    }
 }
 
 #[test]

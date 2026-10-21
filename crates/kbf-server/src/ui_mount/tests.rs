@@ -113,6 +113,20 @@ async fn a_ranged_read_sends_a_range_header_and_a_plain_read_sends_none() {
     assert_eq!(plain.body, b"no range");
 }
 
+/// Catches: a suffix read that sends no `Range` header (the Log page would read the head
+/// of a log, or all of it, when it asked for the end), or sends the span form
+/// `bytes=n-n`, or a bound that is not the one asked for. Mutants: `get_suffix` calling
+/// `ask` with `None`; the `-` dropped from the header; `get_suffix` delegating to
+/// `get_range`.
+#[tokio::test]
+async fn a_suffix_read_sends_a_suffix_range_header() {
+    let source = InProcess::new(api());
+    let got = source.get_suffix("/v1/range", 1_048_576).await;
+    let got = got.expect("an answer");
+    assert_eq!(got.status, 206);
+    assert_eq!(got.body, b"bytes=-1048576");
+}
+
 /// Catches: a method other than `GET` and `HEAD` served, or answered without the security
 /// headers (mutants: `post`, `any` for `get`; the `secure` layer dropped or placed inside
 /// the limit); `HEAD` refused or sent with a body.

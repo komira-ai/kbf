@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use super::*;
 use crate::deploy::offer::{self, Attest, HostProbe, ProbeFault, Stage};
 
+mod facts;
 mod in_bundle;
 
 /// The farm's clock at the start of a run (`Clk`).

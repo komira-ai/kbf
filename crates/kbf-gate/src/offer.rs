@@ -66,15 +66,17 @@ pub struct OfferDoc {
     pub commit: CommitId,
     /// The release set offered: the hash of its `SHA256SUMS`.
     pub set_hash: SetHash,
-    /// The platforms found complete in the release (tarball, SBOM and bundle), by the
-    /// names assets use (`linux-x86_64`, ...), sorted.
+    /// The platforms found complete in the release (tarball, SBOM, bundle and version facts),
+    /// by the names assets use (`linux-x86_64`, ...), sorted.
     pub platforms: Vec<String>,
     /// The beta evidence.
     pub beta: Beta,
     /// The highest metadata-log machine version the offered build runs; absent when its
     /// `kbf --version --json` was not given or lacks it.
     pub meta_log: Option<u64>,
-    /// The commit the farm runs now, which a walk-back returns to; absent when none was given.
+    /// The commit a walk-back returns to: the one the farm runs when an operator made the offer,
+    /// the release before the offered one when the release pipeline did; absent when none was
+    /// given.
     pub previous: Option<CommitId>,
     /// `meta_log` of the previous build; absent when unknown.
     pub previous_meta_log: Option<u64>,

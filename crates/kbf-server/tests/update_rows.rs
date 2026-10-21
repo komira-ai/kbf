@@ -349,6 +349,7 @@ fn every_phase_and_hold_reason_round_trips_under_its_number() {
         HoldReason::Reverted,
         HoldReason::RevertRefused,
         HoldReason::StillCordoned,
+        HoldReason::ActivateRefused,
     ];
     let phases = [
         HostPhase::Pending,
@@ -404,6 +405,19 @@ fn every_phase_and_hold_reason_round_trips_under_its_number() {
         assert_eq!(rows.hosts().expect("a read")[&id("r")].value, row(held));
         forget("update/host/r");
     }
+    // The newest reason spelled out, not counted: 12 is `0c` after the reason key. The read
+    // of a number no build knows is `a_row_this_build_cannot_read_is_refused_not_guessed`.
+    let refused = HostPhase::Held {
+        reason: HoldReason::ActivateRefused,
+    };
+    write_host(&rows, "n", &row(refused.clone()));
+    assert_eq!(
+        raw(&cell, "update/host/n"),
+        "080d10091803208827280a300c380242027632"
+    );
+    let read = rows.hosts().expect("a read");
+    assert_eq!(read[&id("n")].value, row(refused));
+    forget("update/host/n");
     write_host(&rows, "x", &row(HostPhase::Deferred));
     assert!(raw(&cell, "update/host/x").starts_with("080e10"));
 }

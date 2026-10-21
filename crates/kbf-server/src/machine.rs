@@ -379,6 +379,8 @@ mod tests {
             helper_present: false,
             acked_order_id: 0,
             kind: kbf_proto::update::update_status::State::Idle,
+            available: None,
+            release_source: crate::update_status::ReleaseSource::Unreported,
             received_at_unix_ms: u64::from(n),
         }
     }

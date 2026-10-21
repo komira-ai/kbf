@@ -4,7 +4,7 @@
 
 use serde_json::{Value, json};
 
-use crate::tests::Fake;
+use crate::tests::{Fake, health_doc};
 
 /// What an attacker-influenced string looks like: markup, both quotes and an ampersand.
 pub(crate) const HOSTILE: &str = "<script>alert(1)</script>\"'&";
@@ -65,4 +65,5 @@ pub(crate) fn sched_farm() -> Fake {
         .json("/v1/leases", &leases_doc())
         .json("/v1/leases?node=node-a", &node_a_page())
         .json("/v1/queue", &queue_doc())
+        .json("/v1/health", &health_doc())
 }
