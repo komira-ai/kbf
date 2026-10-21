@@ -114,12 +114,14 @@ impl BinaryKind {
 /// The most a binary's `--version --json` may print.
 pub const VERSION_CAP: usize = 4096;
 
-/// What `--version --json` prints. A field this type does not name is refused, and so is
-/// one named twice or a required one missing. `platform` (the installer derives it from
-/// the binary's header), `admin_protocol`, `meta_log` and `seq` (builds before them lack
-/// them) may be absent and are then `None`; `meta_log: None` means not reversible.
+/// What `--version --json` prints. A field this type does not name is ignored: a newer
+/// kbf adds fields, and an installer that refused them would be unable to stage any build
+/// after it (adding `seq` did that). A field named twice, a required one missing and a
+/// wrong type are still refused (serde's derive rejects a repeated known field).
+/// `platform` (the installer derives it from the binary's header), `admin_protocol`,
+/// `meta_log` and `seq` (builds before them lack them) may be absent and are then `None`;
+/// `meta_log: None` means not reversible.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Version {
     /// The version of the admin calls between a proxy and the frontend processes it
     /// starts. `None` for a build that predates the field.
@@ -147,8 +149,8 @@ pub struct Version {
 }
 
 impl Version {
-    /// The object a binary printed, strictly: at most [`VERSION_CAP`] bytes, one JSON
-    /// object of the fields above and nothing after it.
+    /// The object a binary printed: at most [`VERSION_CAP`] bytes, one JSON object holding
+    /// the fields above (others are ignored) and nothing after it.
     pub fn parse(stdout: &[u8]) -> Result<Version, VersionFault> {
         if stdout.len() > VERSION_CAP {
             return Err(VersionFault::Oversize { cap: VERSION_CAP });
