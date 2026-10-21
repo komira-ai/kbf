@@ -583,7 +583,7 @@ impl Farm {
         status
     }
 
-    /// Starts `role` again from the identical command line (the rendered unit's, as kept
+    /// Starts `role` again from the identical command line (the unit's, as kept
     /// in the farm), its output in files of the next generation. The role must have
     /// ended ([`Farm::kill`] or [`Farm::term`]).
     ///

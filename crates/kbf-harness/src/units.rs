@@ -7,8 +7,9 @@
 //! setting is a key of the process's `kbf.toml`, and a [`Unit`] is that file while a farm
 //! builds it.
 //!
-//! A [`Unit`] starts from the settings the mode's unit had when `kbf-deploy` rendered it
-//! for the farm's directories, ports and addresses ([`Unit::new`]), then the farm changes
+//! A [`Unit`] starts from the settings the farm gives a mode for its directories, ports and
+//! addresses ([`Unit::new`]; kbf-cli's `tests/golden/farm-units.txt` records, per process,
+//! the flags they came to, and its tests hold the file to them), then the farm changes
 //! it with [`Unit::replace`], [`Unit::remove`], [`Unit::set`] and [`Unit::append`], by
 //! flag name (`--cold-store=file:///...`). The edits are strict, so a setting that stops
 //! existing is not hidden: a flag that is not one of the mode's is refused (the keys of a
@@ -110,10 +111,17 @@ pub fn names_mode(argv: &[&str], mode: Mode) -> bool {
 /// # Panics
 /// When the unit does not start `kbf` with exactly that word (a defect of the unit).
 fn mode_word(mode: Mode) -> String {
-    let unit = UnitFile::parse(mode.unit()).expect("a packaged unit");
+    mode_word_in(mode.unit(), mode)
+}
+
+/// [`mode_word`] over the text of a unit.
+fn mode_word_in(text: &str, mode: Mode) -> String {
+    let unit = UnitFile::parse(text).expect("a packaged unit");
     let exec = unit.exec_start();
-    assert!(exec[0].ends_with("/kbf"), "{mode}: {exec:?}");
-    assert!(names_mode(&exec[1..], mode), "{mode}: {exec:?}");
+    assert!(
+        exec.first().is_some_and(|kbf| kbf.ends_with("/kbf")) && names_mode(&exec[1..], mode),
+        "{mode}: the unit does not start `kbf --mode={mode}`: {exec:?}"
+    );
     format!("--mode={}", mode.name())
 }
 
@@ -122,25 +130,31 @@ fn mode_word(mode: Mode) -> String {
 /// its `[table]`), and whether the key is a switch (`key = false`, the file's shape of a
 /// flag that takes no value).
 pub fn keys(mode: Mode) -> BTreeMap<&'static str, (&'static str, bool)> {
+    parse_keys(mode.keys())
+}
+
+/// [`keys`] over the text of a file with every setting.
+fn parse_keys(text: &'static str) -> BTreeMap<&'static str, (&'static str, bool)> {
     let mut found = BTreeMap::new();
     let mut table = "";
-    for line in mode.keys().lines() {
+    for line in text.lines() {
         if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
             table = name;
             continue;
         }
         let setting = line.strip_prefix("# ").unwrap_or(line);
-        if let Some((key, shape)) = setting.split_once(" = ")
-            && !table.is_empty()
-            && !key.is_empty()
-            && key
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        {
-            found.insert(key, (table, shape == "false" && !line.starts_with('#')));
+        let key = setting.split_once(" = ").map(|(key, _)| key);
+        // A line of a setting's help may hold ` = ` too: a key is a flag's long name.
+        if let Some(key) = key.filter(|k| k.bytes().all(is_flag_byte)) {
+            found.insert(key, (table, line == format!("{key} = false")));
         }
     }
     found
+}
+
+/// Whether `b` may be in a flag's long name.
+fn is_flag_byte(b: u8) -> bool {
+    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'
 }
 
 /// The value of one setting.
@@ -204,7 +218,7 @@ fn flag_parts(flag: &str) -> (&str, Option<&str>) {
 
 impl Unit {
     /// The unit of `mode` for the process `s` describes, run by the user `uid`: the
-    /// settings its packaged unit's flags had in the form `kbf-deploy` rendered them.
+    /// settings the farm gives it for the directories, ports and addresses of `s`.
     ///
     /// # Panics
     /// When a setting it names is not one of the mode's keys.
@@ -408,36 +422,6 @@ impl Unit {
     }
 }
 
-/// What the farm does to a process's settings, whatever holds them. A unit `kbf-deploy`
-/// rendered and a [`Unit`] both take these edits, so that the test that proves the one
-/// starts what the other did (kbf-cli's `tests/harness_toml_equivalence.rs`) runs the
-/// farm's own edits on both. The trait goes with the rendered path.
-pub trait Edits: Sized {
-    /// The process's settings before the farm's edits.
-    fn base(mode: Mode, s: &Settings, uid: u32) -> Self;
-    #[must_use]
-    fn replace(self, flags: &[String]) -> Self;
-    #[must_use]
-    fn set(self, flags: &[String]) -> Self;
-    #[must_use]
-    fn append(self, flags: &[String]) -> Self;
-}
-
-impl Edits for Unit {
-    fn base(mode: Mode, s: &Settings, uid: u32) -> Self {
-        Unit::new(mode, s, uid)
-    }
-    fn replace(self, flags: &[String]) -> Self {
-        Unit::replace(self, flags)
-    }
-    fn set(self, flags: &[String]) -> Self {
-        Unit::set(self, flags)
-    }
-    fn append(self, flags: &[String]) -> Self {
-        Unit::append(self, flags)
-    }
-}
-
 /// The flag that makes a farm's frontend take the node as its own (the nodes are this
 /// host, whatever its architecture): the unit's default (`linux/x86_64`) leaves an action
 /// that names no architecture with no worker on an aarch64 host.
@@ -465,7 +449,7 @@ impl Container {
 }
 
 /// `unit` with the flags the topology gives `role` set on top of everything else.
-fn overrides<U: Edits>(topo: &Topology, role: Role, unit: U) -> U {
+fn overrides(topo: &Topology, role: Role, unit: Unit) -> Unit {
     let flags: Vec<String> = topo
         .overrides
         .iter()
@@ -477,7 +461,7 @@ fn overrides<U: Edits>(topo: &Topology, role: Role, unit: U) -> U {
 
 /// `unit` for `driver`: the container driver is the unit's own; the native driver replaces
 /// it.
-fn driven<U: Edits>(unit: U, driver: Driver) -> U {
+fn driven(unit: Unit, driver: Driver) -> Unit {
     match driver {
         Driver::StandInContainer => unit,
         Driver::Native => unit.replace(&["--driver=native".to_owned()]),
@@ -489,10 +473,10 @@ fn driven<U: Edits>(unit: U, driver: Driver) -> U {
 /// frontend a SQLite file and a control socket (in the temporary directory: a scratch path
 /// is too long for a socket's).
 #[must_use]
-pub fn frontend<U: Edits>(s: &Settings, uid: u32, socket: &Path, topo: &Topology) -> U {
+pub fn frontend(s: &Settings, uid: u32, socket: &Path, topo: &Topology) -> Unit {
     let state = format!("--state-store=sqlite://{}/state/state.db", s.root.display());
     let control = format!("--handover-socket={}", socket.display());
-    let unit = U::base(Mode::Frontend, s, uid)
+    let unit = Unit::new(Mode::Frontend, s, uid)
         .replace(&[state])
         .set(&[ONE_HOST_PLATFORM.to_owned()])
         .append(&[control])
@@ -510,20 +494,20 @@ pub fn frontend<U: Edits>(s: &Settings, uid: u32, socket: &Path, topo: &Topology
 /// When the topology's driver and node mode do not go together (the farm's start refuses
 /// that first).
 #[must_use]
-pub fn node<U: Edits>(
+pub fn node(
     (s, uid): (&Settings, u32),
     n: usize,
     metrics: u16,
     topo: &Topology,
     container: Option<&Container>,
-) -> U {
+) -> Unit {
     let mode = match topo.node_mode {
         NodeMode::Storage => Mode::Storage,
         NodeMode::StorageAndDaemon => Mode::StorageAndDaemon,
     };
     let cold = format!("--cold-store=file://{}", s.root.join("cold").display());
     let scrape = format!("--metrics-listen=127.0.0.1:{metrics}");
-    let unit = U::base(mode, s, uid).replace(&[cold]).append(&[scrape]);
+    let unit = Unit::new(mode, s, uid).replace(&[cold]).append(&[scrape]);
     let unit = if topo.driver == Driver::Native {
         unit.append(&[
             format!("--frontend=https://{FRONTEND_NAME}:{}", s.wiring.worker),
@@ -538,20 +522,20 @@ pub fn node<U: Edits>(
 
 /// The unit of plain daemon `d` (from 1).
 #[must_use]
-pub fn daemon<U: Edits>(
+pub fn daemon(
     (s, uid): (&Settings, u32),
     d: usize,
     topo: &Topology,
     container: Option<&Container>,
-) -> U {
-    let unit = driven(U::base(Mode::Daemon, s, uid), topo.driver).set(&topo.limits.daemon);
+) -> Unit {
+    let unit = driven(Unit::new(Mode::Daemon, s, uid), topo.driver).set(&topo.limits.daemon);
     with_container(overrides(topo, Role::Daemon(d), unit), container)
 }
 
 /// `unit` with the box's container driver: its `--oci-runtime` made the stand-in `crun`
 /// (the unit names `/usr/bin/crun`, and this box's is the stand-in, which finds its state
 /// beside the link it was run through), the cgroup tree and the id files.
-fn with_container<U: Edits>(unit: U, container: Option<&Container>) -> U {
+fn with_container(unit: Unit, container: Option<&Container>) -> Unit {
     match container {
         Some(c) => unit
             .replace(std::slice::from_ref(&c.oci_runtime))

@@ -11,7 +11,7 @@ mode frontend
 --storage-ca=/farm/frontend/etc/ca.pem
 --storage-client-cert=/farm/frontend/etc/worker.pem
 --storage-client-key=/farm/frontend/etc/worker.key
---storage=https://127.0.0.2:41010
+--storage=https://127.0.0.1:41010
 --worker-client-ca=/farm/frontend/etc/ca.pem
 --worker-listen=127.0.0.1:41001
 --worker-tls-cert=/farm/frontend/etc/worker.pem
@@ -20,7 +20,7 @@ mode frontend
 mode storage-and-daemon
 env XDG_RUNTIME_DIR=/run/user/1000
 --actions-memory-max-gib=10
---advertise-addr=127.0.0.2:41010
+--advertise-addr=127.0.0.1:41010
 --ca-cert=/farm/node-1/etc/ca.pem
 --cert=/farm/node-1/etc/node.pem
 --cgroup-root=/farm/node-1/bin/cgroup
@@ -39,7 +39,7 @@ env XDG_RUNTIME_DIR=/run/user/1000
 --self-cgroup=/farm/node-1/bin/cgroup/kbf
 --server=https://localhost:41001
 --storage-client-ca=/farm/node-1/etc/ca.pem
---storage-listen=127.0.0.2:41010
+--storage-listen=127.0.0.1:41010
 --storage-tls-cert=/farm/node-1/etc/storage.pem
 --storage-tls-key=/farm/node-1/etc/storage.key
 --supervisor-memory-min-mib=256
@@ -47,7 +47,7 @@ env XDG_RUNTIME_DIR=/run/user/1000
 mode storage-and-daemon
 env XDG_RUNTIME_DIR=/run/user/1000
 --actions-memory-max-gib=10
---advertise-addr=127.0.0.3:41011
+--advertise-addr=127.0.0.1:41011
 --ca-cert=/farm/node-2/etc/ca.pem
 --cert=/farm/node-2/etc/node.pem
 --cgroup-root=/farm/node-2/bin/cgroup
@@ -66,7 +66,7 @@ env XDG_RUNTIME_DIR=/run/user/1000
 --self-cgroup=/farm/node-2/bin/cgroup/kbf
 --server=https://localhost:41001
 --storage-client-ca=/farm/node-2/etc/ca.pem
---storage-listen=127.0.0.3:41011
+--storage-listen=127.0.0.1:41011
 --storage-tls-cert=/farm/node-2/etc/storage.pem
 --storage-tls-key=/farm/node-2/etc/storage.key
 --supervisor-memory-min-mib=256
@@ -101,7 +101,7 @@ mode frontend
 --storage-ca=/farm/frontend/etc/ca.pem
 --storage-client-cert=/farm/frontend/etc/worker.pem
 --storage-client-key=/farm/frontend/etc/worker.key
---storage=https://127.0.0.2:41010
+--storage=https://127.0.0.1:41010
 --worker-client-ca=/farm/frontend/etc/ca.pem
 --worker-listen=127.0.0.1:41001
 --worker-tls-cert=/farm/frontend/etc/worker.pem
@@ -110,7 +110,7 @@ mode frontend
 mode storage-and-daemon
 env XDG_RUNTIME_DIR=/run/user/1000
 --actions-memory-max-gib=10
---advertise-addr=127.0.0.2:41010
+--advertise-addr=127.0.0.1:41010
 --ca-cert=/farm/node-1/etc/ca.pem
 --cert=/farm/node-1/etc/node.pem
 --cgroup-root=/farm/node-1/bin/cgroup
@@ -130,7 +130,7 @@ env XDG_RUNTIME_DIR=/run/user/1000
 --self-cgroup=/farm/node-1/bin/cgroup/kbf
 --server=https://localhost:41001
 --storage-client-ca=/farm/node-1/etc/ca.pem
---storage-listen=127.0.0.2:41010
+--storage-listen=127.0.0.1:41010
 --storage-tls-cert=/farm/node-1/etc/storage.pem
 --storage-tls-key=/farm/node-1/etc/storage.key
 --supervisor-memory-min-mib=256
@@ -139,7 +139,7 @@ env XDG_RUNTIME_DIR=/run/user/1000
 mode storage-and-daemon
 env XDG_RUNTIME_DIR=/run/user/1000
 --actions-memory-max-gib=10
---advertise-addr=127.0.0.3:41011
+--advertise-addr=127.0.0.1:41011
 --ca-cert=/farm/node-2/etc/ca.pem
 --cert=/farm/node-2/etc/node.pem
 --cgroup-root=/farm/node-2/bin/cgroup
@@ -159,7 +159,7 @@ env XDG_RUNTIME_DIR=/run/user/1000
 --self-cgroup=/farm/node-2/bin/cgroup/kbf
 --server=https://localhost:41001
 --storage-client-ca=/farm/node-2/etc/ca.pem
---storage-listen=127.0.0.3:41011
+--storage-listen=127.0.0.1:41011
 --storage-tls-cert=/farm/node-2/etc/storage.pem
 --storage-tls-key=/farm/node-2/etc/storage.key
 --supervisor-memory-min-mib=256
@@ -196,14 +196,14 @@ mode frontend
 --storage-ca=/farm/frontend/etc/ca.pem
 --storage-client-cert=/farm/frontend/etc/worker.pem
 --storage-client-key=/farm/frontend/etc/worker.key
---storage=https://127.0.0.2:41010
+--storage=https://127.0.0.1:41010
 --worker-client-ca=/farm/frontend/etc/ca.pem
 --worker-listen=127.0.0.1:41001
 --worker-tls-cert=/farm/frontend/etc/worker.pem
 --worker-tls-key=/farm/frontend/etc/worker.key
 == beta node-1
 mode storage
---advertise-addr=127.0.0.2:41010
+--advertise-addr=127.0.0.1:41010
 --cold-store=file:///farm/node-1/cold
 --frontend=https://localhost:41001
 --hot-store-max-bytes=268435456
@@ -211,13 +211,13 @@ mode storage
 --meta-dir=/farm/node-1/meta
 --metrics-listen=127.0.0.1:41030
 --storage-client-ca=/farm/node-1/etc/ca.pem
---storage-listen=127.0.0.2:41010
+--storage-listen=127.0.0.1:41010
 --storage-tls-cert=/farm/node-1/etc/storage.pem
 --storage-tls-key=/farm/node-1/etc/storage.key
 --write-bytes-in-flight=134217728
 == beta node-2
 mode storage
---advertise-addr=127.0.0.3:41011
+--advertise-addr=127.0.0.1:41011
 --cold-store=file:///farm/node-2/cold
 --frontend=https://localhost:41001
 --hot-store-max-bytes=268435456
@@ -225,13 +225,13 @@ mode storage
 --meta-dir=/farm/node-2/meta
 --metrics-listen=127.0.0.1:41031
 --storage-client-ca=/farm/node-2/etc/ca.pem
---storage-listen=127.0.0.3:41011
+--storage-listen=127.0.0.1:41011
 --storage-tls-cert=/farm/node-2/etc/storage.pem
 --storage-tls-key=/farm/node-2/etc/storage.key
 --write-bytes-in-flight=134217728
 == beta node-3
 mode storage
---advertise-addr=127.0.0.4:41012
+--advertise-addr=127.0.0.1:41012
 --cold-store=file:///farm/node-3/cold
 --frontend=https://localhost:41001
 --hot-store-max-bytes=268435456
@@ -239,7 +239,7 @@ mode storage
 --meta-dir=/farm/node-3/meta
 --metrics-listen=127.0.0.1:41032
 --storage-client-ca=/farm/node-3/etc/ca.pem
---storage-listen=127.0.0.4:41012
+--storage-listen=127.0.0.1:41012
 --storage-tls-cert=/farm/node-3/etc/storage.pem
 --storage-tls-key=/farm/node-3/etc/storage.key
 --write-bytes-in-flight=134217728
@@ -286,14 +286,14 @@ mode frontend
 --storage-ca=/farm/frontend/etc/ca.pem
 --storage-client-cert=/farm/frontend/etc/worker.pem
 --storage-client-key=/farm/frontend/etc/worker.key
---storage=https://127.0.0.2:41010
+--storage=https://127.0.0.1:41010
 --worker-client-ca=/farm/frontend/etc/ca.pem
 --worker-listen=127.0.0.1:41001
 --worker-tls-cert=/farm/frontend/etc/worker.pem
 --worker-tls-key=/farm/frontend/etc/worker.key
 == beta-mutant node-1
 mode storage
---advertise-addr=127.0.0.2:41010
+--advertise-addr=127.0.0.1:41010
 --cold-store-evict-grace-ms=0
 --cold-store-floor-bytes=0
 --cold-store-size-bytes=1048576
@@ -304,13 +304,13 @@ mode storage
 --meta-dir=/farm/node-1/meta
 --metrics-listen=127.0.0.1:41030
 --storage-client-ca=/farm/node-1/etc/ca.pem
---storage-listen=127.0.0.2:41010
+--storage-listen=127.0.0.1:41010
 --storage-tls-cert=/farm/node-1/etc/storage.pem
 --storage-tls-key=/farm/node-1/etc/storage.key
 --write-bytes-in-flight=134217728
 == beta-mutant node-2
 mode storage
---advertise-addr=127.0.0.3:41011
+--advertise-addr=127.0.0.1:41011
 --cold-store=file:///farm/node-2/cold
 --frontend=https://localhost:41001
 --hot-store-max-bytes=268435456
@@ -318,13 +318,13 @@ mode storage
 --meta-dir=/farm/node-2/meta
 --metrics-listen=127.0.0.1:41031
 --storage-client-ca=/farm/node-2/etc/ca.pem
---storage-listen=127.0.0.3:41011
+--storage-listen=127.0.0.1:41011
 --storage-tls-cert=/farm/node-2/etc/storage.pem
 --storage-tls-key=/farm/node-2/etc/storage.key
 --write-bytes-in-flight=134217728
 == beta-mutant node-3
 mode storage
---advertise-addr=127.0.0.4:41012
+--advertise-addr=127.0.0.1:41012
 --cold-store=file:///farm/node-3/cold
 --frontend=https://localhost:41001
 --hot-store-max-bytes=268435456
@@ -332,7 +332,7 @@ mode storage
 --meta-dir=/farm/node-3/meta
 --metrics-listen=127.0.0.1:41032
 --storage-client-ca=/farm/node-3/etc/ca.pem
---storage-listen=127.0.0.4:41012
+--storage-listen=127.0.0.1:41012
 --storage-tls-cert=/farm/node-3/etc/storage.pem
 --storage-tls-key=/farm/node-3/etc/storage.key
 --write-bytes-in-flight=134217728
@@ -379,14 +379,14 @@ mode frontend
 --storage-ca=/farm/frontend/etc/ca.pem
 --storage-client-cert=/farm/frontend/etc/worker.pem
 --storage-client-key=/farm/frontend/etc/worker.key
---storage=https://127.0.0.2:41010
+--storage=https://127.0.0.1:41010
 --worker-client-ca=/farm/frontend/etc/ca.pem
 --worker-listen=127.0.0.1:41001
 --worker-tls-cert=/farm/frontend/etc/worker.pem
 --worker-tls-key=/farm/frontend/etc/worker.key
 == beta-every node-1
 mode storage
---advertise-addr=127.0.0.2:41010
+--advertise-addr=127.0.0.1:41010
 --cold-store-evict-grace-ms=0
 --cold-store-floor-bytes=0
 --cold-store-size-bytes=1048576
@@ -397,13 +397,13 @@ mode storage
 --meta-dir=/farm/node-1/meta
 --metrics-listen=127.0.0.1:41030
 --storage-client-ca=/farm/node-1/etc/ca.pem
---storage-listen=127.0.0.2:41010
+--storage-listen=127.0.0.1:41010
 --storage-tls-cert=/farm/node-1/etc/storage.pem
 --storage-tls-key=/farm/node-1/etc/storage.key
 --write-bytes-in-flight=134217728
 == beta-every node-2
 mode storage
---advertise-addr=127.0.0.3:41011
+--advertise-addr=127.0.0.1:41011
 --cold-store-evict-grace-ms=0
 --cold-store-floor-bytes=0
 --cold-store-size-bytes=1048576
@@ -414,13 +414,13 @@ mode storage
 --meta-dir=/farm/node-2/meta
 --metrics-listen=127.0.0.1:41031
 --storage-client-ca=/farm/node-2/etc/ca.pem
---storage-listen=127.0.0.3:41011
+--storage-listen=127.0.0.1:41011
 --storage-tls-cert=/farm/node-2/etc/storage.pem
 --storage-tls-key=/farm/node-2/etc/storage.key
 --write-bytes-in-flight=134217728
 == beta-every node-3
 mode storage
---advertise-addr=127.0.0.4:41012
+--advertise-addr=127.0.0.1:41012
 --cold-store-evict-grace-ms=0
 --cold-store-floor-bytes=0
 --cold-store-size-bytes=1048576
@@ -431,7 +431,7 @@ mode storage
 --meta-dir=/farm/node-3/meta
 --metrics-listen=127.0.0.1:41032
 --storage-client-ca=/farm/node-3/etc/ca.pem
---storage-listen=127.0.0.4:41012
+--storage-listen=127.0.0.1:41012
 --storage-tls-cert=/farm/node-3/etc/storage.pem
 --storage-tls-key=/farm/node-3/etc/storage.key
 --write-bytes-in-flight=134217728

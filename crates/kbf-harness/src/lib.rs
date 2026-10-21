@@ -3,9 +3,8 @@
 //! and the beta scenarios share.
 //!
 //! - [`farm`]: a frontend, storage nodes (each with a daemon in its process, or alone) and
-//!   plain daemons, each a real `kbf` process started from the `ExecStart=` line
-//!   `kbf-deploy` renders for its unit
-//!   ([`units`]), on a loopback address of its own, under certificates of the right
+//!   plain daemons, each a real `kbf` process started as the packaged unit starts
+//!   it (`kbf --mode=<mode> --config <kbf.toml>`, [`units`]), on a loopback address of its own, under certificates of the right
 //!   rows ([`pki`]); a supervisor with `term`, `kill`, `restart`, a process table and a
 //!   report of every process's output for a hang ([`procs`]).
 //! - [`reapi`]: a client of a farm's frontend (the REAPI listener under the farm CA), and the
@@ -55,7 +54,6 @@ pub mod scrape;
 pub mod stand_in;
 pub mod topology;
 pub mod units;
-pub mod units_rendered;
 
 /// A fresh directory for one unit test, under the temporary directory, named for the test
 /// (`CARGO_TARGET_TMPDIR` is for integration tests only).

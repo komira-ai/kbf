@@ -8,7 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 # The rehearsal harness as a library (docs/design/kbf-cicd.md, sections 4.2 and 4.3): the
-# farm of real `kbf` processes started from the units `kbf-deploy` renders, its
+# farm of real `kbf` processes started as the packaged units start `kbf`, from a generated `kbf.toml`, its
 # supervisor, certificates, metrics scraper, the Buck2 load, the result document, and
 # `kbf-beta`, the binary that runs a beta scenario (B0, `farm_under_build_load`) and
 # writes `beta-result.json`. It spawns the binaries it is given by path: a library cannot
@@ -39,7 +39,6 @@ test = false
 clap.workspace = true
 flate2.workspace = true
 kbf-ca.workspace = true
-kbf-deploy.workspace = true
 kbf-unitfile.workspace = true
 # The kbf.toml a unit is written as.
 toml.workspace = true

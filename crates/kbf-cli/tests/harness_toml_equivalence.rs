@@ -1,34 +1,35 @@
 //! The farm's processes start from a generated `kbf.toml`, as the packaged units start
-//! `kbf`; they used to start from the flags of the unit `kbf-deploy` renders. This holds
-//! the one to the other: for every process of every topology the farm is started in, `kbf`'s
+//! `kbf`; they used to start from the flags of the unit `kbf-deploy` rendered. This holds
+//! the new to the old: for every process of every topology the farm is started in, `kbf`'s
 //! own parser reads the new command line and file as it read the old flags.
 //!
 //! The reference is `tests/golden/farm-units.txt`: per process, its mode, its environment
-//! and the flags the rendered unit gave it after the farm's edits (the old path's
-//! output, recorded while both paths existed and held to the live old path then). A flag
-//! the farm would start without, with another value, or in another mode fails here by
-//! name, and so does a `Debug` of the parsed flags that differs in a default.
+//! and the flags the rendered unit gave it after the farm's edits (recorded from the old
+//! path, run beside the new one, when the farm moved). A flag the farm would start without,
+//! with another value, or in another mode fails here by name, and so does a parsed default
+//! that differs.
 //!
-//! To rewrite the golden after an intended change of the farm's flags:
-//! `BLESS=1 cargo test -p kbf-cli --test harness_toml_equivalence`.
+//! The file is not regenerated: a change of the flags a farm process starts with is an
+//! intended change of the reference, and the reviewer sees it in the diff of the file.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use kbf_harness::topology::{Limits, Role, Topology};
-use kbf_harness::units::{
-    Container, Edits, Mode, Settings, Unit, Wiring, daemon, frontend, keys, node,
-};
-use kbf_harness::units_rendered::Rendered;
+use kbf_harness::units::{Container, Mode, Settings, Unit, Wiring, daemon, frontend, keys, node};
 use kbf_testkit::dir::TestDir;
 
 /// The image the container driver's daemons are pinned to (a 64-digit digest).
 const IMAGE: &str =
     "registry.test/busybox@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
+/// Every process listens on this address (the repository's hygiene scan allows no other
+/// loopback address in a text file); they differ by port.
+const HOST: &str = "127.0.0.1";
+
 const GOLDEN: &str = include_str!("golden/farm-units.txt");
 
-/// A process as a reference describes it.
+/// A process as the reference describes it.
 #[derive(Debug, PartialEq, Eq)]
 struct Process {
     mode: String,
@@ -41,7 +42,7 @@ fn wiring() -> Wiring {
         reapi: 41000,
         worker: 41001,
         api: 41002,
-        storage_url: "https://127.0.0.2:41010".to_owned(),
+        storage_url: "https://127.0.0.1:41010".to_owned(),
     }
 }
 
@@ -94,8 +95,8 @@ fn container(root: &str) -> Container {
     }
 }
 
-/// Every process of `topo`, built by `U`: role name, and what the farm starts it with.
-fn processes<U: Edits, T>(topo: &Topology, shape: impl Fn(U) -> T) -> Vec<(String, T)> {
+/// Every process of `topo`, shaped by `shape`: role name, and what the farm starts it with.
+fn processes<T>(topo: &Topology, shape: impl Fn(Unit) -> T) -> Vec<(String, T)> {
     let w = wiring();
     let uid = 1000;
     let native = topo.driver == kbf_harness::topology::Driver::Native;
@@ -110,25 +111,24 @@ fn processes<U: Edits, T>(topo: &Topology, shape: impl Fn(U) -> T) -> Vec<(Strin
     let mut out = Vec::new();
     let front = Settings {
         image: "",
-        ..place("/farm/frontend", "127.0.0.1", "frontend-1", 41020)
+        ..place("/farm/frontend", HOST, "frontend-1", 41020)
     };
     let socket = Path::new("/tmp/kbf-farm-1.sock");
     out.push((
         "frontend".to_owned(),
-        shape(frontend::<U>(&front, uid, socket, topo)),
+        shape(frontend(&front, uid, socket, topo)),
     ));
     let roots = ["/farm/node-1", "/farm/node-2", "/farm/node-3"];
-    let hosts = ["127.0.0.2", "127.0.0.3", "127.0.0.4"];
     let ids = ["node-1", "node-2", "node-3"];
     for i in 0..topo.storage_nodes {
         let s = place(
             roots[i],
-            hosts[i],
+            HOST,
             ids[i],
             41010 + u16::try_from(i).expect("small"),
         );
         let c = (!native).then(|| container(roots[i]));
-        let unit = node::<U>(
+        let unit = node(
             (&s, uid),
             i + 1,
             41030 + u16::try_from(i).expect("small"),
@@ -138,43 +138,12 @@ fn processes<U: Edits, T>(topo: &Topology, shape: impl Fn(U) -> T) -> Vec<(Strin
         out.push((format!("node-{}", i + 1), shape(unit)));
     }
     let daemons = ["/farm/daemon-1", "/farm/daemon-2"];
-    let dhosts = ["127.0.0.5", "127.0.0.6"];
     let dids = ["daemon-1", "daemon-2"];
     for d in 0..topo.daemons {
-        let s = place(daemons[d], dhosts[d], dids[d], 41020);
+        let s = place(daemons[d], HOST, dids[d], 41020);
         let c = (!native).then(|| container(daemons[d]));
-        let unit = daemon::<U>((&s, uid), d + 1, topo, c.as_ref());
+        let unit = daemon((&s, uid), d + 1, topo, c.as_ref());
         out.push((format!("daemon-{}", d + 1), shape(unit)));
-    }
-    out
-}
-
-/// The old path's processes, as the golden records them.
-fn recorded(topo: &Topology) -> Vec<(String, Process)> {
-    processes::<Rendered, _>(topo, |unit| {
-        let mut flags: Vec<String> = unit.argv[1..].to_vec();
-        flags.sort();
-        Process {
-            mode: unit.argv[0].clone(),
-            env: unit.env.clone(),
-            flags,
-        }
-    })
-}
-
-/// The golden text of every topology's processes.
-fn golden_text(all: &[(&str, Vec<(String, Process)>)]) -> String {
-    let mut out = String::new();
-    for (topo, procs) in all {
-        for (role, p) in procs {
-            out.push_str(&format!("== {topo} {role}\nmode {}\n", p.mode));
-            for (k, v) in &p.env {
-                out.push_str(&format!("env {k}={v}\n"));
-            }
-            for flag in &p.flags {
-                out.push_str(&format!("{flag}\n"));
-            }
-        }
     }
     out
 }
@@ -215,29 +184,6 @@ fn scratch(name: &str) -> TestDir {
     )
 }
 
-/// Catches the reference drifting from the old path while both exist, and (with BLESS) writes
-/// it. With the old path gone the golden is the reference itself.
-#[test]
-fn the_golden_is_what_the_rendered_units_gave_the_farm() {
-    let all: Vec<(&str, Vec<(String, Process)>)> = topologies()
-        .iter()
-        .map(|(name, topo)| (*name, recorded(topo)))
-        .collect();
-    let text = golden_text(&all);
-    if std::env::var_os("BLESS").is_some() {
-        std::fs::write(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/farm-units.txt"),
-            &text,
-        )
-        .expect("bless");
-        return;
-    }
-    assert!(
-        text == GOLDEN,
-        "differs from tests/golden/farm-units.txt:\n{text}"
-    );
-}
-
 /// Catches a farm process that would start with other settings than before: for every
 /// process of every topology, the command line and `kbf.toml` the harness writes parse, by
 /// `kbf`'s own parser, to the same flags (every default included) as the rendered unit's
@@ -250,7 +196,7 @@ fn the_generated_kbf_toml_parses_to_what_the_rendered_flags_parsed_to() {
     let old = golden();
     let mut compared = 0;
     for (name, topo) in topologies() {
-        for (role, (parsed, env)) in processes::<Unit, _>(&topo, |unit: Unit| {
+        for (role, (parsed, env)) in processes(&topo, |unit| {
             let config = kbf_testkit::config::flag_with(dir.path(), &unit.toml());
             let argv = unit.argv(config);
             // The file is read by the parse that follows, so write it before.

@@ -661,11 +661,11 @@ fn unit_under(root: &Path, mode: Mode) -> Unit {
         reapi: 1,
         worker: 2,
         api: 3,
-        storage_url: "https://127.0.0.2:4".to_owned(),
+        storage_url: "https://127.0.0.1:4".to_owned(),
     };
     let settings = Settings {
         root,
-        host: "127.0.0.9",
+        host: "127.0.0.1",
         node_id: "n-1",
         storage_port: 5,
         wiring: &wiring,

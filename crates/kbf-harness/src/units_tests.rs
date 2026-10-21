@@ -12,7 +12,7 @@ fn wiring() -> Wiring {
         reapi: WIRING_PORTS.0,
         worker: WIRING_PORTS.1,
         api: WIRING_PORTS.2,
-        storage_url: "https://127.0.0.2:4444".to_owned(),
+        storage_url: "https://127.0.0.1:4444".to_owned(),
     }
 }
 
@@ -21,7 +21,7 @@ fn unit_of(mode: Mode, image: &str) -> Unit {
     let w = wiring();
     let s = Settings {
         root: Path::new("/R"),
-        host: "127.0.0.9",
+        host: "127.0.0.1",
         node_id: "n-1",
         storage_port: 5555,
         wiring: &w,
@@ -104,24 +104,24 @@ fn every_mode_has_its_settings_and_each_key_has_its_table() {
 #[test]
 fn each_mode_starts_with_the_settings_its_unit_had_for_the_farms_directories() {
     // Catches: a default dropped or renamed, which the farm would then start without (the
-    // equivalence test in kbf-cli's tests holds the whole set to what `kbf-deploy`
-    // rendered).
+    // equivalence test in kbf-cli's tests holds the whole set to the golden of the flags
+    // the farm started with).
     let frontend = unit(Mode::Frontend).flags();
     assert!(
-        frontend.contains(&"--listen=127.0.0.9:1111".to_owned()),
+        frontend.contains(&"--listen=127.0.0.1:1111".to_owned()),
         "{frontend:?}"
     );
-    assert!(frontend.contains(&"--worker-listen=127.0.0.9:2222".to_owned()));
+    assert!(frontend.contains(&"--worker-listen=127.0.0.1:2222".to_owned()));
     assert!(frontend.contains(&"--api-listen=127.0.0.1:3333".to_owned()));
-    assert!(frontend.contains(&"--storage=https://127.0.0.2:4444".to_owned()));
+    assert!(frontend.contains(&"--storage=https://127.0.0.1:4444".to_owned()));
     assert!(frontend.contains(&"--api-token-file=/R/etc/api-token".to_owned()));
     let storage = unit(Mode::Storage).flags();
-    assert!(storage.contains(&"--storage-listen=127.0.0.9:5555".to_owned()));
+    assert!(storage.contains(&"--storage-listen=127.0.0.1:5555".to_owned()));
     assert!(storage.contains(&"--hot-store=file:///R/hot".to_owned()));
     assert!(storage.iter().all(|f| !f.starts_with("--driver")));
     let both = unit(Mode::StorageAndDaemon).flags();
     assert!(both.contains(&"--frontend=https://localhost:2222".to_owned()));
-    assert!(both.contains(&"--advertise-addr=127.0.0.9:5555".to_owned()));
+    assert!(both.contains(&"--advertise-addr=127.0.0.1:5555".to_owned()));
     assert!(both.contains(&"--driver=container".to_owned()));
     assert!(both.contains(&"--actions-memory-max-gib=10".to_owned()));
     let daemon = unit(Mode::Daemon).flags();
@@ -287,7 +287,7 @@ fn the_file_is_each_setting_under_the_table_of_its_group_as_text() {
         Some("s3://kbf-cas?endpoint=http://127.0.0.1:9000&conditional-put=true")
     );
     let listener = parsed["listener"].as_table().expect("[listener]");
-    assert_eq!(listener["storage-listen"].as_str(), Some("127.0.0.9:5555"));
+    assert_eq!(listener["storage-listen"].as_str(), Some("127.0.0.1:5555"));
     // Every key of the file is in the table the mode's keys say.
     let keys = keys(Mode::Storage);
     for (table, body) in &parsed {
@@ -306,7 +306,7 @@ fn the_compositions_apply_the_edits_of_a_farm_to_the_units_defaults() {
     let w = wiring();
     let place = |image| Settings {
         root: Path::new("/R"),
-        host: "127.0.0.9",
+        host: "127.0.0.1",
         node_id: "n-1",
         storage_port: 5555,
         wiring: &w,
@@ -328,7 +328,7 @@ fn the_compositions_apply_the_edits_of_a_farm_to_the_units_defaults() {
     assert!(has(&first, "--cold-store=file:///R/cold"));
     assert!(has(&first, "--metrics-listen=127.0.0.1:9999"));
     assert!(has(&first, "--frontend=https://localhost:2222"));
-    assert!(has(&first, "--advertise-addr=127.0.0.9:5555"));
+    assert!(has(&first, "--advertise-addr=127.0.0.1:5555"));
     assert!(has(&first, "--hot-store-max-bytes=268435456"));
     assert!(has(&nodes(2), "--hot-store-max-bytes=7"));
     let plain: Unit = daemon((&place(""), 1000), 1, &topo, None);
@@ -377,4 +377,41 @@ fn a_container_planted_in_a_directory_names_the_runtime_the_tree_and_the_id_file
         "{:?}",
         c.flags
     );
+}
+
+#[test]
+fn the_keys_of_a_file_are_its_live_and_commented_settings_under_their_tables() {
+    // Catches: a help line that holds ` = ` taken for a key, a commented setting lost, a
+    // setting under the table above it, a switch taken for a value flag or a value flag for
+    // a switch (`kbf` refuses a switch given a string).
+    let got = parse_keys(
+        "# kbf x: a header\n# Prefix with a = b inside\n[one]\nlive = 5\n\
+         # commented = \"SHAPE\"\n# Set a = b\nswitch = false\n[two]\nother = \"x\"\n",
+    );
+    assert_eq!(
+        got.into_iter().collect::<Vec<_>>(),
+        [
+            ("commented", ("one", false)),
+            ("live", ("one", false)),
+            ("other", ("two", false)),
+            ("switch", ("one", true)),
+        ]
+    );
+}
+
+#[test]
+fn a_unit_that_starts_another_binary_or_mode_is_refused() {
+    // Catches: a packaged unit that starts a program other than `kbf`, another mode, or
+    // none, read as the farm's command line: the farm would start the wrong processes.
+    let ok = "[Service]\nExecStart=/var/lib/x/kbf --mode=storage\n";
+    assert_eq!(mode_word_in(ok, Mode::Storage), "--mode=storage");
+    for bad in [
+        "[Service]\nExecStart=/var/lib/x/kbf --mode=daemon\n",
+        "[Service]\nExecStart=/var/lib/x/other --mode=storage\n",
+        "[Service]\nExecStart=/var/lib/x/kbf storage\n",
+        "[Service]\nRestart=no\n",
+    ] {
+        let refused = std::panic::catch_unwind(|| mode_word_in(bad, Mode::Storage));
+        assert!(refused.is_err(), "{bad}");
+    }
 }
