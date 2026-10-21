@@ -15,6 +15,7 @@ use kbf_host::plan::Mode;
 use kbf_host::{Exec, Perms, Step};
 
 use crate::activate::{self, Reverted};
+use crate::helper::fetcher::Fetcher;
 use crate::helper::restart::{self, Restart};
 use crate::helper::service::{self, Procs};
 use crate::layout::Layout;
@@ -86,6 +87,8 @@ pub struct Operator<'a, E: Exec> {
     pub exec: &'a mut E,
     pub restart: &'a Restart,
     pub procs: &'a dyn Procs,
+    /// Says the host's source and what an installed release declares (`rollback` asks both).
+    pub fetcher: &'a dyn Fetcher,
     pub out: &'a mut dyn Write,
     pub apply: bool,
     /// How long to wait for the lock ([`LOCK_WAIT`]).

@@ -127,6 +127,13 @@ pub trait Fetcher {
         }
     }
 
+    /// The word `release_source` holds in `installer.toml` (`url`, `frontend` or `bundled`), as
+    /// of now; `None` when the file cannot be read or the host cannot say. The operator's
+    /// `rollback` asks it, to hold a host that fetches nothing to a kbf that relays.
+    fn source(&self) -> Option<&'static str> {
+        None
+    }
+
     /// What the installed release `commit` declares of itself (`kbf --version --json`), asked
     /// of its own binary as the unprivileged user the verify pipeline runs a binary as. The
     /// release is one this host installed and runs: the question is what it says, not whether
@@ -279,6 +286,10 @@ pub(crate) mod fake {
                 source: *self.source.lock().expect("lock"),
                 seed,
             }
+        }
+
+        fn source(&self) -> Option<&'static str> {
+            *self.source.lock().expect("lock")
         }
 
         fn probe(&self, commit: &CommitId) -> Result<Version, FetchError> {

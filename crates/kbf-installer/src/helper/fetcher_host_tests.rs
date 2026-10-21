@@ -462,6 +462,29 @@ fn the_host_fetcher_looks_at_the_package_and_reports_the_source_the_file_names()
     assert_eq!(noticed.seed, Err(unavailable));
 }
 
+/// The host fetcher tells the word `installer.toml` holds for the source, for the operator's
+/// `rollback`; a file the closed reader refuses, or a host without its parts, has no word.
+///
+/// Catches the word taken for a default when the file cannot be read (a bundled host that no
+/// longer says so), and the trait's default left in place.
+///
+/// Mutants to plant: `source` left at the trait's default (`None`); `unwrap_or("url")` on it.
+#[test]
+fn the_host_fetcher_tells_the_source_word_and_nothing_when_it_cannot() {
+    let seeded = Seeded::scratch("host-fetcher-source");
+    let files = [
+        ("release_source = \"bundled\"\n", "bundled"),
+        (URL_FILE, "url"),
+    ];
+    for (file, word) in files {
+        assert_eq!(seeded.host_fetcher(file).source(), Some(word), "{file:?}");
+    }
+    assert_eq!(seeded.host_fetcher("surprise = 1\n").source(), None);
+    let (layout, _) = host_root("host-fetcher-source-no-parts");
+    let fetcher = HostFetcher::new(layout, path(FILE), || Err("no parts".to_owned()));
+    assert_eq!(fetcher.source(), None);
+}
+
 /// An installed release is asked its version through the host fetcher on every kind of host,
 /// and a host that cannot supply its parts says why it cannot ask.
 ///
