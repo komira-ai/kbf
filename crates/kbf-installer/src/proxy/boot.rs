@@ -31,6 +31,9 @@ use super::model::{PortError, ProcIdent, Slot};
 use super::ports::{Child, Migrator};
 use crate::CommitId;
 
+/// How long the boot waits for a process it told to stop to be gone, before the next attempt.
+const STOP_WITHIN: Duration = Duration::from_secs(10);
+
 /// The slot a first child is started in.
 pub(super) const BOOT_SLOT: Slot = Slot::A;
 
@@ -339,11 +342,21 @@ impl ColdBoot<'_> {
 
     /// Stop the process an attempt started and did not finish with. Unserved (it never
     /// answered ready) is the only case that may be killed; one a takeover reached gets SIGTERM.
+    ///
+    /// Returns once the process is gone, or after [`STOP_WITHIN`]: the next attempt needs the
+    /// slot, and a process told to stop is in it until it has exited. A process still there
+    /// after the limit makes the next spawn refuse, which is that attempt's failure.
     fn stop_left_over(&self, ident: &ProcIdent, error: &ColdError) {
         let child: &dyn Child = self.cold.child;
         let _ = match error {
             ColdError::NotReady(_) => child.kill_unserved(ident),
-            ColdError::Takeover(_) | ColdError::Release { .. } => child.terminate(ident),
+            ColdError::Takeover(_) | ColdError::Release { .. } => {
+                let told = child.terminate(ident);
+                if told.is_ok() {
+                    child.await_exit(ident, STOP_WITHIN);
+                }
+                told
+            }
             ColdError::Spawn(_) | ColdError::Exited(_) | ColdError::Stopped(_) => return,
         };
     }

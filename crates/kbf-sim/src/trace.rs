@@ -87,4 +87,29 @@ mod tests {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
+
+    /// Catches: `as_bytes` and the `Debug` form disagreeing with the `Display` hex that
+    /// run reports quote (a failing seed is replayed by comparing these strings).
+    #[test]
+    fn a_hash_shows_the_same_bytes_in_every_form() {
+        let mut t = Trace::new();
+        t.record("x".to_owned());
+        let h = t.hash();
+        let hex: String = h.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(h.to_string(), hex);
+        assert_eq!(format!("{h:?}"), format!("TraceHash({hex})"));
+        assert_eq!(hex.len(), 64);
+    }
+
+    /// Catches: lines kept when nobody asked for them, or `keep_lines` dropping lines
+    /// recorded before it and failing to keep the ones after.
+    #[test]
+    fn lines_are_kept_only_once_asked_for() {
+        let mut t = Trace::new();
+        t.record("before".to_owned());
+        assert_eq!(t.lines(), None);
+        t.keep_lines();
+        t.record("after".to_owned());
+        assert_eq!(t.lines(), Some(&["after".to_owned()][..]));
+    }
 }

@@ -47,7 +47,7 @@
 //!   attestations` and `release check` hold a directory to one bundle per tarball,
 //!   each that tarball's (its one subject is the tarball's digest); `verify-assets
 //!   attestations` also has `gh` verify each tarball against its bundle.
-//! - `release {locate,main-control,check,verdict,offer,notes,publish}` ([`release`]): a GitHub release of
+//! - `release {locate,main-control,check,verdict,offer,notes,plan,publish}` ([`release`]): a GitHub release of
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
@@ -591,6 +591,9 @@ enum ReleaseVerb {
     /// The checks that make a commit offerable to a farm; writes `offer.json`, sets
     /// nothing on any farm.
     Offer(release::offer::OfferArgs),
+    /// What a push would release: the next version, the push's class, and the freeze and
+    /// superseded refusals. Writes nothing but `--output`.
+    Plan(release::plan::PlanArgs),
     /// The same checks, then write the release's notes.
     Notes {
         #[command(flatten)]
@@ -1002,6 +1005,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             ])
         }
         Verb::Release(ReleaseVerb::Offer(args)) => release::offer::run(&args),
+        Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
         Verb::Release(ReleaseVerb::Notes { subject, out }) => {
             let text = release::notes::notes(&subject.subject())?;
             std::fs::write(&out, &text)

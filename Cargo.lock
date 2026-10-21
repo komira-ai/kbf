@@ -1429,6 +1429,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-blackbox"
+version = "0.1.0"
+dependencies = [
+ "kbf-harness",
+ "kbf-proto",
+ "kbf-testkit",
+ "kbf-transfer",
+ "prost",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "kbf-ca"
 version = "0.1.0"
 dependencies = [
@@ -2341,6 +2354,7 @@ dependencies = [
 name = "kbf-sim-cell"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "kbf-caps",
  "kbf-daemon",
  "kbf-front",

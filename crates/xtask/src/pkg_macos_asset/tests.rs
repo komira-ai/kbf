@@ -7,6 +7,8 @@ use crate::pkg::{package, xar};
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const MAIN: &str = "refs/heads/main";
+// A package built on the former development branch, `feature/arch-v2`: kept as the
+// non-main ref hosts that installed such a package still trust (docs/artifacts.md).
 const FEATURE: &str = "refs/heads/feature/arch-v2";
 const BINARY_BYTES: &[u8] = b"the attested kbf-installer";
 const GH_BYTES: &[u8] = b"the pinned gh";

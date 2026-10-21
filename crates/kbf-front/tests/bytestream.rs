@@ -205,6 +205,35 @@ async fn bytestream_write_refuses_wrong_bytes_and_offsets() {
     assert_eq!(status(&farm, &blob).await, (0, false));
 }
 
+/// Catches: a negative `read_limit` taken as "to the end" or as a huge unsigned limit
+/// (the cast wraps), instead of refused INVALID_ARGUMENT naming it; and a Write whose
+/// stream sends no message at all answered with anything but INVALID_ARGUMENT.
+#[tokio::test]
+async fn a_negative_read_limit_and_a_write_with_no_message_are_refused() {
+    let farm = Farm::start().await;
+    let blob = Blob::new(pseudo_random(1000, 5));
+    farm.upload(&[&blob]).await;
+    assert_eq!(read(&farm, &blob, 0, -1).await, Err(Code::InvalidArgument));
+    let refused = farm
+        .bytestream()
+        .read(ReadRequest {
+            resource_name: read_name(&blob),
+            read_offset: 0,
+            read_limit: -7,
+        })
+        .await
+        .expect_err("negative limit");
+    assert!(refused.message().contains("read_limit -7"), "{refused:?}");
+
+    let refused = farm
+        .bytestream()
+        .write(futures::stream::empty::<WriteRequest>())
+        .await
+        .expect_err("no message");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(refused.message().contains("sent no message"), "{refused:?}");
+}
+
 /// Catches: a write whose resource name claims more than one in-memory blob being
 /// admitted for, or buffered to, the size it names (any client could make the front
 /// hold as much memory as it claims), and a large blob refused as too large. A write

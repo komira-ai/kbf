@@ -330,6 +330,7 @@ impl Membership for MembershipService {
             debts: Debts::from_wire(req.debts_known, req.repair_debts),
             writes: Writes::from_wire(req.writes_known, req.open_writes),
             generation: have,
+            vitals: crate::vitals::Vitals::from_wire(&req),
         };
         let fill = Fill::from_wire(
             req.flush_known,
