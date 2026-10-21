@@ -7,7 +7,7 @@
 //! (`ConditionPathExists=`), on `kbf-installer boot-check` and on `kbf <mode> --check`
 //! (both `ExecStartPre=`; `ExecCondition=` would skip a failed check silently).
 //! kbf-deploy's rule modules are private to it, so the rules are restated here over the
-//! same unit parser (`kbf_deploy::unit`), each with the defect it catches, and `MUTANTS`
+//! same unit parser (`kbf_unitfile`), each with the defect it catches, and `MUTANTS`
 //! plants one defect per rule in a copy of the real file and requires that rule to name
 //! it. `every_rule_has_a_mutant` fails when a rule is added with no mutant, so no rule
 //! can be one that cannot fail.
@@ -33,7 +33,7 @@
 
 use std::path::{Path, PathBuf};
 
-use kbf_deploy::unit::{UnitFile, comments_in_continuations};
+use kbf_unitfile::{UnitFile, comments_in_continuations};
 
 /// The proxy's two units: `kbf-proxy.socket` and `kbf-proxy.service`.
 #[path = "package_units/proxy.rs"]

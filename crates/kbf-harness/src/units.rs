@@ -9,7 +9,7 @@
 
 use kbf_deploy::linux::modes::render;
 use kbf_deploy::linux::{LinuxConfig, Mode};
-use kbf_deploy::unit::UnitFile;
+use kbf_unitfile::UnitFile;
 
 const EXAMPLE: &str = include_str!("../../kbf-deploy/templates/linux/config.example");
 
