@@ -35,6 +35,10 @@
 //!   attested on, and the built deb as the release asset
 //!   `kbf-installer-<commit>-<platform>.deb`, refused unless it holds the binary of the
 //!   attested tarball and trusts the branch it is attested for.
+//! - `pkg-seed --dist <dir> --commit <sha> --platform <p> --trust <dir> --out <dir>`
+//!   ([`pkg_seed`]): the seed directory a `kbf-installer` package can carry, a signed `kbf`
+//!   release (its manifest, tarball, attestation bundle and version facts) made from the
+//!   files the release already has and checked as it is made. No package carries it yet.
 //! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf-installer` package
 //!   carries, in the one form a deb and an rpm put in the same order, and the most a package
 //!   that carries a kbf release may weigh. `pkg-config` and `pkg-asset` take them up with
@@ -102,6 +106,7 @@ pub mod pkg_linux;
 pub mod pkg_macos_asset;
 #[cfg(target_os = "macos")]
 pub mod pkg_macos_install;
+pub mod pkg_seed;
 pub mod pkg_size;
 pub mod pkg_trust;
 pub mod pkg_version;
@@ -296,6 +301,10 @@ enum Verb {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Make the seed directory of a kbf-installer package: a signed `kbf` release (tarball,
+    /// attestation bundle and version facts) and the manifest made from them, refused unless
+    /// the release is whole.
+    PkgSeed(pkg_seed::Args),
     /// The kbf-installer deb as a release asset, refused unless it holds the attested
     /// binary and trusts the branch it is attested for.
     PkgAsset {
@@ -940,6 +949,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             source_ref,
             out,
         } => pkg_trust::write(&gh, &trusted_root, &source_ref, &out),
+        Verb::PkgSeed(args) => pkg_seed::run(&args),
         Verb::PkgAsset {
             package,
             platform,

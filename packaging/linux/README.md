@@ -118,6 +118,16 @@ between the builds, and fails unless both are the same bytes (nfpm takes every t
 `SOURCE_DATE_EPOCH`, which the verb sets; the rpm's build host is fixed in the
 configuration).
 
+`cargo xtask pkg-seed --dist <dir> --commit <sha> --platform <platform> --trust <dir> --out <dir>`
+builds the seed directory the installer reads (`crates/kbf-installer/src/seed.rs`): a
+`manifest.json`, the `kbf` release tarball, its attestation bundle and the release's version
+facts, the last three named for the commit and the platform, and refuses a release that is
+not whole. `--trust` is the directory `pkg-trust` wrote; the digests of its three files go in
+the manifest. `xtask::pkg_seed::check` holds an existing directory to the same names,
+digests, commit, platform and trust digests (it does not open the tarball). No package
+carries a seed yet: `pkg-config` and `pkg-build` do not take one, so the packages above are
+unchanged.
+
 ## CI
 
 The `packages` job of `.github/workflows/beta.yml` fetches the pinned nfpm, builds the

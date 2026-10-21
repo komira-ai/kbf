@@ -122,6 +122,52 @@ fn a_manifest_is_a_closed_set_of_keys_and_reads_back_as_what_it_says() {
     assert!(why.contains("at most 16384"), "{why}");
 }
 
+/// A manifest serializes to exactly the closed set of keys it reads, each under the name the
+/// reader requires, and the bytes read back as the same manifest: the package builder writes
+/// a manifest with `Serialize` and the installer reads it with `Deserialize`, so the two
+/// derives must agree on the key set.
+///
+/// Catches a key renamed or skipped on one side only (the reader requires every key, so a
+/// manifest the builder wrote without it would be refused on every host), a field added to
+/// the struct without the fixture and the builder following, and a value that does not read
+/// back as it was written.
+///
+/// Mutants to plant: `#[serde(skip_serializing_if = ...)]` on a field; `#[serde(rename = ...)]`
+/// on one field; a field added to `Manifest`; `#[serde(skip)]` on a field.
+#[test]
+fn manifest_serializes_to_exactly_its_closed_key_set_and_parses_back() {
+    let seeded = Seeded::scratch("seed-manifest-serialize");
+    let manifest = Manifest::parse(&bytes(&seeded)).expect("parses");
+    let value = serde_json::to_value(&manifest).expect("json");
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    let want = [
+        "bundle_sha256",
+        "commit",
+        "gh_sha256",
+        "installer_conf_sha256",
+        "min_protocol",
+        "platform",
+        "profile",
+        "protocol",
+        "seq",
+        "state_schema",
+        "tarball_sha256",
+        "tarball_size",
+        "trusted_root_sha256",
+    ];
+    assert_eq!(keys, want);
+    assert_eq!(value, seeded.manifest, "the values are the ones written");
+
+    let written = serde_json::to_vec_pretty(&manifest).expect("json");
+    assert_eq!(Manifest::parse(&written), Ok(manifest));
+}
+
 /// The floor is one decimal number in `seq_floor` beside `state.json`, or no file: a host with
 /// no file has no floor (and `admit` then refuses), one with a file that is not a number, or
 /// that cannot be read, is an error and not "no floor" (which would admit nothing, but would

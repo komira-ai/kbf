@@ -8,7 +8,11 @@
 //! seed/<commit12>/manifest.json
 //!                 kbf-<commit>-<platform>.tar.gz
 //!                 kbf-<commit>-<platform>.tar.gz.sigstore.json
+//!                 kbf-<commit>-<platform>.version.json
 //! ```
+//!
+//! The installer does not read the last file (the release's `kbf --version --json`, kept by
+//! the package builder), and the manifest has no key for it.
 //!
 //! The tarball is stored byte for byte, since the attestation binds those bytes. The manifest
 //! ([`Manifest`]) is root's, like the trust files, and says what the package builder says the
@@ -57,8 +61,9 @@ pub const MAX_MANIFEST_BYTES: usize = 16 * 1024;
 pub const COMPONENT: &str = "kbf";
 
 /// `manifest.json`: a closed set of keys, every one required. Digests are 64 lowercase hex
-/// characters, the commit 40, and the platform one a release is built for.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+/// characters, the commit 40, and the platform one a release is built for. The package builder
+/// writes it with this type (`Serialize`), so that builder and reader name the same keys.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// The commit the release was built from, in full.
