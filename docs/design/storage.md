@@ -106,8 +106,13 @@ The router does not repeat the check blob by blob. What a FindMissing showed pre
 an owner is remembered per (blob, owner), shared by every action, for a short time to
 live and within an entry bound (least recently used out first). An entry is trusted only
 while the owner's map generation and published boot (`Member.boot`) are those it was
-verified under: a restarted owner may have lost blobs it held only in RAM, so a new boot
-drops its entries even when the generation did not move, and a caller on an older map
+verified under: a restarted owner is the one whose holdings are least certain (a disk
+replaced or wiped while it was down, say), so a new boot drops its entries even when the
+generation did not move. Today no acknowledged blob lives only in RAM: an upload is
+answered after its bytes are synced on the primary's hot disk and indexed (or, with no
+hot-disk room, are in the object store), so a restart alone loses no acknowledged blob (**Planned**, [storage-ram-ack.md](storage-ram-ack.md): acknowledging from RAM would
+make a restart able to lose one, and the closure check would then ask for durable
+presence only). A caller on an older map
 neither reads nor adds. An owner whose boot is 0 (unknown, a node from before the field)
 is never remembered, because without a boot a restart cannot be told: every check asks
 it.
@@ -207,6 +212,9 @@ server's NVMe or SSD, acknowledges, and flushes them to the object store in the
 background.
 
 So a blob is never reported present before its bytes are durable in the store.
+
+Planned: acknowledging a ByteStream write from RAM on both owners, before the disk; see
+[storage-ram-ack.md](storage-ram-ack.md). Today the order is as stated here.
 
 **ByteStream uploads** follow one rule per stream: bytes arrive in order from offset 0,
 are verified, become durable, and only then is the write acknowledged. There is no
@@ -454,6 +462,8 @@ capabilities.
 
 ## Planned
 
+- **Acknowledge from RAM on both owners, write behind to disk.** Designed, not built:
+  [storage-ram-ack.md](storage-ram-ack.md).
 - **Replicated metadata.** `MetaState` applied from a Raft log kept on each voter's
   local disk, with its snapshots: one voter first (the single-voter log exists, without
   snapshots, see [Metadata](#metadata)), three on three hosts later

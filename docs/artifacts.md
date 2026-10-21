@@ -510,23 +510,26 @@ release already holds must be one of the verified files, byte for byte, or the r
 fails and changes nothing; the files it lacks are uploaded (`cargo xtask release
 publish`).
 
-Two further verbs read the annotated `v*` tag, whose message is the gamma verdict
-(`docs/design/kbf-cicd.md`, section 8.1). `verify` runs both, on a checkout of the whole
-history (the tag object and `origin/main` must be there): `cargo xtask release verdict`
-refuses a lightweight tag, a commit not on main, a message
-that is not a green gamma verdict, a verdict that names another commit, tag or set (the
-set hash is the SHA-256 of `SHA256SUMS`, `kbf_gate::SetHash::of_sums`), a bake under 24
-hours, and a thin bake without a recorded `min-load` waiver; it prints `set-hash=<hex>`.
-`cargo xtask release notes` runs the same checks and writes the notes, which `verify`
-uploads as the artifact `release-notes`, so a dry run shows them. `verify` passes the hash
-to `publish` as a job output, and `release publish` takes it as `--set-hash` and publishes
-nothing when the files are another set. The `publish` job runs in the `prod` environment,
-whose required reviewer approves it.
+Two further verbs read the annotated `v*` tag. Its message is the Beta record (`docs/design/kbf-cicd.md`,
+section 8.1), which `release verdict-write` wrote after `release gates` saw the `ci`, `beta` and
+`artifacts` push runs of the commit succeed. The record is an audit record: **nothing gates on it**, and
+no step of the release workflow judges a verdict. `verify` runs both verbs, on a checkout of the whole
+history (the tag object and `origin/main` must be there): `cargo xtask release verify` refuses a
+tag that names another commit than the release, a tag object named other than its ref, and a
+commit not on main; a tag with no record, or a record that says it failed or names something else,
+verifies the same. It prints `set-hash=<hex>`, the SHA-256 of `SHA256SUMS`
+(`kbf_gate::SetHash::of_sums`). `cargo xtask release notes` runs the same checks and writes the
+notes, which show the record as information and say when the tag carries none; `verify` uploads them
+as the artifact `release-notes`, so a dry run shows them. `verify` passes the hash to `publish` as a
+job output, and `release publish` takes it as `--set-hash` and publishes nothing when the files are
+another set. What gates a release is `release gates` (the three runs green for the commit), then the
+checks of the files themselves (`release check`, the attestations, the set hash) and the tag's
+commit. The `publish` job runs in the `prod` environment, whose required reviewer approves it.
 
 The workflow can also be run by hand (`workflow_dispatch`) with a commit SHA and the
 annotated tag to check. Only `verify` runs then: every check above, and nothing is
 published (`publish` runs only for a pushed tag, and only `publish` holds a write scope).
-`crates/kbf-integration-test/tests/release_workflow` holds the file to this: the verdict step, the
+`crates/kbf-integration-test/tests/release_workflow` holds the file to this: the tag-check step, the
 `prod` environment, a `v*` tag push and a dispatch as the only triggers (no pull request),
 pinned actions and an empty top-level `permissions`. On every pull request
 into `main`, CI asks GitHub the same on-`main` question for the pull request's base

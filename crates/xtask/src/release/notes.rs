@@ -1,15 +1,18 @@
 //! `release notes`: the notes of a release, from the commits since the previous release
-//! and the gamma verdict that was checked (docs/design/kbf-cicd.md, section 8.1, item 3).
-//! A dry run shows them as an artifact of the verify job before anyone approves.
+//! and the Beta record the tag carries, shown as information
+//! (docs/design/kbf-cicd.md, section 8.1, item 3). A dry run shows them as an artifact of
+//! the verify job. What is not reversible comes from the two builds, never from the record.
+//! The record is audit only: a tag without one, or with one that failed, gets notes all the
+//! same, which say so.
 
 use std::path::Path;
 
-use kbf_gate::{Floor, ResultDoc, Verdict, reversible};
+use kbf_gate::{ResultDoc, Verdict, reversible};
 use serde_json::Value;
 
 use super::git;
 use super::offer::{identity_of, whole_field};
-use super::verdict::{Subject, bake_secs, verify};
+use super::verify::{Subject, verify};
 use crate::Error;
 
 /// Commits listed at most; the rest are counted.
@@ -42,8 +45,9 @@ pub fn previous_release(repo: &Path, tag: &str, commit: &str) -> Result<Option<S
     Ok(None)
 }
 
-/// The notes of `s`: refused, like `release verdict`, when the verdict does not pass, and
-/// when what is not reversible cannot be determined (fail closed).
+/// The notes of `s`: refused, like `release verify`, when the tag or the commit is not the
+/// release's, and when what is not reversible cannot be determined (fail closed). The tag's
+/// record is shown and never judged.
 pub fn notes(s: &Subject, ids: &Identities) -> Result<String, Error> {
     let verified = verify(s)?;
     let since = previous_release(s.repo_dir, s.tag, s.commit)?;
@@ -70,7 +74,7 @@ pub fn notes(s: &Subject, ids: &Identities) -> Result<String, Error> {
     let found = irreversible(since.as_deref(), &current, previous.as_ref())?;
     let commits = git::commits(s.repo_dir, since.as_deref(), s.commit)?;
     Ok(render(
-        &verified.doc,
+        verified.record.as_ref(),
         s.tag,
         since.as_deref(),
         &commits,
@@ -130,36 +134,27 @@ fn section(out: &mut String, heading: &str, items: &[String], none: &str) {
     }
 }
 
-fn floor(name: &str, f: Floor) -> String {
-    format!("{name} {} (needs {})", f.measured, f.required)
-}
-
-/// `bake: 24h 00m`. A verified verdict has a finished, forward bake, so this always
-/// yields a line.
-fn bake_line(doc: &ResultDoc) -> Option<String> {
-    bake_secs(doc)
-        .flatten()
-        .map(|secs| format!("bake: {}h {:02}m", secs / 3600, secs % 3600 / 60))
-}
-
-/// The verdict in one line, for the top of the notes.
+/// The record in one line, for the top of the notes. It says what the record states, not
+/// that the release is good: nothing gates on it.
 fn summary(doc: &ResultDoc) -> String {
     let warned = doc
         .gates
         .iter()
         .filter(|g| g.verdict == Verdict::Warn)
         .count();
-    let mut parts: Vec<String> = bake_line(doc).into_iter().collect();
-    parts.push(format!("{} gate(s), {warned} warning(s)", doc.gates.len()));
     format!(
-        "green for the set it names; {}; detail under Gamma verdict",
-        parts.join(", ")
+        "status {:?}; {} gate(s), {warned} warning(s); detail under {:?} record (audit only, \
+         nothing gates on it)",
+        doc.status,
+        doc.gates.len(),
+        doc.stage
     )
 }
 
-/// The notes for a verified `doc`. What the approver must read before the click comes first.
+/// The notes for the release whose tag carries `record`, if any. What the approver must
+/// read before the click comes first.
 fn render(
-    doc: &ResultDoc,
+    record: Option<&ResultDoc>,
     tag: &str,
     since: Option<&str>,
     commits: &[String],
@@ -176,9 +171,9 @@ fn render(
         "Nothing in this release is flagged as not reversible: the metadata log and the wire \
          protocol are the previous release's.",
     );
-    let waivers: Vec<String> = doc
-        .waivers
-        .iter()
+    let waivers: Vec<String> = record
+        .into_iter()
+        .flat_map(|doc| &doc.waivers)
         .map(|w| format!("{} waived by {}: {}", w.what, w.by, w.reason))
         .collect();
     section(
@@ -187,7 +182,11 @@ fn render(
         &waivers,
         "No gate or condition is waived.",
     );
-    section(&mut out, "### Verdict", &[summary(doc)], "");
+    let line = record.map_or_else(
+        || "the tag carries no readable Beta record (nothing gates on it)".to_owned(),
+        summary,
+    );
+    section(&mut out, "### Record", &[line], "");
     let shown: Vec<String> = commits.iter().take(MAX_COMMITS).cloned().collect();
     let title = match since {
         Some(prev) => format!("## Commits since {prev}"),
@@ -198,16 +197,10 @@ fn render(
         out.push_str(&format!("- and {} more\n", commits.len() - MAX_COMMITS));
     }
 
-    let mut gamma = Vec::new();
-    gamma.extend(bake_line(doc));
-    gamma.extend(doc.load.map(|l| {
-        format!(
-            "load: {}, {}, {}",
-            floor("actions", l.actions),
-            floor("builds", l.builds),
-            floor("hours", l.hours)
-        )
-    }));
+    let Some(doc) = record else {
+        return out;
+    };
+    let mut detail = Vec::new();
     for g in &doc.gates {
         let measured = g.measured.map_or("absent".to_owned(), |m| m.to_string());
         let mark = if g.verdict == Verdict::Warn {
@@ -215,14 +208,16 @@ fn render(
         } else {
             ""
         };
-        gamma.push(format!("gate {}: {measured}{mark}", g.name));
+        detail.push(format!("gate {}: {measured}{mark}", g.name));
     }
     for w in &doc.waivers {
-        gamma.push(format!("waived {} by {}: {}", w.what, w.by, w.reason));
+        detail.push(format!("waived {} by {}: {}", w.what, w.by, w.reason));
     }
-    section(&mut out, "## Gamma verdict", &gamma, "No detail recorded.");
+    let title = format!("## {:?} record", doc.stage);
+    section(&mut out, &title, &detail, "No detail recorded.");
     out.push_str(&format!(
-        "\n## Gamma escapes\n\n{} scenario(s) only gamma found.\n",
+        "\n## {:?} escapes\n\n{} scenario(s) only gamma found.\n",
+        doc.stage,
         doc.escapes.len()
     ));
     for e in &doc.escapes {

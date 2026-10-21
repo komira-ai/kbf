@@ -19,6 +19,9 @@
 //!   start fails with `ETXTBSY` because such a child still holds the file open.
 //! - [`m2`]: the verbs of `kbf-m2-act`, the program every action of the M2 sample
 //!   project runs (the M2 image has no shell).
+//! - [`node_view`], [`probe`] and [`canary`]: the platform-neutral half of the black-box
+//!   isolation suites (`kbf-daemon-test`): what a test may ask of a node (the seam the Mac legs
+//!   implement), the probes over a node's files, and unpredictable bytes to look for.
 //! - [`tree`]: an action's input root and the action around it, as plain data (the black-box
 //!   suites upload them through `kbf-harness`).
 //! - [`switch`]: a TCP forwarder a test cuts and restores, to kill and revive a node.
@@ -44,13 +47,16 @@
 use std::io::Write;
 
 pub mod act;
+mod act_probe;
+pub mod canary;
 pub mod config;
 pub mod dir;
 pub mod fake;
 pub mod forked;
 pub mod m2;
+pub mod node_view;
 pub mod port;
-mod probe;
+pub mod probe;
 pub mod reaped;
 pub mod spawn;
 pub mod switch;

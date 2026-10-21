@@ -1,7 +1,9 @@
 use std::cell::RefCell;
+#[cfg(target_os = "linux")]
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::PathBuf;
@@ -349,8 +351,12 @@ fn warm_up_and_survey_directories_are_not_leases_and_an_unknown_lease_name_is() 
     ] {
         rig.dir(name);
     }
+    // A name that is not UTF-8 counts too. APFS refuses such a name (EILSEQ), so on a Mac
+    // the case cannot arise and is planted only where the file system takes it.
+    #[cfg(target_os = "linux")]
     fs::create_dir(rig.leases().join(OsStr::from_bytes(b"lease-\xff"))).expect("odd name");
-    assert_eq!(rig.count(), Ok(9));
+    let want = if cfg!(target_os = "linux") { 9 } else { 8 };
+    assert_eq!(rig.count(), Ok(want));
 }
 
 /// Catches a `pgrep` that did not say "none" read as none. Exit 1 with nothing printed is

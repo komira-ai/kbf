@@ -123,6 +123,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
             state_schema: 3,
             profile: "release".to_owned(),
         }),
+        source: kbf_update::Source::Fetch,
     };
     fs::write(
         host.join(&host.orders_dir()).join(record.file_name()),

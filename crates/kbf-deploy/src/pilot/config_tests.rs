@@ -63,9 +63,8 @@ fn the_example_parses_with_the_documented_defaults() {
             reapi_port: 8980,
             instance_name: "main".into(),
             concurrency: "8".into(),
-            linux_properties: "OSFamily=Linux,label.pool=linux".into(),
-            darwin_properties: "OSFamily=Darwin,label.pool=mac".into(),
-            darwin_labels: "pool=mac".into(),
+            linux_properties: "OSFamily=Linux".into(),
+            darwin_properties: "OSFamily=Darwin".into(),
             darwin_macos_hosts: "26.0-0123456789abcdef".into(),
         }
     );
@@ -189,8 +188,7 @@ fn each_bad_server_setting_is_refused() {
 }
 
 /// Catches buckconfig's settings taking a missing site value or a concurrency buck2
-/// would refuse, and the labels key made required (an empty one is a daemon set with
-/// no labels).
+/// would refuse.
 #[test]
 fn each_bad_overlay_setting_is_refused() {
     let overlay =
@@ -198,11 +196,8 @@ fn each_bad_overlay_setting_is_refused() {
     let base = "KBF_SERVER_HOST=192.0.2.10\nKBF_INSTANCE_NAME=main\n\
                 KBF_LINUX_PROPERTIES=OSFamily=Linux\nKBF_DARWIN_PROPERTIES=OSFamily=Darwin\n\
                 KBF_DARWIN_MACOS_HOSTS=26.0-x\n";
-    let o = overlay(base).expect("labels and concurrency have defaults");
-    assert_eq!(
-        (o.darwin_labels.as_str(), o.concurrency.as_str()),
-        ("", "8")
-    );
+    let o = overlay(base).expect("concurrency has a default");
+    assert_eq!(o.concurrency, "8");
     let cases = [
         (
             base.replace("KBF_SERVER_HOST=192.0.2.10\n", ""),
@@ -236,6 +231,19 @@ fn each_bad_overlay_setting_is_refused() {
     for (text, want) in cases {
         assert_eq!(overlay(&text).err().as_deref(), Some(want), "{want}");
     }
+}
+
+/// Catches `KBF_DARWIN_LABELS` (the daemons' node labels, removed) read again: the key is
+/// no key of the kit's config, so a file that still sets it is refused naming it, not
+/// read with the value ignored.
+#[test]
+fn the_removed_labels_key_is_refused_naming_it() {
+    let err = Config::parse(
+        "KBF_SERVER_HOST=192.0.2.10\nKBF_DARWIN_LABELS=pool=mac\n",
+        KEYS,
+    )
+    .expect_err("refused");
+    assert!(err.to_string().contains("KBF_DARWIN_LABELS"), "{err}");
 }
 
 /// Catches the kit's other keys refused (one config file serves every step of the

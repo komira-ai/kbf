@@ -34,6 +34,24 @@ const SMALL: Limits = Limits {
     attestation: 64,
 };
 
+/// What `kbf --version --json` prints for a build of `commit`.
+fn facts_doc(commit: &str) -> Vec<u8> {
+    format!(
+        "{{\"commit\":\"{}\",\"min_protocol\":6,\"profile\":\"release\",\"protocol\":7,\
+         \"state_schema\":3,\"version\":\"0.1.0\"}}",
+        &commit[..12]
+    )
+    .into_bytes()
+}
+
+/// What a platform stored without its version facts is told.
+fn no_facts_note(platform: ReleasePlatform) -> String {
+    format!(
+        "no version facts (kbf-{COMMIT}-{platform}.version.json): nodes will not be offered \
+         this platform; rebuild the release to include it"
+    )
+}
+
 /// A directory unique to one test, removed when it is dropped.
 struct Dir(PathBuf);
 
@@ -499,6 +517,7 @@ async fn unconfigured_answers_503_everywhere() {
 async fn a_put_needs_the_operator_token() {
     let served = serve().await;
     let path = path_of(COMMIT, "linux-x86_64", "kbf");
+    let facts = path_of(COMMIT, "linux-x86_64", "version.json");
     let wrong = vec![(
         "Authorization",
         "Bearer not-the-token-not-the-token-not-the-token".to_owned(),
@@ -508,16 +527,22 @@ async fn a_put_needs_the_operator_token() {
         ("Origin", "http://evil.example".to_owned()),
     ];
     for (headers, want) in [(Vec::new(), 401), (wrong, 401), (page, 403)] {
-        let reply = http(served.addr, "PUT", &path, &headers, b"payload").await;
-        assert_eq!(reply.status, want, "{}", reply.body);
+        for path in [&path, &facts] {
+            let reply = http(served.addr, "PUT", path, &headers, b"payload").await;
+            assert_eq!(reply.status, want, "{path}: {}", reply.body);
+        }
     }
     assert!(tree(&served.dir.store().join("files")).is_empty());
+    assert!(tree(&served.dir.store().join("index")).is_empty());
     assert_eq!(get_list(&served).await.status, 200);
 
     let off = serve_with(SMALL, true, None).await;
-    let reply = http(off.addr, "PUT", &path, &authorized(), b"payload").await;
-    assert_eq!(reply.status, 403, "{}", reply.body);
+    for path in [&path, &facts] {
+        let reply = http(off.addr, "PUT", path, &authorized(), b"payload").await;
+        assert_eq!(reply.status, 403, "{path}: {}", reply.body);
+    }
     assert!(tree(&off.dir.store().join("files")).is_empty());
+    assert!(tree(&off.dir.store().join("index")).is_empty());
 
     // The token lets the same request through.
     assert_eq!(put(&served, "kbf", b"payload").await.status, 201);
@@ -546,6 +571,13 @@ async fn the_list_names_what_is_stored_and_what_is_complete() {
         put_key(&k, component.as_str().as_bytes(), false).await;
         put_key(&k, b"bundle", true).await;
     }
+    // Only arm64 has its version facts.
+    let commit = Commit::parse(COMMIT).expect("a commit");
+    let doc = facts_doc(COMMIT);
+    store
+        .put_facts(&commit, arm, &mut body(&doc))
+        .await
+        .expect("facts");
     put_key(&key(COMMIT, x86, Component::KbfDaemon), b"d", false).await;
     // darwin-arm64 holds both tarballs but attests only `kbf-daemon`, which no Mac needs: not
     // complete, because the `kbf` its hosts run has no attestation.
@@ -568,12 +600,14 @@ async fn the_list_names_what_is_stored_and_what_is_complete() {
     let want = serde_json::json!({"releases": [{
     "commit": COMMIT,
     "platforms": [
-        {"platform": "linux-x86_64", "complete": false, "components": [
+        {"platform": "linux-x86_64", "complete": false, "version_facts": false,
+         "note": no_facts_note(ReleasePlatform::LinuxX86_64), "components": [
             {"name": "kbf-daemon", "sha256": sha(b"d"), "size": 1, "attested": false}]},
-        {"platform": "linux-arm64", "complete": true, "components": [
+        {"platform": "linux-arm64", "complete": true, "version_facts": true, "components": [
             {"name": "kbf", "sha256": sha(b"kbf"), "size": 3, "attested": true},
             {"name": "kbf-daemon", "sha256": sha(b"kbf-daemon"), "size": 10, "attested": true}]},
-            {"platform": "darwin-arm64", "complete": false, "components": [
+            {"platform": "darwin-arm64", "complete": false, "version_facts": false,
+             "note": no_facts_note(ReleasePlatform::DarwinArm64), "components": [
                 {"name": "kbf", "sha256": sha(b"t"), "size": 1, "attested": false},
                 {"name": "kbf-daemon", "sha256": sha(b"t"), "size": 1, "attested": true}]},
     ]}]});

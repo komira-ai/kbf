@@ -160,7 +160,6 @@ impl Rng {
             ("cpus", "4"),
             ("gpu", "1"),
             ("os", "linux"),
-            ("label.rack", "r1"),
             ("xcode", "16C5032a"),
             ("vm.image", image.as_str()),
         ];
@@ -687,7 +686,8 @@ fn absent_and_out_of_range_values_are_refused() {
 
 /// Catches a decoder that builds a value its own type would refuse: a custom QoS level
 /// `Qos::custom` refuses or whose urgency does not fit in 16 bits, and a capability
-/// request `Request::parse` refuses.
+/// request `Request::parse` refuses, among them a stored `label.<k>` (node labels are
+/// removed: a request that names one is not read back without it).
 #[test]
 fn values_their_types_refuse_are_refused() {
     assert_eq!(
@@ -706,6 +706,12 @@ fn values_their_types_refuse_are_refused() {
         dec(&submit(prequest(builtin(1), 1, &[("nope", "x")]))),
         Err(DecodeError::Request(RequestError::UnknownKey(
             "nope".to_owned()
+        )))
+    );
+    assert_eq!(
+        dec(&submit(prequest(builtin(1), 1, &[("label.x", "r1")]))),
+        Err(DecodeError::Request(RequestError::UnknownKey(
+            "label.x".to_owned()
         )))
     );
 }

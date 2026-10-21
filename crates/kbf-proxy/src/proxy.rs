@@ -22,6 +22,7 @@ use crate::identity::{ProxySecret, SecretOrigin, admin_headers};
 use crate::metrics::Metrics;
 use crate::pool::tcp_connector;
 use crate::probe::poll;
+use crate::remote::RemoteCi;
 use crate::security::Security;
 use crate::serve::serve;
 use crate::slot::{ActiveSlot, HoldGuard};
@@ -49,6 +50,27 @@ impl Proxy {
     /// A token or TLS file is refused, the secret file cannot be read or created, the runtime
     /// could not be built, or the socket could not be made non-blocking.
     pub fn bind(cfg: ProxyConfig, listener: OwnedFd) -> io::Result<(ProxyHandle, ProxyRunner)> {
+        // Read now, like the tokens: a proxy does not start on an allow-list it refuses.
+        let remote = cfg
+            .remote_operator_file
+            .as_deref()
+            .map(RemoteCi::from_file)
+            .transpose()
+            .map_err(|e| io::Error::other(format!("remote_operator_file: {e}")))?;
+        Self::bind_with_remote(cfg, listener, remote)
+    }
+
+    /// [`Proxy::bind`] with the CI credential's gate given, not read from
+    /// `remote_operator_file` (which this ignores): for a caller that has built its own
+    /// verifier, a test with a verifier of its own.
+    ///
+    /// # Errors
+    /// As [`Proxy::bind`], but for the allow-list.
+    pub fn bind_with_remote(
+        cfg: ProxyConfig,
+        listener: OwnedFd,
+        remote: Option<RemoteCi>,
+    ) -> io::Result<(ProxyHandle, ProxyRunner)> {
         let buck2_token = (cfg.buck2_auth == Buck2Auth::Bearer)
             .then_some(cfg.buck2_token_file.as_deref())
             .flatten();
@@ -78,7 +100,10 @@ impl Proxy {
         // The last step that can fail: a start that exits earlier has not made a secret that
         // a child could have read and the supervisor then adopted (`SecretOrigin::Created`).
         let (secret, origin) = ProxySecret::create_or_read(&cfg.proxy_auth_file)?;
-        let security = Security::new(cfg.buck2_auth, tokens, secret.clone());
+        let mut security = Security::new(cfg.buck2_auth, tokens, secret.clone());
+        if let Some(remote) = remote {
+            security = security.with_remote(remote);
+        }
         let core = Core::with_metrics(
             cfg.upstream,
             cfg.limits,

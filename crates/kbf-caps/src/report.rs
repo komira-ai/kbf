@@ -6,14 +6,15 @@
 //! | `arch` (required, once) | the CPU's architecture |
 //! | `cpu.features` (repeated) | the CPU's features; the ISA level follows from them |
 //! | `cpus`, `mem_gib`, `nvme_gib`, `gpu` (once each) | countable capacity |
-//! | `os`, `os_image`, `cpu.model`, `page_size`, `label.<k>` (once each) | exact values |
+//! | `os`, `os_image`, `cpu.model`, `page_size` (once each) | exact values |
 //! | `xcode` (repeated: one per installed build) | a set, matched by membership |
 //! | `vm.image` (repeated: one per image, `<name>@sha256:<64 hex>`) | a set of the `sha256:<hex>` digests, matched by membership |
 //! | `vm.slots`, `vm.max_cpus`, `vm.max_mem_gib` (once each) | checked to be whole numbers, not matched on (report-only) |
 //! | `drivers` (repeated: one per driver the daemon runs) | the drivers; placement reads them for the lease kind, no request key names them |
 //! | `ios.device` (repeated: one per ready device, comma-separated `k=v` fields with an `id`; a value may hold commas, never `=`) | the devices, by id, each with its other attributes; a device request matches one of them |
 //!
-//! Every other entry (`isa_level`, ...) is not matched on and is skipped.
+//! Every other entry (`isa_level`, a `label.<k>` an older daemon still sends, ...) is not
+//! matched on and is skipped.
 //! The reported `isa_level` list is not read: the level is computed from the features,
 //! so it can never disagree with them.
 

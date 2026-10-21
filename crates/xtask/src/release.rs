@@ -22,11 +22,16 @@
 //!   commit and no other, and each tarball has exactly
 //!   one provenance bundle, `<tarball>.sigstore.json`, whose one subject is that
 //!   tarball's digest ([`bundles`]), and no bundle is there for anything else.
-//! - `release verdict <dir> --repo-dir <checkout> --tag <tag> --commit <sha> [--main-ref
-//!   <ref>] [--output <file>]` ([`verdict`]): the annotated tag's message is a green
-//!   gamma verdict for that tag, that commit (on main) and the set `<dir>`'s `SHA256SUMS`
-//!   hashes to, after a bake of 24 hours or more. Prints `set-hash=<hex>`, which
-//!   `publish --set-hash` must be given.
+//! - `release gates --repo <owner/repo> --sha <sha> --branch <name> [--timeout-s <n>]
+//!   [--poll-s <n>] [--output <file>] [--gh <program>]` ([`gates`]): waits for the push runs
+//!   of `ci`, `beta` and `artifacts` for that commit on that branch (by workflow path, the
+//!   latest run of each) and requires all three to have succeeded; a timeout is red.
+//!   Prints `ci_run=`, `beta_run=` and `artifacts_run=`, the ids `verdict-write` takes.
+//! - `release verify <dir> --repo-dir <checkout> --tag <tag> --commit <sha> [--main-ref
+//!   <ref>] [--output <file>]` ([`verify`]): the tag names that commit, which is on main.
+//!   It reads no verdict: the tag's message is an audit record that nothing gates on, and a
+//!   tag without one verifies. Prints `set-hash=<hex>`, the hash of the set `<dir>`'s
+//!   `SHA256SUMS` lists, which `publish --set-hash` must be given.
 //! - `release offer <dir> --repo <owner/repo> --commit <sha> --platform <p>... (--beta-result
 //!   <file> | --waive-beta <reason> --operator <name>) [--previous <sha> --version-json <file>
 //!   --previous-version-json <file>] [--plan] --out <offer.json>` ([`offer`]): the checks
@@ -42,9 +47,9 @@
 //! - `release notes <dir> ... --version-json <file> [--previous-version-json <file>] --out
 //!   <file>` ([`notes`]): the same checks, then the release's notes: first "Before you
 //!   click" (what is not reversible, as `kbf_gate::reversible` and the `protocol` of the two
-//!   builds' `kbf --version --json` say and never from the verdict's own list, unknown counting as
-//!   not reversible; the waivers; the verdict in a line), then the commits since the
-//!   previous release, the verdict, the gamma escapes and what is withdrawn. Without the
+//!   builds' `kbf --version --json` say and never from the record's own list, unknown counting as
+//!   not reversible; the waivers; the tag's Beta record in a line), then the commits since the
+//!   previous release, the record, its escapes and what is withdrawn. Without the
 //!   identity of the previous release, when there is one, it refuses (fail closed).
 //! - `release plan --repo <owner/repo> --sha <sha> --before <sha> [--repo-dir <checkout>]
 //!   [--freeze <text>] [--output <file>] [--gh <program>]` ([`plan`]): the next version
@@ -59,6 +64,11 @@
 //!   changed; the files it lacks are uploaded. A re-run therefore creates no second
 //!   release and replaces no asset. It refuses first when the highest release tag is not
 //!   at `--commit` or an ancestor of it ([`tags::superseded`]).
+//! - `release bump-internal --version <v> --sha <sha> --internal-repo <owner/repo> --submodule
+//!   <name> [--repo <owner/repo>] [--workdir <dir>] [--gh <program>] [--git <program>]`
+//!   ([`bump`]): after the release is published, a pull request in the internal repository
+//!   that moves its submodule to `--sha`, with auto-merge on, if the tag `v<v>` names `--sha`
+//!   and the submodule is not already at or beyond it. The token is `GH_TOKEN`.
 //! - `release tag --repo <owner/repo> --sha <sha> --tag <tag> --message-file <file>
 //!   [--tagger <login>] [--output <file>] [--gh <program>]` ([`tag`]): the annotated tag
 //!   `--tag` at `--sha` through the GitHub API, create-only, after the same stale-run
@@ -66,8 +76,10 @@
 //!   commit with this message. Prints `tag=` and `created=true|false`.
 //! - `release verdict-write <dir> --commit <sha> --tag <tag> --run-id <id> --ci-run <id>
 //!   --beta-run <id> --artifacts-run <id> --out <file> [...]` ([`verdict_write`]): the
-//!   verdict document the tag's message carries, for the stage [`verdict::GATE_STAGE`].
+//!   Beta record the tag's message carries, which nothing gates on.
 
+pub mod bump;
+pub mod gates;
 mod git;
 pub mod identity;
 pub mod notes;
@@ -75,8 +87,8 @@ pub mod offer;
 pub mod plan;
 pub mod tag;
 pub mod tags;
-pub mod verdict;
 pub mod verdict_write;
+pub mod verify;
 
 use std::io::Write;
 use std::path::Path;
@@ -356,7 +368,7 @@ pub struct Release<'a> {
     pub commit: &'a str,
     /// The run of the artifacts workflow that built and attested them.
     pub run_id: u64,
-    /// The set hash the gamma verdict names (`release verdict` prints it): the files must
+    /// The set hash `release verify` printed: the files must
     /// be that set, or nothing is published.
     pub set_hash: &'a kbf_gate::SetHash,
     /// The notes `release notes` wrote: the first part of the release's body.
@@ -425,10 +437,10 @@ fn tag_is_current(tag: &str, standing: &tags::Standing) -> Result<(), Error> {
 /// The `release publish` verb: the lines to print.
 pub fn publish(dir: &Path, r: &Release) -> Result<Vec<String>, Error> {
     let (mut printed, names) = checked(dir, r.commit, Pairing::Required)?;
-    let held_set = verdict::set_hash_of(dir)?;
+    let held_set = verify::set_hash_of(dir)?;
     if &held_set != r.set_hash {
         return Err(Error::Refused(vec![format!(
-            "the files in {} are set {}, the gamma verdict names set {}: gamma ran other bytes",
+            "the files in {} are set {}, `release verify` printed set {}: other bytes than it verified",
             dir.display(),
             held_set.as_str(),
             r.set_hash.as_str()

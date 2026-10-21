@@ -232,7 +232,7 @@ The record of nodes becomes durable state in the control log:
 - a node that is absent (no stream) is remembered, not forgotten;
 - an absent node raises an alert;
 - an absent node gets no work;
-- a node that reconnects recovers its place: its report, labels and placement state
+- a node that reconnects recovers its place: its report and placement state
   (cordoned, draining) are as they were.
 
 ## Converged topology

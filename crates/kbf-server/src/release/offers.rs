@@ -2,11 +2,17 @@
 //! sections 5 and 6.4): for each platform, the `UpdateOffer` that names the desired release
 //! and its components, built from the `update/desired` row and the release store.
 //!
-//! - **One offer per complete platform.** A platform is offered only when the store holds
-//!   every component it needs, attested ([`kbf_types::ReleasePlatform::components`]), for
-//!   the desired commit. An offer carries those components and no others (no host is told
-//!   about `kbf-daemon`), each with its digest, its size and the attestation bytes
-//!   as stored.
+//! - **One offer per complete platform with version facts.** A platform is offered only when
+//!   the store holds every component it needs, attested
+//!   ([`kbf_types::ReleasePlatform::components`]), for the desired commit, and the platform's
+//!   version facts (`kbf-<commit>-<platform>.version.json`, [`super::facts`]). An offer
+//!   carries those components and no others (no host is told about `kbf-daemon`),
+//!   each with its digest, its size and the attestation bytes as stored, and the facts
+//!   (`protocol`, `min_protocol`, `state_schema`, `profile`) as that document states them. A
+//!   platform stored without the document, a release built before the pipeline wrote it
+//!   included, is never offered, and never offered with zeroed facts: the installer refuses
+//!   an offer without facts, so it would only block the node. The facts are a hint: the
+//!   installer runs the staged binary and requires its own report to equal them.
 //! - **Level-triggered.** [`Offers::start`] looks at the row and the store every `every`
 //!   and publishes a new [`Table`] when it differs from the last. A session holds a
 //!   receiver ([`Offers::subscribe`]) and sends its platform's offer when the table gives it
@@ -131,8 +137,15 @@ impl Offers {
             return Ok(Table::new());
         };
         let mut table = Table::new();
-        for held in listing.platforms.iter().filter(|p| p.complete) {
+        for held in listing.platforms.iter().filter(|p| p.complete && p.facts) {
             let platform = held.platform;
+            // Listed with facts, and a key never changes: a document that is gone now is a
+            // store that fails, not a platform without facts.
+            let facts = self
+                .store
+                .facts(&commit, platform)
+                .await?
+                .ok_or(io::Error::from(io::ErrorKind::NotFound))?;
             let mut components = Vec::new();
             for info in held
                 .components
@@ -166,10 +179,10 @@ impl Offers {
                 commit: commit.to_string(),
                 platform: platform.as_str().to_owned(),
                 components,
-                // The release facts the preflight records (protocol, minimum protocol, state
-                // schema, profile) are a later change; the installer refuses an offer that
-                // carries none, so an activation waits for it (fail closed).
-                ..UpdateOffer::default()
+                protocol: facts.protocol,
+                min_protocol: facts.min_protocol,
+                state_schema: facts.state_schema,
+                profile: facts.profile,
             };
             table.insert(platform, offer);
         }
@@ -315,14 +328,31 @@ mod tests {
         assert!(both.subscribe().borrow().is_empty());
     }
 
-    /// A complete linux-x86_64 release of `COMMIT` in `store`.
-    async fn linux_release(store: &ReleaseStore) {
+    /// The version facts document of `COMMIT`'s build: the four facts the offer carries, in
+    /// the shape `kbf --version --json` prints.
+    fn facts_doc(protocol: u32, min_protocol: u32, state_schema: u32) -> String {
+        format!(
+            "{{\"commit\":\"{}\",\"min_protocol\":{min_protocol},\"profile\":\"release\",\
+             \"protocol\":{protocol},\"state_schema\":{state_schema},\"version\":\"0.1.0\"}}",
+            &COMMIT[..12]
+        )
+    }
+
+    fn bytes(b: &'static [u8]) -> impl futures::Stream<Item = io::Result<Bytes>> + Unpin + use<> {
+        futures::stream::iter([Ok::<_, io::Error>(Bytes::from(b))])
+    }
+
+    /// A complete release of `COMMIT` for `platform` in `store`, without version facts.
+    async fn release_without_facts(
+        store: &ReleaseStore,
+        platform: ReleasePlatform,
+        component: Component,
+    ) {
         let key = Key {
             commit: Commit::parse(COMMIT).expect("a commit"),
-            platform: ReleasePlatform::LinuxX86_64,
-            component: Component::Kbf,
+            platform,
+            component,
         };
-        let bytes = |b: &'static [u8]| futures::stream::iter([Ok::<_, io::Error>(Bytes::from(b))]);
         store
             .put_tarball(&key, &mut bytes(b"tarball"))
             .await
@@ -331,6 +361,146 @@ mod tests {
             .put_attestation(&key, &mut bytes(b"bundle"))
             .await
             .expect("an attestation");
+    }
+
+    /// The version facts of `platform` at `COMMIT`.
+    async fn put_facts(store: &ReleaseStore, platform: ReleasePlatform, doc: &str) {
+        let doc = Bytes::from(doc.to_owned());
+        let commit = Commit::parse(COMMIT).expect("a commit");
+        let mut body = futures::stream::iter([Ok::<_, io::Error>(doc)]);
+        store
+            .put_facts(&commit, platform, &mut body)
+            .await
+            .expect("facts");
+    }
+
+    /// A complete linux-x86_64 release of `COMMIT` in `store`, with its version facts.
+    async fn linux_release(store: &ReleaseStore) {
+        release_without_facts(store, ReleasePlatform::LinuxX86_64, Component::Kbf).await;
+        put_facts(store, ReleasePlatform::LinuxX86_64, &facts_doc(7, 6, 3)).await;
+    }
+
+    /// The table `offers` gives for the desired release `COMMIT` after one look.
+    async fn looked(store: Arc<ReleaseStore>) -> Arc<Table> {
+        let rows = rows();
+        rows.offer(&Release::new(COMMIT), FarmTime::from_millis(1))
+            .expect("the row");
+        let offers = Offers::start(store, rows, Duration::from_secs(3600));
+        offers.refresh().await;
+        offers.subscribe().borrow().clone()
+    }
+
+    /// Catches an offer whose facts are not the stored document's: each of the four facts
+    /// has its own value in each platform's document, so a fact left at its default, one
+    /// read from another field, or one taken from the other platform's document shows.
+    ///
+    /// Mutant seen red: `min_protocol` left at the default.
+    #[tokio::test]
+    async fn an_offer_carries_the_facts_of_its_platforms_document() {
+        let (_dir, store) = store("facts-carried");
+        linux_release(&store).await;
+        release_without_facts(&store, ReleasePlatform::DarwinArm64, Component::Kbf).await;
+        put_facts(&store, ReleasePlatform::DarwinArm64, &facts_doc(12, 9, 5)).await;
+        let table = looked(store).await;
+        let facts = |p: ReleasePlatform| {
+            let o = &table[&p];
+            (
+                o.protocol,
+                o.min_protocol,
+                o.state_schema,
+                o.profile.as_str(),
+            )
+        };
+        assert_eq!(facts(ReleasePlatform::LinuxX86_64), (7, 6, 3, "release"));
+        assert_eq!(facts(ReleasePlatform::DarwinArm64), (12, 9, 5, "release"));
+    }
+
+    /// Catches a platform with no version facts document offered anyway (with zeros the
+    /// installer refuses), and one platform's missing document taking the others' offers
+    /// with it: a complete Mac release without a document gets none while the Linux release
+    /// beside it, with one, gets its offer.
+    ///
+    /// Mutant seen red: the offer built with the facts at their defaults for a platform with
+    /// no document.
+    #[tokio::test]
+    async fn a_platform_without_facts_is_not_offered_and_the_others_still_are() {
+        let (_dir, store) = store("facts-missing");
+        linux_release(&store).await;
+        release_without_facts(&store, ReleasePlatform::DarwinArm64, Component::Kbf).await;
+        let table = looked(store).await;
+        let platforms: Vec<_> = table.keys().copied().collect();
+        assert_eq!(platforms, [ReleasePlatform::LinuxX86_64]);
+    }
+
+    /// Catches a release stored before the store kept version facts offered, or unreadable:
+    /// the files of the old layout (an entry and its attestation, no `version.json`) are
+    /// listed as complete without facts and are offered nowhere, and the store reports no
+    /// facts for them.
+    ///
+    /// Mutant seen red: an offer built for a platform whose listing has no facts.
+    #[tokio::test]
+    async fn a_release_stored_before_version_facts_is_held_and_never_offered() {
+        let (dir, store) = store("facts-legacy");
+        let platform = dir.join("index").join(COMMIT).join("linux-arm64");
+        std::fs::create_dir_all(&platform).expect("dirs");
+        std::fs::write(platform.join("kbf"), format!("{} 7\n", "ab".repeat(32))).expect("entry");
+        std::fs::write(platform.join("kbf.attestation"), b"bundle").expect("bundle");
+        let commit = Commit::parse(COMMIT).expect("a commit");
+        let listing = store
+            .commit(commit.clone())
+            .await
+            .expect("list")
+            .expect("held");
+        assert_eq!(
+            listing
+                .platforms
+                .iter()
+                .map(|p| (p.platform, p.complete, p.facts))
+                .collect::<Vec<_>>(),
+            [(ReleasePlatform::LinuxArm64, true, false)]
+        );
+        assert_eq!(
+            store
+                .facts(&commit, ReleasePlatform::LinuxArm64)
+                .await
+                .expect("read"),
+            None
+        );
+        assert!(looked(store).await.is_empty());
+    }
+
+    /// Catches a document that went bad after it was stored (a file edited on disk) turning
+    /// into a zeroed offer, or into a table that loses the offers already made: the look
+    /// fails, and the table it kept is the one before.
+    ///
+    /// Mutant seen red: a look that reads a failing facts document as none and skips the
+    /// platform (the table then loses its offer).
+    #[tokio::test]
+    async fn a_stored_document_that_is_unreadable_keeps_the_table() {
+        let (dir, store) = store("facts-corrupt");
+        linux_release(&store).await;
+        let rows = rows();
+        rows.offer(&Release::new(COMMIT), FarmTime::from_millis(1))
+            .expect("the row");
+        let offers = Offers::start(store.clone(), rows, Duration::from_secs(3600));
+        offers.refresh().await;
+        assert_eq!(offers.subscribe().borrow().len(), 1);
+        let file = dir
+            .join("index")
+            .join(COMMIT)
+            .join("linux-x86_64")
+            .join("version.json");
+        std::fs::write(&file, b"not a report").expect("corrupt it");
+        offers.refresh().await;
+        let table = offers.subscribe().borrow().clone();
+        assert_eq!(table.len(), 1, "the table is kept");
+        assert_eq!(table[&ReleasePlatform::LinuxX86_64].protocol, 7);
+        let commit = Commit::parse(COMMIT).expect("a commit");
+        let err = store
+            .facts(&commit, ReleasePlatform::LinuxX86_64)
+            .await
+            .expect_err("unreadable");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     /// Catches a poll that never looks (the desired release is in the row and the store

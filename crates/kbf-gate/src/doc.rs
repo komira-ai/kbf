@@ -280,7 +280,8 @@ pub struct ResultDoc {
     /// one entry each time the process read changes. Left out when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed: Vec<String>,
-    /// The release tag a gamma verdict is for; `release verdict` refuses another.
+    /// The release tag a record is for. The release workflow does not read it: `release verify`
+    /// checks the tag itself.
     pub tag: Option<String>,
     /// What the run author thought not reversible, one line each. Informational: the release
     /// notes do not read it (verify computes the irreversible list).

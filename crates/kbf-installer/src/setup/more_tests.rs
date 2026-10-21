@@ -933,6 +933,7 @@ fn the_first_release_is_fetched_by_the_host_fetcher_not_the_unwired_one() {
     let got = fetcher.fetch(&ReleaseLocator {
         commit: c(A),
         components: Vec::new(),
+        source: kbf_update::Source::Fetch,
     });
     assert!(
         matches!(&got, Err(FetchError::Unavailable(why)) if !why.is_empty()),
