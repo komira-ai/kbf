@@ -16,281 +16,26 @@ mod common;
 )]
 mod support;
 
+#[path = "support/rig.rs"]
+#[allow(
+    dead_code,
+    reason = "shared with the other binaries that run the rig, which use other parts of it"
+)]
+mod rig;
+
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use kbf_front::{Cache, CacheError, PoolConfig, StreamedRecord, TierStartup};
+use kbf_front::{CacheError, PoolConfig, StreamedRecord};
 use kbf_meta::{BlobAnswer, ObjectId};
-use kbf_objstore::{Capabilities, KeyPrefix};
-use kbf_store::{FaultFs, Fs, FsFile};
 use kbf_tier::{TierOptions, block_name};
-use support::{Log, SEGMENT, SERVER, TestBlob, TierCache};
-
-use common::faulty::FaultyStore;
+use rig::{Counting, Rig, pool, prepare, put};
+use support::{TestBlob, TierCache};
 
 const GIB: u64 = 1 << 30;
 const MIB: usize = 1 << 20;
-
-/// What the filesystem seam counts and does. Shared by every clone and every file.
-#[derive(Debug, Default)]
-struct Probe {
-    /// Files opened for writing and not yet dropped, and the most there were at once.
-    open: AtomicUsize,
-    peak: AtomicUsize,
-    /// File syncs that completed, and bytes written.
-    syncs: AtomicUsize,
-    written: AtomicU64,
-    fail_writes: AtomicBool,
-    fail_syncs: AtomicBool,
-    fail_creates: AtomicBool,
-    gate: Mutex<Gate>,
-    changed: Condvar,
-}
-
-#[derive(Debug, Default)]
-struct Gate {
-    paused: bool,
-    /// Syncs waiting for the pause to end.
-    waiting: usize,
-}
-
-impl Probe {
-    fn gate(&self) -> MutexGuard<'_, Gate> {
-        self.gate.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// A `FaultFs` that tells the [`Probe`] about its files.
-#[derive(Clone, Debug)]
-struct Counting {
-    inner: FaultFs,
-    probe: Arc<Probe>,
-}
-
-#[derive(Debug)]
-struct CountedFile {
-    inner: <FaultFs as Fs>::File,
-    probe: Arc<Probe>,
-    counted: bool,
-}
-
-impl Drop for CountedFile {
-    fn drop(&mut self) {
-        if self.counted {
-            self.probe.open.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-}
-
-impl FsFile for CountedFile {
-    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.inner.append(bytes)
-    }
-
-    fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
-        if self.probe.fail_writes.load(Ordering::SeqCst) {
-            return Err(io::Error::other("a write failed by the test"));
-        }
-        self.inner.write_at(offset, bytes)?;
-        self.probe
-            .written
-            .fetch_add(bytes.len() as u64, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn truncate(&mut self, len: u64) -> io::Result<()> {
-        self.inner.truncate(len)
-    }
-
-    fn sync(&self) -> io::Result<()> {
-        {
-            let mut gate = self.probe.gate();
-            gate.waiting += 1;
-            self.probe.changed.notify_all();
-            while gate.paused {
-                gate = self
-                    .probe
-                    .changed
-                    .wait(gate)
-                    .unwrap_or_else(PoisonError::into_inner);
-            }
-            gate.waiting -= 1;
-        }
-        if self.probe.fail_syncs.load(Ordering::SeqCst) {
-            return Err(io::Error::other("a sync failed by the test"));
-        }
-        self.inner.sync()?;
-        self.probe.syncs.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
-impl Fs for Counting {
-    type File = CountedFile;
-
-    fn list(&self) -> io::Result<Vec<String>> {
-        self.inner.list()
-    }
-
-    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
-        self.inner.read(name)
-    }
-
-    fn file_len(&self, name: &str) -> io::Result<u64> {
-        self.inner.file_len(name)
-    }
-
-    fn read_at(&self, name: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        self.inner.read_at(name, offset, len)
-    }
-
-    fn create(&self, name: &str) -> io::Result<CountedFile> {
-        let inner = self.inner.create(name)?;
-        Ok(self.uncounted(inner))
-    }
-
-    fn create_positioned(&self, name: &str) -> io::Result<CountedFile> {
-        if self.probe.fail_creates.load(Ordering::SeqCst) {
-            return Err(io::Error::other("a create failed by the test"));
-        }
-        let inner = self.inner.create_positioned(name)?;
-        Ok(self.counted(inner))
-    }
-
-    fn open_append(&self, name: &str) -> io::Result<CountedFile> {
-        let inner = self.inner.open_append(name)?;
-        Ok(self.uncounted(inner))
-    }
-
-    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-        self.inner.rename(from, to)
-    }
-
-    fn remove(&self, name: &str) -> io::Result<()> {
-        self.inner.remove(name)
-    }
-
-    fn sync_dir(&self) -> io::Result<()> {
-        self.inner.sync_dir()
-    }
-}
-
-impl Counting {
-    fn new(inner: FaultFs) -> Self {
-        Self {
-            inner,
-            probe: Arc::default(),
-        }
-    }
-
-    /// A file that is not a block (the `TIER` marker): not counted.
-    fn uncounted(&self, inner: <FaultFs as Fs>::File) -> CountedFile {
-        CountedFile {
-            inner,
-            probe: Arc::clone(&self.probe),
-            counted: false,
-        }
-    }
-
-    /// A block file opened for positioned writes: counted until dropped.
-    fn counted(&self, inner: <FaultFs as Fs>::File) -> CountedFile {
-        let now = self.probe.open.fetch_add(1, Ordering::SeqCst) + 1;
-        self.probe.peak.fetch_max(now, Ordering::SeqCst);
-        CountedFile {
-            inner,
-            probe: Arc::clone(&self.probe),
-            counted: true,
-        }
-    }
-
-    /// Syncs wait from now until [`Counting::resume`].
-    fn pause(&self) {
-        self.probe.gate().paused = true;
-    }
-
-    fn resume(&self) {
-        self.probe.gate().paused = false;
-        self.probe.changed.notify_all();
-    }
-
-    fn waiting(&self) -> usize {
-        self.probe.gate().waiting
-    }
-
-    fn syncs(&self) -> usize {
-        self.probe.syncs.load(Ordering::SeqCst)
-    }
-
-    fn peak(&self) -> usize {
-        self.probe.peak.load(Ordering::SeqCst)
-    }
-}
-
-/// One farm: a log and a store that outlive a restart, and a tier directory.
-struct Rig {
-    log: Log,
-    store: FaultyStore,
-    fs: Counting,
-}
-
-impl Drop for Rig {
-    /// A test that fails while the syncs are paused must not leave the writers (and the
-    /// runtime waiting for them) stuck.
-    fn drop(&mut self) {
-        self.fs.resume();
-    }
-}
-
-impl Rig {
-    fn new() -> Self {
-        Self {
-            log: Log::new(),
-            store: FaultyStore::new(Capabilities::default()),
-            fs: Counting::new(FaultFs::new()),
-        }
-    }
-
-    /// A start over this rig's log and store on `fs`, with a tier of `options` and a
-    /// write pool of `pool`.
-    async fn start_on(
-        &self,
-        fs: &Counting,
-        options: TierOptions,
-        pool: PoolConfig,
-    ) -> (Arc<TierCache>, TierStartup) {
-        let cache = Cache::open(self.log.clone(), self.store.clone(), KeyPrefix::default())
-            .await
-            .expect("open")
-            .with_segment_limit(SEGMENT);
-        let (cache, startup) = pooled(cache, pool)
-            .attach_tier(fs.clone(), options, SERVER, None)
-            .await
-            .expect("attach");
-        // The start synced the `TIER` marker; the tests count the blobs' syncs.
-        fs.probe.syncs.store(0, Ordering::SeqCst);
-        (Arc::new(cache), startup)
-    }
-
-    async fn start(&self, writers: usize, queue: usize) -> Arc<TierCache> {
-        let pool = pool(writers, queue);
-        self.start_on(&self.fs, TierOptions::new(GIB), pool).await.0
-    }
-
-    /// Whether `digest` is staged on the tier (not in the store).
-    fn on_tier(&self, digest: &kbf_types::Digest) -> bool {
-        self.log.located(digest).1.is_some()
-    }
-}
-
-fn pool(writers: usize, queue: usize) -> PoolConfig {
-    PoolConfig {
-        writers: writers.try_into().expect("writers"),
-        queue: queue.try_into().expect("queue"),
-        ..PoolConfig::DEFAULT
-    }
-}
 
 /// A tier whose blocks hold 1 MiB, so a 5 MiB stream has a block of its own.
 fn small_blocks() -> TierOptions {
@@ -328,10 +73,6 @@ fn bounded(what: &str, body: impl std::future::Future<Output = ()> + Send + 'sta
     }
 }
 
-fn pooled(cache: TierCache, config: PoolConfig) -> TierCache {
-    cache.with_write_pool(config)
-}
-
 /// Waits until `ready` holds.
 async fn until(what: &str, ready: impl Fn() -> bool) {
     for _ in 0..2000 {
@@ -341,27 +82,6 @@ async fn until(what: &str, ready: impl Fn() -> bool) {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     panic!("timed out waiting for {what}");
-}
-
-/// A blob streamed in 64 KiB pieces and ended as its digest: ready to commit.
-async fn prepare(
-    cache: &Arc<TierCache>,
-    blob: &TestBlob,
-) -> Result<StreamedRecord<support::Log, FaultyStore>, CacheError> {
-    let (cache, blob) = (Arc::clone(cache), blob.clone());
-    tokio::task::spawn_blocking(move || {
-        let mut stream = cache.stream(blob.bytes.len() as u64).expect("a stream");
-        for piece in blob.bytes.chunks(64 << 10) {
-            stream.append(piece)?;
-        }
-        stream.finish(blob.digest, kbf_segments::crc32c(&blob.bytes))
-    })
-    .await
-    .expect("join")
-}
-
-async fn put(cache: &Arc<TierCache>, blob: &TestBlob) -> Result<(), CacheError> {
-    prepare(cache, blob).await?.commit().await
 }
 
 async fn reads_back(cache: &TierCache, blob: &TestBlob) {

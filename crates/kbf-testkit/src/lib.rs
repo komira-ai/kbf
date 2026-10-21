@@ -21,6 +21,7 @@
 //!   project runs (the M2 image has no shell).
 //! - [`tree`]: an action's input root and the action around it, as plain data (the black-box
 //!   suites upload them through `kbf-harness`).
+//! - [`switch`]: a TCP forwarder a test cuts and restores, to kill and revive a node.
 //! - [`reaped`]: a child a test starts, stopped and reaped when the guard drops (SIGTERM,
 //!   then SIGKILL), holding only the descriptors the test gave it.
 //!
@@ -52,6 +53,7 @@ pub mod port;
 mod probe;
 pub mod reaped;
 pub mod spawn;
+pub mod switch;
 pub mod tree;
 
 /// Why a program here stopped short.
