@@ -12,7 +12,7 @@
 //! can be one that cannot fail.
 //!
 //! Catches:
-//! - a unit missing a rule of `check-units` that its mode needs (`restart`, `stop`,
+//! - a unit missing a rule that its mode needs (`restart`, `stop`,
 //!   `delegate`, `handover`, `credential`, `caps`, `swap`, `oom`, `cpuset`, user, slice,
 //!   `LimitNOFILE`), each named below;
 //! - a unit that runs a program outside the installer's tree (`/var/lib/kbf-installer/`),
@@ -153,7 +153,7 @@ fn all<'a>(unit: &'a UnitFile, section: &str, key: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// systemd's `Delegate=` as `config_parse_delegate` reads it (see check-units rule
+/// systemd's `Delegate=` as `config_parse_delegate` reads it (see package rule
 /// `delegate`): a boolean sets all or none, a list adds, an empty value starts over.
 fn delegated(unit: &UnitFile) -> Vec<String> {
     let mut set: Vec<String> = Vec::new();
@@ -237,7 +237,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
                 "kbf.slice sets MemoryMin=, a per-host value".into(),
             );
         }
-        // Catches a slice that disables a controller below it (check-units rule
+        // Catches a slice that disables a controller below it (package rule
         // `delegate`; a slice cannot delegate) or narrows the CPUs or NUMA nodes of
         // every unit in it (`cpuset`; the node's own set is a per-host drop-in, never
         // this static file).
@@ -604,7 +604,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         }
     }
 
-    // Catches a limit on a build node's own unit (check-units rules `caps` and `swap`):
+    // Catches a limit on a build node's own unit (package rules `caps` and `swap`):
     // its leases live in the unit's cgroup, so the builds are capped by the daemon's
     // actions/memory.max alone and a limit here would cap the supervisor with them; and
     // a MemorySwapMax= would turn the daemon's swap watch into an OOM kill of the unit
@@ -622,7 +622,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             v("swap", "a build node sets MemorySwapMax=".into());
         }
         // Catches a build node whose OOM score is not below 0, the build containers'
-        // score (check-units rule `oom`): a host-wide OOM kills the highest score
+        // score (package rule `oom`): a host-wide OOM kills the highest score
         // first, so a lease must die before the daemon that holds them.
         match unit
             .get("OOMScoreAdjust")

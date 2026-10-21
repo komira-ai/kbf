@@ -364,9 +364,16 @@ fn the_rollback_stamp_is_unix_seconds() {
 /// `install-units` must fail loudly, not find a verb that quietly does something else.
 #[test]
 fn the_retired_units_verbs_are_usage_errors() {
-    for verb in ["render-units", "check-units", "install-units"] {
+    // Every argument the base's verb required, so that on the base each one parses.
+    let verbs: [(&str, &[&str]); 3] = [
+        ("render-units", &["--out", "/nonexistent/kbf-deploy/units"]),
+        ("check-units", &["--dir", "/nonexistent/kbf-deploy/units"]),
+        ("install-units", &["--apply"]),
+    ];
+    for (verb, rest) in verbs {
         let mut exec = FakeExec::new(0);
-        let args = ["linux", verb, "--mode", "daemon", "--config", LINUX_CONFIG];
+        let mut args = vec!["linux", verb, "--mode", "daemon", "--config", LINUX_CONFIG];
+        args.extend(rest);
         let (code, out, err) = cli(&mut exec, &no_env, &args);
         assert_eq!(
             (code, out.as_str()),
