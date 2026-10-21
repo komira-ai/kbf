@@ -2,8 +2,6 @@
 //! plays.
 
 use std::future::Future;
-use std::net::{SocketAddr, TcpListener};
-use std::os::fd::AsFd;
 use std::path::PathBuf;
 
 use tokio::net::UnixListener;
@@ -15,17 +13,10 @@ use crate::handover::tests::Scratch;
 fn hello() -> Message {
     Message::Hello {
         version: crate::handover::wire::PROTOCOL,
+        instance: Some(crate::handover::Instance::B),
         reapi: "127.0.0.1:1".parse().expect("address"),
-        worker: "127.0.0.1:2".parse().expect("address"),
-        api: None,
         state: PathBuf::from("/state.db"),
     }
-}
-
-fn listener() -> (TcpListener, SocketAddr) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let local = listener.local_addr().expect("address");
-    (listener, local)
 }
 
 /// A holder at `path` that plays `script` with the first connection.
@@ -66,89 +57,50 @@ async fn nobody_serving_is_a_start_with_no_predecessor() {
     assert!(matches!(error, HandoverError::Socket(_)), "{error}");
 }
 
-/// Catches: sockets taken for other sockets or in another order, an offer that does not
-/// carry the generation it names, a hello that does not reach the holder as it was, and
-/// a `ready` that is not answered by `released`: the successor holds the same sockets the
-/// holder offered, for the two shapes an offer has (with and without the operator API),
-/// and `ready` returns once the holder says it let go.
+/// Catches: an offer that does not carry the generation it names, a hello that does not
+/// reach the holder as it was, a `ready` that is not answered by `released`, and a
+/// successor that cannot tell the predecessor it serves once released: `ready` returns
+/// once the holder says it let go, and the connection it returns says `serving`.
 #[tokio::test]
-async fn an_offer_gives_the_sockets_and_the_generation() {
-    for api in [false, true] {
-        let dir = Scratch::new();
-        let (reapi, reapi_addr) = listener();
-        let (worker, worker_addr) = listener();
-        let (operator, operator_addr) = listener();
-        let asked = hello();
-        let expected = asked.clone();
-        let served = holder(&dir.socket(), move |mut link| async move {
-            assert_eq!(link.hear().await.expect("hello"), expected);
-            let mut sockets = vec![reapi.as_fd(), worker.as_fd()];
-            if api {
-                sockets.push(operator.as_fd());
-            }
-            let offer = Message::Offer { generation: 9, api };
-            link.say_with(&offer, &sockets).await.expect("offer");
-            assert_eq!(link.hear().await.expect("ready"), Message::Ready);
-            link.say(&Message::Released).await.expect("released");
-        });
-        let (offer, sockets) = knock(&dir.socket(), &asked)
+async fn an_offer_gives_the_generation_and_ready_ends_at_released() {
+    let dir = Scratch::new();
+    let asked = hello();
+    let expected = asked.clone();
+    let served = holder(&dir.socket(), move |mut link| async move {
+        assert_eq!(link.hear().await.expect("hello"), expected);
+        link.say(&Message::Offer { generation: 9 })
             .await
-            .expect("an offer")
-            .expect("a frontend serves");
-        assert_eq!(offer.generation, 9);
-        let local = |fd| TcpListener::from(fd).local_addr().expect("a listener");
-        assert_eq!(local(sockets.reapi), reapi_addr);
-        assert_eq!(local(sockets.worker), worker_addr);
-        assert_eq!(sockets.api.map(local), api.then_some(operator_addr));
-        offer.ready().await.expect("the holder let go");
-        served.await.expect("the holder");
-    }
+            .expect("offer");
+        assert_eq!(link.hear().await.expect("ready"), Message::Ready);
+        link.say(&Message::Released).await.expect("released");
+        assert_eq!(link.hear().await.expect("serving"), Message::Serving);
+    });
+    let offer = knock(&dir.socket(), &asked)
+        .await
+        .expect("an offer")
+        .expect("a frontend serves");
+    assert_eq!(offer.generation, 9);
+    let released = offer.ready().await.expect("the holder let go");
+    released.serving().await.expect("told");
+    served.await.expect("the holder");
 }
 
-/// Catches: an offer taken whose sockets are not the ones it announces (too few: the
-/// successor would serve with a socket missing; too many: one would be dropped unseen),
-/// a refusal taken for an offer, and any other first answer taken for one.
+/// Catches: a refusal taken for an offer, and any other first answer taken for one; the
+/// refusal's reason reaches the caller.
 #[tokio::test]
-async fn an_offer_that_is_not_one_is_an_error() {
-    let cases: [(Message, usize, &str); 5] = [
-        (
-            Message::Offer {
-                generation: 1,
-                api: true,
-            },
-            2,
-            "carried 2 sockets, not the 3",
-        ),
-        (
-            Message::Offer {
-                generation: 1,
-                api: false,
-            },
-            3,
-            "carried 3 sockets, not the 2",
-        ),
-        (
-            Message::Offer {
-                generation: 1,
-                api: false,
-            },
-            1,
-            "carried 1 sockets, not the 2",
-        ),
+async fn an_answer_that_is_not_an_offer_is_an_error() {
+    let cases: [(Message, &str); 2] = [
         (
             Message::Refused("other flags".to_owned()),
-            0,
             "refused the handover: other flags",
         ),
-        (Message::Ready, 0, "unexpected handover message: ready"),
+        (Message::Ready, "unexpected handover message: ready"),
     ];
-    for (answer, carried, said) in cases {
+    for (answer, said) in cases {
         let dir = Scratch::new();
-        let held: Vec<_> = (0..carried).map(|_| listener().0).collect();
         let served = holder(&dir.socket(), move |mut link| async move {
             link.hear().await.expect("hello");
-            let sockets: Vec<_> = held.iter().map(AsFd::as_fd).collect();
-            link.say_with(&answer, &sockets).await.expect("answer");
+            link.say(&answer).await.expect("answer");
         });
         let error = knock(&dir.socket(), &hello())
             .await
@@ -176,15 +128,9 @@ async fn ready_ends_in_an_error_unless_the_holder_says_released() {
     ];
     for (answer, wanted) in answers.into_iter().zip(wanted) {
         let dir = Scratch::new();
-        let (reapi, _) = listener();
-        let (worker, _) = listener();
         let served = holder(&dir.socket(), move |mut link| async move {
             link.hear().await.expect("hello");
-            let offer = Message::Offer {
-                generation: 1,
-                api: false,
-            };
-            link.say_with(&offer, &[reapi.as_fd(), worker.as_fd()])
+            link.say(&Message::Offer { generation: 1 })
                 .await
                 .expect("offer");
             link.hear().await.expect("ready");
@@ -192,11 +138,11 @@ async fn ready_ends_in_an_error_unless_the_holder_says_released() {
                 link.say(&answer).await.expect("answer");
             }
         });
-        let (offer, _sockets) = knock(&dir.socket(), &hello())
+        let offer = knock(&dir.socket(), &hello())
             .await
             .expect("an offer")
             .expect("a frontend serves");
-        let error = offer.ready().await.expect_err("not released");
+        let error = offer.ready().await.err().expect("not released");
         assert!(error.to_string().contains(wanted), "{error}");
         served.await.expect("the holder");
     }

@@ -40,7 +40,6 @@ mod pass;
 mod verify;
 
 use std::collections::{BTreeSet, HashMap};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -224,9 +223,6 @@ pub enum Disabled {
     /// The Linux native driver: actions run as the cache's owner and could write it.
     #[error("native-same-uid: native actions run as the daemon's user and could write the cache")]
     NativeSameUid,
-    /// Podman's storage is not one the cache's overlay checks passed on.
-    #[error("graph-driver: {0}")]
-    GraphDriver(String),
 }
 
 impl Disabled {
@@ -239,7 +235,6 @@ impl Disabled {
             Self::LeaseName => "lease-name",
             Self::NoBudget => "no-budget",
             Self::NativeSameUid => "native-same-uid",
-            Self::GraphDriver(_) => "graph-driver",
         }
     }
 }
@@ -356,7 +351,7 @@ struct Inner {
     blobs: PathBuf,
     tmp: PathBuf,
     /// Holds the exclusive flock while the cache is open.
-    _lock: File,
+    _lock: layout::DirLock,
     link_mode: LinkMode,
     link_max: u64,
     uid: u32,

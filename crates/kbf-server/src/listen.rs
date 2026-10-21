@@ -1,16 +1,12 @@
-//! The frontend's listening sockets: bound here, or inherited from the process this one
-//! takes over from ([`crate::handover`]).
-//!
-//! A socket that a handover may pass on keeps a second handle on its file description (a
-//! `dup`), the one that goes over the control socket. That handle is dropped when the
-//! listener stops accepting, so the successor's is the only one left.
+//! The frontend's listening sockets, bound here, and the latch that closes one.
 
+use std::cell::Cell;
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use futures::Stream;
 use kbf_tls::{Incoming, TlsSource};
@@ -22,54 +18,34 @@ use crate::serve::ServeError;
 pub(crate) struct Socket {
     /// Where it listens.
     pub local: SocketAddr,
-    /// A second handle on the same socket, for a successor process; `None` where no
-    /// handover is configured.
-    pub spare: Option<OwnedFd>,
     listener: std::net::TcpListener,
 }
 
 impl Socket {
-    /// A listener on `addr`, with a spare handle when `spare`.
+    /// A listener on `addr`, bound through `binder`.
     ///
     /// # Errors
     /// The address cannot be bound.
-    pub fn bind(addr: SocketAddr, spare: bool) -> Result<Self, ServeError> {
-        let bound =
-            std::net::TcpListener::bind(addr).and_then(|listener| Self::of(listener, spare));
+    pub fn bind(addr: SocketAddr, binder: &Binder) -> Result<Self, ServeError> {
+        let bound = binder.bind(addr).and_then(|listener| {
+            listener.set_nonblocking(true)?;
+            let local = listener.local_addr()?;
+            Ok(Self { local, listener })
+        });
         bound.map_err(bind_error(addr))
     }
 
-    /// The listener `fd` is, which must be listening on `want`: the flags of this process
-    /// decide where it listens, and a handover that passes a socket elsewhere is refused
-    /// (so the checks on the flags, such as plain text off loopback, still describe what
-    /// is served).
+    /// A second handle on the same bound socket: connections wait in one queue, and
+    /// whichever handle is served accepts them. A process that serves a stand-in on the
+    /// clone and hands the original to the real server loses no connection between the
+    /// two ([`crate::managed`]).
     ///
     /// # Errors
-    /// `fd` is not a listening TCP socket, or is on another address than `want`.
-    pub fn adopt(fd: OwnedFd, want: SocketAddr, spare: bool) -> Result<Self, ServeError> {
-        let listener = std::net::TcpListener::from(fd);
-        let adopted = listener.local_addr().and_then(|local| {
-            let matches = local == want;
-            matches.then_some(()).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    format!("the inherited listener is on {local}, not the address of the flags"),
-                )
-            })?;
-            Self::of(listener, spare)
-        });
-        adopted.map_err(bind_error(want))
-    }
-
-    fn of(listener: std::net::TcpListener, spare: bool) -> io::Result<Self> {
-        listener.set_nonblocking(true)?;
-        let local = listener.local_addr()?;
-        let copy = spare.then(|| listener.try_clone());
-        let spare = copy.transpose()?.map(OwnedFd::from);
+    /// The descriptor cannot be duplicated.
+    pub fn try_clone(&self) -> io::Result<Self> {
         Ok(Self {
-            local,
-            spare,
-            listener,
+            local: self.local,
+            listener: self.listener.try_clone()?,
         })
     }
 
@@ -101,6 +77,113 @@ impl Socket {
     }
 }
 
+/// How long binds that fail with `AddrNotAvailable` are retried, all of them together,
+/// before the start is fatal.
+///
+/// A listen address on a VPN or overlay interface can appear seconds after
+/// `network-online.target`, which only waits for the ordinary links. The bound is below
+/// the `TimeoutStartSec=120` of the rendered frontend and storage units (systemd would
+/// kill a start that waits longer, with a worse message), and a later start-up step still
+/// has its share. It is one budget for the whole start ([`Binder`]), not one per bind.
+pub(crate) const BIND_BUDGET: Duration = Duration::from_secs(90);
+
+/// The first wait between two bind attempts; each wait doubles, up to [`BIND_WAIT_MAX`].
+const BIND_WAIT_FIRST: Duration = Duration::from_millis(250);
+const BIND_WAIT_MAX: Duration = Duration::from_secs(2);
+
+/// Binds the listeners of one process start, and holds the one retry budget they share.
+///
+/// A bind whose address is not on this host yet (`AddrNotAvailable`) is retried, every
+/// other error is at once the result. The waits of every bind made through the same
+/// `Binder` are taken from the same [`BIND_BUDGET`], so several listeners on a late
+/// interface wait for it together, not one after the other (three sequential waits of
+/// the whole budget would outlast the unit's start timeout). Each mode makes one
+/// `Binder` when it starts and passes it to every bind. Blocks the thread while it
+/// waits: it runs at start-up, before serving.
+pub(crate) struct Binder {
+    left: Cell<Duration>,
+    attempt: Box<dyn Fn(SocketAddr) -> io::Result<std::net::TcpListener>>,
+    sleep: Box<dyn Fn(Duration)>,
+}
+
+impl Binder {
+    /// A binder with the production budget, binding for real.
+    pub fn new() -> Self {
+        Self::within(BIND_BUDGET)
+    }
+
+    /// A binder that really binds, with `budget` instead of [`BIND_BUDGET`].
+    fn within(budget: Duration) -> Self {
+        Self {
+            left: Cell::new(budget),
+            attempt: Box::new(std::net::TcpListener::bind),
+            sleep: Box::new(std::thread::sleep),
+        }
+    }
+
+    /// A binder over the given bind attempt and sleep, for the tests of the retry and
+    /// of every place that binds.
+    #[cfg(test)]
+    fn scripted(
+        budget: Duration,
+        attempt: Box<dyn Fn(SocketAddr) -> io::Result<std::net::TcpListener>>,
+        sleep: Box<dyn Fn(Duration)>,
+    ) -> Self {
+        Self {
+            left: Cell::new(budget),
+            attempt,
+            sleep,
+        }
+    }
+
+    /// A std listener on `addr`, retried for as much of the budget as is left.
+    pub fn bind(&self, addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+        let before = self.left.get();
+        let mut left = before;
+        let mut retries = 0_u32;
+        let mut sleep = |wait: Duration| {
+            retries += 1;
+            if retries == 1 {
+                tracing::warn!(%addr, ?wait, "listen address not available yet, retrying the bind");
+            } else {
+                tracing::debug!(%addr, ?wait, "listen address still not available");
+            }
+            (self.sleep)(wait);
+        };
+        let got = retry_unavailable(&mut left, &mut sleep, &mut || (self.attempt)(addr));
+        self.left.set(left);
+        if let Err(e) = &got
+            && e.kind() == io::ErrorKind::AddrNotAvailable
+        {
+            tracing::warn!(%addr, waited = ?(before - left), "listen address never became available, giving up");
+        }
+        got
+    }
+}
+
+/// Runs `attempt` until it succeeds, fails with anything but `AddrNotAvailable`, or
+/// `left` is spent; the last error is then the result. `sleep` is called with each wait
+/// (250 ms, doubling to 2 s, the last one cut to what is left) and `left` is reduced by
+/// it. Not generic: a generic function's copies count once each in the coverage ratchet.
+pub(crate) fn retry_unavailable(
+    left: &mut Duration,
+    sleep: &mut dyn FnMut(Duration),
+    attempt: &mut dyn FnMut() -> io::Result<std::net::TcpListener>,
+) -> io::Result<std::net::TcpListener> {
+    let mut wait = BIND_WAIT_FIRST;
+    loop {
+        match attempt() {
+            Err(e) if e.kind() == io::ErrorKind::AddrNotAvailable && !left.is_zero() => {
+                let wait_now = wait.min(*left);
+                sleep(wait_now);
+                *left -= wait_now;
+                wait = (wait * 2).min(BIND_WAIT_MAX);
+            }
+            other => return other,
+        }
+    }
+}
+
 /// The error of a socket on `addr` that could not be made or registered.
 fn bind_error(addr: SocketAddr) -> impl FnOnce(io::Error) -> ServeError {
     move |source| ServeError::Bind { addr, source }
@@ -116,9 +199,9 @@ struct Open {
 /// A gRPC listener that can be closed from outside: [`Latch::close`] ends the stream of
 /// connections and closes the socket at once, wherever the server is in accepting. The
 /// transport's own shutdown keeps the socket open until the last connection is gone, and
-/// stops accepting only when it next looks at the listener; a process that handed its
-/// listener to a successor must not go on holding it (a successor that crashes and is
-/// started again binds the address).
+/// stops accepting only when it next looks at the listener; a process that stops
+/// listening (a handover stops the worker listener) must not go on holding the socket
+/// open, where connections would queue for nobody.
 pub(crate) struct Stoppable(Arc<Mutex<Open>>);
 
 impl Stream for Stoppable {

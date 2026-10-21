@@ -229,6 +229,20 @@ fn a_host_reports_the_membership_it_was_opened_with() {
     assert_eq!(voters, [S1, S2, S3]);
 }
 
+/// Catches: a host whose mutable machine is a copy (a caller recording the outcome
+/// of an applied command would lose it) or that rewinds the core with it.
+#[test]
+fn a_host_lends_its_machine_to_record_outcomes_without_touching_the_log() {
+    let trace = Trace::default();
+    let mut host = open(config(S1, &[S1]), Disk::new(&trace));
+    elect(&mut host);
+    host.propose(vec![7]).unwrap();
+    assert_eq!(host.machine().applied, [1, 2]);
+    host.machine_mut().applied.push(99);
+    assert_eq!(host.machine().applied, [1, 2, 99]);
+    assert_eq!(host.core().applied_index(), LogIndex(2));
+}
+
 #[test]
 fn a_vote_is_synced_before_it_is_sent() {
     let trace = Trace::default();
@@ -348,6 +362,36 @@ fn a_storage_error_stops_the_host() {
     assert!(take(&trace).is_empty(), "a stopped host touched its parts");
     assert!(host.transport().sent.is_empty());
     assert!(host.machine().applied.is_empty());
+}
+
+/// Catches: a host that skips the closing sync when the input ends in a persist with
+/// nothing after it (a term adopted from an answer: it sends nothing, so no later step
+/// would sync it), and one that carries on after that last sync fails.
+#[test]
+fn a_persist_with_nothing_after_it_is_synced_and_its_failure_stops_the_host() {
+    let later_term = Message {
+        term: Term(5),
+        kind: MessageKind::VoteResponse { granted: false },
+    };
+    let trace = Trace::default();
+    let mut host = open(config(S1, &[S1, S2, S3]), Disk::new(&trace));
+    host.receive(S2, later_term.clone(), 0).unwrap();
+    assert_eq!(
+        take(&trace),
+        [Op::WriteHardState(hard(5, None)), Op::Sync],
+        "the adopted term is synced though nothing follows it"
+    );
+    assert_eq!(host.storage().mem.durable().hard, hard(5, None));
+
+    let mut disk = Disk::new(&trace);
+    disk.fail = |op| *op == Op::Sync;
+    let mut host = open(config(S1, &[S1, S2, S3]), disk);
+    assert_eq!(
+        host.receive(S2, later_term, 0),
+        Err(HostError::Storage(Failed))
+    );
+    assert!(host.is_stopped());
+    assert!(host.transport().sent.is_empty());
 }
 
 /// Catches: a failed write that the host treats as done, and a failed snapshot write

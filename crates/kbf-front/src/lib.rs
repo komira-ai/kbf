@@ -59,14 +59,18 @@ mod capabilities;
 mod cas;
 mod closure;
 mod cpu;
+mod default_platform;
 mod described;
+mod dir_cache;
 mod execution;
 mod finished_row;
 mod input_tree;
+mod input_walk;
 mod meta_log;
 pub mod metrics;
 mod proxy;
 mod recorder;
+mod relay;
 mod request_metadata;
 mod routed;
 mod segments;
@@ -89,16 +93,18 @@ pub use crate::backend::Backend;
 pub use crate::bytestream::ByteStreamService;
 pub use crate::cache::HIT_CHECKS_IN_FLIGHT;
 pub use crate::cache::{
-    Admitted, BATCH_READS_IN_FLIGHT, BlobRead, Cache, CacheError, DEFAULT_REAPI_STREAMS,
-    DEFAULT_WORKER_STREAMS, EVICT_BATCH, EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound,
-    FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
-    HeldObject, Losses, MAX_ADMISSION_BYTES, MAX_DECODED_BLOB_BYTES, NEEDS_V3, PASS_OPENS_PER_SEC,
-    PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, READ_WINDOW_BYTES, RecordStream,
-    STREAM_WINDOW_BYTES, StreamedRecord, TierStartError, TierStartup, TouchConfig, VerifiedBlob,
-    WriteConfig,
+    ADOPT_RECORDS, Admitted, BATCH_BLOBS, BATCH_BYTES, BATCH_READS_IN_FLIGHT, BUFFERED_BLOB_BYTES,
+    BlobRead, Cache, CacheError, DEFAULT_REAPI_STREAMS, DEFAULT_WORKER_STREAMS, EVICT_BATCH,
+    EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound, FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX,
+    FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushReport, FlushRound, HeldObject, Losses,
+    MAX_ADMISSION_BYTES, MAX_DECODED_BLOB_BYTES, NEEDS_V3, ObjectKeys, PASS_OPENS_PER_SEC,
+    PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, PoolConfig, READ_WINDOW_BYTES, RebuildConfig,
+    RebuildReport, RecordStream, STREAM_WINDOW_BYTES, StreamedRecord, TailReport, TailState,
+    TierHealth, TierStartError, TierStartup, TouchConfig, VerifiedBlob, WriteConfig,
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
+pub use crate::default_platform::{BadDefaultPlatform, DefaultPlatform};
 pub use crate::described::Described;
 pub use crate::execution::{
     BOOK_CPUS_KEY, BOOK_MEM_GIB_KEY, Closer, Closing, DEFAULT_RESOURCES, Dispatch, ERROR_DOMAIN,
@@ -113,6 +119,8 @@ pub use crate::recorder::{
     ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,
     Tap, listing, owner, wall_now,
 };
+pub use crate::relay::{Handed, Relay, Successor};
+
 pub use crate::request_metadata::{
     CallMetadata, HEADER as REQUEST_METADATA_HEADER, Invalid, InvocationId, MAX_HEADER_BYTES,
     MAX_ID_BYTES, MAX_TEXT_BYTES, Read, ReadRequestMetadata, RequestMetadataLayer, Text,
@@ -228,13 +236,27 @@ where
         Progress::off(),
         authorizers,
         &Recorder::off(),
-        DEFAULT_RESOURCES.memory_bytes,
+        Defaults {
+            memory: DEFAULT_RESOURCES.memory_bytes,
+            platform: DefaultPlatform::NONE,
+        },
     )
 }
 
+/// What an `action` that names less than the farm needs is given.
+#[derive(Clone, Copy, Debug)]
+pub struct Defaults {
+    /// The memory an `action` that names no size books, in bytes
+    /// ([`ExecutionService::with_default_memory`]).
+    pub memory: u64,
+    /// The OS and architecture of an `action` that names neither
+    /// ([`ExecutionService::with_default_platform`]).
+    pub platform: DefaultPlatform,
+}
+
 /// [`routes_with_authorizers`], each call that carries an invocation id sent to
-/// `recorder`, open streams re-sent at each tick of `progress`, and an `action` that
-/// names no memory size booking `default_memory` bytes ([`ExecutionService::with_default_memory`]).
+/// `recorder`, open streams re-sent at each tick of `progress`, and an `action` given
+/// `defaults` where it names no memory size, OS or architecture.
 pub fn routes_recorded<M, O, D>(
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
@@ -242,7 +264,7 @@ pub fn routes_recorded<M, O, D>(
     progress: Progress,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
-    default_memory: u64,
+    defaults: Defaults,
 ) -> Routes
 where
     M: MetaLog,
@@ -258,7 +280,8 @@ where
         )
         .recording(recorder.clone())
         .with_progress(progress)
-        .with_default_memory(default_memory),
+        .with_default_memory(defaults.memory)
+        .with_default_platform(defaults.platform),
     )
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -286,20 +309,100 @@ pub fn routes_proxied<D>(
     streams: OpenStreams,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
-    default_memory: u64,
+    defaults: Defaults,
 ) -> Routes
 where
     D: Dispatch,
 {
-    let OpenStreams { closing, progress } = streams;
-    let execution = ExecutionServer::new(
-        ExecutionService::with_authorizers(backend, dispatch, closing, Arc::clone(&authorizers))
-            .recording(recorder.clone())
-            .with_progress(progress)
-            .with_default_memory(default_memory),
+    proxied(
+        proxy,
+        backend.into(),
+        dispatch,
+        streams,
+        authorizers,
+        recorder,
+        defaults,
+        |execution, _, _| execution,
     )
-    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(MAX_MESSAGE_BYTES);
+}
+
+/// What a frontend that may hand its roles to a successor forwards its `Execute` and
+/// `WaitExecution` calls with once it has ([`Relay`]).
+pub struct Relaying {
+    /// Whether the frontend has handed its roles over.
+    pub farm: Arc<dyn Handed>,
+    /// The successor's channel, named when the successor says who it is.
+    pub successor: Successor,
+    /// How often a relay that fell back to the state store looks in it.
+    pub follow_every: std::time::Duration,
+}
+
+/// [`routes_proxied`] with the `Execution` service behind a [`Relay`]: calls are the
+/// wrapped service's until `relaying.farm` has handed over, and the successor's after.
+#[allow(clippy::too_many_arguments)] // `routes_proxied`'s seven, and the relay's.
+pub fn routes_relayed<D>(
+    proxy: &Proxy,
+    backend: impl Into<Backend>,
+    dispatch: Arc<D>,
+    streams: OpenStreams,
+    authorizers: Arc<Authorizers>,
+    recorder: &Recorder,
+    defaults: Defaults,
+    relaying: Relaying,
+) -> Routes
+where
+    D: Dispatch,
+{
+    let backend = backend.into();
+    let counted = backend.clone();
+    proxied(
+        proxy,
+        backend,
+        dispatch,
+        streams,
+        authorizers,
+        recorder,
+        defaults,
+        move |execution, closing, progress| {
+            let streams = OpenStreams { closing, progress };
+            Relay::new(execution, relaying.farm, relaying.successor, counted)
+                .with_streams(streams)
+                .following_every(relaying.follow_every)
+        },
+    )
+}
+
+/// The routes of [`routes_proxied`], the `Execution` service made by `wrap` from the
+/// service and the two halves of the open streams' wiring.
+#[allow(clippy::too_many_arguments)] // `routes_proxied`'s seven, and the wrap.
+fn proxied<D, E>(
+    proxy: &Proxy,
+    backend: Backend,
+    dispatch: Arc<D>,
+    streams: OpenStreams,
+    authorizers: Arc<Authorizers>,
+    recorder: &Recorder,
+    defaults: Defaults,
+    wrap: impl FnOnce(ExecutionService<D>, Closing, Progress) -> E,
+) -> Routes
+where
+    D: Dispatch,
+    E: kbf_proto::reapi::execution_server::Execution,
+{
+    let OpenStreams { closing, progress } = streams;
+    let service = ExecutionService::with_authorizers(
+        backend,
+        dispatch,
+        closing.clone(),
+        Arc::clone(&authorizers),
+    )
+    .recording(recorder.clone())
+    .with_progress(progress.clone())
+    .with_default_memory(defaults.memory)
+    .with_default_platform(defaults.platform);
+    let execution = ExecutionServer::new(wrap(service, closing, progress))
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let capabilities = CapabilitiesService::new(true, authorizers);
     proxy
         .routes()

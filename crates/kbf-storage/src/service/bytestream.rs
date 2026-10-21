@@ -24,7 +24,7 @@ impl ByteStream for StorageService {
         &self,
         request: Request<ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
-        self.admission.check(&request, Endpoint::Read)?;
+        self.guard(&request, Endpoint::Read)?;
         self.check_map(generation::requested(&request)?).await?;
         let request = request.into_inner();
         let digest = wire::read_resource(&request.resource_name)?;
@@ -71,15 +71,24 @@ impl ByteStream for StorageService {
         request: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
         let leg_from = generation::leg(&request)?;
+        // Only the frontend's identity may ask for an unowned copy; any other caller that
+        // sends the header gets the plain-write rule.
+        let unowned = generation::takes_unowned(
+            leg_from,
+            generation::unowned(&request),
+            self.admission.permits_unowned(&request),
+        );
         let endpoint = if leg_from.is_some() {
             Endpoint::WriteLeg
         } else {
             Endpoint::Write
         };
-        self.admission.check(&request, endpoint)?;
+        self.guard(&request, endpoint)?;
         let requested = generation::requested(&request)?;
         let stream = request.into_inner();
-        let size = self.write_in(requested, leg_from, stream.boxed()).await?;
+        let size = self
+            .write_in(requested, leg_from, unowned, stream.boxed())
+            .await?;
         Ok(wire::committed(size))
     }
 
@@ -88,7 +97,7 @@ impl ByteStream for StorageService {
         &self,
         request: Request<QueryWriteStatusRequest>,
     ) -> Result<Response<QueryWriteStatusResponse>, Status> {
-        self.admission.check(&request, Endpoint::QueryWriteStatus)?;
+        self.guard(&request, Endpoint::QueryWriteStatus)?;
         self.check_map(generation::requested(&request)?).await?;
         let digest = wire::write_resource(&request.into_inner().resource_name)?;
         let complete = self.storage.find_missing(&[digest]).await?.is_empty();

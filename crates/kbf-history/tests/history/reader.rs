@@ -119,7 +119,7 @@ fn records_of_an_instance_the_header_does_not_list_are_still_filtered() {
     // refused here, since its newest chunk names b; the records are read page by page.)
     let mut life = Life::fresh(Limits::default());
     let (inv, _) = closed_build(&mut life);
-    let key = IndexRoot::default().invid(&inv.key);
+    let key = IndexRoot::default().header(&inv.key, life.writer_id);
     let row = life.index.inner.get(&key).unwrap().unwrap();
     let mut header = InvocationHeader::decode(row.value.as_slice()).unwrap();
     header.instances = vec!["a".into()];
@@ -234,6 +234,56 @@ fn listing(instances: &[&str]) -> InvocationHeader {
         instances: instances.iter().map(|&i| i.to_owned()).collect(),
         ..InvocationHeader::default()
     }
+}
+
+#[test]
+fn an_invocations_instances_are_read_from_its_header_row_alone() {
+    // Catches: the first phase of an authorized read answered from the chunks (an
+    // object read for a list one row holds), an empty or truncated list answered as
+    // whole (all-must-allow over it would be true of every caller), an invocation
+    // history does not hold answered with a list, and an undecodable row answered as
+    // none held.
+    let mut life = Life::fresh(Limits::default());
+    let (inv, _) = closed_build(&mut life);
+    let reader = life.reader();
+    let gets = life.objects.counts().gets.load(Ordering::SeqCst);
+    let names = futures::executor::block_on(reader.invocation_instances(&inv.key)).unwrap();
+    assert_eq!(
+        names.as_deref(),
+        Some(&["a".to_owned(), "b".to_owned()][..])
+    );
+    assert_eq!(
+        life.objects.counts().gets.load(Ordering::SeqCst),
+        gets,
+        "no object is read"
+    );
+    let missing = InvRef::named("nobody");
+    let none = futures::executor::block_on(reader.invocation_instances(&missing.key));
+    assert_eq!(none.unwrap(), None);
+    for (name, header) in [
+        ("empty", InvocationHeader::default()),
+        (
+            "wide",
+            InvocationHeader {
+                instances_truncated: true,
+                ..listing(&["a"])
+            },
+        ),
+    ] {
+        let at = InvRef::named(name);
+        life.index
+            .put(&IndexRoot::default().invid(&at.key), header.encode_to_vec());
+        let got = futures::executor::block_on(reader.invocation_instances(&at.key));
+        assert_eq!(got.unwrap(), None, "{name}");
+    }
+    life.index
+        .put(&IndexRoot::default().invid(&inv.key), vec![0xFF]);
+    let err = futures::executor::block_on(reader.invocation_instances(&inv.key)).unwrap_err();
+    assert!(matches!(err, ReadError::Row { .. }), "{err}");
+    // The index itself failing is its own error, not no invocation.
+    life.index.fail_scans.store(true, Ordering::SeqCst);
+    let err = futures::executor::block_on(reader.invocation_instances(&inv.key)).unwrap_err();
+    assert!(matches!(err, ReadError::Index(_)), "{err}");
 }
 
 /// Writes a chunk by hand: `records` under a valid header, with its rows, so a test can
@@ -551,7 +601,7 @@ fn a_header_that_lists_no_instance_or_a_truncated_list_answers_no_caller() {
         &IndexRoot::default().invid(&bare.key),
         header.encode_to_vec(),
     );
-    for allow in [&nothing as &dyn Fn(&str) -> bool, &all] {
+    for allow in [&nothing as &(dyn Fn(&str) -> bool + Sync), &all] {
         let view = futures::executor::block_on(reader.invocation(&bare.key, allow));
         assert_eq!(view.unwrap(), None);
         let page = futures::executor::block_on(reader.records(&bare.key, None, 1, allow));

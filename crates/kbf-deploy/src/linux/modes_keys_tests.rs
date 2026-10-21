@@ -45,7 +45,10 @@ const ALL_SET: &[(&str, &str)] = &[
     ("KBF_REAPI_CERT", "/etc/kbf/front.example.ts.net.crt"),
     ("KBF_REAPI_KEY", "/etc/kbf/front.example.ts.net.key"),
     ("KBF_API_TOKEN_FILE", "/run/secrets/kbf-api-token"),
-    ("KBF_STATE_DIR", "/srv/kbf/state"),
+    (
+        "KBF_STATE_STORE",
+        "postgres://db.example.internal:5432/kbf?application_name=kbf",
+    ),
     ("KBF_RESERVE_CPUS", "4"),
     ("KBF_LEASE_PLACEMENT", "numa-node"),
 ];
@@ -55,7 +58,7 @@ fn words(list: &[&str]) -> Vec<String> {
 }
 
 /// Each mode's whole command line with every setting given: the frontend's three
-/// listeners, certificates, storage URL and SQLite state store; the storage-and-daemon
+/// listeners, certificates, storage URL and Postgres state store; the storage-and-daemon
 /// unit's cold store (with the prefix), meta dir, hot store, listener, registration and
 /// advertised name; the daemons' frontend name and tuning flags. Catches a flag dropped,
 /// renamed or given another key's value (the node's own name where the frontend's
@@ -79,8 +82,7 @@ fn each_mode_renders_its_full_flag_set() {
             "--storage-client-cert=/etc/kbf/worker.pem",
             "--storage-client-key=/etc/kbf/worker.key",
             "--storage-ca=/etc/kbf/ca.pem",
-            "--state-store=sqlite:///srv/kbf/state/state.db",
-            "--handover-socket=/run/kbf-frontend/control.sock",
+            "--state-store=postgres://db.example.internal:5432/kbf?application_name=kbf",
         ])
     );
     assert_eq!(
@@ -88,7 +90,7 @@ fn each_mode_renders_its_full_flag_set() {
         words(&[
             "--cold-store=s3://kbf-cas/farm2/?endpoint=http://127.0.0.1:9000&conditional-put=true",
             "--meta-dir=/var/lib/kbf-server/raft",
-            "--hot-store=file:///var/lib/kbf-server/hot",
+            "--hot-store=file:///var/lib/kbf/hot",
             "--storage-listen=192.0.2.10:8983",
             "--storage-tls-cert=/etc/kbf/storage.pem",
             "--storage-tls-key=/etc/kbf/storage.key",
@@ -96,6 +98,7 @@ fn each_mode_renders_its_full_flag_set() {
             "--frontend=https://front.example.internal:8981",
             "--advertise-addr=storage-node.example.internal:8983",
             "--driver=container",
+            "--oci-runtime=/usr/bin/crun",
             "--server=https://front.example.internal:8981",
             "--ca-cert=/etc/kbf/ca.pem",
             "--cert=/etc/kbf/node.pem",
@@ -112,6 +115,7 @@ fn each_mode_renders_its_full_flag_set() {
         flags(&c, Mode::Daemon),
         words(&[
             "--driver=container",
+            "--oci-runtime=/usr/bin/crun",
             "--server=https://front.example.internal:8981",
             "--cas=https://front.example.internal:8981",
             "--ca-cert=/etc/kbf/ca.pem",
@@ -129,7 +133,7 @@ fn each_mode_renders_its_full_flag_set() {
         flags(&c, Mode::Storage),
         words(&[
             "--cold-store=s3://kbf-cas/farm2/?endpoint=http://127.0.0.1:9000&conditional-put=true",
-            "--hot-store=file:///var/lib/kbf-server/hot",
+            "--hot-store=file:///var/lib/kbf/hot",
             "--meta-dir=/var/lib/kbf-server/raft",
             "--storage-listen=192.0.2.10:8983",
             "--storage-tls-cert=/etc/kbf/storage.pem",
@@ -180,7 +184,11 @@ fn each_new_key_reaches_exactly_the_units_that_read_it() {
             "/etc/kbf/other-token",
             &[Frontend, AllInOne],
         ),
-        ("KBF_STATE_DIR", "/srv/other", &[Frontend]),
+        (
+            "KBF_STATE_STORE",
+            "postgres://other.example/kbf",
+            &[Frontend],
+        ),
         (
             "KBF_RESERVE_CPUS",
             "7",
@@ -282,17 +290,37 @@ fn the_new_keys_refuse_values_a_unit_cannot_carry() {
             "{bad}"
         );
     }
-    let state = refuses("KBF_STATE_DIR", "relative/dir");
-    assert!(
-        matches!(
-            state,
-            LinuxError::Path {
-                key: "KBF_STATE_DIR",
-                ..
-            }
-        ),
-        "{state}"
-    );
+    // The state store: a postgres URI that carries no password, no variable and no
+    // character a unit line cannot hold. The rule `state-store` judges the rest.
+    for bad in [
+        "sqlite:///var/lib/kbf/state.db",
+        "mysql://db/kbf",
+        "postgres://",
+        "postgresql://",
+        "postgres://u:hunter2@db/kbf",
+        "postgres://db/kbf?password=hunter2",
+        "postgres://db/kbf?PassWord=hunter2",
+        "postgres://db/kbf?sslmode=prefer&password=hunter2",
+        "postgres://$PGUSER@db/kbf",
+        "postgres://db/kbf%20x",
+        "postgres://db/kbf;x",
+    ] {
+        let state = refuses("KBF_STATE_STORE", bad);
+        assert!(
+            matches!(state, LinuxError::StateStore { .. })
+                || matches!(state, LinuxError::Chars { .. }),
+            "{bad}: {state}"
+        );
+        assert!(!state.to_string().contains("hunter2"), "{bad}: {state}");
+    }
+    for ok in [
+        "postgres:///kbf?host=/run/postgresql",
+        "postgresql://kbf@db.example:5432/kbf",
+        "postgres://db/kbf?sslmode=prefer&application_name=kbf",
+    ] {
+        let c = config_with(&[("KBF_STATE_STORE", ok)]);
+        assert_eq!(c.state_store, ok);
+    }
     // Taken: each placement, a zero, a nested prefix with or without its slash.
     for (key, value) in [
         ("KBF_LEASE_PLACEMENT", "none"),
@@ -393,9 +421,7 @@ fn on_the_node_a_copy_of_the_key_beside_the_allowed_file_is_refused() {
         );
     let slice = UnitText::new(
         SLICE,
-        crate::linux::render::render(&c, Some(1500), &crate::linux::render::Templates::BUILT_IN)
-            .expect("renders")
-            .slice,
+        crate::linux::shared::render_slice(&c, Some(1500)).expect("renders"),
     );
     let mut exec = FakeExec::new(0);
     let file = |bits: u32, uid: u32, text: &str| Entry::File {
@@ -421,7 +447,6 @@ fn on_the_node_a_copy_of_the_key_beside_the_allowed_file_is_refused() {
         &UnitText::new(Mode::StorageAndDaemon.unit_name(), unit),
         &slice,
         true,
-        None,
     )
     .expect("runs");
     let credential: Vec<String> = r
@@ -436,4 +461,33 @@ fn on_the_node_a_copy_of_the_key_beside_the_allowed_file_is_refused() {
             "FAIL credential: kbf-storage-and-daemon.service gives a build node the cold store's key (EnvironmentFile=/etc/kbf/copy.env, which sets AWS_SECRET_ACCESS_KEY): a build node holds no credential, and its builds run as its user"
         ]
     );
+}
+
+/// Catches a `storage` or `storage-and-daemon` unit ordered after `MINIO_UNIT`, a unit
+/// that does not exist on a host whose cold store is an external S3 endpoint (the
+/// ordering is a no-op there). With `MINIO_UNIT` set to a name nothing else in the
+/// settings uses, the rendered units never carry it.
+#[test]
+fn a_storage_unit_is_not_ordered_after_the_minio_unit() {
+    let c = config_with(&[("MINIO_UNIT", "minio-kbf.service")]);
+    for mode in [Mode::Storage, Mode::StorageAndDaemon] {
+        let text = render(&c, Some(1500), mode).expect("renders");
+        assert!(!text.contains("minio-kbf"), "{mode}:\n{text}");
+        assert!(
+            text.contains("\nAfter=network-online.target\n"),
+            "{mode}:\n{text}"
+        );
+    }
+}
+
+/// The frontend unit gives no `--handover-socket`: its state store is Postgres, which
+/// `kbf frontend` refuses together with the socket (a Postgres store cannot be handed
+/// over). Catches the socket rendered again, whatever the settings.
+#[test]
+fn the_postgres_frontend_unit_gives_no_handover_flag() {
+    for c in [config_with(&[]), config_with(ALL_SET)] {
+        let f = flags(&c, Mode::Frontend);
+        assert!(f.iter().any(|w| w.starts_with("--state-store=postgres://")));
+        assert!(!f.iter().any(|w| w.contains("handover")), "{f:?}");
+    }
 }

@@ -60,7 +60,28 @@ fn request(i: u32) -> pb::RegisterRequest {
         zone: "a".to_owned(),
         protocol: PROTOCOL,
         catching_up: false,
+        ..Default::default()
     }
+}
+
+/// Catches: the report of the node's log history dropped between the wire and the store (the
+/// request's `last_member_id` and `last_boot` not read): a node that says it last wrote as
+/// member 3 at boot 5 is answered member 3 at boot 6, not member 1 at boot 1. Mutant: the
+/// service passes `None` to `register_after`, red.
+#[tokio::test]
+async fn register_reads_the_nodes_last_member_and_boot() {
+    let store = Hooked::new();
+    let (_members, mut client) = serve(&store).await;
+    let got = client
+        .register(pb::RegisterRequest {
+            last_member_id: 3,
+            last_boot: 5,
+            ..request(1)
+        })
+        .await
+        .expect("registers")
+        .into_inner();
+    assert_eq!((got.member_id, got.boot), (3, 6));
 }
 
 /// Catches: a registration answer that lacks what the node needs (the store's id and
@@ -89,8 +110,7 @@ async fn register_answers_with_identity_interval_and_map() {
         .heartbeat(pb::HeartbeatRequest {
             member_id: 1,
             boot: 1,
-            catching_up: false,
-            have_generation: 0,
+            ..Default::default()
         })
         .await
         .expect("beats")
@@ -105,8 +125,8 @@ async fn register_answers_with_identity_interval_and_map() {
         .heartbeat(pb::HeartbeatRequest {
             member_id: 1,
             boot: 1,
-            catching_up: false,
             have_generation: map.generation(),
+            ..Default::default()
         })
         .await
         .expect("beats")
@@ -147,8 +167,7 @@ async fn every_failure_has_its_own_code() {
     let beat = |id, boot| pb::HeartbeatRequest {
         member_id: id,
         boot,
-        catching_up: false,
-        have_generation: 0,
+        ..Default::default()
     };
     let old = client.heartbeat(beat(1, 1)).await.expect_err("old boot");
     assert_eq!(old.code(), Code::FailedPrecondition);
@@ -195,11 +214,16 @@ async fn a_panic_in_the_store_fails_one_call() {
         .expect("the next call works");
 }
 
-fn leaf(role: &str) -> Vec<u8> {
+/// A certificate naming `role` and the DNS names `names`.
+fn leaf(role: &str, names: &[&str]) -> Vec<u8> {
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
-    params.subject_alt_names = vec![SanType::URI(
+    params.subject_alt_names = names
+        .iter()
+        .map(|name| SanType::DnsName((*name).try_into().expect("IA5")))
+        .collect();
+    params.subject_alt_names.push(SanType::URI(
         format!("{ROLE_URI_PREFIX}{role}").try_into().expect("IA5"),
-    )];
+    ));
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     let key = KeyPair::generate().expect("key");
     params.self_signed(&key).expect("cert").der().to_vec()
@@ -208,16 +232,31 @@ fn leaf(role: &str) -> Vec<u8> {
 /// Catches: registration open to the wrong role. Under mutual TLS only a certificate that
 /// names the role `storage` may register: a daemon's or a frontend's is PERMISSION_DENIED,
 /// none is UNAUTHENTICATED, bytes that are no certificate are UNAUTHENTICATED; plain text
-/// admits everyone, as the storage listener does.
+/// admits everyone, as the storage listener does. An admitted storage certificate comes
+/// back with the names it holds (the role URI is not one), none in plain text; whether
+/// they cover an instance is `Register`'s check, over the wire in `worker_roles.rs`.
 #[test]
 fn only_the_storage_role_may_register() {
     let members = Arc::new(Members::new(Hooked::new() as Arc<dyn Store>, config()));
     let certified = MembershipService::new(Arc::clone(&members), Admission::Certified);
     let open = MembershipService::new(members, Admission::Open);
-    assert!(open.admit_leaf(None).is_ok());
-    assert!(certified.admit_leaf(Some(&leaf("storage"))).is_ok());
+    assert_eq!(open.admit_leaf(None).expect("open"), None);
+    let named = certified
+        .admit_leaf(Some(&leaf("storage", &["node-a"])))
+        .expect("admitted")
+        .expect("a certified caller has a certificate");
+    let names = named.identity().names();
+    assert_eq!(names.to_string(), "node-a");
+    assert!(names.covers("node-a") && !names.covers("storage"));
+    let nameless = certified
+        .admit_leaf(Some(&leaf("storage", &[])))
+        .expect("the role is all this checks")
+        .expect("a certificate");
+    assert_eq!(nameless.identity().names().to_string(), "no DNS or IP name");
     for role in ["daemon", "frontend"] {
-        let e = certified.admit_leaf(Some(&leaf(role))).expect_err(role);
+        let e = certified
+            .admit_leaf(Some(&leaf(role, &["node-a"])))
+            .expect_err(role);
         assert_eq!(e.code(), Code::PermissionDenied, "{role}");
         assert!(e.message().contains(role), "{}", e.message());
     }
@@ -259,6 +298,107 @@ async fn the_sweeper_expires_members_by_itself() {
     panic!("the sweeper never marked the silent member Down");
 }
 
+/// Catches: the wire's report not reaching the judgement, or reaching it wrong. A heartbeat
+/// that says it owes 4 is 4; one that says `debts_known = false` is "cannot say" whatever
+/// count rides with it; and a heartbeat from a node that sends neither field (an older
+/// one) is "cannot say" too, never zero.
+#[tokio::test]
+async fn a_heartbeat_carries_what_the_node_owes() {
+    let store = Hooked::new();
+    let (members, mut client) = serve(&store).await;
+    client.register(request(1)).await.expect("registers");
+    members
+        .set_state(kbf_map::MemberId(1), MemberState::Active)
+        .expect("promoted");
+    let beat = |repair_debts, debts_known| pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        repair_debts,
+        debts_known,
+        ..Default::default()
+    };
+    client.heartbeat(beat(4, true)).await.expect("beats");
+    assert_eq!(
+        members
+            .storage_health()
+            .expect("health")
+            .under_replicated_blobs,
+        Some(4)
+    );
+
+    client.heartbeat(beat(9, false)).await.expect("beats");
+    let health = members.storage_health().expect("health");
+    assert_eq!(health.under_replicated_blobs, None);
+    assert_eq!(health.unreported, [kbf_map::MemberId(1)]);
+
+    client.heartbeat(beat(4, true)).await.expect("beats");
+    let older = pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        ..Default::default()
+    };
+    client.heartbeat(older).await.expect("beats");
+    assert_eq!(
+        members
+            .storage_health()
+            .expect("health")
+            .under_replicated_blobs,
+        None
+    );
+}
+
+/// Catches: the wire's open-writes report not reaching the judgement, or reaching it wrong,
+/// and the map generation it rides with. A heartbeat that says 3 writes are open at map 7
+/// shows 3 and 7 for the node; one that says `writes_known = false` shows none whatever count
+/// rides with it; one from an older node (neither field) shows none, never zero. Mutants: the
+/// flag ignored; the count read from the debts field; the generation dropped.
+#[tokio::test]
+async fn a_heartbeat_carries_the_writes_the_node_has_open() {
+    let store = Hooked::new();
+    let (members, mut client) = serve(&store).await;
+    client.register(request(1)).await.expect("registers");
+    members
+        .set_state(kbf_map::MemberId(1), MemberState::Active)
+        .expect("promoted");
+    let beat = |open_writes, writes_known| pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        have_generation: 7,
+        repair_debts: 5,
+        debts_known: true,
+        open_writes,
+        writes_known,
+        ..Default::default()
+    };
+    let node = || members.storage_health().expect("health").nodes[0];
+
+    client.heartbeat(beat(3, true)).await.expect("beats");
+    let seen = node();
+    assert_eq!(
+        (seen.open_writes, seen.repair_debts, seen.generation),
+        (Some(3), Some(5), Some(7))
+    );
+
+    client.heartbeat(beat(0, true)).await.expect("beats");
+    assert_eq!(node().open_writes, Some(0), "counted, and none");
+
+    client.heartbeat(beat(9, false)).await.expect("beats");
+    assert_eq!(
+        node().open_writes,
+        None,
+        "a count sent unknown is not a count"
+    );
+
+    client.heartbeat(beat(3, true)).await.expect("beats");
+    let older = pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        ..Default::default()
+    };
+    client.heartbeat(older).await.expect("beats");
+    assert_eq!(node().open_writes, None, "an older node does not count");
+}
+
 /// Catches: expired rows nobody frees (session rows, the results of finished operations
 /// and every other time-to-live key sit in the file for good): the timer, with no caller,
 /// removes a row whose time ran out, as an `Expire` row in the change feed, and a reap
@@ -292,4 +432,70 @@ async fn the_sweeper_frees_expired_rows() {
         tokio::time::sleep(10 * MS).await;
     }
     panic!("the sweeper never freed the expired row");
+}
+
+/// Catches: an answer that sends a node the map and not the maps before it
+/// (`retained_previous`), on `Register` or on `Heartbeat`: a node that has just started would
+/// then read a blob written before the last change as missing, and no test that fakes the
+/// frontend's answer would notice. Three joins make generations 1, 2, 3.
+#[tokio::test]
+async fn the_answers_carry_the_maps_before_the_newest() {
+    let store = Hooked::new();
+    let (_, mut client) = serve(&store).await;
+    let generations = |maps: &[pb::Map]| -> Vec<u64> {
+        maps.iter()
+            .map(|m| {
+                kbf_map::Map::try_from(m.clone())
+                    .expect("a valid map")
+                    .generation()
+            })
+            .collect()
+    };
+    let mut last = pb::RegisterResponse::default();
+    for i in 1..=3 {
+        last = client
+            .register(request(i))
+            .await
+            .expect("registers")
+            .into_inner();
+    }
+    let newest = kbf_map::Map::try_from(last.map.clone().expect("a map")).expect("valid");
+    assert_eq!(newest.generation(), 3);
+    assert_eq!(
+        generations(&last.retained_previous),
+        [2, 1],
+        "register: newest first, none at or after the map's own generation"
+    );
+
+    let beat = client
+        .heartbeat(pb::HeartbeatRequest {
+            member_id: 1,
+            boot: 1,
+            have_generation: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("beats")
+        .into_inner();
+    assert_eq!(beat.map_generation, 3);
+    assert_eq!(
+        generations(&beat.retained_previous),
+        [2, 1],
+        "heartbeat: a node behind is sent the map and the maps before it"
+    );
+    let current = client
+        .heartbeat(pb::HeartbeatRequest {
+            member_id: 1,
+            boot: 1,
+            have_generation: 3,
+            ..Default::default()
+        })
+        .await
+        .expect("beats")
+        .into_inner();
+    assert_eq!(current.map, None);
+    assert!(
+        current.retained_previous.is_empty(),
+        "a node that is current is sent no maps"
+    );
 }

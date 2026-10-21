@@ -6,12 +6,12 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use common::scratch;
-use kbf_state::fake::{Fake, Flaw};
+use common::{SqliteBackend, scratch};
+use kbf_state::conformance::fence;
+use kbf_state::fake::{Fake, FakeBackend, Flaw};
 use kbf_state::sqlite::{Options, SqliteError, SqliteStore};
-use kbf_state::{Clock, Cond, Fenced, GENERATION, ManualClock, Store, StoreError, TakeError, Txn};
+use kbf_state::{Clock, Cond, Fenced, ManualClock, Store, StoreError, Txn};
 
 fn fake() -> Arc<dyn Store> {
     Arc::new(Fake::with_flaw(
@@ -25,153 +25,247 @@ fn open(dir: &std::path::Path) -> Result<SqliteStore, SqliteError> {
     SqliteStore::open(&dir.join("state.db"), clock, Options::default())
 }
 
-// Catches a generation that does not count up from the store's own row: the first writer
-// of an empty store holds 1, the next holds 2.
-#[test]
-fn each_taker_holds_the_next_generation() {
-    let store = fake();
-    let first = Fenced::take(Arc::clone(&store), None).expect("take");
-    assert_eq!(first.generation(), 1);
-    let second = Fenced::take(Arc::clone(&store), Some(1)).expect("take");
-    assert_eq!(second.generation(), 2);
-}
-
-// Catches a successor that takes over a file that is not the one it was told about (a
-// restored backup, a swapped file): the expectation is checked and nothing is written.
-#[test]
-fn a_taker_that_expects_another_generation_is_refused_and_writes_nothing() {
-    let store = fake();
-    Fenced::take(Arc::clone(&store), None).expect("take");
-    let before = store.get(GENERATION).expect("get").expect("row");
-    let refused = Fenced::take(Arc::clone(&store), Some(7)).expect_err("another generation");
-    assert_eq!(
-        refused,
-        TakeError::Mismatch {
-            expected: 7,
-            found: 1
+// The generic cases (kbf_state::conformance::fence) on the fake and on SQLite; the Postgres
+// run is postgres_fence.rs. Each case names the defect it catches.
+macro_rules! on_each_backend {
+    ($($case:ident),+ $(,)?) => {
+        mod on_the_fake {
+            use super::*;
+            $(#[test] fn $case() {
+                fence::$case(&FakeBackend::new(Flaw::None));
+            })+
         }
-    );
-    assert_eq!(store.get(GENERATION).expect("get"), Some(before));
-    let corrupt = fake();
-    corrupt
-        .txn(Txn::new().put(GENERATION, "x", Cond::Any))
-        .expect("store")
-        .expect("put");
-    assert_eq!(
-        Fenced::take(corrupt, None).expect_err("not a number"),
-        TakeError::Corrupt
-    );
+        mod on_sqlite {
+            use super::*;
+            $(#[test] fn $case() {
+                fence::$case(&SqliteBackend::new("fence"));
+            })+
+        }
+    };
 }
 
-// Catches a lost update: when many handles take the generation of one store at the same
-// moment, exactly one write wins each round, so no two hold the same generation.
-#[test]
-fn concurrent_takers_never_hold_the_same_generation() {
-    let store = fake();
-    let takers: Vec<_> = (0..8)
-        .map(|_| {
-            let store = Arc::clone(&store);
-            std::thread::spawn(move || Fenced::take(store, None))
-        })
-        .collect();
-    let mut held: Vec<u64> = takers
-        .into_iter()
-        .filter_map(|t| t.join().expect("join").ok())
-        .map(|f| f.generation())
-        .collect();
-    held.sort_unstable();
-    let distinct = held.len();
-    held.dedup();
-    assert_eq!(held.len(), distinct, "two handles hold one generation");
-    assert!(!held.is_empty(), "at least one taker won");
-}
+on_each_backend!(
+    f1_each_taker_holds_the_next_generation,
+    f2_a_taker_that_expects_another_generation_is_refused,
+    f3_concurrent_takers_never_hold_the_same_generation,
+    f4_a_superseded_handle_fails_every_kind_of_write,
+    f5_the_holder_still_sees_its_own_conflicts,
+    f6_reads_pass_through,
+    f7_a_write_superseded_before_it_lands_is_fenced,
+    f8_a_reap_superseded_before_it_runs_is_fenced,
+);
 
-// Catches a write path that bypasses the fence: once another handle takes the next
-// generation, a put, a delete, a time-to-live put, a counter and a check-only transaction
-// of the old handle each fail Fenced and change nothing.
-#[test]
-fn a_superseded_handle_fails_every_kind_of_write() {
-    let store = fake();
-    let old = Fenced::take(Arc::clone(&store), None).expect("take");
-    old.txn(Txn::new().put("k", "v", Cond::Any))
-        .expect("the holder writes")
-        .expect("commits");
-    let new = Fenced::take(Arc::clone(&store), Some(1)).expect("take");
-    let writes = [
-        Txn::new().put("k", "stale", Cond::Any),
-        Txn::new().delete("k", Cond::Any),
-        Txn::new().put_ttl("t", "v", Duration::from_secs(5), Cond::Any),
-        Txn::new().next("counter"),
-        Txn::new().check("k", Cond::Any),
-        Txn::new(),
-    ];
-    for txn in writes {
-        assert_eq!(old.txn(txn.clone()).unwrap_err(), StoreError::Fenced);
-        new.txn(txn)
-            .expect("the new holder writes")
-            .expect("commits");
+/// A store that forwards the required methods only, so `reap_expired_if` is the default.
+struct Plain(Fake);
+
+impl Store for Plain {
+    fn apply_batch(
+        &self,
+        batch: Vec<Txn>,
+    ) -> Result<Vec<Result<kbf_state::Commit, kbf_state::Conflict>>, StoreError> {
+        self.0.apply_batch(batch)
     }
-    assert_eq!(
-        old.apply_batch(vec![Txn::new().put("a", "1", Cond::Any)])
-            .unwrap_err(),
-        StoreError::Fenced
-    );
-    assert_eq!(old.reap_expired().unwrap_err(), StoreError::Fenced);
-    assert_eq!(
-        old.get("a").expect("reads are not fenced"),
-        None,
-        "the fenced batch wrote nothing"
-    );
-    assert_eq!(new.reap_expired(), Ok(0));
+    fn get(&self, key: &str) -> Result<Option<kbf_state::Versioned>, StoreError> {
+        self.0.get(key)
+    }
+    fn scan_prefix(&self, p: &str) -> Result<Vec<(String, kbf_state::Versioned)>, StoreError> {
+        self.0.scan_prefix(p)
+    }
+    fn scan_range(&self, s: kbf_state::ScanRange<'_>) -> Result<kbf_state::ScanPage, StoreError> {
+        self.0.scan_range(s)
+    }
+    fn changes(
+        &self,
+        after: kbf_state::Revision,
+        limit: usize,
+    ) -> Result<kbf_state::Changes, StoreError> {
+        self.0.changes(after, limit)
+    }
+    fn reap_expired(&self) -> Result<usize, StoreError> {
+        self.0.reap_expired()
+    }
+    fn commit_stats(&self) -> kbf_state::CommitStats {
+        self.0.commit_stats()
+    }
+    fn now(&self) -> kbf_state::StoreTime {
+        self.0.now()
+    }
 }
 
-// Catches a precondition failure being mistaken for a fence (and the reverse): a lost
-// compare-and-set of the live holder is a Conflict, not Fenced.
+// Catches the default conditional reap judging a precondition wrongly: each kind of
+// precondition, met and unmet, reaps (or refuses) as the transaction rule says.
 #[test]
-fn the_holder_still_sees_its_own_conflicts() {
-    let store = fake();
+fn the_default_conditional_reap_judges_each_precondition() {
+    let clock = Arc::new(ManualClock::default());
+    let store = Plain(Fake::with_flaw(clock, Flaw::None));
+    let revision = store
+        .txn(Txn::new().put("k", "v", Cond::Any))
+        .expect("s")
+        .expect("c")
+        .revision;
+    let version = kbf_state::Version(revision.0);
+    let refused = [
+        ("k", Cond::Absent),
+        ("k", Cond::Version(kbf_state::Version(version.0 + 1))),
+        ("none", Cond::Version(version)),
+    ];
+    for (key, cond) in refused {
+        let conflict = store.reap_expired_if(key, cond).expect("s").unwrap_err();
+        assert_eq!((conflict.index, conflict.key.as_str()), (0, key));
+    }
+    for (key, cond) in [
+        ("k", Cond::Any),
+        ("k", Cond::Version(version)),
+        ("none", Cond::Absent),
+    ] {
+        assert_eq!(store.reap_expired_if(key, cond), Ok(Ok(0)));
+    }
+}
+
+/// A store with the default conditional reap, and a hook that runs just before its plain
+/// reap: where a take can land between the default's read and its reap.
+struct Gapped {
+    inner: Arc<dyn Store>,
+    hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Store for Gapped {
+    fn apply_batch(
+        &self,
+        batch: Vec<Txn>,
+    ) -> Result<Vec<Result<kbf_state::Commit, kbf_state::Conflict>>, StoreError> {
+        self.inner.apply_batch(batch)
+    }
+    fn get(&self, key: &str) -> Result<Option<kbf_state::Versioned>, StoreError> {
+        self.inner.get(key)
+    }
+    fn scan_prefix(&self, p: &str) -> Result<Vec<(String, kbf_state::Versioned)>, StoreError> {
+        self.inner.scan_prefix(p)
+    }
+    fn scan_range(&self, s: kbf_state::ScanRange<'_>) -> Result<kbf_state::ScanPage, StoreError> {
+        self.inner.scan_range(s)
+    }
+    fn changes(
+        &self,
+        after: kbf_state::Revision,
+        limit: usize,
+    ) -> Result<kbf_state::Changes, StoreError> {
+        self.inner.changes(after, limit)
+    }
+    fn reap_expired(&self) -> Result<usize, StoreError> {
+        let hook = self.hook.lock().expect("lock").take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        self.inner.reap_expired()
+    }
+    fn commit_stats(&self) -> kbf_state::CommitStats {
+        self.inner.commit_stats()
+    }
+    fn now(&self) -> kbf_state::StoreTime {
+        self.inner.now()
+    }
+}
+
+// Documents the hazard of the trait default, so nobody relies on it: a `Fenced` handle
+// over a store that does NOT override `reap_expired_if` is not atomic. A rival that takes
+// the generation between the default's read and its reap does not stop the superseded
+// handle's reap. This is why a production `Store` must override the method (the fake,
+// SQLite and Postgres do; F8 shows the fenced result for them).
+#[test]
+fn a_store_that_keeps_the_default_conditional_reap_is_not_atomic() {
+    let raw = fake();
+    let gapped = Arc::new(Gapped {
+        inner: Arc::clone(&raw),
+        hook: std::sync::Mutex::default(),
+    });
+    let old = Fenced::take(gapped.clone(), None).expect("take");
+    let rival = Arc::clone(&raw);
+    *gapped.hook.lock().expect("lock") = Some(Box::new(move || {
+        Fenced::take(rival, Some(1)).expect("the rival takes");
+    }));
+    assert!(
+        old.reap_expired().is_ok(),
+        "the default is read-then-reap: the superseded handle's reap went through"
+    );
+    assert_eq!(
+        Fenced::take(raw, Some(2))
+            .expect("the rival held 2")
+            .generation(),
+        3,
+        "the rival did take generation 2 in the gap"
+    );
+}
+
+// Catches a guarded reap that judges the precondition but does not reap, or reaps but
+// does not make it durable: with the precondition met it removes the expired key and
+// writes its `Expire` row; with it unmet it removes nothing.
+#[test]
+fn a_guarded_reap_removes_what_expired_only_while_its_precondition_holds() {
+    let clock = Arc::new(ManualClock::default());
+    let store = Fake::with_flaw(clock.clone(), Flaw::None);
+    store
+        .txn(Txn::new().put("guard", "g", Cond::Any).put_ttl(
+            "t",
+            "v",
+            std::time::Duration::from_secs(5),
+            Cond::Any,
+        ))
+        .expect("s")
+        .expect("c");
+    clock.advance(std::time::Duration::from_secs(10));
+    assert!(
+        store
+            .reap_expired_if("guard", Cond::Absent)
+            .expect("s")
+            .is_err()
+    );
+    assert_eq!(store.reap_expired_if("guard", Cond::Any), Ok(Ok(1)));
+    let expired = store
+        .changes(kbf_state::Revision::ZERO, 10)
+        .expect("feed")
+        .rows
+        .iter()
+        .filter(|row| row.event == kbf_state::Event::Expire)
+        .count();
+    assert_eq!(expired, 1, "the reap wrote its Expire row once");
+}
+
+// Catches a fenced handle that does not pass the liveness calls to the store underneath:
+// both are answered by the store, for the generation asked about.
+#[test]
+fn a_fenced_handle_forwards_the_liveness_calls() {
+    let store = Arc::new(Plain(Fake::with_flaw(
+        Arc::new(ManualClock::default()),
+        Flaw::None,
+    )));
     let held = Fenced::take(store, None).expect("take");
-    held.txn(Txn::new().put("k", "v", Cond::Absent))
-        .expect("store")
-        .expect("commits");
-    let conflict = held
-        .txn(Txn::new().put("k", "w", Cond::Absent))
-        .expect("the store answers")
-        .expect_err("the key exists");
-    assert_eq!(conflict.key, "k");
+    assert!(matches!(
+        held.hold_liveness(1),
+        Err(StoreError::Failed(why)) if why.contains("cannot announce")
+    ));
+    assert!(matches!(
+        held.holder_alive(1),
+        Err(StoreError::Failed(why)) if why.contains("cannot tell")
+    ));
 }
 
-// Catches a handle that forwards the wrong things: reads, the feed, the clock and the
-// counters all come from the store underneath.
+// Catches a second precondition being forwarded unchecked by a fenced handle: it cannot be
+// checked in the same step as the generation, so it is refused and nothing is reaped.
 #[test]
-fn reads_pass_through() {
-    let store = fake();
-    let held = Fenced::take(Arc::clone(&store), None).expect("take");
-    held.txn(
-        Txn::new()
-            .put("p/a", "1", Cond::Any)
-            .put("p/b", "2", Cond::Any),
-    )
-    .expect("store")
-    .expect("commit");
-    assert_eq!(held.scan_prefix("p/").expect("scan").len(), 2);
-    let page = held
-        .scan_range(kbf_state::ScanRange::new("p/", std::num::NonZeroUsize::MIN))
-        .expect("range");
-    assert_eq!(page.rows.len(), 1);
-    assert!(
-        held.changes(kbf_state::Revision::ZERO, 100)
-            .expect("feed")
-            .rows
-            .len()
-            >= 3
-    );
-    assert_eq!(held.now(), store.now());
-    assert_eq!(held.commit_stats(), store.commit_stats());
-    assert!(
-        held.demote().is_err(),
-        "the fake has no writer role to give up"
-    );
+fn a_fenced_handle_refuses_a_second_reap_precondition() {
+    let held = Fenced::take(fake(), None).expect("take");
+    assert!(matches!(
+        held.reap_expired_if("k", Cond::Any),
+        Err(StoreError::Failed(_))
+    ));
+}
+
+// Catches a fake that grows a writer role it does not have: the fake cannot demote.
+#[test]
+fn the_fake_has_no_writer_role_to_give_up() {
+    let held = Fenced::take(fake(), None).expect("take");
+    assert!(held.demote().is_err());
 }
 
 // Catches a demote that leaves the lock or the writer thread behind: after it a second

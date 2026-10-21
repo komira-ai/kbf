@@ -79,7 +79,8 @@ an error, not an allow.
 
 `authenticationPolicy` is required (as in Buildbarn, where a missing policy is an
 error). Every authorizer key is optional and defaults to `allow`, except
-`invocations.getAuthorizer` and `blobs.getAuthorizer` (below), which default to off.
+`invocations.getAuthorizer`, `blobs.getAuthorizer` and `farm.getAuthorizer` (below), which
+default to off.
 
 ## Authentication policies
 
@@ -125,6 +126,7 @@ replaces the earlier one when it has one. An `all` needs at least one policy.
 | none | UpdateActionResult: always PERMISSION_DENIED |
 | `invocations.getAuthorizer` | not a REAPI call: `GET /v1/invocations/{id}` and below on the operator API listener ([api.md](api.md#get-v1invocationsid-and-below)), asked with every instance name the invocation used |
 | `blobs.getAuthorizer` | not a REAPI call: `GET /v1/blobs/{digest}` on the operator API listener ([api.md](api.md#get-v1blobsdigest)), asked with its `instance` parameter |
+| `farm.getAuthorizer` | not a REAPI call: `GET /v1/update/hosts` on the operator API listener ([api.md](api.md#get-v1updatehosts)), asked with the empty instance name (farm state names no build) |
 
 Each call is authorized against its request's instance name: `instance_name` in the
 REAPI messages; for ByteStream, every segment of the resource name before `blobs/`
@@ -161,6 +163,12 @@ with every instance name the invocation's calls used (all must allow), a blob wi
 request's `instance` parameter. Pages and blobs can hold secrets, so a missing key
 does not allow, as every other slot does: without the key, or without a policy file,
 the route answers `404` and the start line says ` invocations=off` or ` blobs=off`.
+**`farm.getAuthorizer` is off when absent too.** `{"farm": {"getAuthorizer": {...}}}` turns on
+`GET /v1/update/hosts`, the per-host update detail (the commits each host runs and why it
+refused an update), after this file's `authenticationPolicy`; without the key, or without a
+policy file, the route answers `404`. `--invocations-open` does not touch it. A `farm` object
+without `getAuthorizer` is refused, like the two above.
+
 An `invocations` or `blobs` object without `getAuthorizer` is refused, so a file that
 seems to turn a route on never leaves it off unnoticed. `--invocations-open` puts
 `allow` in whichever of the two keys the file leaves out (or both, with no file), for

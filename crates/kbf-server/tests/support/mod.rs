@@ -6,7 +6,6 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::ops::Deref;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -233,6 +232,29 @@ impl Cell {
         Self::start_with(wait, kbf_sched::FINISHED_RETENTION).await
     }
 
+    /// A cell that gives an action naming no OS or architecture `default_platform`, as
+    /// `--default-platform` sets it. (The other cells give it none, so that a test of
+    /// the platform match sees the match.)
+    pub async fn start_with_default_platform(default_platform: kbf_front::DefaultPlatform) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve_with_map(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+            None,
+            None,
+            default_platform,
+        )
+        .await
+    }
+
     /// A cell that books and climbs `ladder`, as `--memory-ladder-gib` sets it. The
     /// other cells book 1 GiB first ([`small_ladder`]), so the small nodes of these
     /// tests can run an action that names no size.
@@ -288,6 +310,7 @@ impl Cell {
             StreamLimits::DEFAULT,
             Some(map),
             None,
+            kbf_front::DefaultPlatform::NONE,
         )
         .await
     }
@@ -302,6 +325,8 @@ impl Cell {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: None,
             local_cache: None,
+            releases: None,
+            poll: None,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         Self::serve_with_map(
@@ -315,6 +340,7 @@ impl Cell {
             StreamLimits::DEFAULT,
             None,
             Some(state),
+            kbf_front::DefaultPlatform::NONE,
         )
         .await
     }
@@ -370,6 +396,8 @@ impl Cell {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: Some(api_token()),
             local_cache: None,
+            releases: None,
+            poll: None,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let cache = Self::cold_cache(&store, None).await;
@@ -496,7 +524,17 @@ impl Cell {
         streams: StreamLimits,
     ) -> Self {
         Self::serve_with_map(
-            cache, store, api_config, raft_dir, wait, retention, ladder, streams, None, None,
+            cache,
+            store,
+            api_config,
+            raft_dir,
+            wait,
+            retention,
+            ladder,
+            streams,
+            None,
+            None,
+            kbf_front::DefaultPlatform::NONE,
         )
         .await
     }
@@ -514,6 +552,7 @@ impl Cell {
         streams: StreamLimits,
         map: Option<Arc<dyn kbf_mapsync::MapSource>>,
         state: Option<kbf_server::StateStore>,
+        default_platform: kbf_front::DefaultPlatform,
     ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -524,6 +563,7 @@ impl Cell {
             hello_wait: HELLO_WAIT,
             tick: Duration::from_millis(50),
             unservable_wait: wait,
+            default_platform,
             memory_ladder: ladder,
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
@@ -612,11 +652,8 @@ async fn run(
 /// this call.
 fn api_token() -> ApiToken {
     use std::os::unix::fs::PermissionsExt;
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-cell");
-    std::fs::create_dir_all(&dir).expect("a token directory");
-    let path = dir.join(format!("token-{}-{n}", std::process::id()));
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-cell");
+    let path = dir.join("token");
     std::fs::write(&path, format!("{API_TOKEN}\n")).expect("write the token");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     ApiToken::from_file(&path).expect("a usable token")

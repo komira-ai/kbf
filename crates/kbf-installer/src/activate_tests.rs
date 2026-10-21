@@ -23,7 +23,11 @@ const E: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 /// A scratch host with the directories a Linux host has above the layout.
 fn host(name: &str) -> (ScratchHost, Layout) {
     let exec = ScratchHost::new(&format!("activate-{name}"));
-    for sub in ["run", "var/lib/kbf-deploy", "usr/local/kbf/releases"] {
+    for sub in [
+        "run",
+        "var/lib/kbf-installer",
+        "var/lib/kbf-installer/releases",
+    ] {
         fs::create_dir_all(exec.root.join(sub)).expect("seed");
     }
     let layout = Layout::linux(Root::new(&exec.root).expect("absolute"));
@@ -33,7 +37,7 @@ fn host(name: &str) -> (ScratchHost, Layout) {
 /// An installed release: a directory named for the commit holding `kbf`, which holds
 /// the commit's name. `age` orders the directories for `gc`.
 fn seed(exec: &ScratchHost, commit: &str, age: u64) {
-    let dir = exec.at(&format!("/usr/local/kbf/releases/{commit}"));
+    let dir = exec.at(&format!("/var/lib/kbf-installer/releases/{commit}"));
     fs::create_dir_all(&dir).expect("dir");
     fs::write(dir.join("kbf"), commit).expect("kbf");
     fs::File::open(&dir)
@@ -47,11 +51,7 @@ fn running(exec: &ScratchHost, layout: &Layout, commit: &str, also: &[&str]) {
     for (i, release) in std::iter::once(&commit).chain(also).enumerate() {
         seed(exec, release, 1_000 + i as u64);
     }
-    symlink(
-        format!("releases/{commit}"),
-        exec.at("/usr/local/kbf/current"),
-    )
-    .expect("link");
+    // The state first, as a swap writes it: a link with no state is a lost state (S21).
     Locked::acquire(layout)
         .expect("lock")
         .write(&State {
@@ -59,13 +59,15 @@ fn running(exec: &ScratchHost, layout: &Layout, commit: &str, also: &[&str]) {
             ..State::default()
         })
         .expect("state");
+    symlink(commit, exec.at("/var/lib/kbf-installer/releases/current")).expect("link");
 }
 
-fn order(commit: &str, id: &str, serial: u64) -> Order {
+/// An order for `commit`. The third argument is only a label for the reader of a test
+/// (the number of the order in the story); an order carries no serial.
+fn order(commit: &str, id: &str, _label: u64) -> Order {
     Order {
         commit: c(commit),
         order_id: id.to_owned(),
-        serial,
     }
 }
 
@@ -81,14 +83,14 @@ fn state_of(layout: &Layout) -> State {
         .expect("a state")
 }
 
-/// Where a link under `/usr/local/kbf` points; `None` when there is no link.
+/// Where a link under `/var/lib/kbf-installer/releases` points; `None` when there is no link.
 fn link(exec: &ScratchHost, name: &str) -> Option<String> {
-    let target = fs::read_link(exec.at(&format!("/usr/local/kbf/{name}"))).ok()?;
+    let target = fs::read_link(exec.at(&format!("/var/lib/kbf-installer/releases/{name}"))).ok()?;
     Some(target.display().to_string())
 }
 
 fn at(commit: &str) -> Option<String> {
-    Some(format!("releases/{commit}"))
+    Some(commit.to_owned())
 }
 
 /// How many link steps the host has applied.
@@ -142,17 +144,17 @@ impl Exec for Killed<'_> {
 
 /// Catches an activation that does not install the new release on trial as the design
 /// says: `current` and `previous` both moved (a rollback target exists), the staged
-/// slot cleared, the serial taken as the floor, the order, the start budget and an
+/// slot cleared, the order, the start budget and an
 /// unstarted window recorded. It also catches a swap that touches a release's files:
 /// the binary of the release that was running keeps its bytes and its inode, so a
 /// process running it is undisturbed.
 ///
-/// Mutants seen red: `previous` not moved; `staged` left; the floor not raised.
+/// Mutants seen red: `previous` not moved; `staged` left.
 #[test]
 fn an_order_swaps_a_staged_release_in_on_trial_and_changes_no_release_file() {
     let (mut exec, layout) = host("swap");
     running(&exec, &layout, A, &[B]);
-    let old = exec.at(&format!("/usr/local/kbf/releases/{A}/kbf"));
+    let old = exec.at(&format!("/var/lib/kbf-installer/releases/{A}/kbf"));
     let inode = fs::metadata(&old).expect("stat").ino();
     let mut was = state_of(&layout);
     was.staged = Some(c(B));
@@ -177,16 +179,17 @@ fn an_order_swaps_a_staged_release_in_on_trial_and_changes_no_release_file() {
             pending_confirm: Some(PendingConfirm {
                 commit: c(B),
                 previous: Some(c(A)),
-                deadline: None,
-                order_id: Some("o1".to_owned()),
+                activation: "o1".to_owned(),
+                deadline_wall: None,
+                deadline_mono_s: None,
                 starts_left: Some(3),
             }),
-            order_floor: 5,
+            ..State::default()
         }
     );
     assert_eq!(fs::read_to_string(&old).expect("read"), A);
     assert_eq!(fs::metadata(&old).expect("stat").ino(), inode);
-    let new = exec.at(&format!("/usr/local/kbf/releases/{B}/kbf"));
+    let new = exec.at(&format!("/var/lib/kbf-installer/releases/{B}/kbf"));
     assert_eq!(fs::read_to_string(new).expect("read"), B);
 }
 
@@ -210,34 +213,26 @@ fn a_release_that_is_not_installed_is_refused_and_nothing_changes() {
     assert_eq!(link_steps(&exec), 0);
 }
 
-/// Catches a downgrade by a replayed old order: below the floor is refused, the floor
-/// itself is allowed (a retry of the order that set it).
+/// Catches a floor that refuses a rollback: a release is ordered down by ordering the old
+/// release again, so an order whose number is below anything recorded is carried out, and
+/// the recorded floor (an old build's field) is left as it was.
 ///
-/// Mutants seen red: the floor not checked; `<` written `<=`.
+/// Mutant seen red: the old floor check put back (the order below 7 is refused).
 #[test]
-fn an_order_below_the_floor_is_refused_and_one_at_the_floor_is_not() {
+fn an_order_is_never_refused_for_its_number_and_the_floor_stays() {
     let (mut exec, layout) = host("floor");
     running(&exec, &layout, A, &[B]);
     let mut was = state_of(&layout);
-    was.order_floor = 7;
+    was.floor.order_id = 7;
     Locked::acquire(&layout)
         .expect("lock")
         .write(&was)
         .expect("w");
-
-    let err = go(&mut exec, &layout, &order(B, "o1", 6), START).expect_err("below");
-    assert!(
-        err.contains("serial 6 is below this host's floor 7"),
-        "{err}"
-    );
-    assert_eq!(state_of(&layout), was);
-    assert_eq!(link_steps(&exec), 0);
-
     assert_eq!(
-        go(&mut exec, &layout, &order(B, "o1", 7), START),
+        go(&mut exec, &layout, &order(B, "o1", 6), START),
         Ok(Activated::Swapped)
     );
-    assert_eq!(state_of(&layout).order_floor, 7);
+    assert_eq!(state_of(&layout).floor.order_id, 7);
 }
 
 /// Catches a repeated order that swaps twice (the host restarts twice and `previous`
@@ -388,10 +383,9 @@ fn a_revert_puts_the_previous_release_back_and_keeps_the_release_it_left() {
         (state.current, state.previous, state.pending_confirm),
         (Some(c(A)), None, None)
     );
-    // The floor stays: the reverted order's serial is not taken back.
-    assert_eq!(state.order_floor, 5);
+    assert_eq!(state.floor, crate::state::Floor::default());
     assert!(
-        exec.at(&format!("/usr/local/kbf/releases/{B}/kbf"))
+        exec.at(&format!("/var/lib/kbf-installer/releases/{B}/kbf"))
             .exists()
     );
 }
@@ -432,7 +426,7 @@ fn a_revert_whose_previous_release_is_gone_changes_nothing() {
         go(&mut exec, &layout, &order(B, "o1", 5), START),
         Ok(Activated::Swapped)
     );
-    fs::remove_file(exec.at(&format!("/usr/local/kbf/releases/{A}/kbf"))).expect("gone");
+    fs::remove_file(exec.at(&format!("/var/lib/kbf-installer/releases/{A}/kbf"))).expect("gone");
     let was = state_of(&layout);
     let steps = link_steps(&exec);
 
@@ -488,7 +482,7 @@ fn the_window_starts_at_the_first_start_and_a_crash_loop_runs_out_of_starts() {
     );
     // The deadline is the first start's plus the window, not moved by the second.
     let p = state_of(&layout).pending_confirm.expect("pending");
-    assert_eq!(p.deadline, Some(50_600));
+    assert_eq!(p.deadline_wall, Some(50_600));
     // Two starts without a confirm: the third reverts, before the service starts.
     assert_eq!(
         check(50_200),
@@ -561,7 +555,7 @@ fn a_swap_not_confirmed_within_its_window_is_reverted() {
         Ok(Activated::Swapped)
     );
     assert_eq!(
-        state_of(&layout).pending_confirm.expect("p").deadline,
+        state_of(&layout).pending_confirm.expect("p").deadline_wall,
         Some(1_300)
     );
 
@@ -683,7 +677,7 @@ fn a_host_killed_between_any_two_steps_of_a_swap_or_a_revert_converges() {
         }
         // The release a revert goes to is whole whatever moved.
         assert!(
-            exec.at(&format!("/usr/local/kbf/releases/{A}/kbf"))
+            exec.at(&format!("/var/lib/kbf-installer/releases/{A}/kbf"))
                 .exists()
         );
 
@@ -769,10 +763,19 @@ fn retention_keeps_the_running_the_previous_and_one_more() {
         (at(C), at(B))
     );
 
-    release::gc(&mut exec, &layout, 1, Mode::Apply, &mut Vec::new()).expect("gc");
-    let mut left: Vec<String> = fs::read_dir(exec.at("/usr/local/kbf/releases"))
+    release::gc(
+        &mut exec,
+        &layout,
+        1,
+        &Default::default(),
+        Mode::Apply,
+        &mut Vec::new(),
+    )
+    .expect("gc");
+    let mut left: Vec<String> = fs::read_dir(exec.at("/var/lib/kbf-installer/releases"))
         .expect("list")
         .map(|i| i.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "current" && name != "previous")
         .collect();
     left.sort();
     assert_eq!(
@@ -783,4 +786,117 @@ fn retention_keeps_the_running_the_previous_and_one_more() {
 
     let done = revert(&mut exec, &layout, &mut Vec::new()).expect("revert");
     assert_eq!(done.to, c(B));
+}
+
+/// Catches a first release that is put on trial, or whose links and state disagree: on a host
+/// with no release `first` writes the state with `current` and no trial (nothing to go back
+/// to, so no pending confirm), points `current` at it and leaves `previous` unset, and a
+/// repeat changes nothing.
+///
+/// Mutants to plant: `pending_confirm` set in `first`; the state written after the links;
+/// the repeat arm removed (the repeat then fails with `NotFirst`).
+#[test]
+fn the_first_release_becomes_current_with_no_trial() {
+    let (mut exec, layout) = host("first");
+    seed(&exec, A, 1_000);
+    first(&mut exec, &layout, &c(A), &mut Vec::new()).expect("first");
+    let state = Locked::acquire(&layout)
+        .expect("lock")
+        .read()
+        .expect("read")
+        .expect("a state");
+    assert_eq!(state.current, Some(c(A)));
+    assert_eq!((state.previous, state.pending_confirm), (None, None));
+    assert_eq!(link(&exec, "current"), at(A));
+    assert_eq!(link(&exec, "previous"), None);
+    first(&mut exec, &layout, &c(A), &mut Vec::new()).expect("a repeat");
+    assert_eq!(link(&exec, "current"), at(A));
+}
+
+/// Catches a first release taken for a host that already runs one, and one that is not on
+/// the host: another release current is `NotFirst` (setup never replaces a release: that is
+/// an update), and a release with no binary is `NotInstalled`; neither writes a state.
+///
+/// Mutants to plant: the `NotFirst` guard removed; the `has_binary` check removed.
+#[test]
+fn a_first_release_never_replaces_one_and_must_be_installed() {
+    let (mut exec, layout) = host("first-refused");
+    running(&exec, &layout, A, &[B]);
+    let err = first(&mut exec, &layout, &c(B), &mut Vec::new()).expect_err("refused");
+    assert!(
+        matches!(&err, ReleaseError::NotFirst(x) if *x == c(B)),
+        "{err:?}"
+    );
+    assert_eq!(
+        state_of(&layout).current,
+        Some(c(A)),
+        "the state is as it was"
+    );
+    let (mut bare, layout) = host("first-missing");
+    let err = first(&mut bare, &layout, &c(D), &mut Vec::new()).expect_err("refused");
+    assert!(
+        matches!(&err, ReleaseError::NotInstalled(x) if *x == c(D)),
+        "{err:?}"
+    );
+    assert!(state::read_unlocked(&layout).expect("read").is_none());
+}
+
+/// Catches a frontend stage of a release that is not on the host: it records a `staged` that
+/// names nothing a confirm could swap in, and holds every other update off as busy. A release
+/// with no directory and one whose directory holds no binary are both `NotInstalled`, and
+/// neither writes the state; the same release installed is staged, and staging it again
+/// changes nothing.
+///
+/// Mutants to plant: the `has_binary` check removed from `stage_frontend`; the state written
+/// before the check.
+#[test]
+fn a_frontend_stage_needs_the_release_on_the_host_and_writes_nothing_otherwise() {
+    let (exec, layout) = host("stage-frontend");
+    running(&exec, &layout, A, &[B]);
+    fs::create_dir_all(exec.at(&format!("/var/lib/kbf-installer/releases/{E}"))).expect("empty");
+    let was = state_of(&layout);
+
+    for missing in [D, E] {
+        let err = stage_frontend(&exec, &layout, &c(missing)).expect_err("not on the host");
+        assert!(
+            matches!(&err, ReleaseError::NotInstalled(x) if *x == c(missing)),
+            "{err:?}"
+        );
+        assert_eq!(state_of(&layout), was, "{missing}: the state is as it was");
+    }
+
+    stage_frontend(&exec, &layout, &c(B)).expect("staged");
+    let staged = state_of(&layout);
+    assert_eq!(staged.staged, Some(c(B)));
+    assert_eq!(
+        (&staged.current, &staged.previous),
+        (&was.current, &was.previous)
+    );
+    stage_frontend(&exec, &layout, &c(B)).expect("a repeat");
+    assert_eq!(state_of(&layout), staged);
+}
+
+/// Catches a first release that stays staged once it is current, as an `activate` of a staged
+/// release does not: a `staged` that names the first release (the operator staged it before
+/// setup made it current) is cleared, and a `staged` that names another release stays (it
+/// is another decision's).
+///
+/// Mutants to plant: `staged` carried over unchanged; `staged` cleared whatever it names.
+#[test]
+fn a_first_release_that_was_staged_is_current_and_no_longer_staged() {
+    for (staged, want) in [(A, None), (B, Some(c(B)))] {
+        let (mut exec, layout) = host(&format!("first-staged-{staged}"));
+        seed(&exec, A, 1_000);
+        Locked::acquire(&layout)
+            .expect("lock")
+            .write(&State {
+                staged: Some(c(staged)),
+                ..State::default()
+            })
+            .expect("state");
+        first(&mut exec, &layout, &c(A), &mut Vec::new()).expect("first");
+        let state = state_of(&layout);
+        assert_eq!(state.current, Some(c(A)), "{staged}");
+        assert_eq!(state.staged, want, "{staged}");
+    }
 }

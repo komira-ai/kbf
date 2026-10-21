@@ -160,14 +160,14 @@ kbf server --node-id=ID --advertise=ADDR --join=SEEDS --cluster-id=CID --electab
     --raft-dir=... --hot-store=file://... --cold-store=s3://...
 
 # all-in-one: server and daemon in one process (trusted mode)
-kbf all-in-one --node-id=ID --advertise=ADDR --join=SEEDS --cluster-id=CID --electable \
+kbf --mode=all-in-one --node-id=ID --advertise=ADDR --join=SEEDS --cluster-id=CID --electable \
     --raft-dir=... --hot-store=file://... --cold-store=s3://... --reserve-cpus=N
 
 # daemon: build node, no server half, no credentials (isolated mode, Macs)
-kbf daemon --join=SEEDS --cluster-id=CID --reserve-cpus=N
+kbf --mode=daemon --join=SEEDS --cluster-id=CID --reserve-cpus=N
 
 # the first node of a new cluster, started once
-kbf all-in-one --bootstrap --voter-count=3 --electable --node-id=ID --advertise=ADDR ...
+kbf --mode=all-in-one --bootstrap --voter-count=3 --electable --node-id=ID --advertise=ADDR ...
 ```
 
 `SEEDS` is a few addresses or a DNS name, comma separated; it is the only host input anywhere (5.3). Resolution is a pure function of (subcommand, `--electable`), and nothing else decides a node's type:

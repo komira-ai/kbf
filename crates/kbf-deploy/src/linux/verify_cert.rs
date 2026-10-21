@@ -1,5 +1,5 @@
 //! `linux verify-cert`: check, read only, that one certificate is what its row of the
-//! farm's certificate table says (docs/deploy/kbf-modes.md, "A node's certificate").
+//! farm's certificate table says (docs/deploy/kbf-units.md, "A node's certificate").
 //! kbf-deploy issues no certificate: the farm's one issuer does, from the one CA, and
 //! this verb checks what it made before a unit is pointed at it.
 //!
@@ -47,7 +47,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::WebPkiClientVerifier;
 use x509_parser::extensions::GeneralName;
 
-use super::check::Failure;
+use super::shared::Failure;
 
 /// How a certificate names its role: `urn:kbf:role:<name>` in its subjectAltName.
 pub const ROLE_URI_PREFIX: &str = "urn:kbf:role:";

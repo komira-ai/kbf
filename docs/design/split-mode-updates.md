@@ -1,7 +1,7 @@
 # Updating a split-mode farm without failing a build
 
 Status: design for the sequence. The pull updater it relies on is partly built: `kbf-installer` (merged), `kbf-update` (the node's client, #908) and
-`kbf-helper` (the root helper, #929) are built or in review; the controller, the node gates, the Envoy switch and the poller are not.
+`kbf-installer run` (the root helper, #929) are built or in review; the controller, the node gates, the Envoy switch and the poller are not.
 Planned-down (#914) is built. It is read against `feature/arch-v2` and these pull requests, fetched
 when this was written: #857, #879 and #887 (the frontend handover, open, stacked), #803 (the rollout state machine, open), #886
 (merged: a restarted node whose index is whole registers `Active`) and #860 (open: a wiped node rebuilds its index while
@@ -97,7 +97,7 @@ The frontend phase is the same on a single box, in split mode and in all-in-one 
 |---|---|---|
 | Poll for a release | frontend: update poller (6.2) | read-only access to the release source |
 | Preflight | frontend: planner (2.4) | `kbf --version --json` of each tarball; build facts of every running host |
-| Staging | each host: update client (`kbf-update`) and root helper (`kbf-helper`), offline verification | session to the frontend |
+| Staging | each host: update client (`kbf-update`) and root helper (`kbf-installer run`), offline verification | session to the frontend |
 | Slot, plan, ordering, resume | the **new** frontend: rollout controller (6.1) | `update/*` rows |
 | Start the new frontend, switch, drain | frontend host: the helper starts the idle instance on its own ports; the baton moves (#879); Envoy routes by health; the old process drains | units `kbf-frontend@{a,b}` (#887), Envoy static config naming both |
 | Cordon, lease count | scheduler (`Farm`), `cordon/<node>` rows (#879) | none new |
@@ -114,7 +114,7 @@ Inputs: the desired release (per platform: tarball and attestation in the releas
 `protocol`, `min_protocol`, `state_schema`, `profile`, `version`; **[F]** `crates/kbf-cli/src/version.rs`) plus the fields of
 3.6; and the same facts of every running host (each reports them in registration). Checks:
 
-1. **Completeness and generation**: every platform the farm runs is complete for the commit (tarball and attestation present), and the desired `generation` is higher than any the hosts have acted on. The **host** verifies the build attestation offline when it stages (pinned `gh` and trusted root, repository, workflow, `main`, source digest equal to the offered commit; `pull-updates.md` section 2); the frontend does not have to. Downgrades are allowed: a higher generation always wins, and there is no floor on commits. **As built**, the installer keeps a floor on **order ids** (`BelowFloor`); the helper passes the monotonically increasing `order_id` as the serial, so a commit downgrade is still allowed (a higher generation gives a new, higher order id).
+1. **Completeness and generation**: every platform the farm runs is complete for the commit (tarball and attestation present), and the desired `generation` is higher than any the hosts have acted on. The **host** verifies the build attestation offline when it stages (pinned `gh` and trusted root, repository, workflow, `main`, source digest equal to the offered commit; `pull-updates.md` section 2); the frontend does not have to. Downgrades are allowed: a higher generation always wins, and there is no floor on commits. **As built**, the installer keeps no floor: an order is newer than the last by (epoch, then id) in the node's client and the helper, a commit downgrade is allowed, and a rollback is the old release offered with a higher generation (which gets a new, higher order id).
 2. **Every host is known and connected.** A host that reports no build halts the plan with its name; it is never skipped.
 3. **Order** (rule in 3.3): the frontend moves first, except a downgrade across a protocol difference, where the nodes move first.
    Refused as a flag day if no order keeps every host inside the frontend's accepted range at every instant.
@@ -182,7 +182,7 @@ both instances' certificates carry their names. **[V]** the cert-reload mechanis
 | E4 | Switch | both | at the offer the old flips its health to `NOT_SERVING` and sends GOAWAY (**[F]** the existing drain, #793/#810); the new flips to `SERVING`. Envoy sees both within one 1 s interval. The old still answers calls that reach it until it stands down; the new **accepts and holds** calls (a held `Execute` has not been acknowledged and has not been written) until it is the writer. |
 | E5 | Stand down | old process | wait up to `--handover-quiesce-secs` (10) for calls between request and queueing; fence the farm; end the worker streams; `Store::demote`; answer `released`. A call that reaches it after this is answered `UNAVAILABLE`, which Envoy retries on the new instance. |
 | E6 | Serve | new process | open the store at the told generation, keep the epoch, answer the held calls. Daemons redial through Envoy and reach it with their leases. |
-| E7 | Settle | controller | every daemon and storage member connected at E3 is connected again; the map generation did not move; `kbf_frontend_relay_lost_total` did not rise; a probe cycle passed |
+| E7 | Settle | controller | every daemon and storage member connected at E3 is connected again; the map generation did not move; `kbf_frontend_relay_untraced` is 0; a probe cycle passed |
 | E8 | Confirm | helper | cancel the revert timer; record `last_good` |
 | E9 | Settling | old process | answers its open streams from the `done/` rows, then exits (the existing drain: exit 0 when streams reach zero). May take as long as the longest build. |
 
@@ -347,7 +347,7 @@ frontend to keep its daemons.
 
 **Kept from #857, #879, #887:** the baton protocol on the control socket (`hello`, `offer <generation>`, `ready`, `released`) and its
 bounded quiesce; `Farm::fence`; `Store::demote` and the generation fence (right for a single writer); the next-generation open with
-the epoch kept; `done/` rows, the follower and `kbf_frontend_relay_lost_total`; operation names that carry the generation;
+the epoch kept; `done/` rows, the follower and `kbf_frontend_relay_untraced`; operation names that carry the generation;
 cordon rows; `READY=1` and `Type=notify`; the existing drain (health `NOT_SERVING`, GOAWAY, exit at zero open streams, #793/#810);
 `kbf frontend handover` (now: start the other instance in standby and trigger the take); `kbf-frontend@.service` and the
 control socket's `RuntimeDirectoryPreserve`.
@@ -425,7 +425,7 @@ backwards.
 | Membership (`kbf.map.v1`) | node and frontend | `Register` refuses a protocol below the frontend's floor (**[F]** `members.rs`) and has no ceiling | one-sided |
 | Storage RPCs and REAPI through the map | frontend and node, daemon and node, node and node (chain replication, repair, read repair) | every storage RPC works between N and N+1 in both roles, because an R=2 pair spans the window | no cross-version test |
 | Operator API, UI JSON | tools and frontend | additive | by convention |
-| State-store **row encodings** | frontend N+1 and holder N (and, in B, both writers) | the holder, demoted to a reader, reads `done/`, `op/`, `lease/` and queue rows the successor writes, for three looks each. In B each reads every row the other writes. Frozen across one step. | not stated anywhere |
+| State-store **row encodings** | frontend N+1 and holder N (and, in B, both writers) | the holder, demoted to a reader, reads `done/`, `op/`, `lease/` and queue rows the successor writes, at every look until its callers finish or cancel. In B each reads every row the other writes. Frozen across one step. | not stated anywhere |
 | SQLite **schema** | frontends only | rule 3.4 | strict equality, no migration |
 | Handover control wire | holder and successor | frozen (K12) | exact match |
 | Node meta log (`MachineVersion` V1 to V4) | one node, across its restart | one-way raise at start | no declared field |
@@ -532,9 +532,10 @@ resolve the operation name from the store (**[F]** names carry the generation, #
 ### 4.2 An `Execute` in flight
 
 **[F]** It stays open and is not told to go away. The old frontend answers it from `done/<op>` rows the new one writes (the follower),
-shows "executing" while the operation holds a lease, and ends `UNAVAILABLE` only when the store has no trace of the operation
-for three looks (`kbf_frontend_relay_lost_total`). That counter is the count of builds a handover failed and must be zero in every
-test but the planted one. A `WaitExecution` is answered the same way. Operation names carry the store generation (**[F]** #857),
+shows "executing" while the operation holds a lease, and relays it until it closes, with no timeout: it ends when the operation
+finishes, the client cancels or the old process stops. An operation the store has no trace of is not answered; it is logged and
+counted (`kbf_frontend_relay_untraced`, a gauge that must be zero at every scrape of every test but the planted one). A
+`WaitExecution` is answered the same way. Operation names carry the store generation (**[F]** #857),
 so a name is never reused. An operation queued but not leased shows what it showed; it is dispatched by the new frontend.
 **Lost, accepted:** memory-ladder history, usage line, recorder state of operations in flight (K13).
 
@@ -566,7 +567,7 @@ attempts; T1 measures it. An `Execute` queued because capacity is short keeps it
 ### 5.1 Principles
 
 - A host reverts **itself** from local state only: a binary that never becomes healthy is put back by the helper's timer or boot
-  counter (**as built**: on Linux the window starts at the new process's first start, from `kbf-helper boot-check --window-secs`, default 900, range 120 to 1800, and the order's `window_s` is ignored; on macOS there is no start hook, so the window is armed at activation and `window_s` is clamped to 120 to 1800).
+  counter (**as built**: on Linux the window starts at the new process's first start, from `kbf-installer boot-check --window-secs`, default 900, range 120 to 1800, and the order's `window_s` is ignored; on macOS there is no start hook, so the window is armed at activation and `window_s` is clamped to 120 to 1800).
 - The controller **holds** on any failure and touches nothing else. It never retries a revert by itself (a revert from a frontend
   outage and one from a bad build look alike from the host).
 - An error from the activate order counts as "swapped, maybe": revert, never retry.
@@ -702,7 +703,7 @@ monotonic id, and a host acts on each at most once. The node client refuses an a
 - it reads `kbf --version --json` from the binary (service user, empty environment, no network, a timeout) and rejects one whose commit differs from the run's;
 - it runs preflight against the live farm and stores the result, so the UI shows blockers without a click;
 - it stores `update/available/<commit>` (hashes, `meta`, attestation time, preflight result, the merge commit subject) and keeps the last few;
-- **it never applies.** `update/policy` decides. `auto_nodes` false (default) offers; true runs the whole sequence's node steps when preflight is
+- **it never applies.** `update/policy` decides. `auto_nodes` false (written by an operator; see Q7) offers; true runs the whole sequence's node steps when preflight is
   clean. `auto_frontend` is separate, defaults to false, and cannot be set to true unless `auto_nodes` is true and the last two runs finished
   without `Held`. A frontend handover is never started by a timer unless an authenticated operator wrote that row;
 - it never proposes a commit older than the running one by itself (an operator may set an older commit as a rollback, and the generation orders it), and it refuses a commit not on main and a run with a failed or missing attestation;
@@ -720,7 +721,7 @@ A server-rendered `kbf-ui` page (**[F]** today read-only, no script, over the re
   build`, `old frontend still draining 3 streams`, `a member is Down`, `last Mac of its class has work waiting`;
 - the run: one row per host with its step (`selected`, `cordoned, waiting for 2 leases`, `waiting for 1 write session`, `restarting`,
   `rebuilding 61%`, `waiting for repair, debt 12`, `confirmed`, `held: reason`), time per step, the frontend phase and the old
-  process's open stream count (Settling), and `handover gap`, `relay_lost`, `failed builds during the run`, map generation;
+  process's open stream count (Settling), and `handover gap`, `relay_untraced`, `failed builds during the run`, map generation;
 - the policy rows, who changed them last and when.
 
 **Does** (a form with a confirm step that names the plan):
@@ -730,7 +731,7 @@ A server-rendered `kbf-ui` page (**[F]** today read-only, no script, over the re
 | Update | `update/desired` + the whole sequence per policy | `update` | blockers; run active; nothing available |
 | Update frontend only | E0 to E8 | `update` | blockers; old instance still draining |
 | Update nodes only | node steps | `update` | frontend not new; blockers |
-| Pause, Resume | `update/policy.paused` | `update` | no run |
+| Pause, Resume | `update/policy.paused` | `update` | never (a pause needs no run; it holds the next one offered) |
 | Skip host | marks a `Held` host failed, frees the slot | `admin` | not `Held`; says the host stays cordoned |
 | Roll back | a release naming the previous one | `update` | not reversible (2.11), with the reason |
 | Accept failing builds | the cold path | `admin` | never a default; a typed reason |
@@ -758,7 +759,7 @@ binary and a test-only "N+1" built from the next commit for the mixed-version te
 | T2 | `idle_is_defined_per_half` | a daemon is picked at zero leases and not before; a storage node is not picked with an open write session or with debt; with the other copy's node silent it is not picked | picking on lease count alone (storage); picking with debt |
 | T3 | `cordon_survives_restart_and_rejoin_takes_work` | the node comes back cordoned, takes no work until uncordon, then takes work (first lease observed) | reconnect clears the cordon; uncordon without a claim |
 | T4 | `node_that_never_becomes_active_holds` | exits at once, never registers, stays `CatchingUp`: boot-counter revert, window revert, hold; other nodes' pids unchanged; builds still pass | missing revert timer; continuing after a failure |
-| T5 | `frontend_switch_with_builds_in_flight` | 20 concurrent 30 s builds, a handover with a `Result` held in flight at the stand-down: all succeed, `relay_lost == 0`, epoch and map generation unchanged, no `loss_requeues` | fence after demote; result applied twice; follower look count not reset |
+| T5 | `frontend_switch_with_builds_in_flight` | 20 concurrent 30 s builds, a handover with a `Result` held in flight at the stand-down: all succeed, `relay_untraced == 0`, epoch and map generation unchanged, no `loss_requeues` | fence after demote; result applied twice; follower ended by a look count |
 | T6 | `new_calls_across_the_switch` | through Envoy, the pinned buck2 starts a target every 50 ms across the switch: zero failed builds; retries by Envoy and by buck2 recorded. **U1's proof** | GOAWAY semantics nobody retries (no retry policy, no health flip → red); the new instance refusing instead of holding |
 | T7 | `hold_gap_and_rows` | the gap metric is set at E6 and stays under the bound; calls held in the new process are answered after `released`; operations waiting for capacity survive a cold start (C16) | answering before `released`; rows not durable |
 | T8 | `capacity_floor_and_wait_limit` | saturate the farm during a node cordon: no node is cordoned below `min_serving`; at the wait limit the node is uncordoned and the run is `Pending` | no floor; no limit |
@@ -800,7 +801,7 @@ T5, T6 and E1 prove the model's one unproven step: if either cannot be made reli
 - **Q4** State-schema migration (3.4) is a `kbf-state` change of a few days and is on the critical path of the first release that changes a column. Until then the planner refuses such a release.
 - **Q5** Planned-down member state: **decided and built** (#914, `planned_down` with `for_secs`; 2.6 step 4); the router-failover alternative is not taken.
 - **Q6** Node graceful stop and a `Leave` call. **Lean yes.**
-- **Q7 [owner]** `auto_nodes` default false until two click-through runs are clean.
+- **Q7 [owner]** `auto_nodes` default false until two click-through runs are clean. **Changed (updfeed U1, CEO-visible):** a policy never written reads `auto_nodes` true. Only an operator's write of `update/desired` starts a run (the poller proposes and never writes it), so that write is the click; `pause` is the stop, and `auto_nodes` written false still stops it.
 - **Q8** One rollout record (K11). **Lean durable `update/*` rows.**
 - **Q9** A nightly mixed-version job against the release before the last tag (T10), a precondition for auto.
 - **Q10** The handover wire frozen at 1 (K12); say so in the doc that owns `handover.rs`.

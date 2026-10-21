@@ -38,8 +38,8 @@
 //! NOT_FOUND or FAILED_PRECONDITION. Hits and writes are served.
 //!
 //! **Who may call** is [`Admission`]: the role in the caller's certificate against the
-//! endpoint's table, the role read by `kbf-peer`; the module docs of [`admission`] say
-//! what is checked and what is planned.
+//! endpoint's table, the role read by `kbf-peer`, and then the map's deny list against the
+//! certificate; the module docs of [`admission`] say what is checked and what is planned.
 //!
 //! **How `Write` takes a blob in.** Where the store offers a [`crate::PutStream`]
 //! ([`Storage::stream`]), each message is appended to it as it arrives and the blob is
@@ -56,6 +56,7 @@ mod catch_up;
 mod client;
 mod generation;
 mod in_process;
+mod open_writes;
 mod segments;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -75,14 +76,19 @@ use tonic::service::Routes;
 use crate::replicate::{self, Chain, MapSource};
 use crate::{Storage, StorageError};
 
-pub use admission::{Admission, Endpoint, PeerRole, ROLE_URI_PREFIX, role_of};
+pub use admission::{Admission, Endpoint, PeerNames, PeerRole, ROLE_URI_PREFIX, host_of, role_of};
 pub use catch_up::CatchUp;
 pub use client::RemoteStorage;
 pub(crate) use client::lift;
 pub use in_process::InProcess;
+pub use open_writes::{OpenWrite, OpenWrites};
 
 /// The metadata entry that carries the map generation on the standard calls.
 pub const MAP_GENERATION_HEADER: &str = "kbf-map-generation";
+
+/// The metadata entry that marks a `Write` as a copy the caller needs on this node
+/// although the map does not place the blob here ([`crate::Storage::put_unowned`]).
+pub const UNOWNED_HEADER: &str = "kbf-unowned-copy";
 
 /// The largest gRPC message the service decodes and sends: a full 16 MiB batch and room
 /// around it, `kbf-front`'s `MAX_MESSAGE_BYTES` (a test pins the two equal).
@@ -120,6 +126,7 @@ pub struct StorageService {
     chain: Option<Arc<Chain>>,
     map: Option<Arc<dyn MapSource>>,
     catch_up: Option<CatchUp>,
+    open_writes: OpenWrites,
     refetch_wait: Duration,
     write_room: Semaphore,
     write_room_bytes: u32,
@@ -136,6 +143,7 @@ impl StorageService {
             chain: None,
             map: None,
             catch_up: None,
+            open_writes: OpenWrites::new(),
             refetch_wait: replicate::REFETCH_WAIT,
             write_room: Semaphore::new(config.write_bytes_in_flight as usize),
             write_room_bytes: config.write_bytes_in_flight,
@@ -177,6 +185,16 @@ impl StorageService {
         self
     }
 
+    /// The service counting the writes it has open in `open_writes`, which the node's
+    /// registration reports ([`OpenWrites`]). A service given none counts into a handle
+    /// nobody reads.
+    #[must_use]
+    pub fn with_open_writes(mut self, open_writes: OpenWrites) -> Self {
+        self.segments = self.storage.segments_counted(&open_writes);
+        self.open_writes = open_writes;
+        self
+    }
+
     /// Whether a miss found from now on must be answered UNAVAILABLE: read before the
     /// store is asked ([`catch_up`]'s module docs say why).
     fn catching_up(&self) -> bool {
@@ -189,6 +207,20 @@ impl StorageService {
     pub const fn with_refetch_wait(mut self, wait: Duration) -> Self {
         self.refetch_wait = wait;
         self
+    }
+
+    /// Admits the call `request` is to `endpoint`, or says why not: the one check every
+    /// handler makes first ([`Admission::guard`]). The caller's role is judged, then its
+    /// certificate against the `denied` list of the map the node holds now (read at each
+    /// call; a node with no map source, or none yet, has no list and enforces nothing).
+    fn guard<T>(
+        &self,
+        request: &tonic::Request<T>,
+        endpoint: Endpoint,
+    ) -> Result<(), tonic::Status> {
+        let map = self.map.as_ref().and_then(|source| source.current());
+        let denied = map.as_deref().map_or(&[][..], kbf_map::Map::denied);
+        self.admission.guard(request, endpoint, denied)
     }
 
     /// Whether a call routed by map generation `requested` may be served now: always, for

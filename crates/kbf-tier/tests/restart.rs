@@ -5,13 +5,15 @@ mod support;
 
 use std::time::Instant;
 
-use kbf_meta::ObjectId;
+use std::num::NonZeroU64;
+
+use kbf_meta::{Epoch, NodeWriter, ObjectId, Writer};
 use kbf_store::{FaultFs, Fs, FsFile};
 use kbf_tier::{TIER, TierError, TierId, WriteTier, block_name, seg_name};
 
 use support::{
     Index, SEAL_AFTER, TIER as OURS, ack_group, ack_upload, blocks, bytes, len_of, open_tier,
-    options,
+    open_tier_as, options,
 };
 
 const LIMIT: u64 = 1 << 20;
@@ -244,6 +246,43 @@ fn a_block_of_this_epoch_refuses_the_start() {
     assert_eq!(blocks(&fs), [block_name(object)]);
 }
 
+fn node(member: u64, boot: u64) -> Writer {
+    let n = |v| NonZeroU64::new(v).expect("not zero");
+    Writer::Node(NodeWriter::new(n(member), n(boot)))
+}
+
+/// Catches: a node writer's start that takes a block of its own boot or a later one
+/// (the boot was reused: it would append to, or delete, another process's block), and
+/// one that refuses over an earlier boot's staged block or another member's (it must
+/// recover the first and leave the second as an orphan, as an earlier epoch's). The
+/// new block is named by the node writer, so a third start sees it. Mutant seen red:
+/// `at_or_after` comparing members only (the earlier boot's block refuses the start).
+#[test]
+fn a_node_writer_restarts_over_earlier_boots_and_refuses_its_own() {
+    let fs = FaultFs::new();
+    let mut index = Index::default();
+    let (tier, _) = open_tier_as(&fs, node(7, 2), opts(), &index).unwrap();
+    let object = ack_upload(&tier, &mut index, b"live").unwrap();
+    assert_eq!(object.writer(), node(7, 2));
+    assert_eq!(
+        block_name(object),
+        "0000000000000007-0000000000000002-0000000000000000.blk"
+    );
+    drop(tier);
+    for again in [node(7, 2), node(7, 1)] {
+        assert!(matches!(
+            open_tier_as(&fs, again, opts(), &Index::default()),
+            Err(TierError::FutureBlock { name }) if name == block_name(object)
+        ));
+    }
+    let (tier, rec) = open_tier_as(&fs, node(7, 3), opts(), &index).unwrap();
+    assert_eq!(rec.sealed, [object]);
+    assert_eq!(tier.read(object, 0, 4).unwrap(), b"live");
+    drop(tier);
+    let (_, rec) = open_tier_as(&fs, node(8, 1), opts(), &Index::default()).unwrap();
+    assert_eq!(rec.removed, [block_name(object)]);
+}
+
 /// Catches: an unsealed staged block left open after a restart (it would never be
 /// sealed or flushed), its committed bytes not counted against the budget, and new
 /// ranges appended to a block of an earlier start.
@@ -264,7 +303,7 @@ fn a_restart_seals_what_was_open_and_counts_what_is_staged() {
     index.seal(open);
     assert!(tier.poll_seals(now + SEAL_AFTER).is_empty());
     let r = tier.reserve_group(1, now).unwrap();
-    assert_eq!(r.object().epoch().get(), 2);
+    assert_eq!(r.object().epoch().map(Epoch::get), Some(2));
     assert_eq!(r.offset(), 0);
     let staged: Vec<ObjectId> = index.staged().iter().map(|s| s.object).collect();
     assert_eq!(staged, [open, sealed]);

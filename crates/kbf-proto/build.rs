@@ -1,5 +1,6 @@
 //! Compiles the vendored REAPI, googleapis and gRPC health protos, `kbf.worker.v1` (its
-//! `Worker` and `Segments` services), `kbf.storage.v1`, `kbf.log.v1`, `kbf.map.v1` and `kbf.update.v1` into Rust.
+//! `Worker` and `Segments` services), `kbf.storage.v1`, `kbf.log.v1`, `kbf.map.v1`, `kbf.enroll.v1`
+//! and `kbf.update.v1` into Rust.
 //!
 //! Parsing is done by `protox`, in pure Rust, so the build needs no `protoc` binary.
 //! Nothing generated is checked in; the code lands in `OUT_DIR`.
@@ -17,6 +18,7 @@ const FILES: &[&str] = &[
     "google/rpc/error_details.proto",
     "google/rpc/status.proto",
     "grpc/health/v1/health.proto",
+    "kbf/enroll/v1/enroll.proto",
     "kbf/log/v1/log.proto",
     "kbf/map/v1/map.proto",
     "kbf/storage/v1/storage.proto",
@@ -38,6 +40,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
+        // The registered store's secret must not reach a log through the derived `Debug`:
+        // `src/store_config.rs` writes this one by hand.
+        .skip_debug([".kbf.enroll.v1.StoreConfig"])
         .compile_fds(descriptors)?;
 
     println!("cargo:rerun-if-changed={}", root.display());

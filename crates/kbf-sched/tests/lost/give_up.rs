@@ -174,6 +174,47 @@ fn silence_after_an_ok_result_is_proposed_lets_the_result_decide() {
     assert!(answer.farm_runs.is_empty());
 }
 
+/// Catches a regrant that outlives the result that decided the operation: `a`'s OK
+/// result is on its way to the log when `a` goes silent, the lease is given up and `b`
+/// is granted (the grant only proposed). The result commits first and answers; the grant
+/// then commits for an operation that is done, and no `Start` goes to `b`.
+#[test]
+fn a_regrant_proposed_beside_a_result_that_decides_starts_nothing() {
+    let (mut f, start) = running_on_a();
+    let record = ControlRecord::Result(ResultRecord {
+        lease: start.lease,
+        operation: start.operation,
+        outcome: ok(),
+    });
+    let report = Event::Report {
+        operation: start.operation,
+        lease: start.lease,
+        outcome: ok(),
+    };
+    assert_eq!(
+        f.s.apply(Input::new(f.now, report)),
+        [Effect::Commit(record.clone())]
+    );
+    pass(&mut f, LEASE_GRACE + Duration::from_secs(1));
+    assert!(f.beat("b", &[]).is_empty());
+    let proposed = raw_tick(&mut f);
+    assert_eq!(f.requeues(), [RequeueReason::Silent]);
+    let [grant] = &grants(&proposed)[..] else {
+        panic!("want the regrant proposed: {proposed:?}");
+    };
+    assert_eq!(grant.worker, w("b"));
+
+    let effects = f.feed(Event::Committed(record));
+    let answer = answer_in(&effects).expect("the worker's result answers");
+    assert_eq!(answer.outcome, ok());
+    let effects = f.feed(Event::Committed(ControlRecord::Lease(grant.clone())));
+    assert!(
+        Farm::starts(&effects).is_empty(),
+        "a Start for a finished operation: {effects:?}"
+    );
+    assert!(f.s.state(start.operation).is_some_and(OpState::is_done));
+}
+
 /// The node holding `start` heartbeats without listing it, after the start grace: the
 /// lease is given up as not started and the operation is placed again. The next `Start`.
 fn drop_start(f: &mut Farm, start: &StartLease) -> StartLease {

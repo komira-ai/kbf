@@ -26,16 +26,28 @@
 //!     under `--advertise-addr`, or the bound address) goes in-process to the storage
 //!     half, with no socket; any other goes over mutual TLS to its owner. **No map, no
 //!     write**: until the daemon holds a map every call fails UNAVAILABLE (there is no
-//!     `--cas` leg to fall back on), and until the storage half holds one it refuses its
-//!     own member as its listener refuses every call, `no storage map yet`. The
+//!     `--cas` leg to fall back on), and until the storage half holds one its service refuses
+//!     every call, its own member's included (UNAVAILABLE, as it refuses any caller's). The
 //!     in-process plane of the one-box mode moves output files without spooling them
 //!     (`Cas::intake`); the routed plane does not yet.
 //! - **One cache**: when the hot store is a directory on `--data-dir`'s filesystem, as
 //!   in `kbf all-in-one` (`crate::one_cache`).
-//! - **Stopping**: as `kbf all-in-one`, the storage half in the server half's place.
-//!   SIGTERM or SIGINT stops the storage half; the daemon half stops after it and the
-//!   process exits 0. A start the storage half refuses exits 2; one the daemon half
-//!   refuses exits as `kbf-daemon` would; a storage half that stops serving exits 1.
+//! - **Stopping**: on the first SIGTERM or SIGINT the daemon half drains
+//!   (`kbf_node::NodeHandle::serve_alongside`): it takes no new lease, lets the running
+//!   ones finish and report, and waits for their acknowledgements, for at most
+//!   `--drain-deadline-secs`; a second signal ends the drain at once and the leases still
+//!   running are abandoned. Only then does the storage half stop (the leases read and
+//!   write their blobs through it) and the process exits 0. A storage half that stops
+//!   serving on its own stops the daemon half at once. The signal handlers are installed
+//!   before anything starts: a signal while the storage half is still starting (its
+//!   registration waits for a frontend that is down) abandons the start and exits 0, and
+//!   one while the daemon half starts is the first signal of its drain, once it serves. A
+//!   start the storage half refuses exits 2; one that can pass on a later try exits 75,
+//!   `EX_TEMPFAIL` (`kbf_server::StartFailure`: a metadata
+//!   directory the stopping process still holds, or a registration whose boot the log
+//!   has set already, the frontend's state store having been restored from an older
+//!   copy); one the daemon half refuses exits as `kbf-daemon` would; a storage half that
+//!   stops serving exits 1.
 //!
 //! Linux only, the container driver only, as `kbf all-in-one`.
 
@@ -137,18 +149,45 @@ fn prepared(flags: &Flags) -> Flags {
 /// Both halves start from `flags`, as [`prepared`] made them: no half sees another copy.
 #[cfg(target_os = "linux")]
 fn serve(flags: Flags) -> Result<(), crate::run::Failed> {
-    use crate::run::{Failed, with_daemon};
+    use crate::run::{Failed, with_draining_daemon};
 
     let sizes = kbf_server::sizes_on(&flags.storage.server, kbf_threads::Topology::detect());
     sizes.log();
     let tokio = sizes.runtime().map_err(Failed::server)?;
-    let start = kbf_server::storage_half::start(&flags.storage, kbf_server::interrupted);
-    let half = tokio.block_on(start);
+    // First of all: from here a SIGTERM waits to be read, and is not the default action
+    // that ends the process under a storage member the other nodes replicate to.
+    let mut signals = {
+        let _context = tokio.enter();
+        kbf_node::Signals::install().map_err(Failed::server)?
+    };
+    // Before the half can hold the keys of a registered cold store.
+    kbf_server::storage_node::harden(&flags.storage).map_err(Failed::server)?;
+    // The storage half is not stopped by a signal: the daemon half drains on it, and the
+    // storage half stops once that is over, since a running action reads and writes its
+    // blobs through it.
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let start = kbf_server::storage_half::start(&flags.storage, move || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    });
+    // A signal while the half starts (its registration waits for a frontend that is down)
+    // abandons the start: nothing is running yet, and the process exits 0.
+    let started = tokio.block_on(async {
+        match futures::future::select(Box::pin(start), Box::pin(signals.recv())).await {
+            futures::future::Either::Left((half, _)) => Some(half),
+            futures::future::Either::Right(_) => None,
+        }
+    });
+    let Some(half) = started else {
+        tracing::info!("stopped before the storage half started");
+        return Ok(());
+    };
     let half = half.map_err(Failed::server)?;
     println!("{}", half.start_line());
     let start = starter(&flags, &half, tokio.handle());
     let serving = Box::pin(half.serve());
-    with_daemon(&tokio, serving, start, &flags.daemon)
+    with_draining_daemon(&tokio, serving, stop, start, signals, &flags.daemon)
 }
 
 /// Whether the daemon half routes its blobs by the storage map: when the node registers
@@ -165,7 +204,7 @@ fn routes_by_map(flags: &Flags) -> bool {
 #[cfg(target_os = "linux")]
 fn local_member(flags: &Flags, half: &StorageHalf) -> LocalMember {
     let addr = flags.storage.registers_as(half.addr);
-    LocalMember::new(addr, half.in_process(), half.maps())
+    LocalMember::new(addr, half.in_process())
 }
 
 /// The daemon half's start over `half` (the module docs, **The daemon half**).

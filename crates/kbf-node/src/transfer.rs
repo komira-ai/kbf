@@ -265,8 +265,7 @@ mod tests {
         let half = kbf_server::storage_half::start(&flags, || Ok(std::future::pending::<()>()))
             .await
             .expect("the storage half starts");
-        let local =
-            kbf_daemon::LocalMember::new(half.addr.to_string(), half.in_process(), half.maps());
+        let local = kbf_daemon::LocalMember::new(half.addr.to_string(), half.in_process());
         // `start_member` builds the plane when the native driver is set up, on a thread of
         // its own: dropping the daemon's runtime in the test's would panic.
         let start = |ca: String, local: kbf_daemon::LocalMember| {
@@ -286,5 +285,63 @@ mod tests {
             .expect("joined")
             .expect_err("no CA file");
         assert!(why.contains("no-such-ca.pem"), "{why}");
+    }
+
+    /// Catches `start_member` trying its own member's address among the storage network
+    /// checks (it is served in-process, and its listener may not be up when the first map
+    /// arrives): a map whose only member is this process's, at an address nothing answers,
+    /// must not end the daemon.
+    #[tokio::test]
+    async fn the_member_daemon_does_not_probe_itself() {
+        use kbf_map::{Map, Member, MemberId, MemberState, Rule};
+
+        let dir = super::super::tests::scratch("transfer-member-reach");
+        super::super::tests::tls_files(&dir);
+        let at = |name: &str| format!("{}", dir.join(name).display());
+        let cli = Cli::try_parse_from([
+            "kbf-daemon".to_owned(),
+            "--server=https://front:7070".to_owned(),
+            format!("--ca-cert={}", at("ca.pem")),
+            format!("--cert={}", at("node.pem")),
+            format!("--key={}", at("node.key")),
+            "--node-id=n1".to_owned(),
+            "--driver=native".to_owned(),
+            format!("--data-dir={}", dir.display()),
+            format!("--xcode-apps={}", dir.join("Applications").display()),
+        ])
+        .expect("flags");
+        let argv = [
+            "storage".to_owned(),
+            "--storage-listen=127.0.0.1:0".to_owned(),
+            format!("--cold-store=file://{}", dir.join("cold").display()),
+            format!("--meta-dir={}", dir.join("meta").display()),
+        ];
+        let matches = kbf_server::storage_node::command().get_matches_from(argv);
+        let flags = kbf_server::storage_node::parse(&matches).expect("the storage flags");
+        let half = kbf_server::storage_half::start(&flags, || Ok(std::future::pending::<()>()))
+            .await
+            .expect("the storage half starts");
+        // A low port nothing listens on: refused at once, were it tried.
+        let own = "127.0.0.1:1".to_owned();
+        let local = kbf_daemon::LocalMember::new(own.clone(), half.in_process());
+        let served = tokio::task::spawn_blocking(move || {
+            let node = super::super::start_member(&cli, local).expect("starts");
+            let member = Member {
+                id: MemberId(1),
+                addr: own,
+                zone: String::new(),
+                weight: 1,
+                state: MemberState::Active,
+                boot: 1,
+            };
+            let map = Map::new(1, vec![member], Rule::Rendezvous, 1, 0, Vec::new());
+            let maps = Arc::clone(&node.reach.as_ref().expect("armed").maps);
+            assert!(maps.offer(map.expect("a map")));
+            let served = node.serve_until(async {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            });
+            assert!(served.is_ok(), "{served:?}");
+        });
+        served.await.expect("its own member is not tried");
     }
 }

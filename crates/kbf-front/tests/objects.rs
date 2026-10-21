@@ -202,7 +202,7 @@ async fn two_caches_over_one_log_and_bucket_never_name_the_same_object() {
     let b = Cache::open(log.clone(), store.clone(), KeyPrefix::default())
         .await
         .expect("open b");
-    let (first, second) = (a.epoch(), b.epoch());
+    let (first, second) = (a.writer(), b.writer());
     assert!(second > first, "{first:?} then {second:?}");
 
     let mut digests = Vec::new();
@@ -216,7 +216,10 @@ async fn two_caches_over_one_log_and_bucket_never_name_the_same_object() {
     let keys = keys(&store).await;
     assert_eq!(keys.len(), 6, "{keys:?}");
     for (cache, count) in [(&a, 3), (&b, 3)] {
-        let epoch = format!("cas/{:016x}/", cache.epoch().get());
+        let kbf_meta::Writer::Epoch(epoch) = cache.writer() else {
+            panic!("an epoch writer");
+        };
+        let epoch = format!("cas/{:016x}/", epoch.get());
         assert_eq!(
             keys.iter().filter(|k| k.starts_with(&epoch)).count(),
             count,
@@ -457,7 +460,7 @@ async fn a_location_in_another_store_is_internal_and_marks_nothing() {
     let elsewhere = blob("in store 1");
     let location = Location {
         store: StoreId::new(1),
-        object: ObjectId::new(cache.epoch(), 99),
+        object: ObjectId::of(cache.writer(), 99),
         offset: 0,
     };
     let applied = cache

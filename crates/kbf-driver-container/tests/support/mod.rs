@@ -5,19 +5,22 @@
 
 // The keepers the driver starts come from the running binary: this test binary.
 kbf_daemon::keeper_test_hook!();
-// The fake podman's actions are kbf-testkit's act steps, run by this test binary
+// The fake crun's actions are kbf-testkit's act steps, run by this test binary
 // through the link `kbf-act` a Fake makes (`fake.rs`).
 kbf_testkit::act_test_hook!();
+// The helper containers of the OCI backend run this binary in its `__chown-dirs` and
+// `__unpack-layers` modes, and so does the stand-in `crun` of the fake tests.
+kbf_driver_container::chown_dirs_test_hook!();
 
 pub mod fake;
-pub mod fake_oci;
 pub mod real;
-pub mod rig;
+#[path = "../../../kbf-image/tests/support/registry.rs"]
+pub mod registry;
 pub mod swap_kill;
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use kbf_daemon::Work;
@@ -27,6 +30,7 @@ use kbf_proto::reapi::platform::Property;
 use kbf_proto::reapi::{
     Action, Command, Digest, Directory, DirectoryNode, FileNode, Platform, SymlinkNode, Tree,
 };
+use kbf_testkit::dir::TestDir;
 use kbf_types::{LeaseId, Resources};
 use prost::Message;
 
@@ -187,13 +191,47 @@ pub fn tree(cas: &MemoryCas, digest: Option<&Digest>) -> Tree {
     Tree::decode(blob(cas, digest).as_slice()).expect("a Tree")
 }
 
+/// A scratch directory a test owns: a [`TestDir`] that, when the test passed, is first
+/// given back the permissions the test took from it (a directory closed with `0o000`
+/// stops `remove_dir_all`) and removed with `rm`. Declare it before anything that runs
+/// in it, so those are gone first.
+#[derive(Debug)]
+pub struct Scratch(TestDir);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // A failed test's directory is the `TestDir`'s to keep or remove: a panic here
+        // while unwinding would abort the process.
+        if !std::thread::panicking() {
+            force_remove(self.0.path());
+        }
+    }
+}
+
 /// A fresh, empty directory for one test, under Cargo's temporary directory for this
-/// target. A directory left by an earlier run is removed first.
-pub fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    force_remove(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch");
-    dir
+/// target, removed when it is dropped.
+pub fn scratch(name: &str) -> Scratch {
+    scratch_in(env!("CARGO_TARGET_TMPDIR"), name)
+}
+
+/// [`scratch`] under `root` (a real-`crun` test's is under the system temporary
+/// directory, whose ancestors every id can search).
+pub fn scratch_in(root: impl AsRef<Path>, name: &str) -> Scratch {
+    Scratch(TestDir::under(root, name))
 }
 
 /// Removes `dir`, first giving the owner every permission on every directory in it.

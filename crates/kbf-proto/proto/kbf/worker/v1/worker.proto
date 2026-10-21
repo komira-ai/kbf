@@ -29,6 +29,22 @@
 // - DaemonMessage.update_status, ServerMessage.update_offer and update_order: pull-based
 //   self-update (kbf.update.v1, docs/design/pull-updates.md). A server that predates
 //   them ignores update_status; a daemon that predates them ignores the others.
+// - ResultAck.reason: why a Result was or was not accepted. A daemon that predates it
+//   reads `accepted`; a server that predates it leaves the reason unspecified, which a
+//   daemon takes as "acknowledged: forget the Result".
+//
+// A Result carries no attempt number: the lease id is the attempt. A lease id is unique
+// per grant and a re-grant of the same operation gets a new one, so a Result of an
+// earlier attempt names a lease the server no longer holds (ResultAck STALE).
+//
+// A server acknowledges a Result only after the state store holds the row that records
+// it; a daemon that keeps the Result until its ack resends it on the next stream.
+//
+// Welcome.protocol_version is the lesser of the Hello's version and the newest the server
+// speaks, when the Hello's is not below the oldest the server accepts (a Hello below it is
+// refused FAILED_PRECONDITION). A Hello in the server's range is answered with its own
+// version, which a daemon of that version requires. A daemon accepts a Welcome from the
+// oldest version it speaks up to the version its Hello named, never above.
 syntax = "proto3";
 
 package kbf.worker.v1;
@@ -158,6 +174,12 @@ enum Phase {
   // falls or its last lease ends. A server that does not know this value reads it as a
   // quarantine, which also takes no lease.
   PHASE_MEMORY_PRESSURE = 4;
+  // The daemon was told to stop (SIGTERM or SIGINT) and is draining: it takes no new
+  // lease, runs the ones it holds to their end, reports their Results and waits for
+  // their ResultAcks, then exits. The server keeps its leases, and its heartbeats keep
+  // the node in contact as usual; it is not lost and nothing is requeued. A server that
+  // does not know this value reads it as a quarantine, which also takes no lease.
+  PHASE_DRAINING = 5;
 }
 
 message NodePhase {
@@ -452,9 +474,10 @@ enum MemoryKill {
   MEMORY_KILL_NODE_PRESSURE = 2;
 }
 
-// The server's answer to a Result: it has decided that Result, so the daemon may forget
-// it. Until a daemon receives the ResultAck for a lease, it resends the Result on its
-// next stream and lists the lease in Heartbeat.running (issue #26).
+// The server's answer to a Result. The daemon may forget the Result on any ResultAck for
+// its lease. Until a daemon receives one, it resends the Result on its next stream and
+// lists the lease in Heartbeat.running (issue #26). The server sends it only once the
+// state store holds the record of the result.
 message ResultAck {
   LeaseId lease_id = 1;
   // Whether this Result became the operation's result, or was a memory kill the server
@@ -464,6 +487,25 @@ message ResultAck {
   // (its operation is finished). A refused result is never written to the action
   // cache. Either way the daemon may forget the Result.
   bool accepted = 2;
+  // Why. Unspecified from a server that predates the field: read `accepted`.
+  ResultAckReason reason = 3;
+}
+
+// Why the server answered a Result as it did.
+enum ResultAckReason {
+  // Not said.
+  RESULT_ACK_REASON_UNSPECIFIED = 0;
+  // The Result became the operation's result (or a memory kill or lost run it took).
+  RESULT_ACK_REASON_ACCEPTED = 1;
+  // The operation is already answered: the first valid Result won, and this is a copy.
+  RESULT_ACK_REASON_DUPLICATE = 2;
+  // The lease was given up or granted again, or this node does not hold it: the Result
+  // is of an earlier attempt. It never reaches the action cache.
+  RESULT_ACK_REASON_STALE = 3;
+  // The server knows no such lease: an unknown one, or one of another lease epoch.
+  RESULT_ACK_REASON_UNKNOWN_LEASE = 4;
+  // The Result names an action other than the one its lease runs.
+  RESULT_ACK_REASON_MISMATCH = 5;
 }
 
 // What one action used, as the runtime that ran it measured it: an input to

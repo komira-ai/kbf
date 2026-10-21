@@ -13,7 +13,8 @@
 //!   reads and writes ([`blobs`]), each call admitted by the same rules.
 //! - The operator API ([`api`]): HTTP/JSON under `/v1` on a third listener, off unless
 //!   `--api-listen` is given; `GET /v1/nodes`, and cordon, drain and uncordon, which
-//!   need the token of `--api-token-file` ([`token`]). On the same listener,
+//!   need the token of `--api-token-file` ([`token`]), and, behind the farm's proxy
+//!   (`--proxy-auth-file`, [`proxy_auth`]), a call that came through it. On the same listener,
 //!   `GET /healthz` and `GET /readyz` for a front's health check ([`health`]), and
 //!   `GET /metrics`, the cache's upload-path metrics for Prometheus ([`metrics`]).
 //!   The REAPI listener answers `/readyz`'s readiness over `grpc.health.v1`
@@ -21,11 +22,16 @@
 //!   over the invocation records kept in memory ([`http_invocations`]), off unless
 //!   the REAPI policy names `invocations.getAuthorizer` (or `--invocations-open` is
 //!   given); and `GET /v1/blobs/{digest}`, a CAS blob's bytes for a browser
-//!   ([`http_blobs`]), off unless the policy also names `blobs.getAuthorizer`.
+//!   ([`http_blobs`]), off unless the policy also names `blobs.getAuthorizer`. Also on the
+//!   same listener, on by default (`--ui=false` turns it off), the read-only, open web UI under
+//!   `/ui` ([`ui_mount`]), whose reads are bounded per caller ([`read_limit`]).
 //! - A drain of the frontend ([`drain`]) that a stop signal or `POST /v1/frontend/drain`
 //!   begins, a second signal escalates, and `kbf cluster` calls through [`api_client`].
 //! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
 //!   cordons, drains and hands drained nodes their update, as far as `updating`.
+//! - Node rolling ([`update`]): the pure picker and node step of a split-mode update
+//!   (`docs/design/split-mode-updates.md`, sections 2.6 to 2.11), which host goes next and
+//!   its one next move. No controller drives them yet.
 //! - The MDM gate ([`mdm`]): the server's verbs at `kbf-mdm-gate` (inventory, enforce
 //!   and withdraw a macOS build, install an allowlisted profile; no erase), a client
 //!   over mutual TLS, and the polling of an update's DDM progress. Not yet called by
@@ -70,10 +76,13 @@ pub mod api_client;
 pub mod blobs;
 #[cfg(test)]
 mod build_commit;
+pub mod cold_apply;
 pub mod config;
 pub mod drain;
+pub mod enroll;
 pub mod farm;
 mod fault;
+pub mod fill;
 mod flag_set;
 pub mod fleet;
 pub mod front_maps;
@@ -81,15 +90,19 @@ pub mod frontend;
 pub mod grpc_health;
 pub mod handover;
 pub mod health;
+mod health_summary;
 pub mod history;
 pub mod http_blobs;
+mod http_history;
 pub mod http_invocations;
+pub mod http_sched;
 pub mod identity;
 pub mod join;
 mod listen;
 mod local;
 pub mod log_file;
 pub mod machine;
+pub mod managed;
 mod map_push;
 pub mod mdm;
 pub mod members;
@@ -97,23 +110,43 @@ pub mod members_rpc;
 mod memory;
 pub mod metrics;
 mod missing;
+pub mod node_map;
+pub mod object_store;
+pub mod proxy_auth;
 pub mod raft_log;
+pub mod read_limit;
+mod rebuild;
 pub mod release;
+pub mod replication;
 pub mod rollout;
 mod run_record;
 pub mod serve;
+#[cfg(test)]
+mod serve_remote_tests;
 pub mod stamp;
 mod start;
+mod start_exit;
 mod startup_pass;
 pub mod state_store;
 pub mod storage_half;
+pub mod storage_health;
 pub mod storage_node;
+pub mod store_config;
 pub mod stores;
 pub mod streams;
+#[cfg(test)]
+mod test_dir;
 mod timeout;
 pub mod token;
+pub mod ui_mount;
+pub mod update;
+pub mod update_hosts;
+pub mod update_status;
+pub mod verbs;
+pub mod vitals;
 pub mod worker;
 pub mod worker_roles;
+pub mod write_rules;
 pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
@@ -124,16 +157,21 @@ pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;
 pub use kbf_tls::{TlsError, TlsFiles, TlsSource};
 pub use local::LocalStore;
+pub use node_map::NodeMap;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
-    Api, Bound, BoundStorage, Listeners, NO_MAP_YET, ServeError, StorageListener, StreamTiming,
-    WorkerTls, bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_options,
-    bind_server_with_policy, bind_server_with_state, bind_server_with_storage, bind_storage,
-    bind_storage_gated, bind_storage_shared,
+    Api, Behind, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming,
+    WorkerTls, bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_policy,
+    bind_server_with_state, bind_server_with_storage, bind_server_with_ui, bind_service,
+    bind_storage,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
+pub use start_exit::{
+    NOT_READY, REFUSED, STALE_WRITER_HINT, StartFailure, hint as start_hint, said as start_said,
+};
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
 pub use streams::{StreamArgs, StreamLimits};
+pub use ui_mount::bind_server_with_options;
 pub use worker::WorkerService;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build

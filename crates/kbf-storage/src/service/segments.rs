@@ -16,7 +16,10 @@ impl Segments for StorageService {
         &self,
         request: Request<BeginRequest>,
     ) -> Result<Response<BeginResponse>, Status> {
-        self.admission.check(&request, Endpoint::Segments)?;
+        self.guard(&request, Endpoint::Segments)?;
+        // Counted while it waits for the map, as a write is; the store's own count of the
+        // upload (from its `Begin`, for as long as the upload lives) takes over from it.
+        let _open = self.open_writes.begin();
         self.check_map(generation::requested(&request)?).await?;
         self.segments.begin(request).await
     }
@@ -25,7 +28,7 @@ impl Segments for StorageService {
         &self,
         request: Request<PutRangeRequest>,
     ) -> Result<Response<PutRangeResponse>, Status> {
-        self.admission.check(&request, Endpoint::Segments)?;
+        self.guard(&request, Endpoint::Segments)?;
         self.check_map(generation::requested(&request)?).await?;
         self.segments.put_range(request).await
     }
@@ -34,7 +37,7 @@ impl Segments for StorageService {
         &self,
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
-        self.admission.check(&request, Endpoint::Segments)?;
+        self.guard(&request, Endpoint::Segments)?;
         self.check_map(generation::requested(&request)?).await?;
         self.segments.commit(request).await
     }
@@ -43,7 +46,7 @@ impl Segments for StorageService {
         &self,
         request: Request<LocateRequest>,
     ) -> Result<Response<LocateResponse>, Status> {
-        self.admission.check(&request, Endpoint::Segments)?;
+        self.guard(&request, Endpoint::Segments)?;
         self.check_map(generation::requested(&request)?).await?;
         self.segments.locate(request).await
     }
@@ -52,7 +55,7 @@ impl Segments for StorageService {
         &self,
         request: Request<ReadRangeRequest>,
     ) -> Result<Response<ReadRangeResponse>, Status> {
-        self.admission.check(&request, Endpoint::Segments)?;
+        self.guard(&request, Endpoint::Segments)?;
         self.check_map(generation::requested(&request)?).await?;
         self.segments.read_range(request).await
     }

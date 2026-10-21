@@ -96,7 +96,7 @@ pub fn is_allowed(a: [u8; 4]) -> bool {
 /// Extensions (compared ignoring ASCII case) of files that may hold a NUL byte; the
 /// scan skips such a file as binary. Any other file holding a NUL byte is refused.
 pub const BINARY_EXTENSIONS: &[&str] = &[
-    "gif", "gz", "ico", "jpeg", "jpg", "pdf", "png", "wasm", "webp", "zip", "zst",
+    "db", "gif", "gz", "ico", "jpeg", "jpg", "pdf", "png", "wasm", "webp", "zip", "zst",
 ];
 
 /// The text of the file at `path` (relative, used for its extension) to scan:
@@ -444,7 +444,12 @@ mod tests {
         for path in ["a.txt", "Makefile", "dir.png/Makefile", "a.png.txt"] {
             assert!(decode(path, bytes).is_err(), "{path}");
         }
-        for path in ["logo.png", "docs/x.PDF", "a.tar.gz"] {
+        for path in [
+            "logo.png",
+            "docs/x.PDF",
+            "a.tar.gz",
+            "tests/golden/state/v1.db",
+        ] {
             assert_eq!(decode(path, bytes), Ok(None), "{path}");
         }
         assert_eq!(decode("a.txt", b"plain"), Ok(Some("plain".to_owned())));
@@ -585,5 +590,62 @@ mod tests {
         // Catches: false positives on a placeholder, a bare prefix or a relative path.
         let text = "/home/<user> /Users/ src/home/x ./home/x";
         assert_eq!(scan(text), vec![]);
+    }
+
+    #[test]
+    fn a_home_directory_named_with_a_leading_dot_is_not_a_home_path() {
+        // Catches: `/home/.cache` or `/Users/.hidden` (a dot directory, which names no
+        // user) reported as a home path, and a real user beside it missed.
+        let text = format!("/{0}/.cache /{1}/.hidden /{0}/alice", "home", "Users");
+        let kinds: Vec<Kind> = scan(&text).into_iter().map(|f| f.kind).collect();
+        assert_eq!(kinds, vec![Kind::HomePath(format!("/{}/alice", "home"))]);
+    }
+
+    #[test]
+    fn each_finding_reads_with_its_line_and_what_was_found() {
+        // Catches: a message that drops the line number or the offending text (a
+        // reviewer could not find it), or reads one kind as another (the private
+        // range as a public address).
+        let public = Finding {
+            line: 3,
+            kind: Kind::Ipv4([8, 8, 8, 8]),
+        };
+        assert_eq!(
+            public.to_string(),
+            format!("line 3: IPv4 address {}", ip(8, "8.8.8"))
+        );
+        let private = Finding {
+            line: 4,
+            kind: Kind::PrivateIpv4([10, 0, 0, 1]),
+        };
+        assert_eq!(
+            private.to_string(),
+            format!("line 4: private IPv4 address {}", ip(10, "0.0.1"))
+        );
+        let home = Finding {
+            line: 5,
+            kind: Kind::HomePath(format!("/{}/alice", "home")),
+        };
+        assert_eq!(
+            home.to_string(),
+            format!("line 5: home path /{}/alice", "home")
+        );
+    }
+
+    #[test]
+    fn other_findings_beside_a_conflict_are_not_markers() {
+        // Catches: `markers` (and so a merge check built on it) counting an address or
+        // a home path as a conflict marker, or losing the marker's own line.
+        let text = format!(
+            "{} {}\n{}",
+            ip(8, "8.8.8"),
+            format_args!("/{}/alice", "home"),
+            conflict("a", "b")
+        );
+        assert_eq!(scan(&text).len(), 5);
+        assert_eq!(
+            markers(&text),
+            vec![(2, "<<<<<<<"), (4, "======="), (6, ">>>>>>>")]
+        );
     }
 }

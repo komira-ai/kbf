@@ -22,13 +22,27 @@
 //!   backlog drains: the rows come back from the object's footer with no LIST. The
 //!   invocations held are bounded by [`Limits::invocations`] (idle ones forgotten
 //!   first, then new ones refused, `stage="invocations"`).
-//! - **Headers.** A newly seen invocation's stored header (a previous life's, or this
-//!   writer's from before it forgot the invocation) is read after the drain, at most
+//! - **Headers.** Each writer keeps a header row of its own per invocation
+//!   (`ui/invid/<inv>/<writer>`), counting the records it wrote; the reader adds the rows
+//!   of every writer up, so no row has two writers. A newly seen invocation's stored
+//!   header (this writer's own, from before it forgot the invocation) is read after the
+//!   drain, at most
 //!   [`Limits::header_reads_per_step`] a step, and merged with what the writer added
 //!   meanwhile. Until the read succeeds no header row is written, so a failed read
 //!   never replaces the stored header with a fresh count. A header row that did not
 //!   commit is written again from the writer's state, and its invocation held until
 //!   one does: a closed invocation gets no later chunk to carry it.
+//! - **A superseded writer.** Once another process holds the state store's generation
+//!   (`StoreError::Fenced`), a batch is sent as two transactions: the rows this writer may
+//!   still write around the fence (`IndexRoot::permit`: its own chunk and header rows and
+//!   the inserts) and the rest, which the fence refuses and which are dropped and counted
+//!   as any refused index row is. The first refusal costs the step no transaction, so a
+//!   last step before a stop writes the rows that may land.
+//! - **Catalog and status rows.** A run of a shape the writer has not seen puts the
+//!   shape's `ui/shape` row once; a run of a test shape adds to its `ui/status` row by
+//!   read-modify-write with the by-status entry in the same transaction (see
+//!   [`DerivedLimits`] and the module `derived`). A header row carries the `ui/inv` list
+//!   entry of each instance it is first to name.
 //!
 //! TODO: mark the index transactions background once the `kbf-state` trait has the
 //! mark (the C7 background lane); until then they are ordinary transactions, sent at
@@ -39,20 +53,24 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use kbf_objstore::{ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
-use kbf_state::{Cond, Txn, Versioned};
+use kbf_state::{Cond, StoreError, Txn, Versioned};
 use prost::Message;
 
-use crate::container::{self, Encoded, Header};
+use crate::container::{self, Encoded, Footer, Header};
+use crate::derived::{Derived, DerivedLimits, TestId};
 use crate::index::HistoryIndex;
 use crate::keys::{Day, Family, HistoryRoot, InvKey, WriterId};
-use crate::pending::{Kept, KeptObject, Pending, PendingLimits, Row};
+use crate::pending::{Also, Kept, KeptObject, Pending, PendingLimits, Row};
 use crate::queue::{Event, EventQueue, InvRef};
 use crate::records::{
-    ChunkBody, ChunkRecord, ChunkRow, ChunkSummary, DigestRow, FailedRun, HitRecord, InvState,
-    InvocationHeader, MAX_INSTANCES, RunRecord, Slow, StreamRow,
+    ChunkBody, ChunkRecord, ChunkRow, ChunkSummary, DigestRow, FailedRun, FlogSummary, HitRecord,
+    InvState, InvocationHeader, MAX_INSTANCES, ObjRow, RunRecord, Slow, StreamRow,
 };
-use crate::run_id::{Minter, StreamId};
+use crate::rows::{ShapeKind, ShapeRow};
+use crate::run_id::{Minter, RunId, StreamId};
 use crate::scoped::Scoped;
+use crate::status::{self, Observed};
+use crate::today::{TODAY_BYTES, Today, TodayRun};
 
 const MS_PER_DAY: u64 = 86_400_000;
 
@@ -89,6 +107,11 @@ pub struct Limits {
     /// Stored headers read per step at most, for invocations the writer has just
     /// opened (one index read each).
     pub header_reads_per_step: usize,
+    /// The shape and status rows' bounds.
+    pub derived: DerivedLimits,
+    /// Bytes of today's runs held in memory at most ([`Today`]); the oldest are
+    /// forgotten first.
+    pub today_bytes: usize,
 }
 
 impl Default for Limits {
@@ -105,6 +128,8 @@ impl Default for Limits {
             reinserts_per_step: 64,
             invocations: 4096,
             header_reads_per_step: 256,
+            derived: DerivedLimits::default(),
+            today_bytes: TODAY_BYTES,
         }
     }
 }
@@ -187,6 +212,9 @@ struct Inv {
     /// one key and value for every chunk of the stream, so only the first chunk queues
     /// it; were it dropped, it comes back from that chunk's object.
     stream_rows: BTreeSet<(u32, u32)>,
+    /// The instances whose `ui/inv` list entry for this invocation committed with a
+    /// header row. An instance not in it has its entry put with the next header row.
+    listed: BTreeSet<String>,
 }
 
 /// The history writer core. See the module docs.
@@ -213,12 +241,20 @@ struct Core {
     held: usize,
     pending: Pending,
     kept: Kept,
+    derived: Derived,
+    today: Arc<Today>,
     drops: Drops,
     /// An index transaction failed this step: the index is not draining.
     index_failed: bool,
     /// The last stream block refill failed: the next step spends its budget on rows,
     /// so a counter that keeps failing never starves them.
     refill_failed: bool,
+    /// A transaction was refused as fenced: another process holds the state store's
+    /// generation. From then on a batch is sent as two transactions, the rows this
+    /// writer may still write ([`IndexRoot::permit`](crate::IndexRoot::permit)) and
+    /// the rest, so the refusal of the shared rows does not take the pointer rows of a
+    /// chunk down with it.
+    fenced: bool,
 }
 
 impl<O: ObjectStore> Writer<O> {
@@ -249,9 +285,12 @@ impl<O: ObjectStore> Writer<O> {
                 held: 0,
                 pending: Pending::new(limits.pending),
                 kept: Kept::new(limits.kept),
+                derived: Derived::new(limits.derived),
+                today: Arc::new(Today::new(limits.today_bytes)),
                 drops: Drops::default(),
                 index_failed: false,
                 refill_failed: false,
+                fenced: false,
             },
         }
     }
@@ -267,6 +306,7 @@ impl<O: ObjectStore> Writer<O> {
         let budget = budget - usize::from(self.refill_streams(budget).await);
         self.core.take_events(now_ms);
         self.read_headers().await;
+        self.read_statuses().await;
         self.core.cut_due(now_ms);
         let mut failed = VecDeque::new();
         while let Some(cut) = self.core.ready.pop_front() {
@@ -277,6 +317,7 @@ impl<O: ObjectStore> Writer<O> {
             }
         }
         self.core.ready = failed;
+        self.core.queue_derived();
         self.apply_pending(budget).await;
         for _ in 0..self.core.reinsert_budget() {
             let Some(object) = self.core.kept.pop() else {
@@ -288,6 +329,7 @@ impl<O: ObjectStore> Writer<O> {
             }
         }
         self.core.requeue_headers();
+        self.core.queue_derived();
         self.core.prune(now_ms);
     }
 
@@ -316,11 +358,24 @@ impl<O: ObjectStore> Writer<O> {
     /// answering.
     async fn read_headers(&mut self) {
         for key in self.core.unread() {
-            let row = self.core.index.root().invid(&key);
+            let row = self.core.index.root().header(&key, self.core.writer);
             let Ok(stored) = self.core.index.get(row).await else {
                 return;
             };
             self.core.header_read(&key, stored);
+        }
+    }
+
+    /// Reads the stored status rows of up to [`DerivedLimits::reads_per_step`] test
+    /// keys with runs waiting, and queues each key's write. A failed read stops the
+    /// reads of this step and writes nothing: the stored row is not known, and writing
+    /// without it would reset the status.
+    async fn read_statuses(&mut self) {
+        for key in self.core.derived.to_read() {
+            let Ok(stored) = self.core.index.get(key.clone()).await else {
+                return;
+            };
+            self.core.status_read(&key, stored);
         }
     }
 
@@ -333,7 +388,9 @@ impl<O: ObjectStore> Writer<O> {
             if batch.is_empty() {
                 return;
             }
-            budget = self.apply(batch, budget).await;
+            for part in self.core.parts(batch) {
+                budget = self.apply(part, budget).await;
+            }
         }
     }
 
@@ -351,21 +408,31 @@ impl<O: ObjectStore> Writer<O> {
                 return 0;
             }
             budget -= 1;
-            let txn = batch.iter().fold(Txn::new(), |t, (key, row)| {
-                t.put(key.clone(), row.value.clone(), row.cond)
-            });
+            let (txn, owner) = Row::txn(&batch);
             match self.core.index.txn(txn).await {
                 Ok(Ok(_)) => {
                     self.core.committed(&batch);
                     return budget;
                 }
                 Ok(Err(conflict)) => {
-                    batch.remove(conflict.index.min(batch.len() - 1));
+                    let at = owner[conflict.index.min(owner.len() - 1)];
+                    let (key, _) = batch.remove(at);
+                    self.core.conflicted(&key);
+                }
+                Err(StoreError::Fenced) if self.core.fence_seen() => {
+                    // Refused whole, which wrote nothing and costs the step nothing: the
+                    // rows come back, and the next try (in this step, if it has budget
+                    // left, so a last step before a stop gets there too) sends the ones
+                    // this writer may still write on their own.
+                    for (key, row) in batch {
+                        self.core.enqueue(key, row);
+                    }
+                    return budget + 1;
                 }
                 Err(_) => {
                     self.core.index_failed = true;
-                    for (_, row) in batch {
-                        self.core.dropped_row(row);
+                    for (key, row) in batch {
+                        self.core.dropped_row(&key, row);
                     }
                     return budget;
                 }
@@ -387,6 +454,13 @@ impl<O: ObjectStore> Writer<O> {
         self.objects.get_range(&object.key, range).await
     }
 
+    /// Today's runs, which the writer feeds from the events it drains. The reads that
+    /// have no day index yet hold this handle.
+    #[must_use]
+    pub fn today(&self) -> Arc<Today> {
+        Arc::clone(&self.core.today)
+    }
+
     /// The writer's drop counts.
     #[must_use]
     pub fn drops(&self) -> Drops {
@@ -397,6 +471,20 @@ impl<O: ObjectStore> Writer<O> {
     #[must_use]
     pub fn pending_rows(&self) -> usize {
         self.core.pending.len()
+    }
+
+    /// Shape and status keys the writer holds, each map's count: the keys it is
+    /// bounded by ([`DerivedLimits::keys`]).
+    #[must_use]
+    pub fn index_keys(&self) -> (usize, usize) {
+        self.core.derived.keys()
+    }
+
+    /// Catalog and status rows owed to the index: shape rows not known to exist and
+    /// status keys with runs not yet written.
+    #[must_use]
+    pub fn index_owed(&self) -> usize {
+        self.core.derived.owed()
     }
 
     /// Objects whose rows are waiting to be restored.
@@ -413,9 +501,34 @@ impl<O: ObjectStore> Writer<O> {
 }
 
 impl Core {
+    /// Notes a fenced refusal and says whether it is the first one of a writer that can
+    /// still write rows of its own: the batch is then tried again, split. A refusal of a
+    /// writer with nothing exempt, or of a batch already split, is a failed write.
+    fn fence_seen(&mut self) -> bool {
+        let first = !self.fenced && self.index.is_exempting();
+        self.fenced = true;
+        first
+    }
+
+    /// `batch` as the transactions it is sent in: one, or after a fenced refusal two,
+    /// the rows this writer may write around the fence first, then the rest.
+    fn parts(&self, batch: Vec<(String, Row)>) -> Vec<Vec<(String, Row)>> {
+        if !self.fenced {
+            return vec![batch];
+        }
+        let (own, rest): (Vec<_>, Vec<_>) = batch
+            .into_iter()
+            .partition(|(key, row)| row.permitted(key, &|op| self.index.exempts(op)));
+        [own, rest]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect()
+    }
+
     /// Takes the queued events into the invocations' chunks.
     fn take_events(&mut self, now_ms: u64) {
         self.minter.forget_before(Day::from_ms(now_ms));
+        self.today.begin(now_ms);
         for event in self.queue.drain() {
             self.ingest(event, now_ms);
         }
@@ -429,7 +542,9 @@ impl Core {
             && !s.unread
             && !s.unsaved
             && !self.ready.iter().any(|c| &c.inv == key)
-            && !self.pending.contains(&self.index.root().invid(key))
+            && !self
+                .pending
+                .contains(&self.index.root().header(key, self.writer))
     }
 
     /// Forgets idle invocations that are closed or were last seen before yesterday
@@ -512,12 +627,46 @@ impl Core {
             return;
         }
         state.unsaved = true;
-        let value = state.header.encode_to_vec();
-        self.queue_row(self.index.root().invid(inv), value, Cond::Any, origin);
+        let mut row = self.header_row(inv);
+        row.origin = origin;
+        self.enqueue(self.index.root().header(inv, self.writer), row);
+    }
+
+    /// `inv`'s header row as the writer holds it, with the list entry of each instance
+    /// not yet listed: the entry commits in the header's transaction, so a header never
+    /// lands without its entries and a restart that rewrites an existing one costs no
+    /// transaction of its own. The entry's time is the header's `list_ms`, which a
+    /// stored header fixed before the first write (the header rule), so it is the same
+    /// entry whatever the writer has forgotten. An id-less pseudo-invocation is listed
+    /// nowhere.
+    fn header_row(&self, inv: &InvKey) -> Row {
+        let state = &self.invs[inv];
+        let root = self.index.root();
+        let mut row = Row::new(state.header.encode_to_vec(), Cond::Any, None);
+        if !state.header.idless {
+            let list_ms = state.header.list_ms;
+            let unlisted = state
+                .header
+                .instances
+                .iter()
+                .filter(|i| !state.listed.contains(*i));
+            row.also = unlisted
+                .map(|i| Also::Put(root.inv_list(i, list_ms, inv), Vec::new()))
+                .collect();
+        }
+        row
     }
 
     /// Notes that the header rows (the [`Cond::Any`] rows) of `batch` committed.
     fn committed(&mut self, batch: &[(String, Row)]) {
+        for (key, row) in batch {
+            self.derived.committed(key);
+            for also in &row.also {
+                if let Also::Put(entry, _) = also {
+                    self.listed(entry);
+                }
+            }
+        }
         let saved: BTreeSet<&str> = batch
             .iter()
             .filter(|(_, row)| row.cond == Cond::Any)
@@ -526,9 +675,9 @@ impl Core {
         if saved.is_empty() {
             return;
         }
-        let rows = self.index.root();
+        let (rows, writer) = (self.index.root(), self.writer);
         for (key, s) in &mut self.invs {
-            s.unsaved &= !saved.contains(rows.invid(key).as_str());
+            s.unsaved &= !saved.contains(rows.header(key, writer).as_str());
         }
     }
 
@@ -539,18 +688,100 @@ impl Core {
         if self.index_failed {
             return;
         }
-        let rows = self.index.root().clone();
-        for (key, s) in self.invs.iter().filter(|(_, s)| s.unsaved) {
-            let row = rows.invid(key);
+        let (rows, writer) = (self.index.root().clone(), self.writer);
+        let unsaved: Vec<InvKey> = (self.invs.iter())
+            .filter(|(_, s)| s.unsaved)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in unsaved {
+            let row = rows.header(&key, writer);
             if !self.pending.contains(&row) {
-                let header = Row {
-                    value: s.header.encode_to_vec(),
-                    cond: Cond::Any,
-                    origin: None,
-                };
-                let _refused = self.pending.insert(row, header);
+                let _refused = self.pending.insert(row, self.header_row(&key));
             }
         }
+    }
+
+    /// Notes that the list entry `key`, if it is one, committed: its invocation, if the
+    /// writer holds it, needs no more puts of it.
+    fn listed(&mut self, key: &str) {
+        let parsed = self.index.root().parse_inv_list(key);
+        let held = parsed
+            .and_then(|(instance, _, inv)| self.invs.get_mut(&inv).map(|state| (state, instance)));
+        if let Some((state, instance)) = held {
+            state.listed.insert(instance);
+        }
+    }
+
+    /// The write of `key` failed its precondition. A pointer row and a shape row that
+    /// exist already are the same row; a status row lost a race.
+    fn conflicted(&mut self, key: &str) {
+        self.derived.conflicted(key);
+    }
+
+    /// Queues the shape rows still owed, and takes the stored status rows read.
+    fn queue_derived(&mut self) {
+        if self.index_failed {
+            return;
+        }
+        let owed: Vec<(String, Row)> = self
+            .derived
+            .unsaved_shapes()
+            .filter(|(key, _)| !self.pending.contains(key))
+            .map(|(key, row)| (key.to_owned(), row))
+            .collect();
+        for (key, row) in owed {
+            let _refused = self.pending.insert(key, row);
+        }
+    }
+
+    /// Takes the stored status row of `key` and queues the write of the row that the
+    /// runs waiting make of it.
+    fn status_read(&mut self, key: &str, stored: Option<Versioned>) {
+        let root = self.index.root().clone();
+        if let Some(row) = self.derived.read(&root, key, stored) {
+            self.enqueue(key.to_owned(), row);
+        }
+    }
+
+    /// Notes what `record` says of its shape and, for a test, of the test's status.
+    fn observe(&mut self, inv: &InvRef, record: &RunRecord) {
+        if record.shape == 0 {
+            return;
+        }
+        let id = TestId {
+            instance: record.instance.clone(),
+            shape: record.shape,
+            cfg: record.cfg.clone(),
+        };
+        let root = self.index.root().clone();
+        let kind = if record.test {
+            ShapeKind::Test
+        } else {
+            ShapeKind::Other
+        };
+        let shape = ShapeRow {
+            kind: kind.into(),
+            first_seen_ms: record.time_ms,
+            last_seen_ms: record.time_ms,
+            target: record.target.clone(),
+        };
+        let mut taken = self.derived.shape(&root, &id, &shape);
+        let result = record.test.then(|| status::classify(record)).flatten();
+        if let Some(status) = result {
+            let run = Observed {
+                status,
+                run_id: record.run_id().to_bytes().to_vec(),
+                time_ms: record.time_ms,
+                execution_ms: u32::try_from(record.execution_us() / 1000).unwrap_or(u32::MAX),
+                digest16: record.action.as_ref().map_or(0, |d| d.prefix16()),
+                inv_key: inv
+                    .record_id
+                    .as_ref()
+                    .map_or_else(String::new, |_| inv.key.to_string()),
+            };
+            taken &= self.derived.test(&root, &id, run);
+        }
+        self.drops.index += u64::from(!taken);
     }
 
     /// How many kept objects to read back this step: none while rows are pending or
@@ -594,10 +825,10 @@ impl Core {
     }
 
     fn ingest(&mut self, event: Event, now_ms: u64) {
-        let inv = match &event {
-            Event::Run { inv, .. } | Event::Hit { inv, .. } | Event::Close { inv } => inv,
-        };
-        if !self.open(inv) {
+        // A failure-log row belongs to no invocation: only the others open one.
+        if let Some(inv) = event.inv()
+            && !self.open(inv)
+        {
             self.drops.invocations += 1;
             return;
         }
@@ -610,6 +841,8 @@ impl Core {
             } => {
                 let day = Day::from_ms(record.time_ms);
                 self.break_if(&inv, day, Some(record.stream), now_ms);
+                self.observe(&inv, &record);
+                self.today.push(TodayRun::of(&record));
                 let state = self.state(&inv.key);
                 note(&mut state.header, &record.instance, record.time_ms);
                 state.header.runs += 1;
@@ -643,6 +876,22 @@ impl Core {
                 let size = record.encoded_len();
                 b.hits.push(record);
                 self.grew(&inv.key, size, now_ms);
+            }
+            Event::Flog(flog) => {
+                // The object is written already: queue its row, restored from the object
+                // if it is dropped.
+                let origin = KeptObject {
+                    key: flog.key.clone(),
+                    footer_offset: flog.footer_offset,
+                    footer_len: flog.footer_len,
+                };
+                let row = ObjRow {
+                    footer_offset: flog.footer_offset,
+                    footer_len: flog.footer_len,
+                    bytes: flog.bytes,
+                };
+                let key = self.index.root().obj_flog(flog.run);
+                self.queue_row(key, row.encode_to_vec(), Cond::Absent, Some(origin));
             }
             Event::Close { inv } => {
                 self.minter.close(&inv.key);
@@ -855,23 +1104,19 @@ impl Core {
     }
 
     fn queue_row(&mut self, key: String, value: Vec<u8>, cond: Cond, origin: Option<KeptObject>) {
-        let row = Row {
-            value,
-            cond,
-            origin,
-        };
-        self.enqueue(key, row);
+        self.enqueue(key, Row::new(value, cond, origin));
     }
 
     /// Puts `row` in [`Pending`], or drops and counts it past its bounds.
     fn enqueue(&mut self, key: String, row: Row) {
-        if let Err(row) = self.pending.insert(key, row) {
-            self.dropped_row(row);
+        if let Err(row) = self.pending.insert(key.clone(), row) {
+            self.dropped_row(&key, row);
         }
     }
 
-    fn dropped_row(&mut self, row: Row) {
+    fn dropped_row(&mut self, key: &str, row: Row) {
         self.drops.index += 1;
+        self.derived.dropped(key);
         if let Some(origin) = row.origin {
             self.kept.push(origin);
         }
@@ -885,15 +1130,41 @@ impl Core {
             self.kept.push(object);
             return false;
         };
-        let parsed = container::decode_footer(&bytes)
+        match container::decode_footer(&bytes) {
+            Ok((Family::InvocationChunk, footer)) => self.restore_chunk(object, &footer),
+            Ok((Family::FailureLog, footer)) => self.restore_flog(&object, &footer),
+            Err(_) => {}
+        }
+        true
+    }
+
+    /// Queues again the `ui/obj` row of a failure-log object, from its footer's summary.
+    fn restore_flog(&mut self, object: &KeptObject, footer: &Footer) {
+        let Ok(summary) = FlogSummary::decode(footer.summary.as_slice()) else {
+            return;
+        };
+        let Ok(id) = <[u8; 12]>::try_from(summary.run_id.as_slice()) else {
+            return;
+        };
+        let row = ObjRow {
+            footer_offset: object.footer_offset,
+            footer_len: object.footer_len,
+            bytes: object.footer_offset + u64::from(object.footer_len),
+        };
+        let key = self.index.root().obj_flog(RunId::from_bytes(id));
+        self.queue_row(key, row.encode_to_vec(), Cond::Absent, Some(object.clone()));
+    }
+
+    /// Queues again the rows of a chunk, from its footer's summary.
+    fn restore_chunk(&mut self, object: KeptObject, footer: &Footer) {
+        let parsed = ChunkSummary::decode(footer.summary.as_slice())
             .ok()
-            .and_then(|(_, footer)| ChunkSummary::decode(footer.summary.as_slice()).ok())
             .and_then(|s| {
                 let inv = InvKey::parse(&s.inv_key).ok();
                 inv.zip(s.row.clone()).map(|(inv, row)| (inv, row, s))
             });
         let Some((inv, mut row, summary)) = parsed else {
-            return true;
+            return;
         };
         // The summary was written before the object's length and footer position were
         // known; the footer and trailer run to the object's end.
@@ -910,7 +1181,12 @@ impl Core {
         // stored header is read), so the footer's is put back only for one forgotten.
         if !self.invs.contains_key(&inv) {
             let header = summary.header.unwrap_or_default().encode_to_vec();
-            self.queue_row(rows.invid(&inv), header, Cond::Absent, Some(object.clone()));
+            self.queue_row(
+                rows.header(&inv, writer),
+                header,
+                Cond::Absent,
+                Some(object.clone()),
+            );
         }
         if row.runs > 0 {
             let value = StreamRow {
@@ -921,7 +1197,6 @@ impl Core {
             let key = rows.stream(day, StreamId(row.stream), summary.stream_first_ms);
             self.queue_row(key, value.encode_to_vec(), Cond::Absent, Some(object));
         }
-        true
     }
 }
 
@@ -968,6 +1243,9 @@ fn start(b: &mut Building, day: Day, now_ms: u64) -> &mut Building {
 /// it if it was closed.
 fn note(h: &mut InvocationHeader, instance: &str, time_ms: u64) {
     h.state = InvState::Open.into();
+    if h.list_ms == 0 {
+        h.list_ms = time_ms;
+    }
     add_instance(h, instance);
     h.first_seen_ms = earliest(h.first_seen_ms, time_ms);
     h.last_seen_ms = h.last_seen_ms.max(time_ms);
@@ -975,7 +1253,7 @@ fn note(h: &mut InvocationHeader, instance: &str, time_ms: u64) {
 
 /// Lists `instance` in `h`, or, with [`MAX_INSTANCES`] listed, marks the list
 /// truncated: the names are the client's, so the header stays bounded.
-fn add_instance(h: &mut InvocationHeader, instance: &str) {
+pub(crate) fn add_instance(h: &mut InvocationHeader, instance: &str) {
     if let Err(at) = h.instances.binary_search_by(|i| i.as_str().cmp(instance)) {
         if h.instances.len() >= MAX_INSTANCES {
             h.instances_truncated = true;
@@ -986,7 +1264,7 @@ fn add_instance(h: &mut InvocationHeader, instance: &str) {
 }
 
 /// The earlier of two times, where 0 is "none yet".
-fn earliest(a: u64, b: u64) -> u64 {
+pub(crate) fn earliest(a: u64, b: u64) -> u64 {
     match (a, b) {
         (0, t) | (t, 0) => t,
         (a, b) => a.min(b),
@@ -1011,6 +1289,10 @@ fn merge(stored: InvocationHeader, added: &InvocationHeader) -> InvocationHeader
     h.last_seen_ms = h.last_seen_ms.max(added.last_seen_ms);
     h.last_chunk_ms = h.last_chunk_ms.max(added.last_chunk_ms);
     h.state = added.state;
+    // The stored time keys the entries that exist: it is never moved.
+    if h.list_ms == 0 {
+        h.list_ms = added.list_ms;
+    }
     h
 }
 

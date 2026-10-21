@@ -1,10 +1,10 @@
-//! What Podman supplies to a container besides the flags `podman::create_args` passes,
-//! written out for the OCI backend: `crun` applies only what `config.json` holds, so
-//! the capability set, the masked and read-only paths and the seccomp filter that
-//! Podman 4.9 adds on its own are listed here, from the same sources, and pinned.
+//! What a container is given besides the settings `spec` writes: `crun` applies only
+//! what `config.json` holds, so the capability set, the masked and read-only paths and
+//! the seccomp filter are listed here, from the containers/common release below, and
+//! pinned.
 //!
 //! - **Capabilities:** containers.conf's `default_capabilities` of containers/common
-//!   v0.57.4 (the library Podman 4.9 builds): the eleven in [`CAPABILITIES`], for the
+//!   v0.57.4: the eleven in [`CAPABILITIES`], for the
 //!   bounding, effective, permitted and ambient sets; the inheritable set is empty.
 //!   They are capabilities of the container's own user namespace, whose ids are the
 //!   daemon user's subordinate ids: they give an action's root nothing over an inode
@@ -17,11 +17,13 @@
 //!   capability set and the node's architecture the way containers/common resolves it:
 //!   an entry with `includes.caps` applies only if the container holds all of them, one
 //!   with `excludes.caps` only if it holds none, and one with `arches` only on those
-//!   architectures. The result is a plain OCI `linux.seccomp` section.
+//!   architectures. The result is a plain OCI `linux.seccomp` section. One edit differs
+//!   from upstream: four `personality` entries that also allow `ADDR_NO_RANDOMIZE`
+//!   (see their `comment` in the profile).
 //! - **Also set:** `noNewPrivileges`, `oom_score_adj` 0, a private cgroup namespace, and
 //!   `/sys/fs/cgroup` read-only (`spec`).
 //!
-//! Left out, on purpose: Podman's `net.ipv4.ping_group_range` and
+//! Left out, on purpose: the `net.ipv4.ping_group_range` and
 //! `net.ipv4.ip_unprivileged_port_start` sysctls (an action has loopback only) and the
 //! `gid=5` option of `/dev/pts` (`crun spec --rootless` leaves it out too).
 
@@ -92,7 +94,7 @@ const PROFILE: &str = include_str!("seccomp.json");
 /// change, which is what a reviewer reads.
 #[cfg(test)]
 pub(crate) const PROFILE_SHA256: &str =
-    "cc374cf23846ce1f62f4dc807a8e2b8673c783c6f56cb475467621035d281e6c";
+    "ade1fa9f5ea569f899c8e3ff4b1d94032d72de6cd1888c012240b87c571594d8";
 
 /// The architecture name containers/common filters on (Go's `GOARCH`) for Rust's
 /// `std::env::consts::ARCH`; `None` for one the profile has no filter for.
@@ -230,7 +232,7 @@ mod tests {
     }
 
     /// Catches an edit of the vendored profile that does not move its pin (and so
-    /// escapes review as "the profile Podman uses").
+    /// escapes review as "the containers/common profile").
     #[test]
     fn the_profile_is_the_pinned_one() {
         assert_eq!(sha256(PROFILE), PROFILE_SHA256);
@@ -263,7 +265,7 @@ mod tests {
     /// Catches capability filtering applied backwards: without `CAP_SYS_ADMIN` the
     /// filter must refuse `bpf`; holding it must allow it. The pinned capability set
     /// has none of it. (`mount` and `unshare` are in the pinned profile's plain allow
-    /// list, as in Podman's: the kernel refuses them without the capability.)
+    /// list: the kernel refuses them without the capability.)
     #[test]
     fn the_capability_set_decides_the_privileged_calls() {
         let plain = seccomp("amd64", &CAPABILITIES).expect("plain");
@@ -396,5 +398,70 @@ mod tests {
         assert_eq!(profile_arch("x86_64"), Some("amd64"));
         assert_eq!(profile_arch("aarch64"), Some("arm64"));
         assert_eq!(profile_arch("riscv64"), None);
+    }
+
+    /// Whether the filter lets `personality(persona)` through on `arch`: some allow
+    /// entry for it whose every argument test holds (`SCMP_CMP_EQ`: the argument is
+    /// `value`; `SCMP_CMP_MASKED_EQ`: the argument masked by `value` is `valueTwo`).
+    fn personality_allowed(arch: &str, persona: u64) -> bool {
+        let section =
+            serde_json::to_value(seccomp(arch, &CAPABILITIES).expect("section")).expect("json");
+        section["syscalls"]
+            .as_array()
+            .expect("syscalls")
+            .iter()
+            .filter(|c| c["action"] == "SCMP_ACT_ALLOW")
+            .filter(|c| {
+                c["names"]
+                    .as_array()
+                    .is_some_and(|n| n.iter().any(|n| n == "personality"))
+            })
+            .any(|call| {
+                let args = call["args"].as_array().expect("personality has arguments");
+                args.iter().all(|arg| {
+                    assert_eq!(arg["index"], 0, "personality has one argument");
+                    let value = arg["value"].as_u64().expect("value");
+                    if arg["op"] == "SCMP_CMP_EQ" {
+                        persona == value
+                    } else {
+                        assert_eq!(arg["op"], "SCMP_CMP_MASKED_EQ");
+                        persona & value == arg["valueTwo"].as_u64().expect("valueTwo")
+                    }
+                })
+            })
+    }
+
+    /// Catches `personality` being refused with `ADDR_NO_RANDOMIZE` set (what `kcov`,
+    /// `gdb`, `rr` and `valgrind` ask for, and the profile answered ENOSYS), and the
+    /// opposite mistake of opening it wider than that one flag: the values the profile
+    /// always allowed stay allowed, each with and without `ADDR_NO_RANDOMIZE`, while
+    /// `READ_IMPLIES_EXEC`, other flags and arbitrary values stay refused.
+    #[test]
+    fn personality_allows_addr_no_randomize_and_nothing_wider() {
+        const ADDR_NO_RANDOMIZE: u64 = 0x0004_0000;
+        const READ_IMPLIES_EXEC: u64 = 0x0040_0000;
+        let base = [0x0, 0x8, 0x2_0000, 0x2_0008];
+        for arch in ["amd64", "arm64"] {
+            for persona in base {
+                assert!(personality_allowed(arch, persona), "{arch} {persona:#x}");
+                let with = persona | ADDR_NO_RANDOMIZE;
+                assert!(personality_allowed(arch, with), "{arch} {with:#x}");
+            }
+            // The query.
+            assert!(personality_allowed(arch, 0xffff_ffff), "{arch} query");
+            for refused in [
+                READ_IMPLIES_EXEC,
+                READ_IMPLIES_EXEC | ADDR_NO_RANDOMIZE,
+                READ_IMPLIES_EXEC | 0x8,
+                0x0002_0000 | 0x0000_0001,
+                0x0000_0001 | ADDR_NO_RANDOMIZE,
+                0x0001_0000 | ADDR_NO_RANDOMIZE,
+                0x0200_0000,
+                0x1234_5678,
+                0xffff_fffe,
+            ] {
+                assert!(!personality_allowed(arch, refused), "{arch} {refused:#x}");
+            }
+        }
     }
 }

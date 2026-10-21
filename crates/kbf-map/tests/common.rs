@@ -12,6 +12,7 @@ pub fn member(id: u64, weight: u32, state: MemberState) -> Member {
         zone: format!("z{}", id % 3),
         weight,
         state,
+        boot: 0,
     }
 }
 

@@ -15,6 +15,7 @@
 //! - [`connect`]: which server to try next, and the wait between rounds of attempts;
 //!   the daemon never stops trying.
 //! - [`report`]: the node report and its hash.
+//! - [`reach`]: the start-up check that the storage members answer a connect.
 //! - [`status`]: the node's software status (OS, kernel, daemon, Xcodes).
 //! - [`driver_watch`]: the driver's report channel, one part per source that feeds it.
 //! - [`cpu_pool`]: [`CpuPool`], the threads (`--cpu-threads`) for work that keeps a core
@@ -41,6 +42,7 @@
 //! crate, so a binary here naming them would be a cycle Cargo refuses. It never offers
 //! [`LocalRuntime`], which isolates nothing.
 
+mod acks;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod cache;
 pub mod cas;
@@ -62,6 +64,7 @@ pub mod numa;
 pub mod phases;
 mod plane;
 pub mod pressure;
+pub mod reach;
 pub mod report;
 pub mod runtime;
 pub mod runtimes;
@@ -74,6 +77,7 @@ pub mod uid;
 mod update_link;
 #[cfg(target_os = "linux")]
 pub mod usage;
+mod welcome;
 mod window;
 
 /// The daemon's version as it reports it (`daemon_version` in `Hello` and
@@ -88,7 +92,9 @@ pub const BUILD_COMMIT: &str = env!("KBF_BUILD_COMMIT");
 
 pub use cas::{Cas, CasError};
 pub use clock::{Clock, Moment, SystemClock};
-pub use config::{Args, DaemonConfig, FENCE_AFTER, KeepAlive, RECHECK_EVERY, TlsFiles};
+pub use config::{
+    Args, DaemonConfig, FENCE_AFTER, KeepAlive, MAX_UNACKED, RECHECK_EVERY, TlsFiles,
+};
 pub use contact::{Acked, Contact};
 pub use cpu_pool::CpuPool;
 pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError, superseded};
@@ -98,7 +104,7 @@ pub use kbf_route::Liveness;
 #[cfg(target_os = "linux")]
 pub use local::{LOCAL_DRIVER, LocalRuntime};
 pub use map::{HeldMaps, REFETCH_WITHIN};
-pub use plane::{FarmCas, FarmLease, LocalMember, member_cas, storage_nodes};
+pub use plane::{FarmCas, FarmLease, LocalMember, StorageNodes, member_cas, storage_nodes};
 pub use report::{Capacity, NodeReport};
 pub use runtime::{FakeRuntime, Runtime, RuntimeError, UPLOAD_DEADLINE, Work, upload_within};
 pub use runtimes::{KindServedTwice, Runtimes};

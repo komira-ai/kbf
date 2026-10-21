@@ -67,7 +67,7 @@ pub const COALESCE_GAP_BYTES: u64 = 1 << 20;
 
 /// One segment of an upload: blobs at consecutive offsets of its record area. Public
 /// so an implementation of the data plane in the server's own process
-/// (`kbf-all-in-one`) packs outputs into the segments this engine sends.
+/// (`kbf all-in-one`) packs outputs into the segments this engine sends.
 #[derive(Clone, Debug, Default)]
 pub struct Planned {
     /// Each blob and its offset in the segment, in the order given.
@@ -544,7 +544,7 @@ fn read_error(record: &Record, e: &std::io::Error) -> CasError {
 /// [`Cas::put_chunks`] for one over a megabyte, streamed from its source),
 /// `in_flight` at a time: what [`Cas::put_records`] does for a store without segment
 /// upload, and what one does with an upload its server refuses for want of a write
-/// tier (`kbf-all-in-one`'s plane).
+/// tier (`kbf all-in-one`'s plane).
 ///
 /// # Errors
 /// The first record that could not be read or stored, or that `cas` stored under

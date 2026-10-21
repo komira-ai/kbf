@@ -71,6 +71,7 @@ fn policy(authenticator: impl Authenticator, authorizers: Authorizers) -> Policy
         authorizers,
         invocations_get: None,
         blobs_get: None,
+        farm_get: None,
     }
 }
 
@@ -464,6 +465,7 @@ async fn every_method_passes_through_the_authenticator_first() {
         authorizers: authorizers(|_| Arc::new(AllowAuthorizer)),
         invocations_get: None,
         blobs_get: None,
+        farm_get: None,
     })
     .await;
     for (path, _, call) in METHODS {

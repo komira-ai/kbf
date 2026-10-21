@@ -301,7 +301,7 @@ impl Server {
         let snapshot = up.query(StagedSnapshot::of);
         let start = TierStart {
             tier: id,
-            epoch: up.writer,
+            writer: kbf_meta::Writer::Epoch(up.writer),
             options: plan.options(),
         };
         let next = Arc::clone(&up.next_object);

@@ -552,7 +552,7 @@ fn the_ledger_survives_a_restart_of_the_helper() {
 /// uid that is about to exit by itself.
 ///
 /// The process is `kbf-act`'s spawned child itself, sleeping 2 s and then exiting
-/// (komira-build-farm#639: a `/bin/sleep` that the child started was looked for while
+/// (kbf#639: a `/bin/sleep` that the child started was looked for while
 /// the child had not started it yet, 24 ms after the action ended, and was not found).
 /// The action writes the child's pid after spawning it and before it exits, so the
 /// child exists once `run-quiet` returns: there is nothing to wait for before looking.

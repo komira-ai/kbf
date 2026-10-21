@@ -8,8 +8,8 @@ use std::fmt;
 use std::io::{self, Write};
 use std::process::Output;
 
-use crate::linux::check::Failure;
 use crate::linux::config::LinuxError;
+use crate::linux::shared::Failure;
 use crate::template::TemplateError;
 use crate::unit::UnitError;
 use kbf_host::exec::{Entry, Exec, Meta, succeeded};
@@ -18,11 +18,14 @@ use kbf_host::plan::Planner;
 use kbf_host::step::{Cmd, Owner, Perms, Step, UrlError};
 use kbf_host::user::{self, RunUser, UserError};
 
-use super::check::CheckError;
+use super::shared::CheckError;
 
 /// The tools the verbs run, where Debian and Ubuntu put them.
 pub const SYSTEMCTL: &str = "/usr/bin/systemctl";
-pub const PODMAN: &str = "/usr/bin/podman";
+/// The OCI runtime the units pass as `--oci-runtime=`, and the tools it maps ids with.
+pub const CRUN: &str = "/usr/bin/crun";
+pub const NEWUIDMAP: &str = "/usr/bin/newuidmap";
+pub const NEWGIDMAP: &str = "/usr/bin/newgidmap";
 pub const SWAPON: &str = "/usr/sbin/swapon";
 pub const SWAPOFF: &str = "/usr/sbin/swapoff";
 pub const MKSWAP: &str = "/usr/sbin/mkswap";
@@ -67,20 +70,23 @@ pub enum HostError {
         "no cgroup v2 memory controller at /sys/fs/cgroup: boot with systemd.unified_cgroup_hierarchy=1"
     )]
     NoMemoryController,
-    #[error(
-        "{0} is not a systemd unit on this host, so the MinIO drop-in would apply to nothing. If MinIO runs in Kubernetes here, its priority comes from the pod"
-    )]
-    NoMinioUnit(String),
     #[error("no user {0}: useradd --system --create-home {0}")]
     NoUser(String),
     #[error(
-        "{user} has no range in {file} (rootless Podman): usermod --add-subuids 100000-165535 --add-subgids 100000-165535 {user}"
+        "{user} has no range in {file} (rootless containers): usermod --add-subuids 100000-165535 --add-subgids 100000-165535 {user}"
     )]
     NoSubIds { user: String, file: HostPath },
     #[error(
-        "{user} does not linger, so /run/user/{uid} (Podman's run directory) ends with its last session: loginctl enable-linger {user}"
+        "{user} does not linger, so /run/user/{uid} (the unit's XDG_RUNTIME_DIR) ends with its last session: loginctl enable-linger {user}"
     )]
     NoLinger { user: String, uid: u32 },
+    #[error(
+        "{path} is missing, which the daemon's containers need: apt install {package} (or the distribution's package that provides it)"
+    )]
+    NoTool {
+        path: HostPath,
+        package: &'static str,
+    },
     #[error("{0} is missing (docs/deploy/storage-node.md, \"Files the units read\")")]
     Missing(HostPath),
     #[error("{path} is owned by uid {uid}, not {user}: chown {user} {path}")]
@@ -91,8 +97,6 @@ pub enum HostError {
     },
     #[error("{path} has mode {perms}: chmod 600 {path}")]
     Readable { path: HostPath, perms: Perms },
-    #[error("{0} needs AWS_ACCESS_KEY_ID= and AWS_SECRET_ACCESS_KEY= lines, each with a value")]
-    S3Env(HostPath),
     #[error("port {0} is in use: free it or pick another in the config")]
     PortInUse(u16),
     #[error("the rendered units break the priorities; nothing was written:\n{}", lines(.0))]
@@ -107,34 +111,6 @@ pub enum HostError {
     RunsAsRoot(String),
     #[error(transparent)]
     ModeCheck(#[from] super::modes::ParseError),
-
-    // image-pull
-    #[error("no image: set KBF_IMAGES or pass --image <repo>@sha256:<digest>")]
-    NoImages,
-    #[error(
-        "image-pull reads and fills {0}'s Podman store as {0}: run it with sudo, even for a dry run"
-    )]
-    PullNeedsRoot(String),
-    #[error(
-        "{image}: the store's copy has digest {got}, not the pinned one (an index digest? pin the {platform} manifest's digest)"
-    )]
-    WrongDigest {
-        image: String,
-        got: String,
-        platform: String,
-    },
-    #[error("{image} is {got}, not {want}")]
-    WrongPlatform {
-        image: String,
-        got: String,
-        want: String,
-    },
-    #[error("{0} is still not in the store after its pull")]
-    NotPulled(String),
-    /// The check after an apply failed. Steps ran, so this is a failed verb (exit 1),
-    /// not a refusal.
-    #[error("the check after the apply: {0}")]
-    AfterApply(Box<HostError>),
 
     // swap
     #[error("KBF_SWAP_SIZE={0}: give it in whole GiB, as 128G")]

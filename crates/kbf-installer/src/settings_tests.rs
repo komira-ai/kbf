@@ -14,7 +14,7 @@ fn host(platform: Platform) -> Layout {
 fn with_settings(text: &str) -> FakeExec {
     let mut exec = trusted_host();
     exec.entries.insert(
-        layout::path(layout::SETTINGS),
+        crate::layout::path(crate::fixtures::SETTINGS_PATH),
         Entry::File {
             perms: Perms::new(0o644),
             owner: Owner { uid: 0, gid: 0 },
@@ -107,11 +107,11 @@ fn a_settings_file_is_closed_and_strict() {
     let message = load("FOO=1\n").expect_err("refused").to_string();
     assert_eq!(
         message,
-        "settings /usr/local/libexec/kbf-deploy/installer.conf: line 1: \"FOO\" is not a setting"
+        "settings /usr/share/kbf-installer/trust/installer.conf: line 1: \"FOO\" is not a setting"
     );
     let mut exec = trusted_host();
     exec.entries.insert(
-        layout::path(layout::SETTINGS),
+        crate::layout::path(crate::fixtures::SETTINGS_PATH),
         Entry::File {
             perms: Perms::new(0o644),
             owner: Owner { uid: 0, gid: 0 },
@@ -137,7 +137,7 @@ fn a_settings_file_others_could_write_is_refused() {
     ] {
         let mut exec = with_settings("RUN_AS_UID=9\n");
         exec.entries.insert(
-            layout::path(layout::SETTINGS),
+            crate::layout::path(crate::fixtures::SETTINGS_PATH),
             Entry::File {
                 perms: Perms::new(mode),
                 owner: Owner { uid, gid: 0 },
@@ -146,11 +146,14 @@ fn a_settings_file_others_could_write_is_refused() {
         );
         let err = Settings::load(&exec, &host(Platform::Linux)).expect_err("refused");
         assert_eq!(err.code(), want);
-        assert!(err.to_string().starts_with(layout::SETTINGS), "{err}");
+        assert!(
+            err.to_string().starts_with(crate::fixtures::SETTINGS_PATH),
+            "{err}"
+        );
     }
     let mut exec = with_settings("");
     exec.entries.insert(
-        layout::path(layout::SETTINGS),
+        crate::layout::path(crate::fixtures::SETTINGS_PATH),
         Entry::Link {
             target: "elsewhere".into(),
         },
@@ -178,7 +181,7 @@ fn a_settings_file_that_cannot_be_read_is_refused_not_ignored() {
 
     let mut exec = with_settings("");
     exec.entries.insert(
-        layout::path(layout::SETTINGS),
+        crate::layout::path(crate::fixtures::SETTINGS_PATH),
         Entry::Dir {
             perms: Perms::new(0o755),
             owner: Owner { uid: 0, gid: 0 },
@@ -186,4 +189,77 @@ fn a_settings_file_that_cannot_be_read_is_refused_not_ignored() {
     );
     let err = Settings::load(&exec, &host).expect_err("a directory");
     assert_eq!(err.code(), "untrusted-link");
+}
+
+fn allowing(names: &[&str]) -> Settings {
+    let mut settings = Settings::defaults(&host(Platform::Linux));
+    settings.source_refs = names
+        .iter()
+        .map(|n| SourceRef::new(n).expect("a ref"))
+        .collect();
+    settings
+}
+
+fn named(settings: &Settings) -> Vec<&str> {
+    settings.source_refs.iter().map(SourceRef::as_str).collect()
+}
+
+fn wanted(names: &[&str]) -> Vec<String> {
+    names.iter().map(|n| (*n).to_owned()).collect()
+}
+
+/// `installer.toml`'s `source_refs` narrows the trust files' list: the refs both name, in the
+/// trust files' order (not the file's), and a ref only the file names is not added.
+///
+/// Catches a narrowing that replaces the list with the file's (a ref the package never
+/// allowed would be believed), and one that reorders it.
+///
+/// Mutants planted: the retain replaced by the file's refs; the retain made a no-op.
+#[test]
+fn installer_toml_narrows_the_refs_and_never_adds_one() {
+    let conf = allowing(&[
+        "refs/heads/main",
+        "refs/heads/feature/arch-v2",
+        "refs/heads/release/1",
+    ]);
+    let narrowed = conf
+        .clone()
+        .narrowed_to(&wanted(&["refs/heads/release/1", "refs/heads/main"]))
+        .expect("both are allowed");
+    assert_eq!(
+        named(&narrowed),
+        ["refs/heads/main", "refs/heads/release/1"]
+    );
+
+    let narrowed = conf
+        .narrowed_to(&wanted(&["refs/heads/main", "refs/heads/not-allowed"]))
+        .expect("one is allowed");
+    assert_eq!(named(&narrowed), ["refs/heads/main"]);
+}
+
+/// A file that names no ref narrows nothing (its default), and one whose refs the package
+/// does not allow is refused: the host would accept no release, and the file cannot add one.
+///
+/// Catches an empty list read as "allow nothing" (every host with the default file would
+/// refuse every release), and a file that names only refs the package does not allow
+/// leaving the list as it was, or widening it.
+///
+/// Mutants planted: the empty case dropped (everything retained away); the empty result
+/// returned as `Ok`.
+#[test]
+fn an_empty_source_refs_narrows_nothing_and_a_disjoint_one_is_refused() {
+    let conf = allowing(&["refs/heads/main", "refs/heads/feature/arch-v2"]);
+    assert_eq!(conf.clone().narrowed_to(&[]), Ok(conf.clone()));
+    for disjoint in [
+        wanted(&["refs/heads/other"]),
+        wanted(&["refs/tags/main"]),
+        wanted(&["refs/heads/other", "refs/heads/another"]),
+    ] {
+        assert_eq!(
+            conf.clone().narrowed_to(&disjoint),
+            Err(NoCommonRef),
+            "{disjoint:?}"
+        );
+    }
+    assert!(NoCommonRef.to_string().contains("never widen"));
 }

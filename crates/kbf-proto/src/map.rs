@@ -63,6 +63,7 @@ impl From<&Member> for pb::Member {
             zone: m.zone.clone(),
             weight: m.weight,
             state: pb::MemberState::from(m.state).into(),
+            boot: m.boot,
         }
     }
 }
@@ -77,6 +78,7 @@ impl TryFrom<pb::Member> for Member {
             zone: m.zone,
             weight: m.weight,
             state: state_from_wire(m.state)?,
+            boot: m.boot,
         })
     }
 }

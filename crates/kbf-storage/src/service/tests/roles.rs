@@ -17,8 +17,9 @@ use kbf_proto::worker::{
 };
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SanType,
+    KeyPair, KeyUsagePurpose, PublicKeyData, SanType, SerialNumber,
 };
+use sha2::{Digest, Sha256};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity, ServerTlsConfig};
 use tonic::{Code, Status};
 
@@ -28,7 +29,7 @@ use crate::service::{
     Admission, Config, Endpoint, PeerRole, ROLE_URI_PREFIX, StorageService, role_of,
 };
 
-fn uri(role: &str) -> SanType {
+pub(super) fn uri(role: &str) -> SanType {
     SanType::URI(
         format!("{ROLE_URI_PREFIX}{role}")
             .try_into()
@@ -36,8 +37,12 @@ fn uri(role: &str) -> SanType {
     )
 }
 
-fn dns(name: &str) -> SanType {
+pub(super) fn dns(name: &str) -> SanType {
     SanType::DnsName(name.try_into().expect("an IA5 name"))
+}
+
+pub(super) fn ip(text: &str) -> SanType {
+    SanType::IpAddress(text.parse().expect("an IP address"))
 }
 
 /// A self-signed certificate with these subjectAltNames.
@@ -50,7 +55,7 @@ fn der(sans: Vec<SanType>) -> Vec<u8> {
 
 /// The roles section 9 names, as the tests spell them (not read from the code under
 /// test), for each endpoint.
-fn expected(endpoint: Endpoint) -> &'static [&'static str] {
+pub(super) fn expected(endpoint: Endpoint) -> &'static [&'static str] {
     match endpoint {
         Endpoint::FindMissing | Endpoint::Read | Endpoint::Write | Endpoint::QueryWriteStatus => {
             &["frontend", "storage", "daemon"]
@@ -135,6 +140,59 @@ fn a_certificate_must_name_exactly_one_known_role() {
     }
 }
 
+/// Catches the unowned-copy marker honoured from a role other than the frontend: under
+/// mutual TLS only a certificate naming `frontend` may send it (every other role, no
+/// certificate and a certificate with no role may not); plain text has no identity and
+/// admits it as it admits every call but a copy.
+#[test]
+fn only_the_frontend_may_ask_for_an_unowned_copy() {
+    for role in PeerRole::ALL {
+        let leaf = der(vec![uri(role.name())]);
+        assert_eq!(
+            Admission::Certified.permits_unowned_leaf(Some(&leaf)),
+            role == PeerRole::Frontend,
+            "{role:?}"
+        );
+    }
+    assert!(!Admission::Certified.permits_unowned_leaf(None));
+    assert!(!Admission::Certified.permits_unowned_leaf(Some(b"not DER")));
+    assert!(!Admission::Certified.permits_unowned_leaf(Some(&der(vec![]))));
+    assert!(Admission::Open.permits_unowned_leaf(None));
+}
+
+/// Catches an unowned marker that changes what a chain copy is: a leg that carries the marker
+/// is still a leg (judged by a copy's rules: stored where the map says the node owns the blob,
+/// refused where it does not), never an unowned local write. Only a call with no leg, that asked,
+/// from a caller that may ask, is taken as an unowned copy. (Admission already refuses a leg
+/// from any caller but a storage node, and a storage node may not ask for an unowned copy, so
+/// no call reaches the guard with both; it is tested where it is decided.)
+#[test]
+fn a_chain_copy_with_the_unowned_marker_is_still_a_chain_copy() {
+    use super::super::generation::takes_unowned;
+    use kbf_map::MemberId;
+    let leg = Some(MemberId(2));
+    for marked in [false, true] {
+        for permitted in [false, true] {
+            assert!(
+                !takes_unowned(leg, marked, permitted),
+                "{marked} {permitted}"
+            );
+        }
+    }
+    assert!(takes_unowned(None, true, true));
+    assert!(!takes_unowned(None, true, false));
+    assert!(!takes_unowned(None, false, true));
+}
+
+/// A client certificate and what a deny entry spells about it.
+pub(super) struct Caller {
+    identity: Identity,
+    /// SHA-256 of its SubjectPublicKeyInfo, lower-case hex.
+    pub(super) spki_sha256: String,
+    /// Its serial, lower-case hex without leading zeros.
+    pub(super) serial: String,
+}
+
 /// A CA, the server's certificate, and client certificates by role.
 pub(crate) struct Pki {
     ca: CertifiedIssuer<'static, KeyPair>,
@@ -154,7 +212,7 @@ impl Pki {
         Self { ca }
     }
 
-    fn server(&self) -> ServerTlsConfig {
+    pub(super) fn server(&self) -> ServerTlsConfig {
         let mut params = CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let key = KeyPair::generate().expect("key");
@@ -195,6 +253,41 @@ impl Pki {
     /// [`Pki::client`] that connects when first used.
     pub(crate) fn lazy_client(&self, addr: std::net::SocketAddr, role: &str) -> Channel {
         self.endpoint(addr, vec![vec![uri(role)]]).connect_lazy()
+    }
+
+    /// A client certificate from the CA with these subjectAltNames and this serial, held
+    /// with the facts a deny entry spells about it.
+    pub(super) fn caller(&self, sans: Vec<SanType>, serial: u64) -> Caller {
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        params.subject_alt_names = sans;
+        params.serial_number = Some(SerialNumber::from(serial));
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let key = KeyPair::generate().expect("key");
+        let spki_sha256 = Sha256::digest(key.subject_public_key_info())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let cert = params.signed_by(&key, &self.ca).expect("sign");
+        Caller {
+            identity: Identity::from_pem(cert.pem(), key.serialize_pem()),
+            spki_sha256,
+            serial: format!("{serial:x}"),
+        }
+    }
+
+    /// A connection to the server at `addr` presenting `caller`'s certificate.
+    pub(super) async fn connect(&self, addr: std::net::SocketAddr, caller: &Caller) -> Channel {
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(self.ca.pem()))
+            .domain_name("localhost")
+            .identity(caller.identity.clone());
+        Channel::from_shared(format!("https://{addr}"))
+            .expect("endpoint")
+            .tls_config(tls)
+            .expect("TLS")
+            .connect()
+            .await
+            .expect("connect")
     }
 
     /// A client of the server at `addr`, with a certificate whose subjectAltNames are
@@ -243,7 +336,7 @@ impl Pki {
 
 /// Every gRPC method the service admits, with the endpoint whose roles it takes: one
 /// row per method, so a check left out of one `Segments` handler is called too.
-const RPCS: [(&str, Endpoint); 12] = [
+pub(super) const RPCS: [(&str, Endpoint); 12] = [
     ("FindMissingBlobs", Endpoint::FindMissing),
     ("Read", Endpoint::Read),
     ("Write", Endpoint::Write),
@@ -260,7 +353,7 @@ const RPCS: [(&str, Endpoint); 12] = [
 
 /// One call of the method `rpc` names (a row of [`RPCS`]), as a client of the wire would
 /// make it.
-async fn call_rpc(rpc: &str, channel: &Channel) -> Result<(), Status> {
+pub(super) async fn call_rpc(rpc: &str, channel: &Channel) -> Result<(), Status> {
     let mut segments = SegmentsClient::new(channel.clone());
     match rpc {
         "Segments.PutRange" => segments
@@ -288,7 +381,7 @@ async fn call_rpc(rpc: &str, channel: &Channel) -> Result<(), Status> {
 
 /// One call to `endpoint`, as a client of the wire would make it (`Segments.Begin` for
 /// the `Segments` endpoint).
-async fn call(endpoint: Endpoint, channel: &Channel) -> Result<(), Status> {
+pub(super) async fn call(endpoint: Endpoint, channel: &Channel) -> Result<(), Status> {
     let digest = super::wire::to_proto(&sha(b"x"));
     match endpoint {
         Endpoint::FindMissing => ContentAddressableStorageClient::new(channel.clone())
@@ -421,7 +514,7 @@ async fn every_method_refuses_an_unexpected_role_over_mutual_tls() {
 /// second, is refused on `ActionStore.Get` (frontend only) and gets past the check on
 /// `Segments`.
 ///
-/// Mutant seen red: `chain.first()` read as `chain.last()` in `Admission::check`.
+/// Mutant seen red: `chain.first()` read as `chain.last()` in `Admission::guard`.
 #[tokio::test]
 async fn the_role_is_read_from_the_leaf_certificate_alone() {
     let pki = Pki::new();

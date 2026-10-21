@@ -1,5 +1,5 @@
 //! [`Backend`]: what Execute and the scheduler need of the store, and nothing more. Three
-//! implementations: a [`Cache`] in this process (what `kbf-server` and `kbf-all-in-one`
+//! implementations: a [`Cache`] in this process (what `kbf-server` and `kbf all-in-one`
 //! have always run), a [`Storage`] reached over gRPC (`kbf frontend` without members,
 //! which holds no blobs of its own: `docs/design/architecture-v2.md`, sections 2 and 7),
 //! and the storage nodes of a map ([`Backend::routed`], `kbf frontend` with members),
@@ -10,11 +10,12 @@
 //! halves of the action-cache write after one. Client CAS, ByteStream and action-cache
 //! calls are not here: they are the cache's services, or the proxy's.
 //!
-//! **The input check over a [`Storage`]** ([`walk`]) reads each Directory of the tree
-//! from the node and asks it which files are missing. It remembers nothing between
-//! Executes: the verified-subtree memory of [`Cache::walk_inputs`] is the node's to keep
-//! (a call that does the check there is the next step, and a [`Storage`] method). Over a
-//! map the same walk reads each Directory from its owners.
+//! **The input check over a [`Storage`]** ([`walk`], in `input_walk`) reads each Directory of the tree
+//! from the node and asks it which files are missing. Over one node it remembers nothing
+//! between Executes. Over a map the same walk reads each Directory from its owners, and
+//! remembers the subtrees it found held for a short time, under the map's epoch, so the
+//! actions of one build, which share most of their inputs, read a shared subtree once
+//! (`input_walk` says what bounds the memory and how a loss invalidates it).
 //!
 //! **The action-cache write over a map.** A node checks an entry against the blobs it
 //! holds itself, and a result's blobs are on the owners of their own digests. The first
@@ -25,12 +26,10 @@
 //! (`kbf_route::Router::commit_with_closure`), until av2-12 gives an entry the
 //! acknowledgements of its writers.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use futures::{StreamExt as _, TryStreamExt as _};
 use kbf_meta::{ActionRecord, ActionWriteError, Role};
 use kbf_objstore::ObjectStore;
 use kbf_proto::reapi::ActionResult;
@@ -41,17 +40,11 @@ use prost::Message as _;
 
 use crate::cache::Cache;
 use crate::closure;
-use crate::input_tree::{Walked, decode};
+use crate::input_tree::Walked;
+use crate::input_walk::{Blobs, Trees, walk};
 use crate::meta_log::{Leadership, MetaLog};
 use crate::metrics::CacheMetrics;
 use crate::routed::Routed;
-
-/// The most Directory blobs [`walk`] reads from a node at once.
-const DIRS_IN_FLIGHT: usize = 16;
-
-/// The most digests one FindMissing of [`walk`] names: a message well under the gRPC
-/// limit, with a call per few thousand files of a tree.
-const FILES_PER_ASK: usize = 4096;
 
 /// The store behind Execute and the scheduler. Cheap to clone.
 #[derive(Clone)]
@@ -97,6 +90,7 @@ impl Backend {
         Self(Arc::new(Remote {
             storage,
             metrics: CacheMetrics::default(),
+            trees: Trees::default(),
         }))
     }
 
@@ -115,7 +109,9 @@ impl Backend {
             bootstrap: Remote {
                 storage,
                 metrics: CacheMetrics::default(),
+                trees: Trees::default(),
             },
+            trees: Trees::default(),
         }))
     }
 
@@ -127,7 +123,11 @@ impl Backend {
         self.0.find_missing(digests).await
     }
 
-    pub(crate) async fn read_blob(&self, digest: &Digest) -> Result<bytes::Bytes, StorageError> {
+    /// The blob `digest`, read whole and verified against its digest.
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] if it is not held, or as the store answers.
+    pub async fn read_blob(&self, digest: &Digest) -> Result<bytes::Bytes, StorageError> {
         self.0.read_blob(digest).await
     }
 
@@ -266,6 +266,10 @@ impl<M: MetaLog, O: ObjectStore + 'static> Plane for Local<M, O> {
 struct Remote {
     storage: Arc<dyn Storage>,
     metrics: CacheMetrics,
+    /// Of one node, whose [`Held`] gives no epoch, only the content cache of decoded
+    /// Directories is used (every Directory it holds is still asked about); nothing is
+    /// remembered as verified.
+    trees: Trees,
 }
 
 impl Plane for Remote {
@@ -301,7 +305,7 @@ impl Plane for Remote {
     }
 
     fn walk_inputs(&self, root: Digest) -> BoxFuture<'_, Answer<Walked>> {
-        Box::pin(async move { walk(&Held(&*self.storage), root).await })
+        Box::pin(async move { walk(&Held(&*self.storage), root, &self.trees).await })
     }
 
     fn metrics(&self) -> &CacheMetrics {
@@ -309,7 +313,11 @@ impl Plane for Remote {
     }
 
     fn render_metrics(&self) -> String {
-        self.metrics.render()
+        let mut out = self.metrics.render();
+        // The process's, as `Cache::render_metrics` adds it: this frontend buffers
+        // bodies for its requests (batch blobs, Segments uploads, whole-blob reads) too.
+        kbf_storage::in_flight::render(&mut out);
+        out
     }
 
     fn leadership(&self) -> Option<Leadership> {
@@ -322,12 +330,18 @@ impl Plane for Remote {
 struct RoutedPlane {
     routed: Arc<Routed>,
     bootstrap: Remote,
+    /// The Directories verified held on the farm, shared by every Execute.
+    trees: Trees,
 }
 
 impl RoutedPlane {
     /// The router, when the map is to be routed by.
     fn routing(&self) -> Option<&Router> {
-        self.routed.active().then(|| self.routed.router())
+        if self.routed.active() {
+            return Some(self.routed.router());
+        }
+        self.routed.tag_bootstrap();
+        None
     }
 }
 
@@ -379,7 +393,7 @@ impl Plane for RoutedPlane {
 
     fn walk_inputs(&self, root: Digest) -> BoxFuture<'_, Answer<Walked>> {
         match self.routing() {
-            Some(router) => Box::pin(async move { walk(router, root).await }),
+            Some(router) => Box::pin(async move { walk(router, root, &self.trees).await }),
             None => self.bootstrap.walk_inputs(root),
         }
     }
@@ -445,12 +459,6 @@ async fn held_by_none(router: &Router, missing: &[Digest]) -> Answer<Vec<Digest>
     Ok(absent)
 }
 
-/// What the input check reads: a blob, and which of some files are held.
-trait Blobs: Send + Sync {
-    fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<bytes::Bytes>>;
-    fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>>;
-}
-
 /// One storage node's blobs.
 struct Held<'a>(&'a dyn Storage);
 
@@ -464,60 +472,22 @@ impl Blobs for Held<'_> {
     }
 }
 
-/// The blobs of a farm, routed by its map.
+/// The blobs of a farm, routed by its map. A file is missing when no owner a read would
+/// try holds it ([`Router::find_missing_anywhere`]), not when its primary lacks it: a
+/// primary that has just joined holds nothing of what it now owns, and refusing the run
+/// for that would refuse every action whose inputs the client no longer uploads.
 impl Blobs for Router {
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<bytes::Bytes>> {
         Box::pin(Router::read_blob(self, digest))
     }
 
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>> {
-        Box::pin(Router::find_missing(self, digests))
+        Box::pin(Router::find_missing_anywhere(self, digests))
     }
-}
 
-/// The input check over a [`Storage`]: every Directory under `root` is read (a level at
-/// a time, [`DIRS_IN_FLIGHT`] at once), and the files they name are asked about in
-/// batches. A Directory the node does not hold, or holds but cannot read, is reported
-/// absent and nothing under it is looked at; the report lists absent directories
-/// (sorted) before absent files (sorted), as [`Cache::walk_inputs`] does.
-///
-/// # Errors
-/// The node could not answer, or a Directory it holds does not decode.
-async fn walk(storage: &dyn Blobs, root: Digest) -> Answer<Walked> {
-    let (mut seen, mut dirs_read) = (BTreeSet::from([root]), 0);
-    let (mut absent_dirs, mut files) = (BTreeSet::new(), BTreeSet::new());
-    let mut level = vec![root];
-    while !level.is_empty() {
-        let read: Vec<_> = futures::stream::iter(level)
-            .map(|dir| async move { (dir, storage.read_blob(&dir).await) })
-            .buffer_unordered(DIRS_IN_FLIGHT)
-            .collect()
-            .await;
-        level = Vec::new();
-        for (dir, blob) in read {
-            match blob {
-                Err(StorageError::NotFound(_) | StorageError::Unreachable(_)) => {
-                    absent_dirs.insert(dir);
-                }
-                other => {
-                    dirs_read += 1;
-                    let decoded = decode(&dir, &other?)?;
-                    files.extend(decoded.files.iter().copied());
-                    level.extend(decoded.dirs.iter().copied().filter(|d| seen.insert(*d)));
-                }
-            }
-        }
+    fn epoch(&self) -> Option<u64> {
+        Router::epoch(self)
     }
-    let files: Vec<Digest> = files.into_iter().collect();
-    let asked: Vec<Vec<Digest>> = futures::stream::iter(files.chunks(FILES_PER_ASK))
-        .then(|chunk| storage.find_missing(chunk))
-        .try_collect()
-        .await?;
-    let absent_files: BTreeSet<Digest> = asked.into_iter().flatten().collect();
-    Ok(Walked {
-        absent: absent_dirs.into_iter().chain(absent_files).collect(),
-        dirs_read,
-    })
 }
 
 #[cfg(test)]

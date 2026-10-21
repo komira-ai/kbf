@@ -68,6 +68,7 @@ impl Owners {
                 zone: String::new(),
                 weight: 1,
                 state: MemberState::Active,
+                boot: 0,
             })
             .collect();
         let r = u8::try_from(count).expect("a few owners");
@@ -75,6 +76,7 @@ impl Owners {
         let view = MapView {
             map: Arc::new(map),
             previous: None,
+            earlier: Vec::new(),
         };
         let hook = Arc::new(Hook::default());
         let many = NonZeroU32::new(1000).expect("not zero");

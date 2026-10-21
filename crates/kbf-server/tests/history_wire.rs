@@ -869,12 +869,9 @@ fn without_the_flag_there_is_no_history() {
     );
 }
 
-/// A scratch directory unique to this call.
-fn scratch(name: &str) -> PathBuf {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("history-wire-{}-{n}-{name}", std::process::id()))
+/// A scratch directory unique to this call, removed when it drops.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("history-wire-{name}"))
 }
 
 /// Catches: a `file://` history directory that is not opened and locked (two servers
@@ -945,4 +942,12 @@ async fn an_s3_history_store_takes_its_key_pair_from_the_environment() {
         .all(|name| std::env::var(name).is_ok());
     let real = args.history.open(Some(&state));
     assert_eq!(real.is_ok(), held, "{:?}", real.err());
+    // The flags and their error show as what they are.
+    if let Err(refused) = &real {
+        let shown = format!("{:?} {refused:?}", args.history.clone());
+        assert!(
+            shown.contains("history_objects") && shown.contains("Store"),
+            "{shown}"
+        );
+    }
 }

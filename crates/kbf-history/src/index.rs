@@ -10,12 +10,16 @@
 //! workers already and for tests.
 
 use std::future::Future;
+use std::num::NonZeroUsize;
+use std::ops::Bound;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use kbf_state::{Commit, Conflict, Store, StoreError, Txn, Versioned};
+use kbf_state::{
+    Commit, Conflict, Direction, Op, Permit, ScanPage, ScanRange, Store, StoreError, Txn, Versioned,
+};
 
-use crate::keys::IndexRoot;
+use crate::keys::{IndexRoot, WriterId};
 
 /// The future an [`Offload`] returns.
 pub type Offloaded = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -46,6 +50,9 @@ pub struct HistoryIndex {
     store: Arc<dyn Store>,
     root: IndexRoot,
     offload: Arc<dyn Offload>,
+    /// What a writer of this index may write after another process holds the store's
+    /// generation ([`HistoryIndex::exempting`]); `None` when the store has no generation.
+    exempt: Option<Permit>,
 }
 
 impl HistoryIndex {
@@ -56,7 +63,33 @@ impl HistoryIndex {
             store,
             root,
             offload,
+            exempt: None,
         }
+    }
+
+    /// This index for the writer `writer`: the rows [`IndexRoot::permit`] names are
+    /// written without the store's generation check, so a process that a successor has
+    /// superseded still records the runs of the calls it kept. A store with no
+    /// generation to check is used as it is.
+    #[must_use]
+    pub fn exempting(mut self, writer: WriterId) -> HistoryIndex {
+        let permit = self.root.permit(writer);
+        if let Some(own) = self.store.own_keys(Arc::clone(&permit)) {
+            self.store = own;
+            self.exempt = Some(permit);
+        }
+        self
+    }
+
+    /// Whether the store gave this index a handle that writes some rows unchecked.
+    pub(crate) fn is_exempting(&self) -> bool {
+        self.exempt.is_some()
+    }
+
+    /// Whether a write of `op` goes around the generation check: the index is
+    /// [`exempting`](HistoryIndex::exempting) and the permit accepts it.
+    pub(crate) fn exempts(&self, op: &Op) -> bool {
+        self.exempt.as_ref().is_some_and(|permit| permit(op))
     }
 
     /// The root the rows live under.
@@ -94,6 +127,28 @@ impl HistoryIndex {
         prefix: String,
     ) -> Result<Vec<(String, Versioned)>, StoreError> {
         self.call(move |s| s.scan_prefix(&prefix)).await
+    }
+
+    /// One page of at most `limit` rows under `prefix` between `lower` and `upper`, in
+    /// `direction` (C8): a bounded read, unlike [`HistoryIndex::scan_prefix`].
+    pub(crate) async fn scan_range(
+        &self,
+        prefix: String,
+        bounds: (Bound<String>, Bound<String>),
+        direction: Direction,
+        limit: NonZeroUsize,
+    ) -> Result<ScanPage, StoreError> {
+        self.call(move |s| {
+            let (lower, upper) = &bounds;
+            s.scan_range(ScanRange {
+                prefix: &prefix,
+                lower: lower.as_ref().map(String::as_str),
+                upper: upper.as_ref().map(String::as_str),
+                direction,
+                limit,
+            })
+        })
+        .await
     }
 
     pub(crate) async fn txn(&self, txn: Txn) -> Result<Result<Commit, Conflict>, StoreError> {

@@ -148,10 +148,27 @@ impl Router {
         let action = *action;
         let walked = self
             .routed(|view| async move {
-                self.walk(&view, &action, move |node| async move {
-                    node.action_result(&action).await
-                })
-                .await
+                let walked = self
+                    .walk(&view, &action, move |node| async move {
+                        node.action_entry(&action).await
+                    })
+                    .await?;
+                let entry = match walked {
+                    Walked::Found(entry) => entry,
+                    Walked::Missed { absent, failure } => {
+                        return Ok(Walked::Missed { absent, failure });
+                    }
+                };
+                // The entry's owner checked its own copy of the closure; the blobs'
+                // owners are asked here, so an entry whose blob is gone from all of them
+                // is a miss (the action runs again).
+                if !self.closure_served(&view, entry.closure.as_deref()).await? {
+                    return Ok(Walked::Missed {
+                        absent: 1,
+                        failure: None,
+                    });
+                }
+                Ok(Walked::Found((entry.result_digest, entry.result)))
             })
             .await?;
         match walked {
@@ -257,7 +274,7 @@ impl Router {
     /// answered after owners of this generation `absent` did not. An owner that failed
     /// without saying it lacked the blob is not in `absent`: it is down, and av2-11 repairs
     /// what it missed when it is back.
-    fn found_elsewhere(
+    pub(crate) fn found_elsewhere(
         &self,
         view: &MapView,
         digest: &Digest,

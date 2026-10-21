@@ -10,12 +10,12 @@
 
 #![cfg(target_os = "linux")]
 
-#[path = "../../kbf-all-in-one/tests/support/node.rs"]
+#[path = "support/node.rs"]
 mod node;
 
 use std::io::{BufRead as _, BufReader};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -27,33 +27,31 @@ use kbf_proto::reapi::{
     Action, ActionResult, Command as ReapiCommand, Digest, Directory, DirectoryNode,
     ExecuteRequest, ExecuteResponse, FileNode, Platform,
 };
+use kbf_testkit::dir::TestDir;
 use kbf_transfer::{Cas as _, TransferConfig, Transfers, digest_of};
 use node::{
-    PROMPT, Running, cgroup_tree, files_holding, id_files, image_path, input_bytes, pki, podman,
+    PROMPT, Running, cgroup_tree, crun, files_holding, id_files, image_path, input_bytes,
+    oci_runtime, pki,
 };
 use prost::Message as _;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-// The stand-in `podman` runs each action as `kbf-act` beside it: a link to this test
+// The stand-in `crun` runs each action as `kbf-act` beside it: a link to this test
 // binary, which answers as `kbf-act` through it.
 kbf_testkit::act_test_hook!();
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf");
 
-/// The stand-in `podman` (`node::podman`).
-const FAKE_PODMAN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-podman");
+/// The stand-in `crun` (`node::crun`).
+const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-crun");
 
 /// The bytes the action writes to its one output file.
 const OUTPUT: &[u8] = b"a file\n";
 
-/// A fresh directory for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-storage-and-daemon")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// A fresh directory for one test, removed when it drops (declare it before the
+/// processes that write into it).
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(node::scratch_root().join("kbf-storage-and-daemon"), name)
 }
 
 /// The scheduler: `kbf-server` in this process over its own stores in `dir`, its worker
@@ -65,6 +63,9 @@ fn scheduler(tokio: &tokio::runtime::Runtime, dir: &Path) -> (SocketAddr, Socket
         "kbf-server".to_owned(),
         "--listen=127.0.0.1:0".to_owned(),
         "--worker-listen=127.0.0.1:0".to_owned(),
+        // The one node is this host, whatever its architecture: the default
+        // (`linux/x86_64`) would leave an action on an aarch64 host with no worker.
+        "--default-platform=none".to_owned(),
         format!("--worker-tls-cert={}", at("server.pem")),
         format!("--worker-tls-key={}", at("server.key")),
         format!("--worker-client-ca={}", at("ca.pem")),
@@ -119,15 +120,14 @@ fn node_flags(dir: &Path, worker: SocketAddr) -> Vec<String> {
 }
 
 /// Starts `kbf storage-and-daemon` with `flags`, its container driver running the
-/// stand-in `podman` in `bin`; the running node and its storage listener's address,
+/// stand-in `crun` in `bin`; the running node and its storage listener's address,
 /// from the start line.
 fn start_node(bin: &Path, flags: &[String]) -> (Running, SocketAddr) {
     let mut child = Command::new(BIN)
         .args(flags)
         .args(cgroup_tree(bin))
+        .arg(oci_runtime(bin))
         .env("PATH", image_path(bin))
-        // The stand-in finds its state beside the link it was run through, which the
-        // driver runs by the name `PATH` finds (argv0 `podman`): from here.
         .current_dir(bin)
         .stdout(Stdio::piped())
         .spawn()
@@ -297,9 +297,10 @@ fn storage_and_daemon_runs_an_action_over_its_own_storage() {
     pki(&dir);
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("mkdir");
-    let image = podman(
+    let image = crun(
         &bin,
-        FAKE_PODMAN,
+        &dir.join("data"),
+        FAKE_CRUN,
         &["write-lines", "$UPPER/out/file.txt", "a file"],
     );
     let tokio = tokio::runtime::Runtime::new().expect("runtime");
@@ -372,18 +373,31 @@ fn replaced(flags: Vec<String>, extra: &[String]) -> Vec<String> {
 /// (plain text off loopback) exits 2 before the daemon half starts; with an `s3://` cold
 /// store (no connection is made until a blob moves) the storage half starts and prints
 /// its start line, and a daemon half whose driver cannot start (no subordinate ids for
-/// its user) then exits 1, as `kbf-daemon` does.
+/// its user) then exits 2, as `kbf-daemon` does.
 #[test]
 fn a_start_either_half_refuses_says_which() {
     let dir = scratch("refused");
     pki(&dir);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    crun(
+        &bin,
+        &dir.join("data"),
+        FAKE_CRUN,
+        &["write-lines", "$UPPER/out/file.txt", "a file"],
+    );
+    let path = image_path(&bin);
+    let host = [("PATH", path.as_str())];
+    // The rendered unit names `/usr/bin/crun`: this box's is the stand-in.
+    let runtime = [oci_runtime(&bin)];
     let worker: SocketAddr = "127.0.0.1:1".parse().expect("address");
     let wide = ["--storage-listen=0.0.0.0:0".to_owned()];
     let plain: Vec<String> = node_flags(&dir, worker)
         .into_iter()
         .filter(|flag| !STORAGE_TLS.iter().any(|tls| flag.starts_with(tls)))
         .collect();
-    let (code, out, err) = refused(&replaced(plain, &wide), &[]);
+    let plain: Vec<String> = plain.into_iter().chain(runtime.clone()).collect();
+    let (code, out, err) = refused(&replaced(plain, &wide), &host);
     assert_eq!(code, Some(2), "{err}");
     assert!(err.contains("kbf storage-and-daemon: storage: "), "{err}");
     assert!(out.is_empty(), "{out}");
@@ -395,14 +409,82 @@ fn a_start_either_half_refuses_says_which() {
     ];
     let flags: Vec<String> = replaced(node_flags(&dir, worker), &s3)
         .into_iter()
+        .chain(runtime.clone())
         .filter(|flag| !flag.starts_with("--hot-store="))
         .collect();
     let env = [
+        host[0],
         ("AWS_ACCESS_KEY_ID", "test-key"),
         ("AWS_SECRET_ACCESS_KEY", "test-secret"),
     ];
     let (code, out, err) = refused(&flags, &env);
-    assert_eq!(code, Some(1), "{err}");
+    // 2, not 1: a user without subordinate ids is a refusal a restart would not change
+    // (the unit's RestartPreventExitStatus=2 leaves it down).
+    assert_eq!(code, Some(2), "{err}");
     assert!(out.starts_with("kbf-storage "), "{out}");
     assert!(err.contains("kbf storage-and-daemon: daemon: "), "{err}");
+}
+
+/// Catches a SIGTERM that arrives while the node is still starting killing the process by
+/// the signal's default action (kbf#1087): the node is told to register with a frontend
+/// that never answers, so its start waits in the registration, with the storage half's
+/// stores open. A `systemctl stop` then must stop it cleanly and exit 0, not end it by
+/// SIGTERM (no exit code), which hard-kills a storage member other nodes replicate to.
+/// Waits for the start's own log line (`cold store:`), logged after the process is
+/// running its start, so the signal is sent while it waits and not before it runs.
+#[test]
+fn a_sigterm_while_the_node_is_still_starting_stops_it_cleanly() {
+    use std::io::Read as _;
+
+    let dir = scratch("sigterm-at-start");
+    pki(&dir);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    crun(
+        &bin,
+        &dir.join("data"),
+        FAKE_CRUN,
+        &["write-lines", "$UPPER/out/file.txt", "a file"],
+    );
+    let worker: SocketAddr = "127.0.0.1:1".parse().expect("address");
+    // An empty file, so that a host's own /etc/kbf/kbf.toml is not read.
+    let config = dir.join("empty.toml");
+    std::fs::write(&config, "").expect("write");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+    // Port 1 refuses, and the registration retries until the frontend answers.
+    let flags: Vec<String> = node_flags(&dir, worker)
+        .into_iter()
+        .chain(["--frontend=http://127.0.0.1:1".to_owned()])
+        .chain([format!("--config={}", config.display())])
+        .collect();
+    let mut child = Command::new(BIN)
+        .args(&flags)
+        .args(cgroup_tree(&bin))
+        .arg(oci_runtime(&bin))
+        .env("PATH", image_path(&bin))
+        .current_dir(&bin)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let running = Running(child);
+    let mut seen = Vec::new();
+    let mut byte = [0_u8; 1];
+    let deadline = Instant::now() + PROMPT;
+    while !String::from_utf8_lossy(&seen).contains("cold store:") {
+        assert!(Instant::now() < deadline, "no start log line");
+        let got = stderr.read(&mut byte).expect("read");
+        assert_eq!(got, 1, "the node ended: {}", String::from_utf8_lossy(&seen));
+        seen.push(byte[0]);
+    }
+    // The start is waiting in the registration: it must be still running, no start line.
+    std::thread::sleep(Duration::from_millis(500));
+    let pid = rustix::process::Pid::from_child(&running.0);
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("SIGTERM");
+    let status = running.wait();
+    assert_eq!(status.code(), Some(0), "{status:?}");
 }

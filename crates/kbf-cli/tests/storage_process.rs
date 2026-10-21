@@ -5,7 +5,7 @@
 //! in-process: the store, its metadata log and its listener are the child's.
 
 use std::io::{BufRead as _, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +13,7 @@ use bytes::Bytes;
 use kbf_cas_conformance::Subject;
 use kbf_storage::Storage as _;
 use kbf_storage::service::RemoteStorage;
+use kbf_testkit::dir::TestDir;
 use kbf_transfer::{TransferConfig, Transfers};
 use tonic::transport::Endpoint;
 
@@ -57,15 +58,18 @@ fn start(dir: &Path, extra: &[&str]) -> Node {
     let meta = format!("--meta-dir={}", dir.join("meta").display());
     let mut flags = vec![cold.as_str(), meta.as_str()];
     flags.extend_from_slice(extra);
-    spawn(&flags, &[])
+    spawn(dir, &flags, &[])
 }
 
 /// `kbf storage --storage-listen=127.0.0.1:0` and these flags, with these variables in
-/// its environment.
-fn spawn(flags: &[&str], env: &[(&str, &str)]) -> Node {
+/// its environment, and the empty settings file of `dir` as its `--config` (it reads no
+/// `/etc/kbf/kbf.toml` of the host).
+fn spawn(dir: &Path, flags: &[&str], env: &[(&str, &str)]) -> Node {
+    std::fs::create_dir_all(dir).expect("directory");
     let mut child = Command::new(BIN)
         .args(["storage", "--storage-listen=127.0.0.1:0"])
         .args(flags)
+        .arg(kbf_testkit::config::flag(dir))
         .envs(env.iter().copied())
         .stdout(Stdio::piped())
         .spawn()
@@ -85,19 +89,17 @@ fn spawn(flags: &[&str], env: &[(&str, &str)]) -> Node {
 
 /// One `kbf storage` process per [`Subject::fresh`], each over empty stores.
 struct Process {
-    scratch: PathBuf,
+    // The nodes come first: fields drop in order, and the directory they write in must
+    // outlive them.
     nodes: Mutex<Vec<Node>>,
+    scratch: TestDir,
 }
 
 impl Process {
     fn new() -> Self {
-        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("storage-process-{}-{n}", std::process::id()));
         Self {
-            scratch,
             nodes: Mutex::new(Vec::new()),
+            scratch: TestDir::under(env!("CARGO_TARGET_TMPDIR"), "storage-process"),
         }
     }
 }
@@ -114,8 +116,7 @@ impl Subject for Process {
     }
 
     fn scratch(&self) -> &Path {
-        std::fs::create_dir_all(&self.scratch).expect("scratch");
-        &self.scratch
+        self.scratch.path()
     }
 }
 
@@ -126,8 +127,7 @@ kbf_cas_conformance::tests!(Process::new());
 /// use them (the conformance suite above is the daemon's side).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_storage_client_reads_what_it_wrote_in_another_process() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("storage-client-{}", std::process::id()));
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "storage-client");
     let node = start(&dir, &[]);
     let channel = Endpoint::from_shared(format!("http://{}", node.addr))
         .expect("endpoint")
@@ -153,8 +153,27 @@ async fn the_storage_client_reads_what_it_wrote_in_another_process() {
 /// before opening anything: storage nodes reach the state store only through a frontend).
 #[test]
 fn a_refused_start_exits_2_and_a_state_store_is_refused() {
-    let run = |args: &[&str]| Command::new(BIN).args(args).output().expect("run kbf");
-    let out = run(&["storage"]);
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "storage-refused");
+    // Every start but the first gets the empty settings file of the test's own, not the host's.
+    let run = |args: &[&str]| {
+        let config = kbf_testkit::config::flag(&dir);
+        Command::new(BIN)
+            .args(args)
+            .arg(config)
+            .output()
+            .expect("run kbf")
+    };
+    // Named and missing, the settings file is the refusal (exit 2, the file named).
+    let out = Command::new(BIN)
+        .args(["storage", "--config", "/nonexistent/kbf.toml"])
+        .output()
+        .expect("run kbf");
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("/nonexistent/kbf.toml"), "{err}");
+    assert!(out.stdout.is_empty());
+    // Given flags, they are the start, and it names the one it lacks.
+    let out = run(&["storage", "--storage-listen=127.0.0.1:0"]);
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -180,11 +199,11 @@ fn a_refused_start_exits_2_and_a_state_store_is_refused() {
 /// does not exit 0 on SIGTERM.
 #[test]
 fn the_s3_and_hot_store_shapes_start_and_stop_on_sigterm() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("storage-shapes-{}", std::process::id()));
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "storage-shapes");
     let meta = format!("--meta-dir={}", dir.join("s3-meta").display());
     let keys = [("AWS_ACCESS_KEY_ID", "a"), ("AWS_SECRET_ACCESS_KEY", "b")];
     let mut s3 = spawn(
+        &dir,
         &[
             "--cold-store=s3://bucket/kbf/?endpoint=http://127.0.0.1:1",
             &meta,
@@ -195,7 +214,7 @@ fn the_s3_and_hot_store_shapes_start_and_stop_on_sigterm() {
     let cold = format!("--cold-store=file://{}", dir.join("cold").display());
     let hot = format!("--hot-store=file://{}", dir.join("hot").display());
     std::fs::create_dir_all(dir.join("hot")).expect("hot directory");
-    let mut tiered = spawn(&[&cold, &hot], &[]);
+    let mut tiered = spawn(&dir, &[&cold, &hot], &[]);
     assert!(tiered.stop().is_some_and(|status| status.success()));
 }
 
@@ -207,8 +226,7 @@ fn the_s3_and_hot_store_shapes_start_and_stop_on_sigterm() {
 /// file, not to a start). Loopback without TLS is every other test here.
 #[test]
 fn plain_text_off_loopback_is_a_refused_start() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("storage-off-loopback-{}", std::process::id()));
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "storage-off-loopback");
     let cold = format!("--cold-store=file://{}", dir.join("cold").display());
     let meta = format!("--meta-dir={}", dir.join("meta").display());
     // A node that wrongly starts serves until it is killed: wait a while, then kill it
@@ -222,6 +240,7 @@ fn plain_text_off_loopback_is_a_refused_start() {
                 &format!("--storage-listen={listen}"),
             ])
             .args(more)
+            .arg(kbf_testkit::config::flag(&dir))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -267,6 +286,20 @@ fn plain_text_off_loopback_is_a_refused_start() {
     );
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("read ") && err.contains("none.pem"), "{err}");
+    // The startup self-checks name all three files at once, not the first the TLS load
+    // meets, and the refusal is about them, not the listener's address.
+    for flag in [
+        "--storage-tls-cert",
+        "--storage-tls-key",
+        "--storage-client-ca",
+    ] {
+        assert!(
+            err.lines().any(|l| l.contains(flag)
+                && l.contains("none.pem")
+                && l.contains("does not exist")),
+            "{flag}: {err}"
+        );
+    }
+    assert_eq!(err.lines().count(), 3, "{err}");
     assert!(!err.contains("--storage-listen"), "{err}");
 }

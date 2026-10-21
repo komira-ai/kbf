@@ -564,11 +564,29 @@ Crash and conflict points in the flusher:
   digest, crc32c from the bytes, for both kinds of block), so the key holds the same
   bytes. On `AlreadyExists` (`conditional_put`) the flusher reads the footer back; if it
   matches, it commits `ObjectFlushed`.
-- If it does not match, the flusher commits `Command::FlushConflict { object }`: the
-  object **stays staged**, its blobs stay `Present` and are read from the local block,
-  the flusher stops retrying it, and an alert fires. It is not marked `Corrupt`, because
-  `ObjectUnreachable { Corrupt }` makes `s.blob()` answer `Unavailable` and would stop
-  reads of good local bytes. An operator resolves it; the block is never evicted.
+- If it does not match, the key is another object's: the member and boot of a node
+  writer are numbers its frontend's state store hands out, and a frontend moved to a
+  fresh state store hands out a pair an earlier store gave to another node, so
+  `cas/<member>/<boot>/<seq>` can name an object of another lifetime. The conditional
+  PUT never overwrites it. The flusher moves the numbering of this writer past the range
+  the other lifetime used (the microseconds since the Unix epoch, if that is past the
+  next number), copies the object's records into a block of its own and syncs it (or
+  streams them to the store when the tier has no room), then commits one
+  `ReseatStaged { tier, from, to, stored }` (log format 5). Applying it moves every index
+  entry still at `from` to `to`, marks `to` staged (not, with `stored`), makes whatever
+  waited for `from` wait for `to` and `to` wait for what `from` waited for, and takes
+  `from` out of the table, in one step. Nothing is marked unreachable, so no blob is
+  unavailable or counted as lost (`kbf_cache_blob_losses_total` and the bake gates stay at
+  zero), and everything before the commit is local to the flusher: a failure or a crash
+  leaves the object and its block as they were, and the unsynced new block is removed.
+  The commit is tried three times (a retry of one that applied is a no-op); then the
+  round backs off. The old block is freed after it. The other object is not touched. The
+  copy is not hashed on the tier path; a record the disk damaged is found by the new
+  object's flush, which hashes every record, and handled as below. An object a build
+  before this one left in `Conflict` (it stayed staged and was not retried) is moved the
+  same way by the first round that finds it; if its block is gone it is marked
+  unreachable as missing, which is a loss and counted as one, and one with no records
+  only leaves the table.
 - A record whose SHA-256 fails in the flusher's re-read means the local disk damaged
   it. The block is not uploaded; it is marked `ObjectUnreachable { Corrupt }` (reads
   stop, as they should), and its blobs heal by re-upload.
@@ -590,6 +608,17 @@ and a binary that runs only version 1 refuses the log at that entry. Tests in
 `kbf-log/tests/tier_codec.rs` and `kbf-server/tests/raft_log.rs` pin both. The snapshot
 encoding ([metadata-snapshots.md](metadata-snapshots.md)), not built yet, gains the
 staged table, the tier registry and the record of objects that left.
+
+`ReseatStaged` (`MetaCommand` field 20) makes **log format 5** (`Format::V5`,
+`MachineVersion::V5`) the same way: a binary that runs only version 4 refuses a log
+raised to 5 at the raise (`kbf-server/tests/write_tier_raft.rs` opens one as version 4
+and gets `RaftLogError::Decode`), and a format-4 log refuses the command on encode and
+decode (`kbf-log/tests/reseat_codec.rs`). A server or storage node raises its log to
+version 5 when its write tier attaches, so after the first start of a build with this
+command that node's log cannot be opened by an older binary (a rollback of one node's
+binary needs its log restored; nodes' logs are separate, so nodes on either version run
+side by side). No older binary ever applies the command, so no two builds disagree on
+what it does.
 
 ### 6.6 A server and a daemon on one host
 
@@ -729,6 +758,63 @@ Where it differs from the sections above, and why:
   footer built from the committed list, PUT, read back, `ObjectFlushed`.
 - Tests: `kbf-front/tests/segments_tier.rs` (commit with every PUT held; flush after the
   store recovers; the budget fallback; restart before the flush).
+
+### 6.12 As built (the write pool)
+
+- **Why.** A ByteStream or storage `Write` used to be a block of its own: a file created
+  when the stream opened, held open while its bytes arrived, synced and sealed with its
+  commit. The files open for writing grew with the uploads in flight (a burst of 2,200
+  actions reached the 1,024 descriptors a node had).
+- **Shape.** `Cache::stream` and a ByteStream `Write` over 16 MiB hand their blob to the
+  write pool (`kbf-front/src/cache/pool.rs`): `--write-pool-writers` (default 8, at least 1)
+  threads started with the first blob, and a queue of `--write-pool-queue` blobs (default
+  4,096, at least 1). A writer holds at most one reservation in the tier at a time, in
+  the open grouped block that all pool blobs share (section 3's grouped block, recovered
+  at a restart as any grouped block is: cut to its committed length, so a partial
+  append is never exposed).
+- **Small blobs (at most 4 MiB, `BUFFERED_BLOB_BYTES`)** are received and hashed as before,
+  held in memory (the storage node takes room for them first), and handed to the pool
+  whole at the commit. A writer takes the blob waiting and every blob queued behind it
+  (up to 256 blobs and 16 MiB), writes them one after another in one range, syncs once,
+  commits one `PutStaged` listing them, and then answers each: **a blob is acknowledged
+  after its bytes are synced and its `PutStaged` applied, as before the pool.**
+- **Larger blobs** stream through a writer: queued when the stream opens, the range
+  reserved when a writer takes it, each chunk written as it arrives. The writer is held
+  until the commit, until the stream is dropped, or until the stream is idle for too long
+  (next bullet), so a slow sender holds a writer, never a second file. A blob larger than
+  the tier's segment limit cannot share a block: it is written to a block of its own
+  (`reserve_upload`), still by one writer.
+- **Idle streams.** Without a bound, a stalled but connected large upload would hold its
+  writer for ever, and with `--write-pool-writers` of them every small blob would wait
+  behind them. A writer waits `--write-pool-stream-idle` seconds (default 30, at least 1)
+  for the next chunk of a stream; when none comes it drops the reservation (the block of
+  its own is closed, or the range in the grouped block is answered as failed) and takes
+  the next job. The stream's next `append` or its commit then fails with
+  `CacheError::Stalled`, which is UNAVAILABLE (`StorageError::Unavailable` on a storage
+  node): the client sends the blob again, as for any retryable failure. The clock runs from
+  the moment a writer takes the stream; a stream still waiting in the queue is not timed.
+  It covers the wait for chunks, not the commit that follows the last one, which the
+  server itself makes at once. The bound limits stalls (no chunk for the interval), not
+  total time: a trickling upload that sends a chunk more often than that can still hold
+  a writer for as long as it likes.
+- **Known limit.** A streamed blob holds a blocking-pool thread of the server runtime
+  while it appends (its `append` blocks). With the default `--write-bytes-in-flight` the
+  streams in flight stay far below the pool's 512 threads; if that flag is raised until
+  more than about 512 large streams can be queued behind busy writers, the blocking pool
+  is exhausted and other blocking work waits. The idle timeout does not bound this, since
+  a queued stream is not timed.
+- **Backpressure.** A blob that finds the queue full is not queued and not refused: it
+  goes straight to the object store (section 3.2's streaming path), as does a blob the
+  tier cannot hold (budget, or a disk error before the commit). `kbf_storage_write_pool_direct_total`
+  counts both.
+- **The descriptor bound.** The pool's blobs keep at most `writers + 1` block files open
+  for writing: one per writer (a sealing block pinned by that writer's range) plus the open
+  grouped block. Not covered: `Segments` uploads (`reserve_range`) and `store_blobs`
+  segments, which have their own bounds. `kbf_storage_open_write_fds` is the tier's whole
+  count (`WriteTier::open_write_files`), as of the last pool step.
+- **Not changed.** Nothing is acknowledged before the sync (no RAM acknowledgement here),
+  and one `PutStaged` still goes through the Raft log before any blob of its batch is
+  answered.
 
 ### 6.11 Where records are verified
 
@@ -875,7 +961,7 @@ directory entries** at a simulated crash:
 | a segment-upload block flushed, crash before `ObjectFlushed`, reflushed: footers equal, no `FlushConflict` | a false conflict from a footer built two ways |
 | a restart with an open upload, and a crash between sync and `PutStaged` on an upload block: no `.blk` left, no budget consumed | orphan files filling the disk |
 | `Begin`s whose totals pass the hot store's budget: the excess goes direct; tier disk use stays under the budget | open uploads uncounted |
-| a same-key object whose footer differs: `FlushConflict`, blobs still `Present` and read locally | a conflict stopping reads of good bytes |
+| a same-key object whose footer differs: the records staged again under a number past the other lifetime's, flushed next round, the other object untouched | a conflict stranding a segment on the tier for ever, or walking the earlier lifetime's numbers one conflict at a time |
 | `ObjectFlushed` commit refused: the block is not evicted | evicting the only copy on a local flag |
 | a tiny budget never evicts a staged block; at the budget writes fall back to direct PUTs | eviction of the only copy; writes refused at the budget |
 | a wrong or missing `TIER` refuses start; with `--hot-store-abandon` objects become `Missing`, re-upload heals, no `NOT_FOUND` | a mount mistake destroying the index |

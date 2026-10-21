@@ -1,6 +1,6 @@
 //! The caller of `kbf-mac-session` the root tests run (`tests/as_root.rs`): the test
 //! binary answers as this client when it runs through a signed copy named
-//! [`super::CLIENT`] or [`super::IMPOSTOR`]. It stands in for `kbf-daemon`: the helper
+//! [`super::CLIENT`] or [`super::IMPOSTOR`]. It stands in for the installed `kbf`: the helper
 //! is started with the client copy's cdhash as the daemon requirement.
 //!
 //! The verbs, by the copy's name (`client` below):
@@ -300,7 +300,22 @@ mod macos {
                         lease: (*lease).to_owned(),
                     },
                 };
-                proto::send(stream.as_fd(), &call, &[]).map_err(ClientError::Io)?;
+                // A helper that refuses this caller at accept answers and closes at once,
+                // so the write can fail with a broken pipe or a reset before the program
+                // reads anything. That is the refusal arriving first: the answer is
+                // still queued on this end, and the program reads it, so the refusal is
+                // still checked by what it says. Any other failure is a failure.
+                match proto::send(stream.as_fd(), &call, &[]) {
+                    Err(why)
+                        if !matches!(
+                            why.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        return Err(ClientError::Io(why));
+                    }
+                    _ => {}
+                }
                 exec_with(&stream, program, args)?;
             }
             _ => {

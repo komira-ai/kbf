@@ -1,0 +1,1 @@
+2026-10-18 03:02:56.960 E  kernel[0:2046a] [com.apple.sandbox.reporting:violation] Sandbox: bash(46466) deny(1) file-write-create /private/var/tmp/kbf-denied-46082

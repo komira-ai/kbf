@@ -368,3 +368,45 @@ async fn get_action_result_misses_when_the_store_lost_an_output_object() {
         "the lost object's blob is still reported held"
     );
 }
+
+/// Catches an entry answered without the closure it was committed with (or with the result
+/// blob in it, which the entry's owner reads itself): the closure of a hit is the output
+/// file and stdout, in digest order, read in the same step as the hit; a miss has none.
+/// Mutant: `action_entry` answers an empty closure.
+#[tokio::test]
+async fn action_entry_reports_the_closure_the_entry_was_committed_with() {
+    let farm = Farm::start().await;
+    let output = Blob::new("output bytes for the closure");
+    let stdout = Blob::new("stdout bytes for the closure");
+    farm.upload(&[&output, &stdout]).await;
+    let action = Blob::new("compile closure.c");
+    let result = ActionResult {
+        output_files: vec![output_file("closure.o", &output)],
+        stdout_digest: Some(stdout.proto.clone()),
+        ..Default::default()
+    };
+    assert!(
+        farm.cache
+            .action_entry(&action.digest)
+            .await
+            .expect("answered")
+            .is_none(),
+        "no entry, no closure"
+    );
+    farm.cache
+        .write_action_result(Role::Daemon, action.digest, &result)
+        .await
+        .expect("daemon write");
+
+    let (result_digest, got, closure) = farm
+        .cache
+        .action_entry(&action.digest)
+        .await
+        .expect("answered")
+        .expect("a hit");
+    assert_eq!(got, result);
+    assert_eq!(result_digest, Blob::of(&result).digest);
+    let mut wanted = vec![output.digest, stdout.digest];
+    wanted.sort();
+    assert_eq!(closure, wanted);
+}

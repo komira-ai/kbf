@@ -13,9 +13,10 @@ use std::sync::Arc;
 
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
 use kbf_meta::StagedState;
+use kbf_objstore::ObjectStore;
 use kbf_storage::flush::OneFlusher;
 use kbf_storage::replicate::MapSource;
-use support::{Farm, SEGMENT, TestBlob, later};
+use support::{CONDITIONAL, Farm, SEGMENT, TestBlob, blobs, key, later, verified};
 
 const GIB: u64 = 1 << 30;
 
@@ -55,6 +56,7 @@ fn member(id: u64, state: MemberState) -> Member {
         zone: String::new(),
         weight: 1,
         state,
+        boot: 0,
     }
 }
 
@@ -255,4 +257,466 @@ async fn an_object_with_one_digest_to_flush_is_flushed_whole() {
     assert_eq!(object, farm.log.object_of(&blobs[1].digest));
     let round = cache.flush_tier(later()).await.expect("round");
     assert_eq!(round.flushed, [object]);
+}
+
+/// Catches: a Draining node stranding what it staged. The map the node holds moves
+/// member 1 (the primary of every blob, holding all of them staged) to Draining: it
+/// owns none of them now, so its round flushes all of them (they were held for good
+/// before), the blobs stay readable from the store afterwards, and the successor that
+/// flushes the same blobs too only makes a second object of each: the node's PUT is
+/// not undone by it, and both copies read back.
+#[tokio::test]
+async fn a_draining_node_flushes_what_it_staged() {
+    let map = two(5, MemberState::Active);
+    let pair = Pair::new(3, &map).await;
+    pair.primary_node.set(&two(6, MemberState::Draining));
+    let round = pair.primary_cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed.len(), 3, "an orphan flushes");
+    assert_eq!(pair.primary.store.put_keys().len(), 3);
+    for b in &pair.blobs {
+        let object = pair.primary.log.object_of(&b.digest);
+        assert_eq!(
+            pair.primary.log.staged_state(object),
+            None,
+            "no longer staged"
+        );
+        let read = pair.primary_cache.read_blob(&b.digest).await.expect("read");
+        assert_eq!(read, b.bytes);
+    }
+    // Member 2 is the sole writer under generation 6 and so rank 1: it flushes its own
+    // copies as well, into its own objects; every blob reads back from both.
+    pair.replica_node.set(&two(6, MemberState::Draining));
+    let round = pair.replica_cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed.len(), 3);
+    let (a, b) = (pair.primary.store.put_keys(), pair.replica.store.put_keys());
+    assert_eq!((a.len(), b.len()), (3, 3));
+    for b in &pair.blobs {
+        let read = pair.replica_cache.read_blob(&b.digest).await.expect("read");
+        assert_eq!(read, b.bytes);
+    }
+}
+
+/// Catches: an r = 1 joiner stranding what it staged (it owns nothing at r = 1 while a
+/// settled writer exists, so under the old gate nothing it staged was ever flushed), and
+/// the settled owner losing its flush while the joiner gets its own. Both nodes hold
+/// the same blobs staged; each flushes all of them.
+#[tokio::test]
+async fn an_r1_joiner_and_the_owner_both_flush() {
+    let members = vec![
+        member(1, MemberState::Active),
+        member(2, MemberState::Joining),
+    ];
+    let map = Arc::new(Map::new(5, members, Rule::Rendezvous, 1, 1, Vec::new()).expect("map"));
+    let pair = Pair::new(2, &map).await;
+    // The joiner (node 2) holds blobs a caller routed to it by an older map.
+    let round = pair.replica_cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed.len(), 2, "the joiner's orphans flush");
+    assert_eq!(pair.replica.store.put_keys().len(), 2);
+    let round = pair.primary_cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed.len(), 2, "rank 1 still flushes");
+    assert_eq!(pair.primary.store.put_keys().len(), 2);
+}
+
+/// Catches: the replica, an owner but not rank 1, flushing once the owner set is
+/// unchanged by the new gate: it keeps its objects staged, whole, and flushes none while
+/// a node that owns none of the digests is told the same map and flushes all of them.
+#[tokio::test]
+async fn a_replica_holds_while_a_non_owner_flushes_the_same_blobs() {
+    let map = two(5, MemberState::Active);
+    let pair = Pair::new(2, &map).await;
+    let round = pair.replica_cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed, []);
+    // A map in which node 2 is not a member of the owner lists at all (member 3 is).
+    let members = vec![
+        member(1, MemberState::Active),
+        member(3, MemberState::Active),
+    ];
+    let other = Arc::new(Map::new(6, members, Rule::Rendezvous, 2, 1, vec![]).expect("map"));
+    pair.replica_node.set(&other);
+    let round = pair.replica_cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed.len(), 2, "owning none of it, node 2 flushes");
+}
+
+/// A gate that flushes everything and holds whatever generation the test sets (0: none).
+#[derive(Debug, Default)]
+struct Switch(std::sync::atomic::AtomicU64);
+
+impl Switch {
+    fn set(&self, generation: u64) {
+        self.0
+            .store(generation, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl kbf_storage::flush::FlushGate for Switch {
+    fn flushes(&self, _: &kbf_types::Digest) -> bool {
+        true
+    }
+
+    fn generation(&self) -> Option<u64> {
+        match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => None,
+            g => Some(g),
+        }
+    }
+}
+
+/// A map in which member 1 alone writes, so it is rank 1 of every digest.
+fn solo(generation: u64) -> Arc<Map> {
+    let members = vec![member(1, MemberState::Active)];
+    Arc::new(Map::new(generation, members, Rule::Rendezvous, 1, 1, Vec::new()).expect("map"))
+}
+
+fn big(seed: u64) -> TestBlob {
+    TestBlob::new(seed, usize::try_from(SEGMENT).expect("size") + 1)
+}
+
+/// Catches: a clear generation that is not the held map's when nothing is staged (a
+/// node with an empty tier would hold a promotion back, or claim a generation it has
+/// not seen), and one that does not follow the map as it moves.
+#[tokio::test]
+async fn with_nothing_staged_the_clear_generation_is_the_held_one() {
+    let farm = Farm::new(Default::default());
+    let node = Node::new(1, &solo(5));
+    let cache = farm
+        .start(GIB)
+        .await
+        .with_flush_gate(OneFlusher::new(Arc::clone(&node) as _));
+    let report = cache.flush_report().await.expect("report");
+    assert_eq!(
+        (report.clear_gen, report.staged_objects, report.staged_bytes),
+        (Some(5), 0, 0)
+    );
+    node.set(&solo(7));
+    assert_eq!(
+        cache.flush_report().await.expect("report").clear_gen,
+        Some(7)
+    );
+}
+
+/// Catches: a clear generation that races ahead of the objects staged before it: it is
+/// the generation the OLDEST unflushed object was staged under, not the held one, and
+/// not the generation at which the report is asked. Two blobs staged under 5 hold it at
+/// 5 while the map moves to 7 and a third is staged under 7; once the flush round has
+/// flushed them all it is the held 7, with an empty backlog.
+#[tokio::test]
+async fn an_unflushed_object_holds_the_clear_generation_at_its_staging_generation() {
+    let farm = Farm::new(Default::default());
+    let node = Node::new(1, &solo(5));
+    let cache = farm
+        .start(GIB)
+        .await
+        .with_flush_gate(OneFlusher::new(Arc::clone(&node) as _));
+    for seed in [1, 2] {
+        cache
+            .store_blobs(vec![big(seed).verified()])
+            .await
+            .expect("stored");
+    }
+    let report = cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(5), 2));
+    assert!(report.staged_bytes > 2 * SEGMENT, "{report:?}");
+    node.set(&solo(7));
+    assert_eq!(
+        cache.flush_report().await.expect("report").clear_gen,
+        Some(5)
+    );
+    cache
+        .store_blobs(vec![big(3).verified()])
+        .await
+        .expect("stored");
+    let report = cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(5), 3));
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed.len(), 3);
+    let report = cache.flush_report().await.expect("report");
+    assert_eq!(
+        (report.clear_gen, report.staged_objects, report.staged_bytes),
+        (Some(7), 0, 0)
+    );
+}
+
+/// Catches: a replica's clear generation stuck for good behind objects only the primary
+/// flushes (it can never flush them, so the fence would never close), and the opposite,
+/// forgetting them once they become this node's to flush. The replica's three objects
+/// are backlog but do not hold the generation while the primary is live; when the map
+/// leaves the replica as the one owner they do, at the generation they were staged
+/// under, until it flushes them.
+#[tokio::test]
+async fn objects_only_the_primary_flushes_do_not_hold_a_replicas_clear_generation() {
+    let map = two(5, MemberState::Active);
+    let pair = Pair::new(3, &map).await;
+    let report = pair.replica_cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(5), 3));
+    assert!(report.staged_bytes > 0);
+    pair.replica_node.set(&two(9, MemberState::Active));
+    let report = pair.replica_cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(9), 3));
+    let alone = Arc::new(
+        Map::new(
+            11,
+            vec![member(2, MemberState::Active)],
+            Rule::Rendezvous,
+            1,
+            1,
+            vec![],
+        )
+        .expect("map"),
+    );
+    pair.replica_node.set(&alone);
+    let report = pair.replica_cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(5), 3));
+    pair.replica_cache.flush_tier(later()).await.expect("round");
+    let report = pair.replica_cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(11), 0));
+}
+
+/// Catches: an object staged while the node held no map (or one from before this
+/// process started, which nothing dated) being counted as staged under the map the node
+/// holds when asked: it is the oldest, generation 0, until it is flushed.
+#[tokio::test]
+async fn an_object_staged_with_no_known_generation_holds_the_clear_generation_at_zero() {
+    let farm = Farm::new(Default::default());
+    let gate = Arc::new(Switch::default());
+    let cache = farm
+        .start(GIB)
+        .await
+        .with_flush_gate(Arc::clone(&gate) as _);
+    cache
+        .store_blobs(vec![big(1).verified()])
+        .await
+        .expect("stored");
+    gate.set(9);
+    let report = cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(0), 1));
+    cache.flush_tier(later()).await.expect("round");
+    assert_eq!(
+        cache.flush_report().await.expect("report").clear_gen,
+        Some(9)
+    );
+}
+
+/// Catches: a node without a gate, or whose gate holds no map, reporting a generation:
+/// it says it cannot say (`None`), never a number a fence would trust. The backlog is
+/// still counted.
+#[tokio::test]
+async fn a_node_that_holds_no_generation_cannot_say() {
+    let farm = Farm::new(Default::default());
+    let cache = farm.start(GIB).await;
+    cache
+        .store_blobs(vec![big(1).verified()])
+        .await
+        .expect("stored");
+    let report = cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (None, 1));
+    let gate = Arc::new(Switch::default());
+    let blind = Farm::new(Default::default())
+        .start(GIB)
+        .await
+        .with_flush_gate(gate);
+    assert_eq!(blind.flush_report().await.expect("report").clear_gen, None);
+}
+
+/// Catches: a cache without a tier reporting a backlog, or none of its generation: it
+/// stages nothing, so everything it ever staged is flushed at the held generation.
+#[tokio::test]
+async fn a_cache_without_a_tier_is_clear_at_the_held_generation() {
+    // Over the farm's own log and store, so the same instantiation of the report that
+    // the tiered tests run takes both ways at its tier check.
+    let farm = Farm::new(Default::default());
+    let cache = kbf_front::Cache::open(
+        farm.log.clone(),
+        farm.store.clone(),
+        kbf_objstore::KeyPrefix::default(),
+    )
+    .await
+    .expect("open")
+    .with_flush_gate(OneFlusher::new(Node::new(1, &solo(4)) as _));
+    let report = cache.flush_report().await.expect("report");
+    assert_eq!(
+        (report.clear_gen, report.staged_objects, report.staged_bytes),
+        (Some(4), 0, 0)
+    );
+}
+
+/// Catches: the backlog gauges missing from a scrape or not following the staged set:
+/// after a round on the replica that flushes nothing they count the three staged
+/// objects (the sum of their committed bytes), and on the primary, once a round has
+/// flushed them and the next has found none, zero.
+#[tokio::test]
+async fn the_staged_backlog_is_scraped() {
+    let map = two(5, MemberState::Active);
+    let pair = Pair::new(3, &map).await;
+    pair.replica_cache.flush_tier(later()).await.expect("round");
+    let metrics = pair.replica_cache.render_metrics();
+    let report = pair.replica_cache.flush_report().await.expect("report");
+    assert!(
+        metrics.contains("\nkbf_write_tier_staged_objects 3\n"),
+        "{metrics}"
+    );
+    let bytes = format!("\nkbf_write_tier_staged_bytes {}\n", report.staged_bytes);
+    assert!(metrics.contains(&bytes), "{metrics}");
+    // The gauges are what a round found at its start: the second round finds none.
+    pair.primary_cache.flush_tier(later()).await.expect("round");
+    pair.primary_cache.flush_tier(later()).await.expect("round");
+    let metrics = pair.primary_cache.render_metrics();
+    assert!(
+        metrics.contains("\nkbf_write_tier_staged_objects 0\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("\nkbf_write_tier_staged_bytes 0\n"),
+        "{metrics}"
+    );
+}
+
+/// Catches: a block that takes more blobs being re-dated by each commit: it is as old as
+/// its first blob. A small blob staged under generation 5 and another into the same open
+/// block under 7 leave one object, still held at 5.
+#[tokio::test]
+async fn a_block_is_as_old_as_its_first_blob() {
+    let farm = Farm::new(Default::default());
+    let node = Node::new(1, &solo(5));
+    let cache = farm
+        .start(GIB)
+        .await
+        .with_flush_gate(OneFlusher::new(Arc::clone(&node) as _));
+    let blobs = support::blobs(1, 2, 4096);
+    cache
+        .store_blobs(vec![blobs[0].verified()])
+        .await
+        .expect("stored");
+    node.set(&solo(7));
+    cache
+        .store_blobs(vec![blobs[1].verified()])
+        .await
+        .expect("stored");
+    assert_eq!(
+        farm.log.object_of(&blobs[0].digest),
+        farm.log.object_of(&blobs[1].digest),
+        "one open block"
+    );
+    let report = cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(5), 1));
+}
+
+/// Catches: a restart losing the dates of what is staged and then claiming the held
+/// generation: the objects a process finds at its start were staged by an earlier one, at
+/// a generation it cannot tell, so they hold the clear generation at 0 until flushed.
+#[tokio::test]
+async fn objects_found_at_a_restart_hold_the_clear_generation_at_zero() {
+    let farm = Farm::new(Default::default());
+    let cache = farm
+        .start(GIB)
+        .await
+        .with_flush_gate(OneFlusher::new(Node::new(1, &solo(5)) as _));
+    cache
+        .store_blobs(vec![big(1).verified()])
+        .await
+        .expect("stored");
+    assert_eq!(
+        cache.flush_report().await.expect("report").clear_gen,
+        Some(5)
+    );
+    drop(cache);
+    let fs = farm.fs.restart();
+    let (cache, startup) = support::start(&fs, &farm.log, &farm.store, GIB, None)
+        .await
+        .expect("restart");
+    assert_eq!(startup.recovery.sealed.len(), 1, "{startup:?}");
+    let cache = cache.with_flush_gate(OneFlusher::new(Node::new(1, &solo(9)) as _));
+    let report = cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(0), 1));
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed.len(), 1);
+    assert_eq!(
+        cache.flush_report().await.expect("report").clear_gen,
+        Some(9)
+    );
+}
+
+/// Catches: a report that answers when the log could not (a node saying "clear" because
+/// it could not look): the failed read is an error, not a number, and the next report,
+/// once the log answers, is the real one.
+#[tokio::test]
+async fn a_report_the_log_cannot_answer_is_an_error() {
+    let farm = Farm::new(Default::default());
+    let cache = farm
+        .start(GIB)
+        .await
+        .with_flush_gate(OneFlusher::new(Node::new(1, &solo(5)) as _));
+    cache
+        .store_blobs(vec![big(1).verified()])
+        .await
+        .expect("stored");
+    farm.log.fail_next_read();
+    assert!(cache.flush_report().await.is_err());
+    let report = cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(5), 1));
+}
+
+/// Catches: the staging dates growing with every object ever staged when nothing asks for
+/// a flush report (a node serving writes whose report nobody polls): the flush round, which
+/// already reads the staged set, drops the date of every object that left it. Two objects
+/// staged are two dates; once the round has flushed them there are none, with no
+/// `flush_report` call in between.
+#[tokio::test]
+async fn a_flush_round_drops_the_dates_of_objects_that_are_no_longer_staged() {
+    let farm = Farm::new(Default::default());
+    let node = Node::new(1, &solo(5));
+    let cache = farm
+        .start(GIB)
+        .await
+        .with_flush_gate(OneFlusher::new(Arc::clone(&node) as _));
+    assert_eq!(cache.dated_objects(), 0);
+    for seed in [1, 2] {
+        cache
+            .store_blobs(vec![big(seed).verified()])
+            .await
+            .expect("stored");
+    }
+    assert_eq!(cache.dated_objects(), 2);
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed.len(), 2);
+    assert_eq!(cache.dated_objects(), 0);
+}
+
+/// Catches: a re-seat that loses the staging date. A staged object whose key another
+/// object holds in the store is staged again under a new id; the date is of the staging,
+/// not of the id, so it moves with the records. Left under the old id, the next prune
+/// drops it and the moved object counts as undated (generation 0), holding the clear
+/// generation at 0 until it is flushed (the handoff stalls). Staged under 5, moved after
+/// the map is 7: the clear generation stays 5 with the moved object unflushed, and is
+/// the held 7 once it is flushed.
+#[tokio::test]
+async fn a_moved_conflicting_object_keeps_its_staging_generation() {
+    let farm = Farm::new(CONDITIONAL);
+    let node = Node::new(1, &solo(5));
+    let cache = farm
+        .start(GIB)
+        .await
+        .with_flush_gate(OneFlusher::new(Arc::clone(&node) as _));
+    let blobs = blobs(1, 2, 4096);
+    cache.store_blobs(verified(&blobs)).await.expect("stored");
+    let object = farm.log.object_of(&blobs[0].digest);
+    let taken = bytes::Bytes::from_static(b"some other object under this key");
+    farm.store
+        .put_new(&key(&cache, object), taken, None)
+        .await
+        .expect("put");
+    node.set(&solo(7));
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.conflicts, [object], "{round:?}");
+    let moved = farm.log.object_of(&blobs[0].digest);
+    assert_ne!(moved, object);
+    assert_eq!(farm.log.staged_state(moved), Some(StagedState::Sealed));
+    // The round pruned: the moved object's date is the one thing left.
+    let report = cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(5), 1));
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed, [moved], "{round:?}");
+    assert_eq!(
+        cache.flush_report().await.expect("report").clear_gen,
+        Some(7)
+    );
 }

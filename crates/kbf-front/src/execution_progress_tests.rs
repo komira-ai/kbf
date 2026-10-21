@@ -32,7 +32,7 @@ fn ticket_named(stage: Stage, name: &str) -> (watch::Sender<Stage>, Ticket) {
     (tx, ticket)
 }
 
-/// Catches (komira-build-farm#791): an open stream that sends nothing while its action
+/// Catches (kbf#791): an open stream that sends nothing while its action
 /// runs, so a load balancer's idle timeout cuts it and Buck2 (which never reconnects)
 /// fails the action. An action that runs for ten intervals gets ten progress
 /// operations after the first one, each the same operation, not done, at its current
@@ -206,4 +206,23 @@ async fn open_executions_is_raised_with_the_stream_and_lowered_however_it_ends()
     assert_eq!(gauge.get(), 0, "lowered when the close ends the stream");
     assert!(ops.next().await.is_none());
     assert_eq!(gauge.get(), 0);
+}
+
+/// Catches an `undrain` that does not take new Execute calls again (an update that
+/// failed its prepare would leave the old process refusing), one that reports a change
+/// when there was none, and one that undoes a close. Mutants: `undrain` doing nothing;
+/// `undrain` returning `true` always; `undrain` setting `Open` from `Closed`.
+#[test]
+fn undrain_takes_calls_again_until_the_close() {
+    let (closer, open) = closing();
+    assert!(!closer.undrain(), "undid a drain that was not there");
+    closer.drain();
+    assert!(open.draining());
+    assert!(closer.undrain());
+    assert!(!open.draining());
+    assert!(!closer.undrain());
+    closer.drain();
+    closer.close();
+    assert!(!closer.undrain(), "undid a close");
+    assert!(open.draining());
 }

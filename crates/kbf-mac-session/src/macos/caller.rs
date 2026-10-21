@@ -1,5 +1,6 @@
 //! The caller check on macOS (S4.3): the connecting process's code signature, found
-//! by its audit token, must satisfy the pinned `kbf-daemon` requirement.
+//! by its audit token, must satisfy the pinned daemon requirement: the installed `kbf` binary, which runs as
+//! `kbf daemon`.
 //!
 //! The audit token (`LOCAL_PEERTOKEN`) names a process by pid and pid version, so a
 //! later process that reuses the pid is not taken for it. The server identifies the
@@ -60,7 +61,7 @@ impl CallerCheck for CodeSignatureCheck {
         let code = SecCode::copy_guest_with_attribues(None, &attributes, Flags::NONE)
             .map_err(|why| format!("no running code for {caller}: {why}"))?;
         code.check_validity(Flags::NONE, &requirement)
-            .map_err(|why| format!("{caller} is not the installed kbf-daemon: {why}"))
+            .map_err(|why| crate::server::not_the_daemon(caller, why))
     }
 }
 
@@ -124,6 +125,7 @@ mod tests {
         // Refused, whether as code that fails the requirement or as code not found.
         let error = check.check(&me).unwrap_err();
         assert!(error.contains(&me.to_string()), "{error}");
+        assert!(error.contains("not the installed `kbf` daemon"), "{error}");
         assert!(CodeSignatureCheck::new("not a requirement").is_err());
     }
 }

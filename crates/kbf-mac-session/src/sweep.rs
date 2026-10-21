@@ -159,7 +159,7 @@ fn note(swept: &mut Swept, path: &Path, result: io::Result<()>) {
 
 /// `result`, with "no such file or directory" taken as success: an entry that is gone
 /// between the walk's listing of it and its removal (a macOS daemon removing its own
-/// temporary file under the lease user's folder, say, komira-build-farm#652) is what
+/// temporary file under the lease user's folder, say, kbf#652) is what
 /// the sweep wanted. Only that error: every other one still leaves the sweep
 /// incomplete.
 fn vanished(result: io::Result<()>) -> io::Result<()> {

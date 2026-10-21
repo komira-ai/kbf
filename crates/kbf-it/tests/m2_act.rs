@@ -3,7 +3,8 @@
 //! with a line on stderr). The code is tested only through the binary, so coverage
 //! counts one build of it.
 
-use std::path::{Path, PathBuf};
+use kbf_testkit::dir::TestDir;
+use std::path::Path;
 use std::process::{Command, Output};
 
 fn act(args: &[&str]) -> Output {
@@ -14,13 +15,8 @@ fn act(args: &[&str]) -> Output {
 }
 
 /// A fresh directory for one test, under Cargo's per-target temporary directory.
-fn dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("old dir");
-    }
-    std::fs::create_dir_all(&dir).expect("dir");
-    dir
+fn dir(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
 fn path(dir: &Path, name: &str) -> String {
@@ -52,6 +48,36 @@ fn every_verb_writes_its_output() {
     );
     assert_eq!(ran(&["pause", &out, "0", "a-salt"], &out), b"a-salt\n");
     assert_eq!(ran(&["hog", &out, "32"], &out), b"32\n");
+}
+
+/// Catches: a `fill` that ignores its salt (two builds of the beta load with different salts
+/// would store the same blobs, so the load would write nothing new), one that is not a
+/// function of the salt (the same salt must give the same bytes, or a rerun of an action
+/// is a different action's output), one of the wrong size (the load's volume is the
+/// product of the sizes it asks for), and output that is not lines of 64 hexadecimal
+/// digits (`sort` and `upper` read it).
+#[test]
+fn fill_writes_the_size_asked_and_bytes_of_its_salt() {
+    let dir = dir("m2-act-fill");
+    let out = path(&dir, "out");
+    let a = ran(&["fill", &out, "3", "salt-a"], &out);
+    assert_eq!(a.len(), 3 * 1024);
+    assert_eq!(ran(&["fill", &out, "3", "salt-a"], &out), a);
+    assert_ne!(ran(&["fill", &out, "3", "salt-b"], &out), a);
+    let text = String::from_utf8(a).expect("text");
+    let mut lines = text.lines().collect::<Vec<_>>();
+    // The last line is cut at the size asked for.
+    lines.pop();
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.len() == 64 && l.bytes().all(|b| b.is_ascii_hexdigit()))
+    );
+    assert!(ran(&["fill", &out, "0", "salt-a"], &out).is_empty());
+    assert_eq!(
+        act(&["fill", &out, "2000000", "salt-a"]).status.code(),
+        Some(2)
+    );
 }
 
 /// Catches: a failure that exits 0 (buck2 would cache a broken output as the

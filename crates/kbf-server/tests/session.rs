@@ -27,20 +27,14 @@ async fn refused(cell: &Cell, first: daemon_message::Message) -> Code {
     }
 }
 
-/// Catches: a session opened by something other than `Hello`, an unsupported protocol
-/// version, a Hello without a node id, or one whose node report lacks (or garbles) the
-/// capacity entries placement needs.
+/// Catches: a session opened by something other than `Hello`, a protocol version below
+/// the oldest (a newer one is welcomed: `worker_welcome.rs`), a Hello without a node id,
+/// or one whose node report lacks (or garbles) the capacity entries placement needs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bad_first_message_is_refused() {
     let cell = Cell::start().await;
     let beat = daemon_message::Message::Offer(Offer::default());
     assert_eq!(refused(&cell, beat).await, Code::InvalidArgument);
-    let mut newer = hello("node-a", 4, 8);
-    newer.protocol_version = 2;
-    assert_eq!(
-        refused(&cell, daemon_message::Message::Hello(newer)).await,
-        Code::FailedPrecondition
-    );
     let mut older = hello("node-a", 4, 8);
     older.protocol_version = 0;
     assert_eq!(
@@ -436,6 +430,7 @@ async fn a_map_request_is_answered_with_the_map_held() {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let held = Map::new(3, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("a map");
     let source = Arc::new(FakeMapSource::new(held));

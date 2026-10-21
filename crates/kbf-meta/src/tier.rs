@@ -8,7 +8,7 @@ use std::fmt;
 use kbf_types::Digest;
 
 use crate::model::ObjectId;
-use crate::state::UnallocatedEpoch;
+use crate::state::ForeignWriter;
 
 /// A local write tier: one directory on one server's disk. The server draws the id the
 /// first time it opens the directory, writes it to the directory's `TIER` file and
@@ -86,8 +86,10 @@ pub enum StagedState {
     /// Sealed: its blob list is final and the flusher may upload it.
     Sealed,
     /// The store holds a different object under its key
-    /// ([`Command::FlushConflict`](crate::Command::FlushConflict)). It stays staged,
-    /// read from its block, and the flusher stops retrying it until an operator acts.
+    /// ([`Command::FlushConflict`](crate::Command::FlushConflict)). It stays staged and
+    /// is read from its block. Builds before the one that stages such an object's
+    /// records again under a new key committed it; the flusher now takes an object in
+    /// this state at the start of a round and moves it, and commits no new one.
     Conflict,
 }
 
@@ -136,9 +138,9 @@ impl StagedObject {
 /// Why a tier command was refused. A refused command changes nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TierError {
-    /// An object names an epoch that was never allocated.
+    /// An object is not of a writer the log takes for the command.
     #[error(transparent)]
-    Unallocated(#[from] UnallocatedEpoch),
+    Foreign(#[from] ForeignWriter),
     /// The tier is not the current tier of any server.
     #[error("{0} is not registered to any server")]
     UnknownTier(TierId),
@@ -195,6 +197,9 @@ pub enum TierError {
     /// horizon).
     #[error("object {0} is not staged")]
     NotStaged(ObjectId),
+    /// A blob indexed at the object is not listed by the command that moves its records.
+    #[error("a blob indexed at object {0} is not listed in the object its records move to")]
+    Unlisted(ObjectId),
     /// The object is still open; only a sealed object is flushed.
     #[error("object {0} is not sealed")]
     NotSealed(ObjectId),

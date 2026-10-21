@@ -3,6 +3,8 @@
 //! (`engine/proxy.rs`) that counts connections and can cut them. All the engine's
 //! tests are one binary, so its async code has one instance to measure.
 
+#[path = "engine/deserted.rs"]
+mod deserted;
 #[path = "engine/fake.rs"]
 mod fake;
 #[path = "engine/front.rs"]

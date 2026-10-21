@@ -1,21 +1,22 @@
 # kbf-all-in-one
 
-The farm server and a worker daemon in one process, for a one-node Linux farm. The
-daemon's blobs move through calls into the server's cache instead of over the network;
+The library behind `kbf all-in-one` (the `kbf` binary, `crates/kbf-cli`; this crate has no
+binary of its own): the farm server and a worker daemon in one process, for a one-node
+Linux farm. The daemon's blobs move through calls into the server's cache instead of over the network;
 everything else is what `kbf-server` and `kbf-daemon` do on one host today. The design
-is in komira-build-farm#657.
+is in kbf#657.
 
-Linux only, the container driver only. Elsewhere the binary exits 2 and says to run
-`kbf-server` and `kbf-daemon`.
+Linux only, the container driver only. Elsewhere `kbf all-in-one` exits 2 and says to run
+`kbf daemon` and a frontend.
 
-## What the binary does today
+## What `kbf all-in-one` does today
 
-1. **The helpers first.** Before any flag is read, a run of this binary as one of the
+1. **The helpers first.** Before any flag is read, a run of the `kbf` binary as one of the
    daemon's helpers (each run's keeper, the container driver's `__chown-dirs`) does that
    and exits, as `kbf-daemon` does. So a helper never reads the command line, opens the
    server's directories or starts a runtime.
 2. **One command line.** Every flag of `kbf-daemon` and every flag of `kbf-server`, in one
-   command. The three thread overrides that both binaries have (`--async-threads`,
+   command (`kbf all-in-one [flags]`). The three thread overrides that both binaries have (`--async-threads`,
    `--blocking-threads`, `--cpu-threads`) size the daemon half, with `--reserve-cpus`; the
    server half sizes itself as `kbf-server` does when none is given. Refused: a
    `--driver` other than `container`, and `--cas`.
@@ -29,7 +30,7 @@ Linux only, the container driver only. Elsewhere the binary exits 2 and says to 
    daemon half stops once the server half has, abandoning the leases still running, and
    the process exits 0. A server half that stops serving on its own stops the daemon too,
    and the process exits 1. A start the server half refuses exits 2, as `kbf-server`
-   does; one the daemon half refuses exits as `kbf-daemon` does (1, or 2 for an
+   does; one that can pass on a later try exits 75 (`kbf_server::StartFailure`); one the daemon half refuses exits as `kbf-daemon` does (1, or 2 for an
    `--image` the node cannot run).
 
 ## `kbf storage-and-daemon`
@@ -122,14 +123,16 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
 - `tests/conformance.rs`: every check of `kbf-cas-conformance` against `LocalDataPlane`,
   over a server started as `kbf-server` starts, with a write tier and without. The
   transfer engine runs the same checks in `kbf-cas-conformance`'s own tests.
-- `tests/binary.rs`: the binary end to end. One action runs on the container driver over
-  the driver's own stand-in `podman` (`kbf-fake-podman`, built from
+- `kbf-cli`'s `tests/all_in_one.rs`: `kbf all-in-one` end to end. One action runs on the container driver over
+  the driver's own stand-in `crun` (`kbf-cli-fake-crun`, built from
   `kbf-driver-container`'s source, which runs the action as a plain process) and a cgroup
   tree of plain directories; its output file, output directory, stdout and stderr are
-  read back over REAPI; SIGTERM ends the process with 0. The binary is given no `--cas`,
-  so a daemon half wired to the transfer engine would not start. Also the starts each
-  half refuses, with their exit statuses, and the binary run with keeper arguments,
-  which answers as the keeper before it reads a flag and starts no server.
+  read back over REAPI; SIGTERM ends the process with 0. `kbf all-in-one` is given no
+  `--cas`, so a daemon half wired to the transfer engine would not start. Also the starts
+  each half refuses, with their exit statuses, and `kbf` run with keeper arguments,
+  which answers as the keeper before it reads a flag and starts no server. Its
+  `--help` is `kbf-cli`'s `tests/help_golden.rs` against
+  `tests/golden/kbf-all-in-one-help.txt`.
 - `tests/one_read.rs`: the container driver's output collection over a lease of the
   plane, with a write tier and without: an inotify watch counts the opens of each output
   file, which must be one each (a file over 1 GiB too, held after with a tier and
@@ -140,7 +143,7 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
   write tier with under 16 MiB live, and so does a 2 GiB upload through the server's
   `Segments` handlers (a remote daemon's path); without a tier, a 256 MiB output
   streams to the cold store with under 16 MiB live.
-- `tests/binary.rs` also runs one action whose 3 MiB input a client uploaded: once the
+- `tests/all_in_one.rs` also runs one action whose 3 MiB input a client uploaded: once the
   hot store is flushed, one inode under the hot store and the data directory holds the
   input (the input cache's entry) and `/metrics` counts it once; after a SIGKILL and a
   restart, the same action leaves the same.
@@ -152,7 +155,7 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
   is gone; the hot store's staged blocks reported to the one cache as its storage
   bytes; and a server half that keeps flushed copies without the one cache and none
   with it.
-- `tests/helpers.rs`: the daemon's helpers run through this binary. The keeper,
+- `kbf-cli`'s `tests/helpers.rs`: the daemon's helpers run through `kbf`. The keeper,
   waiting on its stdin as it does for a run's whole life, has one thread and no
   socket, epoll, eventfd or directory open (read from `/proc`), then writes its kill
   file and exits 0; `__chown-dirs` exits 0, 1 and 2 as the helper does, in its own
@@ -181,8 +184,10 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
 
 ## Not done yet
 
-- **Production use.** The scheduler's state is a SQLite file, `<data-dir>/state.db` (or
-  the `--state-store=sqlite:///...` given), so a restart keeps queued operations and
+- **Production use.** The scheduler's state is Postgres on the host's socket,
+  `postgres:///kbf?host=/run/postgresql` (or the `--state-store` given; the server must
+  have `synchronous_commit` on and the role and database `kbf` must exist, which the
+  installer's `setup` will create), so a restart keeps queued operations and
   every start is a new epoch: the daemon half kills the runs of the leases the earlier
   start granted, and they are queued again. The trust warning below still stands, so
   all-in-one is a development and single-box shape.
@@ -194,6 +199,5 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
   outputs still cross the modelled network; the design's in-process mode (bytes off
   the network model, the control plane on it) and its property A2 (the same final
   index in both modes) are not built, nor A3 (needs a durable scheduler).
-- **Deploying it** (the change after): the `all-in-one` shape in `kbf-deploy`, its unit
-  and `check-units` rules, the ownership step that moves the state directories and keys
-  between the split pair and this binary, and its place among the release artifacts.
+- **Deploying it**: `kbf-deploy` renders the `kbf-all-in-one.service` unit, which runs
+  `kbf all-in-one`.

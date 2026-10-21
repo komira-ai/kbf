@@ -8,9 +8,10 @@ use kbf_storage::StorageError;
 use kbf_types::Digest;
 use tokio::sync::Semaphore;
 
+use crate::closure::{DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL, Verified};
 use crate::flights::Flights;
 use crate::nodes::Nodes;
-use crate::repair::{Limiter, ReadRepair, RepairLimit};
+use crate::repair::{Background, Limiter, ReadRepair, RepairLimit};
 use crate::source::{MapSource, MapView};
 
 /// What [`Router::commit_with_closure`] holds in memory, across all its calls, unless
@@ -34,6 +35,8 @@ pub struct Router {
     /// KiB, shared by every clone.
     pub(crate) copying: Arc<Semaphore>,
     pub(crate) copy_kib: u32,
+    /// The blobs a closure check found held, shared by every clone.
+    pub(crate) verified: Arc<Verified>,
 }
 
 /// The read-repair hook and its limit.
@@ -55,6 +58,11 @@ pub struct Placement {
     /// The member a write goes to: the first owner that is not down. `None` when every
     /// owner is down.
     pub write: Option<Member>,
+    /// Every owner a write may go to, in the order [`Router::put`] tries them: this
+    /// generation's write owners that are not down, primary first (so `write` is the first
+    /// of them). A caller that passes a write through itself and wants to do what the
+    /// router does when the primary fails goes on to the next of these.
+    pub writers: Vec<Member>,
 }
 
 impl Router {
@@ -68,6 +76,7 @@ impl Router {
             flights: Arc::default(),
             copying: Arc::new(Semaphore::new(DEFAULT_COPY_KIB as usize)),
             copy_kib: DEFAULT_COPY_KIB,
+            verified: Arc::new(Verified::new(DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL)),
         }
     }
 
@@ -94,17 +103,69 @@ impl Router {
         self
     }
 
+    /// The same router, copying a blob a read or [`Router::find_missing_anywhere`] found
+    /// away from the owner that should hold it to that owner, in the background, at most
+    /// as often as `limit` lets a find through ([`Router::with_read_repair`] with the
+    /// router's own hook).
+    ///
+    /// The copy never delays the call that found the blob: it runs in a task of its own
+    /// (so the call that finds a blob must run inside a Tokio runtime, or the find is
+    /// not repaired), at most [`crate::MAX_REPAIRS_IN_FLIGHT`] at a time, one per digest, and a
+    /// find that arrives while the copies are all busy is dropped: a later read finds the
+    /// blob away from its owner again and tells the hook again. A copy is read from
+    /// wherever the map has it, hashed against its digest, and written with
+    /// [`kbf_storage::Storage::put_unowned`]; the owner is asked first whether it still
+    /// lacks the blob.
+    #[must_use]
+    pub fn with_background_repair(self, limit: RepairLimit) -> Self {
+        // The task reads through a router without the hook, so a repair's own read is
+        // never reported as a find.
+        let mut plain = self.clone();
+        plain.repair = None;
+        self.with_read_repair(Arc::new(Background::new(plain)), limit)
+    }
+
     /// Who holds `digest` in the map as it is now.
     ///
     /// # Errors
     /// No map has arrived yet.
     pub fn place(&self, digest: &Digest) -> Result<Placement, StorageError> {
         let view = self.view()?;
+        let writers: Vec<Member> = write_order(&view.map, digest)
+            .into_iter()
+            .cloned()
+            .collect();
         Ok(Placement {
             generation: view.map.generation(),
             read: read_order(&view, digest).into_iter().cloned().collect(),
-            write: write_order(&view.map, digest).first().map(|m| (*m).clone()),
+            write: writers.first().cloned(),
+            writers,
         })
+    }
+
+    /// A number that changes whenever what a "this blob is held" answer rests on may have
+    /// changed: the map's generation, and the id and boot of every member in it. A caller
+    /// that remembers an answer beside this number may trust it only while the number is
+    /// the same: a new generation moves blobs between owners, and a restarted owner (a
+    /// new boot) may have lost what it held only in RAM.
+    ///
+    /// `None` when no map has arrived, or when any member's boot is 0 (unknown: a restart
+    /// of that member could not be told), so that nothing is remembered.
+    #[must_use]
+    pub fn epoch(&self) -> Option<u64> {
+        use std::hash::{Hash as _, Hasher as _};
+        let view = self.view().ok()?;
+        let members = view.map.members();
+        if members.iter().any(|m| m.boot == 0) {
+            return None;
+        }
+        // The default hasher has fixed keys: equal inputs give equal numbers.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        view.map.generation().hash(&mut hasher);
+        for member in members {
+            (member.id, member.boot).hash(&mut hasher);
+        }
+        Some(hasher.finish())
     }
 
     /// How many blobs are being read for waiting callers right now: for a gauge, and for
@@ -121,9 +182,12 @@ impl Router {
             .ok_or_else(|| unavailable("no storage map has arrived yet".to_owned()))
     }
 
-    /// Runs `op` against the map as it is now. If a node answers `STALE_MAP`, fetches the
-    /// newer map and runs it once more against that; a second `STALE_MAP`, or a fetch
-    /// that does not bring a newer map, is UNAVAILABLE rather than a loop.
+    /// Runs `op` against the map as it is now. Each time a node answers `STALE_MAP`, fetches
+    /// the newer map and runs it again against that: the map can move several times
+    /// during one call (every member's promotion is a new generation). It stops, with
+    /// UNAVAILABLE rather than a loop, when a fetch brings no map newer than the one just
+    /// used (the generation has stopped moving where this process can see it), or after
+    /// [`MAX_MAP_REFETCHES`] fetches in one call.
     pub(crate) async fn routed<T, Fut>(
         &self,
         op: impl Fn(MapView) -> Fut,
@@ -131,12 +195,34 @@ impl Router {
     where
         Fut: Future<Output = Result<T, StorageError>>,
     {
-        let view = self.view()?;
-        let used = view.map.generation();
-        let first = op(view).await;
-        let Err(StorageError::StaleMap { current }) = first else {
-            return first;
-        };
+        let mut view = self.view()?;
+        let mut fetches = 0;
+        loop {
+            let used = view.map.generation();
+            match op(view).await {
+                Err(StorageError::StaleMap { current }) => {
+                    view = self.newer(used, current, &mut fetches).await?;
+                }
+                done => return done,
+            }
+        }
+    }
+
+    /// The map to run a call again against after a node holding generation `current`
+    /// refused the one of generation `used`: fetched, and newer than `used`.
+    async fn newer(
+        &self,
+        used: u64,
+        current: u64,
+        fetches: &mut usize,
+    ) -> Result<MapView, StorageError> {
+        if *fetches == MAX_MAP_REFETCHES {
+            return Err(unavailable(format!(
+                "the storage map moved {fetches} times during one call; a node now holds \
+                 generation {current}"
+            )));
+        }
+        *fetches += 1;
         let fresh = self
             .maps
             .refetch(current)
@@ -148,19 +234,18 @@ impl Router {
                 fresh.map.generation()
             )));
         }
-        match op(fresh).await {
-            Err(StorageError::StaleMap { current }) => Err(unavailable(format!(
-                "a node holds map generation {current}, newer than the map just fetched"
-            ))),
-            done => done,
-        }
+        Ok(fresh)
     }
 }
 
-/// This generation's read order of `digest`, then the previous generation's.
+/// The most map fetches one routed call makes when nodes keep answering `STALE_MAP`: room
+/// for a run of promotions during one call, and a bound on a map that never settles.
+pub const MAX_MAP_REFETCHES: usize = 8;
+
+/// This generation's read order of `digest`, then each retained earlier generation's, newest
+/// first.
 pub(crate) fn read_order<'a>(view: &'a MapView, digest: &Digest) -> Vec<&'a Member> {
-    view.map
-        .read_order_with_previous(view.previous.as_deref(), digest)
+    view.map.read_order_with_history(&view.history(), digest)
 }
 
 /// The owners a write of `digest` may go to: its write owners that are not down, primary

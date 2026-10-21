@@ -43,6 +43,17 @@ impl ReleasePlatform {
         }
     }
 
+    /// The tarballs a host of this platform needs for a release: `kbf` on Linux, `kbf-daemon`
+    /// on a Mac (`docs/design/pull-updates.md` section 5). The release store calls a platform
+    /// complete when it holds each of these with its attestation.
+    #[must_use]
+    pub const fn components(self) -> &'static [&'static str] {
+        match self {
+            Self::LinuxX86_64 | Self::LinuxArm64 => &["kbf"],
+            Self::DarwinArm64 => &["kbf-daemon"],
+        }
+    }
+
     /// The platform [`ReleasePlatform::as_str`] names `name` for; `None` for any other
     /// text (the match is exact: no case folding, no trimming).
     #[must_use]
@@ -107,6 +118,19 @@ mod tests {
             "macos-arm64",
         ] {
             assert_eq!(ReleasePlatform::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    /// Catches: a Linux host asked for the Mac daemon's tarball (or a Mac for `kbf`), so
+    /// a platform is called complete while holding the wrong files, and a platform with
+    /// no component at all.
+    #[test]
+    fn each_platform_needs_the_tarballs_of_its_host() {
+        assert_eq!(ReleasePlatform::LinuxX86_64.components(), ["kbf"]);
+        assert_eq!(ReleasePlatform::LinuxArm64.components(), ["kbf"]);
+        assert_eq!(ReleasePlatform::DarwinArm64.components(), ["kbf-daemon"]);
+        for platform in ReleasePlatform::ALL {
+            assert!(!platform.components().is_empty(), "{platform}");
         }
     }
 }

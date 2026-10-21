@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
-use kbf_mapsync::{FakeMapSource, MapHolder, MapSource};
+use kbf_mapsync::{FakeMapSource, MapHolder, MapSource, RETAINED_MAPS};
 use tokio::time::timeout;
 
 fn map(generation: u64) -> Map {
@@ -15,6 +15,7 @@ fn map(generation: u64) -> Map {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     Map::new(generation, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("a valid map")
 }
@@ -38,6 +39,47 @@ fn a_holder_never_goes_backwards() {
     assert!(holder.offer(map(9)));
     assert_eq!(holder.generation(), 9);
     assert_eq!(holder.previous().expect("replaced").generation(), 5);
+}
+
+/// Catches a holder that keeps one map before the newest, or that keeps them without a
+/// bound: it retains the newest four it replaced, newest first. Mutants: a history of one
+/// (`previous` is right and the rest is lost), no truncation.
+#[test]
+fn a_holder_retains_the_maps_it_replaced_up_to_a_cap() {
+    let holder = MapHolder::default();
+    for generation in 1..=7 {
+        assert!(holder.offer(map(generation)));
+    }
+    let history: Vec<u64> = holder.history().iter().map(|m| m.generation()).collect();
+    assert_eq!(history, [6, 5, 4, 3]);
+    assert_eq!(history.len(), RETAINED_MAPS);
+    assert_eq!(holder.previous().expect("replaced").generation(), 6);
+}
+
+/// Catches a holder that drops the maps a frontend retained for a node that has just
+/// started, or that takes ones it must not: retained maps join the history, newest first;
+/// one that is not older than the newest, a repeat and one the holder has are left out; and
+/// a map that is refused brings none with it.
+#[test]
+fn retained_maps_join_the_history_without_repeats_or_newer_ones() {
+    let holder = MapHolder::default();
+    assert!(holder.offer_with_retained(map(9), [map(3), map(7), map(7), map(9), map(11), map(5)]));
+    let history: Vec<u64> = holder.history().iter().map(|m| m.generation()).collect();
+    assert_eq!(history, [7, 5, 3]);
+    assert_eq!(holder.previous().expect("replaced").generation(), 7);
+
+    assert!(holder.offer_with_retained(map(10), [map(8), map(7)]));
+    let history: Vec<u64> = holder.history().iter().map(|m| m.generation()).collect();
+    assert_eq!(
+        history,
+        [9, 8, 7, 5],
+        "the map replaced, then the retained ones, capped"
+    );
+
+    assert!(!holder.offer_with_retained(map(10), [map(6)]));
+    assert!(!holder.offer_with_retained(map(2), [map(1)]));
+    let history: Vec<u64> = holder.history().iter().map(|m| m.generation()).collect();
+    assert_eq!(history, [9, 8, 7, 5]);
 }
 
 /// Catches a holder that announces a map it refused, or does not announce one it took:

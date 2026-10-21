@@ -67,6 +67,6 @@ impl State {
                 message: Some(cancel),
             }));
         }
-        Some(answers.iter().map(|a| self.settle(a, None)).collect())
+        Some(answers.iter().map(|a| self.settle(a)).collect())
     }
 }

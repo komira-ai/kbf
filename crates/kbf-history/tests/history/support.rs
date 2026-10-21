@@ -177,6 +177,9 @@ impl ObjectStore for Objects {
     }
 }
 
+/// A call made on the real store, once, before a transaction applies.
+pub type Hook = Box<dyn FnOnce(&dyn Store) + Send>;
+
 /// An index that fails on demand, over any store.
 pub struct Index {
     pub inner: Arc<dyn Store>,
@@ -188,11 +191,18 @@ pub struct Index {
     pub block_counters: AtomicBool,
     /// Fail every `get`.
     pub fail_gets: AtomicBool,
+    /// Fail every `scan_prefix` (the reader's read of an invocation's header rows).
+    pub fail_scans: AtomicBool,
     /// Answer a counter increment with no counter value.
     pub empty_counters: AtomicBool,
     pub txns: AtomicU64,
     pub gets: AtomicU64,
     pub scans: AtomicU64,
+    /// Rows the scans have returned (a bounded read returns few, a whole prefix many).
+    pub rows_read: AtomicU64,
+    /// Runs once, with the real store, just before the next transaction applies: another
+    /// writer's write landing between this writer's read and its write.
+    pub before_txn: Mutex<Option<Hook>>,
     /// A call on this thread panics: the thread that polls the writer and reader.
     pub forbid: Mutex<Option<ThreadId>>,
 }
@@ -205,10 +215,13 @@ impl Index {
             lose_acks: AtomicU32::new(0),
             block_counters: AtomicBool::new(false),
             fail_gets: AtomicBool::new(false),
+            fail_scans: AtomicBool::new(false),
             empty_counters: AtomicBool::new(false),
             txns: AtomicU64::new(0),
             gets: AtomicU64::new(0),
             scans: AtomicU64::new(0),
+            rows_read: AtomicU64::new(0),
+            before_txn: Mutex::new(None),
             forbid: Mutex::new(None),
         })
     }
@@ -266,6 +279,9 @@ impl Store for Index {
         if take_one(&self.fail_txns) {
             return Err(failed("transaction"));
         }
+        if let Some(hook) = self.before_txn.lock().unwrap().take() {
+            hook(self.inner.as_ref());
+        }
         let mut out = self.inner.apply_batch(batch)?;
         if take_one(&self.lose_acks) {
             return Err(failed("acknowledgement"));
@@ -290,13 +306,26 @@ impl Store for Index {
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
         self.check_thread();
         self.scans.fetch_add(1, Ordering::SeqCst);
-        self.inner.scan_prefix(prefix)
+        if self.fail_scans.load(Ordering::SeqCst) {
+            return Err(failed("scan"));
+        }
+        let rows = self.inner.scan_prefix(prefix)?;
+        // A read of one invocation's header rows is a point read (a few rows of one
+        // key); the count is of what a range read returns.
+        if !prefix.contains("/invid/") {
+            self.rows_read
+                .fetch_add(rows.len() as u64, Ordering::SeqCst);
+        }
+        Ok(rows)
     }
 
     fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
         self.check_thread();
         self.scans.fetch_add(1, Ordering::SeqCst);
-        self.inner.scan_range(scan)
+        let page = self.inner.scan_range(scan)?;
+        self.rows_read
+            .fetch_add(page.rows.len() as u64, Ordering::SeqCst);
+        Ok(page)
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
@@ -313,6 +342,11 @@ impl Store for Index {
 
     fn now(&self) -> StoreTime {
         self.inner.now()
+    }
+
+    /// The store's own handle, past this double's planted failures.
+    fn own_keys(&self, permit: kbf_state::Permit) -> Option<Arc<dyn Store>> {
+        self.inner.own_keys(permit)
     }
 }
 
@@ -407,6 +441,29 @@ impl Life {
         }
     }
 
+    /// A life whose index writes the rows of its own writer around the store's fence
+    /// ([`HistoryIndex::exempting`]), over `index` (a store that has a fence to go
+    /// around, or not).
+    pub fn start_exempting(
+        objects: &Objects,
+        index: &Arc<Index>,
+        writer: u64,
+        limits: Limits,
+    ) -> Life {
+        let mut life = Life::start(objects, index, writer, limits);
+        let history = life.history_index().exempting(WriterId(writer));
+        life.writer = Writer::new(
+            objects.clone(),
+            root(),
+            history,
+            WriterId(writer),
+            life.minter.clone(),
+            life.queue.clone(),
+            limits,
+        );
+        life
+    }
+
     pub fn fresh(limits: Limits) -> Life {
         Life::start(&Objects::new(), &Index::fake(), 1, limits)
     }
@@ -429,7 +486,8 @@ impl Life {
         for i in 0..n {
             self.step(now_ms);
             let w = &self.writer;
-            if w.pending_rows() == 0 && w.kept_objects() == 0 && w.unwritten_chunks() == 0 {
+            let rows = w.pending_rows() + w.index_owed();
+            if rows == 0 && w.kept_objects() == 0 && w.unwritten_chunks() == 0 {
                 return i + 1;
             }
         }
@@ -502,6 +560,7 @@ pub fn failed_section(instance: &str) -> FailedRun {
             env_names: vec!["PATH".into()],
             ..CommandRendering::default()
         }),
+        flog_omitted: 0,
     }
 }
 
@@ -525,7 +584,7 @@ pub struct Whole {
 pub fn whole(
     reader: &Reader<Objects>,
     inv: &InvKey,
-    allow: &dyn Fn(&str) -> bool,
+    allow: kbf_history::Allow<'_>,
 ) -> Result<Option<Whole>, ReadError> {
     let Some(InvocationView {
         header,

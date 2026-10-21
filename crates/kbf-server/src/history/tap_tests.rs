@@ -7,12 +7,12 @@ use kbf_history::records::{HitHow, MemoryKill, RunOutcome};
 use kbf_history::{Event, EventQueue, InvRef, Minter, QueueLimits};
 use kbf_invocation::{
     ActionRow, ActionShape, Attempt, AttemptEnd, Ended, EndedKind, How, Listing, NumaBytes,
-    Outcome, Output, ReapiTimes, RecordKey, Run, RunUsage, WallTime,
+    Outcome, Output, ReapiTimes, RecordKey, Run, RunUsage, Target, TargetKind, Text, WallTime,
 };
 use kbf_sched::RequeueReason;
 use kbf_types::{Digest, DigestFunction, Failure, LeaseId, LostWhy, WorkerId};
 
-use super::{HistoryTap, OPEN_CAP};
+use super::{HistoryTap, OPEN_CAP, RUN_INDEX_CAP, RunIndex};
 use kbf_front::Tap as _;
 
 fn digest(n: u8) -> Digest {
@@ -112,9 +112,10 @@ fn record_of(
 }
 
 /// Catches: a field of the row dropped or put in another's place on its way to the
-/// record: the action, result, command, logs, shape, configuration, test flag, node,
-/// lease, every time, the cgroup block (its NUMA bytes by node) and the outputs; and the
-/// id the tap returns not the record's.
+/// record: the action, result, command, logs, shape, configuration, test flag, target
+/// and its kind, node, lease, every time (the attempt's own queue, start and end among
+/// them), the cgroup block (its NUMA bytes by node, its wall time) and the outputs; and
+/// the id the tap returns not the record's.
 #[test]
 fn a_finished_attempt_keeps_what_the_row_and_the_attempt_hold() {
     let mut a = attempt(Some(AttemptEnd::Accepted));
@@ -184,7 +185,10 @@ fn a_finished_attempt_keeps_what_the_row_and_the_attempt_hold() {
     r.shape = Some(Box::new(ActionShape {
         key: 0x0123_4567_89ab_cdef,
         cfg: Some("7a3c1e9f0b2d4c68".to_owned()),
-        target: None,
+        target: Some(Target {
+            kind: TargetKind::Anon,
+            label: Text::sent("root//pkg:name"),
+        }),
         test: true,
     }));
     let (rec, id) = record_of(&r, 1, EndedKind::Finished);
@@ -201,6 +205,15 @@ fn a_finished_attempt_keeps_what_the_row_and_the_attempt_hold() {
     assert_eq!(rec.shape, 0x0123_4567_89ab_cdef);
     assert_eq!(rec.cfg, "7a3c1e9f0b2d4c68");
     assert!(rec.test);
+    assert_eq!(
+        (rec.target.as_str(), rec.target_kind),
+        ("root//pkg:name", 2)
+    );
+    assert_eq!(
+        (rec.attempt_queued_us, rec.started_us, rec.ended_us),
+        (10_000, 30_000, 40_000),
+        "the attempt's own times, not the first submission's"
+    );
     assert_eq!(rec.node, "node-a");
     assert_eq!((rec.lease_epoch, rec.lease_seq), (3, 9));
     assert_eq!((rec.outcome(), rec.exit_code), (RunOutcome::Ok, 0));
@@ -243,6 +256,7 @@ fn a_finished_attempt_keeps_what_the_row_and_the_attempt_hold() {
         [2, 3, 4, 5, 6, 7, 8]
     );
     assert_eq!(c.numa_bytes, [80, 90], "by node, the node past 63 left out");
+    assert_eq!(c.wall_us, 1);
     let outputs: Vec<_> = rec
         .outputs
         .iter()
@@ -581,4 +595,251 @@ fn the_open_list_is_bounded() {
     );
     assert!(closed.contains(&Some("b00001".to_owned())));
     assert!(closed.contains(&Some(format!("b{OPEN_CAP:05}"))));
+}
+
+/// Catches: a target kind that does not round-trip (a BXL function shown as a rule's
+/// target), and a run of an action with no target given one.
+#[test]
+fn a_target_keeps_its_kind_and_a_run_without_one_keeps_none() {
+    for (kind, number) in [
+        (TargetKind::Target, 1),
+        (TargetKind::Anon, 2),
+        (TargetKind::Bxl, 3),
+    ] {
+        let mut r = row(
+            vec![attempt(Some(AttemptEnd::Accepted))],
+            Some(Outcome::Ok { exit_code: 0 }),
+        );
+        r.shape = Some(Box::new(ActionShape {
+            key: 1,
+            cfg: None,
+            target: Some(Target {
+                kind,
+                label: Text::sent("t"),
+            }),
+            test: false,
+        }));
+        let (rec, _) = record_of(&r, 0, EndedKind::Finished);
+        assert_eq!((rec.target.as_str(), rec.target_kind), ("t", number));
+    }
+    let plain = row(
+        vec![attempt(Some(AttemptEnd::Accepted))],
+        Some(Outcome::Ok { exit_code: 0 }),
+    );
+    let (rec, _) = record_of(&plain, 0, EndedKind::Finished);
+    assert_eq!((rec.target.as_str(), rec.target_kind), ("", 0));
+}
+
+/// Catches: a run id the tap minted that the live record cannot be found by (the run
+/// route would answer from history only, and not at all before the chunk is written), a
+/// record found for an id the tap did not mint, and a map that grows without bound: past
+/// its bound the oldest ids go, and the newest stay.
+#[test]
+fn the_run_index_finds_what_was_minted_and_forgets_the_oldest() {
+    let rig = rig(16);
+    let r = row(
+        vec![attempt(Some(AttemptEnd::Accepted))],
+        Some(Outcome::Ok { exit_code: 0 }),
+    );
+    let id = rig
+        .tap
+        .ended(&ended("b", EndedKind::Finished, Some(0)), &r)
+        .expect("an id");
+    let runs = rig.tap.runs();
+    assert_eq!(runs.find(&id), Some((key("b"), 0)));
+    assert_eq!(runs.find(&[0xEE; 12]), None);
+
+    let index = RunIndex::default();
+    for n in 0..=RUN_INDEX_CAP as u64 {
+        let mut id = [0; 12];
+        id[4..].copy_from_slice(&n.to_be_bytes());
+        index.note(id, key("b"), 0);
+    }
+    let first = [0; 12];
+    let mut last = [0; 12];
+    last[4..].copy_from_slice(&(RUN_INDEX_CAP as u64).to_be_bytes());
+    assert_eq!(index.find(&first), None, "the oldest is forgotten");
+    assert_eq!(index.find(&last), Some((key("b"), 0)));
+}
+
+/// Catches: a tap that cannot be shown in a failure message (the recorder's task and the
+/// tests print it), with its run index.
+#[test]
+fn a_tap_shows_as_itself() {
+    let rig = rig(16);
+    let shown = format!("{:?}", rig.tap);
+    assert!(
+        shown.contains("HistoryTap") && shown.contains("RunIndex"),
+        "{shown}"
+    );
+}
+
+mod pool {
+    //! A tap with the tail pool installed: which runs go to it, and what happens when it is
+    //! full. The workers are not started, so a job stays queued where the test can see it.
+
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use futures::future::BoxFuture;
+    use kbf_history::{FlogStore, HistoryRoot, WriterId};
+    use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
+
+    use super::*;
+    use crate::history::reads::Shared;
+    use crate::history::stats::Stats;
+    use crate::history::tails::{
+        BlobReadError, BlobReads, Parts, TailOptions, Tails, Workers, pool,
+    };
+    use crate::http_blobs::ReadBudget;
+
+    /// Blobs that are never there.
+    struct NoBlobs;
+
+    impl BlobReads for NoBlobs {
+        fn read<'a>(&'a self, _: &'a Digest) -> BoxFuture<'a, Result<Bytes, BlobReadError>> {
+            Box::pin(async { Err(BlobReadError("none".to_owned())) })
+        }
+    }
+
+    /// A pool of `queue` jobs over `rig`'s queue, its workers not started.
+    fn made(rig: &Rig, queue: usize) -> (Tails, Arc<Stats>, Workers) {
+        let stats = Arc::new(Stats::new(Arc::clone(&rig.queue)));
+        let objects = Shared(Arc::new(MemoryStore::new(Capabilities::default())));
+        let root = HistoryRoot::under(&KeyPrefix::new("kbf/").expect("a prefix")).expect("a root");
+        let parts = Parts {
+            queue: Arc::clone(&rig.queue),
+            blobs: Arc::new(NoBlobs),
+            budget: ReadBudget::default(),
+            flog: Arc::new(FlogStore::new(objects, root, WriterId(1))),
+            stats: Arc::clone(&stats),
+            open: rig.tap.open_set(),
+        };
+        let options = TailOptions {
+            queue,
+            workers: 1,
+            wait: Duration::from_millis(10),
+            read_timeout: Duration::from_secs(1),
+        };
+        let (tails, workers) = pool(parts, options);
+        (tails, stats, workers)
+    }
+
+    /// A rig whose tap has a pool of `queue` jobs, its workers not started.
+    fn pooled(queue: usize) -> (Rig, Arc<Stats>, Workers) {
+        let rig = rig(16);
+        let (tails, stats, workers) = made(&rig, queue);
+        assert!(!rig.tap.has_tails());
+        rig.tap.install_tails(tails);
+        assert!(rig.tap.has_tails());
+        (rig, stats, workers)
+    }
+
+    fn failing() -> ActionRow {
+        row(
+            vec![attempt(Some(AttemptEnd::Accepted))],
+            Some(Outcome::Ok { exit_code: 1 }),
+        )
+    }
+
+    fn passing() -> ActionRow {
+        row(
+            vec![attempt(Some(AttemptEnd::Accepted))],
+            Some(Outcome::Ok { exit_code: 0 }),
+        )
+    }
+
+    /// Catches (mutant "copy successful runs too"): a run that passed sent through the pool
+    /// (it would be held for reads of logs nobody will want), and a run that failed offered
+    /// to the writer at once with no tails (the pool would be bypassed). The failed run is
+    /// minted, remembered and its id returned, and its invocation is open, as any run's.
+    #[tokio::test]
+    async fn only_a_failed_run_goes_to_the_pool() {
+        let (rig, stats, workers) = pooled(8);
+        let ok = rig
+            .tap
+            .ended(&ended("b", EndedKind::Finished, Some(0)), &passing());
+        assert!(ok.is_some());
+        let events = rig.queue.drain();
+        assert_eq!(events.len(), 1, "a passing run is offered at once");
+        assert!(matches!(&events[0], Event::Run { failed: None, .. }));
+        let bad = rig
+            .tap
+            .ended(&ended("b", EndedKind::Finished, Some(0)), &failing());
+        let id = bad.expect("an id for a run in the pool");
+        assert!(
+            rig.queue.is_empty(),
+            "nothing is offered until its tails are read"
+        );
+        assert_eq!(stats.dropped("tail"), 0);
+        assert_eq!(rig.tap.runs().find(&id), Some((key("b"), 0)));
+        // The invocation is open: an idle record closes it.
+        rig.tap.idle(&key("b"));
+        assert!(matches!(&rig.queue.drain()[..], [Event::Close { .. }]));
+        // Its workers run it: the run arrives with a failed section, then the close again,
+        // since the invocation was closed meanwhile.
+        let handles = workers.spawn();
+        rig.tap.quiesce().await;
+        let events = rig.queue.drain();
+        assert!(
+            matches!(
+                &events[0],
+                Event::Run {
+                    failed: Some(_),
+                    ..
+                }
+            ),
+            "{events:?}"
+        );
+        assert!(matches!(&events[1], Event::Close { .. }), "{events:?}");
+        handles.iter().for_each(tokio::task::JoinHandle::abort);
+    }
+
+    /// Catches: a full pool that waits or fails the run (the tap runs on the recorder's
+    /// task: it never waits), a run lost with its tails (it is offered with none, and its
+    /// id kept, as before the pool), and a drop not counted as `stage="tail"`.
+    #[tokio::test]
+    async fn a_full_pool_offers_the_run_without_tails_and_counts_it() {
+        let (rig, stats, _workers) = pooled(1);
+        let first = rig
+            .tap
+            .ended(&ended("b", EndedKind::Finished, Some(0)), &failing());
+        assert!(first.is_some());
+        assert!(rig.queue.is_empty());
+        let second = rig
+            .tap
+            .ended(&ended("b", EndedKind::Finished, Some(0)), &failing());
+        assert!(second.is_some(), "its id is kept");
+        assert_ne!(first, second);
+        assert_eq!(stats.dropped("tail"), 1);
+        let events = rig.queue.drain();
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], Event::Run { failed: None, .. }),
+            "offered at once, with no tails: {events:?}"
+        );
+    }
+
+    /// Catches: a second pool replacing the first (a run in the first would be lost with
+    /// its workers), and a tap with no pool reporting one or waiting for one.
+    #[tokio::test]
+    async fn the_first_pool_stays() {
+        let (rig, stats, _workers) = pooled(1);
+        let (second, second_stats, _second_workers) = made(&rig, 8);
+        rig.tap.install_tails(second);
+        for _ in 0..2 {
+            rig.tap
+                .ended(&ended("b", EndedKind::Finished, Some(0)), &failing());
+        }
+        assert_eq!(
+            stats.dropped("tail"),
+            1,
+            "the first pool, of one job, is full"
+        );
+        assert_eq!(second_stats.dropped("tail"), 0);
+        let bare = self::rig(4);
+        assert!(!bare.tap.has_tails());
+        // Without a pool, quiesce is at once.
+        bare.tap.quiesce().await;
+    }
 }

@@ -5,7 +5,7 @@ use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use kbf_meta::{Epoch, ObjectId};
+use kbf_meta::{ObjectId, Writer};
 use kbf_segments::MAX_SEGMENT_BYTES;
 use kbf_store::{Fs, FsFile};
 
@@ -320,6 +320,11 @@ pub trait WriteTier: Send + Sync {
 
     /// The acknowledged bytes not yet flushed, and the oldest block's age at `now`.
     fn unflushed(&self, now: Instant) -> Unflushed;
+
+    /// How many block files the tier holds open for writing now: a block keeps its
+    /// handle from its creation until nothing will write it again (a grouped block
+    /// until sealed and every range answered, an upload's block until its commit).
+    fn open_write_files(&self) -> u64;
 }
 
 /// What a dropped or committed reservation tells its tier.
@@ -443,14 +448,14 @@ impl<File> State<File> {
     }
 }
 
-/// Allocates the sequence numbers of the tier's objects within its epoch, shared with
+/// Allocates the sequence numbers of the tier's objects within its writer, shared with
 /// the writer that numbers the direct path's objects so the two never collide.
 pub type NextSeq = Box<dyn Fn() -> u64 + Send + Sync>;
 
 struct Shared<F: Fs> {
     fs: F,
     options: TierOptions,
-    epoch: Epoch,
+    writer: Writer,
     state: Mutex<State<F::File>>,
     next_seq: NextSeq,
 }
@@ -460,7 +465,7 @@ impl<F: Fs + std::fmt::Debug> std::fmt::Debug for Shared<F> {
         f.debug_struct("Tier")
             .field("fs", &self.fs)
             .field("options", &self.options)
-            .field("epoch", &self.epoch)
+            .field("writer", &self.writer)
             .finish_non_exhaustive()
     }
 }
@@ -485,7 +490,7 @@ where
     pub(crate) fn from_parts(
         fs: F,
         options: TierOptions,
-        epoch: Epoch,
+        writer: Writer,
         state: State<F::File>,
         next_seq: NextSeq,
     ) -> Self {
@@ -493,7 +498,7 @@ where
             shared: Arc::new(Shared {
                 fs,
                 options,
-                epoch,
+                writer,
                 state: Mutex::new(state),
                 next_seq,
             }),
@@ -518,7 +523,7 @@ where
         len: u64,
         now: Option<Instant>,
     ) -> Result<Reservation, TierError> {
-        let object = ObjectId::new(self.shared.epoch, (self.shared.next_seq)());
+        let object = ObjectId::of(self.shared.writer, (self.shared.next_seq)());
         let name = block_name(object);
         let file = self
             .shared
@@ -948,6 +953,11 @@ where
             flushed: state.seg_bytes,
             evicted: state.evicted,
         }
+    }
+
+    fn open_write_files(&self) -> u64 {
+        let state = self.lock();
+        state.blocks.values().filter(|b| b.file.is_some()).count() as u64
     }
 
     fn unflushed(&self, now: Instant) -> Unflushed {

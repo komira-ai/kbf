@@ -17,16 +17,27 @@
 //! generation it was routed by; a node that holds a newer map answers `STALE_MAP`, the map
 //! is fetched once and the call run again, and a second answer is UNAVAILABLE; a blob read
 //! whole is hashed against its digest at every owner; a read fails over to the next owner;
-//! a write goes to the first owner that is not down.
+//! a write goes to the first owner that is not down, and to the next if that one cannot be
+//! reached (dead before the map says so; the raw ByteStream upload does the same while none
+//! of its bytes past the request's first frames has been passed on).
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kbf_map::Member;
-use kbf_route::{MapSource, Nodes, Placement, Router, TlsNodes};
+use kbf_route::{MapSource, Nodes, Placement, RepairLimit, Router, TlsNodes};
 use kbf_storage::StorageError;
+use kbf_storage::service::RemoteStorage;
 use kbf_types::Digest;
 use tonic::transport::Channel;
+
+/// How often read repair may be told of a blob found away from its owner: a burst of 256
+/// (a run's worth of inputs), then 64 a second.
+const REPAIR_LIMIT: RepairLimit = RepairLimit {
+    burst: NonZeroU32::new(256).expect("not zero"),
+    per_second: NonZeroU32::new(64).expect("not zero"),
+};
 
 /// The connection to a member, for a caller that speaks to a node without a
 /// [`kbf_storage::Storage`] (the proxy's raw pass-through of a ByteStream). A trait so a
@@ -53,6 +64,9 @@ pub struct Routed {
     channels: Arc<dyn Channels>,
     /// A map with two members or more has been seen.
     settled: AtomicBool,
+    /// The handles to the `--storage` node the frontend calls while it is not routing by the
+    /// map ([`Routed::bootstrapped`]).
+    bootstrap: Vec<RemoteStorage>,
 }
 
 impl std::fmt::Debug for Routed {
@@ -71,10 +85,39 @@ impl Routed {
         channels: Arc<dyn Channels>,
     ) -> Self {
         Self {
-            router: Router::new(Arc::clone(&maps), nodes),
+            // A blob a read finds away from its owner is copied to that owner in the
+            // background (at most [`REPAIR_LIMIT`]): this frontend's certificate is what a
+            // node accepts an unowned copy from.
+            router: Router::new(Arc::clone(&maps), nodes).with_background_repair(REPAIR_LIMIT),
             maps,
             channels,
             settled: AtomicBool::new(false),
+            bootstrap: Vec::new(),
+        }
+    }
+
+    /// The same, also tagging the calls made through `storage`, the handle to the
+    /// `--storage` node, with the generation of the map held ([`Routed::tag_bootstrap`]).
+    #[must_use]
+    pub fn bootstrapped(mut self, storage: RemoteStorage) -> Self {
+        self.bootstrap.push(storage);
+        self
+    }
+
+    /// The generation of the map held now; 0 before the first.
+    #[must_use]
+    pub fn bootstrap_generation(&self) -> u64 {
+        self.maps.current().map_or(0, |view| view.map.generation())
+    }
+
+    /// Tags the handles of [`Routed::bootstrapped`] with the map's generation now. A
+    /// node that holds a map judges every call by it and refuses 0 as behind, and while
+    /// the map has one member the frontend calls only the `--storage` node, so each call
+    /// that does is tagged first and follows every bump.
+    pub fn tag_bootstrap(&self) {
+        let generation = self.bootstrap_generation();
+        for storage in &self.bootstrap {
+            storage.set_map_generation(generation);
         }
     }
 

@@ -1,4 +1,4 @@
-//! A run whose driver panics (the all-in-one design, komira-build-farm#657, section 7.3).
+//! A run whose driver panics (the all-in-one design, kbf#657, section 7.3).
 
 use kbf_proto::reapi::Digest;
 
@@ -53,7 +53,7 @@ async fn reported(done: &mut mpsc::UnboundedReceiver<Done>) -> Done {
 }
 
 /// Catches a run whose driver panics leaving the daemon half-alive (the all-in-one
-/// design, komira-build-farm#657, section 7.3): the panic is contained in the run's
+/// design, kbf#657, section 7.3): the panic is contained in the run's
 /// task, but a run that never reports keeps its lease listed as running in every
 /// heartbeat, so the server neither answers nor runs it again. The run must report
 /// INTERNAL, naming the driver and the panic, after a kill of the lease (what the

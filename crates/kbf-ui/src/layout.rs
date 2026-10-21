@@ -7,7 +7,13 @@ use crate::{PREFIX, STYLESHEET};
 
 /// The navigation: each section's label and page. More sections come with their
 /// routes (nodes, queue, tests).
-const NAV: &[(&str, &str)] = &[("Builds", PREFIX)];
+const NAV: &[(&str, &str)] = &[
+    ("Overview", PREFIX),
+    ("Builds", "/ui/builds"),
+    ("Updates", "/ui/updates"),
+    ("Leases", "/ui/leases"),
+    ("Queue", "/ui/queue"),
+];
 
 /// A URL the page asked for, as the page lists it.
 struct Link<'a> {

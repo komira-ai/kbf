@@ -11,13 +11,16 @@
 # This proves the instrument and the profile on a hosted runner only: its privacy (TCC)
 # grants may be seeded, so a pass says nothing about a fresh Mac. The leases, the
 # xcodebuild logs, the result bundles and each run's deny lines are uploaded.
-# Run by hand, or on a pull request that changes this file, the fixtures, the test or
-# the driver code the profile, the lease's variables and the process tree come from.
+# Run by hand, or on a push to main that changes this file, the
+# fixtures, the test or the driver code the profile, the lease's variables and the process
+# tree come from. A pull request does not run it (a pull request runs the fast gate of
+# ci.yml only; the macOS pool is small).
 name: spike-xcuitest
 
 on:
   workflow_dispatch:
-  pull_request:
+  push:
+    branches: [main]
     paths:
       - .github/workflows/spike-xcuitest.yml
       - tools/spike/macos/fixtures/**

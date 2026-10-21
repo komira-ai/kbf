@@ -130,6 +130,29 @@ fn each_command_has_its_own_label() {
         Command::EvictObjects {
             objects: [object].into(),
         },
+        Command::SetWriter(kbf_meta::NodeWriter::new(
+            std::num::NonZeroU64::MIN,
+            std::num::NonZeroU64::MIN,
+        )),
+        Command::AdoptSegment {
+            object,
+            entries: Vec::new(),
+        },
+        Command::RebuildProgress {
+            after: String::new(),
+        },
+        Command::RebuildDone,
+        Command::ReseatStaged {
+            tier: kbf_meta::TierId::new(1),
+            from: object,
+            to: kbf_meta::StagedPut {
+                object,
+                end: 0,
+                seal: true,
+                blobs: Vec::new(),
+            },
+            stored: false,
+        },
     ];
     let labels: Vec<&str> = commands
         .iter()
@@ -152,14 +175,33 @@ fn every_family_is_printed_once_with_its_type() {
     metrics.find_missing_missing.add(16);
     let _raised = metrics.batch_update.in_flight.raise();
     metrics.execute_dir_reads.add(17);
+    metrics.execute_dir_cache_hits.add(23);
+    metrics.execute_dir_cache_misses.add(24);
+    metrics.execute_dir_cache_merged.add(25);
+    metrics.execute_dir_cache_evictions.add(26);
+    metrics.execute_dir_cache_present_checked.add(27);
+    metrics.execute_dir_cache_bytes.set(28);
+    metrics.execute_walk_dir_read.observe(29);
+    metrics.execute_walk_dir_read.observe(30);
     metrics.sched_queued.set(18);
     metrics.sched_leases.set(19);
-    metrics.frontend_relay_lost.add(20);
+    metrics.frontend_relay_untraced.set(20);
+    metrics.handover_relayed.add(21);
+    let _relays = (
+        metrics.handover_relays_open.raise(),
+        metrics.handover_relays_open.raise(),
+        metrics.handover_relays_open.raise(),
+    );
     let _presubmit = metrics.execute_presubmit_in_flight.raise();
     let (_tier, _tier2) = (
         metrics.tier_in_flight.raise(),
         metrics.tier_in_flight.raise(),
     );
+    metrics.open_write_fds.set(21);
+    metrics.write_pool_direct.add(22);
+    metrics.write_pool_queue.add_one();
+    metrics.write_pool_queue.add_one();
+    metrics.write_pool_queue.add_one();
     let text = metrics.render();
     let types: Vec<&str> = lines(&text, "# TYPE ")
         .iter()
@@ -196,19 +238,37 @@ fn every_family_is_printed_once_with_its_type() {
             "kbf_meta_query_seconds histogram",
             "kbf_execute_presubmit_seconds histogram",
             "kbf_execute_walk_seconds histogram",
+            "kbf_execute_walk_dirs_seconds histogram",
+            "kbf_execute_walk_files_seconds histogram",
+            "kbf_execute_walk_dir_read_seconds histogram",
             "kbf_execute_submit_seconds histogram",
             "kbf_sched_lock_wait_seconds histogram",
             "kbf_tier_wait_seconds histogram",
             "kbf_tier_call_seconds histogram",
             "kbf_execute_presubmit_in_flight gauge",
             "kbf_execute_dir_reads_total counter",
+            "kbf_execute_walk_dirs_read_total counter",
+            "kbf_execute_walk_dirs_skipped_total counter",
+            "kbf_execute_walk_file_asks_total counter",
+            "kbf_execute_walk_files_checked_total counter",
+            "kbf_execute_dir_cache_hits_total counter",
+            "kbf_execute_dir_cache_misses_total counter",
+            "kbf_execute_dir_cache_merged_total counter",
+            "kbf_execute_dir_cache_evictions_total counter",
+            "kbf_execute_dir_cache_present_checked_total counter",
             "kbf_input_directories_cached_total counter",
             "kbf_input_directories_skipped_total counter",
             "kbf_input_directories_joined_total counter",
+            "kbf_execute_dir_cache_bytes gauge",
             "kbf_sched_queued gauge",
             "kbf_sched_leases gauge",
-            "kbf_frontend_relay_lost_total counter",
+            "kbf_frontend_relay_untraced gauge",
+            "kbf_handover_relayed_total counter",
+            "kbf_handover_relays_open gauge",
             "kbf_tier_in_flight gauge",
+            "kbf_storage_open_write_fds gauge",
+            "kbf_storage_write_pool_queue gauge",
+            "kbf_storage_write_pool_direct_total counter",
             "kbf_meta_commit_seconds histogram",
             "kbf_execute_requests_total counter",
             "kbf_execute_errors_total counter",
@@ -233,11 +293,23 @@ fn every_family_is_printed_once_with_its_type() {
         ("kbf_batch_update_in_flight", 1),
         ("kbf_bytestream_write_in_flight", 0),
         ("kbf_execute_dir_reads_total", 17),
+        ("kbf_execute_dir_cache_hits_total", 23),
+        ("kbf_execute_dir_cache_misses_total", 24),
+        ("kbf_execute_dir_cache_merged_total", 25),
+        ("kbf_execute_dir_cache_evictions_total", 26),
+        ("kbf_execute_dir_cache_present_checked_total", 27),
+        ("kbf_execute_dir_cache_bytes", 28),
+        ("kbf_execute_walk_dir_read_seconds_count", 2),
         ("kbf_sched_queued", 18),
         ("kbf_sched_leases", 19),
-        ("kbf_frontend_relay_lost_total", 20),
+        ("kbf_frontend_relay_untraced", 20),
+        ("kbf_handover_relayed_total", 21),
+        ("kbf_handover_relays_open", 3),
         ("kbf_execute_presubmit_in_flight", 1),
         ("kbf_tier_in_flight", 2),
+        ("kbf_storage_open_write_fds", 21),
+        ("kbf_storage_write_pool_queue", 3),
+        ("kbf_storage_write_pool_direct_total", 22),
     ] {
         assert_eq!(
             lines(&text, &format!("{name} ")),

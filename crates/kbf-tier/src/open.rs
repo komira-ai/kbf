@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-use kbf_meta::{Epoch, MetaState, ObjectId, StagedState, TierId};
+use kbf_meta::{MetaState, ObjectId, StagedState, TierId, Writer};
 use kbf_store::{Fs, FsFile};
 
 use crate::block::{
@@ -64,8 +64,8 @@ impl StagedIndex for StagedSnapshot {
 pub struct TierStart {
     /// This server's tier id, as the committed state holds it.
     pub tier: TierId,
-    /// This start's writer epoch. Every block of an earlier start is closed to appends.
-    pub epoch: Epoch,
+    /// This start's writer. Every block of an earlier start is closed to appends.
+    pub writer: Writer,
     /// The sizes and delays.
     pub options: TierOptions,
 }
@@ -111,7 +111,7 @@ where
     ///    blocks; deleted (and listed with the orphans) when the options keep no
     ///    flushed copies.
     ///
-    /// `next_seq` numbers the objects of new blocks within `start.epoch`.
+    /// `next_seq` numbers the objects of new blocks within `start.writer`.
     ///
     /// # Errors
     ///
@@ -135,7 +135,7 @@ where
             .collect();
         if let Some(name) = names
             .iter()
-            .find(|n| parse_block_name(n).is_some_and(|o| o.epoch() >= start.epoch))
+            .find(|n| parse_block_name(n).is_some_and(|o| o.writer().at_or_after(start.writer)))
         {
             return Err(TierError::FutureBlock { name: name.clone() });
         }
@@ -196,7 +196,7 @@ where
             &mut state,
             &mut recovery,
         )?;
-        let tier = Self::from_parts(fs, start.options, start.epoch, state, next_seq);
+        let tier = Self::from_parts(fs, start.options, start.writer, state, next_seq);
         tier.make_room_at_open();
         Ok((tier, recovery))
     }
