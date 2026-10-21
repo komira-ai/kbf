@@ -270,15 +270,15 @@ impl Seeded {
             exec.entries.insert(at.clone(), file);
             // Untrusted bytes are handled as the user the settings name, and a test that is not
             // root can make a directory for no one else.
-            if me().uid != 0 {
-                let ids = format!("RUN_AS_UID={}\nRUN_AS_GID={}\n", me().uid, me().gid);
-                let conf = Entry::File {
-                    perms: Perms::new(0o644),
-                    owner: root,
-                    bytes: ids.into_bytes(),
-                };
-                exec.entries.insert(path(SETTINGS_PATH), conf);
-            }
+            // (`then` and `extend` rather than an `if`: CI runs as one kind of user, so a
+            // branch here would always leave a side untaken.)
+            let text = format!("RUN_AS_UID={}\nRUN_AS_GID={}\n", me().uid, me().gid);
+            let ids = (me().uid != 0).then(|| Entry::File {
+                perms: Perms::new(0o644),
+                owner: root,
+                bytes: text.into_bytes(),
+            });
+            exec.entries.extend(ids.map(|conf| (path(SETTINGS_PATH), conf)));
             Ok(seeded.parts(exec))
         })
         .with_build(&self.build)

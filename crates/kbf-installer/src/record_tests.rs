@@ -94,6 +94,16 @@ fn a_staged_record_is_a_locator_all_three_readers_accept_and_only_two_verbs_take
         err.contains("staged activate record carries no components"),
         "{err}"
     );
+    // Expected facts alone, with no components, are claims too.
+    let facts_only = edit(ORDER_ACTIVATE, |v| {
+        v["source"] = json!("staged");
+        v.as_object_mut().expect("an object").remove("components");
+    });
+    let err = shape_error(&facts_only);
+    assert!(
+        err.contains("staged activate record carries no components"),
+        "{err}"
+    );
 
     let explicit = edit(ORDER_ACTIVATE, |v| v["source"] = json!("fetch"));
     let parsed = OrderRecord::parse(&explicit).expect("an explicit fetch");

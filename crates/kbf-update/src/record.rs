@@ -627,7 +627,8 @@ mod tests {
             (record.verb, record.source),
             (Verb::Activate, Source::Staged)
         );
-        assert!(record.components.is_empty() && record.expected.is_none());
+        assert!(record.components.is_empty());
+        assert!(record.expected.is_none());
         assert_eq!(record.to_bytes().expect("bytes"), golden.as_bytes());
 
         let without = golden.replace(",\"source\":\"staged\"", "");
@@ -675,13 +676,12 @@ mod tests {
         }
 
         let bogus = golden.replace("staged", "bogus");
+        let parsed = OrderRecord::parse(bogus.as_bytes());
         assert!(
-            matches!(
-                OrderRecord::parse(bogus.as_bytes()),
-                Err(RecordError::Parse(why)) if why.contains("bogus")
-            ),
-            "a source that is neither word is not a record"
+            matches!(parsed, Err(RecordError::Parse(_))),
+            "a source that is neither word is not a record: {parsed:?}"
         );
+        assert!(format!("{parsed:?}").contains("bogus"), "{parsed:?}");
     }
 
     /// The words of the two sources, and the default a record leaves out.
@@ -694,7 +694,8 @@ mod tests {
             ["fetch", "staged"]
         );
         assert_eq!(Source::default(), Source::Fetch);
-        assert!(Source::Fetch.is_fetch() && !Source::Staged.is_fetch());
+        assert!(Source::Fetch.is_fetch());
+        assert!(!Source::Staged.is_fetch());
         assert_eq!(
             serde_json::to_string(&Source::Staged).expect("json"),
             "\"staged\""
