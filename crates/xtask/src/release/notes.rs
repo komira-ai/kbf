@@ -18,6 +18,10 @@ use crate::Error;
 /// Commits listed at most; the rest are counted.
 const MAX_COMMITS: usize = 200;
 
+/// The sentence a first release adds: no earlier build says which version fields hosts know.
+const FIRST_RELEASE_INSTALLER: &str = "Hosts running an untagged earlier build: upgrade \
+    kbf-installer before staging (older installers may refuse this build's version output).";
+
 /// The `kbf --version --json` of the release being made and of the one before it, which
 /// the caller ran from attested tarballs only.
 pub struct Identities<'a> {
@@ -90,9 +94,9 @@ fn irreversible(
     previous: Option<&Value>,
 ) -> Result<Vec<String>, Error> {
     let (Some(since), Some(previous)) = (since, previous) else {
-        return Ok(vec![
-            "first release: there is no earlier release to go back to".to_owned(),
-        ]);
+        return Ok(vec![format!(
+            "first release: there is no earlier release to go back to. {FIRST_RELEASE_INSTALLER}"
+        )]);
     };
     let field = |v: &Value, key: &str| whole_field(v, key).map_err(Error::Failed);
     let mut found = Vec::new();
@@ -121,7 +125,42 @@ fn irreversible(
              changed (docs/design/kbf-cicd.md, section 8.3)"
         )),
     }
+    found.extend(installer_line(current, previous));
     Ok(found)
+}
+
+/// The line telling operators to upgrade kbf-installer first: the current build's version
+/// output has top-level keys the previous build's lacks, which installers built before
+/// the current release may refuse. A previous output that is not an object has unknown
+/// keys: fail closed, the line is given. No line when the keys are a subset.
+fn installer_line(current: &Value, previous: &Value) -> Option<String> {
+    let short = current["commit"].as_str().unwrap_or_default();
+    let head = "Upgrade kbf-installer on every host before staging this release";
+    let tail = format!("which installers built before {short} may refuse");
+    let Some(current) = current.as_object() else {
+        return Some(format!(
+            "{head}: its version output is not an object, {tail}"
+        ));
+    };
+    let Some(previous) = previous.as_object() else {
+        return Some(format!(
+            "{head}: the previous release's version output keys are unknown, so the keys this \
+             release adds are unknown, {tail}"
+        ));
+    };
+    let mut added: Vec<&str> = current
+        .keys()
+        .filter(|k| !previous.contains_key(*k))
+        .map(String::as_str)
+        .collect();
+    added.sort_unstable();
+    if added.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{head}: its version output adds {}, {tail}",
+        added.join(", ")
+    ))
 }
 
 fn section(out: &mut String, heading: &str, items: &[String], none: &str) {
@@ -230,4 +269,39 @@ fn render(
         "No release is withdrawn.",
     );
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::installer_line;
+
+    #[test]
+    fn an_unreadable_previous_output_gives_the_line_saying_its_keys_are_unknown() {
+        // Catches: fail-open, an unknown previous read as "nothing added".
+        let cur = json!({"commit": "abcdef012345", "seq": 1});
+        for prev in [json!(null), json!("text"), json!([1])] {
+            let line = installer_line(&cur, &prev).unwrap();
+            assert!(line.starts_with("Upgrade kbf-installer on every host before staging"));
+            assert!(line.contains("keys are unknown"), "{line}");
+            assert!(
+                line.contains("built before abcdef012345 may refuse"),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn added_keys_are_listed_sorted_and_a_subset_gives_no_line() {
+        let prev = json!({"commit": "x", "profile": "r", "gone": 1});
+        let cur = json!({"commit": "abcdef012345", "profile": "r", "zeta": 1, "seq": 2});
+        assert_eq!(
+            installer_line(&cur, &prev).unwrap(),
+            "Upgrade kbf-installer on every host before staging this release: its version \
+             output adds seq, zeta, which installers built before abcdef012345 may refuse"
+        );
+        assert_eq!(installer_line(&prev, &prev), None);
+        assert_eq!(installer_line(&json!({"commit": "x"}), &prev), None);
+    }
 }
