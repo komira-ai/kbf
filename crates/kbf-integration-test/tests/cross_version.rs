@@ -507,9 +507,8 @@ impl Cell {
         std::fs::write(dir.join("facts.json"), text).expect("facts.json");
         let me = std::env::current_exe().expect("this test binary");
         // Only the installer's release states its numbers: a fake `kbf`, like the others.
-        for link in ["kbf"] {
-            std::os::unix::fs::symlink(&me, dir.join(link)).expect("link a fake");
-        }
+        let link = "kbf";
+        std::os::unix::fs::symlink(&me, dir.join(link)).expect("link a fake");
         self.installer_dir = Some(dir);
         self
     }
