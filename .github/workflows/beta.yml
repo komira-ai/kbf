@@ -484,9 +484,13 @@ jobs:
   # here (the Linux jobs run the same tests against /proc, where the network is not
   # enforced); the daemon binary is built and started with each driver, which
   # detects the node through sysctl.
+  #
+  # 75 minutes: a passing run took about 41 (run 39670620620) and the next, with the slot
+  # clean's mutants added and slower test steps on the same runner type, passed every test
+  # step up to the last and was cancelled at 45 (run 39688515489).
   native-macos:
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     permissions:
       contents: read
     env:
