@@ -12,12 +12,39 @@ use crate::router::{Router, unavailable, write_order};
 use crate::source::MapView;
 
 /// Which question a FindMissing round asks of a node.
-#[derive(Clone, Copy)]
-enum Ask {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ask {
     /// Blobs it can serve, RAM-held ones included ([`kbf_storage::Storage::find_missing`]).
     Servable,
     /// Blobs on its disk only ([`kbf_storage::Storage::find_durable`]).
     Durable,
+    /// Blobs on its disk only, after it has waited for its held ones to be written
+    /// ([`kbf_storage::Storage::find_durable_waiting`]).
+    DurableWaiting,
+}
+
+impl Ask {
+    /// The durable question, waiting for held blobs when `wait`.
+    pub(crate) const fn durable(wait: bool) -> Self {
+        if wait {
+            Self::DurableWaiting
+        } else {
+            Self::Durable
+        }
+    }
+
+    /// The question, asked of `node` about `digests`.
+    pub(crate) async fn of(
+        self,
+        node: &dyn kbf_storage::Storage,
+        digests: &[Digest],
+    ) -> Result<Vec<Digest>, StorageError> {
+        match self {
+            Self::Servable => node.find_missing(digests).await,
+            Self::Durable => node.find_durable(digests).await,
+            Self::DurableWaiting => node.find_durable_waiting(digests).await,
+        }
+    }
 }
 
 impl Router {
@@ -58,11 +85,20 @@ impl Router {
     /// so a digest is answered by its primary, or by the next owner when the primary
     /// cannot answer. The question rule 2 asks before a durable record names a blob.
     ///
+    /// With `wait`, each node first waits, for at most its own `--durable-wait`, for its
+    /// held blobs among the digests to be written (`kbf-durable: wait`), so a blob that
+    /// is on its way to the disk is not reported missing.
+    ///
     /// # Errors
     /// As [`Router::find_missing`].
-    pub async fn find_durable(&self, digests: &[Digest]) -> Result<Vec<Digest>, StorageError> {
+    pub async fn find_durable(
+        &self,
+        digests: &[Digest],
+        wait: bool,
+    ) -> Result<Vec<Digest>, StorageError> {
+        let ask = Ask::durable(wait);
         let missing = self
-            .routed(|view| async move { self.find_in_as(&view, digests, Ask::Durable).await })
+            .routed(|view| async move { self.find_in_as(&view, digests, ask).await })
             .await?;
         Ok(digests
             .iter()
@@ -116,10 +152,7 @@ impl Router {
                 // A node bounds the digests of one call, so a long list is several.
                 let mut lacking = Vec::new();
                 for chunk in asked.chunks(MAX_FIND_MISSING_DIGESTS) {
-                    lacking.extend(match ask {
-                        Ask::Servable => node.find_missing(chunk).await?,
-                        Ask::Durable => node.find_durable(chunk).await?,
-                    });
+                    lacking.extend(ask.of(node.as_ref(), chunk).await?);
                 }
                 Ok(lacking)
             }))

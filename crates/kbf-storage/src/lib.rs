@@ -90,6 +90,23 @@ pub trait Storage: Send + Sync {
     /// The store could not answer; never a partial answer.
     fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>>;
 
+    /// [`Storage::find_durable`] after first waiting, for at most the node's own bound
+    /// (`--durable-wait`), for the held digests among `digests` to be written to the
+    /// disk (`kbf-durable: wait` on the wire). A digest still held when the bound ends is
+    /// missing, as a durable answer says. What a caller asks before it writes something
+    /// durable that names a blob and can afford to wait for the write-behind to catch up.
+    ///
+    /// The default asks [`Storage::find_durable`] without waiting: a storage that holds
+    /// nothing in RAM has nothing to wait for, and one that does and does not override
+    /// this refuses a held blob at once instead of reporting it durable, which is the safe
+    /// side.
+    ///
+    /// # Errors
+    /// The store could not answer; never a partial answer.
+    fn find_durable_waiting<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        self.find_durable(digests)
+    }
+
     /// A whole blob, checked against its digest, after touching it: for a blob the
     /// caller decodes. A blob of any size is read with [`Storage::read_range`], a window
     /// at a time.

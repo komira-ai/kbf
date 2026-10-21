@@ -450,6 +450,32 @@ pub struct Args {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub write_pool_stream_idle: u64,
+    /// How long, in seconds, a storage node waits for blobs it holds in RAM to be written
+    /// to its disk when a caller asks for a durable answer that waits (`kbf-durable:
+    /// wait`): an action-cache entry is committed only once every blob it names is on
+    /// an owner's disk, and the writer of the entry asks each owner with this wait; the
+    /// action's owner waits the same for its own copies. A blob still in RAM when it ends
+    /// is reported missing and the write fails UNAVAILABLE, for the caller to try again.
+    /// Nothing holds a blob in RAM yet, so no call waits. At least 1, and under half of
+    /// the 120 seconds a chain's replica may take to commit a blob
+    /// (`kbf_storage::replicate::ChainConfig`): a start with more is refused.
+    #[arg(
+        long,
+        default_value_t = kbf_front::DEFAULT_DURABLE_WAIT.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub durable_wait: u64,
+    /// How long, in seconds, after its own write of a blob it acknowledged from RAM a
+    /// storage node waits before it asks the blob's other owner whether the blob is on its
+    /// disk too, and journals a repair debt if it is not. Long enough that the usual answer
+    /// is yes and nothing is journalled. Nothing acknowledges from RAM yet, so no node
+    /// asks. At least 1.
+    #[arg(
+        long,
+        default_value_t = kbf_storage::repair::RepairConfig::default().peer_grace.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub ram_peer_grace: u64,
     /// How many times a segment PUT is tried. Only a PUT that did not complete
     /// (connect, reset, timeout) or that the store answered 5xx is tried again, after
     /// 100 ms and then four times longer each time, under a new object key; if every
@@ -600,6 +626,12 @@ pub enum ConfigError {
          a segment upload holds its ranges in memory under that bound"
     )]
     SegmentUploadOverWriteBound { cap: u64, bound: u64 },
+    /// A write that waits for blobs to be written could outlast the chain's commit bound.
+    #[error(
+        "--durable-wait {wait} is not under half of the {bound} seconds a chain's replica \
+         may take to commit a blob: a write that waited that long would be judged lost"
+    )]
+    DurableWaitOverCommitBound { wait: u64, bound: u64 },
     /// `kbf storage` would serve plain text off loopback, admitting every caller.
     #[error(
         "--storage-listen {addr} is not a loopback address and the node has no TLS, so it \
@@ -687,9 +719,11 @@ impl Args {
     ///
     /// # Errors
     /// A TLS file cannot be read; `--segment-upload-max-bytes` is over
-    /// `--write-bytes-in-flight`; `--memory-ladder-gib` is not a ladder.
+    /// `--write-bytes-in-flight`; `--durable-wait` is not under half the chain's commit
+    /// bound; `--memory-ladder-gib` is not a ladder.
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
         self.segment_upload_fits_write_bound()?;
+        self.durable_wait_fits_commit_bound()?;
         let reload = Duration::from_secs(self.tls_reload_interval_secs);
         let deny_list = self
             .worker_deny_list
@@ -918,6 +952,36 @@ impl Args {
             queue: self.write_pool_queue,
             stream_idle: Duration::from_secs(self.write_pool_stream_idle),
         }
+    }
+
+    /// How long a caller that needs held blobs written waits for them: `--durable-wait`.
+    #[must_use]
+    pub const fn durable_wait(&self) -> Duration {
+        Duration::from_secs(self.durable_wait)
+    }
+
+    /// How a node's repair worker and peer confirmer are paced: the defaults of
+    /// [`kbf_storage::repair::RepairConfig`] and `--ram-peer-grace`.
+    #[must_use]
+    pub fn repair_config(&self) -> kbf_storage::repair::RepairConfig {
+        kbf_storage::repair::RepairConfig {
+            peer_grace: Duration::from_secs(self.ram_peer_grace),
+            ..kbf_storage::repair::RepairConfig::default()
+        }
+    }
+
+    /// Refuses a `--durable-wait` of half the chain's commit bound or more: a replica
+    /// that waited that long for a blob to be written would be judged lost by its primary.
+    /// A function of its own, as [`Args::segment_upload_fits_write_bound`] is.
+    pub(crate) fn durable_wait_fits_commit_bound(&self) -> Result<(), ConfigError> {
+        let bound = kbf_storage::replicate::ChainConfig::default().commit;
+        if self.durable_wait() * 2 >= bound {
+            return Err(ConfigError::DurableWaitOverCommitBound {
+                wait: self.durable_wait,
+                bound: bound.as_secs(),
+            });
+        }
+        Ok(())
     }
 
     /// The width of the CPU-bound pool on this machine: `--cpu-threads`, else one

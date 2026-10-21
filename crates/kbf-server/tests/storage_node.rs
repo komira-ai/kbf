@@ -3,6 +3,7 @@
 //! (docs/design/architecture-v2.md, section 9).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use bytes::Bytes;
 use clap::CommandFactory as _;
@@ -143,6 +144,21 @@ async fn flags_that_do_not_make_a_node_are_refused() {
     )
     .expect("parses");
     assert!(over.listener().is_err());
+    let slow = flags(&d, &["--durable-wait=60".to_owned()]).expect("parses");
+    assert!(
+        slow.listener().is_err(),
+        "a wait of half the chain's commit bound"
+    );
+    let quick = flags(
+        &d,
+        &[
+            "--durable-wait=59".to_owned(),
+            "--ram-peer-grace=3".to_owned(),
+        ],
+    )
+    .expect("parses");
+    assert!(quick.listener().is_ok());
+    assert_eq!(quick.repair.peer_grace, Duration::from_secs(3));
     let missing: Vec<String> = ["tls-cert", "tls-key", "client-ca"]
         .iter()
         .map(|n| format!("--storage-{n}={}", d.join(format!("no-{n}.pem")).display()))

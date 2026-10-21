@@ -22,8 +22,10 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use bytes::Bytes;
+use kbf_meta::Closure;
 use kbf_types::Digest;
 
 #[cfg(feature = "testkit")]
@@ -48,10 +50,16 @@ impl std::fmt::Debug for BetweenCell {
     }
 }
 
+/// How long [`Cache::durable_waiting`] and the action-cache barrier wait for held blobs to
+/// be written unless [`Cache::with_durable_wait`] says otherwise (`--durable-wait`).
+pub const DEFAULT_DURABLE_WAIT: Duration = Duration::from_secs(10);
+
 /// The set: digest to the verified bytes.
 #[derive(Debug, Default)]
 pub(super) struct Held {
     blobs: Mutex<BTreeMap<Digest, Bytes>>,
+    /// Woken when an entry has left, for a caller waiting for digests to be written.
+    left: tokio::sync::Notify,
 }
 
 impl Held {
@@ -76,7 +84,22 @@ impl Held {
     /// Drops `digest`; whether it was held.
     #[cfg(any(test, feature = "testkit"))]
     pub(super) fn remove(&self, digest: &Digest) -> bool {
-        self.blobs().remove(digest).is_some()
+        let removed = self.blobs().remove(digest).is_some();
+        if removed {
+            self.left.notify_waiters();
+        }
+        removed
+    }
+
+    /// Whether nothing is held.
+    fn is_empty(&self) -> bool {
+        self.blobs().is_empty()
+    }
+
+    /// Whether any of `digests` is held.
+    fn any(&self, digests: &[Digest]) -> bool {
+        let blobs = self.blobs();
+        !blobs.is_empty() && digests.iter().any(|d| blobs.contains_key(d))
     }
 
     /// The bytes held under `digest`.
@@ -195,5 +218,85 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             .into_iter()
             .filter(|d| !super::is_empty_blob(d))
             .collect())
+    }
+
+    /// [`Cache::durable`] after waiting, for at most [`Cache::with_durable_wait`], for the
+    /// held digests among `digests` to leave the set (`kbf-durable: wait`
+    /// ([`kbf_storage::Storage::find_durable_waiting`])). A digest still held when the
+    /// bound ends is missing, because the answer comes from the index alone.
+    ///
+    /// # Errors
+    /// As [`Cache::durable`].
+    pub async fn durable_waiting(&self, digests: &[Digest]) -> Result<Vec<Digest>, CacheError> {
+        self.wait_drained(digests).await;
+        self.durable(digests).await
+    }
+
+    /// Returns when none of `digests` is held, or [`Cache::with_durable_wait`] after it
+    /// was called, whichever comes first; at once when none is held (always, while
+    /// nothing puts a blob in the set). A blob leaves the set only after the index has
+    /// it, so a caller that asks the index afterwards finds what has left.
+    pub(super) async fn wait_drained(&self, digests: &[Digest]) {
+        if !self.held.any(digests) {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + self.durable_wait;
+        loop {
+            // Registered before the set is looked at again, so an entry that leaves in
+            // between wakes this wait instead of being missed.
+            let left = self.held.left.notified();
+            tokio::pin!(left);
+            left.as_mut().enable();
+            if !self.held.any(digests) {
+                return;
+            }
+            self.parked();
+            if tokio::time::timeout_at(deadline, left).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// [`Cache::wait_drained`] for the blobs of an action-cache entry: `result` if given,
+    /// and `closure`. The AC owner's barrier (`docs/design/storage-ram-ack.md`, rule 2,
+    /// step b): the entry is checked against the index, so a blob this node holds only in
+    /// RAM must have been written first. No allocation while nothing is held.
+    pub(super) async fn wait_for_entry(&self, result: Option<&Digest>, closure: &Closure) {
+        if self.held.is_empty() {
+            return;
+        }
+        let digests: Vec<Digest> = result.into_iter().chain(closure.iter()).copied().collect();
+        self.wait_drained(&digests).await;
+    }
+
+    /// The same cache, waiting at most `wait` for held blobs to be written where a caller
+    /// asks it to ([`Cache::durable_waiting`], and the action-cache writes, which wait for
+    /// the blobs of the entry): `--durable-wait`, [`DEFAULT_DURABLE_WAIT`] unless set.
+    #[must_use]
+    pub fn with_durable_wait(mut self, wait: Duration) -> Self {
+        self.durable_wait = wait;
+        self
+    }
+
+    /// Notes that a wait is parked, for [`Cache::parked_for_test`].
+    #[cfg(feature = "testkit")]
+    fn parked(&self) {
+        self.parks.send_modify(|n| *n += 1);
+    }
+
+    /// Notes that a wait is parked: nothing in a release build.
+    #[cfg(not(feature = "testkit"))]
+    #[expect(clippy::unused_self, reason = "the testkit build counts the wait here")]
+    fn parked(&self) {}
+
+    /// Returns once `count` waits for held blobs have parked in all (each time a wait
+    /// finds a blob of its digests still held and sleeps until one leaves or its bound
+    /// ends). A positive event for a test to wait on, so it never polls or sleeps. Only
+    /// with the `testkit` feature.
+    #[cfg(feature = "testkit")]
+    pub async fn parked_for_test(&self, count: usize) {
+        let mut parks = self.parks.subscribe();
+        // The sender lives in `self`, so the wait ends in the count.
+        let _ = parks.wait_for(|n| *n >= count).await;
     }
 }
