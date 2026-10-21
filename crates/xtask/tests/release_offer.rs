@@ -60,14 +60,15 @@ fn bundle(sha: &str, fake_flags: Option<&str>) -> String {
     format!("{b}\n")
 }
 
-/// The assets of commit [`C`] for `platforms` in `<root>/dist`: tarball, SBOM, bundle.
+/// The assets of commit [`C`] for `platforms` in `<root>/dist`: tarball, SBOM, bundle, and
+/// the version facts of `kbf` (listed, as the build job leaves them).
 /// Returns the dist directory and the (sha, name) lines of its `SHA256SUMS`.
 fn make_dist(root: &Path, platforms: &[&str]) -> (PathBuf, Vec<(String, String)>) {
     let dist = root.join("dist");
     std::fs::create_dir_all(&dist).unwrap();
     let mut lines = Vec::new();
     for p in platforms {
-        for ext in ["cdx.json", "tar.gz"] {
+        for ext in ["cdx.json", "tar.gz", "version.json"] {
             let name = format!("kbf-{C}-{p}.{ext}");
             let bytes = format!("{name} bytes");
             std::fs::write(dist.join(&name), &bytes).unwrap();
@@ -504,6 +505,77 @@ fn an_incomplete_platform_or_a_damaged_release_is_refused() {
         &a,
     ));
     assert!(!why.is_empty());
+    assert!(a.asked().is_empty());
+}
+
+#[test]
+fn a_platform_whose_kbf_has_no_version_facts_is_refused() {
+    // Catches: a release offered for a platform whose build job left no version facts (the
+    // farm would have nothing to read of that platform's kbf, the age check nothing to
+    // compare), and a refusal that does not name the tarball and the missing file. The
+    // release is otherwise complete: every other test of this file offers it. Mutant: the
+    // pairing taken out of `verify_sums`.
+    let root = scratch("no-facts");
+    let (dist, lines) = make_dist(&root, &["linux-x86_64", "darwin-arm64"]);
+    let facts = format!("kbf-{C}-darwin-arm64.version.json");
+    std::fs::remove_file(dist.join(&facts)).unwrap();
+    let kept: String = lines
+        .iter()
+        .filter(|(_, n)| *n != facts)
+        .map(|(s, n)| format!("{s}  {n}\n"))
+        .collect();
+    std::fs::write(dist.join("SHA256SUMS"), kept).unwrap();
+    let a = Recorded::all(C);
+    let w = || Evidence::Waived {
+        reason: "r",
+        operator: "o",
+    };
+    let why = refused(plan(&request(&dist, w()), &a));
+    let tarball = format!("kbf-{C}-darwin-arm64.tar.gz");
+    let want = format!("{tarball}: its version facts {facts} are not listed");
+    assert!(why.contains(&want), "{why}");
+    assert!(a.asked().is_empty());
+}
+
+#[test]
+fn a_platform_with_only_another_binarys_tarball_is_refused_for_want_of_kbf_facts() {
+    // Catches: a platform counted complete by the tarball of `kbf-daemon` (any tarball of
+    // the platform counts for the tarball rule), though the offer reads the facts of its
+    // `kbf` and the release has no `kbf` there at all: the sums pairing only fires for a
+    // listed `kbf` tarball. Mutant: the facts requirement taken out of `incomplete`.
+    let root = scratch("daemon-only");
+    let (dist, lines) = make_dist(&root, &["linux-x86_64", "darwin-arm64"]);
+    let mut kept: Vec<(String, String)> = lines
+        .into_iter()
+        .filter(|(_, n)| !n.starts_with(&format!("kbf-{C}-darwin-arm64.")))
+        .collect();
+    for ext in ["cdx.json", "tar.gz"] {
+        let name = format!("kbf-daemon-{C}-darwin-arm64.{ext}");
+        let bytes = format!("{name} bytes");
+        std::fs::write(dist.join(&name), &bytes).unwrap();
+        let sha = sha_of(bytes.as_bytes());
+        if ext == "tar.gz" {
+            let bundle_name = format!("{name}.sigstore.json");
+            let text = bundle(&sha, Some(&bundle_flags()));
+            std::fs::write(dist.join(bundle_name), text).unwrap();
+        }
+        kept.push((sha, name));
+    }
+    for gone in ["cdx.json", "tar.gz", "tar.gz.sigstore.json", "version.json"] {
+        std::fs::remove_file(dist.join(format!("kbf-{C}-darwin-arm64.{gone}"))).unwrap();
+    }
+    kept.sort_by(|a, b| a.1.cmp(&b.1));
+    let text: String = kept.iter().map(|(s, n)| format!("{s}  {n}\n")).collect();
+    std::fs::write(dist.join("SHA256SUMS"), text).unwrap();
+    let a = Recorded::all(C);
+    let w = || Evidence::Waived {
+        reason: "r",
+        operator: "o",
+    };
+    let why = refused(plan(&request(&dist, w()), &a));
+    let facts = format!("kbf-{C}-darwin-arm64.version.json");
+    let want = format!("platform darwin-arm64: no version facts {facts}");
+    assert!(why.contains(&want), "{why}");
     assert!(a.asked().is_empty());
 }
 
