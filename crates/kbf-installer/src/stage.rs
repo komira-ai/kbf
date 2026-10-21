@@ -886,7 +886,7 @@ fn open_owned(path: &Path, owner: Owner) -> Result<File, Refusal> {
     Ok(file)
 }
 
-pub(crate) fn sha256_of(mut file: File) -> io::Result<String> {
+fn sha256_of(mut file: File) -> io::Result<String> {
     let mut hash = Sha256::new();
     let mut buf = vec![0; 64 * 1024];
     loop {

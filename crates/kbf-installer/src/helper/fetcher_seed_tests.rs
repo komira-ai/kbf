@@ -682,7 +682,7 @@ fn a_seed_that_is_not_whole_is_not_found_whole() {
     type Plant = fn(&mut Seeded);
     type Tweak = fn(&Seeded, &mut FakeExec);
     let flux = |what: &str| format!("fetch: package_in_flux: {what} is not the one ");
-    let cases: [(&str, Plant, Tweak, String); 7] = [
+    let cases: [(&str, Plant, Tweak, String); 10] = [
         (
             "a flipped byte",
             |s| {
@@ -730,6 +730,32 @@ fn a_seed_that_is_not_whole_is_not_found_whole() {
             |_, _| {},
             "fetch: rejected: attestation: ".to_owned(),
         ),
+        (
+            "a tarball that is a directory",
+            |_| {},
+            |s, _| {
+                let path = s.layout.join(&s.tarball_path());
+                fs::remove_file(&path).expect("remove");
+                fs::create_dir(&path).expect("a directory");
+            },
+            "fetch: seed_missing: ".to_owned(),
+        ),
+        (
+            "a manifest of another build",
+            |s| s.manifest["commit"] = A.into(),
+            |_, _| {},
+            "commit_or_ref: seed_mismatch: the manifest is for ".to_owned(),
+        ),
+        (
+            "a bundle over the cap",
+            |s| {
+                s.bundle = vec![b'x'; 300_000];
+                s.attested = s.bundle.clone();
+                s.reseal();
+            },
+            |_, _| {},
+            "fetch: rejected: size: ".to_owned(),
+        ),
     ];
     for (index, (what, plant, tweak, want)) in cases.into_iter().enumerate() {
         let (seeded, found) = looked_at(&format!("seed-look-bad-{index}"), plant, tweak);
@@ -742,8 +768,7 @@ fn a_seed_that_is_not_whole_is_not_found_whole() {
     // A tarball one byte longer than the manifest says is its own word: the size.
     let (seeded, found) = looked_at("seed-look-longer", |s| s.tarball.push(0), |_, _| {});
     let want = format!(
-        "fetch: package_in_flux: the tarball is {} bytes, the manifest says {}",
-        seeded.tarball.len(),
+        "fetch: package_in_flux: the tarball is not the {} bytes the manifest names",
         seeded.tarball.len() - 1
     );
     assert_eq!(found.expect_err("longer").to_string(), want);

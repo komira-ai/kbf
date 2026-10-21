@@ -49,9 +49,7 @@ use crate::refusal::{Refusal, TrustFault};
 use crate::run::Runner;
 use crate::seed::{COMPONENT, Looked, MANIFEST, Manifest, Noticed, SeedFacts};
 use crate::settings::Settings;
-use crate::stage::{
-    Fetched, Order, OrderKind, Partial, Pipeline, Policy, Received, Verifier, sha256_of,
-};
+use crate::stage::{Fetched, Order, OrderKind, Partial, Pipeline, Policy, Received, Verifier};
 use crate::trust::trusted_chain;
 
 /// Verifies and installs the release the package carries, as of the moment it is asked.
@@ -215,14 +213,19 @@ impl SeedFetcher {
         let missing = |e: io::Error| {
             FetchError::Unavailable(format!("seed_missing: {}: {e}", from.display()))
         };
+        // Counted and hashed in one read of at most one byte more than the manifest says, as a
+        // fetch counts what it brings in: a file that is longer is seen to be, not read to its end.
         let file = open_nofollow(&from).map_err(missing)?;
-        let len = file.metadata().map_err(missing)?.len();
-        if len != manifest.tarball_size {
-            let says = manifest.tarball_size;
-            let why = format!("the tarball is {len} bytes, the manifest says {says}");
+        let says = manifest.tarball_size;
+        let mut limited = file.take(says.saturating_add(1));
+        let read = copy_hashed(&mut limited, &mut io::sink());
+        let (len, digest) = read.map_err(|fault| match fault {
+            CopyFault::Read(e) | CopyFault::Write(e) => missing(e),
+        })?;
+        if len != says {
+            let why = format!("the tarball is not the {says} bytes the manifest names");
             return Err(flux(&why));
         }
-        let digest = sha256_of(file).map_err(missing)?;
         if digest != manifest.tarball_sha256.as_str() {
             return Err(flux("the tarball is not the one the manifest names"));
         }
