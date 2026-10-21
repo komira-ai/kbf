@@ -1754,7 +1754,7 @@ Errors are JSON, `{"error": "<why>"}`, as everywhere in this API.
 ## `GET /ui`: the web UI
 
 Read-only pages for people with a browser, server-rendered HTML from the `kbf-ui` crate
-([design](design/kbf-ui-v1.md)). On the operator API listener, **on by default**:
+([design](design/kbf-ui-v1.md), [operator guide](deploy/kbf-ui.md)). On the operator API listener, **on by default**:
 `--ui=false` turns it off and every `/ui` path is then a `404`. Without `--api-listen`
 there is nothing to mount it on.
 

@@ -1,6 +1,19 @@
 # kbf UI v1: design
 
-Status: approved with the CEO rulings below (amended 2026-10-20 from the proposal). Read-only web UI for operators and agents. Facts below were read on `feature/arch-v2`; "built" means the code there, "new" means not built. Where this document and `ui-data.md` differ on serving, access or tests, this one wins (`ui-data.md` carries the matching amendments).
+Status: approved with the CEO rulings below (amended 2026-10-20 from the proposal). Read-only web UI for operators and agents. Built marks were re-read against `main` on 2026-10-20, after every page and route merged: "built" means the code on `main`, "follow-up" means not built. The built and follow-up lists are in "Built on main" below; the operator guide is [deploy/kbf-ui.md](../deploy/kbf-ui.md). Where this document and `ui-data.md` differ on serving, access or tests, this one wins (`ui-data.md` carries the matching amendments).
+
+## Built on main
+
+Built: all twelve pages (Overview, Builds, Build, Action, Targets, Target, Nodes, Node, Leases, Queue, Storage, Updates) in the `kbf-ui` crate; the mount in `kbf-server` (`ui_mount.rs`, `--ui` default on, GET and HEAD, the four security headers, the stylesheet at `/ui/static/kbf.css`); the read limiter (`read_limit.rs`); the proxy `/ui` route with open class and the `[proxy] ui` setting, default on; the routes `/v1/invocations/{id}/failures`, `/v1/leases`, `/v1/queue`, `GET /v1/nodes/{id}`, `/v1/health`, and `/v1/storage` with the seven write-tier fields; the black-box suite through the real proxy (`kbf-integration-test`, `ui_through_proxy`); the operator guide (D1).
+
+Differences from the page table in 3, as built:
+
+- There is **no Log page** (`/ui/runs/{run_id}/logs/{stream}`). The Action page shows a failed action's log tails and links the route that downloads the whole log. A full-log page, with ranges, is a follow-up.
+- Target and Targets read `/v1/grid` (and `/v1/tests`, `/v1/shapes/{key}`), not `/v1/shapes/{key}/runs`: a strip is one cell per **build**, the last 16, each a link to its build.
+- Overview reads `/v1/health` and `/v1/invocations`, not `/readyz`. Node reads `/v1/nodes/{id}` only: its leases are the ids in that answer, and it shows no recent failed runs. Storage reads `/v1/storage` only: no cache or cold-store section, and `/v1/members` and `/v1/object-stores` are not read. Build has no slowest-actions list and no banner for `restored` or `gap_from` (it shows `rows capped` in the state line).
+- Refresh is opt-in on Overview, Nodes and Node only (`?refresh=` 5, 10, 30 or 60); no page refreshes by default, and Leases, Queue and Storage have no refresh.
+
+Follow-up, not built: the Log page and its one-line "unredacted" note; `Permissions-Policy`, CORP and COOP; HSTS and the security headers on the proxy's own pages (the 503 handover page); the public-name SNI certificate setting; the 25 percent read-budget share and a ranged-log cap; the server start time on the restart notice (the notice itself is built); the `ui-data.md` and `ARCHITECTURE.md` text listed under R0.
 
 ## CEO rulings (2026-10-20)
 
@@ -75,37 +88,37 @@ These amend the proposal. Where an older sentence below contradicts them, the ru
 
 ## 3. Pages
 
-Freshness: **static** (loaded once) or **refresh N** (`?refresh=N`, 3.1). All paths are under `/ui`. Marks: **built** (in `kbf-ui` today, four pages), **new**, **moved**.
+Freshness: **static** (loaded once) or **refresh N** (`?refresh=N`, 3.1). All paths are under `/ui`. Marks: **built** (on `main`, in `kbf-ui`; eleven of the twelve pages) or **follow-up** (the Log page). The Freshness column is the design's; the Mark column says what was built.
 
 | Page | Path | Shows | Reads | Freshness | Mark |
 |---|---|---|---|---|---|
-| Overview | `/ui` | Version, ready and failing checks, nodes by state, queue depth, lease count, under-replicated blobs, last 10 builds. Update state is not in `/v1/health`; the page links `/ui/updates` for it | `/readyz`, `/v1/health`, `/v1/invocations?page_size=10` | refresh 30 | new, **moves** the built id lookup |
-| Builds | `/ui/builds` | Recent invocations; filters instance, since, until, state; id lookup (GET form) | `/v1/invocations` | static | the built `/ui` page moves here |
-| Build | `/ui/builds/{id}` | Summary, failed actions first, slowest, banners for `restored`, `rows_capped`, `gap_from`, `complete:false` | `/v1/invocations/{id}`, `.../actions`, `.../failures` | refresh while `open` | built, extended |
-| Action | `/ui/builds/{id}/actions/{digest}` | Attempts, node, timings, exit, reason, wait reason, command arguments and environment names for failed runs, log tails | `.../actions/{digest}`, `/v1/runs/{id}` | static | built, extended |
-| Log | `/ui/runs/{run_id}/logs/{stream}` | Whole log as escaped text, ranged, link to the raw route, one-line "unredacted" note | `/v1/runs/{id}/logs/{stream}`, `/v1/blobs/{digest}` | static | new |
-| Targets | `/ui/targets` | Shapes and tests, filter by status, each with a strip of its latest outcomes | `/v1/shapes`, `/v1/tests` | static | new (1.2) |
-| Target | `/ui/targets/{key}` | A target's recent runs (last 16) as a pass/fail strip, oldest left, each cell a link to its run; the server's label | `/v1/shapes/{key}`, `/v1/shapes/{key}/runs` | static | new (1.2) |
-| Nodes | `/ui/nodes` | Connected, placement, phase, software, update state, `needs_attention`, lease count, booked | `/v1/nodes` | refresh 10 | new |
-| Node | `/ui/nodes/{id}` | Capacity, booked, free, leases, recent failed runs (today only) | `/v1/nodes/{id}`, `/v1/leases?node=`, `/v1/runs?node=` | refresh 10 | new |
-| Leases | `/ui/leases` | Lease, node, age, phase, operation | `/v1/leases` | refresh 10 | new |
-| Queue | `/ui/queue` | Depth, oldest age, per platform and QoS, why nothing can run it | `/v1/queue` | refresh 10 | new |
-| Storage | `/ui/storage` | Members, debts, open writes, under-replicated blobs, flush backlog (7 heartbeat fields, N7), cache, cold store (no lost-blob count: not built) | `/v1/members`, `/v1/storage`, `/v1/object-stores` | refresh 30 | new |
-| Updates | `/ui/updates` | Desired release, releases, host update state | `/v1/update`, `/v1/nodes`, `/v1/update/hosts` | static | built, unchanged |
+| Overview | `/ui` | Version, ready and failing checks, nodes by state, queue depth, lease count, under-replicated blobs, last 10 builds. Update state is not in `/v1/health`; the page links `/ui/updates` for it | `/readyz`, `/v1/health`, `/v1/invocations?page_size=10` | refresh 30 | **built**; reads `/v1/health` and `/v1/invocations`, not `/readyz`; refresh is opt-in, off by default |
+| Builds | `/ui/builds` | Recent invocations; filters instance, since, until, state; id lookup (GET form) | `/v1/invocations` | static | **built** (the id lookup moved here); filters are state and instance, not since and until |
+| Build | `/ui/builds/{id}` | Summary, failed actions first, slowest, banners for `restored`, `rows_capped`, `gap_from`, `complete:false` | `/v1/invocations/{id}`, `.../actions`, `.../failures` | static | **built**; no slowest list, no `restored` or `gap_from` banner, no refresh |
+| Action | `/ui/builds/{id}/actions/{digest}` | Attempts, node, timings, exit, reason, wait reason, command arguments and environment names for failed runs, log tails | `.../actions/{digest}`, `/failures`, `/v1/blobs/{digest}` | static | **built** (does not read `/v1/runs/{id}`) |
+| Log | `/ui/runs/{run_id}/logs/{stream}` | Whole log as escaped text, ranged, link to the raw route, one-line "unredacted" note | `/v1/runs/{id}/logs/{stream}`, `/v1/blobs/{digest}` | static | **follow-up**: not built; the Action page shows the tails and links the download |
+| Targets | `/ui/targets` | Shapes and tests, filter by status, each with a strip of its latest outcomes | `/v1/tests`, `/v1/grid` | static | **built** (1.2); needs `--history-objects` |
+| Target | `/ui/targets/{key}` | A target's recent runs (last 16) as a pass/fail strip, oldest left, each cell a link to its run; the server's label | `/v1/shapes/{key}`, `/v1/grid` | static | **built** (1.2); the strip is the last builds, not `/runs` |
+| Nodes | `/ui/nodes` | Connected, placement, phase, software, update state, `needs_attention`, lease count, booked | `/v1/nodes` | opt-in refresh | **built** |
+| Node | `/ui/nodes/{id}` | Capacity, booked, free, leases, recent failed runs (today only) | `/v1/nodes/{id}` | opt-in refresh | **built**; no recent failed runs |
+| Leases | `/ui/leases` | Lease, node, age, phase, operation | `/v1/leases` | static | **built**; `?node=` filter |
+| Queue | `/ui/queue` | Depth, oldest age, per platform and QoS, why nothing can run it | `/v1/queue` | static | **built** |
+| Storage | `/ui/storage` | Members, debts, open writes, under-replicated blobs, flush backlog (7 heartbeat fields, N7), cache, cold store (no lost-blob count: not built) | `/v1/storage` | static | **built**; no cache or cold-store section, `/v1/members` and `/v1/object-stores` are not read |
+| Updates | `/ui/updates` | Desired release, releases, host update state | `/v1/update`, `/v1/nodes`, `/v1/update/hosts` | static | **built** |
 
-The built `/ui` was the Builds id lookup and `BUILDS` read only `/v1/invocations/{id}`. Moving it changes that `Page` declaration and its tests (P1). With the mount (R5, #1373) the `kbf-ui` pages are served at `/ui` through the in-process `Source`; the page marks above say which pages exist (re-derive them against `PAGES` before relying on a mark).
+The id lookup that was once `/ui` is now on Builds (`BUILDS` declares `/v1/invocations` and `/v1/invocations/{id}`). The `kbf-ui` pages are served at `/ui` through the in-process `Source` (R5, #1373); the router in `kbf_ui::respond` is the list of pages (re-derive the marks against it before relying on one).
 
-**The target strip (P8).** One cell per run from `/v1/shapes/{key}/runs`, newest on the right, so a target that alternates pass and fail is visible without reading a number. A cell is an inline SVG with a class plus a text label (`pass`, `fail`, and any other outcome the route carries, shown as itself); status is never by colour alone. The UI draws what the route returns and computes no flake rate; any "flaky" label is the server's. On the Targets list each row carries the same strip for its latest outcomes.
+**The target strip (P8).** Built as one cell per build (the last 16) from `/v1/grid`, newest on the right, so a target that alternates pass and fail is visible without reading a number. A cell is a link to its build with a glyph and a text label naming the outcome (`pass`, `fail`, and any other outcome the route carries, shown as itself); status is never by colour alone. There is no SVG and no read of `/v1/shapes/{key}/runs`. The UI draws what the route returns and computes no flake rate; any "flaky" label is the server's. On the Targets list each row carries the same strip for its latest outcomes.
 
 ### 3.1 Rules for every page
 
 - **Absent means not measured.** Show "not measured" or "unknown", never zero. A null under-replicated count is "unknown".
 - **Honest limits.** `/v1/runs` and `/v1/actions/{digest}/runs` are today's index only: show `partial` and `covers_from`. The target strip shows how many runs the route returned, so a short strip is not read as a quiet target.
-- **Restart notice.** `/v1/nodes`, leases and queue are memory-only: after a restart or swap they are empty until daemons reconnect. These pages show the server start time and a banner, so an empty farm is not read as an outage.
+- **Restart notice.** `/v1/nodes`, leases and queue are memory-only: after a restart or swap they are empty until daemons reconnect. These pages show a banner, so an empty farm is not read as an outage (showing the server start time is a follow-up).
 - **Target labels.** The label shown is server-derived. A client-supplied `target_id`, commit or branch is shown apart, labelled "reported by client (hint)". `{key}` in `/ui/targets/{key}` is the server's shape key and only a lookup. Nothing is keyed on a query value.
 - **Query values are validated server-side.** `refresh` is one of 5, 10, 30, 60 (anything else is 400, not clamped silently). Filters are an enum or a bounded string. Unknown and duplicate parameters are 400.
-- **Refresh.** `<meta http-equiv="refresh" content="N">` with only the integer, never a `url=` part; the target is the page's own URL with its filters and `page_token` kept (tested). On a 503 or 429 page the interval is at least `Retry-After` plus jitter, so tabs do not stampede a new frontend after a swap. Default off, except Overview (30).
-- **Unredacted.** Lists show ids and shapes, not commands. The failures view shows arguments and environment names (N2), the Log page the whole log, all as recorded; the Logs page says so in one line. No gate.
+- **Refresh.** `<meta http-equiv="refresh" content="N">` with only the integer, never a `url=` part; the target is the page's own URL with its filters and `page_token` kept (tested). Built: a page whose read failed does not refresh at all, so tabs do not stampede a new frontend after a swap (the `Retry-After`-plus-jitter interval is not built). Refresh is off by default on every page, including Overview, and offered on Overview, Nodes and Node only.
+- **Unredacted.** Lists show ids and shapes, not commands. The failures view shows arguments and environment names (N2), the Action page the log tails, all as recorded. No gate. The one-line "unredacted" note belongs to the Log page, which is not built, so no page carries it today (follow-up; the operator guide says it).
 - **Errors.** Rendered from the stable error code only, escaped. `WWW-Authenticate` is never passed on (it would make a browser prompt for credentials on the farm's origin). `Retry-After` is parsed as an integer or date and re-emitted normalised.
 
 ## 4. Data sources and the read API
@@ -114,7 +127,7 @@ The built `/ui` was the Builds id lookup and `BUILDS` read only `/v1/invocations
 
 Build pages, history routes, nodes, members, storage, frontend drain, update, update hosts, releases, object-stores, blobs (`inline=text` to 4 MiB), `/healthz`, `/readyz`. Page-size limits differ per route and the UI uses each route's own: the invocation routes allow 1 to 1000 (`MAX_PAGE_SIZE`), the cross-build routes 1 to 200.
 
-History is on only when the farm runs `--history-objects=<URI>`, which needs `--state-store` (Postgres). Left out, nothing is recorded and the history pages answer "history is off" naming the flag. `--history-objects` accepts `s3://...` or `file:///dir`, and `file://` with a state store is accepted today (the directory is owned by one process): single frontend only. A multi-frontend on-prem farm uses an S3-compatible store. **Postgres is an operator-provided runtime dependency**: its provisioning, backup and restore belong to the operator, and this design adds none.
+History is on only when the farm runs `--history-objects=<URI>`, which needs `--state-store` (Postgres). Left out, nothing is recorded and the history routes (`/v1/tests`, `/v1/grid`, the run routes) are not mounted, so they answer `404` and the Targets and Target pages show that `404`. A "History is off" page that names the flag is a follow-up (in review). `--history-objects` accepts `s3://...` or `file:///dir`, and `file://` with a state store is accepted today (the directory is owned by one process): single frontend only. A multi-frontend on-prem farm uses an S3-compatible store. **Postgres is an operator-provided runtime dependency**: its provisioning, backup and restore belong to the operator, and this design adds none.
 
 ### 4.2 New and changed routes (fields in Appendix A)
 
@@ -155,7 +168,7 @@ REAPI, worker, storage and enroll gates, the operator token on write and operato
 ### 5.3 Read-only enforcement and browser defences
 
 - **Read-only.** The `/ui` router accepts GET and HEAD; anything else is 405 (a test through the proxy covers POST, OPTIONS, HEAD). No form posts: the id lookup uses GET. A page-contract test refuses `method=post` and any non-GET link.
-- **Read limiter** (built in #1373, `read_limit.rs`). Each client has at most 4 reads open at once; the 5th is `429` with `Retry-After: 1`, answered before its handler runs. A slot is held until the answer's body is sent or dropped (a blob streams after its handler returns). A client is the node id the proxy named, else the client address; the proxy forwards the client address to the child so browsers are limited one by one (in flight with this change). `/ui` and the `/v1` read routes have separate limits, so a page cannot starve the API or the reverse. The `/v1` read routes (blobs, invocations, runs, `update/hosts`) now answer the same 429, a behaviour change for agents. Path checks: a path over 2048 bytes or a query over 4096 is `414`; a segment over 256 bytes, or one that decodes to a control character, is `400`. The 25 percent budget share and the ranged-log cap are not built.
+- **Read limiter** (built in #1373, `read_limit.rs`). Each client has at most 4 reads open at once; the 5th is `429` with `Retry-After: 1`, answered before its handler runs. A slot is held until the answer's body is sent or dropped (a blob streams after its handler returns). A client is the node id the proxy named, else the client address; the proxy forwards the client address to the child (`x-kbf-client-addr`, built) so browsers are limited one by one. `/ui` and the `/v1` read routes have separate limits, so a page cannot starve the API or the reverse. The `/v1` read routes (blobs, invocations, runs, `update/hosts`) now answer the same 429, a behaviour change for agents. Path checks: a path over 2048 bytes or a query over 4096 is `414`; a segment over 256 bytes, or one that decodes to a control character, is `400`. The 25 percent budget share and the ranged-log cap are not built.
 - **No cookies, no credentials.** The UI sets no cookie and reads none, so there is nothing to forge. No `Access-Control-Allow-*` header is ever sent. `Cross-Origin-Resource-Policy` and `Cross-Origin-Opener-Policy` (`same-origin`) are not built: follow-up unit.
 - **Headers on every `/ui` answer, errors and 405 included** (built in #1373, `ui_mount.rs`): `Content-Security-Policy: default-src 'none'; style-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'` (`kbf_ui::CONTENT_SECURITY_POLICY`; no script of any kind, `default-src` covers `script-src`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` (ids sit in URLs) and `Cache-Control: no-store` (pages carry logs). `Cross-Origin-Resource-Policy: same-origin`, `Cross-Origin-Opener-Policy: same-origin` and a `Permissions-Policy` denying the powerful features are set the same way (`ui_mount.rs`). **Not built, follow-up unit:** HSTS on the proxy (TLS ends there), and the security headers on the proxy's own pages (the 503 handover page); #1368 adds no headers.
 - **XSS.** `Html` escapes every string and has no raw write. Logs are untrusted: escaped text in `<pre>` only. Every emitted href is root-relative, with ids and `page_token` percent-encoded (asserted). Raw blob, log and flog routes answer `Content-Type: text/plain` or `application/octet-stream`, `Content-Disposition: attachment`, `nosniff` and a sandbox CSP; `inline=text` is always `text/plain`. Invalid UTF-8 is replaced, and a 16 KiB tail cut inside a code point is dropped. This matters more with an open UI: an uploaded HTML blob must never render on the farm's origin.
@@ -250,7 +263,7 @@ On by default: `--ui` defaults on and the installer's proxy config `ui` defaults
 | R10 | Storage health through the heartbeat: fields (`kbf-proto`), `/v1/storage` extension | Null-is-unknown; values recover after reconnect; mixed-version compatibility |
 | R11 | `/v1/health` | Same values as `/readyz` and the source routes |
 | P1 | Builds and Build (the move off `/ui`) | Layers 1, 2 and a proxy fetch |
-| P2 | Action and Log | same |
+| P2 | Action (built) and Log (follow-up, not built) | same |
 | P3 | Nodes and Node | same |
 | P4 | Leases | same |
 | P5 | Queue | same |
@@ -258,7 +271,7 @@ On by default: `--ui` defaults on and the installer's proxy config `ui` defaults
 | P7 | Overview, refresh option | same |
 | P8 | Targets and Target: a target's recent runs as a pass/fail strip to spot flakiness | same, plus the strip tests (7.1) |
 | R-T1 | Black-box minimum (7.3), through the real proxy | Layer 3 green; mutants red |
-| D1 | Operator guide: `--ui`, public-name certificate, the open-access and unredacted notice, Postgres as an operator-provided dependency | Followed on a clean cell |
+| D1 | Operator guide ([deploy/kbf-ui.md](../deploy/kbf-ui.md), built): what the UI is, reaching it, turning it off (`[proxy] ui = false`, `--ui=false`), the open and unredacted exposure, the read bound, the pages. Not in it: the public-name certificate (not built) and Postgres as an operator-provided dependency | Claims checked against `main`; not yet followed on a clean cell |
 
 Dropped, not rolled out: R1, R2, R4a, R4d, and the viewer parts of R4b and R4c (Sec-Fetch-Site refusal; the held-request caps stay as built).
 
