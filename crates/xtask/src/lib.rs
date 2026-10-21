@@ -600,6 +600,11 @@ enum ReleaseVerb {
     /// What a push would release: the next version, the push's class, and the freeze and
     /// superseded refusals. Writes nothing but `--output`.
     Plan(release::plan::PlanArgs),
+    /// Create the annotated release tag at `--sha` through the GitHub API: create-only,
+    /// after the stale-run guards; a tag that exists is reused only when it is the same.
+    Tag(release::tag::TagArgs),
+    /// Write the verdict document a release tag carries as its message.
+    VerdictWrite(release::verdict_write::WriteArgs),
     /// The same checks, then write the release's notes.
     Notes {
         #[command(flatten)]
@@ -1061,6 +1066,10 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         }
         Verb::Release(ReleaseVerb::Offer(args)) => release::offer::run(&args),
         Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
+        Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
+        Verb::Release(ReleaseVerb::VerdictWrite(args)) => {
+            release::verdict_write::run(&args, release::verdict::GATE_STAGE)
+        }
         Verb::Release(ReleaseVerb::Identity { dir, commit, out }) => {
             // The binary's unpacking place, of this process alone.
             let scratch =

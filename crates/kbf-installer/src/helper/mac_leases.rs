@@ -201,7 +201,7 @@ impl MacLeases {
         let launched: Vec<&Row> = rows.iter().filter(|r| r.ppid == 1).collect();
         let [daemon] = launched.as_slice() else {
             return Err(format!(
-                "{} processes started by launchd look like a kbf daemon (of pids {pids:?}); expected one",
+                "{} processes started by launchd look like a kbf daemon (of pids {pids:?}); expected one: run the daemon only as its launchd job (stop one started by hand, then `launchctl kickstart -k system/<its label>`)",
                 launched.len()
             ));
         };
@@ -222,7 +222,7 @@ impl MacLeases {
         let started = (self.now)() - daemon.elapsed;
         if started < config.changed_at + CLOCK_SLACK_SECS {
             return Err(format!(
-                "{file} changed after the daemon (pid {}) started: its data-dir may not be {}",
+                "{file} changed after the daemon (pid {}) started: its data-dir may not be {}; restart the daemon's launchd job (`launchctl kickstart -k system/<its label>`) so it reads the file, then order again",
                 daemon.pid, config.data_dir
             ));
         }

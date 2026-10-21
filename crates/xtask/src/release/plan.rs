@@ -33,9 +33,9 @@
 //! Prints `version`, `tag`, `reused`, `code`, `site` and `pipeline` as `key=value` lines,
 //! and appends them to `--output` (on Actions, `GITHUB_OUTPUT`).
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use super::append_output;
 use super::git::{git, git_output};
 use super::tags::{self, Base, Standing, Version};
 use crate::Error;
@@ -216,12 +216,7 @@ pub fn run(a: &PlanArgs) -> Result<Vec<String>, Error> {
         format!("pipeline={}", class.pipeline),
     ];
     if let Some(output) = &a.output {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(output)
-            .and_then(|mut f| writeln!(f, "{}", lines.join("\n")))
-            .map_err(Error::spawn(format!("append to {}", output.display())))?;
+        append_output(output, &lines)?;
     }
     Ok(lines)
 }
