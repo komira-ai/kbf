@@ -161,7 +161,10 @@ async fn every_answer_under_ui_carries_the_security_headers() {
     for (path, status) in [
         ("/ui", 200),
         ("/ui/static/kbf.css", 200),
-        ("/ui/builds", 200),
+        // The list reads `/v1/invocations`, which this router does not have: the page
+        // answers that route's `404`, with the headers.
+        ("/ui/builds", 404),
+        ("/ui/builds?id=x%2Fy", 404),
         ("/ui/nothing-here", 404),
         ("/ui/builds/%00", 400),
         (long.as_str(), 400),

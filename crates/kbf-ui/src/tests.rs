@@ -10,7 +10,9 @@ use std::sync::Mutex;
 use futures::executor::block_on;
 use serde_json::{Value, json};
 
-use crate::pages::{ACTION, BUILD, BUILDS, NODE, NODES, OVERVIEW, PAGES, UPDATES};
+use crate::pages::{
+    ACTION, BUILD, BUILDS, LEASES, NODE, NODES, OVERVIEW, PAGES, QUEUE, UPDATES, sched_farm,
+};
 use crate::read::Page;
 use crate::{Answer, CONTENT_SECURITY_POLICY, Fetched, Source, SourceError, respond};
 
@@ -62,6 +64,11 @@ impl Fake {
     /// Every URL asked, in order.
     pub(crate) fn seen(&self) -> Vec<String> {
         self.seen.lock().expect("not poisoned").clone()
+    }
+
+    /// Forgets the URLs asked so far.
+    pub(crate) fn forget_seen(&self) {
+        self.seen.lock().expect("not poisoned").clear();
     }
 }
 
@@ -181,8 +188,53 @@ pub(crate) fn stderr_blob() -> Value {
         "href": format!("/v1/blobs/{d}?instance=main&name=stderr&inline=text")})
 }
 
-/// A read API holding build `ID` with one page of three rows and a second page, and its
-/// failed action with a stderr blob.
+/// A build as `GET /v1/invocations` lists it, with `failed` failed actions.
+pub(crate) fn listed(id: &str, state: &str, failed: u64) -> Value {
+    json!({
+        "id": id, "first_seen": "2026-10-11T09:00:00.000000Z",
+        "last_seen": "2026-10-11T09:01:00.000000Z", "state": state,
+        "complete": state == "closed", "instances": ["main", "edge"],
+        "counts": {"ran": 2, "hits": 5, "failed": failed},
+        "href": format!("/v1/invocations/{id}"),
+    })
+}
+
+/// The first line of a failure's command arguments: markup, as a hostile build would pass.
+pub(crate) const ARGUMENT: &str = "-DNAME=\"<script>alert(1)</script>\" & more";
+
+/// The stderr object of a failure, with its tail (`tail` null for none) of `STDERR`.
+pub(crate) fn stderr_tail(tail: &Value, truncated: bool) -> Value {
+    let d = digest('5', 4096);
+    json!({"digest": d, "available": true,
+        "href": format!("/v1/blobs/{d}?instance=main&name=stderr&inline=text"),
+        "bytes": 4096, "tail": tail, "tail_bytes": STDERR.len(), "truncated": truncated})
+}
+
+/// An entry of `/failures` for the action `digest`, whose target is `target`.
+pub(crate) fn failure(digest: &str, target: &str, stderr: &Value) -> Value {
+    let mut f = row(
+        digest,
+        target,
+        &json!({"failed": {"code": 2, "message": "<img src=x onerror=alert(1)>"}}),
+    );
+    let extra = json!({
+        "failure": {"class": "infra", "reason": "<b>worker lost</b>"},
+        "command": {"arguments": ["clang", ARGUMENT, "-o", "out/lib.o"],
+            "environment_names": ["PATH", "<ENV>"], "working_directory": "/work/<dir>",
+            "platform": {"OSFamily": "linux", "<k>": "v&"}, "timeout_micros": 90_000_000,
+            "output_paths": ["out/lib.o"], "truncated": false},
+        "command_available": true,
+        "stdout": null,
+        "stderr": stderr,
+    });
+    for (k, v) in extra.as_object().expect("an object") {
+        f[k] = v.clone();
+    }
+    f
+}
+
+/// A read API holding build `ID` with one page of three rows and a second page, its
+/// list of failed actions in two pages, and its failed action with a stderr blob.
 pub(crate) fn farm() -> Fake {
     let base = format!("/v1/invocations/{ID}");
     let ok = row(
@@ -190,6 +242,12 @@ pub(crate) fn farm() -> Fake {
         "//app:ok",
         &json!({"ok": {"exit_code": 0}}),
     );
+    let mut ok_action = action(&stderr_blob());
+    ok_action["outcome"] = json!({"ok": {"exit_code": 0}});
+    ok_action["action"] = json!(digest('b', 10));
+    let tail = stderr_tail(&json!(STDERR), true);
+    let first = failure(&action_digest(), "//app:<b>lib</b>", &tail);
+    let second = failure(&digest('7', 20), "//app:retried", &tail);
     let failed = row(
         &action_digest(),
         "//app:<b>lib</b>",
@@ -208,7 +266,45 @@ pub(crate) fn farm() -> Fake {
             &format!("{base}/actions/{}", action_digest()),
             &action(&stderr_blob()),
         )
+        .json(
+            &format!("{base}/actions/{}", digest('b', 10)),
+            &ok_action,
+        )
+        .json(
+            &format!("{base}/failures"),
+            &json!({"invocation": invocation(ID), "failures": [first],
+                "next_page": format!("{base}/failures?page_token=f%2B1"),
+                "next_page_token": "f+1"}),
+        )
+        .json(
+            &format!("{base}/failures?page_token=f%2B1"),
+            &json!({"invocation": invocation(ID), "failures": [second]}),
+        )
+        .json(
+            &format!("{base}/actions/{}", digest('7', 20)),
+            &retried_action(),
+        )
+        .json(
+            "/v1/invocations",
+            &json!({"invocations": [listed(ID, "closed", 1), listed("<i>b2</i>", "open", 0)],
+                "next_page": "/v1/invocations?page_size=20&page_token=l%2B1"}),
+        )
+        .json(
+            "/v1/invocations?page_token=l%2B1",
+            &json!({"invocations": [], "partial": true}),
+        )
         .with(&stderr_href, 200, STDERR)
+}
+
+/// The answer of `/actions/{digest}` for `retried()`.
+fn retried_action() -> Value {
+    let mut a = retried();
+    let extra = json!({"outputs": [], "outputs_truncated": false, "stdout": null,
+        "stderr": null, "usage": null});
+    for (k, v) in extra.as_object().expect("an object") {
+        a[k] = v.clone();
+    }
+    a
 }
 
 pub(crate) const COMMIT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -339,7 +435,7 @@ pub(crate) fn health_doc() -> Value {
 }
 
 /// A build of `GET /v1/invocations`.
-pub(crate) fn listed(id: &str) -> Value {
+pub(crate) fn latest_build(id: &str) -> Value {
     json!({"id": id, "first_seen": "2026-10-11T09:00:00.000000Z",
         "last_seen": "2026-10-11T09:01:00.000000Z", "state": "closed", "complete": true,
         "counts": {"ran": 11, "hits": 12, "failed": 13}, "instances": ["main", HOSTILE],
@@ -357,7 +453,7 @@ pub(crate) fn fleet_farm() -> Fake {
         .json("/v1/nodes/mac-1", &fleet_node_detail())
         .json(
             LATEST_URL,
-            &json!({"invocations": [listed("build-1"), listed(HOSTILE)],
+            &json!({"invocations": [latest_build("build-1"), latest_build(HOSTILE)],
                 "next_page": "/v1/invocations?page_size=10&page_token=t"}),
         )
 }
@@ -366,6 +462,8 @@ pub(crate) fn fleet_farm() -> Fake {
 fn fake_for(page: &Page) -> Fake {
     if page.name == UPDATES.name {
         updates_farm()
+    } else if page.name == LEASES.name || page.name == QUEUE.name {
+        sched_farm()
     } else if [OVERVIEW.name, NODES.name, NODE.name].contains(&page.name) {
         fleet_farm()
     } else {
@@ -519,19 +617,36 @@ fn contract_table() -> Vec<(&'static Page, Vec<String>)> {
         (&OVERVIEW, vec!["/ui".to_owned()]),
         (
             &BUILDS,
-            vec!["/ui/builds".to_owned(), format!("/ui/builds?id={ID}")],
+            vec![
+                "/ui/builds".to_owned(),
+                "/ui/builds?page_token=l%2B1".to_owned(),
+                format!("/ui/builds?id={ID}"),
+            ],
         ),
         (
             &BUILD,
             vec![
                 format!("/ui/builds/{ID}"),
                 format!("/ui/builds/{ID}?page_token=t%2B1"),
+                format!("/ui/builds/{ID}?failures_token=f%2B1"),
             ],
         ),
-        (&ACTION, vec![action_page()]),
+        (
+            &ACTION,
+            vec![
+                action_page(),
+                // A succeeded action: its log is read from the blob route.
+                format!("/ui/builds/{ID}/actions/{}", digest('b', 10)),
+            ],
+        ),
         (&NODES, vec!["/ui/nodes".to_owned()]),
         (&NODE, vec!["/ui/nodes/mac-1".to_owned()]),
         (&UPDATES, vec!["/ui/updates".to_owned()]),
+        (
+            &LEASES,
+            vec!["/ui/leases".to_owned(), "/ui/leases?node=node-a".to_owned()],
+        ),
+        (&QUEUE, vec!["/ui/queue".to_owned()]),
     ]
 }
 
@@ -638,7 +753,8 @@ fn a_log_href_outside_the_declared_routes_is_not_read() {
         let fake = Fake::default().json(&base, &action(&stderr));
         let answer = render(&fake, &action_page());
         assert_eq!(answer.status(), 200);
-        assert_eq!(fake.seen(), [base], "{href}");
+        let failures = format!("/v1/invocations/{ID}/failures");
+        assert_eq!(fake.seen(), [base, failures], "{href}");
         let page = body(&answer);
         assert!(page.contains("is not a route this page declares"), "{page}");
         assert!(page.contains("problem bug"), "{page}");

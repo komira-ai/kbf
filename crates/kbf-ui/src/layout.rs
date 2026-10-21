@@ -12,6 +12,8 @@ const NAV: &[(&str, &str)] = &[
     ("Builds", "/ui/builds"),
     ("Nodes", "/ui/nodes"),
     ("Updates", "/ui/updates"),
+    ("Leases", "/ui/leases"),
+    ("Queue", "/ui/queue"),
 ];
 
 /// A URL the page asked for, as the page lists it.
