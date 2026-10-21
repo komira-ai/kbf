@@ -109,8 +109,8 @@ while the owner's map generation and published boot (`Member.boot`) are those it
 verified under: a restarted owner is the one whose holdings are least certain (a disk
 replaced or wiped while it was down, say), so a new boot drops its entries even when the
 generation did not move. Today no acknowledged blob lives only in RAM: an upload is
-answered after its bytes are synced and indexed, so a restart alone loses no acknowledged
-blob (**Planned**, [storage-ram-ack.md](storage-ram-ack.md): acknowledging from RAM would
+answered after its bytes are synced on the primary's hot disk and indexed (or, with no
+hot-disk room, are in the object store), so a restart alone loses no acknowledged blob (**Planned**, [storage-ram-ack.md](storage-ram-ack.md): acknowledging from RAM would
 make a restart able to lose one, and the closure check would then ask for durable
 presence only). A caller on an older map
 neither reads nor adds. An owner whose boot is 0 (unknown, a node from before the field)

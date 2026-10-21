@@ -2,8 +2,10 @@
 
 **Planned. Nothing in this document is built.** Every statement under "Today" describes
 the code; every other section describes a design. Until the change lands, a write is
-acknowledged only after it is on the disk of both owners, as [storage.md](storage.md),
-[write-path.md](write-path.md) and [architecture-v2.md](architecture-v2.md) say.
+acknowledged after it is durable on the primary and, unless the replica is lost (a repair
+debt is journaled first), on the replica; a blob with no hot-disk room is durable in the
+object store, and with one owner (R=1) there is one copy. [storage.md](storage.md),
+[write-path.md](write-path.md) and [architecture-v2.md](architecture-v2.md) describe this.
 
 The rules the design must keep:
 
@@ -96,7 +98,11 @@ it is asked for a Held answer from a new leg header value; repair-worker copies 
 send it, because they need a durable copy.
 
 **Replica lost at write time.** Write through, as today: journal the debt first, commit
-`Durable`, acknowledge. There is no weaker mode.
+`Durable`, acknowledge. There is no weaker mode. This includes the second owner taking a
+client write as primary while the first owner is dead but not yet Down in the map: `plan`
+in `chain.rs` makes it the primary with the first owner as the copy, the leg to the
+first owner fails as unreachable, which is "lost" (`Leg`, `ReplicaLeg::lost`), and the
+write goes through with a debt.
 
 ## Rule 1: reads and FindMissing
 
@@ -187,7 +193,8 @@ journal, off the ack path), and the existing worker copies the blob in `Durable`
 the peer is back. A restarted peer answers missing, so the survivor gets its debt. The
 normal path does no IO: the debt is written only when the peer is not durable. The set is
 capped; overflow journals the debt at once. `under_replicated_blobs` counts these debts.
-Residual: both owners crash inside the grace window, which is the kill-both case below.
+Residuals: both owners crash inside the grace window (the kill-both case below), or the
+survivor itself crashes before the peer's own probe fires (the peer then probes it).
 
 ## Failure cases
 
@@ -266,7 +273,8 @@ RAM, crash, the client sees missing and re-uploads, no AC entry names it) is.
   RAM; the second has no second owner, so a RAM ack would be one copy.
 - **Submit stays outside rule 2** (no wait header): a lost input becomes
   `FAILED_PRECONDITION` with `MISSING`, and the client re-uploads and re-runs.
-- **An AC commit requires each closure blob durable on an owner**, the ruling's text. The
+- **An AC commit requires each closure blob durable on an owner**, the requirement that a durable pointer is written only once the blob is on hot
+  disk on at least one owner (rule 2). The
   cheaper alternative (the AC owner's own disk only) can leave a permanent-miss entry
   after both owners lose RAM.
 - **The closure check is durable-only and caches only durable positives**; keeping plain
@@ -297,7 +305,22 @@ barrier exists before anything can be held.
 5. Budget, drain, metrics, shutdown drain, the `meta-backup` refusal; a test-only hold as
    the only producer.
 6. The acknowledgement point behind the flag, the leg header, the chain rig, the crash
-   tests; the "durable, then acknowledged" lines in the docs listed in
-   [storage.md](storage.md) change to the as-built behaviour behind the flag.
+   tests. The "durable, then acknowledged" statements change to the as-built behaviour
+   behind the flag, in these places:
+   - `write-path.md`: section 2 (the bullet that says "never report a blob present before
+     its bytes are durable"), section 3.1 (the closing guarantee), 6.3 (what an
+     acknowledgement means now), 6.4 (crash and restart: a synced block with no commit
+     may now hold acknowledged blobs, lost on that node by design), 6.12 (the
+     "no RAM acknowledgement" line).
+   - `architecture-v2.md`: 4.1 (the contract), section 8 (Writes and AC bullets), section
+     12 (failure modes), section 15 (decisions).
+   - `guides/storage.md`: "Placement and replication" and "The write tier: what is durable
+     when" (add a row for the state after the answer and before the disk: one node loss
+     survives, both do not).
+   - `deploy/storage-node.md`: "Metadata backup and restore" (the `meta-backup`
+     refusal).
+   - `storage.md`: Writes ("So a blob is never reported present before its bytes are
+     durable", the ByteStream paragraph, `QueryWriteStatus`) and the PutAction check in
+     the closure-check section.
 7. Turn it on by default, deploy docs, an alert on `unwritten_oldest_seconds`, after a
    farm run and an explicit go.
