@@ -293,3 +293,33 @@ pub fn mint_raw(header: &Value, claims: &Value, signature: &[u8]) -> String {
         B64.encode(signature)
     )
 }
+
+/// The issuer of [`static_verifier`]: nothing listens there.
+pub const STATIC_ISSUER: &str = "https://token.example";
+
+/// A key source that holds one JWKS and opens no socket: for the tests of a caller that must
+/// not depend on a network (a paused clock, no ports).
+pub struct StaticKeys(pub String);
+
+impl super::KeySource for StaticKeys {
+    fn jwks(&self) -> futures::future::BoxFuture<'_, Result<String, String>> {
+        Box::pin(async move { Ok(self.0.clone()) })
+    }
+}
+
+/// A verifier for [`STATIC_ISSUER`] that knows `keys()[0]` (`k1`) and no other, and a clock
+/// the test sets (it starts at [`NOW`]). Mint with [`mint`] over [`good_claims`]`(STATIC_ISSUER)`.
+pub fn static_verifier() -> (Arc<Verifier>, Arc<AtomicU64>) {
+    let config = OidcConfig::parse(&config_text(STATIC_ISSUER)).expect("a config");
+    let source = StaticKeys(jwks_of(&[&keys()[0]]));
+    let (clock, now) = clock();
+    (
+        Arc::new(Verifier::new(
+            config,
+            Arc::new(source),
+            std::time::Duration::from_secs(30),
+            clock,
+        )),
+        now,
+    )
+}

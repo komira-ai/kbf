@@ -22,6 +22,7 @@ use crate::identity::{ProxySecret, SecretOrigin, admin_headers};
 use crate::metrics::Metrics;
 use crate::pool::tcp_connector;
 use crate::probe::poll;
+use crate::remote::RemoteCi;
 use crate::security::Security;
 use crate::serve::serve;
 use crate::slot::{ActiveSlot, HoldGuard};
@@ -54,6 +55,13 @@ impl Proxy {
             .flatten();
         let tokens =
             Tokens::from_files(&cfg.operator_token_file, buck2_token).map_err(io::Error::other)?;
+        // Read now, like the tokens: a proxy does not start on an allow-list it refuses.
+        let remote = cfg
+            .remote_operator_file
+            .as_deref()
+            .map(RemoteCi::from_file)
+            .transpose()
+            .map_err(|e| io::Error::other(format!("remote_operator_file: {e}")))?;
         let workers = std::thread::available_parallelism().map_or(1, usize::from);
         let runtime = Builder::new_multi_thread()
             .worker_threads(workers.min(MAX_WORKERS))
@@ -78,7 +86,10 @@ impl Proxy {
         // The last step that can fail: a start that exits earlier has not made a secret that
         // a child could have read and the supervisor then adopted (`SecretOrigin::Created`).
         let (secret, origin) = ProxySecret::create_or_read(&cfg.proxy_auth_file)?;
-        let security = Security::new(cfg.buck2_auth, tokens, secret.clone());
+        let mut security = Security::new(cfg.buck2_auth, tokens, secret.clone());
+        if let Some(remote) = remote {
+            security = security.with_remote(remote);
+        }
         let core = Core::with_metrics(
             cfg.upstream,
             cfg.limits,

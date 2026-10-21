@@ -165,6 +165,13 @@ pub struct ProxyConfig {
     pub buck2_token_file: Option<PathBuf>,
     /// The operator token file (`/etc/kbf/operator.token`), read by the proxy itself at start.
     pub operator_token_file: PathBuf,
+    /// The allow-list for CI jobs that call with a GitHub OIDC token instead of the operator
+    /// token (`[remote_operator]` table of this file, for example `/etc/kbf/remote-ci.toml`;
+    /// `kbf-oidc` documents the keys). Unset (the default), the operator token is the only
+    /// credential. Set, an OIDC token is admitted for `POST /v1/update/desired` and
+    /// `POST /v1/update/frontend` and for nothing else (`remote` module).
+    #[serde(default)]
+    pub remote_operator_file: Option<PathBuf>,
     /// The server certificate chain and key, reloaded on SIGHUP together with `client_ca`:
     /// the single-certificate form, served for every name. It is the same as one
     /// `[[server_cert]]` with no names; give this pair or `server_cert`, not both.

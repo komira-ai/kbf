@@ -15,6 +15,7 @@ mod operator;
 pub(crate) mod pki;
 mod ready;
 mod reload;
+mod remote;
 mod routing;
 mod secure;
 mod sni;

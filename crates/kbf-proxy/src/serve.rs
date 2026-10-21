@@ -23,6 +23,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::auth::Refusal as AuthRefusal;
 use crate::body::ProxyBody;
 use crate::control::{MAX_UPDATE_BODY, UPDATE_DEADLINE, UpdateHandler, UpdateReply, UpdateRequest};
 use crate::core::{Core, now};
@@ -30,6 +31,7 @@ use crate::limits::h2_server_builder;
 use crate::metrics::Metrics;
 use crate::pool::BoxIo;
 use crate::reply::{from_update, is_grpc, method_not_allowed, refused, text, unknown};
+use crate::security::Admitted;
 use crate::route::{Route, Target, auth_class, route_of, ui_method_allowed};
 use crate::stream::proxy_child;
 use crate::tls::{Acceptor, Peer, Proto};
@@ -124,16 +126,40 @@ impl<U: UpdateHandler + 'static> Service<U> {
             return method_not_allowed();
         }
         // Who may call it, before the call is counted or held or forwarded.
-        let refusal = auth_class(route).and_then(|class| {
-            let headers = request.headers();
+        let mut request = request;
+        if let Some(class) = auth_class(route) {
             let security = &self.core.security;
-            security
-                .authorize(class, headers, peer.identity.as_ref(), peer.ip, now())
-                .err()
-        });
-        if let Some(refusal) = refusal {
-            Metrics::inc(&self.core.metrics.auth_refused);
-            return refused(route.grpc(), refusal);
+            let call = (request.method(), request.uri());
+            let verdict = security
+                .authorize_call(class, call, request.headers(), peer.identity.as_ref(), peer.ip, now())
+                .await;
+            match verdict {
+                Ok(Admitted::Credential) => {}
+                Ok(Admitted::Ci(who)) => {
+                    tracing::info!(jti = %who.jti, workflow = %who.job_workflow_ref,
+                        git_ref = ?who.git_ref, sha = ?who.sha, path = request.uri().path(),
+                        "remote ci: admitted");
+                    // A call for the child carries the operator token from here on: the
+                    // child's gate takes no other credential, and the OIDC token goes no
+                    // further than this proxy. The update API is the proxy's own.
+                    if route != Route::Update {
+                        let operator = security
+                            .tokens
+                            .operator
+                            .as_ref()
+                            .and_then(crate::auth::Token::bearer_header);
+                        let Some(operator) = operator else {
+                            Metrics::inc(&self.core.metrics.auth_refused);
+                            return refused(route.grpc(), AuthRefusal::PermissionDenied);
+                        };
+                        request.headers_mut().insert(header::AUTHORIZATION, operator);
+                    }
+                }
+                Err(refusal) => {
+                    Metrics::inc(&self.core.metrics.auth_refused);
+                    return refused(route.grpc(), refusal);
+                }
+            }
         }
         // Counted from accept: a bypass stream is one for its whole life, a backend stream
         // until its permit exists.
