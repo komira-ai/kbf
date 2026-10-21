@@ -1,6 +1,6 @@
 # Updating a split-mode farm without failing a build
 
-Status: design for the sequence. The pull updater it relies on is partly built: `kbf-installer` (merged), `kbf-update` (the node's client, #908) and
+Status: design for the sequence. (`kbf-deploy envoy render|check|apply`, named below, is retired: kbf runs no Envoy since the no-Envoy ruling, and the frontend is fronted by kbf-proxy.) The pull updater it relies on is partly built: `kbf-installer` (merged), `kbf-update` (the node's client, #908) and
 `kbf-installer run` (the root helper, #929) are built or in review; the controller, the node gates, the Envoy switch and the poller are not.
 Planned-down (#914) is built. It is read against `feature/arch-v2` and these pull requests, fetched
 when this was written: #857, #879 and #887 (the frontend handover, open, stacked), #803 (the rollout state machine, open), #886
