@@ -115,7 +115,10 @@ async fn an_enrollment_answers_a_certificate_per_key_with_the_bundle_and_the_clo
         START + (answer.certs[0].not_after - START) / 2
     );
     let config = answer.config.expect("config");
-    assert_eq!(config.generation, CONFIG_GENERATION);
+    assert_ne!(
+        config.generation, 0,
+        "0 is the number of a node holding nothing"
+    );
     assert_eq!(config.roles, ["storage", "daemon"]);
     assert_eq!(config.worker_endpoint, "https://front.test:7443");
     assert_eq!(config.storage_port, 8983);
@@ -629,4 +632,350 @@ fn an_advertise_host_on_a_daemon_certificate_is_advertise_invalid() {
         .map(|_| ())
         .expect_err("refused");
     assert_eq!(error, RefusalReason::AdvertiseInvalid);
+}
+
+/// A node id that is `localhost` or a single-label name the frontend serves is refused
+/// `NodeIdNotAllowed` with a token that is otherwise good, and nothing is enrolled or used;
+/// an ordinary id still enrolls. `LOCALHOST` and `x.localhost` are not node ids at all
+/// (upper case and dots) and are refused as malformed before anything is read.
+///
+/// Catches: a token holder enrolling as `localhost` (or as the frontend's one-label name)
+/// and getting a farm-CA certificate whose DNS name is that host's, serverAuth and clientAuth.
+#[tokio::test]
+async fn a_node_id_that_is_localhost_or_a_frontend_name_is_refused() {
+    let farm = farm("enroll-node-id-names");
+    let service = EnrollService::new(
+        Arc::clone(&farm.store),
+        Arc::clone(&farm.ca),
+        &["Front".to_owned(), FRONTEND.to_owned()],
+        NodeSettings::default(),
+    );
+    let ask = |service: &EnrollService, bits: u64, id: &str| {
+        let tok = token(&farm, bits, &spec(&[Role::Daemon]));
+        let (request, _) = enroll_request(&tok, id, &[Role::Daemon], "");
+        service.enroll_now(&request)
+    };
+    for (bits, id) in [(1, "localhost"), (2, "front")] {
+        assert_eq!(
+            ask(&service, bits, id),
+            Err(RefusalReason::NodeIdNotAllowed),
+            "{id}"
+        );
+    }
+    for (bits, id) in [(3, "LOCALHOST"), (4, "x.localhost"), (5, "FRONT")] {
+        assert_eq!(
+            ask(&service, bits, id),
+            Err(RefusalReason::MalformedRequest),
+            "{id}"
+        );
+    }
+    assert!(list_nodes(&*farm.store).expect("nodes").is_empty());
+    assert!(
+        list_tokens(&*farm.store)
+            .expect("tokens")
+            .iter()
+            .all(|t| t.uses == 0)
+    );
+    assert!(ask(&service, 6, "node-01").is_ok());
+    assert_eq!(list_nodes(&*farm.store).expect("nodes").len(), 1);
+}
+
+/// The rule itself, case-insensitive, for what a [`NodeId`] cannot spell today: `.localhost`
+/// names and upper-case spellings of `localhost` and of a frontend name.
+///
+/// Catches: a comparison that is case-sensitive or misses names under `localhost`, which
+/// would let a later widening of the node id grammar reopen the hole.
+#[test]
+fn the_node_id_rule_ignores_case_and_covers_names_under_localhost() {
+    let names = vec!["front".to_owned()];
+    for refused in [
+        "localhost",
+        "LOCALHOST",
+        "x.localhost",
+        "X.LocalHost",
+        "FRONT",
+    ] {
+        assert!(node_id_refused(refused, &names), "{refused}");
+    }
+    for allowed in ["node-01", "localhost2", "front-2", "xlocalhost"] {
+        assert!(!node_id_refused(allowed, &names), "{allowed}");
+    }
+}
+
+/// A token past its `expires_at` on the store's clock is refused `TokenExpired` by the
+/// service, uses nothing and enrolls nothing.
+///
+/// Catches: the service never reaching the registry's expiry check (the registry crate's
+/// own test passes whatever the service does with it).
+#[tokio::test]
+async fn a_token_past_its_expiry_is_refused_token_expired() {
+    let farm = farm("enroll-token-expiry");
+    let mut short = spec(&[Role::Daemon]);
+    short.ttl = Some(std::time::Duration::from_secs(600));
+    let tok = token(&farm, 1, &short);
+    let (request, _) = enroll_request(&tok, "node-01", &[Role::Daemon], "");
+    farm.advance(601);
+    assert_is(
+        &refused(call(&farm, request).await),
+        RefusalReason::TokenExpired,
+    );
+    assert_eq!(uses(&farm), 0);
+    assert!(list_nodes(&*farm.store).expect("nodes").is_empty());
+}
+
+/// The URI `register_cold` registers, as a node is told it: encoded, with the settings that
+/// are not the defaults, and nothing of the key pair.
+const COLD_URI: &str = "s3://farm-cold/cold/main/?endpoint=http%3A%2F%2Fs3.test%3A9000\
+                        &region=eu-west-1&conditional-put=true&min-put-rate=2048";
+
+/// A storage node enrolled while a cold store is registered is told that store, and the
+/// answer's configuration generation moves with the registry's.
+///
+/// Catches: the enroll answer carrying no cold store (the node cannot start its storage
+/// half: `kbf node` refuses a storage config without one), a URI that is not the
+/// registered bucket, prefix, endpoint, region and put settings, and a generation that
+/// does not change when the registration does (a renewing node would never learn of it).
+#[tokio::test]
+async fn a_storage_node_is_told_the_registered_cold_store() {
+    let farm = farm("enroll-cold");
+    crate::enroll::testkit::register_cold(&farm);
+    let tok = token(&farm, 1, &spec(&[Role::Storage, Role::Daemon]));
+    let (request, _) = enroll_request(&tok, "node-01", &[Role::Storage, Role::Daemon], ADVERTISE);
+    let config = call(&farm, request)
+        .await
+        .expect("enrolled")
+        .config
+        .expect("config");
+    assert_eq!(config.cold_store, COLD_URI);
+    let bare = self::farm("enroll-cold-bare");
+    let tok = token(&bare, 1, &spec(&[Role::Storage, Role::Daemon]));
+    let (request, _) = enroll_request(&tok, "node-01", &[Role::Storage, Role::Daemon], ADVERTISE);
+    let before = call(&bare, request).await.expect("enrolled").config;
+    assert_ne!(
+        config.generation,
+        before.expect("config").generation,
+        "a registered store changes the generation"
+    );
+    // The text is a store URI the server's own parser reads back as the registered store.
+    let parsed: crate::stores::StoreUri = config.cold_store.parse().expect("a store URI");
+    let s3 = parsed.as_s3().expect("an S3 store");
+    assert_eq!(
+        (s3.bucket.as_str(), s3.prefix.as_str(), s3.endpoint.as_str()),
+        ("farm-cold", "cold/main/", "http://s3.test:9000")
+    );
+    assert_eq!(s3.region, "eu-west-1");
+    assert!(s3.conditional_put);
+    assert_eq!(s3.min_put_rate.get(), 2048);
+}
+
+/// No answer carries the registered key pair, whatever it is spelt like and wherever in
+/// the answer it might be put.
+///
+/// Catches: a URI (or any field of the answer) built with the access key id or the
+/// secret, as a `?access_key=` query or userinfo: the whole answer is encoded and
+/// searched for both, and the URI's query is checked to hold only the keys of a store URI.
+#[tokio::test]
+async fn the_answer_carries_no_key_of_the_registered_store() {
+    use prost::Message as _;
+    let farm = farm("enroll-cold-secret");
+    crate::enroll::testkit::register_cold(&farm);
+    let tok = token(&farm, 1, &spec(&[Role::Storage]));
+    let (request, _) = enroll_request(&tok, "node-01", &[Role::Storage], ADVERTISE);
+    let answer = call(&farm, request).await.expect("enrolled");
+    let bytes = answer.encode_to_vec();
+    let has = |needle: &str| bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
+    assert!(has("farm-cold"), "the search does see the URI");
+    for secret in [
+        crate::enroll::testkit::COLD_SECRET,
+        crate::enroll::testkit::COLD_ACCESS_KEY,
+    ] {
+        assert!(!has(secret), "the answer holds {secret}");
+    }
+    let uri = answer.config.expect("config").cold_store;
+    let query = uri.split_once('?').expect("a query").1;
+    let keys: Vec<String> = form_urlencoded::parse(query.as_bytes())
+        .map(|(key, _)| key.into_owned())
+        .collect();
+    assert_eq!(
+        keys,
+        ["endpoint", "region", "conditional-put", "min-put-rate"]
+    );
+    assert!(!uri.contains('@'), "no userinfo");
+}
+
+/// A node with no storage role is told no store, and a farm with none registered tells
+/// none and keeps the base generation.
+///
+/// Catches: a daemon-only node learning where the farm's objects are (it has no use for
+/// them), and a farm without a registration sending a made-up store or a generation that
+/// moved for nothing.
+#[tokio::test]
+async fn only_a_storage_node_with_a_registration_is_told_a_cold_store() {
+    let farm = farm("enroll-cold-roles");
+    let tok = token(&farm, 1, &spec(&[Role::Storage]));
+    let (request, _) = enroll_request(&tok, "node-01", &[Role::Storage], ADVERTISE);
+    let config = call(&farm, request)
+        .await
+        .expect("enrolled")
+        .config
+        .expect("config");
+    assert_eq!(config.cold_store, "", "nothing registered, nothing sent");
+    let storage_before = config.generation;
+
+    crate::enroll::testkit::register_cold(&farm);
+    let tok = token(&farm, 2, &spec(&[Role::Daemon]));
+    let (request, _) = enroll_request(&tok, "node-02", &[Role::Daemon], "");
+    let config = call(&farm, request)
+        .await
+        .expect("enrolled")
+        .config
+        .expect("config");
+    assert_eq!(config.cold_store, "", "a daemon is told no store");
+
+    // The generation follows what the node receives: a daemon is told no store, so a
+    // registration changes nothing it holds; a storage node is told it.
+    let bare = self::farm("enroll-cold-roles-bare");
+    let tok = token(&bare, 2, &spec(&[Role::Daemon]));
+    let (request, _) = enroll_request(&tok, "node-02", &[Role::Daemon], "");
+    let daemon_before = call(&bare, request)
+        .await
+        .expect("enrolled")
+        .config
+        .expect("config");
+    assert_eq!(
+        daemon_before.generation, config.generation,
+        "no churn for a node the registration does not concern"
+    );
+    let tok = token(&farm, 3, &spec(&[Role::Storage]));
+    let (request, _) = enroll_request(&tok, "node-03", &[Role::Storage], "s2.nodes.test:8983");
+    let storage_after = call(&farm, request)
+        .await
+        .expect("enrolled")
+        .config
+        .expect("config");
+    assert_ne!(storage_after.generation, storage_before);
+}
+
+/// The generation changes with each of the three endpoint settings and with nothing else
+/// of the frontend's: two frontends with the same flags give the same number to two nodes.
+///
+/// Catches: a generation that leaves out the worker endpoint, the CAS endpoint or the
+/// storage port (a node enrolled before the flag changed would never learn of it), and a
+/// generation that depends on the node or the time (every renewal would re-send the
+/// configuration).
+#[tokio::test]
+async fn the_generation_follows_each_endpoint_the_node_is_told() {
+    let farm = farm("enroll-generation");
+    let base = crate::enroll::testkit::settings();
+    let variants = [
+        base.clone(),
+        NodeSettings {
+            worker_endpoint: "https://proxy.test:443".to_owned(),
+            ..base.clone()
+        },
+        NodeSettings {
+            cas_endpoint: "https://proxy.test:443".to_owned(),
+            ..base.clone()
+        },
+        NodeSettings {
+            storage_port: 8984,
+            ..base.clone()
+        },
+        // The same as the first, from another node: the number is a function of the config.
+        base,
+    ];
+    let mut seen = Vec::new();
+    for (index, settings) in variants.into_iter().enumerate() {
+        let service = crate::enroll::testkit::service_with(&farm.store, &farm.ca, settings);
+        let bits = u64::try_from(index).expect("small") + 1;
+        let tok = token(&farm, bits, &spec(&[Role::Daemon]));
+        let id = format!("node-{bits:02}");
+        let (request, _) = enroll_request(&tok, &id, &[Role::Daemon], "");
+        let config = service
+            .enroll_now(&request)
+            .expect("enrolled")
+            .config
+            .expect("config");
+        seen.push(config.generation);
+    }
+    assert_eq!(seen[0], seen[4], "the same configuration, the same number");
+    for later in 1..4 {
+        for earlier in 0..later {
+            assert_ne!(seen[earlier], seen[later], "variants {earlier} and {later}");
+        }
+    }
+}
+
+/// The generation is the first 8 bytes of the SHA-256 of the encoded configuration (its own
+/// generation zeroed), big-endian, with the low bit set.
+///
+/// Catches: a digest cut to fewer than 8 bytes (a 1-byte generation collides for 1 change
+/// in 128, so a node would keep a stale configuration), a different hash or byte order, a
+/// digest that includes the generation field itself, and a low bit left clear (0 is the
+/// number of a node that holds nothing).
+#[tokio::test]
+async fn the_generation_is_eight_digest_bytes_with_the_low_bit_set() {
+    let farm = farm("enroll-generation-width");
+    let base = crate::enroll::testkit::settings();
+    let variants = [
+        base.clone(),
+        NodeSettings {
+            worker_endpoint: "https://proxy.test:443".to_owned(),
+            ..base.clone()
+        },
+        NodeSettings {
+            cas_endpoint: "https://proxy.test:443".to_owned(),
+            ..base.clone()
+        },
+        NodeSettings {
+            storage_port: 8984,
+            ..base
+        },
+    ];
+    let mut wide = false;
+    for (index, settings) in variants.into_iter().enumerate() {
+        let service = crate::enroll::testkit::service_with(&farm.store, &farm.ca, settings);
+        let bits = u64::try_from(index).expect("small") + 1;
+        let tok = token(&farm, bits, &spec(&[Role::Daemon]));
+        let (request, _) = enroll_request(&tok, &format!("node-{bits:02}"), &[Role::Daemon], "");
+        let config = service
+            .enroll_now(&request)
+            .expect("enrolled")
+            .config
+            .expect("config");
+        let digest = Sha256::digest(prost::Message::encode_to_vec(&pb::NodeConfig {
+            generation: 0,
+            ..config.clone()
+        }));
+        let head: [u8; 8] = digest[..8].try_into().expect("8 bytes");
+        assert_eq!(
+            config.generation,
+            u64::from_be_bytes(head) | 1,
+            "variant {index}: the first 8 digest bytes, low bit set"
+        );
+        wide |= config.generation > u64::from(u32::MAX);
+    }
+    assert!(wide, "no generation used more than 32 bits");
+}
+
+/// A registry that cannot be read refuses the enrollment before the token is spent.
+///
+/// Catches: a token consumed by an enrollment whose answer could not say where the store
+/// is (the node would hold a config with none and the token would be gone), and an
+/// unreadable registration answered as "none registered".
+#[tokio::test]
+async fn an_unreadable_registration_refuses_the_enrollment_and_spends_no_token() {
+    use kbf_state::{Cond, Txn};
+    let farm = farm("enroll-cold-corrupt");
+    crate::enroll::testkit::register_cold(&farm);
+    let txn = Txn::new().put("objstore/bind/cold", vec![0xff, 0xff, 0xff], Cond::Any);
+    farm.store.txn(txn).expect("store").expect("committed");
+    let tok = token(&farm, 1, &spec(&[Role::Storage]));
+    let (request, _) = enroll_request(&tok, "node-01", &[Role::Storage], ADVERTISE);
+    assert_is(
+        &refused(call(&farm, request).await),
+        RefusalReason::StoreUnavailable,
+    );
+    assert_eq!(uses(&farm), 0, "the token was not spent");
+    assert!(list_nodes(&*farm.store).expect("nodes").is_empty());
 }

@@ -24,16 +24,13 @@ pub const MAX_CHUNK: usize = 2 << 20;
 
 /// log2(`AVG_CHUNK`).
 const AVG_BITS: u32 = AVG_CHUNK.trailing_zeros();
-/// Used before the average size: one bit more than the average, so cuts are rarer.
-const MASK_SMALL: u64 = top_bits(AVG_BITS + 1);
-/// Used from the average size on: one bit fewer, so cuts are likelier.
-const MASK_LARGE: u64 = top_bits(AVG_BITS - 1);
-
-/// A mask of the `n` most significant bits. The gear hash shifts left, so the top bits
-/// depend on the widest window of recent bytes.
-const fn top_bits(n: u32) -> u64 {
-    !0u64 << (64 - n)
-}
+/// Used before the average size: the top `AVG_BITS + 1` bits (one more than the average,
+/// so cuts are rarer). The gear hash shifts left, so the top bits depend on the widest
+/// window of recent bytes.
+const MASK_SMALL: u64 = !0u64 << (64 - (AVG_BITS + 1));
+/// Used from the average size on: the top `AVG_BITS - 1` bits (one fewer, so cuts are
+/// likelier).
+const MASK_LARGE: u64 = !0u64 << (64 - (AVG_BITS - 1));
 
 /// 256 fixed pseudo-random words, generated at compile time by splitmix64 from seed 0.
 /// A constant, not a random source: every build computes the same table.
@@ -154,7 +151,8 @@ mod tests {
             let parts: Vec<&[u8]> = chunks(&data).collect();
             assert_eq!(parts.concat(), data, "len {len}");
             for (i, part) in parts.iter().enumerate() {
-                assert!(!part.is_empty() && part.len() <= MAX_CHUNK, "len {len}");
+                assert!(!part.is_empty(), "len {len}");
+                assert!(part.len() <= MAX_CHUNK, "len {len}");
                 if i + 1 < parts.len() {
                     assert!(part.len() >= MIN_CHUNK, "len {len} chunk {i}");
                 }

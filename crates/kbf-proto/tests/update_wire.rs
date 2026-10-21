@@ -17,8 +17,8 @@
 use kbf_proto::update::update_order::Verb;
 use kbf_proto::update::update_status::State;
 use kbf_proto::update::{
-    Component, FetchChunk, FetchRequest, UpdateOffer, UpdateOrder, UpdateStatus,
-    release_service_server::ReleaseServiceServer,
+    Component, DescribeRequest, FetchChunk, FetchRequest, ReleaseComponent, ReleaseDescription,
+    UpdateOffer, UpdateOrder, UpdateStatus, release_service_server::ReleaseServiceServer,
 };
 use kbf_proto::worker::{DaemonMessage, ServerMessage, daemon_message, server_message};
 use prost::Message;
@@ -50,6 +50,11 @@ const OFFER: &[&str] = &[
     "22540a036b626612406162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616218d20922087b2261223a317d0a",
     // components[1] (kbf-daemon)
     "22530a0a6b62662d6461656d6f6e1240636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463641805220178",
+    // protocol = 2, min_protocol = 1, state_schema = 4, profile = release
+    "2802",
+    "3001",
+    "3804",
+    "420772656c65617365",
 ];
 
 const ORDER: &[&str] = &[
@@ -63,6 +68,8 @@ const ORDER: &[&str] = &[
     "222830313233343536373839616263646566303132333435363738396162636465663031323334353637",
     // window_s = 900
     "288407",
+    // generation = 11
+    "300b",
 ];
 
 const STATUS: &[&str] = &[
@@ -98,6 +105,40 @@ const FETCH_REQUEST: &[&str] = &[
 const FETCH_CHUNK: &[&str] = &[
     // data = 00 01 ff
     "0a030001ff",
+];
+
+const DESCRIBE_REQUEST: &[&str] = &[
+    // commit
+    "0a2830313233343536373839616263646566303132333435363738396162636465663031323334353637",
+    // platform = linux-x86_64
+    "120c6c696e75782d7838365f3634",
+];
+
+const RELEASE_COMPONENT: &[&str] = &[
+    // name = 'kbf'
+    "0a036b6266",
+    // platform = linux-x86_64
+    "120c6c696e75782d7838365f3634",
+    // tarball = kbf-<commit>-linux-x86_64.tar.gz: tag 3, length 0x40 = 64
+    "1a40",
+    "6b62662d",
+    "30313233343536373839616263646566303132333435363738396162636465663031323334353637",
+    "2d",
+    "6c696e75782d7838365f3634",
+    "2e7461722e677a",
+    // sha256
+    "224061626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162",
+    // size = 1234
+    "28d209",
+    // bundle_sha256
+    "324063646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364",
+    // bundle_size = 5000
+    "388827",
+];
+
+const RELEASE_DESCRIPTION_COMMIT: &[&str] = &[
+    // commit
+    "0a2830313233343536373839616263646566303132333435363738396162636465663031323334353637",
 ];
 
 /// The bytes the hex pieces spell, in order.
@@ -136,6 +177,10 @@ fn offer() -> UpdateOffer {
         commit: COMMIT.to_owned(),
         platform: "linux-x86_64".to_owned(),
         components: vec![kbf(), kbf_daemon()],
+        protocol: 2,
+        min_protocol: 1,
+        state_schema: 4,
+        profile: "release".to_owned(),
     }
 }
 
@@ -146,6 +191,7 @@ fn order() -> UpdateOrder {
         verb: Verb::Activate.into(),
         commit: COMMIT.to_owned(),
         window_s: 900,
+        generation: 11,
     }
 }
 
@@ -203,6 +249,46 @@ fn fetch_bytes() {
     golden(&chunk, &bytes(FETCH_CHUNK));
 }
 
+fn release_component() -> ReleaseComponent {
+    ReleaseComponent {
+        name: "kbf".to_owned(),
+        platform: "linux-x86_64".to_owned(),
+        tarball: format!("kbf-{COMMIT}-linux-x86_64.tar.gz"),
+        sha256: SHA.to_owned(),
+        size: 1234,
+        bundle_sha256: OTHER_SHA.to_owned(),
+        bundle_size: 5000,
+    }
+}
+
+/// Catches a renumbered or retyped field of `Describe`'s request, the component it
+/// describes or the description (the two-byte varints of 1234 and 5000 and the two-byte
+/// length of the nested component pin the encoding too), and a component that is not field
+/// 2 of the description.
+#[test]
+fn describe_bytes() {
+    let request = DescribeRequest {
+        commit: COMMIT.to_owned(),
+        platform: "linux-x86_64".to_owned(),
+    };
+    golden(&request, &bytes(DESCRIBE_REQUEST));
+    golden(&release_component(), &bytes(RELEASE_COMPONENT));
+    let description = ReleaseDescription {
+        commit: COMMIT.to_owned(),
+        components: vec![release_component()],
+    };
+    // The nested component is 223 bytes (0xdf), a two-byte varint length.
+    let mut want = bytes(RELEASE_DESCRIPTION_COMMIT);
+    want.extend(framed("12df01", RELEASE_COMPONENT));
+    golden(&description, &want);
+    // The request that asks for every complete platform names none.
+    let all = DescribeRequest {
+        commit: COMMIT.to_owned(),
+        platform: String::new(),
+    };
+    golden(&all, &bytes(&DESCRIBE_REQUEST[..1]));
+}
+
 /// proto3 writes no field at its default: an empty message is no bytes, and a message that
 /// sets only the zero values is the same bytes.
 #[test]
@@ -210,6 +296,9 @@ fn defaults_are_not_written() {
     golden(&UpdateStatus::default(), &[]);
     golden(&UpdateOffer::default(), &[]);
     golden(&UpdateOrder::default(), &[]);
+    golden(&DescribeRequest::default(), &[]);
+    golden(&ReleaseComponent::default(), &[]);
+    golden(&ReleaseDescription::default(), &[]);
     let zero = UpdateOrder {
         verb: Verb::Unspecified.into(),
         ..UpdateOrder::default()
@@ -232,12 +321,12 @@ fn the_session_carries_the_messages_on_fields_7_8_and_9() {
         message: Some(server_message::Message::UpdateOffer(offer())),
     };
     // Length 0xe501 = 229 (a two-byte varint).
-    golden(&offered, &framed("42e501", OFFER));
+    golden(&offered, &framed("42f401", OFFER));
     let ordered = ServerMessage {
         message: Some(server_message::Message::UpdateOrder(order())),
     };
     // Length 0x33 = 51.
-    golden(&ordered, &framed("4a33", ORDER));
+    golden(&ordered, &framed("4a35", ORDER));
 }
 
 /// Catches an enum value renumbered: the numbers are on the wire, and a host that reads a

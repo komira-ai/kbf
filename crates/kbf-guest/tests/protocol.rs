@@ -441,3 +441,136 @@ fn a_connection_whose_deadline_cannot_be_cleared_is_closed() {
     assert!(matches!(end, Err(WireError::Closed)), "{end:?}");
     served.join().expect("agent thread").expect("served");
 }
+
+/// A Unix socket whose `try_clone` fails when `clones` is false, as a stream the agent
+/// cannot set up a reader thread on.
+struct Conn {
+    stream: UnixStream,
+    clones: bool,
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(buf)
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl Stream for Conn {
+    fn try_clone(&self) -> io::Result<Self> {
+        if self.clones {
+            self.stream.try_clone().map(|stream| Self {
+                stream,
+                clones: true,
+            })
+        } else {
+            Err(io::Error::from_raw_os_error(libc::EMFILE))
+        }
+    }
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_read_timeout(timeout)
+    }
+    fn shutdown(&self) -> io::Result<()> {
+        self.stream.shutdown(std::net::Shutdown::Both)
+    }
+}
+
+/// Catches an agent that stops serving, or fails, because one connection could not be
+/// set up (mutant: `serve_accepted` returning the connection's error): the first
+/// host's handshake passes, the agent cannot duplicate its stream, that host sees the
+/// connection closed after `Ready`, and the next host still runs its command, after
+/// which `serve_accepted` returns `Ok` with the run used.
+#[test]
+fn a_connection_that_cannot_be_set_up_does_not_stop_the_agent_serving() {
+    let shares = Shares::new("setup-fails");
+    let (broken, mut first) = UnixStream::pair().expect("socket pair");
+    send(
+        &mut first,
+        &HostMsg::Hello {
+            version: VERSION,
+            token: TOKEN,
+        },
+    );
+    let (good, second) = UnixStream::pair().expect("socket pair");
+    let mut queue = std::collections::VecDeque::from([
+        Conn {
+            stream: broken,
+            clones: false,
+        },
+        Conn {
+            stream: good,
+            clones: true,
+        },
+    ]);
+    let config = shares.config();
+    let serving = std::thread::spawn(move || {
+        let mut agent = Agent::new(config);
+        let served = agent.serve_accepted(|| {
+            queue
+                .pop_front()
+                .ok_or_else(|| io::Error::other("no connection left"))
+        });
+        (served, agent)
+    });
+    assert!(matches!(recv(&mut first), GuestMsg::Ready { .. }));
+    assert!(
+        read_frame(&mut first).is_err(),
+        "the connection stayed open"
+    );
+    let mut client = Client::connect(second, TOKEN).expect("handshake");
+    client.run(&act("exit 0", &[])).expect("started");
+    assert_eq!(client.wait().expect("exited").end, End::Exited(0));
+    // The agent serves the connection until the host closes it.
+    drop(client);
+    let (served, agent) = serving.join().expect("agent thread");
+    served.expect("served once the command ran");
+    assert!(agent.has_run());
+}
+
+/// Catches an `accept` failure swallowed or retried (mutant: the error ignored): the
+/// error reaches the caller as it was, and no command has run.
+#[test]
+fn a_failing_accept_ends_serving_with_its_error() {
+    let shares = Shares::new("accept-fails");
+    let mut agent = Agent::new(shares.config());
+    let served = agent.serve_accepted::<UnixStream>(|| Err(io::Error::other("accept broke")));
+    let err = served.expect_err("accept failed");
+    assert_eq!(err.to_string(), "accept broke");
+    assert!(!agent.has_run());
+}
+
+/// Catches a run accepted when the inputs share is not there (mutant: the share's
+/// canonicalisation error ignored, so the command starts in a directory that does not
+/// exist): the request is refused as a bad request, the boot's run is not used, and a
+/// later connection is served.
+#[test]
+fn a_run_without_an_inputs_share_is_refused_without_using_the_run() {
+    let shares = Shares::new("no-inputs");
+    let config = kbf_guest::server::Config {
+        inputs: shares.inputs.join("missing"),
+        ..shares.config()
+    };
+    let served = Served::start(config);
+    let mut client = served.connect();
+    let err = client.run(&act("exit 0", &[])).expect_err("refused");
+    assert!(
+        matches!(
+            &err,
+            ClientError::Refused {
+                reason: Refusal::BadRequest,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    drop(client);
+    assert!(!served.join().has_run());
+}

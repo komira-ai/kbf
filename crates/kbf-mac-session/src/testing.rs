@@ -219,11 +219,8 @@ impl Host for FakeHost {
 /// A fresh scratch directory for one test. Under `/tmp` with a short name, not the
 /// per-user temporary folder: a socket path on macOS holds at most 104 bytes, and
 /// macOS's per-user temporary folder alone takes about 50.
-pub(crate) fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(format!("/tmp/kms-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+pub(crate) fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under("/tmp", &format!("kms-{name}"))
 }
 
 /// Shows tracing output in test logs, so the log statements' arguments run.
@@ -243,8 +240,20 @@ kbf_testkit::act_test_hook!();
 pub(crate) fn act() -> String {
     static LINK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     LINK.get_or_init(|| {
-        let link = scratch("act").join(kbf_testkit::act::NAME);
-        kbf_testkit::act::link_self(&link).unwrap();
+        // Beside the test binary, one link for every run of it (a directory made per run
+        // would never be removed: nothing runs when a process ends). A link to another
+        // build of the binary is replaced by renaming a new one over it, so a run that
+        // is using the old one never finds it missing.
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe.parent().unwrap().join("kbf-mac-session-act");
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join(kbf_testkit::act::NAME);
+        if std::fs::read_link(&link).ok().as_deref() != Some(exe.as_path()) {
+            let new = dir.join(format!("new-{}", std::process::id()));
+            let _ = std::fs::remove_file(&new);
+            kbf_testkit::act::link_self(&new).unwrap();
+            std::fs::rename(&new, &link).unwrap();
+        }
         link
     })
     .display()

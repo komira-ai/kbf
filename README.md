@@ -17,8 +17,9 @@ kbf is written in Rust. Its programs are named `kbf-*`:
   watched by the daemon.
 
 `kbf` is a new binary with the modes `frontend`, `storage`, `daemon`, `storage-and-daemon`
-and `all-in-one`; the programs above remain.
-Smoke test: `kbf all-in-one --help`
+and `all-in-one`, chosen with `kbf --mode=<mode>` (or `mode = "..."` in `/etc/kbf/kbf.toml`);
+the programs above remain.
+Smoke test: `kbf --mode=all-in-one --help`
 
 ## Status
 

@@ -4,13 +4,38 @@
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 use crate::api::{Attempt, Counts, Invocation, Outcome, Text};
-use crate::html::{Href, Html, attr};
+use crate::html::{Html, attr};
 use crate::layout;
-use crate::read::{Page, ReadError, Reader};
-use crate::{Answer, PREFIX, Source};
+use crate::read::{Page, ReadError};
+use crate::{Answer, PREFIX};
 
 mod action;
 mod build;
+mod builds;
+mod failures;
+#[cfg(test)]
+pub(crate) mod history_fixtures;
+mod leases;
+mod nodes;
+mod overview;
+mod queue;
+mod refresh;
+mod sched;
+mod storage;
+mod strip;
+mod target;
+mod targets;
+mod updates;
+
+#[cfg(test)]
+pub(crate) use builds::BUILDS;
+pub(crate) use builds::builds;
+#[cfg(test)]
+pub(crate) use nodes::{NODE, NODES};
+pub(crate) use nodes::{node, nodes};
+#[cfg(test)]
+pub(crate) use overview::OVERVIEW;
+pub(crate) use overview::overview;
 
 pub(crate) use action::action;
 #[cfg(test)]
@@ -18,16 +43,37 @@ pub(crate) use action::{ACTION, LOG_SHOWN_MAX_BYTES};
 #[cfg(test)]
 pub(crate) use build::BUILD;
 pub(crate) use build::build;
+#[cfg(test)]
+pub(crate) use leases::LEASES;
+pub(crate) use leases::leases;
+#[cfg(test)]
+pub(crate) use queue::QUEUE;
+pub(crate) use queue::queue;
+#[cfg(test)]
+pub(crate) use sched::fixtures::sched_farm;
+#[cfg(test)]
+pub(crate) use storage::STORAGE;
+pub(crate) use storage::storage;
+#[cfg(test)]
+pub(crate) use target::TARGET;
+pub(crate) use target::target;
+#[cfg(test)]
+pub(crate) use targets::TARGETS;
+pub(crate) use targets::targets;
+#[cfg(test)]
+pub(crate) use updates::UPDATES;
+use updates::UPDATES_PATH;
+pub(crate) use updates::updates;
 
-/// Builds: look a build up by id.
-pub(crate) const BUILDS: Page = Page {
-    name: "Builds",
-    reads: &["/v1/invocations/{id}"],
-};
+/// The Builds page's path: the build id lookup, moved here from the prefix itself.
+pub(crate) const BUILDS_PATH: &str = "/ui/builds";
 
 /// Every page, for the contract test.
 #[cfg(test)]
-pub(crate) const PAGES: [&Page; 3] = [&BUILDS, &BUILD, &ACTION];
+pub(crate) const PAGES: [&Page; 12] = [
+    &OVERVIEW, &BUILDS, &BUILD, &ACTION, &NODES, &NODE, &UPDATES, &LEASES, &QUEUE, &TARGETS,
+    &TARGET, &STORAGE,
+];
 
 /// What a path segment keeps unencoded: RFC 3986's unreserved characters.
 const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
@@ -101,88 +147,6 @@ pub(crate) fn not_found(path: &str) -> Answer {
         });
     });
     Answer::html(404, body)
-}
-
-/// The Builds page: a form for a build's id and, with `?id=`, that build's summary.
-pub(crate) async fn builds<S: Source>(source: &S, query: &str) -> Answer {
-    let id = query_value(query, "id").filter(|id| !id.is_empty());
-    // An id of `.` or `..` names no build: written into `/v1/invocations/{id}` it is a
-    // dot segment, which a URL client resolves to another route.
-    let dot = matches!(id.as_deref(), Some("." | ".."));
-    let mut r = Reader::new(source, &BUILDS);
-    let found = match &id {
-        Some(id) if !dot => Some(r.json::<Invocation>(&invocation_url(id)).await),
-        _ => None,
-    };
-    let (status, passed_on) = match &found {
-        Some(Err(e)) => (e.status(), e.headers()),
-        _ if dot => (404, &[][..]),
-        _ => (200, &[][..]),
-    };
-    let body = layout::page(BUILDS.name, PREFIX, r.asked(), |h| {
-        h.el("h1", &[], |h| {
-            h.text("Builds");
-        });
-        lookup(h, id.as_deref().unwrap_or_default());
-        match &found {
-            None if dot => {
-                h.el("p", &[attr("class", "problem")], |h| {
-                    h.text("A build id of . or .. names no build.");
-                });
-            }
-            None => {
-                h.el("p", &[attr("class", "hint")], |h| {
-                    h.text(
-                        "A list of recent builds comes with the history routes; until then, \
-                         look a build up by its id (buck2's build id, or the id your client sends).",
-                    );
-                });
-            }
-            Some(Ok(inv)) => {
-                h.el("section", &[attr("class", "card")], |h| {
-                    h.el("h2", &[], |h| {
-                        let href = Href::root_relative(&build_page(&inv.id))
-                            .expect("a build page's path is root-relative");
-                        h.link(&href, &inv.id);
-                    });
-                    summary(h, inv);
-                });
-            }
-            Some(Err(e)) => problem(h, e),
-        }
-    });
-    Answer::html(status, body).passing_on(passed_on)
-}
-
-/// The id form; `id` fills it in.
-fn lookup(h: &mut Html, id: &str) {
-    let action = Href::root_relative(PREFIX).expect("the prefix is root-relative");
-    h.el(
-        "form",
-        &[
-            attr("method", "get"),
-            crate::html::url("action", &action),
-            attr("class", "lookup"),
-        ],
-        |h| {
-            h.el("label", &[attr("for", "id")], |h| {
-                h.text("Build id");
-            });
-            h.void(
-                "input",
-                &[
-                    attr("id", "id"),
-                    attr("name", "id"),
-                    attr("type", "text"),
-                    attr("value", id),
-                    attr("required", "required"),
-                    attr("autocomplete", "off"),
-                    attr("spellcheck", "false"),
-                ],
-            );
-            h.void("input", &[attr("type", "submit"), attr("value", "Look up")]);
-        },
-    );
 }
 
 /// The invocation's header fields and counters, as a definition list.
@@ -332,3 +296,5 @@ pub(crate) fn pill(h: &mut Html, words: &str, class: &'static str) {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_failures;

@@ -157,7 +157,7 @@ fn the_storage_flag_is_a_url() {
     );
 }
 
-/// Catches (komira-build-farm#791 with `--storage`): proxied REAPI routes built without
+/// Catches (kbf#791 with `--storage`): proxied REAPI routes built without
 /// the progress ticker, so an Execute stream waiting for a worker sends nothing and a
 /// load balancer's idle timeout cuts it. The action is in the frontend's own cache (the
 /// scheduler still reads there); the node is unreachable and never asked. With

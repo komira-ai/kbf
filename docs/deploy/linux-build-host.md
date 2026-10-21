@@ -95,8 +95,8 @@ sudo swapon /swapfile
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 ```
 
-On a converged storage node `kbf-deploy linux swap` makes these steps, each only if the host
-lacks it ([storage-node.md](storage-node.md#installing-on-the-host)).
+On a storage node `kbf-deploy linux swap` makes these steps, each only if the host
+lacks it ([storage-node.md](storage-node.md#the-build-swapfile)).
 
 ### Headroom: `--actions-memory-max-gib`
 

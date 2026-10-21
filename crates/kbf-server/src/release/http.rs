@@ -1,5 +1,12 @@
-//! `PUT /v1/releases/{commit}/{platform}/{name}` and `GET /v1/releases`.
+//! `PUT /v1/releases/{commit}/{platform}/{name}`, `GET /v1/releases` and
+//! `GET /v1/releases/{commit}`.
 //!
+//! - `GET /v1/releases/{commit}` is what `ReleaseService.Describe` answers for every
+//!   complete platform, as JSON ([`super::describe::view`]): `200`, `400` for a commit that
+//!   is not 40 lowercase hex digits, `404` when no tarball of it is stored, `409` when no
+//!   platform is complete. It is open like `GET /v1/releases`; saved as
+//!   `releases/<commit>.json` beside the release's `files/`, it is the description a `url`
+//!   source gives.
 //! - The body of a `PUT` is the file: a tarball for `kbf` or `kbf-daemon`, a build
 //!   attestation bundle for the same with the suffix `.attestation`. It is written to the
 //!   store as it streams in ([`ReleaseStore`]), so the server holds a chunk of it, not the
@@ -13,21 +20,22 @@
 //!   Serve the router with `into_make_service_with_connect_info`, as the API's.
 
 use std::io;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, put};
 use futures::StreamExt;
 use serde_json::json;
 
-use super::key::{Key, Part};
+use super::describe::{DescribeError, describe, view};
+use super::key::{Commit, Key, KeyError, Part};
 use super::store::{CommitListing, PutError, ReleaseStore, Stored};
 use crate::api::{error, json, operator_gate};
+use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
 
 /// The list route.
@@ -43,6 +51,7 @@ struct Releases {
 pub fn router(store: Option<Arc<ReleaseStore>>, token: Option<ApiToken>) -> Router {
     Router::new()
         .route(RELEASES, get(list))
+        .route("/v1/releases/{commit}", get(show))
         .route("/v1/releases/{commit}/{platform}/{name}", put(put_file))
         .with_state(Arc::new(Releases { store, token }))
 }
@@ -66,11 +75,11 @@ fn disk_failed(what: &str, e: &io::Error) -> Response {
 async fn put_file(
     State(releases): State<Arc<Releases>>,
     Path((commit, platform, name)): Path<(String, String, String)>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    if let Err((code, why)) = operator_gate(releases.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = operator_gate(releases.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
     let Some(store) = releases.store.as_deref() else {
@@ -121,9 +130,27 @@ async fn list(State(releases): State<Arc<Releases>>) -> Response {
     }
 }
 
+/// `GET /v1/releases/{commit}`: [`describe`] of every complete platform, as the JSON of
+/// [`view`], which is also the file `releases/<commit>.json` of a `url` source.
+async fn show(State(releases): State<Arc<Releases>>, Path(commit): Path<String>) -> Response {
+    let Some(store) = releases.store.as_deref() else {
+        return off();
+    };
+    let Some(commit) = Commit::parse(&commit) else {
+        let why = KeyError::Commit(commit).to_string();
+        return error(StatusCode::BAD_REQUEST, &why);
+    };
+    match describe(store, &commit, None).await {
+        Ok(description) => json(StatusCode::OK, &view(&description)),
+        Err(e @ DescribeError::Unknown(_)) => error(StatusCode::NOT_FOUND, &e.to_string()),
+        Err(e @ DescribeError::Incomplete { .. }) => error(StatusCode::CONFLICT, &e.to_string()),
+        Err(DescribeError::Store(e)) => disk_failed("describe", &e),
+    }
+}
+
 /// The `GET /v1/releases` body: commits with, per platform, the components stored and
 /// whether the platform is complete.
-fn listing_view(listing: &[CommitListing]) -> serde_json::Value {
+pub(super) fn listing_view(listing: &[CommitListing]) -> serde_json::Value {
     let releases: Vec<_> = listing
         .iter()
         .map(|commit| {

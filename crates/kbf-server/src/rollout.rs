@@ -17,7 +17,7 @@
 //! refuses more, whoever asks), drains each, and once a node is drained and connected
 //! records `updating` and hands the node an [`Update`] naming the rollout, the step
 //! and the software set (section 4.2, step 5). What follows (`rebooting`,
-//! `qualifying`, `done`, `quarantined`) needs `kbf-updater` and the node's own report,
+//! `qualifying`, `done`, `quarantined`) needs the node's update helper (`kbf-installer`) and the node's own report,
 //! which are later slices. A drain that pauses at its deadline, a node returned to
 //! placement by someone else, or a refused hand-over holds the node and the rollout:
 //! nothing proceeds by itself (section 4.3). The canary, soak, `min_serving` and

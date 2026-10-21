@@ -20,9 +20,9 @@
 //!   release already current, changes nothing.
 //! - [`confirm`]: the new release came up and says so; the swap is kept. It must name
 //!   the order that made the swap.
-//! - [`revert`]: `current` goes back to the release that ran before; the state is
-//!   written first. If that release is gone, nothing is changed and the swap stays
-//!   pending, for the operator to see.
+//! - [`revert`]: `current` goes back to the release that ran before (a `staged` that names
+//!   it is cleared, as the rollback does); the state is written first. If that release is
+//!   gone, nothing is changed and the swap stays pending, for the operator to see.
 //! - [`boot_check`] runs before every start of the service. The window to confirm starts
 //!   at the first start after the swap, not at the swap: the frontend's own update can
 //!   wait hours between the two. With a start budget (Linux), a release that was
@@ -41,7 +41,7 @@ use kbf_host::exec::Exec;
 use kbf_host::plan::{Mode, Planner, RunAs, execute};
 
 use crate::CommitId;
-use crate::layout::{self, Layout, path};
+use crate::layout::{self, Layout};
 use crate::release::{ReleaseError, has_binary};
 use crate::state::{Locked, PendingConfirm, State};
 
@@ -139,6 +139,7 @@ fn open(host: &Layout) -> Result<(Locked, State), ReleaseError> {
 /// link moved; a state with no current release has nothing to point at.
 fn converge<E: Exec>(
     exec: &mut E,
+    host: &Layout,
     state: &State,
     out: &mut dyn Write,
 ) -> Result<bool, ReleaseError> {
@@ -148,12 +149,12 @@ fn converge<E: Exec>(
     let mut planner = Planner::new(&*exec);
     let mut moved = false;
     match &state.previous {
-        Some(c) => moved |= planner.symlink(path(layout::PREVIOUS), layout::release_link(c))?,
+        Some(c) => moved |= planner.symlink(host.previous(), layout::release_link(c))?,
         None => {
-            planner.absent(path(layout::PREVIOUS))?;
+            planner.absent(host.previous())?;
         }
     }
-    moved |= planner.symlink(path(layout::CURRENT), layout::release_link(current))?;
+    moved |= planner.symlink(host.current(), layout::release_link(current))?;
     let plan = planner.finish();
     execute(&plan, RunAs::Root, Mode::Apply, exec, &mut &mut *out)?;
     Ok(moved)
@@ -174,17 +175,17 @@ pub fn activate<E: Exec>(
     };
     let (lock, state) = open(host)?;
     if let Some(p) = &state.pending_confirm {
-        if p.order_id.as_deref() != Some(order.order_id.as_str()) {
+        if p.activation != order.order_id {
             return Err(ReleaseError::Pending(p.commit.clone()));
         }
-        converge(exec, &state, out)?;
+        converge(exec, host, &state, out)?;
         return Ok(Activated::Repeat);
     }
     if state.current.as_ref() == Some(&order.commit) {
-        converge(exec, &state, out)?;
+        converge(exec, host, &state, out)?;
         return Ok(Activated::AlreadyCurrent);
     }
-    if !has_binary(exec, &order.commit) {
+    if !has_binary(exec, host, &order.commit) {
         return Err(ReleaseError::NotInstalled(order.commit.clone()));
     }
     let next = State {
@@ -192,17 +193,51 @@ pub fn activate<E: Exec>(
         previous: state.current.clone(),
         staged: state.staged.clone().filter(|c| *c != order.commit),
         pending_confirm: Some(PendingConfirm {
+            activation: order.order_id.clone(),
             commit: order.commit.clone(),
             previous: state.current.clone(),
-            deadline,
-            order_id: Some(order.order_id.clone()),
+            deadline_wall: deadline,
+            deadline_mono_s: None,
             starts_left,
         }),
-        order_floor: state.order_floor,
+        ..state.clone()
     };
     lock.write(&next)?;
-    converge(exec, &next, out)?;
+    converge(exec, host, &next, out)?;
     Ok(Activated::Swapped)
+}
+
+/// Make `commit`, installed and verified, the release that runs on a host that has none:
+/// `setup`'s first release. There is no trial (nothing to go back to) and no confirm. The
+/// state is written first and the links follow, as in [`activate`]; a repeat for the same
+/// commit only makes the links agree. A `staged` that names the commit is cleared, as in
+/// [`activate`]: a release that is current is not waiting for a decision.
+pub fn first<E: Exec>(
+    exec: &mut E,
+    host: &Layout,
+    commit: &CommitId,
+    out: &mut dyn Write,
+) -> Result<(), ReleaseError> {
+    let (lock, state) = open(host)?;
+    if state.current.as_ref() == Some(commit) {
+        converge(exec, host, &state, out)?;
+        return Ok(());
+    }
+    if state.current.is_some() {
+        return Err(ReleaseError::NotFirst(commit.clone()));
+    }
+    if !has_binary(exec, host, commit) {
+        return Err(ReleaseError::NotInstalled(commit.clone()));
+    }
+    // As in `activate`: a release that is current is not staged.
+    let next = State {
+        current: Some(commit.clone()),
+        staged: state.staged.filter(|c| c != commit),
+        ..state
+    };
+    lock.write(&next)?;
+    converge(exec, host, &next, out)?;
+    Ok(())
 }
 
 /// Keep the swap that `order_id` made. `commit` is the release the order named, so that
@@ -213,6 +248,17 @@ pub fn confirm(
     commit: &CommitId,
 ) -> Result<Confirmed, ReleaseError> {
     let (lock, state) = open(host)?;
+    confirm_in(&lock, state, order_id, commit)
+}
+
+/// [`confirm`] with the lock held and the state read: for a caller that has more to check
+/// under the same lock.
+pub(crate) fn confirm_in(
+    lock: &Locked,
+    state: State,
+    order_id: &str,
+    commit: &CommitId,
+) -> Result<Confirmed, ReleaseError> {
     let Some(p) = &state.pending_confirm else {
         return if state.current.as_ref() == Some(commit) {
             Ok(Confirmed::AlreadyKept)
@@ -220,21 +266,103 @@ pub fn confirm(
             Err(ReleaseError::NotPending(commit.clone()))
         };
     };
-    match p.order_id.as_deref() {
-        Some(id) if id == order_id && p.commit == *commit => {}
-        other => {
-            return Err(ReleaseError::OtherOrder {
-                commit: p.commit.clone(),
-                pending: other.unwrap_or("(none)").to_owned(),
-                got: order_id.to_owned(),
-            });
-        }
+    if p.activation != order_id || p.commit != *commit {
+        return Err(ReleaseError::OtherOrder {
+            commit: p.commit.clone(),
+            pending: p.activation.clone(),
+            got: order_id.to_owned(),
+        });
     }
     lock.write(&State {
         pending_confirm: None,
         ..state
     })?;
     Ok(Confirmed::Kept)
+}
+
+/// Whether `commit` may be staged for the frontend: not the installed release, and no other
+/// release staged and undecided (one frontend update at a time). Staging the staged
+/// release again is allowed (a repeat).
+pub(crate) fn check_stageable(state: &State, commit: &CommitId) -> Result<(), ReleaseError> {
+    if state.current.as_ref() == Some(commit) {
+        return Err(ReleaseError::AlreadyInstalled(commit.clone()));
+    }
+    match &state.staged {
+        Some(other) if other != commit => Err(ReleaseError::FrontendBusy(other.clone())),
+        _ => Ok(()),
+    }
+}
+
+/// Record the fetched release `commit` as the staged one, moving no link (the frontend
+/// update's first order). The checks of [`check_stageable`] are made again under the lock,
+/// and the release must be on the host. A repeat changes nothing.
+pub fn stage_frontend<E: Exec>(
+    exec: &E,
+    host: &Layout,
+    commit: &CommitId,
+) -> Result<(), ReleaseError> {
+    let (lock, state) = open(host)?;
+    check_stageable(&state, commit)?;
+    if !has_binary(exec, host, commit) {
+        return Err(ReleaseError::NotInstalled(commit.clone()));
+    }
+    lock.write(&State {
+        staged: Some(commit.clone()),
+        ..state
+    })?;
+    Ok(())
+}
+
+/// The frontend's confirm: with `commit` the staged release and no node swap on trial,
+/// `previous` takes the release that ran and `current` takes `commit`, state first and then
+/// the links (`previous` first), and nothing is staged. A repeat (`commit` is already
+/// current) makes the links match the state and changes nothing else.
+pub fn confirm_frontend<E: Exec>(
+    exec: &mut E,
+    host: &Layout,
+    commit: &CommitId,
+    out: &mut dyn Write,
+) -> Result<Confirmed, ReleaseError> {
+    let (lock, state) = open(host)?;
+    if let Some(p) = &state.pending_confirm {
+        return Err(ReleaseError::Pending(p.commit.clone()));
+    }
+    if state.staged.as_ref() != Some(commit) {
+        if state.current.as_ref() != Some(commit) {
+            return Err(ReleaseError::NotStaged {
+                commit: commit.clone(),
+                staged: state.staged,
+            });
+        }
+        converge(exec, host, &state, out)?;
+        return Ok(Confirmed::AlreadyKept);
+    }
+    if !has_binary(exec, host, commit) {
+        return Err(ReleaseError::NotInstalled(commit.clone()));
+    }
+    let next = State {
+        previous: state.current.clone(),
+        current: Some(commit.clone()),
+        staged: None,
+        ..state
+    };
+    lock.write(&next)?;
+    converge(exec, host, &next, out)?;
+    Ok(Confirmed::Kept)
+}
+
+/// The frontend's revert: drop `commit` from `staged` if it is the staged release. Neither
+/// link nor `current` is touched. Whether it was dropped; a repeat finds nothing to drop.
+pub fn revert_frontend(host: &Layout, commit: &CommitId) -> Result<bool, ReleaseError> {
+    let (lock, state) = open(host)?;
+    if state.staged.as_ref() != Some(commit) {
+        return Ok(false);
+    }
+    lock.write(&State {
+        staged: None,
+        ..state
+    })?;
+    Ok(true)
 }
 
 /// Put `current` back on the release that ran before the pending swap (with none
@@ -245,12 +373,14 @@ pub fn revert<E: Exec>(
     out: &mut dyn Write,
 ) -> Result<Reverted, ReleaseError> {
     let (lock, state) = open(host)?;
-    revert_in(exec, lock, state, out)
+    revert_in(exec, host, &lock, state, out)
 }
 
-fn revert_in<E: Exec>(
+/// [`revert`] with the lock held and the state read.
+pub(crate) fn revert_in<E: Exec>(
     exec: &mut E,
-    lock: Locked,
+    host: &Layout,
+    lock: &Locked,
     state: State,
     out: &mut dyn Write,
 ) -> Result<Reverted, ReleaseError> {
@@ -261,7 +391,7 @@ fn revert_in<E: Exec>(
     let Some(to) = back else {
         return Err(ReleaseError::NoPrevious);
     };
-    if !has_binary(exec, &to) {
+    if !has_binary(exec, host, &to) {
         return Err(ReleaseError::PreviousGone(to));
     }
     let from = state.current.clone();
@@ -269,11 +399,57 @@ fn revert_in<E: Exec>(
         current: Some(to.clone()),
         previous: None,
         pending_confirm: None,
+        // As in `activate`: a release that is current is not staged (the proxy may have
+        // staged the release that was `previous`).
+        staged: state.staged.filter(|c| *c != to),
         ..state
     };
     lock.write(&next)?;
-    converge(exec, &next, out)?;
+    converge(exec, host, &next, out)?;
     Ok(Reverted { from, to })
+}
+
+/// `current` back to `previous`, with no window: the operator's `rollback`. `previous` is
+/// only ever a confirmed release, and the rolled-back-from release is not kept as one, so
+/// it is dropped. Refused while a swap is pending (that is a [`revert`]). The state is
+/// written first, then the links, as for every verb.
+pub(crate) fn rollback_in<E: Exec>(
+    exec: &mut E,
+    host: &Layout,
+    lock: &Locked,
+    state: State,
+    out: &mut dyn Write,
+) -> Result<Reverted, ReleaseError> {
+    let to = rollback_target(exec, host, &state)?;
+    let from = state.current.clone();
+    let next = State {
+        current: Some(to.clone()),
+        previous: None,
+        // As in `revert_in`: the release put back is not staged.
+        staged: state.staged.filter(|c| *c != to),
+        ..state
+    };
+    lock.write(&next)?;
+    converge(exec, host, &next, out)?;
+    Ok(Reverted { from, to })
+}
+
+/// The release a rollback goes to, or why it cannot.
+pub(crate) fn rollback_target<E: Exec>(
+    exec: &E,
+    host: &Layout,
+    state: &State,
+) -> Result<CommitId, ReleaseError> {
+    if let Some(p) = &state.pending_confirm {
+        return Err(ReleaseError::Pending(p.commit.clone()));
+    }
+    let Some(to) = state.previous.clone() else {
+        return Err(ReleaseError::NoPrevious);
+    };
+    if !has_binary(exec, host, &to) {
+        return Err(ReleaseError::PreviousGone(to));
+    }
+    Ok(to)
 }
 
 /// Run before every start of the service (see the module docs). `window_secs` is the
@@ -290,13 +466,13 @@ pub fn boot_check<E: Exec>(
     let Some(p) = state.pending_confirm.clone() else {
         return Ok(Boot::Nothing);
     };
-    if p.starts_left == Some(0) || p.deadline.is_some_and(|d| now >= d) {
-        return Ok(Boot::Reverted(revert_in(exec, lock, state, out)?));
+    if p.starts_left == Some(0) || p.deadline_wall.is_some_and(|d| now >= d) {
+        return Ok(Boot::Reverted(revert_in(exec, host, &lock, state, out)?));
     }
     let starts_left = p.starts_left.map(|n| n - 1);
     lock.write(&State {
         pending_confirm: Some(PendingConfirm {
-            deadline: p.deadline.or(Some(now + window_secs)),
+            deadline_wall: p.deadline_wall.or(Some(now + window_secs)),
             starts_left,
             ..p
         }),
@@ -316,10 +492,10 @@ pub fn expire<E: Exec>(
     let Some(p) = &state.pending_confirm else {
         return Ok(Expiry::Nothing);
     };
-    match p.deadline {
+    match p.deadline_wall {
         None => Ok(Expiry::NotStarted),
         Some(d) if now < d => Ok(Expiry::Waiting { secs_left: d - now }),
-        Some(_) => Ok(Expiry::Reverted(revert_in(exec, lock, state, out)?)),
+        Some(_) => Ok(Expiry::Reverted(revert_in(exec, host, &lock, state, out)?)),
     }
 }
 
@@ -331,7 +507,7 @@ pub fn reconcile<E: Exec>(
     out: &mut dyn Write,
 ) -> Result<bool, ReleaseError> {
     let (_lock, state) = open(host)?;
-    converge(exec, &state, out)
+    converge(exec, host, &state, out)
 }
 
 #[cfg(test)]

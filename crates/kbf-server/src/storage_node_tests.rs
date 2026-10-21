@@ -2,7 +2,7 @@
 //! directory, and what it refuses before it opens.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -92,14 +92,13 @@ fn joined(member_id: u64, boot: u64) -> Joined {
         boot,
         interval: Duration::from_secs(1),
         generation: 1,
+        objstore_generation: 0,
     }
 }
 
-/// A fresh, empty metadata directory for `name`.
-fn meta_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-node-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// A fresh, empty metadata directory for `name`, removed when it drops.
+fn meta_dir(name: &str) -> kbf_testkit::dir::TestDir {
+    crate::test_dir::scratch_dir(&format!("kbf-node-{name}"))
 }
 
 /// A start of a registered node over a new log in `dir`, as [`super::assemble`] opens
@@ -151,9 +150,6 @@ async fn a_wiped_node_never_reuses_its_keys() {
     ] {
         assert!(keys.iter().all(|k| k.starts_with(prefix)), "{keys:?}");
     }
-    for dir in [first_dir, wiped_dir] {
-        let _ = std::fs::remove_dir_all(dir);
-    }
 }
 
 /// Catches: a registration of member or boot zero taken (no `NodeWriter` can name it,
@@ -199,7 +195,32 @@ async fn a_registration_the_log_cannot_take_refuses_the_open() {
     let refused = refused.map(|e| e.to_string()).unwrap_or_default();
     assert!(refused.contains("is not after boot 3"), "{refused}");
     assert!(bucket.written().is_empty());
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Catches a stale boot from a real [`open_registered`] (the frontend's state store
+/// restored from an older copy, so its counter hands out a boot the log has set) that
+/// does not exit as not ready, which the units' `RestartPreventExitStatus=2` leaves down
+/// for good (mutant: the `StaleWriter` arm of [`crate::StartFailure`] removed). And that
+/// the restart it asks for recovers: the next registration's boot, one past, opens the
+/// same log, so a gap of N boots takes N restarts.
+#[tokio::test]
+async fn a_stale_boot_exits_not_ready_and_a_later_boot_opens() {
+    let dir = meta_dir("stale-exit");
+    let bucket = Bucket::default();
+    for boot in [3, 3, 2, 4] {
+        let meta = RaftMetaLog::open_dir(&dir, Retention::default(), "kbf/")
+            .await
+            .expect("open the log");
+        let keys = ObjectKeys::under(meta.store_prefix());
+        let opened = open_registered(meta, bucket.clone(), keys, &joined(7, boot)).await;
+        match (boot, opened) {
+            (3 | 4, Ok(cache)) => drop(cache),
+            (_, Err(e)) => {
+                assert_eq!(crate::StartFailure::of(e.as_ref()).status(), 75, "{e}");
+            }
+            (boot, Ok(_)) => panic!("boot {boot} opened over a log at boot 3"),
+        }
+    }
 }
 
 /// Catches: a node root that keeps the log id (node keys would sit under one log's
@@ -259,5 +280,233 @@ async fn a_log_of_several_voters_refuses_the_open_before_it_is_raised() {
         .expect("open the log again");
     assert_eq!(meta.machine_version(), MachineVersion::V1, "nothing raised");
     drop(meta);
+}
+
+// ---- unit U0 of docs/design/frontend-proxy.md, section 11: a node meets a FRESH state store
+
+/// A frontend over a store with nothing in it: the fresh Postgres of the design.
+fn fresh_frontend() -> crate::members::Members {
+    let clock = Arc::new(kbf_state::ManualClock::default());
+    let fake = kbf_state::fake::Fake::with_flaw(clock, kbf_state::fake::Flaw::None);
+    crate::members::Members::new(
+        Arc::new(fake),
+        crate::members::MembershipConfig {
+            ttl: Duration::from_secs(30),
+            dwell: Duration::from_secs(120),
+            replication: 2,
+        },
+    )
+}
+
+fn register_as(members: &crate::members::Members, instance: &str) -> Joined {
+    let r = members
+        .register(&crate::members::Registrant {
+            instance_id: instance.to_owned(),
+            addr: "192.0.2.1:8982".to_owned(),
+            zone: String::new(),
+            weight: 1,
+            protocol: crate::members::PROTOCOL,
+            progress: crate::members::Progress::CaughtUp,
+        })
+        .expect("register");
+    joined(r.id.0, r.boot)
+}
+
+/// A node that has run as `member` for boots `1..=last_boot`, each writing one blob.
+/// Returns the digests it holds.
+async fn node_that_has_run(
+    dir: &Path,
+    bucket: &Bucket,
+    member: u64,
+    last_boot: u64,
+) -> Vec<kbf_types::Digest> {
+    let mut held = Vec::new();
+    for boot in 1..=last_boot {
+        start_and_write(dir, bucket, &joined(member, boot), 1).await;
+        held.push(VerifiedBlob::hashed(Bytes::from(format!("boot {boot} blob 0"))).digest());
+    }
+    held
+}
+
+async fn open_over(
+    dir: &Path,
+    bucket: &Bucket,
+    who: &Joined,
+) -> Result<kbf_front::Cache<RaftMetaLog<kbf_store::StdFs>, Bucket>, Box<dyn std::error::Error>> {
+    let meta = RaftMetaLog::open_dir(dir, Retention::default(), "kbf/")
+        .await
+        .expect("open the log");
+    let prefix = meta.store_prefix();
+    let keys = ObjectKeys {
+        root: prefix_root(&prefix, meta.log_id()).expect("a root"),
+        legacy: prefix,
+    };
+    open_registered(meta, bucket.clone(), keys, who).await
+}
+
+/// Design section 11 asks U0 to check that "a storage node re-registers its existing blobs
+/// without re-upload" against a fresh store. Holds when the fresh store hands the node a
+/// member id its log never set: the log is the node's own, so its blobs are indexed
+/// already; nothing is uploaded again and the new boot writes under the new member.
+/// Catches an open that rebuilds or re-puts what the log already indexes.
+#[tokio::test]
+async fn a_node_given_a_new_member_id_by_a_fresh_store_keeps_its_blobs() {
+    let dir = meta_dir("fresh-new-id");
+    let bucket = Bucket::default();
+    let held = node_that_has_run(&dir, &bucket, 7, 3).await;
+    let uploaded = bucket.written();
+    let members = fresh_frontend();
+    let _other = register_as(&members, "other");
+    let mine = register_as(&members, "me");
+    assert_eq!((mine.member_id, mine.boot), (2, 1), "ids restart at 1");
+    let cache = open_over(&dir, &bucket, &mine)
+        .await
+        .expect("opens at once");
+    assert_eq!(
+        cache.present(&held).await.expect("present"),
+        vec![true; held.len()]
+    );
+    assert_eq!(bucket.written(), uploaded, "nothing was uploaded again");
+}
+
+/// What the same step costs when the node does not report its log's history (a build before
+/// the report) and the fresh store hands it the member id its log has set already: boots
+/// restart at 1, `SetWriter` refuses every boot up to the latest the log holds, so
+/// the node exits 75 once per boot it ever had and opens on the next one. The
+/// blobs are still there and nothing is uploaded. Pins the cost the design must name: N
+/// boots are N restarts at the unit's `RestartSec=`, each after a registration, during
+/// which the node is in no map. Catches a `SetWriter` that stops refusing an old boot (two
+/// processes could then put under one writer) and a fresh-store registration that starts
+/// above the node's boot.
+#[tokio::test]
+async fn a_node_given_its_old_member_id_opens_only_after_one_restart_per_old_boot() {
+    let dir = meta_dir("fresh-same-id");
+    let bucket = Bucket::default();
+    let held = node_that_has_run(&dir, &bucket, 1, 4).await;
+    let uploaded = bucket.written();
+    let members = fresh_frontend();
+    let mut restarts = 0;
+    let cache = loop {
+        let mine = register_as(&members, "me");
+        assert_eq!(
+            mine.member_id, 1,
+            "the first node of a fresh store is member 1"
+        );
+        match open_over(&dir, &bucket, &mine).await {
+            Ok(cache) => break cache,
+            Err(e) => {
+                assert_eq!(crate::StartFailure::of(e.as_ref()).status(), 75, "{e}");
+                restarts += 1;
+            }
+        }
+        assert!(restarts < 20, "never opened");
+    };
+    assert_eq!(restarts, 4, "one 'not ready' exit per boot the log has set");
+    assert_eq!(
+        cache.present(&held).await.expect("present"),
+        vec![true; held.len()]
+    );
+    assert_eq!(bucket.written(), uploaded, "nothing was uploaded again");
+}
+
+/// What the node tells the frontend when it registers ([`super::last_boot`], as
+/// [`super::open_cache`] asks it).
+async fn last_boot_of(dir: &Path) -> Option<crate::members::LastBoot> {
+    let meta = RaftMetaLog::open_dir(dir, Retention::default(), "kbf/")
+        .await
+        .expect("open the log");
+    super::last_boot(&meta).await.expect("read the log")
+}
+
+/// [`register_as`] by a node that reports its log's history, as a registered node does.
+async fn register_with_history(
+    members: &crate::members::Members,
+    instance: &str,
+    dir: &Path,
+) -> Joined {
+    let last = last_boot_of(dir).await;
+    let r = members
+        .register_after(
+            &crate::members::Registrant {
+                instance_id: instance.to_owned(),
+                addr: "192.0.2.1:8982".to_owned(),
+                zone: String::new(),
+                weight: 1,
+                protocol: crate::members::PROTOCOL,
+                progress: crate::members::Progress::CaughtUp,
+            },
+            last,
+        )
+        .expect("register");
+    joined(r.id.0, r.boot)
+}
+
+/// The design's claim as a requirement: the first registration on a fresh store opens the
+/// node, with no restart. Before the registration carried the log's last member and boot
+/// this failed: the store gave member 1 boot 1, and the log refused every boot up to 4.
+/// Catches a registration that does not report the log's history, or a store that does not
+/// start the boot above it.
+#[tokio::test]
+async fn the_first_registration_on_a_fresh_store_opens_a_node_that_had_run_before() {
+    let dir = meta_dir("fresh-first");
+    let bucket = Bucket::default();
+    let _held = node_that_has_run(&dir, &bucket, 1, 4).await;
+    let mine = register_with_history(&fresh_frontend(), "me", &dir).await;
+    assert_eq!((mine.member_id, mine.boot), (1, 5));
+    let opened = open_over(&dir, &bucket, &mine).await.map(drop);
+    assert!(opened.is_ok(), "{opened:?}");
+}
+
+/// A node that ran as member 3 up to boot 5, registering on a fresh store that has handed
+/// out member 1 to another node already, is given member 3 at boot 6 and opens with its
+/// blobs present and nothing uploaded; its next start (a plain restart) is boot 7 and opens
+/// too. Catches a store that hands the node a different member (its log's boots are then
+/// not the ones its keys continue), a boot at or below the log's (the open is refused) and
+/// a restart that needs a second registration to open.
+#[tokio::test]
+async fn an_old_node_opens_at_the_boot_after_its_last_with_no_restart() {
+    let dir = meta_dir("fresh-old-node");
+    let bucket = Bucket::default();
+    let held = node_that_has_run(&dir, &bucket, 3, 5).await;
+    let uploaded = bucket.written();
+    let members = fresh_frontend();
+    let _other = register_as(&members, "other");
+    let mine = register_with_history(&members, "me", &dir).await;
+    assert_eq!((mine.member_id, mine.boot), (3, 6));
+    let cache = open_over(&dir, &bucket, &mine)
+        .await
+        .expect("opens at once");
+    assert_eq!(
+        cache.present(&held).await.expect("present"),
+        vec![true; held.len()]
+    );
+    assert_eq!(bucket.written(), uploaded, "nothing was uploaded");
+    drop(cache);
+    let restart = register_with_history(&members, "me", &dir).await;
+    assert_eq!((restart.member_id, restart.boot), (3, 7));
+    open_over(&dir, &bucket, &restart).await.expect("reopens");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A node whose log's member id is held by a different live instance in the fresh store is
+/// not given it: it gets a new id, boot 1, and opens at once (a member its log never set).
+/// Catches an id handed to two instances, which would put two processes under one member.
+#[tokio::test]
+async fn a_fresh_store_never_gives_a_node_the_id_another_instance_holds() {
+    let dir = meta_dir("fresh-held-id");
+    let bucket = Bucket::default();
+    let held = node_that_has_run(&dir, &bucket, 1, 4).await;
+    let members = fresh_frontend();
+    let holder = register_as(&members, "holder");
+    assert_eq!(holder.member_id, 1);
+    let mine = register_with_history(&members, "me", &dir).await;
+    assert_ne!(mine.member_id, holder.member_id);
+    let cache = open_over(&dir, &bucket, &mine)
+        .await
+        .expect("opens at once");
+    assert_eq!(
+        cache.present(&held).await.expect("present"),
+        vec![true; held.len()]
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

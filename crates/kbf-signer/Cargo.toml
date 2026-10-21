@@ -24,6 +24,8 @@ thiserror.workspace = true
 x509-parser.workspace = true
 
 [dev-dependencies]
+# A child held between fork and exec, for the test of what releases the socket's lock.
+kbf-testkit.workspace = true
 kbf-types.workspace = true
 rcgen.workspace = true
 rustls.workspace = true

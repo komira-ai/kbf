@@ -194,6 +194,16 @@ impl Controller {
     /// [`ControllerError`]: a row or the farm could not be read, a row cannot be written, or
     /// the policy cannot be kept. Moves written before the error stand.
     pub fn tick(&mut self, now: FarmTime) -> Result<Tick, ControllerError> {
+        self.tick_gated(now, true)
+    }
+
+    /// [`Controller::tick`] that starts no host unless `may_start`: hosts already in a step
+    /// are moved as always. The caller's switch for a farm that does not roll by itself
+    /// (`update/policy.auto_nodes`, which the controller does not read).
+    ///
+    /// # Errors
+    /// As [`Controller::tick`].
+    pub fn tick_gated(&mut self, now: FarmTime, may_start: bool) -> Result<Tick, ControllerError> {
         let Some(mut pass) = self.read(now)? else {
             return Ok(Tick::default());
         };
@@ -225,7 +235,7 @@ impl Controller {
                 return Ok(pass.report);
             }
         }
-        if !pass.policy.paused && pass.report.missing.is_empty() {
+        if may_start && !pass.policy.paused && pass.report.missing.is_empty() {
             self.start(&mut pass)?;
         }
         Ok(pass.report)

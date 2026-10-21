@@ -3,7 +3,8 @@
 //! keeps of what the scheduler was fed and what it emitted.
 //!
 //! The shadow is a reference model written from the scheduler's documented rules, not
-//! from its code: first fit in queue order (I11), the unservable verdict and its wait
+//! from its code: placement in queue order, each operation to the least loaded worker
+//! with room (I11), the unservable verdict and its wait
 //! (I10, L2), expiry after G and reconciliation with the running set (I3, I9, L3),
 //! dedup and promotion (I13), and the log-order result rule (I5). Each input's
 //! effects are compared with what the model expects, and the scheduler's observable
@@ -27,7 +28,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Display;
 
-use super::reference::{Verdict, add, blame, exclusive, fits, room, sub, verdict, within};
+use super::reference::{Verdict, add, blame, by_load, exclusive, fits, room, sub, verdict, within};
 use kbf_caps::NodeCaps;
 use kbf_sched::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
 use kbf_sched::{

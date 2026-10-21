@@ -202,7 +202,7 @@ async fn a_fenced_farm_answers_its_callers_from_what_the_successor_wrote() {
     erase(2);
     erase(3);
     assert_eq!(old.follow().expect("follow"), 3);
-    assert_eq!(untraced(), 0, "one look can fall between two transactions");
+    assert_eq!(untraced(), 0, "one look that misses a row is not a report");
     for _ in 0..200 {
         assert_eq!(old.follow().expect("follow"), 3, "nobody is answered");
     }

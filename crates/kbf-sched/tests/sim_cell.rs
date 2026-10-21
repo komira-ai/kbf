@@ -424,8 +424,10 @@ fn request(n: u64) -> Request {
         qos: Qos::Ci,
         kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
-        // Every third action is networked, so it self-fences.
-        hermetic: !n.is_multiple_of(3),
+        // Every fourth action is networked, so it self-fences. Not every third: placement
+        // alternates the two workers in a period of three, so worker-1 got only networked
+        // actions and had no hermetic lease to hide.
+        hermetic: !n.is_multiple_of(4),
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
     }
@@ -616,7 +618,8 @@ fn run_scenario(seed: u64, scenario: Scenario) -> Sim<Cell> {
     let mut sim = Sim::new(seed, faults);
     sim.add_node("leader", Cell::Leader(Leader::new()));
     sim.add_node("log", Cell::Log(Log::default()));
-    // First fit fills worker-1 first: six operations land there and are cut off.
+    // Placement spreads the twelve operations over the cores: four land on worker-1
+    // (6 cores) and are cut off, eight on worker-2 (12 cores).
     let worker_1 = Worker::new(Resources::new(6_000, 64 * GIB), scenario.worker_1);
     sim.add_node("worker-1", Cell::Worker(worker_1));
     let worker_2 = Worker::new(Resources::new(12_000, 64 * GIB), scenario.worker_2);

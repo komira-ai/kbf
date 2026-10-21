@@ -45,3 +45,14 @@ pub(crate) fn refused(m: &ArgMatches, allowed: &[&str]) -> Option<String> {
         .then(|| arg.get_long().map_or(id.as_str(), |long| long).to_owned())
     })
 }
+
+/// The long names of the flags of [`Args`] outside `allowed`: the ones a mode that lists
+/// `allowed` hides and refuses, which `kbf-cli`'s settings file therefore has no key for.
+pub(crate) fn refused_names(allowed: &[&str]) -> BTreeSet<String> {
+    let threads = thread_flags();
+    Args::command()
+        .get_arguments()
+        .filter(|arg| !takes(arg.get_id(), allowed, &threads))
+        .filter_map(|arg| arg.get_long().map(str::to_owned))
+        .collect()
+}

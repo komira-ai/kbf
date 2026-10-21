@@ -313,7 +313,7 @@ impl Drop for Request<'_> {
 }
 
 /// The metadata commands the cache commits, as the `command` label names them.
-pub const COMMANDS: [&str; 19] = [
+pub const COMMANDS: [&str; 20] = [
     "tick",
     "alloc_epoch",
     "put_blob",
@@ -333,6 +333,7 @@ pub const COMMANDS: [&str; 19] = [
     "adopt_segment",
     "rebuild_progress",
     "rebuild_done",
+    "reseat_staged",
 ];
 
 /// The index into [`COMMANDS`] of `command`'s label.
@@ -358,6 +359,7 @@ pub const fn command_label(command: &Command) -> usize {
         Command::AdoptSegment { .. } => 16,
         Command::RebuildProgress { .. } => 17,
         Command::RebuildDone => 18,
+        Command::ReseatStaged { .. } => 19,
     }
 }
 
@@ -417,6 +419,32 @@ pub struct CacheMetrics {
     /// Directory blobs the input-tree checks read from the store, counted as each read
     /// starts.
     pub execute_dir_reads: Counter,
+    /// Of an input-tree check over a store (`input_walk`): the time reading Directories,
+    /// and the time asking which files are held. The two phases run one after the other
+    /// and add up to the check less its bookkeeping.
+    pub execute_walk_dirs: Histogram,
+    pub execute_walk_files: Histogram,
+    /// Directories read from the store by checks over a store; Directories skipped with
+    /// all under them because an earlier check verified them; FindMissing calls for
+    /// files; files asked about.
+    pub execute_walk_dirs_read: Counter,
+    pub execute_walk_dirs_skipped: Counter,
+    pub execute_walk_file_asks: Counter,
+    pub execute_walk_files_checked: Counter,
+    /// One Directory read of an input-tree check over a store, as the walk saw it
+    /// (`kbf_execute_walk_dir_read_seconds`): failed reads included, reads another
+    /// check shared and Directories taken from the content cache not.
+    pub execute_walk_dir_read: Histogram,
+    /// Of the content cache of decoded Directories behind those checks: Directories
+    /// taken without a read (from the cache, or from a read another check had open);
+    /// reads led; of the hits, those another check's read supplied; Directories
+    /// pushed out for room; cached Directories put to FindMissing; bytes held.
+    pub execute_dir_cache_hits: Counter,
+    pub execute_dir_cache_misses: Counter,
+    pub execute_dir_cache_merged: Counter,
+    pub execute_dir_cache_evictions: Counter,
+    pub execute_dir_cache_present_checked: Counter,
+    pub execute_dir_cache_bytes: Level,
     /// One call of the scheduler's submit from an Execute, the wait for its lock
     /// included.
     pub execute_submit: Histogram,
@@ -443,6 +471,14 @@ pub struct CacheMetrics {
     pub tier_wait: Histogram,
     /// One write-tier call, from its hand-over to the blocking pool to its answer.
     pub tier_call: Histogram,
+    /// Block files the write tier holds open for writing, as of the last write-pool
+    /// step (`kbf_storage_open_write_fds`).
+    pub open_write_fds: Level,
+    /// Blobs waiting for a write-pool writer (`kbf_storage_write_pool_queue`).
+    pub write_pool_queue: Gauge,
+    /// Blobs the full write-pool queue sent straight to the object store, or that the
+    /// tier did not take (`kbf_storage_write_pool_direct_total`).
+    pub write_pool_direct: Counter,
     /// Directories the input check took from the decoded-directory cache, touching the
     /// blob but reading nothing.
     pub input_dirs_cached: Counter,
@@ -480,6 +516,19 @@ impl Default for CacheMetrics {
             execute_presubmit_in_flight: Gauge::default(),
             execute_walk: Histogram::new(Unit::Seconds),
             execute_dir_reads: Counter::default(),
+            execute_walk_dirs: Histogram::new(Unit::Seconds),
+            execute_walk_files: Histogram::new(Unit::Seconds),
+            execute_walk_dirs_read: Counter::default(),
+            execute_walk_dirs_skipped: Counter::default(),
+            execute_walk_file_asks: Counter::default(),
+            execute_walk_files_checked: Counter::default(),
+            execute_walk_dir_read: Histogram::new(Unit::Seconds),
+            execute_dir_cache_hits: Counter::default(),
+            execute_dir_cache_misses: Counter::default(),
+            execute_dir_cache_merged: Counter::default(),
+            execute_dir_cache_evictions: Counter::default(),
+            execute_dir_cache_present_checked: Counter::default(),
+            execute_dir_cache_bytes: Level::default(),
             execute_submit: Histogram::new(Unit::Seconds),
             sched_lock_wait: Histogram::new(Unit::Seconds),
             sched_queued: Level::default(),
@@ -490,6 +539,9 @@ impl Default for CacheMetrics {
             tier_in_flight: Gauge::default(),
             tier_wait: Histogram::new(Unit::Seconds),
             tier_call: Histogram::new(Unit::Seconds),
+            open_write_fds: Level::default(),
+            write_pool_queue: Gauge::default(),
+            write_pool_direct: Counter::default(),
             input_dirs_cached: Counter::default(),
             input_dirs_skipped: Counter::default(),
             input_dirs_joined: Counter::default(),
@@ -597,6 +649,24 @@ impl CacheMetrics {
                 &self.execute_walk,
             ),
             (
+                "kbf_execute_walk_dirs_seconds",
+                "The directory phase of one input-tree check over a store: Directories read \
+                 (those not remembered as verified)",
+                &self.execute_walk_dirs,
+            ),
+            (
+                "kbf_execute_walk_files_seconds",
+                "The file phase of one input-tree check over a store: the FindMissing calls \
+                 for the files its Directories name",
+                &self.execute_walk_files,
+            ),
+            (
+                "kbf_execute_walk_dir_read_seconds",
+                "One Directory read from the store by an Execute input-tree check: the \
+                 store's latency per read, failed reads included",
+                &self.execute_walk_dir_read,
+            ),
+            (
                 "kbf_execute_submit_seconds",
                 "The scheduler's submit called from one Execute, the wait for its lock included",
                 &self.execute_submit,
@@ -633,6 +703,58 @@ impl CacheMetrics {
         );
         for (name, help, counter) in [
             (
+                "kbf_execute_walk_dirs_read_total",
+                "Directories the Execute input checks read from the store",
+                &self.execute_walk_dirs_read,
+            ),
+            (
+                "kbf_execute_walk_dirs_skipped_total",
+                "Directories an Execute input check skipped with everything under them \
+                 because an earlier check found them held within the last minute",
+                &self.execute_walk_dirs_skipped,
+            ),
+            (
+                "kbf_execute_walk_file_asks_total",
+                "FindMissing calls the Execute input checks made for files",
+                &self.execute_walk_file_asks,
+            ),
+            (
+                "kbf_execute_walk_files_checked_total",
+                "Files the Execute input checks asked about",
+                &self.execute_walk_files_checked,
+            ),
+            (
+                "kbf_execute_dir_cache_hits_total",
+                "Directories an Execute input check took without reading them: from the \
+                 content cache of decoded Directories (and then asked about, never trusted \
+                 unasked), or from a read another check had open",
+                &self.execute_dir_cache_hits,
+            ),
+            (
+                "kbf_execute_dir_cache_misses_total",
+                "Directories an Execute input check found neither cached nor being read, \
+                 and so read",
+                &self.execute_dir_cache_misses,
+            ),
+            (
+                "kbf_execute_dir_cache_merged_total",
+                "Of the content cache hits, the Directories another check's read supplied \
+                 while this one waited",
+                &self.execute_dir_cache_merged,
+            ),
+            (
+                "kbf_execute_dir_cache_evictions_total",
+                "Decoded Directories pushed out of the content cache to stay within its \
+                 byte bound",
+                &self.execute_dir_cache_evictions,
+            ),
+            (
+                "kbf_execute_dir_cache_present_checked_total",
+                "Cached Directories whose digests an Execute input check put to FindMissing \
+                 to confirm the store still holds them",
+                &self.execute_dir_cache_present_checked,
+            ),
+            (
                 "kbf_input_directories_cached_total",
                 "Directories an input check took from the decoded-directory cache, touching \
                  the blob and reading nothing",
@@ -653,6 +775,12 @@ impl CacheMetrics {
         ] {
             out.counter(name, help, counter.get());
         }
+        out.gauge(
+            "kbf_execute_dir_cache_bytes",
+            "Bytes of decoded Directories the Execute input checks' content cache holds, as \
+             of the end of the last check",
+            self.execute_dir_cache_bytes.get(),
+        );
         out.gauge(
             "kbf_sched_queued",
             "Operations waiting for a lease, as of the last scheduler input",
@@ -685,6 +813,22 @@ impl CacheMetrics {
             "Write-tier calls queued on or running on the blocking pool",
             self.tier_in_flight.get(),
         );
+        out.gauge(
+            "kbf_storage_open_write_fds",
+            "Block files the write tier holds open for writing, as of the last write-pool step",
+            self.open_write_fds.get(),
+        );
+        out.gauge(
+            "kbf_storage_write_pool_queue",
+            "Blobs waiting for a write-pool writer",
+            self.write_pool_queue.get(),
+        );
+        out.counter(
+            "kbf_storage_write_pool_direct_total",
+            "Blobs the write pool sent straight to the object store: its queue was full, or \
+             the tier did not take them",
+            self.write_pool_direct.get(),
+        );
         let name = "kbf_meta_commit_seconds";
         out.head(
             name,
@@ -714,7 +858,7 @@ pub struct TierCounters {
     pub flushes: Counter,
     /// Flush attempts that failed and will be retried.
     pub flush_failures: Counter,
-    /// Objects whose key held another object: `FlushConflict` committed (alert).
+    /// Objects whose key held another object and were moved to an object of their own (alert).
     pub conflicts: Counter,
     /// Objects with a record that failed its digest on the tier: marked corrupt.
     pub corrupt: Counter,
@@ -724,6 +868,10 @@ pub struct TierCounters {
     pub digest_mismatch: Counter,
     /// Blobs read from the tier's disk (a block or a flushed copy).
     pub local_reads: Counter,
+    /// Objects staged on the tier and not flushed, as a flusher round found them at its start.
+    pub staged_objects: Level,
+    /// The committed bytes of those objects.
+    pub staged_bytes: Level,
 }
 
 impl TierCounters {
@@ -809,6 +957,16 @@ impl TierCounters {
                 "kbf_write_tier_flushed_copy_bytes",
                 "Bytes of flushed copies kept on the tier for local reads",
                 usage.flushed,
+            ),
+            (
+                "kbf_write_tier_staged_objects",
+                "Objects staged on the write tier and not flushed, at the start of the last flusher round",
+                self.staged_objects.get(),
+            ),
+            (
+                "kbf_write_tier_staged_bytes",
+                "Committed bytes of the staged objects not flushed, at the start of the last flusher round",
+                self.staged_bytes.get(),
             ),
             (
                 "kbf_write_tier_unflushed_bytes",

@@ -33,10 +33,10 @@ async fn a_history_that_cannot_be_read_is_503_and_names_no_cause() {
 
     let b = world.start(PAGES_ONLY);
     let routes = ["/v1/invocations/down".to_owned(), format!("/v1/runs/{run}")];
-    // The index does not answer a read of the header.
-    world.state.fail_gets.store(STICKY, Ordering::SeqCst);
+    // The index does not answer a read of the header rows (a scan of the invocation's rows).
+    world.state.fail_scans.store(STICKY, Ordering::SeqCst);
     let answer = b.get(&routes[0]).await;
-    world.state.fail_gets.store(0, Ordering::SeqCst);
+    world.state.fail_scans.store(0, Ordering::SeqCst);
     assert_eq!(answer.code, 503, "{}", answer.json);
     assert_eq!(
         answer.json["error"],
@@ -219,11 +219,11 @@ async fn an_index_that_fails_after_a_change_is_503_not_changed() {
         set_header(&first, "flaky", &grown);
         let second = Arc::clone(&first);
         first.after_get("ui/invid/", move || {
-            second.fail_gets.store(STICKY, Ordering::SeqCst);
+            second.fail_scans.store(STICKY, Ordering::SeqCst);
         });
     });
     let answer = b.get("/v1/invocations/flaky").await;
-    world.state.fail_gets.store(0, Ordering::SeqCst);
+    world.state.fail_scans.store(0, Ordering::SeqCst);
     assert_eq!(answer.code, 503, "{}", answer.json);
     assert_eq!(
         answer.json["error"],

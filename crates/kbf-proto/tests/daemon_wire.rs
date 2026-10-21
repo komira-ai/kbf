@@ -4,7 +4,7 @@
 //! storage (docs/design/architecture-v2.md, section 9). The flags keep the credential
 //! off its command line and out of its environment (kbf-cli's tests), its unit loads
 //! none (kbf-deploy's `linux/modes_tests.rs`), and the layering keeps the object-store
-//! client out of the daemon crates (kbf-it's tests/layering.rs); this file keeps it off
+//! client out of the daemon crates (kbf-integration-test's tests/layering.rs); this file keeps it off
 //! the wire's schema: no message of any service in a package the daemon has clients for
 //! (`DAEMON_PACKAGES`: the work stream and segments, storage's action store, ByteStream,
 //! the REAPI services and the release fetch of self-update), and no message of the storage map (which `Welcome` and
@@ -389,5 +389,56 @@ fn words_split_each_naming_style() {
         ("", &[]),
     ] {
         assert_eq!(words(name), want, "{name}");
+    }
+}
+
+/// Messages of the storage node's calls (`Membership`, `ColdStore`): they carry the cold-store
+/// registration generation, its status and the store with its secret, and a daemon must
+/// hold none of them.
+const STORAGE_NODE_MESSAGES: &[&str] = &[
+    ".kbf.map.v1.RegisterRequest",
+    ".kbf.map.v1.RegisterResponse",
+    ".kbf.map.v1.HeartbeatRequest",
+    ".kbf.map.v1.HeartbeatResponse",
+    ".kbf.enroll.v1.GetStoreConfigRequest",
+    ".kbf.enroll.v1.GetStoreConfigResponse",
+    ".kbf.enroll.v1.StoreConfig",
+];
+
+/// Catches: the registration generation, an apply status or the store reaching a daemon by
+/// a message of a storage node's call being embedded in one the daemon sends or receives
+/// (`Welcome`, `MapUpdate`, a daemon `Heartbeat`, the map): the closure of the daemon's wire
+/// holds none of them. (A field added to those messages by name is the walk above's.)
+#[test]
+fn no_message_of_a_storage_nodes_store_calls_is_on_the_daemon_wire() {
+    let set = descriptors();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("proto");
+    let enroll = protox::compile(
+        ["kbf/enroll/v1/enroll.proto"],
+        [
+            root.join("third_party/remote-apis"),
+            root.join("third_party/googleapis"),
+            root.join("third_party/grpc-proto"),
+            root.clone(),
+        ],
+    )
+    .expect("the enroll proto compiles");
+    // A message of enroll.proto reaches the walk only by being imported into a daemon proto, so the
+    // closure over `descriptors()` is the right place to look; the enroll file is compiled to be
+    // sure each name is real.
+    let all: Vec<String> = messages(&set)
+        .into_iter()
+        .chain(messages(&enroll))
+        .map(|(name, _)| name)
+        .collect();
+    for held in STORAGE_NODE_MESSAGES {
+        assert!(all.iter().any(|n| n == held), "{held} is not a message");
+    }
+    let closure = daemon_closure(&set);
+    for held in STORAGE_NODE_MESSAGES {
+        assert!(
+            !closure.contains(*held),
+            "{held} is on the daemon's wire: a daemon-only node holds no cold-store state"
+        );
     }
 }

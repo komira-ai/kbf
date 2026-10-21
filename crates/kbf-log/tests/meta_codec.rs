@@ -246,7 +246,8 @@ fn the_golden_set_names_every_variant() {
             | Command::SetWriter(_)
             | Command::AdoptSegment { .. }
             | Command::RebuildProgress { .. }
-            | Command::RebuildDone => panic!("a later format's command in format 1's set"),
+            | Command::RebuildDone
+            | Command::ReseatStaged { .. } => panic!("a later format's command in format 1's set"),
         };
         seen[i] = true;
     }
@@ -633,10 +634,10 @@ fn malformed_values_are_refused() {
 /// Catches: an encoder or decoder that ignores the committed format, so a binary would
 /// write or read an encoding the log does not allow.
 #[test]
-fn only_formats_1_to_4_are_written_or_read() {
+fn only_formats_1_to_5_are_written_or_read() {
     let entry = LogCommand::Meta(Command::Collect);
     let bytes = encode(Format::V1, &entry).expect("format 1");
-    for format in [Format::new(0), Format::new(5), Format::new(u32::MAX)] {
+    for format in [Format::new(0), Format::new(6), Format::new(u32::MAX)] {
         assert_eq!(encode(format, &entry), Err(EncodeError::Format(format)));
         assert_eq!(decode(format, &bytes), Err(DecodeError::Format(format)));
     }
@@ -645,11 +646,12 @@ fn only_formats_1_to_4_are_written_or_read() {
             Format::V1.get(),
             Format::V2.get(),
             Format::V3.get(),
-            Format::V4.get()
+            Format::V4.get(),
+            Format::V5.get()
         ),
-        (1, 2, 3, 4)
+        (1, 2, 3, 4, 5)
     );
-    for n in 1..=4 {
+    for n in 1..=5 {
         assert_eq!(decode(Format::new(n), &bytes), Ok(entry.clone()), "{n}");
     }
 }

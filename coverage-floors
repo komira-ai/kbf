@@ -1,0 +1,11 @@
+# Coverage floors, checked by the CI test job (crates/kbf-coverage). The pull-request
+# gate is 99.00% of lines and 99.00% of branches in every crate, measured on the fast
+# tests. A crate under 99% on either is listed here with the floor it may not fall
+# below, as a percentage floored to hundredths; `-` means that metric has no floor and
+# must reach 99.00%. A crate at 99% or more on both is not listed.
+#
+# A floor may only rise. `cargo run -p kbf-coverage -- raise` lifts floors to a
+# measurement (a line is dropped once both metrics reach 99%) and never adds or lowers
+# one, and CI fails a pull request whose floors are lower than its base's. Each listed
+# crate has an open issue to reach 99%.
+# crate lines-floor branches-floor

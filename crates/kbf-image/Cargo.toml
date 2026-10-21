@@ -30,6 +30,8 @@ tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "time"] }
 tokio-rustls.workspace = true
 
 [dev-dependencies]
+# Scratch directories the tests own (kbf_testkit::dir).
+kbf-testkit.workspace = true
 rcgen.workspace = true
 rustix = { workspace = true, features = ["process"] }
 rustls.workspace = true

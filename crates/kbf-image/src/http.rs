@@ -3,7 +3,7 @@
 //!
 //! Written over hyper's connection API rather than a client crate: the daemon links
 //! this, and a daemon must not link a standalone HTTP client (the layering test in
-//! `kbf-it`); hyper is already in its closure through tonic.
+//! `kbf-integration-test`); hyper is already in its closure through tonic.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;

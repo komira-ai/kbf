@@ -61,17 +61,17 @@ pub(crate) fn daemon_holds(local: &LocalCache, daemon: &kbf_node::Cli) -> bool {
         .contains("local_cache: Some(LocalCache { fill: Fill { inputs: 0, storage: 4242 } })")
 }
 
-/// For the modes' tests: a directory under the test binary's (unit tests get no
-/// `CARGO_TARGET_TMPDIR`), not made: the check judges a path by its nearest existing
-/// directory.
+/// For the modes' tests: a new directory under the test binary's (unit tests get no
+/// `CARGO_TARGET_TMPDIR`), removed when it drops. Bind it first in the test, so what
+/// the test starts is gone before it is removed.
 #[cfg(test)]
-pub(crate) fn under_target(name: &str) -> std::path::PathBuf {
-    std::env::current_exe()
+pub(crate) fn under_target(name: &str) -> kbf_testkit::dir::TestDir {
+    let beside = std::env::current_exe()
         .expect("test binary")
         .parent()
         .expect("deps")
-        .join("kbf-all-in-one-unit")
-        .join(format!("{name}-{}", std::process::id()))
+        .join("kbf-all-in-one-unit");
+    kbf_testkit::dir::TestDir::under(beside, name)
 }
 
 #[cfg(test)]

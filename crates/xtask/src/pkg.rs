@@ -9,8 +9,9 @@
 //!   other writes (0755 all the way down): `kbf-installer check` refuses to run from a
 //!   user-owned prefix, which is why there is no formula (a Homebrew prefix is the
 //!   user's) and why the tool is not under `/usr/local/bin`;
-//! - `/usr/local/kbf-installer/trust/<name>` (0644) for each `--trust` file: the
-//!   release's pinned `gh`, trusted root and `installer.conf`;
+//! - `/usr/local/kbf-installer/trust/<name>` for each `--trust` file: the release's
+//!   pinned `gh` (0755, like the Linux package's), `trusted_root.jsonl` and
+//!   `installer.conf` (0644), which `cargo xtask pkg-trust` writes ([`trust_mode`]);
 //! - `/Library/LaunchDaemons/com.komira.kbf-installer.plist` (0644): `--launchd-plist`;
 //! - `/var/db/kbf-installer` (0700), the installer's state directory, empty;
 //! - `/Library/Logs/kbf-installer` (0755), where the job writes.
@@ -44,10 +45,12 @@ use std::path::{Path, PathBuf};
 use crate::Error;
 use crate::fetch::Sha256;
 use crate::package::{read, write_new};
+use crate::pkg_linux::TRUST_FILES;
 
 pub mod bom;
 pub mod brew;
 pub mod cpio;
+pub mod open;
 pub mod sha1;
 pub mod tree;
 pub mod xar;
@@ -70,7 +73,10 @@ pub const STATE_MODE: u32 = 0o700;
 /// The installer's configuration, which `kbf-installer setup` writes and whose existence
 /// opens the gate.
 pub const GATE: &str = "/usr/local/etc/kbf/installer.toml";
-/// What the property list runs: the installed tool in its service mode.
+/// The launchd job `run` kickstarts after a swap: the node's daemon (`MAC_DAEMON_LABEL` of
+/// `kbf-installer setup`; Macs are nodes only).
+pub const DAEMON_LABEL: &str = "com.komira.kbf-daemon";
+/// What the property list runs: the installed tool, in `run`, naming [`DAEMON_LABEL`].
 pub const PROGRAM: &str = "/usr/local/kbf-installer/bin/kbf-installer";
 
 /// The package's file name for `version`.
@@ -113,7 +119,8 @@ pub fn gate_problems(plist: &str) -> Vec<String> {
             "runs the installed tool in its service mode",
             format!(
                 "<key>ProgramArguments</key><array><string>{PROGRAM}</string>\
-                 <string>serve</string></array>"
+                 <string>run</string><string>--launchd-label</string><string>{DAEMON_LABEL}</string>\
+                 </array>"
             ),
         ),
         (
@@ -186,6 +193,15 @@ pub struct Build<'a> {
     pub out: &'a Path,
 }
 
+/// The mode of the trust file `name`: the Linux package's ([`TRUST_FILES`]), so the
+/// pinned `gh` is executable and the data files are not; another name is data.
+pub fn trust_mode(name: &str) -> u32 {
+    TRUST_FILES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map_or(0o644, |(_, mode)| *mode)
+}
+
 /// The tree `pkg build` packages.
 fn installed(b: &Build) -> Result<Tree, Error> {
     let binary = read(b.binary)?;
@@ -217,8 +233,12 @@ fn installed(b: &Build) -> Result<Tree, Error> {
                 path.display()
             )));
         };
-        tree.file(&format!("{TRUST_DIR}/{name}"), 0o644, read(path)?)
-            .map_err(fail)?;
+        tree.file(
+            &format!("{TRUST_DIR}/{name}"),
+            trust_mode(name),
+            read(path)?,
+        )
+        .map_err(fail)?;
     }
     Ok(tree)
 }

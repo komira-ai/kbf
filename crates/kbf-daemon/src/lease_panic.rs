@@ -1,5 +1,5 @@
 //! A lease's run with its driver's panics contained (the all-in-one design,
-//! komira-build-farm#657, section 7.3).
+//! kbf#657, section 7.3).
 
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
@@ -12,7 +12,7 @@ use crate::runtime::{RuntimeError, Work};
 use crate::runtimes::AnyRuntime;
 
 /// Runs `work` on `run`. A driver that panics ends this run, never the daemon (or, in
-/// kbf-all-in-one, the server beside it), and the run still reports: a run that never
+/// `kbf all-in-one`, the server beside it), and the run still reports: a run that never
 /// reported would keep its lease listed as running for ever.
 pub(crate) async fn contained(
     run: &dyn AnyRuntime,

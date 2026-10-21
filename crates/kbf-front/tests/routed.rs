@@ -46,7 +46,11 @@ impl Cell {
 
     /// `map`, which a change has just made, and the map it replaced.
     fn set_after(&self, map: Arc<Map>, previous: Option<Arc<Map>>) {
-        *self.view.lock().unwrap_or_else(PoisonError::into_inner) = Some(MapView { map, previous });
+        *self.view.lock().unwrap_or_else(PoisonError::into_inner) = Some(MapView {
+            map,
+            previous,
+            earlier: Vec::new(),
+        });
     }
 }
 
@@ -894,6 +898,7 @@ async fn a_node_with_a_newer_map_makes_the_frontend_fetch_it() {
         farm.cell.fetches.lock().expect("lock").push_back(MapView {
             map: Arc::clone(&newer),
             previous: None,
+            earlier: Vec::new(),
         });
         farm.cell.asked.lock().expect("lock").clear();
     };

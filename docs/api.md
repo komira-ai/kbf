@@ -9,7 +9,7 @@ own address, given with `--api-listen`; without the flag there is no API. The st
 line then ends with ` api=<addr>`. The listener speaks HTTP/1.1, and HTTP/2 in clear
 text (h2c, with prior knowledge); every rule below holds for both.
 
-Reads answer anyone who reaches the address: bind it where only operators do. The
+Reads answer anyone who reaches the address: bind it where only operators do. (Behind the farm's proxy, `--proxy-auth-file`, only a loopback peer reaches it at all: [Who may write](#behind-the-farms-proxy).) The
 exceptions are the [enrollment routes](#v1enrolltokens-and-v1enrollnodes), which pass every
 gate of a write even to be read, and the build pages, [`GET /v1/invocations/{id}`](#get-v1invocationsid-and-below)
 and below, and [`GET /v1/blobs`](#get-v1blobsdigest), which run the REAPI policy and are
@@ -36,11 +36,13 @@ it must come from an operator. Where a request comes from does not show that:
   without a preflight, if the API accepts a "simple" request (`text/plain` or a form
   body, or no body).
 
-So a write must pass every one of these gates, in this order:
+So a write must pass every one of these gates, in this order (the loopback gate is first
+because the token must not cross a network, and it is not an identity: it never lets a
+write through without the token):
 
 | Gate | Refused with |
 |---|---|
-| the peer is loopback, so the token never crosses a network in clear | `403` |
+| the peer is loopback, so the token never crosses a network in clear; with `--proxy-auth-file`, the request must also present the proxy's secret (see [Behind the farm's proxy](#behind-the-farms-proxy)) | `403` |
 | the request has no `Origin` header (browsers send one with a cross-origin POST) | `403` |
 | the server was started with `--api-token-file` (without it, writes are off) | `403` |
 | `Authorization: Bearer <token>` with the file's token (the SHA-256 digests of both are compared in constant time, so neither the token's bytes nor its length show through timing) | `401`, with `WWW-Authenticate: Bearer` |
@@ -67,17 +69,79 @@ server's host that terminates TLS (`tailscale serve`, nginx). The proxy is what 
 the loopback gate pass, so the token is what stands between the network and the
 writes: forward the `Authorization` header unchanged, and expose only what the
 operators' network should reach. A proxy that adds an `Origin` header to every
-request turns writes off.
+request turns writes off. A server started without `--proxy-auth-file` cannot tell such
+a proxy from a local process: both are loopback peers. The farm's own proxy (below)
+is told apart by a secret.
+
+### Behind the farm's proxy
+
+`--proxy-auth-file <path>` says the server sits behind the farm's TLS-terminating proxy
+(`docs/design/frontend-proxy.md`, section 3). The file holds a per-boot secret of exactly
+32 bytes, owned by the server's user with mode `0600` or `0400` (the token file's checks);
+the server refuses to start otherwise. It is read at start, and never taken from the
+command line or the environment. The proxy presents the 32 bytes as 64 lower-case hex
+digits in `x-kbf-proxy-auth`. Then, on the operator API, the worker listener and the REAPI
+listener:
+
+- A request from an address that is not loopback is refused before anything reads it
+  (`403` on this API; `UNAUTHENTICATED` on gRPC).
+- A loopback request that does not present the secret, or presents a wrong one (compared in
+  constant time), is a local caller: its `x-kbf-*` headers mean nothing. On this API it may
+  read, as before, but **a write is refused `403` even with the token**: a write must come
+  through the proxy.
+- A loopback request that presents the secret is the proxy's. A write still needs every
+  other gate, the token included: the secret says who forwarded the request, not that the
+  caller may write.
+- Every `x-kbf-*` header is removed from every request, whatever the result, so nothing
+  past this check can read one. The proxy sets `x-kbf-node-id`, `x-kbf-role` and `x-kbf-node-ips` for a call
+  whose client certificate it verified; the worker listener takes those (and no TLS flag)
+  in place of a certificate: the role table, the `Hello.node_id` binding, the blob calls
+  and `Membership`'s role check use them. A `Hello` whose node id is not the proxy's
+  `x-kbf-node-id` is refused `PERMISSION_DENIED`. A `Membership` registration
+  or heartbeat has no certificate behind the proxy: its names are the proxied node id and
+  the IP addresses in `x-kbf-node-ips` (those of the verified leaf; see
+  `docs/design/frontend-proxy.md` section 3), so the host of its instance id and its address
+  must be that name (up to ASCII case) or one of those addresses (exact equality). A
+  malformed, repeated or oversized `x-kbf-node-ips` is refused `PERMISSION_DENIED`; without
+  one, an IP host is refused. The proxied role must be `storage`. The proxy also sets
+  `x-kbf-client-addr`, the address the client connected from (canonical IP text, no
+  port), on every call; only the per-caller read bound uses it, and a value that is not one
+  IP address is refused `PERMISSION_DENIED` (HTTP 403).
+
+What the flag does not do, and what the proxy must do:
+
+- **Deny-list entries by `serial` or `spki-sha256` do nothing behind the proxy.** The child
+  sees no certificate, only the node id and role the proxy forwarded, so only a `node`
+  entry in `--worker-deny-list` can name a proxied caller. To revoke a certificate, list
+  its node, or have the proxy refuse the certificate. A server started with
+  `--proxy-auth-file` and a deny list holding a `serial` or `spki-sha256` entry logs a
+  warning at start naming the count. (Enforcing them would need the proxy to forward a
+  verified serial and key in a new header; that is the proxy's work, not this flag's.)
+- The storage listener (`kbf storage`, and the in-process one of all-in-one) is not behind
+  the proxy: it keeps its own mutual TLS and its own admission.
+- `--reapi-auth-policy mtls` finds no certificate on a proxied REAPI call and refuses every
+  call; use another policy behind the proxy until the proxy forwards the identity to it.
+- With the flag, `/metrics` and `/healthz` answer a loopback peer only, and a local `curl`
+  write is refused (see above).
+- The server cannot tell the proxy's `x-kbf-node-id` from a client's if the proxy forwards
+  a client's headers: the proxy must remove every client-supplied `x-kbf-*` header before
+  it adds its own. A call from a Unix-socket peer has no address and is refused. The
+  secret file must be owned by the user the server runs as, so the proxy and the server run
+  as one user.
+
+Without the flag, nothing changes: the headers do nothing (they are removed all the same),
+and the gates are the ones in the table.
 
 ## `GET /v1/nodes`
 
 The server that answers, then every node registered since it started, in node-id
-order, with its software and where it is in placement:
+order, with the protocol version it speaks, its software and where it is in
+placement, and, after the list, the oldest protocol version among them:
 
 ```json
 { "server": { "version": "0.1.0+0123456789ab", "commit": "0123456789ab" },
   "nodes": [
-  { "node_id": "mac-1", "connected": true, "software": {
+  { "node_id": "mac-1", "connected": true, "protocol": 1, "software": {
       "os_name": "macOS", "os_version": "15.1", "os_build": "24B83", "kernel": "",
       "daemon_version": "0.1.0", "xcode_builds": ["15F31d", "16C5032a"],
       "xcodes": [
@@ -95,9 +159,10 @@ order, with its software and where it is in placement:
       "Xcode 16B40 (/Applications/Xcode_16.1.app) installed but not ready: /usr/bin/xcodebuild -license check exited with exit status: 69: You have not agreed to the Xcode license agreements.; fix: sudo /Applications/Xcode_16.1.app/Contents/Developer/usr/bin/xcodebuild -license accept" ],
     "placement": { "state": "draining", "deadline_unix_ms": 1791371800000,
                    "leases": ["117399224320012061.42"] } },
-  { "node_id": "old-1", "connected": false, "software": null, "needs_attention": [],
-    "placement": { "state": "serving" } }
-] }
+  { "node_id": "old-1", "connected": false, "protocol": null, "software": null,
+    "needs_attention": [], "placement": { "state": "serving" } }
+],
+  "oldest_protocol": 1, "protocol_unknown": 1 }
 ```
 
 | Field | Meaning |
@@ -106,14 +171,59 @@ order, with its software and where it is in placement:
 | `server.commit` | the commit it was built from, 12 hex digits (`git rev-parse --short=12`), or `unknown` for a build without a git checkout |
 | `node_id` | the id its daemon registered with |
 | `connected` | whether its newest stream is still open |
+| `protocol` | the `kbf.worker.v1` version the `Welcome` that answered the `Hello` opening its newest stream named: the lesser of the `Hello`'s version and the newest the server speaks, so a daemon whose `Hello` names 5 against a server speaking 3 shows 3 ([worker-protocol.md](design/worker-protocol.md)); `null` if no version is known (a `Hello` naming 0, which is not a version, from a server that accepts it). A `Hello` resent on the stream does not change it, and a node that returns on another version shows the new one. It stays after the stream closes: it is the version the node last spoke |
+| `blocked_on` | only on a `joining` member, only when the frontend runs with `--auto-promote`: a list of sentences saying what holds its automatic promotion back (a member that has not flushed, a tail epoch not acknowledged, a member down, the settle time). Absent otherwise; an empty answer for a joiner means only its next beat or the next sweep is owed |
+| `oldest_protocol` | the least `protocol` among the listed nodes whose `protocol` is not `null`, connected or not (a node whose stream closed may return on the version it last spoke); `null` if no listed node names one. Nodes that name none are not in it |
+| `protocol_unknown` | how many listed nodes have a `null` `protocol`. They are never counted in `oldest_protocol`, so `oldest_protocol` says "every node but these speaks at least this": a reader that needs every node reads it with `protocol_unknown` equal to 0 |
 | `software` | the newest `NodeStatus` it sent ([worker-protocol.md](design/worker-protocol.md#nodestatus)); `null` from a daemon that predates it. An empty string or list is a value the node could not read |
 | `software.received_at_unix_ms` | when the server received it, by the server's clock |
 | `software.xcode_builds` | the Xcode builds actions can use on it: only these route work |
 | `software.xcodes` | every installed Xcode, ready or not: `app`, `build` (empty if not known), `state` (`ready`, `license_not_accepted`, `first_launch_not_run`, `metal_toolchain_missing`, `failed`, `not_surveyed` from the daemon's start until its first survey of its Xcodes ends (never advertised; the daemon sends its status again when the survey ends), or `unknown` for a state this server does not know), `reason` (the check that failed and its answer, from the daemon's last survey that changed this Xcode's `DEVELOPER_DIR`, build or state; a survey that differs only in its reason is not sent, so when another check later fails with the same build and state, this is still the earlier check's text) and `fix` (the command an administrator runs on the node, when one is known). Empty from a daemon that predates it |
 | `software.container_images` | the container images the node was pinned to (`kbf-daemon --image`, container driver), as `docker://<repo>@sha256:<digest>`, sorted: each was in its image store, as one architecture's manifest, when the daemon started (a daemon that finds one missing does not start). Status only: no work is placed by image. Empty when none is pinned, on a Mac, and from a daemon that predates it |
+| `update` | where its update is: `{"state", "up_to_date", "availability"}` and nothing more (the commits and the refusal text are on [`GET /v1/update/hosts`](#get-v1updatehosts)). `state` is the host's step state from its newest `UpdateStatus` (`idle`, `fetching`, `staged`, `activated_unconfirmed`, `confirmed`, `reverted`, `refused`, `manual`, or `unknown` for a state this server does not know), `null` unless `availability` is `ok`. `availability`: `unsupported` if the node never sent an `UpdateStatus` (never shown as idle), `unavailable` if it sent one but its newest stream is closed or has not sent its own yet (a restarted daemon is not judged by its previous process), `ok` otherwise. `up_to_date` is `true` or `false` against the desired commit of `GET /v1/update`, and `null` whenever the server cannot judge: no desired release (or no `--state-store`, or a row that cannot be read), a host that is not `ok`, or a running commit that is not a hex prefix of 12 digits or more |
 | `needs_attention` | what an operator must do on the node, one line per item: today each installed Xcode that is not ready, as `Xcode <build> (<app>) installed but not ready: <reason>; fix: <command>`. An Xcode `not_surveyed` keeps the item the same app had in the node's previous status (as when a restarted daemon sends its first status), until a survey reports it; one with no previous item has none. The server also logs each item once at `WARN` (target `kbf_server::attention`) when it appears, and at `INFO` when a status reports it gone (its Xcode ready, changed or removed); a status that repeats an item, or lists its Xcode `not_surveyed`, logs nothing. An item is the same while its Xcode's app, build, state and fix are, so a reason that changes alone is shown here but not logged again. The previous status is kept in the server's memory: after a server restart, each item is logged again when its node reports it; kbf has no alert delivery yet (issue #189) |
+| `lease_count` | how many leases it holds now (granted or running), the number of entries of `GET /v1/nodes/{id}`'s `leases`. In memory like the rest: after a server restart it is 0 until the daemon's leases are granted again |
+| `booked` | what those leases book of its capacity: `{"cpu_millis", "memory_bytes", "gpus", "vms"}`, CPU in thousandths of a core, memory in bytes. A record of the leases' limits, not a measurement of use |
 | `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term, the Raft term under the Raft metadata log: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
+
+The list is the nodes this server process has seen, so it says nothing of a daemon that has
+not connected to it yet: a server that has just started, or that took over from another
+(the frontend swap, [design/frontend-proxy.md](design/frontend-proxy.md)), lists only those
+that have registered since. `oldest_protocol` and `protocol_unknown` describe that list and
+no more. The check that a release may stop accepting the oldest version
+([design/frontend-proxy.md](design/frontend-proxy.md) section 9, rule R1) reads them; it is
+not made by this server.
+
+## `GET /v1/nodes/{id}`
+
+One node: every field of its entry in `GET /v1/nodes`, and three more, a read open like
+the list:
+
+```json
+{ "node_id": "linux-1", "connected": true, "protocol": 1, "software": null,
+  "needs_attention": [], "placement": { "state": "serving" }, "phase": { "state": "serving" },
+  "update": { "state": null, "up_to_date": null, "availability": "unsupported" },
+  "lease_count": 1,
+  "booked": { "cpu_millis": 1000, "memory_bytes": 1073741824, "gpus": 0, "vms": 0 },
+  "capacity": { "cpu_millis": 8000, "memory_bytes": 17179869184, "gpus": 0, "vms": 0 },
+  "free": { "cpu_millis": 7000, "memory_bytes": 16106127360, "gpus": 0, "vms": 0 },
+  "leases": ["117399224320012061.42"] }
+```
+
+| Field | Meaning |
+|---|---|
+| `capacity` | what the node's newest `Hello` said it can run at once |
+| `free` | `capacity` less `booked` on each axis, never below zero |
+| `leases` | the leases it holds, as `term.seq`, in lease order |
+
+`{id}` is the node id as `POST /v1/nodes/{node}:cordon` takes it, percent-encoded as one
+path segment. `404` with `{"error": "no_node"}` for a node that has not registered since
+this server started, and for an id that ends in `:cordon`, `:drain` or `:uncordon`: that
+is a write's path, and a read of it is never a node (an id that holds another colon,
+`host:8080`, is read as it is). A path below the node (`/v1/nodes/{id}/...`) is `404`.
+The node's recent failed runs are not here: they are `GET /v1/runs?node=` with
+`--history-objects`.
 
 ## `GET /v1/members`
 
@@ -126,10 +236,11 @@ frontend, a daemon opens a worker stream.
 ```json
 { "generation": 7,
   "members": [
-    { "id": 1, "addr": "192.0.2.11:8982", "state": "active", "weight": 1 },
-    { "id": 2, "addr": "192.0.2.12:8982", "state": "draining", "weight": 1 },
-    { "id": 3, "addr": "192.0.2.13:8982", "state": "down", "weight": 2 }
-] }
+    { "id": 1, "addr": "192.0.2.11:8982", "state": "active", "weight": 1, "protocol": 1 },
+    { "id": 2, "addr": "192.0.2.12:8982", "state": "draining", "weight": 1, "protocol": 2 },
+    { "id": 3, "addr": "192.0.2.13:8982", "state": "down", "weight": 2, "protocol": null }
+],
+  "oldest_protocol": 1, "protocol_unknown": 1 }
 ```
 
 | Field | Meaning |
@@ -139,26 +250,38 @@ frontend, a daemon opens a worker stream.
 | `addr` | the address callers dial |
 | `state` | `joining` (registered, a write owner, read last), `catching_up`, `active` (a full owner), `draining` (takes no new writes) or `down` (its lease lapsed; kept in the map for the dwell, then it leaves the list) |
 | `weight` | its share of the digests relative to the others |
+| `protocol` | the protocol version in the `RegisterRequest` that wrote the member's row (a heartbeat and a state change keep it; a new registration of the member replaces it). `null` when the row names none, as a row written before this field existed, and for a `down` member: its row expires with its heartbeats, and the version went with it |
+| `oldest_protocol` | the least `protocol` among the members whose `protocol` is not `null`; `null` if none is |
+| `protocol_unknown` | how many members have a `null` `protocol`. Never counted in `oldest_protocol`: read the two together, as for [`GET /v1/nodes`](#get-v1nodes) |
 
-A registered member is `joining` until something promotes it with `Members::set_state`;
-the server does not promote on its own yet, so a script that waits for `active` waits
-for that. A server without a state store keeps no members and answers `404`; a state
-store that cannot be read answers `503`.
+The registration is judged against the map's floor once, when it is made
+([design/frontend-proxy.md](design/frontend-proxy.md) section 9); `protocol` is what it
+named, and nothing judges it again.
+
+A node that registers for the first time in a farm formed more than a minute ago is
+`joining` until the operator promotes it with `POST /v1/members/{id}`; unless the frontend runs
+with `--auto-promote` (off by default) the server does not promote on its own, so a script that
+waits for `active` waits for that. With it, the joiner's own heartbeat promotes it once it is
+filled (`docs/design/rebalance-handoff.md`), and `POST` stays the override. A server without a state store keeps no members and answers `404`; a state
+store that cannot be read answers `503`. The view reads the map and then the member rows
+(for `protocol`), so a stored map or a stored member row that does not decode answers
+`500` for the whole view, not a list without that member's version: the store is up and
+its content is wrong, as it is for the other readers of those rows.
 
 ## `POST /v1/nodes/{node}:cordon`, `:drain`, `:uncordon`
 
 An operator takes a node out of placement, drains it, or returns it
 ([fleet-updates.md](design/fleet-updates.md) sections 3.3 and 4.2):
 
-- `:cordon`: the scheduler offers the node no new lease; its leases run on. A drain
+- `:cordon` (`POST /v1/nodes/{node}:cordon`): the scheduler offers the node no new lease; its leases run on. A drain
   already under way is kept.
-- `:drain`: cordons the node and waits for its leases to end. The body may be
+- `:drain` (`POST /v1/nodes/{node}:drain`): cordons the node and waits for its leases to end. The body may be
   `{"deadline_secs": N}`; without a body the deadline is 30 minutes. With no lease
   left the node is `drained`. If the deadline comes first the drain **pauses**: the
   leases run on, nothing is killed or given up, and the node stays `drain_paused`
   even after they end, until an operator drains it again (a new deadline) or
   uncordons it.
-- `:uncordon`: returns the node to placement and ends any drain.
+- `:uncordon` (`POST /v1/nodes/{node}:uncordon`): returns the node to placement and ends any drain.
 
 The answer is the node, as `GET /v1/nodes` lists it, after the action. `404` for a
 node that never registered or an unknown verb, `400` for a drain body of another
@@ -177,10 +300,11 @@ message yet: the daemon is not told, and the server simply sends it no new `Star
 
 ## `POST /v1/members/{id}`
 
-An operator sets a storage member's state. The body is `{"state": "active"}` or
-`{"state": "draining"}`; the answer is `{"id": N, "state": "...", "generation": G}`,
+An operator sets a storage member's state. The body is `{"state": "active"}`,
+`{"state": "draining"}` or `{"state": "planned_down"}` (which may add `"for_secs": N`, 1 to
+86400, default 900); the answer is `{"id": N, "state": "...", "generation": G}`,
 the map's generation after the change. `down` is the store's verdict, `catching_up` is what a registration says and `joining` is
-the join handoff's, so none of them is accepted (`400`, as is
+written by a registration (a new node in a farm with data), so none of them is accepted (`400`, as is
 any other body). `404` for an id that has no live row (it expired, or never
 registered) or is not a number, or on a server without a state store; `503` when the
 state store cannot be written; `401`, `403` or `415` from the gates of
@@ -190,14 +314,49 @@ by a refused request.
 When a member becomes `active` the cluster also records that it has formed (see below),
 in the same transaction.
 
+**A planned restart.** `planned_down` takes an `active` member out of the write path at
+once, for a restart an operator is about to make; any other state answers `409`. A member
+is `down` in the map only a TTL (15 s by default) after its last heartbeat. Until then a write whose
+primary is the stopped node dials it first and then moves on to the next owner, which costs
+a connection attempt per write, and an action-cache commit does not move on at all and is
+refused `UNAVAILABLE`, which a client retries for about a second and a half. After this call the
+map (one new generation, in the answer) has the member `down`, so every router, chain
+primary and repair worker that holds the map sends writes to the other owner and reads
+the member's blobs from it, and a node or daemon that holds an older map reads it like
+any `down` member (the wire has no new state). The member keeps serving what reaches it
+and keeps heartbeating until it stops; a heartbeat does not undo this, until `for_secs` has
+passed: the first heartbeat after that returns it to `active` (a controller that died, or a
+restart that never came, does not strand a healthy node out of service). The `down/<id>`
+mark that keeps its slot for the dwell (the same time as for a member that fails) is
+written in the same transaction, with a value that says an operator planned it:
+[`GET /v1/storage`](#get-v1storage) shows `"state": "down", "planned_down": true` for it.
+The end of the plan is kept in the member's row, which a frontend built before it drops when it
+rewrites the row, so nothing is planned down while a frontend of an older build serves the same
+state store. Asking again for a member already planned down is the same plan with its end moved to
+`for_secs` from now: `200`, the same answer, no new generation. It is undone by
+`{"state": "active"}` (a restart that did not happen), or by the member
+registering again after the restart: `active` if its index is whole, `catching_up` while
+it rebuilds, the mark deleted. If it never returns, it leaves the map at the end of the
+dwell counted from this call, as any `down` member does. It survives a restart of the
+frontend: it is in the store.
+
 **When a member is `active` without this call.** A registration that says the node's
 index is whole enters `active`, in a fresh cluster and in a formed one alike: it is the
 first start of a cluster, or a restart of a node whose meta log already has its rebuild,
 so a rolling restart leaves every member `active`. The registration also writes the
 `meta/members_formed` mark. A registration that says the node is rebuilding its index
-enters `catching_up` and becomes `active` by its own first beat that says it is done. No
-registration writes `joining`; that state is set by the join handoff in code
-(`Members::set_state`), and a `joining` member is promoted by this call.
+enters `catching_up` and becomes `active` by its own first beat that says it is done.
+The exception is a node the farm has not seen before (a new instance id) that registers
+more than a minute after the first `active` member: its store is empty, so it enters
+`joining` and an `unfilled/<id>` mark is written with it. While the mark is there every
+registration of that member is `joining` whatever it says, and no beat promotes it; this call
+(which removes the mark) does. A member that was `active` and restarts, and a
+returning instance, are `active` again. Nothing copies the blobs that existed before the
+node joined: promoting it says the operator knows it holds what it owns. A replacement host at the
+address of a node the farm has seen is a known instance, so it registers `active` with an
+empty store (the instance id is the address). A farm whose nodes start more than a minute
+apart leaves the later ones `joining` until promoted; `down` members cannot be promoted
+until they register again.
 
 **The risk of promoting a joiner.** `active` makes the member a settled owner: it
 takes the rank-1 slots of the digests it wins in the rendezvous order, and it is read
@@ -224,7 +383,7 @@ rebuild (a new cluster, a cache), or have it hold the slice first; and promote o
 member at a time. `draining` is the reverse: the member takes no new writes, its
 successor takes its slot at once, and it is read first.
 
-## `POST /v1/denied` and `DELETE /v1/denied`
+## `GET /v1/denied`, `POST /v1/denied` and `DELETE /v1/denied`
 
 An operator adds an entry to the storage deny list, or takes one off. A denied
 certificate is refused by every storage node on every method, and by the membership
@@ -255,11 +414,21 @@ map that holds it, which the call builds before it answers (`0` before any membe
 registered; the entry is in the first map then). An entry that is listed already answers
 `200` and keeps its first reason.
 
+`GET /v1/denied` lists the entries with the reasons they were added with:
+`{"denied": [{"entry": "serial a1b", "reason": "a lost laptop", "at_ms": 1791371800000}, ...]}`,
+serials first, then key hashes, then node ids, each in order, as the store's rows hold them
+now (the map the nodes hold lags the rows by up to a beat, and holds no reasons). `at_ms` is
+the store clock's milliseconds, Unix time on a running frontend. The list is empty
+(`{"denied": []}`) when nothing is denied. It passes the same gates as a write, the `GET`
+included, so the reasons reach only an operator, and its answer is `Cache-Control: no-store`.
+It assumes no single writer: every frontend over the store answers from the same rows, a
+frontend that is not the newest included. `404` on a server without a state store.
+
 `DELETE /v1/denied?entry=<entry>` takes the entry off (percent-encode it, or use `+` for the
 space): `200` with the same answer, `404` if it is not listed, `400` with no `entry` or one
 that is not an entry.
 
-Both need a token, a loopback peer, no `Origin` and `Content-Type: application/json` (a
+Both need a token, a loopback peer (one that presents the proxy's secret, with `--proxy-auth-file`), no `Origin` and `Content-Type: application/json` (a
 `DELETE` sends the header and no body), as every write does ([Who may
 write](#who-may-write)); `404` on a server without a state store; `503` when the state
 store cannot be written. A `503` that comes after the row was written leaves the row, and
@@ -283,8 +452,7 @@ storage access but keeps its work stream, and goes on receiving actions (their c
 environments and input digests), and its blob calls on that listener are served, until it
 is listed in `--worker-deny-list`, the file that listener reads
 ([worker-protocol.md](design/worker-protocol.md)). To take a daemon off the farm, list it in
-both. There is no `GET /v1/denied` either: the reasons are kept in the store, and the list
-itself is in the map.
+both. `GET /v1/denied` shows the list; `GET /v1/members` does not.
 
 **Locking yourself out.** An entry that names the frontend's own certificate (by serial or
 key, or a `node` that is the name in it) makes every storage node refuse the frontend. The
@@ -295,6 +463,11 @@ storage node that predates the list ignores it, and the checks at `Register` and
 are the frontend's, so a denied storage node can still register and beat through a frontend
 that predates them. A frontend that predates the list copies it forward in the map
 unchanged.
+
+## `GET /v1/leases` and `GET /v1/queue`
+
+The leases the scheduler holds and the operations waiting for one: open reads, in memory,
+unredacted. Written up in [api-scheduler.md](api-scheduler.md).
 
 ## `GET /v1/frontend/drain` and `POST /v1/frontend/drain`
 
@@ -344,7 +517,9 @@ the drain, and the unit templates in `kbf-deploy` set it.
 --frontend --token-file F` and `kbf cluster undrain <node> --token-file F` (the API's
 `:uncordon`). It prints the answer's JSON, exits 0 on a 2xx and 1 otherwise, and takes
 `--api` for the listener (default `127.0.0.1:8982`). A frontend drain has no undrain:
-restart it.
+restart it. `kbf cluster member <id> --state active|draining|planned-down [--for-secs N] --token-file F` calls
+`POST /v1/members/{id}`, and `kbf cluster denied --token-file F` calls `GET /v1/denied`.
+`kbf cluster object-store ...` calls the `/v1/object-stores/...` routes (below).
 
 ## `/v1/enroll/tokens` and `/v1/enroll/nodes`
 
@@ -354,7 +529,7 @@ store, so a frontend that has no enrollment (one started without `--enroll-liste
 answers every one of these routes with `404` once the call passes the gates.
 
 **Every route here, a GET included, passes every gate of [Who may write](#who-may-write):**
-a loopback peer, no `Origin` header, the bearer token, and `Content-Type: application/json`
+a loopback peer (one that presents the proxy's secret, with `--proxy-auth-file`), no `Origin` header, the bearer token, and `Content-Type: application/json`
 (send it on a GET and a DELETE too, with no body). The list of tokens and nodes is the farm's
 door, so unlike `GET /v1/nodes` it is not open to whoever reaches the address. A refused
 call changes nothing. Every answer carries `Cache-Control: no-store`.
@@ -448,6 +623,7 @@ carries the SHA-256 of the root, and pins it.
 
 With `--instance=b` the enroll port moves ten above, as the others do.
 
+
 **Order of an `Enroll`.** The shape (ids, role names, the size of each CSR) is checked
 first and reads nothing. Then, in one registry transaction: the token **secret** (an
 unknown id and a wrong secret are the same refusal after the same work, byte for byte);
@@ -458,7 +634,18 @@ must be a subset of the token's); and only then the CA: each CSR is parsed
 verifies) and a certificate is issued for it. A CSR is therefore parsed only for a caller
 who proved the secret. The answer carries one certificate per role, the CA bundle (PEM),
 the frontend's clock (`server_time`), `renew_after` (half-way through the shortest life)
-and the `NodeConfig`. A storage node must send `advertise` (`host:port`) and no other node
+and the `NodeConfig`. A node granted the `storage` role is told the farm's cold store in
+`NodeConfig.cold_store`: the store registered with `kbf cluster object-store` (the `cold`
+binding), as `s3://bucket/prefix/?endpoint=...&region=...`, with `conditional-put` and
+`min-put-rate` when they are not the defaults. The URI is built from the registered
+endpoint, region, bucket, prefix and settings only: **never** the access key id, the secret
+or any other query key (the key pair reaches a node through `ColdStore.GetStoreConfig`, over
+its storage certificate). A farm with nothing registered sends an empty `cold_store`, and a
+daemon-only node is sent none. A storage node that holds none asks once at its next start. A
+registry that cannot be read refuses the call (`StoreUnavailable`) before the token is
+spent. The node uses the `cold_store` it is sent with its own process credentials, so the
+frontend decides which endpoint receives the node's signed requests: the same trust as the
+worker and CAS endpoints the frontend already sends in `NodeConfig`. A storage node must send `advertise` (`host:port`) and no other node
 may; the host may not be a frontend name, `localhost`, or a loopback, unspecified,
 link-local or multicast address. Set `node.advertise` in `kbf.toml` on a storage node.
 
@@ -471,6 +658,19 @@ within five minutes of the frontend's clock; the same CSR was not seen in the la
 minutes and the node did not renew in the last minute. Certificates are issued for the
 same keys. The answer carries `config` only when the node's `config_generation` differs.
 
+**When a node gets a new config.** `NodeConfig.generation` is a digest of the rest of the
+config as that node receives it (roles, `worker_endpoint`, `cas_endpoint`, `storage_port`,
+`cold_store`, and the other fields), with the low bit set so it is never 0. It changes
+exactly when something the node is sent changes: a frontend restarted with another
+`--enroll-worker-endpoint`, `--enroll-cas-endpoint` or `--enroll-storage-port`, or a cold
+store registered, changed or taken back (a daemon-only node is not sent the store, so
+that does not change its generation). A restart with the same flags changes nothing. The
+number is **not ordered**: the node keeps it and `Renew` compares it for equality, so a
+frontend put back to an earlier endpoint sends that configuration again. A node stores
+the new config in `node.json` at the renewal that carries it, but the running process
+does not re-dial: it uses the endpoint at its next start. Moving a farm's endpoints is
+therefore "renew, then restart each node within the dwell", and no re-enrollment.
+
 **Refusals** are exactly a `RefusalReason`: the gRPC status code is `reason.code()` and
 the message is `reason.message()`, byte for byte, with no detail. The node client
 recognises a refusal only by both. `NotSigner` is a frontend that lost the writer role,
@@ -478,11 +678,13 @@ or whose CA cannot sign now (its signer is down, the clock is before the build's
 any other state-store failure is `StoreUnavailable`.
 
 **Limits.** The request body is at most **16 KiB** (a longer message is `MalformedRequest`).
-A token bucket per **source address** (the TCP peer; an IPv6 address counts as its /64;
-behind an L4 proxy every call has the proxy's address) allows the burst, then the per-minute
-rate, and at most `--enroll-max-in-flight` calls run at once; the rest are `RateLimited`.
-The table of sources is bounded (4096). **The counts are in memory: they start again at a
-restart and at a handover**, so a new instance gives every source a full bucket. A call is
+A token bucket per **TCP peer address** (an IPv6 address counts as its /64) allows the
+burst, then the per-minute rate, and at most `--enroll-max-in-flight` calls run at once; the rest are `RateLimited`.
+The table of sources is bounded (4096). Behind the bundled kbf-proxy (which routes
+`kbf.enroll.v1` to the child's `--enroll-listen`) every peer is loopback, so these limits are
+in effect one global bucket for the listener; the per-client-address limit is the proxy's, on
+its accept path. **The counts are in memory: they start again at a restart**, so a new
+process gives every source a full bucket. A call is
 ended after 30 seconds and a TLS handshake after its own deadline.
 
 **Start gate (design section 8.3).** Revoking a node refuses its renewal at once, but the
@@ -553,7 +755,13 @@ no registered member.
 ```json
 { "members_total": 3, "members_active": 3, "not_active": [], "silent": [],
   "unreported": [], "debts_total": 3, "under_replicated_blobs": 3,
-  "reasons": ["3 blobs owed"] }
+  "reasons": ["3 blobs owed"],
+  "nodes": [ { "id": 1, "state": "active", "planned_down": false, "repair_debts": 3, "open_writes": 0, "generation": 12,
+               "unflushed_bytes": 1048576, "unflushed_blocks": 2, "oldest_unflushed_ms": 4200,
+               "budget_bytes": 107374182400, "used_bytes": 2097152, "flush_failures": 0, "flush_conflicts": 0 },
+             { "id": 2, "state": "active", "planned_down": false, "repair_debts": 0, "open_writes": null, "generation": 12,
+               "unflushed_bytes": null, "unflushed_blocks": null, "oldest_unflushed_ms": null,
+               "budget_bytes": null, "used_bytes": null, "flush_failures": null, "flush_conflicts": null } ] }
 ```
 
 - `under_replicated_blobs`: the number, or `null` while unknown. A gate treats `null` as
@@ -566,11 +774,307 @@ no registered member.
 - `reasons`: why the number is not zero, in that order, as a rollout would say it
   (`member 3 not active`, `member 2 silent`, `5 blobs owed`); empty when it is known to be
   zero.
+- `nodes`: every registered member in any state (`planned_down` is true for a `down`
+  member an operator planned, [above](#post-v1membersid)), with what its newest report says:
+  `repair_debts` (the copies it owes), `open_writes` (the `Write` calls, action-cache
+  commits and daemon segment uploads it has open now, an upload from `Begin` until its
+  commit ends, as a primary or a replica) and `generation` (the map it held when
+  it counted). A value is `null` when the member's report is older than the freshness
+  window, when it has not reported, or when it cannot say (an older node does not count its
+  writes). `null` is unknown, never zero: whoever reads it fails closed. A node is idle for a
+  rollout only when every other member is `ACTIVE` and fresh, no copy is owed anywhere, and
+  the node itself reports no open write from a map at least as new as the one that stopped
+  routing writes to it (`Members::node_idle`, in-process, with the reasons).
+- The write-tier health of each node, from its heartbeat (read-only; no decision depends on
+  it): `unflushed_bytes` and `unflushed_blocks` (acknowledged data on the node's local disk
+  not yet in the cold store: what losing the disk would take), `oldest_unflushed_ms` (the
+  age of the oldest such block, 0 with none), `budget_bytes` and `used_bytes` (the tier's
+  budget and the bytes counted against it), and `flush_failures` and `flush_conflicts`
+  (counts since the node started). Each is `null` when the report is stale, when the node
+  has not heartbeated since it registered, when it has no write tier, or when it is an older
+  build that does not send it; `null` is unknown, never zero, and a real `0` is shown as
+  `0`. A value above 2^53 - 1 is not a count: it is shown as `null`.
 
 The number is as old as the newest heartbeat. A copy owed since then is not in it, so
 whoever acts on a zero keeps new writes away from the node first (drains it), then reads
 again. A member that left the map (a `DOWN` member leaves after the dwell) is not counted.
 `503` with `{"error": ...}` when the membership cannot be read.
+
+## The admin calls: `GET /v1/admin/role` and `POST /v1/admin/{quiesce,resume,takeover,stand-down}`
+
+A `kbf --mode frontend` started with `--admin-listen <addr>` serves these on a port of
+their own, separate from the operator API. The address must be a loopback address (any
+other is refused at start, in the flags and again when the port is bound): the calls move
+the scheduler's role, so nothing but the host's own processes may reach them. The port
+needs `--state-store`.
+
+**Who may call.** With `--proxy-auth-file` (a frontend behind the proxy) every call, `GET
+role` too, must present the proxy's secret as `x-kbf-proxy-auth: <64 hex digits>` (the
+header of [Behind the farm's proxy](#behind-the-farms-proxy); no identity header is
+needed). A call with no secret, or a wrong one, is refused `403` with
+`{"error": "..."}`, as on the operator API, and is not acted on. The proxy sends the secret
+on every admin call. Without `--proxy-auth-file` the calls take no credential: the port is
+loopback-only and every local process may call it, which is for a host with no proxy. The calls and the `role` answer
+are versioned by `admin_protocol` in `kbf --version --json` (`docs/artifacts.md`).
+
+**`GET /v1/admin/role`**:
+
+```json
+{
+  "role": "active",
+  "instance_id": "5d1c4a52-8b0e-4f64-9a27-3c0e4f8d9a10",
+  "admin_protocol": 1,
+  "generation": 7,
+  "held_generation": 7,
+  "superseded": false,
+  "open_streams": 3,
+  "open_sessions": 2,
+  "reapi": "127.0.0.1:8980",
+  "worker": "127.0.0.1:8981",
+  "api": "127.0.0.1:8982"
+}
+```
+
+- `role`: `candidate` (started with `--await-takeover`: holds no generation and schedules
+  nothing), `active` (holds the generation and schedules), `quiesced` (holds it and has
+  stopped scheduling, assigning and requeueing) or `stood-down` (another process holds the
+  generation).
+- `instance_id`: a UUID, new for each process.
+- `generation`: the generation the state store is at now (`null` if it cannot be read);
+  `held_generation`: the one this process took (`null` for a candidate). A takeover passes
+  the holder's `generation` as `expect`.
+- `superseded`: the store has refused a write of this process because another writer holds
+  the generation.
+- `open_streams`: Execute and WaitExecution streams open; `open_sessions`: worker streams
+  open.
+- `reapi`, `worker`, `api`: the listeners. A candidate has no worker listener, and a
+  stood-down process has none again.
+
+Every call below answers `200` with this object after the call. A call that does not apply
+answers `409` with the object and an `error` naming why (`role`, or a generation); a body
+that is not what the call takes is `400`.
+
+**`POST /v1/admin/quiesce`** (active or quiesced): waits, for at most 10 seconds, for the
+Execute calls between their request and their queueing and the results being taken, then
+fences the farm: it feeds the scheduler nothing, so nothing is granted, assigned or
+requeued, a call that would queue is refused `UNAVAILABLE`, and a worker's result or
+heartbeat is not applied. It writes the requeues the store refused. Idempotent. Open
+streams and worker sessions stay open. While quiesced, a worker's heartbeat or result is not
+applied, so a quiesce is meant to last seconds (a takeover's limit is 10): one longer than
+the leases' expiry lets the scheduler expire the leases of work still running and requeue it
+when the process resumes. Nothing bounds it.
+
+**`POST /v1/admin/resume`** (quiesced or active): undoes a quiesce, for a takeover that did
+not happen. Refused with `409` when the store is no longer at `held_generation` or the
+store has refused a write of this process (another writer holds it: only `stand-down`
+applies). The farm fed the scheduler nothing while it was quiesced, so its memory is the
+store's as of the quiesce; nothing is reloaded.
+
+**`POST /v1/admin/takeover`**, body `{"expect": N}` (candidate only): takes the generation,
+which must be exactly `N` (a store at another generation is refused with `409` and nothing
+is written), keeps the epoch (daemons that redial keep the runs of their leases), reads all
+state from the store, and starts the scheduler, the reconciler and the worker listener on
+the sockets the candidate already bound. `500` if the generation was taken and the
+frontend could not start; the process then ends.
+
+**`POST /v1/admin/stand-down`** (active, quiesced or stood-down): the old holder's step
+after a takeover elsewhere. It ends the worker streams with `UNAVAILABLE` ("connect
+again"), stops the worker listener, goes not ready (`/readyz`, the health service) and
+answers the Execute and WaitExecution streams it kept from the `done/` rows the new
+holder writes, with no GOAWAY and no timeout. It does not give up the state store. It is
+not undone. A process that is never told to stand down but finds it is fenced (the store
+refused a write of its own: `superseded` turns true) fences its farm and answers its kept
+calls from the `done/` rows the same way. The process exits only when told to (`open_streams` and `open_sessions` say
+when it holds nothing).
+
+**A candidate** (`--await-takeover`, which needs `--admin-listen`) opens the state store
+without taking the generation, touches no epoch and writes nothing; it serves `/readyz`,
+`grpc.health.v1` and `GetCapabilities`, and no other REAPI call (`UNIMPLEMENTED`). It runs
+no scheduler or reconciler and binds no worker listener. It makes and changes no schema.
+A SQLite state file is held by one process (an exclusive file lock), so a candidate cannot
+run beside the process that holds the file: side by side needs the Postgres store.
+A start without `--await-takeover` takes the next generation and bumps the epoch, as any
+start does.
+
+## `/v1/object-stores/...`
+
+Registers the farm's object store with the frontend, which keeps it as durable desired state
+with a generation. A
+**connection** is a named endpoint plus a key pair; a **binding** maps a role to a
+connection, a bucket and a prefix. The only role is `cold`, today's `--cold-store`; `history`
+and `backup` answer `422 role_not_supported` until something consumes them. A role here is
+neither an IAM role nor an enrollment role.
+Every verb of the API is in [the verbs table](design/operator-verbs.md); the bodies, the error
+codes and the rotation runbook are in [the design](design/object-store-registration.md).
+
+The routes exist when the frontend is started with `--object-store-secrets-dir DIR` (which
+needs `--api-listen`, `--api-token-file` and `--state-store`). `DIR` holds one file of mode
+0600 per connection, `<name>.<version>.json`, in a directory made 0700; every frontend child
+that serves at once must be able to read it, and it must stay out of any backup of the host
+(the state store, and so `state-backup`, never holds a secret key). Without the flag every
+route answers `404` `not_enabled` to a caller who passed the gate.
+
+**Every route, a GET included, passes the whole gate of [Who may write](#who-may-write)**
+(loopback peer, no `Origin`, the bearer token, `Content-Type: application/json`), because
+the routes list and change the farm's store and the key to it. One token, no roles. A TLS
+proxy on the host reaches them from loopback and passes the gate: whether the proxy carries
+these routes is the operator's decision. Every answer, errors and `405` included, carries
+`Cache-Control: no-store`. A body is at most 16 KiB (`413 payload_too_large`) and refuses
+unknown fields. No route is fenced: two frontend children on one state store both serve them,
+and a lost race is `409 conflict`, never a lost write.
+
+| Route | Does |
+|---|---|
+| `PUT /v1/object-stores/connections/{name}` | create or replace; `201` created, `200` changed or unchanged |
+| `GET /v1/object-stores/connections` | `{connections: [...]}`, never a secret |
+| `GET /v1/object-stores/connections/{name}` | one connection, never a secret |
+| `DELETE /v1/object-stores/connections/{name}` | `{generation}`; `409 in_use` while a binding names it |
+| `POST /v1/object-stores/connections/{name}:verify` | probe the store, change nothing |
+| `PUT /v1/object-stores/bindings/{role}` | bind `cold`; `201` created, `200` changed or unchanged |
+| `DELETE /v1/object-stores/bindings/{role}` | `{generation}`; `409 in_use` once a node has applied it |
+| `GET /v1/object-stores` | the desired state and the nodes' convergence |
+| `GET /v1/object-stores/audit?limit=N` | the newest `N` audit rows (default 50, at most 500) |
+
+The design ([object-store-registration](design/object-store-registration.md)) has the rotation
+runbook; every verb of the API is in [the verbs table](design/operator-verbs.md).
+
+**Names.** `{name}` is `[a-z0-9][a-z0-9_-]{0,62}`, else `400 bad_name`: it becomes a file name
+and a URL segment, so `/`, `.`, `:` and NUL never reach the file system. `{role}` is `cold`.
+
+**`PUT .../connections/{name}`** takes `{endpoint, region?, access_key_id,
+secret_access_key, conditional_put?, min_put_rate?, expect_generation?, verify?}`.
+
+- `endpoint` is `http://host[:port]`: `https` answers `422 tls_unsupported` (the S3 client
+  speaks no TLS yet, so a registration would be accepted and fail on every node); anything
+  else that is not that answers `422 invalid_endpoint`. `access_key_id` and
+  `secret_access_key` are visible ASCII (at most 256 and 1024 characters), `region` is
+  `[a-z0-9-]` (at most 64): else `422 invalid_field`.
+- Changing `endpoint` of a bound connection answers `409 identity_change`; credentials,
+  region, `conditional_put` and `min_put_rate` change freely. The same body again changes
+  nothing (`200`, `changed: false`, the generation stays).
+- `expect_generation` that is not the registry's answers `409 generation_mismatch` and writes
+  nothing; without it the last writer wins and both are in the audit log.
+- `verify` (default `true`): when the connection is the one the `cold` binding names, the
+  frontend probes that bucket and prefix with the key being registered before it writes
+  anything, and a failed probe answers `422 probe_failed` with no row and no file. When no
+  binding names the connection there is no bucket to probe: `verified` is `null`, and the
+  connection is probed when it is bound and by `:verify`.
+- Answer: `{name, generation, changed, access_key_id, secret_set, verified}`, never the
+  secret or a digest of it.
+
+**`PUT .../bindings/{role}`** takes `{connection, bucket, prefix?, expect_generation?,
+verify?}`; `verify` (default `true`) probes the bucket with the connection's stored key
+first. `422 unknown_connection`, `invalid_bucket`, `invalid_prefix` and `probe_failed` write
+nothing. The store identity `(endpoint, bucket, prefix)` is immutable once bound
+(`409 identity_change`): moving to another store is a migration this API has no verb for.
+Answer: `{role, generation, changed, verified}`.
+
+**`POST .../connections/{name}:verify`** takes nothing, or `{bucket?, prefix?}`; without a
+bucket it uses the `cold` binding's, else `422 no_bucket`. It puts one small object under
+`<prefix>.kbf-probe/`, reads it back, checks that a second write is refused when the
+connection says `conditional_put`, and deletes it. `200 {name, verified}`, or `422
+probe_failed` with `verified` (`{ok, put, get, delete, conditional_put}`): the steps, never
+the store's words. The probe proves that *this frontend* can reach the store with this key;
+the frontend connects to an endpoint an operator typed, so it is bounded (20 seconds in all)
+and operator-only behind the token.
+
+**`GET /v1/object-stores`** answers `{generation, connections, bindings, convergence}`;
+`convergence` is `{converged, expected, applied, unsupported, nodes: [{id, state,
+applied_generation, status, last_seen_secs}]}`.
+
+- `status` is one of `ok`, `pending`, `probe_failed`, `identity_mismatch`, `unsupported`: a
+  closed code, never a node's own text. A node that reports `ok` at another generation is
+  shown `pending`.
+- `expected` counts active nodes that report the registration; draining and denied nodes
+  are listed but not counted. A node whose build does not report it at all is `unsupported`,
+  counted in `unsupported` and not in `expected`, and named in `nodes`, so version skew is not
+  mistaken for "not fetched yet".
+- `converged` is true only when at least one node is expected, every expected node has
+  applied the current generation with status `ok`, and none is `unsupported`. It never claims
+  more than the frontend knows: a frontend that has heard from no node says `false`.
+  **This build wires no source of node reports yet: `nodes` is empty and `converged` is `false`.**
+
+**`GET /v1/object-stores/audit`** answers `{entries: [{seq, at, action, subject, outcome,
+generation}]}`, newest first. A row names what was touched and what happened, never a body
+field; the actor is always "the API token", the gate knows no finer identity. Only writes
+leave rows (a refused call, a failed probe and `:verify` leave none), an unchanged repeat leaves
+one with `outcome` `unchanged`.
+
+**Errors** are `{"error": "...", "code": "..."}` (a `probe_failed` also has `verified`). The
+text names no value of the request: a body that does not parse says where, not what.
+
+| Status | `code` |
+|---|---|
+| 400 | `bad_name`, `bad_body`, `bad_query` |
+| 401, 403, 415 | `unauthorized`, `forbidden`, `unsupported_media_type` (the gate's) |
+| 404 | `not_enabled`, `no_such_connection`, `no_such_binding`, `unknown_action` |
+| 409 | `identity_change`, `in_use`, `generation_mismatch`, `conflict` |
+| 413 | `payload_too_large` |
+| 422 | `invalid_field`, `tls_unsupported`, `invalid_endpoint`, `invalid_bucket`, `invalid_prefix`, `role_not_supported`, `unknown_connection`, `no_bucket`, `probe_failed` |
+| 500 | `secret_missing` (the file a row names is missing or not 0600: fail closed, PUT again to repair), `secret_io`, `corrupt_rows`, `internal` |
+| 503 | `state_unavailable` |
+
+`DELETE .../bindings/{role}` answers `409 in_use` when a node reports `ok` at a generation
+at or after the binding's `updated_generation`: it runs on that store, and the API cannot take
+a store back from a running node. (A binding re-PUT with another connection of the same
+endpoint moves `updated_generation`; a node that applied only the earlier version is not
+counted.)
+
+**Rotating the key** (the API never revokes a key at the store):
+
+1. Add the new key at the store.
+2. `PUT` the connection with the new secret. The frontend probes the bound bucket with it
+   first.
+3. Restart the storage nodes through the installer: a running node does not swap
+   credentials in v1, and picks the registration up at its next start.
+4. Poll `GET /v1/object-stores` until `converged` is `true` (a node still on the old key is
+   `pending`).
+5. Only then revoke the old key at the store.
+
+```sh
+T=$(cat <token file>); API=http://127.0.0.1:<port>
+# the body is a file, never an inline secret; the content type is required on every call
+curl -X PUT -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  --data @connection.json $API/v1/object-stores/connections/cold
+curl -X PUT -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  --data '{"connection":"cold","bucket":"farm-cold","prefix":"cold/"}' \
+  $API/v1/object-stores/bindings/cold
+curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' $API/v1/object-stores
+```
+
+**`kbf cluster object-store`** is a client of these routes on the frontend's host, one call a
+verb, printing the answer's JSON (exit 0 on a 2xx, 1 on anything else, 2 for a command line
+that does not parse). Every verb needs `--token-file F`, a read included, because every route
+passes the whole gate; `--api ADDR` names the listener (default `127.0.0.1:8982`).
+
+| Verb | Call |
+|---|---|
+| `object-store status` | `GET /v1/object-stores` |
+| `object-store audit [--limit N]` | `GET /v1/object-stores/audit[?limit=N]` |
+| `object-store connection list` | `GET /v1/object-stores/connections` |
+| `object-store connection show NAME` | `GET /v1/object-stores/connections/NAME` |
+| `object-store connection put NAME --endpoint URL --access-key-id ID (--secret-file F \| --secret-stdin) [--region R] [--conditional-put] [--min-put-rate BYTES] [--expect-generation N] [--no-verify]` | `PUT /v1/object-stores/connections/NAME` |
+| `object-store connection delete NAME` | `DELETE /v1/object-stores/connections/NAME` |
+| `object-store bind --connection NAME --bucket B [--role cold] [--prefix P] [--expect-generation N] [--no-verify]` | `PUT /v1/object-stores/bindings/cold` |
+| `object-store unbind [--role cold]` | `DELETE /v1/object-stores/bindings/cold` |
+| `object-store verify NAME [--bucket B] [--prefix P]` | `POST /v1/object-stores/connections/NAME:verify` |
+
+The secret key is never a flag or an environment variable: `connection put` reads it from
+standard input (`--secret-stdin`) or from a file (`--secret-file F`) that must be a regular
+file whose mode gives its group and others no access (0600 or 0400), else it exits 1 and
+calls nothing. Only the final line ending is cut. Names and the role are checked before any
+call (`bind --role history` exits 2). The key is in none of the command's output or errors.
+
+```sh
+kbf cluster object-store connection put cold --endpoint http://127.0.0.1:9000 \
+  --access-key-id AKID --secret-file key.txt --token-file T   # key.txt is mode 0600
+kbf cluster object-store bind --connection cold --bucket farm-cold --prefix cold/ --token-file T
+kbf cluster object-store status --token-file T
+```
+
+The request body is read into memory and parsed; the buffers are not zeroized, so the
+secret key sits in the frontend's memory for as long as the allocator keeps those pages.
+The key is never logged, never in a state row and never in an answer.
 
 ## `GET /healthz` and `GET /readyz`
 
@@ -604,6 +1108,34 @@ otherwise; the body lists each failing check and why:
 
 `version` and `commit` are those of `GET /v1/nodes`' `server` field. Each `/readyz`
 makes one read of the store, so poll it at the interval the front needs, not faster.
+
+## `GET /v1/health`
+
+The one-screen answer to "is the farm healthy": the values other routes report, composed
+so a reader does not add them up. A read, open like `GET /v1/nodes`; it names no secret.
+It answers `200` whether or not the server is ready (`/readyz` stays the probe), and
+says which in `ready`.
+
+```json
+{ "ready": true, "failing": [],
+  "nodes": { "total": 5, "serving": 2, "cordoned": 1, "draining": 1, "drained": 0,
+             "quarantined": 0, "disconnected": 1 },
+  "queue": { "depth": 3, "oldest_age_ms": null },
+  "leases": 7,
+  "storage": { "members_active": 3, "members_total": 3, "under_replicated_blobs": 0 } }
+```
+
+| Field | Same value as |
+|---|---|
+| `ready`, `failing` | `GET /readyz`: the same evaluation, `failing` as `[{"check", "reason"}]` |
+| `nodes` | the list of `GET /v1/nodes`, each node counted once, in the first of these that holds: `disconnected` (`connected` is false), `quarantined` (`phase.state`), then `placement.state`: `cordoned`, `draining` (a drain running, or paused at its deadline), `drained`, or `serving`. `total` is the number of nodes listed and the sum of the six |
+| `queue.depth` | `queued_operations` of `GET /v1/frontend/drain`. `queue.oldest_age_ms` is `null`: the scheduler does not report the age of its oldest operation yet |
+| `leases` | the sum of `lease_count` of `GET /v1/nodes` |
+| `storage` | `members_active`, `members_total` and `under_replicated_blobs` of `GET /v1/storage` (`null` while unknown, never zero); `storage` is `null` when this server keeps no storage members, and when the membership cannot be read, with `storage_unavailable` saying why |
+
+In memory like `GET /v1/nodes`: after a restart or a frontend swap `nodes`, `queue` and
+`leases` count only what has reconnected since. The update state and the history store's
+counters are not in this answer.
 
 ## `grpc.health.v1` on the REAPI listener
 
@@ -652,6 +1184,13 @@ families: the REAPI listener (clients) and the worker listener (daemons' uploads
 outputs and reads of inputs). The counts are in memory and start at 0 with the
 process.
 
+A storage node (`kbf storage`, and the storage half of `kbf storage-and-daemon`) has no
+operator API and serves this one route, plain HTTP, on `--metrics-listen <addr>`
+(off unless given; the same open read as above, so bind it where only operators do). It
+answers the families of its own cache, among them `kbf_cache_lost_blobs` and
+`kbf_cache_blob_losses_total`, the node's TLS reloads, and, in
+`kbf storage-and-daemon`, the one cache's fill.
+
 Each request family counts from the start of its handler to its answer. A call whose
 caller goes away before the answer counts as an error.
 
@@ -667,6 +1206,7 @@ caller goes away before the answer counts as an error.
 | `kbf_execute_requests_total`, `_errors_total` | counter | Execute calls ended, and those that ended in an error status or were dropped by their caller before the done operation (an operation that finished with a failed `ExecuteResponse` is not one) |
 | `kbf_execute_in_flight` | gauge | Execute and WaitExecution streams open |
 | `kbf_under_replicated_blobs` | gauge | the sum over all registered storage members of the blobs each owes a second copy, exported **only while it is known** (every registered member `ACTIVE` and reporting within the window); absent otherwise, never 0. Frontends with a state store. [`GET /v1/storage`](#get-v1storage) says why it is unknown |
+| `kbf_member_repair_debts{member}`, `kbf_member_open_writes{member}` | gauge | per storage member, the copies it owes and the writes it has open now, one sample per member, **only for a value that is known** (fresh report, and the node says it counts); a member with no sample is unknown, never 0. Frontends with a state store. [`GET /v1/storage`](#get-v1storage) lists the same per node |
 | `kbf_storage_health_known` | gauge | 1 when `kbf_under_replicated_blobs` is exported, 0 when it is unknown (including a membership that cannot be read). Frontends with a state store |
 | `kbf_front_open_executions` | gauge | Execute and WaitExecution operation streams alive: raised when the stream is made (before its first item is read), lowered when it ends or its caller drops it. A call still being authorized or prepared, and one answered from the action cache, is not in it. `GET /v1/frontend/drain` reports it |
 | `kbf_front_executes_started_total` | counter | Execute calls the front took (not refused because it is draining), cache hits included |
@@ -688,9 +1228,15 @@ caller goes away before the answer counts as an error.
 | `kbf_execute_presubmit_seconds` | histogram | an Execute from the handler's start to its first stream item (the first `QUEUED` operation cannot be sent sooner): authorization, the action-cache lookup, the action and command reads, the input-tree walk and the scheduler's submit. Failed and abandoned calls are observed too |
 | `kbf_execute_presubmit_in_flight` | gauge | Executes inside that window now: during a stall with idle slots, this is the number of requests the scheduler has not seen |
 | `kbf_execute_walk_seconds`, `kbf_execute_dir_reads_total` | histogram, counter | the input-tree check of one Execute, whole (directories read concurrently or taken from memory, subtrees skipped, presence checks, any wait for a check another request is running), and the Directory blobs read from the store, counted as each read starts |
+| `kbf_execute_walk_dir_read_seconds` | histogram | one Directory read from the store by an Execute's input-tree check over a store (the farm's frontends): the store's latency per read, failed reads included; Directories taken from the content cache and reads shared with another check are not observed. |
+| `kbf_execute_dir_cache_hits_total`, `kbf_execute_dir_cache_misses_total`, `kbf_execute_dir_cache_merged_total` | counters | the content cache of decoded Directories behind those checks (128 MiB, least recently used out first, shared by every Execute; content is addressed by digest so it never goes stale). Hits: Directories a check took without reading, from the cache or from a read another check had open. Misses: reads a check led. Merged: of the hits, those another check's read supplied. A cached Directory is never taken for held: its digest goes to FindMissing with the check's files (`kbf_execute_dir_cache_present_checked_total` counts them), and one the store reports missing is an absent input, as for a Directory that cannot be read |
+| `kbf_execute_dir_cache_present_checked_total` | counter | cached Directories whose digests a check put to FindMissing to confirm the store still holds them (each costs a digest in a call the files already make, not a read) |
+| `kbf_execute_dir_cache_evictions_total`, `kbf_execute_dir_cache_bytes` | counter, gauge | decoded Directories pushed out of the content cache to stay within its byte bound, and the bytes it held at the end of the last check (about 1 MB for a 1000-Directory, 15k-file tree). Evictions climbing with the same trees walked again means the bound is too small for the working set |
 | `kbf_execute_submit_seconds`, `kbf_sched_lock_wait_seconds` | histogram | the scheduler's submit called from an Execute, and the part of it spent waiting for the scheduler's lock |
 | `kbf_sched_queued`, `kbf_sched_leases` | gauge | operations waiting for a lease, and leases granted or running on all nodes, as of the last submit or scheduler tick (at most a tick old) |
+| `kbf_bytes_in_flight`, `kbf_bytes_in_flight_peak` | gauge, gauge | bytes this process holds in memory for requests in flight now (a ByteStream Write's receive buffer or the message in hand, a Read's window, a BatchUpdateBlobs's blobs, a Segments upload's buffer, and the same on a storage node's Write), and the most it has held at once since the process started (never reset). Counted from the allocation of a buffer until the last reference to it is dropped, however the request ended. Not counted: the segment writer's own buffer, the object store's and write tier's internals, and gRPC's copies of a message. Always printed. The daemon does not serve `/metrics` yet |
 | `kbf_tier_in_flight`, `kbf_tier_wait_seconds`, `kbf_tier_call_seconds` | gauge, histogram | write-tier file calls queued on or running on the blocking pool; the wait of one for a pool thread; and one whole, hand-over to answer. Always printed, 0 without a write tier; a wait near the call time says the pool is full |
+| `kbf_storage_open_write_fds`, `kbf_storage_write_pool_queue`, `kbf_storage_write_pool_direct_total` | gauge, gauge, counter | block files the write tier holds open for writing, as of the last write-pool step (at most `--write-pool-writers` plus one, for the blobs the pool writes); blobs waiting for a pool writer; and blobs the pool sent straight to the object store because its queue (`--write-pool-queue`) was full or the tier did not take them. Always printed, 0 without a write tier |
 | `kbf_input_directories_cached_total` | counter | Directories the input check took from the decoded-directory cache: the blob is touched and its presence checked, nothing is read |
 | `kbf_input_directories_skipped_total` | counter | Directories skipped with everything under them: an earlier check verified them and the retention guarantee of that check still runs |
 | `kbf_input_directories_joined_total` | counter | Directories found being checked for another request, and waited for |
@@ -719,7 +1265,7 @@ watches.
 | `kbf_write_tier_unflushed_bytes`, `kbf_write_tier_unflushed_blocks` | gauge | acknowledged bytes, and the blocks holding them, not yet in the object store |
 | `kbf_write_tier_oldest_unflushed_seconds` | gauge | the age of the oldest of those blocks (since it was created, or since the restart that recovered it); 0 when there is none |
 
-In `kbf-all-in-one`, when the hot store is a directory on the filesystem of `--data-dir`,
+In `kbf all-in-one`, when the hot store is a directory on the filesystem of `--data-dir`,
 the daemon half's input cache and the server half's hot store are one cache
 ([architecture-v2.md](design/architecture-v2.md#10-locality)): the input cache's
 directory is the node's only local copy of a blob, the tier deletes a block once it is
@@ -746,6 +1292,14 @@ could not keep. Without the flag these families are absent and nothing is record
 | `kbf_history_queue_events`, `kbf_history_queue_bytes` | gauge | events waiting for the writer, and their bytes |
 | `kbf_history_pending_rows` | gauge | index rows the writer has not applied yet |
 | `kbf_history_open_invocations` | gauge | invocations the writer holds state for |
+
+The release poller (`--release-poll-every-secs`, on the active frontend) adds these families
+while it runs; without it they are absent.
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_release_poll_polls_total`, `kbf_release_poll_not_modified_total`, `kbf_release_poll_proposals_total`, `kbf_release_poll_errors_total` | counter | the release poller's polls begun, polls answered "not modified", proposals written and polls that failed (the request, the feed or the update rows); present only when the poller runs |
+| `kbf_release_poll_ignored_total{reason}` | counter | feed entries that were not candidates, by the first reason met: `malformed`, `draft`, `prerelease`, `not_version_tag`, `no_commit`, `ref_not_allowed`, `no_checksums`, `unattested` |
 
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
 nodes' slots means work is waiting that placement cannot use (look at the node's booking and
@@ -802,6 +1356,7 @@ route.
 | Route | Answers |
 |---|---|
 | `GET /v1/invocations/{id}` | the invocation: its header fields and counters, links to the routes below, its slowest actions and its phase totals |
+| `GET /v1/invocations/{id}/failures` | the invocation, and a page of the actions that failed (an OK status with a non-zero exit, a failed status, a timeout, a refusal), each with its reason, attempts, command and the end of its logs ([below](#the-failures-view)) |
 | `GET /v1/invocations/{id}/actions` | a page of its action rows, in the order first seen; `?outcome=ok\|failed\|timed_out\|refused`, `?how=cache_hit\|cache_hit_execute\|joined\|ran`, `?requeue_reason=<reason>`, `?memory_kill=none\|own_limit\|node_pressure`; `?sort=wall_ms\|execution_ms\|queue_ms\|input_fetch_ms\|output_upload_ms`, longest first |
 | `GET /v1/invocations/{id}/actions/{digest}` | one action's row, with the outputs, stdout, stderr and usage copied into it, and whether each blob is still held |
 | `GET /v1/invocations/{id}/artifacts` | a page of the outputs of its actions, in row order |
@@ -889,9 +1444,10 @@ copy (it passed, the log was over 16 MiB, or it had none) is `404` `no_log`; an 
 `404` `no_run`; a query string is `400`.
 
 **Across builds** (with `--history-objects`; otherwise these routes do not exist, `404` as
-any unknown path). They are read from the index rows the history writer keeps, never from
-an object, so they answer the same after a restart and cost no object read
-(`docs/design/ui-data.md` 4.3 and 6.2). They run the same policy as the build pages:
+any unknown path). The invocation list and the shape and test routes are read from the index
+rows the history writer keeps, never from an object, so they answer the same after a
+restart and cost no object read; the grid reads the run records of the chunks of the builds
+it names (`docs/design/ui-data.md` 4.3 and 6.2). They run the same policy as the build pages:
 `authenticationPolicy`, then `invocations.getAuthorizer` (`404` with `"off"` when it is not
 named). The authorizer is asked once per request about each instance the request would
 touch, and every answer holds only rows of allowed instances; an invocation is listed only
@@ -908,6 +1464,23 @@ across restarts). An answer over more instances than the index reads at once (25
 | `GET /v1/tests` | the same with `kind=test` |
 | `GET /v1/shapes/{key}?instance=&cfg=` | one `(instance, cfg)` of the key, with `previous_keys: null`; with either absent, `{"shapes": [...]}` of the key's rows (paged) |
 | `GET /v1/shapes/{key}/runs?instance=&cfg=` | the last 16 runs of a test, newest first, each `{run_id, run_href, class, execution_ms, source: "run", digest16}` (`run_href` is `GET /v1/runs/{run_id}`), with `complete: false`, `covers: "recent_16"` (`"none"` for a shape that is not a test) and `needs: "day_index"`: older runs are not answered yet. Both parameters are required |
+| `GET /v1/grid?shapes=<key>,<key>&invocations=<id>,<id>` (or `last=<n>`) | the outcome of shapes in builds: `{"columns": [...], "rows": [...], "shapes": [...]}`. `shapes` is 1 to 50 keys; the builds are named by `invocations` (1 to 50 different ids) or are the newest `last` (1 to 50, of the instances the caller may read, `?instance=` narrows them). A column is `{id, href, first_seen, complete}` (`complete: false` when the build has more than 20,000 records and the read stopped); a row is one `(instance, key, cfg)` some build ran, `{instance, key, cfg, href, cells}`, with one cell for each column: `{status, run_id, run_href}` with `status` `pass`, `fail` (a failure or a timeout), `oom_killed` or `infra`, from the row's last run in that build that is a result, or `{status: "absent"}` where the build has no run of the row. A build that is not held, or that a caller may not read (any of its instances), is `404` `no_record`. `columns=commit` is `400` `needs_report`; there are no `cached_pass` cells yet |
+| `GET /v1/actions/{digest}/runs` | the runs of an action digest (`<64 hex>-<size>`) of today, newest first by end time, `?instance=`, `?class=`; each `{run_id, run_href, instance, worker, class, started, ended, shape}` |
+| `GET /v1/runs?node=&from=&to=&class=&instance=` | the runs of today that overlapped `[from, to]` on `node` (`node` is required; both times are optional), newest first by end time |
+
+The last two read the writer's index of today's runs, in memory (64 MiB, the oldest runs
+forgotten first, empty after a restart), not the day index: their answers always say
+`"partial": true` and `covers_from`, the time from which the index has every run it was
+sent. A run of an instance the caller may not read is never listed.
+
+Both list by end time, newest first; two runs that ended in the same millisecond are
+listed latest arrival first. Runs reach the index in the order the writer receives them,
+and a failed run can arrive after runs that ended later, so the order is the index's own,
+not arrival. `next_page` is a cursor, the end time and arrival number of the last run
+listed (`<ended_ms>.<seq>` in the token); the next page lists the runs that sort before it (older by that key).
+A run that arrives between two pages with an end time older than the cursor is listed on a
+later page; one with a newer end time is not listed by the pages that follow (read the
+first page again to see it). No run is listed twice or skipped by paging.
 
 A shape row is `{instance, key, cfg, kind, target, first_seen, last_seen, href, runs_href}`
 and, for a test, `status` (`passing`, `failing`, `flaky`, `oom_killed`, or `null` while the
@@ -1046,10 +1619,39 @@ row held them when a page passed it: an action still running then is not listed 
 it ends (read its row, or start again). On `/logs`, rows added after the failed ones
 ran out are listed with the rest, failed or not.
 
+### The failures view
+
+`GET /v1/invocations/{id}/failures` answers `{"invocation": {...}, "failures": [...]}` and,
+unless it is the last page, `next_page_token` and `next_page`. `invocation` is the
+invocation's own answer, its `links` including `failures`. `failures` lists, in the order
+the farm first saw them (never grouped by kind), every action row whose outcome is not OK
+with exit code 0; an action still in flight is not listed, and one that passed after a
+rerun is not a failure (its reruns are in its `attempts`). It takes `?page_size=`
+(20 by default, 1 to 100) and `?page_token=`, and no filter. Each failure holds:
+
+| Field | Meaning |
+|---|---|
+| `action`, `href`, `instance`, `target`, `mnemonic` | as on `/actions` |
+| `outcome` | as on `/actions`: `{"ok": {"exit_code": 1}}`, `{"failed": {"code", "message"}}`, `{"timed_out": {}}` or `{"refused": {"reason"}}` |
+| `failure` | the last attempt's failure class (`timeout`, `infra`, `invalid`, `out_of_memory`, `node_memory_pressure`, `missing_input`, `lost`) with the daemon's reason text, `{"class", "reason"}`; `null` when the last attempt did not end in a failure (a run that exited non-zero, a refusal) |
+| `attempts` | every lease, as on `/actions` |
+| `command` | `{"arguments", "environment_names", "working_directory", "platform", "timeout_micros", "output_paths", "truncated"}`, read when the page is answered from the Action and Command blobs. **Unredacted**: arguments are shown as the build sent them. Environment variables are names only, never values. `platform` is the Action's properties, or the Command's when the Action names none; `timeout_micros` is `null` when the Action sets none; `truncated` says strings were dropped from the end (output paths, then names, then arguments) to keep them within 64 KiB. `null` when a blob is not held, was never uploaded or is over 1 MiB |
+| `command_available` | whether `command` is there |
+| `stdout`, `stderr` | `null` when the result has none; else the blob object of `/actions` (`digest`, `available`, `href`) with `bytes` (the log's size), `tail` (the last 16 KiB, invalid UTF-8 replaced, a cut inside a character dropped), `tail_bytes` (the bytes the tail shows) and `truncated` (the log is longer than the tail). When there is no tail, `tail` is `null` and `tail_omitted` says why: `not_held` (the CAS does not hold the blob), `too_large` (over 64 MiB), `unreadable` (the read failed or took over 10 s) or `blobs_off` |
+| `outputs`, `outputs_truncated`, `usage` | as on `/actions/{digest}` |
+
+The command and the log tails are read from the CAS only when the policy names a
+`blobs.getAuthorizer` (the start line says ` blobs=on`): without it they are not read
+and each `tail_omitted` is `blobs_off`, so the page shows nothing the blob route would
+refuse. The body writes `<`, `>` and `&` as `<`, `>` and `&` (a JSON
+parser reads the same text back), and is sent as `application/json` with
+`X-Content-Type-Options: nosniff`, because arguments, targets and logs are text the
+build chose.
+
 | Code | When |
 |---|---|
 | `200` | the answer |
-| `400` | a parameter the route does not take, one given twice, a `page_size` outside 1 to 1000, a filter value not listed above, or a page token that does not decode, was made for another route or another filter, or names a position past the rows |
+| `400` | a parameter the route does not take, one given twice, a `page_size` outside 1 to 1000 (1 to 100 on `/failures`), a filter value not listed above, or a page token that does not decode, was made for another route or another filter, or names a position past the rows |
 | `401` | the policy's `authenticationPolicy` refuses the request |
 | `403` | `invocations.getAuthorizer` refuses one of the invocation's instance names: each one its calls used and each one a row holds, on every route |
 | `404` | the routes are off: `{"error": "<why>", "off": "invocations"}`; no such record is held (never made, removed at the memory bound, or lost at a restart; with `--history-objects`, and not in history either), a page token's included even if a record has been made since under the same key: `{"error": "no_record", "id": "<id>", "records_since": "<time>"}` (below); no such route, `{id}` is not an id or `<id>~<n>`, or no row for the action: `{"error": "<why>"}` |
@@ -1149,6 +1751,59 @@ ignored, as RFC 9110 allows, and the whole blob is sent. Every `200` and `206` s
 
 Errors are JSON, `{"error": "<why>"}`, as everywhere in this API.
 
+## `GET /ui`: the web UI
+
+Read-only pages for people with a browser, server-rendered HTML from the `kbf-ui` crate
+([design](design/kbf-ui-v1.md)). On the operator API listener, **on by default**:
+`--ui=false` turns it off and every `/ui` path is then a `404`. Without `--api-listen`
+there is nothing to mount it on.
+
+- **Open.** No login, no certificate, no token, whatever the REAPI policy says: the pages
+  are served to whoever reaches the port, and show everything unredacted, including the
+  logs of builds and the arguments of failed commands. The routes the pages read that the
+  policy gates on the network (the build pages, run logs, blobs, `GET /v1/update/hosts`)
+  are asked in process with every caller allowed; asked over the network they keep their
+  gates. Keep the operator API on loopback, or behind the proxy and a network you trust.
+- **Read-only.** `GET` and `HEAD`; every other method is `405`. The write routes and their
+  token are unchanged, and the pages mount none of them.
+- **Pages:** `GET /ui` and `GET /ui/` (Overview: readiness, nodes by state, queue, leases and
+  storage from `GET /v1/health`, the ten latest builds from `GET /v1/invocations`),
+  `GET /ui/nodes` (`GET /v1/nodes`), `/ui/nodes/{id}` (`GET /v1/nodes/{id}`),
+  `GET /ui/builds` (the recent builds of
+  `GET /v1/invocations`, filtered by `?state=open|closed` and `?instance=`, paged by
+  `?page_token=`; `?id=` looks one build up by id; any other parameter, one given twice or
+  another state is `400`), `/ui/builds/{id}` (the summary, the failed actions of
+  `/failures` first, then the actions; `?failures_token=` and `?page_token=` page the two
+  lists), `/ui/builds/{id}/actions/{digest}` (the action; for one that failed, its failure
+  class, command arguments and environment names, exit code and the end of its stdout and
+  stderr from `/failures`, each with a link that downloads the whole log, which the blob
+  route answers as an attachment), `/ui/updates`, `/ui/leases` (`GET /v1/leases`;
+  `?node=`, `?page_size=` and `?page_token=` are handed to the route, and the next page is
+  the route's own link on the page's path), `/ui/queue` (`GET /v1/queue`), and the
+  stylesheet at `/ui/static/kbf.css`. Each page lists, at its foot, the `/v1` routes it read, each a link
+  to the JSON. The Action page looks a failed action up in the first 5 pages of
+  `/failures`, or in the one page `?failures_token=` names (the Build page's links name it).
+  The Overview, Nodes and Node pages reload themselves when asked:
+  `?refresh=N` with N one of 5, 10, 30 or 60 (`<meta http-equiv="refresh">` with only the
+  integer); any other value, a repeated `refresh` or another parameter is `400`, and a page
+  whose read failed does not reload.
+- **Headers on every `/ui` answer**, errors included: `Content-Security-Policy:
+  default-src 'none'; style-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri
+  'none'; form-action 'self'` (no script of any kind; the forms are the Builds id lookup and
+  the Leases node filter, both `GET`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
+  `Cache-Control: no-store`.
+- **Bounds.** Each caller has at most 4 reads open at once on `/ui`, and 4 on the read
+  routes the pages use (`/v1/blobs`, `/v1/invocations` and below, `/v1/runs` and the history
+  routes, `/v1/update/hosts`): the fifth is `429` with `Retry-After: 1`, before its handler
+  runs, and a slot is held until the answer's body has been sent or dropped. A caller is
+  the node the proxy named, else the client address the proxy forwarded in
+  `x-kbf-client-addr` (believed only of a call that presented the proxy secret; the header
+  on any other call is stripped unread), else the peer address. So behind the proxy each
+  browser has its own bound; behind a proxy that sends no such header, browsers share the
+  proxy's address and so share one bound. A path longer than 2048 bytes, or a query longer
+  than 4096, is `414`; a path segment longer than 256 bytes, or one that decodes to a
+  control character, is `400`.
+
 ## `STALE_MAP` on a storage node's gRPC calls
 
 Not part of the HTTP API: the answer a storage node (`kbf storage`) gives over gRPC to a
@@ -1189,34 +1844,184 @@ treated as `UNAVAILABLE`. `UNAVAILABLE` for a caller ahead of the node is the no
 lost push: the caller's map may be the right one, so the caller tries again, and the
 node's next push makes the call succeed.
 
-## `PUT /v1/releases/{commit}/{platform}/{name}` and `GET /v1/releases`
+## `PUT /v1/releases/{commit}/{platform}/{name}`, `GET /v1/releases` and `GET /v1/releases/{commit}`
 
 The frontend's release store (`docs/design/pull-updates.md` section 6.3): the tarballs of a
-release and their build attestations, kept as uploaded. Not served by any listener until the
-frontend mounts `kbf_server::release::router`; without a store both answer `503` naming
-`--releases-dir`.
+release and their build attestations, kept as uploaded. Mounted by `--releases-dir`; without a store all three answer
+`503` naming `--releases-dir`.
 
 - `commit` is 40 lowercase hex digits, `platform` is `linux-x86_64`, `linux-arm64` or
   `darwin-arm64`, `name` is `kbf` or `kbf-daemon` (the tarball) or either with the suffix
   `.attestation` (its build attestation bundle). Anything else is `400`; no segment is ever joined
   into a path as it arrived.
 - `PUT` takes the file as the body, with the write gates of the section "Who may write" except
-  the JSON content type (loopback peer, no `Origin`, the bearer token). A tarball is at most
+  the JSON content type (loopback peer, and the proxy's secret with `--proxy-auth-file`, no `Origin`, the bearer token). A tarball is at most
   512 MiB (`413` past it), a bundle at most 256 KiB; an empty body is `400`. The body is written to
   a `.partial` file, synced, and renamed into place, so an interrupted upload leaves nothing
   visible.
 - `201` `{"sha256", "size"}` for a new key. A release is immutable: the same bytes again are
-  `200` with the same answer, other bytes are `409` and change nothing.
+  `200` with the same answer, other bytes are `409` and change nothing. The answer for a
+  bundle carries the bundle's own digest, and the store also names the bundle by that
+  digest next to the tarballs (one file, two names), so that `ReleaseService.Fetch` serves a
+  bundle like a tarball. A bundle stored before that link existed has no such name until the
+  same bytes are put again (`200`); `Describe` reports it as lacking until then, though
+  `GET /v1/releases` and the offers still count its platform complete.
 - `GET` is open and lists `{"releases": [{"commit", "platforms": [{"platform", "complete",
   "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
-  order above, a platform `complete` when both tarballs have their attestation. A component is
+  order above, a platform `complete` when it holds, with their attestations, the tarballs its
+  hosts need: `kbf` for a Linux platform, `kbf-daemon` for `darwin-arm64`. A component is
   listed when its tarball is stored.
 - `GET /v1/releases` and the gRPC `ReleaseService.Fetch` are unauthenticated at the router and
-  the service. `Fetch` is mounted on the worker listener behind its mutual TLS and the role
-  table (the daemon role alone may call it). `GET /v1/releases` is open to whoever reaches the
+  the service. `Fetch` is mounted on the worker listener, behind its mutual TLS and the role
+  table (the daemon role alone may call it) when TLS is configured; in plain-text worker mode
+  it is open, like every worker method. `GET /v1/releases` is open to whoever reaches the
   operator API, like `GET /v1/nodes`: it lists commits, platforms and digests, no bytes. The
   store is mounted by `--releases-dir`, which needs `--api-listen`; without the flag every
   update endpoint answers `503`.
+
+### `ReleaseService.Describe` and `GET /v1/releases/{commit}`
+
+What the store holds of one release, for a caller that was given no offer: the installer's
+`frontend_update` order names a commit and nothing else (`docs/design/kbf-installer.md`
+section 5), so it asks the release source what the commit holds before it fetches. The
+answer is claims, not trust: the installer fetches each file by its digest and verifies the
+tarball against its bundle, which it does for an offer's components too.
+
+`rpc Describe(DescribeRequest) returns (ReleaseDescription)` on `kbf.update.v1.ReleaseService`
+(`crates/kbf-proto/proto/kbf/update/v1/update.proto`):
+
+- `DescribeRequest{commit, platform}`: `commit` is 40 lowercase hex digits; `platform` is
+  `linux-x86_64`, `linux-arm64` or `darwin-arm64`, or empty for every platform the release
+  is complete for.
+- `ReleaseDescription{commit, components}`: one `ReleaseComponent{name, platform, tarball,
+  sha256, size, bundle_sha256, bundle_size}` for each tarball a host of each described
+  platform needs (the same rule as an offer: `kbf` for a Linux platform, `kbf-daemon` for
+  `darwin-arm64`, and nothing else the store happens to hold), in platform order
+  (`linux-x86_64`, `linux-arm64`, `darwin-arm64`). `tarball` is the file name
+  `<name>-<commit>-<platform>.tar.gz`; `sha256` and `size` are the tarball's;
+  `bundle_sha256` and `bundle_size` are the build-provenance bundle's
+  (`<tarball>.sigstore.json`, at most 256 KiB). Both files are served by `Fetch` under their
+  digests.
+- A platform is described only when complete: every tarball it needs is stored with its
+  bundle, and the bundle is served by its digest. With a platform asked, one that is not
+  complete fails the call. With none asked, an incomplete platform is left out and the call
+  fails only when none is complete.
+- `INVALID_ARGUMENT` for a commit that is not exactly 40 lowercase hex digits (a 12-digit
+  short commit included) and for a platform that is not one of the three; `NOT_FOUND` when no
+  tarball of the commit is stored (a bundle alone is not a release); `FAILED_PRECONDITION`
+  when the platform asked is not complete, or none is, with a message that names what is
+  lacking per platform (`linux-arm64 has no tarball of kbf`, `linux-x86_64 has no attestation
+  of kbf`, or a bundle not served by its digest, which putting it again repairs);
+  `UNAVAILABLE` without `--releases-dir`; `INTERNAL` for a store that fails, saying only that.
+- **Who may call it** is the rule of `Fetch`, one row of the worker listener's role table:
+  under mutual TLS the daemon role alone (another role is `PERMISSION_DENIED`, no certificate
+  is `UNAUTHENTICATED`); in plain-text worker mode it is open, like every worker method.
+  The service itself checks nothing.
+
+`GET /v1/releases/{commit}` answers the same description for every complete platform as
+JSON, open like `GET /v1/releases`: `200`, `400` for a commit that is not 40 lowercase hex
+digits, `404` when no tarball of it is stored, `409` when no platform is complete (the
+message is `Describe`'s), `503` without a store.
+
+```json
+{
+  "schema": 1,
+  "commit": "<40 hex>",
+  "components": [
+    {
+      "name": "kbf",
+      "platform": "linux-x86_64",
+      "tarball": "kbf-<commit>-linux-x86_64.tar.gz",
+      "sha256": "<64 hex>",
+      "size": 123,
+      "bundle_sha256": "<64 hex>",
+      "bundle_size": 456
+    }
+  ]
+}
+```
+
+`schema` is `1`. A field is added without moving it; a reader takes `schema` 1 only, ignores
+keys it does not know, and holds every value to the shape above before it uses it.
+
+**The `url` source's file.** A `url` release source is a static HTTPS server of the store's
+layout (`docs/design/kbf-installer.md` section 5): `files/<sha256>` holds every tarball and
+every bundle by digest, and `releases/<commit>.json` is this route's body, saved. Nothing
+in this repository writes that tree: the release workflow attaches tarballs and bundles to a
+GitHub release by name, and `kbf-server` serves no files over HTTP. A mirror is made from a
+frontend's store: copy its `files/` directory and save the route's body for each commit
+(`curl -fsS "$API/v1/releases/$COMMIT" > releases/$COMMIT.json`); a commit that is not
+complete for any platform has no file to save (`409`).
+
+## `GET /v1/update` and `POST /v1/update/{desired,pause,resume}`
+
+The desired release (`docs/design/pull-updates.md` section 6.3), kept in the `update/desired`
+row of the state store. Without `--state-store` every answer is `503` naming it; without
+`--releases-dir`, `GET /v1/update` and `POST /v1/update/desired` are `503` naming that flag
+(`pause` and `resume` need only the state store). A write that other writers kept racing
+for the whole of its retries is `503` with `Retry-After: 1`: send it again.
+
+- `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms"},
+  "paused": bool, "policy": null | {...}, "proposals": [...], "releases": <the body of GET /v1/releases>}`.
+  `proposals` are the releases the release poller found (`--release-poll-every-secs`), oldest
+  first, each `{"commit", "tag", "published_at_secs", "proposed_at_ms"}`: the newest published
+  GitHub release of a `v*` tag whose notes name an allowed ref and a commit and that lists
+  `SHA256SUMS` and a provenance bundle for each tarball. Nothing is verified and nothing is
+  started: a proposal is a suggestion, and the run starts when an operator offers the commit
+  with `POST /v1/update/desired`. The poller asks GitHub's public API with no credential, on
+  the active frontend only, with a conditional request, and backs off after a failure. `policy`
+  is the `update/policy` row when the operator wrote one (`paused`, `auto_nodes`,
+  `auto_frontend`, `new_work_only_to_updated`, `accept_failing_builds`, `max_hosts_out`,
+  `min_serving` and the limits in seconds), else `null`; `paused` is its flag (false without
+  a row).
+- `POST /v1/update/desired` with `{"commit": "<40 lowercase hex>"}` and, optionally,
+  `"expect_generation": N` (JSON content type, the write gates) offers the commit. With
+  `expect_generation` it is a compare-and-set: it writes only if the desired release is at
+  generation N (0 before any offer), else `409` naming both and nothing is written. `409` unless the release store holds some platform of it complete
+  (see above); `400` for a body that is not exactly that. The answer is the desired release.
+  The generation moves only when the commit differs from the desired one, so a repeated click is
+  not a new run; a rollback is the older commit offered the same way and gets a higher
+  generation. Generations increase, but may skip numbers: each write that loses a race has
+  already drawn a counter value.
+- `POST /v1/update/pause` and `POST /v1/update/resume` (the write gates, no body) set `paused` of the policy
+  row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
+  needed, and an offer leaves the flag as it is: while set, no host is started.
+
+## `GET /v1/update/hosts`
+
+What each host last said about its update, for the update page and for agents
+(`docs/design/update-ui.md` section 5). **Off unless the policy names `farm.getAuthorizer`**
+([reapi-auth.md](reapi-auth.md)): the request runs the policy's authenticator and then that
+authorizer (asked with the empty instance name), and without the key or a policy file every
+request is `404` with `"off": "farm"`. It carries what the open `GET /v1/nodes` must not: the
+commits a host runs, staged and installed, and its refusal text.
+
+```json
+{ "desired": { "generation": 3, "commit": "<40 hex>", "set_at_ms": 1791370000000 },
+  "paused": false,
+  "hosts": [
+    { "node_id": "linux-1", "connected": true, "availability": "ok", "state": "refused",
+      "up_to_date": false, "desired_commit": "<40 hex>", "running_commit": "0123456789ab",
+      "installed_commit": "<40 hex>", "staged_commit": "", "refusal": "no helper",
+      "offered_generation": 3, "helper_present": false, "reported_at_unix_ms": 1791370000000 } ],
+  "next_page_token": null }
+```
+
+- `desired` is the row of `GET /v1/update` (`null` before any offer, and without `--state-store`).
+  `paused` is the policy row's `paused` (the pause lives there alone), `false` without a policy
+  row (as on `GET /v1/update`), and `null` (unknown, never `false`) if the policy object has no
+  boolean `paused`.
+- Each host has `availability`, `state` and `up_to_date` as on `GET /v1/nodes`. The rest is as
+  the host last reported, even if it is no longer `ok` (`null` for a host that never sent an
+  `UpdateStatus`): `running_commit` (12 hex digits or `unknown`), `installed_commit` and
+  `staged_commit` (`""` if none or not known), `refusal`, `offered_generation`,
+  `helper_present` and `reported_at_unix_ms` (the server's clock).
+- **Text from a host is data.** Each string is kept cut to 64 bytes (a commit) or 512 bytes
+  (`refusal`) on a character boundary, with control characters replaced by U+FFFD. A reader
+  escapes it as it would any string from outside.
+- Hosts are in node-id order. `?page_size=` (100 by default, 1 to 1000) and `?page_token=` (the
+  `next_page_token` of the page before, null on the last page); any other query key or a bad
+  page size is `400`. A state store that fails is `500`, not hosts without a desired commit.
 
 ## `UNAVAILABLE` from a storage node that is catching up
 

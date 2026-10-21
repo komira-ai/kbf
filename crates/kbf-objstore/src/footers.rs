@@ -150,7 +150,22 @@ pub fn read_footers<'a, S: ObjectStore>(
     from: Option<ListToken>,
     reads: FooterReads,
 ) -> impl Stream<Item = Result<FooterRead, ObjectStoreError>> + Send + 'a {
+    read_footers_unless(store, prefix, from, reads, |_| false)
+}
+
+/// As [`read_footers`], except an object whose key `skip` accepts is not read and not
+/// yielded: a caller that holds the keys it has handled lists a prefix again and reads
+/// only what is new, with no cursor, so an object that appears below keys already seen
+/// (a slow upload that finished after a later one) is found.
+pub fn read_footers_unless<'a, S: ObjectStore>(
+    store: &'a S,
+    prefix: &'a KeyPrefix,
+    from: Option<ListToken>,
+    reads: FooterReads,
+    skip: impl Fn(&ObjectKey) -> bool + Send + 'a,
+) -> impl Stream<Item = Result<FooterRead, ObjectStoreError>> + Send + 'a {
     crate::listing::objects(store, prefix, from, reads.page)
+        .try_filter(move |object| std::future::ready(!skip(&object.key)))
         .map_ok(move |object| async move { Ok(read_one(store, object, reads.tail).await) })
         .try_buffered(reads.concurrency.get())
 }

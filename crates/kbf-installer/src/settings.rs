@@ -1,6 +1,6 @@
 //! The host's settings: what only root may decide about how a release is checked.
 //!
-//! `/usr/local/libexec/kbf-deploy/installer.conf` ([`crate::layout::SETTINGS`]) holds
+//! `installer.conf` in the trust directory (`/usr/share/kbf-installer/trust/` on Linux, [`crate::layout::Layout::settings`]) holds
 //! `KEY=VALUE` lines (blank lines and `#` comments are skipped; every key at most once;
 //! a key this build does not know is refused):
 //!
@@ -16,7 +16,9 @@
 //! settings it may hold decide what is believed.
 //!
 //! Neither the inbox nor the frontend supplies a ref: the refs a release may come from are
-//! this host's own setting, so a hostile offer cannot name a branch it likes.
+//! this host's own setting, so a hostile offer cannot name a branch it likes. The one other
+//! file that may touch the list is `installer.toml`, whose `source_refs` can only narrow it
+//! ([`Settings::narrowed_to`]).
 
 use std::time::Duration;
 
@@ -25,7 +27,7 @@ use kbf_host::path::HostPath;
 
 use crate::attest::SourceRef;
 use crate::binary::Arch;
-use crate::layout::{self, Layout};
+use crate::layout::Layout;
 use crate::refusal::{Refusal, SettingsFault, TrustFault};
 use crate::run::{RunAs, nobody};
 use crate::trust::trusted_chain;
@@ -65,7 +67,7 @@ impl Settings {
     /// else the defaults. `trust` answers who owns what and reads the file: the host's
     /// own [`kbf_host::HostExec`], or a test's.
     pub fn load(trust: &dyn Exec, host: &Layout) -> Result<Settings, Refusal> {
-        Settings::load_from(trust, host, &layout::path(layout::SETTINGS))
+        Settings::load_from(trust, host, &host.settings())
     }
 
     /// [`Settings::load`] for the settings file at `file`.
@@ -96,7 +98,34 @@ impl Settings {
         let text = String::from_utf8(bytes).map_err(|_| refuse(SettingsFault::NotUtf8))?;
         parse(&text, Settings::defaults(host)).map_err(refuse)
     }
+
+    /// These settings with `installer.toml`'s `source_refs` applied: the refs of the trust
+    /// files that `wanted` also names, in the trust files' order. An empty `wanted` is no
+    /// narrowing. A ref `wanted` names that the trust files do not allow is dropped, so the
+    /// result is never wider than the trust files' list.
+    ///
+    /// # Errors
+    /// [`NoCommonRef`] when `wanted` is not empty and names none the trust files allow: the
+    /// host would accept no release, and the file cannot add a ref to make one.
+    pub fn narrowed_to(mut self, wanted: &[String]) -> Result<Settings, NoCommonRef> {
+        if wanted.is_empty() {
+            return Ok(self);
+        }
+        self.source_refs
+            .retain(|allowed| wanted.iter().any(|w| w == allowed.as_str()));
+        if self.source_refs.is_empty() {
+            return Err(NoCommonRef);
+        }
+        Ok(self)
+    }
 }
+
+/// `installer.toml`'s `source_refs` names no ref that `installer.conf` allows.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "installer.toml source_refs names no ref that installer.conf's SOURCE_REFS allows (it may narrow that list, never widen it)"
+)]
+pub struct NoCommonRef;
 
 /// `text` applied over `settings`.
 fn parse(text: &str, mut settings: Settings) -> Result<Settings, SettingsFault> {

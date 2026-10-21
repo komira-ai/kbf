@@ -14,6 +14,7 @@ prost-types.workspace = true
 thiserror.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+zeroize.workspace = true
 
 [build-dependencies]
 protox.workspace = true

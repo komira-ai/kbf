@@ -67,9 +67,11 @@ pub fn status(world: &World, instance: &str, shape: u64, cfg: &str) -> Option<St
     Some(StatusRow::decode(row.value.as_slice()).expect("a status row"))
 }
 
-/// The header row of `inv`, if the index holds one.
+/// The header row of `inv` (its writer's: the first, if several wrote one), if the index
+/// holds one.
 pub fn header(world: &World, inv: &str) -> Option<InvocationHeader> {
-    let key = IndexRoot::default().invid(&InvKey::from_record_id(inv));
-    let row = world.state.fake.get(&key).expect("a read")?;
+    let prefix = IndexRoot::default().header_rows(&InvKey::from_record_id(inv));
+    let rows = world.state.fake.scan_prefix(&prefix).expect("a read");
+    let (_, row) = rows.into_iter().next()?;
     Some(InvocationHeader::decode(row.value.as_slice()).expect("a header"))
 }

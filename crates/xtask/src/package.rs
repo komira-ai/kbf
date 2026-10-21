@@ -201,6 +201,29 @@ pub fn write_tarball(path: &Path, tgz: &[u8], name: &str, bytes: &[u8]) -> Resul
     ))
 }
 
+/// Creates `out` when missing and reads its `SHA256SUMS.<platform>`: its path and the
+/// lines already there (none when the file is missing).
+pub(crate) fn open_sums(
+    out: &Path,
+    platform: Platform,
+) -> Result<(std::path::PathBuf, Vec<sums::Line>), Error> {
+    std::fs::create_dir_all(out).map_err(Error::spawn(format!("create {}", out.display())))?;
+    let path = out.join(format!("{}.{}", sums::SUMS, platform.name()));
+    let lines = match std::fs::read_to_string(&path) {
+        Ok(text) => sums::parse(&text).map_err(Error::Refused)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(Error::spawn(format!("read {}", path.display()))(e)),
+    };
+    Ok((path, lines))
+}
+
+/// Writes `lines` to the sums file `path` and returns the text written.
+pub(crate) fn write_sums(path: &Path, lines: &[sums::Line]) -> Result<String, Error> {
+    let text = sums::render(lines);
+    std::fs::write(path, &text).map_err(Error::spawn(format!("write {}", path.display())))?;
+    Ok(text)
+}
+
 /// The `package` verb: the lines to print.
 pub fn package(
     binary: &Path,
@@ -229,13 +252,7 @@ pub fn package(
     let stem = format!("{name}-{commit}-{}", platform.name());
     let tgz_name = format!("{stem}.tar.gz");
     let sbom_name = format!("{stem}.cdx.json");
-    std::fs::create_dir_all(out).map_err(Error::spawn(format!("create {}", out.display())))?;
-    let sums_path = out.join(format!("{}.{}", sums::SUMS, platform.name()));
-    let mut lines = match std::fs::read_to_string(&sums_path) {
-        Ok(text) => sums::parse(&text).map_err(Error::Refused)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(Error::spawn(format!("read {}", sums_path.display()))(e)),
-    };
+    let (sums_path, mut lines) = open_sums(out, platform)?;
     if let Some(l) = lines
         .iter()
         .find(|l| [&tgz_name, &sbom_name].contains(&&l.name))
@@ -257,9 +274,7 @@ pub fn package(
         sha256: Sha256::of(&sbom_bytes),
         name: sbom_name,
     });
-    let text = sums::render(&lines);
-    std::fs::write(&sums_path, &text)
-        .map_err(Error::spawn(format!("write {}", sums_path.display())))?;
+    let text = write_sums(&sums_path, &lines)?;
     let mut printed = vec![format!("packaged {stem}:")];
     printed.extend(text.lines().map(str::to_owned));
     Ok(printed)

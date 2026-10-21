@@ -4,7 +4,7 @@ use super::*;
 use crate::fixtures::{FakeRunner, ran};
 
 const T: Duration = Duration::from_secs(5);
-const INFO: &str = "Executable=/x/kbf-daemon\nIdentifier=kbf-daemon\n\
+const INFO: &str = "Executable=/x/kbf\nIdentifier=kbf\n\
     CodeDirectory v=20400 size=1 flags=0x10002(adhoc,runtime) hashes=1+2 location=embedded\n\
     CDHash=abcdef\n";
 
@@ -22,7 +22,7 @@ fn codesign(verify: i32, display_stderr: &'static str) -> Result<(), Refusal> {
             if verify_run { "" } else { display_stderr },
         ))
     });
-    check_signature(&runner, "kbf-daemon", Path::new("/out/kbf-daemon"), T)
+    check_signature(&runner, "kbf", Path::new("/out/kbf"), T)
 }
 
 /// Catches the quarantine attribute going unseen: `xattr -p` exiting 0 means the file

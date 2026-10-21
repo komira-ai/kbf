@@ -40,6 +40,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
+        // The registered store's secret must not reach a log through the derived `Debug`:
+        // `src/store_config.rs` writes this one by hand.
+        .skip_debug([".kbf.enroll.v1.StoreConfig"])
         .compile_fds(descriptors)?;
 
     println!("cargo:rerun-if-changed={}", root.display());

@@ -19,9 +19,10 @@ use super::{Farm, NodeAction, State, unix_ms};
 
 /// How many looks in a row at the state store may find an operation neither unfinished
 /// nor ended before it is reported as untraced (a WARN, and `kbf_frontend_relay_untraced`).
-/// A writer ends an operation in two transactions, the second moments after the first, so
-/// one look can fall between them; a successor that died between them leaves the
-/// operation like that for good. Only a report: an untraced operation's callers are not
+/// A writer ends an operation in one transaction (its rows removed, its result put), so a
+/// look finds one or the other; a store that a release ending operations in two
+/// transactions wrote can hold neither for good, and a result past its retention is also
+/// gone. Only a report: an untraced operation's callers are not
 /// answered, they keep waiting (see [`Farm::follow`]).
 pub const UNTRACED_LOOKS: u32 = 2;
 
@@ -82,6 +83,30 @@ impl Farm {
     /// [`Farm::follow`] to answer.
     pub fn fence(&self) {
         self.lock().fenced = true;
+    }
+
+    /// Lets a farm that [`Farm::fence`] stopped for a takeover that did not happen feed the
+    /// scheduler again. Nothing was fed while it was fenced, so the farm's memory is the
+    /// state store's as of the fence; the caller checks first that the store is still at
+    /// the generation this process holds.
+    pub fn resume(&self) {
+        self.lock().fenced = false;
+    }
+
+    /// Whether the state store has refused a write of this farm because a newer writer
+    /// holds it.
+    #[must_use]
+    pub fn superseded(&self) -> bool {
+        self.lock()
+            .durable
+            .as_ref()
+            .is_some_and(Durable::superseded)
+    }
+
+    /// Worker streams open now.
+    #[must_use]
+    pub fn open_sessions(&self) -> usize {
+        self.lock().links.len()
     }
 
     /// Writes, to the state store, the requeues it refused (a lease the scheduler gave
@@ -208,7 +233,7 @@ impl State {
     /// # Errors
     /// UNAVAILABLE if the farm is fenced or the store did not take it.
     pub(super) fn admit(
-        &self,
+        &mut self,
         request: &kbf_sched::Request,
         subject: &crate::action_usage::Subject,
     ) -> Result<(), Status> {

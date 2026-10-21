@@ -1,5 +1,5 @@
-//! The helper's word: `DIR/status.json`, which the root helper writes and the client
-//! reads. A missing file means there is no helper; a file the client cannot understand
+//! The installer's word: `DIR/status.json` (schema 2), which the root `kbf-installer`
+//! writes and the client reads. A missing file means there is no helper; a file the client cannot understand
 //! is a refusal with the reason, never a guess.
 
 use std::fs;
@@ -11,12 +11,13 @@ use serde::Deserialize;
 use crate::types::{Staged, is_hex};
 
 /// The schema this client reads.
-pub const SCHEMA: u64 = 1;
+pub const SCHEMA: u64 = 2;
 
 /// What the helper says it is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HelperState {
     Idle,
+    Fetching,
     Staged,
     ActivatedUnconfirmed,
     Confirmed,
@@ -86,6 +87,7 @@ fn parse(bytes: &[u8]) -> Result<Report, String> {
     }
     let state = match raw.state.as_str() {
         "idle" => HelperState::Idle,
+        "fetching" => HelperState::Fetching,
         "staged" => HelperState::Staged,
         "activated_unconfirmed" => HelperState::ActivatedUnconfirmed,
         "confirmed" => HelperState::Confirmed,

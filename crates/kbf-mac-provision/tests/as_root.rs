@@ -27,7 +27,7 @@
 //!   `time_server`, `time_max_offset_ms` (Remote Login needs Full Disk Access; the clock
 //!   and the runner's own login are left alone).
 //!
-//! No kbf-daemon is built for these tests: they assert that the job is loaded, never
+//! No kbf is built for these tests: they assert that the job is loaded, never
 //! that the daemon runs. When nothing is installed at the daemon's path, a copy of
 //! `/usr/bin/true` stands there, so `launchctl bootstrap` has a program to start.
 //!
@@ -60,7 +60,7 @@ const SCRATCH: &str = "/private/tmp/kbf-mac-provision-as-root";
 const LABEL: &str = "org.example.kbf-daemon";
 const LOG_DIR: &str = "/Library/Logs/kbf";
 const ERR_LOG: &str = "/Library/Logs/kbf/kbf-daemon.err.log";
-const DAEMON_BIN: &str = "/usr/local/kbf/current/kbf";
+const DAEMON_BIN: &str = "/usr/local/kbf-installer/releases/current/kbf";
 const SOFTWARE_UPDATE: &str = "/Library/Preferences/com.apple.SoftwareUpdate";
 /// The items applied and asserted: none can break the job running the tests.
 const SAFE: &str = "hostname,role_user,updates_auto_download,updates_auto_install_macos,\

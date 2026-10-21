@@ -22,6 +22,7 @@ use kbf_proto::reapi::{ActionResult, Directory, FileNode};
 use kbf_proto::worker::segments_server::Segments;
 use kbf_server::LocalStore;
 use kbf_storage::{Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError};
+use kbf_testkit::dir::TestDir;
 use kbf_transfer::{Cas as _, CasError, label, proto_digest};
 use kbf_types::Digest;
 use prost::Message as _;
@@ -179,18 +180,16 @@ impl Storage for Watched {
 /// One test's input cache in `dir/cache` (leases under `dir/leases`), and a plane
 /// over a [`Watched`] in-memory store, its calls run on this runtime.
 struct Kit {
-    dir: PathBuf,
     cache: Arc<Cache>,
     plane: LocalDataPlane,
     storage: Arc<Watched>,
+    /// Last, so it is removed after everything that writes into it is dropped.
+    dir: TestDir,
 }
 
 impl Kit {
     fn new(name: &str) -> Self {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("kbf-all-in-one-one-cache")
-            .join(format!("{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("one-cache-{name}"));
         for sub in ["cache", "leases"] {
             std::fs::create_dir_all(dir.join(sub)).expect("mkdir");
         }
@@ -210,10 +209,10 @@ impl Kit {
         let store = LocalStore::over(Arc::clone(&storage) as Arc<dyn Storage>);
         let plane = LocalDataPlane::new(store, tokio::runtime::Handle::current());
         Self {
-            dir,
             cache,
             plane,
             storage,
+            dir,
         }
     }
 
@@ -460,7 +459,7 @@ async fn scrape(api: std::net::SocketAddr) -> std::collections::BTreeMap<String,
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_hot_stores_blocks_are_the_one_caches_storage_bytes() {
     let local = Arc::new(kbf_storage::local_cache::LocalCache::new());
-    let (store, api, _) = server_half("blocks", 1 << 30, Some(Arc::clone(&local))).await;
+    let (store, api, _dir) = server_half("blocks", 1 << 30, Some(Arc::clone(&local))).await;
     assert_eq!(local.storage_bytes(), 0);
     store.put(vec![5; 1000]).await.expect("put");
     let staged = local.storage_bytes();
@@ -477,17 +476,18 @@ async fn the_hot_stores_blocks_are_the_one_caches_storage_bytes() {
 
 /// A server half started as `kbf-all-in-one` starts it, in a fresh directory named
 /// `name`, with `local` as its one cache: blobs of at least `own` bytes get a block of
-/// their own. Its local store, its operator API, and its hot store's directory.
+/// their own. Its local store, its operator API, and its directory (the hot store is
+/// `hot` in it), which the caller keeps for as long as the server runs.
 async fn server_half(
     name: &str,
     own: u64,
     local: Option<Arc<kbf_storage::local_cache::LocalCache>>,
-) -> (LocalStore, std::net::SocketAddr, PathBuf) {
+) -> (LocalStore, std::net::SocketAddr, TestDir) {
     use clap::Parser as _;
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-all-in-one-one-cache")
-        .join(format!("server-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("one-cache-server-{name}"),
+    );
     let argv = [
         "kbf-server".to_owned(),
         "--listen=127.0.0.1:0".to_owned(),
@@ -503,7 +503,7 @@ async fn server_half(
     let server = kbf_server::start(&args, never).await.expect("start");
     let (store, api) = (server.local(), server.api.expect("the API"));
     tokio::spawn(server.serve());
-    (store, api, dir.join("hot"))
+    (store, api, dir)
 }
 
 /// Catches the hot store's flushed copies decided otherwise than by the one cache: the
@@ -518,7 +518,8 @@ async fn the_hot_store_keeps_flushed_copies_only_without_the_one_cache() {
     for one_cache in [false, true] {
         let local = one_cache.then(|| Arc::new(kbf_storage::local_cache::LocalCache::new()));
         let name = format!("flushed-{one_cache}");
-        let (store, api, hot) = server_half(&name, 1, local).await;
+        let (store, api, dir) = server_half(&name, 1, local).await;
+        let hot = dir.join("hot");
         store.put(vec![6; 1000]).await.expect("put");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let samples = loop {

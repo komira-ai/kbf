@@ -33,12 +33,20 @@
 //! has. `Down` keeps its slot so that a flapping member remaps nothing; when the dwell
 //! ends the member leaves the map and its slice moves (a new generation).
 //!
+//! `Down` is also how an operator takes a running member out of the write path for a planned
+//! restart (`kbf-server`'s `Members::plan_down`): there is no further state on the wire, so a
+//! reader built before it reads such a member like any `Down` one.
+//!
 //! Across generations, [`Map::read_order_with_previous`] lists this generation's read
 //! order, then the previous generation's members not yet listed: a blob written before a
 //! join or a drain is found where it was.
 //!
+//! Across several generations, [`Map::read_order_with_history`] does the same over every retained
+//! map. [`Map::owners_assuming`] and [`Map::placement_fingerprint`] answer "what would
+//! placement be if this member were `Active`", for checking a joiner's fill before promotion.
+//!
 //! This is a pure crate: no I/O, async runtime, clock or randomness. The layering test in
-//! `kbf-it` and the lists in `clippy.toml` enforce it.
+//! `kbf-integration-test` and the lists in `clippy.toml` enforce it.
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 

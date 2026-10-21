@@ -18,12 +18,61 @@
 //!   `.cdx.json`: the assets of that commit and no other, and each tarball has exactly
 //!   one provenance bundle, `<tarball>.sigstore.json`, whose one subject is that
 //!   tarball's digest ([`bundles`]), and no bundle is there for anything else.
+//! - `release verdict <dir> --repo-dir <checkout> --tag <tag> --commit <sha> [--main-ref
+//!   <ref>] [--output <file>]` ([`verdict`]): the annotated tag's message is a green
+//!   gamma verdict for that tag, that commit (on main) and the set `<dir>`'s `SHA256SUMS`
+//!   hashes to, after a bake of 24 hours or more. Prints `set-hash=<hex>`, which
+//!   `publish --set-hash` must be given.
+//! - `release offer <dir> --repo <owner/repo> --commit <sha> --platform <p>... (--beta-result
+//!   <file> | --waive-beta <reason> --operator <name>) [--previous <sha> --version-json <file>
+//!   --previous-version-json <file>] [--plan] --out <offer.json>` ([`offer`]): the checks
+//!   that make a commit offerable, and `offer.json`, the record a deploy reads. It sets
+//!   nothing on any farm.
+//! - `release identity <dir> --commit <sha> --out <file>` ([`identity`]): runs `kbf --version
+//!   --json` from `<dir>`'s linux-x86_64 tarball of that commit and writes what it prints. It
+//!   runs a binary: only after `check` and `verify-assets attestations` on `<dir>`.
+//! - `release previous --tag <tag> --commit <sha> [--repo-dir <checkout>] [--output
+//!   <file>]` ([`notes::previous_release`]): the nearest earlier stable `v*` tag that is
+//!   an ancestor of the commit; prints `previous=` and `previous-commit=` (empty for a
+//!   first release).
+//! - `release notes <dir> ... --version-json <file> [--previous-version-json <file>] --out
+//!   <file>` ([`notes`]): the same checks, then the release's notes: first "Before you
+//!   click" (what is not reversible, as `kbf_gate::reversible` and the `protocol` of the two
+//!   builds' `kbf --version --json` say and never from the verdict's own list, unknown counting as
+//!   not reversible; the waivers; the verdict in a line), then the commits since the
+//!   previous release, the verdict, the gamma escapes and what is withdrawn. Without the
+//!   identity of the previous release, when there is one, it refuses (fail closed).
+//! - `release plan --repo <owner/repo> --sha <sha> --before <sha> [--repo-dir <checkout>]
+//!   [--freeze <text>] [--output <file>] [--gh <program>]` ([`plan`]): the next version
+//!   (`VERSION` and the release tags), the push's class (code, site, pipeline), and the
+//!   refusals: a freeze, a base below an existing tag, a superseded commit ([`tags::superseded`]).
+//!   Prints `key=value` lines and appends them to `--output`.
 //! - `release publish <dir> --repo <owner/repo> --tag <tag> --commit <sha> --run-id <id>
-//!   [--gh <program>]` ([`publish`]): `check`, then creates release `<tag>` with every
-//!   file of `<dir>` (the bundles beside their tarballs). When the release exists,
+//!   --set-hash <hex> --notes-file <file> [--gh <program>]` ([`publish`]): `check`, then
+//!   creates release `<tag>` with every file of `<dir>` (the bundles beside their
+//!   tarballs) and the notes file, verbatim, as the start of its body. When the release exists,
 //!   every asset it holds must be one of these files, byte for byte, or nothing is
 //!   changed; the files it lacks are uploaded. A re-run therefore creates no second
-//!   release and replaces no asset.
+//!   release and replaces no asset. It refuses first when the highest release tag is not
+//!   at `--commit` or an ancestor of it ([`tags::superseded`]).
+//! - `release tag --repo <owner/repo> --sha <sha> --tag <tag> --message-file <file>
+//!   [--tagger <login>] [--output <file>] [--gh <program>]` ([`tag`]): the annotated tag
+//!   `--tag` at `--sha` through the GitHub API, create-only, after the same stale-run
+//!   guards as `publish`. A tag that already exists is reused only when it names this
+//!   commit with this message. Prints `tag=` and `created=true|false`.
+//! - `release verdict-write <dir> --commit <sha> --tag <tag> --run-id <id> --ci-run <id>
+//!   --beta-run <id> --artifacts-run <id> --out <file> [...]` ([`verdict_write`]): the
+//!   verdict document the tag's message carries, for the stage [`verdict::GATE_STAGE`].
+
+mod git;
+pub mod identity;
+pub mod notes;
+pub mod offer;
+pub mod plan;
+pub mod tag;
+pub mod tags;
+pub mod verdict;
+pub mod verdict_write;
 
 use std::io::Write;
 use std::path::Path;
@@ -71,6 +120,16 @@ fn api(gh: &Path, path: &str) -> Result<Option<Value>, Error> {
     let json = serde_json::from_slice(&out.stdout);
     json.map(Some)
         .map_err(|e| Error::Failed(format!("gh api {path}: not JSON: {e}")))
+}
+
+/// Appends `lines` to `output` (on Actions, `GITHUB_OUTPUT`), one per line.
+fn append_output(output: &Path, lines: &[String]) -> Result<(), Error> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output)
+        .and_then(|mut f| writeln!(f, "{}", lines.join("\n")))
+        .map_err(Error::spawn(format!("append to {}", output.display())))
 }
 
 /// Runs `gh <args>`; an error holds what it printed on stderr.
@@ -149,12 +208,7 @@ pub fn locate(
     }
     let line = format!("run-id={id}");
     if let Some(output) = output {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(output)
-            .and_then(|mut f| writeln!(f, "{line}"))
-            .map_err(Error::spawn(format!("append to {}", output.display())))?;
+        append_output(output, std::slice::from_ref(&line))?;
     }
     Ok(vec![
         format!("{commit} is on {MAIN}; run {id} of {ARTIFACTS_WORKFLOW} built it"),
@@ -184,11 +238,15 @@ pub fn main_control(gh: &Path, repo: &str, on: &str, off: &str) -> Result<String
 }
 
 /// Whether `name` is an asset of `commit`: `<binary>-<commit>-<platform>` and
-/// `.tar.gz` or `.cdx.json`.
+/// `.tar.gz`, `.cdx.json`, `.deb` or `.pkg` (the packages; nfpm's own `kbf-installer_<version>_
+/// <arch>.deb` and `pkg build`'s `kbf-installer-<version>-macos-arm64.pkg` name no commit and are
+/// not one).
 fn is_asset_of(name: &str, commit: &str) -> bool {
     let stem = name
         .strip_suffix(".tar.gz")
-        .or_else(|| name.strip_suffix(".cdx.json"));
+        .or_else(|| name.strip_suffix(".cdx.json"))
+        .or_else(|| name.strip_suffix(".deb"))
+        .or_else(|| name.strip_suffix(".pkg"));
     let parts = stem.and_then(|s| s.split_once(&format!("-{commit}-")));
     parts
         .is_some_and(|(binary, platform)| !binary.is_empty() && Platform::named(platform).is_some())
@@ -219,12 +277,27 @@ fn checked(dir: &Path, commit: &str) -> Result<(Vec<String>, Vec<String>), Error
         .map(|l| l.name.as_str())
         .filter(|n| n.ends_with(".tar.gz"))
         .collect();
-    names.extend(tarballs.iter().map(|t| bundles::name_of(t)));
+    let packages: Vec<&str> = lines
+        .iter()
+        .map(|l| l.name.as_str())
+        .filter(|n| bundles::is_package(n))
+        .collect();
+    names.extend(
+        tarballs
+            .iter()
+            .chain(&packages)
+            .map(|t| bundles::name_of(t)),
+    );
+    let and_packages = if packages.is_empty() {
+        String::new()
+    } else {
+        format!(" and {} package(s)", packages.len())
+    };
     let printed = vec![
         sums_line,
         format!("names: every listed file is an asset of {commit}"),
         format!(
-            "bundles: each of the {} tarballs has one provenance bundle",
+            "bundles: each of the {} tarballs{and_packages} has one provenance bundle",
             tarballs.len()
         ),
     ];
@@ -234,6 +307,30 @@ fn checked(dir: &Path, commit: &str) -> Result<(Vec<String>, Vec<String>), Error
 /// The `release check` verb: the lines to print.
 pub fn check(dir: &Path, commit: &str) -> Result<Vec<String>, Error> {
     Ok(checked(dir, commit)?.0)
+}
+
+/// The most characters GitHub takes in a release body.
+const BODY_CAP: usize = 125_000;
+
+/// The notes in `path`, which `release publish` requires: a missing, unreadable, non-UTF-8
+/// or blank file is a refusal, never a quiet fall back to another body.
+pub fn read_notes(path: &Path) -> Result<String, Error> {
+    let text = std::fs::read_to_string(path).map_err(Error::spawn(format!(
+        "read --notes-file {}",
+        path.display()
+    )))?;
+    if text.trim().is_empty() {
+        return Err(Error::Failed(format!(
+            "--notes-file {} is empty: a release is made with its notes",
+            path.display()
+        )));
+    }
+    Ok(text)
+}
+
+/// The commit tag `tag` names, in full.
+pub(crate) fn commit_of(repo: &Path, tag: &str) -> Result<String, Error> {
+    git::commit_of(repo, tag)
 }
 
 /// Which release `release publish` makes or completes.
@@ -246,6 +343,11 @@ pub struct Release<'a> {
     pub commit: &'a str,
     /// The run of the artifacts workflow that built and attested them.
     pub run_id: u64,
+    /// The set hash the gamma verdict names (`release verdict` prints it): the files must
+    /// be that set, or nothing is published.
+    pub set_hash: &'a kbf_gate::SetHash,
+    /// The notes `release notes` wrote: the first part of the release's body.
+    pub notes: &'a str,
     /// The `gh` program.
     pub gh: &'a Path,
     /// An empty directory, for the assets the release already holds.
@@ -253,35 +355,78 @@ pub struct Release<'a> {
 }
 
 impl Release<'_> {
-    /// The release's notes: where the files come from, and how to verify one, online
-    /// and (for a tarball) offline with the bundle released beside it.
-    fn notes(&self) -> String {
+    /// The release's body: the notes, verbatim, then where the files come from and how to
+    /// verify one, online and (for a tarball) offline with the bundle released beside it.
+    fn body(&self) -> Result<String, Error> {
         let repo = self.repo;
-        format!(
-            "The files run {id} of {ARTIFACTS_WORKFLOW} built and attested for {commit} on \
+        let body = format!(
+            "{notes}\n## The files\n\nThe files run {id} of {ARTIFACTS_WORKFLOW} built and attested for {commit} on \
              {MAIN} (https://github.com/{repo}/actions/runs/{id}), unchanged: a release \
              rebuilds nothing.\n\nVerify an asset before use:\n\n```text\ngh attestation \
              verify <asset> --repo {repo} --signer-workflow \
              {repo}/.github/workflows/{ARTIFACTS_WORKFLOW} --source-ref refs/heads/{MAIN} \
-             --deny-self-hosted-runners\n```\n\nEach tarball also has its provenance bundle, \
+             --deny-self-hosted-runners\n```\n\nEach tarball and each package (`.deb` or `.pkg`) also has its provenance bundle, \
              `<asset>{SUFFIX}`, which verifies it with no network but a trusted root \
              (`gh attestation trusted-root > trusted_root.jsonl`):\n\n```text\ngh attestation \
              verify <asset> --bundle <asset>{SUFFIX} --custom-trusted-root trusted_root.jsonl \
              --repo {repo} --signer-workflow {repo}/.github/workflows/{ARTIFACTS_WORKFLOW} \
              --cert-oidc-issuer {ISSUER} --source-ref refs/heads/{MAIN} --source-digest \
              {commit} --predicate-type {PROVENANCE} --deny-self-hosted-runners\n```\n",
+            notes = self.notes.trim_end(),
             id = self.run_id,
             commit = self.commit,
             SUFFIX = bundles::SUFFIX,
             ISSUER = bundles::ISSUER,
             PROVENANCE = bundles::PROVENANCE,
-        )
+        );
+        let len = body.chars().count();
+        if len > BODY_CAP {
+            return Err(Error::Failed(format!(
+                "the release body is {len} characters; GitHub takes {BODY_CAP}"
+            )));
+        }
+        Ok(body)
     }
+}
+
+/// Rule S compares the commit with the highest tag only, so `--tag` is checked too: it
+/// is the highest tag when it already names this commit (a re-run of the same release),
+/// and otherwise it must be strictly above the highest existing release tag.
+fn tag_is_current(tag: &str, standing: &tags::Standing) -> Result<(), Error> {
+    let given = tags::Version::parse_tag(tag);
+    let (top, ok) = match standing {
+        tags::Standing::Untagged => return Ok(()),
+        tags::Standing::Is(top) => (top, given == Some(*top)),
+        tags::Standing::Ahead(top) => (top, given.is_some_and(|v| v > *top)),
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(Error::Refused(vec![format!(
+        "--tag {tag} is no release above the highest release tag {}: a release tag \
+         is v<MAJOR>.<MINOR>.<PATCH>, strictly above the highest unless it names this commit",
+        top.tag()
+    )]))
 }
 
 /// The `release publish` verb: the lines to print.
 pub fn publish(dir: &Path, r: &Release) -> Result<Vec<String>, Error> {
     let (mut printed, names) = checked(dir, r.commit)?;
+    let held_set = verdict::set_hash_of(dir)?;
+    if &held_set != r.set_hash {
+        return Err(Error::Refused(vec![format!(
+            "the files in {} are set {}, the gamma verdict names set {}: gamma ran other bytes",
+            dir.display(),
+            held_set.as_str(),
+            r.set_hash.as_str()
+        )]));
+    }
+    // Refused before GitHub is asked anything (not even the tags), whether or not the
+    // release exists.
+    r.body()?;
+    // Rule S, before the first read of the release: an old run does nothing.
+    let standing = tags::superseded(r.gh, r.repo, r.commit)?;
+    tag_is_current(r.tag, &standing)?;
     let paths: Vec<String> = names
         .iter()
         .map(|n| dir.join(n).display().to_string())
@@ -289,7 +434,7 @@ pub fn publish(dir: &Path, r: &Release) -> Result<Vec<String>, Error> {
     let path_args = paths.iter().map(String::as_str);
     let held = api(r.gh, &format!("repos/{}/releases/tags/{}", r.repo, r.tag))?;
     let Some(held) = held else {
-        let notes = r.notes();
+        let notes = r.body()?;
         let mut args = vec!["release", "create", r.tag, "--repo", r.repo, "--verify-tag"];
         args.extend(["--title", r.tag, "--notes", &notes]);
         args.extend(path_args);

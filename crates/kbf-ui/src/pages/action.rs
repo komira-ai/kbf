@@ -1,24 +1,94 @@
 //! The Action page: one action's answer, with its stdout and stderr as text when the
 //! blob route links them and they are small.
 
+use super::failures::{self, Failure, FailuresPage, LogTail};
 use super::{
     action_label, attempt_end, build_page, bytes, definitions, failed, invocation_url, micros,
-    outcome, pill, problem, segment,
+    outcome, pill, problem, query_value, segment,
 };
-use crate::api::{Action, Attempt, Blob, Output};
+use crate::api::{Action, Attempt, Blob, Outcome, Output};
 use crate::html::{Href, Html, attr};
 use crate::layout;
 use crate::read::{Page, ReadError, Reader};
-use crate::{Answer, PREFIX, Source};
+use crate::{Answer, Source};
 
-/// Action: the action's answer and the log blobs it links.
+/// Action: the action's answer, the log blobs it links, and, for a failed action, the
+/// failures list that holds its command and log tails.
 pub(crate) const ACTION: Page = Page {
     name: "Action",
     reads: &[
         "/v1/invocations/{id}/actions/{digest}",
+        "/v1/invocations/{id}/failures",
         "/v1/blobs/{digest}",
     ],
 };
+
+/// The most pages of `/failures` the page reads to find a failed action when it is not
+/// told which page lists it.
+pub(crate) const FAILURES_PAGES_MAX: usize = 5;
+
+/// Where a failed action's command and log tails were looked for.
+enum Found {
+    /// The action did not fail, so nothing was looked for.
+    NotAsked,
+    /// Its entry in `/failures`.
+    Entry(Box<Failure>),
+    /// Not on the pages read; `more` says the list goes on.
+    Missing { pages: usize, more: bool },
+    /// The list could not be read.
+    Unread(ReadError),
+}
+
+impl Found {
+    fn stream(&self, of: impl Fn(&Failure) -> Option<&LogTail>) -> Option<&LogTail> {
+        match self {
+            Self::Entry(f) => of(f),
+            _ => None,
+        }
+    }
+}
+
+/// `digest` of build `id` in `/failures`: on the page `hint` names when given, else on
+/// the first [`FAILURES_PAGES_MAX`] pages.
+async fn find<S: Source>(
+    r: &mut Reader<'_, S>,
+    id: &str,
+    digest: &str,
+    instance: &str,
+    hint: Option<String>,
+) -> Found {
+    let limit = if hint.is_some() {
+        1
+    } else {
+        FAILURES_PAGES_MAX
+    };
+    let mut token = hint;
+    let mut read = 0;
+    loop {
+        read += 1;
+        let page: FailuresPage = match r.json(&failures::url(id, token.as_deref())).await {
+            Ok(page) => page,
+            Err(e) => return Found::Unread(e),
+        };
+        let next = page.next_page_token;
+        if let Some(f) = page
+            .failures
+            .into_iter()
+            .find(|f| f.action == digest && f.instance == instance)
+        {
+            return Found::Entry(Box::new(f));
+        }
+        match next {
+            Some(next) if read < limit => token = Some(next),
+            more => {
+                return Found::Missing {
+                    pages: read,
+                    more: more.is_some(),
+                };
+            }
+        }
+    }
+}
 
 /// The largest log shown on the page; a larger one is a link. The read API's tails
 /// (`docs/design/invocations-api.md` 4.7) will replace this read when they land.
@@ -37,10 +107,14 @@ enum Log {
     Large(Option<Href>, Option<u64>),
     /// Its text, or why it could not be read.
     Read(Result<String, ReadError>),
+    /// The end of the log, as the failures list carries it, and the link that
+    /// downloads the whole log.
+    Tail(String, String, Option<Href>),
 }
 
-/// The Action page of action `digest` of build `id`.
-pub(crate) async fn action<S: Source>(source: &S, id: &str, digest: &str) -> Answer {
+/// The Action page of action `digest` of build `id`; `?failures_token=` names the page
+/// of `/failures` that lists it.
+pub(crate) async fn action<S: Source>(source: &S, id: &str, digest: &str, query: &str) -> Answer {
     let here = format!("{}/actions/{}", build_page(id), segment(digest));
     let mut r = Reader::new(source, &ACTION);
     let url = format!("{}/actions/{}", invocation_url(id), segment(digest));
@@ -48,15 +122,32 @@ pub(crate) async fn action<S: Source>(source: &S, id: &str, digest: &str) -> Ans
         Ok(a) => a,
         Err(e) => return failed(&ACTION, &here, r.asked(), &e),
     };
-    let stdout = log(&mut r, a.stdout.as_ref()).await;
-    let stderr = log(&mut r, a.stderr.as_ref()).await;
+    let found = if failures::is_failure(a.row.outcome.as_ref()) {
+        let hint = query_value(query, "failures_token");
+        find(&mut r, id, &a.row.action, &a.row.instance, hint).await
+    } else {
+        Found::NotAsked
+    };
+    let stdout = log(
+        &mut r,
+        a.stdout.as_ref(),
+        found.stream(|f| f.stdout.as_ref()),
+    )
+    .await;
+    let stderr = log(
+        &mut r,
+        a.stderr.as_ref(),
+        found.stream(|f| f.stderr.as_ref()),
+    )
+    .await;
     let label = action_label(
         a.row.target.as_ref(),
         a.row.mnemonic.as_ref(),
         &a.row.action,
     );
     let body = layout::page(ACTION.name, &here, r.asked(), |h| {
-        let builds = Href::root_relative(PREFIX).expect("the prefix is root-relative");
+        let builds =
+            Href::root_relative(super::BUILDS_PATH).expect("the Builds path is root-relative");
         let build = Href::root_relative(&build_page(id)).expect("a build page is root-relative");
         h.el("p", &[attr("class", "crumbs")], |h| {
             h.link(&builds, "Builds").text(" / ").link(&build, id);
@@ -75,6 +166,9 @@ pub(crate) async fn action<S: Source>(source: &S, id: &str, digest: &str) -> Ans
                 a.command.clone().unwrap_or_else(|| "none".to_owned()),
             ),
         ];
+        if let Some(Outcome::Ok { exit_code }) = &a.row.outcome {
+            fields.push(("Exit code", exit_code.to_string()));
+        }
         if let Some(u) = &a.usage {
             fields.extend([
                 ("Wall", micros(u.wall_micros)),
@@ -85,6 +179,7 @@ pub(crate) async fn action<S: Source>(source: &S, id: &str, digest: &str) -> Ans
         }
         definitions(h, &fields);
         attempts(h, &a.row.attempts);
+        why(h, &found);
         outputs(h, &a.outputs, a.outputs_truncated);
         show_log(h, "stdout", &stdout);
         show_log(h, "stderr", &stderr);
@@ -92,8 +187,47 @@ pub(crate) async fn action<S: Source>(source: &S, id: &str, digest: &str) -> Ans
     Answer::html(200, body)
 }
 
-/// Reads `blob`'s text through its `href` when it is held, linked and small.
-async fn log<S: Source>(r: &mut Reader<'_, S>, blob: Option<&Blob>) -> Log {
+/// What the failures list says of a failed action: its failure class and command, or
+/// why they are not shown.
+fn why(h: &mut Html, found: &Found) {
+    match found {
+        Found::NotAsked => {}
+        Found::Entry(f) => failures::detail(h, f),
+        Found::Missing { pages, more } => {
+            h.el("h2", &[], |h| {
+                h.text("Failure");
+            });
+            h.el("p", &[attr("class", "hint")], |h| {
+                let tail = if *more {
+                    "; the list goes on, so open the failed actions from the Build page"
+                } else {
+                    ""
+                };
+                h.text(&format!(
+                    "The failure class and command are read from the build's list of failed \
+                     actions, which lists no such action in the {pages} page(s) read{tail}."
+                ));
+            });
+        }
+        Found::Unread(e) => {
+            h.el("h2", &[], |h| {
+                h.text("Failure");
+            });
+            problem(h, e);
+        }
+    }
+}
+
+/// `tail`'s text when the failures list carried one (with the link that downloads the
+/// whole log); else `blob`'s text, read through its `href` when it is held, linked and
+/// small.
+async fn log<S: Source>(r: &mut Reader<'_, S>, blob: Option<&Blob>, tail: Option<&LogTail>) -> Log {
+    if let Some(t) = tail
+        && let Some(text) = &t.tail
+    {
+        let link = t.href.as_deref().and_then(failures::download);
+        return Log::Tail(failures::stream_words(t), text.clone(), link);
+    }
     let Some(blob) = blob else {
         return Log::None;
     };
@@ -136,6 +270,17 @@ fn show_log(h: &mut Html, name: &str, log: &Log) {
                 });
             }
             Log::Read(Err(e)) => problem(h, e),
+            Log::Tail(words, text, download) => {
+                h.el("p", &[], |h| {
+                    h.text(&format!("{words}. "));
+                    if let Some(download) = download {
+                        h.link(download, "Download the whole log");
+                    }
+                });
+                h.el("pre", &[], |h| {
+                    h.text(text);
+                });
+            }
         }
     });
 }

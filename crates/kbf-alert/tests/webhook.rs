@@ -280,7 +280,7 @@ fn undelivered_events_survive_a_restart() {
 /// The test stops the notifier (up to the 1 s timeout of the attempt in flight)
 /// rather than dropping it. A dropped notifier's thread runs on, so the process could
 /// exit in the middle of an attempt; coverage then counts half a loop pass, and the
-/// counts llvm derives from others come out one off (komira-ai/komira-build-farm#422:
+/// counts llvm derives from others come out one off (komira-ai/kbf#422:
 /// one delivery too many, and the backoff `continue` in `Worker::run` at 0).
 #[test]
 fn notify_never_waits_for_the_receiver() {
@@ -392,7 +392,7 @@ fn a_redirect_is_a_failed_attempt_not_a_delivery() {
 /// outage alerts keep coming, so that would hammer a failing receiver at the rate
 /// alerts are raised. The receiver is down (503) and the backoff is an hour, so after
 /// the first attempt the retry time is still ahead when each of the 10 events arrives,
-/// however slow the runner (komira-ai/komira-build-farm#422: with a 1 s backoff, a slow
+/// however slow the runner (komira-ai/kbf#422: with a 1 s backoff, a slow
 /// outbox write could use up the whole wait, and the test then never saw an event
 /// arrive during it). The events are handed over one at a time, each once the last is
 /// in the outbox, so the thread takes each in a pass of its own. Once all 11 are in the

@@ -8,7 +8,7 @@ update routes). **[D]** is decided in another document, **[P]** is proposed here
 
 **Scope ruling.** The page is **read-only**. It has no update button and there is no browser sign-in in this design. An update
 is made through the operator API or the CLI. A browser write path (an update button with an operator sign-in) was drafted in an
-earlier revision of this file, is not designed further, and is tracked as a future, unscheduled issue, komira-build-farm#992 (section 9).
+earlier revision of this file, is not designed further, and is tracked as a future, unscheduled issue, kbf#992 (section 9).
 
 **Where the amendments live.** This file does not change `ui-data.md`: the UI stays read-only and ui-data Q16 (how a human
 authenticates) stays as written there. It amends `pull-updates.md` 6.3 only by naming each change in section 5; the text edits
@@ -37,7 +37,7 @@ everything the page shows.
   without the key never reads as "running". A wrong "running" is a safety error (the operator runs an update into a paused
   farm or never resumes). #976 is asked to say where pause lives (Q11); this file changes its reading only after it does.
   The page also shows `policy.auto_nodes` and `policy.auto_frontend` when present.
-- **[F]** A platform is complete when it has its own components: linux needs `kbf`, darwin needs `kbf-daemon`
+- **[F]** A platform is complete when it has its own components: linux needs `kbf`, darwin needs `kbf`
   (`ReleasePlatform::components` in #976). The page shows completeness per platform with that component named.
 - **[F]** `operator_gate` (`api.rs`): loopback peer, no `Origin` header, `Authorization: Bearer` compared in constant time
   against a digest, `Content-Type: application/json`. The token is read once from `--api-token-file` and only its SHA-256 is
@@ -75,8 +75,7 @@ credential. The page invents no state when a route is refused.
 
 Farm header: the desired commit, generation and set time from `desired`; **paused** by the rule of section 2 (`policy.paused`
 only if that key is present, else `desired.paused`); `policy.auto_nodes` and `policy.auto_frontend` as read-only values; the
-releases list with each commit's platforms, each marked complete or not **with the component it needs (linux: `kbf`, darwin:
-`kbf-daemon`)**; **update available** when the newest complete release differs from `desired.commit`; "N of M hosts up to date"
+releases list with each commit's platforms, each marked complete or not **with the component it needs (`kbf` on linux and darwin)**; **update available** when the newest complete release differs from `desired.commit`; "N of M hosts up to date"
 summed by the page from the per-host `up_to_date` it already reads.
 
 Host table (one row per node, sorted by node id, paginated by `page_size` and `page_token`): node, connected, platform, running
@@ -126,7 +125,7 @@ A3 and A7 are dropped (below).
 **Dropped with the write path.** A3 (`plan_digest` and `plan_issued_at` on `Offer`, `stale_plan`) existed so a browser form
 could hold an apply to the host list its operator confirmed; with no form, the digest has no reader, and a CLI or API caller
 already holds the token and the spec's call. A7 (an audit row for every `desired`, `pause` and `resume`) was for the session
-door; the read-only page needs no audit and the CLI path is unchanged. Both move to the future issue (komira-build-farm#992, section 9). The core
+door; the read-only page needs no audit and the CLI path is unchanged. Both move to the future issue (kbf#992, section 9). The core
 refactor into `offer_desired` and `set_paused` behind two doors is likewise dropped: one door exists and stays as #976 has it.
 
 **Blockers (A4).** Stable codes: `no_complete_platform` (per platform), `host_unsupported`, `helper_missing`, `paused`. An
@@ -165,7 +164,7 @@ PRs below are read-only: none adds a POST, a form, a cookie or a credential.
    changed host list or blocker changes the plan; it writes nothing (counting store); it is a GET only. Mutants: store the
    plan; include `connected` or the step state in the blockers.
 3. **The Updates page** (read-only). Tests: every `availability` and every `UpdateStatus` state renders; a refusal and node id
-   with markup render escaped; completeness names `kbf` for linux and `kbf-daemon` for darwin; the frontend row is separate
+   with markup render escaped; completeness names `kbf` for linux and darwin; the frontend row is separate
    and the plan lists no frontend; **a policy row present without a `paused` key and `desired.paused` true renders paused**,
    and `policy.paused` wins when present; **update available** shows only when the newest complete release differs from
    desired; a refused detail route removes the detail columns and keeps the summary; the page declares no POST and contains no
@@ -193,7 +192,7 @@ PRs 1 to 4 are independent of the controller. PR 3 onward needs the `kbf-ui` mou
   so they stack after arch-v2 is merged into pull-updates.
 - **Q10 `/v1/releases` is open under the spec.** Left open, flagged.
 - **Q11 Where pause lives in #976.** `policy_view` has no `paused` today; ask its owner to state it. Until then the section 2 rule.
-- **Moved to the future issue (komira-build-farm#992, section 9), not open here:** whether the UI writes; the credential for a browser session; a
+- **Moved to the future issue (kbf#992, section 9), not open here:** whether the UI writes; the credential for a browser session; a
   trusted-proxy principal (Q5); carrying the resume generation into the API (Q6); a password-hash dependency (Q12); an Envoy
   `/ui` route with sticky routing (Q13); a hash-chained audit (Q14); a farm-wide apply lock (Q15); the shared token as login
   (Q17). The `ui-data.md` Q16 is unchanged.

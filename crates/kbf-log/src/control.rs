@@ -171,6 +171,11 @@ impl MachineVersion {
     /// as it enters version 2.
     pub const V4: Self = Self(NonZeroU32::MIN.saturating_add(3));
 
+    /// Version 5: version 4 plus `ReseatStaged` (a conflicting staged object's records
+    /// moved to a new object in one step), whose entries are [`Format::V5`]. A log
+    /// enters it as it enters version 2.
+    pub const V5: Self = Self(NonZeroU32::MIN.saturating_add(4));
+
     /// The entry format a log at this version writes and reads; `None` for a version
     /// this binary does not know (a later binary's).
     #[must_use]
@@ -180,6 +185,7 @@ impl MachineVersion {
             2 => Some(Format::V2),
             3 => Some(Format::V3),
             4 => Some(Format::V4),
+            5 => Some(Format::V5),
             _ => None,
         }
     }

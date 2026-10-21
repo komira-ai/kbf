@@ -21,6 +21,13 @@ pub const DEFAULT_PAGE_SIZE: usize = 100;
 /// The largest `?page_size=`.
 pub const MAX_PAGE_SIZE: usize = 1000;
 
+/// Rows a page of `/failures` holds unless `?page_size=` says otherwise: each carries
+/// log tails that cost a CAS read.
+pub(crate) const FAILURES_DEFAULT_PAGE_SIZE: usize = 20;
+
+/// The largest `?page_size=` of `/failures`.
+pub(crate) const FAILURES_MAX_PAGE_SIZE: usize = 100;
+
 /// The routes' path prefix; the record's key follows it.
 pub(crate) const PREFIX: &str = "/v1/invocations/";
 
@@ -56,6 +63,9 @@ pub(crate) enum Route {
     Logs,
     /// `/metrics`.
     Metrics,
+    /// `/failures`: the invocation's answer and a page of its failed rows
+    /// ([`super::failures`]).
+    Failures,
 }
 
 /// The outcomes `?outcome=` names (section 3.2).
@@ -223,6 +233,7 @@ impl Request {
             (Some("artifacts"), None, _) => Route::Artifacts,
             (Some("logs"), None, _) => Route::Logs,
             (Some("metrics"), None, _) => Route::Metrics,
+            (Some("failures"), None, _) => Route::Failures,
             _ => return Err(Bad::NotFound(format!("no route {path:?}"))),
         };
         let page = parse_query(query, route)?;
@@ -256,11 +267,18 @@ fn parse_query(text: &str, route: Route) -> Result<Option<PageQuery>, Bad> {
             true,
             "page_size, page_token, outcome, how, requeue_reason, memory_kill and sort",
         ),
-        Route::Artifacts | Route::Logs => (true, false, "page_size and page_token"),
+        Route::Artifacts | Route::Logs | Route::Failures => {
+            (true, false, "page_size and page_token")
+        }
         _ => (false, false, "no parameters"),
     };
+    let (default_size, max_size) = if route == Route::Failures {
+        (FAILURES_DEFAULT_PAGE_SIZE, FAILURES_MAX_PAGE_SIZE)
+    } else {
+        (DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE)
+    };
     let mut query = PageQuery {
-        size: DEFAULT_PAGE_SIZE,
+        size: default_size,
         token: None,
         filter: Filter::default(),
     };
@@ -274,11 +292,9 @@ fn parse_query(text: &str, route: Route) -> Result<Option<PageQuery>, Bad> {
                 query.size = value
                     .parse()
                     .ok()
-                    .filter(|n| (1..=MAX_PAGE_SIZE).contains(n))
+                    .filter(|n| (1..=max_size).contains(n))
                     .ok_or_else(|| {
-                        Bad::Invalid(format!(
-                            "page_size={value:?}: a page holds 1 to {MAX_PAGE_SIZE}"
-                        ))
+                        Bad::Invalid(format!("page_size={value:?}: a page holds 1 to {max_size}"))
                     })?;
             }
             "page_token" if paged => query.token = Some(value.clone().into_owned()),
@@ -364,6 +380,9 @@ pub(crate) enum Walk {
     /// `/logs`: the next row to look at; `rest: None` while it lists failed rows,
     /// then `Some(n)` with `n` the number of rows there were when those ran out.
     Logs { row: usize, rest: Option<usize> },
+    /// `/failures`: the next row to look at; a row is listed once its outcome is a
+    /// failure, in row order.
+    Failures { row: usize },
 }
 
 /// One entry a cursor found: a row, or one output of a row.
@@ -417,6 +436,7 @@ impl Cursor {
         match (route, filter.sort) {
             (Route::Artifacts, _) => Self::Walk(Walk::Artifacts { row: 0, output: 0 }),
             (Route::Logs, _) => Self::Walk(Walk::Logs { row: 0, rest: None }),
+            (Route::Failures, _) => Self::Walk(Walk::Failures { row: 0 }),
             (_, Some(phase)) => Self::Sorted { phase, after: None },
             _ => Self::Walk(Walk::Actions { row: 0 }),
         }
@@ -428,6 +448,7 @@ impl Cursor {
             Self::Walk(Walk::Actions { .. }) | Self::Sorted { .. } => "actions",
             Self::Walk(Walk::Artifacts { .. }) => "artifacts",
             Self::Walk(Walk::Logs { .. }) => "logs",
+            Self::Walk(Walk::Failures { .. }) => "failures",
         }
     }
 }
@@ -477,6 +498,10 @@ impl Walk {
                     .next(rows, filter),
                 }
             }
+            Self::Failures { row } => {
+                let i = (row..rows.len()).find(|&i| failed(&rows[i]))?;
+                Some((Entry::Row(i), Self::Failures { row: i + 1 }))
+            }
             Self::Logs {
                 row,
                 rest: Some(then),
@@ -511,7 +536,7 @@ impl Token {
     /// The token as it is sent.
     pub(crate) fn encode(self) -> String {
         let (a, b) = match self.cursor {
-            Cursor::Walk(Walk::Actions { row }) => (row, 0),
+            Cursor::Walk(Walk::Actions { row } | Walk::Failures { row }) => (row, 0),
             Cursor::Walk(Walk::Artifacts { row, output }) => (row, output as u64),
             Cursor::Walk(Walk::Logs { row, rest }) => (row, rest.map_or(0, |n| n as u64 + 1)),
             Cursor::Sorted { after, .. } => after.map_or((0, 0), |(value, row)| (row + 1, value)),
@@ -585,6 +610,7 @@ impl Token {
         let (b, rest) = (b as usize, rest.map(|n| n as usize));
         Ok(Cursor::Walk(match walk {
             Walk::Actions { .. } => Walk::Actions { row: a },
+            Walk::Failures { .. } => Walk::Failures { row: a },
             Walk::Artifacts { .. } => Walk::Artifacts { row: a, output: b },
             Walk::Logs { .. } => Walk::Logs { row: a, rest },
         }))
@@ -652,6 +678,7 @@ pub(crate) fn answer(
     let mut b = Builder {
         blobs_on,
         found: Vec::new(),
+        reads: Vec::new(),
     };
     let base = format!("{PREFIX}{}", inv.key());
     let value = match (request.route, &request.page) {
@@ -666,12 +693,17 @@ pub(crate) fn answer(
             Value::Object(action(&mut b, row, &base))
         }
         (Route::Metrics, _) => metrics(inv),
+        (Route::Failures, Some(page)) => {
+            let listed = paged(&mut b, inv, Route::Failures, page, &base)?;
+            super::failures::answer(invocation(inv, &base, now), listed)
+        }
         (route, Some(page)) => paged(&mut b, inv, route, page, &base)?,
         (_, None) => invocation(inv, &base, now),
     };
     Ok(Draft {
         value,
         blobs: b.found,
+        reads: b.reads,
     })
 }
 
@@ -725,6 +757,9 @@ fn paged(
         let at = format!("/{}/{}", start.kind(), entries.len());
         entries.push(match entry {
             Entry::Row(i) if route == Route::Logs => logs(b, &rows[i], base, &at),
+            Entry::Row(i) if route == Route::Failures => {
+                super::failures::entry(b, &rows[i], base, entries.len())
+            }
             Entry::Row(i) => Value::Object(row(&rows[i], base)),
             Entry::Output(i, o) => artifact(b, &rows[i], o, &at),
         });

@@ -11,7 +11,7 @@
 //! heartbeat and resent with each, and on every new stream. One run in ten is long. A `Start` is taken only on
 //! the current stream, with contact confirmed, for a lease it does not hold.
 //!
-//! **The daemon half of `kbf-all-in-one`** ([`FakeDaemon::in_process`]) shares the
+//! **The daemon half of `kbf all-in-one`** ([`FakeDaemon::in_process`]) shares the
 //! server's process. Its run stores the action's output ([`output_of`]) in the server
 //! before it reports, and its result names that output: it reports a run only once the
 //! server has acknowledged the output's upload. The process dies with the server's

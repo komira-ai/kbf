@@ -213,9 +213,7 @@ fn a_get_checks_the_server_and_reads_its_answer() {
 fn a_get_that_cannot_connect_is_an_error() {
     let server = tls_server(&["127.0.0.1"], |_| http("200 OK", b""));
     let client = server.client();
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = closed.local_addr().expect("addr").port();
-    drop(closed);
+    let port = kbf_testkit::port::dead_addr().port();
     let gone = url(&format!("https://127.0.0.1:{port}/"));
     assert!(matches!(
         client.get(&gone, None, &mut Vec::new()),

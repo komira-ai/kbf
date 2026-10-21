@@ -100,17 +100,20 @@ impl ObjectStore for Store {
 struct Dirs {
     raft: PathBuf,
     tier: PathBuf,
+    /// Last, so it is removed after what the test started in it is gone.
+    _root: kbf_testkit::dir::TestDir,
 }
 
 impl Dirs {
     fn new(name: &str) -> Self {
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join("kbf-server-write-tier-raft")
-            .join(format!("{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = kbf_testkit::dir::TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            &format!("kbf-server-write-tier-raft-{name}"),
+        );
         Self {
             raft: root.join("raft"),
             tier: root.join("tier"),
+            _root: root,
         }
     }
 
@@ -129,12 +132,6 @@ impl Dirs {
         let fs = StdFs::new(&self.raft)?;
         let no_new_log = || Err(std::io::Error::other("the log exists"));
         RaftMetaLog::open_running(fs, Retention::default(), "kbf/", no_new_log, runs).await
-    }
-}
-
-impl Drop for Dirs {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(self.raft.parent().expect("a root"));
     }
 }
 
@@ -200,24 +197,29 @@ async fn a_raft_server_with_a_tier_raises_its_log_once() {
     let store = Store::new();
     let (cache, startup) = start(&dirs, &store, true).await;
     assert!(startup.expect("a tier").registered);
-    assert_eq!(cache.meta().machine_version(), MachineVersion::V2);
+    assert_eq!(cache.meta().machine_version(), MachineVersion::V5);
     drop(cache);
 
     let (cache, startup) = start(&dirs, &store, true).await;
     assert!(!startup.expect("a tier").registered);
     let log = cache.meta();
-    assert_eq!(log.machine_version(), MachineVersion::V2);
+    assert_eq!(log.machine_version(), MachineVersion::V5);
     let applied = log.applied_index();
-    log.raise_machine_version(MachineVersion::V2)
+    log.raise_machine_version(MachineVersion::V5)
         .expect("raise");
     assert_eq!(log.applied_index(), applied, "the raise committed again");
     drop(cache);
 
-    let rolled_back = dirs.open_running(MachineVersion::V1).await;
-    assert!(
-        matches!(rolled_back, Err(RaftLogError::Decode { .. })),
-        "{rolled_back:?}"
-    );
+    // A binary that runs only version 4 (every command but `ReseatStaged`) refuses the
+    // log at the raise, as one that runs version 1 does: it never applies an entry it
+    // cannot decode, or skips one.
+    for runs in [MachineVersion::V1, MachineVersion::V4] {
+        let rolled_back = dirs.open_running(runs).await;
+        assert!(
+            matches!(rolled_back, Err(RaftLogError::Decode { .. })),
+            "{runs:?}: {rolled_back:?}"
+        );
+    }
 }
 
 /// Catches: a raft server that raises its log without a tier (an older binary could no

@@ -55,6 +55,7 @@ pub const REQUIRED: &[&str] = &[
 
 /// The keys a profile may leave out (or leave empty), shown after [`REQUIRED`].
 pub const OPTIONAL: &[&str] = &[
+    "xcode_disable_manifest_sandbox",
     "default_developer_dir",
     "xcode_xip_dir",
     "pool_users",
@@ -444,6 +445,9 @@ impl Profile {
                     "kbf_labels: the profile label is kbf-mac-provision's".into(),
                 ));
             }
+        }
+        if !get("xcode_disable_manifest_sandbox").is_empty() {
+            want("xcode_disable_manifest_sandbox", pattern::bit, "0 or 1")?;
         }
         if !get("xcode_xip_dir").is_empty() {
             want("xcode_xip_dir", pattern::absolute_path, "an absolute path")?;

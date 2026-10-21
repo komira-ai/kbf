@@ -19,12 +19,6 @@
 //!   only with `--apply` applies it and waits for Envoy and the Ingress's address
 //!   ([`apply`]).
 //!
-//! The same two verbs take `--topology box`: one host's Envoy in front of two kbf
-//! instances, `a` and `b`, both listed for ever in a static config
-//! ([`box_render`], settings in [`box_config`], `templates/envoy/box.example`).
-//! `render` writes `envoy.json` and `envoy.args` (Envoy's hot-restart flags); `check`
-//! reads those two ([`box_check`]). The default topology is the front, unchanged.
-//!
 //! Both files are JSON, which kubectl and Envoy read, printed as [`json`] describes:
 //! the Deployment's pod template carries the sha256 of `envoy.json`, so the same
 //! settings must always give the same bytes, or every apply would restart Envoy.
@@ -40,17 +34,12 @@
 //! `templates/envoy/config.example`); every key must be set.
 
 pub mod apply;
-pub mod box_check;
-pub mod box_config;
-pub mod box_render;
 pub mod check;
 mod check_failure;
 pub mod config;
 pub mod json;
 pub mod render;
 
-#[cfg(test)]
-mod box_tests;
 #[cfg(test)]
 mod check_mutant_tests;
 #[cfg(test)]
@@ -60,7 +49,6 @@ mod tests;
 
 use std::path::{Path, PathBuf};
 
-pub use box_config::{BoxConfig, BoxError};
 pub use config::{EnvoyConfig, EnvoyError, Server};
 pub use render::Rendered;
 
@@ -68,16 +56,12 @@ pub use render::Rendered;
 pub const MANIFESTS: &str = "manifests.json";
 /// The Envoy bootstrap file `render` writes.
 pub const ENVOY: &str = "envoy.json";
-/// Envoy's hot-restart flags, which the box topology's `render` writes beside [`ENVOY`].
-pub const ENVOY_ARGS: &str = "envoy.args";
 
 /// Why `render` or `check` was refused (exit 2).
 #[derive(Debug, thiserror::Error)]
 pub enum Refusal {
     #[error(transparent)]
     Config(#[from] EnvoyError),
-    #[error(transparent)]
-    BoxConfig(#[from] BoxError),
     #[error("cannot read {path}: {source}")]
     Read {
         path: PathBuf,
@@ -120,45 +104,6 @@ pub fn render_files(config: &Path, out: &Path) -> Result<String, Refusal> {
     ))
 }
 
-/// `envoy render --topology box`: the box settings in `config` rendered into `out`.
-pub fn render_box_files(config: &Path, out: &Path) -> Result<String, Refusal> {
-    let c = BoxConfig::load(config)?;
-    let r = box_render::render_box(&c);
-    write_files(out, [(ENVOY, &r.envoy), (ENVOY_ARGS, &r.args)])?;
-    Ok(format!(
-        "rendered {ENVOY} {ENVOY_ARGS} into {}",
-        out.display()
-    ))
-}
-
-/// `envoy check --topology box`: check `dir`'s `envoy.json` and `envoy.args`, or without
-/// `dir` the render of `config`, against the config's numbers.
-pub fn check_box_files(
-    config: &Path,
-    dir: Option<&Path>,
-) -> Result<Vec<check::CheckFailure>, Refusal> {
-    let c = BoxConfig::load(config)?;
-    let read = |dir: &Path, name: &str| -> Result<(PathBuf, String), Refusal> {
-        let path = dir.join(name);
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Ok((path, text)),
-            Err(source) => Err(Refusal::Read { path, source }),
-        }
-    };
-    let (envoy, args) = match dir {
-        Some(dir) => (read(dir, ENVOY)?, read(dir, ENVOY_ARGS)?.1),
-        None => {
-            let r = box_render::render_box(&c);
-            ((config.to_owned(), r.envoy), r.args)
-        }
-    };
-    let doc = serde_json::from_str(&envoy.1).map_err(|source| Refusal::Parse {
-        path: envoy.0,
-        source,
-    })?;
-    Ok(box_check::check_box(&doc, &args, &(&c).into()))
-}
-
 /// `envoy check`: check `dir`'s `manifests.json`, or without `dir` the render of
 /// `config`, against the config's operator namespace. Every failed check, none when
 /// the render passes.
@@ -182,14 +127,6 @@ pub fn check_files(config: &Path, dir: Option<&Path>) -> Result<Vec<check::Check
 pub fn check_passed() -> String {
     format!(
         "{} methods routed, every check passed",
-        check::METHODS.len()
-    )
-}
-
-/// The line `envoy check --topology box` prints when every check passed.
-pub fn check_box_passed() -> String {
-    format!(
-        "{} methods routed, every box check passed",
         check::METHODS.len()
     )
 }

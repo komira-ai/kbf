@@ -6,8 +6,8 @@
 //! [`SUPPORTED`], or text that names none, with a message that says what to do. The
 //! installer's `check` and the Envoy unit's `ExecStartPre` call them.
 //!
-//! The range is what the tests ran: CI runs the real-Envoy tests (`crates/kbf-it/tests/
-//! envoy_box`) on 1.39.3 (the CI-only pin in `.github/workflows/ci.yml`), and the swap
+//! The range is what the tests ran: CI runs the real-Envoy tests (`crates/kbf-integration-test/tests/
+//! envoy_box`) on 1.39.3 (the CI-only pin in `.github/workflows/beta.yml`), and the swap
 //! spike (`enable_reuse_port` with a graceful drain) ran 1.38.4 into 1.39.3. So 1.38.0 up
 //! to, not including, 1.40.0.
 

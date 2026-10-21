@@ -103,6 +103,39 @@ fn a_write_replaces_the_file_through_a_fresh_copy() {
     assert!(!dir.join(".f.kbf-host-tmp").exists());
 }
 
+/// Catches a file with secret bytes that is readable by others before it is given its mode.
+/// The copy is written first and chmodded after, so it is created 0600 whatever the umask. A
+/// step that fails between the write and the chmod (here the chown, refused to a process that
+/// is not root) leaves the copy behind, and the copy must be private: the bytes may be a
+/// token. A root process's chown does not fail, so there is nothing to look at and the test
+/// says so.
+///
+/// Mutant seen red: the copy created 0644.
+#[test]
+fn a_copy_left_by_a_failed_write_is_private() {
+    let (mut exec, dir) = host("private-copy");
+    let mine = me();
+    if mine.uid == 0 {
+        eprintln!("skipped: a root process's chown does not fail, so no copy is left to look at");
+        return;
+    }
+    let step = Step::WriteFile {
+        path: p("/secret"),
+        perms: Perms::new(0o600),
+        owner: Some(Owner {
+            uid: mine.uid + 1,
+            gid: mine.gid,
+        }),
+        bytes: b"token".to_vec(),
+    };
+    exec.apply(&step)
+        .expect_err("the chown to another user is refused");
+    assert!(!dir.join("secret").exists());
+    let copy = dir.join(".secret.kbf-host-tmp");
+    assert_eq!(fs::read(&copy).expect("the copy is left"), b"token");
+    assert_eq!(mode_of(&copy) & 0o077, 0, "{:o}", mode_of(&copy));
+}
+
 /// Catches `Mkdir` treating a file at the path as the directory (it would chmod the
 /// file, and every later run would plan the directory again), and an existing
 /// directory refused instead of having its permissions set.
@@ -376,7 +409,7 @@ fn a_capture_writes_the_filtered_output_or_nothing() {
 const UNREAD: usize = 1 << 20;
 
 /// Catches a step whose child exits without reading its input being reported as
-/// "Broken pipe" instead of by the child's status (komira-build-farm#488). The input
+/// "Broken pipe" instead of by the child's status (kbf#488). The input
 /// is larger than a pipe, so the write meets a closed pipe on every run, not by luck
 /// of timing: a failing tool reads as its exit, and one that exits 0 succeeds.
 #[test]
@@ -623,7 +656,7 @@ fn a_link_never_replaces_a_file_or_a_directory() {
 fn a_stale_temporary_that_cannot_be_removed_fails_the_flip() {
     let (mut exec, dir) = host("link-stale");
     std::os::unix::fs::symlink("a", dir.join("current")).expect("seed");
-    fs::create_dir_all(dir.join(".current.kbf-host-tmp/x")).expect("seed");
+    fs::create_dir_all(dir.join("current.new/x")).expect("seed");
     exec.apply(&link_step("/current", "b"))
         .expect_err("the temporary name is taken by a directory");
     assert_eq!(
@@ -643,4 +676,122 @@ fn only_einval_reads_as_not_a_link() {
         link_or_other(gone).expect_err("an error").kind(),
         io::ErrorKind::NotFound
     );
+}
+
+/// S23: a link is flipped by renaming a complete new link over its name, so a reader never
+/// finds the name missing. A reader thread reads the link as fast as it can while the link is
+/// flipped many times; it must never see `NotFound`, and every target it reads is one of the
+/// two that were set.
+///
+/// Catches a flip done as remove-then-create (the service's `ExecStart` path would not exist
+/// for an instant), which is also what an interrupted flip would leave.
+///
+/// Mutant seen red: `symlink` removing `full` before creating the link.
+#[test]
+fn a_flipped_link_is_never_missing_for_a_reader() {
+    let (mut exec, dir) = host("link-atomic");
+    std::os::unix::fs::symlink("a", dir.join("current")).expect("seed");
+    let stop = Arc::new(AtomicBool::new(false));
+    let bad = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let reader = {
+        let (stop, bad, reads, path) = (
+            Arc::clone(&stop),
+            Arc::clone(&bad),
+            Arc::clone(&reads),
+            dir.join("current"),
+        );
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match fs::read_link(&path) {
+                    Ok(t) if t == Path::new("a") || t == Path::new("b") => {}
+                    _ => {
+                        bad.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                reads.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+    for i in 0..600 {
+        let target = if i % 2 == 0 { "b" } else { "a" };
+        exec.apply(&link_step("/current", target)).expect("flip");
+    }
+    stop.store(true, Ordering::Relaxed);
+    reader.join().expect("reader");
+    assert!(reads.load(Ordering::Relaxed) > 0);
+    assert_eq!(
+        bad.load(Ordering::Relaxed),
+        0,
+        "a reader saw the link missing or odd"
+    );
+}
+
+/// S23: the new link is made as `<name>.new` beside the link and renamed over it; a `.new`
+/// left by a crashed flip (even a dangling link) is replaced, and none is left after.
+///
+/// Catches a different temporary name (the contract names `current.new`), and a stale one
+/// that blocks the next flip.
+///
+/// Mutant seen red: `new_beside` naming `.<name>.kbf-host-tmp`.
+#[test]
+fn a_flip_goes_through_name_dot_new_and_leaves_none() {
+    let (mut exec, dir) = host("link-dot-new");
+    std::os::unix::fs::symlink("a", dir.join("current")).expect("seed");
+    std::os::unix::fs::symlink("gone", dir.join("current.new")).expect("a crashed flip");
+    exec.apply(&link_step("/current", "b")).expect("flip");
+    assert_eq!(
+        fs::read_link(dir.join("current")).expect("link"),
+        Path::new("b")
+    );
+    assert_eq!(names_in(&dir), ["current"]);
+}
+
+/// Catches `RemoveTree` that leaves part of a tree behind (a directory with files and a
+/// nested directory is gone whole), that follows a link out of the tree (the file a link
+/// inside the tree names must survive), that follows a link as its argument (a link to a
+/// directory is removed and the directory stays), that goes outside the root, and that
+/// reports success for a path that is not there.
+///
+/// Mutant seen red: `remove_dir` (the empty-directory call) in place of `remove_dir_all`. Not run
+/// as a mutant: the `is_dir` test dropped so a link to a directory is walked into.
+#[test]
+fn remove_tree_removes_the_tree_and_never_follows_a_link() {
+    let (mut exec, dir) = host("remove-tree");
+    fs::create_dir_all(dir.join("tree/sub/deeper")).expect("seed");
+    fs::write(dir.join("tree/a"), "a").expect("seed");
+    fs::write(dir.join("tree/sub/deeper/b"), "b").expect("seed");
+    fs::create_dir(dir.join("keep")).expect("seed");
+    fs::write(dir.join("keep/precious"), "p").expect("seed");
+    std::os::unix::fs::symlink(dir.join("keep"), dir.join("tree/sub/out")).expect("link");
+    std::os::unix::fs::symlink(dir.join("keep"), dir.join("alias")).expect("link");
+
+    exec.apply(&Step::RemoveTree { path: p("/tree") })
+        .expect("remove the tree");
+    assert!(!dir.join("tree").exists(), "part of the tree is left");
+    assert!(
+        dir.join("keep/precious").exists(),
+        "a link inside the tree was followed"
+    );
+
+    exec.apply(&Step::RemoveTree { path: p("/alias") })
+        .expect("remove the link");
+    assert!(
+        fs::symlink_metadata(dir.join("alias")).is_err(),
+        "the link stays"
+    );
+    assert!(
+        dir.join("keep/precious").exists(),
+        "a link given as the path was followed"
+    );
+
+    fs::write(dir.join("file"), "f").expect("seed");
+    exec.apply(&Step::RemoveTree { path: p("/file") })
+        .expect("a file is a tree of one");
+    assert!(!dir.join("file").exists());
+
+    let err = exec
+        .apply(&Step::RemoveTree { path: p("/tree") })
+        .expect_err("gone already");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
 }

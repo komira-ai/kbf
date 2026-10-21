@@ -1,5 +1,5 @@
 //! Scenario family F2 of the scheduler's simulation catalog
-//! (`docs/design/simulation.md`, added in komira-ai/komira-build-farm#139): failures of
+//! (`docs/design/simulation.md`, added in komira-ai/kbf#139): failures of
 //! workers, networks, clocks and servers, on the simulated cell of `sim/cell` (a leader
 //! running the scheduler as `kbf-server` does, a log that commits after a random
 //! delay, and workers that follow the daemon's rules).

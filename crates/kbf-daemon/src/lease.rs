@@ -21,7 +21,7 @@
 //!
 //! A run whose driver panics reports INTERNAL, naming the panic, once the runtime has
 //! been asked to kill what the run left: the panic ends that run's task only
-//! (the all-in-one design, komira-build-farm#657, section 7.3), and its lease does
+//! (the all-in-one design, kbf#657, section 7.3), and its lease does
 //! not stay running.
 
 use std::collections::{BTreeMap, BTreeSet};
