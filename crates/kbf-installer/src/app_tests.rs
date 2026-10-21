@@ -431,9 +431,9 @@ fn global_flags_may_follow_the_verb() {
 /// scratch host is laid out for that platform too (`/var/db/kbf-installer` on macOS).
 fn seeded(name: &str) -> (Layout, PathBuf) {
     let (layout, root) = host_root_on(&format!("app-{name}"), Platform::current());
-    fs::create_dir_all(layout.join(&layout.orders_dir())).expect("order spool");
+    crate::testkit::mkdirs(&root, &layout.join(&layout.orders_dir()), 0o755);
     let release = layout.join(&layout.release_dir(&c(A)));
-    fs::create_dir_all(&release).expect("release");
+    crate::testkit::mkdirs(&root, &release, 0o755);
     fs::write(release.join("kbf"), b"x").expect("binary");
     Locked::acquire(&layout)
         .expect("lock")
@@ -526,7 +526,7 @@ fn run_waits_one_interval_between_two_passes_and_not_after_the_last() {
 fn boot_check_counts_a_start_and_refuses_what_it_cannot_read() {
     let (layout, root) = seeded("boot");
     let release = layout.join(&layout.release_dir(&c(B)));
-    fs::create_dir_all(&release).expect("release");
+    crate::testkit::mkdirs(&root, &release, 0o755);
     fs::write(release.join("kbf"), b"x").expect("binary");
     let lock = Locked::acquire(&layout).expect("lock");
     lock.write(&State {

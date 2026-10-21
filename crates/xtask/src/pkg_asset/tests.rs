@@ -5,6 +5,8 @@ use crate::package::tarball as binary_tarball;
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const MAIN: &str = "refs/heads/main";
+// A package built on the former development branch, `feature/arch-v2`: kept as the
+// non-main ref hosts that installed such a package still trust (docs/artifacts.md).
 const FEATURE: &str = "refs/heads/feature/arch-v2";
 const ROOT: &str = "{\"mediaType\":\"trustedroot\"}\n";
 

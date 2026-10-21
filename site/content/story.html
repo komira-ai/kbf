@@ -1,0 +1,108 @@
+<svg class="defs" width="0" height="0" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="m-laptop" viewBox="0 0 60 44"><rect class="m-body" x="8" y="2" width="44" height="28" rx="3"/><path class="m-body" d="M2 36 H58 L54 42 H6 Z"/></symbol>
+    <symbol id="m-studio" viewBox="0 0 60 44"><rect class="m-body" x="8" y="6" width="44" height="34" rx="7"/><circle class="m-dot" cx="30" cy="23" r="3"/></symbol>
+    <symbol id="m-server" viewBox="0 0 60 44"><rect class="m-body" x="6" y="2" width="48" height="11" rx="2"/><rect class="m-body" x="6" y="16" width="48" height="11" rx="2"/><rect class="m-body" x="6" y="30" width="48" height="11" rx="2"/><circle class="m-dot" cx="14" cy="7.5" r="1.8"/><circle class="m-dot" cx="14" cy="21.5" r="1.8"/><circle class="m-dot" cx="14" cy="35.5" r="1.8"/></symbol>
+    <symbol id="m-cache" viewBox="0 0 60 44"><ellipse class="m-body" cx="30" cy="9" rx="22" ry="6"/><path class="m-body" d="M8 9 V33 A22 6 0 0 0 52 33 V9"/></symbol>
+  </defs>
+</svg>
+
+<section class="story-head wrap">
+  <p class="kicker">Why we built it</p>
+  <h1>From one laptop to a farm of our own</h1>
+  <p class="lede">kbf came out of what broke as we grew. This is the order it happened in, with the numbers we can show.</p>
+  <p class="small muted">Dated facts come from our own notes. Numbers in the panel come from real builds on a kbf test farm. Anything not built yet is tagged <span class="tag tag-planned">specified</span>.</p>
+</section>
+
+<div class="story wrap" id="story">
+  <ol class="timeline">
+    <li class="step" id="step-1" data-step="1">
+      <p class="step-n">1</p>
+      <h2>One laptop</h2>
+      <p>Builds and tests ran on the machine we were working on, and the tests took it over: the fans, the memory, the afternoon.</p>
+      <figure class="step-art"><svg viewBox="0 0 480 170" role="img" aria-label="One laptop"><use href="#m-laptop" x="195" y="40" width="90" height="66"/><text class="t2" x="240" y="130" text-anchor="middle">one laptop</text></svg></figure>
+    </li>
+    <li class="step" id="step-2" data-step="2">
+      <p class="step-n">2</p>
+      <h2>Two laptops</h2>
+      <p>A second machine meant sharing the work by hand: this one runs these tests, that one runs the rest, and someone copies the results.</p>
+      <figure class="step-art"><svg viewBox="0 0 480 170" role="img" aria-label="Two laptops sharing work by hand"><use href="#m-laptop" x="95" y="40" width="90" height="66"/><use href="#m-laptop" x="295" y="40" width="90" height="66"/><path class="edge" d="M190 75 L290 75"/><text class="lab" x="240" y="66" text-anchor="middle">by hand</text><text class="t2" x="140" y="130" text-anchor="middle">laptop</text><text class="t2" x="340" y="130" text-anchor="middle">laptop</text></svg></figure>
+    </li>
+    <li class="step" id="step-3" data-step="3">
+      <p class="step-n">3</p>
+      <h2>Two laptops and two Mac Studios</h2>
+      <p>macOS and iOS work needs Macs, so two Mac Studios joined. Nothing scheduled work across them: each machine was its own island.</p>
+      <figure class="step-art"><svg viewBox="0 0 480 170" role="img" aria-label="Two laptops and two Mac Studios, not connected"><use href="#m-laptop" x="30" y="20" width="80" height="58"/><use href="#m-laptop" x="130" y="20" width="80" height="58"/><use href="#m-studio" x="270" y="20" width="80" height="58"/><use href="#m-studio" x="370" y="20" width="80" height="58"/><text class="t2" x="120" y="100" text-anchor="middle">laptops</text><text class="t2" x="360" y="100" text-anchor="middle">Mac Studios</text><text class="lab" x="240" y="146" text-anchor="middle">nothing schedules across them</text></svg></figure>
+    </li>
+    <li class="step" id="step-4" data-step="4">
+      <p class="step-n">4</p>
+      <h2>Six servers on Buildbarn</h2>
+      <p>Remote execution with a shared cache was a big step. Builds spread over six servers, and a result computed once was reused everywhere.</p>
+      <figure class="step-art"><svg viewBox="0 0 480 170" role="img" aria-label="Six servers with a shared cache"><use href="#m-cache" x="20" y="60" width="70" height="52"/><text class="t2" x="55" y="130" text-anchor="middle">shared cache</text><use href="#m-server" x="150" y="10" width="64" height="47"/><use href="#m-server" x="240" y="10" width="64" height="47"/><use href="#m-server" x="330" y="10" width="64" height="47"/><use href="#m-server" x="150" y="85" width="64" height="47"/><use href="#m-server" x="240" y="85" width="64" height="47"/><use href="#m-server" x="330" y="85" width="64" height="47"/><path class="edge" d="M92 86 L146 60"/><path class="edge" d="M92 86 L146 108"/><text class="t2" x="300" y="158" text-anchor="middle">six servers</text></svg></figure>
+    </li>
+    <li class="step" id="step-5" data-step="5">
+      <p class="step-n">5</p>
+      <h2>Where that broke</h2>
+      <h3>Fixed-size slots</h3>
+      <p>The runner slot had one fixed memory size, 7 GiB. An action that needed more was killed for memory; one that needed less left the slot mostly idle; and some builds fit no slot at all. The numbers we kept from that time:</p>
+      <ul class="facts">
+        <li><strong>2026-09-28:</strong> a survey of heavy compiles found about 120 binaries that each took 10 to 27 minutes and 8 to 16 GiB: none of them fits a 7 GiB slot.</li>
+        <li><strong>2026-09-27:</strong> the runner slot was resized from 9 GiB to 7 GiB after a measured peak of 4.98 GiB. Every action booked the whole 7 GiB.</li>
+        <li><strong>2026-09-23 and 2026-09-24:</strong> the development machine ran out of memory and the kernel killed processes, both days.</li>
+      </ul>
+      <h3>Idle machines next to overloaded ones</h3>
+      <p>Utilization depended on slot sizes chosen ahead of time, so machines could sit idle next to overloaded ones.</p>
+      <h3>No UI, Mac or iOS testing</h3>
+      <p>The farm had no support for UI tests, or for tests that need a real Mac or an iOS device.</p>
+      <h3>Other farms</h3>
+      <p>BuildBuddy solved some of this, but it isn't completely open source.</p>
+      <figure class="step-art"><svg viewBox="0 0 480 170" role="img" aria-label="Illustration: six servers, some busy and over their slots, some idle"><use href="#m-cache" x="20" y="60" width="70" height="52"/><use href="#m-server" x="150" y="10" width="64" height="47"/><use href="#m-server" x="240" y="10" width="64" height="47"/><use href="#m-server" x="330" y="10" width="64" height="47"/><use href="#m-server" x="150" y="85" width="64" height="47"/><use href="#m-server" x="240" y="85" width="64" height="47"/><use href="#m-server" x="330" y="85" width="64" height="47"/><text class="bad-t" x="182" y="76" text-anchor="middle">killed</text><text class="lab" x="272" y="76" text-anchor="middle">idle</text><text class="lab" x="362" y="150" text-anchor="middle">idle</text><text class="lab" x="300" y="164" text-anchor="middle">illustration</text></svg></figure>
+    </li>
+  </ol>
+</div>
+
+<section class="band" id="panel">
+  <div class="wrap">
+    <p class="kicker">The numbers</p>
+    <h2>One fixed slot against a memory ladder</h2>
+    <p class="lede">Here are the memory peaks of real actions, and what the two ways of giving them memory would do with the same peaks.</p>
+    <div class="note-box">
+      <p><strong>This is a model applied to real peaks from our farm's builds. It is not a count of past kills.</strong> We have no machine-readable record of what the earlier farm killed. The peaks are real: the daemon measures the peak memory of every action, and these are <span class="mem-ok">the</span> actions that finished, from <span class="mem-source">builds</span> of a slice of a real project on a kbf test farm. Both schemes place the same peaks.</p>
+      <p><strong>Buildbarn as it ran:</strong> one fixed runner slot of 7 GiB, every action booking all 7 GiB. It was resized from 9 GiB to 7 GiB on 2026-09-27, after a measured peak of 4.98 GiB. <strong>kbf</strong> uses its default ladder of 4, 16 and 32 GiB (<code>--memory-ladder-gib</code>).</p>
+    </div>
+    <p class="js-only mem-line" id="mem-line"></p>
+    <p class="no-js">The panel needs scripts. The text above and below holds the same story without it.</p>
+
+    <div class="slots js-only" id="slots">
+      <figure class="hist-fig"><svg id="hist" viewBox="0 0 960 260" role="img" aria-labelledby="hist-t hist-d"><title id="hist-t">Memory peaks of real actions</title><desc id="hist-d">A histogram of the peak memory of each action, from a quarter of a GiB to 16 GiB on a log scale, with the 7 GiB slot and the ladder rungs marked.</desc></svg>
+        <figcaption class="small muted">Peak memory per action, log scale. Bars: how many actions peaked in each range (bar height is the square root of the count). Dashed line: the 7 GiB slot. Triangles: kbf's ladder rungs.</figcaption></figure>
+      <div class="slots-cols">
+        <section class="scheme" aria-labelledby="fx-h">
+          <h3 id="fx-h">Buildbarn as it ran: one 7 GiB slot</h3>
+          <div class="table-wrap"><table id="fx-table"></table></div>
+          <p class="small" id="fx-note"></p>
+          <p class="small">The 2026-09-28 survey of heavy compiles found about 120 binaries that each needed 8 to 16 GiB. That is a separate dated measurement, not part of these peaks. Work of that size never fits a 7 GiB slot.</p>
+        </section>
+        <section class="scheme" aria-labelledby="lad-h">
+          <h3 id="lad-h">kbf's memory ladder: 4, 16 and 32 GiB</h3>
+          <p class="small muted">Every action starts on the first rung. One killed for memory is queued again one rung up, and its action key remembers that floor.</p>
+          <div class="table-wrap"><table id="lad-table"></table></div>
+          <p class="small" id="lad-note"></p>
+        </section>
+      </div>
+      <p class="small" id="cmp-line"></p>
+      <p class="small muted" id="real-oom"></p>
+    </div>
+    <p class="small muted">Booked memory is what a scheme reserves for an action; idle is booked minus the action's peak. The model counts memory only. <a href="https://github.com/komira-ai/kbf/blob/feature/arch-v2/docs/design/scheduler.md">The scheduler design</a> has the rules.</p>
+  </div>
+</section>
+
+<section class="band band-planned" id="so-we-built-kbf">
+  <div class="wrap">
+    <p class="kicker">Step 6</p>
+    <h2>So we built kbf</h2>
+    <p class="lede">One farm that runs the whole build, sizes work as it runs instead of by slots chosen ahead, runs macOS next to Linux, keeps what happened, and is Apache 2.0 licensed.</p>
+    <figure class="step-art kbf-art"><svg viewBox="0 0 480 170" role="img" aria-label="kbf: a frontend, storage, three Linux daemons and a Mac"><use href="#m-server" x="20" y="60" width="70" height="52"/><text class="t1" x="55" y="132" text-anchor="middle">frontend</text><use href="#m-cache" x="150" y="8" width="70" height="52"/><text class="t2" x="185" y="74" text-anchor="middle">storage</text><use href="#m-server" x="300" y="8" width="64" height="47"/><use href="#m-server" x="300" y="64" width="64" height="47"/><use href="#m-studio" x="300" y="118" width="64" height="47"/><text class="t2" x="400" y="38" text-anchor="start">daemon</text><text class="t2" x="400" y="94" text-anchor="start">daemon</text><text class="t2" x="400" y="148" text-anchor="start">Mac daemon</text><path class="edge" d="M92 74 L150 34"/><path class="edge" d="M92 86 L296 34"/><path class="edge" d="M92 86 L296 88"/><path class="edge" d="M92 98 L296 142"/><path class="edge" d="M220 34 L296 34"/></svg></figure>
+    <p class="actions"><a class="button button-primary" href="quickstart.html">Quick start</a> <a class="button" href="design.html">How kbf is built</a></p>
+  </div>
+</section>

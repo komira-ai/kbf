@@ -18,6 +18,12 @@
 //! | yes | loopback | absent or wrong | [`Trust::Unverified`]: the certificate, if any, and nothing from the headers |
 //! | yes | loopback | the secret | [`Trust::Proxied`] with the [`Identity`] of `x-kbf-node-id`, `x-kbf-role` and `x-kbf-node-ips` (each optional: none is anonymous), or refused ([`Refusal::Malformed`]) |
 //!
+//! A [`Trust::Proxied`] call may also carry `x-kbf-client-addr`, the address the client
+//! connected to the proxy from ([`CLIENT_ADDR`]); [`client_addr`] reads it and the layers put
+//! it in the request's extensions as a [`ClientAddr`], for a call that is proxied and for no
+//! other: on a direct or unverified call the header is stripped unread. A value that is not
+//! one IP address is [`Refusal::Malformed`].
+//!
 //! With the flag set the server is behind the proxy, so a call that reaches it from a
 //! remote address is refused (gRPC `UNAUTHENTICATED`, HTTP 403) before anything reads it.
 //! A local process without the secret cannot claim a node id or a role.
@@ -63,6 +69,11 @@ pub const ROLE: &str = "x-kbf-role";
 /// The header carrying the IP addresses of the verified leaf certificate (comma separated
 /// canonical text, see [`kbf_peer::parse_node_ips`]).
 pub const NODE_IPS: &str = "x-kbf-node-ips";
+/// The header carrying the address the client connected to the proxy from: canonical IP
+/// text, no port. The proxy sets it on every forwarded request (`kbf-proxy`'s
+/// `identity::CLIENT_ADDR` is the same name; a test in each crate pins it); it is read only
+/// from a call that presented the secret ([`ClientAddr`]).
+pub const CLIENT_ADDR: &str = "x-kbf-client-addr";
 /// What every header the server reserves for itself starts with.
 const RESERVED: &str = "x-kbf-";
 
@@ -155,6 +166,12 @@ pub enum Trust {
     Proxied(Identity),
 }
 
+/// The address a client connected to the proxy from, as the proxy reported it
+/// (`x-kbf-client-addr`). It is in a request's extensions only when the call was
+/// [`Trust::Proxied`]: a header on a direct call is never read, only stripped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientAddr(pub IpAddr);
+
 /// Why a call is refused before it is read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
@@ -213,6 +230,44 @@ pub fn classify(
             .transpose()?
             .unwrap_or_default(),
     }))
+}
+
+/// The client address a proxied call carries, or `None` if it carries none.
+///
+/// # Errors
+/// [`Refusal::Malformed`] when `x-kbf-client-addr` is not one IP address in text.
+pub fn client_addr(headers: &HeaderMap) -> Result<Option<ClientAddr>, Refusal> {
+    single(headers, CLIENT_ADDR)?
+        .map(|text| {
+            text.parse::<IpAddr>()
+                .map(|ip| ClientAddr(ip.to_canonical()))
+                .map_err(|_| Refusal::Malformed(CLIENT_ADDR))
+        })
+        .transpose()
+}
+
+/// What both layers do to a call: decide its [`Trust`] ([`classify`]), take the
+/// [`ClientAddr`] if and only if it is proxied, strip every `x-kbf-*` header, and record
+/// what was decided in the request's extensions.
+///
+/// # Errors
+/// What [`classify`] and [`client_addr`] refuse; the request is untouched.
+fn admit<B>(
+    secret: Option<&ProxySecret>,
+    peer: Option<SocketAddr>,
+    request: &mut http::Request<B>,
+) -> Result<(), Refusal> {
+    let trust = classify(secret, peer, request.headers())?;
+    let client = match trust {
+        Trust::Proxied(_) => client_addr(request.headers())?,
+        Trust::Direct | Trust::Unverified => None,
+    };
+    strip(request.headers_mut());
+    if let Some(client) = client {
+        request.extensions_mut().insert(client);
+    }
+    request.extensions_mut().insert(trust);
+    Ok(())
 }
 
 /// The one non-empty visible-ASCII value of `name`, or `None` if the header is absent.
@@ -299,12 +354,8 @@ where
 
     fn call(&mut self, mut request: http::Request<B>) -> Self::Future {
         let peer = peer_addr(request.extensions());
-        match classify(self.secret.as_deref(), peer, request.headers()) {
-            Ok(trust) => {
-                strip(request.headers_mut());
-                request.extensions_mut().insert(trust);
-                Either::Right(self.inner.call(request))
-            }
+        match admit(self.secret.as_deref(), peer, &mut request) {
+            Ok(()) => Either::Right(self.inner.call(request)),
             Err(refusal) => {
                 tracing::warn!(call = request.uri().path(), %refusal, "call refused");
                 Either::Left(ready(Ok(refusal.status().into_http())))
@@ -325,12 +376,8 @@ pub async fn gate_requests(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(peer)| *peer);
-    match classify(secret.as_deref(), peer, request.headers()) {
-        Ok(trust) => {
-            strip(request.headers_mut());
-            request.extensions_mut().insert(trust);
-            next.run(request).await
-        }
+    match admit(secret.as_deref(), peer, &mut request) {
+        Ok(()) => next.run(request).await,
         Err(refusal) => crate::api::error(StatusCode::FORBIDDEN, &refusal.to_string()),
     }
 }
