@@ -3,7 +3,7 @@
 //! layout, and a state that sets every field.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use kbf_host::path::Root;
 
@@ -38,9 +38,26 @@ pub fn host_root_on(name: &str, platform: Platform) -> (Layout, PathBuf) {
         layout.join(&layout.releases()),
     ];
     for sub in dirs {
-        fs::create_dir_all(sub).expect("seed");
+        mkdirs(&dir, &sub, 0o755);
     }
     (layout, dir)
+}
+
+/// Create `path` and every missing directory between it and `root` (which must exist) with
+/// exactly `mode`: the mode is set after the creation, so it does not depend on the process's
+/// umask (a box with umask 0002 would otherwise lay down group-writable directories, which the
+/// installer refuses in a state directory). Directories that already exist are left as they are.
+pub fn mkdirs(root: &Path, path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let rel = path.strip_prefix(root).expect("a path under the root");
+    let mut at = root.to_owned();
+    for part in rel.components() {
+        at.push(part);
+        if !at.exists() {
+            fs::create_dir(&at).expect("make the directory");
+            fs::set_permissions(&at, fs::Permissions::from_mode(mode)).expect("set its mode");
+        }
+    }
 }
 
 pub fn full_state() -> State {

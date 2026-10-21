@@ -5,8 +5,8 @@ import { Refused, Tools, main } from './steps';
 const root = path.resolve(__dirname, '..');
 const tools: Tools = {
   capture: (cmd, args) => execFileSync(cmd, args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
-  stream: (cmd, args) => {
-    execFileSync(cmd, args, { cwd: root, stdio: 'inherit' });
+  stream: (cmd, args, input) => {
+    execFileSync(cmd, args, { cwd: root, input, stdio: input === undefined ? 'inherit' : ['pipe', 'inherit', 'inherit'] });
   },
   log: (line) => console.log(line),
 };

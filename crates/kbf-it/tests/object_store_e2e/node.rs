@@ -3,9 +3,10 @@
 //! and stopped as many times as a scenario needs, on the same directory and under the same
 //! advertised address (so the frontend sees one member come back, not a new one).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use kbf_server::storage_half::start;
@@ -35,6 +36,20 @@ fn keys_of(keys: Keys, name: &str) -> Option<String> {
         "AWS_ACCESS_KEY_ID" => Some(keys.id.to_owned()),
         "AWS_SECRET_ACCESS_KEY" => Some(keys.secret.to_owned()),
         _ => None,
+    }
+}
+
+/// The lock file of a raft directory (`kbf_server::raft_log::LOCK`).
+const LOCK: &str = "log.lock";
+
+/// How long a stopped node has to let go of its directory.
+const LET_GO: Duration = Duration::from_secs(30);
+
+/// Whether nothing holds `lock`: taken and let go again at once. A missing file is free.
+fn lock_is_free(lock: &Path) -> bool {
+    match std::fs::OpenOptions::new().write(true).open(lock) {
+        Ok(file) => file.try_lock().is_ok(),
+        Err(_) => true,
     }
 }
 
@@ -88,9 +103,12 @@ impl Seat {
 
 /// A running node.
 pub struct Node {
-    storage: Arc<dyn Storage>,
+    /// Dropped by [`Node::stop`] before it looks at the lock: it holds the log.
+    storage: Option<Arc<dyn Storage>>,
     stop: Option<oneshot::Sender<()>>,
     serving: Option<JoinHandle<()>>,
+    /// The node's raft directory lock: held while any task of the node still holds the log.
+    lock: PathBuf,
 }
 
 impl Node {
@@ -112,14 +130,17 @@ impl Node {
         });
         frontend.promote();
         Self {
-            storage,
+            storage: Some(storage),
             stop: Some(stop),
             serving: Some(serving),
+            lock: seat.dir.join("meta").join(LOCK),
         }
     }
 
     /// Stops the node as an operator's restart does, and waits until it has let go of its
-    /// directory.
+    /// directory: `serve` returning ends the listener, while the tasks beside it (the
+    /// repair worker, the registration) are told to stop and drop their hold on the log a
+    /// moment later, so the lock is what says the directory is free.
     pub async fn stop(mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -127,18 +148,28 @@ impl Node {
         if let Some(serving) = self.serving.take() {
             serving.await.expect("the node stops");
         }
+        self.storage = None;
+        let deadline = tokio::time::Instant::now() + LET_GO;
+        while !lock_is_free(&self.lock) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} is still locked {LET_GO:?} after its node stopped",
+                self.lock.display(),
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Writes a blob through the node and reads it back: the cache is open on whatever
     /// store the node chose, and a store that refuses its keys fails here.
     pub async fn round_trip(&self, text: &str) {
-        let digest = self
-            .storage
+        let storage = self.storage.as_ref().expect("a running node");
+        let digest = storage
             .put(Bytes::copy_from_slice(text.as_bytes()))
             .await
             .expect("the blob is stored");
         assert_eq!(
-            self.storage.read_blob(&digest).await.expect("read back"),
+            storage.read_blob(&digest).await.expect("read back"),
             text.as_bytes()
         );
     }

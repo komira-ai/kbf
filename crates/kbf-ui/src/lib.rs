@@ -14,7 +14,8 @@
 //!   spacing are CSS custom properties, light and dark by `prefers-color-scheme`, so a
 //!   new look is a new stylesheet.
 //!
-//! The pages, under [`PREFIX`]: `/ui` (Builds: look a build up by id; with `?id=`, its
+//! The pages, under [`PREFIX`]: `/ui` (Overview: where the pages are; it reads no route
+//! yet), `/ui/builds` (Builds: look a build up by id; with `?id=`, its
 //! summary from `GET /v1/invocations/{id}`), `/ui/builds/{id}` (Build: the summary
 //! and a page of `GET /v1/invocations/{id}/actions`), and
 //! `/ui/builds/{id}/actions/{digest}` (Action: `GET /v1/invocations/{id}/actions/
@@ -24,9 +25,9 @@
 //! `GET /v1/nodes` and, where it answers, `GET /v1/update/hosts`; read-only, with the
 //! operator-API command to set the desired release shown as text).
 //!
-//! Not mounted on a server yet. A mount routes `GET` under [`PREFIX`] to [`respond`]
-//! and gives it a [`Source`] that asks the server's own routes with the caller's
-//! credentials, and sends every header of [`Answer::headers`].
+//! A mount routes `GET` under [`PREFIX`] to [`respond`], gives it a [`Source`] that asks
+//! the server's own read routes, and sends every header of [`Answer::headers`]
+//! (`kbf-server` mounts it, `ui_mount`).
 
 use std::future::Future;
 
@@ -40,10 +41,14 @@ mod read;
 pub const PREFIX: &str = "/ui";
 
 /// The `Content-Security-Policy` of every answer: nothing loads but this server's
-/// stylesheet (and, should one be added, images and one script from it); no inline
-/// script or style runs; no other site may frame a page.
+/// stylesheet (and, should one be added, its images); no script runs at all (`default-src`
+/// covers `script-src`); no inline style; no other site may frame a page; no `<base>`
+/// moves a link; a form may submit only to this server (the Builds lookup is a GET form).
 pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'self'; img-src 'self'; \
-     script-src 'self'; frame-ancestors 'none'";
+     frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+
+/// The `Referrer-Policy` a mount sends with every answer: ids and page tokens sit in URLs.
+pub const REFERRER_POLICY: &str = "no-referrer";
 
 /// The stylesheet's path.
 const STYLESHEET: &str = "/ui/static/kbf.css";
@@ -164,7 +169,8 @@ pub async fn respond<S: Source + Sync>(source: &S, path: &str, query: &str) -> A
         return pages::not_found(path);
     };
     match segments.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [] | [""] => pages::builds(source, query).await,
+        [] | [""] => pages::overview(),
+        ["builds"] => pages::builds(source, query).await,
         ["builds", id] if !id.is_empty() => pages::build(source, id, query).await,
         ["builds", id, "actions", digest] if !id.is_empty() && !digest.is_empty() => {
             pages::action(source, id, digest).await

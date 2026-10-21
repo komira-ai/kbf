@@ -193,15 +193,6 @@ fn epoch(store: &Arc<Fake>) -> u64 {
     u64::from_be_bytes(<[u8; 8]>::try_from(row.value.as_slice()).expect("eight bytes"))
 }
 
-/// A port nothing listens on.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
-}
-
 async fn refused(addr: SocketAddr) -> bool {
     TcpStream::connect(addr).await.is_err()
 }

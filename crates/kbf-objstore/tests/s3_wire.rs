@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::TryStreamExt as _;
+use futures::{StreamExt as _, TryStreamExt as _};
 use kbf_objstore::s3::{Credentials, S3Config, S3Store};
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError,
@@ -720,4 +720,225 @@ async fn a_request_without_a_body_gets_only_the_base_timeout() {
         .await
         .unwrap_err();
     assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
+}
+
+/// Catches: a store that reports other capabilities than it was configured with (the
+/// conformance suite and the writer pick their paths from them).
+#[tokio::test]
+async fn a_store_reports_the_capabilities_it_was_configured_with() {
+    let claimed = Capabilities {
+        conditional_put: true,
+        object_lock: false,
+    };
+    let s = store("http://127.0.0.1:9".into(), claimed);
+    assert_eq!(s.capabilities(), claimed);
+}
+
+/// Catches: a retained put on a store that did not claim Object Lock sent anyway (the
+/// retention header silently ignored by a store that cannot honour it, so the object is
+/// deletable while the caller believes it is locked); nothing may reach the wire.
+#[tokio::test]
+async fn a_retained_put_without_object_lock_is_refused_before_the_wire() {
+    let (endpoint, seen) = script(vec![]).await;
+    let s = store(endpoint, Capabilities::default());
+    let until = std::time::UNIX_EPOCH + Duration::from_secs(4_107_542_400);
+    let err = s
+        .put_new(&key(), Bytes::from("abc"), Some(until))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ObjectStoreError::Unsupported("Object Lock retention")),
+        "{err}"
+    );
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// Catches: a 412 on a store with no conditional puts read as "already exists" (it is
+/// a service error: nothing sent a condition, so nothing can have failed one).
+#[tokio::test]
+async fn a_412_on_an_unconditional_put_is_a_service_error() {
+    let (endpoint, _) = script(vec![answer(
+        "412 Precondition Failed",
+        &[],
+        "<Error><Code>PreconditionFailed</Code><Message>m</Message></Error>",
+    )])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let err = s
+        .put_new(&key(), Bytes::from("abc"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ObjectStoreError::Service { status: 412, code, .. } if code == "PreconditionFailed"),
+        "{err}"
+    );
+}
+
+/// Catches: a ranged read that turns an unexpected status (here 500) into data or into
+/// NotFound: it is a `Service` error carrying the status and code.
+#[tokio::test]
+async fn a_ranged_read_failing_with_a_server_error_is_a_service_error() {
+    let (endpoint, _) = script(vec![answer(
+        "500 Internal Server Error",
+        &[],
+        "<Error><Code>InternalError</Code><Message>boom</Message></Error>",
+    )])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let err = s
+        .get_range(&key(), ByteRange::new(0, 4).unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ObjectStoreError::Service { status: 500, code, message } if code == "InternalError" && message == "boom"),
+        "{err}"
+    );
+}
+
+/// Catches: a delete on an Object Lock store whose HEAD failed (here 500) carried on to
+/// a DELETE blind (it may delete the wrong version, or report success for an object the
+/// store refused to describe); the HEAD's error is the answer and no DELETE is sent.
+#[tokio::test]
+async fn a_failed_head_before_a_locked_delete_stops_the_delete() {
+    let (endpoint, seen) = script(vec![answer("500 Internal Server Error", &[], "")]).await;
+    let s = store(
+        endpoint,
+        Capabilities {
+            conditional_put: false,
+            object_lock: true,
+        },
+    );
+    let err = s.delete(&key()).await.unwrap_err();
+    assert!(
+        matches!(err, ObjectStoreError::Service { status: 500, .. }),
+        "{err}"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// Catches: the `null` version id (an unversioned object) or an empty one sent as
+/// `versionId=...`, which S3 refuses; the DELETE must carry no version query then.
+#[tokio::test]
+async fn a_locked_delete_of_a_null_or_empty_version_sends_no_version_id() {
+    let (endpoint, seen) = script(vec![
+        answer("200 OK", &["x-amz-version-id: null"], ""),
+        answer("204 No Content", &[], ""),
+        answer("200 OK", &["x-amz-version-id:"], ""),
+        answer("204 No Content", &[], ""),
+        answer("200 OK", &[], ""),
+        answer("204 No Content", &[], ""),
+    ])
+    .await;
+    let s = store(
+        endpoint,
+        Capabilities {
+            conditional_put: false,
+            object_lock: true,
+        },
+    );
+    for _ in 0..3 {
+        s.delete(&key()).await.unwrap();
+    }
+    let heads = seen.lock().unwrap();
+    for i in [1, 3, 5] {
+        assert!(
+            heads[i].starts_with("DELETE /kbf-test/cas/seg-1 HTTP/1.1"),
+            "{}",
+            heads[i]
+        );
+    }
+}
+
+/// An endpoint nothing listens on: a port that was bound and then released.
+async fn dead_endpoint() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{addr}")
+}
+
+/// Catches: an unreachable store reported as success, as an empty result, or as a
+/// service answer: every operation, with or without Object Lock, fails `Transport`
+/// (the caller retries or fails over on that class, and only on it).
+#[tokio::test]
+async fn every_operation_against_an_unreachable_store_fails_with_transport() {
+    for object_lock in [false, true] {
+        let s = store(
+            dead_endpoint().await,
+            Capabilities {
+                conditional_put: false,
+                object_lock,
+            },
+        );
+        let range = ByteRange::new(0, 4).unwrap();
+        let prefix = KeyPrefix::new("p/").unwrap();
+        let errs = [
+            s.create_bucket().await.unwrap_err(),
+            s.put_new(&key(), Bytes::from("abc"), None)
+                .await
+                .unwrap_err(),
+            s.get_range(&key(), range).await.unwrap_err(),
+            s.delete(&key()).await.unwrap_err(),
+            s.list(&prefix, None, PageSize::MAX).await.unwrap_err(),
+        ];
+        for err in errs {
+            assert!(
+                matches!(&err, ObjectStoreError::Transport(_)),
+                "object_lock {object_lock}: {err}"
+            );
+        }
+    }
+}
+
+/// An answer that promises 50 bytes, sends 3 and closes.
+fn cut_short(status: &str, headers: &[&str]) -> String {
+    let mut s = format!("HTTP/1.1 {status}\r\nconnection: close\r\ncontent-length: 50\r\n");
+    for h in headers {
+        s.push_str(h);
+        s.push_str("\r\n");
+    }
+    s.push_str("\r\nabc");
+    s
+}
+
+/// Catches: a body cut off by the connection closing taken for the bytes (a truncated
+/// listing read as the end of a bucket, a short segment read as the whole): the read
+/// and the listing fail `Transport`.
+#[tokio::test]
+async fn an_answer_cut_short_is_a_transport_error_for_reads_and_listings() {
+    let (endpoint, _) = script(vec![
+        cut_short("206 Partial Content", &["content-range: bytes 0-49/50"]),
+        cut_short("200 OK", &[]),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let err = s
+        .get_range(&key(), ByteRange::new(0, 50).unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
+    let err = s
+        .list(&KeyPrefix::new("p/").unwrap(), None, PageSize::MAX)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
+}
+
+/// Catches: a small streamed write whose body fails still sent (an object stored from a
+/// broken source): the body's own error comes back and nothing reaches the wire.
+#[tokio::test]
+async fn a_small_streamed_write_with_a_failing_body_sends_nothing() {
+    let (endpoint, seen) = script(vec![]).await;
+    let s = store(endpoint, Capabilities::default());
+    let body: kbf_objstore::BodyStream = futures::stream::iter(vec![
+        Ok(Bytes::from("ab")),
+        Err(ObjectStoreError::Body("the source broke".into())),
+    ])
+    .boxed();
+    let err = s.put_stream(&key(), 4, body).await.unwrap_err();
+    assert!(
+        matches!(&err, ObjectStoreError::Body(m) if m == "the source broke"),
+        "{err}"
+    );
+    assert!(seen.lock().unwrap().is_empty());
 }

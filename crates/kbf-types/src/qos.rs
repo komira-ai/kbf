@@ -225,4 +225,22 @@ mod tests {
             Err(QosError::Unknown("nightly".to_owned()))
         );
     }
+
+    /// Catches: a name made of digits, `-` or `_` refused (a level such as `nightly-2`
+    /// or `team_a` could not be defined), or punctuation a header cannot carry
+    /// cleanly (`.`, `/`, `+`, `:`, space) accepted.
+    #[test]
+    fn custom_names_may_hold_digits_hyphens_and_underscores_but_no_other_punctuation() {
+        for good in ["nightly-2", "team_a", "0", "-", "_", "x-y_z9"] {
+            let level = Qos::custom(good, 150).unwrap();
+            assert_eq!(level.name(), good);
+            assert_eq!(good.parse::<Qos>(), Err(QosError::Unknown(good.to_owned())));
+        }
+        for bad in ["a.b", "a/b", "a+b", "a:b", "a b", "a\n", "A-b", "a@b"] {
+            assert_eq!(
+                Qos::custom(bad, 150),
+                Err(QosError::InvalidName(bad.to_owned()))
+            );
+        }
+    }
 }

@@ -29,13 +29,12 @@
 //! The scratch directory is removed on every way out but a success: a [`Partial`] removes
 //! itself when dropped, and the pipeline takes it (and drops it on a refusal).
 //!
-//! The binary does not build a [`RealFetcher`] yet: `build_helper` still gives the helper
-//! [`NotWired`](super::fetcher::NotWired). A real one is unreachable until the helper has a
-//! real lease source (the cycle checks leases before it fetches, and the pipeline checks again,
-//! and [`leases::NotWired`](super::leases::NotWired) refuses both), and building it needs the
-//! source, timeout and size cap of `installer.toml` on every host (`run` reads the file only
-//! when `--installer-config` is given), a [`Policy`] (nothing builds one outside the tests) and
-//! the fetch user on the host.
+//! The binary builds a [`RealFetcher`] for each fetch, with
+//! [`HostFetcher`](super::fetcher_host::HostFetcher), from `installer.toml` and the host's
+//! [`Parts`]. For an activation the cycle checks the helper's leases before it fetches, and
+//! the pipeline checks again with the fetch's own lease source (both come from
+//! [`leases::for_restart`](super::leases::for_restart) in the binary); a frontend update
+//! (setup's first release too) skips the pipeline's lease step.
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
@@ -75,6 +74,46 @@ pub struct RealFetcher {
     pub child: ChildProgram,
     pub source: Source,
     pub limits: Limits,
+}
+
+/// What a [`RealFetcher`] takes from the host itself rather than from its configuration: who
+/// answers for ownership, how a tool is run, how leases are counted, who owns the scratch
+/// directory and which program is the fetch child. A test plays each.
+pub struct Parts {
+    /// Says who owns the trust list and reads it; the host's own on a host.
+    pub trust: Box<dyn Exec>,
+    pub runner: Box<dyn Runner>,
+    pub leases: Box<dyn LeaseSource>,
+    /// Who owns the scratch directory and the release: root on a host.
+    pub owner: Owner,
+    pub child: ChildProgram,
+}
+
+impl RealFetcher {
+    /// A fetcher for the host `host` with `settings` and `policy`, pulling from `source`
+    /// within `limits`, and the host's `parts`. Built here, not as a struct literal, so that
+    /// a field added to the struct does not break each place that builds one.
+    pub fn new(
+        host: Layout,
+        settings: Settings,
+        policy: Policy,
+        source: Source,
+        limits: Limits,
+        parts: Parts,
+    ) -> RealFetcher {
+        RealFetcher {
+            host,
+            settings,
+            policy,
+            trust: parts.trust,
+            runner: parts.runner,
+            leases: parts.leases,
+            owner: parts.owner,
+            child: parts.child,
+            source,
+            limits,
+        }
+    }
 }
 
 impl Fetcher for RealFetcher {

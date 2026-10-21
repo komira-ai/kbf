@@ -101,15 +101,15 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
                 t.put("units/other.service", "x");
                 t.inputs()
             },
-            "other.service: a package unit is named kbf-*.service, kbf-*.socket or kbf-*.timer",
+            "other.service: a package unit is named kbf-*.service or kbf-*.socket",
         ),
         (
-            "a unit that is a path",
+            "a unit that is a timer",
             |t| {
-                t.put("units/kbf-gc.path", "x");
+                t.put("units/kbf-gc.timer", "x");
                 t.inputs()
             },
-            "kbf-gc.path: a package unit is named kbf-*.service, kbf-*.socket or kbf-*.timer",
+            "kbf-gc.timer: a package unit is named kbf-*.service or kbf-*.socket",
         ),
         (
             "a directory among the units",
@@ -345,7 +345,27 @@ fn the_real_sysusers_and_tmpfiles_files_say_what_the_contract_says() {
             .map(|l| l.split_whitespace().map(str::to_owned).collect())
             .collect()
     };
-    let users: Vec<String> = lines("sysusers.d/kbf-installer.conf")
+    let entries = lines("sysusers.d/kbf-installer.conf");
+    // Design section 3: `kbf-signer` owns the CA key and has no home, no login and a
+    // system id with a group of its own name; there is no `kbf-verify` user.
+    let signer: Vec<&Vec<String>> = entries.iter().filter(|f| f[1] == "kbf-signer").collect();
+    assert_eq!(signer.len(), 1, "exactly one kbf-signer entry: {entries:?}");
+    let f = signer[0];
+    assert_eq!(
+        [
+            f[0].as_str(),
+            f[2].as_str(),
+            f[f.len() - 2].as_str(),
+            f[f.len() - 1].as_str()
+        ],
+        ["u", "-", "/nonexistent", "/usr/sbin/nologin"],
+        "{f:?}"
+    );
+    assert!(
+        entries.iter().all(|f| f[1] != "kbf-verify"),
+        "section 3: there is no kbf-verify user: {entries:?}"
+    );
+    let users: Vec<String> = entries
         .into_iter()
         .map(|f| {
             assert_eq!((f[0].as_str(), f[3].starts_with('"')), ("u", true), "{f:?}");
@@ -685,34 +705,16 @@ fn postgres_is_suggested_not_required() {
     assert!(!cfg.contains("recommends"), "{cfg}");
 }
 
-/// The slice and the `kbf-*.timer` files (the backup timer) are the units that are not
-/// services; any other name is still refused, and a timer not named `kbf-` is too.
-///
-/// Mutants seen red: the `.timer` suffix not accepted (the backup timer would not package);
-/// any `.timer` accepted.
+/// The slice is the one non-`.service` unit; any other name is still refused.
 #[test]
-fn a_unit_that_is_not_a_service_socket_timer_or_the_slice_is_refused() {
+fn a_unit_that_is_neither_a_service_nor_the_slice_is_refused() {
     let t = Tree::new("slice");
     t.put("units/kbf.slice", "[Slice]");
+    assert!(plan(&t.inputs()).is_ok(), "the slice is packaged");
     t.put("units/kbf-x.timer", "[Timer]");
-    let planned = plan(&t.inputs()).expect("the slice and a kbf timer are packaged");
-    assert!(
-        planned
-            .iter()
-            .any(|e| e.dst == "/usr/lib/systemd/system/kbf-x.timer" && e.mode == 0o644),
-        "{planned:?}"
-    );
-    t.put("units/kbf-x.socket", "[Socket]");
-    t.put("units/kbf-x.path", "[Path]");
-    t.put("units/other.timer", "[Timer]");
     let got = refused(plan(&t.inputs()));
-    assert!(got.contains("kbf-x.path"), "{got}");
-    assert!(!got.contains("kbf-x.socket:"), "{got}");
-    assert!(got.contains("other.timer"), "{got}");
-    assert!(
-        !got.contains("kbf.slice:") && !got.contains("kbf-x.timer:"),
-        "{got}"
-    );
+    assert!(got.contains("kbf-x.timer"), "{got}");
+    assert!(!got.contains("kbf.slice:"), "{got}");
 }
 
 /// A `kbf-*.socket` is packaged beside its service, in the same directory and mode.

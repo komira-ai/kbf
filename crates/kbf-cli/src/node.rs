@@ -36,10 +36,11 @@
 //! uses only until the frontend sends it a map.
 //!
 //! **The object-store credentials.** A storage node is given the cold store
-//! (`NodeConfig.cold_store`), never a key. This build does not fetch keys from the
-//! frontend (`kbf_enroll::keys` is not called): the object-store client uses the
-//! credentials of the process, as `kbf storage` does, and a frontend that asks for
-//! `KEYS` mode is told so on stderr. The frontend builds `cold_store` from the store
+//! (`NodeConfig.cold_store`), never a key. The storage half fetches the keys itself
+//! after it registers: `ColdStore.GetStoreConfig` on the worker listener
+//! (`kbf_server::cold_apply`, `kbf_server::join`), held in memory only; a node that has
+//! its own `AWS_*` key pair starts on it when the frontend has none to give
+//! (`kbf_enroll::keys` is not called from here). The frontend builds `cold_store` from the store
 //! registered for the farm (`kbf cluster object-store`): the bucket, prefix, endpoint
 //! and put settings, nothing else. A farm with no store registered sends none, and a
 //! storage node cannot start; one enrolled before the registration asks the frontend

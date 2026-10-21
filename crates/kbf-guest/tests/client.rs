@@ -4,7 +4,8 @@ use std::os::unix::net::UnixStream;
 
 use kbf_guest::client::{Client, ClientError};
 use kbf_guest::wire::{
-    End, Exit, GuestMsg, HostMsg, RunRequest, TOKEN_LEN, Usage, VERSION, read_frame, write_frame,
+    End, Exit, GuestMsg, HostMsg, Refusal, RunRequest, TOKEN_LEN, Usage, VERSION, read_frame,
+    write_frame,
 };
 
 /// A guest that reads one message per reply and sends the reply.
@@ -98,4 +99,45 @@ fn a_reply_out_of_turn_is_an_error() {
             HostMsg::Kill,
         ]
     );
+}
+
+/// Catches a refusal reported as another error, or its reason or detail lost, and a
+/// run that exits not waited for: the guest's `Refused` to the handshake and to a `Run`
+/// is `ClientError::Refused` with both, and an `Exited` after a started run is the wait's
+/// answer.
+#[test]
+fn a_refusal_is_reported_as_it_was_said_and_an_exit_is_waited_for() {
+    let (host, _guest) = guest(vec![GuestMsg::Refused {
+        reason: Refusal::Token,
+        detail: "wrong token".into(),
+    }]);
+    let err = Client::connect(host, [0; TOKEN_LEN]).expect_err("refused");
+    assert!(
+        matches!(&err, ClientError::Refused { reason: Refusal::Token, detail } if detail == "wrong token"),
+        "{err}"
+    );
+
+    let (host, _guest) = guest(vec![
+        ready(),
+        GuestMsg::Refused {
+            reason: Refusal::AlreadyRan,
+            detail: "this boot already ran a command".into(),
+        },
+    ]);
+    let mut client = Client::connect(host, [7; TOKEN_LEN]).expect("handshake");
+    let err = client.run(&RunRequest::default()).expect_err("refused");
+    assert!(
+        matches!(&err, ClientError::Refused { reason: Refusal::AlreadyRan, detail }
+            if detail == "this boot already ran a command"),
+        "{err}"
+    );
+
+    // The guest answers its third read, the `Kill`, with the exit.
+    let (host, guest) = guest(vec![ready(), GuestMsg::Started { pid: 9 }, exit()]);
+    let mut client = Client::connect(host, [7; TOKEN_LEN]).expect("handshake");
+    assert_eq!(client.run(&RunRequest::default()).expect("started"), 9);
+    client.killer().expect("killer").kill().expect("sent");
+    let exited = client.wait().expect("exited");
+    assert_eq!(exited.end, End::Exited(0));
+    guest.join().expect("guest");
 }

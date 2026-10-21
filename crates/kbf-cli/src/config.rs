@@ -109,6 +109,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "history-objects",
             "invocation-memory",
             "invocations-open",
+            "ui",
         ],
     ),
     (

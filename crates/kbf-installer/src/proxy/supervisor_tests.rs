@@ -497,25 +497,24 @@ fn a_release_that_is_missing_or_not_verified_is_refused_and_nothing_starts() {
 fn a_refused_takeover_is_retried_with_a_new_process_that_then_serves() {
     let rig = rig("supervisor-cold-retry");
     let (gate, _runner) = gate();
-    let env = Env::new(&rig, &gate);
+    let mut env = Env::new(&rig, &gate);
     env.admin.takeover_fails.set(1);
     env.install(A);
     verify(&rig, A);
     let first = std::rc::Rc::new(RefCell::new(None));
     let seen = std::rc::Rc::clone(&first);
     let child = &rig.child;
-    let clock = FastClock {
-        now: Cell::new(Duration::ZERO),
-        on_wait: Box::new(move || {
-            // The wait between the tries: the first process must be gone by now.
-            *seen.borrow_mut() = child_pid_record(child);
-        }),
-        halt: Cell::new(false),
-    };
-    let boot = Boot {
-        clock: &clock,
-        ..env.boot()
-    };
+    // The first process is read while it is asked whether it is ready: once it is stopped,
+    // the boot has cleared its record before the wait between the tries.
+    let gate_ref = &gate;
+    env.admin.holding = Box::new(move || {
+        let mut pid = seen.borrow_mut();
+        if pid.is_none() {
+            *pid = child_pid_record(child);
+        }
+        gate_ref.handle.snapshot().holding
+    });
+    let boot = env.boot();
     let outcome = adopt_children(&gate, child, &state_dir(&rig), &boot);
     let second = rig.child.recorded(Slot::A).expect("recorded");
     let _stop = Cleanup(&rig.child, vec![second.ident.clone()]);

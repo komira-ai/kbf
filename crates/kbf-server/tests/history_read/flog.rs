@@ -29,7 +29,7 @@ fn days(n: u64) -> FarmTime {
 /// The events of a command that exited 2 in invocation `id`, asked on `instance`: queued as
 /// operation `op`, run on a node, with `stdout` and `stderr` for its logs and `result` for
 /// its ActionResult.
-fn failed_run(
+pub(crate) fn failed_run(
     id: &str,
     instance: &str,
     op: u64,
@@ -52,13 +52,13 @@ fn failed_run(
 }
 
 /// The run id, as text, of the first attempt of `inv`'s first action.
-fn run_id(server: &Server, inv: &str) -> String {
+pub(crate) fn run_id(server: &Server, inv: &str) -> String {
     let record = server.recorder.get(&key(inv)).expect("a record");
     hex::encode(record.rows()[0].attempts[0].run_id.expect("an id"))
 }
 
 /// Waits until `n` failure-log rows are in the index.
-async fn copies(world: &World, n: usize) {
+pub(crate) async fn copies(world: &World, n: usize) {
     for _ in 0..500 {
         if world.rows("ui/obj/flog/").len() >= n {
             return;
@@ -70,7 +70,7 @@ async fn copies(world: &World, n: usize) {
 
 /// The run `id` of a build whose chunk is in the stores, once its failed section is: a
 /// run page that shows its tails.
-async fn with_tails(server: &Server, id: &str) -> Value {
+pub(crate) async fn with_tails(server: &Server, id: &str) -> Value {
     for _ in 0..500 {
         let page = server.ok(&format!("/v1/runs/{id}")).await;
         if page["logs"]["stdout"]["tail"].is_string() {
