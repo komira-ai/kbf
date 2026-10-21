@@ -10,8 +10,8 @@ use kbf_host::testkit::FakeExec;
 
 use super::*;
 use crate::CommitId;
-use crate::fixtures::{elf, file, tar_gz};
-use crate::seed_fixture::{SEQ, Seeded};
+use crate::fixtures::{FakeRunner, elf, file, me, ran, tar_gz};
+use crate::seed_fixture::{EARLIER_SEQ, SEQ, Seeded, sha};
 use crate::testkit::{A, B, c};
 
 /// What an honest seed installs, as the pipeline reports it.
@@ -347,6 +347,9 @@ fn an_installer_with_no_build_commit_knows_no_seed_directory() {
                 "{build}: {why}"
             );
         }
+        // The run loop's look is not an order: an installer that can have no seed directory
+        // has no seed, which is no trouble.
+        assert_eq!(fetcher.look(None).seed, Ok(None), "{build}");
     }
 }
 
@@ -577,4 +580,245 @@ fn a_copy_is_counted_and_hashed_and_a_failure_is_told_by_its_side() {
             "{flush_fails}: {got:?}"
         );
     }
+}
+
+// --- the look the run loop takes, without an order ---
+
+/// The package looked at with `plant` done to it and `tweak` to the trust view of the host:
+/// the seed as planted, and what the look found.
+fn looked_at(
+    name: &str,
+    plant: impl FnOnce(&mut Seeded),
+    tweak: impl FnOnce(&Seeded, &mut FakeExec),
+) -> (Seeded, Result<Option<crate::seed::Looked>, FetchError>) {
+    let mut seeded = Seeded::scratch(name);
+    plant(&mut seeded);
+    seeded.write_tarball();
+    let mut exec = seeded.exec();
+    tweak(&seeded, &mut exec);
+    let found = seeded.fetcher_on(exec).look(None).seed;
+    (seeded, found)
+}
+
+/// The view with the file at `at` holding `bytes`, root's.
+fn rewrite(exec: &mut FakeExec, at: &kbf_host::path::HostPath, bytes: &[u8]) {
+    let entry = Entry::File {
+        perms: kbf_host::step::Perms::new(0o644),
+        owner: kbf_host::step::Owner { uid: 0, gid: 0 },
+        bytes: bytes.to_vec(),
+    };
+    exec.entries.insert(at.clone(), entry);
+}
+
+/// How many times `gh` was run.
+fn gh_runs(calls: &std::rc::Rc<std::cell::RefCell<Vec<crate::run::Spawn>>>) -> usize {
+    let is_gh = |spawn: &&crate::run::Spawn| spawn.program.file_name().is_some_and(|n| n == "gh");
+    calls.borrow().iter().filter(is_gh).count()
+}
+
+/// A package whose seed is whole is found whole, with the manifest's commit, `seq` and facts and
+/// the digest of the manifest it was found by; `gh` ran once, on the package's own files, and
+/// nothing was installed or left in `work/`. Looked at again with what was found, while the
+/// manifest is the same, nothing is checked again and the answer is what was found; with a
+/// digest that is not the manifest's, the package is checked again.
+///
+/// Catches a look that installs (a pass that stages), a package checked every five seconds
+/// instead of once per manifest, and a cache that keeps its answer after the manifest changed.
+///
+/// Mutants to plant: the look made by `pull` (the release is installed); the digest not
+/// compared (`gh` runs once in all); the digest compared and the answer built anew every time
+/// (`gh` runs twice at the second look).
+#[test]
+fn a_whole_seed_is_found_once_per_manifest_and_installs_nothing() {
+    let seeded = Seeded::scratch("seed-look-whole");
+    let runner = seeded.runner();
+    let calls = runner.log();
+    let mut fetcher = seeded.fetcher();
+    fetcher.runner = Box::new(runner);
+
+    let noticed = fetcher.look(None);
+    assert_eq!(noticed.source, None, "a seed fetcher reads no installer.toml");
+    let found = noticed.seed.expect("looks").expect("a seed");
+    let manifest = serde_json::to_vec(&seeded.manifest).expect("json");
+    assert_eq!(found.digest, sha(&manifest));
+    assert_eq!(
+        found.seed,
+        SeedFacts {
+            commit: c(B),
+            seq: SEQ,
+            facts: seeded.facts(),
+        }
+    );
+    assert_eq!(gh_runs(&calls), 1);
+    assert!(!seeded.installed());
+    assert_eq!(scratch_left(&seeded), Vec::<String>::new());
+
+    let again = fetcher.look(Some(&found)).seed.expect("looks");
+    assert_eq!(again, Some(found.clone()));
+    assert_eq!(gh_runs(&calls), 1, "the same manifest is not checked again");
+
+    let stale = crate::seed::Looked {
+        digest: "of another manifest".to_owned(),
+        ..found.clone()
+    };
+    let renewed = fetcher.look(Some(&stale)).seed.expect("looks");
+    assert_eq!(renewed, Some(found), "the answer is the manifest's own");
+    assert_eq!(gh_runs(&calls), 2, "another manifest is checked");
+}
+
+/// A seed that is not whole is not found whole, with the word that says what is wrong, and
+/// nothing is installed or left behind: a byte of the tarball changed (the digest), a byte
+/// more (the size), each of the three trust files swapped for another (the package is in
+/// flux, as it is while a package manager is half way through an upgrade), a trust file or
+/// the tarball gone, and a bundle `gh` does not accept (the attestation).
+///
+/// Catches `available` told of a package nobody checked: the manifest alone makes a seed look
+/// fine.
+///
+/// Mutants to plant: the tarball's digest not compared; its size not compared; any one of the
+/// three trust digests not compared; `gh` not run.
+#[test]
+fn a_seed_that_is_not_whole_is_not_found_whole() {
+    type Plant = fn(&mut Seeded);
+    type Tweak = fn(&Seeded, &mut FakeExec);
+    let flux = |what: &str| format!("fetch: package_in_flux: {what} is not the one ");
+    let cases: [(&str, Plant, Tweak, String); 7] = [
+        (
+            "a flipped byte",
+            |s| {
+                let middle = s.tarball.len() / 2;
+                s.tarball[middle] ^= 1;
+            },
+            |_, _| {},
+            flux("the tarball") + "the manifest names",
+        ),
+        (
+            "a swapped gh",
+            |_| {},
+            |s, exec| rewrite(exec, &s.layout.gh(), b"another gh"),
+            flux("gh") + "the manifest was made for",
+        ),
+        (
+            "a swapped trusted root",
+            |_| {},
+            |s, exec| rewrite(exec, &s.layout.trusted_root(), b"another root"),
+            flux("trusted_root.jsonl") + "the manifest was made for",
+        ),
+        (
+            "a swapped installer.conf",
+            |_| {},
+            |s, exec| rewrite(exec, &s.layout.settings(), b"# another\n"),
+            flux("installer.conf") + "the manifest was made for",
+        ),
+        (
+            "an installer.conf that is gone",
+            |_| {},
+            |s, exec| {
+                exec.entries.remove(&s.layout.settings());
+            },
+            "fetch: seed_missing: ".to_owned(),
+        ),
+        (
+            "a tarball that is not on the disk",
+            |_| {},
+            |s, _| fs::remove_file(s.layout.join(&s.tarball_path())).expect("remove"),
+            "fetch: seed_missing: ".to_owned(),
+        ),
+        (
+            "a bundle gh does not accept",
+            |s| s.attested = b"the bundle of another release\n".to_vec(),
+            |_, _| {},
+            "fetch: rejected: attestation: ".to_owned(),
+        ),
+    ];
+    for (index, (what, plant, tweak, want)) in cases.into_iter().enumerate() {
+        let (seeded, found) = looked_at(&format!("seed-look-bad-{index}"), plant, tweak);
+        let why = found.expect_err(what).to_string();
+        assert!(why.starts_with(&want), "{what}: {why}");
+        assert!(!seeded.installed(), "{what}");
+        assert_eq!(scratch_left(&seeded), Vec::<String>::new(), "{what}");
+    }
+
+    // A tarball one byte longer than the manifest says is its own word: the size.
+    let (seeded, found) = looked_at("seed-look-longer", |s| s.tarball.push(0), |_, _| {});
+    let want = format!(
+        "fetch: package_in_flux: the tarball is {} bytes, the manifest says {}",
+        seeded.tarball.len(),
+        seeded.tarball.len() - 1
+    );
+    assert_eq!(found.expect_err("longer").to_string(), want);
+}
+
+/// The room is asked for before a byte of the tarball is read, as a fetch asks it, and a disk
+/// without it is the host's trouble (the word `disk`), not the package's.
+///
+/// Catches a full disk reported against the package, and a look that reads a gigabyte to find
+/// out.
+///
+/// Mutant to plant: the room check removed from the look.
+#[test]
+fn a_look_at_a_seed_with_no_room_on_the_disk_says_disk() {
+    let mut seeded = Seeded::scratch("seed-look-disk");
+    seeded.manifest["tarball_size"] = serde_json::json!(1_u64 << 60);
+    let mut fetcher = seeded.fetcher();
+    fetcher.policy.max_component_bytes = 1 << 60;
+    let why = fetcher.look(None).seed.expect_err("no room").to_string();
+    assert!(why.starts_with("fetch: disk: "), "{why}");
+}
+
+/// A package that carries no seed is not a package in trouble: the look finds nothing, says
+/// nothing, and runs nothing. (It is the state of every host whose package has none.)
+///
+/// Catches a host with no seed told, every five seconds, that its seed is missing.
+///
+/// Mutant to plant: the absent seed directory reported as `seed_missing`.
+#[test]
+fn a_package_without_a_seed_is_found_to_carry_none() {
+    let seeded = Seeded::scratch("seed-look-none");
+    let runner = seeded.runner();
+    let calls = runner.log();
+    let bare = crate::fixtures::trusted_host_on(seeded.layout.platform());
+    let mut fetcher = seeded.fetcher_on(bare);
+    fetcher.runner = Box::new(runner);
+    let noticed = fetcher.look(None);
+    assert_eq!(
+        noticed,
+        crate::seed::Noticed {
+            source: None,
+            seed: Ok(None),
+        }
+    );
+    assert!(calls.borrow().is_empty());
+}
+
+/// An installed release is asked for its version by running its own binary, from its own
+/// directory, as the unprivileged user, with `--version --json`; what it prints is read as the
+/// verify pipeline reads it, and a binary that fails is an error and not a release with no
+/// `seq`.
+///
+/// Catches a binary run as root, one run from a directory the service user can write, and a
+/// failure read as nothing declared.
+///
+/// Mutants to plant: `run_as` left out of the spawn; the working directory made the state
+/// directory; the exit status ignored.
+#[test]
+fn an_installed_release_is_asked_for_its_version_as_the_unprivileged_user() {
+    let seeded = Seeded::scratch("seed-probe");
+    let runner = seeded.runner();
+    let calls = runner.log();
+    let mut fetcher = seeded.fetcher();
+    fetcher.runner = Box::new(runner);
+    let said = fetcher.probe(&c(A)).expect("asked");
+    assert_eq!((said.seq, said.relay), (Some(EARLIER_SEQ), Some(1)));
+    assert_eq!(calls.borrow().len(), 1);
+    let asked = calls.borrow()[0].clone();
+    let release = seeded.layout.join(&seeded.layout.release_dir(&c(A)));
+    assert_eq!(asked.program, release.join("kbf"));
+    assert_eq!(asked.cwd, release);
+    assert_eq!(asked.run_as, Some(me()));
+    let args = ["--version", "--json"].map(std::ffi::OsString::from);
+    assert_eq!(asked.args, args);
+
+    fetcher.runner = Box::new(FakeRunner::new(|_| Ok(ran(1, "", "it failed"))));
+    assert!(fetcher.probe(&c(A)).is_err());
 }

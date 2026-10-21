@@ -1896,6 +1896,7 @@ fn the_same_activation_again_while_on_trial_is_a_repeat() {
 }
 
 mod frontend_tests;
+mod notice_tests;
 mod pipeline_fetcher_tests;
 mod scratch_sweep_tests;
 mod seed_order_tests;

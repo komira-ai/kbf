@@ -5,6 +5,7 @@
 use std::cell::RefCell;
 use std::io;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use kbf_host::exec::Entry;
 use kbf_host::path::HostPath;
@@ -28,20 +29,26 @@ type Answer = Box<dyn Fn(&Spawn) -> io::Result<Ran>>;
 
 /// A runner that records every [`Spawn`] and answers as `answer` says.
 pub struct FakeRunner {
-    calls: RefCell<Vec<Spawn>>,
+    calls: Rc<RefCell<Vec<Spawn>>>,
     answer: Answer,
 }
 
 impl FakeRunner {
     pub fn new(answer: impl Fn(&Spawn) -> io::Result<Ran> + 'static) -> FakeRunner {
         FakeRunner {
-            calls: RefCell::new(Vec::new()),
+            calls: Rc::default(),
             answer: Box::new(answer),
         }
     }
 
     pub fn calls(&self) -> Vec<Spawn> {
         self.calls.borrow().clone()
+    }
+
+    /// The record of calls itself, which a test keeps after the runner is boxed into a
+    /// fetcher and so out of its reach.
+    pub fn log(&self) -> Rc<RefCell<Vec<Spawn>>> {
+        Rc::clone(&self.calls)
     }
 }
 

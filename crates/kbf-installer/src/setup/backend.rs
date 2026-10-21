@@ -35,6 +35,16 @@ pub trait Releases {
     fn install_seed(&self) -> Result<CommitId, SetupError> {
         Err(SetupError::Fetch(FetchError::NotWired))
     }
+
+    /// Whether the release that runs on this host declares the relay a host that fetches
+    /// nothing needs of it (`kbf --version --json`, [`crate::binary::RELAY_NEEDED`]): `false`
+    /// when none is installed. A downloader that cannot run a binary says so.
+    ///
+    /// # Errors
+    /// The release that runs cannot be asked.
+    fn running_relays(&self) -> Result<bool, SetupError> {
+        Err(SetupError::Fetch(FetchError::NotWired))
+    }
 }
 
 /// The first release through the [`Fetcher`]: the one path by which release bytes reach the

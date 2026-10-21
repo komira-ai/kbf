@@ -3,13 +3,16 @@
 //! `kbf.toml`; a host that has a release installs nothing. The first tests play the downloader
 //! with a double (the order of the run); the last run the real one over the seed fetcher.
 
+use std::fs;
+
 use kbf_host::testkit::ScratchHost;
 use kbf_host::{HostExec, Root};
 
 use super::*;
-use crate::fixtures::trusted_host_on;
-use crate::seed_fixture::Seeded;
+use crate::fixtures::{FakeRunner, ran, trusted_host_on};
+use crate::seed_fixture::{SEQ, Seeded};
 use crate::setup::backend::Fetching;
+use crate::state::{Locked, State};
 
 /// What the double records for the install of the package's release.
 const SEED: &str = "the package's release";
@@ -160,6 +163,149 @@ fn the_packages_release_is_verified_installed_and_made_current_by_the_downloader
         .expect("there");
     assert_eq!(state.current, Some(commit));
     assert_eq!(state.staged, None);
+    // The package's release is the release that runs, so the floor starts at its `seq`: nothing
+    // at or below it, the package itself included, is a seed above the floor.
+    assert_eq!(seeded.floor_text(), Some(format!("{SEQ}\n")));
+}
+
+/// A floor that cannot be written after the first release is installed is the operator's: the
+/// release is current (it was made so first, and is not undone), the error says what is wrong,
+/// and the exit is "needs an operator".
+///
+/// Catches the floor's failure swallowed (a host that thinks it has a floor), and the release
+/// undone for it.
+///
+/// Mutants to plant: the floor's error ignored; the floor written before the release is made
+/// current (red on the release being current).
+#[test]
+fn a_floor_that_cannot_be_written_after_the_first_release_needs_an_operator() {
+    let seeded = Seeded::scratch("setup-seed-floor");
+    let fetcher = seeded.fetcher();
+    let mut exec = ScratchHost::new("setup-seed-floor-activate");
+    exec.host = HostExec::new(Root::new(&seeded.root).expect("absolute"));
+    let floor = seeded.layout.join(&seeded.layout.seq_floor());
+    fs::create_dir(floor.with_file_name(".seq_floor.tmp")).expect("in the way");
+    let releases = Fetching::new(&fetcher, seeded.layout.clone(), exec);
+    let err = releases.install_seed().expect_err("no floor");
+    assert!(matches!(err, SetupError::NeedsOperator(_)), "{err:?}");
+    assert!(err.to_string().contains("seq_floor"), "{err}");
+    assert_eq!(err.exit(), Exit::NeedsOperator);
+    assert!(seeded.installed(), "the release stands");
+    assert_eq!(seeded.floor_text(), None);
+}
+
+/// What the double says of the release that runs.
+struct Running(bool);
+
+impl Releases for Running {
+    fn install_first(&self, _: &CommitId) -> Result<(), SetupError> {
+        Ok(())
+    }
+
+    fn install_seed(&self) -> Result<CommitId, SetupError> {
+        Ok(COMMIT.parse().expect("a commit"))
+    }
+
+    fn running_relays(&self) -> Result<bool, SetupError> {
+        Ok(self.0)
+    }
+}
+
+/// A host that has a release takes `bundled` only if the release that runs declares the relay:
+/// otherwise the frontend would never be told the host fetches nothing, and would order a fetch
+/// the installer can only refuse. The refusal is a missing prerequisite (exit 2, `unsupported`),
+/// names the relay, comes before anything is written (a dry run is refused too), and does not
+/// reach the other sources, nor a host with no release (the one it installs is the package's).
+///
+/// Catches a bundled host set up beside a `kbf` that cannot tell the frontend, a refusal made
+/// after `installer.toml` is written, and the check made for every source or for a fresh host.
+///
+/// Mutants to plant: the check removed; the check made after the plan is emitted; the check made
+/// whatever the source; the check made on a host with no release.
+#[test]
+fn bundled_is_refused_beside_a_kbf_that_does_not_relay_before_anything_is_written() {
+    let dry = Options {
+        apply: false,
+        no_start: false,
+    };
+    for mode in [Mode::Daemon, Mode::Frontend, Mode::AllInOne] {
+        for options in [APPLY, dry] {
+            let mut exec = released(host(), Platform::Linux);
+            let got = beside(&mut exec, false, &bundled(mode), options);
+            let err = got.expect_err("refused");
+            assert!(matches!(err, SetupError::Unsupported(_)), "{mode:?}: {err:?}");
+            assert!(err.to_string().contains("relay"), "{mode:?}: {err}");
+            assert_eq!((err.exit(), err.code()), (Exit::Usage, "unsupported"));
+            assert!(!exec.entries.contains_key(&hp(INSTALLER_TOML)), "{mode:?}");
+            assert!(!exec.entries.contains_key(&hp(KBF_TOML)), "{mode:?}");
+            assert_eq!(cmds(&exec), Vec::<String>::new(), "{mode:?}");
+        }
+    }
+
+    // A running kbf that relays: set up as before.
+    let mut exec = released(host(), Platform::Linux);
+    beside(&mut exec, true, &bundled(Mode::Daemon), APPLY).expect("setup");
+    assert!(exec.entries.contains_key(&hp(INSTALLER_TOML)));
+
+    // Another source fetches, and asks nothing of the relay.
+    for mode in [Mode::Daemon, Mode::Frontend] {
+        let mut exec = released(host(), Platform::Linux);
+        beside(&mut exec, false, &raw(mode), APPLY).expect("setup");
+    }
+
+    // A host with no release has none to ask: the one it installs is the package's.
+    let mut exec = host();
+    beside(&mut exec, false, &bundled(Mode::Daemon), APPLY).expect("setup");
+}
+
+/// `setup` on `exec` beside a downloader whose running release relays, or not, as `relays` says.
+fn beside(
+    exec: &mut FakeExec,
+    relays: bool,
+    raw: &Raw,
+    options: Options,
+) -> Result<String, SetupError> {
+    go_with(&FakeOs::linux(), exec, &Running(relays), raw, options)
+}
+
+/// The real downloader asks the release that runs, by the state's `current`: no release is no
+/// relay, a release that declares the level `bundled` needs does, one that declares none (a
+/// build before the field) does not, and a release that cannot be asked is an error and not a
+/// "no".
+///
+/// Catches the question put to the wrong release, a missing release taken for one that relays,
+/// and a failure to ask taken for an answer.
+///
+/// Mutants to plant: the probe made of the seed's commit instead of `current`; a missing state
+/// answered `true`; the probe's error mapped to `false`.
+#[test]
+fn the_downloader_asks_the_release_that_runs_whether_it_relays() {
+    let mut seeded = Seeded::scratch("setup-relay");
+    let ask = |seeded: &Seeded| {
+        let fetcher = seeded.fetcher();
+        let exec = HostExec::new(Root::new(&seeded.root).expect("absolute"));
+        Fetching::new(&fetcher, seeded.layout.clone(), exec).running_relays()
+    };
+    assert!(!ask(&seeded).expect("asks"), "no release runs");
+
+    let state = State {
+        current: Some(crate::testkit::c(crate::testkit::A)),
+        ..State::default()
+    };
+    Locked::acquire(&seeded.layout)
+        .expect("lock")
+        .write(&state)
+        .expect("state");
+    assert!(ask(&seeded).expect("asks"), "A declares the relay");
+
+    seeded.earlier = seeded.earlier.replace("\"relay\":1,", "");
+    assert!(!ask(&seeded).expect("asks"), "A declares none");
+
+    let mut fetcher = seeded.fetcher();
+    fetcher.runner = Box::new(FakeRunner::new(|_| Ok(ran(1, "", "it failed"))));
+    let exec = HostExec::new(Root::new(&seeded.root).expect("absolute"));
+    let got = Fetching::new(&fetcher, seeded.layout.clone(), exec).running_relays();
+    assert!(matches!(got, Err(SetupError::Fetch(_))), "{got:?}");
 }
 
 /// The package's release goes through the verify pipeline on this path as on the others: a

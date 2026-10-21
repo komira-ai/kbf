@@ -114,6 +114,11 @@ impl BinaryKind {
 /// The most a binary's `--version --json` may print.
 pub const VERSION_CAP: usize = 4096;
 
+/// The `relay` a `kbf` must declare for a host to take `release_source = "bundled"`: without
+/// it the frontend is never told that the host fetches nothing, and would order a fetch the
+/// installer can only refuse. Raised when `kbf` relays more of what the installer says.
+pub const RELAY_NEEDED: u64 = 1;
+
 /// What `--version --json` prints. A field this type does not name is refused, and so is
 /// one named twice or a required one missing. `platform` (the installer derives it from
 /// the binary's header), `admin_protocol`, `meta_log` and `seq` (builds before them lack
@@ -134,6 +139,11 @@ pub struct Version {
     pub min_protocol: u64,
     pub protocol: u64,
     pub profile: String,
+    /// How far this build carries what the installer reports to the frontend: at least 1 when
+    /// it reads `available` and `release_source` from `status.json` and sends them on. `None`
+    /// for a build that predates the field, which relays nothing of the sort.
+    #[serde(default)]
+    pub relay: Option<u64>,
     /// The number of commits behind the build's commit, which puts two builds of one branch
     /// in order; 0 when the build could not count them (a shallow checkout), which is below
     /// every counted build. `None` for a build that predates the field.
@@ -147,6 +157,11 @@ pub struct Version {
 }
 
 impl Version {
+    /// Whether this build relays as far as [`RELAY_NEEDED`].
+    pub fn relays(&self) -> bool {
+        self.relay.is_some_and(|level| level >= RELAY_NEEDED)
+    }
+
     /// The object a binary printed, strictly: at most [`VERSION_CAP`] bytes, one JSON
     /// object of the fields above and nothing after it.
     pub fn parse(stdout: &[u8]) -> Result<Version, VersionFault> {

@@ -17,7 +17,8 @@
 use kbf_update::{Facts, Locator, Source};
 
 use crate::CommitId;
-use crate::seed::SeedFacts;
+use crate::binary::Version;
+use crate::seed::{Looked, Noticed, SeedFacts};
 
 /// Where the release for an order can be fetched. Locators and claims, not trust: the
 /// fetcher re-derives every one that matters. Where the bytes come from is the installer's
@@ -112,6 +113,26 @@ pub trait Fetcher {
     fn seed(&self) -> Result<SeedFacts, FetchError> {
         Err(FetchError::NotWired)
     }
+
+    /// What the run loop learns once a pass without an order: the source `installer.toml`
+    /// names, and whether the package's seed is whole (see [`Noticed`]). `known` is the seed
+    /// found whole by an earlier look: while the package's manifest is the one it was found by,
+    /// the package is not checked again, and `known` is the answer. It installs nothing, moves
+    /// nothing and decides nothing about an order. A fetcher that has no package says so.
+    fn look(&self, _known: Option<&Looked>) -> Noticed {
+        Noticed {
+            source: None,
+            seed: Err(FetchError::NotWired),
+        }
+    }
+
+    /// What the installed release `commit` declares of itself (`kbf --version --json`), asked
+    /// of its own binary as the unprivileged user the verify pipeline runs a binary as. The
+    /// release is one this host installed and runs: the question is what it says, not whether
+    /// it may run. A fetcher that cannot run a binary says so.
+    fn probe(&self, _commit: &CommitId) -> Result<Version, FetchError> {
+        Err(FetchError::NotWired)
+    }
 }
 
 /// The fetcher of a build that has none: every fetch is refused.
@@ -136,14 +157,17 @@ pub(crate) mod fake {
     //! A fetcher for tests: it records its calls, and installs the release the way the real
     //! one leaves it (a directory with a `kbf` in it) or fails as told.
 
+    use std::collections::BTreeMap;
     use std::fs;
     use std::sync::{Arc, Mutex};
 
     use kbf_update::Facts;
 
     use super::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
+    use crate::CommitId;
+    use crate::binary::Version;
     use crate::layout::Layout;
-    use crate::seed::SeedFacts;
+    use crate::seed::{Looked, Noticed, SeedFacts};
 
     /// A change a test makes to the report of the release it installs.
     pub type Tamper = fn(&mut InstalledRelease);
@@ -163,6 +187,13 @@ pub(crate) mod fake {
         /// What the package carries once the next fetch has installed (`Some(None)`: nothing
         /// that can be read), a package swapped while its release was fetched.
         pub swap_seed: Arc<Mutex<Option<Option<SeedFacts>>>>,
+        /// The word `installer.toml` is said to hold for the source, if any.
+        pub source: Arc<Mutex<Option<&'static str>>>,
+        /// What each installed release prints for `--version --json`, by commit; a commit with
+        /// no entry cannot be asked.
+        pub versions: Arc<Mutex<BTreeMap<CommitId, String>>>,
+        /// The commits `probe` was asked about, in order.
+        pub probes: Arc<Mutex<Vec<CommitId>>>,
     }
 
     impl FakeFetcher {
@@ -175,6 +206,9 @@ pub(crate) mod fake {
                 tamper: Arc::default(),
                 seed: Arc::default(),
                 swap_seed: Arc::default(),
+                source: Arc::default(),
+                versions: Arc::default(),
+                probes: Arc::default(),
             }
         }
 
@@ -229,6 +263,27 @@ pub(crate) mod fake {
         fn seed(&self) -> Result<SeedFacts, FetchError> {
             let carried = self.seed.lock().expect("lock").clone();
             carried.ok_or(FetchError::NotWired)
+        }
+
+        fn look(&self, _known: Option<&Looked>) -> Noticed {
+            let carried = self.seed.lock().expect("lock").clone();
+            let seed = carried.map_or(Err(FetchError::NotWired), |seed| {
+                Ok(Some(Looked {
+                    digest: "fake".to_owned(),
+                    seed,
+                }))
+            });
+            Noticed {
+                source: *self.source.lock().expect("lock"),
+                seed,
+            }
+        }
+
+        fn probe(&self, commit: &CommitId) -> Result<Version, FetchError> {
+            self.probes.lock().expect("lock").push(commit.clone());
+            let said = self.versions.lock().expect("lock").get(commit).cloned();
+            let said = said.ok_or(FetchError::NotWired)?;
+            Version::parse(said.as_bytes()).map_err(|e| FetchError::Unavailable(e.to_string()))
         }
     }
 }

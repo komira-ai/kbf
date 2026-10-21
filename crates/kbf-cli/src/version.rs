@@ -40,6 +40,13 @@ use serde_json::{Map, Value};
 /// The Cargo profile this binary was built with: `release` or `debug`.
 pub const PROFILE: &str = env!("KBF_BUILD_PROFILE");
 
+/// How far this build relays what its host's installer reports to the frontend: at level 1 it
+/// reads `available` and `release_source` from the installer's `status.json` and sends them in
+/// its `UpdateStatus`. The installer will not take `release_source = "bundled"` beside a `kbf`
+/// that declares less (`kbf_installer::binary::RELAY_NEEDED`; a test pins that this build
+/// meets it). Raised when a later change relays more.
+pub const RELAY: u64 = 1;
+
 /// Whether `args` (the program's name first) are exactly `--version --json` or
 /// `--json --version`.
 #[must_use]

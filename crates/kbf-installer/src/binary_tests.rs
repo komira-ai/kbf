@@ -158,6 +158,29 @@ fn the_version_object_may_carry_seq() {
     assert_eq!(err.code(), "version-unreadable");
 }
 
+/// Catches the `relay` that `kbf --version --json` prints (how far the build relays what the
+/// installer reports) refused as a field the contract does not list, a build that predates it
+/// taken for one that relays, and a level below the one `bundled` needs taken for it. A level
+/// that is text is refused.
+///
+/// Mutants to plant: the `relay` field dropped from `Version` (the object is then refused);
+/// `relays` true for any declared level; `>=` made `>`.
+#[test]
+fn the_version_object_may_carry_a_relay_level_and_bundled_needs_one() {
+    let before = Version::parse(version_json(COMMIT, "release").as_bytes()).expect("pre-relay");
+    assert_eq!(before.relay, None);
+    assert!(!before.relays());
+    for (level, relays) in [(0, false), (RELAY_NEEDED, true), (RELAY_NEEDED + 1, true)] {
+        let said = version_json(COMMIT, "release").replace('}', &format!(",\"relay\":{level}}}"));
+        let v = Version::parse(said.as_bytes()).expect("a build with a relay level parses");
+        assert_eq!(v.relay, Some(level));
+        assert_eq!(v.relays(), relays, "{level}");
+    }
+    let text = version_json(COMMIT, "release").replace('}', ",\"relay\":\"1\"}");
+    let err = Version::parse(text.as_bytes()).expect_err("a relay that is text");
+    assert_eq!(err.code(), "version-unreadable");
+}
+
 /// Catches an unbounded read of what a not yet trusted binary prints: more than 4 KiB is
 /// refused whatever it holds, and exactly 4 KiB of valid JSON (padded with spaces) is read.
 ///

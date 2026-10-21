@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::types::{Staged, is_hex};
+use crate::types::{Available, ReleaseSource, Staged, is_hex};
 
 /// The schema this client reads.
 pub const SCHEMA: u64 = 2;
@@ -35,6 +35,11 @@ pub struct Report {
     pub refusal: String,
     pub acked_order_id: u64,
     pub staged_facts: Option<Staged>,
+    /// The seed the host's package carries, once the installer found it whole and above its
+    /// floor.
+    pub available: Option<Available>,
+    /// Where the installer fetches from, when it says.
+    pub release_source: ReleaseSource,
 }
 
 /// What reading the file found.
@@ -58,6 +63,17 @@ struct Raw {
     refusal: String,
     acked_order_id: u64,
     staged: Option<RawStaged>,
+    /// Written by an installer that carries a package with a seed; absent from the others.
+    #[serde(default)]
+    available: Option<RawAvailable>,
+    #[serde(default)]
+    release_source: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawAvailable {
+    commit: String,
+    seq: u64,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +134,8 @@ fn parse(bytes: &[u8]) -> Result<Report, String> {
             min_protocol: s.min_protocol,
             state_schema: s.state_schema,
         }),
+        available: None,
+        release_source: ReleaseSource::Unreported,
     })
 }
 

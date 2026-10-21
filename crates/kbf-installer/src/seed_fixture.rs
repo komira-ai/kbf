@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::CommitId;
 use crate::binary::Arch;
 use crate::fetch::ChildProgram;
-use crate::fixtures::{FakeRunner, SETTINGS_PATH, elf, file, me, ran, tar_gz, trusted_host_on};
+use crate::fixtures::{FakeRunner, elf, file, me, ran, tar_gz, trusted_host_on};
 use crate::helper::fetcher::ReleaseLocator;
 use crate::helper::fetcher_host::HostFetcher;
 use crate::helper::fetcher_real::Parts;
@@ -30,10 +30,14 @@ use crate::layout::{Layout, path};
 use crate::seed::MANIFEST;
 use crate::settings::Settings;
 use crate::stage::{Policy, Supported, Timeouts};
-use crate::testkit::{B, c, host_root};
+use crate::testkit::{A, B, c, host_root};
 
 /// The `seq` the seed's manifest and its binary declare.
 pub const SEQ: u64 = 500;
+
+/// The `seq` the release that runs before the seed (A, in the cycle tests) declares: older than
+/// the seed's.
+pub const EARLIER_SEQ: u64 = SEQ - 100;
 
 /// The attestation bundle the signer made for the honest tarball.
 const BUNDLE: &[u8] = b"{\"mediaType\":\"application/vnd.dev.sigstore.bundle+json\"}\n";
@@ -41,6 +45,25 @@ const BUNDLE: &[u8] = b"{\"mediaType\":\"application/vnd.dev.sigstore.bundle+jso
 /// The sha256 of `bytes`, as the manifest spells it.
 pub fn sha(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+/// What the package's `installer.conf` holds in the tests. A test that is not root names the
+/// ids it runs `gh` and the probe as (the settings refuse root); a root test run has no ids to
+/// name, so a comment stands in their place. (An index and not an `if`: CI runs as one kind of
+/// user, so a branch here would always leave a side untaken.)
+fn conf_text() -> String {
+    let ids = format!("RUN_AS_UID={}\nRUN_AS_GID={}\n", me().uid, me().gid);
+    let comment = "# a root test run names no unprivileged ids\n";
+    [ids.as_str(), comment][usize::from(me().uid == 0)].to_owned()
+}
+
+/// What `kbf --version --json` prints for a release of the layout's other commit, A, built
+/// before the seed: the same shape as the seed's report, with `seq` as given.
+fn earlier_probe(seq: u64) -> String {
+    format!(
+        "{{\"admin_protocol\":1,\"commit\":\"{}\",\"meta_log\":4,\"min_protocol\":3,\"profile\":\"release\",\"protocol\":4,\"relay\":1,\"seq\":{seq},\"state_schema\":7,\"version\":\"0.1.0\"}}\n",
+        &A[..12]
+    )
 }
 
 /// The seed of one commit on one host.
@@ -59,8 +82,11 @@ pub struct Seeded {
     /// The manifest as the package builder wrote it. A test that changes `tarball` or
     /// `bundle` and wants the manifest to agree calls [`Seeded::reseal`].
     pub manifest: Value,
-    /// What the binary prints for `--version --json`.
+    /// What the seed's binary prints for `--version --json`.
     pub probe: String,
+    /// What any other release's binary prints (the cycle tests' A, which runs before the seed
+    /// is installed): an older `seq`, and a commit of its own.
+    pub earlier: String,
     /// The host's lease source, shared with the fetcher this makes.
     pub leases: FakeLeases,
 }
@@ -90,10 +116,10 @@ impl Seeded {
             "profile": "release",
             "gh_sha256": sha(b"gh"),
             "trusted_root_sha256": sha(b"root"),
-            "installer_conf_sha256": sha(b"conf"),
+            "installer_conf_sha256": sha(conf_text().as_bytes()),
         });
         let probe = format!(
-            "{{\"admin_protocol\":1,\"commit\":\"{build}\",\"meta_log\":4,\"min_protocol\":3,\"profile\":\"release\",\"protocol\":4,\"seq\":{SEQ},\"state_schema\":7,\"version\":\"0.1.0\"}}\n"
+            "{{\"admin_protocol\":1,\"commit\":\"{build}\",\"meta_log\":4,\"min_protocol\":3,\"profile\":\"release\",\"protocol\":4,\"relay\":1,\"seq\":{SEQ},\"state_schema\":7,\"version\":\"0.1.0\"}}\n"
         );
         let seeded = Seeded {
             layout,
@@ -105,6 +131,7 @@ impl Seeded {
             attested: BUNDLE.to_vec(),
             manifest,
             probe,
+            earlier: earlier_probe(EARLIER_SEQ),
             leases: FakeLeases::default(),
         };
         seeded.write_tarball();
@@ -141,11 +168,29 @@ impl Seeded {
         self.manifest["bundle_sha256"] = json!(sha(&self.bundle));
     }
 
+    /// A host whose release that runs before the seed was built as the `seq` given.
+    pub fn set_earlier_seq(&mut self, seq: u64) {
+        self.earlier = earlier_probe(seq);
+    }
+
     /// The seed directory and the files the trust executor sees, all root's, in `exec`: the
     /// manifest and the bundle with their bytes, the tarball by its name (its bytes are on the
-    /// disk).
+    /// disk), and the three trust files holding the bytes the manifest's digests are of.
     pub fn add_to(&self, exec: &mut FakeExec) {
         let root = Owner { uid: 0, gid: 0 };
+        let trust = [
+            (self.layout.gh(), 0o755, b"gh".to_vec()),
+            (self.layout.trusted_root(), 0o644, b"root".to_vec()),
+            (self.layout.settings(), 0o644, conf_text().into_bytes()),
+        ];
+        for (path, mode, bytes) in trust {
+            let entry = Entry::File {
+                perms: Perms::new(mode),
+                owner: root,
+                bytes,
+            };
+            exec.entries.insert(path, entry);
+        }
         let dirs = [
             "/usr/share/kbf-installer/seed".to_owned(),
             self.layout.seed_dir(&self.build).to_string(),
@@ -181,12 +226,16 @@ impl Seeded {
         exec
     }
 
-    /// `gh` accepts the bundle the signer made and no other; the binary prints `probe`.
+    /// `gh` accepts the bundle the signer made and no other; the seed's binary (unpacked for a
+    /// check, or installed) prints `probe`, any other release's prints `earlier`.
     pub fn runner(&self) -> FakeRunner {
         let (attested, probe) = (self.attested.clone(), self.probe.clone());
+        let (earlier, commit) = (self.earlier.clone(), self.commit.to_string());
         FakeRunner::new(move |spawn| {
             if spawn.program.file_name().is_none_or(|n| n != "gh") {
-                return Ok(ran(0, &probe, ""));
+                let ours = spawn.program.to_string_lossy().contains(commit.as_str());
+                let said = if ours { probe.as_str() } else { earlier.as_str() };
+                return Ok(ran(0, said, ""));
             }
             let at = spawn
                 .args
@@ -268,18 +317,6 @@ impl Seeded {
                 bytes: toml.clone().into_bytes(),
             };
             exec.entries.insert(at.clone(), file);
-            // Untrusted bytes are handled as the user the settings name, and a test that is not
-            // root can make a directory for no one else.
-            // (`then` and `extend` rather than an `if`: CI runs as one kind of user, so a
-            // branch here would always leave a side untaken.)
-            let text = format!("RUN_AS_UID={}\nRUN_AS_GID={}\n", me().uid, me().gid);
-            let ids = (me().uid != 0).then(|| Entry::File {
-                perms: Perms::new(0o644),
-                owner: root,
-                bytes: text.into_bytes(),
-            });
-            exec.entries
-                .extend(ids.map(|conf| (path(SETTINGS_PATH), conf)));
             Ok(seeded.parts(exec))
         })
         .with_build(&self.build)
@@ -309,6 +346,11 @@ impl Seeded {
     pub fn set_floor(&self, floor: u64) {
         let path = self.layout.join(&self.layout.seq_floor());
         fs::write(path, format!("{floor}\n")).expect("the floor");
+    }
+
+    /// What the floor file holds, if the host has one.
+    pub fn floor_text(&self) -> Option<String> {
+        fs::read_to_string(self.layout.join(&self.layout.seq_floor())).ok()
     }
 
     /// Whether a release of the seed's commit is installed and verified on the host.

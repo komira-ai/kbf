@@ -27,6 +27,24 @@ fn seq_is_the_rule_applied_to_the_checkout_built() {
     assert_eq!(seq, want);
 }
 
+/// Catches the capability left out of `kbf --version --json`, or printed as something other than
+/// the build's own constant: the installer reads it before it takes `bundled`, and a `kbf` that
+/// does not declare the relay is one the frontend cannot learn from that a host fetches nothing.
+/// The line carries it in the sorted place between `protocol` and `seq`.
+///
+/// Mutants to plant: the key removed; the key written as `0`; the key written as text.
+#[test]
+fn relay_is_the_level_this_build_declares() {
+    assert_eq!(identity()["relay"], serde_json::json!(RELAY));
+    let line = line();
+    let at = |key: &str| {
+        line.find(&format!("\"{key}\":"))
+            .unwrap_or_else(|| panic!("{key} is printed: {line}"))
+    };
+    assert!(at("protocol") < at("relay"), "{line}");
+    assert!(at("relay") < at("seq"), "{line}");
+}
+
 /// Catches `seq` written as a literal: a literal equal to today's count passes the check above
 /// on a machine where the count is what was written, and is wrong on the next commit. The
 /// one place the number may come from is the build's, so the source of `identity` must read it.

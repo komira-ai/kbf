@@ -86,6 +86,8 @@ impl From<&Status> for wire::UpdateStatus {
             staged_protocol: staged.protocol,
             staged_min_protocol: staged.min_protocol,
             staged_state_schema: staged.state_schema,
+            available: None,
+            release_source: 0,
         }
     }
 }
@@ -93,7 +95,7 @@ impl From<&Status> for wire::UpdateStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Staged;
+    use crate::types::{Available, ReleaseSource, Staged};
 
     /// Catches a field of an offer lost or moved on the way in (every field is given a
     /// different value, so a swap shows).
@@ -213,9 +215,22 @@ mod tests {
                 min_protocol: 2,
                 state_schema: 5,
             }),
+            available: Some(Available {
+                commit: "3".repeat(40),
+                seq: 812,
+            }),
+            release_source: ReleaseSource::Bundled,
             gated: true,
         };
         let message = wire::UpdateStatus::from(&full);
+        let seed = message.available.clone().expect("a seed is reported");
+        assert_eq!((seed.commit, seed.seq), ("3".repeat(40), 812));
+        assert_eq!(
+            message.release_source,
+            wire::update_status::ReleaseSource::Bundled as i32
+        );
+        assert_eq!(bare.available, None, "no seed, nothing reported");
+        assert_eq!(bare.release_source, 0, "no source, nothing reported");
         assert_eq!(message.installed_commit, "1".repeat(40));
         assert_eq!(message.staged_commit, "2".repeat(40));
         assert_eq!(message.refusal, "why");
@@ -230,5 +245,26 @@ mod tests {
             ),
             (3, 2, 5)
         );
+    }
+
+    /// Catches a source sent as another, and a source the installer did not report sent as
+    /// one it did.
+    #[test]
+    fn every_release_source_maps_to_its_own_wire_value() {
+        use wire::update_status::ReleaseSource as Wire;
+        let table = [
+            (ReleaseSource::Unreported, Wire::Unspecified),
+            (ReleaseSource::Url, Wire::Url),
+            (ReleaseSource::Frontend, Wire::Frontend),
+            (ReleaseSource::Bundled, Wire::Bundled),
+        ];
+        for (source, expected) in table {
+            let status = Status {
+                release_source: source,
+                ..Status::manual("0123456789ab")
+            };
+            let message = wire::UpdateStatus::from(&status);
+            assert_eq!(message.release_source, expected as i32, "{source:?}");
+        }
     }
 }

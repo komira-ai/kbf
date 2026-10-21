@@ -103,3 +103,7 @@ pub fn render_with(state: &State, memory: &Memory, unverified: &[CommitId]) -> V
     bytes.push(b'\n');
     bytes
 }
+
+#[cfg(test)]
+#[path = "status_tests.rs"]
+mod tests;

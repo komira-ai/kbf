@@ -15,7 +15,7 @@
 //! - an enum value renumbered, or a service renamed (the path a client dials).
 
 use kbf_proto::update::update_order::Verb;
-use kbf_proto::update::update_status::State;
+use kbf_proto::update::update_status::{Available, ReleaseSource, State};
 use kbf_proto::update::{
     Component, DescribeRequest, FetchChunk, FetchRequest, ReleaseComponent, ReleaseDescription,
     UpdateOffer, UpdateOrder, UpdateStatus, release_service_server::ReleaseServiceServer,
@@ -95,6 +95,19 @@ const STATUS: &[&str] = &[
     "5001",
     // staged_state_schema = 4
     "5804",
+];
+
+/// The two fields a host adds when its package carries a seed, in the order they follow the
+/// others: `available`, then `release_source`.
+const PACKAGE: &[&str] = &[
+    // available: tag 12, length 0x2d = 45
+    "622d",
+    // available.commit
+    "0a2830313233343536373839616263646566303132333435363738396162636465663031323334353637",
+    // available.seq = 812
+    "10ac06",
+    // release_source = RELEASE_SOURCE_BUNDLED
+    "6803",
 ];
 
 const FETCH_REQUEST: &[&str] = &[
@@ -208,6 +221,8 @@ fn status() -> UpdateStatus {
         staged_protocol: 2,
         staged_min_protocol: 1,
         staged_state_schema: 4,
+        available: None,
+        release_source: ReleaseSource::Unspecified.into(),
     }
 }
 
@@ -235,6 +250,41 @@ fn order_bytes() {
 #[test]
 fn status_bytes() {
     golden(&status(), &bytes(STATUS));
+}
+
+/// Catches a renumbered or retyped `available` (field 12, a message of the commit and a
+/// two-byte varint `seq`) or `release_source` (field 13, an enum), the enum's `bundled`
+/// renumbered, and either written before a field of a lower number. A host that reports
+/// neither writes neither (`defaults_are_not_written`), so an older frontend reads the rest.
+#[test]
+fn status_reports_the_package_and_the_source() {
+    let package = UpdateStatus {
+        available: Some(Available {
+            commit: COMMIT.to_owned(),
+            seq: 812,
+        }),
+        release_source: ReleaseSource::Bundled.into(),
+        ..UpdateStatus::default()
+    };
+    golden(&package, &bytes(PACKAGE));
+    let full = UpdateStatus {
+        available: package.available.clone(),
+        release_source: package.release_source,
+        ..status()
+    };
+    let mut want = bytes(STATUS);
+    want.extend(bytes(PACKAGE));
+    golden(&full, &want);
+    // The other sources are the numbers the enum says.
+    let numbers = [
+        (ReleaseSource::Unspecified, 0),
+        (ReleaseSource::Url, 1),
+        (ReleaseSource::Frontend, 2),
+        (ReleaseSource::Bundled, 3),
+    ];
+    for (source, number) in numbers {
+        assert_eq!(source as i32, number);
+    }
 }
 
 #[test]

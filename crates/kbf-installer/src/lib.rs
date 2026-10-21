@@ -82,6 +82,7 @@ pub mod run;
 pub mod seed;
 #[cfg(test)]
 mod seed_fixture;
+pub mod seq_floor;
 pub mod settings;
 pub mod setup;
 pub mod spool;

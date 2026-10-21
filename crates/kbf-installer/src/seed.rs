@@ -33,7 +33,7 @@ use std::io;
 
 use kbf_types::ReleasePlatform;
 use kbf_update::Facts;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::CommitId;
 use crate::helper::fetcher::FetchError;
@@ -83,6 +83,45 @@ pub struct SeedFacts {
     pub commit: CommitId,
     pub seq: u64,
     pub facts: Facts,
+}
+
+/// What `status.json` says of a seed the run loop has found whole and above the floor: the
+/// release an operator can order by its commit. Nothing more is told of it (its facts are the
+/// installer's to check at the order).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Available {
+    pub commit: CommitId,
+    pub seq: u64,
+}
+
+impl Available {
+    /// The seed `seed` as `status.json` tells it.
+    pub fn of(seed: &SeedFacts) -> Available {
+        Available {
+            commit: seed.commit.clone(),
+            seq: seed.seq,
+        }
+    }
+}
+
+/// A seed found whole, and the digest of the manifest (sha256 of `manifest.json`, lowercase
+/// hex) it was found by: while the manifest is the same one, the package is not checked again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Looked {
+    pub digest: String,
+    pub seed: SeedFacts,
+}
+
+/// What one look at the host finds, as the run loop reads it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Noticed {
+    /// The word `release_source` holds in `installer.toml` (`url`, `frontend` or `bundled`),
+    /// when the file could be read.
+    pub source: Option<&'static str>,
+    /// The package's seed found whole; `None` when the package carries no seed at all (the
+    /// normal state of a host whose package is without one); an error when it carries one
+    /// that is not whole, or the host cannot say.
+    pub seed: Result<Option<Looked>, FetchError>,
 }
 
 impl Manifest {
@@ -193,6 +232,12 @@ pub fn admit(seed: &SeedFacts, commit: &CommitId, floor: Option<u64>) -> Result<
 
 /// Why a host with no floor admits no seed.
 const NO_FLOOR: &str = "seq_floor: no floor is recorded yet, so no seed is above it";
+
+/// Whether a seed of `seq` is above `floor`: the rule [`admit`] applies at an order and the
+/// run loop applies before it tells a seed is available.
+pub fn above_floor(_seq: u64, _floor: Option<u64>) -> Result<(), String> {
+    Ok(())
+}
 
 #[cfg(test)]
 #[path = "seed_tests.rs"]

@@ -246,3 +246,45 @@ fn the_seed_is_beside_the_trust_directory_and_the_floor_beside_the_state() {
     );
     assert_eq!(mac.seq_floor().as_str(), "/var/db/kbf-installer/seq_floor");
 }
+
+/// The rule on `seq` is one function, which the order and the run loop both ask: a seed is
+/// above a floor only when its `seq` is strictly higher, and a host with no floor has none to
+/// be above. The words are the order's, since the operator reads them in both places.
+///
+/// Catches the run loop announcing a seed the order would refuse (two copies of the rule that
+/// drifted), an equal `seq` taken as above, and no floor taken as a floor of 0.
+///
+/// Mutants to plant: `>` made `>=`; `None` made `Some(0)`; the stub's `Ok(())` for every case.
+#[test]
+fn a_seq_is_above_a_floor_only_when_higher_and_there_is_one() {
+    assert_eq!(above_floor(SEQ, Some(SEQ - 1)), Ok(()));
+    assert_eq!(above_floor(1, Some(0)), Ok(()));
+    for floor in [SEQ, SEQ + 1, u64::MAX] {
+        let want = format!("seq_floor: seed seq {SEQ} is not above {floor}");
+        assert_eq!(above_floor(SEQ, Some(floor)), Err(want));
+    }
+    let none = above_floor(SEQ, None).expect_err("no floor");
+    assert_eq!(
+        none,
+        "seq_floor: no floor is recorded yet, so no seed is above it"
+    );
+    assert_eq!(above_floor(0, None), Err(none), "whatever the seq");
+}
+
+/// What `status.json` tells of a seed is its commit and its `seq`, as the keys the readers
+/// know.
+///
+/// Catches a key renamed (every reader of `status.json` would stop seeing the seed) and the
+/// facts leaking into it.
+///
+/// Mutant to plant: the facts added to `Available`.
+#[test]
+fn an_available_seed_is_told_by_its_commit_and_seq() {
+    let seed = SeedFacts {
+        commit: c(B),
+        seq: SEQ,
+        facts: Seeded::scratch("seed-available").facts(),
+    };
+    let told = serde_json::to_value(Available::of(&seed)).expect("json");
+    assert_eq!(told, json!({"commit": B, "seq": SEQ}));
+}

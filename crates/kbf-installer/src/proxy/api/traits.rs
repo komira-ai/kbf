@@ -55,6 +55,21 @@ pub struct InstallerStatus {
     pub refused_order_id: Option<u64>,
     #[serde(default)]
     pub staged: Option<StagedWire>,
+    /// The seed the host's package carries, once the root half has found it whole and above
+    /// its floor of `seq`; absent from a root half that predates it.
+    #[serde(default)]
+    pub available: Option<AvailableWire>,
+    /// The word `installer.toml` holds for `release_source` (`url`, `frontend` or `bundled`);
+    /// absent from a root half that predates it, or one that could not read the file.
+    #[serde(default)]
+    pub release_source: Option<String>,
+}
+
+/// `available{}` as `status.json` carries it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct AvailableWire {
+    pub commit: CommitId,
+    pub seq: u64,
 }
 
 /// `staged{}` as `status.json` carries it: the facts, not the commit (that is
