@@ -508,9 +508,11 @@ fn continuation_lines_of_a_multi_line_command_are_ignored() {
 /// Catches the daemon taken for a process that merely looks like it: of the processes whose
 /// command line has `--mode=daemon`, only the one started by launchd (parent 1) is the daemon.
 /// One that an action started (here running as pid 412 under another parent) does not make
-/// the check refuse; none under launchd, or two, cannot tell.
+/// the check refuse; none under launchd, or two, cannot tell, and the refusal says to run the
+/// daemon only as its launchd job.
 ///
-/// Mutant seen red: the parent-is-launchd filter dropped.
+/// Mutants seen red: the parent-is-launchd filter dropped; the launchd-job hint dropped from the
+/// refusal.
 #[test]
 fn the_daemon_is_the_one_process_launchd_started() {
     let mut rig = MacHost::new("launchd-one");
@@ -530,7 +532,9 @@ fn the_daemon_is_the_one_process_launchd_started() {
 
     let mut rig = MacHost::new("launchd-none");
     rig.daemon(400, "10:00", DAEMON);
-    refused(rig.count(), "0 processes started by launchd");
+    let answer = rig.count();
+    refused(answer.clone(), "0 processes started by launchd");
+    refused(answer, "launchctl kickstart -k system/");
 
     let mut rig = MacHost::new("launchd-two");
     rig.daemons(said(0, "309\n310\n"));
@@ -584,7 +588,8 @@ fn a_daemon_not_started_as_kbf_toml_says_cannot_tell() {
 /// after the change, so 16:38 (998 s) is allowed, 16:39 (997 s: the daemon started 1 s after
 /// the change) and anything older is not. A daemon older than a day is read in days.
 ///
-/// Mutants seen red: the start-time check dropped (H2); the 2 s slack set to 0; the days of an elapsed time dropped.
+/// Mutants seen red: the start-time check dropped (H2); the 2 s slack set to 0; the days of an
+/// elapsed time dropped; the restart hint dropped from the refusal.
 #[test]
 fn a_daemon_that_started_before_kbf_toml_changed_cannot_tell() {
     for (etime, ok) in [
@@ -603,6 +608,7 @@ fn a_daemon_that_started_before_kbf_toml_changed_cannot_tell() {
             Err(e) => {
                 assert!(!ok, "{etime}: {e}");
                 assert!(e.contains("changed after the daemon"), "{e}");
+                assert!(e.contains("launchctl kickstart -k system/"), "{e}");
             }
             other => panic!("{etime}: {other:?}"),
         }
@@ -615,7 +621,8 @@ fn a_daemon_that_started_before_kbf_toml_changed_cannot_tell() {
 /// long past and only the status-change time is recent: a daemon that started 200 s before it
 /// cannot be told to use this `kbf.toml`, one that started 995 s after it can.
 ///
-/// Mutant seen red: the later of the two times replaced by the modification time alone.
+/// Mutants seen red: the later of the two times replaced by the modification time alone; the
+/// restart hint dropped from the refusal.
 #[test]
 fn a_kbf_toml_whose_status_changed_after_the_daemon_started_cannot_tell() {
     for (etime, ok) in [("20:00", false), ("00:05", true)] {
@@ -635,6 +642,7 @@ fn a_kbf_toml_whose_status_changed_after_the_daemon_started_cannot_tell() {
             Err(e) => {
                 assert!(!ok, "{etime}: {e}");
                 assert!(e.contains("changed after the daemon"), "{e}");
+                assert!(e.contains("launchctl kickstart -k system/"), "{e}");
             }
             other => panic!("{etime}: {other:?}"),
         }
