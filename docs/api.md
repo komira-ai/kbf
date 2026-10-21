@@ -1873,7 +1873,8 @@ release and their build attestations, kept as uploaded. Mounted by `--releases-d
 - `GET` is open and lists `{"releases": [{"commit", "platforms": [{"platform", "complete",
   "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
   order above, a platform `complete` when it holds, with their attestations, the tarballs its
-  hosts need: `kbf` for a Linux platform, `kbf-daemon` for `darwin-arm64`. A component is
+  hosts need: `kbf` for every platform, `darwin-arm64` included (a Mac runs `kbf --mode=daemon`,
+  and no darwin `kbf-daemon` is built). A component is
   listed when its tarball is stored.
 - `GET /v1/releases` and the gRPC `ReleaseService.Fetch` are unauthenticated at the router and
   the service. `Fetch` is mounted on the worker listener, behind its mutual TLS and the role
