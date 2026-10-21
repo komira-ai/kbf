@@ -223,6 +223,12 @@ fn state_names(root: &Path) -> Vec<String> {
 /// `--apply` it exits 0 and the journal is kept under a `.rolled-back-` name and gone from its
 /// own; run again it says there is nothing to uninstall and exits 0.
 ///
+/// The `--apply` half runs on Linux only. On a Mac an applying uninstall clears the
+/// installer job's launchd override (`launchctl enable system/...`), a command on the real
+/// launchd that `--root` does not redirect, so a test of the shipped binary must not make it
+/// (as a non-root user it is refused: "Operation not permitted"). The Mac apply sequence,
+/// the override included, is `src/migrate/uninstall_tests.rs`'s, against the rig.
+///
 /// Mutants seen red: the `Uninstall` arm of the dispatcher removed; the dry-run `continue` removed.
 /// Not run as a mutant: `--apply` ignored.
 #[test]
@@ -239,6 +245,9 @@ fn uninstall_is_a_dry_run_until_apply_and_keeps_the_journal() {
     );
     assert_eq!(state_names(&root), before);
 
+    if cfg!(not(target_os = "linux")) {
+        return;
+    }
     let out = uninstall(&root, &["--apply"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let after = state_names(&root);
