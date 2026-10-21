@@ -47,7 +47,7 @@
 //!   attestations` and `release check` hold a directory to one bundle per tarball,
 //!   each that tarball's (its one subject is the tarball's digest); `verify-assets
 //!   attestations` also has `gh` verify each tarball against its bundle.
-//! - `release {locate,main-control,check,verdict,offer,notes,plan,identity,previous,publish}` ([`release`]): a GitHub release of
+//! - `release {locate,main-control,check,verify,offer,notes,plan,identity,previous,publish}` ([`release`]): a GitHub release of
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
@@ -572,7 +572,7 @@ enum ReleaseVerb {
         /// The artifacts workflow run that built and attested the files.
         #[arg(long)]
         run_id: u64,
-        /// The set hash the verdict names, as `release verdict` printed it.
+        /// The set hash of the verified files, as `release verify` printed it.
         #[arg(long)]
         set_hash: String,
         /// The release's notes (`release notes --out`): the release body, followed by how
@@ -583,9 +583,9 @@ enum ReleaseVerb {
         #[arg(long, default_value = "gh")]
         gh: PathBuf,
     },
-    /// The tag's message is a green verdict of the gate stage for this tag, commit and set
-    /// (a Gamma one after a bake of 24 hours or more). Prints `set-hash=<hex>`.
-    Verdict {
+    /// The tag names this commit, which is on main. Reads no verdict: the tag's message is
+    /// an audit record nothing gates on. Prints `set-hash=<hex>` of the files.
+    Verify {
         #[command(flatten)]
         subject: SubjectArgs,
         /// Append `set-hash=<hex>` to this file (on Actions, `GITHUB_OUTPUT`).
@@ -604,7 +604,7 @@ enum ReleaseVerb {
     /// Create the annotated release tag at `--sha` through the GitHub API: create-only,
     /// after the stale-run guards; a tag that exists is reused only when it is the same.
     Tag(release::tag::TagArgs),
-    /// Write the verdict document a release tag carries as its message.
+    /// Write the Beta record a release tag carries as its message (audit only).
     VerdictWrite(release::verdict_write::WriteArgs),
     /// The same checks, then write the release's notes.
     Notes {
@@ -650,7 +650,7 @@ enum ReleaseVerb {
     },
 }
 
-/// What `release verdict` and `release notes` check a release against.
+/// What `release verify` and `release notes` check a release against.
 #[derive(clap::Args)]
 struct SubjectArgs {
     /// The verified release files (`SHA256SUMS` among them).
@@ -670,14 +670,13 @@ struct SubjectArgs {
 }
 
 impl SubjectArgs {
-    fn subject(&self) -> release::verdict::Subject<'_> {
-        release::verdict::Subject {
+    fn subject(&self) -> release::verify::Subject<'_> {
+        release::verify::Subject {
             repo_dir: &self.repo_dir,
             tag: &self.tag,
             commit: &self.commit,
             dir: &self.dir,
             main_ref: &self.main_ref,
-            stage: release::verdict::GATE_STAGE,
         }
     }
 }
@@ -1028,8 +1027,8 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             &gh, &repo, &on_main, &off_main,
         )?]),
         Verb::Release(ReleaseVerb::Check { dir, commit }) => release::check(&dir, &commit),
-        Verb::Release(ReleaseVerb::Verdict { subject, output }) => {
-            let verified = release::verdict::verify(&subject.subject())?;
+        Verb::Release(ReleaseVerb::Verify { subject, output }) => {
+            let verified = release::verify::verify(&subject.subject())?;
             let line = format!("set-hash={}", verified.set_hash.as_str());
             if let Some(output) = output {
                 std::fs::OpenOptions::new()
@@ -1043,10 +1042,10 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             }
             Ok(vec![
                 format!(
-                    "tag {}: a green {:?} verdict for {} and set {}",
+                    "tag {} names {} on {}; the files are set {}",
                     subject.tag,
-                    verified.doc.stage,
                     subject.commit,
+                    subject.main_ref,
                     verified.set_hash.as_str()
                 ),
                 line,
@@ -1056,9 +1055,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::Release(ReleaseVerb::Gates(args)) => release::gates::run(&args),
         Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
         Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
-        Verb::Release(ReleaseVerb::VerdictWrite(args)) => {
-            release::verdict_write::run(&args, release::verdict::GATE_STAGE)
-        }
+        Verb::Release(ReleaseVerb::VerdictWrite(args)) => release::verdict_write::run(&args),
         Verb::Release(ReleaseVerb::Identity { dir, commit, out }) => {
             // The binary's unpacking place, of this process alone.
             let scratch =

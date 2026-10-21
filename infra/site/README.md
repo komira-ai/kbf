@@ -134,12 +134,11 @@ re-run step 3 (`site`, diff, then `--apply`; the diff shows the one changed `sub
 `prod-site`, then move the three variables (step 4 prints them for `prod-site`; delete the `prod` copies). Not yet
 deployed: nothing to change; just run the steps in order.
 
-### The first release has no gamma verdict
+### The first release needs no verdict
 
-No gamma farm exists yet, so no `v*` tag can pass `release verdict` with a produced verdict. The first tag carries a
-hand-written verdict (the same tag-message format: stage gamma, green, this commit, set hash and tag, a bake of at least 24 h)
-with the CEO's recorded `min-load` waiver for the minimum load, which `xtask/src/release/verdict.rs` already accepts. Nothing is skipped in `verify`: there is no skip flag, and the verdict check
-runs on that tag like any other. Later tags carry gamma's verdict.
+`release verify` reads no verdict (the tag's message is the Beta record, which nothing gates on), so the first tag needs
+no hand-written one and no waiver: it passes the checks every tag passes. Gamma is a farm build check
+(`gamma.yml`); it does not gate the release.
 
 ### Undo
 

@@ -1,4 +1,4 @@
-//! What `release verdict` and `release notes` ask of `git`: a tag's object, whether a
+//! What `release verify` and `release notes` ask of `git`: a tag's object, whether a
 //! commit is on main, the release tags in version order and the commits between two.
 
 use std::path::Path;

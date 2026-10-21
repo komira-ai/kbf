@@ -36,7 +36,7 @@ use kbf_gate::{
     judge, reversible, write_atomic,
 };
 
-use super::{ARTIFACTS_WORKFLOW, MAIN, verdict};
+use super::{ARTIFACTS_WORKFLOW, MAIN, verify};
 use crate::Error;
 use crate::build_commit::not_full_commit;
 use crate::package::Platform;
@@ -318,7 +318,7 @@ pub fn plan(r: &Request, attester: &dyn Attester) -> Result<OfferDoc, Error> {
     if let Err(e) = super::check(r.dir, r.commit) {
         problems.extend(lines_of(e));
     }
-    let set_hash = verdict::set_hash_of(r.dir)?;
+    let set_hash = verify::set_hash_of(r.dir)?;
     // 2. The platforms.
     let mut platforms: Vec<String> = Vec::new();
     match sums::read_sums(&r.dir.join(SUMS)) {
