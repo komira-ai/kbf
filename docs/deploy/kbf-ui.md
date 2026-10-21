@@ -28,8 +28,10 @@ web UI" in [api.md](../api.md).
   address, `--api-listen`. That flag is off unless given, and with it off there is
   nothing to serve the UI on. Bind it where only operators can reach it.
 - **Some pages need history.** Targets and Target read the cross-build routes
-  (`/v1/tests`, `/v1/grid`), which do not exist unless the farm runs with
-  `--history-objects`; without it those pages show the route's `404`. The build pages
+  (`/v1/tests`, `/v1/grid`), and the Log page reads a run's log from history, and those
+  routes do not exist unless the farm runs with `--history-objects=<URI>` (which needs
+  `--state-store`); without it those pages answer `200` with a "History is off on this
+  farm" page that names the flag. A record that is not held is still a `404`. The build pages
   work without it from the server's in-memory records, which a restart empties.
 
 ## Turning it off
@@ -50,7 +52,8 @@ Everything the pages read is shown **unredacted** to whoever reaches the port:
 
 - the build list, each build's actions, targets, and failed-action command arguments and
   environment names;
-- the end of each failed action's stdout and stderr, and a link that downloads the whole log;
+- the end of each failed action's stdout and stderr, each attempt's logs on the Log page
+  (the first 1 MiB, with a note when it is cut), and a link that downloads the whole log;
 - node names, software versions, capacity, leases and the queue, and storage members and
   their health.
 
@@ -61,8 +64,11 @@ subnet or a firewall rule), as you would for any page that shows build logs. If 
 prints a secret into a log, the UI shows it.
 
 Every `/ui` answer carries a `Content-Security-Policy` of `default-src 'none'` with styles
-and images from the page's own origin only (no page uses an image), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
-`Cache-Control: no-store`.
+and images from the page's own origin only (no page uses an image), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+`Cache-Control: no-store`, `Cross-Origin-Resource-Policy: same-origin`,
+`Cross-Origin-Opener-Policy: same-origin` and a `Permissions-Policy` that denies the powerful
+browser features. The proxy adds no HSTS header and puts none of these on its own pages
+(its 503 handover page).
 
 ## The per-client read bound
 
@@ -93,6 +99,7 @@ Overview, Nodes and Node; any other value or parameter is a `400`.
 | Leases | `/ui/leases` | What the scheduler holds now: node, phase, age, operation, platform and QoS; filter `?node=` |
 | Queue | `/ui/queue` | Depth, oldest age, the queue per platform and QoS, and why operations wait or are kept off nodes |
 | Storage | `/ui/storage` | Under-replicated blobs, each member's state, repair debts and open writes, and its write-tier flush backlog |
+| Log | `/ui/runs/{run_id}/logs/{stream}` | One run's log (`stdout`, `stderr` or `result`) as escaped text, the first 1 MiB, with a note when it is cut and a link that downloads the whole log; reached from the Action page |
 | Updates | `/ui/updates` | The desired release, the releases, and each host's update state; the command that sets the release is shown as text only |
 
 Nodes, leases and the queue live in the server's memory: after a restart or a frontend
