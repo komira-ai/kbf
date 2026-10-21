@@ -8,8 +8,8 @@
 //! - a fresh lease directory under the configured scratch root, the input root written
 //!   into it, the working directory and each output's parent made (REAPI);
 //! - its own home, temporary and cache directories inside the lease directory, named by
-//!   `HOME`, `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH` (`home`); so a
-//!   tool's `~` and module caches go with the lease;
+//!   `HOME`, `CFFIXED_USER_HOME`, `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`
+//!   (`home`); so a tool's `~` and module caches go with the lease;
 //! - its `arguments` run with those variables and the Command's environment (which wins
 //!   where both name a variable) and nothing else, stdin from `/dev/null`, stdout and
 //!   stderr captured to files, as the leader of a new process group;
@@ -135,6 +135,7 @@ mod config;
 pub mod denials;
 pub mod home;
 mod keeper;
+pub mod mounts;
 pub mod network;
 pub mod procs;
 mod program;
@@ -151,6 +152,36 @@ pub mod xcode_watch;
 // The keepers this crate's unit tests start come from the test binary.
 #[cfg(test)]
 kbf_daemon::keeper_test_hook!();
+
+/// A scratch directory for one unit test, beside the test binary (inside the target
+/// directory), removed when it is dropped. Declare it before anything that runs in it.
+#[cfg(test)]
+pub(crate) fn unit_dir(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(unit_root(), name)
+}
+
+/// The directory the unit tests' scratch directories are made in.
+#[cfg(test)]
+pub(crate) fn unit_root() -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("test binary");
+    exe.parent()
+        .expect("deps directory")
+        .join("kbf-driver-native-unit")
+}
+
+/// A link to the test binary named for the act steps, in `dir`: one per run of the
+/// binary, which lives as long as the process (so no `TestDir`), remade by rename so
+/// that runs side by side do not race.
+#[cfg(test)]
+pub(crate) fn act_link(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).expect("act directory");
+    let link = dir.join(kbf_testkit::act::NAME);
+    let made = dir.join(format!(".act-{}", std::process::id()));
+    let _ = std::fs::remove_file(&made);
+    kbf_testkit::act::link_self(&made).expect("link");
+    std::fs::rename(&made, &link).expect("place the link");
+    link
+}
 // So do the act steps and the fake Xcode tools they run (src/xcode_tests.rs).
 #[cfg(test)]
 kbf_testkit::act_test_hook!();

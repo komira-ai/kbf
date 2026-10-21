@@ -85,6 +85,30 @@ impl Farm {
         self.lock().fenced = true;
     }
 
+    /// Lets a farm that [`Farm::fence`] stopped for a takeover that did not happen feed the
+    /// scheduler again. Nothing was fed while it was fenced, so the farm's memory is the
+    /// state store's as of the fence; the caller checks first that the store is still at
+    /// the generation this process holds.
+    pub fn resume(&self) {
+        self.lock().fenced = false;
+    }
+
+    /// Whether the state store has refused a write of this farm because a newer writer
+    /// holds it.
+    #[must_use]
+    pub fn superseded(&self) -> bool {
+        self.lock()
+            .durable
+            .as_ref()
+            .is_some_and(Durable::superseded)
+    }
+
+    /// Worker streams open now.
+    #[must_use]
+    pub fn open_sessions(&self) -> usize {
+        self.lock().links.len()
+    }
+
     /// Writes, to the state store, the requeues it refused (a lease the scheduler gave
     /// up while the store did not take the write), so that the successor recovers each
     /// operation queued and not under the lease this process gave up. Works on a fenced
@@ -209,7 +233,7 @@ impl State {
     /// # Errors
     /// UNAVAILABLE if the farm is fenced or the store did not take it.
     pub(super) fn admit(
-        &self,
+        &mut self,
         request: &kbf_sched::Request,
         subject: &crate::action_usage::Subject,
     ) -> Result<(), Status> {

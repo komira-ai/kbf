@@ -20,6 +20,10 @@
 //!   interpreter and has no `[test-interpreters]` row; and a row of that file that is
 //!   stale, repeated, malformed or under `[workflow]` (rules in `interpreters/mod.rs`,
 //!   planted trees for the test-code rule in `test_spawns/mod.rs`);
+//! - test or harness code that names the `kbf` binary (its cargo path, a `bin/kbf` path, a
+//!   link called `kbf`) in a file on neither list of `kbf_spawns/mod.rs`: the helpers that
+//!   add `--config` from `kbf_testkit::config::flag`, and the counted allowance of
+//!   `kbf-cli` process tests that do not yet; a stale row, and a helper that lost its flag;
 //! - an asset `.github/workflows/artifacts.yml` packages with no `actions/attest-sbom`
 //!   step for it and its own SBOM in the attest job, or such a step for an asset no
 //!   job packages (module `attested_assets`);
@@ -30,22 +34,31 @@
 //!   `attested_bundles`);
 //! - the artifacts workflow no longer building the pinned release set (`kbf` for
 //!   three platforms, `kbf-deploy` for macOS too), signing and attesting only on pushes
-//!   to `main` and `feature/arch-v2`, checking `kbf --version --json` (on the binary
+//!   to `main`, checking `kbf --version --json` (on the binary
 //!   built, and again on the packaged tarball with `build-commit check-asset`), signing and
 //!   `darwin-asset`-checking every macOS binary, or docs/artifacts.md describing
 //!   another set (module `release_artifacts`);
-//! - the coverage job's `kbf-coverage --run-id/--repo/--artifact` flags drifting from
-//!   the run and the artifact the job uploads, which breaks the download command the
-//!   ratchet prints (module `coverage_wiring`);
+//! - the beta smoke workflow's Buck2 pin and its actions' commits drifting from
+//!   the copies they are of `ci.yml`'s (module `beta_pins`);
+//! - the test job's coverage gate step skipped by a condition, or its no-lowering check on
+//!   pull requests dropped or made conditional on something else, which lets floors fall
+//!   (module `coverage_wiring`);
+//! - a test scratch directory made by joining a name onto the system temporary directory
+//!   instead of with `kbf_testkit::dir::TestDir`, outside a short list that says why each
+//!   does not leak (module `scratch_dirs`, whose docs say what it misses);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
 //!   scanned or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
 
 mod attested_assets;
 mod attested_bundles;
+mod beta_pins;
 mod coverage_wiring;
 mod interpreters;
+mod kbf_spawns;
 mod release_artifacts;
+mod release_workflow;
+mod scratch_dirs;
 mod test_spawns;
 mod workflows;
 
@@ -576,7 +589,7 @@ mod budget {
 /// The workflow paths `docs/artifacts.md` gives as `--signer-workflow`, relative to the
 /// repository root.
 fn documented_signer_workflows(doc: &str) -> Vec<&str> {
-    const FLAG: &str = "--signer-workflow komira-ai/komira-build-farm/";
+    const FLAG: &str = "--signer-workflow komira-ai/kbf/";
     doc.match_indices(FLAG)
         .map(|(at, _)| {
             doc[at + FLAG.len()..]
@@ -631,7 +644,7 @@ mod selection {
         // Catches: a signer path read with the line's trailing `\` or the next flag, so
         // the repository test opens the wrong file; another repository's workflow
         // taken as ours; a flag at the very end of the text read as a path.
-        let doc = "gh attestation verify x \\\n  --signer-workflow komira-ai/komira-build-farm/.github/workflows/a.yml \\\n  --source-ref refs/heads/main\nalso --signer-workflow komira-ai/komira-build-farm/.github/workflows/b.yml";
+        let doc = "gh attestation verify x \\\n  --signer-workflow komira-ai/kbf/.github/workflows/a.yml \\\n  --source-ref refs/heads/main\nalso --signer-workflow komira-ai/kbf/.github/workflows/b.yml";
         assert_eq!(
             documented_signer_workflows(doc),
             vec![".github/workflows/a.yml", ".github/workflows/b.yml"]
@@ -641,7 +654,7 @@ mod selection {
                 .is_empty()
         );
         assert_eq!(
-            documented_signer_workflows("--signer-workflow komira-ai/komira-build-farm/"),
+            documented_signer_workflows("--signer-workflow komira-ai/kbf/"),
             vec![""]
         );
     }
@@ -655,11 +668,10 @@ mod selection {
         assert!(signs_provenance_on_main(&format!("{cond}{step}")));
         assert!(!signs_provenance_on_main(step));
         assert!(!signs_provenance_on_main(&cond));
-        // The main-only condition of before the development branch was attested no
-        // longer names the signer.
-        let main_only =
-            "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n";
-        assert!(!signs_provenance_on_main(&format!("{main_only}{step}")));
+        // The condition of the time the development branch `feature/arch-v2` was attested
+        // too no longer names the signer.
+        let two_branches = "    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}\n";
+        assert!(!signs_provenance_on_main(&format!("{two_branches}{step}")));
     }
 
     #[test]
@@ -875,4 +887,51 @@ mod selection {
             );
         }
     }
+}
+
+#[test]
+fn every_test_that_starts_kbf_gives_it_a_config_of_its_own_or_is_a_listed_allowance() {
+    // Catches: a new test or harness file that starts the `kbf` binary with no
+    // `--config`, so the child reads the host's /etc/kbf/kbf.toml and the test passes or
+    // fails by the host (rules, lists and planted trees in `kbf_spawns/mod.rs`); a helper
+    // that stopped calling `kbf_testkit::config::flag`; a stale row. The allowance is
+    // pinned at its count, so it cannot grow without this line changing.
+    let root = repo_root();
+    let files = listed_files(&root);
+    let read = |f: &str| {
+        read_bytes(&root.join(f)).map(|b| String::from_utf8(b).expect("UTF-8 Rust source"))
+    };
+    let (naming, problems) =
+        kbf_spawns::scan(&files, read, (kbf_spawns::FLAGGED, kbf_spawns::ALLOWANCE));
+    assert!(problems.is_empty(), "kbf spawns:\n{}", problems.join("\n"));
+    assert!(
+        naming.len() >= kbf_spawns::ALLOWANCE.len(),
+        "the scan found {} starts of kbf; it reads too little",
+        naming.len()
+    );
+    assert_eq!(
+        kbf_spawns::ALLOWANCE.len(),
+        17,
+        "the allowance only shrinks"
+    );
+}
+
+#[test]
+fn no_test_uses_the_hosts_real_kbf_directories() {
+    // Catches: a test or harness file that opens, lists or runs a path under the host's
+    // `/etc/kbf` or `/var/lib/kbf-installer`, so it passes or fails by what the box it runs
+    // on has installed (rules, allowance and planted trees in `kbf_spawns/mod.rs`). The
+    // allowance is pinned at its count, so it cannot grow without this line changing.
+    let root = repo_root();
+    let files = listed_files(&root);
+    let read = |f: &str| {
+        read_bytes(&root.join(f)).map(|b| String::from_utf8(b).expect("UTF-8 Rust source"))
+    };
+    let problems = kbf_spawns::scan_host_paths(&files, read, kbf_spawns::HOST_PATH_ALLOWANCE);
+    assert!(problems.is_empty(), "host paths:\n{}", problems.join("\n"));
+    assert_eq!(
+        kbf_spawns::HOST_PATH_ALLOWANCE.len(),
+        1,
+        "the allowance only shrinks"
+    );
 }

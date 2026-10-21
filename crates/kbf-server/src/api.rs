@@ -3,9 +3,13 @@
 //! `docs/api.md`).
 //!
 //! - `GET /v1/nodes`: every node registered since the server started, with the newest
-//!   software status each sent and where it is in placement ([`crate::fleet`]).
+//!   software status each sent, where its update is (state, `up_to_date` against the
+//!   desired commit, availability: [`crate::update_status`]) and where it is in
+//!   placement ([`crate::fleet`]), the protocol version each speaks, and the oldest of
+//!   those ([`ProtocolSummary`]).
 //! - `GET /v1/members`: the storage members of the current map, as the gRPC
-//!   `Membership` service keeps them ([`crate::members::Members`]).
+//!   `Membership` service keeps them ([`crate::members::Members`]), the protocol version
+//!   each registered naming, and the oldest of those.
 //! - `GET /v1/storage`: whether every blob is known to have its copies elsewhere, from the
 //!   storage members' heartbeats ([`crate::storage_health`]); on a frontend with a state
 //!   store.
@@ -14,8 +18,10 @@
 //!   `{"deadline_secs": N}`; without one the deadline is [`DRAIN_DEADLINE`]. The answer
 //!   is the node as it is after the action.
 //!
-//! - `POST /v1/members/{id}` with `{"state": "active"|"draining"}`: sets a storage
-//!   member's state ([`Members::set_state`]), the operator's promotion of a joiner.
+//! - `POST /v1/members/{id}` with `{"state": "active"|"draining"|"planned_down"}`: sets a
+//!   storage member's state ([`Members::set_state`]), the operator's promotion of a joiner;
+//!   `planned_down` ([`Members::plan_down`]) takes an `Active` member out of the write path
+//!   for a planned restart at once (`409` unless it is `Active`), and `active` undoes it.
 //!
 //! - `POST /v1/denied` with `{"entry": "node X"|"serial S"|"spki-sha256 H", "reason": "..."}`
 //!   and `DELETE /v1/denied?entry=...`: add an entry to the storage deny list, or take it
@@ -41,14 +47,21 @@
 //! page. The gates: a loopback peer, no `Origin` header (no browser page), the bearer
 //! token of `--api-token-file` ([`ApiToken`]; without one, writes are off), and a JSON
 //! content type. The roles of `fleet-updates-security.md` section S9 are planned.
+//!
+//! **Behind the farm's proxy** (`--proxy-auth-file`, [`crate::proxy_auth`]) a loopback peer
+//! is not enough: every route, reads too, takes calls from loopback only, and a write whose
+//! caller did not present the proxy's secret is refused 403 even with the token (the first
+//! gate becomes "loopback, and the proxy's secret"). The secret says who forwarded the
+//! request, not that it may write: the token is still required. Handlers take a [`Caller`]
+//! (the peer address and what the proxy layer decided), never the `x-kbf-*` headers, which
+//! the layer removes.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Path, RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -60,8 +73,14 @@ use serde::{Deserialize, Serialize};
 use crate::drain::{Drain, DrainStatus};
 use crate::enroll::api::EnrollApi;
 use crate::farm::{Farm, NodeAction};
+use crate::fleet::ProtocolSummary;
 use crate::members::{Members, MembershipError};
+use crate::proxy_auth::{Caller, Trust};
+use crate::release::desired::blocking;
 use crate::token::ApiToken;
+use crate::update::Rows;
+
+mod node_detail;
 
 /// The media type of every body this API returns, and of every write it accepts.
 pub const JSON: &str = "application/json";
@@ -108,12 +127,16 @@ struct ApiState {
     token: Option<ApiToken>,
     drain: Arc<Drain>,
     members: Option<Arc<Members>>,
+    /// Where the desired release is read for each node's `update.up_to_date` (`None`:
+    /// no state store, so no desired release).
+    update: Option<Rows>,
 }
 
 /// The API's routes over `farm`; writes need `token`, and without one are refused.
 /// `drain` is what `POST /v1/frontend/drain` begins; `members` is what
 /// `GET /v1/members` reads and `POST /v1/members/{id}` changes (the same value the
-/// `Membership` service registers into). `enroll` is what the `/v1/enroll/...` routes
+/// `Membership` service registers into). `update` is where the desired release is read
+/// to judge each node's `update.up_to_date`. `enroll` is what the `/v1/enroll/...` routes
 /// call ([`crate::enroll::api`]); `None` when this server has no enrollment, which those
 /// routes answer, behind the gate, with 404.
 /// Writes read the peer address from
@@ -123,13 +146,15 @@ pub fn router(
     token: Option<ApiToken>,
     drain: Arc<Drain>,
     members: Option<Arc<Members>>,
+    update: Option<Rows>,
     enroll: Option<Arc<EnrollApi>>,
 ) -> Router {
     let enrollment = crate::enroll::api::routes(token.clone(), enroll);
+    let scheduler = crate::http_sched::router(Arc::clone(&farm));
     Router::new()
         .route(NODES, get(nodes))
         .route(MEMBERS, get(members_view))
-        .route("/v1/nodes/{target}", post(act))
+        .route("/v1/nodes/{target}", get(node_detail::one).post(act))
         .route("/v1/members/{id}", post(set_member_state))
         .route(DENIED, post(deny_entry).delete(allow_entry))
         .route(FRONTEND_DRAIN, get(drain_status).post(begin_drain))
@@ -138,8 +163,10 @@ pub fn router(
             token,
             drain,
             members,
+            update,
         }))
         .merge(enrollment)
+        .merge(scheduler)
 }
 
 /// The drain as it is now.
@@ -162,11 +189,11 @@ struct NoBody {}
 
 async fn begin_drain(
     State(api): State<Arc<ApiState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err((code, why)) = gate(api.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = gate(api.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
     if !body.is_empty()
@@ -181,8 +208,27 @@ async fn begin_drain(
     json(StatusCode::OK, &status(&api))
 }
 
+/// The commit the farm wants, for judging each node's `update.up_to_date`; `None` when
+/// there is none, there is no state store, or the row cannot be read (logged: a node
+/// list that names no verdict is better than none).
+async fn desired_commit(api: &ApiState) -> Option<String> {
+    let rows = api.update.clone()?;
+    match blocking(move || rows.desired()).await {
+        Ok(stored) => stored.value.map(|d| d.commit.as_str().to_owned()),
+        Err(e) => {
+            tracing::warn!("update rows: the desired release is not read for the node list: {e}");
+            None
+        }
+    }
+}
+
 async fn nodes(State(api): State<Arc<ApiState>>) -> Response {
-    json(StatusCode::OK, &api.farm.nodes())
+    let desired = desired_commit(&api).await;
+    let mut view = api.farm.nodes();
+    for node in &mut view.nodes {
+        node.update.judge(desired.as_deref());
+    }
+    json(StatusCode::OK, &view)
 }
 
 /// One storage member of the map.
@@ -192,6 +238,12 @@ struct MemberView {
     addr: String,
     state: &'static str,
     weight: u32,
+    /// What its registration named; `None` if its row names none or has lapsed.
+    protocol: Option<u32>,
+    /// Why a joiner is not promoted yet, when `--auto-promote` is on and it is one
+    /// (`docs/design/rebalance-handoff.md`); absent otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    blocked_on: Vec<String>,
 }
 
 /// The storage members of the current map.
@@ -199,6 +251,8 @@ struct MemberView {
 struct MembersView {
     generation: u64,
     members: Vec<MemberView>,
+    #[serde(flatten)]
+    protocols: ProtocolSummary,
 }
 
 /// A member's state as `GET /v1/members` names it. Exhaustive: a new state fails to
@@ -217,9 +271,15 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
     let Some(members) = api.members.clone() else {
         return no_members();
     };
-    // The store's calls block (its trait says so).
-    let map = match tokio::task::spawn_blocking(move || members.current_map()).await {
-        Ok(Ok(map)) => map,
+    // The store's calls block (its trait says so). The map is read, then the rows that
+    // say which protocol each member registered naming: not one snapshot, so a member
+    // whose row lapses between the two is listed without a version.
+    let read = tokio::task::spawn_blocking(move || {
+        let map = members.current_map()?;
+        Ok::<_, MembershipError>((map, members.protocols()?, members.blocked_joiners()?))
+    });
+    let (map, protocols, blocked) = match read.await {
+        Ok(Ok(read)) => read,
         Ok(Err(e)) => {
             let code = match e {
                 MembershipError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -237,10 +297,11 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
         MembersView {
             generation: 0,
             members: Vec::new(),
+            protocols: ProtocolSummary::of([]),
         },
-        |map| MembersView {
-            generation: map.generation(),
-            members: map
+        |map| {
+            // A member whose row has lapsed (`Down`) has no version to show.
+            let members: Vec<MemberView> = map
                 .members()
                 .iter()
                 .map(|m| MemberView {
@@ -248,8 +309,17 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
                     addr: m.addr.clone(),
                     state: state_name(m.state),
                     weight: m.weight,
+                    protocol: protocols.get(&m.id).copied().flatten(),
+                    blocked_on: blocked
+                        .get(&m.id)
+                        .map_or_else(Vec::new, |b| b.iter().map(ToString::to_string).collect()),
                 })
-                .collect(),
+                .collect();
+            MembersView {
+                generation: map.generation(),
+                protocols: ProtocolSummary::of(members.iter().map(|m| m.protocol)),
+                members,
+            }
         },
     );
     json(StatusCode::OK, &view)
@@ -257,20 +327,23 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
 
 async fn act(
     State(api): State<Arc<ApiState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     Path(target): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let request = Write {
-        peer,
+        peer: &peer,
         headers: &headers,
         target: &target,
         body: &body,
     };
     match write_request(api.token.as_ref(), &request) {
         Ok((node, action)) => match api.farm.place(&node, action) {
-            Ok(view) => json(StatusCode::OK, &view),
+            Ok(mut view) => {
+                view.update.judge(desired_commit(&api).await.as_deref());
+                json(StatusCode::OK, &view)
+            }
             Err(unknown) => error(StatusCode::NOT_FOUND, &unknown.to_string()),
         },
         Err((code, why)) => error(code, &why),
@@ -278,29 +351,33 @@ async fn act(
 }
 
 /// The body of `POST /v1/members/{id}`: the state to put the member in. `Down` is the
-/// store's verdict and `joining`/`catching_up` are the registration's, so none of them
+/// store's verdict and `joining`/`catching_up` are the registration's (a new node in a farm with data is `joining`), so none of them
 /// is accepted.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MemberBody {
     state: MemberTarget,
+    /// With `planned_down`: how long the planned restart may last, in seconds, before the
+    /// member returns by its next heartbeat ([`PLANNED_DOWN_FOR`] if absent).
+    for_secs: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 enum MemberTarget {
     Active,
     Draining,
+    PlannedDown,
 }
 
 async fn set_member_state(
     State(api): State<Arc<ApiState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err((code, why)) = gate(api.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = gate(api.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
     let Some(members) = api.members.clone() else {
@@ -312,18 +389,78 @@ async fn set_member_state(
     let want: MemberBody = match serde_json::from_slice(&body) {
         Ok(want) => want,
         Err(e) => {
-            let why = format!("a member body is {{\"state\": \"active\"|\"draining\"}}: {e}");
+            let why = format!(
+                "a member body is {{\"state\": \"active\"|\"draining\"|\"planned_down\"}}: {e}"
+            );
             return error(StatusCode::BAD_REQUEST, &why);
         }
     };
-    let (state, name) = match want.state {
-        MemberTarget::Active => (MemberState::Active, "active"),
-        MemberTarget::Draining => (MemberState::Draining, "draining"),
+    let change = match want.change() {
+        Ok(change) => change,
+        Err(why) => return error(StatusCode::BAD_REQUEST, &why),
     };
+    let name = change.name();
     // The store's calls block (its trait says so).
-    let set = tokio::task::spawn_blocking(move || members.set_state(MemberId(id), state)).await;
+    let set = tokio::task::spawn_blocking(move || change.apply(&members, MemberId(id))).await;
     member_answer(id, name, set)
 }
+
+/// What a member write asks for. Plain sync code on purpose: the handler is async, and each
+/// test binary that runs it makes its own copy of the coroutine.
+enum Change {
+    Active,
+    Draining,
+    PlannedDown(Duration),
+}
+
+impl MemberBody {
+    /// The change the body asks for.
+    ///
+    /// # Errors
+    /// Why the body is refused: `for_secs` outside 1 to a day, or given with another state.
+    fn change(&self) -> Result<Change, String> {
+        match (self.state, self.for_secs) {
+            (MemberTarget::Active, None) => Ok(Change::Active),
+            (MemberTarget::Draining, None) => Ok(Change::Draining),
+            (MemberTarget::PlannedDown, None) => Ok(Change::PlannedDown(PLANNED_DOWN_FOR)),
+            (MemberTarget::PlannedDown, Some(secs @ 1..=MAX_PLANNED_DOWN_SECS)) => {
+                Ok(Change::PlannedDown(Duration::from_secs(secs)))
+            }
+            (MemberTarget::PlannedDown, Some(_)) => {
+                Err(format!("for_secs is 1 to {MAX_PLANNED_DOWN_SECS}"))
+            }
+            (_, Some(_)) => Err("for_secs goes with planned_down only".to_owned()),
+        }
+    }
+}
+
+impl Change {
+    /// The name the answer gives the state.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Draining => "draining",
+            Self::PlannedDown(_) => "planned_down",
+        }
+    }
+
+    /// Makes the change to member `id`.
+    fn apply(self, members: &Members, id: MemberId) -> Result<Map, MembershipError> {
+        match self {
+            Self::Active => members.set_state(id, MemberState::Active),
+            Self::Draining => members.set_state(id, MemberState::Draining),
+            Self::PlannedDown(for_) => members.plan_down(id, for_),
+        }
+    }
+}
+
+/// How long a planned restart lasts when the request does not say: an update of a node,
+/// with its start and its catching up, fits in it; a controller that died does not hold the
+/// node out longer.
+pub const PLANNED_DOWN_FOR: Duration = Duration::from_secs(15 * 60);
+
+/// The longest a planned restart may be asked to last: a day.
+pub const MAX_PLANNED_DOWN_SECS: u64 = 24 * 60 * 60;
 
 /// The answer to a member write, from what the blocking call returned.
 fn member_answer(
@@ -352,6 +489,9 @@ const fn member_failure(e: &MembershipError) -> StatusCode {
     match e {
         MembershipError::NotRegistered(_) => StatusCode::NOT_FOUND,
         MembershipError::NotSettable(_) => StatusCode::BAD_REQUEST,
+        MembershipError::NotActive { .. } | MembershipError::PinsFull { .. } => {
+            StatusCode::CONFLICT
+        }
         MembershipError::Store(_) | MembershipError::Contended => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -390,11 +530,11 @@ fn entry_of(text: &str) -> Result<DenyEntry, (StatusCode, String)> {
 
 async fn deny_entry(
     State(api): State<Arc<ApiState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err((code, why)) = gate(api.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = gate(api.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
     let Some(members) = api.members.clone() else {
@@ -430,11 +570,11 @@ async fn deny_entry(
 
 async fn allow_entry(
     State(api): State<Arc<ApiState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
-    if let Err((code, why)) = gate(api.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = gate(api.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
     let Some(members) = api.members.clone() else {
@@ -516,7 +656,7 @@ const fn denied_failure(e: &MembershipError) -> StatusCode {
 }
 
 /// The answer of a server that keeps no storage members.
-fn no_members() -> Response {
+pub(crate) fn no_members() -> Response {
     error(
         StatusCode::NOT_FOUND,
         "this server keeps no storage members: it has no --state-store",
@@ -526,8 +666,8 @@ fn no_members() -> Response {
 /// A write as it arrived.
 #[derive(Clone, Copy, Debug)]
 pub struct Write<'a> {
-    /// Who sent it.
-    pub peer: SocketAddr,
+    /// Who sent it, and how far the proxy vouches for it.
+    pub peer: &'a Caller,
     /// Its headers.
     pub headers: &'a HeaderMap,
     /// The last path segment: `{node}:{verb}`.
@@ -546,7 +686,9 @@ struct DrainBody {
 /// The gates every write passes, in order:
 ///
 /// 1. the peer is loopback, so the token never crosses a network in clear (a remote
-///    operator comes through a TLS-terminating proxy on the host): else 403;
+///    operator comes through a TLS-terminating proxy on the host); and, when a proxy is
+///    configured (`--proxy-auth-file`), the request presented the proxy's secret
+///    ([`Trust::Unverified`] is refused): else 403;
 /// 2. no `Origin` header: a browser sends one with every cross-origin POST, and a
 ///    page must not act with an operator's token or from the host: else 403;
 /// 3. writes are on (`token` is given): else 403;
@@ -555,7 +697,7 @@ struct DrainBody {
 ///    send cross-origin without a preflight the API never answers: else 415.
 pub(crate) fn gate(
     token: Option<&ApiToken>,
-    peer: SocketAddr,
+    peer: &Caller,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, String)> {
     operator_gate(token, peer, headers)?;
@@ -573,13 +715,24 @@ pub(crate) fn gate(
 /// tarball) passes these and answers for its own content type.
 pub(crate) fn operator_gate(
     token: Option<&ApiToken>,
-    peer: SocketAddr,
+    peer: &Caller,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, String)> {
-    if !peer.ip().to_canonical().is_loopback() {
+    if !peer.addr.ip().to_canonical().is_loopback() {
         return Err((
             StatusCode::FORBIDDEN,
-            format!("writes are accepted only from the server's own host, not {peer}"),
+            format!(
+                "writes are accepted only from the server's own host, not {}",
+                peer.addr
+            ),
+        ));
+    }
+    if peer.trust == Trust::Unverified {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "this server is behind a proxy: a write must come through it, presenting the \
+             proxy's secret (--proxy-auth-file)"
+                .to_owned(),
         ));
     }
     if headers.contains_key(ORIGIN) {
@@ -641,7 +794,7 @@ pub fn write_request(
 
 /// Whether a `Content-Type` value is `application/json`, in any case, with or without
 /// parameters (`; charset=utf-8`).
-pub(crate) fn is_json(value: &[u8]) -> bool {
+fn is_json(value: &[u8]) -> bool {
     let essence = value.split(|&b| b == b';').next().unwrap_or_default();
     essence.trim_ascii().eq_ignore_ascii_case(JSON.as_bytes())
 }
@@ -712,6 +865,13 @@ mod tests {
             (
                 MembershipError::NotSettable(MemberState::Down),
                 StatusCode::BAD_REQUEST,
+            ),
+            (
+                MembershipError::NotActive {
+                    id: MemberId(4),
+                    state: MemberState::Joining,
+                },
+                StatusCode::CONFLICT,
             ),
             (store(), StatusCode::SERVICE_UNAVAILABLE),
             (MembershipError::Contended, StatusCode::SERVICE_UNAVAILABLE),
@@ -832,3 +992,7 @@ mod tests {
         assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
+
+#[cfg(test)]
+#[path = "api_members_tests.rs"]
+mod members_tests;

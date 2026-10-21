@@ -7,10 +7,14 @@
 //! | key | value | lives |
 //! |---|---|---|
 //! | `instance/<instance id>` | the member id | for ever: a node that returns keeps its id |
-//! | `member/<id>` | the member (address, zone, weight, admin state), its boot counter and its newest debts report | `ttl` after the last heartbeat |
+//! | `member-owner/<id>` | the instance id: written with `instance/<instance id>`, so one id is never given to two instances | for ever |
+//! | `member/<id>` | the member (address, zone, weight, admin state), its boot counter, its newest debts report and the protocol version it registered naming | `ttl` after the last heartbeat |
 //! | `down/<id>` | nothing | `dwell` from the moment the member went `Down` |
 //! | `map` | the current `kbf.map.v1.Map` | for ever; a change is one compare-and-set |
 //! | `meta/members_formed` | nothing | for ever: the cluster has had an `Active` member |
+//! | `meta/members_forming` | nothing | a minute from the first `Active` member |
+//! | `unfilled/<id>` | nothing, or the fill phase of [`Handoff`] (module `handoff`) | for ever, until the member is made `Active` |
+//! | `meta/tail_epoch` | the tail epoch, 8 bytes | for ever (written only with [`Members::with_handoff`]) |
 //! | `deny/<kind>/<value>` | the reason and the time it was added | for ever, until [`Members::allow`] |
 //!
 //! and the counters `member-id` and `boot/<id>`. The store assigns both numbers, so no
@@ -38,12 +42,37 @@
 //! and a registration (which rewrites the row) starts without one. A promotion keeps it.
 //! [`Members::storage_health`] judges the rows ([`crate::storage_health`]).
 //!
+//! **Protocol.** The row keeps the protocol version the node named when it registered, for
+//! the operator view ([`Members::protocols`], `GET /v1/members`): a heartbeat and a state
+//! change keep it, a new registration replaces it, and nothing judges it after the
+//! registration. A row written before the field existed names none and reads as a node
+//! whose version is not known, never as version 0. The row lives `ttl` after the last
+//! heartbeat, so a member that went `Down` has no version either.
+//!
 //! **The map** is a function of the rows: [`Members::refresh`] reads `map`, `member/` and
 //! the `down/` marks, builds the next member list, and if it differs commits generation
 //! `g + 1` with the compare-and-set on `map`'s version and a check on every row it read,
 //! so a row that changed meanwhile fails the commit rather than being decided on stale
 //! reads. A conflict is read again; two frontends racing give one winner and one retry.
 //! Anyone may call it; the frontend does so after every change and on a timer.
+//!
+//! **The floor.** The map carries `min_protocol`, the oldest protocol a registration may name.
+//! The first map of an empty store has [`OLDEST_PROTOCOL`] (the oldest this build accepts,
+//! not its own newest [`PROTOCOL`]: a fresh store must not lock out the nodes a build still
+//! accepts), and every later map has the larger of the stored floor and this build's oldest,
+//! so the floor only rises. [`Members::register`] judges a node against that floor, read from
+//! the store. Nothing lowers it: a frontend rolled back to a build with a lower oldest keeps
+//! the stored floor and refuses the nodes the floor excludes, though that build would accept
+//! them (a rollback across a protocol bump is a flag day,
+//! `docs/design/frontend-proxy.md` section 9). Only registration judges the floor: storage
+//! nodes do not enforce `min_protocol` themselves, and a floor this build lifts reaches the
+//! stored map with the next change of members, not on its own.
+//!
+//! **Joiners.** A node the farm has not seen before, registering after the farm's first
+//! bootstrap minute, is `Joining` with an `unfilled/<id>` mark and is promoted by
+//! [`Members::set_state`] (module `join`), or, with [`Members::with_handoff`], by its own
+//! beat once it is filled (modules `fence` and `promote`); the paragraph below is for the
+//! others.
 //!
 //! **Promotion.** A node's own request moves it in two ways only. A registration saying the
 //! index is whole ([`Progress::CaughtUp`]) writes `Active`, so a rolling restart leaves
@@ -79,14 +108,37 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_map::{DenyEntry, Map, MapError, Member, MemberId, MemberState, Rule};
-use kbf_mapsync::MapSource;
+use kbf_mapsync::{MapSource, RETAINED_MAPS};
 use kbf_proto::kbf::map::v1 as pb;
-use kbf_state::{Cond, Store, StoreError, StoreTime, Txn, Version, Versioned};
+use kbf_state::{Cond, Store, StoreError, StoreTime, Txn, Versioned};
 use prost::Message as _;
 use tokio::sync::watch;
 
-use crate::storage_health::{Debts, MemberReport, Report, StorageHealth, storage_health};
+use crate::storage_health::{
+    MemberReport, NotIdle, Planned, Report, Reported, StorageHealth, node_idle, storage_health,
+};
+use crate::worker::named_protocol;
 
+mod denials;
+pub use denials::Denial;
+mod assign;
+mod blocked;
+mod fence;
+mod handoff;
+mod join;
+mod pins;
+mod promote;
+mod row;
+pub use assign::{LastBoot, MAX_SEED};
+pub use handoff::{Block, Fill, Handoff, fill_fp};
+use pins::pin_key;
+use row::{Live, decode_row, encode_row};
+mod look;
+pub use look::{MemberLook, MembersLook};
+
+/// The value of a `down/<id>` mark written by an operator's planned restart
+/// ([`Members::plan_down`]); the sweeper's marks are empty.
+const PLANNED: &[u8] = b"planned";
 const MAP_KEY: &str = "map";
 const MEMBERS: &str = "member/";
 const ID_COUNTER: &str = "member-id";
@@ -105,9 +157,14 @@ const MAX_VALUE: usize = 253;
 /// The longest reason a deny entry is stored with, in bytes.
 const MAX_REASON: usize = 512;
 
-/// The newest protocol version this build speaks, and the lowest a registration may
-/// name (the map's `min_protocol`).
-pub const PROTOCOL: u32 = 1;
+/// The newest protocol version this build speaks: the worker protocol's, so the two
+/// cannot drift (`kbf --version --json` reports one number for the whole binary).
+pub const PROTOCOL: u32 = crate::worker::PROTOCOL_VERSION;
+
+/// The oldest protocol version this build accepts from a storage node: the worker
+/// protocol's, for the same reason. It is the floor (the map's `min_protocol`) of the
+/// first map a build makes.
+pub const OLDEST_PROTOCOL: u32 = crate::worker::OLDEST_PROTOCOL_VERSION;
 
 /// How long rows live and how many owners a digest has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,9 +301,27 @@ pub enum MembershipError {
         current: u64,
     },
     /// Only `Joining`, `CatchingUp`, `Active` and `Draining` are set by hand; `Down` is
-    /// the store's verdict.
+    /// the store's verdict, or an operator's planned restart ([`Members::plan_down`]).
     #[error("a member cannot be set {0:?}")]
     NotSettable(MemberState),
+    /// Only an `Active` member can be planned down.
+    #[error("member {id} is {state:?}: only an Active member can be planned down")]
+    NotActive {
+        /// The member.
+        id: MemberId,
+        /// Its state.
+        state: MemberState,
+    },
+    /// The pins are at the cap: a new join or drain is refused until one lapses.
+    #[error(
+        "{held} maps from before recent changes are pinned (the cap is {cap}): try again after the dwell"
+    )]
+    PinsFull {
+        /// How many pins the store holds.
+        held: usize,
+        /// The cap.
+        cap: usize,
+    },
     /// Another writer kept winning the compare-and-set.
     #[error("gave up after {ATTEMPTS} attempts against other writers")]
     Contended,
@@ -259,83 +334,6 @@ pub enum MembershipError {
     /// The members the rows give do not make a map.
     #[error("the members do not make a map: {0}")]
     Map(#[from] MapError),
-}
-
-/// A stored member row: the member as the map will hold it, its boot counter and the
-/// newest debts report.
-#[derive(Clone, PartialEq, prost::Message)]
-struct Row {
-    #[prost(message, optional, tag = "1")]
-    member: Option<pb::Member>,
-    #[prost(uint64, tag = "2")]
-    boot: u64,
-    #[prost(message, optional, tag = "3")]
-    report: Option<StoredReport>,
-}
-
-/// [`Report`] as stored.
-#[derive(Clone, PartialEq, prost::Message)]
-struct StoredReport {
-    #[prost(bool, tag = "1")]
-    known: bool,
-    #[prost(uint64, tag = "2")]
-    debts: u64,
-    /// The store's clock at receipt, in nanoseconds.
-    #[prost(uint64, tag = "3")]
-    at_nanos: u64,
-}
-
-impl From<&Report> for StoredReport {
-    fn from(report: &Report) -> Self {
-        let (known, debts) = report.debts.to_wire();
-        Self {
-            known,
-            debts,
-            at_nanos: u64::try_from(report.at.as_duration().as_nanos()).unwrap_or(u64::MAX),
-        }
-    }
-}
-
-impl From<&StoredReport> for Report {
-    fn from(stored: &StoredReport) -> Self {
-        Self {
-            debts: Debts::from_wire(stored.known, stored.debts),
-            at: StoreTime::from_duration(Duration::from_nanos(stored.at_nanos)),
-        }
-    }
-}
-
-/// A decoded row and the version it was read at.
-struct Live {
-    member: Member,
-    boot: u64,
-    report: Option<Report>,
-    version: Version,
-}
-
-fn decode_row(stored: &Versioned) -> Result<Live, MembershipError> {
-    let row = Row::decode(stored.value.as_slice())
-        .map_err(|e| MembershipError::Corrupt(format!("member row: {e}")))?;
-    let mut member = Member::try_from(row.member.unwrap_or_default())
-        .map_err(|e| MembershipError::Corrupt(format!("member row: {e}")))?;
-    // The row's counter is the authority (a row written before the map named boots has
-    // none inside the member).
-    member.boot = row.boot;
-    Ok(Live {
-        member,
-        boot: row.boot,
-        report: row.report.as_ref().map(Report::from),
-        version: stored.version,
-    })
-}
-
-fn encode_row(member: &Member, boot: u64, report: Option<&Report>) -> Vec<u8> {
-    Row {
-        member: Some(pb::Member::from(member)),
-        boot,
-        report: report.map(StoredReport::from),
-    }
-    .encode_to_vec()
 }
 
 fn decode_map(stored: &Versioned) -> Result<Map, MembershipError> {
@@ -354,6 +352,12 @@ fn down_key(id: MemberId) -> String {
 
 fn boot_counter(id: MemberId) -> String {
     format!("boot/{}", id.0)
+}
+
+/// The claim on a member id: `member-owner/<id>` holds the instance that has it, written
+/// with the instance's own row so no two instances are ever given one id.
+fn owner_key(id: MemberId) -> String {
+    format!("member-owner/{}", id.0)
 }
 
 fn instance_key(instance: &str) -> String {
@@ -381,15 +385,25 @@ struct Plan {
     guards: Vec<(MemberId, Cond)>,
 }
 
+/// The floor (`min_protocol`) of the map a change of `current` makes, for a build that
+/// accepts nodes from protocol `oldest` on: `oldest` for the first map; after it the stored
+/// floor, lifted to `oldest` if that is higher. It never falls, so a build with a lower
+/// `oldest` (a rolled-back frontend) keeps the floor the map has. Pure.
+fn next_floor(current: Option<&Map>, oldest: u32) -> u32 {
+    current.map_or(oldest, |map| map.min_protocol().max(oldest))
+}
+
 /// The next map from the current one, the live rows, the live `down/` marks and the deny
-/// list the `deny/` rows give (`denied`: every entry once, sorted); `None` when it would
-/// not change (or there is no member to put in one). A change of `denied` alone is a change.
-/// Pure.
+/// list the `deny/` rows give (`denied`: every entry once, sorted), carrying `floor`
+/// ([`next_floor`]); `None` when it would not change (or there is no member to put in one). A
+/// change of `denied` alone is a change, and a `floor` that differs from the map's is not:
+/// it is lifted by the next change. Pure.
 fn plan(
     current: Option<&Map>,
     rows: &BTreeMap<MemberId, Live>,
     marks: &BTreeSet<MemberId>,
     denied: &[DenyEntry],
+    floor: u32,
     config: &MembershipConfig,
 ) -> Result<Option<Plan>, MapError> {
     let mut members: BTreeMap<MemberId, Member> = rows
@@ -432,7 +446,7 @@ fn plan(
         members,
         Rule::Rendezvous,
         r,
-        current.map_or(PROTOCOL, Map::min_protocol),
+        floor,
         denied.to_vec(),
     )?;
     Ok(Some(Plan {
@@ -445,64 +459,118 @@ fn plan(
 /// How a row is rewritten in place.
 #[derive(Clone, Copy)]
 enum Touch {
-    /// A heartbeat of this boot, what it reports and what it says it owes: a whole time to
-    /// live more, and the debts report replaced.
-    Beat(u64, Progress, Debts),
+    /// A heartbeat of this boot, what it reports, what it says it owes and what it says of
+    /// the handoff: a whole time to live more, and the debts report replaced.
+    Beat(u64, Progress, Reported, Fill),
     /// An administrator's state change: the time to live it had.
     State(MemberState),
+    /// An administrator's planned restart of an `Active` member: `Down` in the row, with
+    /// the dwell mark, in one transaction.
+    PlanDown(Duration),
+    /// An administrator's undoing of a planned restart: `Active` again, only for a member
+    /// that is `Down` on a live row; any other state is left as it is.
+    UndoPlan,
 }
 
-/// The maps a process has seen: the newest, and the generation it replaced.
+/// The maps a process has seen: the newest, and the generations before it.
 #[derive(Default)]
 struct Seen {
     latest: Option<Arc<Map>>,
-    previous: Option<Arc<Map>>,
+    /// Newest first, all older than `latest`, at most [`RETAINED_MAPS`].
+    history: Vec<Arc<Map>>,
 }
 
 /// Membership over a state store.
 pub struct Members {
     store: Arc<dyn Store>,
     config: MembershipConfig,
-    /// The newest map this process has seen, whoever bumped it, and the one before it.
+    /// The newest map this process has seen, whoever bumped it, and those before it.
     seen: Mutex<Seen>,
     /// Its generation (0 before any): [`MapSource::changes`].
     generation: watch::Sender<u64>,
+    /// The oldest protocol this build accepts: the least floor of any map it makes.
+    oldest: u32,
+    /// Automatic promotion of joiners ([`Members::with_handoff`]); `None`: by an operator only.
+    handoff: Option<Handoff>,
 }
 
 impl Members {
-    /// Membership kept in `store`.
+    /// Membership kept in `store`, for a build that accepts storage nodes from
+    /// [`OLDEST_PROTOCOL`] on.
     #[must_use]
     pub fn new(store: Arc<dyn Store>, config: MembershipConfig) -> Self {
+        Self::with_oldest_protocol(store, config, OLDEST_PROTOCOL)
+    }
+
+    /// Membership for a build that accepts storage nodes from protocol `oldest` on. Every
+    /// protocol constant is 1 today, so this is how a test stands in for a later build. Only
+    /// the oldest end of the range judges anything: a node that speaks newer than the
+    /// frontend speaks down to it, so the newest end has no role here.
+    #[must_use]
+    pub fn with_oldest_protocol(
+        store: Arc<dyn Store>,
+        config: MembershipConfig,
+        oldest: u32,
+    ) -> Self {
         Self {
             store,
             config,
             seen: Mutex::default(),
             generation: watch::Sender::new(0),
+            oldest,
+            handoff: None,
         }
     }
 
-    /// Notes `map` as seen: if it is newer than the last, keeps it and wakes the
-    /// [`MapSource::changes`] receivers.
-    fn publish(&self, map: &Map) {
+    /// These members with automatic promotion of joiners on ([`Handoff`]; `--auto-promote`):
+    /// a joiner is made `Active` by its own beat when it is filled (module `promote`), and
+    /// [`Members::refresh`] runs the fence that says so (module `fence`). An operator's
+    /// `set_state(Active)` stays the override.
+    #[must_use]
+    pub fn with_handoff(mut self, handoff: Handoff) -> Self {
+        self.handoff = Some(handoff);
+        self
+    }
+
+    /// Notes `map` as seen: if it is newer than the last, keeps it (and the one it
+    /// replaced) and wakes the [`MapSource::changes`] receivers. `older` are maps the
+    /// store holds from before `map` (the pins, or the map a bump replaced): those this
+    /// process does not have join its history, which stays newest first and at most
+    /// [`RETAINED_MAPS`] long.
+    fn publish(&self, map: &Map, older: Vec<Map>) {
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         if seen
             .latest
             .as_ref()
             .is_none_or(|l| l.generation() < map.generation())
         {
-            seen.previous = seen.latest.replace(Arc::new(map.clone()));
+            if let Some(replaced) = seen.latest.replace(Arc::new(map.clone())) {
+                seen.history.insert(0, replaced);
+            }
             self.generation.send_replace(map.generation());
         }
+        let newest = seen.latest.as_ref().map_or(0, |l| l.generation());
+        for map in older {
+            let generation = map.generation();
+            if generation < newest && seen.history.iter().all(|m| m.generation() != generation) {
+                seen.history.push(Arc::new(map));
+            }
+        }
+        seen.history
+            .sort_by_key(|m| std::cmp::Reverse(m.generation()));
+        seen.history.truncate(RETAINED_MAPS);
     }
 
-    /// The newest map this process has seen and the one it replaced, which a call routed
-    /// by the newer finds a blob written before the change in. `None` before any map.
-    /// Reads no store: [`Members::current_map`] does, and publishes what it finds.
+    /// The newest map this process has seen and the generations before it, newest first
+    /// (a blob written before a change is found in them), at most [`RETAINED_MAPS`]. A
+    /// restarted process has the maps the pins hold after its first read of the store
+    /// ([`Members::current_map`]). `None` before any map. Reads no store:
+    /// [`Members::current_map`] does, and publishes what it finds.
     #[must_use]
-    pub fn view(&self) -> Option<(Arc<Map>, Option<Arc<Map>>)> {
+    pub fn view(&self) -> Option<(Arc<Map>, Vec<Arc<Map>>)> {
         let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         let latest = seen.latest.clone()?;
-        Some((latest, seen.previous.clone()))
+        Some((latest, seen.history.clone()))
     }
 
     /// The map the push protocol reads: its current value (`None` until the first member
@@ -520,6 +588,12 @@ impl Members {
         }))
     }
 
+    /// The settings of automatic promotion, if it is on ([`Members::with_handoff`]).
+    #[must_use]
+    pub fn handoff(&self) -> Option<Handoff> {
+        self.handoff
+    }
+
     /// The configuration.
     #[must_use]
     pub fn config(&self) -> &MembershipConfig {
@@ -528,74 +602,95 @@ impl Members {
 
     /// Registers a storage node: assigns its id (the same for the same instance) and a
     /// larger boot counter, writes its row as `Active` (`CatchingUp` if it is rebuilding
-    /// its index, see the module docs), and rebuilds the map.
+    /// its index, `Joining` while its `unfilled/` mark is there: see the module docs and
+    /// `join`), and rebuilds the map.
+    ///
+    /// The node is judged against the floor of the map this registration makes
+    /// ([`next_floor`]: the stored map's, lifted to this build's oldest), so what the store
+    /// holds decides, not the build's constants. The map is read first, then the node's
+    /// protocol compared, and only then is an identity assigned: a refused node leaves no
+    /// row. The read is [`Members::current_map`], so it also publishes the stored map to
+    /// [`Members::view`] and [`MapSource::changes`], refused or not, and a registration costs
+    /// one more store read than it did. The read and the commit are not one transaction: a
+    /// floor another frontend raises between them is not applied to this call.
     ///
     /// # Errors
-    /// [`MembershipError::Invalid`] or [`MembershipError::Protocol`] for a bad request;
-    /// [`MembershipError::Superseded`] if a newer registration of the instance won;
-    /// the store failing; [`MembershipError::Contended`].
+    /// [`MembershipError::Invalid`] for a bad request; the store failing (the map is read
+    /// before the protocol is judged, so a store that fails is this and not
+    /// [`MembershipError::Protocol`]); [`MembershipError::Protocol`] for a node below the
+    /// floor; [`MembershipError::Superseded`] if a newer registration of the instance won;
+    /// [`MembershipError::Contended`]; [`MembershipError::PinsFull`] for a new instance that
+    /// would join a farm holding data while the pins are at the cap (it gets no identity).
     pub fn register(&self, who: &Registrant) -> Result<Registration, MembershipError> {
+        self.register_after(who, None)
+    }
+
+    /// [`Members::register`] for a node that says which member and boot its metadata log
+    /// last wrote as (`last`; `None` for a node that has no log history or an older node
+    /// that does not say). The store assigns numbers the log will accept: see `assign`.
+    ///
+    /// # Errors
+    /// As [`Members::register`].
+    pub fn register_after(
+        &self,
+        who: &Registrant,
+        last: Option<LastBoot>,
+    ) -> Result<Registration, MembershipError> {
         if who.instance_id.is_empty() || who.addr.is_empty() || who.weight == 0 {
             return Err(MembershipError::Invalid(
                 "an instance id, an address and a weight of at least 1 are required",
             ));
         }
-        if who.protocol < PROTOCOL {
+        let floor = next_floor(self.current_map()?.as_ref(), self.oldest);
+        if who.protocol < floor {
             return Err(MembershipError::Protocol {
                 got: who.protocol,
-                min: PROTOCOL,
+                min: floor,
             });
         }
-        let (id, boot) = self.assign(&who.instance_id)?;
+        // A new instance on a farm that holds data is a joiner ([`Members::assign`]): refused,
+        // before it gets an identity or a mark, when the pins are full.
+        if self.store.get(&instance_key(&who.instance_id))?.is_none() && self.holds_data()? {
+            self.pins_full()?;
+        }
+        let (id, boot) = self.assign(&who.instance_id, last)?;
         let member = Member {
             id,
-            addr: who.addr.clone(),
+            // The spelling enrollment stores, so the update controller can join a host to it.
+            addr: kbf_enroll_registry::canonical_addr(&who.addr),
             zone: who.zone.clone(),
             weight: who.weight,
-            state: match who.progress {
-                Progress::CatchingUp => MemberState::CatchingUp,
-                Progress::CaughtUp => MemberState::Active,
-            },
+            state: MemberState::Active,
             // Published in the map, so a restart inside the lease changes the member (and the
             // generation) even when nothing else about it did.
             boot,
         };
-        self.write_row(&member, boot)?;
+        self.write_row(
+            member,
+            who.progress == Progress::CatchingUp,
+            boot,
+            named_protocol(who.protocol),
+        )?;
         let map = self.refresh()?.ok_or(MembershipError::NoMap)?;
         Ok(Registration { id, boot, map })
     }
 
-    /// The id of `instance` (assigned on first sight) and a new boot counter for it.
-    fn assign(&self, instance: &str) -> Result<(MemberId, u64), MembershipError> {
-        let key = instance_key(instance);
-        for _ in 0..ATTEMPTS {
-            let (id, txn) = match self.store.get(&key)? {
-                Some(known) => {
-                    let id = MemberId(decode_id(&known.value)?);
-                    let txn = Txn::new().check(&key, Cond::Version(known.version));
-                    (id, txn.next(boot_counter(id)))
-                }
-                None => {
-                    // A counter has no precondition, so it cannot conflict.
-                    let taken = self.store.txn(Txn::new().next(ID_COUNTER))?;
-                    let id = MemberId(taken.map_err(|_| MembershipError::Contended)?.counters[0]);
-                    let txn = Txn::new().put(&key, id.0.to_be_bytes(), Cond::Absent);
-                    (id, txn.next(boot_counter(id)))
-                }
-            };
-            if let Ok(commit) = self.store.txn(txn)? {
-                return Ok((id, commit.counters[0]));
-            }
-        }
-        Err(MembershipError::Contended)
-    }
-
     /// Stores `member`'s row with a whole time to live, unless a newer boot is there, and
-    /// clears its `down/` mark. An `Active` row also writes `meta/members_formed`, in the
-    /// same transaction.
-    fn write_row(&self, member: &Member, boot: u64) -> Result<(), MembershipError> {
+    /// clears its `down/` mark. The row names the `protocol` this registration did, in
+    /// place of any an earlier boot wrote. The state is [`Members::admit`]'s (read again at
+    /// every attempt, and the write checks the mark it read); an `Active` row also writes
+    /// `meta/members_formed`, in the same transaction.
+    fn write_row(
+        &self,
+        mut member: Member,
+        rebuilding: bool,
+        boot: u64,
+        protocol: Option<u32>,
+    ) -> Result<(), MembershipError> {
         let key = member_key(member.id);
         for _ in 0..ATTEMPTS {
+            let (state, mark) = self.admit(member.id, rebuilding)?;
+            member.state = state;
             let cond = match self.store.get(&key)? {
                 Some(stored) => {
                     let current = decode_row(&stored)?.boot;
@@ -610,14 +705,26 @@ impl Members {
                 }
                 None => Cond::Absent,
             };
-            let mut txn = Txn::new();
+            let mut txn = Txn::new().check(join::unfilled_key(member.id), mark);
             if member.state == MemberState::Active {
-                txn = txn.put(FORMED, Vec::new(), Cond::Any);
+                txn = self.formed(txn)?;
             }
             let txn = txn
-                .put_ttl(&key, encode_row(member, boot, None), self.config.ttl, cond)
+                .put_ttl(
+                    &key,
+                    encode_row(&member, boot, protocol, None, None, Fill::default()),
+                    self.config.ttl,
+                    cond,
+                )
                 .delete(down_key(member.id), Cond::Any);
             if self.store.txn(txn)?.is_ok() {
+                if member.state == MemberState::Joining {
+                    tracing::warn!(
+                        member = member.id.0,
+                        addr = %member.addr,
+                        "a joiner: it is not primary until promoted by the operator (POST /v1/members, state active)"
+                    );
+                }
                 return Ok(());
             }
         }
@@ -645,10 +752,27 @@ impl Members {
         id: MemberId,
         boot: u64,
         progress: Progress,
-        debts: Debts,
+        said: Reported,
         holder: Option<&dyn Fn(&str) -> bool>,
     ) -> Result<u64, MembershipError> {
-        if self.touch(id, Touch::Beat(boot, progress, debts), holder)? {
+        self.heartbeat_with(id, boot, progress, said, Fill::default(), holder)
+    }
+
+    /// [`Members::heartbeat`] for a node that also says how far its flush and its tail have
+    /// got (`fill`). A joiner's beat that finds it filled promotes it ([`Handoff`]).
+    ///
+    /// # Errors
+    /// As [`Members::heartbeat`].
+    pub fn heartbeat_with(
+        &self,
+        id: MemberId,
+        boot: u64,
+        progress: Progress,
+        said: Reported,
+        fill: Fill,
+        holder: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<u64, MembershipError> {
+        if self.touch(id, Touch::Beat(boot, progress, said, fill), holder)? {
             return Ok(self.refresh()?.map_or(0, |map| map.generation()));
         }
         Ok(self.current_map()?.map_or(0, |map| map.generation()))
@@ -664,8 +788,106 @@ impl Members {
         if state == MemberState::Down {
             return Err(MembershipError::NotSettable(state));
         }
+        if state == MemberState::Draining {
+            let draining = self
+                .store
+                .get(&member_key(id))?
+                .map(|stored| decode_row(&stored))
+                .transpose()?
+                .is_some_and(|live| live.member.state == MemberState::Draining);
+            // As for a join, only a farm that holds data has a handoff to bound.
+            if !draining && self.holds_data()? {
+                self.pins_full()?;
+            }
+        }
         self.touch(id, Touch::State(state), None)?;
         self.refresh()?.ok_or(MembershipError::NoMap)
+    }
+
+    /// Takes a live `Active` member out of the write path for a planned restart of at most
+    /// `for_`, and rebuilds the map: it is `Down` in the map at once, so every router, chain
+    /// and repair worker that holds the new map skips it for writes and reads its blobs from
+    /// the other owner, and a map an older build holds reads it like any `Down` member. The
+    /// `down/` mark that holds its slot for the dwell is written in the same transaction as
+    /// the row, with a value that says an operator planned it ([`Members::planned`]).
+    ///
+    /// The member keeps heartbeating until it stops and a heartbeat does not undo this, until
+    /// `for_` has passed: the first heartbeat after that returns it to `Active` through the
+    /// way a promotion goes (a controller that died, or a restart that never came, does not
+    /// strand a healthy node). It is undone sooner by [`Members::set_state`] to `Active`, or
+    /// by the member registering again (the restart did happen: `Active`, or `CatchingUp`
+    /// while it rebuilds, the mark deleted); if it stops and does not return, its row
+    /// expires and the dwell, counted from this call, decides when it leaves the map.
+    ///
+    /// **Mixed frontends.** The end of the plan lives in the member's row (tag 5), which a
+    /// frontend built before it does not know: it keeps the state `Down` when it rewrites the
+    /// row (a heartbeat, a promotion) but drops the end, so the plan would never run out.
+    /// Plan nothing down while a frontend of an older build serves the same state store.
+    ///
+    /// Asking again for a member already planned down is the same planned restart with its
+    /// end moved to `for_` from now: no new generation.
+    ///
+    /// # Errors
+    /// [`MembershipError::NotRegistered`] if the member has no live row;
+    /// [`MembershipError::NotActive`] unless it is `Active` or already planned down; the
+    /// store failing.
+    pub fn plan_down(&self, id: MemberId, for_: Duration) -> Result<Map, MembershipError> {
+        self.touch(id, Touch::PlanDown(for_), None)?;
+        self.refresh()?.ok_or(MembershipError::NoMap)
+    }
+
+    /// Ends a planned restart of `id` at once: a live member that is `Down` on its row (only a
+    /// plan makes that) is `Active` again, its `down/` mark deleted, and the map rebuilt.
+    /// Whether it changed anything: a member that is not planned down (it returned by its own
+    /// heartbeat or by registering again, or is `CatchingUp` or `Draining`) is left as it is,
+    /// so the undoing of a restart that happened never promotes a node that is rebuilding.
+    ///
+    /// # Errors
+    /// [`MembershipError::NotRegistered`] if the member has no live row (it stopped: its mark
+    /// is deleted when it registers again, or expires with the dwell); the store failing.
+    pub fn undo_plan(&self, id: MemberId) -> Result<bool, MembershipError> {
+        let changed = self.touch(id, Touch::UndoPlan, None)?;
+        if changed {
+            self.refresh()?;
+        }
+        Ok(changed)
+    }
+
+    /// The planned restart of `id`, if there is one: see [`Planned`].
+    ///
+    /// # Errors
+    /// The store failing; a stored row not decoding.
+    pub fn planned(&self, id: MemberId) -> Result<Planned, MembershipError> {
+        let row = match self.store.get(&member_key(id))? {
+            Some(stored) => Some(decode_row(&stored)?),
+            None => None,
+        };
+        self.planned_of(id, row.as_ref())
+    }
+
+    /// Whether `id` is `Down` because an operator planned it and the plan has not run out.
+    ///
+    /// # Errors
+    /// The store failing; a stored row not decoding.
+    pub fn planned_down(&self, id: MemberId) -> Result<bool, MembershipError> {
+        Ok(self.planned(id)?.in_force(self.store.now()))
+    }
+
+    /// `row`'s plan, or the mark's when the member has no live row (it stopped).
+    fn planned_of(&self, id: MemberId, row: Option<&Live>) -> Result<Planned, MembershipError> {
+        // A live row carries its own plan, or none; the mark speaks for a member that stopped.
+        if let Some(live) = row {
+            return Ok(live.planned_until.map_or(Planned::No, Planned::Until));
+        }
+        let marked = self
+            .store
+            .get(&down_key(id))?
+            .is_some_and(|mark| mark.value == PLANNED);
+        Ok(if marked {
+            Planned::Stopped
+        } else {
+            Planned::No
+        })
     }
 
     /// Rewrites `id`'s row as `how` says; whether its state changed. `holder` is
@@ -688,26 +910,72 @@ impl Members {
                 return Err(MembershipError::NotHolder(id));
             }
             let before = live.member.state;
+            let mut step = promote::Step::none();
             let ttl = match how {
-                Touch::Beat(boot, _, _) if boot != live.boot => {
+                Touch::Beat(boot, _, _, _) if boot != live.boot => {
                     return Err(MembershipError::Superseded {
                         id,
                         boot,
                         current: live.boot,
                     });
                 }
-                Touch::Beat(_, progress, debts) => {
+                Touch::Beat(_, progress, said, fill) => {
                     live.report = Some(Report {
-                        debts,
+                        said,
                         at: self.store.now(),
                     });
+                    live.fill = fill;
+                    if before == MemberState::Joining {
+                        step = self.beat_step(&live, progress)?;
+                        if step.promote {
+                            live.member.state = MemberState::Active;
+                        }
+                    }
                     if before == MemberState::CatchingUp && progress == Progress::CaughtUp {
                         live.member.state = MemberState::Active;
+                    }
+                    // A planned restart that ran out: the member is still beating, so it
+                    // never restarted (or the operator's controller is gone); it returns
+                    // by the way a promotion goes, not by waiting to be noticed.
+                    if before == MemberState::Down
+                        && live
+                            .planned_until
+                            .is_some_and(|until| !Planned::Until(until).in_force(self.store.now()))
+                    {
+                        live.member.state = MemberState::Active;
+                        live.planned_until = None;
                     }
                     self.config.ttl
                 }
                 Touch::State(state) => {
                     live.member.state = state;
+                    live.planned_until = None;
+                    stored
+                        .expires_at
+                        .map_or(self.config.ttl, |at| at.since(self.store.now()))
+                }
+                // `Down` on a live row is a plan (nothing else makes one), so a repeat is
+                // taken; so is one whose end an older frontend dropped.
+                Touch::PlanDown(_)
+                    if before != MemberState::Active && before != MemberState::Down =>
+                {
+                    return Err(MembershipError::NotActive { id, state: before });
+                }
+                // Asked again (or by a second controller): the same planned restart, its
+                // end moved to a whole `for_` from now.
+                // Not planned down (it returned by itself, or never went): nothing to undo, and
+                // a member that is rebuilding or draining is not promoted by this.
+                Touch::UndoPlan if before != MemberState::Down => return Ok(false),
+                Touch::UndoPlan => {
+                    live.member.state = MemberState::Active;
+                    live.planned_until = None;
+                    stored
+                        .expires_at
+                        .map_or(self.config.ttl, |at| at.since(self.store.now()))
+                }
+                Touch::PlanDown(for_) => {
+                    live.member.state = MemberState::Down;
+                    live.planned_until = Some(self.store.now().saturating_add(for_));
                     stored
                         .expires_at
                         .map_or(self.config.ttl, |at| at.since(self.store.now()))
@@ -715,12 +983,30 @@ impl Members {
             };
             let mut put = Txn::new().put_ttl(
                 &key,
-                encode_row(&live.member, live.boot, live.report.as_ref()),
+                encode_row(
+                    &live.member,
+                    live.boot,
+                    live.protocol,
+                    live.report.as_ref(),
+                    live.planned_until,
+                    live.fill,
+                ),
                 ttl,
                 Cond::Version(stored.version),
             );
+            put = step.apply(put, id);
             if live.member.state == MemberState::Active && before != MemberState::Active {
-                put = put.put(FORMED, Vec::new(), Cond::Any);
+                put = self.formed(put)?;
+            }
+            // Every time an operator's call leaves the member `Active`, not only on the
+            // transition: a mark a frontend that predates it left is cleaned by the next.
+            if matches!(how, Touch::State(_)) && live.member.state == MemberState::Active {
+                put = put.delete(join::unfilled_key(id), Cond::Any);
+            }
+            if matches!(how, Touch::PlanDown(_)) {
+                put = put.put_ttl(down_key(id), PLANNED, self.config.dwell, Cond::Any);
+            } else if before == MemberState::Down && live.member.state != MemberState::Down {
+                put = put.delete(down_key(id), Cond::Any);
             }
             if self.store.txn(put)?.is_ok() {
                 return Ok(live.member.state != before);
@@ -829,7 +1115,9 @@ impl Members {
     pub fn current_map(&self) -> Result<Option<Map>, MembershipError> {
         let stored = self.store.get(MAP_KEY)?;
         let map = stored.as_ref().map(decode_map).transpose()?;
-        map.iter().for_each(|m| self.publish(m));
+        if let Some(m) = &map {
+            self.publish(m, self.pins()?);
+        }
         Ok(map)
     }
 
@@ -847,11 +1135,22 @@ impl Members {
     /// members whose dwell ran out leave, new and changed rows enter, and the map's deny
     /// list becomes the `deny/` rows ([`Members::denied`]). Returns the map after, and
     /// bumps the generation by one compare-and-set only if something changed (an entry
-    /// added or removed is a change).
+    /// added or removed is a change). With [`Members::with_handoff`] it then moves the
+    /// marks of the joiners along ([`Members::advance`]): a failure of that is logged, never
+    /// returned, since the map is what the caller asked for and the next call tries again.
     ///
     /// # Errors
     /// The store failing; [`MembershipError::Contended`].
     pub fn refresh(&self) -> Result<Option<Map>, MembershipError> {
+        let map = self.refresh_map()?;
+        if let Err(error) = self.advance() {
+            tracing::warn!(%error, "advancing the joiners' handoff failed; tried again at the next refresh");
+        }
+        Ok(map)
+    }
+
+    /// The map's part of [`Members::refresh`].
+    fn refresh_map(&self) -> Result<Option<Map>, MembershipError> {
         for _ in 0..ATTEMPTS {
             let stored = self.store.get(MAP_KEY)?;
             let current = stored.as_ref().map(decode_map).transpose()?;
@@ -860,13 +1159,40 @@ impl Members {
             // A deny written after this read is in the next refresh's map (the sweeper's,
             // within a beat): a row that is not there yet cannot be a precondition.
             let denied = self.denied()?;
-            let Some(plan) = plan(current.as_ref(), &rows, &marks, &denied, &self.config)? else {
-                current.iter().for_each(|m| self.publish(m));
+            let floor = next_floor(current.as_ref(), self.oldest);
+            let Some(plan) = plan(
+                current.as_ref(),
+                &rows,
+                &marks,
+                &denied,
+                floor,
+                &self.config,
+            )?
+            else {
+                if let Some(m) = &current {
+                    self.publish(m, self.pins()?);
+                }
                 return Ok(current);
             };
-            let cond = stored.map_or(Cond::Absent, |s| Cond::Version(s.version));
+            let cond = stored
+                .as_ref()
+                .map_or(Cond::Absent, |s| Cond::Version(s.version));
             let wire = pb::Map::from(&plan.map).encode_to_vec();
             let mut txn = Txn::new().put(MAP_KEY, wire, cond);
+            // The map this bump replaces is pinned in the same transaction, for the dwell,
+            // and the pin that falls out of the cap goes with it.
+            if let Some(replaced) = stored.as_ref().zip(current.as_ref()) {
+                let generation = replaced.1.generation();
+                txn = txn.put_ttl(
+                    pin_key(generation),
+                    replaced.0.value.clone(),
+                    self.config.dwell,
+                    Cond::Any,
+                );
+                if let Some(gone) = generation.checked_sub(RETAINED_MAPS as u64) {
+                    txn = txn.delete(pin_key(gone), Cond::Any);
+                }
+            }
             for id in &plan.newly_down {
                 txn = txn.put_ttl(down_key(*id), Vec::new(), self.config.dwell, Cond::Any);
             }
@@ -874,7 +1200,7 @@ impl Members {
                 txn = txn.check(member_key(*id), *cond);
             }
             if self.store.txn(txn)?.is_ok() {
-                self.publish(&plan.map);
+                self.publish(&plan.map, current.into_iter().collect());
                 return Ok(Some(plan.map));
             }
         }
@@ -889,6 +1215,28 @@ impl Members {
     /// # Errors
     /// The store failing; a stored value not decoding.
     pub fn storage_health(&self) -> Result<StorageHealth, MembershipError> {
+        let (members, now) = self.member_reports()?;
+        Ok(storage_health(&members, now, self.config.freshness()))
+    }
+
+    /// Whether storage node `node` may be stopped now ([`node_idle`]): `at_generation` is
+    /// the map that stopped routing writes to it, which its last report must have seen.
+    ///
+    /// # Errors
+    /// [`NotIdle`] naming the first reason; a membership that cannot be read is one.
+    pub fn node_idle(&self, node: MemberId, at_generation: u64) -> Result<(), NotIdle> {
+        let (members, now) = self
+            .member_reports()
+            .map_err(|e| NotIdle::Unreadable(e.to_string()))?;
+        node_idle(&members, now, self.config.freshness(), node, at_generation)
+            .into_iter()
+            .next()
+            .map_or(Ok(()), Err)
+    }
+
+    /// The members as the judgements read them, and the store's clock after the reads, so
+    /// a report is judged no fresher than the clock then was.
+    fn member_reports(&self) -> Result<(Vec<MemberReport>, StoreTime), MembershipError> {
         let mut members: BTreeMap<MemberId, MemberReport> = BTreeMap::new();
         for member in self.current_map()?.as_ref().map_or(&[][..], Map::members) {
             members.insert(
@@ -896,6 +1244,7 @@ impl Members {
                 MemberReport {
                     id: member.id,
                     state: member.state,
+                    planned: Planned::No,
                     report: None,
                 },
             );
@@ -906,14 +1255,34 @@ impl Members {
                 MemberReport {
                     id,
                     state: live.member.state,
+                    planned: Planned::No,
                     report: live.report,
                 },
             );
         }
-        // After the reads, so a report is judged no fresher than the clock then was.
+        let rows = self.read_rows()?;
+        for member in members.values_mut() {
+            if member.state == MemberState::Down {
+                member.planned = self.planned_of(member.id, rows.get(&member.id))?;
+            }
+        }
         let now = self.store.now();
-        let members: Vec<MemberReport> = members.into_values().collect();
-        Ok(storage_health(&members, now, self.config.freshness()))
+        Ok((members.into_values().collect(), now))
+    }
+
+    /// The protocol version each member with a live row registered naming (`None`: the row
+    /// names none, as a row written before the field existed). A member the map holds
+    /// whose row has lapsed (`Down`) is not here: its row, which held the version, expired
+    /// with the heartbeats, so a reader treats it as not known.
+    ///
+    /// # Errors
+    /// The store failing; a stored row not decoding.
+    pub fn protocols(&self) -> Result<BTreeMap<MemberId, Option<u32>>, MembershipError> {
+        Ok(self
+            .read_rows()?
+            .into_iter()
+            .map(|(id, live)| (id, live.protocol))
+            .collect())
     }
 
     fn read_rows(&self) -> Result<BTreeMap<MemberId, Live>, MembershipError> {

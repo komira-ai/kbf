@@ -32,21 +32,13 @@ mod tests {
     use crate::linux::host::CRUN;
     use crate::linux::modes::{self, Mode};
 
-    /// Catches a rendered unit (converged or per mode) that does not pass the `crun`
+    /// Catches a rendered unit that does not pass the `crun`
     /// program, or that passes a runtime flag the daemon no longer has: every unit that
     /// runs builds passes `--oci-runtime=`, so a node set up from them runs `crun`.
     #[test]
     fn every_rendered_build_unit_passes_the_crun_program_and_no_runtime_flag() {
         let example = include_str!("../../templates/linux/config.example");
         let config = LinuxConfig::parse(example).expect("valid settings");
-        let converged = crate::linux::render::render(
-            &config,
-            Some(1500),
-            &crate::linux::render::Templates::BUILT_IN,
-        )
-        .expect("renders");
-        let daemon = UnitFile::parse(&converged.daemon).expect("unit");
-        assert_eq!(check("kbf-daemon.service", &daemon), Vec::<String>::new());
         for mode in Mode::ALL {
             let text = modes::render(&config, Some(1500), mode).expect("renders");
             let unit = UnitFile::parse(&text).expect("unit");

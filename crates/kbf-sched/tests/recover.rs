@@ -10,9 +10,9 @@ use kbf_sched::{
     RequeueReason, Scheduler,
 };
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmFault, FarmRun, FarmTime,
-    LeaseId, LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Qos, Resources, StateMachine,
-    WaiterId, WorkerId,
+    ActionKey, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmFault, FarmRun,
+    FarmTime, LeaseId, LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Qos,
+    Resources, ResultRecord, StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -431,4 +431,69 @@ fn a_fate_without_runs_raises_the_booking_and_holds_no_kills() {
     assert_eq!(s.fate(OperationId(99)), None, "an operation not held");
     assert_eq!(s.fate(OperationId(6)), None, "no kills to hand on");
     assert!(s.memory_state().runs_by_operation().is_empty());
+}
+
+/// Catches: an operation taken in while the scheduler runs (the store holds one another
+/// writer queued) that does not move the ids past its own (the next operation would
+/// take its id), that is not joined by a request for its action (a second run), or
+/// that is not placed like a recovered one; and a skip that moves the ids back.
+#[test]
+fn an_operation_taken_in_while_running_is_joined_and_the_ids_move_past_it() {
+    let mut s = recovered(Vec::new());
+    s.take_in(queued(12, request(3)));
+    assert_eq!(s.state(OperationId(12)), Some(&OpState::Queued));
+    assert_eq!(s.next_operation(), OperationId(13));
+    assert_eq!(s.queued_len(), 1);
+
+    let again = Event::Submit {
+        waiter: WaiterId(99),
+        request: request(3),
+    };
+    assert!(feed(&mut s, 0, again).is_empty());
+    assert_eq!(
+        s.waiters(OperationId(12)),
+        Some(&[WaiterId(12), WaiterId(99)][..])
+    );
+    assert_eq!(s.next_operation(), OperationId(13), "a joiner took an id");
+
+    s.skip_to(OperationId(20));
+    assert_eq!(s.next_operation(), OperationId(20));
+    s.skip_to(OperationId(15));
+    assert_eq!(s.next_operation(), OperationId(20), "the ids went back");
+}
+
+/// Catches: `take_in` of an operation the scheduler holds that takes it up again: the
+/// store's rows of a finished operation outlive its finish while the write is held, and
+/// a request that finds them must not queue the finished operation afresh (a second
+/// run, a new waiter over the answered ones, the twin entry set again). The state, the
+/// queue, the waiters and the twin stay as the scheduler holds them; one it does not
+/// hold is taken.
+#[test]
+fn an_operation_the_scheduler_holds_is_not_taken_in_again() {
+    let mut s = recovered(vec![leased(12, request(3), 5, "node-a")]);
+    up(&mut s, 0, "node-a");
+    heartbeat(&mut s, 1, "node-a", vec![LeaseId::new(TERM, 5)]);
+    let done = Event::Committed(ControlRecord::Result(ResultRecord {
+        lease: LeaseId::new(TERM, 5),
+        operation: OperationId(12),
+        outcome: Outcome::Failed(Failure::Invalid),
+    }));
+    assert!(matches!(
+        feed(&mut s, 2, done).as_slice(),
+        [Effect::Answer(_)]
+    ));
+    let finished = s.state(OperationId(12)).cloned();
+    assert!(finished.as_ref().is_some_and(OpState::is_done));
+    assert_eq!(s.twin(&request(3)), None);
+
+    assert!(
+        !s.take_in(queued(12, request(3))),
+        "a held operation was taken"
+    );
+
+    assert_eq!(s.state(OperationId(12)), finished.as_ref());
+    assert_eq!(s.queued_len(), 0);
+    assert_eq!(s.waiters(OperationId(12)), Some(&[WaiterId(12)][..]));
+    assert_eq!(s.twin(&request(3)), None, "a finished operation is a twin");
+    assert!(s.take_in(queued(13, request(4))), "a new one was refused");
 }

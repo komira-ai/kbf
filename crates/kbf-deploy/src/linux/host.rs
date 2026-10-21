@@ -8,8 +8,8 @@ use std::fmt;
 use std::io::{self, Write};
 use std::process::Output;
 
-use crate::linux::check::Failure;
 use crate::linux::config::LinuxError;
+use crate::linux::shared::Failure;
 use crate::template::TemplateError;
 use crate::unit::UnitError;
 use kbf_host::exec::{Entry, Exec, Meta, succeeded};
@@ -18,7 +18,7 @@ use kbf_host::plan::Planner;
 use kbf_host::step::{Cmd, Owner, Perms, Step, UrlError};
 use kbf_host::user::{self, RunUser, UserError};
 
-use super::check::CheckError;
+use super::shared::CheckError;
 
 /// The tools the verbs run, where Debian and Ubuntu put them.
 pub const SYSTEMCTL: &str = "/usr/bin/systemctl";
@@ -70,10 +70,6 @@ pub enum HostError {
         "no cgroup v2 memory controller at /sys/fs/cgroup: boot with systemd.unified_cgroup_hierarchy=1"
     )]
     NoMemoryController,
-    #[error(
-        "{0} is not a systemd unit on this host, so the MinIO drop-in would apply to nothing. If MinIO runs in Kubernetes here, its priority comes from the pod"
-    )]
-    NoMinioUnit(String),
     #[error("no user {0}: useradd --system --create-home {0}")]
     NoUser(String),
     #[error(
@@ -101,8 +97,6 @@ pub enum HostError {
     },
     #[error("{path} has mode {perms}: chmod 600 {path}")]
     Readable { path: HostPath, perms: Perms },
-    #[error("{0} needs AWS_ACCESS_KEY_ID= and AWS_SECRET_ACCESS_KEY= lines, each with a value")]
-    S3Env(HostPath),
     #[error("port {0} is in use: free it or pick another in the config")]
     PortInUse(u16),
     #[error("the rendered units break the priorities; nothing was written:\n{}", lines(.0))]

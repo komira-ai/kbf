@@ -11,6 +11,10 @@ use crate::{Answer, PREFIX, Source};
 
 mod action;
 mod build;
+mod leases;
+mod queue;
+mod sched;
+mod updates;
 
 pub(crate) use action::action;
 #[cfg(test)]
@@ -18,6 +22,30 @@ pub(crate) use action::{ACTION, LOG_SHOWN_MAX_BYTES};
 #[cfg(test)]
 pub(crate) use build::BUILD;
 pub(crate) use build::build;
+#[cfg(test)]
+pub(crate) use leases::LEASES;
+use leases::LEASES_PATH;
+pub(crate) use leases::leases;
+#[cfg(test)]
+pub(crate) use queue::QUEUE;
+use queue::QUEUE_PATH;
+pub(crate) use queue::queue;
+#[cfg(test)]
+pub(crate) use sched::fixtures::sched_farm;
+#[cfg(test)]
+pub(crate) use updates::UPDATES;
+use updates::UPDATES_PATH;
+pub(crate) use updates::updates;
+
+/// The Builds page's path: the build id lookup, moved here from the prefix itself.
+pub(crate) const BUILDS_PATH: &str = "/ui/builds";
+
+/// Overview: the first page. It reads no route yet; the pages that carry the farm's
+/// health and the latest builds come with their routes.
+pub(crate) const OVERVIEW: Page = Page {
+    name: "Overview",
+    reads: &[],
+};
 
 /// Builds: look a build up by id.
 pub(crate) const BUILDS: Page = Page {
@@ -27,7 +55,9 @@ pub(crate) const BUILDS: Page = Page {
 
 /// Every page, for the contract test.
 #[cfg(test)]
-pub(crate) const PAGES: [&Page; 3] = [&BUILDS, &BUILD, &ACTION];
+pub(crate) const PAGES: [&Page; 7] = [
+    &OVERVIEW, &BUILDS, &BUILD, &ACTION, &UPDATES, &LEASES, &QUEUE,
+];
 
 /// What a path segment keeps unencoded: RFC 3986's unreserved characters.
 const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
@@ -103,6 +133,35 @@ pub(crate) fn not_found(path: &str) -> Answer {
     Answer::html(404, body)
 }
 
+/// The Overview page: where the pages are. It reads no route.
+pub(crate) fn overview() -> Answer {
+    let body = layout::page(OVERVIEW.name, PREFIX, &[], |h| {
+        h.el("h1", &[], |h| {
+            h.text("Overview");
+        });
+        h.el("p", &[attr("class", "hint")], |h| {
+            h.text(
+                "A read-only view of the farm: every page shows what the farm's own API \
+                 answers, and lists the routes it read at its foot.",
+            );
+        });
+        h.el("ul", &[], |h| {
+            for (path, label) in [
+                (BUILDS_PATH, "Builds"),
+                (UPDATES_PATH, "Updates"),
+                (LEASES_PATH, "Leases"),
+                (QUEUE_PATH, "Queue"),
+            ] {
+                let href = Href::root_relative(path).expect("a page's path is root-relative");
+                h.el("li", &[], |h| {
+                    h.link(&href, label);
+                });
+            }
+        });
+    });
+    Answer::html(200, body)
+}
+
 /// The Builds page: a form for a build's id and, with `?id=`, that build's summary.
 pub(crate) async fn builds<S: Source>(source: &S, query: &str) -> Answer {
     let id = query_value(query, "id").filter(|id| !id.is_empty());
@@ -119,7 +178,7 @@ pub(crate) async fn builds<S: Source>(source: &S, query: &str) -> Answer {
         _ if dot => (404, &[][..]),
         _ => (200, &[][..]),
     };
-    let body = layout::page(BUILDS.name, PREFIX, r.asked(), |h| {
+    let body = layout::page(BUILDS.name, BUILDS_PATH, r.asked(), |h| {
         h.el("h1", &[], |h| {
             h.text("Builds");
         });
@@ -156,7 +215,7 @@ pub(crate) async fn builds<S: Source>(source: &S, query: &str) -> Answer {
 
 /// The id form; `id` fills it in.
 fn lookup(h: &mut Html, id: &str) {
-    let action = Href::root_relative(PREFIX).expect("the prefix is root-relative");
+    let action = Href::root_relative(BUILDS_PATH).expect("the Builds path is root-relative");
     h.el(
         "form",
         &[

@@ -274,7 +274,7 @@ impl Router {
     /// answered after owners of this generation `absent` did not. An owner that failed
     /// without saying it lacked the blob is not in `absent`: it is down, and av2-11 repairs
     /// what it missed when it is back.
-    fn found_elsewhere(
+    pub(crate) fn found_elsewhere(
         &self,
         view: &MapView,
         digest: &Digest,

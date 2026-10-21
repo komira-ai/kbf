@@ -6,12 +6,14 @@
 //! crate share one state file and one layout:
 //!
 //! - [`layout`]: each release in its own directory under
-//!   `/usr/local/kbf/releases/<commit>/`, the `current` and `previous` links beside them,
-//!   kbf-deploy's state under `/var/lib/kbf-deploy/` and its settings under
-//!   `/etc/kbf-deploy/`.
-//! - [`state`]: `state.json` (the current, previous and staged commits, the one waiting
-//!   to be confirmed, and the order floor), read and written under an exclusive lock on
-//!   `/run/kbf-deploy.lock` and replaced whole by a rename.
+//!   `/var/lib/kbf-installer/releases/<commit>/` (macOS: `/usr/local/kbf-installer`), the
+//!   `current` and `previous` links beside them in `releases/`, the state in the same tree
+//!   (macOS: `/var/db/kbf-installer`) and the trust files under
+//!   `/usr/share/kbf-installer/trust/`.
+//! - [`state`]: `state.json`, schema 2 (the current, previous and staged commits, the one
+//!   waiting to be confirmed, the order floor and the rest), with `state.json.bak` as the
+//!   last good copy, read and written under an exclusive lock on
+//!   `/run/kbf-installer/lock` and replaced whole by a rename.
 //! - [`release`]: the `install`, `rollback` and `gc` verbs.
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
@@ -54,6 +56,7 @@ use clap::{Args, Subcommand};
 use kbf_host::exec::HostExec;
 use kbf_host::path::Root;
 use kbf_host::plan::Mode;
+use kbf_installer::helper::service::{self, Procs};
 use kbf_installer::layout::{Layout, Platform};
 
 use state::{CurrentLink, Status};
@@ -183,19 +186,48 @@ pub fn run(verb: Host, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
         }
         Host::Gc(a) => {
             let host = a.apply.layout();
-            release::gc(
-                &mut HostExec::new(host.root().clone()),
-                &host,
-                a.keep,
-                a.apply.mode(),
-                out,
-            )
+            let procs = service::HostProcs::new(host.platform());
+            return gc(&procs, &host, a.keep, a.apply.mode(), out, err);
         }
     };
+    finish(done, err)
+}
+
+/// The exit of a verb: success, or the error on `err` and failure.
+fn finish<E: std::fmt::Display>(done: Result<(), E>, err: &mut dyn Write) -> ExitCode {
     match done {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(err, "kbf-deploy: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `gc`, keeping every release a process of `procs` executes from (S22); where that cannot
+/// be told, nothing is removed and the verb fails.
+fn gc(
+    procs: &dyn Procs,
+    host: &Layout,
+    keep: usize,
+    mode: Mode,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    match service::in_use(procs, host) {
+        Ok(in_use) => finish(
+            release::gc(
+                &mut HostExec::new(host.root().clone()),
+                host,
+                keep,
+                &in_use,
+                mode,
+                out,
+            ),
+            err,
+        ),
+        Err(e) => {
+            let _ = writeln!(err, "kbf-deploy: cannot tell which releases run: {e}");
             ExitCode::FAILURE
         }
     }
@@ -245,7 +277,7 @@ pub fn status_lines(host: &Layout, status: &Status) -> String {
     ));
     match &s.pending_confirm {
         Some(p) => {
-            let by = match p.deadline {
+            let by = match p.deadline_wall {
                 Some(deadline) => format!("by {deadline} (unix seconds)"),
                 None => "once its window starts (its first start)".to_owned(),
             };
@@ -257,7 +289,10 @@ pub fn status_lines(host: &Layout, status: &Status) -> String {
         }
         None => text.push_str("pending confirm: none\n"),
     }
-    text.push_str(&format!("order floor: {}\n", s.order_floor));
+    text.push_str(&format!(
+        "floor: epoch {}, order {}, generation {}\n",
+        s.floor.epoch, s.floor.order_id, s.floor.generation
+    ));
     let link = match &status.link {
         CurrentLink::Missing => "missing".to_owned(),
         CurrentLink::To(target) => target.display().to_string(),

@@ -23,7 +23,6 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::box_render::RETRY_ON;
 pub use super::check_failure::CheckFailure;
 use super::render::{CONFIG_HASH_ANNOTATION, sha256_hex};
 
@@ -493,22 +492,13 @@ fn check_envoy(
     c.require(!truthy(&chain["transport_socket"]), || {
         CheckFailure::ListenerPlaintext
     });
-    let used = check_hcm(c, hcm, &clusters, Kit::Front)?;
+    let used = check_hcm(c, hcm, &clusters)?;
     for (name, cl) in &clusters {
         if used.contains(&name.to_string()) {
-            check_cluster(c, cl, &text(name), ca_file, Kit::Front)?;
+            check_cluster(c, cl, &text(name), ca_file)?;
         }
     }
     Ok(())
-}
-
-/// Which topology's rules the connection manager is held to.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Kit {
-    /// The Kubernetes front.
-    Front,
-    /// One host's Envoy in front of two instances ([`super::box_check`]).
-    Box,
 }
 
 /// The connection manager `hcm`, its routes and the stream bounds every method of
@@ -517,7 +507,6 @@ pub(super) fn check_hcm(
     c: &mut Checker,
     hcm: &Value,
     clusters: &[(&Value, &Value)],
-    kit: Kit,
 ) -> Result<BTreeSet<String>, Malformed> {
     let codec = hcm.get("codec_type");
     let h2 = codec.is_none_or(|v| *v == "AUTO" || *v == "HTTP2");
@@ -550,7 +539,7 @@ pub(super) fn check_hcm(
     c.require(vhosts.len() == 1 && every_authority, || CheckFailure::Vhost);
     let routes = vhosts.first().map_or(&[][..], |v| list(&v["routes"]));
     for r in routes {
-        check_route_shape(c, r, kit);
+        check_route_shape(c, r);
     }
     let mut used = BTreeSet::new();
     for method in METHODS {
@@ -589,58 +578,13 @@ pub(super) fn check_hcm(
                 secs: show(idle),
             }
         });
-        if kit == Kit::Box {
-            // An action's own timeout is uncapped, so a bound on silence that the
-            // connection manager's value gives these two can cut a long one.
-            let long = method.ends_with("/Execute") || method.ends_with("/WaitExecution");
-            c.require(!long || route_idle.is_some_and(|d| d.is_zero()), || {
-                CheckFailure::ExecuteIdle {
-                    path: path.clone(),
-                    got: route_idle.map_or_else(|| "absent".to_owned(), show),
-                }
-            });
-            check_retry(c, r, &path);
-        }
     }
     Ok(used)
 }
 
-/// A route's `retry_policy` (box only): only conditions that repeat no work
-/// ([`RETRY_ON`]), and none on a ByteStream call, whose body streams.
-fn check_retry(c: &mut Checker, r: &Value, path: &str) {
-    let policy = &r["route"]["retry_policy"];
-    if policy.is_null() {
-        return;
-    }
-    let bytestream = path.starts_with("/google.bytestream.");
-    let on: Vec<&str> = policy["retry_on"]
-        .as_str()
-        .map_or_else(Vec::new, |s| s.split(',').collect());
-    let allowed = RETRY_ON.split(',').collect::<Vec<_>>();
-    let extra = extra_keys(policy, &["retry_on", "num_retries"]);
-    let why = if bytestream {
-        Some("a ByteStream body streams and cannot be replayed".to_owned())
-    } else if on.is_empty() || !on.iter().all(|c| allowed.contains(c)) {
-        Some(format!(
-            "retry_on {} is not within {RETRY_ON}",
-            text(&policy["retry_on"])
-        ))
-    } else if !extra.is_empty() {
-        Some(format!("unmodelled keys {}", json!(extra)))
-    } else {
-        None
-    };
-    if let Some(why) = why {
-        c.failures.push(CheckFailure::RetryRoutes {
-            path: path.to_owned(),
-            why,
-        });
-    }
-}
-
 /// A route matches on `path` or `prefix` alone, is not a catch-all, and its action
 /// only picks a cluster and sets timeouts.
-fn check_route_shape(c: &mut Checker, r: &Value, kit: Kit) {
+fn check_route_shape(c: &mut Checker, r: &Value) {
     let m = &r["match"];
     let prefix = m["prefix"].as_str();
     c.require(prefix != Some("") && prefix != Some("/"), || {
@@ -655,11 +599,7 @@ fn check_route_shape(c: &mut Checker, r: &Value, kit: Kit) {
             extra: json!(extra).to_string(),
         }
     });
-    let mut known = ACTION_KEYS.to_vec();
-    if kit == Kit::Box {
-        known.push("retry_policy");
-    }
-    let extra = extra_keys(&r["route"], &known);
+    let extra = extra_keys(&r["route"], &ACTION_KEYS);
     c.require(extra.is_empty(), || CheckFailure::RouteAction {
         matched: m.to_string(),
         extra: json!(extra).to_string(),
@@ -674,7 +614,6 @@ pub(super) fn check_cluster(
     cl: &Value,
     name: &str,
     ca_file: Option<&str>,
-    kit: Kit,
 ) -> Result<(), Malformed> {
     let cluster = || name.to_owned();
     let hcs = list(&cl["health_checks"]);
@@ -730,12 +669,8 @@ pub(super) fn check_cluster(
         cluster: cluster(),
     });
     for e in eps {
-        // The front dials each server by the name it checks; a box dials loopback ports
-        // and checks the one name it was given.
-        let host = match kit {
-            Kit::Front => &e["endpoint"]["address"]["socket_address"]["address"],
-            Kit::Box => &e["endpoint"]["hostname"],
-        };
+        // The front dials each server by the name it checks.
+        let host = &e["endpoint"]["address"]["socket_address"]["address"];
         let criteria = &e["metadata"]["filter_metadata"]["envoy.transport_socket_match"];
         let m = matches
             .iter()

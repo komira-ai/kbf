@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::mem::MaybeUninit;
 use std::os::fd::OwnedFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,6 +24,7 @@ use kbf_all_in_one::LocalDataPlane;
 use kbf_daemon::cpu_pool::CpuPool;
 use kbf_driver_container::tree::{OutputLimits, collect};
 use kbf_proto::reapi::{ActionResult, Digest, Tree};
+use kbf_testkit::dir::TestDir;
 use kbf_transfer::{Cas, Record, Source, fetch};
 use kbf_types::LeaseId;
 use prost::Message as _;
@@ -32,19 +33,21 @@ use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
 /// Servers started by this binary so far: each directory is one server's alone.
 static STARTED: AtomicU64 = AtomicU64::new(0);
 
-/// A fresh, empty directory under Cargo's temporary directory for this target.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-all-in-one-one-read")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch directory");
-    dir
+/// A fresh, empty directory under Cargo's temporary directory for this target, removed
+/// when it drops.
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("one-read-{name}"))
 }
 
 /// The plane over a server started in this runtime on the stores under `dir`, with a
-/// write tier (`tier`) or without one.
+/// write tier (`tier`) or without one, at the cold store's default free-space floor.
 async fn plane(dir: &Path, tier: bool) -> Arc<LocalDataPlane> {
+    plane_with_floor(dir, tier, None).await
+}
+
+/// [`plane`], with the cold store's free-space floor `floor` bytes (the server's
+/// test-only `--cold-store-floor-bytes`) in place of 5% of its disk, at least 1 GiB.
+async fn plane_with_floor(dir: &Path, tier: bool, floor: Option<u64>) -> Arc<LocalDataPlane> {
     let n = STARTED.fetch_add(1, Ordering::SeqCst);
     let mut argv = vec![
         "kbf-server".to_owned(),
@@ -55,6 +58,9 @@ async fn plane(dir: &Path, tier: bool) -> Arc<LocalDataPlane> {
             dir.join(format!("cold-{n}")).display()
         ),
     ];
+    if let Some(floor) = floor {
+        argv.push(format!("--cold-store-floor-bytes={floor}"));
+    }
     if tier {
         argv.push(format!(
             "--hot-store=file://{}",
@@ -179,7 +185,6 @@ async fn each_output_file_is_read_once(tier: bool) {
     let root = tree.root.expect("a root");
     assert_eq!(root.files.len(), 1, "{root:?}");
     assert_eq!(read(&lease, root.files[0].digest.as_ref()).await, nested);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches an output file read twice on the in-process plane (once by the walk that
@@ -231,7 +236,6 @@ async fn a_file_over_1_gib_is_read_once(tier: bool) {
     collected.expect("collect");
     let digest = result.output_files[0].digest.clone().expect("a digest");
     assert!(lease.missing(&[digest]).await.is_empty(), "not held");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches a file over 1 GiB not taken by the plane (read again, or refused): with a
@@ -255,7 +259,9 @@ async fn without_a_tier_a_file_over_1_gib_is_read_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_blob_over_5_gib_is_not_refused_for_its_size() {
     let dir = scratch("over-5-gib");
-    let plane = plane(&dir.join("server"), true).await;
+    // A floor of 64 MiB, not 5% of the disk: the store then needs the blob's 5 GiB and
+    // the floor free, not the 7 GB or more a large disk's default asks on top of it.
+    let plane = plane_with_floor(&dir.join("server"), true, Some(64 << 20)).await;
     let digest = kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [7; 32], (5 << 30) + 1);
     let record = Record {
         digest,
@@ -269,5 +275,44 @@ async fn a_blob_over_5_gib_is_not_refused_for_its_size() {
     let why = why.to_string();
     assert!(why.contains("could not be read"), "{why}");
     assert!(!why.contains("largest blob"), "{why}");
-    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One small output file collected through a lease of a plane without a tier, whose
+/// cold store has the free-space floor `floor`.
+async fn collect_small_file(
+    name: &str,
+    floor: u64,
+) -> Result<(), kbf_driver_container::tree::TreeError> {
+    let dir = scratch(name);
+    let plane = plane_with_floor(&dir.join("server"), false, Some(floor)).await;
+    let upper = dir.join("upper");
+    let out = upper.join("out");
+    std::fs::create_dir_all(&out).expect("mkdir");
+    std::fs::write(out.join("small"), b"a small output\n").expect("write");
+    let lease = plane.lease(&LeaseId::new(1, 1));
+    let mut result = ActionResult::default();
+    collect(
+        &lease,
+        &upper,
+        &CpuPool::new(1),
+        "",
+        &["out/small".to_owned()],
+        OutputLimits::DEFAULT,
+        &mut result,
+    )
+    .await
+}
+
+/// Catches a test plane that ignores the floor it is given (mutant: the default always
+/// used), which would leave `a_blob_over_5_gib_is_not_refused_for_its_size` needing the
+/// big disk again without any test noticing: a floor no disk meets refuses a small
+/// file, a floor of one byte stores it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_planes_floor_is_the_one_its_store_enforces() {
+    collect_small_file("floor-high", u64::MAX)
+        .await
+        .expect_err("a floor above all free space refuses the write");
+    collect_small_file("floor-low", 1)
+        .await
+        .expect("a floor of one byte takes it");
 }

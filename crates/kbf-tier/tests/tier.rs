@@ -253,6 +253,56 @@ fn an_upload_block_is_sealed_by_its_commit() {
     assert_eq!(fs.contents(&name), None, "commit refused: block deleted");
 }
 
+/// Catches: a count of open write files that counts a block after nothing will write it
+/// again (the write pool's gauge would never fall), or misses one still taking ranges: the
+/// open grouped block counts from its first range to its seal and last answer; an upload's
+/// block from its reservation to its commit; a refused upload's block not at all after
+/// its drop.
+#[test]
+fn open_write_files_counts_the_blocks_that_can_still_be_written() {
+    let (_fs, tier) = fresh(1 << 20);
+    let mut index = Index::default();
+    assert_eq!(tier.open_write_files(), 0);
+    let t0 = Instant::now();
+    let (object, _) = ack_group(&tier, &mut index, b"aa", t0).unwrap();
+    assert_eq!(tier.open_write_files(), 1, "the open grouped block");
+    let late = tier.reserve_group(2, t0).unwrap();
+    assert_eq!(tier.open_write_files(), 1, "ranges share a block");
+    let upload = tier.reserve_upload(4).unwrap();
+    assert_eq!(
+        tier.open_write_files(),
+        2,
+        "an upload has a block of its own"
+    );
+    drop(upload);
+    assert_eq!(
+        tier.open_write_files(),
+        1,
+        "a dropped upload's block is gone"
+    );
+    let t1 = t0 + SEAL_AFTER;
+    let next = tier.reserve_group(2, t1).unwrap();
+    assert_ne!(next.object(), object);
+    assert_eq!(
+        tier.open_write_files(),
+        2,
+        "the sealing block waits for its range, and the new one"
+    );
+    tier.write(&late, 0, b"bb").unwrap();
+    let late = tier.sync(late).unwrap();
+    tier.committed(late);
+    assert_eq!(tier.open_write_files(), 1, "the sealing block let go");
+    drop(next);
+    assert_eq!(tier.open_write_files(), 1, "the open block stays open");
+    let r = tier.reserve_upload(4).unwrap();
+    tier.write(&r, 0, b"rec!").unwrap();
+    let synced = tier.sync(r).unwrap();
+    assert_eq!(tier.open_write_files(), 2);
+    index.put_staged(&synced, true);
+    tier.committed(synced);
+    assert_eq!(tier.open_write_files(), 1, "an upload's commit closes it");
+}
+
 /// Catches: a block that keeps acknowledging after a failed sync. A failed
 /// `fdatasync` reports a write-back error once, to one caller: a later sync of
 /// another range of the same block can return success over lost pages.

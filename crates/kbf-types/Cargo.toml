@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+# The wipe-on-drop of `object_store_api::Secret`.
+zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

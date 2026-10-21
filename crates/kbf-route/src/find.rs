@@ -22,29 +22,36 @@ impl Router {
     ///
     /// Only the primary is asked. A cold build asks mostly about blobs nobody holds, and
     /// a replica asked on every miss would double the calls for nothing: whatever the
-    /// primary has not got, a write sends again. When the primary cannot answer, its
+    /// primary has not got, a write sends again. This is the question a client's
+    /// FindMissing is: a blob only a replica holds is reported missing, the client
+    /// uploads it, and the upload fills the primary. A caller that must not refuse a
+    /// blob a read would find (the input check of an Execute) asks
+    /// [`Router::find_missing_anywhere`]. When the primary cannot answer, its
     /// digests go to the next owner that is not down, so a call that completes was
     /// answered for every digest, never for some.
     ///
     /// # Errors
     /// Some digest's every owner is down or could not answer.
     pub async fn find_missing(&self, digests: &[Digest]) -> Result<Vec<Digest>, StorageError> {
-        let missing = self.routed(|view| self.find_in(view, digests)).await?;
+        let missing = self
+            .routed(|view| async move { self.find_in(&view, digests).await })
+            .await?;
         Ok(digests
             .iter()
-            .filter(|d| missing.contains(d))
+            .filter(|d| missing.contains_key(d))
             .copied()
             .collect())
     }
 
-    /// The digests missing, as the map `view` places them.
-    async fn find_in(
+    /// The digests missing, as the map `view` places them, each with the owner that said
+    /// it lacks it.
+    pub(crate) async fn find_in(
         &self,
-        view: MapView,
+        view: &MapView,
         digests: &[Digest],
-    ) -> Result<BTreeSet<Digest>, StorageError> {
+    ) -> Result<BTreeMap<Digest, MemberId>, StorageError> {
         let generation = view.map.generation();
-        let mut missing = BTreeSet::new();
+        let mut missing = BTreeMap::new();
         let mut pending: BTreeSet<Digest> = digests.iter().copied().collect();
         let mut failure = None;
         // Each round asks every pending digest of the owner at the next rank.
@@ -76,10 +83,10 @@ impl Router {
                 Ok(lacking)
             }))
             .await;
-            for ((_, asked), answer) in by_owner.values().zip(answers) {
+            for ((owner, asked), answer) in by_owner.values().zip(answers) {
                 match answer {
                     Ok(lacking) => {
-                        missing.extend(lacking);
+                        missing.extend(lacking.into_iter().map(|d| (d, owner.id)));
                         for digest in asked {
                             pending.remove(digest);
                         }

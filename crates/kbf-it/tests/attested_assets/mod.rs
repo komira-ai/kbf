@@ -2,7 +2,7 @@
 //!
 //! The attest job names each tarball and its SBOM by hand, one `actions/attest-sbom`
 //! step per tarball (in the attest job of its platform group), and runs only on a push to
-//! `main` or `feature/arch-v2`; the verify job after it refuses
+//! `main`; the verify job after it refuses
 //! a tarball with no SBOM attestation (`cargo xtask verify-assets attestations`). So a
 //! binary added to a build job's `Package` steps without its attest step passes every
 //! pull request check and turns `main` red. [`unattested`] reads both lists from the
@@ -43,6 +43,55 @@ pub fn packaged(workflow: &str) -> Result<Vec<(String, String)>, String> {
             };
             let name = binary.rsplit_once('/').map_or(binary, |(_, n)| n);
             found.push((name.to_owned(), platform.to_owned()));
+        }
+    }
+    Ok(found)
+}
+
+/// The platform of every `cargo xtask pkg-asset` line in the workflow's `run:` steps that
+/// makes the `kbf-installer` deb an asset (it has no `--verify-only`: that one only checks
+/// the file the attest job signed), in file order. An error names a line without
+/// `--platform`.
+pub fn packaged_debs(workflow: &str) -> Result<Vec<String>, String> {
+    let mut found = Vec::new();
+    for step in workflows::run_steps(workflow)? {
+        for line in step.script.lines().map(str::trim_start) {
+            let Some(args) = line.strip_prefix("cargo xtask pkg-asset ") else {
+                continue;
+            };
+            let words: Vec<&str> = args.split_whitespace().collect();
+            if words.contains(&"--verify-only") {
+                continue;
+            }
+            let platform = words
+                .iter()
+                .position(|w| *w == "--platform")
+                .and_then(|i| words.get(i + 1));
+            let Some(platform) = platform else {
+                return Err(format!(
+                    "{}/{}: a pkg-asset line without --platform: {line}",
+                    step.job, step.step
+                ));
+            };
+            found.push((*platform).trim_matches('"').to_owned());
+        }
+    }
+    Ok(found)
+}
+
+/// The platform (always `darwin-arm64`) of every `cargo xtask pkg-macos-asset` line in the
+/// workflow's `run:` steps that makes the Mac `kbf-installer` `.pkg` an asset (it has no
+/// `--verify-only`: that one only checks the file the attest job signed), in file order.
+pub fn packaged_macos_pkgs(workflow: &str) -> Result<Vec<String>, String> {
+    let mut found = Vec::new();
+    for step in workflows::run_steps(workflow)? {
+        for line in step.script.lines().map(str::trim_start) {
+            let Some(args) = line.strip_prefix("cargo xtask pkg-macos-asset ") else {
+                continue;
+            };
+            if !args.split_whitespace().any(|w| w == "--verify-only") {
+                found.push("darwin-arm64".to_owned());
+            }
         }
     }
     Ok(found)

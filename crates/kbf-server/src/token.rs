@@ -146,7 +146,7 @@ fn bearer_digest(authorization: &[u8]) -> Option<[u8; 32]> {
 /// The file cannot be opened or read, is not a regular file, or has another owner or
 /// mode.
 #[cfg(unix)]
-fn read_owner_only(path: &Path, limit: usize) -> Result<Vec<u8>, TokenFileError> {
+pub(crate) fn read_owner_only(path: &Path, limit: usize) -> Result<Vec<u8>, TokenFileError> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let read = |source| TokenFileError::Read {

@@ -96,6 +96,12 @@ impl PlatformClass {
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
+
+    /// Its name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// The operating system of a host, and for a Mac its class.

@@ -150,7 +150,7 @@ rules the field comments cannot. Numbers in `kbf.worker.v1`: `DaemonMessage.upda
 `name` is `kbf` or `kbf-daemon`. `sha256` is 64 lowercase hex digits of the tarball and is also its name in
 `ReleaseService.Fetch`. `attestation` is the build-provenance bundle (JSON lines, at most 256 KiB) of the tarball.
 
-**Which components a platform needs.** `linux-x86_64`, `linux-arm64`: `kbf`. `darwin-arm64`: `kbf-daemon`. A
+**Which components a platform needs.** `linux-x86_64`, `linux-arm64`: `kbf`. `darwin-arm64`: `kbf` (no darwin `kbf-daemon` is built; the installer refuses a Mac offer that names it). A
 platform is **complete** for a commit when the frontend holds every component it needs, with their attestations.
 
 **UpdateOffer.**
@@ -177,7 +177,7 @@ order at a huge epoch, is taken and wedges the installer until root clears `stat
 acts on is measured from nothing and is taken at any epoch. A compromised service user can still write a first order
 with a huge epoch: an availability limit, the same exposure as ordering an activation early (section 7.3 of the
 design study). `window_s` is the confirm window of `ACTIVATE`, **per platform as built**: on Linux the helper ignores it, and the window starts at the new
-process's first start (`kbf-helper boot-check --window-secs`, default 900, range 120 to 1800); on macOS there is no start hook, so the window is
+process's first start (`kbf-installer boot-check --window-secs`, default 900, range 120 to 1800); on macOS there is no start hook, so the window is
 armed at activation and `window_s` is clamped to 120 to 1800. Either way a compromised frontend cannot set a year.
 
 **UpdateStatus.** Sent after `Welcome` and on every change. `running_commit` is the process's own build commit
@@ -187,7 +187,15 @@ it is listed `unsupported`, and a rollout halts at it (it never skips a host sil
 
 **ReleaseService.Fetch.** On the worker listener, admitted nodes only (mutual TLS). The argument is 64 lowercase
 hex digits and nothing else; an unknown digest is `NOT_FOUND`. The server never builds a path from anything but the
-validated digest. Chunks are at most 1 MiB. **The caller is the installer's fetch child (section 7.1), not the `kbf` process.**
+validated digest. Chunks are at most 1 MiB. **The caller is the installer's fetch child (section 7.1), not the `kbf` process.** It serves the release's tarballs and its attestation bundles, each under the digest of its bytes.
+
+**ReleaseService.Describe.** For a caller that was given no offer (a `frontend_update` order is a locator). `DescribeRequest{commit, platform}`
+(`platform` optional) returns a `ReleaseDescription{commit, components}`: per described platform, the tarballs a host of it needs, each with
+its `sha256` and `size` and its bundle's `bundle_sha256` and `bundle_size`; a platform is described only when it is complete, as for an offer.
+Admitted as `Fetch` is (one row of the role table). `INVALID_ARGUMENT` for a commit that is not 40 lowercase hex digits or an unknown platform,
+`NOT_FOUND` for a commit with no stored tarball, `FAILED_PRECONDITION` naming what an incomplete platform lacks. The same description is
+`GET /v1/releases/{commit}` as JSON, the file `releases/<commit>.json` of a `url` source (`docs/api.md`). It is a claim; the installer verifies
+what it fetches (`kbf-installer.md` section 5).
 
 **The order, as the node relays it.** `UpdateOrder` is unchanged and carries `order_id`, `epoch`, `verb`, `commit` and
 `window_s`. The "update to commit `<hash>`" order is `VERB_ACTIVATE`. It gains one additive field, `uint64 generation = 6`
@@ -246,7 +254,7 @@ installer verifies each bundle against the pinned root. **Envoy is a dependency,
 never fetches it. Release-manifest and Envoy-component pinning, and cross-version Envoy upgrades, are deferred (section 12).
 
 **The disk index is the source of truth for bytes.** The release store on disk (`files/<sha256>` and
-`index/<commit>/<platform>/<name>`, with attestation bundles) is authoritative for what the frontend can serve. The
+`index/<commit>/<platform>/<name>`, with attestation bundles, which are also named by their digest in `files/`) is authoritative for what the frontend can serve. The
 `update/release/...` rows are metadata over it (digest, size, attestation present); a lost or stale row is rebuilt from
 the disk index, never the reverse. The desired release, the slot, the per-host phase rows and the policy are state-store rows.
 
@@ -259,6 +267,8 @@ the disk index, never the reverse. The desired release, the slot, the per-host p
   exactly one regular file named `<name>`; that is an early failure for mistakes, not trust. Path segments are
   validated (40 lowercase hex, a known platform, a known name) and never joined raw.
 - `GET /v1/releases`: commits with, per platform, which components are present and whether the platform is complete.
+- `GET /v1/releases/{commit}`: the description `ReleaseService.Describe` gives for every complete platform, as JSON (section 5): the
+  files of the release by digest, and the `releases/<commit>.json` of a `url` source.
 - `POST /v1/update/desired {commit}`: the commit needs at least one complete platform (else 409). Compare-and-set
   on `update/desired`; the counter gives the new generation only when the commit differs from the current one.
 - `GET /v1/update`: `{desired, releases}`. The policy fields are set through `POST /v1/update/policy` (admin). There is no auto-update endpoint.
@@ -266,6 +276,27 @@ the disk index, never the reverse. The desired release, the slot, the per-host p
   `helper_present`, `up_to_date` (true, false or null) and `availability` (`ok`, `unavailable`, `unsupported`).
 
 ### 6.4 Sessions
+
+**As built.** The frontend looks at the desired row and the release store once a farm tick and
+keeps one offer per complete platform; each session sends its node's platform offer after
+`Welcome` and whenever that offer changes (the same offer is never sent twice on a session).
+A look that fails keeps the table. The node's platform is read from its first `Hello`.
+The rollout controller (`kbf-server/src/update`) runs on the frontend with a state store, once a
+farm tick, and starts no host when an operator wrote `update/policy.auto_nodes` false or paused the
+run (a policy never written reads as `auto_nodes` true: the desired write is the click; hosts already
+in a step are always moved). Its orders go out as `UpdateOrder` on the host's stream with the `Welcome`
+epoch (an order of another epoch is refused before it is sent); a confirmation carries an id
+of its own, drawn from the order counter, because a node drops a repeated id. Its facts come
+from the farm and each node's `UpdateStatus` of its current stream. A Linux host
+is joined to its storage member by the address it advertised at enrollment, matched exactly; the
+mark is `Members::plan_down` and its undoing `Members::undo_plan`; a host that matches no member is
+never started. **Not yet:** no operator action starts a run with `auto_nodes` written off.
+`GET /v1/nodes` lists `update` per node and `GET /v1/update/hosts` its detail (`docs/api.md`).
+
+**Mixed versions.** `auto_nodes` is a plain bool in the `update/policy` row, so a row that does not
+carry it reads false; a policy row that was never written reads as the defaults, true. An old frontend's
+`set_paused` on a never-written row stores a row without `auto_nodes`, so a new frontend reads `auto_nodes`
+off after the resume until an operator writes `true`.
 
 After `Welcome`, and to every connected node at every change of the desired release or of a platform's
 completeness, the frontend sends an `UpdateOffer` for that node's platform. `UpdateStatus` is kept as the newest per
@@ -276,7 +307,7 @@ node and ignored from a replaced stream, exactly as `NodeStatus` is.
 `POST /v1/update/frontend {commit}` (write gate as the other writes; admin) is the one route that updates the frontend. Gamma calls it. The commit must have a complete platform for the frontend host (else 409), and no frontend
 update may be in flight (409). The frontend then **writes an order record into its own host's `orders/` directory**, by the same mechanism as
 `kbf-update` uses for nodes (a dot-prefixed temporary name, then rename; section 7), with `verb=frontend_update`, the `commit`, a `generation` from the
-store counter, the store `epoch` and an `order_id`, and the components and expected facts of the release from its own store. The route returns the order id; the installer refuses a second order while one is in flight (`frontend_busy`) and one whose installed Envoy is outside the tested range (`envoy_range`). The root CLI `kbf-installer update --commit SHA --frontend` stays as the **local fallback** and runs the same code. It does not go
+store counter, the store `epoch` and an `order_id`. The record is a locator: it carries no components and no expected facts, and the root half fetches and verifies the release itself ([kbf-installer.md](kbf-installer.md) section 6). The route returns the order id; the installer refuses a second order while one is in flight (`frontend_busy`) and one whose installed Envoy is outside the tested range (`envoy_range`). The root CLI `kbf-installer update --commit SHA --frontend` stays as the **local fallback** and runs the same code. It does not go
 through a node session, and nothing is sent on the wire. The installer's reply is the host's `status.json`, which the route's status
 read (`GET /v1/update`) reports.
 
@@ -311,7 +342,7 @@ still run unprivileged there, so a fault in them is not root.
 | Command | Does |
 |---|---|
 | `kbf-installer run` | every 5 seconds (a fixed constant, not a key), each pass: finish a restart it owes; revert a swap whose confirm window ran out; sweep leftover scratch (7.3); act on order records from `orders/` in (epoch, id) order, once each. For `activate`: refuse it while a trial is pending (a release activated and not yet confirmed or reverted: there is one confirm window at a time, never two timers), check the order (below), **fetch, verify and install the release for the commit (7.1, 7.2)**, write `pending_confirm`, flip `previous` then `current`, restart the one configured service; `confirm`: keep it; `revert`: flip back and restart; write `status.json` |
-| `kbf-installer confirm`, `revert`, `rollback`, `update --frontend` | the operator verbs: **inline root CLI runs under the installer's lock** (exit 4 while a `run` pass holds it); no socket, and `kbf` cannot run them. `confirm` and `revert` name the activation; `rollback` is the only verb below the floor. `update --commit SHA --frontend` is the local fallback of the `frontend_update` order (section 6.5) |
+| `kbf-installer confirm`, `revert`, `rollback` | the operator verbs: **inline root CLI runs under the installer's lock** (exit 4 while a `run` pass holds it); no socket, and `kbf` cannot run them. `confirm` and `revert` name the activation; `rollback` is the only verb below the floor. `update --commit SHA --frontend` is not among them: it needs no root, is refused through `sudo`, and is a client of the proxy's update API (`--api`, `--token-file`, `--api-ca`) that waits for the swap; the API writes the `frontend_update` order (section 6.5) |
 | `kbf-installer boot-check` | `ExecStartPre` on Linux: count the starts of a release on trial and revert one that keeps failing before it starts again; start the confirm window at the first start |
 
 **The order spool.** `orders/` is owned by `kbf` with mode 0700. Root opens it with `openat` and `O_NOFOLLOW` relative to a

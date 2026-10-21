@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 use crate::closure::{DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL, Verified};
 use crate::flights::Flights;
 use crate::nodes::Nodes;
-use crate::repair::{Limiter, ReadRepair, RepairLimit};
+use crate::repair::{Background, Limiter, ReadRepair, RepairLimit};
 use crate::source::{MapSource, MapView};
 
 /// What [`Router::commit_with_closure`] holds in memory, across all its calls, unless
@@ -103,6 +103,28 @@ impl Router {
         self
     }
 
+    /// The same router, copying a blob a read or [`Router::find_missing_anywhere`] found
+    /// away from the owner that should hold it to that owner, in the background, at most
+    /// as often as `limit` lets a find through ([`Router::with_read_repair`] with the
+    /// router's own hook).
+    ///
+    /// The copy never delays the call that found the blob: it runs in a task of its own
+    /// (so the call that finds a blob must run inside a Tokio runtime, or the find is
+    /// not repaired), at most [`crate::MAX_REPAIRS_IN_FLIGHT`] at a time, one per digest, and a
+    /// find that arrives while the copies are all busy is dropped: a later read finds the
+    /// blob away from its owner again and tells the hook again. A copy is read from
+    /// wherever the map has it, hashed against its digest, and written with
+    /// [`kbf_storage::Storage::put_unowned`]; the owner is asked first whether it still
+    /// lacks the blob.
+    #[must_use]
+    pub fn with_background_repair(self, limit: RepairLimit) -> Self {
+        // The task reads through a router without the hook, so a repair's own read is
+        // never reported as a find.
+        let mut plain = self.clone();
+        plain.repair = None;
+        self.with_read_repair(Arc::new(Background::new(plain)), limit)
+    }
+
     /// Who holds `digest` in the map as it is now.
     ///
     /// # Errors
@@ -119,6 +141,31 @@ impl Router {
             write: writers.first().cloned(),
             writers,
         })
+    }
+
+    /// A number that changes whenever what a "this blob is held" answer rests on may have
+    /// changed: the map's generation, and the id and boot of every member in it. A caller
+    /// that remembers an answer beside this number may trust it only while the number is
+    /// the same: a new generation moves blobs between owners, and a restarted owner (a
+    /// new boot) may have lost what it held only in RAM.
+    ///
+    /// `None` when no map has arrived, or when any member's boot is 0 (unknown: a restart
+    /// of that member could not be told), so that nothing is remembered.
+    #[must_use]
+    pub fn epoch(&self) -> Option<u64> {
+        use std::hash::{Hash as _, Hasher as _};
+        let view = self.view().ok()?;
+        let members = view.map.members();
+        if members.iter().any(|m| m.boot == 0) {
+            return None;
+        }
+        // The default hasher has fixed keys: equal inputs give equal numbers.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        view.map.generation().hash(&mut hasher);
+        for member in members {
+            (member.id, member.boot).hash(&mut hasher);
+        }
+        Some(hasher.finish())
     }
 
     /// How many blobs are being read for waiting callers right now: for a gauge, and for
@@ -195,10 +242,10 @@ impl Router {
 /// for a run of promotions during one call, and a bound on a map that never settles.
 pub const MAX_MAP_REFETCHES: usize = 8;
 
-/// This generation's read order of `digest`, then the previous generation's.
+/// This generation's read order of `digest`, then each retained earlier generation's, newest
+/// first.
 pub(crate) fn read_order<'a>(view: &'a MapView, digest: &Digest) -> Vec<&'a Member> {
-    view.map
-        .read_order_with_previous(view.previous.as_deref(), digest)
+    view.map.read_order_with_history(&view.history(), digest)
 }
 
 /// The owners a write of `digest` may go to: its write owners that are not down, primary

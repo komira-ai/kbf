@@ -8,8 +8,20 @@
 //!   have written `sh -c`.
 //! - [`fake`]: the same binary run through a link named `xcrun`, `xcodebuild` or
 //!   `sandbox-exec` answers as that tool, from a rules file the test writes.
+//! - [`config`]: the empty `kbf.toml` a test hands to every `kbf` child it starts, so the child
+//!   never reads the host's settings file.
+//! - [`dir`]: a scratch directory a test owns and that is removed on drop.
+//! - [`port`]: loopback ports a test can rely on (dead ones, and ones held until used).
+//! - [`forked`]: a child held between `fork` and `exec`, to show what a lock or a file
+//!   a test holds open does when another thread of the test binary starts a program.
+//! - [`spawn`]: starting a program the test has just copied or written, again while the
+//!   start fails with `ETXTBSY` because such a child still holds the file open.
 //! - [`m2`]: the verbs of `kbf-m2-act`, the program every action of the M2 sample
 //!   project runs (the M2 image has no shell).
+//! - [`tree`]: an action's input root and the action around it, as plain data (the black-box
+//!   suites upload them through `kbf-harness`).
+//! - [`reaped`]: a child a test starts, stopped and reaped when the guard drops (SIGTERM,
+//!   then SIGKILL), holding only the descriptors the test gave it.
 //!
 //! A test runs [`act`] and the fakes in one of two ways:
 //! - through a bin of its own package, because Cargo sets `CARGO_BIN_EXE_<name>` only
@@ -30,8 +42,15 @@
 use std::io::Write;
 
 pub mod act;
+pub mod config;
+pub mod dir;
 pub mod fake;
+pub mod forked;
 pub mod m2;
+pub mod port;
+pub mod reaped;
+pub mod spawn;
+pub mod tree;
 
 /// Why a program here stopped short.
 #[derive(Debug, PartialEq, Eq)]

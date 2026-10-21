@@ -7,6 +7,7 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 
 use super::*;
+use kbf_testkit::dir::TestDir;
 
 /// A point of a sweep at which a test makes entries vanish (see [`vanishing`]).
 pub(super) enum Point<'a> {
@@ -78,14 +79,11 @@ fn root() -> bool {
     me() == 0
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "kbf-mac-session-sweep-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(
+        std::env::temp_dir(),
+        &format!("kbf-mac-session-sweep-{name}"),
+    )
 }
 
 fn chmod(path: &Path, mode: u32) {
@@ -120,7 +118,8 @@ fn names(dir: &Path) -> Vec<String> {
 /// next user of the uid would own them), or one that removes the shared folder itself.
 #[test]
 fn everything_the_uid_owns_goes_and_the_folder_stays() {
-    let base = scratch("owned").join("Shared");
+    let _base_own = scratch("owned");
+    let base = _base_own.join("Shared");
     fs::create_dir(&base).unwrap();
     populate(&base);
     let swept = sweep(&owned_plan(&base), "kbf-lease-1-1", me());
@@ -139,7 +138,8 @@ fn everything_the_uid_owns_goes_and_the_folder_stays() {
 /// system's), or one that never descends into another owner's directory.
 #[test]
 fn nothing_of_another_uid_goes() {
-    let base = scratch("others").join("Shared");
+    let _base_own = scratch("others");
+    let base = _base_own.join("Shared");
     fs::create_dir(&base).unwrap();
     populate(&base);
     let swept = sweep(&owned_plan(&base), "kbf-lease-1-1", other());
@@ -293,7 +293,8 @@ fn places_that_cannot_be_read_are_errors_and_the_walk_goes_on() {
 /// it cannot stop every other lease's deletion (a CI run showed one doing just that).
 #[test]
 fn deep_trees_are_bounded_without_blocking_other_users() {
-    let base = scratch("deep").join("Shared");
+    let _base_own = scratch("deep");
+    let base = _base_own.join("Shared");
     let mut deep = base.clone();
     for _ in 0..=MAX_DEPTH + 1 {
         deep.push("d");
@@ -319,7 +320,8 @@ fn deep_trees_are_bounded_without_blocking_other_users() {
 /// directory other than the one it examined (one swapped in by a rename).
 #[test]
 fn another_filesystem_or_a_swapped_directory_is_not_entered() {
-    let base = scratch("dev").join("Shared");
+    let _base_own = scratch("dev");
+    let base = _base_own.join("Shared");
     fs::create_dir(&base).unwrap();
     populate(&base);
     let dir = open_base(&base).unwrap().unwrap();
@@ -405,7 +407,7 @@ fn empty_removes_every_entry_whoever_owns_it_and_keeps_the_folder() {
     assert_eq!(names(&home), ["locked"]);
 }
 
-/// Catches (komira-build-farm#652): a sweep that records an error for an entry which
+/// Catches (kbf#652): a sweep that records an error for an entry which
 /// vanished between the listing of its folder and its examination, so `user-delete`
 /// refused with "the sweep for ... is incomplete: ...: No such file or directory".
 /// First the departing uid's own entries (gone before the walk examines them; the one
@@ -414,7 +416,8 @@ fn empty_removes_every_entry_whoever_owns_it_and_keeps_the_folder() {
 /// `/private/var/folders/.../T`), which the walk only examines.
 #[test]
 fn an_entry_that_vanishes_after_the_listing_is_not_an_error() {
-    let base = scratch("vanish-listed").join("Shared");
+    let _base_own = scratch("vanish-listed");
+    let base = _base_own.join("Shared");
     fs::create_dir(&base).unwrap();
     fs::write(base.join("daemon-temp"), "x").unwrap();
     fs::create_dir_all(base.join("daemon-dir/inner")).unwrap();
@@ -444,14 +447,15 @@ fn an_entry_that_vanishes_after_the_listing_is_not_an_error() {
     assert_eq!(names(&triald), ["kept"]);
 }
 
-/// Catches (komira-build-farm#652): a directory being emptied whose entries vanish
+/// Catches (kbf#652): a directory being emptied whose entries vanish
 /// between its listing and their examination (the same daemon, one level down) that
 /// fails the sweep, or one that leaves the directory behind because of it; and the
 /// same for `empty`, which clears the lease user's home. The vanished entries are the
 /// second listing's, the one of the directory being removed.
 #[test]
 fn entries_that_vanish_while_a_directory_is_emptied_are_not_an_error() {
-    let base = scratch("vanish-emptied").join("Shared");
+    let _base_own = scratch("vanish-emptied");
+    let base = _base_own.join("Shared");
     let tree = base.join("tree");
     for (run, uid) in [("sweep", me()), ("empty", other())] {
         fs::create_dir_all(tree.join("sub")).unwrap();
@@ -479,11 +483,12 @@ fn entries_that_vanish_while_a_directory_is_emptied_are_not_an_error() {
     }
 }
 
-/// Catches (komira-build-farm#652): `empty` (the home folder) recording an error for an
+/// Catches (kbf#652): `empty` (the home folder) recording an error for an
 /// entry gone since the listing, or counting it as removed.
 #[test]
 fn empty_passes_over_an_entry_gone_since_the_listing() {
-    let home = scratch("vanish-home").join("home");
+    let _home_own = scratch("vanish-home");
+    let home = _home_own.join("home");
     fs::create_dir(&home).unwrap();
     fs::write(home.join("gone"), "x").unwrap();
     fs::write(home.join("file"), "x").unwrap();
@@ -501,12 +506,13 @@ fn empty_passes_over_an_entry_gone_since_the_listing() {
     assert!(names(&home).is_empty());
 }
 
-/// Catches (komira-build-farm#652): a directory gone between its examination and its
+/// Catches (kbf#652): a directory gone between its examination and its
 /// opening that fails the sweep: another owner's directory the walk searches, and one
 /// of the departing uid it removes.
 #[test]
 fn a_directory_gone_since_it_was_examined_holds_nothing() {
-    let base = scratch("vanish-open").join("Shared");
+    let _base_own = scratch("vanish-open");
+    let base = _base_own.join("Shared");
     for (what, uid) in [("searched", other()), ("removed", me())] {
         fs::create_dir_all(base.join("dir/sub")).unwrap();
         fs::write(base.join("kept"), "x").unwrap();
@@ -519,13 +525,14 @@ fn a_directory_gone_since_it_was_examined_holds_nothing() {
     }
 }
 
-/// Catches (komira-build-farm#652): a removal step that fails on an entry gone since
+/// Catches (kbf#652): a removal step that fails on an entry gone since
 /// it was examined (the unlink or the directory's opening answers "no such file").
 /// The entry is examined, then removed by someone else, then removal runs on the stale
 /// examination: no listing is involved, so this is the narrowest window.
 #[test]
 fn an_entry_gone_since_it_was_examined_is_removed_already() {
-    let base = scratch("vanish-stale").join("Shared");
+    let _base_own = scratch("vanish-stale");
+    let base = _base_own.join("Shared");
     fs::create_dir_all(base.join("dir")).unwrap();
     fs::write(base.join("file"), "x").unwrap();
     let dir = open_base(&base).unwrap().expect("the folder exists");
@@ -538,20 +545,21 @@ fn an_entry_gone_since_it_was_examined_is_removed_already() {
     }
 }
 
-/// Catches (komira-build-farm#652): a directory removed after the walk opened it that
+/// Catches (kbf#652): a directory removed after the walk opened it that
 /// fails the walk when listed. The walk relies on rustix's `Dir`, which reads a removed
 /// directory as empty (its own fallback for the "no such file or directory" the kernel
 /// answers), so this pins that.
 #[test]
 fn listing_a_directory_removed_since_it_was_opened_finds_nothing() {
-    let dir = scratch("vanish-listing").join("dir");
+    let _dir_own = scratch("vanish-listing");
+    let dir = _dir_own.join("dir");
     fs::create_dir(&dir).unwrap();
     let opened = open_base(&dir).unwrap().expect("the directory exists");
     fs::remove_dir(&dir).unwrap();
     assert_eq!(listed(&opened).unwrap(), Vec::<OsString>::new());
 }
 
-/// Catches (komira-build-farm#652): a fix that swallows more than "no such file": a
+/// Catches (kbf#652): a fix that swallows more than "no such file": a
 /// folder the sweep cannot read (permission denied) must still leave the sweep
 /// incomplete when another entry vanishes in the same walk, and the vanished entry
 /// must not add an error of its own.
@@ -561,7 +569,8 @@ fn a_vanished_entry_does_not_hide_a_real_error() {
         eprintln!("skipped: permission bits do not stop root");
         return;
     }
-    let base = scratch("vanish-real").join("Shared");
+    let _base_own = scratch("vanish-real");
+    let base = _base_own.join("Shared");
     fs::create_dir(&base).unwrap();
     fs::write(base.join("daemon-temp"), "x").unwrap();
     fs::create_dir(base.join("locked")).unwrap();

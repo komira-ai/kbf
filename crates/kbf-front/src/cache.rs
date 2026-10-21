@@ -81,6 +81,10 @@ pub enum CacheError {
     /// already ([`Cache::open_node`]): two processes would name the same keys.
     #[error(transparent)]
     StaleWriter(#[from] StaleWriter),
+    /// A streamed upload sent no chunk for `--write-pool-stream-idle`, so the write pool
+    /// freed its writer. The client may send the blob again: UNAVAILABLE.
+    #[error("{0}")]
+    Stalled(String),
     /// The cache's own records disagree (a segment read back without a blob just
     /// packed into it, an index entry with no readable range, a log answering with
     /// the wrong outcome). A bug or a broken backend, never the client's fault.
@@ -112,6 +116,7 @@ impl From<CacheError> for Status {
             | CacheError::Unreachable(_)
             | CacheError::Meta(_)
             | CacheError::Store(_)
+            | CacheError::Stalled(_)
             | CacheError::Tier(_) => Status::unavailable(message),
             CacheError::Segment(_)
             | CacheError::Pack(_)
@@ -196,6 +201,12 @@ pub struct Cache<M, O> {
     runtime: Option<tokio::runtime::Handle>,
     /// Which digests this node flushes ([`Cache::with_flush_gate`]); none: all.
     gate: Option<Arc<dyn FlushGate>>,
+    /// How many writers the write pool has and how many blobs may wait for one
+    /// ([`Cache::with_write_pool`]).
+    pool_config: PoolConfig,
+    /// The write pool, started with the first blob a tier takes; `None` inside if it
+    /// cannot run (no runtime).
+    pool: std::sync::OnceLock<Option<WritePool>>,
 }
 
 impl<M, O> Drop for Cache<M, O> {
@@ -255,7 +266,19 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             trees: Arc::new(InputTrees::new(InputTreeConfig::DEFAULT)),
             runtime: tokio::runtime::Handle::try_current().ok(),
             gate: None,
+            pool_config: PoolConfig::DEFAULT,
+            pool: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The same cache, with the write pool sized as `config` says instead of
+    /// [`PoolConfig::DEFAULT`]: the blobs of ByteStream and storage writes are appended to
+    /// the write tier by `config.writers` writers, at most `config.queue` waiting for one.
+    /// Call it before the cache stores anything.
+    #[must_use]
+    pub fn with_write_pool(mut self, config: PoolConfig) -> Self {
+        self.pool_config = config;
+        self
     }
 
     /// The same cache, flushing only the staged objects that hold a digest `gate` says
@@ -264,6 +287,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// Without a gate every sealed object is flushed.
     #[must_use]
     pub fn with_flush_gate(mut self, gate: Arc<dyn FlushGate>) -> Self {
+        self.writer.born.judge_by(Arc::clone(&gate));
         self.gate = Some(gate);
         self
     }
@@ -767,15 +791,18 @@ fn unexpected(applied: &Applied) -> CacheError {
 }
 
 mod batch;
+mod clear;
 mod consistency;
 mod direct;
 mod evict;
 mod flush;
 mod losses;
+mod pool;
 mod read;
 mod rebuild;
 mod stream;
 mod stream_store;
+mod tail;
 mod tier;
 mod touches;
 mod upload;
@@ -783,6 +810,7 @@ mod verify;
 mod write_group;
 
 pub use batch::BATCH_READS_IN_FLIGHT;
+pub use clear::FlushReport;
 pub use consistency::{
     EVICT_BATCH, EvictReady, HeldObject, NEEDS_V3, PASS_OPENS_PER_SEC, PassReport,
 };
@@ -791,11 +819,14 @@ pub use flush::{
     FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
 };
 pub use losses::Losses;
+use pool::WritePool;
+pub use pool::{BATCH_BLOBS, BATCH_BYTES, BUFFERED_BLOB_BYTES, PoolConfig};
 pub use read::{BlobRead, MAX_DECODED_BLOB_BYTES, READ_WINDOW_BYTES};
 pub use rebuild::{ADOPT_RECORDS, RebuildConfig, RebuildReport};
 pub(crate) use stream::TierRange;
 pub use stream::{RecordStream, StreamedRecord};
-pub use tier::{TierStartError, TierStartup};
+pub use tail::{TailReport, TailState};
+pub use tier::{TierHealth, TierStartError, TierStartup};
 pub use touches::TouchConfig;
 use touches::Touches;
 pub(crate) use upload::BuiltSegment;

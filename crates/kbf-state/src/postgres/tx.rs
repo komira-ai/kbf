@@ -101,6 +101,19 @@ impl<'p> Tx<'p> {
             open: true,
         };
         if flaw != Flaw::SequenceRevisions {
+            // Queue before the snapshot. A transaction at SERIALIZABLE takes its snapshot
+            // at its first query, so waiting on the head row with `FOR UPDATE` as that
+            // query ends, when the holder commits, in "could not serialize access": every
+            // waiter is rolled back and runs again, one lucky one per round. `LOCK TABLE`
+            // as the first statement waits without a snapshot, and the head row is then
+            // free and current. `SHARE UPDATE EXCLUSIVE` conflicts with itself and with nothing a
+            // reader or writer takes (`ACCESS SHARE`, `ROW SHARE`, `ROW EXCLUSIVE`): a
+            // stronger mode would also block a new connection's `PREPARE` of the statements
+            // on `head`, so a pool could not grow while a writer is in flight. It does
+            // conflict with `VACUUM` and `ANALYZE` of the table, which then wait or yield.
+            tx.session
+                .client
+                .batch_execute("LOCK TABLE head IN SHARE UPDATE EXCLUSIVE MODE")?;
             let s: &mut Session = &mut tx.session;
             let head: i64 = s.client.query_one(&s.st.head_lock, &[])?.get(0);
             tx.alloc = Alloc::Locked { head, last: head };

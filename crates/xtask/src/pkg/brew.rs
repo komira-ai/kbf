@@ -13,7 +13,7 @@
 use super::{GATE, IDENTIFIER, LOG_DIR, PREFIX, PROGRAM, pkg_name, valid_version};
 use crate::fetch::Sha256;
 
-const HOMEPAGE: &str = "https://github.com/komira-ai/komira-build-farm";
+const HOMEPAGE: &str = "https://github.com/komira-ai/kbf";
 
 const CASK: &str = r#"cask "kbf-installer" do
   version "@VERSION@"

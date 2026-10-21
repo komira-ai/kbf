@@ -409,7 +409,7 @@ fn an_unknown_key_is_refused() {
     assert_eq!(
         Profile::parse(edited(append("sleep=0")).as_bytes()).unwrap_err(),
         ProfileError::UnknownKey {
-            line: 42,
+            line: 43,
             key: "sleep".into()
         }
     );
@@ -422,7 +422,7 @@ fn a_repeated_key_is_refused() {
     assert_eq!(
         Profile::parse(edited(append("firewall=off")).as_bytes()).unwrap_err(),
         ProfileError::Duplicate {
-            line: 42,
+            line: 43,
             key: "firewall".into()
         }
     );
@@ -469,7 +469,7 @@ fn a_key_with_a_space_or_capital_is_refused() {
         assert_eq!(
             Profile::parse(text.as_bytes()).unwrap_err(),
             ProfileError::UnknownKey {
-                line: 42,
+                line: 43,
                 key: key.into()
             }
         );
@@ -789,44 +789,34 @@ fn with_old_key() -> String {
     edited(replace("kbf_data_dir=", "kbf_scratch="))
 }
 
-/// The daemon's arguments without the node label (it holds the profile's SHA-256, which
+/// The node's `kbf.toml` without the node label (it holds the profile's SHA-256, which
 /// differs when the file's bytes do).
-fn args_without_node_label(p: &Profile) -> Vec<String> {
-    let label = p.node_label();
-    kbf_mac_provision::launchd::daemon_args(p)
-        .into_iter()
-        .filter(|a| *a != label)
-        .collect()
+fn config_without_node_label(p: &Profile) -> String {
+    kbf_mac_provision::launchd::render_config(p).replace(&p.node_label(), "NODE-LABEL")
 }
 
-/// Catches: the job not running `kbf node` with the config file and the labels (a plist
-/// that still names `kbf-daemon` and the profile's server and certificates would skip
-/// enrollment), the profile's server, certificates, node id and data directory still
-/// rendered as arguments (`kbf node` takes them from `kbf.toml` and the frontend), or the
-/// removed `--scratch` and `--cache-dir` flags.
+/// Catches: the job not running `kbf --mode=daemon --config <kbf.toml>` and nothing
+/// else (a flag after `--config` could not be told from the file's key, and the labels,
+/// the server and the certificates would be set twice), a plist that still names
+/// `kbf-daemon`, the word `node` (removed) back, or the removed `--scratch` and
+/// `--cache-dir` flags.
 #[test]
-fn the_job_runs_kbf_node_with_its_config_and_the_labels() {
+fn the_job_runs_the_daemon_mode_with_its_config_and_nothing_else() {
     let p = Profile::parse(edited(|_| {}).as_bytes()).unwrap();
     assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     let args = kbf_mac_provision::launchd::daemon_args(&p);
-    let label = p.node_label();
     assert_eq!(
         args,
         [
-            "/usr/local/kbf/current/kbf",
-            "node",
+            "/usr/local/kbf-installer/releases/current/kbf",
+            "--mode=daemon",
             "--config",
             "/usr/local/etc/kbf/kbf.toml",
-            "--label",
-            label.as_str(),
-            "--label",
-            "pool=mac",
-            "--label",
-            "rack=r2",
         ]
     );
     let plist = kbf_mac_provision::launchd::render_plist(&p);
     for absent in [
+        "<string>node</string>",
         "--scratch",
         "--cache-dir",
         "--cache-",
@@ -835,6 +825,8 @@ fn the_job_runs_kbf_node_with_its_config_and_the_labels() {
         "--cert",
         "--data-dir",
         "--node-id",
+        "--label",
+        "--driver",
         "current/kbf-daemon",
     ] {
         assert!(!plist.contains(absent), "{absent} in\n{plist}");
@@ -855,7 +847,10 @@ fn the_old_key_is_accepted_with_a_warning_and_renders_the_same() {
         "{}",
         old.warnings[0]
     );
-    assert_eq!(args_without_node_label(&old), args_without_node_label(&new));
+    assert_eq!(
+        config_without_node_label(&old),
+        config_without_node_label(&new)
+    );
     assert!(!kbf_mac_provision::launchd::render_plist(&old).contains("--scratch"));
 }
 
@@ -887,7 +882,7 @@ fn the_old_key_twice_is_a_duplicate() {
     let text = format!("{}kbf_scratch=/Volumes/kbf/x\n", with_old_key());
     assert_eq!(
         refusal(&text),
-        "profile line 42: duplicate key: kbf_scratch"
+        "profile line 43: duplicate key: kbf_scratch"
     );
 }
 

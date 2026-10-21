@@ -12,6 +12,9 @@
 //!   [`Family`]s, object keys and, under an [`IndexRoot`], index row keys.
 //! - [`HistoryIndex`]: the state store under its [`IndexRoot`], every blocking call run
 //!   through an [`Offload`] (the server's blocking pool, or [`Inline`]).
+//! - [`RowKind`] and [`IndexRoot::permit`]: which kind of row a `ui/` key is (a writer's
+//!   own, an insert, or shared by every writer) and which a process may write once another
+//!   holds the state store's generation.
 //! - [`records`]: run, hit and outcome records, tails, command renderings and the
 //!   failed-run section, each with its `instance`; the index row values.
 //! - [`run_id`]: time-ordered [`RunId`]s, stream blocks and the fallback range.
@@ -22,6 +25,7 @@
 //! - [`flog`]: failed runs' logs copied into `r30/flog` objects that outlive the CAS blobs,
 //!   and [`Reader::failure_log`] to read a range of one back.
 //! - [`Scoped`]: an object store that refuses every key outside `history/`.
+//! - [`Today`]: the runs of today in memory, bounded, by action digest and by node.
 //! - [`status`] and the shape and status rows ([`ShapeRow`], [`StatusRow`]): what a test's
 //!   runs say of it (outcome rules, the flaky proof, a ring of its last runs).
 //! - The cross-build reads on the [`Reader`]: [`Reader::list_invocations`],
@@ -35,8 +39,10 @@
 pub mod container;
 mod derived;
 pub mod flog;
+mod header_rows;
 mod index;
 pub mod keys;
+mod kinds;
 mod listing;
 mod pending;
 mod queue;
@@ -46,12 +52,14 @@ mod rows;
 pub mod run_id;
 mod scoped;
 pub mod status;
+mod today;
 mod writer;
 
 pub use derived::DerivedLimits;
 pub use flog::{FlogObject, FlogParts, FlogRef, FlogStore};
 pub use index::{HistoryIndex, Inline, Offload, Offloaded};
 pub use keys::{Class, Day, Family, HistoryRoot, IndexPrefixError, IndexRoot, InvKey, WriterId};
+pub use kinds::{Ownership, RowKind};
 pub use listing::{
     InstanceList, InvocationPage, ListQuery, ListedInvocation, MAX_PAGE, MAX_SCAN, PageCursor,
     PageCursorError, ShapeEntry, ShapePage, StatusEntry, StatusPage,
@@ -65,4 +73,7 @@ pub use reader::{
 pub use rows::{Mark, RingRun, ShapeKind, ShapeRow, StatusKind, StatusRow, Verdict};
 pub use run_id::{Minted, Minter, RunId, StreamId};
 pub use scoped::Scoped;
+pub use today::{
+    ActionKey, MAX_EXAMINED, TODAY_BYTES, Today, TodayCursor, TodayPage, TodayQuery, TodayRun,
+};
 pub use writer::{Drops, Limits, SLOWEST, Writer};

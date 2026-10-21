@@ -18,7 +18,8 @@ use oci_spec::runtime::{
 use super::hardening::{
     CAPABILITIES, MASKED_PATHS, READONLY_PATHS, SeccompError, held_capabilities, seccomp,
 };
-use crate::container::{ContainerSpec, EXEC_ROOT};
+use super::init;
+use crate::container::{ACTION_ID, ContainerSpec, EXEC_ROOT};
 use crate::subids::DaemonIds;
 
 /// The OCI version the file declares (what `crun spec` writes).
@@ -104,11 +105,13 @@ pub(crate) struct Placement<'a> {
     pub ids: &'a DaemonIds,
     /// Go's name for the node's architecture, for the seccomp profile.
     pub arch: &'a str,
+    /// The container's first process (`init`), on the node.
+    pub init: &'a Path,
 }
 
-/// The mounts of an action: the standard ones of `crun spec --rootless`, the hosts file,
+/// The mounts of an action: the standard ones of `crun spec --rootless`, the `hosts`, `hostname` and `resolv.conf` files,
 /// the exec-root overlay, the shared trees read-only inside it, and [`WRITABLE`].
-fn mounts(spec: &ContainerSpec) -> Vec<Mount> {
+fn mounts(spec: &ContainerSpec, init: &Path) -> Vec<Mount> {
     let shm = format!("size={}m", spec.limits.shm_mib);
     let open = ["rbind", "ro", "nosuid", "noexec", "nodev"];
     let mut mounts = vec![
@@ -144,8 +147,12 @@ fn mounts(spec: &ContainerSpec) -> Vec<Mount> {
             "cgroup",
             &["nosuid", "noexec", "nodev", "relatime", "ro"],
         ),
+        // Into the `/dev` above, a `tmpfs` made for this container: no mount point in the
+        // image. Executable (no `noexec`): it is the container's first process.
+        bind(init, init::DEST, &["rbind", "ro", "nosuid", "nodev"]),
         bind(&spec.dir.join("etc/hosts"), "/etc/hosts", &open),
         bind(&spec.dir.join("etc/hostname"), "/etc/hostname", &open),
+        bind(&spec.dir.join("etc/resolv.conf"), "/etc/resolv.conf", &open),
     ];
     let overlay = format!(
         "lowerdir={},upperdir={},workdir={},{OVERLAY_OPTIONS}",
@@ -182,6 +189,16 @@ fn mounts(spec: &ContainerSpec) -> Vec<Mount> {
     mounts
 }
 
+/// The container's `process.args`: the init, then `--` and the action's own argv. The
+/// init runs the action as its child and reaps what the action leaves orphaned.
+fn init_argv(argv: &[String]) -> Vec<String> {
+    [init::DEST, "--"]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(argv.iter().cloned())
+        .collect()
+}
+
 fn rlimit(typ: PosixRlimitType, value: u64) -> PosixRlimit {
     built(
         PosixRlimitBuilder::default()
@@ -202,8 +219,8 @@ pub(crate) fn namespaces() -> Vec<LinuxNamespace> {
 }
 
 /// The process environment: the Command's variables, then `HOSTNAME` and `HOME` unless
-/// it sets them: `HOSTNAME=localhost` and the home of uid 0, `/root`, which are the same
-/// on every node.
+/// it sets them: `HOSTNAME=localhost` and `HOME=/root`, the writable home directory (owned by
+/// the action's uid, which the image's user database need not name), the same on every node.
 pub(crate) fn environment(env: &[(String, String)]) -> Vec<String> {
     let mut out: Vec<String> = env.iter().map(|(n, v)| format!("{n}={v}")).collect();
     for (name, default) in [("HOSTNAME", HOSTNAME), ("HOME", "/root")] {
@@ -219,7 +236,7 @@ pub(crate) fn environment(env: &[(String, String)]) -> Vec<String> {
 /// | Isolation                                | `config.json`                                     |
 /// |------------------------------------------|---------------------------------------------------|
 /// | no network                               | a new network namespace, nothing configured (crun brings `lo` up) |
-/// | no id of the daemon user, root inside    | `uidMappings`/`gidMappings` container `0..65536` to the daemon user's first subordinate range; `process.user` 0:0 |
+/// | no id of the daemon user, not root       | `uidMappings`/`gidMappings` container `0..65536` to the daemon user's first subordinate range; `process.user` 1000:1000 |
 /// | only the Command's environment           | `process.env` is the Command's variables only      |
 /// | the Command's argv and directory         | `process.args`, `process.cwd`                      |
 /// | the lease cgroup, `memory.oom.group=1`   | `cgroupsPath` a child of the lease cgroup, `unified` `memory.oom.group`       |
@@ -256,8 +273,10 @@ pub(crate) fn action_config(
     let process = built(
         ProcessBuilder::default()
             .terminal(false)
-            .user(built(UserBuilder::default().uid(0u32).gid(0u32).build()))
-            .args(spec.argv.clone())
+            .user(built(
+                UserBuilder::default().uid(ACTION_ID).gid(ACTION_ID).build(),
+            ))
+            .args(init_argv(&spec.argv))
             .env(environment(&spec.env))
             .cwd(PathBuf::from(cwd))
             .capabilities(capabilities)
@@ -306,7 +325,7 @@ pub(crate) fn action_config(
             .root(root)
             .hostname(HOSTNAME)
             .process(process)
-            .mounts(mounts(spec))
+            .mounts(mounts(spec, placement.init))
             .linux(linux)
             .build(),
     ))
@@ -358,6 +377,7 @@ mod tests {
             cgroup: "/kbf.slice/actions/kbf-lease-1-2",
             ids: &ids(),
             arch: "amd64",
+            init: Path::new("/scratch/oci-bin/kbf-init"),
         };
         let config = action_config(spec, &placement).expect("config");
         serde_json::from_slice(&render(&config).expect("render")).expect("json")
@@ -395,12 +415,82 @@ mod tests {
                 cgroup: "/kbf.slice/actions/kbf-lease-1-2",
                 ids: &ids(),
                 arch: "amd64",
+                init: Path::new("/scratch/oci-bin/kbf-init"),
             };
             render(&action_config(&spec(), &placement).expect("config")).expect("render")
         };
         let first = build();
         for _ in 0..30 {
             assert_eq!(build(), first);
+        }
+    }
+
+    /// Catches the action being the container's first process again (nothing then reaps
+    /// what it orphans), the init's mount missing, writable or in the image's root (a
+    /// mount point written into the image shared by every lease), or one the action
+    /// cannot execute: `process.args` is the init, `--`, then the action's argv unchanged;
+    /// the init is a read-only bind into `/dev`, after `/dev` is mounted, without `noexec`.
+    #[test]
+    fn the_action_runs_as_the_child_of_a_reaping_init() {
+        let mut spec = spec();
+        spec.argv = vec!["/bin/tool".to_owned(), "-c".to_owned(), "true".to_owned()];
+        let config = config_of(&spec);
+        assert_eq!(
+            config["process"]["args"],
+            json!(["/dev/kbf-init", "--", "/bin/tool", "-c", "true"])
+        );
+        let mounts = config["mounts"].as_array().expect("mounts");
+        let at = |dest: &str| mounts.iter().position(|m| m["destination"] == dest);
+        let init = at("/dev/kbf-init").expect("the init is mounted");
+        assert!(at("/dev").expect("/dev") < init, "into the /dev tmpfs");
+        assert_eq!(mounts[init]["type"], "bind");
+        assert_eq!(mounts[init]["source"], "/scratch/oci-bin/kbf-init");
+        let options: Vec<&str> = mounts[init]["options"]
+            .as_array()
+            .expect("options")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(options.contains(&"ro"), "{options:?}");
+        assert!(!options.contains(&"noexec"), "{options:?}");
+    }
+
+    /// Catches the action running as root (a mode-000 file would be readable, a
+    /// directory it does not own writable), and as an id its namespace does not map
+    /// (the container would not start): the process is uid and gid 1000, and the
+    /// mappings that hold id 1000 are the only ones, from container id 0.
+    #[test]
+    fn the_action_runs_as_an_unprivileged_id_its_namespace_maps() {
+        let config = config_of(&spec());
+        assert_eq!(config["process"]["user"], json!({"uid": 1000, "gid": 1000}));
+        for (key, host) in [("uidMappings", 100_000), ("gidMappings", 200_000)] {
+            let maps = config["linux"][key].as_array().expect(key);
+            assert_eq!(maps.len(), 1, "{key}");
+            assert_eq!(maps[0]["containerID"], 0);
+            assert_eq!(maps[0]["hostID"], host);
+            assert!(maps[0]["size"].as_u64().expect("size") > 1000, "{key}");
+        }
+    }
+
+    /// Catches an action container without its own `hosts`, `hostname` or `resolv.conf`
+    /// (the image's, or none, would answer a lookup), or one of them writable: each is a
+    /// read-only bind of the file the lease wrote under its `etc/`.
+    #[test]
+    fn the_name_files_are_read_only_binds_of_the_leases_own() {
+        let config = config_of(&spec());
+        let mounts = config["mounts"].as_array().expect("mounts");
+        for name in ["hosts", "hostname", "resolv.conf"] {
+            let dest = format!("/etc/{name}");
+            let found = mounts.iter().find(|m| m["destination"] == dest);
+            assert!(found.is_some(), "no mount of {dest}");
+            let mount = found.expect("checked");
+            assert_eq!(mount["type"], "bind");
+            assert_eq!(
+                mount["source"],
+                format!("/scratch/kbf-lease-1-2/etc/{name}")
+            );
+            let options = mount["options"].as_array().expect("options");
+            assert!(options.iter().any(|o| o == "ro"), "{dest}: {options:?}");
         }
     }
 

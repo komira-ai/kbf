@@ -1,5 +1,5 @@
 //! Simulation family F3, the rollout half (`docs/design/simulation.md` section 5, F3;
-//! the catalog is komira-ai/komira-build-farm#139): the real [`RolloutDriver`] and
+//! the catalog is komira-ai/kbf#139): the real [`RolloutDriver`] and
 //! [`MemoryRolloutStore`] over a [`Fleet`] implemented on a `kbf_sched::Scheduler`
 //! fed with virtual time, with running work, workers that heartbeat, reboot into
 //! their update and come back, an operator, and an [`Applier`] that records each

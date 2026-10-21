@@ -34,9 +34,13 @@
 //!   exception is a host that leaves its step: the orders that undo the step come first
 //!   ([`Controller`]).
 //!
-//! **What is not here.** The farm: no [`Transport`] to the helpers, no [`FactsSource`] over
-//! the `Farm`, the members and the heartbeats, no metrics, and no call from the frontend.
-//! Nothing outside the tests runs a [`Controller`] yet.
+//! **The farm side.** [`ports`] gives a [`Transport`] over the worker sessions and the
+//! members and a [`FactsSource`] over the `Farm`, the members and the enrollment registry
+//! (`session`), and [`spawn_controller`] runs the controller where the frontend starts,
+//! starting hosts unless an operator wrote `update/policy.auto_nodes` false or paused the run.
+//! A Linux host is joined to its storage member by the address it advertised at enrollment,
+//! matched on its lower-cased spelling; a host that matches no member is never started and `FarmFacts::unlinked`
+//! says why.
 
 mod codec;
 mod command;
@@ -48,8 +52,11 @@ mod node_step;
 mod pick;
 mod policy;
 mod ports;
+mod proposal;
 mod report;
 mod rows;
+mod runner;
+mod session;
 mod slot;
 mod steps;
 
@@ -65,6 +72,9 @@ pub use node_step::{HostPhase, Transition, step};
 pub use pick::{Pick, Picked, Skip, WaitReason, pick};
 pub use policy::{Policy, PolicyError};
 pub use ports::{FactsSource, FarmView, SourceError, Transport, TransportError};
+pub use proposal::{PROPOSED, Proposal, proposal_key};
 pub use report::{CommandError, ControllerError, Moved, Tick};
 pub use rows::{RowError, Rows, Stored};
+pub use runner::spawn as spawn_controller;
+pub use session::{FarmFacts, SessionTransport, ports};
 pub use slot::{Holder, Slot, SlotClass};

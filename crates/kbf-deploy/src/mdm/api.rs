@@ -294,9 +294,7 @@ mod tests {
         assert!(call(&exec, &a, &Call::get("/x"), Mode::Apply, &mut Vec::new()).is_ok());
         assert_eq!(server.requests().len(), 1);
 
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = closed.local_addr().expect("addr").port();
-        drop(closed);
+        let port = kbf_testkit::port::dead_addr().port();
         let exec = FakeExec::new(0);
         let err = call(
             &exec,

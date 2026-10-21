@@ -3,7 +3,8 @@
 //! without building the server, `verify-assets attestations` without GitHub, and
 //! `sudo-test` and `crun-tests` without root or systemd.
 //!
-//! - Run under any name but `kbf-server`, `gh` or `sudo`, it is cargo: it
+//! - Run under any name but `kbf-server`, `gh`, `sudo`, `uname`, `id`, `systemd-sysusers` or
+//!   `systemd-tmpfiles`, it is cargo: it
 //!   appends its arguments as one line to `target/debug/cargo-args` in its working
 //!   directory, "builds" by hard-linking itself to `target/debug/kbf-server`, and
 //!   writes the stamp that build embeds to `target/debug/kbf-server.stamp`:
@@ -11,6 +12,8 @@
 //!   not 12 lowercase hex digits fails the build with the build script's message. With
 //!   `--no-run` it builds nothing: it prints the file `cargo-messages` in its working
 //!   directory, the JSON messages a test wrote for it.
+//! - As cargo with a `loom_` filter among its arguments (`xtask proxy-loom`), it prints the
+//!   result line of five passing tests and builds nothing.
 //! - Run as `kbf-server`, it prints `kbf-server 0.1.0+<stamp>` from the stamp file next
 //!   to it.
 //! - Run as `kbf`, it prints `kbf 0.1.0+<stamp>` for `--version`, with the stamp from the
@@ -25,6 +28,8 @@
 //!   change in `crates/xtask/tests/pkg_macos.rs`): it prints `kbf-installer-stub` and
 //!   its arguments on stdout and on stderr, and exits 0, so `--version` passes the
 //!   signing check and a job that runs it leaves its arguments in its log.
+//!   With `XTASK_FAKE_INSTALLER_VERSION=<stamp>` and the one argument `--version` it
+//!   prints `kbf-installer 0.1.0+<stamp>` instead.
 //! - Run as `gh attestation verify <file> <flags>`, it appends its arguments as one line
 //!   to `gh-args` next to it, and verifies the file when `attested` next to it holds
 //!   the line `<SHA-256 of the file> <flags>`: the store of attestations, each the file
@@ -45,8 +50,15 @@
 //!   --dir <dir>` copies every file of `releases/<tag>/` into `<dir>`.
 //! - Run as `sudo`, it appends `<working directory>: <arguments>` as one line to
 //!   `sudo-args` next to it, and exits 0 (the tests it was asked to run passed).
+//! - Run as `uname` (by name, from PATH, or by path), it is a host that is no platform of
+//!   ours: `-s` prints `Linux` and `-m` prints `riscv64` (or `XTASK_FAKE_MACHINE` when set). Run as `id`, `-u` prints 1000
+//!   (a user that is not root).
+//! - Run as `systemd-sysusers` or `systemd-tmpfiles` (by name, from PATH, or by path), it
+//!   appends `<name> <arguments>` as one line to `systemd-args` next to the fake's own
+//!   file and exits 0: the host's systemd, as `packaging/install.sh` calls it.
 //!
-//! `XTASK_FAKE_DEFECT` plants one defect of the real build: `ignores-override` (the
+//! `XTASK_FAKE_DEFECT` plants one defect of the real build (`beta-bundle-any-commit`: the
+//! bundle check ignores the commit for the beta workflow's bundles only): `ignores-override` (the
 //! build embeds the head whatever the override), `accepts-bad` (a malformed override
 //! builds), `fails-other` (a malformed override fails, but not on the override),
 //! `build-fails` (every build fails), `json-fails` (`kbf --version --json` exits 1), `stamp-fails` (every build with an override
@@ -55,13 +67,14 @@
 //! attestation store: `accepts-all` (every file verifies, whatever the flags) or
 //! `ignores-bytes` (a file verifies when any attestation has its flags). Of a bundle:
 //! `bundle-any-file` (a bundle verifies any file whose flags it lists) or
-//! `bundle-any-commit` (`--source-digest` is not compared). Of the API:
+//! `bundle-any-commit` (`--source-digest` is not compared) or `bundle-deb-bundle-any` (a
+//! bundle named for a `.deb` verifies any file whose flags it lists). Of the API:
 //! `api-fails` (every `gh api` exits 1 with an HTTP 502) or `api-garbage` (every `gh
 //! api` prints something that is not JSON). Of releases: `release-fails` (every `gh
 //! release` command exits 1). Of sudo:
 //! `tests-fail` (it exits 101, as a failed test binary does) or `fails:<a>,<b>,...`
 //! (it exits 101 when one of its arguments is one of `<a>`, `<b>`, ..., so some units
-//! of several fail).
+//! of several fail). Of systemd: `systemd-fails` (every systemd tool exits 1).
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
@@ -126,6 +139,15 @@ fn kbf(argv0: &str, args: &[String]) -> ExitCode {
 
 /// `kbf-installer`, the stand-in: its arguments, once on each output.
 fn installer_stub(args: &[String]) -> ExitCode {
+    // `XTASK_FAKE_INSTALLER_VERSION=<stamp>` makes `--version` answer as the real
+    // installer does, `kbf-installer 0.1.0+<stamp>`, for the tests of `pkg-config
+    // --version-of`.
+    if let (Ok(stamp), [flag]) = (std::env::var("XTASK_FAKE_INSTALLER_VERSION"), args)
+        && flag == "--version"
+    {
+        println!("kbf-installer 0.1.0+{stamp}");
+        return ExitCode::SUCCESS;
+    }
     let line = format!("kbf-installer-stub {}", args.join(" "));
     println!("{line}");
     eprintln!("{line}");
@@ -152,6 +174,12 @@ fn cargo(argv0: &str, args: &[String]) -> ExitCode {
             "{}",
             std::fs::read_to_string("cargo-messages").expect("cargo-messages")
         );
+        return ExitCode::SUCCESS;
+    }
+    // `cargo test -p kbf-proxy ... -- loom_` (proxy-loom): cargo's result line for the five
+    // models, as the real run prints it.
+    if args.iter().any(|a| a == "loom_") {
+        println!("test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out");
         return ExitCode::SUCCESS;
     }
     let head = std::env::var("XTASK_FAKE_HEAD").expect("XTASK_FAKE_HEAD");
@@ -287,8 +315,13 @@ fn verify_bundle(dir: &Path, sha256: &str, file: &str, bundle: &str, rest: &[Str
             })
         })
         .unwrap_or_default();
-    let by_commit = !defect("bundle-any-commit");
-    let by_bytes = !defect("bundle-any-file");
+    // `beta-bundle-any-commit` is `bundle-any-commit` for the beta workflow's bundles only,
+    // so the artifacts controls pass and the beta control is the one reached.
+    let beta = flags.iter().any(|f| f.ends_with("/beta.yml"));
+    let by_commit = !(defect("bundle-any-commit") || (beta && defect("beta-bundle-any-commit")));
+    let by_bytes = !(defect("bundle-any-file")
+        || (defect("bundle-deb-bundle-any")
+            && (bundle.ends_with(".deb.sigstore.json") || bundle.ends_with(".pkg.sigstore.json"))));
     let wanted = if by_commit {
         flags.join(" ")
     } else {
@@ -430,10 +463,50 @@ fn sudo(argv0: &str, args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn systemd(name: &str, args: &[String]) -> ExitCode {
+    let exe = std::env::current_exe().expect("the fake's own path");
+    let dir = exe.parent().expect("the fake's directory");
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("systemd-args"))
+        .expect("systemd-args");
+    writeln!(log, "{name} {}", args.join(" ")).expect("systemd-args");
+    if defect("systemd-fails") {
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// `uname -s` and `uname -m` of a host with no platform of ours.
+fn uname(args: &[String]) -> ExitCode {
+    match args {
+        [a] if a == "-s" => println!("Linux"),
+        [a] if a == "-m" => {
+            println!(
+                "{}",
+                std::env::var("XTASK_FAKE_MACHINE").unwrap_or("riscv64".to_owned())
+            );
+        }
+        _ => return ExitCode::FAILURE,
+    }
+    ExitCode::SUCCESS
+}
+
+/// `id -u` of a user that is not root.
+fn id(args: &[String]) -> ExitCode {
+    match args {
+        [a] if a == "-u" => println!("1000"),
+        _ => return ExitCode::FAILURE,
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args();
     let argv0 = args.next().expect("argv0");
     let rest: Vec<String> = args.collect();
+    let base = argv0.rsplit('/').next().unwrap_or(&argv0);
     if argv0.ends_with("/kbf-server") {
         server(&argv0)
     } else if argv0.ends_with("/kbf") {
@@ -444,6 +517,12 @@ fn main() -> ExitCode {
         gh(&argv0, &rest)
     } else if argv0.ends_with("/sudo") {
         sudo(&argv0, &rest)
+    } else if matches!(base, "systemd-sysusers" | "systemd-tmpfiles") {
+        systemd(base, &rest)
+    } else if argv0 == "uname" || argv0.ends_with("/uname") {
+        uname(&rest)
+    } else if argv0 == "id" || argv0.ends_with("/id") {
+        id(&rest)
     } else {
         cargo(&argv0, &rest)
     }

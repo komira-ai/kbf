@@ -1,5 +1,5 @@
 //! The server's blob store as calls in this process: [`LocalStore`], what a worker
-//! daemon linked into the server's own process (`kbf-all-in-one`) reads and writes blobs
+//! daemon linked into the server's own process (`kbf all-in-one`) reads and writes blobs
 //! through, with no listener, TLS or protobuf encoding between them.
 //!
 //! Each call is one the worker listener serves a remote daemon, on the same [`Cache`]:

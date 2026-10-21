@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use kbf_testkit::dir::TestDir;
 use xtask::entitlements::{ALLOWLIST, AllowList, Defect, Error, compare, render, signed_keys};
 
 fn repo_root() -> PathBuf {
@@ -90,6 +91,7 @@ fn kbf_vmm_gets_the_virtualization_plist() {
 fn every_other_binary_gets_none() {
     let list = committed();
     for name in [
+        "kbf",
         "kbf-daemon",
         "kbf-mac-session",
         "kbf-guest",
@@ -109,8 +111,7 @@ fn every_other_binary_gets_none() {
 /// check would accept for an unentitled binary).
 #[test]
 fn a_missing_or_unreadable_list_is_refused() {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("darwin-entitlements");
-    std::fs::create_dir_all(&dir).expect("create the test directory");
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "darwin-entitlements");
     let missing = dir.join("no-such-list.txt");
     let err = AllowList::read(&missing).expect_err("a missing list");
     assert_eq!(err, Error::Missing(missing.clone()));
@@ -122,7 +123,7 @@ fn a_missing_or_unreadable_list_is_refused() {
         )
     );
     assert!(
-        matches!(AllowList::read(&dir), Err(Error::Unreadable { ref path, .. }) if *path == dir),
+        matches!(AllowList::read(&dir), Err(Error::Unreadable { ref path, .. }) if path.as_path() == dir.path()),
         "a directory as the list"
     );
 }
@@ -228,7 +229,7 @@ fn a_line_renders_its_own_keys_sorted() {
 /// The signature cases of the hosted macOS test, on the text `codesign` prints: each
 /// row is a binary name, what its signature carries, and the refusal it must get (or
 /// none). Catches a check that lets any entitlement through for an unlisted binary
-/// (a lookup that ignores the name finds kbf-vmm's set for kbf-daemon), a subset
+/// (a lookup that ignores the name finds kbf-vmm's set for kbf), a subset
 /// compare that accepts one more key (get-task-allow among them), a check that treats
 /// "no entitlements" as always fine, a compare of the count only, and one that takes
 /// an empty dictionary in an unlisted binary's signature for no entitlements (the
@@ -255,23 +256,23 @@ fn a_signature_is_compared_with_the_list() {
             )),
         ),
         (
-            "kbf-daemon",
+            "kbf",
             String::new(),
-            Ok("entitlements of kbf-daemon: none, as the allow list says".to_owned()),
+            Ok("entitlements of kbf: none, as the allow list says".to_owned()),
         ),
         (
-            "kbf-daemon",
+            "kbf",
             signed(&vz),
             Err(Error::UnlistedCarries {
-                name: "kbf-daemon".to_owned(),
+                name: "kbf".to_owned(),
                 signed: signed(&vz),
             }),
         ),
         (
-            "kbf-daemon",
+            "kbf",
             empty_dict.clone(),
             Err(Error::UnlistedCarries {
-                name: "kbf-daemon".to_owned(),
+                name: "kbf".to_owned(),
                 signed: empty_dict,
             }),
         ),
@@ -303,8 +304,8 @@ fn a_signature_is_compared_with_the_list() {
     }
     let messages = [
         (
-            compare(&list, "kbf-daemon", &signed(&vz)),
-            "gives kbf-daemon no entitlements",
+            compare(&list, "kbf", &signed(&vz)),
+            "gives kbf no entitlements",
         ),
         (
             compare(&list, "kbf-vmm", &signed(&gta)),

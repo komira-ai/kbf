@@ -73,6 +73,17 @@ pub struct RebuildReport {
     pub duration: Duration,
 }
 
+/// What [`Cache::adopt`] did with one segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Adopted {
+    /// Its records are in the index (or were already).
+    Segment,
+    /// It is an object of this cache's current writer: its own puts index it.
+    Own,
+    /// Its key names no object of this cache, or an epoch this log never allocated.
+    Foreign,
+}
+
 impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// Indexes the objects of the store that the index does not know, resuming where an
     /// earlier call stopped, and marks the rebuild done ([`Command::RebuildDone`]): a
@@ -164,16 +175,17 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         }
     }
 
-    /// Adopts the records of `segment`, in commands of at most [`ADOPT_RECORDS`].
-    async fn adopt(
+    /// Adopts the records of `segment`, in commands of at most [`ADOPT_RECORDS`], and
+    /// counts what happened in `report`. Shared with the tail pass ([`super::tail`]).
+    pub(super) async fn adopt(
         &self,
         segment: &SegmentFooter,
         report: &mut RebuildReport,
-    ) -> Result<(), CacheError> {
+    ) -> Result<Adopted, CacheError> {
         let Some(object) = self.writer.keys.object(&segment.key) else {
             tracing::warn!(key = %segment.key, "rebuild: not an object of this cache, skipped");
             report.foreign += 1;
-            return Ok(());
+            return Ok(Adopted::Foreign);
         };
         let entries: Vec<_> = segment
             .footer
@@ -193,17 +205,17 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 }
                 Applied::Adopted(Err(AdoptRefused::CurrentWriter(_))) => {
                     report.own += 1;
-                    return Ok(());
+                    return Ok(Adopted::Own);
                 }
                 Applied::Adopted(Err(refused @ AdoptRefused::UnallocatedEpoch(_))) => {
                     tracing::warn!(key = %segment.key, %refused, "rebuild: skipped");
                     report.foreign += 1;
-                    return Ok(());
+                    return Ok(Adopted::Foreign);
                 }
                 other => return Err(unexpected(&other)),
             }
         }
         report.segments += 1;
-        Ok(())
+        Ok(Adopted::Segment)
     }
 }

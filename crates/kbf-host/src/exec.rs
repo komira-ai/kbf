@@ -224,7 +224,10 @@ fn symlink(full: &Path, target: &Path) -> io::Result<()> {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
         _ => {}
     }
-    let tmp = temp_beside(full);
+    // `<name>.new`: where a link is made before it is renamed over `<name>`, so that the name
+    // always holds a whole link, the old one or the new (a crash leaves the `.new`, which the
+    // next run removes).
+    let tmp = new_beside(full);
     // A link left by an interrupted run.
     match fs::remove_file(&tmp) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
@@ -239,7 +242,16 @@ fn symlink(full: &Path, target: &Path) -> io::Result<()> {
     fs::File::open(parent)?.sync_all()
 }
 
-/// The name a step makes its new file or link under before renaming it over `full`.
+/// `<name>.new` beside `full`: the name a link is made under before it is renamed over `full`.
+fn new_beside(full: &Path) -> PathBuf {
+    let name = full
+        .file_name()
+        .expect("a HostPath names a file")
+        .to_string_lossy();
+    full.with_file_name(format!("{name}.new"))
+}
+
+/// The name a step makes its new file under before renaming it over `full`.
 fn temp_beside(full: &Path) -> PathBuf {
     let name = full
         .file_name()

@@ -161,6 +161,38 @@ impl TlsSource {
         })
     }
 
+    /// Replaces the certificate chain and key of a source made by [`TlsSource::fixed`]
+    /// with no client CA: the next handshake uses them, an open connection keeps what it
+    /// was accepted under. For a caller that holds a key in memory and renews the
+    /// certificate for it (the frontend's enroll listener, whose key is never a file). A
+    /// text that does not make a configuration, or a leaf already expired, changes
+    /// nothing.
+    ///
+    /// # Errors
+    /// [`TlsError`] as [`TlsSource::fixed`] gives, [`TlsError::Expired`] for a leaf whose
+    /// validity ended, and [`TlsError::Config`] for a source that watches files or
+    /// verifies client certificates (it would drop what the files or the CA say).
+    pub fn replace(&self, cert: &[u8], key: &[u8]) -> Result<(), TlsError> {
+        let shared = &*self.shared;
+        if shared.watch || shared.files.client_ca.is_some() {
+            return Err(TlsError::Config(
+                "only a fixed source without a client CA can be replaced in memory".to_owned(),
+            ));
+        }
+        let material = Material {
+            cert: cert.to_vec(),
+            key: key.to_vec(),
+            client_ca: None,
+        };
+        let built = build(&shared.files, &material, true)?;
+        let mut state = shared.state();
+        state.config = built.config;
+        state.not_after = built.not_after;
+        state.seen = Seen::Files(digest(&material));
+        shared.applied.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// The configuration a handshake that starts now uses.
     #[must_use]
     pub fn config(&self) -> Arc<ServerConfig> {

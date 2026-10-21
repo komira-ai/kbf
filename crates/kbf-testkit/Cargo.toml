@@ -21,7 +21,7 @@ test = false
 # (mkfifo, and signal to ignore one). `kbf-m2-act` still links statically.
 [dependencies]
 libc.workspace = true
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true, features = ["process", "net"] }
 
 [lints]
 workspace = true

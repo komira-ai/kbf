@@ -44,7 +44,7 @@
 //!     counts exactly the staged bytes.
 //! 13. **Drained** (invariant F). At the end no object is left staged.
 //!
-//! One more, of all-in-one (its design, komira-build-farm#657, sections 7.4 and 8),
+//! One more, of all-in-one (its design, kbf#657, sections 7.4 and 8),
 //! in [`Kind::WholeProcess`] runs, where the daemon half stores each output before it
 //! reports and dies with the server:
 //!
@@ -642,8 +642,9 @@ mod tests {
         assert!(all_accepted(&reported, &seen.accepted).is_ok());
         // An action-cache entry for an action with no accepted result.
         let mut cached = MetaState::new(Retention::default());
-        let Applied::Epoch(epoch) = cached.execute(1, Command::AllocEpoch) else {
-            panic!("an epoch")
+        let epoch = match cached.execute(1, Command::AllocEpoch) {
+            Applied::Epoch(epoch) => epoch,
+            other => panic!("an epoch, got {other:?}"),
         };
         let result = input_of(&action(0));
         let location = Location {

@@ -1,7 +1,7 @@
 # Updating a split-mode farm without failing a build
 
 Status: design for the sequence. The pull updater it relies on is partly built: `kbf-installer` (merged), `kbf-update` (the node's client, #908) and
-`kbf-helper` (the root helper, #929) are built or in review; the controller, the node gates, the Envoy switch and the poller are not.
+`kbf-installer run` (the root helper, #929) are built or in review; the controller, the node gates, the Envoy switch and the poller are not.
 Planned-down (#914) is built. It is read against `feature/arch-v2` and these pull requests, fetched
 when this was written: #857, #879 and #887 (the frontend handover, open, stacked), #803 (the rollout state machine, open), #886
 (merged: a restarted node whose index is whole registers `Active`) and #860 (open: a wiped node rebuilds its index while
@@ -97,7 +97,7 @@ The frontend phase is the same on a single box, in split mode and in all-in-one 
 |---|---|---|
 | Poll for a release | frontend: update poller (6.2) | read-only access to the release source |
 | Preflight | frontend: planner (2.4) | `kbf --version --json` of each tarball; build facts of every running host |
-| Staging | each host: update client (`kbf-update`) and root helper (`kbf-helper`), offline verification | session to the frontend |
+| Staging | each host: update client (`kbf-update`) and root helper (`kbf-installer run`), offline verification | session to the frontend |
 | Slot, plan, ordering, resume | the **new** frontend: rollout controller (6.1) | `update/*` rows |
 | Start the new frontend, switch, drain | frontend host: the helper starts the idle instance on its own ports; the baton moves (#879); Envoy routes by health; the old process drains | units `kbf-frontend@{a,b}` (#887), Envoy static config naming both |
 | Cordon, lease count | scheduler (`Farm`), `cordon/<node>` rows (#879) | none new |
@@ -567,7 +567,7 @@ attempts; T1 measures it. An `Execute` queued because capacity is short keeps it
 ### 5.1 Principles
 
 - A host reverts **itself** from local state only: a binary that never becomes healthy is put back by the helper's timer or boot
-  counter (**as built**: on Linux the window starts at the new process's first start, from `kbf-helper boot-check --window-secs`, default 900, range 120 to 1800, and the order's `window_s` is ignored; on macOS there is no start hook, so the window is armed at activation and `window_s` is clamped to 120 to 1800).
+  counter (**as built**: on Linux the window starts at the new process's first start, from `kbf-installer boot-check --window-secs`, default 900, range 120 to 1800, and the order's `window_s` is ignored; on macOS there is no start hook, so the window is armed at activation and `window_s` is clamped to 120 to 1800).
 - The controller **holds** on any failure and touches nothing else. It never retries a revert by itself (a revert from a frontend
   outage and one from a bad build look alike from the host).
 - An error from the activate order counts as "swapped, maybe": revert, never retry.
@@ -703,7 +703,7 @@ monotonic id, and a host acts on each at most once. The node client refuses an a
 - it reads `kbf --version --json` from the binary (service user, empty environment, no network, a timeout) and rejects one whose commit differs from the run's;
 - it runs preflight against the live farm and stores the result, so the UI shows blockers without a click;
 - it stores `update/available/<commit>` (hashes, `meta`, attestation time, preflight result, the merge commit subject) and keeps the last few;
-- **it never applies.** `update/policy` decides. `auto_nodes` false (default) offers; true runs the whole sequence's node steps when preflight is
+- **it never applies.** `update/policy` decides. `auto_nodes` false (written by an operator; see Q7) offers; true runs the whole sequence's node steps when preflight is
   clean. `auto_frontend` is separate, defaults to false, and cannot be set to true unless `auto_nodes` is true and the last two runs finished
   without `Held`. A frontend handover is never started by a timer unless an authenticated operator wrote that row;
 - it never proposes a commit older than the running one by itself (an operator may set an older commit as a rollback, and the generation orders it), and it refuses a commit not on main and a run with a failed or missing attestation;
@@ -801,7 +801,7 @@ T5, T6 and E1 prove the model's one unproven step: if either cannot be made reli
 - **Q4** State-schema migration (3.4) is a `kbf-state` change of a few days and is on the critical path of the first release that changes a column. Until then the planner refuses such a release.
 - **Q5** Planned-down member state: **decided and built** (#914, `planned_down` with `for_secs`; 2.6 step 4); the router-failover alternative is not taken.
 - **Q6** Node graceful stop and a `Leave` call. **Lean yes.**
-- **Q7 [owner]** `auto_nodes` default false until two click-through runs are clean.
+- **Q7 [owner]** `auto_nodes` default false until two click-through runs are clean. **Changed (updfeed U1, CEO-visible):** a policy never written reads `auto_nodes` true. Only an operator's write of `update/desired` starts a run (the poller proposes and never writes it), so that write is the click; `pause` is the stop, and `auto_nodes` written false still stops it.
 - **Q8** One rollout record (K11). **Lean durable `update/*` rows.**
 - **Q9** A nightly mixed-version job against the release before the last tag (T10), a precondition for auto.
 - **Q10** The handover wire frozen at 1 (K12); say so in the doc that owns `handover.rs`.

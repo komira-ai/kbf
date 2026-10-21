@@ -46,6 +46,11 @@ ExecStart=/usr/local/bin/kbf daemon \
     --data-dir=/var/lib/kbf \
     --actions-memory-max-gib=200 \
     --supervisor-memory-min-mib=256
+# The daemon drains on SIGTERM for up to --drain-deadline-secs (600 by default), then
+# stops. The stop timeout is that plus 60 s, so systemd never SIGKILLs a drain; it stays
+# finite, so a hung daemon still lets a reboot through.
+TimeoutStopSec=660
+KillSignal=SIGTERM
 Restart=on-failure
 RestartSec=5
 # Exit 2 is a command line kbf refused (or an image it cannot parse): a restart cannot

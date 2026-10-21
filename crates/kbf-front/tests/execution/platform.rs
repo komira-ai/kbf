@@ -479,3 +479,90 @@ async fn the_default_memory_is_the_one_the_service_is_given() {
     assert_eq!(submitted[1].request.resources.memory_bytes, 8 << 30);
     assert_eq!(submitted[2].request.resources.memory_bytes, 1 << 30);
 }
+
+/// The `needs` each platform makes under `default`, with the action digest it keeps.
+async fn needs_under(
+    default: kbf_front::DefaultPlatform,
+    cases: &[(&str, &[(&str, &str)])],
+) -> Vec<kbf_caps::Request> {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_default_platform(Arc::clone(&script), default).await;
+    for (argv, props) in cases {
+        let job = job(argv, props, false);
+        farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+        start(&farm, &job.action).await.expect("Execute");
+        let submitted = script.submitted();
+        let digest = submitted.last().expect("submitted").request.key.action;
+        assert_eq!(
+            digest.hash_hex(),
+            job.action.proto.hash,
+            "{argv}: the default must not change the action digest"
+        );
+    }
+    script
+        .submitted()
+        .into_iter()
+        .map(|s| s.request.needs)
+        .collect()
+}
+
+fn request(props: &[(&str, &str)]) -> kbf_caps::Request {
+    kbf_caps::Request::parse(props.iter().copied()).unwrap()
+}
+
+/// Catches: an action that names no OS and no architecture left to match every node
+/// (so a Mac that sorts first takes it); and the default changing what the client
+/// sent: the action digest (so the cache key) must stay the client's. A property kbf
+/// does not read (`pool`) and an empty platform both name nothing.
+#[tokio::test]
+async fn an_action_naming_no_os_or_arch_is_given_the_default() {
+    let linux = [("os", "linux"), ("arch", "x86_64")];
+    let cases: &[(&str, &[(&str, &str)])] = &[
+        ("empty", &[]),
+        ("pool", &[("pool", "mojo-bench")]),
+        ("cpus only", &[("cpus", "2")]),
+    ];
+    let got = needs_under(kbf_front::DefaultPlatform::LINUX_X86_64, cases).await;
+    let want = [request(&linux), request(&linux), {
+        let mut both = linux.to_vec();
+        both.push(("cpus", "2"));
+        request(&both)
+    }];
+    assert_eq!(got, want);
+}
+
+/// Catches: the default applied where the client said something about where it runs:
+/// `OSFamily=Darwin` alone or `ISA=arm-a64` alone (given the other half, a Linux
+/// default would make a Mac action unservable or a conflict), an explicit Linux, an
+/// ISA level alone, and what only a Mac reports (`xcode`, an iOS device), which a
+/// Linux default would leave to wait out the unservable wait or refuse as a conflict.
+#[tokio::test]
+async fn a_request_that_says_where_it_runs_keeps_what_it_said() {
+    let cases: &[(&str, &[(&str, &str)])] = &[
+        ("darwin alone", &[("OSFamily", "Darwin")]),
+        ("arm alone", &[("ISA", "arm-a64")]),
+        ("explicit linux", &[("OSFamily", "Linux")]),
+        ("isa level alone", &[("ISA", "x86-64-v3")]),
+        ("xcode only", &[("xcode", "16C5032a")]),
+        ("ios device", &[("ios.device", "1")]),
+    ];
+    let got = needs_under(kbf_front::DefaultPlatform::LINUX_X86_64, cases).await;
+    let want = [
+        request(&[("os", "macos")]),
+        request(&[("arch", "arm64")]),
+        request(&[("os", "linux")]),
+        request(&[("arch", "x86_64"), ("isa_level", "x86-64-v3")]),
+        request(&[("xcode", "16C5032a")]),
+        request(&[("ios.device", "1")]),
+    ];
+    assert_eq!(got, want);
+}
+
+/// Catches: `none` still applying the built-in: the request stays empty, as it was
+/// before the flag.
+#[tokio::test]
+async fn no_default_platform_leaves_the_request_as_the_client_made_it() {
+    let cases: &[(&str, &[(&str, &str)])] = &[("empty", &[]), ("pool", &[("pool", "x")])];
+    let got = needs_under(kbf_front::DefaultPlatform::NONE, cases).await;
+    assert_eq!(got, [request(&[]), request(&[])]);
+}

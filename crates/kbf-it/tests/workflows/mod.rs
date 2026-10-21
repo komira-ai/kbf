@@ -19,7 +19,7 @@
 //!   `contents` ([`RELEASE_SCOPES`]), which may be `write` only in a job whose `if:` is
 //!   exactly [`RELEASE_TAG_PUSH_ONLY`]. So no pull request or merge-queue run holds a
 //!   token that can sign an attestation, every attestation this repository signs names
-//!   `refs/heads/main` or `refs/heads/feature/arch-v2`, and only a pushed `v*` tag runs a job that can create a release
+//!   `refs/heads/main`, and only a pushed `v*` tag runs a job that can create a release
 //!   (or push to the repository);
 //! - a job calls a reusable workflow that is not one of this repository's linted
 //!   workflow files (its runners are not in a file this lint read);
@@ -78,6 +78,12 @@
 mod stages;
 mod yaml;
 
+mod jobs;
+pub use jobs::{
+    dispatch_inputs, job_env, job_environment, job_needs, job_outputs, job_permission_levels,
+    push_filters,
+};
+
 use yaml::{Node, Value};
 
 /// The keys GitHub reads at the top of a workflow file.
@@ -134,15 +140,16 @@ const ALLOWED_OWNERS: &[&str] = &["actions"];
 /// Further `owner/repository` actions the repository's Actions policy allows.
 const ALLOWED_REPOSITORIES: &[&str] = &["tailscale/github-action"];
 
-/// Token scopes a job may set to `write` when it runs only for a push to `main` or to
-/// `feature/arch-v2`: the OIDC token and the attestations API, which together sign
+/// Token scopes a job may set to `write` when it runs only for a push to `main`:
+/// the OIDC token and the attestations API, which together sign
 /// build provenance.
 const SIGNING_SCOPES: &[&str] = &["id-token", "attestations"];
 
 /// The one `if:` spelling under which a job may hold [`SIGNING_SCOPES`] for writing: a
-/// push, to `main` or to the development branch. No pull request or merge-queue run
-/// satisfies it, and every attestation signed under it names one of those two refs.
-const SIGNING_PUSH_ONLY: &str = "${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}";
+/// push, to `main` only. No pull request or merge-queue run satisfies it, and every
+/// attestation signed under it names `refs/heads/main`.
+const SIGNING_PUSH_ONLY: &str =
+    "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
 
 /// Token scopes a job may set to `write` when it runs only for a pushed release tag:
 /// the repository's contents, which creating a release and uploading its assets need.
@@ -300,6 +307,19 @@ pub fn job_condition(text: &str, job: &str) -> Result<Option<String>, String> {
             .map(|c| Some(c.to_owned()))
             .ok_or_else(|| format!("the `if:` of job `{job}` is not a string")),
     }
+}
+
+/// The names of the jobs of a workflow text, in file order. An error when the text does not
+/// parse or has no `jobs` mapping.
+pub fn job_names(text: &str) -> Result<Vec<String>, String> {
+    let root = yaml::load(text)?;
+    let Some(Value::Map(jobs)) = get(top_of(&root)?, "jobs").map(|j| &j.value) else {
+        return Err("the workflow has no `jobs` mapping".to_owned());
+    };
+    Ok(jobs
+        .iter()
+        .filter_map(|(k, _)| k.as_str().map(str::to_owned))
+        .collect())
 }
 
 /// One step with a `run:` script, in a workflow job or an action file's composite

@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use crate::clock::StoreTime;
-use crate::store::Store;
+use crate::own_keys::{OwnKeys, Permit};
+use crate::store::{LivenessGuard, Store};
 use crate::types::{
     Changes, Commit, CommitStats, Cond, Conflict, Revision, ScanPage, ScanRange, StoreError, Txn,
     Version, Versioned,
@@ -40,6 +41,7 @@ pub enum TakeError {
 /// check that the generation row is still the version this handle wrote, so once another
 /// handle takes the next generation, every write here fails with [`StoreError::Fenced`]
 /// and none lands. Reads are not fenced.
+#[derive(Clone)]
 pub struct Fenced {
     inner: Arc<dyn Store>,
     generation: u64,
@@ -64,6 +66,36 @@ impl Fenced {
     /// [`TakeError`]: the store failed, the generation is not what was expected, the row
     /// is not a number, or another writer took it first.
     pub fn take(inner: Arc<dyn Store>, expect: Option<u64>) -> Result<Fenced, TakeError> {
+        Fenced::take_with(inner, expect, |_| Ok(())).map(|(fenced, ())| fenced)
+    }
+
+    /// [`Fenced::take`], and the holder's liveness announcement for the new generation
+    /// ([`Store::hold_liveness`]), made *before* the generation row is written. So there
+    /// is no moment at which the generation is held and its holder is not announced: an
+    /// observer that reads the generation and asks [`Store::holder_alive`] is never told
+    /// "dead" about a live holder. When the backend cannot announce, or the generation
+    /// already has a holder, nothing is written. The caller owns the guard and keeps it
+    /// for as long as the handle is in use.
+    ///
+    /// # Errors
+    /// As [`Fenced::take`]; the failed announcement is [`TakeError::Store`].
+    pub fn take_holding(
+        inner: Arc<dyn Store>,
+        expect: Option<u64>,
+    ) -> Result<(Fenced, LivenessGuard), TakeError> {
+        let announcer = Arc::clone(&inner);
+        Fenced::take_with(inner, expect, move |generation| {
+            announcer.hold_liveness(generation)
+        })
+    }
+
+    /// The take, with `before` run on the generation about to be written, after the
+    /// expectation is checked and before the row is.
+    fn take_with<T>(
+        inner: Arc<dyn Store>,
+        expect: Option<u64>,
+        before: impl FnOnce(u64) -> Result<T, StoreError>,
+    ) -> Result<(Fenced, T), TakeError> {
         let (found, cond) = match inner.get(GENERATION)? {
             None => (0, Cond::Absent),
             Some(row) => {
@@ -76,28 +108,23 @@ impl Fenced {
             return Err(TakeError::Mismatch { expected, found });
         }
         let generation = found + 1;
+        let held = before(generation)?;
         let txn = Txn::new().put(GENERATION, generation.to_be_bytes(), cond);
         let commit = inner.txn(txn)?.map_err(|_| TakeError::Lost)?;
         // The one put of the transaction wrote the highest revision, which is its version.
         let version = Version(commit.revision.0);
-        Ok(Fenced {
+        let fenced = Fenced {
             inner,
             generation,
             version,
-        })
+        };
+        Ok((fenced, held))
     }
 
     /// The generation this handle holds.
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
-    }
-
-    fn fenced(&self) -> Result<(), StoreError> {
-        match self.inner.get(GENERATION)? {
-            Some(row) if row.version == self.version => Ok(()),
-            _ => Err(StoreError::Fenced),
-        }
     }
 }
 
@@ -135,8 +162,31 @@ impl Store for Fenced {
     }
 
     fn reap_expired(&self) -> Result<usize, StoreError> {
-        self.fenced()?;
-        self.inner.reap_expired()
+        // The generation is checked by the backend in the step that reaps, not by a read
+        // of ours before it: a take between the two would let a superseded handle reap.
+        self.inner
+            .reap_expired_if(GENERATION, Cond::Version(self.version))?
+            .map_err(|_| StoreError::Fenced)
+    }
+
+    /// A fenced handle already reaps under its generation as the one precondition; a
+    /// second one cannot be checked in the same step, so it is refused.
+    fn reap_expired_if(
+        &self,
+        _key: &str,
+        _cond: Cond,
+    ) -> Result<Result<usize, Conflict>, StoreError> {
+        Err(StoreError::Failed(
+            "a fenced handle reaps with reap_expired, under its generation".to_owned(),
+        ))
+    }
+
+    fn hold_liveness(&self, generation: u64) -> Result<LivenessGuard, StoreError> {
+        self.inner.hold_liveness(generation)
+    }
+
+    fn holder_alive(&self, generation: u64) -> Result<bool, StoreError> {
+        self.inner.holder_alive(generation)
     }
 
     fn commit_stats(&self) -> CommitStats {
@@ -149,5 +199,13 @@ impl Store for Fenced {
 
     fn demote(&self) -> Result<(), StoreError> {
         self.inner.demote()
+    }
+
+    fn own_keys(&self, permit: Permit) -> Option<Arc<dyn Store>> {
+        Some(Arc::new(OwnKeys::new(
+            Arc::new(self.clone()),
+            Arc::clone(&self.inner),
+            permit,
+        )))
     }
 }

@@ -531,6 +531,7 @@ async fn the_successor_authorizes_a_relayed_call_again() {
         authorizers: Authorizers::allow_all(),
         invocations_get: None,
         blobs_get: None,
+        farm_get: None,
     };
     let successor = Farm::with_policy(Arc::new(Nothing), policy).await;
     let rig = Rig::to(successor.channel(), vec![], Arc::default());

@@ -1,12 +1,16 @@
 //! `linux install-units --mode MODE`: one mode's unit of the one `kbf` binary on the
-//! host (docs/deploy/kbf-modes.md, "Installing a mode's unit").
+//! host (docs/deploy/kbf-units.md, "Installing a mode's unit").
 //!
 //! It checks the host first, read only, and each refusal says the fix:
+//! - the host has the cgroup v2 memory controller (every unit sets a memory limit or
+//!   reservation), and no listener of the unit's flags is on a port another process
+//!   holds (a unit of this mode that is running keeps its own ports);
 //! - the unit names a `User=` other than root, and the host has that user; for a mode
 //!   that runs builds, the kbf user has subuid and subgid ranges and lingers;
 //! - `kbf` is an executable in `--bin-dir` (or, without it, in `KBF_BIN_DIR`);
 //! - the rendered unit passes `check-units --mode MODE --installable` on this host
-//!   ([`modes::check_on_host`]), its flags parsed by that `kbf`'s own `check-args`;
+//!   ([`modes::check_on_host`]); `kbf` is not run on the unit's flags (kbf-cli's tests
+//!   parse each rendered unit, and `kbf --mode=MODE --check` checks them on the host);
 //! - every file the unit reads is there: each `EnvironmentFile=` (the cold store's key,
 //!   the state store's URI), each file a `--*key=` or `--*token-file=` flag names the
 //!   unit's user's alone (owner and no group or other bit: kbf reads it as that user),
@@ -23,25 +27,30 @@
 //! 4. when a file changed: `daemon-reload`, then enable and restart the unit; otherwise
 //!    it is enabled and started only if it is not (the frontend's template is enabled as
 //!    such and `kbf-frontend@a` started; a serving instance is never restarted, the plan
-//!    says to run `kbf frontend handover`); after any start of a unit with
+//!    says to `systemctl restart` it when its builds may drain); after any start of a unit with
 //!    `--api-listen=127.0.0.1:<port>`, a wait of up to 60 s for its `/readyz`.
 //!
+//! A mode that runs builds on a host with no active swap prints a `WARN:` line first
+//! (its leases may swap; `kbf-deploy linux swap` makes the swapfile).
+//!
 //! Without `--apply` every step is a `DRY-RUN:` line: nothing is written, reloaded or
-//! started. There is no `--uninstall` for a mode's unit yet (`install-units
-//! --uninstall` moves the four files of the converged node's units aside).
+//! started. There is no `--uninstall` for a mode's unit.
 
 use std::io::Write;
 
 use super::LinuxConfig;
-use super::host::{self, HostError, binary, inspect, note, parents, stat, under, unit_is};
-use super::install::{READY, ROOT, UNITS, rootless, systemctl};
+use super::host::{
+    self, HostError, SS, binary, inspect, note, parents, stat, tool, under, unit_is,
+};
 use super::modes::{self, Mode, UnitText};
-use super::render::{SLICE, Templates, render};
+use super::shared::{self, SLICE};
+use super::shared::{READY, ROOT, UNITS, rootless, systemctl, text_of};
+use super::stores::LISTEN_FLAGS;
 use crate::unit::UnitFile;
 use kbf_host::exec::{Entry, Exec, Kind};
 use kbf_host::path::HostPath;
 use kbf_host::plan::{self, Plan, Planner, RunAs};
-use kbf_host::step::{HttpUrl, Owner, Perms};
+use kbf_host::step::{Cmd, HttpUrl, Owner, Perms};
 use kbf_host::user::RunUser;
 
 /// What `install-units --mode` was asked for.
@@ -67,6 +76,7 @@ fn plan_with<E: Exec>(
     out: &mut dyn Write,
 ) -> Result<Plan, HostError> {
     let (c, mode) = (&a.config, a.mode);
+    memory_controller(exec)?;
     let kbf_user = if mode.runs_builds() {
         let kbf = host::user_named(exec, &c.user)?;
         rootless(exec, &kbf)?;
@@ -76,7 +86,7 @@ fn plan_with<E: Exec>(
     };
     let name = mode.unit_name();
     let text = modes::render(c, kbf_user.as_ref().map(|u| u.uid), mode)?;
-    let slice = render(c, None, &Templates::BUILT_IN)?.slice;
+    let slice = shared::render_slice(c, None)?;
     let unit = UnitFile::parse(&text)?;
     let user = host::user_named(exec, unit_user(&unit, &name)?)?;
 
@@ -92,7 +102,6 @@ fn plan_with<E: Exec>(
         &UnitText::new(name.clone(), text.clone()),
         &UnitText::new(SLICE, slice.clone()),
         true,
-        Some(&bin),
     )?;
     if !report.failures.is_empty() {
         return Err(HostError::Units(report.failures));
@@ -101,6 +110,16 @@ fn plan_with<E: Exec>(
         note(out, format_args!("{line}"))?;
     }
     files_read(exec, &unit, &user)?;
+    if mode.runs_builds() && host::swaps(exec)?.is_empty() {
+        note(
+            out,
+            format_args!(
+                "WARN: no swap is active: run `kbf-deploy linux swap` first (builds may swap)"
+            ),
+        )?;
+    }
+    let instances = mode.instances();
+    ports_free(exec, &unit, &instances, out)?;
 
     let mut planner = Planner::new(exec);
     let mut changed = false;
@@ -134,9 +153,8 @@ fn plan_with<E: Exec>(
     let mut started = false;
     // The frontend's unit is a template: it is enabled by that name (DefaultInstance=
     // makes it the first instance) and started as an instance. A serving instance is
-    // never restarted: a restart drains it and refuses every new build until the next
-    // start, which is what `kbf frontend handover` exists not to do.
-    let instances = mode.instances();
+    // never restarted by the install: a restart drains it and refuses every new build until the next
+    // start, so the operator chooses when (its Postgres store cannot be handed over).
     let first = instances[0].clone();
     let serving = || -> Result<Option<String>, HostError> {
         for instance in &instances {
@@ -153,11 +171,14 @@ fn plan_with<E: Exec>(
             planner.run(systemctl(&["restart", &name]));
             started = true;
         } else if let Some(serving) = serving()? {
+            // The rendered unit has no control socket (its store is Postgres, which cannot
+            // be handed over): the operator restarts it, which drains the builds in flight.
             note(
                 out,
                 format_args!(
-                    "{serving} is serving and is not restarted: run `kbf frontend handover` \
-                     to start the other instance on the new unit and binary"
+                    "{serving} is serving and is not restarted: its state store cannot be \
+                     handed over: `systemctl restart` it when its builds may drain, to run \
+                     the new unit and binary"
                 ),
             )?;
         } else {
@@ -187,6 +208,60 @@ fn plan_with<E: Exec>(
         );
     }
     Ok(planner.finish())
+}
+
+/// The cgroup v2 file that lists the controllers the root cgroup can delegate.
+const CONTROLLERS: &str = "/sys/fs/cgroup/cgroup.controllers";
+
+/// The host has the cgroup v2 memory controller: every mode's unit sets `MemoryMin=` or
+/// `MemorySwapMax=`, and the daemon's `actions/memory.max` needs it.
+fn memory_controller<E: Exec>(exec: &E) -> Result<(), HostError> {
+    let controllers = text_of(exec, &HostPath::new(CONTROLLERS)?)?;
+    if controllers.is_some_and(|t| t.split_whitespace().any(|w| w == "memory")) {
+        Ok(())
+    } else {
+        Err(HostError::NoMemoryController)
+    }
+}
+
+/// None of the unit's listeners ([`LISTEN_FLAGS`]) is on a port something listens on,
+/// unless an instance of the unit is running: its ports are its own, and a re-install
+/// must not refuse itself.
+fn ports_free<E: Exec>(
+    exec: &E,
+    unit: &UnitFile,
+    instances: &[String],
+    out: &mut dyn Write,
+) -> Result<(), HostError> {
+    for instance in instances {
+        if unit_is(exec, "is-active", instance)? {
+            return note(
+                out,
+                format_args!("{instance} is running: its ports are its own"),
+            );
+        }
+    }
+    // `ss -Hltn`: `<state> <recv-q> <send-q> <local address:port> <peer>`.
+    let listening = host::checked(exec, &Cmd::new(tool(SS)).arg("-Hltn"))?;
+    for flag in LISTEN_FLAGS {
+        let Some(port) = unit
+            .flag(flag)
+            .and_then(|v| v.rsplit_once(':'))
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let tail = format!(":{port}");
+        let held = listening.lines().any(|l| {
+            l.split_whitespace()
+                .nth(3)
+                .is_some_and(|local| local.ends_with(&tail))
+        });
+        if held {
+            return Err(HostError::PortInUse(port));
+        }
+    }
+    Ok(())
 }
 
 /// The unit's `User=`, unless it names none or root.
@@ -276,7 +351,12 @@ fn directories(unit: &UnitFile) -> Result<Vec<(HostPath, u32)>, HostError> {
     {
         let file = HostPath::new(file)?;
         let dir = file.as_str().rsplit_once('/').map_or("", |(dir, _)| dir);
-        dirs.push((HostPath::new(dir)?, 0o700));
+        let dir = HostPath::new(dir)?;
+        // The all-in-one unit keeps its state file in `--data-dir`: that directory is
+        // made once, with the data directory's mode, not made again as 0700.
+        if !dirs.iter().any(|(made, _)| *made == dir) {
+            dirs.push((dir, 0o700));
+        }
     }
     Ok(dirs)
 }

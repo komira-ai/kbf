@@ -5,45 +5,42 @@
 //! node does with that, and nothing about the wire:
 //!
 //! - [`start`] makes a [`Handle`] the session feeds and a [`Worker`] that runs beside it.
-//! - An offer is checked ([`Offer::check`]), then fetched through a [`Source`] into the
-//!   [inbox](inbox), where a root helper picks it up. Every byte is counted against the
-//!   offered size and hashed on the way; a directory becomes visible by one rename after
-//!   the digest matched.
-//! - An order is written into the inbox as a small fixed file when it is for the current
-//!   session, newer than every order before it, for a release the helper holds, and, for
-//!   an activation, when no lease is live. An accepted activation closes the update
-//!   gate ([`Handle::gate`]); the daemon takes no lease while it is closed.
-//! - [`Status`] says where the node stands, from its own state and the helper's status
+//! - An offer is checked ([`Offer::check`]) and remembered by commit. **No release bytes
+//!   pass through the node**: the root `kbf-installer` pulls the release itself.
+//! - An order is written into the [order spool](spool) as a small [`OrderRecord`] when it
+//!   is for the current session, newer than every order before it, and, for an activation,
+//!   when the node holds the offer for its commit (the record carries its components and
+//!   expected facts) and no lease is live. An accepted activation closes the update gate
+//!   ([`Handle::gate`]); the daemon takes no lease while it is closed.
+//! - [`Status`] says where the node stands, from its own state and the installer's status
 //!   file ([`helper`]).
 //!
 //! # Trust
 //!
-//! The client does not decide trust. It copies bytes the frontend served into a
-//! directory the unprivileged service user owns, and a root helper verifies the GitHub
-//! build attestation of what it finds there, offline, before anything is installed.
-//! Whatever runs as the service user can write the inbox: on a host whose actions share
-//! that uid it can stage a release that verifies or order an early activation. That is
-//! a loss of availability, never an unsigned install.
+//! The client does not decide trust and holds no release. It writes a record into a
+//! directory the unprivileged service user owns, and the root installer fetches the release
+//! for the commit, verifies the GitHub build attestation offline and the binary's own report,
+//! and only then installs. Whatever runs as the service user can write the spool: it can
+//! order an early activation of a release that verifies, or write a record the installer
+//! refuses. That is a loss of availability, never an unattested install.
 
 mod client;
 #[cfg(test)]
 mod fixtures;
 mod floors;
-mod grpc;
 pub mod helper;
-pub mod inbox;
 mod offer;
-mod source;
-mod stage;
+pub mod record;
+pub mod spool;
 mod types;
 mod wire;
 
 pub use client::{Config, Decision, Handle, StartError, Worker, start};
-pub use grpc::ReleaseClient;
 pub use offer::Refusal;
-pub use source::{Chunks, FetchError, Source};
-pub use stage::Backoff;
+pub use record::{
+    Facts, Locator, MAX_AGE_SECS, MAX_RECORD_BYTES, MAX_RECORDS, OrderRecord, RecordError,
+};
 pub use types::{
-    COMPONENT_NAMES, Component, FREE_DISK_FACTOR, MAX_ATTESTATION_BYTES, MAX_COMPONENT_BYTES,
-    Offer, Order, Staged, State, Status, Verb,
+    COMPONENT_NAMES, Component, Expected, MAX_ATTESTATION_BYTES, MAX_COMPONENT_BYTES, Offer, Order,
+    Staged, State, Status, Verb,
 };

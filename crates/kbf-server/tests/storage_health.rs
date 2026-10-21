@@ -23,7 +23,8 @@ use kbf_server::members::{
     Members, MembershipConfig, MembershipError, PROTOCOL, Progress, Registrant,
 };
 use kbf_server::storage_health::{
-    Debts, MemberReport, NotReady, Report, StorageGate, StorageHealth, render, storage_health,
+    Debts, MemberReport, NotReady, Report, Reported, StorageGate, StorageHealth, render,
+    storage_health,
 };
 use kbf_state::{Store, StoreTime};
 
@@ -38,8 +39,9 @@ fn reported(id: u64, state: MemberState, debts: Debts, seconds: u64) -> MemberRe
     MemberReport {
         id: MemberId(id),
         state,
+        planned: kbf_server::storage_health::Planned::No,
         report: Some(Report {
-            debts,
+            said: Reported::debts(debts),
             at: at(seconds),
         }),
     }
@@ -79,6 +81,7 @@ fn every_member_active_and_reporting_is_the_sum_of_their_debts() {
 #[test]
 fn a_member_that_is_down_makes_the_number_unknown_however_little_the_others_owe() {
     let down = MemberReport {
+        planned: kbf_server::storage_health::Planned::No,
         id: MemberId(2),
         state: MemberState::Down,
         report: None,
@@ -139,6 +142,7 @@ fn a_member_that_stopped_reporting_is_silent() {
     );
 
     let never = MemberReport {
+        planned: kbf_server::storage_health::Planned::No,
         report: None,
         ..on_the_edge
     };
@@ -194,6 +198,7 @@ fn the_debts_of_those_who_answered_are_shown_when_the_total_is_unknown() {
 fn every_reason_is_listed_and_named() {
     let down = reported(3, MemberState::Down, Debts::Known(0), 100);
     let silent = MemberReport {
+        planned: kbf_server::storage_health::Planned::No,
         report: None,
         ..active(2, 0)
     };
@@ -275,13 +280,25 @@ impl Pair {
 
     fn beat_a(&self, debts: Debts) {
         self.members
-            .heartbeat(self.a.0, self.a.1, Progress::CaughtUp, debts, None)
+            .heartbeat(
+                self.a.0,
+                self.a.1,
+                Progress::CaughtUp,
+                Reported::debts(debts),
+                None,
+            )
             .expect("a beats");
     }
 
     fn beat_b(&self, debts: Debts) {
         self.members
-            .heartbeat(self.b.0, self.b.1, Progress::CaughtUp, debts, None)
+            .heartbeat(
+                self.b.0,
+                self.b.1,
+                Progress::CaughtUp,
+                Reported::debts(debts),
+                None,
+            )
             .expect("b beats");
     }
 
@@ -403,7 +420,7 @@ fn a_member_that_registers_again_starts_without_a_report() {
             again.id,
             again.boot,
             Progress::CaughtUp,
-            Debts::Known(0),
+            Reported::debts(Debts::Known(0)),
             None,
         )
         .expect("beats");
@@ -423,7 +440,7 @@ fn the_report_of_a_superseded_boot_is_refused() {
         pair.a.0,
         pair.a.1,
         Progress::CaughtUp,
-        Debts::Known(0),
+        Reported::debts(Debts::Known(0)),
         None,
     );
     assert!(matches!(refused, Err(MembershipError::Superseded { .. })));
@@ -543,4 +560,47 @@ impl Down for MemberReport {
             ..self
         }
     }
+}
+
+// Catches: write-tier values kept after the report that carried them went stale (an
+// operator would read a dead node's last numbers as current), values shown for a node that
+// sent none, and an unset value shown as zero. A fresh report shows its values, with a real
+// 0 distinct from unknown; a stale one and a missing one show every value unknown.
+#[test]
+fn a_nodes_vitals_are_shown_only_while_its_report_is_fresh() {
+    use kbf_server::vitals::Vitals;
+
+    let said = Vitals {
+        unflushed_bytes: Some(0),
+        used_bytes: Some(5),
+        ..Vitals::NONE
+    };
+    let with = |seconds| {
+        let mut member = reported(1, MemberState::Active, Debts::Known(0), seconds);
+        if let Some(report) = member.report.as_mut() {
+            report.said.vitals = said;
+        }
+        member
+    };
+    assert_eq!(judge(&[with(100)]).nodes[0].vitals, said, "fresh");
+    assert_eq!(
+        judge(&[with(100 - FRESH.as_secs())]).nodes[0].vitals,
+        said,
+        "as old as the window"
+    );
+    assert_eq!(
+        judge(&[with(100 - FRESH.as_secs() - 1)]).nodes[0].vitals,
+        Vitals::NONE,
+        "a second past the window: unknown, not the last numbers"
+    );
+    let silent = MemberReport {
+        report: None,
+        ..with(100)
+    };
+    assert_eq!(judge(&[silent]).nodes[0].vitals, Vitals::NONE);
+    assert_eq!(
+        judge(&[active(1, 0)]).nodes[0].vitals,
+        Vitals::NONE,
+        "a node that sends none"
+    );
 }

@@ -49,8 +49,8 @@ ExecStartPre=+/usr/bin/kbf-installer boot-check
 # and exits 2 for those. Anything that can become ready later (a listen address, a peer,
 # a DNS name, a mount) is not refused here: it exits 75 (not ready, restarted), so a check
 # that runs before the bind retry never leaves the unit down for good (kbf#998, #1000).
-ExecStartPre=/var/lib/kbf-installer/current/kbf --mode=storage-and-daemon --check
-ExecStart=/var/lib/kbf-installer/current/kbf --mode=storage-and-daemon
+ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=storage-and-daemon --check
+ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage-and-daemon
 # The storage half drains on SIGTERM: a Write in flight is finished and acknowledged
 # before the process exits, and a large one takes longer than systemd's 90 s default stop
 # timeout, which would SIGKILL it and fail the upload (check-units rule `stop`).

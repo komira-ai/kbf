@@ -185,6 +185,12 @@ pub enum HandoverError {
     /// A frontend that hands over has no `--state-store`, which the flag requires.
     #[error("a handover needs --state-store")]
     NoState,
+    /// A handover over a Postgres state store, which cannot give up its writer role yet.
+    #[error(
+        "a handover needs a sqlite:// --state-store: a postgres:// store cannot be handed \
+         over yet (stop the frontend, then start the new one)"
+    )]
+    PostgresStore,
     /// The state store failed, or could not be given up.
     #[error("state store: {0}")]
     Store(#[from] kbf_state::StoreError),
