@@ -486,6 +486,8 @@ pub struct Parsed {
     /// `--check` was given: print the problems and exit, start nothing. Always false for
     /// [`Invocation::Registered`], which carries its own ([`node::Start::check`]).
     pub check: bool,
+    /// The settings file the command line loads: `--config`, else the default.
+    pub config: PathBuf,
 }
 
 /// Parses a command line (its first word is the program's name): `kbf --mode=<mode>
@@ -564,10 +566,13 @@ fn parse_words(
         return Ok(Parsed {
             invocation: Invocation::Registered(Box::new(node::Start {
                 mode: Some(mode.name),
-                config: path.unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH)),
+                config: path
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH)),
                 check: split.check,
             })),
             check: false,
+            config: path.unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH)),
         });
     }
     // The flag wins over the file's `mode`; say so (a start that reads the file says it
@@ -596,7 +601,12 @@ fn parse_words(
         .chain(split.rest)
         .collect();
     let check = split.check;
-    parse_with_file(argv).map(|invocation| Parsed { invocation, check })
+    let config = path.unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH));
+    parse_with_file(argv).map(|invocation| Parsed {
+        invocation,
+        check,
+        config,
+    })
 }
 
 /// The mode a command line that names none gets from the settings file.
@@ -779,8 +789,8 @@ fn refuse_foreign_flags(mode: &str, m: &ArgMatches) -> Result<(), clap::Error> {
 /// Starts a parsed command line: the startup checks of the host ([`preflight::refusal`]),
 /// and, when they pass, the mode ([`run`]). Every start goes through here, the one that
 /// reads `kbf.toml` ([`node::run`]) after it has enrolled included.
-fn start(invocation: &Invocation) -> ExitCode {
-    preflight::refusal(invocation).unwrap_or_else(|| run(invocation))
+fn start(invocation: &Invocation, config: &std::path::Path) -> ExitCode {
+    preflight::refusal(invocation, config).unwrap_or_else(|| run(invocation))
 }
 
 /// Runs a parsed command line: the mode's own entry point.
@@ -833,8 +843,11 @@ pub fn main() -> ExitCode {
         Ok(Parsed {
             invocation,
             check: true,
-        }) => preflight::check_only(&invocation),
-        Ok(Parsed { invocation, .. }) => start(&invocation),
+            config,
+        }) => preflight::check_only(&invocation, &config),
+        Ok(Parsed {
+            invocation, config, ..
+        }) => start(&invocation, &config),
         Err(e) => e.exit(),
     }
 }

@@ -1,18 +1,25 @@
 //! What each mode asks of its host, read from its parsed flags: which files it reads,
 //! which certificate is whose, which store needs which credential.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use kbf_server::Args;
 use kbf_server::proxy_auth::SECRET_BYTES;
 use kbf_server::stores::StoreUri;
 
-use super::{CertNeed, ContainerNeed, FileNeed, Needs, Row};
+use super::{CertNeed, ContainerNeed, FileNeed, KeyRule, Needs, Row, key_file};
 use crate::Invocation;
 
 /// The needs of `invocation`.
 #[must_use]
 pub fn needs(invocation: &Invocation) -> Needs {
+    needs_in(invocation, Path::new(crate::config::DEFAULT_PATH))
+}
+
+/// The needs of `invocation` started with the settings file `config`: the legacy key file
+/// is the `s3.env` in its directory.
+#[must_use]
+pub fn needs_in(invocation: &Invocation, config: &Path) -> Needs {
     match invocation {
         // The flags of a start that enrolls are made after it has: the start checks them
         // then (`node::run`).
@@ -20,11 +27,13 @@ pub fn needs(invocation: &Invocation) -> Needs {
         Invocation::Daemon(cli) => {
             let mut n = Needs::new("daemon");
             daemon(&mut n, cli);
+            n.key = KeyRule::Absent;
             n
         }
         Invocation::Storage(flags) => {
             let mut n = Needs::new("storage");
             storage(&mut n, flags);
+            n.key = KeyRule::Holder(key_file(config));
             n
         }
         Invocation::Frontend(flags) => {
@@ -47,13 +56,19 @@ pub fn needs(invocation: &Invocation) -> Needs {
             let mut n = Needs::new("storage-and-daemon");
             storage(&mut n, &flags.storage);
             daemon(&mut n, &flags.daemon);
+            n.key = KeyRule::RootAlone(key_file(config));
             n
         }
         Invocation::AllInOne(flags) => {
             let mut n = Needs::new("all-in-one");
             server_files(&mut n, &flags.server);
             n.s3 = s3(&flags.server);
+            n.hot_store = hot_dir(&flags.server);
             daemon(&mut n, &flags.daemon);
+            // An all-in-one with an S3 cold store holds the key on purpose.
+            if !n.s3 {
+                n.key = KeyRule::Absent;
+            }
             n
         }
     }
@@ -67,6 +82,9 @@ impl Needs {
             certs: Vec::new(),
             s3: false,
             container: None,
+            hot_store: None,
+            cpuset: false,
+            key: KeyRule::None,
         }
     }
 
@@ -168,7 +186,17 @@ fn server_files(n: &mut Needs, a: &Args) {
     }
 }
 
+/// The directory of a `file://` hot store: the one directory whose ancestors the process
+/// must be able to enter.
+fn hot_dir(args: &Args) -> Option<PathBuf> {
+    match &args.hot_store {
+        Some(StoreUri::File(dir)) => Some(dir.clone()),
+        _ => None,
+    }
+}
+
 fn storage(n: &mut Needs, flags: &kbf_server::storage_node::StorageFlags) {
+    n.hot_store = hot_dir(&flags.server);
     // A node that registers with a frontend may be given the key pair by it
     // (`kbf_server::cold_apply`); the start says which variable is missing if the
     // frontend has no store registered either.
@@ -200,4 +228,6 @@ fn daemon(n: &mut Needs, cli: &kbf_node::Cli) {
     n.container = d.container.map(|c| ContainerNeed {
         oci_runtime: c.oci_runtime,
     });
+    // Leases are placed on the node's CPUs and NUMA nodes by the container driver.
+    n.cpuset = n.container.is_some();
 }
