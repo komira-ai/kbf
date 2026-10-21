@@ -575,10 +575,16 @@ impl Run<'_> {
                     ));
                 }
                 s => {
+                    // The store says why it refused a file (a version facts document that
+                    // contradicts the upload, naming it); no host path is in that text.
+                    let why = reply
+                        .json()
+                        .and_then(|j| j.get("error").and_then(|e| e.as_str().map(str::to_owned)))
+                        .map_or_else(String::new, |e| format!(": {e}"));
                     return Err(fail(
                         Exit::Failed,
                         "upload_failed",
-                        format!("PUT {path}: status {s}"),
+                        format!("PUT {path}: status {s}{why}"),
                     ));
                 }
             }

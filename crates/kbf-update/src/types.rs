@@ -40,8 +40,8 @@ pub struct Offer {
     pub platform: String,
     /// What to fetch.
     pub components: Vec<Component>,
-    /// What the frontend's preflight recorded about the release (the offer's `platform`
-    /// is the platform of these facts). Claims: the installer checks the fetched binary's
+    /// What the frontend's version facts document states about the release (the offer's
+    /// `platform` is the platform of these facts). Claims: the installer checks the fetched binary's
     /// own report against them. Zeros when the frontend predates the fields.
     pub expected: Expected,
 }

@@ -1852,8 +1852,8 @@ release and their build attestations, kept as uploaded. Mounted by `--releases-d
 
 - `commit` is 40 lowercase hex digits, `platform` is `linux-x86_64`, `linux-arm64` or
   `darwin-arm64`, `name` is `kbf` or `kbf-daemon` (the tarball) or either with the suffix
-  `.attestation` (its build attestation bundle). Anything else is `400`; no segment is ever joined
-  into a path as it arrived.
+  `.attestation` (its build attestation bundle), or `version.json` (the platform's version
+  facts, below). Anything else is `400`; no segment is ever joined into a path as it arrived.
 - `PUT` takes the file as the body, with the write gates of the section "Who may write" except
   the JSON content type (loopback peer, and the proxy's secret with `--proxy-auth-file`, no `Origin`, the bearer token). A tarball is at most
   512 MiB (`413` past it), a bundle at most 256 KiB; an empty body is `400`. The body is written to
@@ -1866,8 +1866,22 @@ release and their build attestations, kept as uploaded. Mounted by `--releases-d
   bundle like a tarball. A bundle stored before that link existed has no such name until the
   same bytes are put again (`200`); `Describe` reports it as lacking until then, though
   `GET /v1/releases` and the offers still count its platform complete.
+- **Version facts.** `PUT /v1/releases/{commit}/{platform}/version.json` takes, as the body
+  (at most 4 KiB), the exact bytes of that platform's `kbf --version --json`: the file
+  `kbf-<commit>-<platform>.version.json` the release's build writes. The offers carry its
+  `protocol`, `min_protocol`, `state_schema` and `profile` (`docs/design/pull-updates.md`
+  section 6.2). The document is read with the parser the installer reads a staged binary's report
+  with, and is `400`, naming the file and the reason, when it does not parse, names another commit
+  (its first 12 digits) or, if it names one, another platform than the path, is not a `release`
+  build, has a `protocol` or `state_schema` of 0 or past 32 bits, or a `min_protocol` above
+  `protocol`. Same immutability and answers as a tarball. **A platform stored without it is
+  accepted and held, and is never offered:** the `201`/`200` answer of its tarball or attestation
+  `PUT` carries `"note": "no version facts (kbf-<commit>-<platform>.version.json): nodes will not
+  be offered this platform; rebuild the release to include it"`, and `GET /v1/releases` lists the
+  platform with `"version_facts": false` and the same `note` (`true` and no `note` when stored).
+  A commit stored before this field existed lists as `false` and is not offered either.
 - `GET` is open and lists `{"releases": [{"commit", "platforms": [{"platform", "complete",
-  "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
+  "version_facts", "note"?, "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
   order above, a platform `complete` when it holds, with their attestations, the tarballs its
   hosts need: `kbf` for a Linux platform, `kbf-daemon` for `darwin-arm64`. A component is
   listed when its tarball is stored.

@@ -16,7 +16,8 @@
 //! listener's mutual TLS and role table.
 //!
 //! - The offers, [`offers::Offers`]: the `UpdateOffer` each platform is to be sent over its
-//!   nodes' sessions, built from the desired release and what the store holds.
+//!   nodes' sessions, built from the desired release and what the store holds, the platform's
+//!   version facts ([`facts`]) included. A platform without them is held and never offered.
 //!
 //! - The poller, [`poll`]: on the active frontend, proposes the newest GitHub release of a `v*`
 //!   tag as an `update/proposed/<commit>` row. It never writes `update/desired`.
@@ -27,6 +28,7 @@
 
 mod describe;
 pub mod desired;
+pub mod facts;
 pub mod grpc;
 pub mod http;
 pub mod key;
@@ -36,7 +38,7 @@ pub mod store;
 
 pub use grpc::service;
 pub use http::router;
-pub use key::{Commit, Component, Key, KeyError, Part, Sha256Hex};
+pub use key::{Commit, Component, FACTS_SEGMENT, Key, KeyError, Part, Sha256Hex};
 pub use store::{
     CommitListing, ComponentInfo, Limits, PlatformListing, PutError, ReleaseStore, Stored,
 };

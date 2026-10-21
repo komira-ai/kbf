@@ -43,7 +43,7 @@ pub struct Locator {
 }
 
 /// What the release is expected to declare about itself (`kbf --version --json`), as the
-/// frontend's preflight recorded it. The installer requires the fetched binary to say the
+/// frontend's release store holds it (the platform's version facts document). The installer requires the fetched binary to say the
 /// same, before it switches to it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -210,8 +210,8 @@ impl OrderRecord {
     }
 
     /// The shape rules both ends hold: a full commit; an activation names its components
-    /// (each within the offer's limits) and the expected facts, every one there (a release
-    /// the frontend never preflighted is not activated); every other verb carries neither.
+    /// (each within the offer's limits) and the expected facts, every one there (an offer
+    /// without facts is not activated); every other verb carries neither.
     /// A `frontend_update` is a locator like a `confirm`: the root half fetches the commit
     /// from its own source and re-derives every fact, so the record names no file, no
     /// digest and no claim.

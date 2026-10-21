@@ -34,6 +34,24 @@ const SMALL: Limits = Limits {
     attestation: 64,
 };
 
+/// What `kbf --version --json` prints for a build of `commit`.
+fn facts_doc(commit: &str) -> Vec<u8> {
+    format!(
+        "{{\"commit\":\"{}\",\"min_protocol\":6,\"profile\":\"release\",\"protocol\":7,\
+         \"state_schema\":3,\"version\":\"0.1.0\"}}",
+        &commit[..12]
+    )
+    .into_bytes()
+}
+
+/// What a platform stored without its version facts is told.
+fn no_facts_note(platform: ReleasePlatform) -> String {
+    format!(
+        "no version facts (kbf-{COMMIT}-{platform}.version.json): nodes will not be offered \
+         this platform; rebuild the release to include it"
+    )
+}
+
 /// A directory unique to one test, removed when it is dropped.
 struct Dir(PathBuf);
 
@@ -546,6 +564,13 @@ async fn the_list_names_what_is_stored_and_what_is_complete() {
         put_key(&k, component.as_str().as_bytes(), false).await;
         put_key(&k, b"bundle", true).await;
     }
+    // Only arm64 has its version facts.
+    let commit = Commit::parse(COMMIT).expect("a commit");
+    let doc = facts_doc(COMMIT);
+    store
+        .put_facts(&commit, arm, &mut body(&doc))
+        .await
+        .expect("facts");
     put_key(&key(COMMIT, x86, Component::KbfDaemon), b"d", false).await;
     // darwin-arm64 holds both tarballs but only one attestation: not complete.
     let darwin = ReleasePlatform::DarwinArm64;
@@ -567,12 +592,14 @@ async fn the_list_names_what_is_stored_and_what_is_complete() {
     let want = serde_json::json!({"releases": [{
     "commit": COMMIT,
     "platforms": [
-        {"platform": "linux-x86_64", "complete": false, "components": [
+        {"platform": "linux-x86_64", "complete": false, "version_facts": false,
+         "note": no_facts_note(ReleasePlatform::LinuxX86_64), "components": [
             {"name": "kbf-daemon", "sha256": sha(b"d"), "size": 1, "attested": false}]},
-        {"platform": "linux-arm64", "complete": true, "components": [
+        {"platform": "linux-arm64", "complete": true, "version_facts": true, "components": [
             {"name": "kbf", "sha256": sha(b"kbf"), "size": 3, "attested": true},
             {"name": "kbf-daemon", "sha256": sha(b"kbf-daemon"), "size": 10, "attested": true}]},
-            {"platform": "darwin-arm64", "complete": false, "components": [
+            {"platform": "darwin-arm64", "complete": false, "version_facts": false,
+             "note": no_facts_note(ReleasePlatform::DarwinArm64), "components": [
                 {"name": "kbf", "sha256": sha(b"t"), "size": 1, "attested": true},
                 {"name": "kbf-daemon", "sha256": sha(b"t"), "size": 1, "attested": false}]},
     ]}]});
