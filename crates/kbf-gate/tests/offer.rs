@@ -22,6 +22,7 @@ fn doc() -> OfferDoc {
         previous: Some(CommitId::parse(&"cd".repeat(20)).unwrap()),
         previous_meta_log: Some(4),
         reversible: true,
+        min_installer: None,
     }
 }
 
@@ -182,4 +183,22 @@ fn a_previous_meta_log_needs_a_previous_commit_and_an_attested_beta_needs_a_run(
         run_id: "  ".to_owned(),
     };
     assert!(offer_err(&blank).contains("names no run"));
+}
+
+#[test]
+fn min_installer_is_optional_on_read_and_left_out_when_absent() {
+    // Proves: an offer made before the field reads (as `None`, every installer accepts it) and
+    // is rewritten byte for byte as the golden has it (so nothing that read it before breaks);
+    // one that names a level reads it back and writes it. Mutants: the field required on read;
+    // `None` written as `null`; the value dropped on write.
+    let old = doc().to_bytes().unwrap();
+    assert!(!String::from_utf8_lossy(&old).contains("min_installer"));
+    assert_eq!(OfferDoc::from_bytes(&old).unwrap().min_installer, None);
+    let needing = OfferDoc {
+        min_installer: Some(3),
+        ..doc()
+    };
+    let bytes = needing.to_bytes().unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("\"min_installer\": 3"));
+    assert_eq!(OfferDoc::from_bytes(&bytes).unwrap(), needing);
 }

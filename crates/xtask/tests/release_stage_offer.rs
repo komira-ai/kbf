@@ -556,6 +556,18 @@ fn a_kbf_that_fails_or_names_another_commit_is_an_error() {
 }
 
 #[test]
+fn the_offer_names_the_installer_level_of_the_tree_that_made_it() {
+    // Catches: an offer that does not say which installer may deploy it (a host's older
+    // installer would then fail half way at the version probe instead of refusing first), and
+    // one that names a level other than this tree's installer's.
+    // Mutants: `min_installer` left `None`; written as a constant.
+    let f = released("min-installer");
+    let (code, _, err) = f.run(&[], None);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(f.offer().min_installer, Some(kbf_installer::version::LEVEL));
+}
+
+#[test]
 fn the_release_before_decides_whether_going_back_is_reversible() {
     // Catches: reversibility from anything but the two builds' `meta_log` (N-1's, run, is
     // 5, 4 or 3 against N's 4), `previous` not the commit of the release before, and

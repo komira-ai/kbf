@@ -10,6 +10,7 @@ use crate::deploy::offer::{self, Attest, HostProbe, ProbeFault, Stage};
 
 mod facts;
 mod in_bundle;
+mod min_installer;
 
 /// The farm's clock at the start of a run (`Clk`).
 const NOW: u64 = 1_790_000_000;
@@ -110,6 +111,8 @@ struct Fields {
     platforms: Vec<&'static str>,
     meta_log: Option<u64>,
     previous_meta_log: Option<u64>,
+    /// The offer's `min_installer`; the key is left out when `None`.
+    min_installer: Option<u32>,
 }
 
 impl Fields {
@@ -122,11 +125,12 @@ impl Fields {
             platforms: vec!["darwin-arm64", "linux-x86_64"],
             meta_log: Some(4),
             previous_meta_log: Some(5),
+            min_installer: None,
         }
     }
 
     fn doc(&self) -> OfferDoc {
-        let json = json!({
+        let mut json = json!({
             "version": 1,
             "created": self.created,
             "target": self.target,
@@ -139,6 +143,9 @@ impl Fields {
             "previous_meta_log": self.previous_meta_log,
             "reversible": kbf_gate::reversible(self.meta_log, self.previous_meta_log),
         });
+        if let Some(min) = self.min_installer {
+            json["min_installer"] = json!(min);
+        }
         OfferDoc::from_bytes(json.to_string().as_bytes()).expect("a valid offer")
     }
 }
@@ -176,9 +183,21 @@ fn deploy_mode(
     bundle: Option<Vec<u8>>,
     probe: &dyn Probe,
 ) -> (Farm, Summary) {
+    deploy_at_level(crate::version::LEVEL, apply, policy, bundle, probe)
+}
+
+/// [`deploy_mode`], by an installer of level `level`.
+fn deploy_at_level(
+    level: u32,
+    apply: bool,
+    policy: OfferPolicy,
+    bundle: Option<Vec<u8>>,
+    probe: &dyn Probe,
+) -> (Farm, Summary) {
     let f = farm(two_nodes());
     let mut o = opts(apply);
     o.offer = policy;
+    o.installer_level = level;
     let clock = Clk(f.now.clone());
     let (smoke, check) = (FixedSmoke(SmokeResult::Pass), FixedCheck(Ok(true)));
     let observed = Obs(&f);

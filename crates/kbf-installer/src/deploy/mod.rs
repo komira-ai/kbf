@@ -164,6 +164,9 @@ pub struct Options {
     pub set_hash: Option<kbf_gate::SetHash>,
     /// What the deploy requires of an offer (docs/design/gamma-deploy.md, "The offer").
     pub offer: OfferPolicy,
+    /// This installer's level ([`crate::version::LEVEL`]); an offer whose `min_installer` is
+    /// above it is refused. A field so a test can play an older installer.
+    pub installer_level: u32,
 }
 
 impl Options {
@@ -186,6 +189,7 @@ impl Options {
             result: None,
             set_hash: None,
             offer: OfferPolicy::Unchecked,
+            installer_level: crate::version::LEVEL,
         }
     }
 }
@@ -503,6 +507,7 @@ impl Run<'_> {
                 &self.opts.commit,
                 self.env.clock.now(),
                 *max_age,
+                self.opts.installer_level,
             )
             .map_err(refused),
         }
@@ -527,7 +532,14 @@ impl Run<'_> {
         let doc = offer::from_bundle(entry).map_err(refused)?;
         self.sum.offer = Some(OfferRecord::of(stage.word(), &doc));
         let now = self.env.clock.now();
-        let judged = offer::check_header(*stage, &doc, &self.opts.commit, now, *max_age);
+        let judged = offer::check_header(
+            *stage,
+            &doc,
+            &self.opts.commit,
+            now,
+            *max_age,
+            self.opts.installer_level,
+        );
         judged.map_err(refused)?;
         self.offer_doc = Some(doc);
         Ok(())
