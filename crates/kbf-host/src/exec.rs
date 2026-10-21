@@ -170,6 +170,16 @@ impl Exec for HostExec {
                     fs::remove_file(&full)
                 }
             }
+            Step::RemoveTree { path } => {
+                let full = self.root.join(path);
+                // A link is removed, not followed: `remove_dir_all` is asked only about a
+                // real directory.
+                if fs::symlink_metadata(&full)?.is_dir() {
+                    fs::remove_dir_all(&full)
+                } else {
+                    fs::remove_file(&full)
+                }
+            }
             Step::Run(cmd) => succeeded(cmd, output(cmd)?).map(drop),
             Step::Capture {
                 cmd,

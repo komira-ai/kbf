@@ -1,14 +1,32 @@
 import { execFileSync } from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { Refused, Tools, main } from './steps';
 
 const root = path.resolve(__dirname, '..');
 const tools: Tools = {
-  capture: (cmd, args) => execFileSync(cmd, args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
-  stream: (cmd, args, input) => {
-    execFileSync(cmd, args, { cwd: root, input, stdio: input === undefined ? 'inherit' : ['pipe', 'inherit', 'inherit'] });
+  capture: (cmd, args, cwd) => execFileSync(cmd, args, { cwd: cwd ?? root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
+  stream: (cmd, args, opts) => {
+    execFileSync(cmd, args, { cwd: opts?.cwd ?? root, input: opts?.input, stdio: opts?.input === undefined ? 'inherit' : ['pipe', 'inherit', 'inherit'] });
   },
   log: (line) => console.log(line),
+  mkScratch: () => fs.mkdtempSync(path.join(os.tmpdir(), 'kbf-upload-')),
+  removeScratch: (dir) => fs.rmSync(dir, { recursive: true, force: true }),
+  readFile: (p) => fs.readFileSync(p, 'utf8'),
+  writeFile: (p, data) => fs.writeFileSync(p, data),
+  listFiles: (dir) => {
+    const out: string[] = [];
+    const walk = (d: string): void => {
+      for (const f of fs.readdirSync(d).sort()) {
+        const p = path.join(d, f);
+        if (fs.statSync(p).isDirectory()) walk(p);
+        else out.push(path.relative(dir, p).split(path.sep).join('/'));
+      }
+    };
+    walk(dir);
+    return out.sort();
+  },
 };
 
 try {
