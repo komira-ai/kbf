@@ -86,6 +86,39 @@ impl Verb {
     }
 }
 
+/// Where the release an order names comes from: the installer's configured source, or the
+/// release its own package carries. It chooses between the two and never names a place: no
+/// path or URL travels in an order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    /// Pull it from the source `installer.toml` names, as every order has meant so far. This
+    /// is what an order that says nothing means, so a sender writes the word only for
+    /// [`Source::Staged`].
+    #[default]
+    Fetch,
+    /// Use the release the installer's package carries (its seed): nothing is pulled, and the
+    /// release goes through the same verification as a pulled one.
+    Staged,
+}
+
+impl Source {
+    /// The word the order file carries.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::Staged => "staged",
+        }
+    }
+
+    /// Whether this is the default, which a record leaves out.
+    #[must_use]
+    pub const fn is_fetch(&self) -> bool {
+        matches!(self, Self::Fetch)
+    }
+}
+
 /// The frontend's order that this node change now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Order {

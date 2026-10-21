@@ -32,6 +32,9 @@
 //! - [`stage`]: the verify pipeline, in the order of the contract: size, digest,
 //!   attestation, shape, the binary's own report, the lease check, then the install behind a
 //!   `VERIFIED` marker; behind the [`stage::Verifier`] trait.
+//! - [`seed`]: the release the package itself carries, its manifest, and the rules by which an
+//!   order that names it ([`helper::fetcher_seed`]) is admitted. It goes through the same
+//!   [`stage`] pipeline as a fetched release.
 //! - [`archive`], [`binary`] and [`darwin`]: the tarball, the kind of executable and its
 //!   `--version --json`, and on macOS the quarantine attribute and the code signature.
 //! - [`envoy`]: the Envoy of a frontend host, rendered from settings and checked (a library
@@ -76,6 +79,9 @@ pub mod record_release;
 pub mod refusal;
 pub mod release;
 pub mod run;
+pub mod seed;
+#[cfg(test)]
+mod seed_fixture;
 pub mod settings;
 pub mod setup;
 pub mod spool;
