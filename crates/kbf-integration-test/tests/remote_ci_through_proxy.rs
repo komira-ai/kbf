@@ -84,7 +84,8 @@ impl Rig {
             &format!("remote-ci-through-proxy-{name}"),
         );
         let base = free_base();
-        let pki = kbf_integration_test::pki::write(&dir.path().join("pki"), "remote-ci").expect("certificates");
+        let pki = kbf_integration_test::pki::write(&dir.path().join("pki"), "remote-ci")
+            .expect("certificates");
         let operator = dir.path().join("operator.token");
         private(&operator, OPERATOR_TOKEN.as_bytes());
         let secret_file = dir.path().join("proxy-auth");
