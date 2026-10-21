@@ -178,7 +178,7 @@ fn good() -> ResultDoc {
     d
 }
 
-/// A tag message: the verdict `doc` as the evaluator writes it.
+/// A tag message: the verdict `doc` as a verdict producer writes it.
 fn msg(doc: &ResultDoc) -> Vec<u8> {
     doc.to_bytes().unwrap()
 }
@@ -232,7 +232,7 @@ fn accepted(name: &str, doc: &ResultDoc) {
 
 #[test]
 fn the_golden_verdict_bytes_are_what_the_gate_crate_writes() {
-    // Catches: a serializer change that the evaluator and this check would both follow
+    // Catches: a serializer change that a verdict producer and this check would both follow
     // (they share the type), so a verdict already in a tag stops parsing. `BLESS=1`
     // rewrites the file; the diff is then reviewed.
     let bytes = msg(&good());

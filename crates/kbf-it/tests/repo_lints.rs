@@ -43,8 +43,6 @@
 //! - the test job's coverage gate step skipped by a condition, or its no-lowering check on
 //!   pull requests dropped or made conditional on something else, which lets floors fall
 //!   (module `coverage_wiring`);
-//! - the bake evaluator named anywhere under `.github/` (a workflow, a local action or any
-//!   other file): it runs on the operator's side, never in Actions (module `bake_operator_side`);
 //! - a test scratch directory made by joining a name onto the system temporary directory
 //!   instead of with `kbf_testkit::dir::TestDir`, outside a short list that says why each
 //!   does not leak (module `scratch_dirs`, whose docs say what it misses);
@@ -54,7 +52,6 @@
 
 mod attested_assets;
 mod attested_bundles;
-mod bake_operator_side;
 mod beta_pins;
 mod coverage_wiring;
 mod interpreters;
