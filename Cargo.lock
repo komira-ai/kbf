@@ -1571,8 +1571,8 @@ name = "kbf-daemon-test"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "kbf-ca",
  "kbf-daemon",
- "kbf-deploy",
  "kbf-front",
  "kbf-harness",
  "kbf-proto",
