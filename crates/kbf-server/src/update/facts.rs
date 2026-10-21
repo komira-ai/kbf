@@ -162,7 +162,9 @@ pub enum HelperStatus {
     Confirmed,
     /// `REVERTED`: the helper put the previous release back (it did so itself).
     Reverted,
-    /// `REFUSED`: a revert that could not run, because the previous release is missing.
+    /// `REFUSED`: the helper refused the order. At step 6 that is the activate order itself,
+    /// before any flip. At steps 7 to 9 it is a revert that could not run, because the
+    /// previous release is missing.
     Refused,
 }
 

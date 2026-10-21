@@ -197,6 +197,9 @@ const fn phase_code(phase: &HostPhase) -> (u32, u32) {
     }
 }
 
+/// The number of a hold reason in a `Held` row. A number is never reused or moved. A build
+/// that does not know one reads the row as [`Corrupt`]: an older controller refuses the row
+/// of a host held for 12 (`ActivateRefused`) instead of guessing its reason.
 const fn reason_code(reason: HoldReason) -> u32 {
     match reason {
         HoldReason::SecondMemberDown => 1,
@@ -210,6 +213,7 @@ const fn reason_code(reason: HoldReason) -> u32 {
         HoldReason::Reverted => 9,
         HoldReason::RevertRefused => 10,
         HoldReason::StillCordoned => 11,
+        HoldReason::ActivateRefused => 12,
     }
 }
 
@@ -226,6 +230,7 @@ fn reason_from(code: u32) -> Option<HoldReason> {
         9 => HoldReason::Reverted,
         10 => HoldReason::RevertRefused,
         11 => HoldReason::StillCordoned,
+        12 => HoldReason::ActivateRefused,
         _ => return None,
     })
 }
