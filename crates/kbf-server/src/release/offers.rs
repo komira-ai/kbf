@@ -6,7 +6,7 @@
 //!   the store holds every component it needs, attested
 //!   ([`kbf_types::ReleasePlatform::components`]), for the desired commit, and the platform's
 //!   version facts (`kbf-<commit>-<platform>.version.json`, [`super::facts`]). An offer
-//!   carries those components and no others (a Linux host is not told about `kbf-daemon`),
+//!   carries those components and no others (no host is told about `kbf-daemon`),
 //!   each with its digest, its size and the attestation bytes as stored, and the facts
 //!   (`protocol`, `min_protocol`, `state_schema`, `profile`) as that document states them. A
 //!   platform stored without the document, a release built before the pipeline wrote it
@@ -399,7 +399,7 @@ mod tests {
     async fn an_offer_carries_the_facts_of_its_platforms_document() {
         let (_dir, store) = store("facts-carried");
         linux_release(&store).await;
-        release_without_facts(&store, ReleasePlatform::DarwinArm64, Component::KbfDaemon).await;
+        release_without_facts(&store, ReleasePlatform::DarwinArm64, Component::Kbf).await;
         put_facts(&store, ReleasePlatform::DarwinArm64, &facts_doc(12, 9, 5)).await;
         let table = looked(store).await;
         let facts = |p: ReleasePlatform| {
@@ -426,7 +426,7 @@ mod tests {
     async fn a_platform_without_facts_is_not_offered_and_the_others_still_are() {
         let (_dir, store) = store("facts-missing");
         linux_release(&store).await;
-        release_without_facts(&store, ReleasePlatform::DarwinArm64, Component::KbfDaemon).await;
+        release_without_facts(&store, ReleasePlatform::DarwinArm64, Component::Kbf).await;
         let table = looked(store).await;
         let platforms: Vec<_> = table.keys().copied().collect();
         assert_eq!(platforms, [ReleasePlatform::LinuxX86_64]);

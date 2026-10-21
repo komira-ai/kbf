@@ -66,6 +66,12 @@ impl Platform {
     }
 }
 
+/// `<name>-<commit>-<platform>`: what every asset `package` writes for the binary `name`
+/// is named by, before its extension.
+pub fn asset_stem(name: &str, commit: &str, platform: Platform) -> String {
+    format!("{name}-{commit}-{}", platform.name())
+}
+
 /// The gzip-compressed tar holding `bytes` as the one file `name`, mode [`MODE`], owner
 /// and group 0, time [`MTIME`].
 ///
@@ -249,7 +255,7 @@ pub fn package(
             sbom.display()
         )));
     }
-    let stem = format!("{name}-{commit}-{}", platform.name());
+    let stem = asset_stem(name, commit, platform);
     let tgz_name = format!("{stem}.tar.gz");
     let sbom_name = format!("{stem}.cdx.json");
     let (sums_path, mut lines) = open_sums(out, platform)?;

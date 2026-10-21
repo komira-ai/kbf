@@ -448,19 +448,13 @@ async fn offers_follow_the_desired_release_and_a_platforms_completeness() {
 
     // The Mac's platform of A: a tarball first, then its attestation.
     front
-        .put(
-            A,
-            "darwin-arm64",
-            "kbf-daemon",
-            &tarball(A, "kbf-daemon"),
-            false,
-        )
+        .put(A, "darwin-arm64", "kbf", &tarball(A, "kbf"), false)
         .await;
     assert!(
         offer_within(&mut mac, QUIET).await.is_none(),
         "not attested yet"
     );
-    front.attest(A, "darwin-arm64", "kbf-daemon").await;
+    front.attest(A, "darwin-arm64", "kbf").await;
     assert!(
         offer_within(&mut mac, QUIET).await.is_none(),
         "attested, but no version facts"
@@ -471,7 +465,7 @@ async fn offers_follow_the_desired_release_and_a_platforms_completeness() {
         (offered.generation, offered.platform.as_str()),
         (3, "darwin-arm64")
     );
-    assert_eq!(offered.components[0].name, "kbf-daemon");
+    assert_eq!(offered.components[0].name, "kbf");
     assert_eq!(
         (offered.protocol, offered.min_protocol, offered.state_schema),
         (12, 9, 5),
@@ -542,7 +536,7 @@ async fn an_unknown_or_incomplete_platform_is_offered_nothing() {
 async fn a_platform_without_version_facts_is_held_with_a_note_and_offered_nowhere() {
     let front = start();
     linux(&front, A).await;
-    let path = format!("/v1/releases/{A}/darwin-arm64/kbf-daemon");
+    let path = format!("/v1/releases/{A}/darwin-arm64/kbf");
     let (code, stored) = http(front.api, "PUT", &path, true, None, b"mac tarball").await;
     assert_eq!(code, 201, "{stored}");
     let note = format!(

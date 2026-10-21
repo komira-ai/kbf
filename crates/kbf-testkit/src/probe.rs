@@ -219,9 +219,19 @@ fn ps_sees(marker: &str) -> Outcome {
     };
     let listing = String::from_utf8_lossy(&out.stdout);
     let (pid, uid) = (std::process::id(), rustix::process::getuid().as_raw());
-    if marker_seen(&listing, marker, pid, uid) {
+    ps_verdict(
+        marker_seen(&listing, marker, pid, uid),
+        out.status.success(),
+    )
+}
+
+/// What `ps-sees` reports: `ok` when the marker was seen, `ESRCH` when `ps` listed the
+/// processes and the marker was not among them, `EIO` when `ps` itself failed (so a
+/// listing that could not be had never reads as "not seen").
+pub(crate) fn ps_verdict(seen: bool, ps_ran: bool) -> Outcome {
+    if seen {
         Outcome::Ok
-    } else if out.status.success() {
+    } else if ps_ran {
         Outcome::Errno(libc::ESRCH)
     } else {
         Outcome::Errno(libc::EIO)
@@ -364,10 +374,34 @@ mod tests {
         assert_eq!(outcome(&other), Outcome::Errno(libc::EIO));
     }
 
+    /// Catches: a `ps` that failed read as "not seen" (a listing that could not be had
+    /// must not pass for a refusal), and a marker seen read as anything but `ok`.
+    ///
+    /// Mutants seen red: the `ps` failure mapped to `ESRCH`; `seen` ignored.
+    #[test]
+    fn ps_sees_reports_seen_not_seen_and_a_failed_ps_apart() {
+        assert_eq!(ps_verdict(true, true), Outcome::Ok);
+        assert_eq!(ps_verdict(true, false), Outcome::Ok);
+        assert_eq!(ps_verdict(false, true), Outcome::Errno(libc::ESRCH));
+        assert_eq!(ps_verdict(false, false), Outcome::Errno(libc::EIO));
+    }
+
+    /// Catches: `ps-sees` with an empty marker taken as a probe (every line would hold
+    /// it); it is not a probe word, so the act step refuses it as an unknown step.
+    #[test]
+    fn an_empty_ps_sees_marker_is_not_a_probe() {
+        assert!(matches!(parse(&["ps-sees", ""]), Ok(None)));
+        assert!(matches!(
+            parse(&["ps-sees", "x"]),
+            Ok(Some(Probe::PsSees("x")))
+        ));
+    }
+
     /// Catches: a marker found in the process that asks (its own arguments name it), in
     /// the asking user's other processes, in root's (the `launchctl asuser` that
-    /// started the asker holds the marker), or in the header; and a marker missed in
-    /// another user's process whatever its arguments' spacing.
+    /// started the asker holds the marker), in the header, or on a line that is the
+    /// marker alone (no pid and uid before it); and a marker missed in another user's
+    /// process whatever its arguments' spacing.
     #[test]
     fn the_marker_counts_only_in_another_users_process() {
         let (me, uid) = (500, 600);
@@ -377,7 +411,8 @@ mod tests {
                        501   600 kbf-act sleep needle-7391\n\
                        502   0   launchctl asuser 600 kbf-act ps-sees needle-7391\n\
                        503   601 kbf-act   sleep   needle-7392\n\
-                       junk line\n";
+                       junk line\n\
+                       needle-7391\n";
         assert!(!marker_seen(listing, "needle-7391", me, uid));
         let with_other = format!("{listing}504   601 kbf-act sleep needle-7391\n");
         assert!(marker_seen(&with_other, "needle-7391", me, uid));

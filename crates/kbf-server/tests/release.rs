@@ -579,12 +579,13 @@ async fn the_list_names_what_is_stored_and_what_is_complete() {
         .await
         .expect("facts");
     put_key(&key(COMMIT, x86, Component::KbfDaemon), b"d", false).await;
-    // darwin-arm64 holds both tarballs but only one attestation: not complete.
+    // darwin-arm64 holds both tarballs but attests only `kbf-daemon`, which no Mac needs: not
+    // complete, because the `kbf` its hosts run has no attestation.
     let darwin = ReleasePlatform::DarwinArm64;
     for component in Component::ALL {
         put_key(&key(COMMIT, darwin, component), b"t", false).await;
     }
-    put_key(&key(COMMIT, darwin, Component::Kbf), b"bundle", true).await;
+    put_key(&key(COMMIT, darwin, Component::KbfDaemon), b"bundle", true).await;
     // An attestation alone is not a component.
     put_key(&key(OTHER_COMMIT, x86, Component::Kbf), b"orphan", true).await;
     // Strangers.
@@ -607,8 +608,8 @@ async fn the_list_names_what_is_stored_and_what_is_complete() {
             {"name": "kbf-daemon", "sha256": sha(b"kbf-daemon"), "size": 10, "attested": true}]},
             {"platform": "darwin-arm64", "complete": false, "version_facts": false,
              "note": no_facts_note(ReleasePlatform::DarwinArm64), "components": [
-                {"name": "kbf", "sha256": sha(b"t"), "size": 1, "attested": true},
-                {"name": "kbf-daemon", "sha256": sha(b"t"), "size": 1, "attested": false}]},
+                {"name": "kbf", "sha256": sha(b"t"), "size": 1, "attested": false},
+                {"name": "kbf-daemon", "sha256": sha(b"t"), "size": 1, "attested": true}]},
     ]}]});
     assert_eq!(listing.json(), want);
     let attestation = store
@@ -624,9 +625,9 @@ async fn the_list_names_what_is_stored_and_what_is_complete() {
 }
 
 /// Catches a platform called complete (or incomplete) by a rule that is not the platform's:
-/// a Linux host needs `kbf` and a Mac needs `kbf-daemon` (the tarball of each platform holds
-/// one binary), so each is complete with its own component attested and nothing else, and
-/// neither is complete with the other platform's component alone.
+/// every host needs `kbf` (the tarball holds one binary, and a Mac runs `kbf --mode=daemon`
+/// like the rest), so a platform is complete with `kbf` attested and nothing else, and not
+/// with `kbf-daemon` alone, on Linux or on a Mac.
 ///
 /// Mutant seen red: every platform wanting both components (a release is never complete).
 #[tokio::test]
@@ -641,12 +642,7 @@ async fn a_platform_is_complete_with_the_tarball_its_hosts_need() {
             .expect("put");
     };
     put_both(&key(COMMIT, ReleasePlatform::LinuxX86_64, Component::Kbf)).await;
-    put_both(&key(
-        COMMIT,
-        ReleasePlatform::DarwinArm64,
-        Component::KbfDaemon,
-    ))
-    .await;
+    put_both(&key(COMMIT, ReleasePlatform::DarwinArm64, Component::Kbf)).await;
     put_both(&key(
         COMMIT,
         ReleasePlatform::LinuxArm64,
@@ -794,7 +790,7 @@ async fn fetch_streams_the_exact_bytes() {
         let k = key(
             &format!("{i:040x}"),
             ReleasePlatform::DarwinArm64,
-            Component::KbfDaemon,
+            Component::Kbf,
         );
         let digest = store
             .put_tarball(&k, &mut body(&bytes))
@@ -895,15 +891,15 @@ async fn store_component(
     }
 }
 
-/// `COMMIT` complete for every platform (`kbf` for the Linux ones, `kbf-daemon` for the
-/// Mac), and a `kbf-daemon` of the first Linux platform that no host of it needs.
+/// `COMMIT` complete for every platform (`kbf` for each), and a `kbf-daemon` of the first
+/// Linux platform that no host of it needs.
 async fn store_a_complete_release(store: &ReleaseStore) {
     use ReleasePlatform::{DarwinArm64, LinuxArm64, LinuxX86_64};
     for (platform, component) in [
         (LinuxX86_64, Component::Kbf),
         (LinuxX86_64, Component::KbfDaemon),
         (LinuxArm64, Component::Kbf),
-        (DarwinArm64, Component::KbfDaemon),
+        (DarwinArm64, Component::Kbf),
     ] {
         store_component(store, COMMIT, platform, component, true).await;
     }
@@ -1028,7 +1024,7 @@ async fn describe_names_every_file_of_a_complete_release_by_its_digest() {
         [
             ("linux-x86_64", "kbf"),
             ("linux-arm64", "kbf"),
-            ("darwin-arm64", "kbf-daemon"),
+            ("darwin-arm64", "kbf"),
         ]
     );
     for c in &all.components {
@@ -1073,7 +1069,7 @@ async fn describe_can_be_asked_for_one_platform() {
     for (platform, want) in [
         ("linux-x86_64", ("linux-x86_64", "kbf")),
         ("linux-arm64", ("linux-arm64", "kbf")),
-        ("darwin-arm64", ("darwin-arm64", "kbf-daemon")),
+        ("darwin-arm64", ("darwin-arm64", "kbf")),
     ] {
         let one = describe(&mut client, COMMIT, platform)
             .await
@@ -1158,8 +1154,8 @@ async fn describe_refuses_a_request_that_is_not_exactly_a_commit_and_a_platform(
 }
 
 /// `COMMIT` as an upload that stopped part way leaves it: Linux x86_64 has its tarball and
-/// no bundle; Linux arm64 has nothing; the Mac has `kbf`, which it does not need, and not
-/// `kbf-daemon`, which it does.
+/// no bundle; Linux arm64 has nothing; the Mac has `kbf-daemon`, which it does not need, and
+/// not `kbf`, which it does.
 async fn store_a_release_part_way(store: &ReleaseStore) {
     store_component(
         store,
@@ -1173,7 +1169,7 @@ async fn store_a_release_part_way(store: &ReleaseStore) {
         store,
         COMMIT,
         ReleasePlatform::DarwinArm64,
-        Component::Kbf,
+        Component::KbfDaemon,
         true,
     )
     .await;
@@ -1196,7 +1192,7 @@ async fn describe_of_a_platform_asked_for_says_what_it_lacks() {
     for (platform, lack) in [
         ("linux-x86_64", "linux-x86_64 has no attestation of kbf"),
         ("linux-arm64", "linux-arm64 has no tarball of kbf"),
-        ("darwin-arm64", "darwin-arm64 has no tarball of kbf-daemon"),
+        ("darwin-arm64", "darwin-arm64 has no tarball of kbf"),
     ] {
         let status = describe(&mut client, COMMIT, platform)
             .await
@@ -1222,7 +1218,7 @@ async fn describe_with_no_complete_platform_names_what_each_lacks() {
     assert_eq!(status.code(), Code::FailedPrecondition);
     for lack in [
         "linux-x86_64 has no attestation of kbf",
-        "darwin-arm64 has no tarball of kbf-daemon",
+        "darwin-arm64 has no tarball of kbf",
     ] {
         assert!(status.message().contains(lack), "{}", status.message());
     }

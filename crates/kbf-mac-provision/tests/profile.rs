@@ -233,16 +233,6 @@ fn every_malformed_profile_is_refused() {
             "kbf_cert: ",
         ),
         (
-            "bad label",
-            edited(set("kbf_labels", "pool=mac rack")),
-            "is not key=value",
-        ),
-        (
-            "profile label",
-            edited(set("kbf_labels", "profile=x")),
-            "profile label",
-        ),
-        (
             "relative xip dir",
             edited(set("xcode_xip_dir", "xip")),
             "xcode_xip_dir: ",
@@ -409,7 +399,7 @@ fn an_unknown_key_is_refused() {
     assert_eq!(
         Profile::parse(edited(append("sleep=0")).as_bytes()).unwrap_err(),
         ProfileError::UnknownKey {
-            line: 43,
+            line: 42,
             key: "sleep".into()
         }
     );
@@ -422,7 +412,7 @@ fn a_repeated_key_is_refused() {
     assert_eq!(
         Profile::parse(edited(append("firewall=off")).as_bytes()).unwrap_err(),
         ProfileError::Duplicate {
-            line: 43,
+            line: 42,
             key: "firewall".into()
         }
     );
@@ -448,16 +438,77 @@ fn a_value_outside_the_character_set_is_refused() {
     for bad in [
         "$", "`", ";", "|", "&", "<", "\"", "'", "\\", "\t", "*", "\r",
     ] {
-        let text = edited(set("kbf_labels", &format!("pool=m{bad}c")));
+        let text = edited(set("time_server", &format!("time.example.n{bad}t")));
+        let line = text
+            .lines()
+            .position(|l| l.starts_with("time_server="))
+            .unwrap()
+            + 1;
         assert_eq!(
             Profile::parse(text.as_bytes()).unwrap_err(),
             ProfileError::BadCharacter {
-                line: 33,
-                key: "kbf_labels".into()
+                line,
+                key: "time_server".into()
             },
             "{bad:?}"
         );
     }
+}
+
+/// The test profile with a `kbf_labels` line, whatever its value.
+fn with_kbf_labels(value: &str) -> String {
+    edited(|l| {
+        l.retain(|x| !x.starts_with("kbf_labels="));
+        l.push(format!("kbf_labels={value}"));
+    })
+}
+
+/// Catches: a profile that still sets `kbf_labels` accepted (its labels would be dropped
+/// from `kbf.toml` without a word, and a lone operator would think the node still
+/// carries them), or refused without naming the key and saying to delete it. The
+/// daemon takes no node label, so the key has no meaning; every value is refused,
+/// an empty one (the old profiles all had the line) and a malformed one included.
+#[test]
+fn a_profile_with_kbf_labels_is_refused_naming_the_key() {
+    for value in ["pool=mac rack=r2", "", "pool=mac rack", "profile=x"] {
+        let said = refusal(&with_kbf_labels(value));
+        assert!(
+            said.contains("kbf_labels") && said.contains("delete the line"),
+            "{value:?}: {said}"
+        );
+    }
+    let last = with_kbf_labels("pool=mac").lines().count();
+    assert_eq!(
+        refusal(&with_kbf_labels("pool=mac")),
+        format!(
+            "profile line {last}: kbf_labels: node labels are removed and this key has no effect; delete the line"
+        )
+    );
+}
+
+/// Catches: the profile without `kbf_labels` refused (every profile written after the
+/// key went must be accepted), or the key still on the required list.
+#[test]
+fn a_profile_without_kbf_labels_is_accepted() {
+    assert_eq!(refusal(&edited(|_| {})), "accepted");
+    assert!(
+        !kbf_mac_provision::profile::REQUIRED
+            .iter()
+            .chain(kbf_mac_provision::profile::OPTIONAL)
+            .any(|k| *k == "kbf_labels")
+    );
+}
+
+/// Catches: `print` still showing a node label, which the profile no longer has (the
+/// profile's SHA-256 stays).
+#[test]
+fn print_shows_no_node_label() {
+    let mac = FakeMac::fresh("print-no-label");
+    let printed = Profile::parse(mac.profile_text().as_bytes())
+        .unwrap()
+        .print();
+    assert!(!printed.contains("node_label"), "{printed}");
+    assert!(printed.contains("profile_sha256="), "{printed}");
 }
 
 /// Catches: a key allowed a space (the script's mutant "a key may hold a space"),
@@ -469,7 +520,7 @@ fn a_key_with_a_space_or_capital_is_refused() {
         assert_eq!(
             Profile::parse(text.as_bytes()).unwrap_err(),
             ProfileError::UnknownKey {
-                line: 43,
+                line: 42,
                 key: key.into()
             }
         );
@@ -537,9 +588,9 @@ fn blank_lines_and_comments_are_skipped() {
 }
 
 /// Catches: `print` leaving a key out, showing an empty optional key, or getting the
-/// SHA-256 or node label wrong (the script's `t_print`).
+/// SHA-256 wrong (the script's `t_print`).
 #[test]
-fn print_shows_the_resolved_profile_its_sha256_and_the_node_label() {
+fn print_shows_the_resolved_profile_and_its_sha256() {
     let mac = FakeMac::fresh("print");
     let text = mac.profile_text();
     let sha = support::sha256_hex(text.as_bytes());
@@ -549,18 +600,16 @@ fn print_shows_the_resolved_profile_its_sha256_and_the_node_label() {
         "profile=mac-arm64-test",
         "hostname=kbf-mac-07",
         "xcode_xip_dir=/Library/kbf/xip",
-        "kbf_labels=pool=mac rack=r2",
         "default_developer_dir=/Applications/Xcode-27.0.app/Contents/Developer",
         "expect_probe=host_identity:17A000=26.6-0123456789abcdef",
         "expect_probe=host_identity:18A000=",
         &format!("profile_sha256={sha}"),
-        &format!("node_label=profile=mac-arm64-test@{}", &sha[..12]),
     ] {
         assert!(lines.contains(&want), "print lacks {want:?}:\n{printed}");
     }
     let file_lines = text.lines().filter(|l| !l.is_empty()).count();
-    // Every line of the file, then the SHA-256 and the node label.
-    assert_eq!(lines.len(), file_lines + 2, "{printed}");
+    // Every line of the file, then the SHA-256.
+    assert_eq!(lines.len(), file_lines + 1, "{printed}");
     for line in text.lines() {
         assert!(lines.contains(&line), "print lacks {line:?}");
     }
@@ -579,16 +628,16 @@ fn print_shows_the_resolved_profile_its_sha256_and_the_node_label() {
 }
 
 /// Catches: an optional key left out of the file printed as `key=` (the script's
-/// `t_print`), or an empty `kbf_labels` printed.
+/// `t_print`), or an empty optional key printed.
 #[test]
 fn print_leaves_out_empty_and_absent_keys() {
     let text = edited(|l| {
         drop_keys(&["xcode_xip_dir"])(l);
-        set("kbf_labels", "")(l);
+        append("kbf_cache=")(l);
     });
     let printed = Profile::parse(text.as_bytes()).unwrap().print();
     assert!(!printed.contains("xcode_xip_dir"), "{printed}");
-    assert!(!printed.contains("kbf_labels"), "{printed}");
+    assert!(!printed.contains("kbf_cache"), "{printed}");
 }
 
 /// Catches: the example profile drifting from the parser's rules, so the example the
@@ -596,11 +645,11 @@ fn print_leaves_out_empty_and_absent_keys() {
 #[test]
 fn the_example_profile_is_accepted() {
     let p = Profile::parse(support::EXAMPLE.as_bytes()).unwrap();
-    assert!(p.node_label().starts_with("profile=mac-arm64-pool@"));
+    assert_eq!(p.get("profile"), "mac-arm64-pool");
     assert_eq!(p.role_id, 480);
     assert_eq!(p.lease_uids, 600..=699);
     assert_eq!(p.time_max_offset_ms, 250);
-    assert_eq!(p.labels, ["pool=mac", "rack=r2"]);
+    assert!(!support::EXAMPLE.contains("kbf_labels"));
     assert_eq!(p.xcodes[1].app(), "/Applications/Xcode-27.0.app");
     assert_eq!(p.probes[0].key, "host_identity");
 }
@@ -789,15 +838,9 @@ fn with_old_key() -> String {
     edited(replace("kbf_data_dir=", "kbf_scratch="))
 }
 
-/// The node's `kbf.toml` without the node label (it holds the profile's SHA-256, which
-/// differs when the file's bytes do).
-fn config_without_node_label(p: &Profile) -> String {
-    kbf_mac_provision::launchd::render_config(p).replace(&p.node_label(), "NODE-LABEL")
-}
-
 /// Catches: the job not running `kbf --mode=daemon --config <kbf.toml>` and nothing
-/// else (a flag after `--config` could not be told from the file's key, and the labels,
-/// the server and the certificates would be set twice), a plist that still names
+/// else (a flag after `--config` could not be told from the file's key, and the
+/// server and the certificates would be set twice), a plist that still names
 /// `kbf-daemon`, the word `node` (removed) back, or the removed `--scratch` and
 /// `--cache-dir` flags.
 #[test]
@@ -847,9 +890,11 @@ fn the_old_key_is_accepted_with_a_warning_and_renders_the_same() {
         "{}",
         old.warnings[0]
     );
+    // The profile's bytes differ (the key's name), and the file does not.
+    assert_ne!(old.sha256, new.sha256);
     assert_eq!(
-        config_without_node_label(&old),
-        config_without_node_label(&new)
+        kbf_mac_provision::launchd::render_config(&old),
+        kbf_mac_provision::launchd::render_config(&new)
     );
     assert!(!kbf_mac_provision::launchd::render_plist(&old).contains("--scratch"));
 }
@@ -882,7 +927,7 @@ fn the_old_key_twice_is_a_duplicate() {
     let text = format!("{}kbf_scratch=/Volumes/kbf/x\n", with_old_key());
     assert_eq!(
         refusal(&text),
-        "profile line 43: duplicate key: kbf_scratch"
+        "profile line 42: duplicate key: kbf_scratch"
     );
 }
 
