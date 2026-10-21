@@ -1,0 +1,50 @@
+# The security advisories against kbf's dependencies, kept in one issue instead of failing
+# pull requests (ci.yml checks bans, licences and sources only). This workflow runs
+# `cargo deny check advisories` daily and on every push to main, and `cargo xtask
+# advisories` (crates/xtask/src/advisories.rs) opens the issue "Security advisories in kbf's
+# dependencies" when there are advisories, rewrites its table when they change, and
+# comments and closes it when none remain. The run is green whatever it finds: the issue is
+# the signal. It fails only when cargo-deny or the GitHub API failed.
+#
+# `issues: write` is the one write scope, and only under the `if:` the workflow lint
+# (crates/kbf-integration-test/tests/workflows) requires for it: a run whose ref is main.
+name: advisories
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One run at a time, so two runs never race to open the same issue.
+concurrency:
+  group: advisories
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    if: ${{ github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+      issues: write
+    env:
+      DENY_VERSION: 0.20.2
+      DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: Install cargo-deny (pinned version and checksum)
+        run: cargo xtask fetch --url "https://github.com/EmbarkStudios/cargo-deny/releases/download/$DENY_VERSION/cargo-deny-$DENY_VERSION-x86_64-unknown-linux-musl.tar.gz" --sha256 "$DENY_SHA256" --out "$HOME/.cargo/bin/cargo-deny" --extract tar.gz --member "cargo-deny-$DENY_VERSION-x86_64-unknown-linux-musl/cargo-deny"
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo xtask advisories --repo "${{ github.repository }}"

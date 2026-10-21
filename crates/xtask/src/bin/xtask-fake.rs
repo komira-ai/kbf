@@ -12,6 +12,9 @@
 //!   not 12 lowercase hex digits fails the build with the build script's message. With
 //!   `--no-run` it builds nothing: it prints the file `cargo-messages` in its working
 //!   directory, the JSON messages a test wrote for it.
+//! - As cargo run as `cargo deny ...` (`advisories`), it prints the file `deny-stderr` in its
+//!   working directory on stderr, as `cargo deny --format json` does, and exits with the
+//!   number in `deny-exit` (default 0).
 //! - As cargo with a `loom_` filter among its arguments (`xtask proxy-loom`), it prints the
 //!   result line of five passing tests and builds nothing.
 //! - Run as `kbf-server`, it prints `kbf-server 0.1.0+<stamp>` from the stamp file next
@@ -57,6 +60,13 @@
 //!   `Validation Failed`), `race` (another run made the ref first, with another message),
 //!   `lose-ref-502` / `lose-ref-422` (the next ref is stored, and its reply is lost as that
 //!   HTTP status), or `fail-get:<code>` (every GET of a ref fails with that status).
+//! - Run as `gh api -X <METHOD> <path> [--input -]` (the method first: the issue calls of
+//!   `advisories`), it appends `{"args": [...], "body": <JSON or null>}` as one line to
+//!   `gh-calls` next to it, and answers `{"number": 42, "html_url": ...}`. It reads the
+//!   body from stdin only with `--input -` on its arguments, as `gh` does: a call without
+//!   one is sent with no body and refused with HTTP 422, as GitHub refuses an issue with
+//!   no title. With `gh-fault` next to it holding `empty-reply`, it answers a write with
+//!   nothing at all (an HTTP 204), and with `fail-write` it refuses a write with HTTP 404.
 //! - Run as `gh release create|upload <tag> <files> --repo <repo> ...`, it copies each
 //!   file into `releases/<tag>/` next to it (create makes that directory and fails if
 //!   it exists; a file already there fails the command, as GitHub refuses an asset
@@ -209,6 +219,17 @@ fn cargo(argv0: &str, args: &[String]) -> ExitCode {
         .open(dir.join("cargo-args"))
         .expect("cargo-args");
     writeln!(log, "{}", args.join(" ")).expect("cargo-args");
+    // `cargo deny ... check advisories --format json` (advisories): the file `deny-stderr`
+    // in the working directory is what cargo-deny printed (JSON lines, on stderr), and
+    // `deny-exit` (default 0) its exit status.
+    if args.first().is_some_and(|a| a == "deny") {
+        eprint!(
+            "{}",
+            std::fs::read_to_string("deny-stderr").expect("deny-stderr")
+        );
+        let code = std::fs::read_to_string("deny-exit").unwrap_or_default();
+        return ExitCode::from(code.trim().parse::<u8>().unwrap_or(0));
+    }
     if defect("build-fails") {
         eprintln!("xtask-fake: build failed");
         return ExitCode::from(101);
@@ -270,6 +291,7 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
         .expect("gh-args");
     writeln!(log, "{}", args.join(" ")).expect("gh-args");
     match args[0].as_str() {
+        "api" if args[1] == "-X" => return issues_write(dir, args),
         "api" if args.iter().any(|a| a == "--input") => return api_write(dir, args),
         "api" => return api(dir, &args[1]),
         "release" => return release(dir, args),
@@ -532,6 +554,41 @@ fn api_write(dir: &Path, args: &[String]) -> ExitCode {
     };
     write_answers(dir, answers);
     println!("{reply}");
+    ExitCode::SUCCESS
+}
+
+/// A `gh api -X <METHOD> <path> [--input -]` call (the issue calls of `advisories`): the
+/// call, with the body `gh` would have sent, appended to `gh-calls`.
+fn issues_write(dir: &Path, args: &[String]) -> ExitCode {
+    let sends_stdin = args.windows(2).any(|w| w == ["--input", "-"]);
+    let body: serde_json::Value = if sends_stdin {
+        serde_json::from_reader(std::io::stdin()).expect("a JSON body")
+    } else {
+        serde_json::Value::Null
+    };
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("gh-calls"))
+        .expect("gh-calls");
+    writeln!(log, "{}", serde_json::json!({ "args": args, "body": body })).expect("gh-calls");
+    if body.is_null() {
+        eprintln!("gh: Validation Failed (HTTP 422)");
+        return ExitCode::FAILURE;
+    }
+    let fault = std::fs::read_to_string(dir.join("gh-fault")).unwrap_or_default();
+    if fault == "fail-write" {
+        eprintln!("gh: Not Found (HTTP 404)");
+        return ExitCode::FAILURE;
+    }
+    if fault == "empty-reply" {
+        return ExitCode::SUCCESS;
+    }
+    let path = &args[3];
+    println!(
+        "{}",
+        serde_json::json!({ "number": 42, "html_url": format!("https://github.com/{}/42", path.trim_start_matches("repos/")) })
+    );
     ExitCode::SUCCESS
 }
 
