@@ -17,11 +17,11 @@
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use kbf_deploy::unit::UnitFile;
 use kbf_host::path::Root;
 use kbf_installer::cli::Cli;
 use kbf_installer::layout::{Layout, Platform};
 use kbf_installer::setup::plan::MAC_DAEMON_LABEL;
+use kbf_unitfile::UnitFile;
 
 const INSTALLER: &str = "/usr/bin/kbf-installer";
 const PLIST: &str = "com.komira.kbf-installer.plist";
