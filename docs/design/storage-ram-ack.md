@@ -163,6 +163,11 @@ node yet, so each of them answers as it did and the tests put a blob there throu
   durably, and that some owner holds in RAM, is `UNAVAILABLE`; one that no owner holds at
   all (the action's owner has a copy, no reader asks it) is `Absent`.
 - The closure check asks `kbf-durable: only` and so remembers only durable positives.
+- The durable questions (`only`, `wait`) touch exactly the digests they report present,
+  the indexed ones, as `find_missing` does (retention and touches in `storage.md`). The
+  closure check and a copy's dedup therefore still refresh the retention of an entry's
+  blobs on their owners; a digest that is only held in RAM is reported missing and is not
+  touched, and neither is an absent one.
 - The repair worker asks the owner `kbf-durable: only`. A node that receives a copy from a
   peer (a chain leg or the worker) dedups on the durable question, so a copy sent to an
   owner that holds the blob only in RAM is written. **PR 6** refines this with the leg

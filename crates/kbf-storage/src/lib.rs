@@ -84,7 +84,9 @@ pub trait Storage: Send + Sync {
     /// wire). There is no default: a storage that holds nothing in RAM answers with
     /// [`Storage::find_missing`] explicitly, and one that does (or wraps one) decides, so
     /// no wrapper answers a durable question with the held-inclusive answer by omission.
-    /// Touches nothing.
+    /// The digests it reports present are touched, as [`Storage::find_missing`] touches
+    /// them, so a closure check or a copy's dedup that asks keeps the blobs it finds; a
+    /// digest reported missing (absent, or held in RAM only) is not touched.
     ///
     /// # Errors
     /// The store could not answer; never a partial answer.
@@ -99,7 +101,7 @@ pub trait Storage: Send + Sync {
     /// The default asks [`Storage::find_durable`] without waiting: a storage that holds
     /// nothing in RAM has nothing to wait for, and one that does and does not override
     /// this refuses a held blob at once instead of reporting it durable, which is the safe
-    /// side.
+    /// side. What it reports present is touched, as in [`Storage::find_durable`].
     ///
     /// # Errors
     /// The store could not answer; never a partial answer.

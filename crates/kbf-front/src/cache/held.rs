@@ -204,16 +204,21 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// reachable object, as `FindMissingBlobs` with `kbf-durable: only` asks
     /// ([`kbf_storage::Storage::find_durable`]). A blob held in RAM and not yet in the
     /// index is missing: a restart would lose it. The empty blob is never missing.
-    /// Touches nothing: it is a question asked before something durable is written, not
-    /// a use of the blobs.
+    /// The digests it reports present (the indexed ones) are touched exactly as
+    /// [`Cache::find_missing`] touches them, so an action-cache hit or a leg dedup that
+    /// asks this keeps the blobs of the entry alive on their owners; a held-only or absent
+    /// digest is missing and is not touched.
     ///
     /// # Errors
     /// The metadata log is unavailable; never a partial answer.
     pub async fn durable(&self, digests: &[Digest]) -> Result<Vec<Digest>, CacheError> {
-        let missing = self
-            .writer
-            .query(|s| s.find_missing(digests).missing)
+        let (missing, objects) = self
+            .touched(|s| {
+                let found = s.find_missing(digests);
+                ((found.missing, found.objects), found.touch)
+            })
             .await?;
+        self.used(objects);
         Ok(missing
             .into_iter()
             .filter(|d| !super::is_empty_blob(d))
@@ -223,7 +228,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// [`Cache::durable`] after waiting, for at most [`Cache::with_durable_wait`], for the
     /// held digests among `digests` to leave the set (`kbf-durable: wait`
     /// ([`kbf_storage::Storage::find_durable_waiting`])). A digest still held when the
-    /// bound ends is missing, because the answer comes from the index alone.
+    /// bound ends is missing, because the answer comes from the index alone. Once present,
+    /// a digest is touched, as in [`Cache::durable`].
     ///
     /// # Errors
     /// As [`Cache::durable`].

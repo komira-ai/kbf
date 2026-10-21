@@ -9,12 +9,15 @@
 //! action's owner is member 3, and the blobs live on members 1 (primary) and 2.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use kbf_front::{Cache, CacheError, CacheStorage, MemoryMetaLog, SegmentsConfig, VerifiedBlob};
+use kbf_front::{
+    Cache, CacheError, CacheStorage, MemoryMetaLog, SegmentsConfig, TouchConfig, VerifiedBlob,
+};
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
 use kbf_meta::{ActionRecord, ActionWriteError, Closure, Role};
 use kbf_objstore::MemoryStore;
@@ -22,7 +25,7 @@ use kbf_proto::reapi::{ActionResult, OutputFile};
 use kbf_route::{MapSource, MapView, Nodes, RefetchError, Router};
 use kbf_storage::service::{Admission, Config, RemoteStorage, StorageService};
 use kbf_storage::{Storage, StorageError};
-use kbf_types::Digest;
+use kbf_types::{Digest, FarmTime};
 use prost::Message;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Endpoint, Server};
@@ -331,7 +334,26 @@ impl MapSource for Fixed {
 }
 
 fn farm() -> Farm {
-    let caches: Vec<Arc<MemCache>> = (0..3).map(|_| cache()).collect();
+    farm_of(cache)
+}
+
+/// A farm whose caches record the touches they owe and commit none (the flusher's period
+/// is an hour), so `touches_pending` says which node was asked about what.
+fn touching_farm() -> Farm {
+    farm_of(|| {
+        Arc::new(
+            Cache::memory()
+                .with_durable_wait(WAIT)
+                .with_touches(TouchConfig {
+                    every: Duration::from_secs(3600),
+                    batch: NonZeroUsize::new(100).expect("non-zero"),
+                }),
+        )
+    })
+}
+
+fn farm_of(make: fn() -> Arc<MemCache>) -> Farm {
+    let caches: Vec<Arc<MemCache>> = (0..3).map(|_| make()).collect();
     let members: Vec<Member> = (1..=3)
         .map(|id| Member {
             id: MemberId(id),
@@ -567,6 +589,47 @@ async fn a_closure_blob_held_in_ram_makes_the_entry_a_miss() {
     assert!(
         hit.is_some(),
         "on a disk: a hit, nothing remembered the miss"
+    );
+}
+
+/// Catches a closure check that keeps nothing alive (mutant: the check does not touch what
+/// it finds durable, or does not ask): an entry's output is on its owner's disk, two days
+/// old, and a hit of the entry through the router asks that owner about it. The owner owes
+/// the blob a touch afterwards, so a hit of an entry nobody downloads from still refreshes
+/// its closure.
+#[tokio::test]
+async fn a_hit_touches_the_closure_blobs_on_their_owner() {
+    let farm = touching_farm();
+    let action = farm.action();
+    let (result, output) = farm.entry().await;
+    write(&farm.caches[0], &output).await;
+    write(&farm.caches[2], &result).await;
+    write(&farm.caches[2], &output).await;
+    farm.caches[2]
+        .commit_action_record(
+            Role::Daemon,
+            action,
+            ActionRecord {
+                result: result.digest(),
+                closure: [output.digest()].into_iter().collect::<Closure>(),
+            },
+        )
+        .await
+        .expect("the entry");
+    for cache in &farm.caches {
+        cache
+            .tick(FarmTime::from_millis(0).saturating_add(Duration::from_secs(2 * 86_400)))
+            .await
+            .expect("tick");
+    }
+    assert_eq!(farm.caches[0].touches_pending(), 0, "nothing is owed yet");
+
+    let hit = farm.router.action_result(&action).await.expect("answered");
+    assert!(hit.is_some(), "a hit");
+    assert_eq!(
+        farm.caches[0].touches_pending(),
+        1,
+        "the owner of the closure blob owes it a touch"
     );
 }
 

@@ -673,3 +673,82 @@ fn outside_a_runtime_a_collection_still_commits_the_recorded_touches() {
         assert_eq!(missing, [unreported]);
     });
 }
+
+/// A blob held in RAM (in the held set, not in the index), as the drain has not yet written it.
+fn held_only(cache: &TestCache, text: &str) -> Digest {
+    let blob = VerifiedBlob::hashed(Bytes::from(text.to_owned()));
+    assert!(cache.hold_for_test(&blob));
+    blob.digest()
+}
+
+/// Catches (mutant "the durable answer touches nothing": the closure check and the leg dedup
+/// ask it, so an entry hit every day would lose its blobs about 8 days after the last
+/// write): the durable question reports an indexed blob present and so owes it the touch
+/// `find_missing` records. Both blobs are two days old, so the touch is due; a blob held
+/// only in RAM is reported missing and is not touched, nor is one nobody has. The committed
+/// touch names the indexed blob alone.
+#[tokio::test]
+async fn durable_touches_what_it_reports_present_and_only_that() {
+    let cache = cache().await;
+    let log = cache.meta();
+    let present = store(&cache, "durable and two days old").await;
+    let held = held_only(&cache, "held in RAM only");
+    let absent = VerifiedBlob::hashed(Bytes::from_static(b"never stored")).digest();
+    cache.tick(days(2)).await.expect("tick");
+
+    let missing = cache
+        .durable(&[present, held, absent])
+        .await
+        .expect("durable");
+    assert_eq!(missing, [held, absent], "the index alone answers");
+    flushed(&cache).await;
+    assert_eq!(log.touches(), [BTreeSet::from([present])]);
+}
+
+/// Catches (mutant "the waiting form does not touch"): `durable_waiting` for a blob that is
+/// held and leaves the set while it waits (the drain: the index takes it first) answers
+/// present and touches it, as `durable` does.
+#[tokio::test]
+async fn durable_waiting_touches_a_blob_once_it_is_present() {
+    let cache = cache().await;
+    let log = cache.meta();
+    let blob = VerifiedBlob::hashed(Bytes::from_static(b"drained while waited for"));
+    let digest = blob.digest();
+    assert!(cache.hold_for_test(&blob));
+    cache
+        .store_blobs(vec![blob])
+        .await
+        .expect("the drain's write");
+    cache.tick(days(2)).await.expect("tick");
+
+    let asked = [digest];
+    let waiting = cache.durable_waiting(&asked);
+    tokio::pin!(waiting);
+    tokio::select! {
+        () = cache.parked_for_test(1) => {}
+        done = &mut waiting => panic!("did not wait for the held blob: {done:?}"),
+    }
+    assert!(cache.release_for_test(&digest));
+    assert_eq!(within(waiting).await.expect("durable"), []);
+    flushed(&cache).await;
+    assert_eq!(log.touches(), [BTreeSet::from([digest])]);
+}
+
+/// Catches (mutant "the waiting form touches what it waited for and did not get"): a blob
+/// still held when the wait ends is reported missing and is not touched; a digest nobody
+/// has is the same.
+#[tokio::test]
+async fn durable_waiting_does_not_touch_what_it_reports_missing() {
+    let cache = cache().await.with_durable_wait(Duration::from_millis(1));
+    let log = cache.meta();
+    let held = held_only(&cache, "held until the wait ends");
+    let absent = VerifiedBlob::hashed(Bytes::from_static(b"never stored")).digest();
+    cache.tick(days(2)).await.expect("tick");
+
+    let missing = within(cache.durable_waiting(&[held, absent]))
+        .await
+        .expect("durable");
+    assert_eq!(missing, [held, absent]);
+    flushed(&cache).await;
+    assert_eq!(log.touches(), []);
+}

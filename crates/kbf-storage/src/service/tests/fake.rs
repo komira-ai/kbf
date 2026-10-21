@@ -59,6 +59,10 @@ pub(crate) struct Mem {
     pub ram_only: Arc<Mutex<BTreeSet<Digest>>>,
     /// Calls of `find_durable`.
     pub durable_asked: AtomicUsize,
+    /// The digests a `find_missing`, `find_durable` or `find_durable_waiting` answered as
+    /// present, as the node's cache touches them to keep their retention (a question
+    /// whose positives are not touched here would let an entry's blobs expire).
+    pub touched: Mutex<Vec<Digest>>,
     /// How many `find_durable_waiting` calls reached the store.
     pub waited: AtomicUsize,
     pub actions: Mutex<BTreeMap<Digest, (Digest, ActionResult)>>,
@@ -110,6 +114,11 @@ impl Storage for Mem {
             }
             self.failing()?;
             let blobs = self.blobs.lock().expect("lock");
+            self.touched.lock().expect("lock").extend(
+                digests
+                    .iter()
+                    .filter(|d| d.size_bytes != 0 && blobs.contains_key(d)),
+            );
             Ok(digests
                 .iter()
                 .filter(|d| d.size_bytes != 0 && !blobs.contains_key(d))
@@ -127,6 +136,11 @@ impl Storage for Mem {
             self.failing()?;
             let blobs = self.blobs.lock().expect("lock");
             let ram_only = self.ram_only.lock().expect("lock");
+            self.touched.lock().expect("lock").extend(
+                digests.iter().filter(|d| {
+                    d.size_bytes != 0 && blobs.contains_key(d) && !ram_only.contains(d)
+                }),
+            );
             Ok(digests
                 .iter()
                 .filter(|d| d.size_bytes != 0 && (!blobs.contains_key(d) || ram_only.contains(d)))
@@ -141,6 +155,11 @@ impl Storage for Mem {
             self.failing()?;
             let blobs = self.blobs.lock().expect("lock");
             let ram_only = self.ram_only.lock().expect("lock");
+            self.touched.lock().expect("lock").extend(
+                digests.iter().filter(|d| {
+                    d.size_bytes != 0 && blobs.contains_key(d) && !ram_only.contains(d)
+                }),
+            );
             Ok(digests
                 .iter()
                 .filter(|d| d.size_bytes != 0 && (!blobs.contains_key(d) || ram_only.contains(d)))
