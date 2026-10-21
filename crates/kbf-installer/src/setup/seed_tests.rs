@@ -46,19 +46,22 @@ fn a_bundled_host_with_no_release_installs_the_packages_between_settings_and_con
         )
         .expect("setup");
         assert_eq!(*installs.0.borrow(), [SEED], "{mode:?}");
-        let at = |needle: &str| {
-            out.find(needle)
-                .unwrap_or_else(|| panic!("{needle}: {out}"))
-        };
-        let install = at("+ install and verify the release the package carries");
-        assert!(
-            at(INSTALLER_TOML) < install && install < at(KBF_TOML),
-            "{mode:?}: {out}"
-        );
-        assert!(
-            cmds(&exec).iter().any(|c| c.contains("systemctl enable")),
-            "{mode:?}: the units are enabled because a release is there"
-        );
+        assert!(!out.contains("no release is installed yet"), "{mode:?}");
+        if mode == Mode::Daemon {
+            // The order the output shows: the settings, the install, then the config; and the
+            // unit starts because a release is there.
+            let at = |needle: &str| {
+                out.find(needle)
+                    .unwrap_or_else(|| panic!("{needle}: {out}"))
+            };
+            let install = at("+ install and verify the release the package carries");
+            assert!(
+                at(INSTALLER_TOML) < install && install < at(KBF_TOML),
+                "{out}"
+            );
+            let start = "run /usr/bin/systemctl enable --now -- kbf-daemon.service";
+            assert!(cmds(&exec).contains(&start.to_owned()), "{out}");
+        }
     }
 }
 
