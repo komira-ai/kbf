@@ -122,7 +122,7 @@ enum Tag {
 /// An outcome: an object of one tag this page does not know is [`Outcome::Other`];
 /// anything else is read as [`Outcome`], so a known tag of another shape, or an
 /// outcome that is not one tag, is malformed.
-fn known_or_other<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Outcome>, D::Error> {
+pub(crate) fn known_or_other<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Outcome>, D::Error> {
     let Some(v) = Option::<Value>::deserialize(d)? else {
         return Ok(None);
     };

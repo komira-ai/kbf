@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use super::age;
 use crate::tests::{
-    Fake, body, render, storage_doc, storage_farm, storage_node, storage_node_unknown,
+    Fake, body, fleet_farm, render, storage_doc, storage_farm, storage_node, storage_node_unknown,
 };
 
 fn page_of(doc: &Value) -> (u16, String) {
@@ -265,11 +265,11 @@ fn the_tables_have_headers_and_the_page_has_headings() {
 /// entry dropped; the route dropped (the page is a 404).
 #[test]
 fn the_page_is_reachable_from_the_overview_and_the_navigation() {
-    let overview = body(&render(&storage_farm(), "/ui"));
+    let overview = body(&render(&fleet_farm(), "/ui"));
     // The Overview's own list, not the navigation every page has.
     let overview = &overview[overview.find("<main>").expect("main")..];
     assert!(
-        overview.contains("<li><a href=\"/ui/storage\">Storage</a></li>"),
+        overview.contains("<p><a href=\"/ui/storage\">Storage</a></p>"),
         "{overview}"
     );
     let builds = body(&render(&storage_farm(), "/ui/builds"));
