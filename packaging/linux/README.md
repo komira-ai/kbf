@@ -10,7 +10,7 @@ inputs, and `crates/xtask/src/pkg_linux.rs` is the one place that says what goes
 
 | path | what |
 |---|---|
-| `sysusers.d/kbf-installer.conf` | the users `kbf`, `kbf-server`, `kbf-fetch`, `kbf-verify` (no login); installed to `/usr/lib/sysusers.d` |
+| `sysusers.d/kbf-installer.conf` | the users `kbf`, `kbf-server`, `kbf-fetch`, `kbf-signer` (no login); installed to `/usr/lib/sysusers.d` |
 | `tmpfiles.d/kbf-installer.conf` | `/run/kbf-installer` (0755), `/var/cache/kbf-fetch` (0711); the units author's file, packaged unchanged; installed to `/usr/lib/tmpfiles.d` |
 | `units/` | the unit files (`kbf-*.service`, `kbf-*.socket`, `kbf.slice`), installed to `/usr/lib/systemd/system`; `testdata/units` is the fixture for the unit tests only |
 | `testdata/` | fixtures for the install test only: two gated units and three stand-in trust files |
@@ -96,7 +96,7 @@ Two call sites, one way to build: both go through `pkg-config` and `pkg-build`.
 - Each mode unit runs `/var/lib/kbf-installer/releases/current/kbf`, the link the installer
   creates and flips (`layout.rs`), after `kbf-installer boot-check`. The frontend template
   runs its `slots/%i` link.
-- `crates/kbf-it/tests/package_installer_verbs.rs` parses every `kbf-installer` command line of
+- `crates/kbf-integration-test/tests/package_installer_verbs.rs` parses every `kbf-installer` command line of
   these units, and of the macOS property list, with the binary's own parser and refuses a verb that
   is not built; it also holds the exec path to the layout's.
 

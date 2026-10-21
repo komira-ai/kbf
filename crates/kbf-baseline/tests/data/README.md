@@ -11,14 +11,14 @@ The buck2 is the release CI pins (`BUCK2_VERSION` 2026-10-01 in
 
 | file | job | build |
 |---|---|---|
-| `m1-first` | `integration / m1-cell` | `crates/kbf-it/m1/buck2`, `//...` on a fresh cell: 5 actions run on the farm |
+| `m1-first` | `integration / m1-cell` | `crates/kbf-integration-test/m1/buck2`, `//...` on a fresh cell: 5 actions run on the farm |
 | `m1-second` | `integration / m1-cell` | the same after `buck2 clean`: 5 remote cache hits |
 | `m1-failing` | `integration / m1-cell` | `//...` with `-c kbf_m1.fail=yes`: `//:verdict` fails (exit 3) on the farm, `//:pause` is a cache hit |
-| `m2-first` | `ci / m2-container` | `crates/kbf-it/m2/buck2`, `//...` through the container driver: 5 actions on the farm, `//:hog` run again after its memory kill |
+| `m2-first` | `ci / m2-container` | `crates/kbf-integration-test/m2/buck2`, `//...` through the container driver: 5 actions on the farm, `//:hog` run again after its memory kill |
 
 Captured by workflow runs 38245718952 (integration) and 38245719045 (ci) of
-komira-build-farm, on commit 0718a2d, which added the event logs to `crates/kbf-it/m1/run.sh`
-and `crates/kbf-it/m2/run.sh`. To capture again, download the `m1-cell-logs` or
+komira-build-farm, on commit 0718a2d, which added the event logs to `crates/kbf-integration-test/m1/run.sh`
+and `crates/kbf-integration-test/m2/run.sh`. To capture again, download the `m1-cell-logs` or
 `m2-container-logs` artifact of a run and copy `buck2-<name>.json-lines.gz` and
 `buck2-<name>.log` here. The logs hold the hosted runner's paths and host name, as
 buck2 records them.

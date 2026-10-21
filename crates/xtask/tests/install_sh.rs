@@ -543,7 +543,7 @@ fn help_prints_the_usage_and_says_envoy_is_a_frontend_prerequisite() {
 #[test]
 fn a_restrictive_umask_does_not_narrow_the_directories_it_makes() {
     // Catches: the script not setting its own umask: `usr/share/kbf-installer` made
-    // 0700 under the caller's 077 would hide the trust files from the `kbf-verify` user.
+    // 0700 under the caller's 077 would hide the trust files from every account but root.
     if host().is_none() {
         return;
     }

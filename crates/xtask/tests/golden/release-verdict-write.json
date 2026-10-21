@@ -1,0 +1,59 @@
+{
+  "schema": 1,
+  "stage": "beta",
+  "commit": "357494ac6b0fecfa065d6c8fa038cfca9ae9c13f",
+  "set_hash": "4a4b874a1e9776a52e38fd82a053825f309f46187a803a0fc0c6670c6670e768",
+  "run_id": "9001",
+  "attempt": 2,
+  "status": "green",
+  "started": 5000,
+  "finished": 5000,
+  "desired_generation": null,
+  "deploy": null,
+  "bake": null,
+  "load": null,
+  "waivers": [],
+  "gates": [
+    {
+      "name": "ci",
+      "measured": 1.0,
+      "threshold": {
+        "at_least": 1.0
+      },
+      "verdict": "green",
+      "started": 5000,
+      "finished": 5000
+    },
+    {
+      "name": "beta",
+      "measured": 1.0,
+      "threshold": {
+        "at_least": 1.0
+      },
+      "verdict": "green",
+      "started": 5000,
+      "finished": 5000
+    },
+    {
+      "name": "artifacts",
+      "measured": 1.0,
+      "threshold": {
+        "at_least": 1.0
+      },
+      "verdict": "green",
+      "started": 5000,
+      "finished": 5000
+    }
+  ],
+  "note": "gate runs: ci 111, beta 222, artifacts 333; tested_bytes: rebuilt",
+  "tag": "v0.3.7",
+  "not_reversible": [
+    "meta-log format"
+  ],
+  "escapes": [
+    "e1"
+  ],
+  "withdrawn": [
+    "v0.3.6"
+  ]
+}

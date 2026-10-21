@@ -6,9 +6,18 @@ use tower_service::Service;
 use super::*;
 use crate::proxy_auth::Caller;
 
+/// What `GET /v1/health` answers: the Overview reads it, so `/ui` is a page only if it
+/// parses.
+const HEALTH: &str = r#"{"ready": true, "failing": [],
+    "nodes": {"total": 0, "serving": 0, "cordoned": 0, "draining": 0, "drained": 0,
+        "quarantined": 0, "disconnected": 0},
+    "queue": {"depth": 0, "oldest_age_ms": null}, "leases": 0, "storage": null}"#;
+
 /// A router with the routes the sources below ask.
 fn api() -> Router {
     Router::new()
+        .route("/v1/health", get(|| async { HEALTH }))
+        .route("/v1/invocations", get(|| async { "{\"invocations\": []}" }))
         .route("/v1/thing", get(|| async { "{\"n\": 1}" }))
         .route("/v1/big", get(|| async { "x".repeat(1000) }))
         .route(
@@ -152,7 +161,11 @@ async fn every_answer_under_ui_carries_the_security_headers() {
     for (path, status) in [
         ("/ui", 200),
         ("/ui/static/kbf.css", 200),
+        // The list reads `/v1/invocations`, which this router answers; a build looked up
+        // by id reads `/v1/invocations/{id}`, which it does not have: the page answers
+        // that route's `404`, with the headers.
         ("/ui/builds", 200),
+        ("/ui/builds?id=x%2Fy", 404),
         ("/ui/nothing-here", 404),
         ("/ui/builds/%00", 400),
         (long.as_str(), 400),

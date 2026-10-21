@@ -382,6 +382,7 @@ fn the_visible_verbs_are_the_contracts() {
             "gc",
             "boot-check",
             "migrate",
+            "uninstall",
             "quiesce",
             "check",
             "proxy"
@@ -430,9 +431,9 @@ fn global_flags_may_follow_the_verb() {
 /// scratch host is laid out for that platform too (`/var/db/kbf-installer` on macOS).
 fn seeded(name: &str) -> (Layout, PathBuf) {
     let (layout, root) = host_root_on(&format!("app-{name}"), Platform::current());
-    fs::create_dir_all(layout.join(&layout.orders_dir())).expect("order spool");
+    crate::testkit::mkdirs(&root, &layout.join(&layout.orders_dir()), 0o755);
     let release = layout.join(&layout.release_dir(&c(A)));
-    fs::create_dir_all(&release).expect("release");
+    crate::testkit::mkdirs(&root, &release, 0o755);
     fs::write(release.join("kbf"), b"x").expect("binary");
     Locked::acquire(&layout)
         .expect("lock")
@@ -498,6 +499,33 @@ fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
     assert!(err.starts_with("kbf-installer:"), "{err}");
 }
 
+/// Catches `run` not removing the scratch a killed stage left in `work/` when it starts: the
+/// verb is run as an ordinary user over a host with a `<commit>.partial` directory (with a
+/// download in it) and a `<commit>.check` directory, and both are gone afterwards while a
+/// neighbour that is not scratch stays. The helper's tests drive `recover` directly; this
+/// one pins that the verb calls it.
+///
+/// Red on main: nothing sweeps `work/`, so the directories are still there.
+///
+/// Mutant it is meant to catch (reasoned, not run): the `recover` call dropped from `run`
+/// (red: the directories stay).
+#[test]
+fn run_removes_the_scratch_a_killed_stage_left_when_it_starts() {
+    let (layout, root) = seeded("run-sweeps");
+    let work = layout.join(&layout.work_dir());
+    let partial = work.join(format!("{B}.partial"));
+    fs::create_dir_all(partial.join("dl")).expect("a killed stage's directory");
+    fs::write(partial.join("dl/kbf.tar.gz"), b"half a download").expect("its download");
+    fs::create_dir_all(work.join(format!("{B}.check"))).expect("a killed stage's checks");
+    fs::write(work.join("notes.txt"), b"not scratch").expect("a neighbour");
+    let (exit, err) = on(&root, &RUN);
+    assert_eq!(exit, Exit::Ok, "{err}");
+    let (check, notes) = (work.join(format!("{B}.check")), work.join("notes.txt"));
+    assert!(!partial.exists(), "the .partial directory stays");
+    assert!(!check.exists(), "the .check directory stays");
+    assert!(notes.is_file(), "a file that is not scratch went");
+}
+
 /// Catches `run` not waiting between passes, or not stopping after the last: two passes on a
 /// host take one `PASS_INTERVAL` (the only wait, none after the last pass) and exit 0.
 ///
@@ -525,7 +553,7 @@ fn run_waits_one_interval_between_two_passes_and_not_after_the_last() {
 fn boot_check_counts_a_start_and_refuses_what_it_cannot_read() {
     let (layout, root) = seeded("boot");
     let release = layout.join(&layout.release_dir(&c(B)));
-    fs::create_dir_all(&release).expect("release");
+    crate::testkit::mkdirs(&root, &release, 0o755);
     fs::write(release.join("kbf"), b"x").expect("binary");
     let lock = Locked::acquire(&layout).expect("lock");
     lock.write(&State {
@@ -846,7 +874,8 @@ fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
 /// until a lease source was wired): the helper `run` builds reads the lease cgroups of the
 /// unit it restarts, below the host root's `/sys/fs/cgroup`, so a populated lease of
 /// `kbf-daemon.service` is one live lease. A unit that never ran (no cgroup), a unit of no
-/// mode and a launchd label each cannot tell, with the reason: the activation is refused
+/// mode and a launchd label (the Mac source, which looks under the host root for
+/// `sandbox-exec`) each cannot tell, with the reason: the activation is refused
 /// (fail closed), and `run` itself still starts for them.
 ///
 /// Mutants seen red: `leases::NotWired` left in `build_helper` (the daemon's lease reads as
@@ -874,8 +903,9 @@ fn run_builds_a_helper_whose_lease_source_reads_the_restarted_units_cgroup() {
     assert!(err.contains("no such cgroup"), "{err}");
     let err = source(&["--unit", "kbf.service"]).expect_err("no mode's unit");
     assert!(err.contains("is no unit of any mode"), "{err}");
-    let err = source(&["--launchd-label", "com.example.kbf"]).expect_err("not wired");
-    assert!(err.contains("no lease source wired"), "{err}");
+    let err = source(&["--launchd-label", "com.example.kbf"]).expect_err("a Mac source");
+    assert!(err.contains("sandbox-exec"), "{err}");
+    assert!(!err.contains("no lease source wired"), "{err}");
 }
 
 /// Catches `run --installer-config` reading the config under a host root that is not an
@@ -1281,7 +1311,7 @@ fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
         &["stage"],
         &["activate"],
     ];
-    let free: [&[&str]; 7] = [
+    let free: [&[&str]; 8] = [
         // `update` is an unprivileged client of the proxy's API (new-layout hosts only); the
         // root half it asks for, `run`, is held.
         &[
@@ -1297,6 +1327,9 @@ fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
         &["boot-check"],
         &["quiesce"],
         &["migrate"],
+        // `uninstall` is for a host the installer does not manage, an unmigrated old-layout
+        // host that never adopted it included.
+        &["uninstall"],
         &fetch_child,
     ];
     for args in held {
@@ -1491,6 +1524,96 @@ fn the_migrate_report_is_on_standard_output_as_text_or_one_object() {
     );
 }
 
+/// Catches `uninstall` missing from the command line or from the dispatcher: its flag parses
+/// (a unit name, and a path is a usage error of the parser), the verb needs root like the other
+/// verbs that change a host, the dispatcher runs it on a host with nothing of the installer
+/// and says so on standard output with exit 0 (as text, or with `--json` as the one object
+/// `verb`, `apply`, `message`), and an apply on a host the installer manages is exit 5 whose
+/// reason names the way out. Nothing is changed by any of them.
+///
+/// Mutant seen red: the `Uninstall` arm of the dispatcher removed (the verb says "not
+/// implemented"). Not run as mutants: `finish_report` fixed to the verb `migrate`; the refusal
+/// printed as a report.
+#[test]
+fn uninstall_parses_runs_through_the_dispatcher_and_refuses_an_adopted_host() {
+    let cli = parse(&["uninstall", "--installer-unit", "kbf-installer.service"]);
+    let Verb::Uninstall(args) = &cli.verb else {
+        panic!("not the uninstall verb");
+    };
+    assert_eq!(
+        args.installer_unit.as_ref().map(|u| u.as_str()),
+        Some("kbf-installer.service")
+    );
+    assert!(cli.verb.needs_root());
+    assert!(
+        Cli::try_parse_from([
+            "kbf-installer",
+            "uninstall",
+            "--installer-unit",
+            "../x.service"
+        ])
+        .is_err()
+    );
+
+    let root = kbf_host::testkit::scratch("app-uninstall");
+    let root = root.to_str().expect("text");
+    for json in [false, true] {
+        let mut args = vec!["--root", root, "uninstall"];
+        if json {
+            args.insert(0, "--json");
+        }
+        let (exit, out, err) = run_as(1000, &args);
+        assert_eq!(exit, Exit::Ok, "{err}");
+        assert!(out.contains("nothing to uninstall"), "{out}");
+        if json {
+            let v: Value = serde_json::from_str(out.trim()).expect("one object");
+            assert_eq!(
+                (v["verb"].clone(), v["apply"].clone()),
+                (serde_json::json!("uninstall"), serde_json::json!(false))
+            );
+        } else {
+            assert!(!out.trim_start().starts_with('{'), "{out}");
+        }
+    }
+
+    // A host `setup` ran on is the installer's: refused, with the way out.
+    let (_, adopted) = seeded("uninstall-adopted");
+    // The installer's directory as a host has it (the check judges it like every file).
+    fs::set_permissions(
+        adopted.join("var/lib/kbf-installer"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("mode");
+    let adopted = adopted.to_str().expect("text").to_owned();
+    let (exit, out, err) = run_as(1000, &["--root", &adopted, "--apply", "uninstall"]);
+    assert_eq!(exit, Exit::NeedsOperator, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("state.json"), "{err}");
+    let (exit, out, _) = run_as(1000, &["--json", "--root", &adopted, "uninstall"]);
+    assert_eq!(exit, Exit::NeedsOperator);
+    let v: Value = serde_json::from_str(out.trim()).expect("one object");
+    assert_eq!(
+        (v["verb"].clone(), v["error"].clone()),
+        (serde_json::json!("uninstall"), serde_json::json!("failed"))
+    );
+}
+
+/// Catches the shared reporter drifting from `migrate`'s: the verb name it is given is the one
+/// in the object.
+#[test]
+fn a_report_names_its_verb() {
+    let mut out = Vec::new();
+    assert_eq!(
+        finish_report("uninstall", true, true, "gone", &mut out),
+        Exit::Ok
+    );
+    let v: Value = serde_json::from_slice(&out).expect("one object");
+    assert_eq!(
+        v,
+        serde_json::json!({"verb": "uninstall", "apply": true, "message": "gone"})
+    );
+}
+
 /// Catches a failed `migrate` (here: a probe user the host does not have) not being said the
 /// way every other verb's failure is: exit 2 for the usage error, the reason after the
 /// program's name on standard error, or with `--json` the object `error: failed` on standard
@@ -1538,4 +1661,68 @@ fn a_path_is_not_joined_to_a_relative_root() {
         under(Path::new("/srv/root"), &path).expect("joined"),
         PathBuf::from("/srv/root/etc/kbf/installer.toml")
     );
+}
+
+/// Catches the release keys' flags missing from the command line of `setup`: `bundled` is a
+/// value of `--release-source`, and the four flags that write `release_ca` and the frontend
+/// snapshot reach the arguments `setup` validates, each by its own name. (The checks and the
+/// writing are `setup/release_config_tests.rs`'s.)
+///
+/// Mutants to plant: `Bundled` removed from `ReleaseSource`; a flag renamed; the flattened
+/// `ReleaseFlags` removed from `SetupArgs`.
+#[test]
+fn setup_takes_bundled_and_the_release_key_flags() {
+    let cli = parse(&[
+        "setup",
+        "--mode=daemon",
+        "--release-source=bundled",
+        "--release-ca",
+        "/ca.pem",
+        "--frontend-worker-url",
+        "https://w.example:8981",
+        "--frontend-ca",
+        "/fe.pem",
+        "--frontend-ca-sha256",
+        "ab",
+    ]);
+    let Verb::Setup(args) = &cli.verb else {
+        panic!("not the setup verb");
+    };
+    assert_eq!(args.release_source, Some(ReleaseSource::Bundled));
+    assert_eq!(args.release.release_ca.as_deref(), Some("/ca.pem"));
+    assert_eq!(
+        args.release.frontend_worker_url.as_deref(),
+        Some("https://w.example:8981")
+    );
+    assert_eq!(args.release.frontend_ca.as_deref(), Some("/fe.pem"));
+    assert_eq!(args.release.frontend_ca_sha256.as_deref(), Some("ab"));
+    let plain = parse(&["setup", "--mode=daemon"]);
+    let Verb::Setup(args) = &plain.verb else {
+        panic!("not the setup verb");
+    };
+    assert_eq!(
+        args.release,
+        crate::setup::release_keys::ReleaseFlags::default()
+    );
+}
+
+/// Catches a bundled host's replay floor asked of a frontend it does not have: `migrate` seeds the
+/// floor from the frontend only for a `frontend` host, and a `url` or `bundled` host takes it
+/// from `--min-generation` or starts without one, saying so.
+///
+/// Mutants to plant: `Bundled` mapped to `Frontend` (the migration would then ask for a frontend
+/// and stop); `Url` mapped to `Frontend`.
+#[test]
+fn a_bundled_hosts_replay_floor_is_seeded_like_a_url_hosts() {
+    assert_eq!(floor_source(ReleaseSource::Url), migrate::Source::Url);
+    assert_eq!(floor_source(ReleaseSource::Bundled), migrate::Source::Url);
+    assert_eq!(
+        floor_source(ReleaseSource::Frontend),
+        migrate::Source::Frontend
+    );
+    let cli = parse(&["migrate", "--release-source", "bundled"]);
+    let Verb::Migrate(args) = &cli.verb else {
+        panic!("not the migrate verb");
+    };
+    assert_eq!(args.release_source, ReleaseSource::Bundled);
 }

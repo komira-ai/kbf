@@ -17,6 +17,7 @@ use crate::activate::{self, Activated, Arm, Confirmed, Expiry};
 use crate::layout::{self, Layout, Platform};
 use crate::release::{self, ReleaseError};
 use crate::spool::{Entry, read_capped};
+use crate::stage;
 use crate::state::{self, Locked, State, StateError};
 use kbf_host::plan::Mode;
 use kbf_host::{Exec, HostPath, Perms, Step};
@@ -133,6 +134,12 @@ impl<E: Exec> Helper<E> {
         self.leases.as_ref()
     }
 
+    /// Replace the lease source, for a test that plays a Mac's.
+    #[cfg(test)]
+    pub(crate) fn set_leases(&mut self, leases: Box<dyn LeaseSource>) {
+        self.leases = leases;
+    }
+
     /// The host's executor, for a test to read what was done.
     pub fn exec(&self) -> &E {
         &self.exec
@@ -189,11 +196,22 @@ impl<E: Exec> Helper<E> {
         Ok(state::read_unlocked(&self.host)?.unwrap_or_default())
     }
 
-    /// Run once at start: make the links agree with the state after an interrupted verb.
-    /// A link that moved means the service may still run the old release: restart it.
+    /// Run once at start: remove the scratch a killed stage left in `work/`, and make the
+    /// links agree with the state after an interrupted verb. A link that moved means the
+    /// service may still run the old release: restart it.
+    ///
+    /// The sweep is made here and only here, under the lock: this process is not staging
+    /// yet, and a pass must not sweep, since `setup` stages the first release in a process
+    /// of its own. A sweep that fails is logged, never a refusal (as with the gc after a swap:
+    /// nothing was ordered that it could undo, and a refusal would hide the host's real
+    /// state in `status.json`); the start goes on, and a commit the leftovers still wedge is
+    /// refused when it is ordered.
     pub fn recover(&mut self) -> Result<(), HelperError> {
         let mut memory = self.load()?;
         let runs_frontend = host_mode::frontend_host(&self.host).is_ok();
+        if let Err(e) = self.sweep_scratch() {
+            let _ = writeln!(self.log, "work sweep: {e}");
+        }
         match activate::reconcile(&mut self.exec, &self.host, &mut self.log) {
             // A frontend host owes the unit a restart only for a node swap on trial: the
             // proxy owns the frontend's children, and reads `installed_commit` itself. `|`,
@@ -205,6 +223,13 @@ impl<E: Exec> Helper<E> {
             Err(e) => refuse(&mut memory, &e.to_string()),
         }
         self.save(&memory)
+    }
+
+    /// [`stage::sweep_work`] under the lock, which is let go before this returns (the repair
+    /// that follows takes it again).
+    fn sweep_scratch(&self) -> Result<(), ReleaseError> {
+        let lock = Locked::acquire(&self.host)?;
+        stage::sweep_work(&self.host, &lock)
     }
 
     /// One pass. `now` is seconds since the epoch.
@@ -583,9 +608,13 @@ impl<E: Exec> Helper<E> {
             ));
         }
         // The lease check again, from what the installer observes.
-        match self.leases.live() {
-            Ok(0) => {}
-            Ok(n) => return Err(format!("{n} leases are live; not activating")),
+        match self.leases.live_noted() {
+            Ok((0, note)) => {
+                if let Some(note) = note {
+                    let _ = writeln!(self.log, "leases: {note}");
+                }
+            }
+            Ok((n, _)) => return Err(format!("{n} leases are live; not activating")),
             Err(why) => return Err(format!("cannot tell whether leases are live: {why}")),
         }
         // Already the running release: nothing to fetch, `activate` says so.

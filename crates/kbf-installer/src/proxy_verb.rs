@@ -36,13 +36,15 @@
 //! quoted, logged or passed in an argument vector.
 //!
 //! This module and the root helper (`helper/`, `run.rs`) share a binary and nothing else:
-//! `kbf-it`'s layering test fails if the root half ever names `kbf_proxy` or this module.
+//! `kbf-integration-test`'s layering test fails if the root half ever names `kbf_proxy` or this module.
 //!
 //! The only environment variables read are the service manager's socket-activation markers,
 //! `LISTEN_PID` and `LISTEN_FDS`; everything else is the `[proxy]` table.
 //!
-//! `--check` loads the whole file the way a run does, so a bad key outside `[proxy]` is
-//! refused (exit 2) too. A stop signal drains for at most 5 s; the process ends within
+//! `--check` loads the file the way a run does, so a bad value of a key the verb reads (the
+//! two windows, the fetch timeout, `database`, `[proxy]`) is refused (exit 2) too. It does
+//! not check the rest of the file: `setup` and the fetcher refuse a bad key there, not this
+//! verb. A stop signal drains for at most 5 s; the process ends within
 //! [`STOP_BOUND`] of the first one is seen, whatever the drain is doing, and at once on a
 //! second. SIGTERM and SIGINT are unblocked at start, so a launcher's inherited mask cannot
 //! hide them. SIGHUP is held pending from the first line of the verb until its reload handler
@@ -155,9 +157,10 @@ pub struct Loaded {
     pub fetch_timeout_s: u32,
 }
 
-/// Reads `path` and returns what the verb takes from it, checked: every refusal of
-/// `installer.toml` and of the `[proxy]` table itself, and a file with no `[proxy]` table at
-/// all.
+/// Reads `path` and returns what the verb takes from it, checked: the keys it reads
+/// ([`InstallerToml::parse_tolerant`]: any other key, a source a later build wrote for one, is
+/// ignored, so a package downgrade does not take the public port down), the `[proxy]` table
+/// itself, and a file with no `[proxy]` table at all.
 pub fn load(path: &Path) -> Result<Loaded, VerbError> {
     loaded_from(path, &read_config(path)?)
 }
@@ -178,7 +181,7 @@ fn read_config(path: &Path) -> Result<String, VerbError> {
 /// What the verb takes from `text`, the configuration read from `path`.
 fn loaded_from(path: &Path, text: &str) -> Result<Loaded, VerbError> {
     let usage = |why: String| VerbError::Usage(format!("{}: {why}", path.display()));
-    let installer = InstallerToml::parse(text).map_err(|e| usage(e.to_string()))?;
+    let installer = InstallerToml::parse_tolerant(text).map_err(|e| usage(e.to_string()))?;
     let proxy = installer
         .proxy
         .ok_or_else(|| usage("has no [proxy] table".to_owned()))?;

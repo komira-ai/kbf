@@ -69,7 +69,7 @@ There is no other build system in this repository.
 
 ## No new shell or Python
 
-kbf's tooling is Rust. The repository lints (`cargo test -p kbf-it --test
+kbf's tooling is Rust. The repository lints (`cargo test -p kbf-integration-test --test
 repo_lints`) refuse a workflow `run:` step with shell logic (more than one line, a
 pipe, `&&`, `;`, `$(`, a backtick, `if`, `for` or `while`) outright: a step is one
 command, and anything more is a `cargo xtask` verb or a flag of the program the

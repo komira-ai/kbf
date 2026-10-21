@@ -7,12 +7,15 @@
 //! in it now, and it is still read so that `budget-diff` can compare against a base
 //! list that has it.
 //!
-//! [`parse`] reads the file; the repository lints (`crates/kbf-it/tests/repo_lints.rs`)
+//! [`parse`] reads the file; the repository lints (`crates/kbf-integration-test/tests/repo_lints.rs`)
 //! hold it against what the tree contains. [`new_rows`] is `cargo xtask budget-diff`:
 //! the list may only shrink, so a row a change adds is refused, whatever its file is.
 //! One exception is a section the base list has no header for: the change that
 //! adds the header brings the section's first rows. The other exception is
-//! [`SANCTIONED`], rows the CEO ruled in by name. A header the base has may not go
+//! [`SANCTIONED`], rows the CEO ruled in by name. A path git reports as renamed
+//! (`git diff --find-renames`) keeps its base row: a row for the new path is compared
+//! as the old path's, so a pure rename is no growth and a rename that also adds a row
+//! is still refused. A header the base has may not go
 //! (an empty section keeps it), so a section cannot be dropped and brought back full.
 
 use std::collections::BTreeMap;
@@ -147,6 +150,49 @@ fn headers(text: &str) -> BTreeSet<Section> {
 /// lacks a header `base` has: dropping a header would let a later change bring the
 /// section back as new, rows and all.
 pub fn new_rows(base: &str, head: &str) -> Result<Vec<Row>, Vec<String>> {
+    new_rows_renamed(base, head, &BTreeMap::new())
+}
+
+/// The path a renamed key had in the base: the part of `key` before any `#` is looked
+/// up in `renames` (new path to old path); a key of a path not renamed is returned as is.
+fn base_key(key: &str, renames: &BTreeMap<String, String>) -> String {
+    let (path, rest) = key.split_at(key.find('#').unwrap_or(key.len()));
+    match renames.get(path) {
+        Some(old) => format!("{old}{rest}"),
+        None => key.to_owned(),
+    }
+}
+
+/// The paths git reports as renamed in `git diff --find-renames --name-status -z`
+/// output: new path to old path. Other statuses are not renames.
+pub fn parse_renames(raw: &[u8]) -> BTreeMap<String, String> {
+    let text = String::from_utf8_lossy(raw);
+    let mut fields = text.split('\0');
+    let mut out = BTreeMap::new();
+    while let Some(status) = fields.next() {
+        if status.starts_with('R') {
+            let old = fields.next().unwrap_or_default();
+            let new = fields.next().unwrap_or_default();
+            if !new.is_empty() {
+                out.insert(new.to_owned(), old.to_owned());
+            }
+        } else if !status.is_empty() {
+            fields.next();
+        }
+    }
+    out
+}
+
+/// [`new_rows`], reading a row of a renamed path (`renames`: new path to old path) as
+/// the old path's row: it is new only when the base has no row for the old path.
+///
+/// # Errors
+/// As [`new_rows`].
+pub fn new_rows_renamed(
+    base: &str,
+    head: &str,
+    renames: &BTreeMap<String, String>,
+) -> Result<Vec<Row>, Vec<String>> {
     let (base_rows, base_problems) = parse(base);
     let (head_rows, head_problems) = parse(head);
     let base_headers = headers(base);
@@ -173,7 +219,7 @@ pub fn new_rows(base: &str, head: &str) -> Result<Vec<Row>, Vec<String>> {
     Ok(head_rows
         .into_iter()
         .filter(|r| base_headers.contains(&r.section))
-        .filter(|r| !listed.contains(&(r.section, r.key.as_str())))
+        .filter(|r| !listed.contains(&(r.section, base_key(&r.key, renames).as_str())))
         .filter(|r| !SANCTIONED.contains(&(r.section, r.key.as_str())))
         .collect())
 }
@@ -230,6 +276,61 @@ mod tests {
         }
         let head = BASE.replace("[src-sh-c]\n", "[src-sh-c]\npackaging/install.sh\tx\n");
         assert_eq!(keys(&new_rows(BASE, &head).expect("parse")).len(), 1);
+    }
+
+    fn renames(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(old, new)| ((*new).to_owned(), (*old).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn a_renamed_path_keeps_its_row() {
+        // Catches: a pure rename read as a new row (kbf#1401); a rename map that
+        // excuses a path's row in another section, or a workflow `path#step` key.
+        let head = BASE.replace("a.sh\t", "moved/a.sh\t");
+        let map = renames(&[("a.sh", "moved/a.sh")]);
+        assert_eq!(new_rows(BASE, &head).expect("parse").len(), 1);
+        assert_eq!(new_rows_renamed(BASE, &head, &map), Ok(vec![]));
+        let head = BASE.replace("ci.yml#j/s", "wf.yml#j/s");
+        let map = renames(&[("ci.yml", "wf.yml")]);
+        assert_eq!(new_rows_renamed(BASE, &head, &map), Ok(vec![]));
+        let head = BASE.replace("[src-sh-c]\n", "[src-sh-c]\nmoved/a.sh\tother section\n");
+        let rows =
+            new_rows_renamed(BASE, &head, &renames(&[("a.sh", "moved/a.sh")])).expect("parse");
+        assert_eq!(keys(&rows), vec![(Section::SrcShC, "moved/a.sh")]);
+    }
+
+    #[test]
+    fn a_rename_that_also_adds_a_row_is_refused() {
+        // Catches: a rename that excuses every row of the new path, so a row added
+        // with the rename (a second step of a moved workflow) passes.
+        let head = BASE.replace(
+            "ci.yml#j/s\tto port\n",
+            "wf.yml#j/s\tto port\nwf.yml#j/t\tnew\n",
+        );
+        let map = renames(&[("ci.yml", "wf.yml")]);
+        let rows = new_rows_renamed(BASE, &head, &map).expect("parse");
+        assert_eq!(keys(&rows), vec![(Section::Workflow, "wf.yml#j/t")]);
+        // A new path that no rename names stays refused, and a removal is fine.
+        let head = BASE.replace("b.py\tto delete\n", "c.sh\tnew\n");
+        assert_eq!(new_rows_renamed(BASE, &head, &map).expect("parse").len(), 1);
+        let head = BASE.replace("b.py\tto delete\n", "");
+        assert_eq!(new_rows_renamed(BASE, &head, &map), Ok(vec![]));
+    }
+
+    #[test]
+    fn parse_renames_reads_git_name_status() {
+        // Catches: a parser that reads a modified, added or deleted path as a rename,
+        // or that loses its place after a one-path record.
+        let raw = b"M\0a.sh\0R100\0old/x\0new/x\0A\0b\0D\0c\0R099\0p\0q\0";
+        assert_eq!(
+            parse_renames(raw),
+            renames(&[("old/x", "new/x"), ("p", "q")])
+        );
+        assert_eq!(parse_renames(b""), BTreeMap::new());
+        assert_eq!(parse_renames(b"R100\0only-one\0"), BTreeMap::new());
     }
 
     #[test]

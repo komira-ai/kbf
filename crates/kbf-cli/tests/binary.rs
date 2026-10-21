@@ -141,6 +141,7 @@ fn version_json_reports_the_build_identity() {
                 "min_protocol",
                 "profile",
                 "protocol",
+                "seq",
                 "state_schema",
                 "version"
             ],
@@ -162,6 +163,8 @@ fn version_json_reports_the_build_identity() {
             kbf_server::worker::OLDEST_PROTOCOL_VERSION
         );
         assert!(v["state_schema"].as_u64().is_some_and(|n| n >= 1), "{out}");
+        // A number, whatever the checkout the test was built in: 0 where it could not count.
+        assert!(v["seq"].is_u64(), "{out}");
     }
 }
 

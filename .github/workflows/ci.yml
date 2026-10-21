@@ -1,11 +1,11 @@
 # The pull-request gate: two jobs, `lint` and `test`. GitHub-hosted runners only; the repository
-# lints in crates/kbf-it/tests/repo_lints.rs hold every workflow to that, to commit-SHA pinned
+# lints in crates/kbf-integration-test/tests/repo_lints.rs hold every workflow to that, to commit-SHA pinned
 # actions from the set the repository's Actions policy allows (actions/* and
 # tailscale/github-action), and to a top-level `permissions: {}`.
 #
 # A pull request runs only this. The rest of the suite (the slow tests, the Arm run, the
 # jobs that need a service, root, crun or a Mac, the packages and the beta smoke) runs on a
-# push to main or feature/arch-v2, in beta.yml. This workflow runs on those pushes too, so
+# push to main, in beta.yml. This workflow runs on those pushes too, so
 # the merged result meets the same gate and the Cargo cache below is saved.
 #
 # The Cargo cache (registry, git checkouts and target) is keyed on the runner, the job,
@@ -17,7 +17,7 @@ on:
   pull_request:
   merge_group:
   push:
-    branches: [main, feature/arch-v2]
+    branches: [main]
 
 permissions: {}
 
@@ -83,7 +83,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: cargo xtask release main-control --repo "$GITHUB_REPOSITORY" --on-main "$BASE_SHA" --off-main "$GITHUB_SHA"
-      - run: cargo test -p kbf-it --locked --test repo_lints
+      - run: cargo test -p kbf-integration-test --locked --test repo_lints
         if: ${{ !cancelled() }}
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
@@ -133,6 +133,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The merge commit and its first parent, the base branch (no-lowering --base-ref).
+          fetch-depth: 2
+      # The restored target/, the instrumented workspace build and its profiles outgrew a
+      # hosted runner's free disk (runs died with "No space left on device", or the runner
+      # was lost mid-test). Remove toolchains the image preinstalls that this job never
+      # uses; the Postgres service container's image is not touched.
+      - name: Free disk before (report)
+        run: df -h /
+      - name: Remove preinstalled toolchains this job does not use
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+      - name: Free disk after (report)
+        run: df -h /
       - run: rustup toolchain install "$COVERAGE_TOOLCHAIN" --profile minimal --component llvm-tools-preview
       # xtask builds with the coverage nightly, the one toolchain this job installs.
       - name: Install cargo-llvm-cov (pinned version and checksum)
@@ -225,7 +237,7 @@ jobs:
           persist-credentials: false
       - name: Floors are not lower than the base's
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
-        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base base/coverage-floors --floors coverage-floors
+        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base-ref HEAD^1 --base base/coverage-floors --floors coverage-floors
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:

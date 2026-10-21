@@ -1393,19 +1393,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kbf-bake"
-version = "0.1.0"
-dependencies = [
- "clap",
- "kbf-gate",
- "serde",
- "serde_json",
- "thiserror",
- "time",
- "ureq",
-]
-
-[[package]]
 name = "kbf-baseline"
 version = "0.1.0"
 dependencies = [
@@ -1790,7 +1777,7 @@ dependencies = [
  "flate2",
  "futures",
  "kbf-deploy",
- "kbf-it",
+ "kbf-integration-test",
  "kbf-proto",
  "kbf-testkit",
  "kbf-transfer",
@@ -1905,18 +1892,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kbf-invocation"
-version = "0.1.0"
-dependencies = [
- "kbf-sched",
- "kbf-types",
- "prost",
- "prost-build",
- "protox",
-]
-
-[[package]]
-name = "kbf-it"
+name = "kbf-integration-test"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -1926,6 +1902,7 @@ dependencies = [
  "h2",
  "hex",
  "http",
+ "kbf-auth",
  "kbf-cli",
  "kbf-daemon",
  "kbf-deploy",
@@ -1936,6 +1913,7 @@ dependencies = [
  "kbf-objstore",
  "kbf-proto",
  "kbf-proxy",
+ "kbf-sched",
  "kbf-server",
  "kbf-state",
  "kbf-storage",
@@ -1959,6 +1937,17 @@ dependencies = [
  "tonic",
  "tracing-subscriber",
  "xtask",
+]
+
+[[package]]
+name = "kbf-invocation"
+version = "0.1.0"
+dependencies = [
+ "kbf-sched",
+ "kbf-types",
+ "prost",
+ "prost-build",
+ "protox",
 ]
 
 [[package]]
@@ -2098,7 +2087,7 @@ dependencies = [
  "kbf-driver-container",
  "kbf-driver-native",
  "kbf-front",
- "kbf-it",
+ "kbf-integration-test",
  "kbf-map",
  "kbf-outputs",
  "kbf-proto",

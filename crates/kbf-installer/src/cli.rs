@@ -65,6 +65,10 @@ pub enum Verb {
     /// Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's
     /// tree, or put it back with `--rollback`. A dry run without `--apply`.
     Migrate(MigrateArgs),
+    /// Remove what the package left on a host that is rolled back or was never adopted: the
+    /// LaunchDaemon plist, its receipt, disable override, logs and the files a rollback moved
+    /// aside (a Mac). A dry run without `--apply`.
+    Uninstall(UninstallArgs),
     /// For maintainer scripts: take the lock; exit 5 while a swap is pending.
     Quiesce,
     /// Validate the installer's configuration, trust files and path chain.
@@ -103,6 +107,7 @@ impl Mode {
 pub enum ReleaseSource {
     Url,
     Frontend,
+    Bundled,
 }
 
 #[derive(Args)]
@@ -111,12 +116,17 @@ pub struct SetupArgs {
     #[arg(long, value_enum)]
     pub mode: Mode,
     /// Where releases are fetched from. Default: the frontend for the modes that enroll,
-    /// a file server (`url`) for `frontend` and `all-in-one`.
+    /// a file server (`url`) for `frontend` and `all-in-one`. `bundled` fetches nothing: it
+    /// takes no --release-url and no --commit.
     #[arg(long, value_enum)]
     pub release_source: Option<ReleaseSource>,
     /// The https base URL of the file server, for --release-source url.
     #[arg(long)]
     pub release_url: Option<String>,
+    /// The keys of the release source that go with it in installer.toml: the file server's CA
+    /// (`url`) and the frontend's worker listener with its CA (`frontend`).
+    #[command(flatten)]
+    pub release: crate::setup::release_keys::ReleaseFlags,
     /// Refuse orders below this generation. A floor only goes up.
     #[arg(long)]
     pub min_generation: Option<u64>,
@@ -343,7 +353,8 @@ pub struct MigrateArgs {
     /// and disabled first by a rollback.
     #[arg(long, value_parser = crate::migrate::Unit::new)]
     pub installer_unit: Option<crate::migrate::Unit>,
-    /// Where the host gets its releases: decides where the replay floor is seeded from.
+    /// Where the host gets its releases: decides where the replay floor is seeded from. Only a
+    /// `frontend` host has a frontend to ask; a `url` or `bundled` one does not.
     #[arg(long, value_enum, default_value = "url")]
     pub release_source: ReleaseSource,
     /// The lowest generation an order may carry: the floor when there is no frontend to ask.
@@ -356,6 +367,18 @@ pub struct MigrateArgs {
     /// Mac an applying migration creates when it is not there (the way `setup` does).
     #[arg(long)]
     pub fetch_user: Option<String>,
+}
+
+#[derive(Args)]
+pub struct UninstallArgs {
+    /// The installer's own unit: stopped and, on Linux, disabled. A Mac without the flag acts
+    /// on the package's job, `com.komira.kbf-installer.plist`; a Linux host without it leaves
+    /// its unit to the package manager.
+    /// The unit must be `.plist` on a Mac and `.service` on Linux (else exit 2). On a Mac a
+    /// name other than the package's job replaces it as the job acted on: the package's own
+    /// plist is then left in place, while the installer's tree, logs and receipt are removed.
+    #[arg(long, value_parser = crate::migrate::Unit::new)]
+    pub installer_unit: Option<crate::migrate::Unit>,
 }
 
 #[derive(Args)]
@@ -416,6 +439,7 @@ impl Verb {
             Verb::Gc(_) => "gc",
             Verb::BootCheck(_) => "boot-check",
             Verb::Migrate(_) => "migrate",
+            Verb::Uninstall(_) => "uninstall",
             Verb::Quiesce => "quiesce",
             Verb::Check => "check",
             Verb::Proxy(_) => "proxy",
@@ -459,6 +483,9 @@ impl Verb {
             | Verb::BootCheck(_)
             | Verb::Quiesce
             | Verb::Migrate(_)
+            // `uninstall` is for a host the installer does not manage (rolled back, or never
+            // adopted), and an old-layout host that was never adopted is one.
+            | Verb::Uninstall(_)
             | Verb::Proxy(_)
             // `update` only POSTs to the proxy's API as an unprivileged client, and the proxy
             // exists only on a new-layout host; the root half of an update (`run`) is guarded.
@@ -483,6 +510,7 @@ impl Verb {
             | Verb::RecordRelease(_)
             | Verb::Gc(_)
             | Verb::Migrate(_)
+            | Verb::Uninstall(_)
             | Verb::Quiesce
             | Verb::Setup(_)
             | Verb::FetchChild(_) => None,

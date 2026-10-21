@@ -924,7 +924,7 @@ Every new module stays under 1,000 lines; `cache` is split into
 ## 10. Test plan
 
 Every test names the defect it catches and the mutant that makes it go red. C-1, C-2,
-C-9, C-12 and C-18 need real rootless `crun` (the M2 harness, `kbf-it`). C-3 and C-3b
+C-9, C-12 and C-18 need real rootless `crun` (the M2 harness, `kbf-integration-test`). C-3 and C-3b
 need macOS. The rest run against `MemoryCas`, `kbf_front::routes` in process (which
 serve FindMissing and Batch today), or a counting fake CAS.
 

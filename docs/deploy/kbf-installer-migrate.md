@@ -22,7 +22,7 @@ installed is a different case, see "A host the Mac kit installed" below, and
 ```text
 kbf-installer migrate [--apply] --unit kbf-daemon.service [--unit ...] \
     [--helper-unit kbf-helper.service] [--installer-unit kbf-installer.service] \
-    [--release-source url|frontend] [--min-generation N] [--fetch-user NAME]
+    [--release-source url|frontend|bundled] [--min-generation N] [--fetch-user NAME]
 kbf-installer migrate --rollback [--apply] [--unit ...] [--helper-unit ...] [--installer-unit ...]
 ```
 
@@ -31,7 +31,7 @@ kbf-installer migrate --rollback [--apply] [--unit ...] [--helper-unit ...] [--i
 | `--unit` | a unit that runs kbf from `/usr/local/kbf/current`, to repoint at the installer's tree; repeat for several; `.service`, or `.plist` for launchd |
 | `--helper-unit` | the old helper's unit: stopped and disabled, so the installer is the only manager |
 | `--installer-unit` | the installer's own unit: enabled and started as the last step; a rollback stops and disables it first |
-| `--release-source` | where the host gets its releases (`url`, the default, or `frontend`); decides where the replay floor is seeded from |
+| `--release-source` | where the host gets its releases (`url`, the default, `frontend`, or `bundled`, which fetches nothing); decides where the replay floor is seeded from |
 | `--min-generation` | the lowest generation an order may carry; the floor when there is no frontend to ask |
 | `--fetch-user` | the unprivileged user the old binaries' `--version --json` runs as; default `kbf-fetch` (`_kbf-fetch` on a Mac) |
 | `--rollback` | put the old layout back instead |
@@ -98,6 +98,30 @@ is missing (the way `setup` does); a dry run says it cannot and that `migrate --
 The restart is steps 7 and 8: each running unit of `--unit` is stopped, rewritten, and started
 again, so the node is down for that time and runs from the installer's tree afterwards.
 
+### Removing the installer afterwards: `kbf-installer uninstall`
+
+A rollback undoes an adoption, not the package: the installer never removes itself, so a rolled-back
+Mac still has `/Library/LaunchDaemons/com.komira.kbf-installer.plist`, `/Library/Logs/kbf-installer`,
+the package receipt (`pkgutil --pkgs`), the launchd disable override of `com.komira.kbf-installer`
+(the rollback set it) and the `.rolled-back-<time>` files. `kbf-installer uninstall [--apply]` removes
+them. It is refused (exit 5) unless the host is rolled back (journal phase `rolled_back`) or was never
+adopted (no journal and no `state.json`), and takes the installer's lock (exit 4 while a `run` pass holds
+it). Without `--apply` it prints each path it would remove and the receipt id, one per line, and changes
+nothing. On a Mac it boots the job out (only if loaded), removes the plist, runs `launchctl enable
+system/com.komira.kbf-installer` (clearing the override, so a reinstalled package is not left
+disabled), runs `pkgutil --forget com.komira.kbf-installer` (only if the receipt is there), removes the
+log directory, `installer.toml`, the installer's tree and every `<name>.rolled-back-<UTC time>` of both,
+and last archives the journal as `migration.json.rolled-back-<time>` in `/var/db/kbf-installer`: the
+journal is kept, never deleted. `uninstall.json` in that directory records the suffix and the steps
+done after each one, so a run that died is finished by running it again; a host already clean says
+"nothing to uninstall" and exits 0. On Linux the package's files (binary, unit file, trust files) are
+the package manager's and are left: `--installer-unit kbf-installer.service` stops and disables the unit
+and the journal is archived. `--installer-unit` names another job on a Mac.
+
+`setup` runs `launchctl enable system/com.komira.kbf-installer` before it bootstraps the job (also with
+`--no-start`), so installing the package again and running `setup` works on a Mac whose override was
+set by a rollback.
+
 ## How a unit is rewritten
 
 In a systemd unit only the value of an `Exec*=` or `Environment=` line changes, and in a launchd
@@ -123,8 +147,8 @@ decide the generation:
 
 | source | `--min-generation` | result |
 |---|---|---|
-| `url` (default) | given | generation is that value |
-| `url` | not given | generation zero, and the warning `NO REPLAY FLOOR: no frontend to ask and no --min-generation: replay memory starts from generation zero, so a stale signed order for an older release is not refused until you set min_generation` |
+| `url` (default) or `bundled` | given | generation is that value |
+| `url` or `bundled` | not given | generation zero, and the warning `NO REPLAY FLOOR: no frontend to ask and no --min-generation: replay memory starts from generation zero, so a stale signed order for an older release is not refused until you set min_generation` |
 | `frontend` | given | the frontend's generation, or the flag when the frontend cannot be asked (a warning says so) |
 | `frontend` | not given | the frontend's generation; when it cannot be had, exit 5 (`the frontend's current generation could not be had (...): retry, or give --min-generation`) |
 
