@@ -2088,7 +2088,6 @@ dependencies = [
  "clap",
  "futures",
  "kbf-daemon",
- "kbf-deploy",
  "kbf-driver-container",
  "kbf-driver-native",
  "kbf-front",
