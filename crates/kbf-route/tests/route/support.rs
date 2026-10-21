@@ -1,7 +1,7 @@
 //! What the tests run over: storage nodes that hold what they are told to and fail as
 //! they are told to, a map a test sets, and a hook that records.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -159,6 +159,10 @@ pub struct Node {
     /// `(digest, offset, limit)` of each read.
     pub reads: Mutex<Vec<(Digest, u64, u64)>>,
     pub finds: Mutex<Vec<Vec<Digest>>>,
+    /// Blobs held in RAM only: present to `find_missing`, missing to `find_durable`.
+    ram_only: Mutex<BTreeSet<Digest>>,
+    /// The digests of each `find_durable` call.
+    durable_finds: Mutex<Vec<Vec<Digest>>>,
     pub puts: Mutex<Vec<Digest>>,
     pub commits: Mutex<Vec<Digest>>,
     pub action_gets: AtomicUsize,
@@ -188,6 +192,8 @@ impl Node {
             chunk: 4,
             reads: Mutex::default(),
             finds: Mutex::default(),
+            ram_only: Mutex::default(),
+            durable_finds: Mutex::default(),
             puts: Mutex::default(),
             commits: Mutex::default(),
             action_gets: AtomicUsize::new(0),
@@ -204,6 +210,16 @@ impl Node {
             .expect("lock")
             .insert(digest, Bytes::copy_from_slice(bytes));
         digest
+    }
+
+    /// Makes the held `digest` RAM-only, as a blob a write acknowledged from RAM is until it is on disk: the node serves it and says it is present, but not durable ([`Storage::find_durable`]).
+    pub fn make_ram_only(&self, digest: &Digest) {
+        self.ram_only.lock().expect("lock").insert(*digest);
+    }
+
+    /// The digests of each `find_durable` call.
+    pub fn durable_log(&self) -> Vec<Vec<Digest>> {
+        self.durable_finds.lock().expect("lock").clone()
     }
 
     /// The bytes held under `digest`, if any.
@@ -387,6 +403,23 @@ impl Storage for Node {
             Ok(digests
                 .iter()
                 .filter(|d| d.size_bytes != 0 && !blobs.contains_key(d))
+                .copied()
+                .collect())
+        })
+    }
+
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(async move {
+            self.durable_finds
+                .lock()
+                .expect("lock")
+                .push(digests.to_vec());
+            self.check()?;
+            let blobs = self.blobs.lock().expect("lock");
+            let ram_only = self.ram_only.lock().expect("lock");
+            Ok(digests
+                .iter()
+                .filter(|d| d.size_bytes != 0 && (!blobs.contains_key(d) || ram_only.contains(d)))
                 .copied()
                 .collect())
         })

@@ -170,8 +170,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 
     /// Where each of `digests` is, in order: the object and offset of a blob present
     /// and reachable, `None` for any other (the empty blob included: it is in no
-    /// object). The present ones are touched before the answer, as a read is, so a
-    /// fill that reads them next finds them.
+    /// object; a blob held in RAM too). The present ones are touched before the answer, as
+    /// a read is, so a fill that reads them next finds them.
     ///
     /// # Errors
     /// The metadata log is unavailable or kept changing.
@@ -179,11 +179,18 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self,
         digests: &[Digest],
     ) -> Result<Vec<Option<Location>>, CacheError> {
+        // Held first, then the index (`held` module docs). A held blob has no object
+        // location to give, so it is `None` even if the index has it too (the drain's
+        // window), and the caller reads it whole.
+        let held = self.held.which(digests);
+        self.between_steps().await;
         let found = self
             .touched(|s| {
                 let found: Vec<Option<Location>> = digests
                     .iter()
-                    .map(|d| match s.blob(d) {
+                    .zip(&held)
+                    .map(|(d, held)| match s.blob(d) {
+                        _ if *held => None,
                         BlobAnswer::Present { location, .. } => Some(location),
                         BlobAnswer::Unavailable | BlobAnswer::Absent => None,
                     })

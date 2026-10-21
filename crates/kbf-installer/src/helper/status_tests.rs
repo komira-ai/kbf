@@ -111,3 +111,39 @@ fn a_status_with_no_seed_and_no_source_carries_neither_key() {
         assert!(json.get(key).is_none(), "{key}");
     }
 }
+
+/// The id of the order a refusal answers is told while there is one, and every reader of the
+/// status takes it: the frontend proxy's (which blames a refusal on its own update by it), the
+/// strict reader, and the node's, which ignores the key and reads the rest as before. A status
+/// whose refusal is no order's has no such key.
+///
+/// Catches a writer and a reader that disagree on the key's name (the proxy would then never
+/// attribute a refusal, and an update whose order was refused would wait out its staging
+/// deadline), and a key written as `null`.
+///
+/// Mutants to plant: the key renamed in the writer; its `skip_serializing_if` removed.
+#[test]
+fn the_order_a_refusal_answers_is_told_while_there_is_one_and_read_by_every_reader() {
+    use crate::proxy::api::traits::{JsonFileStatus, StatusReader};
+    use crate::status_v2::StatusV2;
+    let (state, mut memory) = described();
+    memory.refused_order_id = Some(41);
+    let bytes = render(&state, &memory);
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(json["refused_order_id"], 41);
+    let strict = StatusV2::parse(&bytes).expect("parses");
+    assert_eq!(strict.refused_order_id, Some(41));
+    let dir = kbf_host::testkit::scratch("status-refused-id");
+    let path = dir.join("status.json");
+    fs::write(&path, &bytes).expect("written");
+    let proxy = JsonFileStatus::new(&path);
+    let read = proxy.read().expect("the proxy reads it");
+    assert_eq!(read.refused_order_id, Some(41));
+    let node = kbf_update::helper::read(&path);
+    assert!(matches!(node, Helper::Reported(_)), "{node:?}");
+
+    let (state, memory) = described();
+    let bytes = render(&state, &memory);
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert!(json.get("refused_order_id").is_none(), "{json}");
+}

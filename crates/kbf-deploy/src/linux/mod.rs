@@ -30,8 +30,8 @@
 //! `linux meta-verify --archive FILE --into DIR` extracts and checks one ([`meta`]).
 //!
 //! `kbf-deploy linux verify-cert --row ROW --cert FILE --ca-cert FILE [--node-id ID]`
-//! ([`verify_cert`]) checks, read only, that a certificate is its row of the farm's
-//! certificate table: its one role, its extended key usage, its chain to the CA.
+//! ([`verify_cert`], over kbf-ca's checks) checks, read only, that a certificate is its
+//! row of the farm's certificate table: its one role, its extended key usage, its chain to the CA.
 //!
 //! The settings are a closed set of `KEY=VALUE` lines ([`config::KEYS`],
 //! `templates/linux/config.example`).

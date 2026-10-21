@@ -68,8 +68,14 @@ Every `/ui` answer carries a `Content-Security-Policy` of `default-src 'none'` w
 and images from the page's own origin only (no page uses an image), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
 `Cache-Control: no-store`, `Cross-Origin-Resource-Policy: same-origin`,
 `Cross-Origin-Opener-Policy: same-origin` and a `Permissions-Policy` that denies the powerful
-browser features. The proxy adds no HSTS header and puts none of these on its own pages
-(its 503 handover page).
+browser features. The proxy leaves a forwarded answer's headers as the server set them. The answers the proxy
+makes itself (the 503 handover page during a frontend swap, 404, 405, 401, the probes) carry
+a stricter set: `Content-Security-Policy: default-src 'none'; frame-ancestors 'none';
+base-uri 'none'; form-action 'none'`, `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`, `Cache-Control: no-store` and
+`Cross-Origin-Resource-Policy: same-origin`. Nothing sets HSTS: a farm often serves a
+private-CA or self-signed certificate, and HSTS would stop a browser from proceeding past
+the certificate warning to the UI.
 
 ## The per-client read bound
 

@@ -334,12 +334,17 @@ fn the_bake_confirms_after_the_window_and_posts_desired_only_if_asked() {
     assert!(!w.phases().contains(&Phase::Nodes));
 }
 
+/// An order for the nodes that never gets an answer ends the update, which is `failed` at
+/// `nodes` (see `nodes_tests`); it does not undo the frontend, which was swapped and confirmed:
+/// the new child serves and the staged release is kept.
 #[test]
-fn a_failed_desired_post_does_not_fail_the_frontend() {
+fn a_desired_post_that_never_lands_ends_the_update_but_does_not_undo_the_frontend() {
     let (w, old) = World::with_old();
     w.st.borrow_mut().desired_err = true;
-    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Done));
+    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Failed));
     assert!(!w.last_intent().nodes_posted);
+    assert_eq!(w.holders(), vec![Slot::B]);
+    assert_eq!(w.count("order revert"), 0);
 }
 
 #[test]

@@ -460,11 +460,18 @@ impl<E: Exec> Helper<E> {
             Kind::Frontend(_) => "floor: ",
             Kind::Node => "",
         };
+        // The proxy blames a refusal on its update by the order's id alone, so only its own
+        // kinds of order are named: the node's ids are another counter's.
+        let named = |o: &Order| match kind_of(o, &state, frontend_host) {
+            Kind::Frontend(_) => Some(o.id),
+            Kind::Node => None,
+        };
         match parsed {
             // A frontend order on a host that runs no frontend: refused, and like any
             // refusal of a record it does not move a floor.
-            Ok(o) if !frontend_host && o.verb == Verb::FrontendUpdate => refuse(
+            Ok(o) if !frontend_host && o.verb == Verb::FrontendUpdate => refuse_order(
                 memory,
+                named(&o),
                 &format!(
                     "denied: order {}: this host runs no frontend (frontend_update is refused): {}",
                     o.id,
@@ -475,8 +482,9 @@ impl<E: Exec> Helper<E> {
                 if floor(&o, memory).0 != 0
                     && o.epoch > floor(&o, memory).0.saturating_add(order::MAX_EPOCH_JUMP) =>
             {
-                refuse(
+                refuse_order(
                     memory,
+                    named(&o),
                     &format!(
                         "{}order {} is from epoch {}, more than {} above the last acted on ({}): \
                          not acted on",
@@ -489,8 +497,9 @@ impl<E: Exec> Helper<E> {
                 );
             }
             Ok(o) if o.epoch < floor(&o, memory).0 => {
-                refuse(
+                refuse_order(
                     memory,
+                    named(&o),
                     &format!(
                         "{}order {} is from epoch {}, older than the last acted on ({})",
                         word(&o),
@@ -517,6 +526,9 @@ impl<E: Exec> Helper<E> {
                     }
                 }
                 memory.last_acted_id = o.id;
+                // Every way of acting on an order sets the event, so a refusal here is this
+                // order's: the proxy that wrote it can tell it from an older one by the id.
+                memory.refused_order_id = named(&o).filter(|_| memory.event == Event::Refused);
             }
             // Not acknowledged: a garbage file must not move the floor.
             Err(why) => refuse(memory, &format!("order file {name}: {why}")),
@@ -900,9 +912,19 @@ fn platform_prefix(host: &Layout) -> &'static str {
     }
 }
 
+/// Record a refusal that is no order's (a record that could not be read, a restart that failed,
+/// the spool crowded): it names none.
 fn refuse(memory: &mut Memory, why: &str) {
     memory.event = Event::Refused;
     memory.refusal = why.to_owned();
+    memory.refused_order_id = None;
+}
+
+/// Record the refusal of an order, named by `id` when it is one of the proxy's, so that whoever
+/// wrote the order can tell its refusal from an older one.
+fn refuse_order(memory: &mut Memory, id: Option<u64>, why: &str) {
+    refuse(memory, why);
+    memory.refused_order_id = id;
 }
 
 fn release_err(e: &ReleaseError) -> String {

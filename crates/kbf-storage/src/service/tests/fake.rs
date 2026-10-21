@@ -2,7 +2,7 @@
 //! to stall and to count, the `Segments` it hands out, a loopback server, and a server
 //! that answers what a correct one never would.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -54,6 +54,11 @@ pub(crate) fn patterned(len: usize) -> Vec<u8> {
 #[derive(Default)]
 pub(crate) struct Mem {
     pub blobs: Arc<Mutex<BTreeMap<Digest, Bytes>>>,
+    /// Blobs of `blobs` held in RAM only: present to `find_missing`, missing to
+    /// `find_durable`, as a blob acknowledged from RAM is until it is on disk.
+    pub ram_only: Mutex<BTreeSet<Digest>>,
+    /// Calls of `find_durable`.
+    pub durable_asked: AtomicUsize,
     pub actions: Mutex<BTreeMap<Digest, (Digest, ActionResult)>>,
     /// An entry is answered without its closure, as a node from before the field does.
     pub legacy_actions: AtomicBool,
@@ -106,6 +111,20 @@ impl Storage for Mem {
             Ok(digests
                 .iter()
                 .filter(|d| d.size_bytes != 0 && !blobs.contains_key(d))
+                .copied()
+                .collect())
+        })
+    }
+
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(async move {
+            self.durable_asked.fetch_add(1, Ordering::SeqCst);
+            self.failing()?;
+            let blobs = self.blobs.lock().expect("lock");
+            let ram_only = self.ram_only.lock().expect("lock");
+            Ok(digests
+                .iter()
+                .filter(|d| d.size_bytes != 0 && (!blobs.contains_key(d) || ram_only.contains(d)))
                 .copied()
                 .collect())
         })

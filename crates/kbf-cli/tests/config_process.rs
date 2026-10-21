@@ -7,9 +7,9 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use kbf_ca::verify_cert::{CLIENT_AUTH, ROLE_URI_PREFIX, Row};
 use kbf_cli::config::group_of;
 use kbf_cli::names;
-use kbf_deploy::linux::verify_cert::{CLIENT_AUTH, ROLE_URI_PREFIX, Row};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose as Eku, IsCa,
     KeyPair, KeyUsagePurpose, SanType, date_time_ymd,
