@@ -131,6 +131,7 @@ async fn rig_of(
         rows: Some(rows.clone()),
         token: Some(ApiToken::for_tests(BEARER)),
         farm,
+        own_commit: own_commit.to_owned(),
     });
     Rig {
         update,
@@ -138,6 +139,19 @@ async fn rig_of(
         calls,
         _dir: dir,
     }
+}
+
+/// `rig` for a server started without `--releases-dir`: the same rows, build and token, and
+/// no release store.
+fn without_store(rig: Rig) -> Rig {
+    let update = Arc::new(Update {
+        held: None,
+        rows: rig.update.rows.clone(),
+        token: Some(ApiToken::for_tests(BEARER)),
+        farm: Arc::clone(&rig.update.farm),
+        own_commit: rig.update.own_commit.clone(),
+    });
+    Rig { update, ..rig }
 }
 
 async fn offer(rig: &Rig, body: &Value) -> (u16, String) {
@@ -168,6 +182,28 @@ fn desired_commit(rig: &Rig) -> Option<String> {
         .expect("the row")
         .value
         .map(|d| d.commit.as_str().to_owned())
+}
+
+fn desired_source(rig: &Rig) -> Option<Source> {
+    rig.rows.desired().expect("the row").value.map(|d| d.source)
+}
+
+/// What `GET /v1/update` shows as desired: "<generation> <source>", or "0 -" before any offer.
+async fn shown(rig: &Rig) -> String {
+    let response = view(State(Arc::clone(&rig.update))).await;
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("a body");
+    let doc: Value = serde_json::from_slice(&bytes).expect("json");
+    let desired = &doc["desired"];
+    let generation = desired["generation"].as_u64().unwrap_or(0);
+    format!("{generation} {}", desired["source"].as_str().unwrap_or("-"))
+}
+
+/// The status and the parsed body of an offer.
+async fn offered(rig: &Rig, body: &Value) -> (u16, Value) {
+    let (code, text) = offer(rig, body).await;
+    (code, serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
 const SEQ_500: TargetSeq = TargetSeq::Seq(500);
@@ -483,4 +519,175 @@ async fn the_running_commit_is_never_refused_and_never_looked_up() {
     assert_eq!(code, 409, "{body}");
     assert!(body.contains("seq_unknown"), "{body}");
     assert_eq!(rig.calls.load(Ordering::SeqCst), 1);
+}
+
+/// The two bodies of a fetch of `OTHER`: no `source`, and the explicit word.
+fn fetch_bodies() -> [Value; 2] {
+    [
+        json!({"commit": OTHER}),
+        json!({"commit": OTHER, "source": "fetch"}),
+    ]
+}
+
+/// Catches: a staged offer of the build's own commit that needs a release store (the proxy
+/// posts it to a frontend started without `--releases-dir`, where a fetch is `503`), a staged
+/// offer written as a fetch, an answer that does not say its source, and the seq lookup asked.
+///
+/// Mutants it catches: the `503` made before the source is read; `Source::Fetch` passed to
+/// `offer_expecting`; `source` left out of `desired_view`.
+#[tokio::test]
+async fn a_staged_offer_of_the_own_commit_needs_no_release_store() {
+    let rig = without_store(rig_of(OWN_SEQ, OWN_FULL, Some(&[])).await);
+    let (code, said) = offered(&rig, &json!({"commit": OWN_FULL, "source": "staged"})).await;
+    assert_eq!(code, 200, "{said}");
+    assert_eq!(said["commit"], OWN_FULL);
+    assert_eq!(said["source"], "staged");
+    assert_eq!(desired_commit(&rig).as_deref(), Some(OWN_FULL));
+    assert_eq!(desired_source(&rig), Some(Source::Staged));
+    assert_eq!(rig.calls.load(Ordering::SeqCst), 0);
+}
+
+/// Catches: a staged offer held to what a fetch needs of the store: here the store holds no
+/// platform of the build's own commit, so the fetch of it is `409` and the staged offer is
+/// taken. The checks are keyed by the source, not removed: the fetch is still refused.
+///
+/// Mutants it catches: the completeness check run for a staged offer; the check dropped for a
+/// fetch.
+#[tokio::test]
+async fn a_staged_offer_needs_nothing_of_the_store_that_a_fetch_needs() {
+    let rig = rig_of(OWN_SEQ, NO_PLATFORM, Some(&[])).await;
+    let (code, said) = offered(&rig, &json!({"commit": NO_PLATFORM})).await;
+    assert_eq!(code, 409, "{said}");
+    let error = said["error"].as_str().unwrap_or_default();
+    assert!(error.contains("no platform"), "{said}");
+    assert_eq!(desired_commit(&rig), None);
+    let staged = json!({"commit": NO_PLATFORM, "source": "staged"});
+    let (code, said) = offered(&rig, &staged).await;
+    assert_eq!(code, 200, "{said}");
+    assert_eq!(desired_source(&rig), Some(Source::Staged));
+}
+
+/// Catches: a staged offer of a commit that is not the build's own written (the proxy would
+/// move the hosts to a release this server has not got), a refusal that a program cannot tell
+/// from the other `409`s (no `code`), and `rollback` lifting the own-commit rule (it skips R4
+/// only). `OTHER` is complete in the store and newer than the build, so a fetch takes it.
+///
+/// Mutants it catches: the own-commit check dropped; `rollback` skipping it.
+#[tokio::test]
+async fn a_staged_offer_of_another_commit_is_not_own_and_writes_nothing() {
+    let rig = rig_of(OWN_SEQ, OWN_FULL, Some(&[(OTHER, TargetSeq::Seq(501))])).await;
+    for rollback in [false, true] {
+        let body = json!({"commit": OTHER, "source": "staged", "rollback": rollback});
+        let (code, said) = offered(&rig, &body).await;
+        assert_eq!(code, 409, "{said}");
+        assert_eq!(said["code"], "not_own");
+        let error = said["error"].as_str().unwrap_or_default();
+        for part in [OTHER, OWN_FULL] {
+            assert!(error.contains(part), "{part}: {said}");
+        }
+        assert_eq!(desired_commit(&rig), None, "rollback {rollback}");
+    }
+    let (code, said) = offered(&rig, &json!({"commit": OTHER})).await;
+    assert_eq!(code, 200, "the same commit as a fetch is offered: {said}");
+}
+
+/// Catches: the own-commit rule compared by the first 12 digits when the build knows all 40: a
+/// sibling (the same 12 digits, another tail) is not this build and is `not_own`, while the
+/// build's own commit is taken. A build that knows only its 12 digits names its own commit by
+/// them, as R4 does, and refuses a commit with other digits.
+///
+/// Mutants it catches: a prefix-only compare of the 12 digits; the sibling taken as the build.
+#[tokio::test]
+async fn a_staged_sibling_that_shares_only_twelve_digits_is_not_own() {
+    let rig = rig_of(OWN_SEQ, OWN_FULL, Some(&[])).await;
+    let (code, said) = offered(&rig, &json!({"commit": SIBLING, "source": "staged"})).await;
+    assert_eq!(code, 409, "{said}");
+    assert_eq!(said["code"], "not_own");
+    assert_eq!(desired_commit(&rig), None);
+    let (code, said) = offered(&rig, &json!({"commit": OWN_FULL, "source": "staged"})).await;
+    assert_eq!(code, 200, "{said}");
+    let short = rig_of(OWN_SEQ, OWN_COMMIT, Some(&[])).await;
+    let (code, said) = offered(&short, &json!({"commit": OTHER, "source": "staged"})).await;
+    assert_eq!(code, 409, "{said}");
+    assert_eq!(desired_commit(&short), None);
+    let (code, said) = offered(&short, &json!({"commit": OWN_FULL, "source": "staged"})).await;
+    assert_eq!(code, 200, "{said}");
+}
+
+/// Catches: a source that is not one of the two words read as a fetch or a staged offer (a
+/// typo would then move the hosts from the wrong place), an answer that does not name the
+/// field, and a row written anyway.
+///
+/// Mutants it catches: `source` read as a free text; an unknown word defaulting to a fetch.
+#[tokio::test]
+async fn a_source_that_is_not_fetch_or_staged_is_a_400_that_writes_nothing() {
+    let rig = rig_of(OWN_SEQ, OWN_FULL, Some(&[])).await;
+    for source in [json!("bogus"), json!("Staged"), json!(2), Value::Null] {
+        let (code, text) = offer(&rig, &json!({"commit": OWN_FULL, "source": source})).await;
+        assert_eq!(code, 400, "{source}: {text}");
+        assert!(text.contains("source"), "{source}: {text}");
+    }
+    assert_eq!(desired_commit(&rig), None);
+}
+
+/// Catches: an explicit `"source": "fetch"` read as anything but the default: it passes the
+/// checks of a fetch and is written as one, as an offer with no `source`.
+///
+/// Mutants it catches: `"fetch"` refused as an unknown word; `"fetch"` taken as a staged offer.
+#[tokio::test]
+async fn an_explicit_fetch_is_an_offer_with_no_source() {
+    let mut seen = Vec::new();
+    for body in &fetch_bodies() {
+        let rig = rig(OWN_SEQ, Some(&[(OTHER, TargetSeq::Seq(501))])).await;
+        let (code, said) = offered(&rig, body).await;
+        seen.push((code, said["source"].clone(), desired_source(&rig)));
+    }
+    assert_eq!(seen[0], seen[1]);
+    assert_eq!(seen[0], (200, json!("fetch"), Some(Source::Fetch)));
+}
+
+/// Catches: a fetch on a server started without `--releases-dir` taken, or refused with
+/// another status or words, once the staged path needs no store: still `503` naming the flag,
+/// for an absent source and the explicit word, and nothing is written.
+///
+/// Mutants it catches: the store required of no source; the `503` dropped for a fetch.
+#[tokio::test]
+async fn a_fetch_with_no_release_store_is_a_503_naming_the_flag() {
+    for body in &fetch_bodies() {
+        let rig = without_store(rig(OWN_SEQ, Some(&[])).await);
+        let (code, text) = offer(&rig, body).await;
+        assert_eq!(code, 503, "{text}");
+        assert!(text.contains("--releases-dir"), "{text}");
+        assert_eq!(desired_commit(&rig), None);
+    }
+}
+
+/// Catches: the same commit offered from the other source answered as a repeat (the run would
+/// not move to the package), a repeat from the same source starting a new run, `GET
+/// /v1/update` not saying the source of the desired release, and `expect_generation` not
+/// applying to a staged offer.
+///
+/// Mutants it catches: the source dropped between the body and the row; the generation kept
+/// when only the source differs; `source` left out of `desired_view`.
+#[tokio::test]
+async fn the_same_commit_from_the_other_source_is_a_new_run_and_the_view_says_which() {
+    let rig = rig_of(OWN_SEQ, OWN_FULL, Some(&[])).await;
+    assert_eq!(shown(&rig).await, "0 -");
+    let fetch = json!({"commit": OWN_FULL});
+    let staged = json!({"commit": OWN_FULL, "source": "staged"});
+    let steps = [
+        (&fetch, "1 fetch"),
+        (&staged, "2 staged"),
+        (&staged, "2 staged"),
+        (&fetch, "3 fetch"),
+    ];
+    for (body, want) in steps {
+        let (code, said) = offered(&rig, body).await;
+        assert_eq!(code, 200, "{said}");
+        assert_eq!(shown(&rig).await, want);
+    }
+    let stale = json!({"commit": OWN_FULL, "source": "staged", "expect_generation": 1});
+    let (code, said) = offered(&rig, &stale).await;
+    assert_eq!(code, 409, "{said}");
+    assert_eq!(shown(&rig).await, "3 fetch");
 }

@@ -29,15 +29,14 @@
 //!
 //! `--source` is `fetch` (the default: the installer fetches from the source it is configured
 //! with) or `staged` (the release the host's package carries). The request names it only when it
-//! is `staged`, so a fetch is the request every build has sent. A staged update takes no
-//! `--nodes` yet.
+//! is `staged`, so a fetch is the request every build has sent. With `--nodes` the new
+//! frontend gives the nodes the same source: a staged update has each node use the release its
+//! own package carries.
 
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::time::Duration;
-
-use kbf_update::Source;
 
 use super::api::{Https, Trust};
 use super::cli::{CALL_TIMEOUT, host_platform, read_token};
@@ -75,16 +74,11 @@ pub fn run(args: &UpdateArgs, out: &mut dyn Write, err: &mut dyn Write) -> Exit 
 }
 
 /// The client and the options for `args`, or what is wrong with them. `rng` is the random
-/// source of a request id the caller did not give. A staged update asking for the nodes is
-/// refused first, before anything is read: the order for the nodes does not name its source
-/// yet, so the proxy would refuse it too.
+/// source of a request id the caller did not give.
 pub(super) fn plan(
     args: &UpdateArgs,
     rng: fn(usize) -> Result<Vec<u8>, String>,
 ) -> Result<(Https, Options), String> {
-    if args.source == Source::Staged && args.nodes {
-        return Err("--source staged takes no --nodes yet".to_owned());
-    }
     let addr: SocketAddr = args
         .api
         .parse()

@@ -75,6 +75,18 @@ impl fmt::Display for Refused {
     }
 }
 
+/// The commit of this process: [`crate::BUILD_COMMIT_FULL`] when the build knew it, else
+/// [`crate::BUILD_COMMIT`]. [`AgeCheck::running`] names the running build by it, and so does a
+/// staged offer of `POST /v1/update/desired`, which takes only the build's own commit.
+#[must_use]
+pub fn running_commit() -> &'static str {
+    if crate::BUILD_COMMIT_FULL.is_empty() {
+        crate::BUILD_COMMIT
+    } else {
+        crate::BUILD_COMMIT_FULL
+    }
+}
+
 /// The running child and where to learn a release's `seq`.
 pub struct AgeCheck {
     own_seq: u64,
@@ -95,12 +107,7 @@ impl AgeCheck {
     /// The check of this process: [`crate::BUILD_SEQ`] and its commit, in full when the build
     /// knew it ([`crate::BUILD_COMMIT_FULL`]), else [`crate::BUILD_COMMIT`].
     pub fn running(lookup: Arc<dyn SeqLookup>) -> Self {
-        let commit = if crate::BUILD_COMMIT_FULL.is_empty() {
-            crate::BUILD_COMMIT
-        } else {
-            crate::BUILD_COMMIT_FULL
-        };
-        Self::new(crate::BUILD_SEQ, commit, lookup)
+        Self::new(crate::BUILD_SEQ, running_commit(), lookup)
     }
 
     /// Whether `commit` may be offered as the desired release. The running build's own commit

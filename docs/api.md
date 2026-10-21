@@ -1986,11 +1986,11 @@ complete for any platform has no file to save (`409`).
 
 The desired release (`docs/design/pull-updates.md` section 6.3), kept in the `update/desired`
 row of the state store. Without `--state-store` every answer is `503` naming it; without
-`--releases-dir`, `GET /v1/update` and `POST /v1/update/desired` are `503` naming that flag
-(`pause` and `resume` need only the state store). A write that other writers kept racing
+`--releases-dir`, `GET /v1/update` and a fetch by `POST /v1/update/desired` are `503` naming that flag
+(`pause` and `resume` need only the state store; a staged offer needs no release store). A write that other writers kept racing
 for the whole of its retries is `503` with `Retry-After: 1`: send it again.
 
-- `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms"},
+- `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms", "source"},
   "paused": bool, "policy": null | {...}, "proposals": [...], "releases": <the body of GET /v1/releases>}`.
   `proposals` are the releases the release poller found (`--release-poll-every-secs`), oldest
   first, each `{"commit", "tag", "published_at_secs", "proposed_at_ms"}`: the newest published
@@ -2004,11 +2004,11 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
   `min_serving` and the limits in seconds), else `null`; `paused` is its flag (false without
   a row).
 - `POST /v1/update/desired` with `{"commit": "<40 lowercase hex>"}` and, optionally,
-  `"expect_generation": N` and `"rollback": bool` (JSON content type, the write gates) offers the commit. With
+  `"expect_generation": N`, `"rollback": bool` and `"source": "fetch" | "staged"` (JSON content type, the write gates) offers the commit. With
   `expect_generation` it is a compare-and-set: it writes only if the desired release is at
-  generation N (0 before any offer), else `409` naming both and nothing is written. `409` unless the release store holds some platform of it complete
+  generation N (0 before any offer), else `409` naming both and nothing is written. For a fetch, `409` unless the release store holds some platform of it complete
   (see above); `400` for a body that is not exactly that. The answer is the desired release.
-  The generation moves only when the commit differs from the desired one, so a repeated click is
+  The generation moves only when the commit or the source differs from the desired one, so a repeated click is
   not a new run; a rollback is the older commit offered the same way and gets a higher
   generation. Generations increase, but may skip numbers: each write that loses a race has
   already drawn a counter value.
@@ -2023,11 +2023,22 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
   (`seq` 0) does not apply R4. The release store does not record `seq` yet, so today R4 allows
   every offer. A release naming the running build's own commit is never refused by R4, and the
   store is not asked about it. The answer is `{"error": "<code>: ...", "code": "older" | "seq_tie" | "seq_unknown"}`;
-  the other `409`s of this route have no `code`.
+  the other `409`s of a fetch have no `code`.
   `"rollback": true` (optional, default false; spelled as `rollback` of the proxy's
-  `POST /v1/update/frontend`) skips this check and no other: the release must still be complete,
-  `expect_generation` still applies, and so will the own-commit rule of `source=staged`.
+  `POST /v1/update/frontend`) skips this check and no other: for a fetch the release must still be complete,
+  `expect_generation` still applies, and so does the own-commit rule of `source=staged` (it skips R4, which a staged
+  offer never reaches).
   The codes `older`, `seq_unknown` and `seq_tie` are stable: a client may key on them.
+  **`source`** says where the hosts get the release. `"fetch"`, which an absent key means, is everything above. `"staged"`
+  is the release the hosts' packages carry, the proxy's order for the nodes after a frontend update from the host's
+  package (`docs/design/frontend-proxy.md` section 4, step 9). It skips the release store (a server started without
+  `--releases-dir` takes it, where a fetch is `503`) and R4, and wants one thing: the commit is this server's own build,
+  compared in full when the build knows its 40 digits, else by the 12 it has. Any other commit is `409`
+  `{"error": "...", "code": "not_own"}` and nothing is written; the code is stable. Any other `source` value is `400`.
+  The generation moves when the commit or the source differs from the desired release's, so the same commit offered from
+  the other source is a new run. A staged desired release sends no offer to the nodes, and each host is ordered to use
+  its package's release. `GET /v1/update` and `GET /v1/update/hosts` show the `source` of `desired`
+  (`GET /v1/update` only on a server with a release store, as above).
 - `POST /v1/update/pause` and `POST /v1/update/resume` (the write gates, no body) set `paused` of the policy
   row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
   needed, and an offer leaves the flag as it is: while set, no host is started.
@@ -2042,7 +2053,7 @@ request is `404` with `"off": "farm"`. It carries what the open `GET /v1/nodes` 
 commits a host runs, staged and installed, and its refusal text.
 
 ```json
-{ "desired": { "generation": 3, "commit": "<40 hex>", "set_at_ms": 1791370000000 },
+{ "desired": { "generation": 3, "commit": "<40 hex>", "set_at_ms": 1791370000000, "source": "fetch" },
   "paused": false,
   "hosts": [
     { "node_id": "linux-1", "connected": true, "availability": "ok", "state": "refused",

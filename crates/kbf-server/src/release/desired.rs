@@ -8,21 +8,29 @@
 //!   proposal starts nothing.
 //! - `POST /v1/update/desired {"commit": "<40 hex>"}` offers the commit: the store must hold
 //!   it complete (tarball and attestation) for at least one platform, else `409` naming
-//!   what is missing. The row's generation moves only when the commit differs from the
-//!   desired one (a repeated click keeps it); a rollback is the older commit offered the same
-//!   way. R4 refuses a release older than this build by build seq ([`super::target_seq`]) unless
-//!   the body says `"rollback": true`, which skips only that check. It
-//!   passes the gates of every `/v1` write ([`crate::api::operator_gate`]) and wants a
+//!   what is missing. The row's generation moves only when the commit or the source differs
+//!   from the desired one (a repeated click keeps it); a rollback is the older commit offered
+//!   the same way. R4 refuses a release older than this build by build seq
+//!   ([`super::target_seq`]) unless the body says `"rollback": true`, which skips only that
+//!   check. It passes the gates of every `/v1` write ([`crate::api::operator_gate`]) and wants a
 //!   JSON body.
 //!   An optional `expect_generation` makes it a compare-and-set: the row is written only if the
 //!   desired release is at that generation (0 before any offer), else `409` naming both and
 //!   nothing is written. `GET` also shows the `policy` row when the operator wrote one.
+//! - An optional `"source"` is `"fetch"` (absent means it: what every sender meant before the
+//!   field) or `"staged"`; any other value is `400`. The checks above are those of a fetch. A
+//!   staged offer skips the release store and R4 and wants one thing: the commit is this
+//!   build's own ([`crate::update::age::same_commit`] on the build's full commit, else on the
+//!   12 digits it has), else `409` with `"code": "not_own"` and nothing written. The proxy
+//!   posts it in step 9, after the child it started took the generation, so the hosts use the
+//!   release their package carries; a server started without `--releases-dir` takes it. `GET`
+//!   shows the `source` of the desired release.
 //! - `POST /v1/update/pause` and `resume` set `paused` of the policy row (a compare-and-set of
 //!   that one field): while set, no host is started. It needs no run, and survives the next offer.
 //! - Without a state store (`--state-store`: the rows have nowhere to live) every answer is
 //!   `503` saying so. Without a release store (`--releases-dir`) `GET /v1/update` and `POST
-//!   /v1/update/desired` are `503` saying so; `pause` and `resume` touch only the policy row
-//!   and work.
+//!   /v1/update/desired` of a fetch are `503` saying so; `pause` and `resume` touch only the
+//!   policy row and work, and so does a staged offer.
 //! - A write that other writers kept racing for all of its retries is `503` with
 //!   `Retry-After: 1`. Generations increase and may skip numbers (a write that loses a race
 //!   has drawn a counter value).
@@ -43,14 +51,18 @@ use serde_json::json;
 
 use super::key::Commit;
 use super::store::ReleaseStore;
-use super::target_seq::AgeCheck;
+use super::target_seq::{AgeCheck, running_commit};
 use crate::api::{error, error_coded, json, operator_gate};
 use crate::farm::Farm;
 use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
-use crate::update::{Desired, Policy, Proposal, Release, RowError, Rows, Source};
+use crate::update::{Desired, Policy, Proposal, Release, RowError, Rows, Source, age};
 
-/// The release store and the R4 check over it, present together.
+/// The code of the `409` for a staged offer of a commit that is not this build's own. The
+/// proxy's admin client keys on it (`kbf-installer`, `proxy/admin.rs`).
+const NOT_OWN: &str = "not_own";
+
+/// The release store and the R4 check over it, present together: what a fetch needs.
 struct Held {
     store: Arc<ReleaseStore>,
     age: AgeCheck,
@@ -61,6 +73,9 @@ struct Update {
     rows: Option<Rows>,
     token: Option<ApiToken>,
     farm: Arc<Farm>,
+    /// The commit of this build ([`running_commit`]): what a staged offer must name. It is
+    /// kept outside `held` because a staged offer needs no release store.
+    own_commit: String,
 }
 
 /// The routes. `store` and `rows` are each `None` when the server has none: the routes then
@@ -84,6 +99,7 @@ pub fn router(
             rows,
             token,
             farm,
+            own_commit: running_commit().to_owned(),
         }))
 }
 
@@ -124,6 +140,7 @@ pub(crate) fn desired_view(desired: Option<&Desired>) -> serde_json::Value {
             "generation": d.generation.0,
             "commit": d.commit.as_str(),
             "set_at_ms": d.set_at.as_millis(),
+            "source": d.source,
         })
     })
 }
@@ -223,6 +240,9 @@ struct Offer {
     /// An older release on purpose: skips R4, the age check, and nothing else.
     #[serde(default)]
     rollback: bool,
+    /// Where the hosts get the release; absent is a fetch, as every offer meant before.
+    #[serde(default)]
+    source: Source,
 }
 
 /// The gates of a write, then the JSON content type for a body.
@@ -255,18 +275,17 @@ async fn set_desired(
     let Some(rows) = update.rows.clone() else {
         return unavailable("the update state", "--state-store");
     };
-    let Some(Held { store, age }) = update.held.as_ref() else {
-        return unavailable("the release store", "--releases-dir");
-    };
     let Ok(Offer {
         commit,
         expect_generation,
         rollback,
+        source,
     }) = serde_json::from_slice::<Offer>(&body)
     else {
         return error(
             StatusCode::BAD_REQUEST,
-            "the body must be {\"commit\": \"<40 hex>\"}",
+            "the body must be {\"commit\": \"<40 hex>\"}, and \"source\" may be \"fetch\" or \
+             \"staged\"",
         );
     };
     let Some(parsed) = Commit::parse(&commit) else {
@@ -275,46 +294,79 @@ async fn set_desired(
             "commit must be 40 lowercase hex digits",
         );
     };
+    // What the offer needs depends on where the release comes from: a fetch, the release store;
+    // a staged release, the package of the host, which the server only knows to be its own.
+    let refusal = match source {
+        Source::Fetch => fetch_refusal(&update, &parsed, rollback).await,
+        Source::Staged => staged_refusal(&update, &parsed),
+    };
+    if let Some(refusal) = refusal {
+        return refusal;
+    }
+    // The wall clock: the controller counts its waits from this, across restarts.
+    let now = update.farm.wall_now();
+    let release = Release::new(commit);
+    let write = move || rows.offer_expecting(&release, source, now, expect_generation);
+    match blocking(write).await {
+        Ok(desired) => json(StatusCode::OK, &desired_view(Some(&desired))),
+        Err(e @ RowError::Stale { .. }) => error(StatusCode::CONFLICT, &e.to_string()),
+        Err(e) => row_failed(&e),
+    }
+}
+
+/// What a fetch needs, or the refusal: a release store (`503` without), that holds `commit`
+/// complete for some platform (`409`), and R4 unless `rollback` (`409` coded).
+async fn fetch_refusal(update: &Update, commit: &Commit, rollback: bool) -> Option<Response> {
+    let Some(Held { store, age }) = update.held.as_ref() else {
+        return Some(unavailable("the release store", "--releases-dir"));
+    };
     let listing = match store.list().await {
         Ok(listing) => listing,
-        Err(e) => return store_failed(&e),
+        Err(e) => return Some(store_failed(&e)),
     };
     let complete = listing
         .iter()
-        .filter(|c| c.commit == parsed)
+        .filter(|c| c.commit == *commit)
         .flat_map(|c| &c.platforms)
         .any(|p| p.complete);
     if !complete {
-        return error(
+        return Some(error(
             StatusCode::CONFLICT,
             "the release store holds no platform of this commit complete (tarball and attestation)",
-        );
+        ));
     }
     // R4: not older than the running build, by build seq.
     // A rollback is the explicit exception; it still needs a complete release.
     let aged = if rollback {
         Ok(Ok(()))
     } else {
-        age.check(&parsed).await
+        age.check(commit).await
     };
     match aged {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => None,
         Ok(Err(refused)) => {
             let code = refused.refusal.code();
-            return error_coded(StatusCode::CONFLICT, &refused.to_string(), code);
+            let response = error_coded(StatusCode::CONFLICT, &refused.to_string(), code);
+            Some(response)
         }
-        Err(e) => return store_failed(&e),
+        Err(e) => Some(store_failed(&e)),
     }
-    // The wall clock: the controller counts its waits from this, across restarts.
-    let now = update.farm.wall_now();
-    let release = Release::new(commit);
-    match blocking(move || rows.offer_expecting(&release, Source::Fetch, now, expect_generation))
-        .await
-    {
-        Ok(desired) => json(StatusCode::OK, &desired_view(Some(&desired))),
-        Err(e @ RowError::Stale { .. }) => error(StatusCode::CONFLICT, &e.to_string()),
-        Err(e) => row_failed(&e),
+}
+
+/// What a staged offer needs, or the refusal: `commit` is this build's own, whatever the
+/// release store holds and whatever R4 would say (`409` coded [`NOT_OWN`]). A build that knows
+/// its full commit compares all 40 digits; one that knows 12 compares those, as R4 does for
+/// its own commit ([`same_commit`](age::same_commit)).
+fn staged_refusal(update: &Update, commit: &Commit) -> Option<Response> {
+    if age::same_commit(&update.own_commit, commit.as_str()) {
+        return None;
     }
+    let why = format!(
+        "{} is not the release of this server ({}): a staged update takes only that",
+        commit.as_str(),
+        update.own_commit
+    );
+    Some(error_coded(StatusCode::CONFLICT, &why, NOT_OWN))
 }
 
 async fn pause(state: State<Arc<Update>>, peer: Caller, headers: HeaderMap) -> Response {

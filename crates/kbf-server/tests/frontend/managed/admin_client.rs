@@ -22,7 +22,7 @@ use kbf_installer::CommitId;
 use kbf_installer::proxy::admin::{Admin, AdminError, Deadlines};
 use kbf_installer::proxy::child_http::Headers;
 use kbf_installer::proxy::model::{
-    OpenCounts, Readiness as ChildReadiness, RoleInfo, RoleState, Slot, Source,
+    DesiredError, OpenCounts, Readiness as ChildReadiness, RoleInfo, RoleState, Slot, Source,
 };
 use kbf_installer::proxy::ports::ChildAdmin;
 use kbf_state::Op;
@@ -965,14 +965,16 @@ async fn open_counts_are_the_childs_own_streams_and_a_stood_down_child_with_a_qu
 /// the bearer token and a JSON body, and the child writes the desired release. B holds its
 /// own commit; A's release store does not, so an offer that went to A (the old slot) fails.
 ///
-/// Pins what a commit that is not the child's own release gets TODAY: a `409` with an
-/// `error` text and no `code`, which the client reads as `Conflict`. Once the child answers
-/// `"code": "not_own"` (the desired-commit gate, kbf#1145), the client's `NotOwn` is the
-/// answer and this assertion changes to it.
+/// A commit the child's release store does not hold, offered as a fetch, is a `409` with an
+/// `error` text and no `code`, which the client reads as `Conflict`. The same commit offered
+/// as a staged release is not the child's own: a `409` with `"code": "not_own"`, which the
+/// client reads as `NotOwn` and the swap's step 9 reads as a refusal under that code. It
+/// writes nothing.
 ///
 /// A wrong token is the child's `401`, a `Status` the swap notes as a failed offer.
 ///
-/// Mutants seen red: the offer sent to the old slot; the bearer token dropped.
+/// Mutants seen red: the offer sent to the old slot; the bearer token dropped. Mutants it
+/// catches: the child answering the staged refusal with no `code` (`Conflict` for `NotOwn`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn post_desired_reaches_the_new_childs_operator_port_with_its_own_release() {
     let host = Host::start("admin-desired").await;
@@ -1026,23 +1028,46 @@ async fn post_desired_reaches_the_new_childs_operator_port_with_its_own_release(
         "{to_old:?}"
     );
 
-    // A commit the child does not hold is a 409 today, with no code.
+    // A commit the child does not hold, offered as a fetch, is a 409 with no code.
     let other = commit(NOWHERE);
-    let not_own = host
-        .run(move |admin| admin.try_post_desired(Slot::B, &other))
+    let conflict = host
+        .run({
+            let other = other.clone();
+            move |admin| admin.try_post_desired(Slot::B, &other)
+        })
         .await;
     assert!(
         matches!(
-            &not_own,
+            &conflict,
             Err(AdminError::Conflict {
                 call: "post_desired",
                 error
             }) if error.contains(NO_PLATFORM)
         ),
+        "{conflict:?}"
+    );
+    // Offered as a staged release it is not the child's own: a 409 that names `not_own`.
+    let not_own = host
+        .run({
+            let other = other.clone();
+            move |admin| admin.try_post_desired_from(Slot::B, &other, Source::Staged)
+        })
+        .await;
+    assert!(
+        matches!(&not_own, Err(AdminError::NotOwn { error }) if error.contains(NOWHERE)),
         "{not_own:?}"
+    );
+    // The swap's step 9 reads the same answer as a refusal for good, under that code.
+    let verdict = host
+        .run(move |admin| admin.post_desired(Slot::B, &other, Source::Staged))
+        .await;
+    assert!(
+        matches!(&verdict, Err(DesiredError::Refused { code, .. }) if code == "not_own"),
+        "{verdict:?}"
     );
     let (_, update) = get(host.b.api, "/v1/update").await;
     assert_eq!(update["desired"]["commit"], NEW, "a refused offer wrote");
+    assert_eq!(update["desired"]["source"], "fetch", "a refusal wrote it");
 
     // The same client with another token: the child's gate answers.
     let wrong = Arc::new(Admin::new(

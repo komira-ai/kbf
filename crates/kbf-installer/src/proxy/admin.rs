@@ -85,11 +85,13 @@
 //! a call that got no answer are [`DesiredError::Unreached`] and the swap sends the order
 //! again; any other status is the child's refusal ([`DesiredError::Refused`], with the `code`
 //! the child gave or `http_` and the status), which the swap does not send again. A `409` is
-//! [`AdminError::NotOwn`] when its body says `"code": "not_own"` (a commit
-//! other than the child's own build, which needs a rollback flag this body does not
-//! carry), and [`AdminError::Conflict`] otherwise. The child's answer today has no `code`,
-//! only an `error` text, so today every `409` is a [`AdminError::Conflict`]; the code is
-//! what a distinct answer is keyed on, not the text.
+//! [`AdminError::NotOwn`] when its body says `"code": "not_own"` and [`AdminError::Conflict`]
+//! otherwise. The child says `not_own` to a staged order for a commit other than its own
+//! build (`POST /v1/update/desired` with `"source": "staged"`; a staged order is the proxy's
+//! step 9 for a frontend update from the host's package, and wants no release store of the
+//! child). Its `409`s of a fetch are not `not_own`: the store holds no platform of the
+//! commit (no code), or R4 refused it (`older`, `seq_tie` or `seq_unknown`). The code is what
+//! a distinct answer is keyed on, not the text.
 //!
 //! A `503` is sent again, at most three times in all, one second apart (`OFFER_TRIES`,
 //! `OFFER_PAUSE`) and only while the pause fits in [`Deadlines::call`]; the last `503` is
@@ -223,8 +225,9 @@ pub enum AdminError {
     /// candidate's `role` says it cannot read it.
     #[error("takeover: the candidate cannot read the generation the store is at")]
     NoGeneration,
-    /// `post_desired`: a `409` that says the commit is not the child's own release. Not a
-    /// retry: the offer has to say it is a rollback, or go to a child that was built from it.
+    /// `post_desired`: a `409` that says the commit is not the child's own release (a staged
+    /// offer, which takes only the commit the child was built from). Not a retry: the offer
+    /// has to go to a child that was built from the commit.
     #[error("post_desired: the commit is not the child's own release: {error}")]
     NotOwn { error: String },
     /// `post_desired`: the operator token could not be read, so nothing was sent.
@@ -430,7 +433,18 @@ impl Admin {
     }
 
     pub fn try_post_desired(&self, slot: Slot, commit: &CommitId) -> Result<(), AdminError> {
-        let answer = self.post_offer(slot, commit, Source::Fetch)?;
+        self.try_post_desired_from(slot, commit, Source::Fetch)
+    }
+
+    /// [`Admin::try_post_desired`] for a release from `source`: a staged one is taken by a
+    /// child only if the commit is its own, else it answers `409` coded `not_own`.
+    pub fn try_post_desired_from(
+        &self,
+        slot: Slot,
+        commit: &CommitId,
+        source: Source,
+    ) -> Result<(), AdminError> {
+        let answer = self.post_offer(slot, commit, source)?;
         match answer.status {
             409 if reason(&answer.body).code.as_deref() == Some(NOT_OWN) => {
                 Err(AdminError::NotOwn {

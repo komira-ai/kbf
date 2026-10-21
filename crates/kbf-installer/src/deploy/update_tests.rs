@@ -535,15 +535,34 @@ fn the_source_of_the_flags_is_the_source_of_the_options() {
     assert_eq!(packaged.source, Source::Staged);
 }
 
-/// Catches a staged update that asks for the nodes getting as far as the proxy: the order for
-/// the nodes does not name its source yet, so the flags are refused (exit 2) before the token
-/// is read or anything is sent, naming both flags.
+/// Catches `--source staged` with `--nodes` still refused as a usage error before anything is
+/// read, as it was while the order for the nodes did not name its source: the verb plans it,
+/// and the options carry both the source and the nodes.
 ///
-/// Mutant planted: the refusal dropped (the run goes on to read the token file, which is not
-/// there).
+/// Mutant it catches: the refusal of the two flags together left in `plan`.
 #[test]
-fn a_staged_update_takes_no_nodes_yet_and_the_flags_say_so_before_anything_is_read() {
-    let why = usage(&["--api", "127.0.0.1:8443", "--source", "staged", "--nodes"]);
-    assert!(why.contains("--source staged"), "{why}");
-    assert!(why.contains("--nodes"), "{why}");
+fn a_staged_update_with_nodes_is_planned_with_both() {
+    let token = token_in("update-staged-nodes");
+    let token = token.to_str().expect("utf8");
+    let base = ["--api", "127.0.0.1:8443", "--token-file", token];
+    let mut named = base.to_vec();
+    named.extend_from_slice(&["--source", "staged", "--nodes"]);
+    let (_, options) = plan(&args(&named), fixed_random).expect("a plan");
+    assert_eq!(options.source, Source::Staged);
+    assert!(options.nodes);
+}
+
+/// Catches a staged update's request that drops the nodes or the source: the nodes are asked
+/// for, and the source is named, so the new frontend gives the nodes the same source.
+///
+/// Mutant it catches: `nodes` forced to false when the source is staged.
+#[test]
+fn a_staged_update_with_nodes_names_both_in_the_request() {
+    let api = Api::new(vec![accepted()], vec![status("done")]);
+    let (exit, _) = go_with(&api, &staged(true));
+    assert_eq!(exit, Exit::Ok);
+    let want = json!({
+        "commit": B, "request_id": ID, "nodes": true, "rollback": false, "source": "staged",
+    });
+    assert_eq!(api.posted(), [want]);
 }

@@ -202,8 +202,8 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub nodes: bool,
     /// Where the release comes from: `fetch` (from the source the installer is configured with,
-    /// as every update has) or `staged` (the release this host's package carries). `staged`
-    /// takes no `--nodes` yet.
+    /// as every update has) or `staged` (the release this host's package carries). With
+    /// `--nodes` the nodes are given the same source.
     #[arg(long, default_value = "fetch", value_parser = parse_source)]
     pub source: Source,
     /// Names this update to the API, so a run repeated after a lost connection is the same

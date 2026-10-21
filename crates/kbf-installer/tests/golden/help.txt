@@ -201,7 +201,7 @@ Options:
       --nodes
           Have the new frontend update the nodes once it has baked. Without it only the frontend is swapped
       --source <SOURCE>
-          Where the release comes from: `fetch` (from the source the installer is configured with, as every update has) or `staged` (the release this host's package carries). `staged` takes no `--nodes` yet [default: fetch]
+          Where the release comes from: `fetch` (from the source the installer is configured with, as every update has) or `staged` (the release this host's package carries). With `--nodes` the nodes are given the same source [default: fetch]
       --request-id <REQUEST_ID>
           Names this update to the API, so a run repeated after a lost connection is the same update. Random when not given
       --handover-timeout-s <HANDOVER_TIMEOUT_S>

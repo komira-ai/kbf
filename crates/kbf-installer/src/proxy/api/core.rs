@@ -824,7 +824,7 @@ fn fill_from_supervisor(body: &mut StatusBody, u: RunningUpdate) {
 
 /// What a request that takes its release from the host's package cannot also ask for, whatever
 /// the host is: a rollback goes back to a release the host fetched (the package carries only
-/// the newest), and the nodes cannot yet take a release from the host's package.
+/// the newest). The nodes may be asked for: the new frontend gives them the same source.
 fn source_fits(req: &UpdateRequest) -> Result<(), ApiError> {
     if req.source.is_fetch() {
         return Ok(());
@@ -833,12 +833,6 @@ fn source_fits(req: &UpdateRequest) -> Result<(), ApiError> {
         return Err(ApiError::conflict(
             "source_refused",
             "a rollback goes back to a release the host fetched, not to its package's",
-        ));
-    }
-    if req.nodes {
-        return Err(ApiError::conflict(
-            "source_refused",
-            "a staged update does not update the nodes yet: ask for the frontend only",
         ));
     }
     Ok(())

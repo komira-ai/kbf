@@ -30,10 +30,13 @@
 //! source the installer is configured with; `staged` is the release the host's package
 //! carries (`available` in `status.json`). `POST` refuses a source the host cannot take
 //! before it saves or writes anything: 409 `source_refused` for a fetch on a host whose
-//! `release_source` is bundled, and for a staged update that asks for a rollback or for the
-//! nodes (the nodes cannot yet take a release from the host's package); 422 `not_staged` for
-//! a staged update whose commit is not the one the package carries. The source is kept in the
-//! request map, written into the order, reported by the status and handed to the supervisor.
+//! `release_source` is bundled, and for a staged update that asks for a rollback (the package
+//! carries only the newest release); 422 `not_staged` for a staged update whose commit is not
+//! the one the package carries. The source is kept in the request map, written into the
+//! order, reported by the status and handed to the supervisor, whose order for the nodes
+//! (step 9) names it: a staged update may ask for the nodes, and the new frontend takes only
+//! its own commit as a staged release (`409 not_own` otherwise, which fails the update at
+//! `nodes`).
 //!
 //! What `status.json` says moves the update:
 //!

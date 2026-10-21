@@ -236,24 +236,32 @@ fn a_rollback_is_refused_for_a_staged_update() {
     left_no_trace(&rig, "r1");
 }
 
-/// Catches nodes being ordered from a release only this host has: the order for the nodes
-/// does not name its source yet, so a staged update that asks for the nodes is refused, and
-/// the same request without them is taken.
+/// Catches the nodes still refused for a staged update, as they were while the order for the
+/// nodes did not name its source: a staged update that asks for the nodes is accepted, the
+/// request map keeps both, and the supervisor, once the installer has staged the release, is
+/// handed both, so that step 9 orders the nodes with the source `staged`.
 ///
-/// Mutant planted: the refusal dropped (a staged update with `nodes` is accepted).
+/// Mutant it catches: the refusal of `nodes` for a staged source left in `source_fits`.
 #[test]
-fn a_staged_update_takes_no_nodes_yet() {
-    let rig = Rig::new("pr5a-staged-nodes");
+fn a_staged_update_with_nodes_is_accepted_and_the_supervisor_is_handed_both() {
+    let rig = Rig::new("pr5b-staged-nodes");
     rig.set_status(host(Some(B), None));
     let with_nodes = UpdateRequest {
         nodes: true,
         ..staged_req(B, "r1")
     };
-    let e = refused(rig.core().post(with_nodes));
-    is_refusal(&e, StatusCode::CONFLICT, "source_refused");
-    assert!(e.message.contains("nodes"), "{}", e.message);
-    left_no_trace(&rig, "r1");
-    accepted(rig.core().post(staged_req(B, "r1")));
+    let mut core = rig.core();
+    let (_, phase) = accepted(core.post(with_nodes));
+    assert_eq!(phase, Phase::Accepted);
+    let kept = Idempotency::open(&rig.dir);
+    let entry = kept.get("r1").expect("the entry");
+    assert_eq!((entry.nodes, entry.source), (true, Source::Staged));
+    rig.set_status(staged(B));
+    let s = body(&mut core);
+    assert_eq!(s.phase, Some(Phase::Preflight));
+    let starts = rig.sup.0.lock().unwrap().starts.clone();
+    assert_eq!(starts.len(), 1);
+    assert_eq!((starts[0].nodes, starts[0].source), (true, Source::Staged));
 }
 
 /// Catches a request id reused for a request that asks for another source being taken for
@@ -282,23 +290,19 @@ fn a_request_id_reused_with_another_source_is_refused_and_with_the_same_one_is_a
 }
 
 /// Catches a retry judged by what it asks for before it is judged by its id: a request id used
-/// for an update that fetches and takes the nodes, asked again with source `staged` and the
-/// nodes, is a request id reused (409 `request_id_reused`, exit 1 in the CLI), not a staged
-/// update that cannot take nodes (409 `source_refused`, exit 3).
+/// for an update that fetches, asked again with source `staged` and a rollback, is a request id
+/// reused (409 `request_id_reused`, exit 1 in the CLI), not a staged rollback (409
+/// `source_refused`, exit 3).
 ///
-/// Mutant planted: the source and nodes check run before the request map is looked up.
+/// Mutant it catches: the source check run before the request map is looked up.
 #[test]
-fn a_retry_with_another_source_and_nodes_is_a_reused_id_before_it_is_a_refused_source() {
-    let rig = Rig::new("pr5a-reuse-nodes");
+fn a_retry_with_another_source_and_a_rollback_is_a_reused_id_before_it_is_a_refused_source() {
+    let rig = Rig::new("pr5a-reuse-rollback");
     rig.set_status(host(Some(B), None));
     let mut core = rig.core();
-    let first = UpdateRequest {
-        nodes: true,
-        ..fetch_req(B, "r1")
-    };
-    accepted(core.post(first));
+    accepted(core.post(fetch_req(B, "r1")));
     let again = UpdateRequest {
-        nodes: true,
+        rollback: true,
         ..staged_req(B, "r1")
     };
     let e = refused(core.post(again));

@@ -337,8 +337,8 @@ fn offer(operator: &mut Operator, request: &Seen) -> Reply {
         }
         Some(commit) => {
             let why = format!(
-                "{commit} is not this frontend's own release ({}): an offer of one must say it \
-                 is a rollback",
+                "{commit} is not this frontend's own release ({}): a staged update takes only \
+                 that",
                 operator.own
             );
             let mut body = json!({"error": why});
@@ -1286,7 +1286,7 @@ fn a_409_that_names_not_own_is_told_from_the_other_409s() {
     };
     assert!(error.contains("not this frontend's own release"), "{error}");
 
-    // The refusal as it is today: the same text, and no `code`.
+    // The refusal of a child from before the code: the same text, and no `code`.
     lock(&rig.b.operator).coded = false;
     assert!(matches!(
         rig.admin.try_post_desired(Slot::B, &foreign),
@@ -1318,6 +1318,34 @@ fn a_409_that_names_not_own_is_told_from_the_other_409s() {
             ..
         })
     ));
+}
+
+#[test]
+fn a_staged_offer_is_sent_with_its_source_and_its_not_own_is_told() {
+    // Catches: `try_post_desired_from` sending a fetch body whatever the source it is given
+    // (the child would take a staged order for a fetch); the `not_own` of a staged refusal
+    // read as the busy kind. The fixture child takes the commit alone, so its answers are
+    // forced.
+    // Mutants it catches: the source dropped in `try_post_desired_from`; `NotOwn` keyed on the
+    // text.
+    let rig = Rig::new();
+    let force = |reply: Reply| rig.b.force("/v1/update/desired", reply);
+    let (commit, staged) = (offered(), Source::Staged);
+    let refusal = json!({"error": "not the release of this server", "code": "not_own"});
+    force(Reply::json(409, refusal));
+    let got = rig.admin.try_post_desired_from(Slot::B, &commit, staged);
+    assert!(
+        matches!(&got, Err(AdminError::NotOwn { error }) if error.contains("this server")),
+        "{got:?}"
+    );
+    force(Reply::json(200, json!({"generation": 3})));
+    let landed = rig.admin.try_post_desired_from(Slot::B, &commit, staged);
+    assert!(landed.is_ok(), "{landed:?}");
+    let seen = rig.b.operator_port.seen();
+    let want = format!(r#"{{"commit":"{COMMIT_B}","source":"staged"}}"#).into_bytes();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].body, want);
+    assert_eq!(seen[1].body, want);
 }
 
 #[test]
