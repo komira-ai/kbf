@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use futures::executor::block_on;
 use serde_json::{Value, json};
 
-use crate::pages::{ACTION, BUILD, BUILDS, OVERVIEW, PAGES, UPDATES};
+use crate::pages::{ACTION, BUILD, BUILDS, LEASES, OVERVIEW, PAGES, QUEUE, UPDATES, sched_farm};
 use crate::read::Page;
 use crate::{Answer, CONTENT_SECURITY_POLICY, Fetched, Source, SourceError, respond};
 
@@ -540,6 +540,11 @@ fn contract_table() -> Vec<(&'static Page, Vec<String>)> {
             ],
         ),
         (&UPDATES, vec!["/ui/updates".to_owned()]),
+        (
+            &LEASES,
+            vec!["/ui/leases".to_owned(), "/ui/leases?node=node-a".to_owned()],
+        ),
+        (&QUEUE, vec!["/ui/queue".to_owned()]),
     ]
 }
 
@@ -565,6 +570,8 @@ fn every_page_reads_only_the_routes_it_declares() {
         for path in paths {
             let fake = if page.name == UPDATES.name {
                 updates_farm()
+            } else if page.name == LEASES.name || page.name == QUEUE.name {
+                sched_farm()
             } else {
                 farm()
             };

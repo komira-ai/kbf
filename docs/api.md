@@ -1774,14 +1774,16 @@ there is nothing to mount it on.
   lists), `/ui/builds/{id}/actions/{digest}` (the action; for one that failed, its failure
   class, command arguments and environment names, exit code and the end of its stdout and
   stderr from `/failures`, each with a link that downloads the whole log, which the blob
-  route answers as an attachment), `/ui/updates`, and the stylesheet at
-  `/ui/static/kbf.css`. Each page lists, at its foot, the `/v1` routes it read, each a link
+  route answers as an attachment), `/ui/updates`, `/ui/leases` (`GET /v1/leases`;
+  `?node=`, `?page_size=` and `?page_token=` are handed to the route, and the next page is
+  the route's own link on the page's path), `/ui/queue` (`GET /v1/queue`), and the
+  stylesheet at `/ui/static/kbf.css`. Each page lists, at its foot, the `/v1` routes it read, each a link
   to the JSON. The Action page looks a failed action up in the first 5 pages of
   `/failures`, or in the one page `?failures_token=` names (the Build page's links name it).
 - **Headers on every `/ui` answer**, errors included: `Content-Security-Policy:
   default-src 'none'; style-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri
-  'none'; form-action 'self'` (no script of any kind; the form is the Builds id lookup, a
-  `GET`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
+  'none'; form-action 'self'` (no script of any kind; the forms are the Builds id lookup and
+  the Leases node filter, both `GET`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
   `Cache-Control: no-store`.
 - **Bounds.** Each caller has at most 4 reads open at once on `/ui`, and 4 on the read
   routes the pages use (`/v1/blobs`, `/v1/invocations` and below, `/v1/runs` and the history

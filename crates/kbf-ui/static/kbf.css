@@ -118,6 +118,8 @@ table.rows th, table.rows td {
   overflow-wrap: anywhere;
 }
 table.rows th { color: var(--muted); font-weight: 500; }
+.scroll { overflow-x: auto; }
+.pager { margin: var(--space-3) 0; }
 
 .pill {
   display: inline-block;
