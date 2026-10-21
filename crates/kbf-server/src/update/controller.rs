@@ -39,7 +39,8 @@
 //! controller ([`ControllerError::EpochBehind`]): see [`Controller::new`].
 //!
 //! **A run's commit stays with its hosts.** A host is stepped toward the commit of the run
-//! that started it ([`HostRow::commit`]). When a higher generation is offered (a rollback), a
+//! that started it ([`HostRow::commit`]), from the source that run named
+//! ([`HostRow::source`]). When a higher generation is offered (a rollback), a
 //! host that has done nothing irreversible (`Selected` to `Gated`) is given back, so the
 //! release being rolled back is not activated on it ([`super::GiveBack::Superseded`]); a host
 //! past the activate order finishes the step it began. The new generation is carried out by
@@ -285,6 +286,7 @@ impl Controller {
         }
         let facts = Facts {
             target: desired.commit.clone(),
+            source: desired.source,
             generation: desired.generation,
             // Drawn from the store when a move needs one ([`Controller::advance`]).
             next_order: OrderId::new(self.epoch, u64::MAX),
@@ -403,6 +405,7 @@ impl Controller {
         let stored = pass.rows[id].clone();
         let mut facts = pass.facts.clone();
         facts.target = stored.value.commit.clone();
+        facts.source = stored.value.source;
         let mut moved = decide(&facts, host, &pass.policy, pass.now);
         if moved.order.is_some() {
             // The step asked for an order id: draw one, and ask again with it. The step is

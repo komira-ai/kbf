@@ -95,6 +95,10 @@ pub enum GiveBack {
     /// Not in the design's table: it says a rollback is a higher generation and walks the
     /// hosts back, not what a host in steps 1 to 5 does meanwhile.
     Superseded,
+    /// A staged run, and the host's package does not carry the run's release (it reports
+    /// none, or another commit): the host is put back before the activate order is minted.
+    /// Not persisted: an alert only.
+    NotAvailable,
 }
 
 /// Why a run is held for a person (section 5.1: a failure holds the run, never retried,
