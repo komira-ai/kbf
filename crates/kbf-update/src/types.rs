@@ -176,6 +176,10 @@ pub struct Order {
     pub commit: String,
     /// How long the helper waits for a confirmation before it reverts.
     pub window_s: u32,
+    /// Where the release comes from. `None` when the message named a number this build does
+    /// not know: the client refuses that order. (Unlike `verb`, an unset message is
+    /// `Some(Source::Fetch)`.)
+    pub source: Option<Source>,
 }
 
 /// Where the node stands, as the frontend is told.
