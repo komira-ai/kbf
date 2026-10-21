@@ -289,7 +289,7 @@ async fn the_check_of_a_server_is_the_build_it_is() {
         .await
         .expect("a check")
         .is_err();
-    assert_eq!(refused, crate::BUILD_SEQ >= 1);
+    assert_eq!(refused, std::hint::black_box(crate::BUILD_SEQ) >= 1);
 }
 
 /// Catches: a failed read of the seq answered as a refusal or an allowance; it is a 500 that
@@ -443,7 +443,7 @@ async fn the_check_of_a_server_uses_its_full_commit_when_it_has_one() {
         .is_err();
     assert_eq!(
         refused,
-        !crate::BUILD_COMMIT_FULL.is_empty() && crate::BUILD_SEQ >= 1
+        !crate::BUILD_COMMIT_FULL.is_empty() && std::hint::black_box(crate::BUILD_SEQ) >= 1
     );
 }
 
