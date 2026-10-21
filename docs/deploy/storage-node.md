@@ -487,7 +487,7 @@ unit gains this flag once the scheduler's state is built:
 
 | Path | Holds | Mode |
 |---|---|---|
-| `<data-dir>/leases` | lease directories (every real driver) | 0700 |
+| `<data-dir>/leases` | lease directories (every real driver) | 0700; 0711 under the container driver and for a native pool (`--pool-users`), whose slot users search it to reach their own lease directory (each is 0700, its user's) |
 | `<data-dir>/cache` | the input cache (container driver) | 0700 |
 | `<data-dir>/trees` | the shared input trees (container driver, Linux) | 0711 |
 
