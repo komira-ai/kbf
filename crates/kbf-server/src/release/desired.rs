@@ -48,7 +48,7 @@ use crate::api::{error, error_coded, json, operator_gate};
 use crate::farm::Farm;
 use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
-use crate::update::{Desired, Policy, Proposal, Release, RowError, Rows};
+use crate::update::{Desired, Policy, Proposal, Release, RowError, Rows, Source};
 
 /// The release store and the R4 check over it, present together.
 struct Held {
@@ -307,7 +307,8 @@ async fn set_desired(
     }
     // The wall clock: the controller counts its waits from this, across restarts.
     let now = update.farm.wall_now();
-    match blocking(move || rows.offer_expecting(&Release::new(commit), now, expect_generation))
+    let release = Release::new(commit);
+    match blocking(move || rows.offer_expecting(&release, Source::Fetch, now, expect_generation))
         .await
     {
         Ok(desired) => json(StatusCode::OK, &desired_view(Some(&desired))),

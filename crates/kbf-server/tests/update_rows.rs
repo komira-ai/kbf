@@ -15,7 +15,7 @@ mod support;
 
 use kbf_server::update::{
     Desired, Generation, HoldReason, Holder, HostPhase, HostRecord, HostRow, OrderId, Policy,
-    PolicyError, Release, RowError, Rows, Slot, SlotClass, Stored,
+    PolicyError, Release, RowError, Rows, Slot, SlotClass, Source, Stored,
 };
 use kbf_state::{Cond, Txn};
 use kbf_types::FarmTime;
@@ -56,7 +56,14 @@ fn row(phase: HostPhase) -> HostRow {
             boot_before: Some(10),
         },
         commit: Release::new("v2"),
+        source: Source::Fetch,
     }
+}
+
+/// Offers `commit` from `source` at `at`, expecting no particular generation.
+fn offer_from(rows: &Rows, commit: &str, source: Source, at: FarmTime) -> Desired {
+    let release = Release::new(commit);
+    rows.offer_expecting(&release, source, at, None).unwrap()
 }
 
 fn write_host(rows: &Rows, name: &str, row: &HostRow) {
@@ -163,6 +170,100 @@ fn the_bytes_of_every_row_are_frozen() {
         );
         assert_eq!(rows.policy().expect("a read"), all);
     }
+}
+
+/// Catches: a staged source written under the wrong tag, number or place. The frozen bytes
+/// of the two rows above, each followed by the source: `28 01` on a desired row (tag 5, the
+/// next after the retired 4) and `48 01` on a host row (tag 9, the next after the commit's 8),
+/// and each reads back as staged. The fetch rows above are the same bytes without it.
+///
+/// Mutants: `source` on tag 4, the retired number (the desired bytes end `2001`); `source` on
+/// tag 10 of the host row, not the next number 9 (the host bytes end `5001`); staged written
+/// as 2 (the bytes end `02`).
+#[test]
+fn a_staged_row_ends_with_its_source_and_reads_back_staged() {
+    for backing in BACKINGS {
+        let cell = Cell::new(backing, "staged-bytes");
+        let rows = Rows::new(cell.store());
+
+        let now = FarmTime::from_millis(1000);
+        let offered = offer_from(&rows, "v2", Source::Staged, now);
+        assert_eq!(raw(&cell, "update/desired"), "08011202763218e8072801");
+        assert_eq!(rows.desired().unwrap().value.unwrap(), offered);
+
+        let held = HostPhase::Held {
+            reason: HoldReason::RepairWait,
+        };
+        let staged = HostRow {
+            source: Source::Staged,
+            ..row(held)
+        };
+        write_host(&rows, "s1", &staged);
+        assert_eq!(
+            raw(&cell, "update/host/s1"),
+            "080d10091803208827280a30073802420276324801"
+        );
+        assert_eq!(rows.hosts().expect("a read")[&id("s1")].value, staged);
+    }
+}
+
+/// Catches: a row written before the source existed, or by a writer that does not know it,
+/// read as anything but a fetch; and a zero source made `Corrupt` (the rule for every other
+/// enum of these rows, which `source` deliberately does not follow). A desired row and a
+/// host row with no tag 5 or 9 read as fetch, and so do ones that say 0 outright.
+///
+/// Mutants: a zero source refused as `Corrupt`; an absent source read as staged.
+#[test]
+fn a_row_with_no_source_reads_as_a_fetch() {
+    let cell = Cell::new(Backing::Fake, "legacy");
+    let rows = Rows::new(cell.store());
+    // The bytes of the first frozen desired row above, which has no tag 5.
+    put_raw(
+        &cell,
+        "update/desired",
+        &[0x08, 0x01, 0x12, 0x02, 0x76, 0x32, 0x18, 0xe8, 0x07],
+    );
+    let legacy = rows.desired().unwrap().value.unwrap();
+    assert_eq!(legacy.source, Source::Fetch);
+    assert_eq!(legacy.generation, Generation(1));
+    // The same with the source said outright as 0.
+    put_raw(
+        &cell,
+        "update/desired",
+        &[0x08, 0x01, 0x12, 0x02, 0x76, 0x32, 0x28, 0x00],
+    );
+    let zero = rows.desired().unwrap().value.unwrap();
+    assert_eq!(zero.source, Source::Fetch);
+
+    // A host row that is `Selected` with order number 7, and has no tag 9.
+    put_raw(&cell, "update/host/h", &[0x08, 0x02, 0x10, 0x07]);
+    let legacy = rows.hosts().expect("a read")[&id("h")].value.clone();
+    assert_eq!(legacy.source, Source::Fetch);
+    assert_eq!(legacy.record.phase, HostPhase::Selected);
+    put_raw(&cell, "update/host/h", &[0x08, 0x02, 0x48, 0x00]);
+    let zero = rows.hosts().expect("a read")[&id("h")].value.clone();
+    assert_eq!(zero.source, Source::Fetch);
+}
+
+/// Catches: a source serialized as anything but its lowercase word, or whose default is not
+/// a fetch (what a row that names none reads as). Both words are written and read, so each
+/// variant of the derived impls runs.
+///
+/// Mutants: the `rename_all` dropped (`"Staged"`); the default made staged; a variant dropped
+/// from the rename.
+#[test]
+fn a_source_is_its_lowercase_word_and_defaults_to_fetch() {
+    let staged = serde_json::to_string(&Source::Staged).unwrap();
+    assert_eq!(staged, "\"staged\"");
+    let fetch: Source = serde_json::from_str("\"fetch\"").unwrap();
+    assert_eq!(fetch, Source::Fetch);
+    let bogus = serde_json::from_str::<Source>("\"bogus\"");
+    assert!(bogus.is_err());
+    let fetch_word = serde_json::to_string(&Source::Fetch).unwrap();
+    assert_eq!(fetch_word, "\"fetch\"");
+    let staged_back: Source = serde_json::from_str("\"staged\"").unwrap();
+    assert_eq!(staged_back, Source::Staged);
+    assert_eq!(Source::default(), Source::Fetch);
 }
 
 /// Catches: a policy row that only knows the eight agreed fields, as the operator API
@@ -309,13 +410,16 @@ fn every_phase_and_hold_reason_round_trips_under_its_number() {
 
 /// Catches: a reader that guesses. A number this build does not know, a zero (a field
 /// that is not there), a hold reason on a phase that has none, a `Held` with no reason, two
-/// places held by one host, an empty name, an empty commit, generation 0 and bytes that are
-/// no message are each refused with the row's name, never read as the nearest phase.
+/// places held by one host, an empty name, an empty commit, generation 0, a source above
+/// staged (2) on either row and bytes that are no message are each refused with the row's
+/// name, never read as the nearest phase or as a fetch.
+///
+/// Mutant: the limit of `source_from` moved from 1 to 2 (a source of 2 reads as staged).
 #[test]
 fn a_row_this_build_cannot_read_is_refused_not_guessed() {
     let cell = Cell::new(Backing::Fake, "corrupt");
     let rows = Rows::new(cell.store());
-    let bad_hosts: [(&str, &[u8]); 6] = [
+    let bad_hosts: [(&str, &[u8]); 7] = [
         ("no phase", &[0x10, 0x00]),
         ("a phase from the future", &[0x08, 0x63]),
         ("a reason on a step", &[0x08, 0x03, 0x30, 0x01]),
@@ -324,6 +428,7 @@ fn a_row_this_build_cannot_read_is_refused_not_guessed() {
             "held for a reason from the future",
             &[0x08, 0x0d, 0x30, 0x63],
         ),
+        ("an unknown source", &[0x08, 0x03, 0x48, 0x02]),
         ("not a message", &[0xff, 0xff, 0xff]),
     ];
     for (what, bytes) in bad_hosts {
@@ -357,6 +462,13 @@ fn a_row_this_build_cannot_read_is_refused_not_guessed() {
     put_raw(&cell, "update/desired", &[0x08, 0x01]);
     assert!(matches!(rows.desired(), Err(RowError::Corrupt { .. })));
     put_raw(&cell, "update/desired", &[0x12, 0x02, 0x76, 0x32]);
+    assert!(matches!(rows.desired(), Err(RowError::Corrupt { .. })));
+    // A run with a commit and a generation, and a source of 2.
+    put_raw(
+        &cell,
+        "update/desired",
+        &[0x08, 0x01, 0x12, 0x02, 0x76, 0x32, 0x28, 0x02],
+    );
     assert!(matches!(rows.desired(), Err(RowError::Corrupt { .. })));
     put_raw(&cell, "update/policy", &[0xff]);
     assert!(matches!(rows.policy(), Err(RowError::Corrupt { .. })));
@@ -403,6 +515,7 @@ fn offers_grow_the_generation_and_leave_the_pause_alone() {
                 generation: Generation(1),
                 commit: Release::new("v2"),
                 set_at: at,
+                source: Source::Fetch,
             }
         );
         assert!(
@@ -433,7 +546,14 @@ fn offers_grow_the_generation_and_leave_the_pause_alone() {
 /// was set), and a generation that is not above the current run's when the counter it is
 /// drawn from is behind the row (a row written without the counter, or a counter restored
 /// from an older backup than the row). Setting the older commit again afterwards is a new
-/// run: that is the rollback.
+/// run: that is the rollback. The run is the pair of commit and source: the same commit from
+/// another source is a new run (the hosts of the old one that have done nothing irreversible
+/// are given back), and the same pair again is not.
+///
+/// Mutants: a commit-only compare (the staged offer of the commit already desired as a fetch
+/// keeps generation 91); a source-only compare (`v1` offered after `v2`, both fetches, keeps
+/// generation 1); a compare that never matches (the repeat of the staged offer is generation
+/// 93, not 92); the source not stored in the new row (the staged offer reads back as a fetch).
 #[test]
 fn the_commit_already_desired_keeps_its_generation_and_a_generation_is_always_above_the_row() {
     for backing in BACKINGS {
@@ -465,6 +585,7 @@ fn the_commit_already_desired_keeps_its_generation_and_a_generation_is_always_ab
             generation: Generation(90),
             commit: Release::new("x"),
             set_at: FarmTime::from_millis(1),
+            source: Source::Fetch,
         };
         put_raw(
             &cell,
@@ -479,6 +600,25 @@ fn the_commit_already_desired_keeps_its_generation_and_a_generation_is_always_ab
             next.generation,
             Generation(91),
             "above the row, whatever the counter says"
+        );
+
+        // The same commit from another source is another run, the same pair again is not.
+        let staged = offer_from(&rows, "y", Source::Staged, FarmTime::from_millis(50));
+        assert_eq!(staged.source, Source::Staged);
+        assert_eq!(
+            staged.generation,
+            Generation(92),
+            "the same commit from another source is a new run"
+        );
+        let repeat = offer_from(&rows, "y", Source::Staged, FarmTime::from_millis(60));
+        assert_eq!(repeat, staged, "the same pair changes nothing");
+        assert_eq!(rows.desired().unwrap().value.unwrap(), staged);
+        let fetch = offer_from(&rows, "y", Source::Fetch, FarmTime::from_millis(70));
+        assert_eq!(fetch.source, Source::Fetch);
+        assert_eq!(
+            fetch.generation,
+            Generation(93),
+            "and back to a fetch is another"
         );
     }
 }
