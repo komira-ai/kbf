@@ -163,7 +163,7 @@ words, in either order): one JSON object on one line of stdout, exit 0, the fiel
 sorted by name.
 
 ```text
-{"admin_protocol":1,"commit":"0123456789ab","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"seq":812,"state_schema":1,"version":"0.1.0"}
+{"admin_protocol":1,"commit":"0123456789ab","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"relay":1,"seq":812,"state_schema":1,"version":"0.1.0"}
 ```
 
 - `admin_protocol`: the version of the admin calls of `kbf --mode frontend` (`GET role`,
@@ -180,6 +180,13 @@ sorted by name.
 - `protocol` and `min_protocol`: the newest and the oldest `kbf.worker.v1` version the
   binary speaks. The daemon half speaks exactly `protocol`; the server half accepts
   `min_protocol` through `protocol`.
+- `relay`: how far the build carries what its host's installer reports to the frontend. At
+  `1` it reads `available` and `release_source` from the installer's `status.json` and sends
+  them in its `UpdateStatus`. `kbf-installer setup` takes `release_source = "bundled"` on a
+  host that has a release only beside a `kbf` that declares at least the level the installer
+  needs (`kbf_installer::binary::RELAY_NEEDED`); a build before this field prints none. An
+  installer whose reader refuses keys it does not know refuses to stage a `kbf` that prints
+  it, so the installers ship first.
 - `seq`: the number of commits behind the commit built (`git rev-list --count HEAD`), so
   two builds of one branch are put in order by it: a later commit has the larger number.
   It is `0` when the build could not count them (a shallow checkout, which holds only part
@@ -510,26 +517,26 @@ release already holds must be one of the verified files, byte for byte, or the r
 fails and changes nothing; the files it lacks are uploaded (`cargo xtask release
 publish`).
 
-Two further verbs read the annotated `v*` tag, whose message is the verdict of the gate
-stage (`docs/design/kbf-cicd.md`, section 8.1; today Beta, written by `release
-verdict-write` after `release gates` saw the `ci`, `beta` and `artifacts` push runs of the
-commit succeed). `verify` runs both, on a checkout of the whole
-history (the tag object and `origin/main` must be there): `cargo xtask release verdict`
-refuses a lightweight tag, a commit not on main, a message
-that is not a green verdict of the gate stage, a verdict that names another commit, tag or
-set (the set hash is the SHA-256 of `SHA256SUMS`, `kbf_gate::SetHash::of_sums`), and, for
-Gamma, a bake under 24 hours and a thin bake without a recorded `min-load` waiver (a Beta
-verdict records no bake, and one that does is refused); it prints `set-hash=<hex>`.
-`cargo xtask release notes` runs the same checks and writes the notes, which `verify`
-uploads as the artifact `release-notes`, so a dry run shows them. `verify` passes the hash
-to `publish` as a job output, and `release publish` takes it as `--set-hash` and publishes
-nothing when the files are another set. The `publish` job runs in the `prod` environment,
-whose required reviewer approves it.
+Two further verbs read the annotated `v*` tag. Its message is the Beta record (`docs/design/kbf-cicd.md`,
+section 8.1), which `release verdict-write` wrote after `release gates` saw the `ci`, `beta` and
+`artifacts` push runs of the commit succeed. The record is an audit record: **nothing gates on it**, and
+no step of the release workflow judges a verdict. `verify` runs both verbs, on a checkout of the whole
+history (the tag object and `origin/main` must be there): `cargo xtask release verify` refuses a
+tag that names another commit than the release, a tag object named other than its ref, and a
+commit not on main; a tag with no record, or a record that says it failed or names something else,
+verifies the same. It prints `set-hash=<hex>`, the SHA-256 of `SHA256SUMS`
+(`kbf_gate::SetHash::of_sums`). `cargo xtask release notes` runs the same checks and writes the
+notes, which show the record as information and say when the tag carries none; `verify` uploads them
+as the artifact `release-notes`, so a dry run shows them. `verify` passes the hash to `publish` as a
+job output, and `release publish` takes it as `--set-hash` and publishes nothing when the files are
+another set. What gates a release is `release gates` (the three runs green for the commit), then the
+checks of the files themselves (`release check`, the attestations, the set hash) and the tag's
+commit. The `publish` job runs in the `prod` environment, whose required reviewer approves it.
 
 The workflow can also be run by hand (`workflow_dispatch`) with a commit SHA and the
 annotated tag to check. Only `verify` runs then: every check above, and nothing is
 published (`publish` runs only for a pushed tag, and only `publish` holds a write scope).
-`crates/kbf-integration-test/tests/release_workflow` holds the file to this: the verdict step, the
+`crates/kbf-integration-test/tests/release_workflow` holds the file to this: the tag-check step, the
 `prod` environment, a `v*` tag push and a dispatch as the only triggers (no pull request),
 pinned actions and an empty top-level `permissions`. On every pull request
 into `main`, CI asks GitHub the same on-`main` question for the pull request's base

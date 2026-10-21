@@ -5,7 +5,7 @@
 //! file for another platform is refused before anything executes it. The version is what
 //! `kbf --version --json` prints (crates/kbf-cli/src/version.rs): `commit` (the first 12
 //! hex digits), `min_protocol`, `protocol`, `profile`, `state_schema` and `version`, and
-//! `admin_protocol`, `meta_log` and `seq` when the build has them.
+//! `admin_protocol`, `meta_log`, `relay` and `seq` when the build has them.
 //! It is a consistency check on a file the attestation already vouches for, not trust.
 
 use std::fmt;
@@ -110,6 +110,18 @@ impl BinaryKind {
 // What `--version --json` prints is read by `kbf_types::Version`, the one parser the release
 // store reads its version facts with too.
 pub use kbf_types::{VERSION_CAP, Version};
+
+/// The `relay` a `kbf` must declare for a host to take `release_source = "bundled"`: without
+/// it the frontend is never told that the host fetches nothing, and would order a fetch the
+/// installer can only refuse. Raised when `kbf` relays more of what the installer says.
+pub const RELAY_NEEDED: u64 = 1;
+
+/// Whether `version` relays as far as [`RELAY_NEEDED`]. A free function, not a method: the
+/// level is the installer's to raise, while `Version` (in `kbf-types`) only carries it.
+#[must_use]
+pub fn relays(version: &Version) -> bool {
+    version.relay.is_some_and(|level| level >= RELAY_NEEDED)
+}
 
 #[cfg(test)]
 #[path = "binary_tests.rs"]

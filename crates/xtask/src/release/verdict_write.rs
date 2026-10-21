@@ -1,30 +1,28 @@
-//! `release verdict-write`: the verdict document a release tag carries as its message.
+//! `release verdict-write`: the Beta record a release tag carries as its message.
 //!
 //! It records that the gates of one commit passed: the commit, the set the files in `<dir>`
 //! hash to ([`set_hash_of`]), the tag the release is planned to get, and the three runs
 //! (`ci`, `beta`, `artifacts`) that passed it, each as a green gate and named in the note.
-//! It judges nothing itself: the caller has already required those runs to be green.
+//! It judges nothing itself: the caller has already required those runs to be green. The
+//! record is an audit record: `release verify` does not read it, and the release notes
+//! only show it.
 //!
-//! The stage is [`super::verdict::GATE_STAGE`]. A Gamma verdict says a bake happened, so it is refused
-//! unless `--bake-file` holds one: a JSON object with `bake` (`start`, `end`, unix seconds)
-//! that lasted [`MIN_BAKE_SECS`] and `load` (`actions`, `builds`, `hours`, each
-//! `measured` and `required`) whose floors are met. A bake record for any other stage is
-//! refused too, rather than carried along unchecked.
-//!
-//! Beta tests bytes it rebuilt itself, not the attested ones;
-//! the note says so: `tested_bytes: rebuilt`.
+//! The stage is [`STAGE`], Beta. It records no bake and no load: a bake belongs to the
+//! gamma farm check, which is not a stage of this record. Beta tests bytes it rebuilt
+//! itself, not the attested ones; the note says so: `tested_bytes: rebuilt`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use kbf_gate::{
-    CommitId, GateResult, Header, Limit, MinLoad, ResultDoc, Sample, SetHash, Stage, Window,
-};
-use serde_json::Value;
+use kbf_gate::{CommitId, GateResult, Header, Limit, ResultDoc, Sample, SetHash, Stage};
 
 use super::tags::Version;
-use super::verdict::{MIN_BAKE_SECS, set_hash_of};
+use super::verify::set_hash_of;
 use crate::Error;
 use crate::build_commit::full_commit;
+
+/// The stage of the record a release carries: Beta, the last stage whose runs the release
+/// workflow requires.
+pub const STAGE: Stage = Stage::Beta;
 
 /// The arguments of `release verdict-write`.
 #[derive(clap::Args)]
@@ -61,9 +59,6 @@ pub struct WriteArgs {
     /// An earlier release this one withdraws, one line (repeat for more).
     #[arg(long)]
     pub withdraws: Vec<String>,
-    /// The bake record, for a Gamma verdict.
-    #[arg(long)]
-    pub bake_file: Option<PathBuf>,
     /// When the gates were decided, unix seconds (default: now).
     #[arg(long)]
     pub at: Option<u64>,
@@ -72,61 +67,12 @@ pub struct WriteArgs {
     pub out: PathBuf,
 }
 
-/// A bake record: the bake's span and the load it saw.
-struct Bake {
-    window: Window,
-    load: MinLoad,
-}
-
-fn bake_of(file: &Path) -> Result<Bake, Error> {
-    let bytes = crate::package::read(file)?;
-    let at = file.display();
-    let doc: Value = serde_json::from_slice(&bytes)
-        .map_err(|e| Error::Usage(format!("--bake-file {at}: not JSON: {e}")))?;
-    let part = |key: &str| {
-        doc.get(key)
-            .cloned()
-            .ok_or_else(|| Error::Usage(format!("--bake-file {at}: no `{key}`")))
-    };
-    let window = serde_json::from_value(part("bake")?)
-        .map_err(|e| Error::Usage(format!("--bake-file {at}: `bake`: {e}")))?;
-    let load = serde_json::from_value(part("load")?)
-        .map_err(|e| Error::Usage(format!("--bake-file {at}: `load`: {e}")))?;
-    Ok(Bake { window, load })
-}
-
-/// Why a Gamma verdict may not be written for this bake (none, or one that is no bake).
-fn bake_problems(bake: Option<&Bake>) -> Vec<String> {
-    let Some(bake) = bake else {
-        return vec![
-            "a Gamma verdict says a bake happened: --bake-file is required for it".to_owned(),
-        ];
-    };
-    let mut problems = Vec::new();
-    match bake
-        .window
-        .end
-        .map(|end| end.checked_sub(bake.window.start))
-    {
-        Some(Some(secs)) if secs >= MIN_BAKE_SECS => {}
-        Some(Some(secs)) => problems.push(format!(
-            "the bake lasted {secs} s, less than {MIN_BAKE_SECS} s (24 h)"
-        )),
-        Some(None) => problems.push("the bake ends before it starts".to_owned()),
-        None => problems.push("the bake record has no end".to_owned()),
-    }
-    if !bake.load.met() {
-        problems.push("the bake's minimum load was not met".to_owned());
-    }
-    problems
-}
-
 fn green_gate(name: &str, at: u64) -> GateResult {
     GateResult::decide(name, Sample::Value(1.0), Limit::AtLeast(1.0), at, at)
 }
 
-/// The verdict for `stage`: the document, or what refuses it.
-pub fn build(a: &WriteArgs, stage: Stage, now: u64) -> Result<ResultDoc, Error> {
+/// The record: the document, or what refuses it.
+pub fn build(a: &WriteArgs, now: u64) -> Result<ResultDoc, Error> {
     full_commit("--commit", &a.commit)?;
     let commit = CommitId::parse(&a.commit).map_err(|e| Error::Failed(e.to_string()))?;
     if Version::parse_tag(&a.tag).is_none() {
@@ -135,26 +81,11 @@ pub fn build(a: &WriteArgs, stage: Stage, now: u64) -> Result<ResultDoc, Error> 
             a.tag
         )));
     }
-    let bake = a.bake_file.as_deref().map(bake_of).transpose()?;
-    match stage {
-        Stage::Gamma => {
-            let problems = bake_problems(bake.as_ref());
-            if !problems.is_empty() {
-                return Err(Error::Refused(problems));
-            }
-        }
-        _ if bake.is_some() => {
-            return Err(Error::Usage(format!(
-                "--bake-file: a bake record belongs to a Gamma verdict, this is {stage:?}"
-            )));
-        }
-        _ => {}
-    }
     let at = a.at.unwrap_or(now);
     let set_hash: SetHash = set_hash_of(&a.dir)?;
     let mut doc = ResultDoc::begin(
         Header {
-            stage,
+            stage: STAGE,
             commit,
             set_hash,
             run_id: a.run_id.to_string(),
@@ -169,10 +100,6 @@ pub fn build(a: &WriteArgs, stage: Stage, now: u64) -> Result<ResultDoc, Error> 
     ];
     doc.status = doc.status_from_gates();
     doc.finished = Some(at);
-    if let Some(bake) = bake {
-        doc.bake = Some(bake.window);
-        doc.load = Some(bake.load);
-    }
     doc.tag = Some(a.tag.clone());
     doc.note = Some(format!(
         "gate runs: ci {}, beta {}, artifacts {}; tested_bytes: rebuilt",
@@ -185,15 +112,15 @@ pub fn build(a: &WriteArgs, stage: Stage, now: u64) -> Result<ResultDoc, Error> 
 }
 
 /// The `release verdict-write` verb: the lines to print.
-pub fn run(a: &WriteArgs, stage: Stage) -> Result<Vec<String>, Error> {
+pub fn run(a: &WriteArgs) -> Result<Vec<String>, Error> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let doc = build(a, stage, now)?;
+    let doc = build(a, now)?;
     let bytes = doc.to_bytes().map_err(|e| Error::Failed(e.to_string()))?;
     std::fs::write(&a.out, bytes).map_err(Error::spawn(format!("write {}", a.out.display())))?;
     Ok(vec![format!(
-        "wrote the {stage:?} verdict of {} for {} to {}",
+        "wrote the {STAGE:?} record of {} for {} to {}",
         a.tag,
         a.commit,
         a.out.display()

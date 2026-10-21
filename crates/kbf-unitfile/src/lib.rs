@@ -11,7 +11,8 @@
 //!   reads the last, the one systemd uses for a single-valued key.
 //!
 //! The docs check in `kbf-integration-test` reads the example units in `docs/deploy/*.md` with it,
-//! and `kbf-deploy linux check-units` the rendered ones, so both read units one way.
+//! and `kbf-deploy linux check-units` the rendered ones, so both read units one way. It was
+//! `kbf-deploy`'s `unit` module (still re-exported there as `kbf_deploy::unit`).
 
 /// One `Key=value` line, continuations joined.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -272,5 +273,39 @@ MemoryMin=4G
             UnitFile::parse("[Service]\nExecStart \\\n  --b\n"),
             Err(UnitError::NotDirective(2))
         );
+    }
+
+    /// Catches a drop-in placed before the unit's own assignments (its single-valued key
+    /// would then lose to the unit's), and an empty-valued reset dropped as "no value".
+    #[test]
+    fn a_drop_in_comes_after_the_units_own_directives() {
+        let mut u =
+            UnitFile::parse("[Service]\nMemoryMin=1G\nExecStart=/bin/a --x=1\n").expect("unit");
+        let drop_in = UnitFile::parse("[Service]\nMemoryMin=2G\nExecStart=\n").expect("drop-in");
+        u.extend(drop_in);
+        assert_eq!(u.get_in("Service", "MemoryMin"), Some("2G"));
+        assert_eq!(u.get("ExecStart"), Some(""));
+        assert!(u.exec_start().is_empty());
+        assert_eq!(u.directives().len(), 4);
+    }
+
+    /// Catches a comment line inside a continued directive missed (or the line after the
+    /// directive's last line, or a comment at the start of a directive, reported), and a
+    /// wrong line number.
+    #[test]
+    fn comments_inside_a_continued_directive_are_found_by_line() {
+        let text =
+            "[Service]\n# before\nExecStart=/bin/a \\\n# inside\n  ; also inside\n  --b\n# after\n";
+        assert_eq!(comments_in_continuations(text), [4, 5]);
+        assert!(comments_in_continuations("[Service]\n# only\nA=b\n").is_empty());
+        assert!(comments_in_continuations("").is_empty());
+    }
+
+    /// Catches the whitespace set drifting from systemd's: U+00A0 is part of a value.
+    #[test]
+    fn only_systemds_whitespace_is_trimmed() {
+        let u = UnitFile::parse("[A]\n\tK\t=\t v\u{a0}\t\n").expect("unit");
+        assert_eq!(u.get("K"), Some("v\u{a0}"));
+        assert_eq!(WHITESPACE, [' ', '\t', '\n', '\r']);
     }
 }

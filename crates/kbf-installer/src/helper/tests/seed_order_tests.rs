@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::seed::SeedFacts;
-use crate::seed_fixture::{SEQ, Seeded};
+use crate::seed_fixture::{EARLIER_SEQ, SEQ, Seeded};
 
 const BUNDLED: &str = "release_source = \"bundled\"\n";
 
@@ -210,35 +210,52 @@ fn a_staged_order_is_refused_for_another_commit_or_a_seq_not_above_the_floor() {
     let head = "commit_or_ref: order 5:";
     let mismatch = format!("{head} seed_mismatch: this host carries {B}, not");
     let below = format!("{head} seq_floor: seed seq {SEQ} is not above");
-    let cases: [(&str, &str, Option<u64>, String); 5] = [
-        ("another commit", C, Some(0), format!("{mismatch} {C}")),
+    // Whether the release that runs declares a `seq`: one that does keeps the floor at least at
+    // it, so a host with no floor at an order is one whose release declares none.
+    let cases: [(&str, &str, Option<u64>, bool, String); 5] = [
+        (
+            "another commit",
+            C,
+            Some(0),
+            true,
+            format!("{mismatch} {C}"),
+        ),
         (
             "the same 12 digits",
             &other,
             Some(0),
+            true,
             format!("{mismatch} {other}"),
         ),
         (
             "no floor",
             B,
             None,
+            false,
             format!("{head} seq_floor: no floor is recorded yet, so no seed is above it"),
         ),
         (
             "a floor equal to the seq",
             B,
             Some(SEQ),
+            true,
             format!("{below} {SEQ}"),
         ),
         (
             "a floor above the seq",
             B,
             Some(SEQ + 7),
+            true,
             format!("{below} {}", SEQ + 7),
         ),
     ];
-    for (index, (what, commit, floor, want)) in cases.into_iter().enumerate() {
-        let (mut rig, seeded) = seeded_node(&format!("seedcyc-refused-{index}"), |_| {});
+    for (index, (what, commit, floor, declares, want)) in cases.into_iter().enumerate() {
+        let name = format!("seedcyc-refused-{index}");
+        let (mut rig, seeded) = seeded_node(&name, |s| {
+            if !declares {
+                s.earlier = s.earlier.replace(&format!("\"seq\":{EARLIER_SEQ},"), "");
+            }
+        });
         if let Some(floor) = floor {
             seeded.set_floor(floor);
         }

@@ -10,6 +10,8 @@ use kbf_host::Root;
 use kbf_host::testkit::{ScratchHost, reply};
 
 use super::*;
+use crate::fixtures::version_json;
+use crate::helper::fetcher::fake::FakeFetcher;
 use crate::helper::operator;
 use crate::helper::service::fake::ServiceRecorder;
 use crate::layout::Layout;
@@ -23,6 +25,7 @@ struct Rig {
     exec: ScratchHost,
     layout: Layout,
     service: ServiceRecorder,
+    fetcher: FakeFetcher,
     restart: Restart,
     out: Vec<u8>,
 }
@@ -67,10 +70,12 @@ impl Rig {
         let kbf = exec.root.join("var/lib/kbf-installer/releases");
         symlink(B, kbf.join("current")).expect("current");
         symlink(A, kbf.join("previous")).expect("previous");
+        let fetcher = FakeFetcher::new(&layout);
         Rig {
             exec,
             layout,
             service,
+            fetcher,
             restart: Restart::Systemd(UNIT.to_owned()),
             out: Vec::new(),
         }
@@ -82,6 +87,7 @@ impl Rig {
             exec: &mut self.exec,
             restart: &self.restart,
             procs: &self.service,
+            fetcher: &self.fetcher,
             out: &mut self.out,
             apply,
             wait: Duration::ZERO,
@@ -246,6 +252,122 @@ fn rollback_goes_to_previous_and_only_when_nothing_is_on_trial() {
     assert!(!rig.marker());
     let err = rig.op(true).rollback().expect_err("no previous");
     assert_eq!(err.exit_code(), 5, "{err}");
+}
+
+/// What a kbf that declares `relay` level 1 prints for `kbf --version --json`.
+fn relays(commit: &str) -> String {
+    version_json(commit, "release").replace('}', ",\"relay\":1}")
+}
+
+impl Rig {
+    /// The host's `installer.toml` says `source`, and the kbf of release `A` (the previous one)
+    /// prints each of `said` (the last one is what the fake keeps).
+    fn previous_prints(&self, source: Option<&'static str>, said: &[String]) {
+        *self.fetcher.source.lock().expect("lock") = source;
+        for text in said {
+            self.fetcher
+                .versions
+                .lock()
+                .expect("lock")
+                .insert(c(A), text.clone());
+        }
+    }
+
+    fn state_bytes(&self) -> Vec<u8> {
+        fs::read(self.layout.join(&self.layout.state_file())).expect("state.json")
+    }
+
+    fn probed(&self) -> Vec<crate::CommitId> {
+        self.fetcher.probes.lock().expect("lock").clone()
+    }
+}
+
+/// Catches a rollback that puts a bundled host on a kbf that cannot relay a staged order: such a
+/// host fetches nothing, a new kbf reaches it only as a staged order, and a kbf that does not
+/// relay is the one that could not hand it on. Whatever the previous release's kbf prints
+/// without `relay` (no field, level 0, no JSON, or nothing to ask) is refused (exit 3) with a
+/// dry run too, before anything is written: `state.json` is the same bytes, `current` stays, no
+/// restart is owed or made. The message says why and the way forward.
+///
+/// Mutants planted: the bundled check removed (the rollback goes ahead); an unknown relay read
+/// as relaying (the no-field and no-JSON cases go ahead); the check made after the state is
+/// written (the bytes differ).
+#[test]
+fn a_bundled_host_is_not_rolled_back_to_a_kbf_that_cannot_relay() {
+    let level_0 = version_json(A, "release").replace('}', ",\"relay\":0}");
+    let cases = [
+        ("no-field", vec![version_json(A, "release")]),
+        ("level-0", vec![level_0]),
+        ("no-json", vec!["it prints no JSON".to_owned()]),
+        ("nothing-to-ask", Vec::new()),
+    ];
+    for (name, said) in cases {
+        for apply in [false, true] {
+            let mut rig = Rig::new(&format!("bundled-{name}-{apply}"), false);
+            rig.previous_prints(Some("bundled"), &said);
+            let before = rig.state_bytes();
+            let err = rig.op(apply).rollback().expect_err("cannot relay");
+            assert_eq!(err.exit_code(), 3, "{name} {apply}: {err}");
+            let text = err.to_string();
+            let wants = [
+                "the previous release's kbf cannot relay a staged order",
+                "no way to update",
+                "update --source staged",
+                "release_source back to url",
+            ];
+            for want in wants {
+                assert!(text.contains(want), "{name} {apply}: {text}");
+            }
+            assert_eq!(rig.state_bytes(), before, "{name} {apply}");
+            assert_eq!(rig.state().current, Some(c(B)), "{name} {apply}");
+            assert_eq!(rig.link("current"), B, "{name} {apply}");
+            assert_eq!(rig.restarts(), 0, "{name} {apply}");
+            assert!(!rig.marker(), "{name} {apply}");
+        }
+    }
+}
+
+/// Catches the relay check asking the wrong release, or refusing a kbf that relays: on a bundled
+/// host whose previous release declares `relay`, a dry run changes nothing and the rollback
+/// goes ahead as it always did, and the release asked is the one rolled back to (the current
+/// release has no answer in the fake, so asking it would refuse).
+///
+/// Mutants planted: the current release asked instead of `previous`; the answer inverted.
+#[test]
+fn a_bundled_host_is_rolled_back_to_a_kbf_that_relays() {
+    let mut rig = Rig::new("bundled-relays", false);
+    rig.previous_prints(Some("bundled"), &[relays(A)]);
+    rig.op(false).rollback().expect("dry run");
+    assert_eq!(rig.state().current, Some(c(B)));
+    rig.op(true).rollback().expect("rolled back");
+    let state = rig.state();
+    assert_eq!((state.current, state.previous), (Some(c(A)), None));
+    assert_eq!(rig.link("current"), A);
+    assert_eq!(rig.restarts(), 1);
+    assert_eq!(rig.probed(), vec![c(A), c(A)]);
+}
+
+/// Catches the check applied to a host that fetches: a url or frontend host (and one whose
+/// `installer.toml` cannot be read) rolls back to a kbf that does not relay as it always did,
+/// and the release is not even asked.
+///
+/// Mutants planted: the source word not compared (every host is checked); the unknown source
+/// treated as bundled.
+#[test]
+fn a_host_that_fetches_is_rolled_back_whatever_the_previous_kbf_relays() {
+    let hosts = [
+        ("url", Some("url")),
+        ("frontend", Some("frontend")),
+        ("none", None),
+    ];
+    for (name, source) in hosts {
+        let mut rig = Rig::new(&format!("fetching-{name}"), false);
+        rig.previous_prints(source, &[version_json(A, "release")]);
+        rig.op(true).rollback().expect("rolled back");
+        assert_eq!(rig.state().current, Some(c(A)), "{name}");
+        assert_eq!(rig.restarts(), 1, "{name}");
+        assert!(rig.probed().is_empty(), "{name}");
+    }
 }
 
 /// Catches a revert or a rollback that puts a release back as `current` while `staged` still

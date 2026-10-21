@@ -141,12 +141,14 @@ fn version_json_reports_the_build_identity() {
                 "min_protocol",
                 "profile",
                 "protocol",
+                "relay",
                 "seq",
                 "state_schema",
                 "version"
             ],
             "{out}"
         );
+        assert_eq!(v["relay"], kbf_cli::version::RELAY);
         assert_eq!(v["commit"], kbf_server::BUILD_COMMIT);
         assert_eq!(v["admin_protocol"], kbf_server::managed::ADMIN_PROTOCOL);
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));

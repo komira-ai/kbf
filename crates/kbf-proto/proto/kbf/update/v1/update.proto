@@ -104,6 +104,24 @@ message UpdateStatus {
     // The host takes no update by itself (no helper or not enabled).
     STATE_MANUAL = 8;
   }
+  // A release the host's package carries, which its installer has found whole.
+  message Available {
+    // The commit: 40 lowercase hex digits.
+    string commit = 1;
+    // The number of commits behind it: puts two builds of one branch in order.
+    uint64 seq = 2;
+  }
+  // Where the host's installer fetches the releases it installs from.
+  enum ReleaseSource {
+    // The installer does not say (it predates the field).
+    RELEASE_SOURCE_UNSPECIFIED = 0;
+    // An https file server.
+    RELEASE_SOURCE_URL = 1;
+    // The frontend's release store.
+    RELEASE_SOURCE_FRONTEND = 2;
+    // Nothing: the release is the one the host's package carries.
+    RELEASE_SOURCE_BUNDLED = 3;
+  }
   // The process's own build commit: 12 hex digits, or `unknown`.
   string running_commit = 1;
   // The commit installed as current, from the helper: 40 hex digits; empty if not known.
@@ -124,6 +142,14 @@ message UpdateStatus {
   uint32 staged_protocol = 9;
   uint32 staged_min_protocol = 10;
   uint32 staged_state_schema = 11;
+  // The release the host's package carries, when the host's installer has found it whole
+  // (its digests and its build attestation, checked offline) and newer than any release the
+  // host has confirmed. Unset when there is none, or when the installer predates the field. A
+  // report, not an offer: nothing here asks the host to do anything.
+  Available available = 12;
+  // Where the host's installer fetches releases from: a host that fetches nothing cannot
+  // carry out an order that does.
+  ReleaseSource release_source = 13;
 }
 
 message FetchRequest {

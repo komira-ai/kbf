@@ -17,11 +17,11 @@
 # already holds must be one of the verified files, byte for byte, or the run fails and
 # changes nothing.
 #
-# The tag is annotated and its message is the gamma verdict (docs/design/kbf-cicd.md,
-# section 8.1). The verify job also checks it (cargo xtask release verdict): green, for this
-# tag, this commit on main and the set of files SHA256SUMS lists, after a bake of 24 hours or
-# more. It writes the release notes (cargo xtask release notes) and uploads them as the
-# artifact `release-notes`, so a dry run shows them before anyone approves; they start with
+# The tag is annotated and its message is the Beta record (docs/design/kbf-cicd.md,
+# section 8.1), an audit record that nothing gates on. The verify job checks the tag
+# (cargo xtask release verify): it names this commit, which is on main; it prints the hash of
+# the set of files SHA256SUMS lists, which publish must be given. It reads no verdict. It
+# writes the release notes (cargo xtask release notes) and uploads them as the artifact `release-notes`, so a dry run shows them before anyone approves; they start with
 # "Before you click" (what is not reversible, computed from `kbf --version --json` of this
 # release and the previous one, run only from attested tarballs). The publish job downloads
 # that artifact and its body is that file (`release publish --notes-file`). It runs in the
@@ -42,7 +42,7 @@ on:
         required: true
         type: string
       tag:
-        description: The annotated v* tag whose message is the gamma verdict, checked as a release would check it
+        description: The annotated v* tag whose message is the Beta record, checked as a release would check it
         required: true
         type: string
 
@@ -79,10 +79,10 @@ jobs:
       TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
     outputs:
       run-id: ${{ steps.locate.outputs.run-id }}
-      set-hash: ${{ steps.verdict.outputs.set-hash }}
+      set-hash: ${{ steps.verify-tag.outputs.set-hash }}
     steps:
       # The whole history, every branch and every tag: the annotated tag object (whose
-      # message is the verdict) and origin/main, which the verdict and the notes read.
+      # message is the Beta record) and origin/main, which the tag check and the notes read.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -130,9 +130,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_REPOSITORY/.github/workflows/artifacts.yml" --commit "$COMMIT" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"
-      - name: The tag's message is a green gamma verdict for this commit and these files
-        id: verdict
-        run: cargo xtask release verdict dist --tag "$TAG" --commit "$COMMIT" --output "$GITHUB_OUTPUT"
+      - name: The tag names this commit, which is on main; the set of these files
+        id: verify-tag
+        run: cargo xtask release verify dist --tag "$TAG" --commit "$COMMIT" --output "$GITHUB_OUTPUT"
       # What the release changes about going back (section 8.3) is read from the builds
       # themselves: `kbf --version --json` of this release and of the one before it. A
       # binary runs here only after the attestation step above has verified the files it

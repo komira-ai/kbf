@@ -31,6 +31,7 @@ fn the_installer_parses_what_kbf_prints() {
     assert_eq!(parsed.meta_log, Some(num("meta_log")));
     assert_eq!(parsed.min_protocol, num("min_protocol"));
     assert_eq!(parsed.protocol, num("protocol"));
+    assert_eq!(parsed.relay, Some(num("relay")));
     assert_eq!(parsed.seq, Some(num("seq")));
     assert_eq!(parsed.state_schema, num("state_schema"));
     assert_eq!(parsed.commit, text("commit"));
@@ -46,6 +47,23 @@ fn the_installer_parses_what_kbf_prints() {
         );
     }
     assert_eq!(parsed.platform, None);
+}
+
+/// The installer takes `release_source = "bundled"` only beside a `kbf` that declares the relay
+/// (`RELAY_NEEDED`), and `kbf` is shipped by the same build as the installer: the level this
+/// build declares must meet the level this build's installer needs, or `setup` would refuse the
+/// release it was shipped with.
+///
+/// Catches the two numbers drifting apart (the installer's raised, the build's not).
+///
+/// Mutant to plant: `RELAY_NEEDED` raised to 2 (red on both assertions).
+#[test]
+fn the_build_declares_the_relay_its_installer_needs() {
+    let parsed = Version::parse(kbf_cli::version::line().as_bytes()).expect("parses");
+    assert!(kbf_installer::binary::relays(&parsed), "{parsed:?}");
+    let declared = kbf_cli::version::RELAY;
+    let needed = kbf_installer::binary::RELAY_NEEDED;
+    assert!(declared >= needed, "declares {declared}, needs {needed}");
 }
 
 /// The installer refuses a release that declares a `protocol`, `min_protocol` or

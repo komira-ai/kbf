@@ -8,7 +8,7 @@ use std::time::Duration;
 use super::harness::{PROMPT, Rig, status_json};
 use super::*;
 use crate::fixtures::{PLATFORM, commit, offer_of, scratch};
-use crate::types::Staged;
+use crate::types::{Available, Staged};
 
 fn why_of(decision: &Decision) -> String {
     decision.refusal().unwrap_or_default().to_owned()
@@ -193,6 +193,59 @@ async fn the_helpers_status_maps_to_the_state() {
     let status = rig.rx.borrow().clone();
     assert_eq!(status.state, State::Refused);
     assert!(status.refusal.contains("cannot read"), "{}", status.refusal);
+}
+
+/// Catches the report of the host's package lost on the way to the frontend: the seed the
+/// installer found whole, and the source it fetches from, reach the status with their values
+/// (every word of the source, and none for a word this build does not know, which is not a
+/// refusal); an installer that writes neither key reports neither, and one that stops writing
+/// them stops being read as having them; a seed with a commit that is not 40 hex digits
+/// refuses the whole file, as any other commit does.
+///
+/// Mutants to plant: the keys read and not put in the status; `bundled` read as `url`; an unknown
+/// word refused; the commit not checked.
+#[tokio::test]
+async fn the_package_and_the_source_the_helper_reports_reach_the_status() {
+    let rig = Rig::new("package");
+    let status = rig.rx.borrow().clone();
+    assert_eq!(status.available, None);
+    assert_eq!(status.release_source, ReleaseSource::Unreported);
+
+    let with = |extra: &str| {
+        let mut text = status_json("idle", "", "", 0);
+        text.pop();
+        format!("{text},{extra}}}")
+    };
+    let commit = "b".repeat(40);
+    let seed = format!("\"available\":{{\"commit\":\"{commit}\",\"seq\":812}}");
+    let want = Some(Available {
+        commit: commit.clone(),
+        seq: 812,
+    });
+    let words = [
+        ("url", ReleaseSource::Url),
+        ("frontend", ReleaseSource::Frontend),
+        ("bundled", ReleaseSource::Bundled),
+        ("carrier-pigeon", ReleaseSource::Unreported),
+    ];
+    for (word, source) in words {
+        rig.write_status(&with(&format!("{seed},\"release_source\":\"{word}\"")));
+        let status = rig.rx.borrow().clone();
+        assert_eq!(status.state, State::Idle, "{word}");
+        assert_eq!(status.available, want, "{word}");
+        assert_eq!(status.release_source, source, "{word}");
+    }
+
+    // The installer stops writing both: they are not remembered.
+    rig.write_status(&status_json("idle", "", "", 0));
+    let status = rig.rx.borrow().clone();
+    assert_eq!(status.available, None);
+    assert_eq!(status.release_source, ReleaseSource::Unreported);
+
+    rig.write_status(&with("\"available\":{\"commit\":\"XYZ\",\"seq\":1}"));
+    let status = rig.rx.borrow().clone();
+    assert_eq!(status.state, State::Refused);
+    assert!(status.refusal.contains("available"), "{}", status.refusal);
 }
 
 /// Catches the poll loop not running: a status file written while the worker runs is

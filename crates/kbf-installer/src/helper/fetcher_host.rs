@@ -37,6 +37,8 @@
 use kbf_host::{HostExec, HostPath, Owner};
 use kbf_update::{Facts, Source as OrderSource};
 
+use crate::CommitId;
+use crate::binary::Version;
 use crate::fetch::{ChildProgram, Limits, ProgramFault, Source};
 use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
 use crate::helper::fetcher_real::{Parts, RealFetcher};
@@ -46,7 +48,7 @@ use crate::installer_toml::{InstallerToml, ReadError, Source as Configured};
 use crate::layout::{Layout, Platform};
 use crate::refusal::Refusal;
 use crate::run::SystemRunner;
-use crate::seed::SeedFacts;
+use crate::seed::{Looked, Noticed, SeedFacts};
 use crate::settings::{NoCommonRef, Settings};
 use crate::stage::Policy;
 use crate::version;
@@ -124,7 +126,9 @@ impl HostFetcher {
 
     /// The seed fetcher for this fetch.
     fn build_seed(&self) -> Result<SeedFetcher, FetchError> {
-        self.assemble_seed().map_err(FetchError::from)
+        self.assemble_seed()
+            .map(|(seed, _)| seed)
+            .map_err(FetchError::from)
     }
 
     /// What either kind of fetch reads of the host, in this order: its parts, `installer.toml`
@@ -153,13 +157,14 @@ impl HostFetcher {
         ))
     }
 
-    /// The fetcher of an order that takes the package's release. The configured source is not
-    /// asked: a staged order is allowed on every host, and the fetch child is not used.
-    fn assemble_seed(&self) -> Result<SeedFetcher, NotBuilt> {
+    /// The fetcher of an order that takes the package's release, and the word the configured
+    /// source goes by. The source is not asked: a staged order is allowed on every host, and the
+    /// fetch child is not used.
+    fn assemble_seed(&self) -> Result<(SeedFetcher, &'static str), NotBuilt> {
         let (parts, toml, settings) = self.read()?;
         let policy = Policy::of(&toml);
         let seed = SeedFetcher::new(self.host.clone(), settings, policy, parts, &self.build);
-        Ok(seed)
+        Ok((seed, toml.source.word()))
     }
 }
 
@@ -184,6 +189,33 @@ impl Fetcher for HostFetcher {
 
     fn seed(&self) -> Result<SeedFacts, FetchError> {
         self.build_seed()?.seed()
+    }
+
+    /// The package is looked at whatever the source is, and the source is told whether or not
+    /// the package carries a seed: the frontend needs the second to know a host fetches nothing.
+    fn look(&self, known: Option<&Looked>) -> Noticed {
+        match self.assemble_seed() {
+            Ok((seed, source)) => Noticed {
+                source: Some(source),
+                seed: seed.scan(known),
+            },
+            Err(e) => Noticed {
+                source: None,
+                seed: Err(FetchError::from(e)),
+            },
+        }
+    }
+
+    /// The word `installer.toml` holds for the source; `None` when the host's parts or the file
+    /// cannot be read.
+    fn source(&self) -> Option<&'static str> {
+        self.assemble_seed().ok().map(|(_, word)| word)
+    }
+
+    /// Any installed release is asked, on every kind of host: the seed fetcher has the runner
+    /// and the settings, and no source of its own to be denied.
+    fn probe(&self, commit: &CommitId) -> Result<Version, FetchError> {
+        self.build_seed()?.probe(commit)
     }
 }
 
