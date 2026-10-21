@@ -133,6 +133,12 @@ impl<E: Exec> Helper<E> {
         self.leases.as_ref()
     }
 
+    /// Replace the lease source, for a test that plays a Mac's.
+    #[cfg(test)]
+    pub(crate) fn set_leases(&mut self, leases: Box<dyn LeaseSource>) {
+        self.leases = leases;
+    }
+
     /// The host's executor, for a test to read what was done.
     pub fn exec(&self) -> &E {
         &self.exec
@@ -583,9 +589,13 @@ impl<E: Exec> Helper<E> {
             ));
         }
         // The lease check again, from what the installer observes.
-        match self.leases.live() {
-            Ok(0) => {}
-            Ok(n) => return Err(format!("{n} leases are live; not activating")),
+        match self.leases.live_noted() {
+            Ok((0, note)) => {
+                if let Some(note) = note {
+                    let _ = writeln!(self.log, "leases: {note}");
+                }
+            }
+            Ok((n, _)) => return Err(format!("{n} leases are live; not activating")),
             Err(why) => return Err(format!("cannot tell whether leases are live: {why}")),
         }
         // Already the running release: nothing to fetch, `activate` says so.
