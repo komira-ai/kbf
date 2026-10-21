@@ -40,7 +40,10 @@ stages:
     after: [build]
     result: gamma-verdict.json
     events: [workflow_run]
-  # release.yml publishes a pushed v* tag, or dry-runs a commit by hand.
+  # release.yml gates, plans, verifies, tags with the release bot, publishes and bumps the
+  # internal repository, in one run. It is started by hand (a dry run through `verify`); the push
+  # event is allowed here for the change that adds `push: branches: [main]`, which the workflow
+  # lint (tests/release_workflow) pins until then.
   - name: prod
     runs: actions
     after: [gamma]
@@ -101,7 +104,17 @@ jobs:
     stage: gamma
   - job: gamma.yml#check
     stage: gamma
+  - job: release.yml#gates
+    stage: prod
+  - job: release.yml#plan
+    stage: prod
   - job: release.yml#verify
     stage: prod
+  - job: release.yml#tag
+    stage: prod
+  - job: release.yml#notes
+    stage: prod
   - job: release.yml#publish
+    stage: prod
+  - job: release.yml#bump
     stage: prod

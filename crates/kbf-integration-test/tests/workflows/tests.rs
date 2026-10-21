@@ -538,13 +538,12 @@ fn signing_scopes_are_allowed_for_a_push_to_main_only() {
 }
 
 /// The `if:` line under which a job may create a release, as the lint requires it.
-const TAG_PUSH_IF: &str =
-    "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}\n";
+const TAG_PUSH_IF: &str = "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}\n";
 
 #[test]
-fn contents_write_needs_a_job_that_runs_only_for_a_pushed_release_tag() {
+fn contents_write_needs_a_job_that_runs_only_for_a_release_push_to_main() {
     // Catches: `contents: write` (create a release, push a branch or a tag) allowed in a
-    // job a pull request, the merge queue, a push to main or a manual run runs; and
+    // job a pull request, the merge queue, a tag, a dispatch or a push that releases nothing runs; and
     // the exception refused where the release workflow needs it.
     clean(&workflow(&format!(
         "    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {{contents: write, actions: read}}\n"
@@ -552,17 +551,19 @@ fn contents_write_needs_a_job_that_runs_only_for_a_pushed_release_tag() {
     for cond in [
         "",
         SIGNING_PUSH_IF,
-        "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')\n",
-        "    if: ${{ startsWith(github.ref, 'refs/tags/v') }}\n",
-        "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}\n",
-        "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') || true }}\n",
+        "    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true'\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
+        "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}\n",
+        "    if: ${{ github.event_name == 'workflow_dispatch' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' || true }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' }}\n",
     ] {
         let body =
             format!("    runs-on: ubuntu-latest\n{cond}    permissions: {{contents: write}}\n");
         assert_eq!(
             scan(&workflow(&body)),
             vec![format!(
-                "line {}: `contents: write` is allowed only in a job whose `if:` is exactly `{RELEASE_TAG_PUSH_ONLY}`",
+                "line {}: `contents: write` is allowed only in a job whose `if:` is exactly `{RELEASE_PUSH_ONLY}`",
                 if cond.is_empty() { 7 } else { 8 }
             )],
             "{body}"
