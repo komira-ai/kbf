@@ -1894,6 +1894,7 @@ dependencies = [
  "kbf-daemon",
  "kbf-deploy",
  "kbf-front",
+ "kbf-harness",
  "kbf-host",
  "kbf-installer",
  "kbf-map",
