@@ -228,4 +228,70 @@ mod tests {
         );
         assert_eq!(error_code_message(b""), (String::new(), String::new()));
     }
+
+    /// Catches: a non-UTF-8 error body that panics or leaks lossy bytes into the code
+    /// (callers match on the code), and prose from a proxy dropped instead of kept (up
+    /// to 200 characters) as the message an operator reads.
+    #[test]
+    fn error_body_that_is_not_xml_keeps_its_prose_and_not_utf8_gives_nothing() {
+        assert_eq!(
+            error_code_message(b"\xff\xfe"),
+            (String::new(), String::new())
+        );
+        let prose = "x".repeat(300);
+        let (code, message) = error_code_message(prose.as_bytes());
+        assert_eq!(code, "");
+        assert_eq!(message, "x".repeat(200));
+    }
+
+    /// Catches: a listing entry with a bad size, a bad `IsTruncated`, a key kbf would
+    /// refuse, or an empty continuation token taken as a page (a listing that never
+    /// advances), each accepted instead of refused as a protocol error.
+    #[test]
+    fn listing_answers_that_break_the_contract_are_protocol_errors() {
+        let why_bytes = |body: &[u8]| {
+            let err = list_page(body).unwrap_err();
+            assert!(matches!(err, ObjectStoreError::Protocol(_)), "{err:?}");
+            err.to_string()
+        };
+        let why = |body: &str| why_bytes(body.as_bytes());
+        assert!(why("<ListBucketResult><Contents><Key>a</Key><Size>x</Size></Contents></ListBucketResult>")
+            .contains("a: missing or bad <Size>"));
+        assert!(
+            why("<ListBucketResult><Contents><Key>a</Key></Contents></ListBucketResult>")
+                .contains("missing or bad <Size>")
+        );
+        assert!(
+            why("<ListBucketResult><Contents><Size>1</Size></Contents></ListBucketResult>")
+                .contains("<Contents> without <Key>")
+        );
+        assert!(why("<ListBucketResult><Contents><Key></Key><Size>1</Size></Contents></ListBucketResult>")
+            .contains("listed key"));
+        assert!(
+            why("<ListBucketResult><IsTruncated>maybe</IsTruncated></ListBucketResult>")
+                .contains("<IsTruncated> is \"maybe\"")
+        );
+        assert!(
+            why("<ListBucketResult><IsTruncated>true</IsTruncated>\
+             <NextContinuationToken></NextContinuationToken></ListBucketResult>")
+            .contains("truncated without <NextContinuationToken>")
+        );
+        assert!(why("<Other/>").contains("root element is <Other>"));
+        assert!(why_bytes(b"\xff").contains("ListObjectsV2 answer:"));
+    }
+
+    /// Catches: a pretty-printed answer (whitespace text between elements) whose text
+    /// nodes are taken for elements, so a key or the token is read from the wrong node.
+    #[test]
+    fn a_pretty_printed_listing_reads_the_same_as_a_compact_one() {
+        let body = "<ListBucketResult>\n  <IsTruncated>true</IsTruncated>\n  \
+                    <NextContinuationToken>t</NextContinuationToken>\n  \
+                    <Contents>\n    <Key>p/a</Key>\n    <Size>7</Size>\n  </Contents>\n\
+                    </ListBucketResult>";
+        let page = list_page(body.as_bytes()).unwrap();
+        assert_eq!(page.next, Some(ListToken(Token::Continue("t".into()))));
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.objects[0].key.as_str(), "p/a");
+        assert_eq!(page.objects[0].size, 7);
+    }
 }

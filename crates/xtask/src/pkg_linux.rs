@@ -5,7 +5,7 @@
 //!
 //! - [`plan`] lists the files from the inputs and refuses what the contract
 //!   (docs/design/kbf-installer.md, section 3) does not ship: a unit that is not
-//!   `kbf-*.service`, `kbf-*.socket` or `kbf-*.timer` (or the slice), a trust file other than the three, an empty unit directory;
+//!   `kbf-*.service` or `kbf-*.socket` (or the slice), a trust file other than the three, an empty unit directory;
 //! - [`config`] renders the list as the nfpm configuration, with the dependencies as
 //!   constants here (never Podman, never Envoy), no maintainer script, every file
 //!   `root:root`, and no time (nfpm takes it from `SOURCE_DATE_EPOCH`);
@@ -27,7 +27,7 @@ pub const NAME: &str = "kbf-installer";
 pub const BINARY_PATH: &str = "/usr/bin/kbf-installer";
 /// Where the unit files go.
 pub const UNIT_DIR: &str = "/usr/lib/systemd/system";
-/// The one packaged unit that is not a `kbf-*.service`, `kbf-*.socket` or `kbf-*.timer`: the slice
+/// The one packaged unit that is not a `kbf-*.service` or `kbf-*.socket`: the slice
 /// the units run in.
 pub const SLICE: &str = "kbf.slice";
 /// The directory the package owns, holding [`TRUST_DIR`].
@@ -47,7 +47,7 @@ pub const TMPFILES_DIRS: [(&str, &str); 2] = [
     ("/var/cache/kbf-fetch", "711"),
 ];
 /// The users `sysusers.d` makes.
-pub const USERS: [&str; 4] = ["kbf", "kbf-server", "kbf-fetch", "kbf-verify"];
+pub const USERS: [&str; 4] = ["kbf", "kbf-server", "kbf-fetch", "kbf-signer"];
 /// The `User=` and `Group=` names a unit's text sets, as `("User" | "Group", name)`, in
 /// order. Comments and empty values (which reset the setting) are skipped.
 pub fn unit_accounts(text: &str) -> Vec<(&'static str, String)> {
@@ -104,7 +104,7 @@ pub struct Entry {
 pub struct Inputs<'a> {
     /// The `kbf-installer` binary.
     pub binary: &'a Path,
-    /// The directory of `kbf-*.service`, `kbf-*.timer` files and the slice.
+    /// The directory of `kbf-*.service` and `kbf-*.socket` files and the slice.
     pub units: &'a Path,
     /// The directory of the three trust files.
     pub trust: &'a Path,
@@ -178,7 +178,7 @@ fn version_ok(version: &str) -> bool {
 pub struct Sources<'a> {
     /// The `kbf-installer` binary.
     pub binary: &'a Path,
-    /// The directory of `kbf-*.service`, `kbf-*.timer` files and the slice.
+    /// The directory of `kbf-*.service` and `kbf-*.socket` files and the slice.
     pub units: &'a Path,
     /// The directory of the three trust files.
     pub trust: &'a Path,
@@ -236,14 +236,9 @@ fn entries(i: &Sources, mut problems: Vec<String>) -> Result<Vec<Entry>, Error> 
     }
     for (name, src) in units {
         let kbf = name.starts_with("kbf-");
-        if !(name == SLICE
-            || (kbf
-                && (name.ends_with(".service")
-                    || name.ends_with(".socket")
-                    || name.ends_with(".timer"))))
-        {
+        if !(name == SLICE || (kbf && (name.ends_with(".service") || name.ends_with(".socket")))) {
             problems.push(format!(
-                "{name}: a package unit is named kbf-*.service, kbf-*.socket or kbf-*.timer (or is {SLICE})"
+                "{name}: a package unit is named kbf-*.service or kbf-*.socket (or is {SLICE})"
             ));
         }
         entries.push(file(

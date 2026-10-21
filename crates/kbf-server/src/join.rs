@@ -321,7 +321,7 @@ impl Joiner {
         let fill = self.fill.beat();
         let answer = self
             .client
-            .heartbeat(pb::HeartbeatRequest {
+            .heartbeat(fill.vitals.put_on(pb::HeartbeatRequest {
                 member_id: joined.member_id,
                 boot: joined.boot,
                 repair_debts,
@@ -338,7 +338,8 @@ impl Joiner {
                 staged_bytes: fill.staged_bytes,
                 tail_epoch_done: fill.tail_epoch_done,
                 fill_fp: fill.fill_fp,
-            })
+                ..pb::HeartbeatRequest::default()
+            }))
             .await?
             .into_inner();
         self.fill.learn(answer.tail_epoch);
