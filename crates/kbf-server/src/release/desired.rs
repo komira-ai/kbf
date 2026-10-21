@@ -10,7 +10,8 @@
 //!   it complete (tarball and attestation) for at least one platform, else `409` naming
 //!   what is missing. The row's generation moves only when the commit differs from the
 //!   desired one (a repeated click keeps it); a rollback is the older commit offered the same
-//!   way. It passes the gates of every `/v1` write ([`crate::api::operator_gate`]) and wants a
+//!   way. R4 refuses a release older than this build by build seq ([`super::target_seq`]). It
+//!   passes the gates of every `/v1` write ([`crate::api::operator_gate`]) and wants a
 //!   JSON body.
 //!   An optional `expect_generation` makes it a compare-and-set: the row is written only if the
 //!   desired release is at that generation (0 before any offer), else `409` naming both and
@@ -41,14 +42,21 @@ use serde_json::json;
 
 use super::key::Commit;
 use super::store::ReleaseStore;
+use super::target_seq::AgeCheck;
 use crate::api::{error, json, operator_gate};
 use crate::farm::Farm;
 use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
 use crate::update::{Desired, Policy, Proposal, Release, RowError, Rows};
 
+/// The release store and the R4 check over it, present together.
+struct Held {
+    store: Arc<ReleaseStore>,
+    age: AgeCheck,
+}
+
 struct Update {
-    store: Option<Arc<ReleaseStore>>,
+    held: Option<Held>,
     rows: Option<Rows>,
     token: Option<ApiToken>,
     farm: Arc<Farm>,
@@ -68,7 +76,10 @@ pub fn router(
         .route("/v1/update/pause", post(pause))
         .route("/v1/update/resume", post(resume))
         .with_state(Arc::new(Update {
-            store,
+            held: store.map(|store| Held {
+                age: AgeCheck::running(store.clone()),
+                store,
+            }),
             rows,
             token,
             farm,
@@ -79,6 +90,15 @@ fn unavailable(what: &str, flag: &str) -> Response {
     error(
         StatusCode::SERVICE_UNAVAILABLE,
         &format!("{what} is off: the server was started without {flag}"),
+    )
+}
+
+/// A read of the release store failed: logged, and a `500` that says nothing of the path.
+fn store_failed(e: &std::io::Error) -> Response {
+    tracing::error!("release store: {e}");
+    error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the release store failed",
     )
 }
 
@@ -158,7 +178,7 @@ async fn view(State(update): State<Arc<Update>>) -> Response {
     let Some(rows) = update.rows.clone() else {
         return unavailable("the update state", "--state-store");
     };
-    let Some(store) = update.store.as_deref() else {
+    let Some(Held { store, .. }) = update.held.as_ref() else {
         return unavailable("the release store", "--releases-dir");
     };
     let policy_rows = rows.clone();
@@ -179,13 +199,7 @@ async fn view(State(update): State<Arc<Update>>) -> Response {
     let paused = policy.as_ref().is_some_and(|p| p.paused);
     let releases = match store.list().await {
         Ok(listing) => super::http::listing_view(&listing),
-        Err(e) => {
-            tracing::error!("release store: list: {e}");
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "the release store failed",
-            );
-        }
+        Err(e) => return store_failed(&e),
     };
     json(
         StatusCode::OK,
@@ -237,7 +251,7 @@ async fn set_desired(
     let Some(rows) = update.rows.clone() else {
         return unavailable("the update state", "--state-store");
     };
-    let Some(store) = update.store.as_deref() else {
+    let Some(Held { store, age }) = update.held.as_ref() else {
         return unavailable("the release store", "--releases-dir");
     };
     let Ok(Offer {
@@ -258,13 +272,7 @@ async fn set_desired(
     };
     let listing = match store.list().await {
         Ok(listing) => listing,
-        Err(e) => {
-            tracing::error!("release store: list: {e}");
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "the release store failed",
-            );
-        }
+        Err(e) => return store_failed(&e),
     };
     let complete = listing
         .iter()
@@ -276,6 +284,12 @@ async fn set_desired(
             StatusCode::CONFLICT,
             "the release store holds no platform of this commit complete (tarball and attestation)",
         );
+    }
+    // R4: not older than the running build, by build seq.
+    match age.check(&parsed).await {
+        Ok(Ok(())) => {}
+        Ok(Err(refused)) => return error(StatusCode::CONFLICT, &refused.to_string()),
+        Err(e) => return store_failed(&e),
     }
     // The wall clock: the controller counts its waits from this, across restarts.
     let now = update.farm.wall_now();
@@ -313,3 +327,6 @@ async fn paused(
         Err(e) => row_failed(&e),
     }
 }
+
+#[cfg(test)]
+mod tests;

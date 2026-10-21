@@ -33,6 +33,7 @@ pub mod key;
 pub mod offers;
 pub mod poll;
 pub mod store;
+pub mod target_seq;
 
 pub use grpc::service;
 pub use http::router;
