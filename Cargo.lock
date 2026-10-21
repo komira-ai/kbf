@@ -1722,6 +1722,7 @@ dependencies = [
  "http-body",
  "kbf-auth",
  "kbf-caps",
+ "kbf-front",
  "kbf-invocation",
  "kbf-map",
  "kbf-meta",
@@ -2432,6 +2433,7 @@ dependencies = [
  "kbf-proto",
  "kbf-segments",
  "kbf-store",
+ "kbf-testkit",
  "kbf-tls",
  "kbf-types",
  "rcgen",
@@ -2456,6 +2458,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rustix",
+ "tokio",
 ]
 
 [[package]]
