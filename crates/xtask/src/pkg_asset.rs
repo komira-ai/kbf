@@ -1,5 +1,6 @@
 //! `pkg-asset --package <deb> --platform <platform> --commit <sha> --binary-tarball <file>
-//! --expect-ref refs/heads/<branch> [--gh <program>] (--out <dir> | --verify-only)`: the
+//! --kbf-tarball <file> --expect-ref refs/heads/<branch> [--gh <program>]
+//! (--out <dir> | --verify-only)`: the
 //! `kbf-installer` deb as a release asset, `kbf-installer-<commit>-<platform>.deb`, and
 //! the checks that tie it to the bytes the attestation covers.
 //!
@@ -10,6 +11,9 @@
 //! - `usr/bin/kbf-installer` is byte for byte the binary inside `--binary-tarball`, the
 //!   tarball `build-commit check-asset` has already shown names the commit: the deb
 //!   carries the bytes the build identified, not others;
+//! - `usr/bin/kbf` is, in the same way, byte for byte the `kbf` inside `--kbf-tarball`
+//!   (`kbf-<commit>-<platform>.tar.gz`, checked by `build-commit check-asset` too), and
+//!   both binaries are mode 0755;
 //! - `usr/share/kbf-installer/trust/installer.conf` is exactly `SOURCE_REFS=` and
 //!   `--expect-ref` ([`crate::pkg_trust::conf`]): a deb built on `main` trusts `main`
 //!   and a deb built on a feature branch trusts that branch, never the reverse;
@@ -34,6 +38,10 @@ use crate::{Error, build_commit, pkg_trust, sums};
 
 /// The binary's path in the deb, and in the data tarball (no leading slash).
 const BINARY: &str = "usr/bin/kbf-installer";
+/// The `kbf`'s path in the deb, and in the data tarball (no leading slash).
+const KBF: &str = "usr/bin/kbf";
+/// The name of the `kbf` inside its release tarball.
+const KBF_MEMBER: &str = "kbf";
 
 /// The package file `package` names: the file itself, or, for a directory, the one file
 /// in it whose name ends `.<ext>` (what nfpm left in `pkg-build --out`, under a name made
@@ -186,10 +194,51 @@ pub struct Check<'a> {
     pub platform: Platform,
     /// The `kbf-installer-<commit>-<platform>.tar.gz` the deb's binary must equal.
     pub binary_tarball: &'a Path,
+    /// The `kbf-<commit>-<platform>.tar.gz` whose `kbf` the deb must hold.
+    pub kbf_tarball: &'a Path,
     /// The branch the deb must trust: `refs/heads/<branch>`.
     pub expect_ref: &'a str,
     /// The pinned `gh` the deb's must equal, when the job has it.
     pub gh: Option<&'a Path>,
+}
+
+/// What is wrong with `in_deb`, the file `path` of the package, as the file `member` of the
+/// release tarball at `tarball`: not in the package, the tarball without it, not its bytes,
+/// or not mode 0755.
+///
+/// # Errors
+/// The tarball cannot be read.
+fn binary_problems(
+    in_deb: Option<&Member>,
+    path: &str,
+    member: &str,
+    tarball: &Path,
+) -> Result<Vec<String>, Error> {
+    let tgz = read(tarball)?;
+    let shipped = members(&tgz)
+        .ok()
+        .and_then(|m| m.into_iter().find(|m| m.path == member));
+    let mut problems = Vec::new();
+    match (in_deb, shipped) {
+        (None, _) => problems.push(format!("holds no {path}")),
+        (Some(_), None) => {
+            problems.push(format!("{} holds no {member}", tarball.display()));
+        }
+        (Some(in_deb), Some(in_tarball)) => {
+            if in_deb.bytes != in_tarball.bytes {
+                problems.push(format!(
+                    "{path} (sha256:{}) is not the binary of {} (sha256:{})",
+                    Sha256::of(&in_deb.bytes),
+                    tarball.display(),
+                    Sha256::of(&in_tarball.bytes)
+                ));
+            }
+            if in_deb.mode != 0o755 {
+                problems.push(format!("{path} has mode {:04o}, not 0755", in_deb.mode));
+            }
+        }
+    }
+    Ok(problems)
 }
 
 /// What is wrong with `deb` (the bytes of the package) as the `kbf-installer` package
@@ -245,31 +294,12 @@ pub fn problems(deb: &[u8], c: &Check) -> Result<Vec<String>, Error> {
         }
     };
     let file = |path: &str| files.iter().find(|m| m.path == path);
-    // The binary the attestation covers is the one in the package.
-    let tarball = read(c.binary_tarball)?;
-    let shipped = members(&tarball)
-        .ok()
-        .and_then(|m| m.into_iter().find(|m| m.path == pkg_linux::NAME));
-    match (file(BINARY), shipped) {
-        (None, _) => problems.push(format!("holds no {BINARY}")),
-        (Some(_), None) => problems.push(format!(
-            "{} holds no {}",
-            c.binary_tarball.display(),
-            pkg_linux::NAME
-        )),
-        (Some(in_deb), Some(in_tarball)) => {
-            if in_deb.bytes != in_tarball.bytes {
-                problems.push(format!(
-                    "{BINARY} (sha256:{}) is not the binary of {} (sha256:{})",
-                    Sha256::of(&in_deb.bytes),
-                    c.binary_tarball.display(),
-                    Sha256::of(&in_tarball.bytes)
-                ));
-            }
-            if in_deb.mode != 0o755 {
-                problems.push(format!("{BINARY} has mode {:04o}, not 0755", in_deb.mode));
-            }
-        }
+    // The binaries the attestation covers are the ones in the package.
+    for (path, member, tarball) in [
+        (BINARY, pkg_linux::NAME, c.binary_tarball),
+        (KBF, KBF_MEMBER, c.kbf_tarball),
+    ] {
+        problems.extend(binary_problems(file(path), path, member, tarball)?);
     }
     let dir = TRUST_DIR.trim_start_matches('/');
     for (name, mode) in TRUST_FILES {

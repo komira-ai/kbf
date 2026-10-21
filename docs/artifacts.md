@@ -356,6 +356,10 @@ refusing it unless:
 
 - `usr/bin/kbf-installer` is byte for byte the binary in the tarball
   `build-commit check-asset` checked for the commit;
+- `usr/bin/kbf` is byte for byte the `kbf` in the tarball `kbf-<commit>-<platform>.tar.gz`
+  that `build-commit check-asset` checked for the commit (`--kbf-tarball`), and both
+  binaries are mode 0755. The deb and the rpm carry the `kbf` their job built; the
+  `install.sh` payload does not;
 - its control file says the architecture of the platform;
 - `/usr/share/kbf-installer/trust/gh` is the pinned `gh` the job downloaded (checked by
   SHA-256 before use) and executable, `trusted_root.jsonl` is the Sigstore trusted root
@@ -367,7 +371,7 @@ refusing it unless:
 It is attested like a tarball: build provenance (as one subject of the `SHA256SUMS`
 attestation, and alone, with its bundle `kbf-installer-<commit>-<platform>.deb.sigstore.json`
 in `bundles-linux`) and **no SBOM attestation**: provenance and a bundle only. (Its
-binary has an SBOM, in the tarball's; the `gh` it carries has none here.) The verify job
+binaries have SBOMs, in the tarballs'; the `gh` it carries has none here.) The verify job
 checks both offline with the installer's flags, and runs `cargo xtask pkg-asset
 --verify-only` on the signed file, so the package that was attested is the one whose
 contents were checked.

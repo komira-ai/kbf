@@ -21,6 +21,7 @@ impl Tree {
         let dir = scratch(name);
         let t = Tree { dir };
         t.put("kbf-installer", "binary");
+        t.put("kbf", "kbf binary");
         t.put("units/kbf-node.service", "node unit");
         t.put("units/kbf-installer.service", "installer unit");
         for (n, _) in TRUST_FILES {
@@ -42,6 +43,7 @@ impl Tree {
         let at = |rel: &str| -> &'static Path { Box::leak(self.dir.join(rel).into_boxed_path()) };
         Inputs {
             binary: at("kbf-installer"),
+            kbf: at("kbf"),
             units: at("units"),
             trust: at("trust"),
             sysusers: at("sysusers.conf"),
@@ -50,6 +52,23 @@ impl Tree {
             version: "0.0.0+ci",
         }
     }
+
+    /// The sources of the `install.sh` payload: the inputs without the `kbf`.
+    fn sources(&self) -> Sources<'_> {
+        let i = self.inputs();
+        Sources {
+            binary: i.binary,
+            units: i.units,
+            trust: i.trust,
+            sysusers: i.sysusers,
+            tmpfiles: i.tmpfiles,
+        }
+    }
+}
+
+/// The paths of `entries`.
+fn dsts(entries: Vec<Entry>) -> Vec<String> {
+    entries.into_iter().map(|e| e.dst).collect()
 }
 
 fn refused(r: Result<Vec<Entry>, Error>) -> String {
@@ -68,6 +87,7 @@ fn the_plan_is_the_contract_paths_with_their_modes() {
         .map(|e| (e.dst, e.mode, e.sha256.is_some()))
         .collect();
     let want = [
+        ("/usr/bin/kbf", 0o755, true),
         ("/usr/bin/kbf-installer", 0o755, true),
         ("/usr/lib/systemd/system/kbf-installer.service", 0o644, true),
         ("/usr/lib/systemd/system/kbf-node.service", 0o644, true),
@@ -91,10 +111,52 @@ fn the_plan_is_the_contract_paths_with_their_modes() {
 }
 
 #[test]
+fn the_package_carries_the_given_kbf_at_usr_bin_kbf_mode_0755_root_owned() {
+    // Catches: the kbf left out of the package, put at another path (the installer's, or
+    // under /usr/local), given a mode other than 0755 (a kbf no unit can run) or an owner
+    // other than root in the nfpm configuration, or made of other bytes than the file
+    // given (the installer's, for one).
+    let t = Tree::new("kbf");
+    let entries = plan(&t.inputs()).expect("plan");
+    let kbf = entries.iter().find(|e| e.dst == KBF_PATH).expect("kbf");
+    assert_eq!(KBF_PATH, "/usr/bin/kbf");
+    assert_eq!(kbf.mode, 0o755);
+    assert_eq!(kbf.sha256, Some(Sha256::of(b"kbf binary")));
+    assert_eq!(kbf.src, t.dir.join("kbf"));
+    let text = config(&entries, Platform::LinuxX86_64, "1.2.3+ci");
+    let head = "  - dst: \"/usr/bin/kbf\"\n";
+    let at = text.find(head).expect("kbf in the config");
+    let chunk: Vec<&str> = text[at..].lines().take(3).collect();
+    assert_eq!(
+        chunk[1],
+        format!("    src: {}", quoted(&t.dir.join("kbf").to_string_lossy()))
+    );
+    assert_eq!(
+        chunk[2],
+        "    file_info: {mode: 0755, owner: root, group: root}"
+    );
+}
+
+#[test]
+fn the_install_sh_payload_list_has_every_file_of_the_package_but_the_kbf() {
+    // Catches: the kbf in `files`, the list the install.sh payload is made from (a payload
+    // that places a kbf the installer then neither verified nor knows), and the payload
+    // list and the package drifting apart in any other file.
+    let t = Tree::new("payload");
+    let planned = dsts(plan(&t.inputs()).expect("plan"));
+    let payload = dsts(files(&t.sources()).expect("files"));
+    let kbf = KBF_PATH.to_owned();
+    assert!(planned.contains(&kbf));
+    assert!(!payload.contains(&kbf));
+    let others: Vec<String> = planned.into_iter().filter(|d| *d != kbf).collect();
+    assert_eq!(payload, others);
+}
+
+#[test]
 fn the_plan_refuses_what_the_package_does_not_ship() {
     // Each case changes the tree in one way and names what the refusal must say.
     type Change = fn(&Tree) -> Inputs<'_>;
-    let cases: [(&str, Change, &str); 11] = [
+    let cases: [(&str, Change, &str); 12] = [
         (
             "a unit not named kbf-*.service",
             |t| {
@@ -151,6 +213,14 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
                 t.inputs()
             },
             "kbf-installer",
+        ),
+        (
+            "a missing kbf",
+            |t| {
+                std::fs::remove_file(t.dir.join("kbf")).expect("rm");
+                t.inputs()
+            },
+            "/kbf: No such file or directory",
         ),
         (
             "a unit directory that is not there",
@@ -398,6 +468,7 @@ fn the_fixtures_make_a_plan_with_the_real_files() {
     let binary = root.join("testdata/units/kbf-node.service");
     let plan = plan(&Inputs {
         binary: &binary,
+        kbf: &binary,
         units: &root.join("testdata/units"),
         trust: &root.join("testdata/trust"),
         sysusers: &root.join("sysusers.d/kbf-installer.conf"),
@@ -656,6 +727,7 @@ fn the_package_ships_exactly_the_units_directory() {
     );
     let plan = plan(&Inputs {
         binary: &root.join("units/kbf-installer.service"),
+        kbf: &root.join("units/kbf-installer.service"),
         units: &root.join("units"),
         trust: &root.join("testdata/trust"),
         sysusers: &root.join("sysusers.d/kbf-installer.conf"),

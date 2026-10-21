@@ -117,12 +117,15 @@ fn the_payload_is_the_packages_files_at_the_packages_paths_and_modes_sorted() {
 fn the_payload_is_exactly_the_debs_files_with_the_debs_modes_and_bytes() {
     // Catches: the payload and the package drifting apart again: both are read from the
     // real packaging/linux sources here, and the payload's (path, mode, sha256) must be
-    // the deb's listing without its directories. A second list of files in the tarball
-    // code, or a different mode rule, goes red.
+    // the deb's listing without its directories and without the `kbf` the deb carries and
+    // the payload does not (a payload that places a kbf the installer never verified). A
+    // second list of files in the tarball code, or a different mode rule, goes red.
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
     let dir = scratch("same-as-deb");
     let binary = dir.join("kbf-installer");
     std::fs::write(&binary, b"the installer").expect("binary");
+    let kbf = dir.join("kbf");
+    std::fs::write(&kbf, b"the kbf").expect("kbf");
     let sources = pkg_linux::Sources {
         binary: &binary,
         units: &root.join("units"),
@@ -130,9 +133,23 @@ fn the_payload_is_exactly_the_debs_files_with_the_debs_modes_and_bytes() {
         sysusers: &root.join("sysusers.d/kbf-installer.conf"),
         tmpfiles: &root.join("tmpfiles.d/kbf-installer.conf"),
     };
-    let deb: Vec<String> = pkg_linux::listing(&pkg_linux::files(&sources).expect("deb"))
+    let package = pkg_linux::plan(&pkg_linux::Inputs {
+        binary: &binary,
+        kbf: &kbf,
+        units: &root.join("units"),
+        trust: &root.join("testdata/trust"),
+        sysusers: &root.join("sysusers.d/kbf-installer.conf"),
+        tmpfiles: &root.join("tmpfiles.d/kbf-installer.conf"),
+        platform: Platform::LinuxX86_64,
+        version: "0.0.0+ci",
+    })
+    .expect("deb");
+    let listing = pkg_linux::listing(&package);
+    assert!(listing.contains(" /usr/bin/kbf "), "{listing}");
+    let deb: Vec<String> = listing
         .lines()
         .filter(|l| l.starts_with("file "))
+        .filter(|l| !l.contains(" /usr/bin/kbf "))
         .map(str::to_owned)
         .collect();
     let tar: Vec<String> = payload(&pkg_linux::files(&sources).expect("deb"))

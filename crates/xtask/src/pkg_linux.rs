@@ -5,7 +5,9 @@
 //!
 //! - [`plan`] lists the files from the inputs and refuses what the contract
 //!   (docs/design/kbf-installer.md, section 3) does not ship: a unit that is not
-//!   `kbf-*.service` or `kbf-*.socket` (or the slice), a trust file other than the three, an empty unit directory;
+//!   `kbf-*.service` or `kbf-*.socket` (or the slice), a trust file other than the three, an empty unit directory.
+//!   The package carries the `kbf` it is given at [`KBF_PATH`]; [`files`], the list the
+//!   `install.sh` payload is made from, does not;
 //! - [`config`] renders the list as the nfpm configuration, with the dependencies as
 //!   constants here (never Podman, never Envoy), no maintainer script, every file
 //!   `root:root`, and no time (nfpm takes it from `SOURCE_DATE_EPOCH`);
@@ -25,6 +27,8 @@ use crate::package::{Platform, read};
 pub const NAME: &str = "kbf-installer";
 /// Where the binary goes.
 pub const BINARY_PATH: &str = "/usr/bin/kbf-installer";
+/// Where the `kbf` runtime goes: the package carries the one release it was built with.
+pub const KBF_PATH: &str = "/usr/bin/kbf";
 /// Where the unit files go.
 pub const UNIT_DIR: &str = "/usr/lib/systemd/system";
 /// The one packaged unit that is not a `kbf-*.service` or `kbf-*.socket`: the slice
@@ -104,6 +108,8 @@ pub struct Entry {
 pub struct Inputs<'a> {
     /// The `kbf-installer` binary.
     pub binary: &'a Path,
+    /// The `kbf` binary, installed at [`KBF_PATH`].
+    pub kbf: &'a Path,
     /// The directory of `kbf-*.service` and `kbf-*.socket` files and the slice.
     pub units: &'a Path,
     /// The directory of the three trust files.
@@ -173,8 +179,9 @@ fn version_ok(version: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '+')
 }
 
-/// The files a package or a payload is made of: [`plan`] without the version and the
-/// platform, which only the nfpm configuration needs.
+/// The files a package or a payload is made of: [`plan`] without the version, the
+/// platform (which only the nfpm configuration needs) and the `kbf` (which only the
+/// packages carry).
 pub struct Sources<'a> {
     /// The `kbf-installer` binary.
     pub binary: &'a Path,
@@ -210,19 +217,25 @@ pub fn plan(i: &Inputs) -> Result<Vec<Entry>, Error> {
         sysusers: i.sysusers,
         tmpfiles: i.tmpfiles,
     };
-    entries(&sources, problems)
+    entries(&sources, Some(i.kbf), problems)
 }
 
-/// Everything the package installs, sorted by path: the one list the deb, the rpm and
-/// the `install.sh` payload ([`crate::installer_tarball`]) are all made from.
+/// Everything the package installs except the `kbf`, sorted by path: the list the
+/// `install.sh` payload ([`crate::installer_tarball`]) is made from, and, with the `kbf`
+/// added by [`plan`], the deb and the rpm. The payload carries no `kbf`: the installer
+/// fetches the first one.
 ///
 /// # Errors
 /// [`Error::Refused`] with every problem with the sources.
 pub fn files(i: &Sources) -> Result<Vec<Entry>, Error> {
-    entries(i, Vec::new())
+    entries(i, None, Vec::new())
 }
 
-fn entries(i: &Sources, mut problems: Vec<String>) -> Result<Vec<Entry>, Error> {
+fn entries(
+    i: &Sources,
+    kbf: Option<&Path>,
+    mut problems: Vec<String>,
+) -> Result<Vec<Entry>, Error> {
     let mut entries = vec![
         file(BINARY_PATH.to_owned(), 0o755, i.binary, &mut problems),
         file(SYSUSERS_PATH.to_owned(), 0o644, i.sysusers, &mut problems),
@@ -230,6 +243,9 @@ fn entries(i: &Sources, mut problems: Vec<String>) -> Result<Vec<Entry>, Error> 
         dir(SHARE_DIR),
         dir(TRUST_DIR),
     ];
+    if let Some(kbf) = kbf {
+        entries.push(file(KBF_PATH.to_owned(), 0o755, kbf, &mut problems));
+    }
     let units = files_in(i.units, &mut problems);
     if units.is_empty() {
         problems.push(format!("no unit files in {}", i.units.display()));

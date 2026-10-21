@@ -2,7 +2,8 @@
 //! --trust <dir> --sysusers <file> --tmpfiles <file> --out <dir>`: the payload
 //! `packaging/install.sh` places: the files of the Debian package, at the same paths
 //! with the same modes, because it is made from the same list ([`crate::pkg_linux::files`],
-//! which the deb and the rpm are made from too) and cannot drift from it:
+//! which the deb and the rpm are made from too, with the `kbf` they carry added) and
+//! cannot drift from it:
 //!
 //! - `usr/bin/kbf-installer` (0755);
 //! - `usr/lib/systemd/system/<file>` (0644): `kbf-*.service`, `kbf-*.socket` and `kbf.slice` only;
@@ -22,8 +23,9 @@
 //! After writing it the verb reads the file back and refuses it unless it holds exactly
 //! the files it meant to write ([`check_tarball`]).
 //!
-//! The package ships no kbf runtime release (the installer fetches the first), so
-//! neither does this; the payload is Linux only (a Mac gets the `.pkg`).
+//! The deb and the rpm carry the `kbf` they were built with at `/usr/bin/kbf`; this
+//! payload does not (the installer fetches the first), and the payload is Linux only (a
+//! Mac gets the `.pkg`).
 
 use std::io::Read;
 use std::path::Path;

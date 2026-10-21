@@ -1,8 +1,10 @@
 # kbf-installer: the Linux packages
 
 `kbf-installer` is the one package of the farm. It is the root tool that installs, verifies
-and activates kbf releases; it ships no kbf runtime release (`kbf-installer setup`
-installs the first one into `/var/lib/kbf-installer/releases/<sha>/`). The contract is
+and activates kbf releases. The deb and the rpm also carry the `kbf` of the build at
+`/usr/bin/kbf` (no seed, no maintainer script); the `install.sh` payload does not, and
+`kbf-installer setup` installs the first release of a connected host into
+`/var/lib/kbf-installer/releases/<sha>/`. The contract is
 `docs/design/kbf-installer.md`, sections 3 (files and users), 7 (units and gating) and 9
 (P11). A deb and an rpm are built by [nfpm](https://nfpm.goreleaser.com), pinned in CI by
 SHA-256, from a configuration `cargo xtask pkg-config` writes: this directory holds the
@@ -19,6 +21,8 @@ inputs, and `crates/xtask/src/pkg_linux.rs` is the one place that says what goes
 ## What the package holds
 
 - `/usr/bin/kbf-installer` (0755);
+- `/usr/bin/kbf` (0755): the `kbf` binary `pkg-config --kbf` names (CI: the one the job built
+  and `pkg-asset --kbf-tarball` holds equal to the `kbf` release tarball);
 - every file of `packaging/linux/units` (the `kbf-*.service` and `kbf-*.socket` files and `kbf.slice`; the
   unit files are packaging's input from the units author, packaged unchanged) in
   `/usr/lib/systemd/system` (0644);
@@ -103,7 +107,7 @@ Two call sites, one way to build: both go through `pkg-config` and `pkg-build`.
 ## Commands
 
 ```
-cargo xtask pkg-config --binary <kbf-installer> --units packaging/linux/units \
+cargo xtask pkg-config --binary <kbf-installer> --kbf <kbf> --units packaging/linux/units \
   --trust <dir of gh, installer.conf, trusted_root.jsonl> \
   --sysusers packaging/linux/sysusers.d/kbf-installer.conf \
   --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf \
@@ -121,6 +125,6 @@ configuration).
 ## CI
 
 The `packages` job of `.github/workflows/beta.yml` fetches the pinned nfpm, builds the
-test-only `kbf-installer-stub` and the packages, then runs `pkg-install-test` on the deb
-in Ubuntu and the rpm in Fedora. The real binary replaces the stub by one path change:
-the `--binary` of `pkg-config`.
+test-only `kbf-installer-stub` (also as the package's `kbf`) and the packages, then runs
+`pkg-install-test` on the deb in Ubuntu and the rpm in Fedora. The real binaries replace the
+stub by two path changes: the `--binary` and the `--kbf` of `pkg-config`.

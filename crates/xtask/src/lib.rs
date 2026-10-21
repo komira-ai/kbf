@@ -34,7 +34,8 @@
 //!   package from the pinned `gh`, `gh`'s trusted root and the branch the package is
 //!   attested on, and the built deb as the release asset
 //!   `kbf-installer-<commit>-<platform>.deb`, refused unless it holds the binary of the
-//!   attested tarball and trusts the branch it is attested for.
+//!   attested `kbf-installer` tarball, the `kbf` of the attested `kbf` tarball (the deb and
+//!   the rpm carry it at `/usr/bin/kbf`) and trusts the branch it is attested for.
 //! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf-installer` package
 //!   carries, in the one form a deb and an rpm put in the same order, and the most a package
 //!   that carries a kbf release may weigh. `pkg-config` and `pkg-asset` take them up with
@@ -246,6 +247,9 @@ enum Verb {
         /// The kbf-installer binary.
         #[arg(long)]
         binary: PathBuf,
+        /// The `kbf` binary the package carries at `/usr/bin/kbf` (0755).
+        #[arg(long)]
+        kbf: PathBuf,
         /// The directory of `kbf-*.service` files.
         #[arg(long)]
         units: PathBuf,
@@ -319,6 +323,9 @@ enum Verb {
         /// The `kbf-installer-<commit>-<platform>.tar.gz` whose binary the deb must hold.
         #[arg(long)]
         binary_tarball: PathBuf,
+        /// The `kbf-<commit>-<platform>.tar.gz` whose `kbf` the deb must hold.
+        #[arg(long)]
+        kbf_tarball: PathBuf,
         /// The branch the deb must trust, and is attested for (`$GITHUB_REF`).
         #[arg(long)]
         expect_ref: String,
@@ -1011,6 +1018,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         ),
         Verb::PkgConfig {
             binary,
+            kbf,
             units,
             trust,
             sysusers,
@@ -1028,6 +1036,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             pkg_linux::write_config(
                 &pkg_linux::Inputs {
                     binary: &binary,
+                    kbf: &kbf,
                     units: &units,
                     trust: &trust,
                     sysusers: &sysusers,
@@ -1062,6 +1071,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             platform,
             commit,
             binary_tarball,
+            kbf_tarball,
             expect_ref,
             gh,
             out,
@@ -1076,6 +1086,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             &pkg_asset::Check {
                 platform,
                 binary_tarball: &binary_tarball,
+                kbf_tarball: &kbf_tarball,
                 expect_ref: &expect_ref,
                 gh: gh.as_deref(),
             },

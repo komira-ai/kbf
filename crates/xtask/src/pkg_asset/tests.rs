@@ -72,6 +72,8 @@ fn ar(members: &[(&str, &[u8])]) -> Vec<u8> {
 struct Fix {
     binary: Vec<u8>,
     binary_mode: u32,
+    kbf: Vec<u8>,
+    kbf_mode: u32,
     gh: Vec<u8>,
     gh_mode: u32,
     conf: String,
@@ -87,6 +89,8 @@ impl Fix {
         Fix {
             binary: b"\x7fELF the kbf-installer built for the commit".to_vec(),
             binary_mode: 0o755,
+            kbf: b"\x7fELF the kbf runtime built for the commit".to_vec(),
+            kbf_mode: 0o755,
             gh: b"\x7fELF the pinned gh".to_vec(),
             gh_mode: 0o755,
             conf: format!("SOURCE_REFS={MAIN}\n"),
@@ -106,6 +110,7 @@ impl Fix {
         let control_tgz = tgz(&[("control", 0o644, control.as_bytes())]);
         let mut files: Vec<(&str, u32, &[u8])> = vec![
             ("usr/bin/kbf-installer", self.binary_mode, &self.binary),
+            ("usr/bin/kbf", self.kbf_mode, &self.kbf),
             ("usr/share/kbf-installer/trust/gh", self.gh_mode, &self.gh),
             (
                 "usr/share/kbf-installer/trust/installer.conf",
@@ -130,8 +135,9 @@ impl Fix {
     }
 }
 
-/// A directory with the attested tarball of `binary` for `platform`, the pinned gh and
-/// `deb`: (dir, deb path, tarball path, gh path).
+/// A directory with the attested tarball of `binary` for `platform`, the attested tarball
+/// of the good package's `kbf` (`kbf.tar.gz`, where `check` looks for it), the pinned gh
+/// and `deb`: (dir, deb path, tarball path, gh path).
 fn world(
     name: &str,
     fix: &Fix,
@@ -145,6 +151,11 @@ fn world(
         binary_tarball("kbf-installer", binary).expect("tarball"),
     )
     .expect("tarball");
+    std::fs::write(
+        dir.join("kbf.tar.gz"),
+        binary_tarball("kbf", &Fix::new().kbf).expect("kbf tarball"),
+    )
+    .expect("kbf tarball");
     let gh = dir.join("gh");
     std::fs::write(&gh, b"\x7fELF the pinned gh").expect("gh");
     let deb = dir.join("kbf-installer_0.1.0+0123456789ab_amd64.deb");
@@ -153,9 +164,13 @@ fn world(
 }
 
 fn check<'a>(platform: Platform, tarball: &'a Path, r: &'a str, gh: Option<&'a Path>) -> Check<'a> {
+    // The `kbf` tarball `world` wrote beside the installer's; the leak lives as long as
+    // the test binary.
+    let kbf_tarball = tarball.with_file_name("kbf.tar.gz").into_boxed_path();
     Check {
         platform,
         binary_tarball: tarball,
+        kbf_tarball: Box::leak(kbf_tarball),
         expect_ref: r,
         gh,
     }
@@ -246,6 +261,64 @@ fn a_package_whose_binary_is_not_the_attested_one_is_refused() {
     .expect("problems");
     assert_eq!(got.len(), 1, "{got:?}");
     assert!(got[0].ends_with("holds no kbf-installer"), "{got:?}");
+}
+
+#[test]
+fn a_package_whose_kbf_is_not_the_attested_one_is_refused() {
+    // Catches: the deb carrying a kbf other than the one the kbf release tarball holds
+    // (`build-commit check-asset` showed that one names the commit, and the attestation
+    // covers it), even by one byte; the installer's binary shipped as the kbf (the two
+    // swapped); a kbf tarball with no kbf in it; and the kbf compared with the
+    // installer's tarball, or the installer's with the kbf's, so that one refusal is
+    // reported for the other.
+    let mut fix = Fix::new();
+    let mut other = fix.kbf.clone();
+    *other.last_mut().expect("byte") ^= 1;
+    fix.kbf = other;
+    let got = found("kbf-differs", &fix, MAIN);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].starts_with("usr/bin/kbf (sha256:"), "{got:?}");
+    assert!(got[0].contains("is not the binary of"), "{got:?}");
+    let mut fix = Fix::new();
+    fix.kbf = fix.binary.clone();
+    let got = found("kbf-is-installer", &fix, MAIN);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].starts_with("usr/bin/kbf (sha256:"), "{got:?}");
+    // The kbf tarball holds another file name.
+    let fix = Fix::new();
+    let (dir, deb, tarball, gh) = world(
+        "kbf-tarball-other-name",
+        &fix,
+        &fix.binary,
+        Platform::LinuxX86_64,
+    );
+    let kbf_tarball = dir.join("t.tar.gz");
+    std::fs::write(
+        &kbf_tarball,
+        binary_tarball("kbf-installer", &fix.kbf).expect("tarball"),
+    )
+    .expect("t");
+    let c = Check {
+        kbf_tarball: &kbf_tarball,
+        ..check(Platform::LinuxX86_64, &tarball, MAIN, Some(&gh))
+    };
+    let got = problems(&std::fs::read(&deb).expect("deb"), &c).expect("problems");
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].ends_with("holds no kbf"), "{got:?}");
+}
+
+#[test]
+fn a_kbf_that_is_not_mode_0755_is_refused() {
+    // Catches: the mode of the kbf not checked (a kbf of 0644 that no unit can run, or one
+    // writable by its group), the check made on the installer's binary alone, and a
+    // message that names the installer's path for the kbf's.
+    for mode in [0o644, 0o700, 0o775] {
+        let mut fix = Fix::new();
+        fix.kbf_mode = mode;
+        let got = found("kbf-mode", &fix, MAIN);
+        let want = format!("usr/bin/kbf has mode {mode:04o}, not 0755");
+        assert_eq!(got, [want]);
+    }
 }
 
 #[test]
@@ -360,6 +433,7 @@ fn the_wrong_architecture_a_missing_trust_file_and_a_bad_root_are_refused() {
     );
     for gone in [
         "usr/bin/kbf-installer",
+        "usr/bin/kbf",
         "usr/share/kbf-installer/trust/gh",
         "usr/share/kbf-installer/trust/installer.conf",
         "usr/share/kbf-installer/trust/trusted_root.jsonl",
@@ -689,6 +763,12 @@ fn files_the_check_needs_that_are_not_there_are_errors_not_findings() {
     assert!(!matches!(err, Error::Refused(_)), "{err:?}");
     let c = check(Platform::LinuxX86_64, &tarball, MAIN, Some(&none));
     let err = problems(&bytes, &c).expect_err("no gh");
+    assert!(!matches!(err, Error::Refused(_)), "{err:?}");
+    let c = Check {
+        kbf_tarball: &none,
+        ..check(Platform::LinuxX86_64, &tarball, MAIN, Some(&gh))
+    };
+    let err = problems(&bytes, &c).expect_err("no kbf tarball");
     assert!(!matches!(err, Error::Refused(_)), "{err:?}");
     assert!(binary_version(&none).is_err());
     let empty = dir.join("empty");

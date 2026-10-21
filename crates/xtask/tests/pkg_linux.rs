@@ -8,10 +8,13 @@
 use kbf_testkit::dir::TestDir;
 use std::path::Path;
 use std::process::{Command, Output};
+use xtask::fetch::Sha256;
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const STUB: &str = env!("CARGO_BIN_EXE_kbf-installer-stub");
 const FALSE: &str = "/usr/bin/false";
+/// The bytes of the `kbf` the package carries, not the installer's.
+const KBF: &[u8] = b"a stand-in kbf";
 
 /// An empty directory of its own for one test.
 fn scratch(name: &str) -> TestDir {
@@ -39,6 +42,7 @@ fn copy_inputs(dir: &Path) {
         std::fs::copy(packaging.join(file), dir.join(file.replace('/', "-"))).expect("copy");
     }
     std::fs::copy(STUB, dir.join("kbf-installer")).expect("stub");
+    std::fs::write(dir.join("kbf"), KBF).expect("kbf");
 }
 
 fn s(p: &Path) -> &str {
@@ -61,6 +65,8 @@ fn config(dir: &Path, version: &str) -> Output {
         "pkg-config",
         "--binary",
         s(&dir.join("kbf-installer")),
+        "--kbf",
+        s(&dir.join("kbf")),
         "--units",
         s(&dir.join("testdata/units")),
         "--trust",
@@ -103,6 +109,42 @@ fn pkg_config_writes_the_configuration_and_the_listing() {
         listing.contains(" /usr/lib/systemd/system/kbf-node.service "),
         "{listing}"
     );
+    // The package carries the file `--kbf` names, at /usr/bin/kbf, not the installer's.
+    assert!(yaml.contains("dst: \"/usr/bin/kbf\"\n"), "{yaml}");
+    let kbf = format!("file 0755 /usr/bin/kbf {}\n", Sha256::of(KBF));
+    assert!(listing.contains(&kbf), "{listing}");
+}
+
+#[test]
+fn pkg_config_needs_the_kbf_the_package_carries() {
+    // Catches: `--kbf` optional (a package with no kbf, exit 0), and a package written
+    // before the usage error is reported.
+    let dir = scratch("config-no-kbf");
+    copy_inputs(&dir);
+    let out = dir.join("out");
+    let run = xtask(&[
+        "pkg-config",
+        "--binary",
+        s(&dir.join("kbf-installer")),
+        "--units",
+        s(&dir.join("testdata/units")),
+        "--trust",
+        s(&dir.join("testdata/trust")),
+        "--sysusers",
+        s(&dir.join("sysusers.d-kbf-installer.conf")),
+        "--tmpfiles",
+        s(&dir.join("tmpfiles.d-kbf-installer.conf")),
+        "--platform",
+        "linux-x86_64",
+        "--version",
+        "0.0.0+ci",
+        "--out",
+        s(&out),
+    ]);
+    assert_eq!(run.status.code(), Some(2), "{}", text(&run.stderr));
+    let said = text(&run.stderr);
+    assert!(said.contains("--kbf"), "{said}");
+    assert!(!out.exists());
 }
 
 #[test]
@@ -180,6 +222,8 @@ fn pkg_config_takes_the_version_from_the_binary_or_from_the_flag_and_not_both() 
             "pkg-config".to_owned(),
             "--binary".to_owned(),
             s(&dir.join("kbf-installer")).to_owned(),
+            "--kbf".to_owned(),
+            s(&dir.join("kbf")).to_owned(),
             "--units".to_owned(),
             s(&dir.join("testdata/units")).to_owned(),
             "--trust".to_owned(),
@@ -314,8 +358,9 @@ fn tgz(files: &[(&str, u32, &[u8])]) -> Vec<u8> {
     tar.into_inner().expect("tar").finish().expect("gzip")
 }
 
-/// A deb as nfpm writes one, holding `binary`, a `gh`, and the trust files for `source_ref`.
-fn deb_of(binary: &[u8], source_ref: &str) -> Vec<u8> {
+/// A deb as nfpm writes one, holding `binary`, `kbf`, a `gh`, and the trust files for
+/// `source_ref`.
+fn deb_of(binary: &[u8], kbf: &[u8], source_ref: &str) -> Vec<u8> {
     let control = tgz(&[(
         "control",
         0o644,
@@ -324,6 +369,7 @@ fn deb_of(binary: &[u8], source_ref: &str) -> Vec<u8> {
     let conf = format!("SOURCE_REFS={source_ref}\n");
     let data = tgz(&[
         ("usr/bin/kbf-installer", 0o755, binary),
+        ("usr/bin/kbf", 0o755, kbf),
         ("usr/share/kbf-installer/trust/gh", 0o755, b"the pinned gh"),
         (
             "usr/share/kbf-installer/trust/installer.conf",
@@ -410,16 +456,19 @@ fn pkg_asset_adds_the_package_as_the_asset_or_only_verifies_it() {
     // Catches: `--out` and `--verify-only` swapped (the verify job writing into a
     // directory, the build job writing nothing), the package found by directory not
     // reaching the check, a refused package leaving an asset behind, and a deb that is
-    // not the attested binary's accepted.
+    // not the attested binary's accepted, the same for the `kbf` the deb carries and
+    // `--kbf-tarball`.
     let dir = scratch("asset");
     let binary: &[u8] = b"\x7fELF the kbf-installer";
     let tarball = dir.join(format!("kbf-installer-{COMMIT}-linux-x86_64.tar.gz"));
     std::fs::write(&tarball, tgz(&[("kbf-installer", 0o755, binary)])).expect("tarball");
+    let kbf_tarball = dir.join(format!("kbf-{COMMIT}-linux-x86_64.tar.gz"));
+    std::fs::write(&kbf_tarball, tgz(&[("kbf", 0o755, KBF)])).expect("kbf tarball");
     let pkgs = dir.join("pkgs");
     std::fs::create_dir_all(&pkgs).expect("pkgs");
     std::fs::write(
         pkgs.join("kbf-installer_0.1.0_amd64.deb"),
-        deb_of(binary, MAIN),
+        deb_of(binary, KBF, MAIN),
     )
     .expect("deb");
     let out = dir.join("dist");
@@ -434,6 +483,8 @@ fn pkg_asset_adds_the_package_as_the_asset_or_only_verifies_it() {
             COMMIT,
             "--binary-tarball",
             s(&tarball),
+            "--kbf-tarball",
+            s(&kbf_tarball),
             "--expect-ref",
             MAIN,
         ];
@@ -463,7 +514,8 @@ fn pkg_asset_adds_the_package_as_the_asset_or_only_verifies_it() {
     // A package of another binary: refused by either mode, and nothing is written.
     let other = dir.join("other");
     std::fs::create_dir_all(&other).expect("other");
-    std::fs::write(other.join("p.deb"), deb_of(b"another binary", MAIN)).expect("deb");
+    let another = deb_of(b"another binary", KBF, MAIN);
+    std::fs::write(other.join("p.deb"), another).expect("deb");
     let fresh = dir.join("fresh");
     let refused = run(&other, &["--out", s(&fresh)]);
     assert_eq!(refused.status.code(), Some(1), "{}", text(&refused.stderr));
@@ -474,6 +526,21 @@ fn pkg_asset_adds_the_package_as_the_asset_or_only_verifies_it() {
     );
     assert!(!fresh.exists());
     let refused = run(&other.join("p.deb"), &["--verify-only"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", text(&refused.stderr));
+    // A package of another kbf: refused by either mode too, and nothing is written.
+    let other_kbf = dir.join("other-kbf");
+    std::fs::create_dir_all(&other_kbf).expect("other kbf");
+    let another = deb_of(binary, b"another kbf", MAIN);
+    std::fs::write(other_kbf.join("p.deb"), another).expect("deb");
+    let fresh = dir.join("fresh-kbf");
+    let refused = run(&other_kbf, &["--out", s(&fresh)]);
+    assert_eq!(refused.status.code(), Some(1), "{}", text(&refused.stderr));
+    let said = text(&refused.stderr);
+    assert!(said.contains("usr/bin/kbf (sha256:"), "{said}");
+    assert!(said.contains("is not the binary of"), "{said}");
+    assert!(!said.contains("usr/bin/kbf-installer"), "{said}");
+    assert!(!fresh.exists());
+    let refused = run(&other_kbf.join("p.deb"), &["--verify-only"]);
     assert_eq!(refused.status.code(), Some(1), "{}", text(&refused.stderr));
 }
 
@@ -494,6 +561,8 @@ fn pkg_asset_names_a_directory_without_a_package() {
         COMMIT,
         "--binary-tarball",
         s(&dir.join("none.tar.gz")),
+        "--kbf-tarball",
+        s(&dir.join("none-kbf.tar.gz")),
         "--expect-ref",
         MAIN,
         "--verify-only",
@@ -504,4 +573,38 @@ fn pkg_asset_names_a_directory_without_a_package() {
         "{}",
         text(&out.stderr)
     );
+}
+
+#[test]
+fn pkg_asset_needs_the_kbf_tarball_in_both_modes() {
+    // Catches: `--kbf-tarball` optional, so that a deb is made an asset, or verified after
+    // signing, with its kbf compared with nothing.
+    let dir = scratch("asset-no-kbf-tarball");
+    let none = dir.join("none.tar.gz");
+    let run = |mode: &[&str]| {
+        let mut args = vec![
+            "pkg-asset",
+            "--package",
+            s(&dir),
+            "--platform",
+            "linux-x86_64",
+            "--commit",
+            COMMIT,
+            "--binary-tarball",
+            s(&none),
+            "--expect-ref",
+            MAIN,
+        ];
+        args.extend(mode);
+        xtask(&args)
+    };
+    let dist = dir.join("dist");
+    let modes: [&[&str]; 2] = [&["--verify-only"], &["--out", s(&dist)]];
+    for mode in modes {
+        let out = run(mode);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+        let said = text(&out.stderr);
+        assert!(said.contains("--kbf-tarball"), "{said}");
+    }
+    assert!(!dist.exists());
 }

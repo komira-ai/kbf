@@ -261,7 +261,8 @@ jobs:
       # installer.conf that trusts the branch this commit is attested on (`PKG_SOURCE_REF`: the
       # pushed branch on a push). nfpm builds it twice and the bytes must match; a fresh Ubuntu
       # container installs, runs and removes it; `pkg-asset` then refuses it unless it holds the
-      # binary of the tarball checked above and trusts that branch, and lists it in SHA256SUMS.
+      # binary of the tarball checked above and the kbf of the kbf tarball (the package carries the
+      # `kbf` of this job at /usr/bin/kbf), and trusts that branch, and lists it in SHA256SUMS.
       - name: Fetch the pinned gh, for the package's trust directory
         run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_amd64.tar.gz" --sha256 "$GH_SHA256_X86_64_LINUX" --out "$RUNNER_TEMP/tools/gh" --extract tar.gz --member "gh_${GH_VERSION}_linux_amd64/bin/gh"
       - name: Fetch nfpm (pinned version, checked by SHA-256)
@@ -273,13 +274,13 @@ jobs:
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
       - name: Write the nfpm configuration
-        run: cargo xtask pkg-config --binary "target/$TARGET/release/kbf-installer" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --platform linux-x86_64 --version-of "target/$TARGET/release/kbf-installer" --out target/pkg
+        run: cargo xtask pkg-config --binary "target/$TARGET/release/kbf-installer" --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --platform linux-x86_64 --version-of "target/$TARGET/release/kbf-installer" --out target/pkg
       - name: Build the deb and the rpm, each twice
         run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/nfpm.yaml --out target/pkg/out
       - name: Install, run, remove and purge the deb in a fresh Ubuntu container
         run: cargo xtask pkg-install-test --package target/pkg/out --format deb --listing target/pkg/listing.txt --image-dir packaging/linux/test/ubuntu --probe "/usr/share/kbf-installer/trust/gh --version::gh version $GH_VERSION" --probe "kbf-installer --version --json::${GITHUB_SHA:0:12}"
       - name: The deb is the attested binary and trusts this branch, and is an asset
-        run: cargo xtask pkg-asset --package target/pkg/out --platform linux-x86_64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-x86_64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
+        run: cargo xtask pkg-asset --package target/pkg/out --platform linux-x86_64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-x86_64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" --gh "$RUNNER_TEMP/tools/gh" --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-x86_64
@@ -363,7 +364,8 @@ jobs:
       # installer.conf that trusts the branch this commit is attested on (`PKG_SOURCE_REF`: the
       # pushed branch on a push). nfpm builds it twice and the bytes must match; a fresh Ubuntu
       # container installs, runs and removes it; `pkg-asset` then refuses it unless it holds the
-      # binary of the tarball checked above and trusts that branch, and lists it in SHA256SUMS.
+      # binary of the tarball checked above and the kbf of the kbf tarball (the package carries the
+      # `kbf` of this job at /usr/bin/kbf), and trusts that branch, and lists it in SHA256SUMS.
       - name: Fetch the pinned gh, for the package's trust directory
         run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_arm64.tar.gz" --sha256 "$GH_SHA256_AARCH64_LINUX" --out "$RUNNER_TEMP/tools/gh" --extract tar.gz --member "gh_${GH_VERSION}_linux_arm64/bin/gh"
       - name: Fetch nfpm (pinned version, checked by SHA-256)
@@ -375,13 +377,13 @@ jobs:
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
       - name: Write the nfpm configuration
-        run: cargo xtask pkg-config --binary "target/$TARGET/release/kbf-installer" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --platform linux-arm64 --version-of "target/$TARGET/release/kbf-installer" --out target/pkg
+        run: cargo xtask pkg-config --binary "target/$TARGET/release/kbf-installer" --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --platform linux-arm64 --version-of "target/$TARGET/release/kbf-installer" --out target/pkg
       - name: Build the deb and the rpm, each twice
         run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/nfpm.yaml --out target/pkg/out
       - name: Install, run, remove and purge the deb in a fresh Ubuntu container
         run: cargo xtask pkg-install-test --package target/pkg/out --format deb --listing target/pkg/listing.txt --image-dir packaging/linux/test/ubuntu --probe "/usr/share/kbf-installer/trust/gh --version::gh version $GH_VERSION" --probe "kbf-installer --version --json::${GITHUB_SHA:0:12}"
       - name: The deb is the attested binary and trusts this branch, and is an asset
-        run: cargo xtask pkg-asset --package target/pkg/out --platform linux-arm64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
+        run: cargo xtask pkg-asset --package target/pkg/out --platform linux-arm64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --gh "$RUNNER_TEMP/tools/gh" --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-arm64
@@ -792,9 +794,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_WORKFLOW_REF" --source-ref "$GITHUB_REF" --commit "$GITHUB_SHA" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"
       - name: The signed linux-x86_64 package holds the attested binary and trusts this branch
-        run: cargo xtask pkg-asset --verify-only --package "dist/kbf-installer-$GITHUB_SHA-linux-x86_64.deb" --platform linux-x86_64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-x86_64.tar.gz" --expect-ref "$GITHUB_REF"
+        run: cargo xtask pkg-asset --verify-only --package "dist/kbf-installer-$GITHUB_SHA-linux-x86_64.deb" --platform linux-x86_64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-x86_64.tar.gz" --expect-ref "$GITHUB_REF" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz"
       - name: The signed linux-arm64 package holds the attested binary and trusts this branch
-        run: cargo xtask pkg-asset --verify-only --package "dist/kbf-installer-$GITHUB_SHA-linux-arm64.deb" --platform linux-arm64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$GITHUB_REF"
+        run: cargo xtask pkg-asset --verify-only --package "dist/kbf-installer-$GITHUB_SHA-linux-arm64.deb" --platform linux-arm64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$GITHUB_REF" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz"
 
   # Push to main only, after attest-darwin-arm64: the checks the planned deployment
   # job is to make (cargo xtask verify-assets, crates/xtask/src/sums.rs), for the branch
