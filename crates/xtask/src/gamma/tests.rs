@@ -416,3 +416,17 @@ fn the_policy_names_the_host_by_its_tag_and_says_to_tag_it() {
     has(&text, &format!("\"{HOST_TAG}\": [\"autogroup:admin\"]"));
     has(&text, &format!("tailscale set --advertise-tags={HOST_TAG}"));
 }
+
+/// Catches: the check job's farm config set as a repository variable (GitHub prints a variable
+/// in the step header and the farm's addresses are in it), or left out of the held steps; and
+/// the secret's name drifting from the one `check-build` reads.
+#[test]
+fn the_farm_config_is_a_secret_and_the_targets_a_variable() {
+    let lines = held_steps(REPO, HOST, USER, TAG).unwrap();
+    let secret = format!("gh secret set {BUCKCONFIG_ENV} --env gamma --repo {REPO}");
+    assert!(lines.contains(&secret), "{secret}");
+    let targets = format!("gh variable set GAMMA_CHECK_TARGETS --repo {REPO}");
+    assert!(lines.contains(&targets), "{targets}");
+    let text = lines.join("\n");
+    lacks(&text, &format!("gh variable set {BUCKCONFIG_ENV}"));
+}

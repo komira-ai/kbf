@@ -131,7 +131,7 @@ result = "release.json"
 The lint refuses a workflow job that names a stage not in the file, an `actions` stage with no job, a `pull_request` trigger
 on any of these workflows, an unpinned `uses:`, and `id-token: write` anywhere but `attest`. A `runs = "operator"` stage has
 no job; the lint instead checks that `release.yml` verifies the verdict (section 8). The stage file as built is
-`release/stages.yml`, where gamma is an `actions` stage with the jobs `gamma.yml#offer` and `gamma.yml#deploy`, after the
+`release/stages.yml`, where gamma is an `actions` stage with the jobs `gamma.yml#offer`, `gamma.yml#deploy` and `gamma.yml#check`, after the
 build stage until the beta result is attested.
 
 ## 3. The artifact every stage consumes
@@ -448,6 +448,12 @@ beta scenario in the same change that fixes it (section 11).
   account may run that one command as root (`cargo xtask gamma sudoers-line` prints the line, made from the same argument
   list, with the commit as forty `[0-9a-f]` classes and no wildcard). The host verifies the attestations itself: the tar is
   bytes, not trust (`gamma-deploy.md`).
+- **`check`** needs `offer` and `deploy`, has the deploy's `if:`, environment and concurrency group, and `contents: read`.
+  After a deploy that succeeded it builds komira's `main` against the farm just updated, with the farm's normal caching,
+  and passes only on `BUILD SUCCEEDED` with `local: 0` in buck2's last `Commands:` line (`cargo xtask gamma check-build`).
+  The job summary shows that line and the verdict; buck2's output stays in a log file on the runner, because it names the
+  farm. The targets are the repository variable `GAMMA_CHECK_TARGETS`; the farm's buckconfig is a secret of the
+  environment. No flag that bypasses the cache is accepted anywhere (`gamma-deploy.md`, "The check after a deploy").
 - **What is public.** This repository's logs and artifacts are. The installer's summary names nodes, so the table and the
   uploaded `summary.json` hold only an allow-list of it (the commit, the result, the exit status and reason code, the step
   names, the platform, state and seconds of each node, the post checks and the offer's numbers), never a node, a free text or

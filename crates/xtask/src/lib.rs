@@ -51,11 +51,12 @@
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
-//! - `gamma {evidence,deploy,summary,sudoers-line,held-steps}` ([`gamma`]): the steps of
-//!   `gamma.yml`, which follows a cut release to the one gamma host: whether the release run
-//!   published, the deploy through `tailscale ssh` and `sudo` (refused unless the commit is
-//!   the highest release), its summary with no node or host in it, the sudoers line, and the
-//!   settings a person makes once (printed, never applied).
+//! - `gamma {evidence,deploy,check-build,summary,sudoers-line,held-steps}` ([`gamma`]): the
+//!   steps of `gamma.yml`, which follows a cut release to the one gamma host: whether the
+//!   release run published, the deploy through `tailscale ssh` and `sudo` (refused unless the
+//!   commit is the highest release), the build of komira's main against the updated farm (with
+//!   the farm's cache; it must run nothing locally), the summary with no node or host in it,
+//!   the sudoers line, and the settings a person makes once (printed, never applied).
 //! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
 //!   unit.
@@ -706,6 +707,29 @@ enum GammaVerb {
         #[arg(long, default_value = "gh")]
         gh: PathBuf,
     },
+    /// Build komira's main against the farm just updated, with its normal caching. Passes
+    /// only for `BUILD SUCCEEDED` and `local: 0`; the farm's buckconfig is the environment
+    /// variable `GAMMA_FARM_BUCKCONFIG`. Prints the `Commands:` line and the verdict, and
+    /// nothing buck2 wrote.
+    CheckBuild {
+        /// The checkout of komira's main (its `buck2` launcher is at the top).
+        #[arg(long)]
+        komira_dir: PathBuf,
+        /// The targets to build, separated by white space (the variable
+        /// `GAMMA_CHECK_TARGETS`). A flag, such as `--no-remote-cache`, is refused.
+        #[arg(long)]
+        targets: String,
+        /// Where the farm's buckconfig is written: an absolute path, given to buck2.
+        #[arg(long)]
+        buckconfig_file: PathBuf,
+        /// Where buck2's whole output goes. It is never printed.
+        #[arg(long)]
+        log: PathBuf,
+        /// Append the `Commands:` line and the verdict to this file (on Actions,
+        /// `GITHUB_STEP_SUMMARY`).
+        #[arg(long)]
+        summary: PathBuf,
+    },
     /// Append a table of the redacted summary to a file (`GITHUB_STEP_SUMMARY`).
     Summary {
         #[arg(long)]
@@ -1095,6 +1119,23 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             raw: &raw,
             summary: &summary,
         }),
+        Verb::Gamma(GammaVerb::CheckBuild {
+            komira_dir,
+            targets,
+            buckconfig_file,
+            log,
+            summary,
+        }) => {
+            let config = std::env::var(gamma::BUCKCONFIG_ENV).unwrap_or_default();
+            gamma::check_build(&gamma::CheckBuild {
+                komira_dir: &komira_dir,
+                targets: &targets,
+                config: &config,
+                buckconfig_file: &buckconfig_file,
+                log: &log,
+                summary: &summary,
+            })
+        }
         Verb::Gamma(GammaVerb::Summary { file, output }) => gamma::summary(&file, &output),
         Verb::Gamma(GammaVerb::SudoersLine { user }) => Ok(vec![gamma::sudoers_line(&user)?]),
         Verb::Gamma(GammaVerb::HeldSteps {

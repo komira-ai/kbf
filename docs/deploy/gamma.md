@@ -3,8 +3,9 @@
 `.github/workflows/gamma.yml` follows a cut release to the one gamma host, the frontend of our own build farm. The
 design is `docs/design/kbf-cicd.md`, section 5.4; the command it runs on the host is `kbf-installer deploy`
 (`docs/design/gamma-deploy.md`). The workflow is inert until the settings below exist: while any of the repository
-variables `GAMMA_HOST`, `GAMMA_USER` and `TS_TAG` is unset, its `deploy` job is skipped, which is a green run. Deleting one
-of them stops gamma again.
+variables `GAMMA_HOST`, `GAMMA_USER` and `TS_TAG` is unset, its `deploy` job is skipped, which is a green run, and so is the
+`check` job that builds komira's `main` against the farm after the deploy (`gamma-deploy.md`, "The check after a deploy").
+Deleting one of them stops gamma again.
 
 Nothing here is applied by code. `cargo xtask gamma held-steps` prints every step for the names it is given, checks the
 names first, and has no `--apply`:
@@ -17,7 +18,10 @@ What it prints, in order:
 
 1. **GitHub.** The `gamma` environment, restricted to deployments from `main`; the three repository variables; and the
    secrets `TS_OAUTH_CLIENT_ID` and `TS_OAUTH_SECRET` of that environment, which `gh` asks for on the terminal (no value is
-   on a command line). The OAuth client is the only credential in the workflow.
+   on a command line). The OAuth client is the only credential that reaches the host. Two more settings serve the check:
+   the repository variable `GAMMA_CHECK_TARGETS` (the komira targets to build, separated by spaces) and the secret
+   `GAMMA_FARM_BUCKCONFIG` of the environment (the buckconfig that points buck2 at the farm; a secret and not a variable
+   because it names the farm and GitHub prints a variable in the step's log).
 2. **Tailscale.** An OAuth client with the scope "Auth Keys: Write" only, restricted to the tag, and the policy block: the
    tag owners, a grant to the host's SSH port and an SSH rule that lets the tag log in to the host as the deploy account.
    An SSH rule's destination is a tag, not a device name, so the host carries its own tag (`tag:kbf-gamma-host`).

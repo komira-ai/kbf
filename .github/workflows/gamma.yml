@@ -20,8 +20,14 @@
 # installer's summary out of the log and the artifact: the table and the uploaded file are the
 # redacted one. The tar is bytes, not trust: the host verifies the attestations itself.
 #
+# `check` follows a deploy that succeeded and builds komira's main against the farm just
+# updated, with the farm's normal caching: it passes only on BUILD SUCCEEDED with `local: 0`,
+# and the job summary shows buck2's Commands line and the verdict. The repository variable
+# GAMMA_CHECK_TARGETS names the targets; the farm's buckconfig is a secret of the environment.
+#
 # Inert until configured: with any of the repository variables GAMMA_HOST, GAMMA_USER and
-# TS_TAG unset, `deploy` is skipped, which is a green run. Deleting one is the stop switch.
+# TS_TAG unset, `deploy` is skipped, which is a green run, and `check` with it. Deleting one is
+# the stop switch.
 # The OAuth client is the only credential, a secret of the `gamma` environment, which allows
 # deployments from main only, and it reaches one step, after `cargo xtask` is built. No
 # host or user is written in this file (they are repository variables, and public once a step
@@ -144,3 +150,51 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
           overwrite: true
+
+  # After a deploy that succeeded, build komira's main against the farm that was just updated,
+  # with the farm's normal caching, and pass only on BUILD SUCCEEDED with `local: 0` in buck2's
+  # Commands line (nothing ran on this runner). The job is skipped, which is green, whenever
+  # `deploy` is: the stop switch is the same. It joins the tailnet as `deploy` does and queues in
+  # the same group, so it never runs during a roll; a newer release replaces a check that is
+  # still pending, and that release has its own.
+  #
+  # komira's text runs in one step only, inside `cargo xtask gamma check-build`, after the
+  # build of `cargo xtask`: no other step of this job runs a script of the checkout. That step
+  # holds the farm's buckconfig, a secret of the `gamma` environment and not a variable
+  # because it names the farm and the logs are public. `check-build` prints the Commands line
+  # and the verdict and nothing else of what buck2 wrote, and refuses any flag in the targets.
+  check:
+    needs: [offer, deploy]
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.offer.outputs.staged == 'true' && vars.GAMMA_HOST != '' && vars.GAMMA_USER != '' && vars.TS_TAG != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    concurrency:
+      group: gamma
+      cancel-in-progress: false
+    environment: gamma
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # Built before komira's text is in the workspace.
+      - run: cargo build -p xtask --locked
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: komira-ai/komira
+          ref: main
+          path: komira-main
+          persist-credentials: false
+      - uses: tailscale/github-action@a392da0a182bba0e9613b6243ebd69529b1878aa # v4.1.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: ${{ vars.TS_TAG }}
+          use-cache: true
+      - name: Build komira main on the farm
+        env:
+          TARGETS: ${{ vars.GAMMA_CHECK_TARGETS }}
+          GAMMA_FARM_BUCKCONFIG: ${{ secrets.GAMMA_FARM_BUCKCONFIG }}
+        run: cargo xtask gamma check-build --komira-dir komira-main --targets "$TARGETS" --buckconfig-file "$RUNNER_TEMP/farm.buckconfig" --log "$RUNNER_TEMP/check-build.log" --summary "$GITHUB_STEP_SUMMARY"

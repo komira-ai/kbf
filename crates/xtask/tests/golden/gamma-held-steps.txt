@@ -7,10 +7,14 @@ gh api -X POST repos/komira-ai/kbf/environments/gamma/deployment-branch-policies
 gh variable set GAMMA_HOST --repo komira-ai/kbf --body farm-front
 gh variable set GAMMA_USER --repo komira-ai/kbf --body kbf-deploy
 gh variable set TS_TAG --repo komira-ai/kbf --body tag:kbf-gamma-ci
+gh variable set GAMMA_CHECK_TARGETS --repo komira-ai/kbf
 gh secret set TS_OAUTH_CLIENT_ID --env gamma --repo komira-ai/kbf
 gh secret set TS_OAUTH_SECRET --env gamma --repo komira-ai/kbf
+gh secret set GAMMA_FARM_BUCKCONFIG --env gamma --repo komira-ai/kbf
 # The secrets are asked for on the terminal: no value is on a command line.
-# While GAMMA_HOST, GAMMA_USER or TS_TAG is unset the deploy job is skipped (a green run). To stop gamma, delete one: gh variable delete GAMMA_HOST --repo komira-ai/kbf
+# GAMMA_CHECK_TARGETS, asked for the same way, is the komira targets the check job builds after a deploy, separated by spaces. It is a variable, so it is public.
+# GAMMA_FARM_BUCKCONFIG is the text of the buckconfig that points buck2 at the farm. It is a secret and not a variable because it names the farm and this repository's logs are public (GitHub masks it line by line).
+# While GAMMA_HOST, GAMMA_USER or TS_TAG is unset the deploy job is skipped (a green run), and so is the check job that follows it. To stop gamma, delete one: gh variable delete GAMMA_HOST --repo komira-ai/kbf
 # GitHub prints a variable's value in the log of any step that has it in its environment, and this repository's logs are public: use the short tailnet name for the host, never an address.
 
 # 2. Tailscale: an OAuth client with the scope "Auth Keys: Write" only, restricted to tag:kbf-gamma-ci; its id and secret are the two secrets of step 1.
@@ -20,6 +24,7 @@ gh secret set TS_OAUTH_SECRET --env gamma --repo komira-ai/kbf
   "grants": [{ "src": ["tag:kbf-gamma-ci"], "dst": ["tag:kbf-gamma-host"], "ip": ["22"] }],
   "ssh": [{ "action": "accept", "src": ["tag:kbf-gamma-ci"], "dst": ["tag:kbf-gamma-host"], "users": ["kbf-deploy"] }]
 }
+# The check job builds on the farm over the tailnet with the same identity (tag:kbf-gamma-ci): also grant it the farm's build port in that policy, and nothing else.
 
 # 3. The frontend host, as root there
 # a. The account kbf-deploy exists. It has no password: it only receives the ssh command.

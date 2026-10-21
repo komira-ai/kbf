@@ -26,6 +26,14 @@
 //!   failure.
 //! - `gamma sudoers-line --user <account>` ([`sudoers_line`]): the line of the host's sudoers
 //!   file that lets the account run [`COMMAND`] as root and nothing else.
+//! - `gamma check-build --komira-dir <dir> --targets <targets> --buckconfig-file <path> --log
+//!   <file> --summary <file>` ([`check_build`]): after the deploy, builds komira's main
+//!   (`<dir>`) against the farm just updated, with the farm's normal caching, using the config
+//!   in the environment variable [`BUCKCONFIG_ENV`] (a secret: it names the farm). Passes only
+//!   for `BUILD SUCCEEDED`, `local: 0` in buck2's last `Commands:` line and exit status 0;
+//!   `--no-remote-cache` is refused wherever it could come from. buck2's output goes to
+//!   `--log` and is never printed; the `Commands:` line and the verdict are appended to
+//!   `--summary` (on Actions, `GITHUB_STEP_SUMMARY`).
 //! - `gamma held-steps --repo <owner/repo> --host <h> --user <u> [--tag <tag>]`
 //!   ([`held_steps`]): the settings a person makes once (the environment, its variables and
 //!   secrets, the Tailscale policy, the host). It prints them and does nothing: it has no
@@ -41,6 +49,9 @@ use serde_json::{Value, json};
 use crate::Error;
 use crate::build_commit::full_commit;
 use crate::release::{self, tags};
+
+mod check;
+pub use check::{BUCKCONFIG_ENV, CheckBuild, check_build};
 
 /// The workflow whose push run on `main` this follows: `release.yml`, named `release`.
 pub const RELEASE_WORKFLOW: &str = "release";
@@ -452,10 +463,14 @@ const HELD: &[&str] = &[
     "gh variable set GAMMA_HOST --repo {repo} --body {host}",
     "gh variable set GAMMA_USER --repo {repo} --body {user}",
     "gh variable set TS_TAG --repo {repo} --body {tag}",
+    "gh variable set GAMMA_CHECK_TARGETS --repo {repo}",
     "gh secret set TS_OAUTH_CLIENT_ID --env gamma --repo {repo}",
     "gh secret set TS_OAUTH_SECRET --env gamma --repo {repo}",
+    "gh secret set GAMMA_FARM_BUCKCONFIG --env gamma --repo {repo}",
     "# The secrets are asked for on the terminal: no value is on a command line.",
-    "# While GAMMA_HOST, GAMMA_USER or TS_TAG is unset the deploy job is skipped (a green run). To stop gamma, delete one: gh variable delete GAMMA_HOST --repo {repo}",
+    "# GAMMA_CHECK_TARGETS, asked for the same way, is the komira targets the check job builds after a deploy, separated by spaces. It is a variable, so it is public.",
+    "# GAMMA_FARM_BUCKCONFIG is the text of the buckconfig that points buck2 at the farm. It is a secret and not a variable because it names the farm and this repository's logs are public (GitHub masks it line by line).",
+    "# While GAMMA_HOST, GAMMA_USER or TS_TAG is unset the deploy job is skipped (a green run), and so is the check job that follows it. To stop gamma, delete one: gh variable delete GAMMA_HOST --repo {repo}",
     "# GitHub prints a variable's value in the log of any step that has it in its environment, and this repository's logs are public: use the short tailnet name for the host, never an address.",
     "",
     r#"# 2. Tailscale: an OAuth client with the scope "Auth Keys: Write" only, restricted to {tag}; its id and secret are the two secrets of step 1."#,
@@ -465,6 +480,7 @@ const HELD: &[&str] = &[
     r#"  "grants": [{ "src": ["{tag}"], "dst": ["{host_tag}"], "ip": ["22"] }],"#,
     r#"  "ssh": [{ "action": "accept", "src": ["{tag}"], "dst": ["{host_tag}"], "users": ["{user}"] }]"#,
     "}",
+    "# The check job builds on the farm over the tailnet with the same identity ({tag}): also grant it the farm's build port in that policy, and nothing else.",
     "",
     "# 3. The frontend host, as root there",
     "# a. The account {user} exists. It has no password: it only receives the ssh command.",

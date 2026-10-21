@@ -177,7 +177,8 @@ fn the_permissions_are_exact() {
 #[test]
 fn the_oauth_client_reaches_one_step_after_the_build() {
     let text = real_gamma();
-    assert_eq!(text.matches("secrets.").count(), 2);
+    // Two for the Tailscale step of each of `deploy` and `check`, one for the farm's config.
+    assert_eq!(text.matches("secrets.").count(), 5);
     let steps = job_steps(&text, "deploy").expect("steps");
     let at = |pred: &dyn Fn(&Step) -> bool| steps.iter().position(pred).expect("step");
     let build = at(&|s| s.run.as_deref() == Some("cargo build -p xtask --locked"));
@@ -365,6 +366,196 @@ fn the_deploys_queue_in_the_deploy_job_and_not_in_the_workflow() {
     refused(&plant(group, ""), "a `concurrency` in `deploy`");
 }
 
+/// The lines of the `check` job the plants work on.
+const CHECKOUT: &str =
+    "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n";
+const KOMIRA_WITH: &str = concat!(
+    "        with:\n",
+    "          repository: komira-ai/komira\n",
+    "          ref: main\n",
+    "          path: komira-main\n",
+    "          persist-credentials: false\n"
+);
+const CHECK_BUILD: &str = concat!(
+    "      # Built before komira's text is in the workspace.\n",
+    "      - run: cargo build -p xtask --locked\n"
+);
+const CHECK_READ: &str =
+    "    environment: gamma\n    permissions:\n      contents: read\n    steps:\n";
+const GROUP: &str = "    concurrency:\n      group: gamma\n      cancel-in-progress: false\n";
+const TARGETS_ENV: &str = "          TARGETS: ${{ vars.GAMMA_CHECK_TARGETS }}\n";
+const FARM_ENV: &str = "          GAMMA_FARM_BUCKCONFIG: ${{ secrets.GAMMA_FARM_BUCKCONFIG }}\n";
+const SUMMARY_ARG: &str = "--summary \"$GITHUB_STEP_SUMMARY\"";
+
+/// The checkout of komira's main, as `check` has it.
+fn komira_step() -> String {
+    format!("{CHECKOUT}{KOMIRA_WITH}")
+}
+
+/// Proves `check` follows a successful deploy in the same environment, group and `if:`: it
+/// needs the offer and the deploy, runs in `gamma`, has the deploy's exact `if:` (so an unset
+/// repository variable skips both: the stop switch) and queues in the deploy's group. Catches:
+/// a check that runs when the deploy did not, outside the environment, or during a roll.
+#[test]
+fn check_needs_the_deploy_and_shares_its_gate_environment_and_group() {
+    let needs = "the needs of `check`";
+    let line = "    needs: [offer, deploy]\n";
+    refused(&plant(line, "    needs: [offer]\n"), needs);
+    refused(&plant(line, "    needs: [deploy]\n"), needs);
+    refused(&plant(line, ""), needs);
+    let environment = "the environment of `check`";
+    let no_env = CHECK_READ.replacen("    environment: gamma\n", "", 1);
+    refused(&plant(CHECK_READ, &no_env), environment);
+    let prod = CHECK_READ.replacen("gamma", "prod", 1);
+    refused(&plant(CHECK_READ, &prod), environment);
+    // Only the check's `if:` is changed in each plant below (the deploy's is not).
+    let check_if = "the `if:` of `check`";
+    let head = "    needs: [offer, deploy]\n    if: ${{ ";
+    refused(&plant(head, &format!("{head}true || ")), check_if);
+    let conclusion = "github.event.workflow_run.conclusion == 'success' && ";
+    refused(&plant(&format!("{head}{conclusion}"), head), check_if);
+    let tail = "    runs-on: ubuntu-24.04\n    timeout-minutes: 120\n";
+    let unset = [" && vars.TS_TAG != '' }}\n", tail].concat();
+    let open = [" }}\n", tail].concat();
+    refused(&plant(&unset, &open), check_if);
+    // The group is the deploy's, so a check never runs during a roll.
+    assert_eq!(real_gamma().matches(GROUP).count(), 2);
+    let own = [GROUP, CHECK_READ].concat();
+    refused(&plant(&own, CHECK_READ), "a `concurrency` in `check`");
+    let renamed = GROUP.replace("group: gamma", "group: gamma-check");
+    let text = plant(&own, &[renamed.as_str(), CHECK_READ].concat());
+    refused(&text, "the jobs in the `gamma` group");
+}
+
+/// Proves the permissions of `check` are `contents: read` and nothing else. Catches: a write
+/// scope, another read scope, `id-token` and no permissions at all (the workflow's `{}` would
+/// make the checkout fail, and a looser default must not take its place).
+#[test]
+fn check_has_contents_read_and_nothing_else() {
+    let perms = "the permissions of `check`";
+    let read = "contents: read\n";
+    let write = CHECK_READ.replace(read, "contents: write\n");
+    refused(&plant(CHECK_READ, &write), perms);
+    let actions = CHECK_READ.replace(read, "contents: read\n      actions: read\n");
+    refused(&plant(CHECK_READ, &actions), perms);
+    let signs = CHECK_READ.replace(read, "contents: read\n      id-token: write\n");
+    refused(&plant(CHECK_READ, &signs), "id-token");
+    let none = CHECK_READ.replace("    permissions:\n      contents: read\n", "");
+    refused(&plant(CHECK_READ, &none), perms);
+}
+
+/// Proves `check` builds `cargo xtask` before it joins the tailnet and that the one secret
+/// beyond the Tailscale client, the farm's buckconfig, reaches the `check-build` step alone and
+/// as a secret. Catches: no build before the tailnet, a variable in the secret's place (a
+/// variable is printed in the step's header and the config names the farm), a second variable
+/// or secret in that step, and a credential in the checkout or in the script.
+#[test]
+fn check_holds_the_farm_secret_in_the_check_build_step_alone() {
+    let no_build = plant(CHECK_BUILD, "");
+    let before = "`check` must build cargo xtask before the Tailscale step";
+    refused(&no_build, before);
+    let exact = "the `check-build` env is not exactly";
+    let leak = "          LEAK: ${{ secrets.TS_OAUTH_SECRET }}\n";
+    let leaked = [TARGETS_ENV, leak].concat();
+    refused(&plant(TARGETS_ENV, &leaked), exact);
+    let public = FARM_ENV.replace("secrets.", "vars.");
+    refused(&plant(FARM_ENV, &public), exact);
+    refused(&plant(FARM_ENV, ""), exact);
+    refused(&plant(TARGETS_ENV, ""), exact);
+    let token = "          token: ${{ secrets.TS_OAUTH_SECRET }}\n";
+    let with_token = [KOMIRA_WITH, token].concat();
+    let credential = "holds a credential";
+    refused(&plant(KOMIRA_WITH, &with_token), credential);
+    let script = "run: echo ${{ secrets.X }} && cargo xtask gamma check-build ";
+    let in_script = plant("run: cargo xtask gamma check-build ", script);
+    refused(&in_script, credential);
+}
+
+/// Proves komira's text is checked out once, by `check` alone, as exactly the pinned inputs and
+/// after `cargo xtask` is built. Catches: another ref, another repository, another path,
+/// credentials kept, submodules fetched, a second checkout, the checkout in `deploy` (which
+/// holds the OAuth client for the host) and the checkout before the build.
+#[test]
+fn komira_is_checked_out_once_by_check_alone_as_the_pinned_inputs() {
+    let once = "`check` checks out komira once, after the xtask build";
+    let picks = "checks out a ref or a repository";
+    let changes = [
+        ("ref: main", "ref: v1"),
+        ("komira-ai/komira", "evil/fork"),
+        ("path: komira-main", "path: ."),
+        ("credentials: false", "credentials: true"),
+    ];
+    for (old, new) in changes {
+        let text = plant(KOMIRA_WITH, &KOMIRA_WITH.replacen(old, new, 1));
+        refused(&text, picks);
+        refused(&text, once);
+    }
+    let submodules = [KOMIRA_WITH, "          submodules: true\n"].concat();
+    refused(&plant(KOMIRA_WITH, &submodules), once);
+    let step = komira_step();
+    let twice = [step.as_str(), step.as_str()].concat();
+    refused(&plant(&step, &twice), once);
+    let download = "      - uses: actions/download-artifact@";
+    let in_deploy = plant(download, &[step.as_str(), download].concat());
+    refused(&in_deploy, "of `deploy` checks out a ref or a repository");
+    let ordered = [CHECK_BUILD, step.as_str()].concat();
+    let swapped = [step.as_str(), CHECK_BUILD].concat();
+    refused(&plant(&ordered, &swapped), once);
+}
+
+/// Proves komira's text runs only inside the one `check-build` step: the job runs no other
+/// script of the checkout, the verb has nothing chained to it, there is one such step, and no
+/// local action of the checkout is used. Catches: `buck2` run by a step of its own or after the
+/// verb, a second verb, and `uses: ./komira-main/...`.
+#[test]
+fn komira_runs_only_inside_the_check_build_step() {
+    let more = "`check` runs more than the build and one check-build";
+    let own = "      - run: ./komira-main/buck2 build //...\n";
+    refused(&[real_gamma(), own.to_owned()].concat(), more);
+    let tails = [
+        " && ./komira-main/buck2 version",
+        "; ./komira-main/buck2 version",
+        " | tee out",
+        " > out",
+        " $(id)",
+    ];
+    for tail in tails {
+        refused(&plant(SUMMARY_ARG, &[SUMMARY_ARG, tail].concat()), more);
+    }
+    let verb = "      - run: cargo xtask gamma check-build --komira-dir komira-main\n";
+    refused(&[real_gamma(), verb.to_owned()].concat(), more);
+    let local = "      - uses: ./komira-main/action\n";
+    let planted = [real_gamma(), local.to_owned()].concat();
+    refused(&planted, "./komira-main/action");
+}
+
+/// Catches: the flag that bypasses the farm's cache anywhere in the file, in the script, in a
+/// variable's value or in a comment. The check is of the farm with its cache.
+#[test]
+fn the_cache_flag_is_nowhere_in_the_file() {
+    let flag = "`no-remote-cache` appears";
+    let bypass = [SUMMARY_ARG, " --no-remote-cache"].concat();
+    refused(&plant(SUMMARY_ARG, &bypass), flag);
+    let note = "# a build with --no-remote-cache\n# Gamma:";
+    refused(&plant("# Gamma:", note), flag);
+    let value = "          TARGETS: --no-remote-cache\n";
+    refused(&plant(TARGETS_ENV, value), flag);
+    assert!(!real_gamma().contains("no-remote-cache"));
+}
+
+/// Proves the workflow and the verb agree on the farm's config: the environment variable the
+/// verb reads is the secret the check-build step sets, the targets are a repository variable,
+/// and the config is not one (GitHub prints a variable in the log of the step that has it).
+#[test]
+fn the_farm_config_is_the_secret_the_verb_reads_and_the_targets_a_variable() {
+    let text = real_gamma();
+    let env = xtask::gamma::BUCKCONFIG_ENV;
+    let secret = format!("          {env}: ${{{{ secrets.{env} }}}}\n");
+    assert!(text.contains(&secret), "{secret}");
+    assert!(text.contains(TARGETS_ENV));
+    assert!(!text.contains(&format!("vars.{env}")));
+}
+
 /// Proves nothing in the file runs on a pull request.
 #[test]
 fn nothing_in_the_file_runs_on_a_pull_request() {
@@ -372,7 +563,7 @@ fn nothing_in_the_file_runs_on_a_pull_request() {
 }
 
 /// The environment references of the workflow's `cargo xtask` lines.
-const REFERENCES: [&str; 8] = [
+const REFERENCES: [&str; 9] = [
     "$GITHUB_REPOSITORY",
     "$GITHUB_OUTPUT",
     "$GITHUB_STEP_SUMMARY",
@@ -381,6 +572,7 @@ const REFERENCES: [&str; 8] = [
     "$SHA",
     "$GAMMA_HOST",
     "$GAMMA_USER",
+    "$TARGETS",
 ];
 
 /// A word of a `run:` line without its quotes, each environment reference replaced by `1`.
@@ -409,7 +601,7 @@ fn xtask_words(text: &str, job: &str) -> Vec<Vec<String>> {
 fn every_xtask_line_of_the_workflow_is_a_command_line_xtask_accepts() {
     let text = real_gamma();
     let mut seen = 0;
-    for job in ["offer", "deploy"] {
+    for job in ["offer", "deploy", "check"] {
         for words in xtask_words(&text, job) {
             let args: Vec<&str> = words.iter().map(String::as_str).collect();
             assert!(!words.iter().any(|w| w.contains('$')), "{args:?}");
@@ -417,12 +609,16 @@ fn every_xtask_line_of_the_workflow_is_a_command_line_xtask_accepts() {
             seen += 1;
         }
     }
-    assert_eq!(seen, 4);
+    assert_eq!(seen, 5);
     // The check is not blind: a misspelt flag and a missing one are refused.
     let check = |line: &str| xtask::check_args(&line.split(' ').collect::<Vec<_>>());
     assert!(check("gamma sudoers-line --user x").is_ok());
     assert!(check("gamma evidence --repo 1 --sha 1 --run_id 1").is_err());
     assert!(check("gamma evidence --repo 1").is_err());
+    let build = "gamma check-build --komira-dir 1 --targets 1 --buckconfig-file 1 --log 1";
+    assert!(check(&format!("{build} --summary 1")).is_ok());
+    assert!(check(build).is_err());
+    assert!(check(&format!("{build} --summary 1 --no-remote-cache")).is_err());
 }
 
 /// Every workflow file of the repository, `(file name, text)`.
@@ -478,6 +674,7 @@ fn the_stage_file_lists_gamma_as_an_actions_stage_with_its_jobs() {
     );
     assert!(stages.contains("gamma.yml#offer"));
     assert!(stages.contains("gamma.yml#deploy"));
+    assert!(stages.contains("gamma.yml#check"));
     let checked = |change: &dyn Fn(&str) -> String| {
         let mut planted = workflows.clone();
         for (name, text) in &mut planted {

@@ -8,7 +8,7 @@
 //!   than in the one shape [`workflow_run`] describes (both run with the base
 //!   repository's secrets and token), in any form (a string, a list or a mapping,
 //!   block or flow). That shape is `gamma.yml`: the workflow named `gamma`, following
-//!   the workflow `release` on `main`, with two jobs of exact conditions, permissions
+//!   the workflow `release` on `main`, with three jobs of exact conditions, permissions
 //!   and steps;
 //! - a job's `runs-on` is not exactly one GitHub-hosted runner label from
 //!   [`HOSTED_LABELS`], written out literally: a string, a one-entry list, or a
