@@ -82,6 +82,11 @@ pub struct OfferDoc {
     pub previous_meta_log: Option<u64>,
     /// [`reversible`] of the two numbers above.
     pub reversible: bool,
+    /// The lowest installer level (`kbf_installer::version::LEVEL`) that may deploy this
+    /// offer; absent in an offer made before the field, which every installer accepts. An
+    /// installer below it refuses the deploy before it fetches or uploads anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_installer: Option<u32>,
 }
 
 /// The fields as read, before validation.
@@ -99,6 +104,8 @@ struct RawOfferDoc {
     previous: Option<CommitId>,
     previous_meta_log: Option<u64>,
     reversible: bool,
+    #[serde(default)]
+    min_installer: Option<u32>,
 }
 
 impl TryFrom<RawOfferDoc> for OfferDoc {
@@ -116,6 +123,7 @@ impl TryFrom<RawOfferDoc> for OfferDoc {
             previous: r.previous,
             previous_meta_log: r.previous_meta_log,
             reversible: r.reversible,
+            min_installer: r.min_installer,
         };
         doc.validate()?;
         Ok(doc)
