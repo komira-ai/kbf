@@ -3,6 +3,7 @@
 //! `kbf.toml`; a host that has a release installs nothing. The first tests play the downloader
 //! with a double (the order of the run); the last run the real one over the seed fetcher.
 
+use kbf_host::testkit::ScratchHost;
 use kbf_host::{HostExec, Root};
 
 use super::*;
@@ -145,7 +146,11 @@ fn a_bundled_setup_with_no_package_fails_before_the_config_and_enables_no_unit()
 fn the_packages_release_is_verified_installed_and_made_current_by_the_downloader() {
     let seeded = Seeded::scratch("setup-seed");
     let fetcher = seeded.fetcher();
-    let exec = HostExec::new(Root::new(&seeded.root).expect("absolute"));
+    // `activate::first` applies a root plan, and the real `HostExec` refuses it to the user CI
+    // runs as (`NotRoot`). `ScratchHost` is the suite's seam for that: it reports euid 0 and
+    // trusts the running binary, and its file steps go to a `HostExec` on the seeded root.
+    let mut exec = ScratchHost::new("setup-seed-activate");
+    exec.host = HostExec::new(Root::new(&seeded.root).expect("absolute"));
     let releases = Fetching::new(&fetcher, seeded.layout.clone(), exec);
     let commit = releases.install_seed().expect("the package's release");
     assert_eq!(commit, seeded.commit);
@@ -210,7 +215,10 @@ fn the_downloader_cannot_fetch_on_a_bundled_host_either() {
     let releases = Fetching::new(&fetcher, seeded.layout.clone(), exec);
     let err = releases.install_first(&seeded.commit).expect_err("denied");
     assert!(
-        matches!(&err, SetupError::Fetch(FetchError::Order { word: "denied", .. })),
+        matches!(
+            &err,
+            SetupError::Fetch(FetchError::Order { word: "denied", .. })
+        ),
         "{err:?}"
     );
     assert_eq!(err.exit(), Exit::Refused);

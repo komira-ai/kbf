@@ -185,7 +185,7 @@ impl Seeded {
     pub fn runner(&self) -> FakeRunner {
         let (attested, probe) = (self.attested.clone(), self.probe.clone());
         FakeRunner::new(move |spawn| {
-            if !spawn.program.file_name().is_some_and(|n| n == "gh") {
+            if spawn.program.file_name().is_none_or(|n| n != "gh") {
                 return Ok(ran(0, &probe, ""));
             }
             let at = spawn

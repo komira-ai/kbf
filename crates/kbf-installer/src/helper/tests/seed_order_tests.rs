@@ -451,7 +451,13 @@ fn a_staged_activation_holds_the_release_to_the_manifests_facts() {
     rig.cycle(T0);
     assert_eq!(rig.refusal(), "");
     assert_eq!(rig.current(), Some(c(B)));
-    let want = rig.fetcher.seed.lock().expect("lock").clone().expect("seed");
+    let want = rig
+        .fetcher
+        .seed
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("seed");
     let asked = rig.fetcher.expected.lock().expect("lock").clone();
     assert_eq!(asked, vec![want.facts]);
 }
@@ -498,7 +504,13 @@ fn a_staged_release_that_declares_other_facts_than_the_manifest_is_refused_befor
 #[test]
 fn a_package_that_changed_while_its_release_was_fetched_is_refused_before_the_flip() {
     let other = |rig: &Rig| {
-        let mut seed = rig.fetcher.seed.lock().expect("lock").clone().expect("seed");
+        let mut seed = rig
+            .fetcher
+            .seed
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("seed");
         seed.seq += 1;
         seed
     };

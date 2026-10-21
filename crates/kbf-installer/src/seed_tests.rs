@@ -182,7 +182,9 @@ fn refusal_of(got: Result<(), FetchError>) -> (&'static str, String) {
 #[test]
 fn an_order_is_admitted_for_the_seeds_commit_with_a_seq_above_the_floor() {
     let seeded = Seeded::scratch("seed-admit");
-    let seed = Manifest::parse(&bytes(&seeded)).expect("parses").seed_facts();
+    let seed = Manifest::parse(&bytes(&seeded))
+        .expect("parses")
+        .seed_facts();
     assert_eq!(admit(&seed, &c(B), Some(SEQ - 1)), Ok(()));
     assert_eq!(admit(&seed, &c(B), Some(0)), Ok(()));
 

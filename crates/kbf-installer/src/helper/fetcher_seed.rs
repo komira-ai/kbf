@@ -30,8 +30,8 @@ use kbf_host::step::Owner;
 use kbf_update::{Facts, Locator, Source};
 use sha2::{Digest, Sha256};
 
-use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
 use crate::fetch;
+use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
 use crate::helper::fetcher_real::{Parts, fetch_error, refused, replaced_bytes};
 use crate::helper::leases::LeaseSource;
 use crate::layout::Layout;
@@ -133,7 +133,13 @@ impl SeedFetcher {
     /// release.
     fn trusted(&self, path: &HostPath, kind: Kind) -> Result<(), FetchError> {
         trusted_chain(&*self.trust, path, kind).map_err(|r| {
-            if matches!(&r, Refusal::Untrusted { fault: TrustFault::Missing, .. }) {
+            if matches!(
+                &r,
+                Refusal::Untrusted {
+                    fault: TrustFault::Missing,
+                    ..
+                }
+            ) {
                 FetchError::Unavailable(format!("seed_missing: {path} is missing"))
             } else {
                 refused(r)
@@ -175,9 +181,7 @@ impl SeedFetcher {
             .create_new(true)
             .mode(0o600)
             .open(&to)
-            .map_err(|e| {
-                FetchError::Unavailable(format!("cannot create {}: {e}", to.display()))
-            })?;
+            .map_err(|e| FetchError::Unavailable(format!("cannot create {}: {e}", to.display())))?;
         let copied = copy_hashed(&mut source.take(size + 1), &mut out);
         let (bytes, sha256) = match copied {
             Ok(done) => done,
