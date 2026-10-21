@@ -30,7 +30,7 @@ fn bundled(mode: Mode) -> Raw {
 /// installs one: it fetches nothing), the install made before `installer.toml` says where from
 /// or after `kbf.toml`, and the package's release fetched by a commit nobody gave.
 ///
-/// Mutants planted: the arm for `None`, `false` and a bundled source removed; the install made
+/// Mutants to plant: the arm for `None`, `false` and a bundled source removed; the install made
 /// in a dry run; `have_release` left false after it (the units are not enabled).
 #[test]
 fn a_bundled_host_with_no_release_installs_the_packages_between_settings_and_config() {
@@ -70,7 +70,7 @@ fn a_bundled_host_with_no_release_installs_the_packages_between_settings_and_con
 ///
 /// Catches the package's release installed over a running host's, and a dry run that installs.
 ///
-/// Mutants planted: the arm taken whatever `have_release` is; the install made when `apply` is
+/// Mutants to plant: the arm taken whatever `have_release` is; the install made when `apply` is
 /// false.
 #[test]
 fn a_bundled_host_with_a_release_installs_nothing_and_a_dry_run_only_names_the_install() {
@@ -117,7 +117,7 @@ fn a_bundled_host_with_a_release_installs_nothing_and_a_dry_run_only_names_the_i
 ///
 /// Catches a setup that says it is done when no release could be installed.
 ///
-/// Mutant planted: the install error ignored.
+/// Mutant to plant: the install error ignored.
 #[test]
 fn a_bundled_setup_with_no_package_fails_before_the_config_and_enables_no_unit() {
     let mut exec = host();
@@ -140,7 +140,7 @@ fn a_bundled_setup_with_no_package_fails_before_the_config_and_enables_no_unit()
 /// frontend's first update would then be busy for ever), and a first release held to a floor a
 /// host that has never run cannot have.
 ///
-/// Mutants planted: `activate::first` not called; the seed's `seq` compared with a floor.
+/// Mutants to plant: `activate::first` not called; the seed's `seq` compared with a floor.
 #[test]
 fn the_packages_release_is_verified_installed_and_made_current_by_the_downloader() {
     let seeded = Seeded::scratch("setup-seed");
@@ -163,7 +163,7 @@ fn the_packages_release_is_verified_installed_and_made_current_by_the_downloader
 ///
 /// Catches a first release installed without being verified because the package is root's.
 ///
-/// Mutants planted: `Pipeline::verify` replaced by the install of the copied tarball.
+/// Mutants to plant: `Pipeline::verify` replaced by the install of the copied tarball.
 #[test]
 fn a_package_release_the_pipeline_refuses_is_not_installed_by_setup() {
     let mut seeded = Seeded::scratch("setup-seed-unattested");
@@ -201,7 +201,7 @@ fn a_package_release_the_pipeline_refuses_is_not_installed_by_setup() {
 ///
 /// Catches a gate kept in the callers: this is the third one.
 ///
-/// Mutant planted: the denial made by the cycle's callers only.
+/// Mutant to plant: the denial made by the cycle's callers only.
 #[test]
 fn the_downloader_cannot_fetch_on_a_bundled_host_either() {
     let seeded = Seeded::scratch("setup-bundled-fetch");

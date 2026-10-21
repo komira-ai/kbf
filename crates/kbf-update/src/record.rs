@@ -578,7 +578,7 @@ mod tests {
     /// proxy whose request type is closed, refuses the record whole, so a fetch would break
     /// after any upgrade), and a reader that refuses the word `fetch`.
     ///
-    /// Mutants planted: `skip_serializing_if` removed from the field (the golden bytes gain
+    /// Mutants to plant: `skip_serializing_if` removed from the field (the golden bytes gain
     /// the key); the word `fetch` made an unknown variant.
     #[test]
     fn a_record_that_fetches_is_todays_bytes_and_an_explicit_fetch_is_read() {
@@ -614,7 +614,7 @@ mod tests {
     /// ways to say where the bytes come from), a source on a verb that moves no release, and
     /// the check widened until the empty activation passes.
     ///
-    /// Mutants planted: the staged arm for `activate` removed (the golden is `NoComponents`);
+    /// Mutants to plant: the staged arm for `activate` removed (the golden is `NoComponents`);
     /// components allowed beside a staged source; the source refused on `frontend_update`;
     /// allowed on `confirm`; an unknown word read as `fetch`.
     #[test]

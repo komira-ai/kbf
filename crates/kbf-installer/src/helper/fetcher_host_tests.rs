@@ -332,7 +332,7 @@ fn a_bundled_host_denies_every_fetch_by_the_fetcher_itself() {
 /// Catches a staged order read as a fetch (the frontend source is not buildable, and a `url`
 /// host would start the child), and `staged` allowed on a `bundled` host only.
 ///
-/// Mutants planted: the staged form building the real fetcher (every case but `url`, which
+/// Mutants to plant: the staged form building the real fetcher (every case but `url`, which
 /// starts the child, is red); the staged form refused unless the file says `bundled`.
 #[test]
 fn a_staged_order_takes_the_package_on_every_kind_of_host_and_never_starts_the_child() {
@@ -373,7 +373,7 @@ fn a_staged_order_takes_the_package_on_every_kind_of_host_and_never_starts_the_c
 ///
 /// Catches the hook answered from the configuration, and a missing seed taken for a seed.
 ///
-/// Mutant planted: the hook delegating to the fetch-source fetcher (a `url` host without a
+/// Mutant to plant: the hook delegating to the fetch-source fetcher (a `url` host without a
 /// child refuses).
 #[test]
 fn the_host_fetcher_reports_the_seed_of_its_package_or_why_it_has_none() {
