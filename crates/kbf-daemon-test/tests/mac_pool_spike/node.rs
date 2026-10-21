@@ -19,7 +19,7 @@ use rcgen::{
 
 /// A directory under `/private/tmp`, root's and mode 0755 (the runner's home is not
 /// searchable by a pool user, so nothing a pool user must reach lives there), removed when
-/// it drops. It holds a copy of this test binary as `kbf-act`, so an action can run the act
+/// it drops. It holds a copy of this test binary as `kbf-act`, a copy of `kbf`, so an action can run the act
 /// steps, the node's certificates (`tls/`), the daemon's data directory (`data/`) and its
 /// log.
 pub struct Scratch(TestDir);
@@ -32,6 +32,11 @@ impl Scratch {
         let act = dir.join(kbf_testkit::act::NAME);
         std::fs::copy(std::env::current_exe().expect("this binary"), &act).expect("copy");
         std::fs::set_permissions(&act, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        // `kbf` too: the daemon's native driver runs its own executable as the `__as-user`
+        // program for each pool user, and a pool user cannot search the runner's home.
+        let kbf_copy = dir.join("kbf");
+        std::fs::copy(kbf(), &kbf_copy).expect("copy kbf");
+        std::fs::set_permissions(&kbf_copy, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         tls(&dir.join("tls"));
         Self(dir)
     }
@@ -46,6 +51,11 @@ impl Scratch {
             .join(kbf_testkit::act::NAME)
             .to_string_lossy()
             .into_owned()
+    }
+
+    /// The copy of `kbf` a pool user can run.
+    pub fn kbf(&self) -> PathBuf {
+        self.path().join("kbf")
     }
 
     pub fn tls(&self) -> PathBuf {
@@ -154,7 +164,7 @@ impl Daemon {
         let dir = scratch.tls();
         let at = |name: &str| dir.join(name).display().to_string();
         let url = format!("https://localhost:{port}");
-        let child = Command::new(kbf())
+        let child = Command::new(scratch.kbf())
             .args([
                 "daemon",
                 "--driver",

@@ -195,7 +195,7 @@ fn the_harness_runs_and_the_runner_is_measured() {
         ));
     }
 
-    let kbf = node::kbf();
+    let kbf = scratch.kbf();
     say("kbf", kbf.display());
     direct_probes(&pool, &kbf, &mut facts);
 

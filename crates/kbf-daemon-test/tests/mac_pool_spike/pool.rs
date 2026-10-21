@@ -61,15 +61,18 @@ impl Pool {
         std::fs::set_permissions(HOMES, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let gid = FIRST_UID.to_string();
         let group = format!("/Groups/{GROUP}");
+        // The guard exists before the first record: a failure below drops it, which
+        // removes whatever was made. `Comment` is set first on every record, so a record
+        // that exists is always marked and the next run's sweep can remove it.
+        let mut pool = Self { users: Vec::new() };
         for attr in [
             vec![],
+            vec!["Comment", MARK],
             vec!["PrimaryGroupID", gid.as_str()],
             vec!["Password", "*"],
-            vec!["Comment", MARK],
         ] {
             dscl(&[&[".", "-create", group.as_str()][..], &attr[..]].concat());
         }
-        let mut pool = Self { users: Vec::new() };
         for i in 0..count {
             let name = format!("kbf-pool-{i}");
             let uid = FIRST_UID + i;
@@ -88,13 +91,13 @@ impl Pool {
             let (uid_text, home_text) = (uid.to_string(), home.to_string_lossy().into_owned());
             for attr in [
                 vec![],
+                vec!["Comment", MARK],
                 vec!["UniqueID", uid_text.as_str()],
                 vec!["PrimaryGroupID", gid.as_str()],
                 vec!["UserShell", "/usr/bin/false"],
                 vec!["NFSHomeDirectory", home_text.as_str()],
                 vec!["IsHidden", "1"],
                 vec!["Password", "*"],
-                vec!["Comment", MARK],
             ] {
                 dscl(&[&[".", "-create", record.as_str()][..], &attr[..]].concat());
             }
