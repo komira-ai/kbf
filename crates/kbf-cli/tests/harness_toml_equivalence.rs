@@ -23,9 +23,19 @@ use kbf_testkit::dir::TestDir;
 const IMAGE: &str =
     "registry.test/busybox@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
-/// Every process listens on this address (the repository's hygiene scan allows no other
-/// loopback address in a text file); they differ by port.
-const HOST: &str = "127.0.0.1";
+/// The address of a role, as the farm gives them out: the frontend's is the first of the
+/// loopback block, then each node's, then each plain daemon's. Built at run time (the
+/// repository's hygiene scan allows no other literal loopback address in a text file), so
+/// that a process told another's address differs from the golden, which writes `{host}`
+/// for a process's own and `{host:node-1}` for node 1's.
+fn host_of(role: &str, nodes: usize) -> String {
+    let n = match role.split_once('-') {
+        None => 0,
+        Some(("node", n)) => n.parse::<usize>().expect("a number"),
+        Some((_, d)) => nodes + d.parse::<usize>().expect("a number"),
+    };
+    format!("127.0.0.{}", n + 1)
+}
 
 const GOLDEN: &str = include_str!("golden/farm-units.txt");
 
@@ -37,23 +47,13 @@ struct Process {
     flags: Vec<String>,
 }
 
-fn wiring() -> Wiring {
+fn wiring(nodes: usize) -> Wiring {
     Wiring {
         reapi: 41000,
         worker: 41001,
         api: 41002,
-        storage_url: "https://127.0.0.1:41010".to_owned(),
+        storage_url: format!("https://{}:41010", host_of("node-1", nodes)),
     }
-}
-
-/// The flags `b0`'s mutants give a node: a cold store that holds nothing for long.
-fn shrunk() -> Vec<String> {
-    vec![
-        format!("--cold-store-size-bytes={}", 1 << 20),
-        "--cold-store-floor-bytes=0".to_owned(),
-        "--cold-store-evict-grace-ms=0".to_owned(),
-        format!("--hot-store-max-bytes={}", 1 << 20),
-    ]
 }
 
 /// The topologies a farm is started in: the rehearsal's (container driver, storage and
@@ -64,7 +64,7 @@ fn topologies() -> Vec<(&'static str, Topology)> {
     rehearsal_small.limits = Limits::small();
     let mut beta_mutant = Topology::beta();
     beta_mutant.overrides = vec![
-        (Role::Node(1), shrunk()),
+        (Role::Node(1), kbf_harness::b0::shrunk()),
         // `b0`'s `extra_flags` in the test of a farm that never becomes ready.
         (
             Role::Daemon(1),
@@ -72,7 +72,9 @@ fn topologies() -> Vec<(&'static str, Topology)> {
         ),
     ];
     let mut beta_every = Topology::beta();
-    beta_every.overrides = (1..=3).map(|n| (Role::Node(n), shrunk())).collect();
+    beta_every.overrides = (1..=3)
+        .map(|n| (Role::Node(n), kbf_harness::b0::shrunk()))
+        .collect();
     vec![
         ("rehearsal", Topology::rehearsal(2)),
         ("rehearsal-small", rehearsal_small),
@@ -97,21 +99,31 @@ fn container(root: &str) -> Container {
 
 /// Every process of `topo`, shaped by `shape`: role name, and what the farm starts it with.
 fn processes<T>(topo: &Topology, shape: impl Fn(Unit) -> T) -> Vec<(String, T)> {
-    let w = wiring();
+    let nodes = topo.storage_nodes;
+    let w = wiring(nodes);
     let uid = 1000;
     let native = topo.driver == kbf_harness::topology::Driver::Native;
-    let place = |root: &'static str, host: &'static str, id: &'static str, port: u16| Settings {
-        root: Path::new(root),
-        host,
-        node_id: id,
-        storage_port: port,
-        wiring: &w,
-        image: if native { "" } else { IMAGE },
+    let place = |root: &'static str, host: &'_ str, id: &'static str, port: u16| {
+        // The settings borrow the address; it outlives them in the caller's frame.
+        let host: &'static str = Box::leak(host.to_owned().into_boxed_str());
+        Settings {
+            root: Path::new(root),
+            host,
+            node_id: id,
+            storage_port: port,
+            wiring: &w,
+            image: if native { "" } else { IMAGE },
+        }
     };
     let mut out = Vec::new();
     let front = Settings {
         image: "",
-        ..place("/farm/frontend", HOST, "frontend-1", 41020)
+        ..place(
+            "/farm/frontend",
+            &host_of("frontend", nodes),
+            "frontend-1",
+            41020,
+        )
     };
     let socket = Path::new("/tmp/kbf-farm-1.sock");
     out.push((
@@ -120,10 +132,10 @@ fn processes<T>(topo: &Topology, shape: impl Fn(Unit) -> T) -> Vec<(String, T)> 
     ));
     let roots = ["/farm/node-1", "/farm/node-2", "/farm/node-3"];
     let ids = ["node-1", "node-2", "node-3"];
-    for i in 0..topo.storage_nodes {
+    for i in 0..nodes {
         let s = place(
             roots[i],
-            HOST,
+            &host_of(ids[i], nodes),
             ids[i],
             41010 + u16::try_from(i).expect("small"),
         );
@@ -140,7 +152,7 @@ fn processes<T>(topo: &Topology, shape: impl Fn(Unit) -> T) -> Vec<(String, T)> 
     let daemons = ["/farm/daemon-1", "/farm/daemon-2"];
     let dids = ["daemon-1", "daemon-2"];
     for d in 0..topo.daemons {
-        let s = place(daemons[d], HOST, dids[d], 41020);
+        let s = place(daemons[d], &host_of(dids[d], nodes), dids[d], 41020);
         let c = (!native).then(|| container(daemons[d]));
         let unit = daemon((&s, uid), d + 1, topo, c.as_ref());
         out.push((format!("daemon-{}", d + 1), shape(unit)));
@@ -174,6 +186,20 @@ fn golden() -> BTreeMap<String, Process> {
         }
     }
     found.extend(current);
+    // The placeholders are the process's own address and node 1's.
+    let nodes: BTreeMap<&str, usize> = topologies()
+        .iter()
+        .map(|(name, topo)| (*name, topo.storage_nodes))
+        .collect();
+    for (name, p) in &mut found {
+        let (topo, role) = name.split_once(' ').expect("topology and role");
+        let n = nodes[topo];
+        for flag in &mut p.flags {
+            *flag = flag
+                .replace("{host:node-1}", &host_of("node-1", n))
+                .replace("{host}", &host_of(role, n));
+        }
+    }
     found
 }
 
