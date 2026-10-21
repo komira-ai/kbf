@@ -16,7 +16,7 @@ use std::process::ExitCode;
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use kbf_coverage::floors::{self, Floors};
-use kbf_coverage::{CrateCoverage, gate, lcov, raise};
+use kbf_coverage::{CrateCoverage, gate, lcov, raise, renames};
 
 /// Per-crate coverage table and gate. With no subcommand, the flags are `check`'s.
 #[derive(Debug, Parser)]
@@ -82,6 +82,11 @@ struct NoLoweringArgs {
     /// any other way of not reading it is still an error.
     #[arg(long)]
     allow_missing_base: bool,
+    /// The git revision `--base` was taken from. A crate git sees renamed since it
+    /// (`crates/A/Cargo.toml` to `crates/B/Cargo.toml`, with a new package name) keeps
+    /// its base floor under the new name. Without it, no crate is renamed.
+    #[arg(long)]
+    base_ref: Option<String>,
 }
 
 const DEFAULT_FLOORS: &str = "coverage-floors";
@@ -207,7 +212,16 @@ fn no_lowering(args: &NoLoweringArgs) -> Result<bool, Box<dyn Error>> {
         );
         return Ok(true);
     }
-    let lowered = raise::lowered(&read_floors(&args.base)?, &read_floors(&args.floors)?);
+    let renames = match &args.base_ref {
+        Some(rev) => renames::git_renames(Path::new("."), rev)
+            .map_err(|e| format!("--base-ref {rev}: {e}"))?,
+        None => BTreeMap::new(),
+    };
+    let lowered = renames::lowered_renamed(
+        &read_floors(&args.base)?,
+        &read_floors(&args.floors)?,
+        &renames,
+    );
     if lowered.is_empty() {
         println!(
             "kbf-coverage no-lowering: {} lowers no threshold of {}",
