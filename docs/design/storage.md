@@ -108,11 +108,13 @@ live and within an entry bound (least recently used out first). An entry is trus
 while the owner's map generation and published boot (`Member.boot`) are those it was
 verified under: a restarted owner is the one whose holdings are least certain (a disk
 replaced or wiped while it was down, say), so a new boot drops its entries even when the
-generation did not move. Today no acknowledged blob lives only in RAM: an upload is
+generation did not move. By default no acknowledged blob lives only in RAM: an upload is
 answered after its bytes are synced on the primary's hot disk and indexed (or, with no
-hot-disk room, are in the object store), so a restart alone loses no acknowledged blob (**Planned**, [storage-ram-ack.md](storage-ram-ack.md): acknowledging from RAM would
-make a restart able to lose one, and the closure check would then ask for durable
-presence only). A caller on an older map
+hot-disk room, are in the object store), so a restart alone loses no acknowledged blob.
+With `--ram-ack-bytes` over 0 a blob of at most 4 MiB can be acknowledged from RAM on both
+owners ([storage-ram-ack.md](storage-ram-ack.md)), so a restart of both can lose one; the
+closure check therefore asks for durable presence only (`kbf-durable: only`) and
+remembers only durable positives. A caller on an older map
 neither reads nor adds. An owner whose boot is 0 (unknown, a node from before the field)
 is never remembered, because without a boot a restart cannot be told: every check asks
 it.
@@ -211,14 +213,18 @@ whole segments with one commit, and a local write tier that syncs segments to a
 server's NVMe or SSD, acknowledges, and flushes them to the object store in the
 background.
 
-So a blob is never reported present before its bytes are durable in the store.
-
-Planned: acknowledging a ByteStream write from RAM on both owners, before the disk; see
-[storage-ram-ack.md](storage-ram-ack.md). Today the order is as stated here.
+So a blob is never reported present before its bytes are durable in the store, except
+for the blobs a node holds in RAM under `--ram-ack-bytes` (off by default): such a blob is
+present because the node can serve exactly its bytes now, and is not durable until the
+node's drain has put it in the index. Only a durable question (`kbf-durable: only` or
+`wait` on `FindMissingBlobs`) leaves it out, and every record that names a blob asks one
+([storage-ram-ack.md](storage-ram-ack.md)). With the flag at 0 the order is as stated here.
 
 **ByteStream uploads** follow one rule per stream: bytes arrive in order from offset 0,
 are verified, become durable, and only then is the write acknowledged. There is no
-partial resume; a broken stream starts again from 0. `QueryWriteStatus` reports a
+partial resume; a broken stream starts again from 0. (With `--ram-ack-bytes` over 0 a
+blob of at most 4 MiB is acknowledged once both owners hold it in RAM, before it is
+durable; `QueryWriteStatus` reports its full size then.) `QueryWriteStatus` reports a
 blob's full size once it is durable and 0 before, never bytes a live stream has merely
 buffered. An upload of a blob already durable is answered at once. No blob is too
 large: a ByteStream write of at most 16 MiB (`MAX_UNSTAGED_BLOB_BYTES`) is held in
@@ -462,7 +468,8 @@ capabilities.
 
 ## Planned
 
-- **Acknowledge from RAM on both owners, write behind to disk.** Designed, not built:
+- **Acknowledge from RAM on both owners, write behind to disk.** Built behind
+  `--ram-ack-bytes`, default 0 (off); turning it on by default is the last step:
   [storage-ram-ack.md](storage-ram-ack.md).
 - **Replicated metadata.** `MetaState` applied from a Raft log kept on each voter's
   local disk, with its snapshots: one voter first (the single-voter log exists, without

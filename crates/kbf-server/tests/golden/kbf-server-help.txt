@@ -15,7 +15,7 @@ Options:
           The durable object store, where every blob ends up: `file:///absolute/path` (a directory, `kbf_objstore::FsStore`: locked while the server runs, a second server on it is refused; a write that would leave its filesystem with less free than it keeps, 5% of its size and at least 1 GiB, is refused and wakes the evictor, which forgets the least recently used objects (never one used in the last minute) and deletes their files while less than twice that is free) or `s3://bucket/prefix?endpoint=http://host:port` (MinIO, RustFS; the key pair is `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; query keys `region`, `conditional-put=true` for a store that refuses to overwrite a key, and `min-put-rate=BYTES_PER_SEC`, the slowest rate a PUT body may reach the store at: a PUT is cut after 60 seconds plus its body's length at that rate, 1 MiB/s by default). Objects are keyed under `<prefix><log id>/` (`kbf/` for a directory and for an S3 URI without a path), the id of the metadata log. A directory is checked against the index by a start-up pass in the background; a lost or damaged object is also found when it is read, or before an action-cache hit that needs it is served (a miss). There is no `memory:` store: a `file://` path on a tmpfs is one
 
       --hot-store <URI>
-          The fast tier in front of the cold store: `file:///absolute/path`, a directory on an SSD (or a tmpfs). Uploads land there and are flushed to the cold store in the background; reads are served from it while a blob is still there. Its budget is not a flag: 80% of the filesystem's free space less what it keeps free (5% of its size, at least 1 GiB, and never more than half of what is free), at most `--hot-store-max-bytes`; at the budget, writes take the direct path to the cold store. Without it, uploads go straight to the cold store. A daemon's outputs (a segment upload, or the in-process plane) and a ByteStream Write over 16 MiB are written through to it as they arrive, so a large one is never held in memory. Without it, or when it has no room, a daemon's blob over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is streamed to the cold store as it arrives (a ByteStream Write, or the in-process plane's own stream), never held whole and never refused for its size. The first start with a hot store raises the metadata log to machine version 2, once; a binary that runs only version 1 no longer reads it. The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise
+          The fast tier in front of the cold store: `file:///absolute/path`, a directory on an SSD (or a tmpfs). Uploads land there and are flushed to the cold store in the background; reads are served from it while a blob is still there. Its budget is not a flag: 80% of the filesystem's free space less what it keeps free (5% of its size, at least 1 GiB, and never more than half of what is free), at most `--hot-store-max-bytes`; at the budget, writes take the direct path to the cold store. Without it, uploads go straight to the cold store. A daemon's outputs (a segment upload, or the in-process plane) and a ByteStream Write over 16 MiB are written through to it as they arrive, so a large one is never held in memory. Without it, or when it has no room, a daemon's blob over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is streamed to the cold store as it arrives (a ByteStream Write, or the in-process plane's own stream), never held whole and never refused for its size. The first start with a hot store raises the metadata log to machine version 5, once; a binary that runs only an earlier version no longer reads it. The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise
 
       --hot-store-max-bytes <BYTES>
           The most bytes the hot store's block files may hold before they are flushed, lower than its automatic budget
@@ -221,12 +221,12 @@ Options:
           [default: 10]
 
       --ram-peer-grace <RAM_PEER_GRACE>
-          How long, in seconds, after its own write of a blob it acknowledged from RAM a storage node waits before it asks the blob's other owner whether the blob is on its disk too, and journals a repair debt if it is not. Long enough that the usual answer is yes and nothing is journalled. Nothing acknowledges from RAM yet, so no node asks. At least 1
+          How long, in seconds, after its own write of a blob it acknowledged from RAM a storage node waits before it asks the blob's other owner whether the blob is on its disk too, and journals a repair debt if it is not. Long enough that the usual answer is yes and nothing is journalled. Only a node that acknowledges from RAM (`--ram-ack-bytes`) asks. At least 1
           
           [default: 5]
 
       --ram-ack-bytes <RAM_ACK_BYTES>
-          How many bytes of blobs a storage node may hold in RAM, acknowledged to the writer and not yet written to its disk. 0, the default, is off: a write is acknowledged from disk, as before. Nothing acknowledges from RAM yet, so with any value no blob is held and the node behaves as with 0. A blob that finds the budget full is written through to the disk before it is acknowledged, never waited for. A node that does hold blobs counts them in `kbf_storage_ram_unwritten_bytes`, writes them to its disk in the background and, when it stops, within `--ram-drain-deadline`. A node can hold this many bytes beside the `--write-bytes-in-flight` it receives. Storage nodes only: a server with no replica to hold a second copy holds nothing
+          How many bytes of blobs a storage node may hold in RAM, acknowledged to the writer and not yet written to its disk. 0, the default, is off: a write is acknowledged from disk, as before. Over 0, a blob of at most 4 MiB written to two owners is acknowledged once both hold it verified in RAM, and written to each disk afterwards: losing both owners' RAM before then loses the blob. A blob that finds the budget full is written through to the disk before it is acknowledged, never waited for. Set it on every storage node or none. A node that does hold blobs counts them in `kbf_storage_ram_unwritten_bytes`, writes them to its disk in the background and, when it stops, within `--ram-drain-deadline`. A node can hold this many bytes beside the `--write-bytes-in-flight` it receives. Storage nodes only: a server with no replica to hold a second copy holds nothing
           
           [default: 0]
 
@@ -264,21 +264,6 @@ Options:
           How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
           
           [default: 300]
-
-      --release-poll-every-secs <SECONDS>
-          How often, in seconds, the active frontend asks GitHub for new releases of `--release-poll-repo` and records the newest one the farm could run as a proposal (`proposals` of `GET /v1/update`). A proposal starts nothing: only an operator's `POST /v1/update/desired` does. The question is one conditional request with no credential, so an unchanged feed costs nothing. 0 turns the poller off. Only the newest 30 releases are read (no further pages), so a `v*` release buried under more than 30 newer releases of other tags is not seen. It needs `--state-store`, which holds the proposals
-          
-          [default: 300]
-
-      --release-poll-repo <OWNER/NAME>
-          The GitHub repository, `owner/name`, whose releases of `v*` tags are polled
-          
-          [default: komira-ai/kbf]
-
-      --release-poll-refs <REF>
-          The refs a polled release may have been built from, as its notes say, separated by commas; a release built from another is ignored and counted
-          
-          [default: main]
 
       --ui[=<BOOL>]
           Serves the web UI on the operator API (`--api-listen`): read-only pages under `/ui` (`docs/design/kbf-ui-v1.md`). On by default; `--ui=false` turns it off, and `/ui` is then a `404`. The UI is open: it asks for no login or certificate, and it shows everything unredacted, the logs of builds and the arguments of failed commands, to whoever reaches the operator API's port, whatever the REAPI policy says of `--invocations-open`. Only `GET` and `HEAD` are served; the operator API's write routes and their token are unchanged. Keep the operator API on loopback, or behind the proxy and a network you trust

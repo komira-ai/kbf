@@ -1,0 +1,32 @@
+[package]
+name = "kbf-host-install"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The root side of the host-driven package update: the forced command of the key that
+# `kbf-updater` holds (docs/deploy/host-install.md). sshd runs it with the command the
+# updater asked for in `SSH_ORIGINAL_COMMAND`; it accepts two verbs, checks them against a
+# root-owned allowlist and runs `apt-get` for the one package, one source, no shell.
+[[bin]]
+name = "kbf-host-install"
+path = "src/main.rs"
+
+[dependencies]
+# The refusal and failure lines, the audit line and the allowlist file.
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# The audit line's time, and `O_NOFOLLOW` for the files read as root.
+time.workspace = true
+rustix = { workspace = true, features = ["fs"] }
+toml.workspace = true
+
+[dev-dependencies]
+kbf-testkit.workspace = true
+
+[lints]
+workspace = true

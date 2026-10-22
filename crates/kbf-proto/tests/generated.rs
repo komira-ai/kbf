@@ -188,6 +188,7 @@ fn worker_messages_round_trip() {
             numa: vec![worker::NumaNodeBytes { node: 1, bytes: 6 }],
             ..worker::CgroupUsage::default()
         }),
+        ..worker::ResourceUsage::default()
     };
     let back = worker::ResourceUsage::decode(usage.encode_to_vec().as_slice()).expect("decode");
     assert_eq!(back, usage);

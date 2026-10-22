@@ -244,6 +244,10 @@ fn the_bounded_step_gives_up_on_a_held_schema_lock() {
     );
     assert_eq!(schema::current(&s.config()), Ok(1));
     held.commit().expect("lock let go");
+    // The schema lock is one key on the whole server, and the other database tests take it
+    // while they migrate their own schemas in parallel: once this test lets go, the step is
+    // given time to wait them out (200 ms was not always enough), and still migrates.
+    let mut db = Database::new(s.config(), next_release()).bounded(Duration::from_secs(30));
     assert_eq!(
         db.before_start(2).expect("migrates"),
         "migrated the schema from 1 to 2"

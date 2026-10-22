@@ -161,7 +161,7 @@ fn two_live_children_with_no_update_leave_the_hold() {
 #[test]
 fn a_frontend_is_started_on_its_slots_ports_and_a_candidate_awaits_the_takeover() {
     let table = UpstreamTable { base_port: 18_000 };
-    let argv = frontend_argv(Path::new("/run/kbf-proxy/proxy-auth"), table);
+    let argv = frontend_argv(Path::new("/run/kbf-proxy/proxy-auth"), table, None);
     let words = |slot, start| -> Vec<String> {
         argv(slot, start)
             .into_iter()
@@ -194,6 +194,39 @@ fn a_frontend_is_started_on_its_slots_ports_and_a_candidate_awaits_the_takeover(
         children_dir(Path::new("/var/lib/kbf-proxy")),
         PathBuf::from("/var/lib/kbf-proxy/children")
     );
+}
+
+/// Catches the children's file lost on the way to the command line (the children of an
+/// all-in-one host would read the default `kbf.toml`, which is the sibling's there), and one
+/// given to a host that has none: with a file named, every slot and start carries `--config=`
+/// once and is otherwise the command line without it; with none, no word starts `--config`.
+///
+/// Mutants to plant: the `--config` word dropped (red: none carries it); the word pushed
+/// whatever `config_file` is (red: the plain command line has it).
+#[test]
+fn the_frontend_children_read_the_file_installer_toml_names_and_no_other() {
+    let table = UpstreamTable { base_port: 18_000 };
+    let secret = Path::new("/run/kbf-proxy/proxy-auth");
+    let named = frontend_argv(secret, table, Some(Path::new("/etc/kbf/frontend.toml")));
+    let plain = frontend_argv(secret, table, None);
+    let words = |argv: &Argv, slot, start| -> Vec<String> {
+        argv(slot, start)
+            .into_iter()
+            .map(|w| w.to_string_lossy().into_owned())
+            .collect()
+    };
+    for slot in [Slot::A, Slot::B] {
+        for start in [Start::Active, Start::Candidate] {
+            let with = words(&named, slot, start);
+            let without = words(&plain, slot, start);
+            let (config, rest): (Vec<String>, Vec<String>) = with
+                .into_iter()
+                .partition(|word| word.starts_with("--config"));
+            assert_eq!(config, ["--config=/etc/kbf/frontend.toml"]);
+            assert_eq!(rest, without);
+            assert!(without.iter().all(|word| !word.starts_with("--config")));
+        }
+    }
 }
 
 /// Catches an adoption that fails at the gate (the startup hold is gone: ended already, or

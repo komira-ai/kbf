@@ -180,6 +180,7 @@ pub fn installer_toml_url() -> InstallerToml {
         frontend: None,
         proxy: None,
         database: None,
+        frontend_config: None,
     }
 }
 

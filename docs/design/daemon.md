@@ -921,8 +921,9 @@ The first time a process sees a key it logs what the key stands for, once:
 `usage::Child` spawns an action as the leader of its own process group and reaps it
 with `wait4`, which returns the CPU time and peak resident memory of the process and
 every descendant it waited for. These are packed into a `ResourceUsage` inside the
-result (see [worker-protocol.md](worker-protocol.md#resourceusage)). Today the local
-runtime reports usage; the container driver does not yet.
+result (see [worker-protocol.md](worker-protocol.md#resourceusage)). Both the local
+runtime and the container driver report usage; the container driver's peak is the
+lease cgroup's `memory.peak`, the local runtime's the largest resident set of any one process.
 
 ## Planned
 

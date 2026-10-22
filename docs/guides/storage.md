@@ -122,9 +122,13 @@ it on to the second owner. The second owner checks the digest and stores it firs
 then does the primary's own copy count as present. The write is acknowledged after both
 hold it.
 
+With `--ram-ack-bytes` over 0 (off by default) the acknowledgement comes earlier for a blob
+of at most 4 MiB: both owners hold it verified in RAM, the second owner first, and each
+writes it to its disk afterwards ([What is durable when](#the-write-tier-what-is-durable-when)).
+
 If the second owner cannot be reached, the primary writes a **repair debt** to its journal
 before it acknowledges, so the write succeeds with one copy and a durable record that a
-second copy is owed. A repair worker makes the copy when the owner returns. A blob present
+second copy is owed. That write is acknowledged from the primary's disk, never from RAM. A repair worker makes the copy when the owner returns. A blob present
 on a primary therefore has either a second copy or a durable debt. If the primary crashes
 in between, the blob is absent and the writer writes it again.
 
@@ -166,6 +170,15 @@ With a hot store, the write path changes:
 | After the answer, before the flush | A crash of kbf, a restart, and a power loss of the host. The block and the log are synced. |
 | After the answer, before the flush | **Not** the loss of the hot store's disk. With replication 2 and a second member, the second owner holds a copy; on one node, the blob is lost. |
 | After the flush | Loss of the hot store. The blob is in the cold store, and the cold store's own durability applies. |
+| After the answer, before either owner has written the blob (`--ram-ack-bytes` over 0 only, a blob of at most 4 MiB) | The loss of **one** owner, or of its process: the other holds the blob in RAM, serves it, writes it to its disk, and owes the lost one a copy. **Not** the loss of both owners' RAM (both processes, or both hosts losing power) before either has written it: the blob is gone, a read is `NOT_FOUND`, the writer uploads it again, and no action-cache entry names it. |
+
+With `--ram-ack-bytes` over 0, a node holds the blobs it acknowledged from RAM until its
+drain has synced them, which takes milliseconds when the disk keeps up:
+`kbf_storage_ram_unwritten_bytes` is the bytes still in RAM and
+`kbf_storage_ram_unwritten_oldest_seconds` the age of the oldest. A full budget does not
+fail a write: it is written to the disk before it is acknowledged, counted in
+`kbf_storage_ram_writethrough_total{reason="budget"}`. A node that stops drains what it
+holds within `--ram-drain-deadline`; `SIGKILL` and a power loss do not.
 
 The flush starts at most about 31 seconds after the block is opened (the 30-second seal
 delay plus the next once-a-second flusher round; a block that reaches 128 MiB is sealed

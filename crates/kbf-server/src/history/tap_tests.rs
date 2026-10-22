@@ -149,6 +149,7 @@ fn a_finished_attempt_keeps_what_the_row_and_the_attempt_hold() {
                     bytes: 70,
                 },
             ],
+            ..RunUsage::default()
         }),
         booked_memory_bytes: Some(1 << 30),
         cap_bytes: None,
@@ -251,12 +252,12 @@ fn a_finished_attempt_keeps_what_the_row_and_the_attempt_hold() {
             c.periods,
             c.throttled_periods,
             c.throttled_us,
-            c.memory_peak_bytes
+            c.memory_peak_bytes.unwrap_or(0)
         ],
         [2, 3, 4, 5, 6, 7, 8]
     );
     assert_eq!(c.numa_bytes, [80, 90], "by node, the node past 63 left out");
-    assert_eq!(c.wall_us, 1);
+    assert_eq!(c.wall_us, Some(1));
     let outputs: Vec<_> = rec
         .outputs
         .iter()
@@ -842,4 +843,127 @@ mod pool {
         // Without a pool, quiesce is at once.
         bare.tap.quiesce().await;
     }
+}
+
+/// Catches: a footprint run written with a cgroup block of zeros beside its footprint
+/// block (a reader would take the zeros as a measured peak), the basis, pressure or
+/// booking dropped, and a cgroup run given a footprint block.
+#[test]
+fn the_basis_picks_the_block_the_record_carries() {
+    use kbf_history::records::UsageBasis as Wire;
+    use kbf_invocation::{FootprintUsage, UsageBasis};
+    let record = |usage: RunUsage| {
+        let mut a = attempt(Some(AttemptEnd::Accepted));
+        a.run = Some(Box::new(Run {
+            usage: Some(usage),
+            ..Run::default()
+        }));
+        let r = row(vec![a], Some(Outcome::Ok { exit_code: 0 }));
+        record_of(&r, 0, EndedKind::Finished).0
+    };
+    let mac = record(RunUsage {
+        wall_micros: 9,
+        basis: UsageBasis::MacFootprint,
+        footprint: Some(FootprintUsage {
+            peak_footprint_bytes: Some(1),
+            ..FootprintUsage::default()
+        }),
+        node_cpu_pressure_centi: Some(250),
+        booked_millicpus: Some(1000),
+        ..RunUsage::default()
+    });
+    assert_eq!(mac.basis(), Wire::MacFootprint);
+    assert_eq!(mac.cgroup, None);
+    let f = mac.footprint.expect("footprint block");
+    assert_eq!((f.peak_footprint_bytes, f.wall_us), (Some(1), Some(9)));
+    assert_eq!(
+        (mac.node_cpu_pressure_centi, mac.booked_millicpus),
+        (Some(250), Some(1000))
+    );
+    let linux = record(RunUsage {
+        basis: UsageBasis::Cgroup,
+        memory_peak_bytes: Some(4),
+        ..RunUsage::default()
+    });
+    assert_eq!(linux.basis(), Wire::Cgroup);
+    assert_eq!(linux.footprint, None);
+    assert_eq!(
+        linux.cgroup.expect("cgroup block").memory_peak_bytes,
+        Some(4)
+    );
+    assert_eq!(
+        (linux.node_cpu_pressure_centi, linux.booked_millicpus),
+        (None, None)
+    );
+    let none = record_of(
+        &row(
+            vec![attempt(Some(AttemptEnd::Accepted))],
+            Some(Outcome::Ok { exit_code: 0 }),
+        ),
+        0,
+        EndedKind::Finished,
+    )
+    .0;
+    assert_eq!(none.basis(), Wire::Unspecified);
+}
+
+/// Catches: an unreadable `memory.peak` (a kernel before 5.19) or a missing wall time
+/// written as 0 (a zero peak would pass for a sample), and a lease counter dropped.
+#[test]
+fn an_absent_peak_and_wall_stay_absent_and_the_lease_counters_are_kept() {
+    use kbf_invocation::UsageBasis;
+    let record = |usage: RunUsage| {
+        let mut a = attempt(Some(AttemptEnd::Accepted));
+        a.run = Some(Box::new(Run {
+            usage: Some(usage),
+            ..Run::default()
+        }));
+        let r = row(vec![a], Some(Outcome::Ok { exit_code: 0 }));
+        record_of(&r, 0, EndedKind::Finished).0
+    };
+    let bare = record(RunUsage {
+        basis: UsageBasis::Cgroup,
+        cpu_usage_micros: Some(5),
+        ..RunUsage::default()
+    });
+    let c = bare.cgroup.expect("cgroup block");
+    assert_eq!((c.memory_peak_bytes, c.wall_us), (None, None));
+    assert_eq!(c.memory_events_max, None);
+    let full = record(RunUsage {
+        wall_micros: 8,
+        basis: UsageBasis::Cgroup,
+        memory_peak_bytes: Some(0),
+        memory_events_max: Some(2),
+        memory_events_oom_kill: Some(0),
+        memory_swap_peak_bytes: Some(3),
+        memory_anon_swap_peak_bytes: Some(4),
+        cpu_pressure_some_micros: Some(5),
+        memory_pressure_some_micros: Some(6),
+        memory_pressure_full_micros: Some(7),
+        cpus_effective: Some(16),
+        ..RunUsage::default()
+    });
+    let c = full.cgroup.expect("cgroup block");
+    assert_eq!((c.memory_peak_bytes, c.wall_us), (Some(0), Some(8)));
+    assert_eq!(
+        [
+            c.memory_events_max,
+            c.memory_events_oom_kill,
+            c.memory_swap_peak_bytes,
+            c.memory_anon_swap_peak_bytes,
+            c.cpu_pressure_some_us,
+            c.memory_pressure_some_us,
+            c.memory_pressure_full_us,
+        ],
+        [
+            Some(2),
+            Some(0),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(6),
+            Some(7)
+        ]
+    );
+    assert_eq!(c.cpus_effective, Some(16));
 }

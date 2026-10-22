@@ -376,3 +376,10 @@ impl ResultDoc {
         Ok(doc)
     }
 }
+
+/// Whether going from release N back to N-1 is reversible: both `meta_log` numbers are
+/// known and `meta_log(N) <= meta_log(N-1)`. An unknown number on either side is not
+/// reversible (fail closed), and so is a first release with nothing to go back to.
+pub fn reversible(meta_log: Option<u64>, previous_meta_log: Option<u64>) -> bool {
+    matches!((meta_log, previous_meta_log), (Some(n), Some(p)) if n <= p)
+}

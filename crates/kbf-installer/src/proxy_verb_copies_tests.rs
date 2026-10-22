@@ -84,6 +84,7 @@ fn the_start_with_copies_runs_the_copy_of_the_installed_release_and_migrates_it_
         upstream: config.upstream,
         status: state_dir.join(releases::STATUS),
         local: Some(local),
+        frontend_config: None,
         watch: None,
     };
     let retry = Retry {
@@ -94,7 +95,7 @@ fn the_start_with_copies_runs_the_copy_of_the_installed_release_and_migrates_it_
     let child = ProcChild::new(
         layout,
         children_dir(&with.state_dir),
-        frontend_argv(&with.proxy_auth_file, with.upstream),
+        frontend_argv(&with.proxy_auth_file, with.upstream, None),
     );
     let child = run_from_copies(child, with.local.as_ref());
     let started = start_with(&handle, &gate, &SystemClock::new(), &child, with, retry);
@@ -257,6 +258,7 @@ fn a_proxy_with_its_own_copies_opens_no_order_spool() {
         &handover,
         regular,
         &kbf_host::Root::host(),
+        None,
     );
     match served {
         Err(VerbError::Failed(text)) => {
