@@ -398,11 +398,16 @@ pub fn run(
         Vec::new()
     };
     let service_uid = ctx.service.as_ref().map(|u| u.uid);
-    kbf_settings::check_files(&*exec, &valid.kbf, service_uid)?;
+    let mut problems = Vec::new();
+    kbf_settings::push_problems(&*exec, &valid.kbf, service_uid, &mut problems);
     // The proxy's files belong to the proxy's user, which on an all-in-one host is not the
-    // sibling's `service`.
+    // sibling's `service`. Both are checked before either is reported.
     if let Some(proxy) = &valid.proxy {
-        kbf_settings::check_files(&*exec, &proxy.files(), ctx.frontend_uid())?;
+        let frontend = ctx.frontend_uid();
+        kbf_settings::push_problems(&*exec, &proxy.files(), frontend, &mut problems);
+    }
+    if !problems.is_empty() {
+        return Err(SetupError::Invalid(problems));
     }
     let proxy = match valid.deploy {
         Some(_) => installer_settings(&*exec, &valid, ctx.platform)?.proxy,

@@ -624,11 +624,7 @@ pub fn retire(exec: &dyn Exec, ctx: &Ctx, shadows: &[super::Shadow]) -> Result<P
 
 /// A setting `setup` writes without a flag of its own: `[table] key = "value"`.
 fn setting(table: &'static str, key: &'static str, value: String) -> Setting {
-    Setting {
-        table,
-        key,
-        value,
-    }
+    Setting { table, key, value }
 }
 
 /// The loopback address the sibling of an all-in-one host listens on.

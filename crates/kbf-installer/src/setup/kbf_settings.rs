@@ -666,6 +666,22 @@ pub fn check_files(
     service: Option<u32>,
 ) -> Result<(), SetupError> {
     let mut problems = Vec::new();
+    push_problems(exec, settings, service, &mut problems);
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(SetupError::Invalid(problems))
+    }
+}
+
+/// [`check_files`], adding each problem to `problems`, so a host whose files belong to two
+/// users is checked whole: every problem of both is reported at once.
+pub fn push_problems(
+    exec: &dyn Exec,
+    settings: &[Setting],
+    service: Option<u32>,
+    problems: &mut Vec<String>,
+) {
     for s in SPECS
         .iter()
         .filter(|s| matches!(s.kind, Want::Cert | Want::Key))
@@ -679,11 +695,6 @@ pub fn check_files(
         if let Err(rule) = check_file(exec, s.kind, &setting.value, service) {
             problems.push(format!("--{}: {rule}", s.flag.unwrap_or(s.key)));
         }
-    }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(SetupError::Invalid(problems))
     }
 }
 
