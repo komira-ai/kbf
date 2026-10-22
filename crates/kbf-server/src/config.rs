@@ -557,10 +557,9 @@ pub struct Args {
     /// Build history: `--history-objects` and `--history-index-root`.
     #[command(flatten)]
     pub history: crate::history::HistoryFlags,
-    /// The release poller: `--release-poll-every-secs`, `--release-poll-repo` and
-    /// `--release-poll-refs`.
+    /// The retired release poller's flags: accepted, hidden, ignored.
     #[command(flatten)]
-    pub release_poll: crate::release::poll::PollFlags,
+    pub release_poll: crate::retired::RetiredPollFlags,
     /// Serves the web UI on the operator API (`--api-listen`): read-only pages under `/ui`
     /// (`docs/design/kbf-ui-v1.md`). On by default; `--ui=false` turns it off, and `/ui` is
     /// then a `404`. The UI is open: it asks for no login or certificate, and it shows
@@ -935,7 +934,6 @@ impl Args {
             token,
             local_cache,
             releases,
-            poll: self.release_poll.config(),
         }))
     }
 
