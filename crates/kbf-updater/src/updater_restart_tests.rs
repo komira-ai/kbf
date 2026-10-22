@@ -636,7 +636,29 @@ fn a_record_that_contradicts_itself_refuses_to_start() {
         RollState::Failed,
     );
     failed_without_failure.roll.failure = None;
+    let mut failed_without_host = record(
+        [(Done, 1), (Pending, 0), (Pending, 0), (Pending, 0)],
+        RollState::Failed,
+    );
+    failed_without_host.roll.failure = Some(Failure {
+        alias: "st1".into(),
+        code: ErrorCode::InstallFailed,
+        detail: "x".into(),
+    });
+    let mut failed_host_no_failure =
+        record([(Done, 1), (Failed, 1), (Pending, 0), (Pending, 0)], run);
+    failed_host_no_failure.roll.failure = None;
     let cases: Vec<(&str, Record, &str)> = vec![
+        (
+            "failed, no failed host",
+            failed_without_host,
+            "failed without a failure and a failed host",
+        ),
+        (
+            "failed host, no failure",
+            failed_host_no_failure,
+            "not failed",
+        ),
         (
             "later host ahead",
             record(
@@ -743,4 +765,26 @@ fn a_host_that_left_the_inventory_fails_the_roll_before_it_is_touched() {
         (ErrorCode::UnknownAlias, "gone")
     );
     assert!(rig.log.events().is_empty());
+}
+
+/// Catches a resume whose first write fails leaving the updater believing a thread still
+/// drives (every later `drive` would then be refused as busy): the failure is `state_lost`,
+/// the same on the next try, and the roll on disk is untouched with no port called.
+#[test]
+fn a_resume_that_cannot_record_itself_is_state_lost_and_leaves_the_roll_alone() {
+    let rig = Rig::new("r-resume-unwritable");
+    let rec = record(
+        [(Done, 1), (Pending, 0), (Pending, 0), (Pending, 0)],
+        RollState::Running,
+    );
+    rig.store().save(&rec).expect("save");
+    let (u, _) = crashing(&rig, 0);
+    for _ in 0..2 {
+        assert_eq!(
+            u.drive("roll-1").expect_err("lost").code,
+            ErrorCode::StateLost
+        );
+    }
+    assert!(rig.log.events().is_empty());
+    assert_eq!(rig.store().load().expect("l").expect("r"), rec);
 }

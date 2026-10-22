@@ -508,6 +508,18 @@ mod tests {
     use super::*;
     use crate::updater_tests::{Rig, all};
 
+    /// Catches the internal readers panicking or inventing a roll when there is none: both
+    /// say `unknown_roll`.
+    #[test]
+    fn the_readers_of_an_empty_updater_say_unknown_roll() {
+        let u = Rig::new("empty-readers").open();
+        assert_eq!(u.snapshot().expect_err("none").code, ErrorCode::UnknownRoll);
+        assert_eq!(
+            u.update(|_| {}).expect_err("none").code,
+            ErrorCode::UnknownRoll
+        );
+    }
+
     /// Catches a roll that resumes past a failed host if a record ever holds one on a running
     /// roll (the loader refuses such a file, so this is the second lock on the door): the
     /// roll fails with `state_lost` and no port is called.

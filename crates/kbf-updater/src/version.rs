@@ -194,7 +194,8 @@ mod tests {
     /// same bound and alphabet.
     #[test]
     fn the_ere_states_the_same_rule() {
-        assert!(ERE.starts_with('^') && ERE.ends_with('$'));
+        assert!(ERE.starts_with('^'));
+        assert!(ERE.ends_with('$'));
         assert!(ERE.contains("[0-9]"));
         assert!(ERE.contains("[A-Za-z0-9.+~-]"));
         assert!(ERE.contains(&format!("{{0,{}}}", MAX_LEN - 1)));

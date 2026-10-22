@@ -187,10 +187,9 @@ fn parse_line(line: &str) -> Result<Host, String> {
             "host key type {key_type:?} is not a supported type"
         ));
     }
-    if key.is_empty()
-        || !key
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+    if !key
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
     {
         return Err("the host key is not base64".to_owned());
     }
@@ -255,11 +254,9 @@ mod tests {
         plan.iter().map(|h| h.alias.clone()).collect()
     }
 
+    /// The refusal as text: `line N: reason`.
     fn line_error(text: &str) -> String {
-        match Inventory::parse(text).expect_err("refused") {
-            InventoryError::Line { line, reason } => format!("{line}: {reason}"),
-            other => panic!("not a line error: {other}"),
-        }
+        Inventory::parse(text).expect_err("refused").to_string()
     }
 
     /// Catches a reader that drops a field or reads the wrong column: every field of every
@@ -339,7 +336,7 @@ mod tests {
         ];
         for (text, want) in cases {
             let got = line_error(&format!("# header\n{text}"));
-            assert!(got.starts_with("2: "), "{text}: {got}");
+            assert!(got.starts_with("line 2: "), "{text}: {got}");
             assert!(got.contains(want), "{text}: {got}");
         }
     }
@@ -380,15 +377,16 @@ mod tests {
             let got = Inventory::load(&path, mine);
             assert_eq!(got.is_ok(), ok, "mode {mode:o}: {got:?}");
             if !ok {
-                assert!(matches!(got, Err(InventoryError::Mode { mode: m }) if m == mode));
+                let want = format!("the inventory is writable by group or others (mode {mode:o})");
+                assert_eq!(got.expect_err("refused").to_string(), want);
             }
         }
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
         let other = Inventory::load(&path, mine + 1).expect_err("owner");
-        assert!(
-            matches!(other, InventoryError::Owner { found, expected } if found == mine && expected == mine + 1)
+        assert_eq!(
+            other.to_string(),
+            format!("the inventory is owned by uid {mine}, not {}", mine + 1)
         );
-        assert!(other.to_string().contains("owned by uid"));
         let missing = Inventory::load(&path.with_extension("none"), mine).expect_err("missing");
         assert!(matches!(missing, InventoryError::Io(_)));
     }
