@@ -112,7 +112,10 @@ fn an_unknown_rule_has_a_placement_fingerprint_of_its_own() {
     let alone = unknown(7, 2, two_active());
     assert_eq!(alone, unknown(-3, 2, two_active()));
     assert_eq!(alone, unknown(7, 1, two_active()));
-    assert_eq!(alone, unknown(7, 1, vec![member(9, 3, MemberState::Active)]));
+    assert_eq!(
+        alone,
+        unknown(7, 1, vec![member(9, 3, MemberState::Active)])
+    );
     let known = map(5, 2, two_active()).placement_fingerprint();
     assert_ne!(alone, known);
 }
