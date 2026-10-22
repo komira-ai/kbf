@@ -463,3 +463,12 @@ fn the_probe_route_needs_its_verify_row() {
         )]
     );
 }
+
+#[test]
+fn the_ui_design_names_no_route_the_server_dropped() {
+    let text = fs::read_to_string(root().join("docs/design/kbf-ui-v1.md")).unwrap();
+    assert!(
+        !text.contains("update/hosts"),
+        "docs/design/kbf-ui-v1.md names `update/hosts`, a route the server no longer serves"
+    );
+}

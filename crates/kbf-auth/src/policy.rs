@@ -33,12 +33,9 @@ pub struct Policy {
     /// because the route serves build outputs and logs. The route is also off
     /// without [`Self::invocations_get`].
     pub blobs_get: Option<Arc<dyn Authorizer>>,
-    /// `farm.getAuthorizer` (the `farm.get` authority): asked, with the empty instance
-    /// name (farm state names no build), by the operator API's per-host update detail
-    /// (`GET /v1/update/hosts`), which runs [`Self::authenticator`] too. `None`, when
-    /// the file names no such key or there is no file, turns that route off: unlike
-    /// every other authorizer, a missing one does not allow, because the route serves
-    /// the commits each host runs and why it refused an update.
+    /// `farm.getAuthorizer` (the `farm.get` authority): read so that a policy file naming
+    /// the key still loads, and asked by no route. It gated `GET /v1/update/hosts`, which
+    /// the server no longer has (`docs/reapi-auth.md`).
     pub farm_get: Option<Arc<dyn Authorizer>>,
 }
 
