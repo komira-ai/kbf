@@ -2,7 +2,7 @@
 //! "all-in-one"`) to the proxy layout: the split into the sibling's, the children's and the
 //! installer's files, the original kept, what flags override, what has no place, the operator
 //! token and the commands left to the operator. The helpers are `tests.rs`'s. Each test says the
-//! defect it catches and names the mutants to plant to see it go red; none is claimed to have run.
+//! behaviour it asserts.
 
 use super::*;
 use crate::setup::aio_migrate;
@@ -89,10 +89,6 @@ fn dir_meta(exec: &FakeExec, path: &str) -> (u32, Owner) {
 /// replaced. The operator token keeps its bytes and becomes `kbf-server`'s, which the earlier
 /// layout's was not (the proxy's children could not read it). The output does not say that a
 /// running kbf keeps the old file until it is restarted: the earlier unit is not to be restarted.
-///
-/// Mutants to plant: no copy; the copy written after `kbf.toml`; the copy 0644; a key of the
-/// earlier file not carried (red: its flag is required); the token left to `kbf`; the token
-/// made anew; the generic note of a replaced `kbf.toml` printed for the move.
 #[test]
 fn an_earlier_host_is_split_into_the_new_files_and_its_original_is_kept() {
     let mut exec = earlier_host(EARLIER);
@@ -120,8 +116,6 @@ fn an_earlier_host_is_split_into_the_new_files_and_its_original_is_kept() {
 /// Catches the note about settings with no place printed when there are none: an earlier file
 /// whose keys all have a place (no listeners, no worker certificate) is split with no such note,
 /// and the commands are still shown.
-///
-/// Mutant to plant: the note always pushed.
 #[test]
 fn an_earlier_file_with_every_key_placed_gets_no_note_about_settings() {
     let mut bare = EARLIER.to_owned();
@@ -140,11 +134,8 @@ fn an_earlier_file_with_every_key_placed_gets_no_note_about_settings() {
 /// finished host plan nothing and the copy is as it was; a run that finds the copy made and the
 /// file not yet replaced (a stop between the two) writes the one file it was missing and nothing
 /// for the copy; and the short command of the first run, on the finished host, is refused for
-/// the flags it lacks (pinned: the moved files are not read for values, as the setup doc says).
-///
-/// Mutants to plant: the copy planned on every run; the move planned for a file that no longer
-/// says `all-in-one`; the directory of the copy planned again; values read from the moved files
-/// (red: the short command is no longer refused, which this test pins until that is wanted).
+/// the flags it lacks (pinned: the moved files are not read for values, as the setup doc says,
+/// and this test holds that until it is wanted otherwise).
 #[test]
 fn a_second_run_does_nothing_new_and_a_stopped_run_resumes_without_the_copy() {
     let mut exec = earlier_host(EARLIER);
@@ -173,9 +164,6 @@ fn a_second_run_does_nothing_new_and_a_stopped_run_resumes_without_the_copy() {
 /// Catches an original lost: a copy that is kept and holds another file is not written over and
 /// the new file is not written over the file it does not match; setup refuses (exit 5) naming the
 /// copy, before it plans anything, dry run or apply.
-///
-/// Mutants to plant: the copy overwritten; the check dropped (red: the copy changes); the check
-/// made after the first plan is applied (red: files are written).
 #[test]
 fn a_copy_of_another_original_is_refused_and_nothing_is_touched() {
     let other = "mode = \"all-in-one\"\n# another\n";
@@ -201,9 +189,6 @@ fn a_copy_of_another_original_is_refused_and_nothing_is_touched() {
 /// the children's file and to `installer.toml`), everything else is carried, and the original
 /// keeps the old values. The cold store and the metadata directory given with the file's own
 /// values are accepted.
-///
-/// Mutants to plant: the earlier file's value filled in over a flag; `--database` ignored when the
-/// file has one; a given cold store or metadata directory refused although it is the file's.
 #[test]
 fn a_flag_of_the_run_overrides_the_old_value_and_the_rest_is_carried() {
     let database = "postgres:///kbf2?host=/run/postgresql&user=kbf-server";
@@ -229,9 +214,6 @@ fn a_flag_of_the_run_overrides_the_old_value_and_the_rest_is_carried() {
 /// held to the rules of a fresh host's (the REAPI key must belong to `kbf-server`, which the
 /// earlier layout's did not), with the same line, and so is a REAPI certificate owned by `kbf`
 /// (a certificate must be root's or `kbf-server`'s); nothing is written.
-///
-/// Mutants to plant: a required flag defaulted; the line left out; the carried files unchecked;
-/// the certificate left unchecked.
 #[test]
 fn what_is_missing_or_wrong_in_the_carried_values_is_refused_before_any_write() {
     let no_id = EARLIER.replace("node-id = \"farm-1\"\n", "");
@@ -272,9 +254,6 @@ fn what_is_missing_or_wrong_in_the_carried_values_is_refused_before_any_write() 
 /// Catches a flag that repoints the data of a host being moved: `--cold-store` or `--meta-dir`
 /// naming another place than the earlier file does is refused (exit 5) with the flag named and
 /// no value in the message, before anything is planned, and nothing is written.
-///
-/// Mutants to plant: the check dropped (red: the run goes through); the check on the cold store
-/// only; a value in the message.
 #[test]
 fn another_cold_store_or_meta_dir_than_the_files_is_refused_without_the_value() {
     let mut cold = minimal();
@@ -303,9 +282,6 @@ fn another_cold_store_or_meta_dir_than_the_files_is_refused_without_the_value() 
 /// its name), among them the listeners, the worker listener's certificate, the operator's own
 /// table and a key of the layout whose value is not text; no value is printed; the keys that were
 /// carried are not named; and the original, which keeps them all, is named.
-///
-/// Mutants to plant: the note left out; a value in the note; the note naming every key; a key
-/// whose value is not text counted as carried.
 #[test]
 fn settings_with_no_place_in_the_new_layout_are_named_and_never_printed() {
     let tail = "\n[log]\nlog-files = 3\nlog-secret = \"hunter2-value\"\n";
@@ -358,9 +334,6 @@ fn settings_with_no_place_in_the_new_layout_are_named_and_never_printed() {
 /// every run plans, and the output has the operator's commands in order: stop the earlier unit and
 /// wait for it, disable it, reload systemd, then start the sibling and the proxy, with the exit 75
 /// retry, the warning about a reboot in between and the warning not to restart the earlier unit.
-///
-/// Mutants to plant: a `systemctl stop` of the earlier unit planned by setup; an `enable --now` of
-/// the sibling or of the proxy units; the steps in another order; the wait left out.
 #[test]
 fn setup_stops_and_starts_none_of_the_move_and_prints_the_commands_in_order() {
     let mut os = FakeOs::linux();
@@ -398,8 +371,6 @@ fn setup_stops_and_starts_none_of_the_move_and_prints_the_commands_in_order() {
 /// Catches a dry run that writes, or one that leaves the move out of the plan: the copy, the
 /// children's file and `kbf.toml` are named with `DRY-RUN:` and the commands are shown, and the
 /// host is as it was (the earlier file, no copy, no directory for it, the token still `kbf`'s).
-///
-/// Mutant to plant: the dry run applying a step.
 #[test]
 fn a_dry_run_shows_the_split_and_changes_nothing() {
     let mut exec = earlier_host(EARLIER);
@@ -418,9 +389,6 @@ fn a_dry_run_shows_the_split_and_changes_nothing() {
 /// Catches the host named by the wrong error: a run without `--proxy` on an earlier host (the
 /// command line that set it up) is told what the host is and what to add (exit 5), not only that
 /// `--proxy` is required, and nothing is touched, dry run or apply.
-///
-/// Mutants to plant: the earlier file not read before the flags are checked (red: exit 2); the
-/// message without the flag.
 #[test]
 fn a_run_without_proxy_on_an_earlier_host_names_the_host_and_changes_nothing() {
     for options in [APPLY, DRY] {
@@ -446,9 +414,6 @@ fn a_run_without_proxy_on_an_earlier_host_names_the_host_and_changes_nothing() {
 /// and the old file is left; the output says so and not that a first token was made. With no token
 /// anywhere (no key, or a key that names a file that is not there) the first one is made, as on a
 /// fresh host.
-///
-/// Mutants to plant: the other path not read (red: a new token is made); the old file removed;
-/// the bytes printed.
 #[test]
 fn the_operator_token_of_the_earlier_file_is_kept_wherever_it_was() {
     let mut exec = released(host(), Platform::Linux);
@@ -480,9 +445,6 @@ fn the_operator_token_of_the_earlier_file_is_kept_wherever_it_was() {
 /// at the path `api-token-file` names, the layout's is kept (its bytes, `kbf-server`'s) and the
 /// output names the other file as not used, never its bytes; with the same bytes in both files
 /// there is nothing to say.
-///
-/// Mutants to plant: the note left out; the note printed when the bytes are the same; the bytes of
-/// either token in the note; the other file chosen over the layout's.
 #[test]
 fn a_second_token_that_differs_is_named_as_unused_and_an_equal_one_is_not() {
     let mut exec = earlier_host(&token_named(OTHER_TOKEN));
