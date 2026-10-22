@@ -36,10 +36,11 @@ impl State {
     pub(super) fn bounds_of(&self, operation: OperationId, worker: &WorkerId) -> Bounds {
         let mut bounds = self.bounds_on(worker);
         if self.learned.keys() && self.sched.size_key(operation).is_some() {
-            let bound = self.sched.key_floor_bound_of(operation);
-            if bound > 0 {
-                bounds.host_memory = bound;
-            }
+            // Never below the worker's own memory (the bound is the largest worker, and
+            // the one that reported is among those that could run it).
+            bounds.host_memory = bounds
+                .host_memory
+                .max(self.sched.key_floor_bound_of(operation));
         }
         bounds
     }

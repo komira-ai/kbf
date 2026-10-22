@@ -1091,3 +1091,97 @@ fn a_keyed_operation_is_bounded_by_the_largest_worker_and_an_unkeyed_one_by_its_
     assert_eq!(state.bounds_of(ops[0], &small).host_memory, 64 << 30);
     assert_eq!(state.bounds_of(ops[1], &small).host_memory, 16 << 30);
 }
+
+/// A stored operation names its estimator key at restart only when what names it is there:
+/// a subject, a platform that pins the OS, and a key that is not the empty subject's.
+#[test]
+fn a_stored_operation_is_registered_only_when_it_can_be_named() {
+    use super::durable::StoredOperation;
+    use crate::action_usage::Subject;
+    use kbf_front::Described;
+
+    let rows = store();
+    let farm = farm_over(&rows, LearnedSizes::On);
+    let (subject, _) = Subject::of(Described {
+        arguments: vec!["cc".to_owned()],
+        ..Described::default()
+    });
+    let (empty, _) = Subject::of(Described::default());
+    let linux = kbf_caps::Request::from_platform([("OSFamily", "linux")]).unwrap();
+    let stored = |needs: kbf_caps::Request, subject: Option<Subject>| StoredOperation {
+        operation: kbf_types::OperationId(1),
+        request: kbf_sched::Request {
+            key: ActionKey {
+                instance: "main".to_owned(),
+                action: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+            },
+            qos: Qos::Ci,
+            kind: LeaseKind::Action,
+            resources: Resources::new(1_000, 4 << 30),
+            hermetic: true,
+            do_not_cache: false,
+            needs,
+        },
+        lease: None,
+        losses: 0,
+        fate: None,
+        subject,
+        size_key: Some(5),
+    };
+    let (key, _) = estimator_key_and_run();
+    {
+        let mut state = farm.lock();
+        state.register_stored(&stored(linux.clone(), None), 5);
+        state.register_stored(
+            &stored(kbf_caps::Request::default(), Some(subject.clone())),
+            5,
+        );
+        state.register_stored(&stored(linux.clone(), Some(empty)), 5);
+        assert!(state.learned.named(&key).is_empty(), "none can be named");
+        state.register_stored(&stored(linux, Some(subject)), 5);
+    }
+    assert_eq!(farm.lock().learned.named(&key), vec![5]);
+}
+
+/// A report the farm never saw start, and a success that carries no usage, teach the
+/// estimator nothing and are counted as not shown; neither stops the report.
+#[test]
+fn a_report_without_a_booking_or_usage_is_counted_not_shown() {
+    use crate::learned::Skip;
+    let rows = store();
+    let killed = killed_farm(rows.clone(), &rows);
+    // A lease the farm never saw start.
+    let stranger = kbf_types::LeaseId::new(9, 4_242);
+    let report = super::Report {
+        lease: stranger,
+        outcome: kbf_types::Outcome::Completed {
+            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+        },
+        measured: None,
+        exit_code: Some(0),
+        run: None,
+    };
+    let now = killed.farm.now();
+    killed
+        .farm
+        .lock()
+        .take_report(now, &killed.node, kbf_types::OperationId(0), report);
+    assert_eq!(killed.farm.lock().learned.skipped(Skip::NoBooking), 1);
+
+    // A success of the retry that measured nothing.
+    let (operation, lease) = newest(&killed.farm, &killed.node);
+    let report = super::Report {
+        lease,
+        outcome: kbf_types::Outcome::Completed {
+            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+        },
+        measured: None,
+        exit_code: Some(0),
+        run: None,
+    };
+    killed
+        .farm
+        .lock()
+        .take_report(now, &killed.node, operation, report);
+    assert_eq!(killed.farm.lock().learned.skipped(Skip::NoBasis), 1);
+}

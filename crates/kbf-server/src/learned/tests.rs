@@ -890,3 +890,28 @@ fn only_on_reports_a_decay() {
     assert_eq!(l2_floor(&learned), 8 * GIB, "the estimator still decays");
     assert!(learned.take_lowered().is_empty());
 }
+
+/// The registry of size keys is bounded: past the cap the estimator key registered first
+/// is forgotten with its size keys, and the newest stay.
+#[test]
+fn the_registry_of_size_keys_is_bounded_and_forgets_the_oldest() {
+    let mut learned = Learned::new(LearnedSizes::On, 4 * GIB, EPOCH);
+    let shaped = |n: u64| {
+        Key::new(
+            Instance::new("main"),
+            PlatformClass::new("linux"),
+            Basis::Cgroup,
+            Shape(n),
+            None,
+        )
+    };
+    for n in 0..=STARTED_CAP as u64 {
+        learned.register(&shaped(n), n);
+    }
+    assert!(learned.named(&shaped(0)).is_empty(), "the oldest is gone");
+    assert_eq!(learned.summary_key(0), None);
+    let newest = STARTED_CAP as u64;
+    assert_eq!(learned.named(&shaped(newest)), vec![newest]);
+    assert_eq!(learned.summary_key(newest), Some(shaped(newest)));
+    assert_eq!(learned.named(&shaped(1)), vec![1]);
+}
