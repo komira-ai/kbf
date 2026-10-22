@@ -739,7 +739,12 @@ impl Cs {
         // The launchd-own agents of the uid (distnoted, cfprefsd): the shipped clean's check
         // tolerates them too, so they are counted apart.
         let is_agent = |l: &&str| {
-            l.contains("distnoted") || l.contains("cfprefsd") || l.contains("com.apple.rootless")
+            l.contains("distnoted")
+                || l.contains("cfprefsd")
+                || l.contains("com.apple.rootless")
+                || l.starts_with("< launchd-user|")
+                || l.starts_with("< launchd-gui|")
+                || l.starts_with("< procs|")
         };
         let agents = lines.iter().filter(|l| is_agent(*l)).count();
         let others = lines.len() - agents;
@@ -911,7 +916,7 @@ fn baseline_and_builds() {
         let path = format!("{WORK}/snap.b0.{i}");
         let o = e.root(
             &format!(
-                "touch \"$MK\"; snap | awk '/^== /{{s=$2}} s!=\"ds\" && s!=\"folders\"{{print}}' | sed -e \"s#$H#<H>#g\" -e \"s#$U#<U>#g\" -e \"s/$ID/<ID>/g\" > '{path}' 2>&1; wc -l < '{path}'"
+                "touch \"$MK\"; snap | grep -v -e '^ds|' -e '^folders|' | sed -e \"s#$H#<H>#g\" -e \"s#$U#<U>#g\" -e \"s/$ID/<ID>/g\" > '{path}' 2>&1; wc -l < '{path}'"
             ),
             180,
         );
@@ -939,7 +944,7 @@ fn baseline_and_builds() {
     let m = cs.last_marker.lock().unwrap().clone();
     let o = env0.root(
         &format!(
-            "awk '/^== /{{s=$2}} s!=\"ds\" && s!=\"folders\"{{print}}' '{WORK}/snap.{m}.after' | sed -e 's#{HOMES}/kbf-cs-0#<H>#g' -e 's/kbf-cs-0/<U>/g' -e 's/61000/<ID>/g' > '{WORK}/b1.norm'; sdiff_ '{}' '{WORK}/b1.norm'",
+            "grep -v -e '^ds|' -e '^folders|' '{WORK}/snap.{m}.after' | sed -e 's#{HOMES}/kbf-cs-0#<H>#g' -e 's/kbf-cs-0/<U>/g' -e 's/61000/<ID>/g' > '{WORK}/b1.norm'; sdiff_ '{}' '{WORK}/b1.norm'",
             snaps[0]
         ),
         60,

@@ -83,7 +83,7 @@ cs_sweep() { # every user of the spike (by name, uid block and mark), then the h
 
 # ---------------------------------------------------------------- snapshot
 
-snap() { # a passive, root-only reading of everything the uid can own or leave
+snap_raw() { # a passive, root-only reading of everything the uid can own or leave
   echo "== home";    find -x "$H" -exec ls -ldeO@ {} + 2>&1 | dates
   echo "== folders"; find -x "$F" -exec ls -ldeO@ {} + 2>&1 | dates
   echo "== shared";  find /private/tmp /private/var/tmp /Users/Shared /Library/Caches -xdev -user "$ID" -exec ls -ldeO@ {} + 2>&1 | dates
@@ -101,6 +101,7 @@ snap() { # a passive, root-only reading of everything the uid can own or leave
   case " $SNAPX " in *" btm "*)  echo "== btm"; sfltool dumpbtm 2>&1 | grep -c -E "$U|$H" ;; esac
 }
 
+snap() { snap_raw | awk '/^== /{s=substr($0,4); next} {print s"|"$0}'; }
 sdiff_() { diff "$1" "$2" | grep '^[<>]' | cut -c1-200; }
 
 # ---------------------------------------------------------------- the plant wrapper
@@ -455,10 +456,10 @@ probe_W03() { pr 'home_nonempty'; }
 fixture_W04() {
   cat >"$W/$M.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0"><dict><key>Label</key><string>$M</string><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>1</integer><key>UserName</key><string>$U</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>echo x >>"$H/respawn-$M"; sleep 2</string></array></dict></plist>
+<plist version="1.0"><dict><key>Label</key><string>$M</string><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>1</integer><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>echo x >>"$H/respawn-$M"; sleep 2</string></array></dict></plist>
 EOF
   chmod 644 "$W/$M.plist"
-  echo "W04 fixture bootstrap: $(launchctl bootstrap "user/$ID" "$W/$M.plist" 2>&1 | head -2 | tr '\n' ' ')"
+  echo "W04 fixture bootstrap user/: $(launchctl bootstrap "user/$ID" "$W/$M.plist" 2>&1 | head -2 | tr '\n' ' ') plutil: $(plutil -lint "$W/$M.plist" 2>&1 | head -1) domain: $(launchctl print "user/$ID" 2>&1 | head -1)"
   sleep 3
 }
 do_W04() { launchctl submit -l "kbf.w4.$M" -- /bin/sh -c "echo x >>$H/submit-$M; sleep 2"; echo "submit rc=$?"; sleep 2; }
@@ -479,7 +480,7 @@ plant_W05() { p W05 do_W05; }
 probe_W05() { echo "INFO W05 canaries: $(procs_of | grep -c canary) maxprocperuid: $(sysctl -n kern.maxprocperuid)"; pr 'procs_of | grep -q canary'; }
 
 plant_W06a() { p W06a bg_ok hd "$K" hold-deleted "$L/big" 128; }
-probe_W06a() { pr 'lsof -a +L1 -u "$ID" 2>/dev/null | sed 1d | grep -q .'; }
+probe_W06a() { echo "INFO W06a lsof: $(lsof -a +L1 -u "$ID" 2>/dev/null | sed 1d | awk '{print $1,$2,$9}' | head -4 | tr '\n' ';')"; pr 'lsof -a +L1 -u "$ID" 2>/dev/null | sed 1d | grep -q canary'; }
 plant_W06() { plant_W06a; }
 probe_W06() { probe_W06a; }
 
@@ -500,7 +501,7 @@ teardown_W06b() {
 }
 
 plant_W06c() { p W06c bg_ok hl2 "$K" hold-lock "$H/lock"; p W06cu bg_ok ls "$K" listen-unix "${T}s$M" 300; }
-probe_W06c() { pr 'home_nonempty || lsof -nP -a -u "$ID" 2>/dev/null | sed 1d | grep -q .'; }
+probe_W06c() { pr 'home_nonempty || lsof -nP -a -u "$ID" 2>/dev/null | grep -q canary'; }
 
 do_W07() {
   while IFS= read -r d; do
@@ -556,10 +557,10 @@ probe_W10() { echo "INFO W10 home: $(stat -f '%Sp %Sf' "$H") entry: $(stat -f '%
 fixture_W11() {
   cat >"$W/$M.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0"><dict><key>Label</key><string>$M</string><key>StartInterval</key><integer>5</integer><key>UserName</key><string>$U</string><key>ProgramArguments</key><array><string>/usr/bin/touch</string><string>$H/si-$M</string></array></dict></plist>
+<plist version="1.0"><dict><key>Label</key><string>$M</string><key>StartInterval</key><integer>5</integer><key>ProgramArguments</key><array><string>/usr/bin/touch</string><string>$H/si-$M</string></array></dict></plist>
 EOF
   chmod 644 "$W/$M.plist"
-  echo "W11 fixture bootstrap: $(launchctl bootstrap "user/$ID" "$W/$M.plist" 2>&1 | head -2 | tr '\n' ' ')"
+  echo "W11 fixture bootstrap user/: $(launchctl bootstrap "user/$ID" "$W/$M.plist" 2>&1 | head -2 | tr '\n' ' ') plutil: $(plutil -lint "$W/$M.plist" 2>&1 | head -1)"
 }
 do_W11a() { printf '* * * * * touch %s/cron-%s\n' "$H" "$M" >"$L/ct" && crontab "$L/ct"; }
 plant_W11() { p W11a do_W11a; }
@@ -654,6 +655,10 @@ PL
   echo "shm: root-open=$("$K" shm-open /kbfposshm 2>&1) other-uid-open=$(asu_other "$K" shm-open /kbfposshm 2>&1) ipcs-shm-lines=$(ipcs -a 2>/dev/null | grep -ci shm)"
   "$K" shm-unlink /kbfposshm >/dev/null 2>&1
   pkill -9 -U "$ID" 2>/dev/null
+  # crash reports: does ReportCrash write anything for a crash at all on this host? (root-run canary)
+  touch "$W/mk.crashctl"; "$K" crash-segv >/dev/null 2>&1; "$K" crash-abort >/dev/null 2>&1; sleep 45
+  _c=$(find /Library/Logs/DiagnosticReports "$HOME/Library/Logs/DiagnosticReports" /var/root/Library/Logs/DiagnosticReports -newer "$W/mk.crashctl" -type f 2>/dev/null | head -3 | tr '\n' ';')
+  echo "crash-report-control (root-run canary crash, 45 s) -> $([ -n "$_c" ] && echo "POSITIVE $_c" || echo "BLIND: no report appeared")"
 }
 
 cs_inventory() {
