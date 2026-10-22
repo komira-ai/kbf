@@ -313,10 +313,51 @@ refuses `frontend_update` orders here (the host "runs no frontend"), and the uni
 the sibling's. Until it reads the children's file from `installer.toml`, the children of an
 all-in-one host are not swapped through the update API.
 
-**Only a fresh host.** A `kbf.toml` that says `mode = "all-in-one"` is the earlier layout, one
-process for everything. `setup` does not rewrite it into this one: it refuses (exit 5,
-`needs_operator`), naming the file, and changes nothing. Keep such a host on
-`kbf-all-in-one.service`; moving it is a separate step that `setup` does not take.
+**A host of the earlier layout is moved.** A `kbf.toml` that says `mode = "all-in-one"` is the
+earlier layout, one process for everything (`kbf-all-in-one.service`). Run the same command as for
+a fresh host, with `--proxy`; without it `setup` refuses (exit 5, `needs_operator`), naming the
+file and saying what to add, and changes nothing. `setup` then splits the file:
+
+- The original is kept first, root's 0600, as `kbf.toml.all-in-one` in
+  `/var/lib/kbf-installer/migration-units/` (0700). It is made once and never overwritten. A copy
+  that is there and holds another file is refused (exit 5) before anything is written, since
+  neither may be lost.
+- The settings carry over as flags: a flag this run does not give takes the old file's value
+  (`--cold-store`, `--meta-dir`, the identity rows `--daemon-server`, `--daemon-ca-cert`,
+  `--daemon-cert`, `--daemon-key` and `--node-id`, the REAPI pair, `--worker-client-ca`, and
+  `[scheduler] state-store` for `--database`), and a flag that is given overrides it, except
+  `--cold-store` and `--meta-dir`: the move keeps both where they are, so a value other than the
+  file's is refused (exit 5, the flag named, no value printed) rather than starting the sibling on
+  a metadata directory with no log of the cold store. They are then checked as a fresh host's are,
+  so a value the file lacks is reported as its missing flag, and a carried key or certificate file
+  must belong to the user the new layout reads it as (the REAPI key to `kbf-server`, which the
+  earlier layout's did not; a REAPI certificate or client CA owned by `kbf` is refused too, since
+  a certificate must be root's or `kbf-server`'s). The stores go to the sibling's `kbf.toml`, the
+  state store to `frontend.toml`, the REAPI pair and the client CA to `[proxy]` of
+  `installer.toml`; the metadata directory and the cold store are the same.
+- The operator token stays the same token. If it is at `/etc/kbf/api-token` it is rewritten with
+  its own bytes as `kbf-server`'s (the earlier layout's belonged to `kbf`, and the proxy's
+  children could not read it); a token at another path that `[tls] api-token-file` names is
+  copied there and the old file is left. If both files are there and differ, the one at
+  `/etc/kbf/api-token` is kept and the output names the other as not used.
+- A key with no place in the new layout (the listeners, `worker-tls-cert` and `worker-tls-key`,
+  anything the operator added) is named in the output as `[table] key` and never printed; the
+  original keeps it.
+- `setup` stops and starts none of the services of the move (as on any run it enables
+  `kbf-installer.service` and starts it): the earlier unit drains without a time limit and holds
+  the metadata directory the sibling needs. It prints the commands, in order: stop
+  `kbf-all-in-one.service` and wait until it has exited, disable it, `systemctl daemon-reload`,
+  then start `kbf-storage-and-daemon.service` and the proxy units. A start that finds the metadata
+  directory still held exits 75 and is retried. Until the unit is disabled both the earlier unit
+  and the new ones are enabled, so do not reboot the host in between. Do not restart the earlier
+  unit once `kbf.toml` is replaced; for that reason the move does not print the note that a
+  running kbf keeps the old file until it is restarted.
+
+A moved host's `kbf.toml` no longer says `all-in-one`, so a second run is a fresh host's: it plans
+nothing new, does not look at the copy, and needs every flag, since the moved files are not read
+for values. That includes a run repeated after a stop part way (`kbf.toml` is written last of the
+files, before the units are enabled): give the flags of the first run again, or the missing ones
+are reported by name (exit 2). A dry run shows the plan, including the copy, and writes nothing.
 
 ## The state database
 

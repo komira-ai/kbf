@@ -28,8 +28,10 @@
 //!   frontend children and `kbf-storage-and-daemon.service` beside them. `kbf.toml` is the
 //!   sibling's (`mode = "storage-and-daemon"` on the loopback `--storage-port`) and
 //!   `frontend.toml`, which `installer.toml` names as `frontend_config`, the children's; the
-//!   second is written first. Only a fresh host: a `kbf.toml` that says `mode = "all-in-one"`
-//!   is refused (exit 5) and left as it is.
+//!   second is written first. A `kbf.toml` that says `mode = "all-in-one"` is the earlier layout
+//!   (one process for everything): `setup` splits it into these files, keeping the original, and
+//!   names what the new layout has no place for, but stops and starts none of the services of
+//!   the move; it prints the commands that finish the move ([`aio_migrate`]).
 //! - `[proxy] listen` of `installer.toml` (the operator's key) becomes the drop-in
 //!   `kbf-proxy.socket.d/listen.conf` on Linux, and no key removes the drop-in. Setup never
 //!   reloads systemd or restarts the socket: it says that is needed.
@@ -43,6 +45,7 @@
 //!   ([`release_keys`]); the flags decide them, so a run for another source leaves none behind.
 //! - `kbf.toml` is written after every file a unit needs, and the units after it.
 
+pub mod aio_migrate;
 pub mod backend;
 pub mod deploy_config;
 pub mod kbf_settings;
@@ -315,13 +318,26 @@ pub fn run(
     if options.apply {
         os.trusted_binary()?;
     }
-    // Before the flags are checked: a host of the earlier layout re-run with the command line
-    // that set it up (no `--proxy`) is told it is that host, not that `--proxy` is required.
-    if raw.mode == Mode::AllInOne {
-        plan::refuse_earlier_all_in_one(&*exec, os.platform())?;
+    // A host of the earlier layout is moved: the flags this run does not give come from its
+    // `kbf.toml`. That is read before the flags are checked, and a run without `--proxy` (the
+    // command line that set the host up) is told it is that host, not that `--proxy` is required.
+    let earlier = match raw.mode {
+        Mode::AllInOne => aio_migrate::read(&*exec, os.platform())?,
+        _ => None,
+    };
+    let mut adopted = raw.clone();
+    if let Some(earlier) = &earlier {
+        earlier.adopt(&mut adopted)?;
     }
-    let valid = raw.validate(os.platform()).map_err(SetupError::Invalid)?;
-    let ctx = plan::context(os, valid.mode)?;
+    let moving = earlier.is_some();
+    let valid = adopted
+        .validate(os.platform())
+        .map_err(|problems| aio_migrate::invalid(problems, moving))?;
+    let mut ctx = plan::context(os, valid.mode)?;
+    if let Some(earlier) = &earlier {
+        earlier.check(&*exec, &ctx)?;
+    }
+    ctx.earlier = earlier;
     // A host that fetches nothing is told so to the frontend by the `kbf` that runs on it, or the
     // frontend orders it a fetch the installer can only refuse. A host with a release has such a
     // `kbf`, and it must relay; a host with none installs the package's, which is this build's.
@@ -345,7 +361,7 @@ pub fn run(
         kbf_settings::push_problems(&*exec, &proxy.files(), frontend, &mut problems);
     }
     if !problems.is_empty() {
-        return Err(SetupError::Invalid(problems));
+        return Err(aio_migrate::invalid(problems, moving));
     }
     let proxy = match valid.deploy {
         Some(_) => installer_settings(&*exec, &valid, ctx.platform)?.proxy,

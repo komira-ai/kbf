@@ -1729,3 +1729,6 @@ mod seed;
 
 #[path = "aio_tests.rs"]
 mod aio;
+
+#[path = "aio_migrate_tests.rs"]
+mod aio_migrate_tests;

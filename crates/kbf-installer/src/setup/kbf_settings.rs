@@ -318,6 +318,14 @@ const PROXY_REFUSED: [&str; 5] = [
     "worker-tls-key",
 ];
 
+/// Whether an all-in-one host of the proxy layout writes `[table] key` somewhere: in the sibling's
+/// `kbf.toml`, or, for the REAPI pair and the worker client CA, in the `[proxy]` table.
+pub fn all_in_one_writes(table: &str, key: &str) -> bool {
+    SPECS
+        .iter()
+        .any(|s| s.takes.mode(Mode::AllInOne) && s.table == table && s.key == key)
+}
+
 /// The `(table, key)` pairs `mode` writes.
 pub fn written(mode: Mode) -> Vec<(&'static str, &'static str)> {
     SPECS
@@ -425,11 +433,51 @@ impl KbfFlags {
         ]
     }
 
+    /// The flags by name, to be filled.
+    fn slots_mut(&mut self) -> [(&'static str, &mut Option<String>); 19] {
+        [
+            ("listen", &mut self.listen),
+            ("worker-listen", &mut self.worker_listen),
+            ("api-listen", &mut self.api_listen),
+            ("reapi-tls-cert", &mut self.reapi_tls_cert),
+            ("reapi-tls-key", &mut self.reapi_tls_key),
+            ("worker-tls-cert", &mut self.worker_tls_cert),
+            ("worker-tls-key", &mut self.worker_tls_key),
+            ("worker-client-ca", &mut self.worker_client_ca),
+            ("storage-url", &mut self.storage_url),
+            ("storage-ca", &mut self.storage_ca),
+            ("storage-client-cert", &mut self.storage_client_cert),
+            ("storage-client-key", &mut self.storage_client_key),
+            ("cold-store", &mut self.cold_store),
+            ("meta-dir", &mut self.meta_dir),
+            ("daemon-server", &mut self.daemon_server),
+            ("daemon-ca-cert", &mut self.daemon_ca_cert),
+            ("daemon-cert", &mut self.daemon_cert),
+            ("daemon-key", &mut self.daemon_key),
+            ("node-id", &mut self.node_id),
+        ]
+    }
+
     pub(super) fn get(&self, flag: &str) -> Option<&str> {
         self.slots()
             .into_iter()
             .find(|(name, _)| *name == flag)
             .and_then(|(_, value)| value.as_deref())
+    }
+
+    /// Gives each flag an all-in-one host takes that was not given the value `earlier` has for
+    /// its key, `(table, key)`: the settings of the earlier layout's `kbf.toml` carried over,
+    /// where a flag of this run takes precedence. A key that host had and this layout takes no
+    /// flag for (the listeners and the worker listener's certificate, which the proxy owns) is
+    /// not a flag to fill: `validate` refuses those with `--proxy`.
+    pub fn fill_from(&mut self, earlier: impl Fn(&str, &str) -> Option<String>) {
+        for spec in SPECS.iter().filter(|s| s.takes.mode(Mode::AllInOne)) {
+            for (flag, slot) in self.slots_mut() {
+                if spec.flag == Some(flag) && slot.is_none() {
+                    *slot = earlier(spec.table, spec.key);
+                }
+            }
+        }
     }
 
     /// Check the flags for `mode`: the settings to write, or a line per problem pushed to
