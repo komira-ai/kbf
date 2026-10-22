@@ -2172,6 +2172,7 @@ mod tests {
         let with = logged(&argv(Some(flag("update-dir", &dir.join("update")))));
         assert!(with.contains("--update-dir is no longer read"), "{with}");
         let without = logged(&argv(None));
+        std::io::Write::flush(&mut Sink::default()).expect("the sink flushes");
         assert!(!without.contains("no longer read"), "{without}");
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
