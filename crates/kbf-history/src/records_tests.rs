@@ -35,7 +35,7 @@ fn the_test_flag_is_field_33_and_older_records_read_false() {
 
 #[test]
 fn the_submit_evidence_fields_are_43_to_47_and_older_records_read_absent() {
-    // Catches: a field renumbered into E1a's usage fields (39 to 42) or onto another
+    // Catches: a field renumbered into the usage fields (39 to 42) or onto another
     // (the wire would read one value as another), `optional` lost on the operation id or
     // a total (a 0 on the wire would read as "measured 0", where absent is "unknown"),
     // and a record written before the fields failing to decode or reading a value.
