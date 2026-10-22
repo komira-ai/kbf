@@ -733,7 +733,7 @@ fn a_cancelled_run_on_a_commit_main_has_moved_past_ends_green_as_superseded() {
         );
         assert!(
             err.contains(&format!(
-                "superseded: {SHA} was replaced on {BRANCH} by {NEWER}; the release of the newer commit includes it"
+                "superseded: {SHA} was replaced on {BRANCH} by {NEWER}; a later code release includes it"
             )),
             "{file}: {err}"
         );

@@ -15,8 +15,11 @@
 #          succeeded (cargo xtask release gates). Read-only. When a newer push to main cancelled
 #          a run of this commit (the concurrency group of ci, beta or artifacts replaces the
 #          older commit's pending run), and main's head is now a commit ahead of this one, the
-#          job ends green with `superseded=true`: the release of the newer commit includes this
-#          one, and every job below is skipped on that output. A cancelled run while this commit
+#          job ends green with `superseded=true`: a later code release includes this commit (the
+#          newer push's own run releases only when that push is code; a docs, site or pipeline
+#          push releases nothing, and the next code push does). The newer commit's checks are
+#          not awaited. A manual Cancel of a run of a commit main has since passed also reads
+#          as superseded. Every job below is skipped on that output. A cancelled run while this commit
 #          is still main's head, a failure of any kind, and a run that is absent stay red.
 # plan     reads VERSION and the tags: the next version, and whether the push is code (it
 #          ships in a release), the site, or the pipeline itself (cargo xtask release plan).

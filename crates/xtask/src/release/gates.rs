@@ -10,17 +10,21 @@
 //! `--poll-s`, and refuses at once when one is already red, without waiting for the rest.
 //!
 //! Red, each with its line: a run that concluded anything but `success` (failure,
-//! cancelled, skipped, neutral, ...), with the one exception below; no run at all (beta's concurrency group replaces a
-//! pending run, so a commit's beta may never have run); and the end of `--timeout-s` with
-//! a run still going. A GitHub error is red too: run the job again.
+//! cancelled, skipped, neutral, ...), with the one exception below; no run at all (beta's
+//! concurrency group replaces a pending run, so a commit's beta may never have run); and the
+//! end of `--timeout-s` with a run still going. A GitHub error is red too: run the job again.
 //!
 //! The exception, superseded: when a newer commit lands on `--branch`, GitHub cancels the
 //! pending `ci`, `beta` and `artifacts` runs of the older one (their concurrency groups), so a
 //! run that concluded `cancelled` is not the commit's own verdict. If every run that is not
 //! green or going concluded `cancelled`, and the branch head is no longer `--sha` but a commit
-//! ahead of it, the verb ends green with `superseded=true`, and the release of the newer commit
-//! includes this one. A `cancelled` run while `--sha` is still the head stays red (someone
-//! cancelled the current commit's checks), and so does any other conclusion, beside it or not.
+//! ahead of it, the verb ends green with `superseded=true`. The newer commit's own run decides
+//! whether anything is released: if that push is docs, site or pipeline only, nothing is
+//! released until the next code push, whose release (a later tag) includes this commit. The
+//! verdict does not wait for the newer commit's checks; if they fail, that commit goes red
+//! itself. A `cancelled` run while `--sha` is still the head stays red (someone cancelled the
+//! current commit's checks), and so does any other conclusion, beside it or not. A manual
+//! cancel of a run of a commit that the branch has since passed also reads as superseded.
 //! The head is read with two more GETs (`branches/<branch>`, `compare/<sha>...<head>`), made
 //! only when a run was cancelled.
 //!
@@ -200,7 +204,7 @@ fn listed(gh: &Path, repo: &str, file: &str, sha: &str, branch: &str) -> Result<
 /// The end of a superseded commit: green, with `superseded=true` and no run ids.
 fn superseded(a: &GatesArgs, newer: &str) -> Result<Vec<String>, Error> {
     eprintln!(
-        "superseded: {} was replaced on {} by {newer}; the release of the newer commit includes it",
+        "superseded: {} was replaced on {} by {newer}; a later code release includes it",
         a.sha, a.branch
     );
     let lines = vec!["superseded=true".to_owned()];

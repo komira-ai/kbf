@@ -554,12 +554,17 @@ The additions:
    with "concluded cancelled, not success" although nothing failed. `release gates` therefore ends **green with
    `superseded=true`** when every run that is not green concluded `cancelled` **and** the head of `main` is no longer the
    commit but a commit ahead of it (`branches/main`, then `compare/<sha>...<head>`; the log line is "superseded: <sha> was
-   replaced on main by <newer sha>; the release of the newer commit includes it"). Every later job (`plan`, `verify`, `tag`,
+   replaced on main by <newer sha>; a later code release includes it"). Every later job (`plan`, `verify`, `tag`,
    `notes`, `publish`, `bump`) is skipped on `needs.gates.outputs.superseded`, and the workflow lint refuses a version of
    the file in which one of them is not. Everything else stays red: a conclusion other than `cancelled` (failure,
    `timed_out`, ...) even on a superseded commit, a `cancelled` run while the commit is still the head of `main` (someone
    cancelled the current commit's checks), a head that is not ahead of the commit, a head GitHub does not report, and a run
-   that is absent. The check only reads (`contents: read`, `actions: read`).
+   that is absent. The check only reads (`contents: read`, `actions: read`). Superseded means "a later code release
+   includes this commit", not "the newer commit releases": `plan` classifies per push, so when the newest commit of a burst is
+   docs, site, `.github` only or changes the pipeline, the older code commit ends green with no release until the next code
+   push (its tag is a descendant, so nothing is lost). The verdict also does not wait for the newer commit's checks: if they
+   fail, that commit goes red itself. A manual Cancel of a run of a commit that `main` has since passed reads as superseded
+   too; that is benign, because the newer commit is still gated.
 2. **A `prod` environment with a required reviewer**, as kci's prod, on the `publish` job. **One approval per release:** the
    kbf.dev deploy job (the only one with `id-token: write`) `needs` `publish` and runs in a second environment, `prod-site`,
    which has no reviewer and admits `v*` tags only; the AWS role trusts `prod-site`, so the approved `publish` job (which
