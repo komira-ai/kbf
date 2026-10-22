@@ -3,18 +3,25 @@
 //! entry (nothing in a running node calls it yet). Time is tokio's paused clock, on a
 //! current-thread runtime, where a spawned task runs only when the test awaits: so a test
 //! can tell the drain `after` makes from the background task's.
+//!
+//! The tests of the flush a stop makes of the blocks staged on the hot store run on the
+//! real clock instead: that flush reads and hashes on threads of the process, which a
+//! paused clock does not wait for.
 
-use std::sync::Arc;
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use kbf_front::{Cache, Hold, MemoryMetaLog, VerifiedBlob};
-use kbf_meta::Retention;
+use kbf_meta::{Retention, ServerId};
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
+use kbf_store::FaultFs;
+use kbf_tier::TierOptions;
 
 use super::RamDrain;
 
@@ -83,8 +90,85 @@ fn cache(budget: u64) -> (Arc<TestCache>, Arc<AtomicBool>) {
     (Arc::new(cache), refuse)
 }
 
+/// [`cache`] with a write tier on an in-memory disk, so that a blob stored is staged
+/// (in the open block, which the flusher seals only 30 s after it opened), and no RAM
+/// budget: the default of a node.
+async fn tiered() -> (Arc<TestCache>, Arc<AtomicBool>) {
+    let meta = MemoryMetaLog::new(Retention::default());
+    let epoch = meta.alloc_epoch();
+    let refuse = Arc::new(AtomicBool::new(false));
+    let store = Refusing {
+        inner: MemoryStore::new(Capabilities::default()),
+        refuse: Arc::clone(&refuse),
+    };
+    let cache = Cache::new(meta, store, KeyPrefix::default(), epoch);
+    let options = TierOptions::new(1 << 20);
+    let (cache, _) = cache
+        .attach_tier(FaultFs::new(), options, ServerId::new(1), None)
+        .await
+        .expect("attach");
+    (Arc::new(cache), refuse)
+}
+
+/// The blocks of `cache`'s tier that hold acknowledged bytes not yet in the store.
+fn unflushed(cache: &TestCache) -> u64 {
+    cache.tier_health().expect("a tier").unflushed_blocks
+}
+
+/// The 64 bytes of `seed`'s blob.
+fn bytes(seed: u8) -> Bytes {
+    Bytes::from(vec![seed; 64])
+}
+
 fn blob(seed: u8) -> VerifiedBlob {
-    VerifiedBlob::hashed(Bytes::from(vec![seed; 64]))
+    VerifiedBlob::hashed(bytes(seed))
+}
+
+/// What the subscriber wrote.
+#[derive(Clone, Default)]
+struct Log(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for Log {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Log {
+    type Writer = Log;
+
+    fn make_writer(&'a self) -> Log {
+        self.clone()
+    }
+}
+
+impl Log {
+    fn text(&self) -> String {
+        let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// The log of this thread, until the guard drops. Other tests of the binary reach the
+/// same callsites with no subscriber and can leave their interest cached as never, so
+/// the cache is rebuilt once ours is installed.
+fn capture(log: &Log) -> tracing::subscriber::DefaultGuard {
+    let guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    tracing_core::callsite::rebuild_interest_cache();
+    guard
 }
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -169,4 +253,92 @@ async fn with_no_budget_a_stop_drains_nothing() {
     assert_eq!(cache.hold(&blob(4)), Hold::Budget);
     assert_eq!(ram.after(async { "served" }).await, "served");
     assert_eq!(cache.unwritten().blobs, 0);
+}
+
+/// A stop flushes the blocks staged on the hot store after the node's calls have ended and
+/// not before, with no RAM budget: `served` stages a blob (a call that was in flight) and
+/// ends, and the block is in the store when `after` returns only because the stop's flush
+/// took it, with the 30 s seal delay of the open block not passed. The output of `served`
+/// comes through. Catches a stop that does not flush the tier (mutant: `after` returns
+/// `served`'s output at once: one block is still staged), one that flushes before `served`
+/// ends (mutant: the flush is awaited first: the blob staged by `served` is missed), and one
+/// that flushes only with a RAM budget (mutant: the flush is inside `if self.holds`).
+#[tokio::test]
+async fn the_stop_flushes_what_is_staged_after_serving_ends() {
+    let (cache, _) = tiered().await;
+    let ram = RamDrain::start(Arc::clone(&cache), 0, DEADLINE);
+    let staged = blob(5);
+    let served = {
+        let cache = Arc::clone(&cache);
+        let staged = staged.clone();
+        async move {
+            assert_eq!(unflushed(&cache), 0, "nothing is staged before the call");
+            cache.store_blobs(vec![staged]).await.expect("staged");
+            assert_eq!(unflushed(&cache), 1, "the call staged its blob");
+            "served"
+        }
+    };
+    assert_eq!(ram.after(served).await, "served");
+    assert_eq!(unflushed(&cache), 0, "flushed by the stop");
+    let read = cache.read_blob(&staged.digest()).await.expect("read");
+    assert_eq!(read, bytes(5));
+}
+
+/// A stop whose store keeps refusing ends at its deadline with the block still staged,
+/// says how much was left, and the output of `served` comes through; the block is not
+/// dropped: it is flushed when the store answers again. Catches a stop that waits without
+/// end (the test would hang), one that drops what it could not flush (mutant: the block
+/// is discarded when the deadline passes: it is gone, and so is the blob) and one that
+/// ends without a line saying what was left (mutant: the timed-out arm does not log).
+#[tokio::test]
+async fn a_stop_that_cannot_flush_ends_at_its_deadline_and_says_what_is_left() {
+    let log = Log::default();
+    let _guard = capture(&log);
+    let (cache, refuse) = tiered().await;
+    refuse.store(true, Ordering::SeqCst);
+    let ram = RamDrain::start(Arc::clone(&cache), 0, Duration::from_millis(500));
+    let staged = blob(6);
+    let served = {
+        let cache = Arc::clone(&cache);
+        let staged = staged.clone();
+        async move {
+            cache.store_blobs(vec![staged]).await.expect("staged");
+            7
+        }
+    };
+    assert_eq!(ram.after(served).await, 7);
+    assert_eq!(unflushed(&cache), 1, "never dropped");
+    let said = log.text();
+    assert!(said.contains("still staged on the hot store"), "{said}");
+    assert!(said.contains("blocks=1"), "{said}");
+
+    refuse.store(false, Ordering::SeqCst);
+    let later = Instant::now() + Duration::from_secs(120);
+    let round = cache.flush_tier(later).await.expect("round");
+    assert_eq!(round.flushed.len(), 1);
+    assert_eq!(unflushed(&cache), 0);
+    let read = cache.read_blob(&staged.digest()).await.expect("read");
+    assert_eq!(read, bytes(6));
+}
+
+/// A flush that works logs one line saying so and nothing at ERROR. Catches a stop that
+/// reports a flush that finished as one that did not (mutant: the arms are swapped).
+#[tokio::test]
+async fn a_stop_that_flushes_says_so() {
+    let log = Log::default();
+    let _guard = capture(&log);
+    let (cache, _) = tiered().await;
+    let ram = RamDrain::start(Arc::clone(&cache), 0, DEADLINE);
+    let staged = blob(8);
+    let served = {
+        let cache = Arc::clone(&cache);
+        async move {
+            cache.store_blobs(vec![staged]).await.expect("staged");
+            "served"
+        }
+    };
+    assert_eq!(ram.after(served).await, "served");
+    let said = log.text();
+    assert!(said.contains("no block is left staged"), "{said}");
+    assert!(!said.contains("ERROR"), "{said}");
 }

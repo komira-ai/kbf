@@ -487,10 +487,12 @@ pub struct Args {
     /// Storage nodes only: a server with no replica to hold a second copy holds nothing.
     #[arg(long, default_value_t = 0)]
     pub ram_ack_bytes: u64,
-    /// How long, in seconds, a storage node that is stopping waits for the blobs it holds
-    /// in RAM to be written to its disk (`--ram-ack-bytes`), after its calls have ended.
-    /// The blobs left when it ends are lost to the stop and are counted in the log. At
-    /// least 1.
+    /// How long, in seconds, a storage node that is stopping waits, after its calls have
+    /// ended, for the blobs it holds in RAM to be written to its disk (`--ram-ack-bytes`)
+    /// and then for the blocks staged on its hot store to be flushed to the cold store: one
+    /// bound for both. The blobs left in RAM when it ends are lost to the stop; the blocks
+    /// left on the hot store are on its disk, flushed by the next start. Both are counted
+    /// in the log. At least 1.
     #[arg(
         long,
         default_value_t = 30,
@@ -988,8 +990,8 @@ impl Args {
         self.ram_ack_bytes
     }
 
-    /// How long a stopping node waits to write what it holds in RAM:
-    /// `--ram-drain-deadline`.
+    /// How long a stopping node waits to write what it holds in RAM and to flush what is
+    /// staged on its hot store: `--ram-drain-deadline`.
     #[must_use]
     pub const fn ram_drain_deadline(&self) -> Duration {
         Duration::from_secs(self.ram_drain_deadline)
