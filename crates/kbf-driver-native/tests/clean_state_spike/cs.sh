@@ -967,9 +967,15 @@ probe_BR7() { probe_BR; }
 
 mkpk8() {
   mkdir -p "$L/pk8" && cd "$L/pk8" && build_env swift package init --type library --name Pk8 >/dev/null 2>&1 || { echo "swift package init failed"; return 1; }
-  build_env defaults write com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox -bool YES 2>&1 | head -2
-  build_env defaults write com.apple.dt.Xcode IDEPackageSupportDisablePluginExecutionSandbox -bool YES 2>&1 | head -2
-  echo "xcode prefs: $(build_env defaults read com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox 2>&1 | head -1)"
+  _dw=$(build_env defaults write com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox -bool YES 2>&1); echo "defaults-write rc=$? msg=$(printf %s "$_dw" | tr '\n' '|' | cut -c1-240)"
+  build_env defaults write com.apple.dt.Xcode IDEPackageSupportDisablePluginExecutionSandbox -bool YES >/dev/null 2>&1
+  if [ "$(build_env defaults read com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox 2>/dev/null)" != 1 ]; then
+    _pf="$L/home/Library/Preferences/com.apple.dt.Xcode.plist"; mkdir -p "$L/home/Library/Preferences"
+    build_env plutil -create xml1 "$_pf" 2>&1 | head -1
+    build_env plutil -insert IDEPackageSupportDisableManifestSandbox -bool YES "$_pf" 2>&1 | head -1
+    build_env plutil -insert IDEPackageSupportDisablePluginExecutionSandbox -bool YES "$_pf" 2>&1 | head -1
+    echo "plutil fallback wrote $_pf; read back: $(build_env defaults read com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox 2>&1 | head -1)"
+  fi
 }
 do_BR8() {
   mkpk8 || return 1
