@@ -765,7 +765,10 @@ fn a_kbf_that_cannot_be_named_or_copied_is_not_adopted() {
     });
 
     let cases = [
-        (&broken, "probe_failed: --version --json did not finish cleanly"),
+        (
+            &broken,
+            "probe_failed: --version --json did not finish cleanly",
+        ),
         (&short, "it prints no commit_full"),
         (&odd, "\"ABC\" is not a commit id"),
         (&lying, "commit_mismatch: "),
