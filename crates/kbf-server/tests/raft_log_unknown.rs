@@ -222,23 +222,22 @@ async fn a_log_raised_past_what_a_binary_runs_opens_at_the_version_it_runs() {
 }
 
 /// Asserts that the skipped count rises by one for each skipped entry: a log with none
-/// reads zero, and after each of three starts that each add an entry this binary does not
-/// know, it reads one more.
+/// reads zero, and a log with three entries this binary does not know, among known ones,
+/// reads three after its open.
 #[tokio::test]
 async fn the_skipped_count_rises_with_each_skipped_entry() {
     let fs = FaultFs::new();
     let log = open(&fs, 2).await;
     assert_eq!(log.skipped_entries(), 0);
     drop(log);
-    let mut counts = Vec::new();
-    for _ in 0..3 {
-        let dir = fs.restart();
-        append_all(&dir, vec![UNKNOWN.to_vec()]);
-        let log = open(&dir.restart(), 2).await;
-        counts.push(log.skipped_entries());
-        drop(log);
-    }
-    assert_eq!(counts, [1, 2, 3]);
+    let dir = fs.restart();
+    let unknown = UNKNOWN.to_vec();
+    append_all(
+        &dir,
+        vec![unknown.clone(), alloc_epoch(), unknown.clone(), unknown],
+    );
+    let log = open(&dir.restart(), 2).await;
+    assert_eq!(log.skipped_entries(), 3);
 }
 
 /// Asserts that bytes that are not a well-formed message still stop the open after an
