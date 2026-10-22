@@ -1,11 +1,13 @@
-//! The static unit files of the kbf-installer package (`packaging/linux/units/`) against
-//! the rules `kbf-deploy linux check-units` (retired) enforced on the units it rendered, and against
-//! the kbf-installer contract (docs/design/kbf-installer.md, section 7).
+//! The static unit files of the kbf-installer and kbf packages (`packaging/linux/units/`)
+//! against the rules `kbf-deploy linux check-units` (retired) enforced on the units it rendered,
+//! and against the kbf-installer contract (docs/design/kbf-installer.md, section 7).
 //!
-//! The package ships these files disabled, with no rendering: kbf-installer's own unit,
-//! each mode's unit, the frontend and proxy units, gated on `/etc/kbf/kbf.toml`
-//! (`ConditionPathExists=`), on `kbf-installer boot-check` and on `kbf <mode> --check`
-//! (both `ExecStartPre=`; `ExecCondition=` would skip a failed check silently).
+//! The packages ship these files disabled, with no rendering: kbf-installer's own unit and the
+//! proxy units (the kbf-installer package), and each mode's unit, the frontend's included (the
+//! kbf package, which runs `/usr/bin/kbf`), gated on `/etc/kbf/kbf.toml`
+//! (`ConditionPathExists=`), on `kbf-installer boot-check --kbf=/usr/bin/kbf --mode=<mode>` and
+//! on `kbf --mode=<mode> --check` (both `ExecStartPre=`; `ExecCondition=` would skip a failed
+//! check silently).
 //! The rules are held here, over the unit parser (`kbf_unitfile`) the docs check uses, each with the defect it catches, and `MUTANTS`
 //! plants one defect per rule in a copy of the real file and requires that rule to name
 //! it. `every_rule_has_a_mutant` fails when a rule is added with no mutant, so no rule
@@ -15,14 +17,14 @@
 //! - a unit missing a rule that its mode needs (`restart`, `stop`,
 //!   `delegate`, `credential`, `caps`, `swap`, `oom`, `cpuset`, user, slice,
 //!   `LimitNOFILE`), each named below;
-//! - a unit that runs a program outside the installer's tree (`/var/lib/kbf-installer/`),
-//!   another mode than its name, a `--config` or any flag the contract does not give it;
+//! - a unit that runs a program other than `/usr/bin/kbf` and the installer's binary, another
+//!   mode than its name, a `--config` or any flag the contract does not give it;
 //! - kbf-installer's own unit running anything but `run`, or gating its start on a step that is
 //!   not built; the verbs every unit and the macOS property list name exist, and the runtime
-//!   units' program is the layout's current link: `package_installer_verbs.rs`;
+//!   units' program is `/usr/bin/kbf`: `package_installer_verbs.rs`;
 //! - a unit that starts without its gate (`ConditionPathExists=`, the two checks, in
 //!   order), or whose gate is `ExecCondition=` or a `-`-prefixed command that ignores a
-//!   failure;
+//!   failure, or whose `boot-check` names another kbf or another mode than the unit's;
 //! - kbf-installer's own unit losing a hardening key or its place before the runtime units;
 //! - a kbf-deploy placeholder (`@KEY@`, `<value>`) left in a file that is not rendered;
 //! - a file added or removed without this test being told.
@@ -39,10 +41,9 @@ use kbf_unitfile::{UnitFile, comments_in_continuations};
 #[path = "package_units/proxy.rs"]
 mod proxy;
 
-/// The installer's tree: every program of a kbf unit is under it.
-const TREE: &str = "/var/lib/kbf-installer/";
-/// The release kbf-installer flipped to.
-const CURRENT: &str = "/var/lib/kbf-installer/releases/current/";
+/// The `kbf` the kbf package installs: the program of every mode unit, which no release
+/// tree holds.
+const KBF: &str = "/usr/bin/kbf";
 /// The installer binary the units call.
 const INSTALLER: &str = "/usr/bin/kbf-installer";
 /// The configuration every runtime unit is gated on and every mode reads.
@@ -293,8 +294,8 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         }
     }
 
-    // Every program the unit runs is the installer's: the package replaces
-    // /usr/bin/kbf-installer, the installer replaces the tree. Only the two root checks
+    // Every program the unit runs is a package's own file: the kbf-installer package replaces
+    // /usr/bin/kbf-installer, the kbf package replaces /usr/bin/kbf. Only the two root checks
     // carry a `+`; a `-` would ignore a failed gate, and `!`, `@`, `:` change the sandbox.
     // The proxy's reload is the one `ExecReload` a unit may have, and it runs a program outside
     // the installer's tree (`/bin/kill`): `proxy-reload` pins its exact text, so the generic
@@ -316,11 +317,11 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             .split_whitespace()
             .next()
             .unwrap_or("");
-        let allowed = program.starts_with(TREE) || program == INSTALLER;
-        if !allowed || program.contains("..") {
+        let allowed = program == KBF || program == INSTALLER;
+        if !allowed {
             v(
                 "exec",
-                format!("{key} runs {program}, not a file under {TREE}"),
+                format!("{key} runs {program}, not {KBF} or {INSTALLER}"),
             );
         }
     }
@@ -398,18 +399,17 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     }
 
     let mode = mode.expect("a mode unit");
-    // The frontend for a host without the proxy: no handover, the release
-    // `releases/current` points at, its configuration named by `--config`.
+    // The frontend for a host without the proxy: no handover, the packaged `/usr/bin/kbf`,
+    // its configuration named by `--config`.
     let plain = name == "kbf-frontend.service";
     // Catches a unit that starts another mode (or an old binary) under this mode's name,
     // a `--config` (kbf reads /etc/kbf/kbf.toml itself), or a flag the contract does not
     // give the mode: the frontend's `--config` only.
-    let kbf = format!("{CURRENT}kbf");
     let mode_flag = format!("--mode={mode}");
-    if start.get(..2) != Some(&[kbf.as_str(), mode_flag.as_str()][..]) {
+    if start.get(..2) != Some(&[KBF, mode_flag.as_str()][..]) {
         v(
             "exec",
-            format!("ExecStart= is {start:?}, not {kbf} {mode_flag}"),
+            format!("ExecStart= is {start:?}, not {KBF} {mode_flag}"),
         );
     }
     // Catches a positional mode word (`kbf frontend`): kbf takes no subcommand, the mode
@@ -438,11 +438,11 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             format!("ExecStart= flags are {flags:?}, not {allowed:?}"),
         );
     }
-    // Catches a start without the two checks, in this order: boot-check first (root, counts
-    // the start of a release on trial), then the mode's own `--check`. Written as ExecStartPre=, so a failure
-    // fails the unit.
-    let boot = format!("+{INSTALLER} boot-check");
-    let check = format!("{kbf} --mode={mode} --check");
+    // Catches a start without the two checks, in this order: boot-check first (root, brings the
+    // state database to the schema the kbf at /usr/bin/kbf needs, for the mode the unit runs),
+    // then the mode's own `--check`. Written as ExecStartPre=, so a failure fails the unit.
+    let boot = format!("+{INSTALLER} boot-check --kbf={KBF} --mode={mode}");
+    let check = format!("{KBF} --mode={mode} --check");
     let mut want: Vec<&str> = vec![boot.as_str()];
     want.push(check.as_str());
     // A frontend's check is made with the slot's kbf too.
@@ -862,26 +862,26 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-daemon.service",
-        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=daemon",
-        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=daemon \\\n    # a note\n    ",
+        "ExecStart=/usr/bin/kbf --mode=daemon",
+        "ExecStart=/usr/bin/kbf --mode=daemon \\\n    # a note\n    ",
         "continuation",
     ),
     (
         "kbf-daemon.service",
-        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=daemon",
+        "ExecStart=/usr/bin/kbf --mode=daemon",
         "ExecStart=/usr/local/bin/kbf daemon",
         "exec",
     ),
     (
         "kbf-daemon.service",
-        "ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=daemon --check",
-        "ExecStartPre=-/var/lib/kbf-installer/releases/current/kbf --mode=daemon --check",
+        "ExecStartPre=/usr/bin/kbf --mode=daemon --check",
+        "ExecStartPre=-/usr/bin/kbf --mode=daemon --check",
         "exec-prefix",
     ),
     (
         "kbf-storage.service",
-        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage\n",
-        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage --config=/etc/kbf/kbf.toml\n",
+        "ExecStart=/usr/bin/kbf --mode=storage\n",
+        "ExecStart=/usr/bin/kbf --mode=storage --config=/etc/kbf/kbf.toml\n",
         "flags",
     ),
     (
@@ -892,15 +892,39 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-all-in-one.service",
-        "ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=all-in-one --check",
-        "ExecCondition=/var/lib/kbf-installer/releases/current/kbf --mode=all-in-one --check",
+        "ExecStartPre=/usr/bin/kbf --mode=all-in-one --check",
+        "ExecCondition=/usr/bin/kbf --mode=all-in-one --check",
         "gate-skip",
     ),
     (
         "kbf-daemon.service",
-        "ExecStartPre=+/usr/bin/kbf-installer boot-check\n",
+        "ExecStartPre=+/usr/bin/kbf-installer boot-check --kbf=/usr/bin/kbf --mode=daemon\n",
         "",
         "gate-check",
+    ),
+    (
+        "kbf-daemon.service",
+        "boot-check --kbf=/usr/bin/kbf --mode=daemon\n",
+        "boot-check\n",
+        "gate-check",
+    ),
+    (
+        "kbf-daemon.service",
+        "boot-check --kbf=/usr/bin/kbf --mode=daemon\n",
+        "boot-check --kbf=/var/lib/kbf-installer/releases/current/kbf --mode=daemon\n",
+        "gate-check",
+    ),
+    (
+        "kbf-storage.service",
+        "boot-check --kbf=/usr/bin/kbf --mode=storage\n",
+        "boot-check --kbf=/usr/bin/kbf --mode=daemon\n",
+        "gate-check",
+    ),
+    (
+        "kbf-storage-and-daemon.service",
+        "ExecStart=/usr/bin/kbf --mode=storage-and-daemon\n",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage-and-daemon\n",
+        "exec",
     ),
     (
         "kbf-storage.service",
@@ -1121,19 +1145,19 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-frontend.service",
-        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=frontend --config /etc/kbf/kbf.toml",
+        "ExecStart=/usr/bin/kbf --mode=frontend --config /etc/kbf/kbf.toml",
         "ExecStart=/var/lib/kbf-installer/slots/a/kbf --mode=frontend --config /etc/kbf/kbf.toml",
         "slots",
     ),
     (
         "kbf-frontend.service",
-        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=frontend --config /etc/kbf/kbf.toml",
+        "ExecStart=/usr/bin/kbf --mode=frontend --config /etc/kbf/kbf.toml",
         "ExecStart=/var/lib/kbf-installer/slots/a/kbf --mode=frontend --config /etc/kbf/kbf.toml",
         "exec",
     ),
     (
         "kbf-frontend.service",
-        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=frontend --config /etc/kbf/kbf.toml",
+        "ExecStart=/usr/bin/kbf --mode=frontend --config /etc/kbf/kbf.toml",
         "ExecStart=/var/lib/kbf-installer/current/kbf --mode=frontend --config /etc/kbf/kbf.toml",
         "exec",
     ),
@@ -1193,13 +1217,13 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-frontend.service",
-        "ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=frontend --check",
+        "ExecStartPre=/usr/bin/kbf --mode=frontend --check",
         "ExecStartPre=/var/lib/kbf-installer/slots/a/kbf --mode=frontend --check",
         "gate-check",
     ),
     (
         "kbf-frontend.service",
-        "ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=frontend --check",
+        "ExecStartPre=/usr/bin/kbf --mode=frontend --check",
         "ExecStartPre=/var/lib/kbf-installer/slots/a/kbf --mode=frontend --check",
         "slots",
     ),
@@ -1223,7 +1247,7 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-frontend.service",
-        "ExecStartPre=+/usr/bin/kbf-installer boot-check\n",
+        "ExecStartPre=+/usr/bin/kbf-installer boot-check --kbf=/usr/bin/kbf --mode=frontend\n",
         "",
         "gate-check",
     ),

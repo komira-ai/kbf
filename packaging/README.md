@@ -11,12 +11,15 @@
   two placed files (`systemd-sysusers`, `systemd-tmpfiles --create`, those files only); a
   host without those tools is refused before anything is placed. It is the one shell file the distribution keeps
   (`tools/interpreter_budget.tsv`); every builder is Rust.
-- The payload is `cargo xtask installer-tarball`: the Debian package's file list, read
-  from the same Rust list (`xtask::pkg::files`, which the deb and rpm are built from), so
-  paths and modes cannot drift: `usr/bin/kbf-installer` and the pinned `gh` 0755, the
+- The payload is `cargo xtask installer-tarball`: the `kbf-installer` Debian package's file
+  list, read from the same Rust list (`xtask::pkg::files`, which the deb and rpm are built
+  from), so paths and modes cannot drift: `usr/bin/kbf-installer` and the pinned `gh` 0755, the
   `kbf-*.service` and `kbf-*.socket` units and `kbf.slice`, exactly the three trust files, and
   `usr/lib/sysusers.d/kbf-installer.conf` and `usr/lib/tmpfiles.d/kbf-installer.conf`
   (the files under `packaging/linux/`), with fixed owners and times so the same inputs
-  are the same bytes. It holds no kbf release; `setup` installs the first one.
+  are the same bytes. It holds no `kbf` and none of the five mode units: the `kbf` package
+  (`/usr/bin/kbf` and the mode units, `packaging/linux/README.md`) carries them. `setup` still
+  enables the unit of its mode, so on a host that has this payload and not the `kbf` package it
+  fails on the missing unit; install the `kbf` package first.
 - Tested by `crates/xtask/tests/install_sh.rs` against a local HTTP server, with a stub
   installer (`xtask-fake`) and stub unit, trust, sysusers.d and tmpfiles.d files, and fake systemd tools.

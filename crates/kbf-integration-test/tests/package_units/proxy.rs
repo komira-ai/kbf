@@ -7,7 +7,7 @@
 
 use kbf_unitfile::UnitFile;
 
-use super::{INSTALLER, INSTALLER_CONFIG, all, read, rules_of, trim, violations};
+use super::{INSTALLER, INSTALLER_CONFIG, KBF, all, read, rules_of, trim, violations};
 
 /// The rules of this module, by the tag a violation starts with.
 pub(super) const RULES: [&str; 13] = [
@@ -95,10 +95,19 @@ pub(super) fn service_rules(
             v("proxy-socket-pair", format!("no {key}=kbf-proxy.socket"));
         }
     }
-    // Catches a command line that is not the verb with the installer's file: another
-    // verb, a second config, a flag the contract does not give it, a `--check` that is
-    // not the gate in front of the start.
-    let verb = [INSTALLER, "proxy", "--config", INSTALLER_CONFIG];
+    // Catches a command line that is not the verb with the installer's file and the kbf the
+    // kbf package installed (`--kbf-binary`, with which the proxy runs its children from its
+    // own copies of that file): another verb, a second config, no `--kbf-binary` or another
+    // path for it, a flag the contract does not give it, a `--check` that is not the gate in
+    // front of the start.
+    let verb = [
+        INSTALLER,
+        "proxy",
+        "--config",
+        INSTALLER_CONFIG,
+        "--kbf-binary",
+        KBF,
+    ];
     if start != verb {
         v(
             "proxy-exec",
@@ -262,14 +271,32 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-proxy.service",
-        "ExecStart=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml\n",
-        "ExecStart=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml --listen 0.0.0.0:443\n",
+        "ExecStart=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml --kbf-binary /usr/bin/kbf\n",
+        "ExecStart=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml --kbf-binary /usr/bin/kbf --listen 0.0.0.0:443\n",
         "proxy-exec",
     ),
     (
         "kbf-proxy.service",
-        "ExecStartPre=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml --check\n",
+        "ExecStart=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml --kbf-binary /usr/bin/kbf\n",
+        "ExecStart=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml\n",
+        "proxy-exec",
+    ),
+    (
+        "kbf-proxy.service",
+        "ExecStart=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml --kbf-binary /usr/bin/kbf\n",
+        "ExecStart=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml --kbf-binary /var/lib/kbf-installer/releases/current/kbf\n",
+        "proxy-exec",
+    ),
+    (
+        "kbf-proxy.service",
+        "ExecStartPre=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml --kbf-binary /usr/bin/kbf --check\n",
         "",
+        "proxy-exec",
+    ),
+    (
+        "kbf-proxy.service",
+        "--kbf-binary /usr/bin/kbf --check\n",
+        "--check\n",
         "proxy-exec",
     ),
     (

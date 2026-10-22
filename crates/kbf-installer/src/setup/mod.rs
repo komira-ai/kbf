@@ -256,6 +256,17 @@ fn released(exec: &dyn Exec, layout: &Layout) -> Result<bool, SetupError> {
     present(exec, &layout.current())
 }
 
+/// The `kbf` the kbf package installs, which every mode unit runs.
+const PACKAGED_KBF: &str = "/usr/bin/kbf";
+
+/// Whether the host has the `kbf` the kbf package installs: a host from the packages has no
+/// release tree, and this file is what its units run. A link counts, as it does for
+/// [`released`]: only its being there is asked.
+fn packaged_kbf(exec: &dyn Exec) -> Result<bool, SetupError> {
+    let path = HostPath::new(PACKAGED_KBF).expect("an absolute path");
+    present(exec, &path)
+}
+
 /// Whether anything is at `path`: a link counts, whether or not it points at something.
 fn present(exec: &dyn Exec, path: &HostPath) -> Result<bool, SetupError> {
     Ok(exec.stat(path)?.is_some() || exec.inspect(path)?.is_some())
@@ -427,7 +438,9 @@ pub fn run(
         notes.extend(written.notes);
     }
 
-    let after = plan::after_release(os, &*exec, &valid, &ctx, have_release, options.no_start)?;
+    // A unit has a `kbf` to run when a release is installed or the kbf package is.
+    let runs = have_release || packaged_kbf(&*exec)?;
+    let after = plan::after_release(os, &*exec, &valid, &ctx, runs, options.no_start)?;
     steps += emit(&after.plan, exec, options.apply, out)?;
     notes.extend(after.notes);
 

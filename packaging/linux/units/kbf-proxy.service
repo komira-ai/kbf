@@ -6,12 +6,14 @@
 # passes that file by flag and nothing by environment.
 # kbf docs/design/frontend-proxy.md, sections 2, 5 and 6; kbf-proxy-api.md, section 11.
 #
-# Not the root helper: kbf-installer.service stages and flips releases as root, this
-# service runs as the frontend's own user and only executes the releases the root half
-# staged (/var/lib/kbf-installer/releases/<commit>/kbf, world-readable). It replaces the
-# frontend unit on a host that uses it: the proxy starts slot a and slot b
-# itself (`kbf --mode=frontend`, each slot on its own loopback ports; no `--instance`: the
-# two slots do not hand over to each other), so enable one or the other, never both.
+# Not the root helper: this service runs as the frontend's own user. With --kbf-binary it
+# is told the kbf the kbf package installed (/usr/bin/kbf), copies and verifies that file
+# under its state directory at a start that has no installed release recorded, and starts
+# its children only from the copies it holds; the root half stages no release for it. It
+# does not notice a later /usr/bin/kbf. It replaces the frontend unit on a host that uses
+# it: the proxy starts slot a and slot b itself (`kbf --mode=frontend`, each slot on its
+# own loopback ports; no `--instance`: the two slots do not hand over to each other), so
+# enable one or the other, never both.
 #
 # The children are this unit's processes but not its main process. KillMode=process makes a
 # stop or restart of the proxy signal the proxy alone: the frontends keep serving the
@@ -51,8 +53,8 @@ RuntimeDirectory=kbf-proxy
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
 # `--check` loads the whole file the way a run does and exits 2 on a bad table.
-ExecStartPre=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml --check
-ExecStart=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml
+ExecStartPre=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml --kbf-binary /usr/bin/kbf --check
+ExecStart=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml --kbf-binary /usr/bin/kbf
 # `systemctl reload` is SIGHUP to the proxy: it re-reads the server certificate, key and client
 # CA and swaps them in as one unit, and no open stream is cut. The command exits 0 at once; a
 # rejected file shows only as one journal line from the proxy and as
