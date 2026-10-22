@@ -1832,6 +1832,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-host-install"
+version = "0.1.0"
+dependencies = [
+ "kbf-testkit",
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "toml",
+]
+
+[[package]]
 name = "kbf-image"
 version = "0.1.0"
 dependencies = [
