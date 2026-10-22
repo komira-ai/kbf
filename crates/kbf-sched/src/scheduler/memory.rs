@@ -584,15 +584,11 @@ impl Scheduler {
     /// would own whole could take: it books what it asked for, and is not raised again.
     pub(super) fn undo_key_raise(&mut self, id: OperationId) {
         let op = self.ops.get_mut(&id).expect("queued operations exist");
-        let Some(applied) = op.key_applied.filter(|a| !a.undone) else {
-            return;
-        };
-        if applied.applied == op.request.resources.memory_bytes {
-            op.request.resources.memory_bytes = applied.base;
-        }
+        let raised = op.key_applied.expect("a raised operation");
+        op.request.resources.memory_bytes = raised.base;
         op.key_applied = Some(KeyApplied {
-            base: applied.base,
-            applied: applied.base,
+            base: raised.base,
+            applied: raised.base,
             undone: true,
         });
     }
