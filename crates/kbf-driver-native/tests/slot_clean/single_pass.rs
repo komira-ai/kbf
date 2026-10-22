@@ -279,7 +279,7 @@ struct Reports {
 
 impl Reports {
     fn plant(rig: &Rig, id: u32) -> (Self, Planted) {
-        let user_dir = PathBuf::from(format!("/Users/kbf-ch33-{id}"));
+        let user_dir = Path::new("/Users").join(format!("kbf-ch33-{id}"));
         let reports = user_dir.join("Library/Logs/DiagnosticReports");
         std::fs::create_dir_all(&reports).expect("reports");
         let report = |uid: u32| {

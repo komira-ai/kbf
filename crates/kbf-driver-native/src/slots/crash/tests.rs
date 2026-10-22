@@ -8,6 +8,9 @@ use kbf_testkit::dir::TestDir;
 
 use super::*;
 
+/// The folder of the users' homes on a Mac.
+const USERS: &str = "/Users";
+
 fn me() -> u32 {
     rustix::process::geteuid().as_raw()
 }
@@ -48,17 +51,20 @@ fn a_header_names_the_uid_by_its_user_id_value() {
 fn the_crash_folders_are_the_systems_and_every_users() {
     let dirs = crash_dirs(&["alice".to_owned(), "bob".to_owned()]);
     let shown: Vec<&str> = dirs.iter().map(|d| d.to_str().unwrap()).collect();
+    let user = |name: &str, retired: &str| {
+        format!("{USERS}/{name}/Library/Logs/DiagnosticReports{retired}")
+    };
     assert_eq!(
         shown,
         [
-            "/Library/Logs/DiagnosticReports",
-            "/Library/Logs/DiagnosticReports/Retired",
-            "/cores",
-            "/private/var/root/Library/Logs/DiagnosticReports",
-            "/Users/alice/Library/Logs/DiagnosticReports/Retired",
-            "/Users/alice/Library/Logs/DiagnosticReports",
-            "/Users/bob/Library/Logs/DiagnosticReports/Retired",
-            "/Users/bob/Library/Logs/DiagnosticReports",
+            "/Library/Logs/DiagnosticReports".to_owned(),
+            "/Library/Logs/DiagnosticReports/Retired".to_owned(),
+            "/cores".to_owned(),
+            "/private/var/root/Library/Logs/DiagnosticReports".to_owned(),
+            user("alice", "/Retired"),
+            user("alice", ""),
+            user("bob", "/Retired"),
+            user("bob", ""),
         ]
     );
     assert_eq!(crash_dirs(&[]).len(), 4);

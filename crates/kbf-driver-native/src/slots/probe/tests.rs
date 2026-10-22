@@ -21,7 +21,7 @@ fn a_job_is_launchds_own_by_the_folder_of_its_plist() {
         assert!(is_own_plist(own), "{own}");
     }
     for lease in [
-        "/Users/kbf-pool-0/Library/LaunchAgents/com.apple.fake.plist",
+        "/Volumes/pool/kbf-pool-0/Library/LaunchAgents/com.apple.fake.plist",
         "/Library/LaunchAgents/System.plist",
         "/tmp/System/x.plist",
         "/Library/Apple",
@@ -55,14 +55,13 @@ fn the_services_of_a_domain_are_the_table_between_its_braces() {
 #[test]
 fn the_shared_plan_covers_the_shared_places_and_caches_not_the_folders() {
     let plan = shared_plan();
-    let owned: Vec<&str> = plan.owned.iter().map(|p| p.to_str().unwrap()).collect();
     assert_eq!(
-        owned,
+        plan.owned,
         [
-            "/Users/Shared",
-            "/private/tmp",
-            "/private/var/tmp",
-            "/Library/Caches"
+            Path::new("/Users").join("Shared"),
+            PathBuf::from("/private/tmp"),
+            PathBuf::from("/private/var/tmp"),
+            PathBuf::from("/Library/Caches"),
         ]
     );
     assert_eq!(
@@ -75,8 +74,8 @@ fn the_shared_plan_covers_the_shared_places_and_caches_not_the_folders() {
 }
 
 /// Catches a mount list read wrong: a device with spaces in its name, options after the
-/// path, a mount that is only a prefix of the root (`/Users/kbf-pool-10` is not under
-/// `/Users/kbf-pool-1`), and the order: a mount inside a mount first.
+/// path, a mount that is only a prefix of the root (`kbf-pool-10` is not under
+/// `kbf-pool-1`), and the order: a mount inside a mount first.
 #[test]
 fn mounts_under_the_roots_come_off_deepest_first() {
     let mount = "\

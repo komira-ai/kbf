@@ -87,7 +87,7 @@ fn the_domains_are_booted_out_whole_and_no_job_by_its_label() {
     let mut fake = Fake::new(vec![listing(&["kbf.agent"]), listing(&[])]);
     fake.jobs = vec![(
         "kbf.agent",
-        plist("/Users/p/Library/LaunchAgents/kbf.plist"),
+        plist("/Volumes/pool/p/Library/LaunchAgents/kbf.plist"),
     )];
     assert_eq!(end(&fake, 700), Ok(()));
     assert_eq!(
@@ -121,7 +121,7 @@ fn only_a_plist_in_a_system_folder_is_launchds_own() {
     );
 
     for lease in [
-        plist("/Users/p/Library/LaunchAgents/com.apple.fake.plist"),
+        plist("/Volumes/pool/p/Library/LaunchAgents/com.apple.fake.plist"),
         exited(0, "x = {\n}\n"),
         exited(113, ""),
         Said::TimedOut,
