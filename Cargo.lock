@@ -2609,6 +2609,8 @@ name = "kbf-updater"
 version = "0.1.0"
 dependencies = [
  "httparse",
+ "kbf-host-install",
+ "kbf-testkit",
  "libc",
  "serde",
  "serde_json",
