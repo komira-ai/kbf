@@ -8,7 +8,7 @@
 //! |---|---|---|
 //! | `instance/<instance id>` | the member id | for ever: a node that returns keeps its id |
 //! | `member-owner/<id>` | the instance id: written with `instance/<instance id>`, so one id is never given to two instances | for ever |
-//! | `member/<id>` | the member (address, zone, weight, admin state), its boot counter, its newest debts report and the protocol version it registered naming | `ttl` after the last heartbeat |
+//! | `member/<id>` | the member (address, zone, weight, admin state), its boot counter, its newest debts report, the protocol version it registered naming and what it said of its build and log | `ttl` after the last heartbeat |
 //! | `down/<id>` | nothing | `dwell` from the moment the member went `Down` |
 //! | `map` | the current `kbf.map.v1.Map` | for ever; a change is one compare-and-set |
 //! | `meta/members_formed` | nothing | for ever: the cluster has had an `Active` member |
@@ -48,6 +48,14 @@
 //! registration. A row written before the field existed names none and reads as a node
 //! whose version is not known, never as version 0. The row lives `ttl` after the last
 //! heartbeat, so a member that went `Down` has no version either.
+//!
+//! **Node facts.** The row also keeps what the node said of the build it runs and of its
+//! metadata log: the newest log version its build can raise it to, the version the log is at,
+//! and the commit built ([`NodeFacts`]; row tags 7 to 9, [`Members::node_facts`], `GET
+//! /v1/members`). A registration replaces them, a heartbeat updates the log version and keeps
+//! the rest, and a node that says nothing reads as `None`, never 0. Nothing decides on them
+//! yet. A frontend built before them drops them when it rewrites a row, and they return with
+//! the node's next heartbeat to a frontend that knows them (module `facts`).
 //!
 //! **The map** is a function of the rows: [`Members::refresh`] reads `map`, `member/` and
 //! the `down/` marks, builds the next member list, and if it differs commits generation
@@ -123,6 +131,7 @@ mod denials;
 pub use denials::Denial;
 mod assign;
 mod blocked;
+mod facts;
 mod fence;
 mod handoff;
 mod join;
@@ -130,6 +139,7 @@ mod pins;
 mod promote;
 mod row;
 pub use assign::{LastBoot, MAX_SEED};
+pub use facts::{MAX_BUILD_COMMIT, NodeFacts};
 pub use handoff::{Block, Fill, Handoff, fill_fp};
 use pins::pin_key;
 use row::{Live, decode_row, encode_row};
@@ -458,10 +468,11 @@ fn plan(
 
 /// How a row is rewritten in place.
 #[derive(Clone, Copy)]
-enum Touch {
-    /// A heartbeat of this boot, what it reports, what it says it owes and what it says of
-    /// the handoff: a whole time to live more, and the debts report replaced.
-    Beat(u64, Progress, Reported, Fill),
+enum Touch<'a> {
+    /// A heartbeat of this boot, what it reports, what it says it owes, what it says of
+    /// the handoff and what it says of its build and log: a whole time to live more, and the
+    /// debts report replaced ([`NodeFacts::after_beat`] says what becomes of the facts).
+    Beat(u64, Progress, Reported, Fill, &'a NodeFacts),
     /// An administrator's state change: the time to live it had.
     State(MemberState),
     /// An administrator's planned restart of an `Active` member: `Down` in the row, with
@@ -636,6 +647,21 @@ impl Members {
         who: &Registrant,
         last: Option<LastBoot>,
     ) -> Result<Registration, MembershipError> {
+        self.register_reporting(who, last, &NodeFacts::default())
+    }
+
+    /// [`Members::register_after`] for a node that also says what it runs and what its
+    /// metadata log is at (`facts`): the row keeps them, in place of any an earlier boot
+    /// wrote ([`NodeFacts`]).
+    ///
+    /// # Errors
+    /// As [`Members::register`].
+    pub fn register_reporting(
+        &self,
+        who: &Registrant,
+        last: Option<LastBoot>,
+        facts: &NodeFacts,
+    ) -> Result<Registration, MembershipError> {
         if who.instance_id.is_empty() || who.addr.is_empty() || who.weight == 0 {
             return Err(MembershipError::Invalid(
                 "an instance id, an address and a weight of at least 1 are required",
@@ -670,22 +696,24 @@ impl Members {
             who.progress == Progress::CatchingUp,
             boot,
             named_protocol(who.protocol),
+            facts,
         )?;
         let map = self.refresh()?.ok_or(MembershipError::NoMap)?;
         Ok(Registration { id, boot, map })
     }
 
     /// Stores `member`'s row with a whole time to live, unless a newer boot is there, and
-    /// clears its `down/` mark. The row names the `protocol` this registration did, in
-    /// place of any an earlier boot wrote. The state is [`Members::admit`]'s (read again at
-    /// every attempt, and the write checks the mark it read); an `Active` row also writes
-    /// `meta/members_formed`, in the same transaction.
+    /// clears its `down/` mark. The row names the `protocol` and the `facts` this
+    /// registration did, in place of any an earlier boot wrote. The state is
+    /// [`Members::admit`]'s (read again at every attempt, and the write checks the mark it
+    /// read); an `Active` row also writes `meta/members_formed`, in the same transaction.
     fn write_row(
         &self,
         mut member: Member,
         rebuilding: bool,
         boot: u64,
         protocol: Option<u32>,
+        facts: &NodeFacts,
     ) -> Result<(), MembershipError> {
         let key = member_key(member.id);
         for _ in 0..ATTEMPTS {
@@ -712,7 +740,7 @@ impl Members {
             let txn = txn
                 .put_ttl(
                     &key,
-                    encode_row(&member, boot, protocol, None, None, Fill::default()),
+                    encode_row(&member, boot, protocol, None, None, Fill::default(), facts),
                     self.config.ttl,
                     cond,
                 )
@@ -759,7 +787,9 @@ impl Members {
     }
 
     /// [`Members::heartbeat`] for a node that also says how far its flush and its tail have
-    /// got (`fill`). A joiner's beat that finds it filled promotes it ([`Handoff`]).
+    /// got (`fill`). A joiner's beat that finds it filled promotes it ([`Handoff`]). The beat
+    /// says nothing of the node's build or log, as an older node's does not: the row's log
+    /// version becomes `None` ([`Members::heartbeat_reporting`] says it).
     ///
     /// # Errors
     /// As [`Members::heartbeat`].
@@ -772,7 +802,27 @@ impl Members {
         fill: Fill,
         holder: Option<&dyn Fn(&str) -> bool>,
     ) -> Result<u64, MembershipError> {
-        if self.touch(id, Touch::Beat(boot, progress, said, fill), holder)? {
+        let said_nothing = NodeFacts::default();
+        self.heartbeat_reporting(id, boot, progress, said, (fill, &said_nothing), holder)
+    }
+
+    /// [`Members::heartbeat_with`] for a node that also says what it runs and what its
+    /// metadata log is at now (`facts`, with `fill`): the row takes the log version, and
+    /// the other two facts if it holds none ([`NodeFacts`]).
+    ///
+    /// # Errors
+    /// As [`Members::heartbeat`].
+    pub fn heartbeat_reporting(
+        &self,
+        id: MemberId,
+        boot: u64,
+        progress: Progress,
+        said: Reported,
+        (fill, facts): (Fill, &NodeFacts),
+        holder: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<u64, MembershipError> {
+        let beat = Touch::Beat(boot, progress, said, fill, facts);
+        if self.touch(id, beat, holder)? {
             return Ok(self.refresh()?.map_or(0, |map| map.generation()));
         }
         Ok(self.current_map()?.map_or(0, |map| map.generation()))
@@ -895,7 +945,7 @@ impl Members {
     fn touch(
         &self,
         id: MemberId,
-        how: Touch,
+        how: Touch<'_>,
         holder: Option<&dyn Fn(&str) -> bool>,
     ) -> Result<bool, MembershipError> {
         let key = member_key(id);
@@ -912,19 +962,20 @@ impl Members {
             let before = live.member.state;
             let mut step = promote::Step::none();
             let ttl = match how {
-                Touch::Beat(boot, _, _, _) if boot != live.boot => {
+                Touch::Beat(boot, _, _, _, _) if boot != live.boot => {
                     return Err(MembershipError::Superseded {
                         id,
                         boot,
                         current: live.boot,
                     });
                 }
-                Touch::Beat(_, progress, said, fill) => {
+                Touch::Beat(_, progress, said, fill, facts) => {
                     live.report = Some(Report {
                         said,
                         at: self.store.now(),
                     });
                     live.fill = fill;
+                    live.facts = live.facts.after_beat(facts);
                     if before == MemberState::Joining {
                         step = self.beat_step(&live, progress)?;
                         if step.promote {
@@ -990,6 +1041,7 @@ impl Members {
                     live.report.as_ref(),
                     live.planned_until,
                     live.fill,
+                    &live.facts,
                 ),
                 ttl,
                 Cond::Version(stored.version),
@@ -1282,6 +1334,21 @@ impl Members {
             .read_rows()?
             .into_iter()
             .map(|(id, live)| (id, live.protocol))
+            .collect())
+    }
+
+    /// What each member with a live row said of the build it runs and of its metadata log
+    /// ([`NodeFacts`]; a fact the node did not say is `None`, never 0). A member the map
+    /// holds whose row has lapsed (`Down`) is not here: its row, which held the facts,
+    /// expired with the heartbeats, so a reader treats it as not known.
+    ///
+    /// # Errors
+    /// The store failing; a stored row not decoding.
+    pub fn node_facts(&self) -> Result<BTreeMap<MemberId, NodeFacts>, MembershipError> {
+        Ok(self
+            .read_rows()?
+            .into_iter()
+            .map(|(id, live)| (id, live.facts))
             .collect())
     }
 

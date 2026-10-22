@@ -9,7 +9,8 @@
 //!   those ([`ProtocolSummary`]).
 //! - `GET /v1/members`: the storage members of the current map, as the gRPC
 //!   `Membership` service keeps them ([`crate::members::Members`]), the protocol version
-//!   each registered naming, and the oldest of those.
+//!   each registered naming, and the oldest of those, and what each said of the build it
+//!   runs and of its metadata log (`runs_log`, `log_version`, `build_commit`).
 //! - `GET /v1/storage`: whether every blob is known to have its copies elsewhere, from the
 //!   storage members' heartbeats ([`crate::storage_health`]); on a frontend with a state
 //!   store.
@@ -240,6 +241,15 @@ struct MemberView {
     weight: u32,
     /// What its registration named; `None` if its row names none or has lapsed.
     protocol: Option<u32>,
+    /// The newest metadata-log machine version its build can raise its log to, as its
+    /// registration said; `None` if the node says none, its row names none or has lapsed.
+    runs_log: Option<u32>,
+    /// The machine version its metadata log was at in its newest heartbeat; `None` as for
+    /// `runs_log`.
+    log_version: Option<u32>,
+    /// The commit its binary was built from, as its registration said (at most 64 bytes;
+    /// the text `unknown` for a build with no git checkout); `None` as for `runs_log`.
+    build_commit: Option<String>,
     /// Why a joiner is not promoted yet, when `--auto-promote` is on and it is one
     /// (`docs/design/rebalance-handoff.md`); absent otherwise.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -272,13 +282,15 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
         return no_members();
     };
     // The store's calls block (its trait says so). The map is read, then the rows that
-    // say which protocol each member registered naming: not one snapshot, so a member
-    // whose row lapses between the two is listed without a version.
+    // say which protocol each member registered naming and what it said of its build and
+    // log: not one snapshot, so a member whose row lapses between the two is listed
+    // without a version.
     let read = tokio::task::spawn_blocking(move || {
         let map = members.current_map()?;
-        Ok::<_, MembershipError>((map, members.protocols()?, members.blocked_joiners()?))
+        let rows = (members.protocols()?, members.node_facts()?);
+        Ok::<_, MembershipError>((map, rows, members.blocked_joiners()?))
     });
-    let (map, protocols, blocked) = match read.await {
+    let (map, (protocols, facts), blocked) = match read.await {
         Ok(Ok(read)) => read,
         Ok(Err(e)) => {
             let code = match e {
@@ -310,6 +322,9 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
                     state: state_name(m.state),
                     weight: m.weight,
                     protocol: protocols.get(&m.id).copied().flatten(),
+                    runs_log: facts.get(&m.id).and_then(|f| f.runs_log),
+                    log_version: facts.get(&m.id).and_then(|f| f.log_version),
+                    build_commit: facts.get(&m.id).and_then(|f| f.build_commit.clone()),
                     blocked_on: blocked
                         .get(&m.id)
                         .map_or_else(Vec::new, |b| b.iter().map(ToString::to_string).collect()),

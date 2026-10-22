@@ -73,6 +73,7 @@ use crate::listen::Binder;
 use crate::members::LastBoot;
 use crate::metrics::bind_node_sockets;
 use crate::node_map::NodeMap;
+use crate::raft_log::RUNS;
 use crate::ram_drain::RamDrain;
 use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, Registered, bind_node};
@@ -799,7 +800,13 @@ pub(crate) async fn open_cache<C: ColdPick>(
             // The member and boot the log last wrote as: a store that counts from 1 gives
             // the node a boot above it, so the open below is not refused.
             let last = last_boot(&meta).await?;
-            let mut joiner = joiner.with_catch_up(catch_up.clone()).with_last_boot(last);
+            // What the node runs and what its log is at go to the frontend in the
+            // registration and every heartbeat; the handle follows the raise `open_registered`
+            // makes below.
+            let mut joiner = joiner
+                .with_catch_up(catch_up.clone())
+                .with_last_boot(last)
+                .with_log(RUNS.get(), meta.version_handle());
             let joined = joiner.join().await;
             // The store is chosen after the registration and before the cache opens: the
             // keys the frontend registered are probed first (`crate::cold_apply`), and the

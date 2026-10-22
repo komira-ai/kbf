@@ -16,7 +16,9 @@ use hooked::Hooked;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_map::{MemberId, MemberState};
 use kbf_objstore::MemoryStore;
-use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
+use kbf_server::members::{
+    Fill, Members, MembershipConfig, NodeFacts, PROTOCOL, Progress, Registrant,
+};
 use kbf_server::storage_health::Reported;
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
@@ -195,7 +197,9 @@ async fn no_map_is_empty_and_no_state_store_is_not_found() {
 
 /// Catches a view that reads another source than the members the `Membership` service
 /// writes (a registered member must appear, with the id the registration answered), one
-/// that drops or renames a field (`id`, `addr`, `state`, `weight`, `generation`), and one
+/// that drops or renames a field (`id`, `addr`, `state`, `weight`, `generation`, and the
+/// node facts, which read `null` for a node that said none: an object with a key missing
+/// is another shape than one with it `null`), and one
 /// that names a state other than the map's: a member the operator set `joining` is
 /// `joining` until promoted, and `active` after (a registration that is caught up is
 /// `active` at once).
@@ -218,9 +222,11 @@ async fn a_registered_member_is_listed_and_active_once_promoted() {
         joined["members"],
         json!([
             { "id": a.id.0, "addr": "192.0.2.1:8982", "state": "joining", "weight": 1,
-              "protocol": PROTOCOL },
+              "protocol": PROTOCOL, "runs_log": null, "log_version": null,
+              "build_commit": null },
             { "id": b.id.0, "addr": "192.0.2.2:8982", "state": "joining", "weight": 3,
-              "protocol": PROTOCOL },
+              "protocol": PROTOCOL, "runs_log": null, "log_version": null,
+              "build_commit": null },
         ])
     );
 
@@ -530,6 +536,80 @@ async fn a_member_whose_row_lapsed_names_no_protocol() {
     assert_eq!(protocols_of(&view), json!([3, 2, null]), "{view}");
     assert_eq!(view["oldest_protocol"], json!(2), "{view}");
     assert_eq!(view["protocol_unknown"], json!(1), "{view}");
+}
+
+/// Full commits, as a node built from a git checkout reports them.
+const COMMIT_A: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+const COMMIT_C: &str = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
+const COMMIT_Z: &str = "ffffffffffffffffffffffffffffffffffffffff";
+
+/// What the entry of member `i` (in the map's order) says of its build and log:
+/// `[runs_log, log_version, build_commit]`.
+fn facts_of(view: &Value, i: usize) -> Value {
+    let m = &view["members"][i];
+    json!([m["runs_log"], m["log_version"], m["build_commit"]])
+}
+
+/// Catches: the node facts missing from the view, shown for another member, swapped with
+/// one another (`runs_log` for `log_version`), or shown as 0 or "" for a node that said
+/// none (an older build must read `null`); a heartbeat's log version not reaching the view,
+/// or its `runs_log` and `build_commit` replacing the registration's; and a `down` member,
+/// whose row lapsed with its heartbeats, shown with facts it no longer has.
+#[tokio::test]
+async fn a_member_lists_what_it_runs_and_where_its_log_is() {
+    let (clock, fake, state) = store();
+    let server = start(Some(state));
+    let frontend = other_frontend(&fake);
+    let said = |runs_log, log_version, commit: &str| NodeFacts {
+        runs_log: Some(runs_log),
+        log_version: Some(log_version),
+        build_commit: Some(commit.to_owned()),
+    };
+    let a = frontend
+        .register_reporting(&registrant(1, 1), None, &said(5, 1, COMMIT_A))
+        .expect("a");
+    let b = frontend.register(&registrant(2, 1)).expect("b");
+    frontend
+        .register_reporting(&registrant(3, 1), None, &said(6, 2, COMMIT_C))
+        .expect("c");
+    let view = members(server.api).await;
+    assert_eq!(facts_of(&view, 0), json!([5, 1, COMMIT_A]), "{view}");
+    assert_eq!(facts_of(&view, 1), json!([null, null, null]), "{view}");
+    assert_eq!(facts_of(&view, 2), json!([6, 2, COMMIT_C]), "{view}");
+
+    // A heartbeat brings the log version the log was raised to, and nothing else.
+    let beat = said(9, 4, COMMIT_Z);
+    frontend
+        .heartbeat_reporting(
+            a.id,
+            a.boot,
+            Progress::CaughtUp,
+            Reported::default(),
+            (Fill::default(), &beat),
+            None,
+        )
+        .expect("beat a");
+    let view = members(server.api).await;
+    assert_eq!(facts_of(&view, 0), json!([5, 4, COMMIT_A]), "{view}");
+
+    // Only `a` and `b` keep beating: `c` lapses and is `down` in the map, with no facts.
+    clock.advance(TTL - Duration::from_secs(1));
+    for registered in [&a, &b] {
+        frontend
+            .heartbeat(
+                registered.id,
+                registered.boot,
+                Progress::CaughtUp,
+                Reported::default(),
+                None,
+            )
+            .expect("beat");
+    }
+    clock.advance(Duration::from_secs(2));
+    frontend.refresh().expect("refreshed");
+    let view = members(server.api).await;
+    assert_eq!(view["members"][2]["state"], json!("down"), "{view}");
+    assert_eq!(facts_of(&view, 2), json!([null, null, null]), "{view}");
 }
 
 /// Catches `/v1/members` behind a gate `/v1/nodes` does not have (the operator scripts
