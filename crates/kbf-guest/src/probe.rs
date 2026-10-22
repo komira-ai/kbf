@@ -38,17 +38,18 @@ pub trait Host {
     fn pause(&self, d: Duration);
 }
 
-/// Polls `cond` every [`TICK`] until it holds or `limit` of waiting has passed.
-pub fn wait_until(host: &dyn Host, limit: Duration, cond: impl Fn() -> bool) -> bool {
+/// Polls `cond` every [`TICK`] until it holds or `limit` of waiting has passed; the time
+/// waited when it held, `None` when the time was up.
+pub fn wait_until(host: &dyn Host, limit: Duration, cond: impl Fn() -> bool) -> Option<Duration> {
     let mut waited = Duration::ZERO;
     while !cond() {
         if waited >= limit {
-            return false;
+            return None;
         }
         host.pause(TICK);
         waited += TICK;
     }
-    true
+    Some(waited)
 }
 
 /// `probe-guest`'s arguments.
@@ -60,6 +61,10 @@ pub struct GuestArgs {
     /// Wait for this path to exist first (the automount share).
     #[arg(long)]
     pub wait_path: Option<PathBuf>,
+    /// The directory the system's own automount would show the share at; its
+    /// readability is part of the answer, whatever `--wait-path` is.
+    #[arg(long, default_value = "/Volumes/My Shared Files/kbf")]
+    pub automount_dir: PathBuf,
     #[arg(long, default_value_t = 5000)]
     pub vsock_port: u32,
     #[arg(long, default_value = "kbf.probe")]
@@ -84,12 +89,13 @@ pub struct ReadyArgs {
     pub wait_process: Option<String>,
 }
 
-fn wait_for_path(host: &dyn Host, path: Option<&Path>) -> Result<(), String> {
+/// Waits for `path`; the milliseconds it took (0 when there is nothing to wait for).
+fn wait_for_path(host: &dyn Host, path: Option<&Path>) -> Result<u64, String> {
     match path {
-        Some(p) if !wait_until(host, WAIT, || host.exists(p)) => {
-            Err(format!("{} never appeared", p.display()))
-        }
-        _ => Ok(()),
+        Some(p) => wait_until(host, WAIT, || host.exists(p))
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .ok_or_else(|| format!("{} never appeared", p.display())),
+        None => Ok(0),
     }
 }
 
@@ -98,20 +104,18 @@ fn wait_for_path(host: &dyn Host, path: Option<&Path>) -> Result<(), String> {
 /// # Errors
 /// The wait path never appeared.
 pub fn probe_guest(host: &dyn Host, a: &GuestArgs) -> Result<Value, String> {
-    wait_for_path(host, a.wait_path.as_deref())?;
+    let share_wait_ms = wait_for_path(host, a.wait_path.as_deref())?;
     let (uid, euid) = host.ids();
-    let automount_dir = a
-        .wait_path
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("/Volumes/My Shared Files/kbf"));
     Ok(json!({
+        "share_wait_ms": share_wait_ms,
+        "share_path": a.wait_path,
         "uid": uid,
         "euid": euid,
         "session": host.session(),
         "vsock": host.vsock(a.vsock_port),
         "console": host.console(&a.console_name),
         "mount_custom_tag": host.mount_tag(&a.tag, &a.mountpoint),
-        "automount": host.automount(&automount_dir),
+        "automount": host.automount(&a.automount_dir),
     }))
 }
 
@@ -120,14 +124,19 @@ pub fn probe_guest(host: &dyn Host, a: &GuestArgs) -> Result<Value, String> {
 /// # Errors
 /// The path or the process never appeared.
 pub fn probe_ready(host: &dyn Host, a: &ReadyArgs) -> Result<Value, String> {
-    wait_for_path(host, a.wait_path.as_deref())?;
+    let share_wait_ms = wait_for_path(host, a.wait_path.as_deref())?;
     if let Some(name) = &a.wait_process
-        && !wait_until(host, WAIT, || host.process_running(name))
+        && wait_until(host, WAIT, || host.process_running(name)).is_none()
     {
         return Err(format!("process {name} never appeared"));
     }
     let (uid, euid) = host.ids();
-    Ok(json!({"uid": uid, "euid": euid, "session": host.session()}))
+    Ok(json!({
+        "uid": uid,
+        "euid": euid,
+        "session": host.session(),
+        "share_wait_ms": share_wait_ms,
+    }))
 }
 
 /// Writes `value` to `out` through a temporary file, so the host never reads half of it.
@@ -205,6 +214,7 @@ mod tests {
         GuestArgs {
             out: PathBuf::from("/o"),
             wait_path: wait.map(PathBuf::from),
+            automount_dir: PathBuf::from("/auto"),
             vsock_port: 5000,
             console_name: "c".into(),
             tag: "t".into(),
@@ -216,32 +226,42 @@ mod tests {
     #[test]
     fn waiting_stops_when_the_condition_holds_or_the_time_is_up() {
         let h = Fake::new();
-        assert!(wait_until(&h, WAIT, || true));
+        assert_eq!(wait_until(&h, WAIT, || true), Some(Duration::ZERO));
         assert_eq!(h.pauses.get(), 0);
-        assert!(!wait_until(&h, Duration::from_secs(1), || false));
+        assert_eq!(wait_until(&h, Duration::from_secs(1), || false), None);
         assert_eq!(h.pauses.get(), 2);
+        let h = Fake::new();
+        let n = Cell::new(0);
+        let waited = wait_until(&h, WAIT, || {
+            n.set(n.get() + 1);
+            n.get() > 3
+        });
+        assert_eq!(waited, Some(TICK * 3));
     }
 
-    /// Catches answers lost on the way into the JSON, a wait path that is ignored, and
-    /// an automount probe aimed at the wrong directory.
+    /// Catches answers lost on the way into the JSON, a wait path that is ignored, the
+    /// time spent waiting for the share not recorded, and an automount probe aimed at
+    /// the wait path instead of the system automount directory.
     #[test]
     fn probe_guest_collects_every_answer_after_the_share_appears() {
         let h = Fake::new();
         h.appears_after.set(Some(3));
         let v = probe_guest(&h, &guest_args(Some("/share"))).expect("probe");
         assert_eq!(h.pauses.get(), 3);
+        assert_eq!(v["share_wait_ms"], 1500);
         assert_eq!(v["uid"], 0);
         assert_eq!(v["session"], "System");
         assert_eq!(v["vsock"]["port"], 5000);
         assert_eq!(v["console"]["name"], "c");
         assert_eq!(v["mount_custom_tag"]["exit_code"], 1);
-        assert_eq!(v["automount"]["dir"], "/share");
+        assert_eq!(v["automount"]["dir"], "/auto");
+        assert_eq!(v["share_path"], "/share");
         let there = Fake::new();
         there.present.borrow_mut().push(PathBuf::from("/share"));
         probe_guest(&there, &guest_args(Some("/share"))).expect("present");
         assert_eq!(there.pauses.get(), 0);
         let v = probe_guest(&Fake::new(), &guest_args(None)).expect("no wait");
-        assert_eq!(v["automount"]["dir"], "/Volumes/My Shared Files/kbf");
+        assert_eq!(v["share_wait_ms"], 0);
     }
 
     /// Catches a probe that writes an answer when its share never mounted.

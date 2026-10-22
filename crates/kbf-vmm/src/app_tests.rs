@@ -136,6 +136,13 @@ fn probe_takes_a_base_elsewhere_and_reports_an_unusable_work_directory() {
 fn probe_bench_takes_the_run_count() {
     let work = work_with_base("app-bench");
     let sys = FakeSystem::new();
+    for _ in 0..4 {
+        sys.script(
+            crate::fake::Script::booted()
+                .with_guest_file(crate::guest::READY_SYSTEM, "{}")
+                .with_guest_file(crate::guest::READY_LOGIN, "{}"),
+        );
+    }
     let (code, out, _) = go(
         Some(&sys),
         &[
@@ -267,4 +274,63 @@ fn the_command_line_parses_gates_in_any_case_and_defaults_to_twenty_runs() {
             ..
         })
     ));
+}
+
+/// Catches `image setup` not reaching the setup step (it needs root, so as a user it says
+/// what is missing and exits 0), a `--disk-gib` outside the range the parser accepts, and
+/// the subcommand not parsing.
+#[test]
+fn image_setup_runs_the_offline_write_and_disk_size_is_bounded() {
+    let work = work_with_base("app-setup");
+    let base = work.join("base");
+    let sys = FakeSystem::new();
+    let args = ["image", "setup", "--base", base.to_str().expect("p")];
+    let (code, out, _) = go(Some(&sys), &args);
+    assert_eq!(code, OK);
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).expect("json")["status"],
+        "needs-manual"
+    );
+    sys.uid.set(0);
+    let (code, out, _) = go(Some(&sys), &args);
+    assert_eq!(code, OK, "{out}");
+    assert_eq!(sys.offline_calls.borrow()[0].0, base.join("disk.img"));
+    for bad in ["0", "31", "4097", "-1"] {
+        assert!(
+            Cli::try_parse_from([
+                "kbf-vmm",
+                "image",
+                "base",
+                "--ipsw",
+                "a",
+                "--sha256",
+                "b",
+                "--out",
+                "c",
+                "--disk-gib",
+                bad,
+            ])
+            .is_err(),
+            "{bad}"
+        );
+    }
+    for good in ["32", "4096"] {
+        assert!(
+            Cli::try_parse_from([
+                "kbf-vmm",
+                "image",
+                "base",
+                "--ipsw",
+                "a",
+                "--sha256",
+                "b",
+                "--out",
+                "c",
+                "--disk-gib",
+                good,
+            ])
+            .is_ok(),
+            "{good}"
+        );
+    }
 }

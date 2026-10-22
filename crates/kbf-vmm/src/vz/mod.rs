@@ -17,8 +17,11 @@
 //!
 //! # SAFETY
 //! The framework requires every VM call to run on the VM's serial queue; [`Queued`] wraps
-//! a value that is only ever touched inside `DispatchQueue::exec_*` on that queue. The
-//! wrapper's `Send` impl is the one place that claims it.
+//! a value that may only be used inside `DispatchQueue::exec_*` on the queue it belongs
+//! to, and its `get` is `unsafe` so that each use states that. The value is also released
+//! on that queue (`helper::release_on_queue`). [`Shared`] wraps the few objects the
+//! documentation says are safe to use from any thread (an `NSProgress`, a loaded
+//! restore image), and its constructor is the `unsafe` step.
 
 use objc2::rc::Retained;
 use objc2_foundation::{NSData, NSError, NSString, NSURL};
@@ -32,14 +35,46 @@ pub mod install;
 /// A value that is only used on one dispatch queue.
 pub struct Queued<T>(T);
 
-// SAFETY: `Queued` values are created on one thread and then only dereferenced inside
-// closures that run on the serial queue the value belongs to (see the module docs).
+// SAFETY: a `Queued` value can be created on any thread, but the only way to reach what is
+// inside is the `unsafe` `get`, whose caller promises to be on the value's queue. Moving
+// the wrapper between threads therefore never touches the value.
 unsafe impl<T> Send for Queued<T> {}
 
 impl<T> Queued<T> {
     pub fn new(v: T) -> Self {
         Self(v)
     }
+
+    /// The wrapped value.
+    ///
+    /// # Safety
+    /// The caller is running on the dispatch queue this value belongs to.
+    pub unsafe fn get(&self) -> &T {
+        &self.0
+    }
+
+    /// Takes the value out, for a release on the queue.
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+/// A value the framework documents as usable from any thread.
+pub struct Shared<T>(T);
+
+// SAFETY: `Shared::new` is `unsafe`; its caller promises that `T` may be used from any
+// thread, which is what `Send` for the wrapper claims.
+unsafe impl<T> Send for Shared<T> {}
+
+impl<T> Shared<T> {
+    /// Wraps `v`.
+    ///
+    /// # Safety
+    /// `v` is documented as usable from any thread, or is immutable once created.
+    pub unsafe fn new(v: T) -> Self {
+        Self(v)
+    }
+
     pub fn get(&self) -> &T {
         &self.0
     }

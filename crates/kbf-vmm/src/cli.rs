@@ -103,11 +103,18 @@ pub enum ImageCmd {
         #[arg(long)]
         out: PathBuf,
         /// The guest disk's size.
-        #[arg(long, default_value_t = 64)]
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u64).range(32..=4096))]
         disk_gib: u64,
         /// As root, write the Setup Assistant marker and the probe launch daemons into
         /// the installed image (probe P0's question).
         #[arg(long)]
         offline_setup: bool,
+    },
+    /// As root, write the probe launch daemons and the Setup Assistant marker into an
+    /// existing base bundle (the `--offline-setup` step, for a bundle built without it).
+    Setup {
+        /// The base bundle directory.
+        #[arg(long)]
+        base: PathBuf,
     },
 }

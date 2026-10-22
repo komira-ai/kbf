@@ -17,7 +17,8 @@ pub struct Timing {
     pub start_timeout: Duration,
     /// How long a started VM must stay running to count as booted.
     pub hold: Duration,
-    /// How long to wait for a marker the guest writes.
+    /// How long to wait for a marker the guest writes; longer than the guest's own wait
+    /// for the share, so the guest gives up first and says why.
     pub guest_timeout: Duration,
     /// One wait for a helper event or a file.
     pub tick: Duration,
@@ -31,7 +32,7 @@ impl Timing {
         Self {
             start_timeout: Duration::from_secs(90),
             hold: Duration::from_secs(20),
-            guest_timeout: Duration::from_secs(240),
+            guest_timeout: Duration::from_secs(320),
             tick: Duration::from_millis(100),
             retry_window: Duration::from_secs(60),
         }
@@ -147,10 +148,18 @@ impl Vm {
                 }
                 Poll::Gone { code, signal } => {
                     self.gone = true;
+                    let log = self
+                        .proc
+                        .diagnostics()
+                        .filter(|t| !t.trim().is_empty())
+                        .map(|t| format!("; helper log: {}", t.trim()))
+                        .unwrap_or_default();
                     return Step::Failed(Boot {
                         booted: false,
                         started_ms: self.started_ms(),
-                        failure: Some(format!("helper ended (code {code:?}, signal {signal:?})")),
+                        failure: Some(format!(
+                            "helper ended (code {code:?}, signal {signal:?}){log}"
+                        )),
                         code: None,
                     });
                 }
@@ -196,7 +205,8 @@ impl Vm {
     pub fn wait_file(&mut self, path: &Path, wait: Duration, tick: Duration) -> Option<Duration> {
         let began = Instant::now();
         loop {
-            if path.exists() {
+            // Existence only, without following a link the guest may have left.
+            if std::fs::symlink_metadata(path).is_ok() {
                 return Some(began.elapsed());
             }
             if began.elapsed() >= wait || self.gone {

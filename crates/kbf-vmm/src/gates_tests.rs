@@ -5,7 +5,7 @@ use serde_json::json;
 use crate::cli::Gate;
 use crate::fake::{FakeSystem, Script, ctx, good_signature, tmp, work_with_base};
 use crate::gates::{self, g1, g2, g3, g5, p0, p2, p6};
-use crate::guest::{ROOT_RESULT, USER_RESULT};
+use crate::guest::{READY_SYSTEM, ROOT_RESULT, USER_RESULT};
 use crate::report::Status;
 use crate::spec::{Event, LIMIT_EXCEEDED};
 use crate::system::{Poll, Signature};
@@ -53,15 +53,93 @@ fn g1_runs_two_clones_per_identity_and_reports_each() {
     assert_eq!(r.status, Status::Ok);
     assert_eq!(r.details["same_identifier"]["booted"], 2);
     assert_eq!(r.details["new_identifier"]["booted"], 2);
+    assert_eq!(r.details["evidence"], "vm_running_only");
+    assert!(r.summary.as_deref().expect("summary").contains("weak"));
     assert!(
         r.summary
             .expect("summary")
-            .contains("same identifier: 2 of 2 booted at once")
+            .contains("same identifier: 2 of 2 running at once")
     );
     // 2 same-identifier clones of four files, 2 new-identifier clones of three.
     assert_eq!(sys.cloned.borrow().len(), 8 + 6);
     assert_eq!(sys.starts.borrow().len(), 4);
     assert!(!work.join("g1-same-0").exists(), "clones are removed");
+}
+
+/// Catches G1 calling a clone booted on the framework's running state alone: with a guest
+/// binary each clone must also write the launch-daemon marker, the two are reported
+/// separately, and one silent clone ends the waiting for the rest of its arm.
+#[test]
+fn g1_looks_for_the_guest_marker_when_it_can() {
+    let work = work_with_base("g1-guest");
+    let bin = work.join("guest-bin");
+    std::fs::write(&bin, "x").expect("bin");
+    let sys = FakeSystem::new();
+    // Same-identifier arm: both clones write the marker. Fresh arm: the first is running
+    // but silent (a clone that sits in firmware), the second is not waited for.
+    sys.script(Script::booted().with_guest_file(READY_SYSTEM, "{}"))
+        .script(Script::booted().with_guest_file(READY_SYSTEM, "{}"))
+        .script(Script::booted())
+        .script(Script::booted().with_guest_file(READY_SYSTEM, "{}"));
+    let mut c = ctx(&sys, &work);
+    c.guest_binary = Some(bin);
+    let r = g1(&c);
+    assert_eq!(r.status, Status::Ok, "{r:?}");
+    assert_eq!(r.details["evidence"], "guest_userspace_marker");
+    let (same, fresh) = (&r.details["same_identifier"], &r.details["new_identifier"]);
+    assert_eq!(
+        (
+            same["booted"].clone(),
+            same["reached_guest_userspace"].clone()
+        ),
+        (json!(2), json!(2))
+    );
+    assert_eq!(
+        (
+            fresh["booted"].clone(),
+            fresh["reached_guest_userspace"].clone()
+        ),
+        (json!(2), json!(0))
+    );
+    assert!(same["vms"][0]["guest_marker_ms"].is_number());
+    assert!(fresh["vms"][0]["guest_marker_ms"].is_null());
+    let text = r.summary.expect("summary");
+    assert!(
+        text.contains("2 of 2 running at once, 2 reached guest userspace"),
+        "{text}"
+    );
+    assert!(
+        text.contains("2 of 2 running, 0 reached guest userspace"),
+        "{text}"
+    );
+    assert!(!text.contains("weak"));
+}
+
+/// Catches a clone that did not even start being waited on for a guest marker, or a
+/// share that cannot be made being counted as a boot.
+#[test]
+fn g1_does_not_wait_for_a_guest_marker_from_a_clone_that_failed() {
+    let work = work_with_base("g1-guest-fail");
+    let bin = work.join("guest-bin");
+    std::fs::write(&bin, "x").expect("bin");
+    let sys = FakeSystem::new();
+    sys.script(Script::failing("no disk", None));
+    let mut c = ctx(&sys, &work);
+    c.guest_binary = Some(bin);
+    let r = g1(&c);
+    let same = &r.details["same_identifier"];
+    assert_eq!(
+        (
+            same["booted"].clone(),
+            same["reached_guest_userspace"].clone()
+        ),
+        (json!(1), json!(0))
+    );
+    assert!(same["vms"][0]["guest_marker_ms"].is_null());
+    c.guest_binary = Some(work.join("missing"));
+    let r = g1(&c);
+    assert_eq!(r.status, Status::Error);
+    assert!(r.reason.expect("reason").contains("copy"));
 }
 
 /// Catches a failed boot being counted as one, and the failure text being dropped.
@@ -135,6 +213,11 @@ fn g2_names_the_channel_the_host_saw() {
         }
         sys.script(s);
         let r = g2(&ctx(&sys, &work));
+        assert!(
+            r.details
+                .get("devices_refused_so_retried_without_console_port")
+                .is_none()
+        );
         assert_eq!(r.status, Status::Ok, "{want}: {r:?}");
         assert_eq!(r.details["channel"], want);
         assert_eq!(r.details["guest"][USER_RESULT]["vsock"]["socket_errno"], 47);
@@ -165,25 +248,64 @@ fn g2_without_a_guest_agent_needs_a_person() {
 fn g2_and_g3_report_a_guest_that_does_not_boot_as_an_error() {
     let work = work_with_base("g23-noboot");
     let sys = FakeSystem::new();
-    sys.script(Script::failing("no disk", None));
+    sys.script(Script::failing("no disk", None))
+        .script(Script::failing("no disk", None));
     let r = g2(&ctx(&sys, &work));
     assert_eq!(r.status, Status::Error);
     assert!(r.reason.expect("reason").contains("did not boot: no disk"));
+    // G2 retried once without the console port; G3 never retries.
+    assert_eq!(sys.starts.borrow().len(), 2);
+    sys.script(Script::failing("no disk", None));
+    assert_eq!(g3(&ctx(&sys, &work)).status, Status::Error);
+    assert_eq!(sys.starts.borrow().len(), 3);
     *sys.start_error.borrow_mut() = Some("cannot spawn".into());
     let r = g3(&ctx(&sys, &work));
     assert_eq!(r.status, Status::Error);
     assert!(r.reason.expect("reason").contains("cannot spawn"));
 }
 
+/// Catches a console device the framework refuses for a macOS guest failing both G2 and
+/// G3: G2 retries without the console port and records that, and G3 never asks for the
+/// vsock listener or the console port at all.
+#[test]
+fn g2_retries_without_the_console_port_and_g3_never_asks_for_the_channels() {
+    let work = work_with_base("g2-retry");
+    let sys = FakeSystem::new();
+    sys.script(Script::failing("console device not supported", None))
+        .script(Script::booted().with_guest_file(
+            USER_RESULT,
+            &json!({"vsock": {"socket_errno": 47}}).to_string(),
+        ));
+    let r = g2(&ctx(&sys, &work));
+    assert_eq!(r.status, Status::Ok, "{r:?}");
+    assert!(
+        r.details["devices_refused_so_retried_without_console_port"]
+            .as_str()
+            .expect("why")
+            .contains("console device not supported")
+    );
+    let starts = sys.starts.borrow();
+    assert!(!starts[0].0.console_ports.is_empty() && !starts[0].0.vsock_ports.is_empty());
+    assert!(starts[1].0.console_ports.is_empty() && !starts[1].0.vsock_ports.is_empty());
+    drop(starts);
+    let sys = FakeSystem::new();
+    let work = work_with_base("g3-plain");
+    let _ = g3(&ctx(&sys, &work));
+    let starts = sys.starts.borrow();
+    assert!(starts[0].0.console_ports.is_empty() && starts[0].0.vsock_ports.is_empty());
+    assert!(starts[0].0.tagged.is_some() && starts[0].0.automount_dir.is_some());
+}
+
 /// Catches a needs-root verdict that ignores the root control: the verdict is true only
-/// when the unprivileged mount failed and the root one worked.
+/// when the unprivileged mount failed and the root one worked; when root fails too the
+/// answer is unknown (null), with the root attempt kept, not "no root needed".
 #[test]
 fn g3_compares_the_user_with_the_root_control() {
     for (user, root, want) in [
         (1, 0, json!(true)),
         (0, 0, json!(false)),
-        (1, 1, json!(false)),
-        (0, 1, json!(false)),
+        (1, 1, json!(null)),
+        (0, 1, json!(null)),
     ] {
         let work = work_with_base("g3-verdict");
         let sys = FakeSystem::new();
@@ -199,6 +321,11 @@ fn g3_compares_the_user_with_the_root_control() {
             "user {user} root {root}"
         );
         assert_eq!(r.details["automount_readable_without_root"], true);
+        assert_eq!(
+            r.details.get("custom_tag_mount_inconclusive").is_some(),
+            want.is_null(),
+            "user {user} root {root}"
+        );
     }
 }
 
@@ -248,6 +375,8 @@ fn g5_runs_every_arm_it_can_and_names_what_is_missing() {
     );
     drop(starts);
 
+    assert_eq!(r.details["launch_daemon_child"], true);
+    assert_eq!(r.details["launchd_context"], "System");
     let work = work_with_base("g5-user");
     let sys = FakeSystem::new();
     sys.console_uid.set(None);
@@ -255,7 +384,7 @@ fn g5_runs_every_arm_it_can_and_names_what_is_missing() {
     assert_eq!(r.status, Status::NeedsManual);
     let why = r.reason.expect("reason");
     assert!(
-        why.contains("not a child of launchd")
+        why.contains("not a launch daemon")
             && why.contains("not root")
             && why.contains("logged in"),
         "{why}"
@@ -263,6 +392,37 @@ fn g5_runs_every_arm_it_can_and_names_what_is_missing() {
     assert_eq!(r.details["arms"].as_array().expect("arms").len(), 2);
     assert_eq!(r.details["throwaway_uid"], gates::THROWAWAY_UID);
     assert!(sys.starts.borrow().iter().all(|(_, u)| u.is_none()));
+}
+
+/// Catches a process that only has parent pid 1 (`nohup &`, `sudo -b`) being taken for a
+/// launch daemon: the launchd domain must be `System`.
+#[test]
+fn g5_requires_the_system_launchd_domain_not_just_parent_pid_one() {
+    for (context, daemon) in [
+        (Some("System"), true),
+        (Some("Aqua"), false),
+        (Some("Background"), false),
+        (None, false),
+    ] {
+        let work = work_with_base("g5-domain");
+        let sys = FakeSystem::new();
+        sys.uid.set(0);
+        sys.ppid.set(1);
+        sys.console_uid.set(Some(0));
+        *sys.context.borrow_mut() = context.map(str::to_owned);
+        let r = g5(&ctx(&sys, &work), None);
+        assert_eq!(r.details["launch_daemon_child"], daemon, "{context:?}");
+        assert_eq!(r.details["parent_pid_is_1"], true);
+        assert_eq!(
+            r.status,
+            if daemon {
+                Status::Ok
+            } else {
+                Status::NeedsManual
+            },
+            "{context:?}"
+        );
+    }
 }
 
 /// Catches an arm whose clone fails being dropped from the report.
@@ -389,6 +549,79 @@ fn p0_writes_the_payload_into_a_clone_as_root() {
     assert_eq!(r.details["failure"], "not permitted");
     sys.clone_fails_on.replace(Some("disk.img"));
     assert_eq!(p0(&ctx(&sys, &work)).status, Status::Error);
+}
+
+/// Catches P0 claiming the guest ran the payload when it was only written: the clone is
+/// booted only with a guest binary, `payload_ran` follows the launch-daemon marker, and
+/// without a binary the summary says the files were read back only.
+#[test]
+fn p0_boots_the_clone_to_see_whether_the_payload_runs() {
+    let bin_work = work_with_base("p0-boot");
+    let bin = bin_work.join("guest-bin");
+    std::fs::write(&bin, "x").expect("bin");
+    for (marker, want, text) in [
+        (true, json!(true), "ran a launch daemon"),
+        (false, json!(false), "wrote no marker"),
+    ] {
+        let work = work_with_base("p0-boot-run");
+        let sys = FakeSystem::new();
+        sys.uid.set(0);
+        let script = if marker {
+            Script::booted().with_guest_file(READY_SYSTEM, "{}")
+        } else {
+            Script::booted()
+        };
+        sys.script(script);
+        let mut c = ctx(&sys, &work);
+        c.guest_binary = Some(bin.clone());
+        let r = p0(&c);
+        assert_eq!(r.status, Status::Ok, "{r:?}");
+        assert_eq!(r.details["payload_ran"], want);
+        assert!(r.summary.expect("summary").contains(text));
+        assert_eq!(sys.starts.borrow().len(), 1);
+        assert_eq!(
+            sys.starts.borrow()[0].0.bundle,
+            work.join("p0-vm"),
+            "the written clone is the one booted"
+        );
+        assert!(!work.join("p0-vm").exists() && !work.join("p0-vm-share").exists());
+    }
+    let work = work_with_base("p0-noboot");
+    let sys = FakeSystem::new();
+    sys.uid.set(0);
+    let r = p0(&ctx(&sys, &work));
+    assert!(sys.starts.borrow().is_empty());
+    assert!(r.details["payload_ran"].is_null());
+    assert!(r.summary.expect("summary").contains("read back only"));
+    // A clone that does not start is a recorded answer, not a gate error.
+    let work = work_with_base("p0-boot-fails");
+    let sys = FakeSystem::new();
+    sys.uid.set(0);
+    sys.script(Script::failing("no", None));
+    let mut c = ctx(&sys, &work);
+    c.guest_binary = Some(bin);
+    let r = p0(&c);
+    assert_eq!(r.details["payload_ran"], false);
+    assert_eq!(r.details["boot"]["boot"]["booted"], false);
+    *sys.start_error.borrow_mut() = Some("cannot spawn".into());
+    let r = p0(&c);
+    assert_eq!(r.details["boot"]["attempted"], false);
+    assert!(
+        r.details["boot"]["failure"]
+            .as_str()
+            .expect("why")
+            .contains("cannot spawn")
+    );
+    // A share that cannot be made (the guest binary is missing) is recorded, not fatal.
+    c.guest_binary = Some(work.join("missing"));
+    let r = p0(&c);
+    assert_eq!(r.details["boot"]["attempted"], false);
+    assert!(
+        r.details["boot"]["failure"]
+            .as_str()
+            .expect("why")
+            .contains("copy")
+    );
 }
 
 /// Catches P6 starting a VM from a binary that does not have the signature the question

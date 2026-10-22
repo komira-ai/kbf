@@ -44,6 +44,7 @@ fn every_failure_is_not_a_boot() {
                 events: vec![],
                 guest_files: vec![],
                 exits_on_stop: true,
+                log: None,
             },
             "no started event",
         ),
@@ -84,6 +85,7 @@ fn every_failure_is_not_a_boot() {
                 }],
                 guest_files: vec![],
                 exits_on_stop: true,
+                log: None,
             },
             "signal Some(9)",
         ),
@@ -135,6 +137,7 @@ fn waiting_for_a_file() {
         }],
         guest_files: vec![],
         exits_on_stop: true,
+        log: None,
     });
     let mut gone = vm(&sys, &work);
     let began = std::time::Instant::now();
@@ -156,6 +159,7 @@ fn stop_asks_first_and_kills_when_ignored() {
     assert!(polite.stop(&t));
     sys.script(Script {
         exits_on_stop: false,
+        log: None,
         ..Script::booted()
     });
     let mut stubborn = vm(&sys, &work);
@@ -220,6 +224,7 @@ fn a_start_is_retried_only_for_the_guest_limit() {
         events: vec![],
         guest_files: vec![],
         exits_on_stop: true,
+        log: None,
     });
     assert!(
         c.spawn_retrying("d", &spec)
@@ -275,6 +280,32 @@ fn the_real_timing_is_longer_than_the_test_timing() {
     assert!(Timing::real().guest_timeout > Duration::from_secs(60));
 }
 
+/// Catches a helper that dies without the cause reaching the report: the tail of its
+/// log is part of the failure, and an empty log adds nothing.
+#[test]
+fn a_helper_that_ended_reports_its_log_tail() {
+    let work = work_with_base("probe-log-tail");
+    let sys = FakeSystem::new();
+    let gone = || Poll::Gone {
+        code: Some(1),
+        signal: None,
+    };
+    sys.script(
+        Script::booted()
+            .then(gone())
+            .with_log("  cannot execute: permission denied\n"),
+    );
+    sys.script(Script::booted().then(gone()).with_log("   \n"));
+    let t = Timing::instant();
+    let with = vm(&sys, &work).await_boot(&t).failure.expect("failure");
+    assert!(
+        with.contains("helper log: cannot execute: permission denied"),
+        "{with}"
+    );
+    let blank = vm(&sys, &work).await_boot(&t).failure.expect("failure");
+    assert!(!blank.contains("helper log"), "{blank}");
+}
+
 /// Catches a start time read from the wrong event, and a clone onto an existing
 /// directory deleting what was there.
 #[test]
@@ -288,6 +319,7 @@ fn the_start_time_is_the_started_event_and_an_existing_clone_is_kept() {
         ],
         guest_files: vec![],
         exits_on_stop: true,
+        log: None,
     });
     let mut v = vm(&sys, &work);
     assert!(v.await_boot(&Timing::instant()).booted);

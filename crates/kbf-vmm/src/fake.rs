@@ -23,6 +23,8 @@ pub struct Script {
     pub guest_files: Vec<(String, String)>,
     /// Whether the helper exits after `request_stop`.
     pub exits_on_stop: bool,
+    /// What the helper's log tail says.
+    pub log: Option<String>,
 }
 
 impl Script {
@@ -32,6 +34,7 @@ impl Script {
             events: vec![Poll::Event(Event::Started { ms: 100 })],
             guest_files: Vec::new(),
             exits_on_stop: true,
+            log: None,
         }
     }
 
@@ -50,12 +53,19 @@ impl Script {
             })],
             guest_files: Vec::new(),
             exits_on_stop: true,
+            log: None,
         }
     }
 
     /// Adds a file the guest writes.
     pub fn with_guest_file(mut self, name: &str, body: &str) -> Self {
         self.guest_files.push((name.to_owned(), body.to_owned()));
+        self
+    }
+
+    /// Sets the helper's log tail.
+    pub fn with_log(mut self, text: &str) -> Self {
+        self.log = Some(text.to_owned());
         self
     }
 
@@ -72,9 +82,13 @@ pub struct FakeProc {
     killed: bool,
     stop_asked: bool,
     exits_on_stop: bool,
+    log: Option<String>,
 }
 
 impl VmProcess for FakeProc {
+    fn diagnostics(&self) -> Option<String> {
+        self.log.clone()
+    }
     fn pid(&self) -> u32 {
         self.pid
     }
@@ -117,6 +131,7 @@ pub struct FakeSystem {
     pub identity: RefCell<Result<Vec<u8>, String>>,
     pub uid: Cell<u32>,
     pub ppid: Cell<u32>,
+    pub context: RefCell<Option<String>>,
     pub console_uid: Cell<Option<u32>>,
     pub purge: RefCell<Result<(), String>>,
     pub purges: Cell<u32>,
@@ -146,6 +161,7 @@ impl FakeSystem {
             identity: RefCell::new(Ok(b"fresh-id".to_vec())),
             uid: Cell::new(501),
             ppid: Cell::new(1234),
+            context: RefCell::new(Some("System".to_owned())),
             console_uid: Cell::new(Some(501)),
             purge: RefCell::new(Ok(())),
             purges: Cell::new(0),
@@ -227,6 +243,7 @@ impl System for FakeSystem {
             killed: false,
             stop_asked: false,
             exits_on_stop: script.exits_on_stop,
+            log: script.log,
         }))
     }
     fn purge_cache(&self) -> Result<(), String> {
@@ -238,6 +255,9 @@ impl System for FakeSystem {
     }
     fn ppid(&self) -> u32 {
         self.ppid.get()
+    }
+    fn launchd_context(&self) -> Option<String> {
+        self.context.borrow().clone()
     }
     fn console_uid(&self) -> Option<u32> {
         self.console_uid.get()

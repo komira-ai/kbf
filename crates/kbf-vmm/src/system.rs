@@ -30,11 +30,15 @@ pub trait VmProcess {
     fn poll(&mut self, wait: Duration) -> Poll;
     /// SIGKILL: the helper gets no chance to stop its VM.
     fn kill9(&mut self);
-    /// Closes the helper's stdin, which asks it to stop its VM and exit.
+    /// Closes the helper's stdin, which makes it force-stop its VM (the guest is not asked
+    /// to shut down) and exit.
     fn request_stop(&mut self);
     /// Waits for the helper to exit (after [`request_stop`](Self::request_stop) or
     /// [`kill9`](Self::kill9)), up to `wait`; true once it has.
     fn wait_gone(&mut self, wait: Duration) -> bool;
+    /// The tail of what the helper wrote to its log, for a failure report; `None` when
+    /// there is no log.
+    fn diagnostics(&self) -> Option<String>;
 }
 
 /// One file written into a guest volume while the guest is off (probe P0).
@@ -79,6 +83,9 @@ pub trait System {
     fn purge_cache(&self) -> Result<(), String>;
     fn uid(&self) -> u32;
     fn ppid(&self) -> u32;
+    /// The launchd domain this process runs in (`launchctl managername`: `System` for a
+    /// launch daemon, `Aqua` or `Background` for a login session); `None` when unknown.
+    fn launchd_context(&self) -> Option<String>;
     /// The owner of `/dev/console`: 0 when nobody is logged in at the console.
     fn console_uid(&self) -> Option<u32>;
     /// macOS version and build, architecture and this binary's version, as JSON.

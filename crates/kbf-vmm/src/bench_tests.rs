@@ -26,7 +26,7 @@ fn stats_summarize_each_column_over_the_runs_that_have_it() {
             login: None,
             aqua: None,
             stop_to_exit: 5.0,
-            slot_reusable: Some(7.0),
+            failure: None,
         },
         Run {
             clone: 3.0,
@@ -35,7 +35,7 @@ fn stats_summarize_each_column_over_the_runs_that_have_it() {
             login: None,
             aqua: Some(9.0),
             stop_to_exit: 15.0,
-            slot_reusable: None,
+            failure: Some("helper ended".into()),
         },
         Run {
             clone: 2.0,
@@ -44,7 +44,7 @@ fn stats_summarize_each_column_over_the_runs_that_have_it() {
             login: None,
             aqua: None,
             stop_to_exit: 10.0,
-            slot_reusable: Some(9.0),
+            failure: None,
         },
     ];
     let s = bench::stats(&runs);
@@ -56,7 +56,12 @@ fn stats_summarize_each_column_over_the_runs_that_have_it() {
     assert!(s["boot_to_login_ms"].is_null());
     assert_eq!(s["boot_to_aqua_ready_ms"]["n"], 1);
     assert_eq!(s["stop_to_exit_ms"]["median_ms"], 10.0);
-    assert_eq!(s["slot_reusable_ms"]["n"], 2);
+    assert_eq!(s["failed_runs"], 1);
+    assert_eq!(s["failures"], json!(["helper ended"]));
+    assert!(
+        s.get("slot_reusable_ms").is_none(),
+        "no measure claims to time slot reuse"
+    );
 }
 
 /// Catches a bench that purges the cache on the warm runs or not on the cold ones, a
@@ -77,7 +82,7 @@ fn a_bench_runs_cold_then_warm_and_reports_every_measure() {
         assert_eq!(m["runs"], 3, "{mode}");
         assert_eq!(m["boot_to_system_ready_ms"]["n"], 3, "{mode}");
         assert_eq!(m["boot_to_login_ms"]["n"], 3, "{mode}");
-        assert_eq!(m["slot_reusable_ms"]["n"], 3, "{mode}");
+        assert_eq!(m["failed_runs"], 0, "{mode}");
         assert!(m["boot_to_aqua_ready_ms"].is_null(), "{mode}");
         assert!(m["clone_ms"]["median_ms"].as_f64().expect("ms") >= 0.0);
     }
@@ -105,8 +110,16 @@ fn a_bench_without_guest_markers_needs_a_person_and_keeps_the_host_numbers() {
     let sys = FakeSystem::new();
     let r = bench::run(&ctx(&sys, &work), 2);
     assert_eq!(r.status, Status::NeedsManual);
-    assert!(r.reason.expect("reason").contains("starts kbf-guest"));
-    assert_eq!(r.details["warm"]["boot_to_running_ms"]["n"], 2);
+    assert!(r.reason.expect("reason").contains("launch daemons"));
+    // One silent run ends the batch: more would each wait out the whole guest timeout.
+    assert_eq!(r.details["warm"]["boot_to_running_ms"]["n"], 1);
+    assert_eq!(sys.starts.borrow().len(), 1 + 1);
+    assert!(
+        r.details["warm"]["incomplete"]
+            .as_str()
+            .expect("why")
+            .contains("first run")
+    );
     assert!(r.details["warm"]["boot_to_system_ready_ms"].is_null());
 }
 
@@ -174,4 +187,71 @@ fn a_clone_failure_stops_the_bench() {
     let r = bench::run(&ctx(&sys, &work), 1);
     assert_eq!(r.status, Status::Error);
     assert!(r.reason.expect("reason").contains("EXDEV"));
+}
+
+/// Catches a helper that died being waited on until the guest timeout (a missing
+/// payload would then cost the whole timeout per run), and a failure not counted.
+#[test]
+fn a_helper_that_dies_ends_the_run_and_is_counted() {
+    let work = work_with_base("bench-dies");
+    let sys = FakeSystem::new();
+    for _ in 0..2 {
+        sys.script(Script::booted().then(crate::system::Poll::Gone {
+            code: Some(1),
+            signal: None,
+        }));
+    }
+    let mut c = ctx(&sys, &work);
+    c.timing.guest_timeout = std::time::Duration::from_secs(60);
+    let began = std::time::Instant::now();
+    let r = bench::run(&c, 1);
+    assert!(began.elapsed() < std::time::Duration::from_secs(30));
+    assert_eq!(r.details["warm"]["failed_runs"], 1);
+    assert!(
+        r.details["warm"]["failures"][0]
+            .as_str()
+            .expect("text")
+            .contains("helper ended")
+    );
+}
+
+/// Catches finished runs thrown away when a later one breaks the batch, and a report
+/// that does not say it is incomplete.
+#[test]
+fn runs_that_finished_are_kept_when_a_later_one_breaks() {
+    let work = work_with_base("bench-partial-batch");
+    let sys = FakeSystem::new();
+    *sys.purge.borrow_mut() = Err("must be root".into());
+    for _ in 0..2 {
+        sys.script(ready());
+    }
+    // Each run clones four files: two runs fit, the third breaks.
+    sys.clone_budget.set(Some(8));
+    let r = bench::run(&ctx(&sys, &work), 3);
+    assert_eq!(r.status, Status::Ok, "{r:?}");
+    assert_eq!(r.details["warm"]["runs"], 2);
+    assert!(
+        r.details["warm"]["incomplete"]
+            .as_str()
+            .expect("why")
+            .contains("no more clones")
+    );
+}
+
+/// Catches a report that leaves out how the numbers were taken: the polling intervals
+/// that bound their precision, the idle host, the order of the runs, the force stop.
+#[test]
+fn the_report_says_how_the_numbers_were_taken() {
+    let work = work_with_base("bench-method");
+    let sys = FakeSystem::new();
+    for _ in 0..4 {
+        sys.script(ready());
+    }
+    let r = bench::run(&ctx(&sys, &work), 2);
+    let m = &r.details["method"];
+    assert_eq!(m["runs_requested"], 2);
+    assert_eq!(m["guest_poll_ms"], 500);
+    assert_eq!(m["host_poll_ms"], 1);
+    assert!(m["load"].as_str().expect("load").contains("idle"));
+    assert_eq!(m["stop"], "force stop");
 }

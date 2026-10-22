@@ -43,7 +43,8 @@ impl Host for SystemHost {
     fn vsock(&self, port: u32) -> Value {
         // macOS has no public AF_VSOCK; 40 is the Linux value, tried to see what the
         // kernel answers. The socket call is the question; a connect is tried only if it
-        // succeeds, with a Linux-layout address for the host (CID 2).
+        // succeeds, with a BSD-layout address (length byte, family byte) for the host
+        // (CID 2).
         const AF_VSOCK: libc::c_int = 40;
         // SAFETY: plain socket(2) call; the descriptor is closed below.
         let fd = unsafe { libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0) };

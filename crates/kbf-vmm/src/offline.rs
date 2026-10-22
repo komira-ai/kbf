@@ -57,6 +57,18 @@ pub fn parse_attach(plist_bytes: &[u8]) -> Result<Attach, String> {
     })
 }
 
+/// The first whole-disk device node (`/dev/diskN`) named anywhere in `output`.
+#[must_use]
+pub fn whole_disk(output: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(output);
+    let at = text.find("/dev/disk")?;
+    let digits: String = text[at + "/dev/disk".len()..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    (!digits.is_empty()).then(|| format!("/dev/disk{digits}"))
+}
+
 /// The mount that is the Data volume: the one holding `private/var/db`.
 #[must_use]
 pub fn data_volume(mounts: &[PathBuf]) -> Option<&PathBuf> {
@@ -118,7 +130,23 @@ pub fn write(disk: &Path, files: &[OfflineFile]) -> Result<Value, String> {
             &disk_s,
         ],
     )?;
-    let attach = parse_attach(&out)?;
+    let attach = match parse_attach(&out) {
+        Ok(a) => a,
+        Err(e) => {
+            // The image is attached whether or not the output could be read: find the
+            // whole-disk device in the raw text and detach it, or later starts fail on a
+            // locked disk.
+            let detached =
+                whole_disk(&out).map(|dev| run("/usr/bin/hdiutil", &["detach", "-force", &dev]));
+            return Err(match detached {
+                Some(Ok(_)) => format!("{e}; the image was detached again"),
+                Some(Err(d)) => format!("{e}; and detaching it failed: {d}"),
+                None => format!(
+                    "{e}; no device in the output, so the image may still be attached (see `hdiutil info`)"
+                ),
+            });
+        }
+    };
     let result = (|| {
         let root = data_volume(&attach.mounts).ok_or_else(|| {
             format!(
@@ -161,6 +189,18 @@ mod tests {
         assert_eq!(a.device, "/dev/disk4");
         assert_eq!(a.entries.len(), 3);
         assert_eq!(a.mounts, vec![PathBuf::from("/Volumes/Data")]);
+    }
+
+    /// Catches a device lookup that returns a slice (`/dev/disk4s1`) instead of the whole
+    /// disk, finds nothing in unreadable output, or takes `/dev/disk` with no number.
+    #[test]
+    fn the_whole_disk_is_found_in_text_that_is_not_a_plist() {
+        assert_eq!(
+            whole_disk(b"garbage /dev/disk4s1 more /dev/disk5").as_deref(),
+            Some("/dev/disk4")
+        );
+        assert_eq!(whole_disk(b"/dev/diskX"), None);
+        assert_eq!(whole_disk(b"nothing"), None);
     }
 
     /// Catches a parser that accepts a plist with no entities as an attach.

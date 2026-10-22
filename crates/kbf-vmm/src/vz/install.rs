@@ -19,7 +19,7 @@ use objc2_virtualization::{
 };
 use serde_json::{Value, json};
 
-use super::{Queued, config, describe, new_machine_identifier, url};
+use super::{Queued, Shared, config, describe, new_machine_identifier, url};
 use crate::bundle::{AUX, DISK, FILES, HARDWARE_MODEL, MACHINE_ID};
 use crate::spec::VmSpec;
 
@@ -30,7 +30,7 @@ struct Installing {
 }
 
 /// Loads the restore image at `ipsw`.
-fn load(ipsw: &Path) -> Result<Queued<Retained<VZMacOSRestoreImage>>, String> {
+fn load(ipsw: &Path) -> Result<Shared<Retained<VZMacOSRestoreImage>>, String> {
     let (tx, rx) = mpsc::channel();
     let block = RcBlock::new(move |image: *mut VZMacOSRestoreImage, err: *mut NSError| {
         // SAFETY: non-null pointers are live objects for the duration of the call; the
@@ -38,8 +38,9 @@ fn load(ipsw: &Path) -> Result<Queued<Retained<VZMacOSRestoreImage>>, String> {
         let r = unsafe {
             match err.as_ref() {
                 Some(e) => Err(describe(e).0),
+                // SAFETY (Shared): a loaded restore image is immutable data.
                 None => Retained::retain(image)
-                    .map(Queued::new)
+                    .map(|i| Shared::new(i))
                     .ok_or_else(|| "the framework returned no restore image".to_owned()),
             }
         };
@@ -57,6 +58,9 @@ fn load(ipsw: &Path) -> Result<Queued<Retained<VZMacOSRestoreImage>>, String> {
 /// The restore image is unusable on this host or a step failed.
 pub fn install(ipsw: &Path, out: &Path, disk_gib: u64) -> Result<Value, String> {
     let began = Instant::now();
+    let disk_bytes = disk_gib
+        .checked_mul(1 << 30)
+        .ok_or_else(|| format!("--disk-gib {disk_gib} is too large"))?;
     fs::create_dir_all(out).map_err(|e| format!("create {}: {e}", out.display()))?;
     if let Some(f) = FILES.iter().find(|f| out.join(f).exists()) {
         return Err(format!("{} already holds {f}", out.display()));
@@ -88,7 +92,7 @@ pub fn install(ipsw: &Path, out: &Path, disk_gib: u64) -> Result<Value, String> 
     fs::write(out.join(MACHINE_ID), new_machine_identifier())
         .map_err(|e| format!("write machine-identifier: {e}"))?;
     File::create(out.join(DISK))
-        .and_then(|f| f.set_len(disk_gib << 30))
+        .and_then(|f| f.set_len(disk_bytes))
         .map_err(|e| format!("create disk.img: {e}"))?;
     // SAFETY: creates the auxiliary storage file at a path nothing else uses; the model
     // was built from the restore image just above.
@@ -116,7 +120,7 @@ pub fn install(ipsw: &Path, out: &Path, disk_gib: u64) -> Result<Value, String> 
     let queue = DispatchQueue::new("com.kbf.vmm.install", DispatchQueueAttr::SERIAL);
     let holder: Arc<Mutex<Option<Queued<Installing>>>> = Arc::new(Mutex::new(None));
     let (done_tx, done_rx) = mpsc::channel::<Result<(), String>>();
-    let (progress_tx, progress_rx) = mpsc::channel::<Queued<Retained<NSProgress>>>();
+    let (progress_tx, progress_rx) = mpsc::channel::<Shared<Retained<NSProgress>>>();
     let cfg = Queued::new(built.config);
     let ipsw_url = Queued::new(url(ipsw));
     let (q, h) = (queue.clone(), holder.clone());
@@ -134,7 +138,8 @@ pub fn install(ipsw: &Path, out: &Path, disk_gib: u64) -> Result<Value, String> 
                 &vm,
                 ipsw_url.get(),
             );
-            let _ = progress_tx.send(Queued::new(installer.progress()));
+            // SAFETY (Shared): NSProgress is documented as thread safe.
+            let _ = progress_tx.send(Shared::new(installer.progress()));
             let block = RcBlock::new(move |err: *mut NSError| {
                 // A non-null `err` is live for the call.
                 let r = match err.as_ref() {
@@ -169,7 +174,12 @@ pub fn install(ipsw: &Path, out: &Path, disk_gib: u64) -> Result<Value, String> 
         .recv_timeout(Duration::from_secs(3 * 3600))
         .map_err(|_| "the install did not finish in 3 hours".to_owned());
     finished.store(true, Ordering::SeqCst);
-    drop(holder);
+    // The VM and installer are released on their queue, not on this thread.
+    queue.exec_sync(move || {
+        if let Ok(mut slot) = holder.lock() {
+            drop(slot.take().map(Queued::into_inner));
+        }
+    });
     result??;
     Ok(json!({
         "macos_version": version,

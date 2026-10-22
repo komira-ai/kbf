@@ -86,6 +86,7 @@ pub fn run(
                 offline_setup: *offline_setup,
             },
         ),
+        Cmd::Image(ImageCmd::Setup { base }) => image::setup(sys, base),
     };
     let failed = report.status == Status::Error;
     let _ = writeln!(out, "{}", report.on_host(sys.host_facts()).to_line());

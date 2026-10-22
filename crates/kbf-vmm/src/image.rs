@@ -1,7 +1,8 @@
 //! `image base`: builds the base bundle the probes clone, from a macOS restore image.
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
@@ -103,7 +104,84 @@ pub struct BaseArgs {
     pub offline_setup: bool,
 }
 
-/// `image base`. Nothing is created when the digest is bad or the file's digest differs.
+/// The curl flags of a restore image download. `-q` first, so a `.curlrc` of the invoking
+/// user (root, usually) is not read; https only, also across redirects; a size and a time
+/// cap, so a hostile or broken server cannot fill the disk or hang the run before the
+/// digest check.
+pub const FETCH_FLAGS: [&str; 15] = [
+    "-q",
+    "--fail",
+    "--location",
+    "--silent",
+    "--show-error",
+    "--proto",
+    "=https",
+    "--proto-redir",
+    "=https",
+    "--connect-timeout",
+    "30",
+    "--max-time",
+    "7200",
+    "--max-filesize",
+    "40G",
+];
+
+/// The restore image's name inside the new bundle directory.
+pub const STAGED: &str = "restore.ipsw";
+
+/// Copies `src` to the new file `dst` (`O_EXCL`, mode 0600) and returns the SHA-256 of
+/// the bytes copied. The installer is handed `dst`, never `src`, so the file that was
+/// hashed is the file that is installed even if `src` changes after this returns.
+///
+/// # Errors
+/// `src` cannot be read or `dst` cannot be written.
+pub fn stage(src: &Path, dst: &Path) -> Result<String, ImageError> {
+    let io_err =
+        |what: &str, p: &Path, e: io::Error| ImageError::Io(format!("{what} {}: {e}", p.display()));
+    let mut from = File::open(src).map_err(|e| io_err("read", src, e))?;
+    let mut to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dst)
+        .map_err(|e| io_err("create", dst, e))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = from
+            .read(&mut buf)
+            .and_then(|n| to.write_all(&buf[..n]).map(|()| n))
+            .map_err(|e| io_err("copy", src, e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Gets the restore image into `staged` and returns its SHA-256: a download is hashed
+/// where it landed, a local file is copied while it is hashed.
+fn obtain(sys: &dyn System, source: &Source, staged: &Path) -> Result<String, String> {
+    match source {
+        Source::Path(p) => stage(p, staged).map_err(|e| e.to_string()),
+        Source::Url(url) => {
+            if !url.starts_with("https://") {
+                return Err(format!(
+                    "{url}: only https:// downloads are accepted; download the file and pass its path"
+                ));
+            }
+            sys.fetch(url, staged)
+                .map_err(|e| format!("download {url}: {e}"))?;
+            sha256_file(staged).map_err(|e| format!("read {}: {e}", staged.display()))
+        }
+    }
+}
+
+/// `image base`. The new bundle directory is made first and holds a private copy of the
+/// restore image; the copy is checked against the pin before the installer sees it, and
+/// the directory is removed on any failure up to and including the install. Nothing the
+/// pin refuses is installed.
 #[must_use]
 pub fn base(sys: &dyn System, args: &BaseArgs) -> Report {
     let probe = "image-base";
@@ -117,36 +195,41 @@ pub fn base(sys: &dyn System, args: &BaseArgs) -> Report {
             format!("{} already exists; pick a new --out", args.out.display()),
         );
     }
-    let (ipsw, downloaded) = match parse_source(&args.ipsw) {
-        Source::Path(p) => (p, false),
-        Source::Url(url) => {
-            if let Err(e) = std::fs::create_dir_all(&args.out) {
-                return Report::error(probe, format!("create {}: {e}", args.out.display()));
-            }
-            let dest = args.out.join("restore.ipsw");
-            if let Err(e) = sys.fetch(&url, &dest) {
-                let _ = std::fs::remove_dir_all(&args.out);
-                return Report::error(probe, format!("download {url}: {e}"));
-            }
-            (dest, true)
-        }
-    };
-    let actual = match verify(&ipsw, &expected) {
-        Ok(a) => a,
-        Err(e) => {
-            if downloaded {
-                let _ = std::fs::remove_dir_all(&args.out);
-            }
-            return Report::error(probe, e.to_string());
-        }
-    };
-    let installed = match sys.install_image(&ipsw, &args.out, args.disk_gib) {
-        Ok(v) => v,
-        Err(e) => return Report::error(probe, format!("install: {e}")),
-    };
-    if downloaded {
-        let _ = std::fs::remove_file(&ipsw);
+    // `create_dir` fails on a directory another process made since the check above, so
+    // the removals below only ever remove what this call made.
+    let made = args
+        .out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::create_dir(&args.out));
+    if let Err(e) = made {
+        return Report::error(probe, format!("create {}: {e}", args.out.display()));
     }
+    let staged = args.out.join(STAGED);
+    let fail = |message: String| {
+        let _ = std::fs::remove_dir_all(&args.out);
+        Report::error(probe, message)
+    };
+    let actual = match obtain(sys, &parse_source(&args.ipsw), &staged) {
+        Ok(a) => a,
+        Err(e) => return fail(e),
+    };
+    if actual != expected {
+        return fail(
+            ImageError::Mismatch {
+                path: PathBuf::from(&args.ipsw),
+                expected,
+                actual,
+            }
+            .to_string(),
+        );
+    }
+    let installed = match sys.install_image(&staged, &args.out, args.disk_gib) {
+        Ok(v) => v,
+        Err(e) => return fail(format!("install: {e}")),
+    };
+    let _ = std::fs::remove_file(&staged);
     let offline = args.offline_setup.then(|| {
         sys.offline_write(
             &args.out.join(crate::bundle::DISK),
@@ -173,10 +256,35 @@ pub fn base(sys: &dyn System, args: &BaseArgs) -> Report {
         Some(e) => Report::needs_manual(
             probe,
             format!(
-                "the bundle installed, but the offline setup (P0) failed: {e}; finish the image by hand at a console"
+                "the bundle installed, but the offline setup (P0) failed: {e}; run `kbf-vmm image setup --base {}` as root to try again",
+                args.out.display()
             ),
             details,
         ),
+    }
+}
+
+/// `image setup`: the offline write (P0) into an existing base bundle.
+#[must_use]
+pub fn setup(sys: &dyn System, base: &Path) -> Report {
+    let probe = "image-setup";
+    if sys.uid() != 0 {
+        return Report::needs_manual(
+            probe,
+            "needs root: attaching the guest disk image and writing root-owned files into its Data volume; run with sudo",
+            json!({"uid": sys.uid()}),
+        );
+    }
+    if let Err(e) = crate::bundle::check(base) {
+        return Report::error(probe, e.to_string());
+    }
+    match sys.offline_write(&base.join(crate::bundle::DISK), &guest::offline_payload()) {
+        Ok(observed) => Report::ok(
+            probe,
+            format!("the probe launch daemons are in {}", base.display()),
+            json!({"bundle": base, "offline_setup": observed}),
+        ),
+        Err(e) => Report::error(probe, format!("offline setup: {e}")),
     }
 }
 
@@ -339,6 +447,9 @@ mod tests {
         let r = base(&sys, &args(&dir, &ipsw_file(&dir), HELLO));
         assert_eq!(r.status, Status::Error);
         assert!(r.reason.expect("reason").contains("install: no space"));
+        // The directory this call made, with the staged copy, is gone: a rerun is not
+        // refused for "already exists".
+        assert!(!dir.join("out").exists());
     }
 
     /// Catches an offline write that goes to the wrong disk or whose failure hides the
@@ -401,5 +512,91 @@ mod tests {
         let mut a = args(&dir, "https://example/r.ipsw", HELLO);
         a.out = file.join("sub");
         assert!(base(&sys, &a).reason.expect("reason").contains("create"));
+    }
+
+    /// Catches a copy that is not byte-for-byte what was hashed, one that overwrites a
+    /// file, and an installer that is handed the caller's path instead of the private
+    /// copy (the caller's file could change after the digest check).
+    #[test]
+    fn the_installer_gets_a_private_copy_of_the_checked_bytes() {
+        let dir = tmp("image-stage");
+        let src = dir.join("src.ipsw");
+        std::fs::write(&src, "hello").expect("src");
+        let dst = dir.join("dst");
+        assert_eq!(stage(&src, &dst).expect("stage"), HELLO);
+        assert_eq!(std::fs::read(&dst).expect("dst"), b"hello");
+        let mode = std::fs::metadata(&dst).expect("meta").permissions();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+            0o600
+        );
+        let text = |r: Result<String, ImageError>| r.unwrap_err().to_string();
+        assert!(text(stage(&src, &dst)).contains("create"));
+        assert!(text(stage(&dir.join("no"), &dir.join("d2"))).contains("read"));
+        // A directory opens but cannot be read: the copy error names the source.
+        assert!(text(stage(&dir, &dir.join("d3"))).contains("copy"));
+
+        let sys = FakeSystem::new();
+        let a = args(&dir, &src.to_string_lossy(), HELLO);
+        assert_eq!(base(&sys, &a).status, Status::Ok);
+        assert_eq!(sys.installs.borrow()[0].0, dir.join("out").join(STAGED));
+        assert!(
+            !dir.join("out").join(STAGED).exists(),
+            "the copy is removed after the install"
+        );
+    }
+
+    /// Catches a plain-http download being accepted, which a network position could
+    /// swap before the digest check, and a download that leaves its directory behind.
+    #[test]
+    fn only_https_downloads_are_accepted() {
+        let dir = tmp("image-http");
+        let sys = FakeSystem::new();
+        let r = base(&sys, &args(&dir, "http://example/r.ipsw", HELLO));
+        assert_eq!(r.status, Status::Error);
+        assert!(r.reason.expect("reason").contains("only https://"));
+        assert!(sys.fetched.borrow().is_empty());
+        assert!(!dir.join("out").exists());
+    }
+
+    /// Catches a download command that follows a redirect off https, has no size or time
+    /// cap, or reads the invoking user's curl configuration.
+    #[test]
+    fn the_download_is_https_only_capped_and_ignores_curlrc() {
+        let f = FETCH_FLAGS;
+        assert_eq!(f[0], "-q");
+        let at = |flag: &str| f.iter().position(|x| *x == flag).expect(flag);
+        assert_eq!(f[at("--proto") + 1], "=https");
+        assert_eq!(f[at("--proto-redir") + 1], "=https");
+        assert!(holds(&[
+            f.contains(&"--max-filesize"),
+            f.contains(&"--max-time"),
+            f.contains(&"--connect-timeout"),
+            f.contains(&"--fail"),
+        ]));
+    }
+
+    /// Catches `image setup` writing as a non-root user, writing into a directory that
+    /// is not a bundle, writing to the wrong disk, or hiding a write failure.
+    #[test]
+    fn setup_writes_the_payload_into_an_existing_base_as_root() {
+        let work = crate::fake::work_with_base("image-setup");
+        let base_dir = work.join("base");
+        let sys = FakeSystem::new();
+        let r = setup(&sys, &base_dir);
+        assert_eq!(r.status, Status::NeedsManual);
+        assert!(r.reason.expect("reason").contains("root"));
+        assert!(sys.offline_calls.borrow().is_empty());
+        sys.uid.set(0);
+        let r = setup(&sys, &work.join("none"));
+        assert_eq!(r.status, Status::Error);
+        assert!(sys.offline_calls.borrow().is_empty());
+        let r = setup(&sys, &base_dir);
+        assert_eq!(r.status, Status::Ok);
+        assert_eq!(sys.offline_calls.borrow()[0].0, base_dir.join("disk.img"));
+        *sys.offline.borrow_mut() = Err("no volume".into());
+        let r = setup(&sys, &base_dir);
+        assert_eq!(r.status, Status::Error);
+        assert!(r.reason.expect("reason").contains("no volume"));
     }
 }

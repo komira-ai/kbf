@@ -1,6 +1,7 @@
 //! The VM helper (`kbf-vmm vm-run`): runs one VM on its own serial dispatch queue and
 //! reports on stdout, one JSON [`Event`] per line, until its stdin closes or the guest
-//! stops. The main thread only waits on channels; it is never needed by the framework.
+//! stops. Closing stdin force-stops the VM (the guest is not asked to shut down). The main
+//! thread only waits on channels; it is never needed by the framework.
 
 use std::io::{Read, Write};
 use std::os::fd::RawFd;
@@ -148,6 +149,17 @@ fn fail(stage: &str, message: String, code: Option<String>) -> Result<(), String
     Err(message)
 }
 
+/// Releases the VM, its delegate and its listeners on the VM's queue, where the framework
+/// expects every call on them, instead of on whichever thread drops the last reference.
+fn release_on_queue(queue: &DispatchQueue, holder: &Holder) {
+    let h = holder.clone();
+    queue.exec_sync(move || {
+        if let Ok(mut slot) = h.lock() {
+            drop(slot.take().map(Queued::into_inner));
+        }
+    });
+}
+
 /// Runs the VM `spec` describes.
 ///
 /// # Errors
@@ -220,8 +232,14 @@ pub fn run(spec: &VmSpec) -> Result<(), String> {
 
     match start_rx.recv_timeout(Duration::from_secs(120)) {
         Ok(Ok(())) => emit(&Event::Started { ms: ms() }),
-        Ok(Err((message, code))) => return fail("start", message, code),
-        Err(_) => return fail("start", "no start completion in 120 s".to_owned(), None),
+        Ok(Err((message, code))) => {
+            release_on_queue(&queue, &holder);
+            return fail("start", message, code);
+        }
+        Err(_) => {
+            release_on_queue(&queue, &holder);
+            return fail("start", "no start completion in 120 s".to_owned(), None);
+        }
     }
 
     // The parent closing stdin is the request to stop.
@@ -248,15 +266,23 @@ pub fn run(spec: &VmSpec) -> Result<(), String> {
                 };
                 let _ = stop_tx.send(r);
             });
-            // SAFETY: on the VM's queue; `stopWithCompletionHandler` is the force stop.
+            // SAFETY: on the VM's queue. `stopWithCompletionHandler` is a force stop, not a
+            // request to the guest to shut down: the guest sees an unclean shutdown.
             unsafe { running.get().vm.stopWithCompletionHandler(&block) };
         });
         match stop_rx.recv_timeout(Duration::from_secs(30)) {
             Ok(Ok(())) => {}
-            Ok(Err((message, code))) => return fail("stop", message, code),
-            Err(_) => return fail("stop", "no stop completion in 30 s".to_owned(), None),
+            Ok(Err((message, code))) => {
+                release_on_queue(&queue, &holder);
+                return fail("stop", message, code);
+            }
+            Err(_) => {
+                release_on_queue(&queue, &holder);
+                return fail("stop", "no stop completion in 30 s".to_owned(), None);
+            }
         }
     }
+    release_on_queue(&queue, &holder);
     emit(&Event::Stopped { ms: ms() });
     Ok(())
 }

@@ -34,7 +34,7 @@ fn version_prints_name_and_version() {
     );
 }
 
-/// Catches a help text that hides a subcommand the CEO is told to run, or shows the
+/// Catches a help text that hides a subcommand the docs tell the operator to run, or shows the
 /// internal helper mode.
 #[test]
 fn help_lists_the_commands_and_hides_the_helper_mode() {
@@ -84,6 +84,7 @@ fn every_vm_command_refuses_off_macos() {
             ],
             "image",
         ),
+        (vec!["image", "setup", "--base", w], "image"),
         (vec!["vm-run", "--spec", "s.json"], "vm-run"),
     ] {
         let out = run(&args);

@@ -3,13 +3,14 @@
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::hostfs::{chown_tree, sibling, tail_of};
 use crate::spec::{Event, VmSpec};
 use crate::system::{OfflineFile, Poll, Signature, System, VmProcess};
 use crate::{offline, signature, vz};
@@ -34,6 +35,8 @@ struct ProcessVm {
     child: Child,
     stdin: Option<ChildStdin>,
     events: Receiver<Event>,
+    /// Where the helper's stderr goes.
+    log: PathBuf,
 }
 
 impl ProcessVm {
@@ -48,7 +51,14 @@ impl ProcessVm {
     }
 }
 
+/// How much of the helper's log a failure report carries.
+const LOG_TAIL_BYTES: usize = 2048;
+
 impl VmProcess for ProcessVm {
+    fn diagnostics(&self) -> Option<String> {
+        tail_of(&self.log, LOG_TAIL_BYTES)
+    }
+
     fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -98,28 +108,6 @@ impl Drop for ProcessVm {
     }
 }
 
-/// Gives `uid` ownership of `path` and of everything under it.
-fn chown_tree(path: &Path, uid: u32) -> Result<(), String> {
-    let meta =
-        std::fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
-    let c =
-        std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
-    // SAFETY: `c` is a NUL-terminated path; lchown does not follow symlinks.
-    if unsafe { libc::lchown(c.as_ptr(), uid, uid) } != 0 {
-        return Err(format!(
-            "chown {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
-    if meta.is_dir() {
-        for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
-            chown_tree(&entry.map_err(|e| e.to_string())?.path(), uid)?;
-        }
-    }
-    Ok(())
-}
-
 fn run_text(program: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(program)
         .args(args)
@@ -151,8 +139,8 @@ impl System for RealSystem {
     }
 
     fn start_vm(&self, spec: &VmSpec, run_as: Option<u32>) -> Result<Box<dyn VmProcess>, String> {
-        let spec_path = spec.bundle.with_extension("spec.json");
-        let log_path = spec.bundle.with_extension("helper.log");
+        let spec_path = sibling(&spec.bundle, "spec.json");
+        let log_path = sibling(&spec.bundle, "helper.log");
         std::fs::write(
             &spec_path,
             serde_json::to_vec(spec).map_err(|e| e.to_string())?,
@@ -196,6 +184,7 @@ impl System for RealSystem {
             child,
             stdin,
             events,
+            log: log_path,
         }))
     }
 
@@ -223,6 +212,10 @@ impl System for RealSystem {
     fn ppid(&self) -> u32 {
         // SAFETY: getppid cannot fail.
         u32::try_from(unsafe { libc::getppid() }).unwrap_or(0)
+    }
+
+    fn launchd_context(&self) -> Option<String> {
+        run_text("/bin/launchctl", &["managername"])
     }
 
     fn console_uid(&self) -> Option<u32> {
@@ -266,13 +259,8 @@ impl System for RealSystem {
 
     fn fetch(&self, url: &str, dest: &Path) -> Result<(), String> {
         let status = Command::new("/usr/bin/curl")
-            .args([
-                "--fail",
-                "--location",
-                "--silent",
-                "--show-error",
-                "--output",
-            ])
+            .args(crate::image::FETCH_FLAGS)
+            .arg("--output")
             .arg(dest)
             .arg(url)
             .stdin(Stdio::null())

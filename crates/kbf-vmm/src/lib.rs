@@ -11,6 +11,7 @@ pub mod bundle;
 pub mod cli;
 pub mod gates;
 pub mod guest;
+pub mod hostfs;
 pub mod image;
 pub mod probe;
 pub mod report;
