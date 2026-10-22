@@ -488,8 +488,8 @@ rebuilt. Its assets are every tarball and SBOM in the table above, for that comm
 it.
 
 One run of `release.yml` cuts a release; nobody tags. It is started by hand
-(`workflow_dispatch`, no inputs: it releases the commit it runs on) and, in a later change that
-adds `push: branches: [main]` and nothing else, by every push to `main`. A tag pushed by hand
+(`workflow_dispatch`, no inputs: it releases the commit it runs on, as a dry run) and by every
+push to `main` (`push: branches: [main]`). A tag pushed by hand
 starts nothing, and only the release bot (a GitHub App, the one bypass of the `v*` tag ruleset)
 can create one. The jobs, each with the least token it needs:
 
@@ -557,7 +557,7 @@ them.)
 (a dispatch only), the job graph and the scopes, `if:` and environment of each job, the halt on
 red, a checkout of the run's commit alone, the release bot's key read in `tag` and `bump` only,
 the data that flows from job to job, pinned actions and an empty top-level `permissions`. The
-workflow is named `release` and its job `publish`, because `gamma.yml` follows both. On every
+job list is pinned, `publish` among them (`gamma.yml`, which followed the workflow, is deleted). On every
 pull request into `main`, CI asks GitHub the same on-`main` question for the pull request's base
 commit (which must pass) and its merge commit (which must be refused), so a check that
 accepts every commit, or none, fails there (`cargo xtask release main-control`).

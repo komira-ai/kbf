@@ -30,6 +30,8 @@ const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const SECRET: &str = "abababababababababababababababababababababababababababababababab";
 /// What Linux `setup` writes (the Mac's are in `a_mac_node_gets_its_fetch_account_and_launchd_jobs`).
 const KBF_TOML: &str = "/etc/kbf/kbf.toml";
+/// The frontend children's file on an all-in-one host, beside the sibling's `kbf.toml`.
+const AIO_FRONTEND_TOML: &str = "/etc/kbf/frontend.toml";
 const INSTALLER_TOML: &str = "/etc/kbf/installer.toml";
 const ENROLL_TOKEN: &str = "/etc/kbf/enroll.token";
 const API_TOKEN: &str = "/etc/kbf/api-token";
@@ -51,10 +53,21 @@ fn raw(mode: Mode) -> Raw {
         commit: None,
         database: mode.keeps_state_in_database().then(|| DATABASE.to_owned()),
         kbf: serving_flags(mode),
-        proxy: Default::default(),
+        proxy: proxy_flags(mode),
         create_local_database: false,
         deploy: Default::default(),
         installer_config: None,
+    }
+}
+
+/// `--proxy`, which an all-in-one host cannot be set up without and no other fixture takes.
+fn proxy_flags(mode: Mode) -> super::proxy::ProxyFlags {
+    match mode {
+        Mode::AllInOne => super::proxy::ProxyFlags {
+            proxy: true,
+            ..Default::default()
+        },
+        _ => Default::default(),
     }
 }
 
@@ -68,6 +81,9 @@ fn serving_flags(mode: Mode) -> super::kbf_settings::KbfFlags {
             ..Default::default()
         },
         Mode::AllInOne => super::kbf_settings::KbfFlags {
+            reapi_tls_cert: some("/etc/kbf/reapi.pem"),
+            reapi_tls_key: some("/etc/kbf/reapi.key"),
+            worker_client_ca: some("/etc/kbf/ca.pem"),
             cold_store: some("file:///var/lib/kbf/cold"),
             meta_dir: some("/var/lib/kbf-meta"),
             daemon_server: some("https://farm.example:8981"),
@@ -106,10 +122,13 @@ fn put(exec: &mut FakeExec, path: &str, perms: u32, owner: Owner, bytes: &str) {
 fn host() -> FakeExec {
     let mut exec = FakeExec::new(0);
     put(&mut exec, SRC, 0o600, RUNNER, "tok-abc123\n");
-    // The all-in-one daemon half's CA, certificate and key (`serving_flags`).
+    // The all-in-one daemon half's CA, certificate and key (`serving_flags`), the sibling's: its
+    // user is `kbf`. The proxy's certificate and key are the frontend user's (`kbf-server`).
     put(&mut exec, "/etc/kbf/ca.pem", 0o644, ROOT, "ca");
     put(&mut exec, "/etc/kbf/node.pem", 0o644, ROOT, "cert");
     put(&mut exec, "/etc/kbf/node.key", 0o600, KBF, "key");
+    put(&mut exec, "/etc/kbf/reapi.pem", 0o644, ROOT, "cert");
+    put(&mut exec, "/etc/kbf/reapi.key", 0o600, KBF_SERVER, "key");
     exec
 }
 
@@ -636,7 +655,7 @@ fn an_existing_operator_token_is_never_replaced() {
 
     let mut again = host();
     go_ok(&FakeOs::linux(), &mut again, &raw(Mode::AllInOne));
-    assert_eq!(file_meta(&again, API_TOKEN), (0o600, KBF));
+    assert_eq!(file_meta(&again, API_TOKEN), (0o600, KBF_SERVER));
     for mode in [Mode::Storage, Mode::Daemon, Mode::StorageAndDaemon] {
         let mut node = host();
         go_ok(&FakeOs::linux(), &mut node, &raw(mode));
@@ -742,7 +761,14 @@ fn each_mode_enables_its_own_units() {
         (Mode::Storage, &["kbf-storage.service"]),
         (Mode::Daemon, &["kbf-daemon.service"]),
         (Mode::StorageAndDaemon, &["kbf-storage-and-daemon.service"]),
-        (Mode::AllInOne, &["kbf-all-in-one.service"]),
+        (
+            Mode::AllInOne,
+            &[
+                "kbf-proxy.socket",
+                "kbf-proxy.service",
+                "kbf-storage-and-daemon.service",
+            ],
+        ),
     ];
     for (mode, units) in want {
         let mut exec = released(host(), Platform::Linux);
@@ -1826,3 +1852,6 @@ mod release_config;
 
 #[path = "seed_tests.rs"]
 mod seed;
+
+#[path = "aio_tests.rs"]
+mod aio;

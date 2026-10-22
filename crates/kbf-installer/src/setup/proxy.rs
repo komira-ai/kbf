@@ -5,7 +5,14 @@
 //! owns the public port (the socket unit's), starts the frontend children itself on loopback
 //! ports counted up from `--proxy-base-port`, and terminates TLS. So `setup` writes the proxy's
 //! table, enables the proxy's two units instead of `kbf-frontend.service`, and leaves the
-//! TLS files out of `kbf.toml` (the children speak plain h2c behind the proxy):
+//! TLS files out of `kbf.toml` (the children speak plain h2c behind the proxy).
+//!
+//! `--mode=all-in-one` is always behind the proxy (`--proxy` is required): the host runs the
+//! proxy and its frontend children, and beside them `kbf-storage-and-daemon.service`, a sibling
+//! process that holds the storage and the daemon on the loopback port `--storage-port` gives
+//! (default 8990). The files for the proxy are the same as for a frontend; the table here is
+//! all the proxy needs, and the rest of that layout is `plan.rs`'s (`kbf.toml` is the sibling's,
+//! `frontend.toml` the children's). The flags and the table:
 //!
 //! | flag | key of `[proxy]` |
 //! |---|---|
@@ -13,6 +20,7 @@
 //! | `--worker-client-ca` | `client_ca_file` |
 //! | `--proxy-base-port` | `[proxy.upstream] base_port` |
 //! | `--buck2-auth`, `--buck2-token-file` | `buck2_auth`, `buck2_token_file` |
+//! | `--storage-port` (all-in-one) | none: `storage-listen` of the sibling's `kbf.toml` |
 //!
 //! The operator token is the one `setup` makes (`operator_token_file`). Everything else in the
 //! table (the secret file, the state directory, the hold bound, the limits) is the proxy's
@@ -49,6 +57,10 @@ use crate::layout::Platform;
 /// The first port of slot A when `--proxy-base-port` is not given.
 pub const DEFAULT_BASE_PORT: u16 = 18_000;
 
+/// The loopback port of an all-in-one host's sibling when `--storage-port` is not given: the
+/// storage node's port that the documentation and the packaged examples use.
+pub const DEFAULT_STORAGE_PORT: u16 = 8990;
+
 /// The ports of a default host that the children's range must not cover: the proxy socket
 /// unit's public port, the operator API's `kbf.toml` default, and the storage node's port that
 /// the documentation and the packaged examples use (a storage node can share the host).
@@ -78,10 +90,12 @@ impl AuthFlag {
 /// The flags as the command line gave them.
 #[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProxyFlags {
-    /// Set this frontend host up behind `kbf-installer proxy`: write the `[proxy]` table of
+    /// Set this host up behind `kbf-installer proxy`: write the `[proxy]` table of
     /// installer.toml and enable kbf-proxy.socket and kbf-proxy.service instead of
-    /// kbf-frontend.service. Only for `--mode=frontend`. The proxy takes --reapi-tls-cert,
-    /// --reapi-tls-key and --worker-client-ca; the listener flags are not taken.
+    /// kbf-frontend.service (an all-in-one host also gets kbf-storage-and-daemon.service, and
+    /// cannot be set up without --proxy). Only for `--mode=frontend` and `--mode=all-in-one`.
+    /// The proxy takes --reapi-tls-cert, --reapi-tls-key and --worker-client-ca; the listener
+    /// flags are not taken.
     #[arg(long)]
     pub proxy: bool,
     /// The first loopback port of the frontend children the proxy starts (1024 to 65521);
@@ -94,6 +108,11 @@ pub struct ProxyFlags {
     /// The Buck2 API key file, an absolute path, for --buck2-auth bearer.
     #[arg(long)]
     pub buck2_token_file: Option<String>,
+    /// The loopback port of the kbf-storage-and-daemon sibling an all-in-one host runs, which
+    /// the frontend child dials in plain text (1024 to 65535, clear of the children's ports).
+    /// Default 8990. Only for `--mode=all-in-one`, with --proxy.
+    #[arg(long)]
+    pub storage_port: Option<u16>,
 }
 
 /// The proxy host's settings, valid.
@@ -105,6 +124,8 @@ pub struct ProxyPlan {
     pub server_cert: String,
     pub server_key: String,
     pub client_ca: String,
+    /// The loopback port of the sibling, for an all-in-one host; none for a frontend host.
+    pub storage_port: Option<u16>,
 }
 
 impl ProxyFlags {
@@ -124,10 +145,16 @@ impl ProxyFlags {
                 (self.proxy_base_port.is_some(), "--proxy-base-port"),
                 (self.buck2_auth.is_some(), "--buck2-auth"),
                 (self.buck2_token_file.is_some(), "--buck2-token-file"),
+                (self.storage_port.is_some(), "--storage-port"),
             ] {
                 if given {
                     problems.push(format!("{flag} is for --proxy"));
                 }
+            }
+            if mode == Mode::AllInOne {
+                problems.push(
+                    "--mode=all-in-one runs behind the proxy: --proxy is required".to_owned(),
+                );
             }
             return None;
         }
@@ -135,12 +162,18 @@ impl ProxyFlags {
             problems.push("--proxy is for Linux: the proxy runs as systemd units".to_owned());
             return None;
         }
-        if mode != Mode::Frontend {
+        if !matches!(mode, Mode::Frontend | Mode::AllInOne) {
             problems.push(format!(
-                "--proxy is for --mode=frontend: the proxy starts `kbf --mode=frontend` children, which a {} host cannot sit behind",
+                "--proxy is for --mode=frontend and --mode=all-in-one: the proxy starts `kbf --mode=frontend` children, which a {} host cannot sit behind",
                 mode_name(mode)
             ));
             return None;
+        }
+        // An all-in-one host has the sibling beside the proxy; a frontend host has none.
+        let aio = mode == Mode::AllInOne;
+        let storage_port = self.storage_port.unwrap_or(DEFAULT_STORAGE_PORT);
+        if !aio && self.storage_port.is_some() {
+            problems.push("--storage-port is for --mode=all-in-one".to_owned());
         }
         let (owned, rest): (Vec<Setting>, Vec<Setting>) = kbf
             .drain(..)
@@ -170,6 +203,19 @@ impl ProxyFlags {
                 "--proxy-base-port: the children's ports would cover {port}, which the public socket or the operator API uses by default"
             ));
         }
+        if aio {
+            if storage_port < 1024 {
+                problems.push("--storage-port: must be 1024 to 65535".to_owned());
+            } else if RESERVED_PORTS[..2].contains(&storage_port) {
+                // The first two of `RESERVED_PORTS` are the proxy's (the socket unit's, which the
+                // sibling could not bind, and the operator API's default).
+                problems.push(
+                    "--storage-port: the public socket or the operator API uses it".to_owned(),
+                );
+            } else if covers(base_port, storage_port) {
+                problems.push("--storage-port: the children's ports would cover it".to_owned());
+            }
+        }
         let auth = self.buck2_auth.map_or(Buck2Auth::None, AuthFlag::auth);
         match (&self.buck2_token_file, auth) {
             (Some(file), Buck2Auth::Bearer) => {
@@ -195,6 +241,7 @@ impl ProxyFlags {
             server_cert,
             server_key,
             client_ca,
+            storage_port: aio.then_some(storage_port),
         };
         // The proxy's own rules (bearer needs its file, the limits fit the budget), by the
         // function it starts with, so setup cannot write a table the proxy would refuse.
@@ -240,13 +287,16 @@ pub fn leftover_tls_keys(kbf_toml: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// Whether `port` is inside either slot's range, the children being started from `base`.
+fn covers(base: u16, port: u16) -> bool {
+    [base, base.saturating_add(SLOT_STRIDE)]
+        .into_iter()
+        .any(|start| (start..=start.saturating_add(SLOT_SPAN)).contains(&port))
+}
+
 /// A reserved port inside either slot's range, if any.
 fn reserved_in_range(base: u16) -> Option<u16> {
-    RESERVED_PORTS.into_iter().find(|port| {
-        [base, base + SLOT_STRIDE]
-            .into_iter()
-            .any(|start| (start..=start + SLOT_SPAN).contains(port))
-    })
+    RESERVED_PORTS.into_iter().find(|port| covers(base, *port))
 }
 
 impl ProxyPlan {
@@ -373,7 +423,7 @@ fn take_owned(from: &ProxyConfig, to: &mut ProxyConfig) {
 #[cfg(test)]
 mod layout_tests {
     use super::{MAX_BASE_PORT, SLOT_STRIDE};
-    use crate::deploy::observe;
+    use crate::observe;
     use kbf_proxy::route::Target;
 
     #[test]

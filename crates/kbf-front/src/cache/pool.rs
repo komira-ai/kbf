@@ -629,6 +629,22 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             .as_ref()
     }
 
+    /// Why a blob of `size` bytes that [`Cache::tier_open`] did not take is written to the
+    /// store: the pool's queue was full if it is a blob the pool buffers and the queue is at
+    /// its bound now, else the tier or the pool is not there for it. A label for a metric,
+    /// read once the choice is made.
+    pub(super) fn store_reason(&self, size: u64) -> super::ram::WriteThrough {
+        let full = size <= BUFFERED_BLOB_BYTES
+            && self
+                .write_pool()
+                .is_some_and(|pool| pool.full(&self.writer.metrics));
+        if full {
+            super::ram::WriteThrough::QueueFull
+        } else {
+            super::ram::WriteThrough::StorePath
+        }
+    }
+
     /// A blob of `size` bytes for the pool, if there is one and it has room.
     pub(super) fn pool_open(&self, size: u64) -> Option<PoolWrite> {
         let pool = self.write_pool()?;

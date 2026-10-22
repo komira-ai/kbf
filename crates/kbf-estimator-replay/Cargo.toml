@@ -1,0 +1,33 @@
+[package]
+name = "kbf-estimator-replay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kbf-estimator-replay"
+path = "src/main.rs"
+
+# The exporter reads the operator API with kbf-server's own client (`OperatorClient`), through a
+# wrapper that can send a GET only. The replay drives `kbf-sched` and `kbf-estimator`
+# (both pure) in process.
+[dependencies]
+clap.workspace = true
+kbf-caps.workspace = true
+kbf-estimator.workspace = true
+kbf-sched.workspace = true
+kbf-server.workspace = true
+kbf-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+kbf-testkit.workspace = true
+
+[lints]
+workspace = true

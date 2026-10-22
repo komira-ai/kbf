@@ -59,6 +59,13 @@ impl Born {
         *self.gate.lock().unwrap_or_else(PoisonError::into_inner) = Some(gate);
     }
 
+    /// The generation the gate holds now, else 0 (not known): what a staged object, and a
+    /// blob held in RAM, is dated by.
+    pub(super) fn generation(&self) -> u64 {
+        let gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        gate.as_ref().and_then(|g| g.generation()).unwrap_or(0)
+    }
+
     /// Records that `object` is staged now: the generation held, else 0 (not known). The
     /// first record of an object stands: a block takes several `PutStaged`s, and is as
     /// old as the first.
@@ -70,6 +77,22 @@ impl Born {
         at.seq += 1;
         let seq = at.seq;
         at.by_object.entry(object).or_insert((held, seq));
+    }
+
+    /// Dates `object` no later than `born`: the staged object a drain made of a blob
+    /// acknowledged under map `born` is as old as the acknowledgement, not as the drain. A
+    /// note, so a prune whose query began before it keeps it.
+    pub(super) fn lower(&self, object: ObjectId, born: u64) {
+        let mut at = self.at.lock().unwrap_or_else(PoisonError::into_inner);
+        at.seq += 1;
+        let seq = at.seq;
+        at.by_object
+            .entry(object)
+            .and_modify(|(held, noted)| {
+                *held = (*held).min(born);
+                *noted = seq;
+            })
+            .or_insert((born, seq));
     }
 
     /// Moves the date of `from` to `to`, the object a re-seat staged in its place: it
@@ -154,6 +177,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     pub async fn flush_report(&self) -> Result<FlushReport, CacheError> {
         // Before the query, so a map taken in between only lowers what is said.
         let held = self.gate.as_ref().and_then(|g| g.generation());
+        // The set before the staged objects, as every reader looks (a drain stages a blob
+        // and dates it by its acknowledgement before it drops the entry): a blob drained
+        // between the two looks is among the staged objects, never in neither.
+        let unwritten = self.held.oldest_born();
+        self.between_steps().await;
         let mark = self.writer.born.mark();
         let Some(staging) = self.writer.tier.get() else {
             return Ok(FlushReport {
@@ -181,8 +209,15 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 (staged, mine, bytes)
             })
             .await?;
+        // A blob acknowledged from RAM and not yet written is not staged, but it will be, and
+        // it was acknowledged under the map it is dated by: until it is in the index the
+        // node has not flushed everything from before that map. A node holding nothing
+        // (always, without `--ram-ack-bytes`) is as before.
         Ok(FlushReport {
-            clear_gen: held.map(|held| self.writer.born.clear(held, mark, &staged, &mine)),
+            clear_gen: held.map(|held| {
+                let clear = self.writer.born.clear(held, mark, &staged, &mine);
+                unwritten.map_or(clear, |born| clear.min(born))
+            }),
             staged_objects: staged.len() as u64,
             staged_bytes: bytes,
         })

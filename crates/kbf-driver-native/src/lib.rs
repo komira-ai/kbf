@@ -128,7 +128,7 @@
 //!
 //! Not yet: a per-lease user (which would make "every process of the action" exact,
 //! keep actions out of each other's files and the daemon's key, and close the gaps
-//! above), CPU limits, resource usage in the result, and network isolation on Linux.
+//! above), CPU limits, and network isolation on Linux.
 
 mod cas;
 mod config;
@@ -144,6 +144,7 @@ mod runtime;
 pub mod simulator;
 pub mod slots;
 mod sweep;
+pub mod usage;
 pub mod user_folders;
 pub mod whole_machine;
 pub mod xcode;

@@ -47,7 +47,6 @@ mod codec;
 mod command;
 mod controller;
 mod facts;
-mod gate;
 mod moves;
 mod node_step;
 mod pick;
@@ -61,15 +60,16 @@ mod session;
 mod slot;
 mod steps;
 
+pub use crate::storage_gate::{
+    GateFail, GateMode, MemberFacts, member_facts, storage_gate, storage_half,
+};
 pub use codec::{Desired, HostRow};
 pub use command::{Alert, Command, GiveBack, HoldReason, Severity, SlotOp};
 pub use controller::Controller;
 pub use facts::{
     AvailableFact, DaemonLoad, Facts, Generation, HelperReport, HelperStatus, HostFacts, HostKind,
-    HostRecord, MemberFacts, Observations, OrderId, Platform, PlatformClass, Release, SlotView,
-    Source, Work,
+    HostRecord, Observations, OrderId, Platform, PlatformClass, Release, SlotView, Source, Work,
 };
-pub use gate::{GateFail, GateMode, storage_gate};
 pub use node_step::{HostPhase, Transition, step};
 pub use pick::{Pick, Picked, Skip, WaitReason, pick};
 pub use policy::{Policy, PolicyError};
@@ -78,5 +78,5 @@ pub use proposal::{PROPOSED, Proposal, proposal_key};
 pub use report::{CommandError, ControllerError, Moved, Tick};
 pub use rows::{RowError, Rows, Stored};
 pub use runner::spawn as spawn_controller;
-pub use session::{FarmFacts, SessionTransport, member_facts, ports, storage_half};
+pub use session::{FarmFacts, SessionTransport, ports};
 pub use slot::{Holder, Slot, SlotClass};

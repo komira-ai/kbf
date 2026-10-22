@@ -164,6 +164,9 @@ pub struct Loaded {
     /// `fetch_timeout_s`: how long the root half's fetch may take, which sizes the update
     /// API's staging deadline.
     pub fetch_timeout_s: u32,
+    /// `frontend_config`: the file the frontend children read (`--config=`) instead of the
+    /// default `kbf.toml`; none on a host that has no sibling beside the proxy.
+    pub frontend_config: Option<PathBuf>,
 }
 
 /// Reads `path` and returns what the verb takes from it, checked: the keys it reads
@@ -198,6 +201,7 @@ fn loaded_from(path: &Path, text: &str) -> Result<Loaded, VerbError> {
         proxy,
         confirm_window_s: installer.confirm_window_s,
         fetch_timeout_s: installer.fetch_timeout_s,
+        frontend_config: installer.frontend_config,
     })
 }
 
@@ -495,6 +499,7 @@ fn serve(
     handover: &HandoverConfig,
     listener: OwnedFd,
     root: &kbf_host::Root,
+    frontend_config: Option<PathBuf>,
 ) -> Result<(), VerbError> {
     let Assembled { watch, pending } = assemble::assemble(handover)?;
     #[cfg(target_os = "linux")]
@@ -505,12 +510,13 @@ fn serve(
         upstream: config.upstream,
         status: handover.status_file.clone(),
         local: handover.local.clone(),
+        frontend_config,
         watch,
     };
-    // Off Linux nothing supervises the proxy, so neither the database, the host root nor the
-    // binary watch is used.
+    // Off Linux nothing supervises the proxy, so neither the database, the host root, the
+    // children's file nor the binary watch is used.
     #[cfg(not(target_os = "linux"))]
-    let _ = (database, root, watch);
+    let _ = (database, root, frontend_config, watch);
     unblock_stop_signals();
     let (handle, runner) = Proxy::bind(config, listener).map_err(VerbError::starting)?;
     let runtime = handle.runtime();
@@ -590,6 +596,8 @@ struct Supervise {
     /// The proxy's own copies of `kbf` (`--kbf-binary`): the children are run from them and a
     /// start with no installed release recorded adopts the package's kbf.
     local: Option<Local>,
+    /// The file the frontend children read instead of the default `kbf.toml`, if any.
+    frontend_config: Option<std::path::PathBuf>,
     /// The binary watch's seams (`--kbf-binary`, so set exactly when `local` is): the copies it
     /// stages into and the swap it starts through, the one the update API holds. Started once
     /// the swap's slot is filled ([`crate::proxy::binary_watch`]). `None` watches nothing.
@@ -649,7 +657,11 @@ fn supervise(
             let child = ProcChild::new(
                 layout,
                 children_dir(&with.state_dir),
-                frontend_argv(&with.proxy_auth_file, with.upstream),
+                frontend_argv(
+                    &with.proxy_auth_file,
+                    with.upstream,
+                    with.frontend_config.as_deref(),
+                ),
             );
             let child = Arc::new(run_from_copies(child, with.local.as_ref()));
             let watch = with.watch.clone();
@@ -808,7 +820,14 @@ pub fn run(args: &ProxyArgs, root: &Path) -> Result<(), VerbError> {
         &Layout::new(root.clone(), Platform::current()),
     );
     handover.local = open_local(args, &handover.state_dir)?;
-    serve(loaded.proxy, database, &handover, listener, &root)
+    serve(
+        loaded.proxy,
+        database,
+        &handover,
+        listener,
+        &root,
+        loaded.frontend_config,
+    )
 }
 
 #[cfg(test)]

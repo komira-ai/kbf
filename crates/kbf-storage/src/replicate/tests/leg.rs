@@ -35,6 +35,7 @@ fn leg(channel: tonic::transport::Channel, size: u64) -> Leg {
         1,
         MemberId(1),
         size,
+        false,
         Duration::from_secs(30),
         Duration::from_secs(30),
     )
@@ -293,6 +294,7 @@ async fn replica_answering(code: tonic::Code) -> Result<Option<StorageError>, St
         1,
         MemberId(1),
         2000 * 1024,
+        false,
         Duration::from_secs(30),
         Duration::from_secs(30),
     );

@@ -31,22 +31,15 @@ stages:
     after: [build]
     result: beta-result.json
     events: [push]
-  # gamma.yml follows a cut release (a completed run of release.yml on main) to the one gamma
-  # host, our own build farm's frontend: its `offer` job stages the offer, and its `deploy`
-  # job is skipped unless the repository variables are set, and otherwise runs
-  # `kbf-installer deploy` there. The 24 hour bake and its verdict run outside Actions.
-  - name: gamma
-    runs: actions
-    after: [build]
-    result: gamma-verdict.json
-    events: [workflow_run]
+  # Gamma has no stage here: gamma.yml is deleted, and gamma moves to kbf-updater (the
+  # package-update design, section 13). The 24 hour bake and its verdict run outside Actions.
   # release.yml gates, plans, verifies, tags with the release bot, publishes and bumps the
   # internal repository, in one run. It is started by hand (a dry run through `verify`); the push
   # event is allowed here for the change that adds `push: branches: [main]`, which the workflow
   # lint (tests/release_workflow) pins until then.
   - name: prod
     runs: actions
-    after: [gamma]
+    after: [beta]
     result: release.json
     events: [push, workflow_dispatch]
 jobs:
@@ -100,12 +93,6 @@ jobs:
     stage: beta
   - job: beta.yml#mixed-version
     stage: beta
-  - job: gamma.yml#offer
-    stage: gamma
-  - job: gamma.yml#deploy
-    stage: gamma
-  - job: gamma.yml#check
-    stage: gamma
   - job: release.yml#gates
     stage: prod
   - job: release.yml#plan
