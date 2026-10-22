@@ -5,11 +5,14 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 
 use hyper::header::{ALLOW, HeaderValue};
+use kbf_proxy::control::{UpdateHandler, UpdateReply, UpdateRequest};
 use rustix::io::{FdFlags, fcntl_getfd};
 
 use super::*;
+use crate::proxy::api::core::Parts;
 use crate::proxy::api::traits::RestartPending;
-use crate::proxy::orders::SpoolError;
+use crate::proxy::handover;
+use crate::proxy::releases::Local;
 use crate::testkit::A;
 
 pub(super) const PROXY: &str = r#"
@@ -89,8 +92,7 @@ fn the_update_apis_numbers_and_places_come_from_the_file_and_the_flags() {
     let (layout, _) = crate::testkit::host_root_on("places", Platform::Linux);
     let cfg = handover_config(&args, &loaded, &layout);
     // The children's ports are the upstream table's: in a slot the operator listener is at
-    // offset 2 and the admin calls at 3, slot B ten ports above slot A, all on loopback; and
-    // the operator token is the one the proxy checks callers against.
+    // offset 2 and the admin calls at 3, slot B ten ports above slot A, all on loopback.
     let at = |port| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     assert_eq!(
         cfg.slots,
@@ -98,10 +100,6 @@ fn the_update_apis_numbers_and_places_come_from_the_file_and_the_flags() {
             admin: [at(18003), at(18013)],
             operator: [at(18002), at(18012)],
         }
-    );
-    assert_eq!(
-        cfg.operator_token_file,
-        PathBuf::from("/etc/kbf/operator.token")
     );
     assert!(!cfg.gate.is_filled());
     assert_eq!(
@@ -390,27 +388,15 @@ fn errors_map_to_exit_codes_and_words() {
     );
 }
 
-/// Catches the update API's start-up errors mapped to the wrong exit: a spool or counter the
-/// service user cannot use is the operator's (exit 2, which the unit does not restart); a
-/// program that cannot be identified is not (exit 1).
+/// Catches the seams' start-up errors mapped to the wrong exit: one the operator has to fix (a
+/// spool or counter the service user cannot use) is a usage error (exit 2, which the unit does
+/// not restart); one that may pass is a failure (exit 1). The words are kept.
 #[test]
-fn the_update_apis_start_up_errors_map_to_exit_codes() {
-    let spool = HandoverError::Orders {
-        dir: PathBuf::from("/o"),
-        source: SpoolError::Counter(std::io::Error::other("c")),
-    };
-    assert_eq!(
-        VerbError::from(spool),
-        VerbError::Usage(
-            "update API: the order spool at /o: the order counter cannot be read or made durable: c"
-                .to_owned()
-        )
-    );
-    let binary = HandoverError::Binary(std::io::Error::other("proc"));
-    assert_eq!(
-        VerbError::from(binary),
-        VerbError::Failed("update API: cannot tell which program is running: proc".to_owned())
-    );
+fn the_seams_start_up_errors_map_to_exit_codes() {
+    let usage = AssembleError::Usage("u".to_owned());
+    let failed = AssembleError::Failed("f".to_owned());
+    assert_eq!(VerbError::from(usage), VerbError::Usage("u".to_owned()));
+    assert_eq!(VerbError::from(failed), VerbError::Failed("f".to_owned()));
 }
 
 /// The update API's seams over a scratch directory: the state directory exists, the spool and
@@ -430,7 +416,6 @@ pub(super) fn handover(name: &str) -> HandoverConfig {
             admin: [loopback(18003), loopback(18013)],
             operator: [loopback(18002), loopback(18012)],
         },
-        operator_token_file: root.join("operator.token"),
         installer_toml: root.join("installer.toml"),
         gate: GateSlot::new(),
     }
@@ -487,6 +472,36 @@ fn a_spool_that_cannot_be_opened_is_a_usage_error_before_anything_is_bound() {
         text.contains(&handover.orders_dir.display().to_string()),
         "{text}"
     );
+}
+
+/// Catches the verb building the update API's seams for a proxy that keeps its own copies of
+/// `kbf`: with a file where `orders/` should be, which the API's seams refuse as a usage error,
+/// and a descriptor that fails the bind, the refusal is the bind's, a failure to start, so the
+/// verb asked [`assemble`] for the seams and not the API.
+///
+/// Mutants it catches: `serve` building the update API's seams whatever `local` says (the
+/// spool's usage error comes first).
+#[test]
+fn with_copies_the_verb_does_not_open_the_order_spool() {
+    let loaded = load(&file("copies", PROXY.as_bytes())).expect("valid");
+    let mut handover = handover("copies");
+    let local = Local::open(PathBuf::from("/usr/bin/kbf"), &handover.state_dir).expect("copies");
+    handover.local = Some(local);
+    fs::write(&handover.orders_dir, b"a file").expect("a file in the way");
+    let regular = OwnedFd::from(fs::File::open(file("fd-copies", b"x")).expect("open"));
+    let database = state_database(&file("copies-db", PROXY.as_bytes())).expect("a database");
+    match serve(
+        loaded.proxy,
+        database,
+        &handover,
+        regular,
+        &kbf_host::Root::host(),
+    ) {
+        Err(VerbError::Failed(text)) => {
+            assert!(text.starts_with("cannot start the proxy: "), "{text}");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// Catches `run` reading a table and then serving without a socket: `--check` stops after the
@@ -614,14 +629,15 @@ fn json(reply: &UpdateReply) -> serde_json::Value {
 /// changes them first). What stops the proxy is a channel: one message for each drain. The
 /// bound of the stop is an hour, so the test process is never ended by it.
 struct Api {
-    bridge: UpdateBridge,
+    route: Route,
     stop: Arc<Stop>,
     died: Arc<AtomicBool>,
     drains: mpsc::Receiver<()>,
 }
 
 fn api(name: &str, edit: impl FnOnce(&mut Parts)) -> Api {
-    let mut parts = handover::parts(&handover(name)).expect("the seams");
+    let cfg = handover(name);
+    let mut parts = handover::parts(&cfg).expect("the seams");
     edit(&mut parts);
     let stop = Arc::new(Stop {
         seen: AtomicBool::new(false),
@@ -633,9 +649,10 @@ fn api(name: &str, edit: impl FnOnce(&mut Parts)) -> Api {
     let drain: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let _ = tx.send(());
     });
-    let bridge = start_updates(parts, &stop, &died, &drain).expect("the actor");
+    let pending = handover::api_over(parts, &cfg);
+    let route = start_route(pending, &stop, &died, &drain).expect("the actor");
     Api {
-        bridge,
+        route,
         stop,
         died,
         drains,
@@ -651,15 +668,15 @@ fn api(name: &str, edit: impl FnOnce(&mut Parts)) -> Api {
 #[tokio::test]
 async fn the_bridge_carries_the_request_to_the_api_and_the_answer_back() {
     let api = api("bridge", |_| {});
-    let reply = api.bridge.handle(asked("GET", UPDATE, "")).await;
+    let reply = api.route.handle(asked("GET", UPDATE, "")).await;
     assert_eq!(reply.status, 200);
     assert_eq!(json(&reply)["update_id"], serde_json::Value::Null);
 
-    let reply = api.bridge.handle(asked("POST", UPDATE, &post_of())).await;
+    let reply = api.route.handle(asked("POST", UPDATE, &post_of())).await;
     assert_eq!(reply.status, 503);
     assert_eq!(json(&reply)["error"], "handover_unavailable");
 
-    let reply = api.bridge.handle(asked("PUT", UPDATE, "")).await;
+    let reply = api.route.handle(asked("PUT", UPDATE, "")).await;
     assert_eq!(reply.status, 405);
     assert_eq!(
         reply.headers,
@@ -667,12 +684,12 @@ async fn the_bridge_carries_the_request_to_the_api_and_the_answer_back() {
     );
 
     let abort = format!("{UPDATE}/abort");
-    let reply = api.bridge.handle(asked("POST", &abort, "")).await;
+    let reply = api.route.handle(asked("POST", &abort, "")).await;
     assert_eq!(reply.status, 409);
     assert_eq!(json(&reply)["error"], "no_update_open");
 
     let reply = api
-        .bridge
+        .route
         .handle(asked("POST", "/v1/update/desired", ""))
         .await;
     assert_eq!(reply.status, 404);
@@ -696,7 +713,7 @@ impl RestartPending for Dies {
 #[tokio::test]
 async fn an_update_api_that_dies_stops_the_proxy_once_and_fails_the_verb() {
     let api = api("death", |parts| parts.restart = Box::new(Dies));
-    let reply = api.bridge.handle(asked("GET", UPDATE, "")).await;
+    let reply = api.route.handle(asked("GET", UPDATE, "")).await;
     assert_eq!(reply.status, 503);
     assert_eq!(
         api.drains.recv_timeout(LONG),
@@ -706,7 +723,7 @@ async fn an_update_api_that_dies_stops_the_proxy_once_and_fails_the_verb() {
     assert!(api.died.load(Ordering::SeqCst));
     assert!(api.stop.seen.load(Ordering::SeqCst), "no bound is running");
     for _ in 0..3 {
-        let reply = api.bridge.handle(asked("GET", UPDATE, "")).await;
+        let reply = api.route.handle(asked("GET", UPDATE, "")).await;
         assert_eq!(reply.status, 503);
     }
     assert!(
@@ -843,24 +860,6 @@ fn the_driver_asks_the_child_control_for_the_recorded_process_of_a_slot() {
     let recorded = recorded_by(&child);
     assert_eq!(recorded(Own::A), Some(ident));
     assert_eq!(recorded(Own::B), None);
-}
-
-/// Catches a start-up line that does not say what the API does: it names the files, the
-/// staging deadline (the fetch limit of 900 s and five minutes) and that a `POST` is refused,
-/// and why.
-#[test]
-fn the_start_up_line_says_what_the_update_api_will_do() {
-    let cfg = handover("line");
-    let parts = handover::parts(&cfg).expect("the seams");
-    assert_eq!(
-        update_line(&parts, &cfg),
-        format!(
-            "update API on (status {}, orders {}, staging deadline 1200 s); \
-             a POST is refused: proxy not bound yet",
-            cfg.status_file.display(),
-            cfg.orders_dir.display()
-        )
-    );
 }
 
 /// Catches `Stop::production` carrying another bound or another exit than the verb's: its
@@ -1025,7 +1024,7 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
     // would fail at once if the start ever ran it.
     std::os::unix::fs::symlink(std::env::current_exe().expect("test binary"), &program)
         .expect("link");
-    fs::write(release.join(crate::stage::VERIFIED), format!("{A}\n")).expect("VERIFIED");
+    fs::write(release.join(crate::layout::VERIFIED), format!("{A}\n")).expect("VERIFIED");
     let state_dir = root.join("proxy-state");
     fs::create_dir_all(&state_dir).expect("state dir");
     let status = root.join("status.json");
@@ -1052,7 +1051,6 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
         state_dir: state_dir.clone(),
         proxy_auth_file: config.proxy_auth_file.clone(),
         upstream: config.upstream,
-        operator_token_file: config.operator_token_file.clone(),
         status,
         local: None,
         watch: None,

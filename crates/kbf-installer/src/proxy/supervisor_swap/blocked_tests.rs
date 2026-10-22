@@ -7,8 +7,7 @@ use std::sync::Arc;
 
 use super::rig::{Rig, quick};
 use super::{Spawn, SwapSupervisor};
-use crate::proxy::api::model::UpdateId;
-use crate::proxy::api::traits::{Supervisor, UpdateSpec};
+use crate::proxy::kinds::{Supervisor, UpdateId, UpdateSpec};
 use crate::proxy::model::{Locator, Phase, Slot, StagedFacts, Verb};
 use crate::proxy::runtime::RequestQueue;
 use crate::testkit::{A, B, c};

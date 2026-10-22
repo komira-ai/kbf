@@ -1,17 +1,18 @@
-//! What the update API is made of when the proxy verb hosts it: every seam of
-//! [`Parts`](super::api::core::Parts) bound to its real implementation in one function,
-//! [`parts`].
+//! What the update API is made of when the proxy verb hosts it, the path of a proxy without
+//! `--kbf-binary`: every seam of [`Parts`](super::api::core::Parts) bound to its real
+//! implementation in one function, [`parts`]. A proxy that keeps its own copies of `kbf` does
+//! not come here at all (see [`super::assemble`]).
 //!
 //! | seam | here |
 //! |---|---|
-//! | `status` | [`JsonFileStatus`] over the root half's `status.json` (with [`HandoverConfig::local`], the proxy's own `releases.json`), read when a call needs it (a file that is not there yet is an unreadable status, not a failure to start) |
-//! | `orders` | the [`OrderSpool`] of `orders/`, opened here, once; with [`HandoverConfig::local`] none is opened and the writer refuses every order |
+//! | `status` | [`JsonFileStatus`] over the root half's `status.json`, read when a call needs it (a file that is not there yet is an unreadable status, not a failure to start) |
+//! | `orders` | the [`OrderSpool`] of `orders/`, opened here, once |
 //! | `requests` | [`Idempotency`] in the proxy's state directory (`requests.json`) |
 //! | `restart` | the [`RunningBinary`] captured at start |
 //! | `clock`, `hook` | the system clock; no crash points |
 //! | `config` | the confirm window of `installer.toml`, and a staging deadline sized by its `fetch_timeout_s` ([`staging_deadline`]) |
 //! | `compat` | [`StubGate`]: everything is compatible until the gate (R1, R4) is built |
-//! | `supervisor` | [`Handover`](super::handover_swap::Handover): the swap, built over the proxy's gate once the verb has bound the proxy and filled [`HandoverConfig::gate`] |
+//! | `supervisor` | [`Handover`]: the swap, built over the proxy's gate once the verb has bound the proxy and filled [`HandoverConfig::gate`] |
 //!
 //! **One spool per `orders/` directory.** [`OrderSpool::open`] removes the half-written files
 //! of an earlier run, so a second spool over the same directory, in this process or another,
@@ -24,10 +25,10 @@
 //! a usage error before anything is bound), and the swap needs the proxy's gate, which only
 //! exists after it. The supervisor [`parts`] returns therefore waits for [`HandoverConfig::gate`],
 //! a slot the verb fills right after the bind: until then its status is idle and a `POST` is
-//! refused ("proxy not bound yet", [`start_blocked`](super::api::traits::Supervisor::start_blocked)), nothing written. It is built
-//! on its first call after the fill, which is `Core::new` asking for the status, so an update a
-//! predecessor left in flight is resumed before the API serves. See
-//! [`super::handover_swap`].
+//! refused ("proxy not bound yet", [`start_blocked`](super::kinds::Supervisor::start_blocked)),
+//! nothing written. It is built on its first call after the fill, which is `Core::new` asking
+//! for the status, so an update a predecessor left in flight is resumed before the API serves.
+//! See [`super::handover_swap`].
 //!
 //! **Fail fast, on purpose.** An order spool that cannot be opened ends the start
 //! ([`HandoverError::Orders`]), and with it the data plane: the verb exits 2, which the unit
@@ -37,64 +38,29 @@
 //! route only; take it by returning a `Parts` over a spool that refuses, not by skipping the
 //! error here.
 //!
-//! **Without a spool.** A proxy that keeps its own copies of `kbf` (`--kbf-binary`,
-//! [`HandoverConfig::local`]) owns no `orders/` and opens none, so there is nothing to fail:
-//! the swap's orders are the [`Local::orders`] over the proxy's `releases.json`, which
-//! `status_file` names, and the API's writer is one that refuses every order with the reason.
-//! The swap is then also started by the binary watch ([`super::binary_watch`]): [`parts_shared`]
-//! hands it a clone of the supervisor (the same swap, see [`Handover`]) beside the copies.
+//! **The seam with the verb.** [`legacy`] is the one thing the rest of the proxy calls: it builds
+//! the seams and hands them back as an [`Assembled`] whose route starts the API's actor and
+//! answers through the API's handler. Deleting the update API deletes this module and that one
+//! call.
 
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use kbf_update::Source;
+use async_trait::async_trait;
 
-use super::api::core::{Config, NoCrash, Parts, StagingDeadline};
+use super::api::actor::ActorTiming;
+use super::api::core::{Config, Core, NoCrash, Parts, StagingDeadline};
+use super::api::handler::{Handler, HandlerRequest};
 use super::api::idempotency::Idempotency;
-use super::api::traits::{
-    JsonFileStatus, OrderError, OrderWriter, StubGate, Supervisor, SystemClock,
-};
-use super::binary_watch::Wiring;
-use super::handover_swap::{GateSlot, Handover, SlotAddrs};
-use super::model::{Locator, Verb};
+use super::api::traits::{JsonFileStatus, StubGate, SystemClock};
+use super::assemble::{Answer, Answered, AssembleError, Assembled, Call, Pending, Route};
+use super::handover_swap::{Handover, Orders};
 use super::orders::{OrderSpool, SpoolError};
-use super::releases::Local;
+use super::root_orders::SpoolRootOrders;
 use super::running_binary::RunningBinary;
-use crate::CommitId;
 
-/// What [`parts`] is built from.
-#[derive(Clone, Debug)]
-pub struct HandoverConfig {
-    /// The proxy's state directory: `requests.json` (the API's request map) and `orders.json`
-    /// (the spool's counter) are written here.
-    pub state_dir: PathBuf,
-    /// The order spool, `orders/`: owned by the service user, read by the root half. Not opened
-    /// when [`local`](Self::local) is set.
-    pub orders_dir: PathBuf,
-    /// The root half's `status.json`; with [`local`](Self::local), the proxy's own
-    /// `releases.json`, which has the same shape.
-    pub status_file: PathBuf,
-    /// The proxy's own copies of `kbf` and its orders over them (`--kbf-binary`). When set, the
-    /// swap's orders are [`Local::orders`] (the staged and installed releases are read from, and
-    /// confirm and revert are written to, `status_file`), no order spool is opened, and the
-    /// update API's order writer refuses. When not, the root half's spool and `status.json` are
-    /// used as ever.
-    pub local: Option<Local>,
-    /// The confirm window the orders ask for (`confirm_window_s` of `installer.toml`).
-    pub confirm_window_s: u32,
-    /// How long the root half's fetch may take (`fetch_timeout_s` of `installer.toml`).
-    pub fetch_timeout_s: u32,
-    /// The loopback ports of the two children's admin and operator listeners, by slot.
-    pub slots: SlotAddrs,
-    /// The operator token the swap presents to a child's operator API (`desired`).
-    pub operator_token_file: PathBuf,
-    /// `installer.toml`: the `database` the swap's migrator brings forward before a candidate
-    /// starts.
-    pub installer_toml: PathBuf,
-    /// Set once by the verb right after the bind; the supervisor waits for it.
-    pub gate: GateSlot,
-}
+pub use super::handover_swap::HandoverConfig;
 
 /// Why [`parts`] could not build the API's seams.
 #[derive(Debug, thiserror::Error)]
@@ -107,6 +73,19 @@ pub enum HandoverError {
     /// The running program cannot be identified, so `restart_pending` has no answer.
     #[error("cannot tell which program is running: {0}")]
     Binary(io::Error),
+}
+
+impl From<HandoverError> for AssembleError {
+    /// An order spool or state directory the service user cannot use is the operator's to fix:
+    /// exit 2, which `kbf-proxy.service` does not restart. A program that cannot be identified
+    /// is not.
+    fn from(e: HandoverError) -> Self {
+        let text = format!("update API: {e}");
+        match e {
+            HandoverError::Orders { .. } => AssembleError::Usage(text),
+            HandoverError::Binary(_) => AssembleError::Failed(text),
+        }
+    }
 }
 
 /// What the root half needs beyond a fetch (verify, install, probe the release, find the
@@ -124,92 +103,49 @@ pub fn staging_deadline(fetch_timeout_s: u32) -> StagingDeadline {
     StagingDeadline::from_secs(secs).unwrap_or(StagingDeadline::DEFAULT)
 }
 
+impl Handover {
+    /// A handover whose orders go through `spool` (a clone of the spool the API writes with, so
+    /// that the swap's orders and the API's take one counter) and whose staged and installed
+    /// releases are read from `cfg.status_file`, the root half's `status.json`.
+    #[must_use]
+    pub fn new(cfg: &HandoverConfig, spool: OrderSpool) -> Handover {
+        let orders: Orders = Arc::new(SpoolRootOrders::new(spool, &cfg.status_file));
+        Handover::over(cfg, orders)
+    }
+
+    /// [`new`](Self::new) with its ports replaced by `seams`.
+    #[cfg(test)]
+    pub(super) fn with_seams(
+        cfg: &HandoverConfig,
+        spool: OrderSpool,
+        seams: super::handover_swap::Seams,
+    ) -> Handover {
+        Handover::new(cfg, spool).seamed(seams)
+    }
+}
+
 /// The seams of the update API, real where there is an implementation. Opens the order spool
-/// (unless the proxy keeps its own copies, [`HandoverConfig::local`]: there is none then) and
-/// the request map; reads no file (`status.json` is read when a call needs it).
+/// and the request map; reads no file (`status.json` is read when a call needs it).
 ///
 /// # Errors
 /// [`HandoverError`]: the order spool cannot be opened, or the running program cannot be
 /// identified.
 pub fn parts(cfg: &HandoverConfig) -> Result<Parts, HandoverError> {
-    parts_shared(cfg).map(|(parts, _)| parts)
-}
-
-/// [`parts`], and for a proxy that keeps its own copies ([`HandoverConfig::local`]) the
-/// [`Wiring`] of the binary watch: its copies and a clone of the supervisor the API holds, so
-/// that an update the watch starts is the one the API reports. `None` without copies.
-///
-/// # Errors
-/// As [`parts`].
-pub fn parts_shared(cfg: &HandoverConfig) -> Result<(Parts, Option<Wiring>), HandoverError> {
-    match &cfg.local {
-        Some(local) => {
-            let binary = RunningBinary::capture().map_err(HandoverError::Binary)?;
-            let swap = Handover::local(cfg, Arc::clone(&local.orders));
-            let wiring = Wiring {
-                local: local.clone(),
-                swap: swap.clone(),
-            };
-            let parts = wired(cfg, Box::new(swap), Box::new(NoOrders), binary);
-            Ok((parts, Some(wiring)))
+    let spool = OrderSpool::open(&cfg.orders_dir, &cfg.state_dir).map_err(|source| {
+        HandoverError::Orders {
+            dir: cfg.orders_dir.clone(),
+            source,
         }
-        None => {
-            let spool = OrderSpool::open(&cfg.orders_dir, &cfg.state_dir).map_err(|source| {
-                HandoverError::Orders {
-                    dir: cfg.orders_dir.clone(),
-                    source,
-                }
-            })?;
-            let binary = RunningBinary::capture().map_err(HandoverError::Binary)?;
-            Ok((assemble(cfg, spool, binary), None))
-        }
-    }
-}
-
-/// The update API's order writer when the proxy keeps its own copies: there is no order spool
-/// to write to, so every order is refused, with the reason.
-struct NoOrders;
-
-/// Why [`NoOrders`] refuses.
-const NO_ORDERS: &str =
-    "this proxy installs from its own copy of kbf (--kbf-binary): there is no order spool";
-
-impl OrderWriter for NoOrders {
-    fn write(
-        &mut self,
-        _verb: Verb,
-        _commit: &CommitId,
-        _window_s: u32,
-    ) -> Result<Locator, OrderError> {
-        Err(OrderError(NO_ORDERS.to_owned()))
-    }
-
-    fn write_update(
-        &mut self,
-        _commit: &CommitId,
-        _window_s: u32,
-        _source: Source,
-    ) -> Result<Locator, OrderError> {
-        Err(OrderError(NO_ORDERS.to_owned()))
-    }
+    })?;
+    let binary = RunningBinary::capture().map_err(HandoverError::Binary)?;
+    Ok(parts_over(cfg, spool, binary))
 }
 
 /// [`parts`] over a spool and a binary identity it is given.
-fn assemble(cfg: &HandoverConfig, spool: OrderSpool, binary: RunningBinary) -> Parts {
-    let supervisor = Handover::new(cfg, spool.clone());
-    wired(cfg, Box::new(supervisor), Box::new(spool), binary)
-}
-
-/// The seams that do not depend on where the orders go.
-fn wired(
-    cfg: &HandoverConfig,
-    supervisor: Box<dyn Supervisor>,
-    orders: Box<dyn OrderWriter>,
-    binary: RunningBinary,
-) -> Parts {
+fn parts_over(cfg: &HandoverConfig, spool: OrderSpool, binary: RunningBinary) -> Parts {
     Parts {
-        supervisor,
-        orders,
+        supervisor: Box::new(Handover::new(cfg, spool.clone())),
+        orders: Box::new(spool),
         status: Box::new(JsonFileStatus::new(&cfg.status_file)),
         compat: Box::new(StubGate),
         clock: Arc::new(SystemClock::new()),
@@ -220,6 +156,86 @@ fn wired(
             window_s: cfg.confirm_window_s,
             staging_deadline: staging_deadline(cfg.fetch_timeout_s),
         },
+    }
+}
+
+/// The update API's route over `parts`, not started: [`legacy`] after [`parts`], split so that a
+/// test can change the seams between the two.
+pub fn api_over(parts: Parts, cfg: &HandoverConfig) -> Box<dyn Pending> {
+    Box::new(Api {
+        parts,
+        status_file: cfg.status_file.clone(),
+        orders_dir: cfg.orders_dir.clone(),
+    })
+}
+
+/// The update API as the path without `--kbf-binary` serves it: the seams of [`parts`], and
+/// nothing running yet. The swap behind it is the API's own (it holds the handover), and no
+/// binary watch is wired.
+///
+/// # Errors
+/// [`AssembleError`]: as [`parts`]'s [`HandoverError`] maps (see its `From`).
+pub fn legacy(cfg: &HandoverConfig) -> Result<Assembled, AssembleError> {
+    Ok(Assembled {
+        watch: None,
+        pending: api_over(parts(cfg)?, cfg),
+    })
+}
+
+/// The update API before it runs.
+struct Api {
+    parts: Parts,
+    status_file: PathBuf,
+    orders_dir: PathBuf,
+}
+
+impl Pending for Api {
+    /// What the API will do: the files it reads and writes, its staging deadline, and whether a
+    /// `POST` is taken now and, if not, why.
+    fn note(&self) -> String {
+        let driver = self
+            .parts
+            .supervisor
+            .start_blocked()
+            .map_or("handover ready".to_owned(), |why| {
+                format!("a POST is refused: {why}")
+            });
+        format!(
+            "update API on (status {}, orders {}, staging deadline {} s); {driver}",
+            self.status_file.display(),
+            self.orders_dir.display(),
+            self.parts.config.staging_deadline.secs(),
+        )
+    }
+
+    /// Starts the API's actor over the seams. If it dies, `on_death` stops the proxy.
+    fn start(self: Box<Self>, on_death: Box<dyn FnOnce() + Send>) -> io::Result<Route> {
+        let handler = Handler::start(Core::new(self.parts), ActorTiming::default(), on_death)?;
+        Ok(Route::new(Bridge(handler)))
+    }
+}
+
+/// The update API behind the proxy's update route: the [`Handler`] of the API, called with the
+/// proxy's request and answering with the proxy's reply (the fields are the same, and so are
+/// the header types). It checks nothing: the proxy authenticated the caller before it called.
+struct Bridge(Handler);
+
+#[async_trait]
+impl Answer for Bridge {
+    async fn answer(&self, call: Call) -> Answered {
+        let reply = self
+            .0
+            .handle(HandlerRequest {
+                method: call.method,
+                path: call.path,
+                body: call.body,
+            })
+            .await;
+        Answered {
+            status: reply.status,
+            headers: reply.headers,
+            body: reply.body,
+        }
     }
 }
 

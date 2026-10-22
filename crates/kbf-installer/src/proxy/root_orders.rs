@@ -6,7 +6,8 @@
 //!
 //! `status.json` is read whole on every call, never cached: the swap asks precisely
 //! because the answer may have changed (`installed` after a `confirm`). The file is
-//! replaced by a rename, so a read sees one complete version.
+//! replaced by a rename, so a read sees one complete version. The reads are
+//! [`super::releases`]'s, shared with the proxy's own status file:
 //!
 //! - [`staged`](RootOrders::staged): `staged_commit` joined with `staged{}`
 //!   (`protocol`, `min_protocol`, `state_schema`, and `profile` when the writer sets it:
@@ -20,19 +21,15 @@
 //! [`PortError`]: a guess about what the root half said could confirm the wrong commit.
 //! Unknown fields are ignored, as the update API's reader does.
 
-use std::fs::File;
-use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use super::api::traits::InstallerStatus;
 use super::model::{Locator, PortError, StagedFacts};
 use super::orders::OrderSpool;
-use super::ports::{RootOrders, StatusFacts};
+use super::ports::RootOrders;
+use super::releases::{installed_commit, staged_facts};
 use crate::CommitId;
 
-/// The most bytes of `status.json` that are read. The writer's file is a few hundred bytes;
-/// the cap keeps a file that grew without bound from being pulled into memory.
-pub const MAX_STATUS: u64 = 64 * 1024;
+pub use super::releases::{MAX_STATUS, StatusFile};
 
 /// [`RootOrders`] on disk: writes through a clone of the spool, reads `status.json`.
 pub struct SpoolRootOrders {
@@ -50,76 +47,6 @@ impl SpoolRootOrders {
             status: status.into(),
         }
     }
-}
-
-/// The facts of `status.json` and nothing else: what the proxy's start reads before any order
-/// spool exists. The reads are those of [`SpoolRootOrders`].
-pub struct StatusFile {
-    status: PathBuf,
-}
-
-impl StatusFile {
-    /// The facts of the status file at `status`.
-    #[must_use]
-    pub fn new(status: impl Into<PathBuf>) -> StatusFile {
-        StatusFile {
-            status: status.into(),
-        }
-    }
-}
-
-impl StatusFacts for StatusFile {
-    fn staged(&self) -> Result<Option<StagedFacts>, PortError> {
-        staged_facts(&self.status)
-    }
-
-    fn installed(&self) -> Result<Option<CommitId>, PortError> {
-        installed_commit(&self.status)
-    }
-}
-
-/// The `staged{}` facts of the `status.json` at `path`, joined with `staged_commit`.
-///
-/// # Errors
-/// As [`installed_commit`].
-fn staged_facts(path: &Path) -> Result<Option<StagedFacts>, PortError> {
-    Ok(read_status(path)?.and_then(|status| status.staged_facts()))
-}
-
-/// The root half's `status.json` at `path`, whole; `None` when there is no file. Errors as
-/// the module doc says.
-fn read_status(path: &Path) -> Result<Option<InstallerStatus>, PortError> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(unreadable(path, &e)),
-    };
-    let mut bytes = Vec::new();
-    file.take(MAX_STATUS + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| unreadable(path, &e))?;
-    if bytes.len() as u64 > MAX_STATUS {
-        return Err(PortError(format!(
-            "{} is over {MAX_STATUS} bytes",
-            path.display()
-        )));
-    }
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|e| PortError(format!("{} does not parse: {e}", path.display())))
-}
-
-/// `installed_commit` of the `status.json` at `path`: the release the root half runs. The
-/// proxy's boot reads it with no spool; [`RootOrders::installed`] reads the same fact.
-///
-/// # Errors
-/// The file cannot be read, is over [`MAX_STATUS`] bytes, or does not parse.
-pub fn installed_commit(path: &Path) -> Result<Option<CommitId>, PortError> {
-    Ok(read_status(path)?.and_then(|status| status.installed_commit))
-}
-
-fn unreadable(path: &Path, e: &io::Error) -> PortError {
-    PortError(format!("cannot read {}: {e}", path.display()))
 }
 
 impl RootOrders for SpoolRootOrders {

@@ -10,9 +10,15 @@ use hyper::{Request, Response};
 use kbf_update::Source;
 use serde::Deserialize;
 
-use super::model::{NewChild, OldChild, UpdateId};
 use crate::CommitId;
-use crate::proxy::model::{Failure, Locator, Phase, Slot, StagedFacts, Verb};
+use crate::proxy::model::{Locator, StagedFacts, Verb};
+
+// The swap's supervisor and what it deals in are the swap's (`proxy::kinds`), named here as
+// they always were.
+pub use crate::proxy::kinds::{
+    RestartPending, Retired, RunningUpdate, Supervisor, SupervisorError, SupervisorStatus,
+    UpdateSpec,
+};
 
 /// Writes one record into `orders/` (FP section 2). The order ids (`order_id`, `epoch`,
 /// `generation`) come from the writer, which owns their counter: where that counter
@@ -83,15 +89,9 @@ pub struct AvailableWire {
 }
 
 /// `staged{}` as `status.json` carries it: the facts, not the commit (that is
-/// `staged_commit`, beside it). [`InstallerStatus::staged_facts`] joins the two.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub struct StagedWire {
-    pub protocol: u32,
-    pub min_protocol: u32,
-    pub state_schema: u32,
-    #[serde(default)]
-    pub profile: Option<String>,
-}
+/// `staged_commit`, beside it). [`InstallerStatus::staged_facts`] joins the two. The type is
+/// the one the swap reads its own status file with.
+pub use crate::proxy::releases::StagedWire;
 
 impl InstallerStatus {
     /// The stable word of the refusal: what precedes the first colon.
@@ -153,94 +153,6 @@ impl StatusReader for JsonFileStatus {
         let bytes = std::fs::read(&self.path).map_err(|e| StatusError(e.to_string()))?;
         serde_json::from_slice(&bytes).map_err(|e| StatusError(e.to_string()))
     }
-}
-
-/// Whether the running proxy is no longer the installed program (FP section 10): the
-/// package manager replaced the binary and nothing restarted the proxy. There is no marker
-/// file; [`crate::proxy::RunningBinary`] compares file identities.
-pub trait RestartPending: Send {
-    fn restart_pending(&self) -> bool;
-}
-
-/// One update's facts as the supervisor (U7) reports them.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RunningUpdate {
-    pub update_id: UpdateId,
-    pub from: CommitId,
-    pub to: CommitId,
-    pub phase: Phase,
-    pub since_s: u64,
-    /// The slot of the child that is SERVING requests now, not the candidate and not the
-    /// child that was started last: the old child's slot until the switch, the new child's
-    /// from `switched` on, and the old child's again after a rollback or a revert (the new
-    /// child was stood down). `GET /v1/update/frontend` reports it as `active_slot`, and
-    /// `kbf-installer deploy` reads it to follow the frontend across a handover
-    /// (docs/design/frontend-proxy.md section 4).
-    pub active_slot: Slot,
-    pub old: Option<OldChild>,
-    pub new: NewChild,
-    /// How many nodes the new child has begun to update.
-    pub nodes_updated: u32,
-    pub failure: Option<Failure>,
-    /// Where the update's release came from.
-    pub source: Source,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SupervisorStatus {
-    /// The newest update the supervisor knows, open or ended.
-    pub update: Option<RunningUpdate>,
-    /// An old child still lives from an update that is otherwise over.
-    pub old_child_draining: bool,
-    /// The commit the active child runs, if it knows.
-    pub running: Option<CommitId>,
-}
-
-/// What `start` is given.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UpdateSpec {
-    pub update_id: UpdateId,
-    /// The caller's idempotency key; the swap records it in `update.json`.
-    pub request_id: String,
-    pub from: Option<CommitId>,
-    pub to: CommitId,
-    pub nodes: bool,
-    pub rollback: bool,
-    /// Where the release came from; the order for the nodes names the same.
-    pub source: Source,
-    pub facts: StagedFacts,
-    pub order: Locator,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Retired {
-    pub dropped_streams: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum SupervisorError {
-    #[error("no update is open")]
-    NotOpen,
-    #[error("refused: {0}")]
-    Refused(String),
-    #[error("{0}")]
-    Failed(String),
-}
-
-/// The U7 swap. Every call is made by the one actor, so an implementation sees them one
-/// at a time. `start` is idempotent on `update_id`.
-pub trait Supervisor: Send {
-    /// Why `start` cannot be called at all, when that is known before an update is
-    /// accepted. `POST` then answers 503 with this text, and saves no `request_id` and
-    /// writes no order, so the installer does not fetch a release that nothing can take
-    /// over. `None` is a supervisor that can start.
-    fn start_blocked(&self) -> Option<String>;
-
-    fn start(&mut self, spec: &UpdateSpec) -> Result<(), SupervisorError>;
-    fn abort(&mut self) -> Result<Phase, SupervisorError>;
-    fn rollback(&mut self) -> Result<Phase, SupervisorError>;
-    fn force_retire(&mut self, reason: &str) -> Result<Retired, SupervisorError>;
-    fn status(&self) -> SupervisorStatus;
 }
 
 /// The verdict of rules R1 and R4 (FP section 9).

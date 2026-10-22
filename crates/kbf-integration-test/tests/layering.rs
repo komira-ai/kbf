@@ -504,19 +504,24 @@ fn the_proxy_reaches_no_child_installer_or_runtime_crate() {
 /// settings file whose `[proxy]` table the verb reads, and the swap's real gate over the
 /// proxy's handle (`proxy/gate_real.rs`, with its tests), and the supervisor that starts the
 /// children on the ports of the proxy's upstream table (`proxy/supervisor.rs`, which also
-/// holds the real gate), the verb's own tests (`proxy_verb_tests.rs`, which start a real
-/// proxy over a migrated database), and the table `setup --proxy` writes (`setup/proxy.rs`, which
+/// holds the real gate), the verb's own tests (`proxy_verb_tests.rs` and
+/// `proxy_verb_copies_tests.rs`, which start a real proxy over a migrated database), the seam
+/// that gives the verb its update route (`proxy/assemble.rs`, with its tests: the route is the
+/// proxy's `UpdateHandler`), and the table `setup --proxy` writes (`setup/proxy.rs`, which
 /// builds the table the proxy would read, with the proxy's own defaults and checks). The rest of
 /// `proxy/` is written against traits and names no proxy
 /// type. Everything else, the root helper
 /// (`helper/`, `run.rs`) first of all, runs as root and links a network stack it never runs
 /// if it names a proxy type.
 const MAY_NAME_THE_PROXY: &[&str] = &[
+    "proxy/assemble.rs",
+    "proxy/assemble_tests.rs",
     "proxy/gate_real.rs",
     "proxy/gate_real_tests.rs",
     "proxy/supervisor.rs",
     "proxy/supervisor_tests.rs",
     "proxy_verb.rs",
+    "proxy_verb_copies_tests.rs",
     "proxy_verb_tests.rs",
     "installer_toml.rs",
     "setup/proxy.rs",
@@ -598,4 +603,183 @@ fn the_root_half_of_the_installer_names_nothing_of_the_proxy() {
         "these installer files name kbf_proxy, but only {MAY_NAME_THE_PROXY:?} may (the root \
          half shares the binary and nothing else): {violations:?}"
     );
+}
+
+/// The files of `kbf-installer/src` that are the swap and what runs it, which stay when the
+/// update API, the order spool and the staging code are deleted. They are not tests: a test of
+/// the swap may still use a fixture of a module that goes, and goes with it.
+const KEPT_SWAP_FILES: &[&str] = &[
+    "proxy/admin.rs",
+    "proxy/aio.rs",
+    "proxy/binary_watch.rs",
+    "proxy/boot.rs",
+    "proxy/child_http.rs",
+    "proxy/child_real.rs",
+    "proxy/cold.rs",
+    "proxy/gate_real.rs",
+    "proxy/handover_swap.rs",
+    "proxy/kinds.rs",
+    "proxy/migrator.rs",
+    "proxy/model.rs",
+    "proxy/ports.rs",
+    "proxy/record.rs",
+    "proxy/recover.rs",
+    "proxy/releases.rs",
+    "proxy/retire.rs",
+    "proxy/running_binary.rs",
+    "proxy/runtime.rs",
+    "proxy/supervisor.rs",
+    "proxy/supervisor_swap.rs",
+    "proxy/supervisor_swap/migrator.rs",
+    "proxy/supervisor_swap/mirror.rs",
+    "proxy/supervisor_swap/status.rs",
+    "proxy/swap.rs",
+    "proxy_verb.rs",
+];
+
+/// How a file names a module that is deleted with the update API by its path: the text.
+const DELETED_WITH_THE_API: &[&str] = &[
+    // The update API.
+    "proxy::api",
+    "super::api",
+    // The update API's wiring (`handover_swap::` is the swap's and is not matched).
+    "handover::",
+    // The order spool and the root half's orders (`root_orders::` too).
+    "orders::",
+    // The staging code.
+    "stage::",
+];
+
+/// How a `use` names those modules without a path in front of them, inside braces or alone:
+/// `use super::{api::X, model::Y}`, `use crate::{layout, stage}`, `use super::orders;`. A word
+/// counts only whole: `handover_swap` and `LocalOrders` are other words.
+const DELETED_WORDS: &[&str] = &["api", "handover", "orders", "root_orders", "stage"];
+
+/// What a line starts with when it opens a `use` statement.
+const USE_OPENERS: &[&str] = &["use ", "pub use ", "pub(crate) use ", "pub(super) use "];
+
+/// The `use` statements of `text`, each as one string: its lines up to the `;` joined.
+fn use_statements(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut open = false;
+    for line in text.lines().map(str::trim) {
+        if USE_OPENERS.iter().any(|opener| line.starts_with(opener)) {
+            found.push(String::new());
+            open = true;
+        }
+        if open {
+            let statement = found.last_mut().expect("the statement was opened");
+            statement.push(' ');
+            statement.push_str(line);
+            open = !line.contains(';');
+        }
+    }
+    found
+}
+
+/// The words of `statement`: the runs of letters, digits and `_`.
+fn whole_words(statement: &str) -> impl Iterator<Item = &str> {
+    statement.split(|c: char| !c.is_alphanumeric() && c != '_')
+}
+
+/// The modules of [`DELETED_WITH_THE_API`] and [`DELETED_WORDS`] that `text` names.
+fn names_deleted_modules(text: &str) -> Vec<&'static str> {
+    let mut named: Vec<&'static str> = DELETED_WITH_THE_API
+        .iter()
+        .copied()
+        .filter(|needle| text.contains(needle))
+        .collect();
+    let uses = use_statements(text);
+    for &word in DELETED_WORDS {
+        if uses.iter().any(|u| whole_words(u).any(|w| w == word)) {
+            named.push(word);
+        }
+    }
+    named
+}
+
+/// Catches a file of the swap that names a module deleted with the update API (`proxy::api`,
+/// `handover::`, `orders::` and `root_orders::`, `stage::`, or one of those words in a `use`:
+/// `use super::{handover, stage}`): a later change that deletes those modules would then have to
+/// edit the swap. The one place that names the update API's wiring
+/// is the seam (`proxy/assemble.rs`), and it names that and nothing else of them. Re-exports
+/// the old modules define for kept items are theirs and are not looked at.
+///
+/// Mutants it catches: an import of `proxy::api`, of `handover::`, of the spool or of
+/// `stage::` added to a file of the swap, as a path or inside braces; the seam naming the order
+/// spool.
+#[test]
+fn the_swap_names_nothing_that_is_deleted_with_the_update_api() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-installer/src");
+    let read = |file: &str| {
+        std::fs::read_to_string(src.join(file))
+            .unwrap_or_else(|e| panic!("read {file}: {e}"))
+    };
+    let mut violations = Vec::new();
+    for file in KEPT_SWAP_FILES {
+        let text = read(file);
+        // A file that was moved or emptied would otherwise pass with nothing in it.
+        assert!(text.lines().count() > 20, "{file} is not the swap's file");
+        for named in names_deleted_modules(&text) {
+            violations.push(format!("{file} names {named}"));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "these files of the swap name a module that is deleted with the update API (move what \
+         they use into a kept module and re-export it from the old place): {violations:?}"
+    );
+
+    let seam = read("proxy/assemble.rs");
+    let named = names_deleted_modules(&seam);
+    assert_eq!(
+        named,
+        ["handover::"],
+        "the seam names the update API's wiring, once, and nothing else of what is deleted"
+    );
+    assert!(seam.contains("handover::legacy"), "the seam's one call");
+}
+
+/// Catches a scan that cannot fail: each way to name a deleted module is seen, and the names of
+/// the kept modules next to them (`handover_swap`, `releases`, `layout`) are not.
+///
+/// The grouped and the bare spellings are seen too (`use super::{api::X, model::Y}`,
+/// `use crate::{layout, stage}`, `use super::orders;`), across lines, and a word in a comment or
+/// in code that is not a `use` is not.
+///
+/// Mutants it catches: a needle or a word dropped from [`DELETED_WITH_THE_API`] or
+/// [`DELETED_WORDS`]; `handover::` loosened to `handover`, which would match the kept
+/// `handover_swap::`; the words matched as substrings (`LocalOrders`); the statement cut at its
+/// first line; the scan taking every line for a `use`.
+#[test]
+fn the_scan_for_deleted_modules_sees_each_way_to_name_them() {
+    for named in [
+        "use crate::proxy::api::core::Core;",
+        "use super::api::traits::Supervisor;",
+        "use super::handover::parts;",
+        "use super::orders::OrderSpool;",
+        "use super::root_orders::StatusFile;",
+        "use crate::stage::VERIFIED;",
+        "use super::{api::traits::Supervisor, model::Source};",
+        "use crate::proxy::{api, kinds};",
+        "use super::{handover, orders};",
+        "use super::orders;",
+        "use crate::stage;",
+        "use super::{\n    kinds::Supervisor,\n    root_orders::StatusFile,\n};",
+        "pub use super::{model::Slot, stage};",
+        "use crate::{\n    layout,\n    stage,\n};",
+    ] {
+        assert!(!names_deleted_modules(named).is_empty(), "{named}");
+    }
+    for kept in [
+        "use super::handover_swap::Handover;",
+        "use super::releases::{LocalOrders, StatusFile};",
+        "use crate::layout::VERIFIED;",
+        "use super::kinds::Supervisor;",
+        "use super::{handover_swap::Handover, releases::LocalOrders};",
+        "/// The stage uses the api, the handover and orders.\nfn go() {}",
+        "let stage = 1;\nuse super::kinds::Supervisor;\nfn go() -> u8 { stage }",
+    ] {
+        assert_eq!(names_deleted_modules(kept), Vec::<&str>::new(), "{kept}");
+    }
 }

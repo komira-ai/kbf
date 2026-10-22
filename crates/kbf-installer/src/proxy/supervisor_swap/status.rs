@@ -1,8 +1,7 @@
 //! The supervisor's status, assembled from the intent record, the proxy's permits
 //! ([`Gate::open_streams`]) and the child's own counts ([`ChildAdmin::open_counts`]).
 
-use super::super::api::model::{NewChild, OldChild, UpdateId};
-use super::super::api::traits::{RunningUpdate, SupervisorStatus};
+use super::super::kinds::{NewChild, OldChild, RunningUpdate, SupervisorStatus, UpdateId};
 use super::super::model::{Intent, Phase, Slot, Step};
 use super::Parts;
 

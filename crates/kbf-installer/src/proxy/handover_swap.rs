@@ -1,33 +1,32 @@
-//! The real supervisor of the update API as the proxy verb hosts it, and the slot that lets it
-//! be built before the proxy is bound.
+//! The real supervisor of the swap as the proxy verb hosts it, and the slot that lets it be
+//! built before the proxy is bound.
 //!
-//! [`super::handover::parts`] runs before `Proxy::bind` (an order spool the service user
-//! cannot open is a usage error before anything is bound), and the swap's ports need what
-//! only exists after it: the proxy's gate, the children's process control, the secret the
-//! proxy sends the children, and what stops the process when the swap thread dies. The verb
-//! learns those in `supervise` and puts them in a [`GateSlot`] that [`HandoverConfig`] carries
-//! (set once, [`GateSlot::fill`]); [`Handover`] is the [`Supervisor`] that waits for it.
+//! The verb builds the supervisor before `Proxy::bind` (what it is built from is read from the
+//! flags and the file, and an order spool the service user cannot open is a usage error before
+//! anything is bound), and the swap's ports need what only exists after it: the proxy's gate,
+//! the children's process control, the secret the proxy sends the children, and what stops the
+//! process when the swap thread dies. The verb learns those in `supervise` and puts them in a
+//! [`GateSlot`] that [`HandoverConfig`] carries (set once, [`GateSlot::fill`]); [`Handover`] is
+//! the [`Supervisor`] that waits for it.
 //!
 //! - **Until the slot is filled**: `status` is the idle status, `start_blocked` says "the
 //!   proxy is not bound yet", `start` fails with the same words and the other calls say no
 //!   update is open. Nothing is built and nothing runs.
 //! - **From the first call after it is filled**: a [`SwapSupervisor`] is built over the
-//!   host's ports (the first call is `Core::new`'s ask for the status, so a predecessor's
-//!   update in flight is resumed before the API serves) and every call goes to it. It is
-//!   built once.
+//!   host's ports and every call goes to it. The first call also resumes an update a
+//!   predecessor left in flight. It is built once.
 //!
 //! The ports, one by one: `child`, `gate`, `old_proc`, `releases_dir` and the secret come from
 //! the slot; `admin` is [`Admin`] over the two ports of each slot of the upstream table (the
-//! secret on every call, the operator token read from its file on each `post_desired`);
-//! `recorder` is [`FileRecorder`] over the state directory; `orders` is [`SpoolRootOrders`]
-//! over a clone of the one order spool (it shares the counter, and never opens `orders/`), or,
-//! for a proxy that keeps its own copies of `kbf` ([`Handover::local`]), the
-//! [`LocalOrders`] of the proxy's `releases.json`: staged facts, confirm and revert then touch
-//! no spool and no file of the root half; `migrator` is [`StateDbMigrator`], the
-//! [`DbMigrator`] over the state database `installer.toml` names, opened at each migration,
-//! with the staged facts read from `HandoverConfig::status_file` (the root half's
-//! `status.json`, or `releases.json`, which has the same shape and whose `state_schema` is
-//! that of the copied binary); `clock` is the system clock.
+//! secret on every call); `recorder` is [`FileRecorder`] over the state directory; `orders` is
+//! the [`LocalOrders`] of the proxy's `releases.json` for a proxy that keeps its own copies of
+//! `kbf` ([`Handover::local`]): staged facts, confirm and revert then touch no spool and no
+//! file of the root half. (The update API's path builds its handover over the order port of the
+//! root half's spool instead.) `migrator` is [`StateDbMigrator`], the [`DbMigrator`] over the
+//! state database `installer.toml` names, opened at each migration, with the staged facts read
+//! from `HandoverConfig::status_file` (`releases.json`, whose `state_schema` is that of the
+//! copied binary, or the root half's `status.json`, which has the same shape); `clock` is the
+//! system clock.
 //!
 //! `start_blocked` refuses while the start-up hold is in force ([`Host::held`]: no frontend
 //! child was adopted, so the active slot is a guess). It does not look at the database: an
@@ -40,18 +39,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use super::admin::{Admin, Deadlines};
-use super::api::traits::{Retired, Supervisor, SupervisorError, SupervisorStatus, UpdateSpec};
 use super::child_http::Headers;
-use super::handover::HandoverConfig;
+use super::kinds::{Retired, Supervisor, SupervisorError, SupervisorStatus, UpdateSpec};
 use super::migrator::DbMigrator;
 use super::model::PortError;
 use super::model::{Mode, Phase, ProcIdent, Slot, Timing};
-use super::orders::OrderSpool;
 use super::ports::{Child, Gate};
 use super::ports::{ChildAdmin, Migrator, RootOrders};
 use super::record::FileRecorder;
-use super::releases::LocalOrders;
-use super::root_orders::{SpoolRootOrders, StatusFile};
+use super::releases::{Local, LocalOrders, StatusFile};
 use super::runtime::{RequestQueue, SystemClock};
 use super::supervisor_swap::{Config, Parts, SwapSupervisor};
 use crate::CommitId;
@@ -88,6 +84,41 @@ impl SlotAddrs {
     pub fn operator(&self, slot: Slot) -> SocketAddr {
         self.operator[index(slot)]
     }
+}
+
+/// What the swap's wiring is built from, and what the update API (the path without
+/// `--kbf-binary`) is built from besides.
+#[derive(Clone, Debug)]
+pub struct HandoverConfig {
+    /// The proxy's state directory: `update.json` (the swap's record) is written here, and, for
+    /// the update API, `requests.json` (its request map) and `orders.json` (the spool's
+    /// counter).
+    pub state_dir: PathBuf,
+    /// The order spool, `orders/`: owned by the service user, read by the root half. Read by
+    /// the update API only, and not opened when [`local`](Self::local) is set.
+    pub orders_dir: PathBuf,
+    /// The root half's `status.json`; with [`local`](Self::local), the proxy's own
+    /// `releases.json`, which has the same shape.
+    pub status_file: PathBuf,
+    /// The proxy's own copies of `kbf` and its orders over them (`--kbf-binary`). When set, the
+    /// swap's orders are [`Local::orders`] (the staged and installed releases are read from, and
+    /// confirm and revert are written to, `status_file`), no order spool is opened and the
+    /// update API is not built. When not, the root half's spool and `status.json` are used as
+    /// ever.
+    pub local: Option<Local>,
+    /// The confirm window the update API's orders ask for (`confirm_window_s` of
+    /// `installer.toml`). Read by the update API only.
+    pub confirm_window_s: u32,
+    /// How long the root half's fetch may take (`fetch_timeout_s` of `installer.toml`). Read
+    /// by the update API only.
+    pub fetch_timeout_s: u32,
+    /// The loopback ports of the two children's admin and operator listeners, by slot.
+    pub slots: SlotAddrs,
+    /// `installer.toml`: the `database` the swap's migrator brings forward before a candidate
+    /// starts.
+    pub installer_toml: PathBuf,
+    /// Set once by the verb right after the bind; the supervisor waits for it.
+    pub gate: GateSlot,
 }
 
 /// What the verb knows once the proxy is bound and its children are adopted.
@@ -155,14 +186,14 @@ pub(super) struct Seams {
     pub(super) timing: Option<Timing>,
 }
 
-/// The root half's orders as the swap holds them.
-type Orders = Arc<dyn RootOrders + Send + Sync>;
+/// The orders to the root half as the swap holds them.
+pub(super) type Orders = Arc<dyn RootOrders + Send + Sync>;
 
 /// The supervisor that is the swap once the proxy is bound. See the module documentation.
 ///
 /// A clone is the same swap, not another one: the swap supervisor is built once and the clones
-/// share it. The update API holds one and the binary watch ([`super::binary_watch`]) another,
-/// and an update started through either is the one both see.
+/// share it. The binary watch ([`super::binary_watch`]) holds one and, on the update API's path,
+/// the API another, and an update started through either is the one both see.
 #[derive(Clone)]
 pub struct Handover {
     cfg: HandoverConfig,
@@ -172,13 +203,6 @@ pub struct Handover {
 }
 
 impl Handover {
-    /// `spool` is the clone of the spool the API writes with.
-    #[must_use]
-    pub fn new(cfg: &HandoverConfig, spool: OrderSpool) -> Handover {
-        let orders = SpoolRootOrders::new(spool, &cfg.status_file);
-        Handover::over(cfg, Arc::new(orders))
-    }
-
     /// A handover over the proxy's own copies of `kbf`: `orders` (the ones of
     /// [`Local`](super::releases::Local)) are the swap's, and nothing is spooled.
     #[must_use]
@@ -186,7 +210,9 @@ impl Handover {
         Handover::over(cfg, orders)
     }
 
-    fn over(cfg: &HandoverConfig, orders: Orders) -> Handover {
+    /// A handover whose orders to the root half are `orders`.
+    #[must_use]
+    pub(super) fn over(cfg: &HandoverConfig, orders: Orders) -> Handover {
         Handover {
             cfg: cfg.clone(),
             orders,
@@ -195,13 +221,10 @@ impl Handover {
         }
     }
 
-    /// A handover whose ports are replaced by `seams`.
+    /// The same handover with its ports replaced by `seams`.
     #[cfg(test)]
-    pub(super) fn with_seams(cfg: &HandoverConfig, spool: OrderSpool, seams: Seams) -> Handover {
-        Handover {
-            seams,
-            ..Handover::new(cfg, spool)
-        }
+    pub(super) fn seamed(self, seams: Seams) -> Handover {
+        Handover { seams, ..self }
     }
 
     /// [`local`](Self::local) with its ports replaced by `seams`.
@@ -211,10 +234,7 @@ impl Handover {
         orders: Arc<LocalOrders>,
         seams: Seams,
     ) -> Handover {
-        Handover {
-            seams,
-            ..Handover::local(cfg, orders)
-        }
+        Handover::local(cfg, orders).seamed(seams)
     }
 
     /// Run `call` on the swap supervisor, building it first if the slot has just been filled;
@@ -243,13 +263,12 @@ pub fn admin_secret(proxy: &hyper::HeaderMap) -> Headers {
 }
 
 /// The client of the children's admin and operator ports: each call goes to the port of its
-/// slot with `secret`, and the operator token is read from `token_file` on every offer.
-fn admin_of(slots: SlotAddrs, token_file: PathBuf, secret: Headers) -> Admin {
+/// slot with `secret`.
+fn admin_of(slots: SlotAddrs, secret: Headers) -> Admin {
     Admin::new(
         move |slot| slots.admin(slot),
         move |slot| slots.operator(slot),
         secret,
-        move || std::fs::read(&token_file),
         Deadlines::frontend(),
     )
 }
@@ -301,13 +320,10 @@ impl Migrator for StateDbMigrator {
 /// The swap supervisor over `host`'s ports. Resumes an update that was in flight.
 fn build(cfg: &HandoverConfig, orders: &Orders, host: &Host, seams: &Seams) -> SwapSupervisor {
     let orders = Arc::clone(orders);
-    let admin: Arc<dyn ChildAdmin + Send + Sync> = seams.admin.clone().unwrap_or_else(|| {
-        Arc::new(admin_of(
-            cfg.slots,
-            cfg.operator_token_file.clone(),
-            host.secret.clone(),
-        ))
-    });
+    let admin: Arc<dyn ChildAdmin + Send + Sync> = seams
+        .admin
+        .clone()
+        .unwrap_or_else(|| Arc::new(admin_of(cfg.slots, host.secret.clone())));
     let migrator = StateDbMigrator {
         apply: seams.apply.clone(),
         ..StateDbMigrator::new(&cfg.status_file, cfg.installer_toml.clone())

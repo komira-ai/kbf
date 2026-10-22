@@ -83,12 +83,6 @@ pub struct State {
     /// How each child was started, in order.
     pub starts: Vec<(Slot, Start)>,
     pub open_counts_err: bool,
-    /// Every order for the nodes goes unanswered.
-    pub desired_err: bool,
-    /// The child refuses every order for the nodes for good, with this code.
-    pub desired_refused: Option<String>,
-    /// The next this many orders for the nodes go unanswered, then they land.
-    pub desired_fails: u32,
     pub resume_fails: Vec<Slot>,
     /// `role` on these slots errors although the process lives (it does not answer).
     pub role_fails: Vec<Slot>,
@@ -170,9 +164,6 @@ impl World {
                 quiesce_takes: Duration::from_millis(200),
                 starts: Vec::new(),
                 open_counts_err: false,
-                desired_err: false,
-                desired_refused: None,
-                desired_fails: 0,
                 resume_fails: Vec::new(),
                 role_fails: Vec::new(),
                 term_takes: Duration::ZERO,
@@ -730,39 +721,6 @@ impl ChildAdmin for World {
             open_sessions: p.sessions.at(now),
         })
         .ok_or_else(|| gone(slot))
-    }
-
-    fn post_desired(
-        &self,
-        slot: Slot,
-        commit: &CommitId,
-        source: Source,
-    ) -> Result<(), DesiredError> {
-        // The event of a fetch is the one it has always been; a source is named after it.
-        let named = if source.is_fetch() {
-            String::new()
-        } else {
-            format!(" {}", source.name())
-        };
-        self.log_event(format!(
-            "admin:desired {slot:?} {}{named}",
-            &commit.as_str()[..4]
-        ));
-        let mut st = self.st.borrow_mut();
-        if let Some(code) = st.desired_refused.clone() {
-            return Err(DesiredError::Refused {
-                code,
-                why: "refused for good".into(),
-            });
-        }
-        if st.desired_err {
-            return Err(DesiredError::Unreached("desired refused".into()));
-        }
-        if st.desired_fails > 0 {
-            st.desired_fails -= 1;
-            return Err(DesiredError::Unreached("desired not answered".into()));
-        }
-        Ok(())
     }
 }
 

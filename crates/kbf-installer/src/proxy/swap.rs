@@ -106,7 +106,7 @@ impl<'a> Swap<'a> {
     }
 
     /// What the swap chose to carry on past: calls that failed without ending the update
-    /// (a stand-down the fence makes harmless, a `desired` post that is repeated).
+    /// (a stand-down the fence makes harmless).
     pub fn notes(&self) -> &[String] {
         &self.notes
     }
@@ -138,16 +138,13 @@ impl<'a> Swap<'a> {
         self.settle()
     }
 
-    /// Bake, confirm, nodes, and (on a frontend) drain and retire the old child.
+    /// Bake, confirm, and (on a frontend) drain and retire the old child. Nothing is done for
+    /// the nodes: the rollout is retired, and an update recorded at `nodes` by an older build
+    /// goes on to the drain.
     pub(super) fn settle(&mut self) -> Result<Phase, Halt> {
         // A confirm the root already holds is not asked for again.
         if self.intent.phase <= Phase::Baking && !self.root_confirmed {
             go_end!(self.bake());
-        }
-        // Nodes follow a confirmed release only: with the confirm failed the host still
-        // boots the old `current`, so the nodes are not sent to the new one.
-        if self.intent.phase <= Phase::Nodes && !self.confirm_failed() && !self.nodes_failed() {
-            go_end!(self.nodes());
         }
         if self.intent.mode == super::model::Mode::AllInOne {
             let end = self.end_phase();
@@ -189,8 +186,8 @@ impl<'a> Swap<'a> {
         matches!(&self.intent.failure, Some(f) if f.step == Step::Confirm)
     }
 
-    /// The order for the nodes would not land; the failure is recorded and the update goes on
-    /// to retire the old child. The nodes are not asked again (a restart finds this record).
+    /// An older build recorded that the order for the nodes would not land. No build records
+    /// it now; the record of one is read, and its update ends `failed` as it did.
     pub(super) fn nodes_failed(&self) -> bool {
         matches!(&self.intent.failure, Some(f) if f.step == Step::Nodes)
     }
@@ -560,8 +557,8 @@ impl<'a> Swap<'a> {
     /// Send the `confirm` order, again with a doubling wait if the root half refuses or
     /// cannot be reached. The new child serves, so the update does not undo itself: when
     /// every try fails, `failure{step: confirm}` is recorded, the staged release is kept,
-    /// the nodes are not sent, and the old child is still drained and retired. The update
-    /// then ends `failed`. A later success clears the failure.
+    /// and the old child is still drained and retired. The update then ends `failed`. A
+    /// later success clears the failure.
     fn confirm(&mut self) -> Result<(), Halt> {
         let t = self.plan.timing;
         let mut wait = t.poll;
@@ -598,54 +595,5 @@ impl<'a> Swap<'a> {
             Some(ident) => !self.new_alive || self.ports.child.exited(ident).is_some(),
             None => true,
         }
-    }
-
-    /// Step 9: the new child updates the nodes. The order is posted again, one `poll` apart,
-    /// while the child gives no answer (for `desired_within`); a child that answers and refuses
-    /// it, and one that never answers, end the update `failed` at `nodes`, with the child's own
-    /// code or `timeout`. A failure here does not undo the frontend: it was swapped and keeps
-    /// serving, and the old child is drained and retired as in any update.
-    pub(super) fn nodes(&mut self) -> Result<Flow, Halt> {
-        if !self.plan.nodes {
-            return Ok(Flow::Go);
-        }
-        self.set_phase(Phase::Nodes)?;
-        let t = self.plan.timing;
-        let began = self.now();
-        let (admin, slot) = (self.ports.admin, self.intent.new_slot);
-        let (to, source) = (self.plan.to.clone(), self.plan.source);
-        loop {
-            let posted = admin.post_desired(slot, &to, source);
-            let Err(e) = posted else {
-                self.intent.nodes_posted = true;
-                self.save()?;
-                return Ok(Flow::Go);
-            };
-            if !e.is_unreached() {
-                return self.fail_nodes(e.to_string());
-            }
-            self.note(format!("posting desired failed: {e}"));
-            if self.now().saturating_sub(began) >= t.desired_within {
-                let reason = format!(
-                    "timeout: no answer in {} s (the last: {e})",
-                    t.desired_within.as_secs()
-                );
-                return self.fail_nodes(reason);
-            }
-            self.sleep(t.poll)?;
-        }
-    }
-
-    /// The order for the nodes will not land: record why and go on to drain the old child.
-    /// Only the nodes were not told, so the phase is not `failed` yet: the end of the update
-    /// is (see [`Swap::end_phase`]).
-    fn fail_nodes(&mut self, reason: String) -> Result<Flow, Halt> {
-        self.note(format!("the order for the nodes failed: {reason}"));
-        self.intent.failure = Some(Failure {
-            step: Step::Nodes,
-            reason,
-        });
-        self.save()?;
-        Ok(Flow::Go)
     }
 }

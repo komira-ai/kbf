@@ -4,6 +4,10 @@
 //! the proxy's permits and the child's counts are zero and the gate's `retire` closed the slot.
 //! There is no timeout and no SIGKILL on this path: a stuck stream stays visible in the
 //! status until the operator force-retires it (U8b).
+//!
+//! With `--kbf-binary` the update route answers 410 (`assemble.rs`), and nothing else calls
+//! `abort`, `rollback` or `force_retire`: a drain that never idles waits there until the proxy
+//! is restarted, and `Swapper::busy` refuses every later swap meanwhile.
 
 use super::model::{CrashPoint, Halt, Mode, Phase, Retired, RoleState, Slot, Step};
 use super::swap::{Flow, Swap};

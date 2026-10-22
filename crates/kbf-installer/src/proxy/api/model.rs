@@ -8,25 +8,9 @@ use serde::{Deserialize, Serialize};
 use crate::CommitId;
 use crate::proxy::model::{Failure, Phase, Slot};
 
-/// An update's id, assigned by the API and stable across a retried request.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct UpdateId(pub String);
-
-/// The old child's counters: streams are counted by the proxy; `open_executions` and
-/// `queued_operations` are the wire's fields for what the child reports of itself (Q8).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OldChild {
-    pub open_streams: u64,
-    pub oldest_stream_age_s: u64,
-    pub open_executions: u64,
-    pub queued_operations: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NewChild {
-    pub open_streams: u64,
-}
+// The update's id and the children's counters are the swap's (`proxy::kinds`), named here as
+// they always were.
+pub use crate::proxy::kinds::{NewChild, OldChild, UpdateId};
 
 /// The body of `POST /v1/update/frontend`. Unknown fields are refused. The `deploy` verb is
 /// the client: it builds the body from this type and reads the answer as [`StatusBody`], so

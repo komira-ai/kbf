@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::CommitId;
 
 /// Where the release of an update or an order comes from. It is `kbf-update`'s word for it,
-/// named here so that everything that carries it spells it once.
+/// named here so that everything that carries it spells it once: no other non-test file of the
+/// swap names `kbf_update`.
 pub use kbf_update::Source;
 
 /// One of the two child positions of a frontend host. The proxy keeps its children at
@@ -49,6 +50,9 @@ pub enum Phase {
     Switching,
     Switched,
     Baking,
+    /// Recorded by builds that rolled out to the nodes after the bake. No build enters it now:
+    /// the swap goes from `Baking` to `Draining`. It stays so that an `update.json` written
+    /// with it is read, and so that the order of the variants is unchanged.
     Nodes,
     Draining,
     Done,
@@ -82,8 +86,9 @@ pub enum Step {
     Rollback,
     Restart,
     Confirm,
-    /// The new frontend would not take the order for the nodes (step 9): it refused it for
-    /// good, or never answered. The frontend itself was swapped and keeps serving.
+    /// A build that rolled out to the nodes recorded this when the new frontend would not take
+    /// the order for them. No build records it now (the rollout is retired); an `update.json`
+    /// that has it is still read, and its update ends `failed`.
     Nodes,
 }
 
@@ -281,9 +286,6 @@ pub struct Timing {
     pub poll: Duration,
     /// How often a short wait (quiesce, takeover resolving) looks again.
     pub tick: Duration,
-    /// How long the new frontend that does not answer is offered the order for the nodes again
-    /// (step 9), one `poll` apart, before the update ends `failed` at `nodes`.
-    pub desired_within: Duration,
 }
 
 impl Timing {
@@ -299,7 +301,6 @@ impl Timing {
             confirm_backoff_max: Duration::from_secs(30),
             poll: Duration::from_secs(1),
             tick: Duration::from_millis(100),
-            desired_within: Duration::from_secs(300),
         }
     }
 
@@ -319,11 +320,12 @@ pub struct Plan {
     pub mode: Mode,
     pub from: CommitId,
     pub to: CommitId,
-    /// Update the nodes after the bake (FP section 5 step 9).
+    /// Recorded, not acted on: the rollout to the nodes (FP section 5 step 9) is retired, so
+    /// the swap does nothing for the nodes whatever this says.
     pub nodes: bool,
     /// The downgrade flag of the API; recorded, not acted on here.
     pub rollback: bool,
-    /// Where the release came from; the order for the nodes (step 9) names the same.
+    /// Where the release came from.
     pub source: Source,
     /// The slot that serves now.
     pub old_slot: Slot,
@@ -374,6 +376,8 @@ pub struct Intent {
     pub phase: Phase,
     pub phase_started: u64,
     pub bake_started: Option<u64>,
+    /// Set by builds that posted the order for the nodes; no build sets it now. Read from an
+    /// older `update.json`, and reported as the count of nodes updated.
     pub nodes_posted: bool,
     pub old_slot: Slot,
     pub new_slot: Slot,
@@ -456,25 +460,3 @@ pub enum CrashPoint {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct PortError(pub String);
-
-/// Why the order for the nodes (step 9) did not land. The swap offers it again after the one
-/// kind and gives up on the other.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum DesiredError {
-    /// The child answered and will not take this order however often it is sent: `code` is
-    /// the one the child gave (`not_own`, `older`, ...) or, if it gave none, `http_` and the
-    /// status.
-    #[error("{code}: {why}")]
-    Refused { code: String, why: String },
-    /// There is no answer to go by: the child was not reached, did not answer in time, or
-    /// answered that it is busy or failed. Sending the same order again is the same offer.
-    #[error("{0}")]
-    Unreached(String),
-}
-
-impl DesiredError {
-    /// Whether the order got no answer to go by, so that sending it again is the same offer.
-    pub fn is_unreached(&self) -> bool {
-        matches!(self, DesiredError::Unreached(_))
-    }
-}

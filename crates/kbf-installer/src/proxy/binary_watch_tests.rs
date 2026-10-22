@@ -20,9 +20,11 @@ use kbf_state::postgres::schema::Outcome;
 
 use super::*;
 use crate::fixtures::{FakeRunner, ran, version_json, version_json_full};
+use crate::proxy::assemble;
 use crate::proxy::child_http::Headers;
-use crate::proxy::handover::{HandoverConfig, parts_shared};
-use crate::proxy::handover_swap::{ApplyHook, GateSlot, Host, NOT_BOUND, Seams, SlotAddrs};
+use crate::proxy::handover_swap::{
+    ApplyHook, GateSlot, HandoverConfig, Host, NOT_BOUND, Seams, SlotAddrs,
+};
 use crate::proxy::model::{Halt, Phase, Slot};
 use crate::proxy::ports::ChildAdmin;
 use crate::proxy::releases::STATUS;
@@ -773,7 +775,6 @@ fn config_for(local: &Local, root: &Path) -> HandoverConfig {
             admin: [addr, addr],
             operator: [addr, addr],
         },
-        operator_token_file: root.join("operator.token"),
         installer_toml: root.join("installer.toml"),
         gate: GateSlot::new(),
     };
@@ -824,16 +825,17 @@ fn blocking_apply() -> (ApplyHook, Schemas, mpsc::Sender<()>) {
 
 /// The watch over the real [`Handover`] and the swap rig, as the verb wires it: before the proxy
 /// is bound the new kbf waits ("proxy not bound yet"); once it is, one poll copies it, stages
-/// it and starts the swap, which the clone the API holds sees at once (one swap, not two); while
-/// the migration runs, a changed file waits for the swap to be over and a second start with the
-/// same update id is a no-op; when the swap is done `B` is installed in `releases.json` and the
-/// rig saw exactly one candidate start, and the file, still `B`, is the release that serves.
+/// it and starts the swap, which a clone of the handover sees at once (one swap, not two);
+/// while the migration runs, a changed file waits for the swap to be over and a second start
+/// with the same update id is a no-op; when the swap is done `B` is installed in
+/// `releases.json` and the rig saw exactly one candidate start, and the file, still `B`, is the
+/// release that serves.
 ///
-/// Mutants it catches: a handover that is cloned into a second swap supervisor (the API's clone
+/// Mutants it catches: a handover that is cloned into a second swap supervisor (the clone
 /// shows no update); `busy` that does not look at the update going on (a second swap is
 /// started or refused); the migration asked for another schema than the kbf printed.
 #[test]
-fn the_real_handover_runs_the_swap_the_watch_starts_and_the_apis_clone_sees_it() {
+fn the_real_handover_runs_the_swap_the_watch_starts_and_a_clone_sees_it() {
     let mut bench = Bench::new("real", Some(A), usize::MAX);
     let cfg = config_for(&bench.local, &bench.root);
     let rig = Rig::new(None);
@@ -845,13 +847,13 @@ fn the_real_handover_runs_the_swap_the_watch_starts_and_the_apis_clone_sees_it()
         timing: Some(quick()),
     };
     let orders = Arc::clone(&bench.local.orders);
-    let mut api = Handover::local_with_seams(&cfg, orders, seams);
+    let mut swap = Handover::local_with_seams(&cfg, orders, seams);
     let in_use: InUse = Box::new(Vec::new);
     let clock = Arc::clone(&bench.clock);
-    bench.watch = Watch::new(bench.local.clone(), Box::new(api.clone()), clock, in_use);
+    bench.watch = Watch::new(bench.local.clone(), Box::new(swap.clone()), clock, in_use);
     bench.install(B, 1, 0);
 
-    assert_eq!(Swapper::busy(&api).as_deref(), Some(NOT_BOUND));
+    assert_eq!(Swapper::busy(&swap).as_deref(), Some(NOT_BOUND));
     assert_eq!(bench.pass(), Pass::Quiet);
     assert_eq!(bench.pass(), Pass::Busy(NOT_BOUND.to_owned()));
     assert!(!bench.local.copies.verified(&c(B)));
@@ -861,9 +863,9 @@ fn the_real_handover_runs_the_swap_the_watch_starts_and_the_apis_clone_sees_it()
     let id = format!("pkg-{}-{START_S}", &B[..12]);
     assert_eq!(bench.pass(), Pass::Started(id.clone()));
 
-    let shown = api.status().update.expect("the update is shown");
+    let shown = swap.status().update.expect("the update is shown");
     assert_eq!(shown.update_id, UpdateId(id.clone()));
-    let busy = Swapper::busy(&api).expect("an update is going on");
+    let busy = Swapper::busy(&swap).expect("an update is going on");
     assert!(busy.contains(&id), "{busy}");
     bench.install(B, 2, 0);
     assert_eq!(bench.pass(), Pass::Quiet);
@@ -876,41 +878,44 @@ fn the_real_handover_runs_the_swap_the_watch_starts_and_the_apis_clone_sees_it()
     let facts = bench.staged().expect("staged for the migration");
     let again = bench.watch.spec(&c(A), facts);
     assert_eq!(again.update_id, UpdateId(id));
-    assert_eq!(Swapper::start(&mut api, &again), Ok(()));
+    assert_eq!(Swapper::start(&mut swap, &again), Ok(()));
 
     release.send(()).expect("the migration is waiting");
     until("the update to end", || {
-        api.status()
+        swap.status()
             .update
             .is_some_and(|u| matches!(u.phase, Phase::Done | Phase::Failed))
     });
 
-    let update = api.status().update.expect("shown");
+    let update = swap.status().update.expect("shown");
     assert_eq!(update.phase, Phase::Done, "{:?}", update.failure);
     assert_eq!(*lock(&schemas), [7]);
     assert_eq!(bench.local.orders.installed(), Ok(Some(c(B))));
     assert_eq!(rig.count("spawn"), 1, "one candidate was started");
-    until("the swap to be over", || Swapper::busy(&api).is_none());
+    until("the swap to be over", || Swapper::busy(&swap).is_none());
     assert_eq!(bench.pass(), Pass::Same(c(B)));
     assert_eq!(rig.count("spawn"), 1);
 }
 
-/// Catches a watch whose swap is not the one the update API holds: with the wiring and the
-/// supervisor that `parts_shared` makes, an update started through the wiring is shown by the
-/// supervisor of the API's parts (the same swap, not one built beside it). The swap runs on
-/// the defaults, so only what `start` records at once is looked at, not how the update ends.
+/// Catches a wiring whose swap is not built over the config it was assembled from: with the
+/// wiring [`assemble::local`] makes, the gate the config carries is the one the swap waits for
+/// (the swap says "proxy not bound yet" until it is filled, and, once it is, an update started
+/// through the wiring is shown by a clone of the swap). The swap runs on the defaults, so only
+/// what `start` records at once is looked at, not how the update ends.
 ///
-/// Mutant it catches: a second `Handover` built for the wiring (the API's supervisor shows no
-/// update).
+/// Mutant it catches: a swap built over a gate of its own (it never learns the proxy is bound
+/// and shows no update).
 #[test]
-fn the_wiring_and_the_apis_supervisor_are_one_swap() {
+fn the_wiring_assembled_from_a_config_waits_for_that_configs_gate() {
     let bench = Bench::new("shared", Some(A), usize::MAX);
     let cfg = config_for(&bench.local, &bench.root);
     let rig = Rig::new(None);
     let releases = bench.local.copies.root().to_owned();
+    let assembled = assemble::local(&cfg, &bench.local);
+    let mut swap = assembled.watch.expect("a watched proxy").swap;
+    let observer = swap.clone();
+    assert_eq!(Swapper::busy(&swap).as_deref(), Some(NOT_BOUND));
     assert!(cfg.gate.fill(host_over(&rig, releases)));
-    let (api, wiring) = parts_shared(&cfg).expect("the seams");
-    let mut swap = wiring.expect("a proxy with copies is watched").swap;
     let facts = StagedFacts {
         commit: c(B),
         protocol: 4,
@@ -919,12 +924,12 @@ fn the_wiring_and_the_apis_supervisor_are_one_swap() {
         profile: None,
     };
     let spec = bench.watch.spec(&c(A), facts);
-    assert!(api.supervisor.status().update.is_none());
+    assert!(observer.status().update.is_none());
 
     assert_eq!(Supervisor::start(&mut swap, &spec), Ok(()));
 
-    let update = api.supervisor.status().update;
-    let shown = update.expect("the API's supervisor shows the update");
+    let update = observer.status().update;
+    let shown = update.expect("a clone of the swap shows the update");
     assert_eq!(shown.update_id, spec.update_id);
 }
 

@@ -19,9 +19,13 @@
 //! - [`migrator::DbMigrator`], the `Migrator` over the state database;
 //! - [`releases`], the proxy's own copies of the `kbf` it runs and the [`ports::RootOrders`] that
 //!   goes with them (a status file the proxy writes itself): what `kbf-installer proxy
-//!   --kbf-binary PATH` turns on (see [`handover`]); without the flag nothing uses it;
+//!   --kbf-binary PATH` turns on (see [`assemble`]); without the flag nothing uses it;
 //! - [`binary_watch`], which polls the kbf at that path and starts the swap to a new one (the
-//!   trigger of a package upgrade, in place of the update API).
+//!   trigger of a package upgrade, in place of the update API);
+//! - [`assemble`], what the verb builds to supervise the swap: with `--kbf-binary` the swap over
+//!   the copies, the binary watch and an update route that answers 410; without it the update
+//!   API (the one call into [`handover`]). [`kinds`] holds what the swap's supervisor deals in
+//!   (the update it is asked to start, its status and refusals), which the API names too.
 //!
 //! Child control over HTTP: [`child_http`] is the blocking loopback client that the real
 //! child control and the fleet read call a child's ports with (U8b); [`admin`] is the
@@ -45,8 +49,8 @@
 //! [`handover_swap::StateDbMigrator`], the same [`migrator::DbMigrator`] built per migration
 //! (see [`handover_swap`]). `Admin::ready` reports `health` and `capabilities` as not ready
 //! until their probes exist, so a swap on a real child stops at `ready`.
-//! [`root_orders::SpoolRootOrders`] is the swap's order port ([`handover_swap`] builds it), or,
-//! with `--kbf-binary`, [`releases::LocalOrders`].
+//! [`releases::LocalOrders`] is the swap's order port with `--kbf-binary`; without it
+//! [`root_orders::SpoolRootOrders`] is ([`handover`] builds it).
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
@@ -92,7 +96,7 @@
 //!   ([`child_real::ProcChild::recorded`]), and [`supervisor::adopt_children`] reads it;
 //!   [`Swap::adopt`] reads `update.json` alone.
 //! - **confirm** is sent once the bake passes and is idempotent at the root half, because
-//!   a restart between the confirm and the `nodes` record sends it again.
+//!   a restart between the confirm and the `draining` record sends it again.
 //! - **abort** ends an update as `failed` with step `abort`, not `rolled_back`; so does an
 //!   abort that arrives while the old child quiesces (it is `abort`, not `switch`).
 //! - **Compatibility gate (R1, R4)** is not here: [`model::StagedFacts`] is carried and
@@ -104,15 +108,13 @@
 //!   its own), so a restart finishes it, or puts the new child back if it never landed.
 //!   The new child served: it is never killed, only drained and sent SIGTERM.
 //! - **Confirm** is sent up to `Timing::confirm_attempts` times with a doubling wait. If
-//!   it never lands, the new child keeps serving, the staged release is kept, the nodes
-//!   are not sent, the old child is drained and retired, and the update ends `failed`
-//!   with `failure.step == confirm`. After the switch no failure drops the staged release.
-//! - **Nodes** (step 9): the order for the nodes is posted again, one `Timing::poll` apart,
-//!   while the new child gives no answer, for `Timing::desired_within`. A child that answers
-//!   and refuses it (a 4xx, or a 409 with a code such as `not_own`) and one that never answers
-//!   end the update `failed` with `failure.step == nodes` (`failure.reason` is the child's code
-//!   and words, or `timeout`). The frontend was swapped and keeps serving, and the old child is
-//!   still drained and retired. The order names the update's source when it is not a fetch.
+//!   it never lands, the new child keeps serving, the staged release is kept, the old child
+//!   is drained and retired, and the update ends `failed` with `failure.step == confirm`.
+//!   After the switch no failure drops the staged release.
+//! - **Nodes** (step 9) are retired: the swap makes no call for the nodes and enters no
+//!   `nodes` phase, whatever the plan's `nodes` says; after the bake it drains the old child.
+//!   An `update.json` written by a build that did is still read: a record at `nodes` goes on
+//!   to the drain, and a failure recorded at step `nodes` ends the update `failed`.
 //! - **All-in-one stop**: after `quiesce`, the proxy sends SIGTERM to the old process
 //!   ([`aio`]).
 //! - A dead new child during the bake (the proxy running) leaves the update parked in
@@ -132,6 +134,7 @@
 pub mod admin;
 mod aio;
 pub mod api;
+pub mod assemble;
 pub mod binary_watch;
 #[cfg(target_os = "linux")]
 pub mod boot;
@@ -142,6 +145,7 @@ mod cold;
 pub mod gate_real;
 pub mod handover;
 pub mod handover_swap;
+pub mod kinds;
 pub mod migrator;
 pub mod model;
 pub mod orders;

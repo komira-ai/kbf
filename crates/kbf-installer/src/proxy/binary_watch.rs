@@ -50,13 +50,10 @@ use std::sync::Arc;
 use std::thread::{Builder, JoinHandle};
 use std::time::Duration;
 
-use kbf_update::Source;
-
-use super::api::model::UpdateId;
-use super::api::traits::{RunningUpdate, Supervisor, SupervisorError, UpdateSpec};
 use super::handover_swap::Handover;
+use super::kinds::{RunningUpdate, Supervisor, SupervisorError, UpdateId, UpdateSpec};
 use super::migrator::probe_version;
-use super::model::{Locator, StagedFacts, Verb};
+use super::model::{Locator, Source, StagedFacts, Verb};
 use super::ports::{Clock, RootOrders};
 use super::releases::Local;
 use crate::CommitId;
@@ -116,7 +113,7 @@ fn describe(update: &RunningUpdate) -> String {
 
 impl Swapper for Handover {
     /// The supervisor's own refusal ([`Supervisor::start_blocked`]) or, since it does not
-    /// count a swap that is going on (the API answers that itself), an update not yet over.
+    /// count a swap that is going on, an update not yet over.
     fn busy(&self) -> Option<String> {
         self.start_blocked().or_else(|| {
             let update = self.status().update?;
@@ -131,8 +128,7 @@ impl Swapper for Handover {
 }
 
 /// What the watch needs of the proxy: the copies and orders of `--kbf-binary` (whose `binary`
-/// is the file watched) and the swap, which is the one the update API holds
-/// ([`super::handover::parts_shared`]).
+/// is the file watched) and the swap ([`super::assemble::local`] builds both).
 #[derive(Clone)]
 pub struct Wiring {
     pub local: Local,

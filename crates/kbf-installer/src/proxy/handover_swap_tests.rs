@@ -10,19 +10,18 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use hyper::StatusCode;
 use kbf_update::record::parse_file_name;
 
 use super::*;
 use crate::fixtures::{FakeRunner, ran, version_json};
 use crate::helper::memory::{Memory, StagedFacts as KeptFacts};
 use crate::helper::status;
-use crate::proxy::api::core::{Core, Fault};
-use crate::proxy::api::model::{UpdateId, UpdateRequest};
-use crate::proxy::handover::parts;
+use crate::proxy::kinds::UpdateId;
 use crate::proxy::model::{Intent, Locator, Plan, StagedFacts, Step, Verb};
+use crate::proxy::orders::OrderSpool;
 use crate::proxy::ports::{ChildAdmin, Recorder, RootOrders, StatusFacts};
 use crate::proxy::releases::{self, Local};
+use crate::proxy::root_orders::SpoolRootOrders;
 use crate::proxy::supervisor_swap::rig::{Rig, quick};
 use crate::state::State;
 use crate::testkit::{A, B, c};
@@ -51,7 +50,6 @@ fn config(name: &str) -> (HandoverConfig, OrderSpool, PathBuf) {
         confirm_window_s: 900,
         fetch_timeout_s: 900,
         slots: ports_of([addr(1), addr(1)], [addr(1), addr(1)]),
-        operator_token_file: root.join("operator.token"),
         installer_toml: root.join("installer.toml"),
         gate: GateSlot::new(),
     };
@@ -578,15 +576,11 @@ fn serve_once(answer: &'static str) -> (SocketAddr, JoinHandle<String>) {
     (at, seen)
 }
 
-/// Catches an admin client pointed at the wrong slot's port, without the proxy's secret, or
-/// with the wrong token: a call to slot B's admin port reaches B's (and not A's) with the
-/// secret header, and an offer to slot A reaches A's operator port with the token the file
-/// holds (the file's newline dropped) and the secret.
+/// Catches an admin client pointed at the wrong slot's port, or without the proxy's secret: a
+/// call to slot B's admin port reaches B's (and not A's) with the secret header, and a readiness
+/// read of slot A reaches A's operator port.
 #[test]
-fn the_admin_client_is_bound_to_each_slots_ports_with_the_secret_and_the_token() {
-    let dir = kbf_host::testkit::scratch("handover-swap-admin");
-    let token = dir.join("token");
-    fs::write(&token, "tok-123\n").expect("token");
+fn the_admin_client_is_bound_to_each_slots_ports_with_the_secret() {
     let secret = Headers::new()
         .with("x-kbf-proxy-auth", SECRET.as_bytes())
         .expect("header");
@@ -598,7 +592,7 @@ fn the_admin_client_is_bound_to_each_slots_ports_with_the_secret_and_the_token()
         serve_once(r#"{"admin_protocol":1,"open_streams":4,"open_sessions":2}"#);
     let (operator_a, seen_operator_a) = serve_once("{}");
     let slots = ports_of([nothing, admin_b], [operator_a, nothing]);
-    let admin = admin_of(slots, token, secret);
+    let admin = admin_of(slots, secret);
 
     let counts = admin.try_open_counts(Slot::B).expect("answered");
     assert_eq!((counts.open_streams, counts.open_sessions), (4, 2));
@@ -609,16 +603,11 @@ fn the_admin_client_is_bound_to_each_slots_ports_with_the_secret_and_the_token()
         "{head}"
     );
 
-    admin.try_post_desired(Slot::A, &c(A)).expect("answered");
+    assert!(admin.try_ready(Slot::A).expect("answered").readyz);
     let head = seen_operator_a
         .join()
         .expect("A's operator port was called");
-    assert!(head.starts_with("POST /v1/update/desired"), "{head}");
-    assert!(head.contains("authorization: Bearer tok-123\r\n"), "{head}");
-    assert!(
-        head.contains(&format!("x-kbf-proxy-auth: {SECRET}")),
-        "{head}"
-    );
+    assert!(head.starts_with("GET /readyz"), "{head}");
 }
 
 // ----- how the swap learns that a release is staged -----
@@ -705,7 +694,6 @@ fn config_local(name: &str) -> (HandoverConfig, Local, PathBuf) {
         confirm_window_s: 900,
         fetch_timeout_s: 900,
         slots: ports_of([addr(1), addr(1)], [addr(1), addr(1)]),
-        operator_token_file: root.join("operator.token"),
         installer_toml: root.join("installer.toml"),
         gate: GateSlot::new(),
     };
@@ -846,44 +834,5 @@ fn a_swap_that_fails_reverts_the_staged_release_in_releases_json() {
     assert_eq!(*seen.lock().unwrap(), [(3, DbMigrator::LOCK_WAIT)]);
     assert_eq!(recorded(&cfg), (None, Some(c(A))));
     assert_eq!(rig.count("spawn"), 0, "no candidate was started");
-    assert!(!cfg.orders_dir.exists(), "no order spool was made");
-}
-
-/// The update API over the seams of `parts` with the proxy's copies: a `POST` that passes
-/// every check (the host runs `A`, per `releases.json`, and the proxy is bound) is refused
-/// where the order would be written, as 503 `order_unwritable` with the reason, and no
-/// `orders/` is made.
-///
-/// Mutants it catches: the API's writer being a spool (the order is written); the writer
-/// accepting the order and writing nothing.
-#[test]
-fn the_update_api_orders_nothing_when_the_proxy_keeps_its_own_copies() {
-    let (cfg, local, root) = config_local("api");
-    let _gone = Gone(root.clone());
-    copied(&local, &root, &[A]);
-    local.orders.adopt(&c(A)).expect("A is installed");
-    let rig = Rig::new(None);
-    let deaths = Arc::new(Mutex::new(Vec::new()));
-    cfg.gate
-        .fill(host_over(&rig, local.copies.root().to_owned(), &deaths));
-    let mut core = Core::new(parts(&cfg).expect("the seams"));
-    let request = UpdateRequest {
-        commit: c(B),
-        request_id: "r1".to_owned(),
-        nodes: false,
-        rollback: false,
-        source: kbf_update::Source::Fetch,
-    };
-
-    let refused = match core.post(request) {
-        Err(Fault::Api(e)) => e,
-        other => panic!("not refused: {other:?}"),
-    };
-
-    assert_eq!(
-        (refused.status, refused.code),
-        (StatusCode::SERVICE_UNAVAILABLE, "order_unwritable")
-    );
-    assert!(refused.message.contains("no order spool"), "{refused:?}");
     assert!(!cfg.orders_dir.exists(), "no order spool was made");
 }

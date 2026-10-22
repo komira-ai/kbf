@@ -33,7 +33,7 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use crate::proxy::api::traits::RestartPending;
+use crate::proxy::kinds::RestartPending;
 
 /// Where the package installs the program.
 #[cfg(target_os = "macos")]

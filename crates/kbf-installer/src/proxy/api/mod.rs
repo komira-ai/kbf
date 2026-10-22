@@ -19,7 +19,8 @@
 //!
 //! # How an update moves
 //!
-//! `POST` checks the request (409 and 422 cases, and a 503 from a supervisor that
+//! `POST` checks the request (409 and 422 cases, a 400 `nodes_retired` for a request that asks
+//! for the rollout to the nodes, which is retired, and a 503 from a supervisor that
 //! [cannot start](traits::Supervisor::start_blocked)), saves its `request_id`, writes a
 //! `frontend_update` order (a locator; the root half fetches, verifies and stages without
 //! flipping, FP section 2) and answers 202 with phase `accepted`. From then on the API

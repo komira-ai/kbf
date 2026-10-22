@@ -8,8 +8,7 @@ use std::time::{Duration, Instant};
 use super::rig::{Rig, quick};
 use super::status::active_after;
 use super::{Parts, Spawn, SwapSupervisor, panic_text, spawn_error};
-use crate::proxy::api::model::{OldChild, UpdateId};
-use crate::proxy::api::traits::{Retired, Supervisor, SupervisorError, UpdateSpec};
+use crate::proxy::kinds::{OldChild, Retired, Supervisor, SupervisorError, UpdateId, UpdateSpec};
 use crate::proxy::model::{
     AdoptError, Failure, Intent, Locator, Mode, Phase, Plan, ProcIdent, Request, Slot, StagedFacts,
     Step, Timing, Verb,
@@ -168,7 +167,6 @@ fn an_update_goes_through_every_phase_in_the_order_of_the_design() {
             Phase::Switching,
             Phase::Switched,
             Phase::Baking,
-            Phase::Nodes,
             Phase::Draining,
             Phase::Done,
         ]
@@ -184,26 +182,26 @@ fn an_update_goes_through_every_phase_in_the_order_of_the_design() {
             "release_into B",
             "admin:stand_down A",
             "order confirm",
-            "admin:desired B",
             "terminate pid 100",
         ],
     );
     let status = h.sup.status();
     let update = status.update.expect("the update");
     assert_eq!((update.phase, update.active_slot), (Phase::Done, Slot::B));
-    assert_eq!(update.nodes_updated, 1);
+    // The spec asks for the nodes (`nodes: true`) and the swap does nothing for them.
+    assert_eq!(update.nodes_updated, 0);
     assert_eq!(status.running, Some(c(B)));
     assert!(update.old.is_none(), "nothing drains after the end");
     assert!(h.deaths.lock().unwrap().is_empty());
 }
 
 /// Catches a source that stops at the supervisor: the update it was given is `staged`, so the
-/// record in `update.json` says so (a restarted proxy has no other source to read), the status
-/// reads it from that record, and the order for the nodes names it.
+/// record in `update.json` says so (a restarted proxy has no other source to read), and the
+/// status reads it from that record.
 ///
 /// Mutants planted: the plan built with source `fetch`; the status always `fetch`.
 #[test]
-fn the_source_of_an_update_is_kept_in_its_record_and_named_in_the_order_for_the_nodes() {
+fn the_source_of_an_update_is_kept_in_its_record() {
     let mut h = harness("sw-source");
     let staged = UpdateSpec {
         source: kbf_update::Source::Staged,
@@ -214,13 +212,13 @@ fn the_source_of_an_update_is_kept_in_its_record_and_named_in_the_order_for_the_
     assert_eq!(last_intent(&h.rig).source, kbf_update::Source::Staged);
     let update = h.sup.status().update.expect("the update");
     assert_eq!(update.source, kbf_update::Source::Staged);
-    assert!(h.rig.log().contains(&format!("admin:desired B {B} staged")));
 
     let mut h = harness("sw-source-fetch");
     h.sup.start(&spec("u1", Some(A), B)).unwrap();
     assert!(h.sup.wait_closed(WAIT));
     assert_eq!(last_intent(&h.rig).source, kbf_update::Source::Fetch);
-    assert!(h.rig.log().contains(&format!("admin:desired B {B}")));
+    let update = h.sup.status().update.expect("the update");
+    assert_eq!(update.source, kbf_update::Source::Fetch);
 }
 
 #[test]
@@ -391,7 +389,7 @@ fn the_status_shows_the_old_child_while_it_drains_and_force_retire_ends_it() {
     let status = h.sup.status();
     let update = status.update.expect("update");
     assert_eq!(update.active_slot, Slot::B);
-    assert_eq!(update.nodes_updated, 1);
+    assert_eq!(update.nodes_updated, 0);
     assert_eq!(
         update.old,
         Some(OldChild {
@@ -548,8 +546,8 @@ fn the_slot_that_serves_after_an_update_follows_how_it_ended() {
     for (step, serves) in [
         (Step::Confirm, new),
         (Step::Rollback, new),
-        // The order for the nodes is sent after the switch and the confirm: the new child
-        // serves, whether or not the nodes were told.
+        // An older build's record can say it failed at the order for the nodes, which was
+        // sent after the switch and the confirm: the new child serves.
         (Step::Nodes, new),
         (Step::Switch, old),
         (Step::Migrate, old),

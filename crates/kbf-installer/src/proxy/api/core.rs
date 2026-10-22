@@ -336,6 +336,7 @@ impl Core {
         }
         // A new request only: a retry is judged by its id first (`request_id_reused`).
         source_fits(&req)?;
+        nodes_retired(&req)?;
         let status = self.preflight(&req)?;
         let entry = self
             .parts
@@ -839,6 +840,18 @@ fn source_fits(req: &UpdateRequest) -> Result<(), ApiError> {
         return Err(ApiError::conflict(
             "source_refused",
             "a staged update does not update the nodes yet: ask for the frontend only",
+        ));
+    }
+    Ok(())
+}
+
+/// The rollout to the nodes is retired: the swap makes no call for them, so a request that asks
+/// for it is refused, whatever else it says, and told to ask for the frontend only.
+fn nodes_retired(req: &UpdateRequest) -> Result<(), ApiError> {
+    if req.nodes {
+        return Err(ApiError::bad(
+            "nodes_retired",
+            "the rollout to the nodes is retired: ask for the frontend only (nodes: false)",
         ));
     }
     Ok(())

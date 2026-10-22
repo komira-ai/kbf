@@ -14,19 +14,19 @@
 //! `/readyz` says 503, and the reason is on the standard error. A child outlives the proxy: a
 //! stop of the proxy signals the proxy alone (`KillMode=process` in `kbf-proxy.service`).
 //!
-//! **The update API.** `/v1/update/frontend` is the update API of [`crate::proxy::api`], run
-//! by an actor on a thread of its own and called through `UpdateBridge`. The proxy
-//! authenticates that route (the operator token) before it calls, bounds the body and the
-//! time, and the API behind it does no check of its own: this verb is the only place the two
-//! meet. Its seams are bound by [`crate::proxy::handover`] (`--update-dir` names the root
-//! half's `status.json`, `--orders-dir` the order spool, the proxy's `state_dir` the request
-//! map and the spool's counter, `confirm_window_s` the window its orders ask for). Behind it is
-//! the handover driver ([`crate::proxy::handover_swap`]): once the proxy is bound and its
-//! children adopted, `supervise` fills the driver's slot with the proxy's gate, the children's
-//! process control and the proxy's secret, and the driver runs the swap on a thread of its own.
-//! A `POST` it cannot take (an update open, no idle slot, no `releases/` directory) is refused
-//! with 503 and nothing is written. If the actor or the swap thread dies the proxy is stopped
-//! as a stop signal stops it and the verb exits 1, so the service manager starts it again.
+//! **The update route.** [`crate::proxy::assemble`] builds what the verb supervises the swap
+//! with, and what answers on `/v1/update/frontend*`; the proxy authenticates that route (the
+//! operator token) before it calls, bounds the body and the time, and what answers does no
+//! check of its own. Without `--kbf-binary` it is the update API, run by an actor on a thread
+//! of its own (`--update-dir` names the root half's `status.json`, `--orders-dir` the order
+//! spool, the proxy's `state_dir` the request map and the spool's counter, `confirm_window_s`
+//! the window its orders ask for). Behind it is the handover driver
+//! ([`crate::proxy::handover_swap`]): once the proxy is bound and its children adopted,
+//! `supervise` fills the driver's slot with the proxy's gate, the children's process control
+//! and the proxy's secret, and the driver runs the swap on a thread of its own. A `POST` it
+//! cannot take (an update open, no idle slot, no `releases/` directory) is refused with 503 and
+//! nothing is written. If the actor or the swap thread dies the proxy is stopped as a stop
+//! signal stops it and the verb exits 1, so the service manager starts it again.
 //!
 //! **`--kbf-binary PATH`** names the kbf the package installed (`/usr/bin/kbf`) and makes the
 //! proxy keep its own copies ([`crate::proxy::releases`]). The copies are `releases/<commit>/`
@@ -34,11 +34,11 @@
 //! are run from them, and the installed and staged releases are in `releases.json` there, a
 //! file of the shape of the root half's `status.json`: the order spool is not opened
 //! (`--orders-dir` and `--update-dir` are not looked at), the swap's confirm and revert touch
-//! no file of the root half, and the update API refuses to order a release. A start that
-//! finds no installed release recorded copies the kbf at `PATH` and records it as the
-//! installed one. Once the swap's slot is filled the proxy also polls the file at `PATH` every
-//! 5 s ([`crate::proxy::binary_watch`]): a package that replaced it is copied, its facts are
-//! staged and the swap to it is started, as the update API would, with no request. Without the
+//! no file of the root half, and the update API is not built: every call on the update route
+//! is answered 410. A start that finds no installed release recorded copies the kbf at `PATH`
+//! and records it as the installed one. Once the swap's slot is filled the proxy also polls the
+//! file at `PATH` every 5 s ([`crate::proxy::binary_watch`]): a package that replaced it is
+//! copied, its facts are staged and the swap to it is started, with no request. Without the
 //! flag nothing of this exists and the proxy works as before.
 //!
 //! The start migrates before it runs anything: the installed release is brought to the
@@ -75,7 +75,6 @@ use std::time::Duration;
 
 use kbf_proxy::Proxy;
 use kbf_proxy::config::ProxyConfig;
-use kbf_proxy::control::{UpdateHandler, UpdateReply, UpdateRequest};
 use kbf_proxy::route::Target;
 use kbf_proxy::slot::Slot;
 use rustix::io::{Errno, FdFlags, fcntl_getfd, fcntl_setfd};
@@ -88,11 +87,8 @@ use crate::database::{Database, DatabaseError};
 use crate::exit::Exit;
 use crate::installer_toml::{InstallerToml, MAX_FILE_BYTES};
 use crate::layout::{Layout, Platform};
-use crate::proxy::api::actor::ActorTiming;
-use crate::proxy::api::core::{Core, Parts};
-use crate::proxy::api::handler::{Handler, HandlerRequest};
-use crate::proxy::handover::{self, HandoverConfig, HandoverError};
-use crate::proxy::handover_swap::{GateSlot, SlotAddrs};
+use crate::proxy::assemble::{self, AssembleError, Assembled, Pending, Route};
+use crate::proxy::handover_swap::{GateSlot, HandoverConfig, SlotAddrs};
 #[cfg(target_os = "linux")]
 use crate::proxy::handover_swap::{Host, admin_secret};
 use crate::proxy::releases::{self, Local};
@@ -124,15 +120,13 @@ impl From<Errno> for VerbError {
     }
 }
 
-impl From<HandoverError> for VerbError {
-    /// An order spool or state directory the service user cannot use is the operator's to fix:
-    /// exit 2, which `kbf-proxy.service` does not restart. A program that cannot be identified
-    /// is not.
-    fn from(e: HandoverError) -> Self {
-        let text = format!("update API: {e}");
+impl From<AssembleError> for VerbError {
+    /// A seam the service user cannot use (an order spool, a state directory) is the operator's
+    /// to fix: exit 2, which `kbf-proxy.service` does not restart. One that may pass is not.
+    fn from(e: AssembleError) -> Self {
         match e {
-            HandoverError::Orders { .. } => VerbError::Usage(text),
-            HandoverError::Binary(_) => VerbError::Failed(text),
+            AssembleError::Usage(text) => VerbError::Usage(text),
+            AssembleError::Failed(text) => VerbError::Failed(text),
         }
     }
 }
@@ -207,9 +201,9 @@ fn loaded_from(path: &Path, text: &str) -> Result<Loaded, VerbError> {
     })
 }
 
-/// Where the update API reads and writes: the flags and the file. With `--kbf-binary` the
-/// status file is the proxy's own `releases.json` (in its state directory) and `--update-dir`
-/// is not looked at; [`open_local`] adds the copies.
+/// Where the swap and the update API read and write: the flags and the file. With
+/// `--kbf-binary` the status file is the proxy's own `releases.json` (in its state directory)
+/// and `--update-dir` is not looked at; [`open_local`] adds the copies.
 fn handover_config(args: &ProxyArgs, loaded: &Loaded, layout: &Layout) -> HandoverConfig {
     let table = loaded.proxy.upstream;
     let at = |port: u16| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
@@ -224,7 +218,6 @@ fn handover_config(args: &ProxyArgs, loaded: &Loaded, layout: &Layout) -> Handov
             admin: [admin(Slot::A), admin(Slot::B)],
             operator: [operator(Slot::A), operator(Slot::B)],
         },
-        operator_token_file: loaded.proxy.operator_token_file.clone(),
         installer_toml: config_path(args, Platform::current()),
         gate: GateSlot::new(),
         state_dir: loaded.proxy.state_dir.clone(),
@@ -480,66 +473,22 @@ fn release_reload_signal() {
     change_mask(libc::SIG_UNBLOCK, &[libc::SIGHUP]);
 }
 
-/// The update API behind the proxy's update route: the [`Handler`] of the API, called with the
-/// proxy's request and answering with the proxy's reply (the fields are the same, and so are
-/// the header types). It checks nothing: the proxy authenticated the caller before it called
-/// (see the module doc).
-struct UpdateBridge(Handler);
-
-impl UpdateHandler for UpdateBridge {
-    async fn handle(&self, request: UpdateRequest) -> UpdateReply {
-        let reply = self
-            .0
-            .handle(HandlerRequest {
-                method: request.method,
-                path: request.path,
-                body: request.body,
-            })
-            .await;
-        UpdateReply {
-            status: reply.status,
-            headers: reply.headers,
-            body: reply.body,
-        }
-    }
-}
-
-/// Starts the update API's actor over `parts`. If the actor dies, `drain` stops the proxy
+/// Starts what serves the update route. If that dies, `drain` stops the proxy
 /// ([`actor_died`]).
-fn start_updates(
-    parts: Parts,
+fn start_route(
+    pending: Box<dyn Pending>,
     stop: &Arc<Stop>,
     died: &Arc<AtomicBool>,
     drain: &Arc<dyn Fn() + Send + Sync>,
-) -> std::io::Result<UpdateBridge> {
+) -> std::io::Result<Route> {
     let (stop, died, drain) = (Arc::clone(stop), Arc::clone(died), Arc::clone(drain));
-    let on_death = move || actor_died(&stop, &died, &*drain);
-    Handler::start(Core::new(parts), ActorTiming::default(), on_death).map(UpdateBridge)
-}
-
-/// What the verb says on the standard error about the update API once it is built.
-fn update_line(parts: &Parts, handover: &HandoverConfig) -> String {
-    let driver = parts
-        .supervisor
-        .start_blocked()
-        .map_or("handover ready".to_owned(), |why| {
-            format!("a POST is refused: {why}")
-        });
-    let orders = match &handover.local {
-        Some(_) => "none, the proxy keeps its own copies".to_owned(),
-        None => handover.orders_dir.display().to_string(),
-    };
-    format!(
-        "update API on (status {}, orders {orders}, staging deadline {} s); {driver}",
-        handover.status_file.display(),
-        parts.config.staging_deadline.secs(),
-    )
+    pending.start(Box::new(move || actor_died(&stop, &died, &*drain)))
 }
 
 /// Serves on `listener` until a stop signal. The signal handlers are registered before the
-/// proxy serves, so none is lost to the default action. The update API's seams are built
-/// first: an order spool or a state directory the service user cannot use is a usage error
-/// before anything is bound.
+/// proxy serves, so none is lost to the default action. The swap's seams and the update route
+/// are built first: an order spool or a state directory the service user cannot use is a usage
+/// error before anything is bound.
 fn serve(
     config: ProxyConfig,
     database: Database,
@@ -547,14 +496,13 @@ fn serve(
     listener: OwnedFd,
     root: &kbf_host::Root,
 ) -> Result<(), VerbError> {
-    let (parts, watch) = handover::parts_shared(handover)?;
+    let Assembled { watch, pending } = assemble::assemble(handover)?;
     #[cfg(target_os = "linux")]
     let supervise_with = Supervise {
         database,
         state_dir: config.state_dir.clone(),
         proxy_auth_file: config.proxy_auth_file.clone(),
         upstream: config.upstream,
-        operator_token_file: config.operator_token_file.clone(),
         status: handover.status_file.clone(),
         local: handover.local.clone(),
         watch,
@@ -622,11 +570,11 @@ fn serve(
         &handover.gate,
         death_hook(&stop, &died, &drain),
     );
-    let note = update_line(&parts, handover);
-    let updates = start_updates(parts, &stop, &died, &drain)?;
+    let note = pending.note();
+    let route = start_route(pending, &stop, &died, &drain)?;
     let _ = writeln!(std::io::stderr(), "kbf-installer: proxy: {note}");
     let _ = writeln!(std::io::stderr(), "kbf-installer: proxy serving");
-    outcome(runner.run(updates), &died)
+    outcome(runner.run(route), &died)
 }
 
 /// Where the supervisor finds what it reads.
@@ -637,7 +585,6 @@ struct Supervise {
     state_dir: std::path::PathBuf,
     proxy_auth_file: std::path::PathBuf,
     upstream: kbf_proxy::config::UpstreamTable,
-    operator_token_file: std::path::PathBuf,
     /// The root half's `status.json`; with `local`, the proxy's own `releases.json`.
     status: std::path::PathBuf,
     /// The proxy's own copies of `kbf` (`--kbf-binary`): the children are run from them and a
@@ -749,11 +696,11 @@ fn start_with(
 ) -> Result<crate::proxy::supervisor::Startup, String> {
     use crate::proxy::boot::FileReport;
     use crate::proxy::model::Timing;
-    use crate::proxy::root_orders::StatusFile;
+    use crate::proxy::releases::StatusFile;
     use crate::proxy::supervisor::{Adopt, Boot, adopt_children, child_admin, host_migrator};
     use crate::run::SystemRunner;
 
-    child_admin(handle, with.upstream, with.operator_token_file).map(|admin| {
+    child_admin(handle, with.upstream).map(|admin| {
         let report = FileReport::new(&with.state_dir);
         let facts = StatusFile::new(&with.status);
         let migrator = host_migrator(with.database, &facts, child);

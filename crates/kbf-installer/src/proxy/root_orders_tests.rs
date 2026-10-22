@@ -159,6 +159,26 @@ fn a_malformed_file_is_an_error() {
     }
 }
 
+/// Pins a difference from the reader this one replaced (the update API's `InstallerStatus`, which
+/// also type-checked `state`, `refusal` and `acked_order_id`): the swap and the cold start read
+/// three keys, and a wrong type in a key they do not read is not an error.
+///
+/// Mutants it catches: the reader taking more keys than those three, so that a wrong type in
+/// one of the others is an error again.
+#[test]
+fn a_wrong_type_in_a_key_the_swap_does_not_read_is_not_an_error() {
+    let rig = rig("other-keys");
+    put(
+        &rig,
+        &format!(
+            "{{\"installed_commit\":\"{}\",\"state\":7,\"refusal\":3,\"acked_order_id\":\"x\"}}",
+            commit('a').as_str()
+        ),
+    );
+    assert_eq!(rig.adapter.installed(), Ok(Some(commit('a'))));
+    assert_eq!(rig.adapter.staged(), Ok(None));
+}
+
 /// Catches the cap being off by one in either direction: a file of exactly `MAX_STATUS`
 /// bytes is read, one byte more is refused without being parsed.
 ///

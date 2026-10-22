@@ -463,7 +463,7 @@ pub fn req(commit: &str, request_id: &str) -> super::model::UpdateRequest {
     super::model::UpdateRequest {
         commit: c(commit),
         request_id: request_id.to_owned(),
-        nodes: true,
+        nodes: false,
         rollback: false,
         source: Source::Fetch,
     }

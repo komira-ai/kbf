@@ -7,12 +7,12 @@ use super::fakes::*;
 use super::model::*;
 use super::swap::Swap;
 
-fn crash_when(w: &World, f: impl Fn(&Intent) -> bool + 'static) {
+pub(super) fn crash_when(w: &World, f: impl Fn(&Intent) -> bool + 'static) {
     *w.crash_on_record.borrow_mut() = Some(Box::new(f));
 }
 
 /// Run until the proxy dies.
-fn run_to_crash(w: &World, mode: Mode, old: ProcIdent) {
+pub(super) fn run_to_crash(w: &World, mode: Mode, old: ProcIdent) {
     let r = Swap::begin(w.ports(), plan(mode), Some(old)).and_then(|mut s| s.run());
     assert!(
         matches!(r, Err(Halt::Crashed(_))),
@@ -21,7 +21,7 @@ fn run_to_crash(w: &World, mode: Mode, old: ProcIdent) {
 }
 
 /// A new proxy adopts the recorded update and runs it on.
-fn restart(w: &World) -> (Result<Phase, Halt>, Vec<String>) {
+pub(super) fn restart(w: &World) -> (Result<Phase, Halt>, Vec<String>) {
     w.proxy_restart();
     let intent = w.last_intent();
     let timing = match intent.mode {
@@ -33,7 +33,7 @@ fn restart(w: &World) -> (Result<Phase, Halt>, Vec<String>) {
     (end, swap.notes().to_vec())
 }
 
-fn draining_world() -> (World, ProcIdent) {
+pub(super) fn draining_world() -> (World, ProcIdent) {
     let (w, old) = World::with_old();
     w.permits(Slot::A, 3, Some(secs(400)));
     w.busy(Slot::A, 2, Some(secs(500)));
@@ -41,7 +41,7 @@ fn draining_world() -> (World, ProcIdent) {
     (w, old)
 }
 
-fn failed_at(w: &World) -> Option<Step> {
+pub(super) fn failed_at(w: &World) -> Option<Step> {
     w.last_intent().failure.map(|f| f.step)
 }
 
@@ -57,7 +57,6 @@ fn a_restart_at_every_phase_boundary_ends_with_exactly_one_serving_child() {
         Phase::Switching,
         Phase::Switched,
         Phase::Baking,
-        Phase::Nodes,
         Phase::Draining,
     ];
     for phase in phases {
@@ -217,20 +216,6 @@ fn row_proxy_crash_during_bake_an_expired_bake_passes_at_once() {
 }
 
 #[test]
-fn row_proxy_crash_during_nodes_posts_desired_again_after_the_restart() {
-    let (w, old) = World::with_old();
-    crash_when(&w, |i| i.phase == Phase::Nodes && i.nodes_posted);
-    run_to_crash(&w, Mode::Frontend, old);
-    assert_eq!(w.count("admin:desired"), 1);
-    assert_eq!(restart(&w).0, Ok(Phase::Done));
-    assert_eq!(
-        w.count("admin:desired"),
-        2,
-        "nodes_posted is advisory: the post is repeated"
-    );
-}
-
-#[test]
 fn row_proxy_crash_during_draining_keeps_waiting_on_the_old_childs_counts() {
     let (w, old) = draining_world();
     w.crash_at.set(Some(CrashPoint::WhileDraining));
@@ -372,30 +357,6 @@ fn a_new_child_that_lost_the_generation_after_it_served_is_retired_not_killed() 
     assert_eq!(w.count("kill"), 0);
     assert_eq!(w.count("terminate pid 101"), 1);
     assert_eq!(w.holders(), vec![Slot::A]);
-}
-
-fn failed_at_nodes(i: &Intent) -> bool {
-    i.failure.as_ref().is_some_and(|f| f.step == Step::Nodes)
-}
-
-/// Catches a restart that sends the order for the nodes again after the child refused it for
-/// good: the refusal is in `update.json`, so the new proxy goes on to drain and retire, and the
-/// update ends `failed` at `nodes` as it would have, with the order sent once in all.
-///
-/// Mutant planted: the restart's `settle` not looking at the recorded failure.
-#[test]
-fn a_restart_after_a_refusal_of_the_order_for_the_nodes_does_not_send_it_again() {
-    let (w, old) = draining_world();
-    w.st.borrow_mut().desired_refused = Some("not_own".to_owned());
-    crash_when(&w, failed_at_nodes);
-    run_to_crash(&w, Mode::Frontend, old);
-    assert_eq!(w.count("admin:desired"), 1);
-    let (end, _) = restart(&w);
-    assert_eq!(end, Ok(Phase::Failed), "{:#?}", w.log());
-    assert_eq!(failed_at(&w), Some(Step::Nodes));
-    assert_eq!(w.count("admin:desired"), 1);
-    assert_eq!(w.holders(), vec![Slot::B]);
-    assert!(w.when("terminate pid 100").is_some(), "old child retired");
 }
 
 fn before_in(w: &World, a: &str, b: &str) {

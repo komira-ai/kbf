@@ -11,11 +11,10 @@ use super::*;
 use crate::proxy::api::core::{Core, CrashPoint, Fault, Reply};
 use crate::proxy::api::model::UpdateRequest;
 use crate::proxy::api::traits::Compat;
-use crate::proxy::handover_swap::NOT_BOUND;
+use crate::proxy::handover_swap::{GateSlot, NOT_BOUND, SlotAddrs};
 use crate::proxy::model::Verb;
 use crate::proxy::ports::RootOrders;
 use crate::proxy::record::Fsync;
-use crate::proxy::releases::{self, Local};
 use crate::proxy::root_orders::SpoolRootOrders;
 use crate::testkit::{A, B, c};
 
@@ -37,7 +36,6 @@ fn config(name: &str) -> HandoverConfig {
             admin: [addr(18003), addr(18013)],
             operator: [addr(18002), addr(18012)],
         },
-        operator_token_file: root.join("operator.token"),
         installer_toml: root.join("installer.toml"),
         gate: GateSlot::new(),
     }
@@ -182,7 +180,7 @@ fn the_api_and_the_swaps_orders_are_numbered_by_one_counter() {
     )
     .expect("the spool");
     let swap = SpoolRootOrders::new(spool.clone(), &cfg.status_file);
-    let mut seams = assemble(&cfg, spool, binary(Path::new("/nonexistent")));
+    let mut seams = parts_over(&cfg, spool, binary(Path::new("/nonexistent")));
 
     let first = seams
         .orders
@@ -203,10 +201,10 @@ fn the_api_and_the_swaps_orders_are_numbered_by_one_counter() {
 fn restart_pending_is_the_captured_binarys() {
     let cfg = config("restart");
     let exe = std::env::current_exe().expect("the test binary");
-    let same = assemble(&cfg, spool_of(&cfg), binary(&exe));
+    let same = parts_over(&cfg, spool_of(&cfg), binary(&exe));
     assert!(!same.restart.restart_pending());
     let cfg = config("restart-other");
-    let other = assemble(&cfg, spool_of(&cfg), binary(Path::new("/nonexistent")));
+    let other = parts_over(&cfg, spool_of(&cfg), binary(Path::new("/nonexistent")));
     assert!(other.restart.restart_pending());
 }
 
@@ -296,65 +294,48 @@ fn a_spool_that_cannot_be_opened_is_an_error_that_names_it() {
     }
 }
 
-/// A configuration for a proxy that keeps its own copies: the status file is its
-/// `releases.json`, in the state directory with the copies.
-fn config_local(name: &str) -> HandoverConfig {
-    let mut cfg = config(name);
-    let local = Local::open(PathBuf::from("/usr/bin/kbf"), &cfg.state_dir).expect("copies");
-    cfg.status_file = cfg.state_dir.join(releases::STATUS);
-    cfg.local = Some(local);
-    cfg
+/// Catches the update API's start-up errors mapped to the wrong exit: a spool or counter the
+/// service user cannot use is the operator's (a usage error, exit 2, which the unit does not
+/// restart); a program that cannot be identified is not (a failure, exit 1). The words are the
+/// API's, with the reason after them.
+///
+/// Mutants it catches: the two arms swapped; the reason dropped from the words.
+#[test]
+fn the_apis_start_up_errors_map_to_usage_and_failure_with_the_reason() {
+    let spool = HandoverError::Orders {
+        dir: PathBuf::from("/o"),
+        source: SpoolError::Counter(io::Error::other("c")),
+    };
+    assert_eq!(
+        AssembleError::from(spool),
+        AssembleError::Usage(
+            "update API: the order spool at /o: the order counter cannot be read or made durable: c"
+                .to_owned()
+        )
+    );
+    let binary = HandoverError::Binary(io::Error::other("proc"));
+    assert_eq!(
+        AssembleError::from(binary),
+        AssembleError::Failed("update API: cannot tell which program is running: proc".to_owned())
+    );
 }
 
-/// Catches seams that open root's order spool for a proxy that keeps its own copies (it owns
-/// no `orders/`, and failing fast on it would keep the proxy down), or an API writer that
-/// writes an order: with a file where `orders/` would be the seams are built, nothing is made
-/// there or in the state directory, the status is the proxy's `releases.json`, and both
-/// orders the API can write are refused with the reason.
-///
-/// Mutants it catches: `parts` opening the spool whatever `local` says; the writer being a
-/// spool; either writer method answering `Ok`.
+/// Catches a start-up line that does not say what the API does: it names the files, the staging
+/// deadline (the fetch limit of 900 s and five minutes) and that a `POST` is refused, and why.
 #[test]
-fn with_copies_no_order_spool_is_opened_and_the_apis_writer_refuses_every_order() {
-    let cfg = config_local("copies-no-spool");
-    fs::write(&cfg.orders_dir, b"a file").expect("a file in the way");
-    let text = format!(r#"{{"installed_commit":"{A}"}}"#);
-    fs::write(&cfg.status_file, text).expect("releases.json");
-
-    let mut seams = parts(&cfg).expect("there is no spool to fail on");
-
-    assert_eq!(fs::read(&cfg.orders_dir).expect("untouched"), b"a file");
-    assert!(!cfg.state_dir.join("orders.json").exists(), "a counter");
-    let status = seams.status.read().expect("the proxy's own file");
-    assert_eq!(status.installed_commit, Some(c(A)));
-    let first = seams.orders.write(Verb::FrontendUpdate, &c(B), 900);
-    let source = kbf_update::Source::Fetch;
-    let second = seams.orders.write_update(&c(B), 900, source);
-    for refused in [first, second] {
-        let err = refused.expect_err("an order is refused");
-        assert!(err.0.contains("there is no order spool"), "{}", err.0);
-    }
-}
-
-/// Catches the binary watch being handed to a proxy that does not keep copies, or handed the
-/// wrong copies: `parts_shared` gives a wiring only with `local`, the wiring is that `local`
-/// (the same binary, the same copies and the same orders, not new ones), and the seams are the
-/// same as `parts` builds.
-///
-/// Mutants it catches: a wiring made whatever `local` says; the wiring over a `Local` opened
-/// again (its orders are not the config's); `parts_shared` leaving the seams unbuilt.
-#[test]
-fn only_a_proxy_with_copies_gets_the_wiring_of_the_binary_watch() {
-    let (seams, none) = parts_shared(&config("no-wiring")).expect("the seams");
-    assert!(none.is_none());
-    assert_eq!(seams.config.window_s, 900);
-
-    let cfg = config_local("wiring");
-    let own = cfg.local.clone().expect("copies");
-    let (seams, some) = parts_shared(&cfg).expect("the seams");
-    let wiring = some.expect("a proxy with copies is watched");
-    assert_eq!(seams.config.window_s, 900);
-    assert_eq!(wiring.local.binary, own.binary);
-    assert!(Arc::ptr_eq(&wiring.local.copies, &own.copies));
-    assert!(Arc::ptr_eq(&wiring.local.orders, &own.orders));
+fn the_start_up_line_says_what_the_update_api_will_do() {
+    let cfg = config("line");
+    let Ok(assembled) = legacy(&cfg) else {
+        panic!("the seams");
+    };
+    assert!(assembled.watch.is_none());
+    assert_eq!(
+        assembled.pending.note(),
+        format!(
+            "update API on (status {}, orders {}, staging deadline 1200 s); \
+             a POST is refused: proxy not bound yet",
+            cfg.status_file.display(),
+            cfg.orders_dir.display()
+        )
+    );
 }

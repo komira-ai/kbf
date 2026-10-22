@@ -65,7 +65,6 @@ fn a_swap_runs_every_phase_in_order_and_retires_the_old_child_last() {
             Phase::Switching,
             Phase::Switched,
             Phase::Baking,
-            Phase::Nodes,
             Phase::Draining,
             Phase::Done
         ]
@@ -77,8 +76,7 @@ fn a_swap_runs_every_phase_in_order_and_retires_the_old_child_last() {
     before(&w, "admin:takeover B", "release_into B");
     before(&w, "release_into B", "admin:stand_down A");
     before(&w, "admin:stand_down A", "order confirm");
-    before(&w, "order confirm", "admin:desired B");
-    before(&w, "admin:desired B", "terminate pid 100");
+    before(&w, "order confirm", "terminate pid 100");
     assert_eq!(w.holders(), vec![Slot::B]);
     assert_eq!(w.count("kill"), 0);
     assert!(!w.alive(100) && w.alive(101));
@@ -323,28 +321,30 @@ fn an_operator_abort_while_the_candidate_starts_kills_it_and_leaves_the_old_chil
     untouched(&w, 100);
 }
 
+/// Catches the retired rollout to the nodes being run: a plan that asks for the nodes (the
+/// standard plan does) is baked, confirmed after the window and drained as one that does not
+/// is, with no `nodes` phase, nothing recorded as posted, and the old child retired straight
+/// after the confirm. The child's port has no call to offer a release to its nodes, so the
+/// swap has nothing to post with.
+///
+/// Mutants it catches: the `nodes` phase entered after the bake; `nodes_posted` set; the
+/// drain waiting on the nodes.
 #[test]
-fn the_bake_confirms_after_the_window_and_posts_desired_only_if_asked() {
-    let (w, old) = World::with_old();
-    let mut p = plan(Mode::Frontend);
-    p.nodes = false;
-    assert_eq!(go(&w, p, old), Ok(Phase::Done));
-    assert!(w.when("order confirm").unwrap() >= secs(300));
-    assert_eq!(w.count("admin:desired"), 0);
-    assert!(!w.phases().contains(&Phase::Nodes));
-}
-
-/// An order for the nodes that never gets an answer ends the update, which is `failed` at
-/// `nodes` (see `nodes_tests`); it does not undo the frontend, which was swapped and confirmed:
-/// the new child serves and the staged release is kept.
-#[test]
-fn a_desired_post_that_never_lands_ends_the_update_but_does_not_undo_the_frontend() {
-    let (w, old) = World::with_old();
-    w.st.borrow_mut().desired_err = true;
-    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Failed));
-    assert!(!w.last_intent().nodes_posted);
-    assert_eq!(w.holders(), vec![Slot::B]);
-    assert_eq!(w.count("order revert"), 0);
+fn the_bake_confirms_after_the_window_and_the_nodes_are_never_told() {
+    for nodes in [true, false] {
+        let (w, old) = World::with_old();
+        let mut p = plan(Mode::Frontend);
+        p.nodes = nodes;
+        assert_eq!(go(&w, p, old), Ok(Phase::Done), "nodes {nodes}");
+        assert!(
+            w.when("order confirm").unwrap() >= secs(300),
+            "nodes {nodes}"
+        );
+        assert!(!w.phases().contains(&Phase::Nodes), "nodes {nodes}");
+        assert!(!w.last_intent().nodes_posted, "nodes {nodes}");
+        assert_eq!(w.last_intent().failure, None, "nodes {nodes}");
+        before(&w, "order confirm", "terminate pid 100");
+    }
 }
 
 #[test]
@@ -367,15 +367,10 @@ fn a_confirm_that_keeps_failing_keeps_the_new_child_serving_and_retires_the_old_
     let gaps: Vec<u64> = times.windows(2).map(|p| p[1] - p[0]).collect();
     assert_eq!(gaps, vec![1, 2, 4, 8, 16]);
     // The new child served: the staged release stays, nothing is stood back up, the
-    // old child is still drained and retired, the nodes are not sent.
+    // old child is still drained and retired.
     assert_eq!(w.count("order revert"), 0, "staged is not dropped");
     assert_eq!(w.count("admin:resume"), 0);
     assert_eq!(w.count("kill"), 0);
-    assert_eq!(
-        w.count("admin:desired"),
-        0,
-        "no nodes under an unconfirmed release"
-    );
     assert!(w.when("terminate pid 100").expect("old retired") >= secs(600));
     assert!(!w.alive(100) && w.alive(101));
     assert_eq!(w.holders(), vec![Slot::B]);
@@ -390,7 +385,6 @@ fn a_confirm_that_fails_twice_then_lands_ends_done_with_no_failure_left() {
     assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Done));
     assert_eq!(w.count("order confirm"), 3);
     assert_eq!(w.last_intent().failure, None, "a landed confirm clears it");
-    assert_eq!(w.count("admin:desired"), 1);
     assert_eq!(w.count("order revert"), 0);
 }
 

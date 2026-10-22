@@ -56,6 +56,19 @@ fn crashed_at(phase: Phase, nodes: bool) -> World {
     w
 }
 
+/// The proxy died in a record at the `nodes` phase. No build writes one now (the rollout to the
+/// nodes is retired), so it is the record of the drain with the phase an older build left in
+/// its place: the confirm has landed, and the nodes were being told.
+fn crashed_at_nodes() -> World {
+    let w = crashed_at(Phase::Draining, true);
+    w.records
+        .borrow_mut()
+        .last_mut()
+        .expect("a record was written")
+        .phase = Phase::Nodes;
+    w
+}
+
 /// The proxy died right after the root's confirm landed, before `update.json` knew.
 fn crashed_after_confirm(nodes: bool) -> World {
     let (w, old) = World::with_old();
@@ -84,8 +97,9 @@ fn assert_post_confirm_restart(w: &World, end: Result<Phase, Halt>) {
 #[test]
 fn at_phase_nodes_the_confirm_has_landed_and_a_dead_new_child_is_started_again() {
     // Defect: the boundary moved off `nodes` (a `confirmed` that needs `draining`) and a
-    // crash in `nodes` rolled back although the root's `current` names the new release.
-    let w = crashed_at(Phase::Nodes, true);
+    // record at `nodes`, left by an older build, rolled back although the root's `current`
+    // names the new release.
+    let w = crashed_at_nodes();
     assert_eq!(w.st.borrow().installed, Some(c(B)), "the root confirmed");
     w.kill_pid(101);
     w.busy(Slot::A, 1, Some(secs(900)));
@@ -116,8 +130,9 @@ fn at_phase_baking_the_confirm_has_not_landed_and_a_dead_new_child_rolls_back() 
 
 #[test]
 fn a_confirm_that_landed_before_update_json_recorded_it_is_not_rolled_back_with_nodes() {
-    // Defect: phase still `baking` (the `nodes` record comes after the confirm) was read
-    // as before the confirm, so the restart rolled back while `current` names the new one.
+    // Defect: phase still `baking` (the next record, the drain's, comes after the confirm)
+    // was read as before the confirm, so the restart rolled back while `current` names the
+    // new one. The plan asks for the nodes, which changes nothing.
     let w = crashed_after_confirm(true);
     assert_eq!(w.last_intent().phase, Phase::Baking);
     assert_eq!(w.st.borrow().installed, Some(c(B)));
@@ -125,11 +140,6 @@ fn a_confirm_that_landed_before_update_json_recorded_it_is_not_rolled_back_with_
     w.busy(Slot::A, 1, Some(secs(900)));
     let (end, notes) = restart(&w);
     assert_post_confirm_restart(&w, end);
-    assert_eq!(
-        w.count("admin:desired"),
-        1,
-        "the nodes are sent after a confirm that update.json missed"
-    );
     assert!(
         notes.iter().any(|n| n.contains("the root wins")),
         "the disagreement is recorded: {notes:?}"
@@ -138,15 +148,14 @@ fn a_confirm_that_landed_before_update_json_recorded_it_is_not_rolled_back_with_
 
 #[test]
 fn a_confirm_that_landed_before_the_drain_was_recorded_is_not_rolled_back_without_nodes() {
-    // Defect: with `nodes` false the phase goes `baking` -> `draining`, and a crash in
-    // between was treated as before the confirm.
+    // Defect: the phase goes `baking` -> `draining`, and a crash in between was treated as
+    // before the confirm.
     let w = crashed_after_confirm(false);
     assert_eq!(w.last_intent().phase, Phase::Baking);
     w.kill_pid(101);
     w.busy(Slot::A, 1, Some(secs(900)));
     let (end, notes) = restart(&w);
     assert_post_confirm_restart(&w, end);
-    assert_eq!(w.count("admin:desired"), 0, "this update sends no nodes");
     assert!(notes.iter().any(|n| n.contains("the root wins")));
 }
 
@@ -203,8 +212,12 @@ fn update_json_saying_confirmed_while_the_root_says_not_rolls_back() {
 fn an_unreadable_root_ends_failed_at_restart_and_touches_no_child() {
     // Defect: a guess. Whichever way the restart guessed, a wrong one resumes the old
     // release over a confirmed one or starts the new one over an unconfirmed one.
-    for phase in [Phase::Baking, Phase::Nodes, Phase::Draining] {
-        let w = crashed_at(phase, true);
+    let worlds = [
+        (Phase::Baking, crashed_at(Phase::Baking, true)),
+        (Phase::Nodes, crashed_at_nodes()),
+        (Phase::Draining, crashed_at(Phase::Draining, true)),
+    ];
+    for (phase, w) in worlds {
         w.st.borrow_mut().installed_err = true;
         w.kill_pid(101);
         let (end, _) = restart(&w);

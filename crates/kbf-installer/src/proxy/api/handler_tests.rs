@@ -54,7 +54,7 @@ fn call(method: &str, path: &str, body: &Value) -> HandlerRequest {
 }
 
 fn post_body(commit: &str, request_id: &str) -> Value {
-    json!({"commit": commit, "request_id": request_id, "nodes": true, "rollback": false})
+    json!({"commit": commit, "request_id": request_id, "nodes": false, "rollback": false})
 }
 
 fn json_of(reply: &HandlerReply) -> Value {

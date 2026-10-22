@@ -82,7 +82,6 @@ fn the_start_with_copies_runs_the_copy_of_the_installed_release_and_migrates_it_
         state_dir: state_dir.clone(),
         proxy_auth_file: config.proxy_auth_file.clone(),
         upstream: config.upstream,
-        operator_token_file: config.operator_token_file.clone(),
         status: state_dir.join(releases::STATUS),
         local: Some(local),
         watch: None,
@@ -207,31 +206,11 @@ fn check_refuses_a_kbf_binary_that_is_not_an_absolute_path() {
     );
 }
 
-/// Catches the start-up line claiming an order spool a proxy with its own copies does not have.
-///
-/// Mutants it catches: the line printing the spool directory whatever `local` says; the line
-/// leaving out that the proxy keeps its own copies.
-#[test]
-fn the_start_up_line_says_there_is_no_order_spool_with_the_proxys_own_copies() {
-    let mut cfg = handover("line-local");
-    let binary = PathBuf::from("/usr/bin/kbf");
-    cfg.local = Some(Local::open(binary, &cfg.state_dir).expect("copies"));
-    let parts = handover::parts(&cfg).expect("the seams");
-    assert_eq!(
-        update_line(&parts, &cfg),
-        format!(
-            "update API on (status {}, orders none, the proxy keeps its own copies, \
-             staging deadline 1200 s); a POST is refused: proxy not bound yet",
-            cfg.status_file.display()
-        )
-    );
-}
-
 /// Catches a proxy with its own copies that still opens root's order spool and fails fast on
 /// it: with a file where `orders/` would be, the seams are built and the start fails only at
 /// the bind (a failure, not the usage error of a spool the service user cannot use).
 ///
-/// Mutant it catches: `parts` opening the spool whatever `local` says.
+/// Mutant it catches: the update API's seams built whatever `local` says.
 #[test]
 fn a_proxy_with_its_own_copies_opens_no_order_spool() {
     let loaded = load(&file("cp-spool", PROXY.as_bytes())).expect("valid");

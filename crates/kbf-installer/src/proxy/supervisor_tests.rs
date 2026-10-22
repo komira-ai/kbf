@@ -273,15 +273,6 @@ impl ChildAdmin for ScriptAdmin<'_> {
     fn open_counts(&self, _: Slot) -> Result<crate::proxy::model::OpenCounts, PortError> {
         unreachable!("the boot never counts")
     }
-
-    fn post_desired(
-        &self,
-        _: Slot,
-        _: &CommitId,
-        _: kbf_update::Source,
-    ) -> Result<(), crate::proxy::model::DesiredError> {
-        unreachable!("the boot never posts a desired release")
-    }
 }
 
 /// Time that moves only when the boot sleeps, plus a real millisecond so a process that
@@ -392,7 +383,7 @@ fn verify(rig: &crate::proxy::child_rig::Rig, commit: &str) {
         .child
         .layout
         .join(&rig.child.layout.release_dir(&c(commit)));
-    std::fs::write(dir.join(crate::stage::VERIFIED), format!("{commit}\n")).expect("VERIFIED");
+    std::fs::write(dir.join(crate::layout::VERIFIED), format!("{commit}\n")).expect("VERIFIED");
 }
 
 fn reasons(env: &Env<'_>) -> Vec<&'static str> {
@@ -843,48 +834,45 @@ fn serve_once(listener: TcpListener) -> std::thread::JoinHandle<String> {
     })
 }
 
-/// Catches an admin client wired to the wrong place: the desired-release offer of each slot goes
-/// to that slot's operator port, with the proxy's secret and the operator token read from the
-/// file at the call (a missing file is the error of the token, not of the network).
+/// Catches an admin client wired to the wrong place: the admin calls of each slot go to that
+/// slot's admin port with the proxy's secret, and the readiness read to its operator port.
+///
+/// Mutants it catches: the slot ignored (every call to slot A's ports); the two ports of a slot
+/// swapped; the secret left off an admin call.
 #[test]
-fn the_child_admin_offers_a_release_to_the_operator_port_of_its_slot() {
-    use crate::proxy::admin::AdminError;
+fn the_child_admin_reaches_the_ports_of_its_slot() {
     let (gate, _runner) = gate();
-    let token_file = kbf_host::testkit::scratch("supervisor-child-admin").join("operator.token");
-    let offset = UpstreamTable { base_port: 0 }.port(kbf_proxy::slot::Slot::A, Target::Operator);
-    let stride =
-        UpstreamTable { base_port: 0 }.port(kbf_proxy::slot::Slot::B, Target::Operator) - offset;
-
-    let table = UpstreamTable { base_port: 20_000 };
-    let missing = child_admin(&gate.handle, table, token_file.clone()).expect("admin");
-    assert!(
-        matches!(
-            missing.try_post_desired(Slot::A, &c(A)),
-            Err(AdminError::Token(std::io::ErrorKind::NotFound))
-        ),
-        "no token file"
-    );
-
-    std::fs::write(&token_file, "operator-token\n").expect("token");
+    let base = UpstreamTable { base_port: 0 };
+    let admin_offset = base.admin_port(kbf_proxy::slot::Slot::A);
+    let operator_offset = base.port(kbf_proxy::slot::Slot::A, Target::Operator);
+    let stride = base.admin_port(kbf_proxy::slot::Slot::B) - admin_offset;
     for (slot, extra) in [(Slot::A, 0), (Slot::B, stride)] {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let table = UpstreamTable {
-            base_port: port - offset - extra,
+            base_port: port - admin_offset - extra,
         };
-        let admin = child_admin(&gate.handle, table, token_file.clone()).expect("admin");
+        let admin = child_admin(&gate.handle, table).expect("admin");
         let seen = serve_once(listener);
-        admin.try_post_desired(slot, &c(A)).expect("offered");
+        // The fixture's empty answer is not a role view; only the request is looked at.
+        drop(admin.try_role(slot));
         let head = seen.join().expect("fixture");
-        assert!(head.starts_with("POST /v1/update/desired "), "{head}");
-        assert!(
-            head.contains("authorization: Bearer operator-token\r\n"),
-            "{head}"
-        );
+        assert!(head.starts_with("GET /v1/admin/role "), "{head}");
         for (name, value) in gate.handle.admin_headers().iter() {
             let line = format!("{}: {}\r\n", name.as_str(), value.to_str().expect("ASCII"));
             assert!(head.contains(&line), "{line:?} in {head}");
         }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let table = UpstreamTable {
+            base_port: port - operator_offset - extra,
+        };
+        let admin = child_admin(&gate.handle, table).expect("admin");
+        let seen = serve_once(listener);
+        admin.try_ready(slot).expect("ready");
+        let head = seen.join().expect("fixture");
+        assert!(head.starts_with("GET /readyz "), "{head}");
     }
 }
 
@@ -895,7 +883,7 @@ mod migration {
 
     use super::*;
     use crate::fixtures::{FakeRunner, ran, version_json};
-    use crate::proxy::root_orders::StatusFile;
+    use crate::proxy::releases::StatusFile;
 
     const URL: &str = "postgres://kbf_marker_user:hunter2_marker@127.0.0.1:1/kbf_marker_db";
     const SECRETS: [&str; 4] = [

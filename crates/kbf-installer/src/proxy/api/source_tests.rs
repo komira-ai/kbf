@@ -282,9 +282,9 @@ fn a_request_id_reused_with_another_source_is_refused_and_with_the_same_one_is_a
 }
 
 /// Catches a retry judged by what it asks for before it is judged by its id: a request id used
-/// for an update that fetches and takes the nodes, asked again with source `staged` and the
-/// nodes, is a request id reused (409 `request_id_reused`, exit 1 in the CLI), not a staged
-/// update that cannot take nodes (409 `source_refused`, exit 3).
+/// for an update that fetches, asked again with source `staged` and the nodes, is a request id
+/// reused (409 `request_id_reused`, exit 1 in the CLI), not a staged update that cannot take
+/// nodes (409 `source_refused`, exit 3).
 ///
 /// Mutant planted: the source and nodes check run before the request map is looked up.
 #[test]
@@ -292,11 +292,7 @@ fn a_retry_with_another_source_and_nodes_is_a_reused_id_before_it_is_a_refused_s
     let rig = Rig::new("pr5a-reuse-nodes");
     rig.set_status(host(Some(B), None));
     let mut core = rig.core();
-    let first = UpdateRequest {
-        nodes: true,
-        ..fetch_req(B, "r1")
-    };
-    accepted(core.post(first));
+    accepted(core.post(fetch_req(B, "r1")));
     let again = UpdateRequest {
         nodes: true,
         ..staged_req(B, "r1")

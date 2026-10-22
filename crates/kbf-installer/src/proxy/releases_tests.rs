@@ -17,8 +17,7 @@ use sha2::{Digest, Sha256};
 
 use super::model::{Locator, Source, StagedFacts, Verb};
 use super::ports::{RootOrders, StatusFacts};
-use super::releases::{Copies, CopyError, Local, LocalOrders, RELEASES, STATUS};
-use super::root_orders::StatusFile;
+use super::releases::{Copies, CopyError, Local, LocalOrders, RELEASES, STATUS, StatusFile};
 use crate::CommitId;
 use crate::fixtures::{FakeRunner, ran, scratch_dir, version_json, version_json_full};
 use crate::testkit::{A, B, C, c};

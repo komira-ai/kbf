@@ -224,7 +224,7 @@ fn a_restarted_process_hands_over_what_the_first_one_waited_for() {
     );
     assert_eq!(
         (spec.nodes, spec.rollback, spec.order.order_id),
-        (true, false, 101)
+        (false, false, 101)
     );
     assert_eq!(written(&rig).len(), 1);
 }

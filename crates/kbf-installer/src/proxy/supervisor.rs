@@ -45,8 +45,7 @@ use super::migrator::{DbMigrator, installed_schema};
 use super::model::{PortError, ProcIdent, RoleState, Slot, Start, Timing};
 use super::ports::{Child as _, ChildAdmin, Clock, Migrator, StatusFacts};
 use super::record::FileRecorder;
-use super::releases::Local;
-use super::root_orders::installed_commit;
+use super::releases::{Local, installed_commit};
 use crate::CommitId;
 use crate::database::Database;
 use crate::layout::Layout;
@@ -128,16 +127,11 @@ pub fn frontend_argv(proxy_auth_file: &Path, table: UpstreamTable) -> Argv {
 }
 
 /// The admin and operator calls on the frontend children, at the loopback ports `table` gives
-/// each slot, carrying the proxy's secret. `token_file` is the operator token, read on every
-/// `post_desired` (the boot calls none).
+/// each slot, carrying the proxy's secret.
 ///
 /// # Errors
 /// The proxy's secret is not a legal header value (never, for the 64 hex digits it is).
-pub fn child_admin(
-    handle: &kbf_proxy::ProxyHandle,
-    table: UpstreamTable,
-    token_file: PathBuf,
-) -> Result<Admin, String> {
+pub fn child_admin(handle: &kbf_proxy::ProxyHandle, table: UpstreamTable) -> Result<Admin, String> {
     let loopback = |port: u16| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let admin_headers = handle.admin_headers();
     let pairs: Vec<(&str, &[u8])> = admin_headers
@@ -149,7 +143,6 @@ pub fn child_admin(
             move |slot| loopback(table.admin_port(gate_slot(slot))),
             move |slot| loopback(table.port(gate_slot(slot), Target::Operator)),
             secret,
-            move || std::fs::read(&token_file),
             Deadlines::frontend(),
         )
     })

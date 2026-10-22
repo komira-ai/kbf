@@ -10,8 +10,7 @@ use super::*;
 use crate::fixtures::{FakeRunner, ran, version_json_full};
 use crate::proxy::child_real::Recorded;
 use crate::proxy::child_rig::{Rig, rig};
-use crate::proxy::releases::Local;
-use crate::proxy::root_orders::StatusFile;
+use crate::proxy::releases::{Local, StatusFile};
 use crate::testkit::{A, B, c};
 
 /// The package's kbf (some bytes), what `Local` makes of it, and a runner that says it is a

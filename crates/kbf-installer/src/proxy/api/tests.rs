@@ -9,7 +9,7 @@ use hyper::StatusCode;
 use super::core::{ApiError, Core, Crash, CrashHook, CrashPoint, Fault, NoCrash, Reply};
 use super::fakes::{COMMIT_C, Rig, facts, idle, req, staged};
 use super::idempotency::Idempotency;
-use super::model::{OldChild, RollbackBlocked, StatusBody, UpdateId, abortable};
+use super::model::{OldChild, RollbackBlocked, StatusBody, UpdateId, UpdateRequest, abortable};
 use super::refusal;
 use super::traits::{
     Compat, CompatGate, InstallerState, InstallerStatus, JsonFileStatus, StatusReader, StubGate,
@@ -112,6 +112,38 @@ fn a_supervisor_that_cannot_start_refuses_the_post_before_anything_is_saved_or_w
     assert_eq!(written(&rig).len(), 1);
 }
 
+/// Catches the retired rollout to the nodes being accepted: a request that asks for the nodes is
+/// refused with a 400 `nodes_retired` before the request id is saved, an order written or the
+/// supervisor asked, and the same id is still free for the frontend-only request.
+///
+/// Mutants it catches: the refusal dropped (the request is accepted); the refusal made after the
+/// request id is saved (the retry is a reused id) or the order written.
+#[test]
+fn a_request_for_the_nodes_is_refused_and_nothing_is_saved_or_written() {
+    let rig = Rig::new("u8a-nodes-retired");
+    let mut core = rig.core();
+    let asks = UpdateRequest {
+        nodes: true,
+        ..req(B, "r1")
+    };
+
+    let e = refused(core.post(asks));
+
+    assert_eq!(
+        (e.status, e.code),
+        (StatusCode::BAD_REQUEST, "nodes_retired")
+    );
+    assert!(e.message.contains("nodes: false"), "{}", e.message);
+    assert!(written(&rig).is_empty(), "an order was written");
+    assert!(
+        Idempotency::open(&rig.dir).get("r1").is_none(),
+        "the request id was saved"
+    );
+    assert_eq!(rig.sup.starts(), 0);
+    let (_, phase) = accepted(core.post(req(B, "r1")));
+    assert_eq!(phase, Phase::Accepted);
+}
+
 #[test]
 fn same_request_id_returns_the_same_update_without_a_second_order() {
     let rig = Rig::new("u8a-idem");
@@ -134,7 +166,7 @@ fn a_request_id_reused_for_another_request_is_refused() {
         (StatusCode::CONFLICT, "request_id_reused")
     );
     let mut other = req(B, "r1");
-    other.nodes = false;
+    other.nodes = true;
     assert_eq!(refused(core.post(other)).code, "request_id_reused");
 }
 
@@ -377,7 +409,7 @@ fn staging_follows_status_json_to_a_handover() {
     assert_eq!((spec.update_id, spec.to, spec.from), (id, c(B), Some(c(A))));
     assert_eq!(
         (spec.nodes, spec.rollback, spec.facts),
-        (true, false, facts())
+        (false, false, facts())
     );
     assert_eq!(spec.request_id, "r1", "the swap records the caller's key");
     assert_eq!(spec.order.order_id, 101);

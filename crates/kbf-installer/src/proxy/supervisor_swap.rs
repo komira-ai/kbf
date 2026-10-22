@@ -1,12 +1,12 @@
-//! The handover driver: the real [`Supervisor`] of the update API, over the swap.
+//! The handover driver: the real [`Supervisor`], over the swap.
 //!
 //! # The seam
 //!
 //! [`SwapSupervisor::new`] is the one constructor the proxy verb calls to put a real swap
-//! behind `POST /v1/update/frontend` in place of a supervisor that refuses. It takes the
+//! behind whatever starts one (the binary watch, or the update API's `POST
+//! /v1/update/frontend`) in place of a supervisor that refuses. It takes the
 //! ports of the swap ([`Parts`]: the children, the admin client, the proxy's gate, the
-//! migrator, the recorder, the root half's orders, the clock) and a [`Config`]; it keeps
-//! the [`Supervisor`] trait of the API unchanged.
+//! migrator, the recorder, the root half's orders, the clock) and a [`Config`].
 //!
 //! Which port is which, on a host:
 //! - `child`: [`super::child_real::ProcChild`];
@@ -15,8 +15,9 @@
 //! - `migrator`: [`super::migrator::DbMigrator`] (the handover driver wraps it as
 //!   `StateDbMigrator`); [`ExpandOnlyDefault`] is the one that migrates nothing, for a test;
 //! - `recorder`: [`super::record::FileRecorder`] over the proxy's state directory;
-//! - `orders`: [`super::root_orders::SpoolRootOrders`] over the order spool the API writes
-//!   with, so the `confirm` and `revert` the swap sends take the same counter;
+//! - `orders`: the swap's [`RootOrders`]: [`super::releases::LocalOrders`] of the proxy's own
+//!   copies, or, for the update API's path, the order spool it writes with, so that the
+//!   `confirm` and `revert` the swap sends take the same counter;
 //! - `clock`: [`super::runtime::SystemClock`].
 //!
 //! # What it does
@@ -78,7 +79,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use super::api::traits::{Retired, Supervisor, SupervisorError, SupervisorStatus, UpdateSpec};
+use super::kinds::{Retired, Supervisor, SupervisorError, SupervisorStatus, UpdateSpec};
 use super::model::{
     Failure, Halt, Intent, Mode, Phase, Plan, ProcIdent, Request, Slot, Step, Timing,
 };

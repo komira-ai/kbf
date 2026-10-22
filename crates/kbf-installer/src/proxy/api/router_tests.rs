@@ -70,7 +70,7 @@ fn parse(resp: &Response<Bytes>) -> Value {
 }
 
 fn post_body(commit: &str, request_id: &str) -> Value {
-    json!({"commit": commit, "request_id": request_id, "nodes": true, "rollback": false})
+    json!({"commit": commit, "request_id": request_id, "nodes": false, "rollback": false})
 }
 
 const U: &str = "/v1/update/frontend";
@@ -87,21 +87,42 @@ async fn post_answers_202_with_the_update_id_and_the_same_one_for_a_retry() {
     assert_eq!(h.rig.orders.written.lock().unwrap().len(), 1);
 }
 
+/// Catches the retired rollout to the nodes being taken: a body that leaves `nodes` to its
+/// default (`true`) or asks for it is refused with a 400 whose code is `nodes_retired` and whose
+/// words name the key to change, and it writes no order and starts nothing; the same body with
+/// `"nodes": false` is taken, and `rollback` still defaults to false.
+///
+/// Mutants it catches: the refusal dropped (the request is accepted with a 202); the refusal
+/// answered with another status or code; the refusal made after the order is written.
 #[tokio::test]
-async fn post_defaults_are_nodes_true_and_rollback_false() {
+async fn a_post_that_asks_for_the_nodes_is_refused_and_one_that_does_not_is_taken() {
     let h = harness("u8a-r-defaults", quick());
+    for body in [
+        json!({"commit": B, "request_id": "r1"}),
+        json!({"commit": B, "request_id": "r1", "nodes": true}),
+    ] {
+        let (status, answer) = send(&h, Method::POST, U, body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(answer["error"], "nodes_retired", "{body}");
+        let message = answer["message"].as_str().unwrap_or_default();
+        assert!(message.contains("nodes: false"), "{message}");
+    }
+    assert!(h.rig.orders.written.lock().unwrap().is_empty());
+    assert_eq!(h.rig.sup.starts(), 0);
+
     let (status, _) = send(
         &h,
         Method::POST,
         U,
-        json!({"commit": B, "request_id": "r1"}),
+        json!({"commit": B, "request_id": "r1", "nodes": false}),
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     h.rig.set_status(staged(B));
     send(&h, Method::GET, U, Value::Null).await;
     let spec = h.rig.sup.0.lock().unwrap().starts[0].clone();
-    assert!(spec.nodes && !spec.rollback);
+    assert!(!spec.nodes);
+    assert!(!spec.rollback);
 }
 
 #[tokio::test]

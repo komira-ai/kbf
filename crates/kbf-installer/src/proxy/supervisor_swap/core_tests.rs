@@ -140,7 +140,7 @@ fn request() -> UpdateRequest {
     UpdateRequest {
         commit: c(B),
         request_id: "req-1".into(),
-        nodes: true,
+        nodes: false,
         rollback: false,
         source: Source::Fetch,
     }

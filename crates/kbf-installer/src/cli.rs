@@ -419,8 +419,8 @@ pub struct ProxyArgs {
     /// a verified copy of each kbf it runs in `releases` of its state directory, starts its
     /// children only from those copies, and keeps its installed and staged releases in
     /// `releases.json` there: root's `status.json` and order spool are not used (`--update-dir`
-    /// and `--orders-dir` are ignored) and the update API orders nothing. Without it the proxy
-    /// works as before.
+    /// and `--orders-dir` are ignored) and the update API is not served (its route answers
+    /// 410). Without it the proxy works as before.
     #[arg(long)]
     pub kbf_binary: Option<std::path::PathBuf>,
 }

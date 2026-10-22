@@ -51,13 +51,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::migrator::probe_version;
 use super::model::{Locator, PortError, StagedFacts};
 use super::ports::{RootOrders, StatusFacts};
-use super::root_orders::StatusFile;
 use crate::CommitId;
 use crate::layout::{RELEASE_BINARY, VERIFIED};
 use crate::run::Runner;
@@ -341,6 +340,122 @@ fn put(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
+}
+
+/// The most bytes of a status file that are read. The writer's file is a few hundred bytes;
+/// the cap keeps a file that grew without bound from being pulled into memory.
+pub const MAX_STATUS: u64 = 64 * 1024;
+
+/// `staged{}` as a status file carries it: the facts, not the commit (that is `staged_commit`,
+/// beside it). [`StatusWire::staged_facts`] joins the two.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct StagedWire {
+    pub protocol: u32,
+    pub min_protocol: u32,
+    pub state_schema: u32,
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+/// The fields of a status file that the swap and the cold start read. Unknown fields are
+/// ignored: the writer may add fields (the root half's `status.json` has many).
+#[derive(Deserialize)]
+struct StatusWire {
+    #[serde(default)]
+    installed_commit: Option<CommitId>,
+    #[serde(default)]
+    staged_commit: Option<CommitId>,
+    #[serde(default)]
+    staged: Option<StagedWire>,
+}
+
+impl StatusWire {
+    /// `staged{}` joined with `staged_commit`; `None` when either half is absent, because the
+    /// facts are the writer's word that a release was copied, verified and probed.
+    fn staged_facts(&self) -> Option<StagedFacts> {
+        let (commit, wire) = (self.staged_commit.as_ref()?, self.staged.as_ref()?);
+        Some(StagedFacts {
+            commit: commit.clone(),
+            protocol: wire.protocol,
+            min_protocol: wire.min_protocol,
+            state_schema: wire.state_schema,
+            profile: wire.profile.clone(),
+        })
+    }
+}
+
+/// The facts of a status file and nothing else: what the proxy's start reads before any order
+/// spool exists. The file is read whole on every call, never cached: the swap asks precisely
+/// because the answer may have changed (`installed` after a `confirm`). It is replaced by a
+/// rename, so a read sees one complete version. A missing file is nothing staged and nothing
+/// installed (no writer has written yet); one over [`MAX_STATUS`] bytes, one that cannot be
+/// read and one that does not parse is a [`PortError`]: a guess about what the writer said
+/// could confirm the wrong commit.
+pub struct StatusFile {
+    status: PathBuf,
+}
+
+impl StatusFile {
+    /// The facts of the status file at `status`.
+    #[must_use]
+    pub fn new(status: impl Into<PathBuf>) -> StatusFile {
+        StatusFile {
+            status: status.into(),
+        }
+    }
+}
+
+impl StatusFacts for StatusFile {
+    fn staged(&self) -> Result<Option<StagedFacts>, PortError> {
+        staged_facts(&self.status)
+    }
+
+    fn installed(&self) -> Result<Option<CommitId>, PortError> {
+        installed_commit(&self.status)
+    }
+}
+
+/// The `staged{}` facts of the status file at `path`, joined with `staged_commit`.
+///
+/// # Errors
+/// As [`installed_commit`].
+pub fn staged_facts(path: &Path) -> Result<Option<StagedFacts>, PortError> {
+    Ok(read_status(path)?.and_then(|status| status.staged_facts()))
+}
+
+/// `installed_commit` of the status file at `path`: the release that is running. The proxy's
+/// cold start reads it with no order port.
+///
+/// # Errors
+/// The file cannot be read, is over [`MAX_STATUS`] bytes, or does not parse.
+pub fn installed_commit(path: &Path) -> Result<Option<CommitId>, PortError> {
+    Ok(read_status(path)?.and_then(|status| status.installed_commit))
+}
+
+/// The status file at `path`, whole; `None` when there is no file.
+fn read_status(path: &Path) -> Result<Option<StatusWire>, PortError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(path, &e)),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_STATUS + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| unreadable(path, &e))?;
+    if bytes.len() as u64 > MAX_STATUS {
+        return Err(PortError(format!(
+            "{} is over {MAX_STATUS} bytes",
+            path.display()
+        )));
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| PortError(format!("{} does not parse: {e}", path.display())))
+}
+
+fn unreadable(path: &Path, e: &io::Error) -> PortError {
+    PortError(format!("cannot read {}: {e}", path.display()))
 }
 
 /// The [`RootOrders`] of a proxy that stages its own copies: a status file of its own, written

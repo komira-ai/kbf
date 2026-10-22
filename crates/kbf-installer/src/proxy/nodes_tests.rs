@@ -1,136 +1,114 @@
-//! Step 9 of the swap, the order for the nodes: the source it names, when it is sent again,
-//! and what a refusal of it does to the update. Against the fakes of [`super::fakes`].
+//! Step 9 of the swap, the order for the nodes, is retired: no call is made for the nodes and
+//! no `nodes` phase is entered. What is left is the reading of an `update.json` that an older
+//! build wrote, which may be at that phase or may have failed at that step. Against the fakes of
+//! [`super::fakes`].
 
 use super::fakes::*;
 use super::model::*;
-use super::swap::Swap;
-use crate::testkit::B;
+use super::record::FileRecorder;
+use super::recover_tests::{crash_when, draining_world, failed_at, restart, run_to_crash};
+use crate::testkit::{A, B};
 
-fn go(w: &World, plan: Plan, old: ProcIdent) -> Result<Phase, Halt> {
-    Swap::begin(w.ports(), plan, Some(old))?.run()
-}
-
-/// The plan of an update whose release came from the host's package.
-fn staged_plan() -> Plan {
-    Plan {
-        source: Source::Staged,
-        ..plan(Mode::Frontend)
+/// An update stopped after the confirm landed (the drain was about to start), and its record
+/// rewritten the way a build that told the nodes would have left it: at the `nodes` phase, with
+/// `failure` as that build recorded it.
+fn left_at_nodes_by_an_older_build(failure: Option<Failure>) -> World {
+    let (w, old) = draining_world();
+    crash_when(&w, |i| i.phase == Phase::Draining);
+    run_to_crash(&w, Mode::Frontend, old);
+    {
+        let mut records = w.records.borrow_mut();
+        let last = records.last_mut().expect("a record was written");
+        last.phase = Phase::Nodes;
+        last.failure = failure;
     }
+    w
 }
 
-/// A world where the old child drains late, so that the end of the update is well after the
-/// order for the nodes.
-fn draining_world() -> (World, ProcIdent) {
-    let (w, old) = World::with_old();
-    w.permits(Slot::A, 3, Some(secs(400)));
-    w.busy(Slot::A, 2, Some(secs(500)));
-    w.sessions(Slot::A, 1, Some(secs(600)));
-    (w, old)
-}
-
-/// The log's lines for the order for the nodes.
-fn desired(w: &World) -> Vec<String> {
-    w.log()
-        .into_iter()
-        .filter(|line| line.starts_with("admin:desired"))
+/// The phases the records written after the first `written` ones are at.
+fn phases_after(w: &World, written: usize) -> Vec<Phase> {
+    w.records.borrow()[written..]
+        .iter()
+        .map(|record| record.phase)
         .collect()
 }
 
-/// Catches a source that stops at the plan: the order for the nodes names the source of the
-/// update when it is not a fetch, and is the event it has always been when it is. The intent
-/// (`update.json`) keeps the source too, because the order is sent again after a restart.
+/// Catches a record at the `nodes` phase, which a build that told the nodes left when it died
+/// there, being refused, being run again from an earlier phase, or being waited on: the
+/// confirm has landed, so the restart goes straight to the drain, enters no phase for the nodes
+/// and ends the update `done` once the old child is idle and retired.
 ///
-/// Mutants planted: the order sent with source `fetch` whatever the plan says; the intent
-/// built with source `fetch`; the plan of a restart built with source `fetch`.
+/// Mutants it catches: the `nodes` phase entered again; a restart that does nothing for a record
+/// at `nodes`; the drain waiting for the nodes to be told.
 #[test]
-fn the_order_for_the_nodes_names_the_source_of_the_update_and_the_intent_keeps_it() {
-    let (w, old) = World::with_old();
-    assert_eq!(go(&w, staged_plan(), old), Ok(Phase::Done));
-    let want = format!("admin:desired B {} staged", &B[..4]);
-    assert_eq!(desired(&w), [want]);
-    let intent = w.last_intent();
-    assert_eq!(intent.source, Source::Staged);
-    let resumed = Plan::resumed(&intent, Timing::frontend());
-    assert_eq!(resumed.source, Source::Staged);
-
-    let (w, old) = World::with_old();
-    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Done));
-    let want = format!("admin:desired B {}", &B[..4]);
-    assert_eq!(desired(&w), [want]);
-    assert_eq!(w.last_intent().source, Source::Fetch);
-}
-
-/// Catches an order for the nodes that a child refused for good being taken for a success:
-/// the update would end `done` with the nodes never told, and the operator would be told the
-/// release was rolled out. The refusal is recorded with the child's code, is not sent again,
-/// and ends the update `failed` at `nodes`. The frontend itself was swapped, and stays so: the
-/// staged release is kept, the new child serves, and the old one is drained and retired as in
-/// any update.
-///
-/// Mutants planted: the refusal noted and the update `done`; the refusal sent again; the
-/// failure recorded as step `confirm`.
-#[test]
-fn a_refusal_of_the_order_for_the_nodes_ends_the_update_failed_at_nodes() {
-    let (w, old) = draining_world();
-    w.st.borrow_mut().desired_refused = Some("not_own".to_owned());
-    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Failed));
-    let f = w.last_intent().failure.expect("the failure is surfaced");
-    assert_eq!(f.step, Step::Nodes);
-    assert!(f.reason.starts_with("not_own: "), "{}", f.reason);
-    let tries = w.count("admin:desired");
-    assert_eq!(tries, 1, "a refusal for good is not repeated");
+fn a_record_at_the_retired_nodes_phase_goes_on_to_the_drain() {
+    let w = left_at_nodes_by_an_older_build(None);
+    let written = w.records.borrow().len();
+    assert_eq!(restart(&w).0, Ok(Phase::Done), "{:#?}", w.log());
+    assert_eq!(phases_after(&w, written), [Phase::Draining, Phase::Done]);
     assert!(!w.last_intent().nodes_posted);
-    assert_eq!(w.count("order revert"), 0, "the staged release is kept");
-    assert_eq!(w.count("admin:resume"), 0);
-    assert_eq!(w.count("kill"), 0);
+    assert_eq!(w.last_intent().failure, None);
     assert!(w.when("terminate pid 100").expect("old retired") >= secs(600));
-    assert!(!w.alive(100));
-    assert!(w.alive(101));
+    assert_eq!(w.count("order revert"), 0);
     assert_eq!(w.holders(), vec![Slot::B]);
-    assert_eq!(w.phases().last(), Some(&Phase::Failed));
-    assert!(w.phases().contains(&Phase::Draining));
 }
 
-/// Catches an order for the nodes that gets no answer being given up on at once, as it was
-/// before: it is sent again, one poll apart, until the child answers, and the update ends as
-/// the plan said it would.
+/// Catches the failure an older build recorded at step `nodes` (the child refused the order for
+/// good, or never answered) being lost at a restart: the new proxy does not send anything, goes
+/// on to drain and retire, and the update ends `failed` at `nodes` as it would have. The frontend
+/// was swapped and stays so: the staged release is kept and the new child serves.
 ///
-/// Mutant planted: one try only (the update ends `done`, the nodes never told).
+/// Mutants it catches: the end of the update ignoring a recorded failure at `nodes` (it ends
+/// `done`); the failure dropped at the restart.
 #[test]
-fn an_order_for_the_nodes_that_gets_no_answer_is_sent_again_until_it_does() {
-    let (w, old) = World::with_old();
-    w.st.borrow_mut().desired_fails = 2;
-    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Done));
-    assert_eq!(w.count("admin:desired"), 3);
-    assert!(w.last_intent().nodes_posted);
-    assert!(w.last_intent().failure.is_none());
-    let times: Vec<u64> =
-        w.st.borrow()
-            .events
-            .iter()
-            .filter(|e| e.1.starts_with("admin:desired"))
-            .map(|e| (e.0 - START).as_secs())
-            .collect();
-    let gaps: Vec<u64> = times.windows(2).map(|p| p[1] - p[0]).collect();
-    assert_eq!(gaps, vec![1, 1], "one poll apart");
+fn a_failure_an_older_build_recorded_at_nodes_still_ends_the_update_failed() {
+    let failure = Failure {
+        step: Step::Nodes,
+        reason: "not_own: refused for good".to_owned(),
+    };
+    let w = left_at_nodes_by_an_older_build(Some(failure));
+    let written = w.records.borrow().len();
+    assert_eq!(restart(&w).0, Ok(Phase::Failed), "{:#?}", w.log());
+    assert_eq!(failed_at(&w), Some(Step::Nodes));
+    assert_eq!(phases_after(&w, written), [Phase::Draining, Phase::Failed]);
+    assert_eq!(w.count("order revert"), 0, "the staged release is kept");
+    assert_eq!(w.count("kill"), 0);
+    assert!(w.when("terminate pid 100").is_some(), "old child retired");
+    assert_eq!(w.holders(), vec![Slot::B]);
 }
 
-/// Catches a child that never answers holding the update for ever: the order is sent again
-/// for `desired_within` and then the update ends `failed` at `nodes` with the reason
-/// `timeout`, the frontend as it is (the new child serves).
+/// Catches an `update.json` of a build that told the nodes no longer parsing: the phase word
+/// `nodes`, the step word `nodes` and the flag `nodes_posted` are all still read, so a proxy
+/// that comes up on such a file resumes the update instead of refusing every start.
 ///
-/// Mutants planted: no bound; the bound counted from the start of the update.
+/// Mutants it catches: the `nodes` variant of the phase or of the step removed.
 #[test]
-fn a_child_that_never_answers_ends_the_update_failed_at_nodes_after_the_bound() {
-    let (w, old) = World::with_old();
-    w.st.borrow_mut().desired_err = true;
-    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Failed));
-    let f = w.last_intent().failure.expect("the failure is surfaced");
-    assert_eq!(f.step, Step::Nodes);
-    assert!(f.reason.starts_with("timeout"), "{}", f.reason);
-    let t = Timing::frontend();
-    let tries = w.count("admin:desired") as u64;
-    assert_eq!(tries, t.desired_within.as_secs() / t.poll.as_secs() + 1);
-    assert_eq!(w.holders(), vec![Slot::B]);
-    assert!(!w.last_intent().nodes_posted);
+fn an_update_json_of_a_build_that_told_the_nodes_is_still_read() {
+    let dir = kbf_host::testkit::scratch("proxy-nodes-record");
+    let text = serde_json::json!({
+        "update_id": "u1",
+        "request_id": "r1",
+        "mode": "frontend",
+        "from": A,
+        "to": B,
+        "nodes": true,
+        "rollback": false,
+        "phase": "nodes",
+        "phase_started": 1_700_000_000_u64,
+        "bake_started": 1_700_000_000_u64,
+        "nodes_posted": true,
+        "old_slot": "a",
+        "new_slot": "b",
+        "old_proc": null,
+        "new_proc": null,
+        "respawned": false,
+        "retire": null,
+        "rolling_back": false,
+        "failure": {"step": "nodes", "reason": "timeout: no answer"},
+    });
+    std::fs::write(dir.join("update.json"), text.to_string()).expect("seed");
+    let intent = FileRecorder::load(&dir).expect("read").expect("present");
+    assert_eq!(intent.phase, Phase::Nodes);
+    assert!(intent.nodes_posted);
+    assert_eq!(intent.failure.map(|f| f.step), Some(Step::Nodes));
 }
