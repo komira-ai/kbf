@@ -1721,6 +1721,19 @@ name = "kbf-estimator"
 version = "0.1.0"
 
 [[package]]
+name = "kbf-estimator-replay"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-server",
+ "kbf-testkit",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "kbf-front"
 version = "0.1.0"
 dependencies = [
