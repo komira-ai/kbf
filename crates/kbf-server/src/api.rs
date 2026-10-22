@@ -252,7 +252,7 @@ struct MemberView {
     weight: u32,
     /// What its registration named; `None` if its row names none or has lapsed.
     protocol: Option<u32>,
-    /// The newest metadata-log machine version its build can raise its log to, as its
+    /// The newest metadata-log machine version its build runs (informational), as its
     /// registration said; `None` if the node says none, its row names none or has lapsed.
     runs_log: Option<u32>,
     /// The machine version its metadata log was at in its newest heartbeat; `None` as for

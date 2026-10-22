@@ -254,8 +254,8 @@ frontend, a daemon opens a worker stream.
 | `state` | `joining` (registered, a write owner, read last), `catching_up`, `active` (a full owner), `draining` (takes no new writes) or `down` (its lease lapsed; kept in the map for the dwell, then it leaves the list) |
 | `weight` | its share of the digests relative to the others |
 | `protocol` | the protocol version in the `RegisterRequest` that wrote the member's row (a heartbeat and a state change keep it; a new registration of the member replaces it). `null` when the row names none, as a row written before this field existed, and for a `down` member: its row expires with its heartbeats, and the version went with it |
-| `runs_log` | the newest metadata-log machine version the node's build can raise its log to, as the `RegisterRequest` that wrote the row said (a heartbeat never replaces it; it fills it only when the row holds none) |
-| `log_version` | the machine version the node's metadata log was at in its newest heartbeat (a registration says it too); it rises when the log is raised |
+| `runs_log` | the newest metadata-log machine version the node's build runs, as the `RegisterRequest` that wrote the row said (a heartbeat never replaces it; it fills it only when the row holds none). Informational: it is frozen at 5 and gates nothing |
+| `log_version` | the machine version the node's metadata log was at in its newest heartbeat (a registration says it too). Informational: no build raises a log any more, so it is the version an earlier build left, and 1 for a new log |
 | `build_commit` | the commit the node's binary was built from, as its registration said (a heartbeat never replaces it; it fills it only when the row holds none): 40 hex digits, or the 12-digit commit when the build did not know the full one, or the text `unknown` when the build had no git checkout; at most 64 bytes are kept |
 | `oldest_protocol` | the least `protocol` among the members whose `protocol` is not `null`; `null` if none is |
 | `protocol_unknown` | how many members have a `null` `protocol`. Never counted in `oldest_protocol`: read the two together, as for [`GET /v1/nodes`](#get-v1nodes) |

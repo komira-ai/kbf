@@ -686,19 +686,13 @@ fn tier_of_server_1(runtime: &Runtime, log: &Log) -> Option<TierId> {
         .expect("a query")
 }
 
-/// Catches (mutant "the batch is encoded in format 1", the group-commit side of the
-/// merge with the machine-version raise: after the raise the tier's `AddTier` is
-/// refused; mutant "a refused command takes the next command's answer" (`and` for
-/// `and_then` where the batch's answers are handed out): before the raise the blob
-/// after the refused `AddTier` is answered with the `AllocEpoch`'s epoch): a batch is
-/// encoded in the format the log has committed when the batch commits. Before the raise
-/// to machine version 2 a write tier command in a batch is refused and the rest of the
-/// batch commits, each caller answered with its own outcome; after the raise the same
-/// command commits in a batch with format-1 commands, and a restart replays both
-/// batches (the version, the tier and the blobs come back). A raise commits alone
-/// under the host's lock, so no batch holds a `MachineVersion` entry.
+/// Asserts that a batch holding a write tier command commits whole on a log that was
+/// never raised, each caller answered with its own outcome (the blobs, the tier and the
+/// epoch, in the order proposed), and that a restart replays the batch: the log is still
+/// at machine version 1, and the tier and the blobs come back. A command needs no raise
+/// to commit, and no batch holds a `MachineVersion` entry.
 #[test]
-fn a_batch_is_encoded_in_the_format_committed_before_it_and_replays() {
+fn a_batch_with_a_tier_command_commits_whole_on_a_log_never_raised() {
     let runtime = runtime();
     let (gate, entered) = Gate::new();
     let inner = FaultFs::new();
@@ -709,61 +703,25 @@ fn a_batch_is_encoded_in_the_format_committed_before_it_and_replays() {
     let (log, epoch) = opened(&runtime, fs);
     let _disarm = Disarm(Arc::clone(&gate));
     let (digest_1, put_1) = blob(epoch, 1);
-    let before = one_batch(
+    let (digest_2, put_2) = blob(epoch, 2);
+    let batch = one_batch(
         &runtime,
         &log,
         (&gate, &entered),
         blob(epoch, 0).1,
-        vec![add_tier(), put_1, Command::AllocEpoch],
+        vec![put_1, add_tier(), Command::AllocEpoch, put_2],
     );
-    match before.as_slice() {
-        [
-            Err(MetaLogError::Unavailable(_)),
-            Ok(Applied::Blob(Ok(_))),
-            Ok(Applied::Epoch(e)),
-        ] if *e > epoch => {}
-        other => panic!("before the raise the batch answered {other:?}"),
-    }
-    assert_eq!(tier_of_server_1(&runtime, &log), None);
-    open_gate(&gate);
-    drop(log);
-
-    let inner = inner.restart();
-    let (gate, entered) = Gate::new();
-    let fs = GateFs {
-        inner: inner.clone(),
-        gate: Arc::clone(&gate),
-    };
-    let log = runtime
-        .block_on(RaftMetaLog::open(fs, Retention::default(), "kbf/", new_id))
-        .expect("reopen after the refused tier command");
-    assert!(matches!(
-        seen(&runtime, &log, digest_1),
-        BlobAnswer::Present { .. }
-    ));
-    log.raise_machine_version(MachineVersion::V2)
-        .expect("a raise");
-    gate.arm();
-    let log = Arc::new(log);
-    let _disarm_raised = Disarm(Arc::clone(&gate));
-    let (digest_2, put_2) = blob(epoch, 2);
-    let (digest_3, put_3) = blob(epoch, 3);
-    let after = one_batch(
-        &runtime,
-        &log,
-        (&gate, &entered),
-        blob(epoch, 4).1,
-        vec![put_2, add_tier(), Command::AllocEpoch, put_3],
-    );
-    match after.as_slice() {
+    match batch.as_slice() {
         [
             Ok(Applied::Blob(Ok(_))),
             Ok(Applied::Tier(Ok(()))),
-            Ok(Applied::Epoch(_)),
+            Ok(Applied::Epoch(e)),
             Ok(Applied::Blob(Ok(_))),
-        ] => {}
-        other => panic!("after the raise the batch answered {other:?}"),
+        ] if *e > epoch => {}
+        other => panic!("the batch answered {other:?}"),
     }
+    assert_eq!(log.machine_version(), MachineVersion::V1);
+    assert_eq!(tier_of_server_1(&runtime, &log), Some(TierId::new(1)));
     open_gate(&gate);
     drop(log);
 
@@ -773,10 +731,10 @@ fn a_batch_is_encoded_in_the_format_committed_before_it_and_replays() {
     };
     let log = runtime
         .block_on(RaftMetaLog::open(fs, Retention::default(), "kbf/", new_id))
-        .expect("reopen after the raised batch");
-    assert_eq!(log.machine_version(), MachineVersion::V2);
+        .expect("reopen after the batch");
+    assert_eq!(log.machine_version(), MachineVersion::V1);
     assert_eq!(tier_of_server_1(&runtime, &log), Some(TierId::new(1)));
-    for digest in [digest_1, digest_2, digest_3] {
+    for digest in [digest_1, digest_2] {
         assert!(
             matches!(seen(&runtime, &log, digest), BlobAnswer::Present { .. }),
             "a committed blob did not replay"

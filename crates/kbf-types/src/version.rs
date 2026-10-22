@@ -59,9 +59,10 @@ pub struct Version {
     /// that predates the field or did not know its full commit (no git checkout).
     #[serde(default)]
     pub commit_full: Option<String>,
-    /// The highest metadata-log machine version the build runs. Going from release N to
-    /// N-1 is reversible only if `meta_log(N) <= meta_log(N-1)`; `None` (a build that
-    /// predates the field) is unknown, and unknown is not reversible.
+    /// The highest metadata-log machine version the build runs. Informational from the
+    /// build that stopped raising logs on: it no longer changes with a release. Going from
+    /// release N to N-1 is reversible only if `meta_log(N) <= meta_log(N-1)`; `None` (a
+    /// build that predates the field) is unknown, and unknown is not reversible.
     #[serde(default)]
     pub meta_log: Option<u64>,
     pub min_protocol: u64,

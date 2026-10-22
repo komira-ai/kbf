@@ -78,16 +78,16 @@ fn the_command_round_trips_with_its_records_in_order() {
     }
 }
 
-/// Asserts that the encoder refuses the command under every format before format 5, and
-/// that the decoder reads its format-5 bytes under those formats as the same command as
-/// under format 5.
+/// Asserts that the encoder writes the command to the same bytes under every format, and
+/// that the decoder reads those bytes as the same command under every format, because
+/// neither depends on the committed format: a log of any format takes it with no raise.
 #[test]
-fn formats_before_five_write_it_not_and_read_it() {
-    for format in [Format::V1, Format::V2, Format::V3, Format::V4] {
-        assert!(enc(format, &reseat(false)).is_err(), "{format:?} wrote it");
-    }
+fn every_format_writes_it_and_reads_it() {
     let bytes = enc(Format::V5, &reseat(false)).expect("encoded");
-    for format in [Format::V1, Format::V2, Format::V3, Format::V4] {
+    for n in 1..=5 {
+        let format = Format::new(n);
+        let wrote = enc(format, &reseat(false));
+        assert_eq!(wrote, Ok(bytes.clone()), "{format:?}");
         assert_eq!(dec(format, &bytes), Ok(reseat(false)), "{format:?}");
     }
 }

@@ -15,7 +15,7 @@
 //! `CatchingUp`, and the first heartbeat after [`CatchUp::finish`] makes it `Active`.
 //!
 //! **What the node runs.** Every call also says the newest metadata-log version the node's
-//! build can raise its log to, the version the log is at now, and the commit the binary was
+//! build runs (informational), the version the log is at now, and the commit the binary was
 //! built from ([`Joiner::with_log`], [`reported_commit`]). The frontend shows them in
 //! `GET /v1/members` and decides nothing on them (`members::NodeFacts`).
 

@@ -228,7 +228,8 @@ message HeartbeatRequest {
   // metadata log sends none of the first two. Information only: no decision of the frontend
   // depends on it yet.
   //
-  // The newest metadata-log machine version this build can raise its log to.
+  // The newest metadata-log machine version this build runs (informational: it is frozen,
+  // and this build raises no log).
   optional uint32 runs_log = 24;
   // The metadata-log machine version the node's log is at now. Changes when the log is
   // raised; every heartbeat carries the current value.

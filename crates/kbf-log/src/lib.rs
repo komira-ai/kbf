@@ -5,15 +5,18 @@
 //! values they carry are in this crate ([`FarmBatch`], [`Report`], [`Takeover`],
 //! [`Checkpoint`], [`MachineVersion`]).
 //!
-//! [`encode`] takes the log's committed [`Format`]: [`Format::V1`]; [`Format::V2`],
-//! which adds the write tier's metadata commands (docs/design/write-path.md, section
-//! 6.5); [`Format::V3`], which adds `EvictObjects`; [`Format::V4`], which adds node
-//! writers (`SetWriter`, and object ids naming a storage node's member and boot) and the
-//! commands of a rebuild of the index; or [`Format::V5`], which adds `ReseatStaged`. Any
-//! other format is refused, and so is a command under a format before the one it joined,
-//! so a binary never writes an encoding the log does not allow. [`decode`] takes a
-//! format only to refuse a number this binary does not know: what it decodes never
-//! depends on it, so every command this binary knows decodes under every format.
+//! [`encode`] and [`decode`] take the log's committed [`Format`]: [`Format::V1`];
+//! [`Format::V2`], which added the write tier's metadata commands
+//! (docs/design/write-path.md, section 6.5); [`Format::V3`], which added `EvictObjects`;
+//! [`Format::V4`], which added node writers (`SetWriter`, and object ids naming a storage
+//! node's member and boot) and the commands of a rebuild of the index; or [`Format::V5`],
+//! which added `ReseatStaged`. Any other format is refused, and that is all either takes
+//! it for: what [`encode`] writes and what [`decode`] reads never depend on it, so every
+//! command this binary knows is written and read under every format. A command is not a
+//! reason to raise a log's format: a binary writes every command it knows to a log of any
+//! format, and a reader that does not know one skips it (below). The formats stay so
+//! that a log which holds a [`MachineVersion`] entry, written by a build that raised its
+//! log, still replays.
 //!
 //! Every format changes additively, and a reader skips what it does not know instead of
 //! refusing it. A later binary may add a field to a message, a command to a `oneof`, or a
@@ -59,9 +62,9 @@ use kbf_proto::kbf::log::v1 as proto;
 use prost::Message;
 use proto::log_command::Command as P;
 
-/// Which entry encodings a log may hold. Committed in the log, raised only by a
-/// committed entry, so every replica encodes an entry under the same format. Decoding
-/// does not depend on it.
+/// Which entry encodings a log was raised to: the format of the highest committed
+/// [`MachineVersion`] entry. Neither encoding nor decoding depends on it, and no binary
+/// of this build raises it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Format(u32);
 
@@ -162,7 +165,8 @@ pub enum LogCommand {
     Takeover(Takeover),
     /// A determinism check.
     Checkpoint(Checkpoint),
-    /// Raises the machine version.
+    /// Raises the machine version. A log written by an earlier build holds these; this
+    /// build writes none outside its tests.
     MachineVersion(MachineVersion),
     /// A command this binary does not know: a `oneof` arm that no message of this binary
     /// names, or an enum value it does not know inside a command it does. The entry's
@@ -176,11 +180,6 @@ pub enum EncodeError {
     /// This binary does not write the format.
     #[error("log format {} is not supported", .0.get())]
     Format(Format),
-    /// The command is not part of the format (a tier command under format 1,
-    /// `EvictObjects` under format 1 or 2, `SetWriter` or a node writer's object before
-    /// format 4).
-    #[error("the command is not part of log format {}", .0.get())]
-    Command(Format),
     /// A digest names a hash function the format has no value for.
     #[error("a digest names a hash function log format 1 cannot encode")]
     DigestFunction,
@@ -250,15 +249,14 @@ pub enum DecodeError {
     SetOrder(&'static str),
 }
 
-/// Encodes `command` under `format`.
+/// Encodes `command` under `format`, which must be one this binary knows and which
+/// nothing else depends on: every command this binary knows encodes under every format it
+/// knows, to the same bytes.
 pub fn encode(format: Format, command: &LogCommand) -> Result<Vec<u8>, EncodeError> {
     if !format.known() {
         return Err(EncodeError::Format(format));
     }
     let command = match command {
-        LogCommand::Meta(c) if !meta::takes(format, c) => {
-            return Err(EncodeError::Command(format));
-        }
         LogCommand::Meta(c) => P::Meta(meta::to_proto(c)?),
         LogCommand::Bootstrap(b) => P::Bootstrap(proto::Bootstrap {
             log_id: b.log_id.get(),

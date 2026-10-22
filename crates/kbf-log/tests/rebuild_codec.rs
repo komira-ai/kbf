@@ -109,25 +109,20 @@ fn rebuild_commands_have_their_golden_bytes() {
     }
 }
 
-/// Asserts that the encoder refuses a rebuild command, or an object of another log,
-/// under every format before format 4, and that the decoder reads the format-4 bytes
-/// under those formats as the same command as under format 4, because decoding does not
-/// depend on the committed format.
+/// Asserts that the encoder writes a rebuild command, or an object of another log, to the
+/// same bytes under every format, and that the decoder reads those bytes as the same
+/// command under every format, because neither depends on the committed format: a log
+/// of any format takes the rebuild with no raise.
 #[test]
-fn rebuild_commands_are_written_from_v4_and_read_under_every_format() {
+fn rebuild_commands_are_written_and_read_under_every_format() {
     for (name, command, hex) in golden() {
         let bytes = hex::decode(&hex).expect("hex");
-        for format in [Format::V1, Format::V2, Format::V3] {
-            assert_eq!(
-                enc(format, &command),
-                Err(EncodeError::Command(format)),
-                "{name} under {format:?}"
-            );
-            assert_eq!(
-                dec(format, &bytes).as_ref(),
-                Ok(&command),
-                "{name} under {format:?}"
-            );
+        for n in 1..=5 {
+            let format = Format::new(n);
+            let wrote = enc(format, &command);
+            assert_eq!(wrote, Ok(bytes.clone()), "{name} under {format:?}");
+            let read = dec(format, &bytes);
+            assert_eq!(read.as_ref(), Ok(&command), "{name} under {format:?}");
         }
     }
 }

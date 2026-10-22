@@ -64,8 +64,7 @@ fn put_blob(epoch: u64) -> Command {
 /// Catches: a new log whose id is not the one drawn, or is not recorded before the
 /// store writes; a record in another form than four exact lines; a log that commits no
 /// `Bootstrap`, or a prefix other than `<root><log id>/`; a log that counts other
-/// voters than its one (the start-up pass raises the machine version itself only in a
-/// single-voter cell).
+/// voters than its one.
 #[tokio::test]
 async fn a_new_log_records_its_id_and_commits_one_bootstrap() {
     let fs = FaultFs::new();
@@ -505,23 +504,19 @@ fn append(fs: &FaultFs, format: Format, command: &LogCommand) -> u64 {
     last.index.0 + 1
 }
 
-/// Catches (docs/design/metadata-snapshots.md section 4, "PR 4 adds the raise"): a raise
-/// the machine does not apply (the write tier's commands stay refused: mutant "the
-/// machine keeps decoding format 1"), a raise committed again when the log is already
-/// there (mutant "commit the entry on every call"), a version lowered by a later call,
-/// and a raise a restart forgets (the format must come from the log, not the process).
-/// Before the raise a tier command is refused without stopping the log. The clock is
-/// paused, so no tick lands between the reads of the applied index.
+/// Asserts that a write tier command commits on a log at machine version 1, with no
+/// raise, and that a raise (the entry an earlier build wrote) is applied as one entry:
+/// the version moves to the one it names, a raise to a version the log is at or past
+/// commits nothing, the version is never lowered, and a restart replays it (the version
+/// comes from the log, not the process). A raise the disk refuses raises nothing. The
+/// clock is paused, so no tick lands between the reads of the applied index.
 #[tokio::test(start_paused = true)]
-async fn raising_the_machine_version_to_2_lets_tier_commands_commit_and_lasts() {
+async fn a_tier_command_commits_with_no_raise_and_a_raise_is_replayed_and_lasts() {
     let fs = FaultFs::new();
     let log = open(&fs, 3).await;
     assert_eq!(log.machine_version(), MachineVersion::V1);
-    let refused = log.commit(add_tier()).await;
-    assert!(
-        matches!(refused, Err(MetaLogError::Unavailable(_))),
-        "{refused:?}"
-    );
+    assert_eq!(log.commit(add_tier()).await, Ok(Applied::Tier(Ok(()))));
+    assert_eq!(log.machine_version(), MachineVersion::V1);
     let before = log.applied_index();
     log.raise_machine_version(MachineVersion::V2)
         .expect("a raise");
@@ -550,31 +545,25 @@ async fn raising_the_machine_version_to_2_lets_tier_commands_commit_and_lasts() 
     assert_eq!(log.machine_version(), MachineVersion::V1);
 }
 
-/// Catches: a binary whose highest machine version stays 2 (mutant `RUNS = V2`), which
-/// could never take `EvictObjects`; and an `EvictObjects` committed into a log below
-/// version 3, which a version-2 replica would refuse. The raise lasts across a restart.
+/// Asserts that `EvictObjects` commits on a log at machine version 1, with no raise, and
+/// on the same log after a raise to 2 and to 3 (the entries an earlier build wrote), and
+/// that the raised version lasts across a restart.
 #[tokio::test(start_paused = true)]
-async fn raising_the_machine_version_to_3_lets_evict_objects_commit_and_lasts() {
+async fn evict_objects_commits_on_a_log_at_any_version() {
     let evict = || Command::EvictObjects {
         objects: [ObjectId::new(Epoch::new(1), 1)].into(),
     };
     let fs = FaultFs::new();
     let log = open(&fs, 6).await;
-    for to in [MachineVersion::V1, MachineVersion::V2] {
+    for to in [MachineVersion::V1, MachineVersion::V2, MachineVersion::V3] {
         log.raise_machine_version(to).expect("a raise");
-        let refused = log.commit(evict()).await;
-        assert!(
-            matches!(refused, Err(MetaLogError::Unavailable(_))),
-            "at {to:?}: {refused:?}"
+        assert_eq!(log.machine_version(), to);
+        assert_eq!(
+            log.commit(evict()).await,
+            Ok(Applied::Evicted(Evicted::default())),
+            "at {to:?}"
         );
     }
-    log.raise_machine_version(MachineVersion::V3)
-        .expect("a raise");
-    assert_eq!(log.machine_version(), MachineVersion::V3);
-    assert_eq!(
-        log.commit(evict()).await,
-        Ok(Applied::Evicted(Evicted::default()))
-    );
     drop(log);
     let log = open(&fs.restart(), 6).await;
     assert_eq!(log.machine_version(), MachineVersion::V3);
@@ -584,12 +573,11 @@ async fn raising_the_machine_version_to_3_lets_evict_objects_commit_and_lasts() 
     );
 }
 
-/// Catches: a binary that does not run machine version 4 (mutant `RUNS = V3`), which
-/// could never register a storage node's writer; and a `SetWriter`, or a put of a node
-/// writer's object, committed into a log below version 4, which a version-3 replica
-/// would refuse. Raised, both commit, and the raise lasts across a restart.
+/// Asserts that a `SetWriter`, and a put of a node writer's object, commit on a log that
+/// was never raised, and that a restart replays them: the log is still at machine
+/// version 1 and remembers boot 1, so boot 2 is the next.
 #[tokio::test(start_paused = true)]
-async fn raising_the_machine_version_to_4_lets_node_writers_commit_and_lasts() {
+async fn node_writers_commit_on_a_log_never_raised_and_last() {
     let one = NonZeroU64::MIN;
     let writer = NodeWriter::new(one, one);
     let put = Command::PutBlob {
@@ -602,18 +590,6 @@ async fn raising_the_machine_version_to_4_lets_node_writers_commit_and_lasts() {
     };
     let fs = FaultFs::new();
     let log = open(&fs, 7).await;
-    for to in [MachineVersion::V1, MachineVersion::V2, MachineVersion::V3] {
-        log.raise_machine_version(to).expect("a raise");
-        for command in [Command::SetWriter(writer), put.clone()] {
-            let refused = log.commit(command).await;
-            assert!(
-                matches!(refused, Err(MetaLogError::Unavailable(_))),
-                "at {to:?}: {refused:?}"
-            );
-        }
-    }
-    log.raise_machine_version(MachineVersion::V4)
-        .expect("a raise");
     assert_eq!(
         log.commit(Command::SetWriter(writer)).await,
         Ok(Applied::Writer(Ok(())))
@@ -622,9 +598,10 @@ async fn raising_the_machine_version_to_4_lets_node_writers_commit_and_lasts() {
         log.commit(put.clone()).await,
         Ok(Applied::Blob(Ok(BlobWrite::Stored)))
     );
+    assert_eq!(log.machine_version(), MachineVersion::V1);
     drop(log);
     let log = open(&fs.restart(), 7).await;
-    assert_eq!(log.machine_version(), MachineVersion::V4);
+    assert_eq!(log.machine_version(), MachineVersion::V1);
     let next = NodeWriter::new(one, one.saturating_add(1));
     assert_eq!(
         log.commit(Command::SetWriter(next)).await,
@@ -668,15 +645,12 @@ fn answers(m: &MetaState, object: ObjectId) -> Answers {
     )
 }
 
-/// Format 3's first condition, a version-2 log still opens: a log
-/// at machine version 2, written by this binary with format-1 and format-2 commands,
-/// reopens under this binary (which runs version 3) at version 2, replays to the same
-/// answers, and still refuses `EvictObjects` until it is raised explicitly. Catches:
-/// an open that raises the log to what the binary runs (mutant: `MetaMachine::new`
-/// starts at `runs`; the version reads 3), and a replay that applies an old entry
-/// otherwise than it applied live (the whole state is compared; mutant: replayed
-/// entries executed at index 0, which moves the mark's generation). After a second
-/// restart an explicit raise to 3 changes no answer and lets the evict commit.
+/// Asserts that a log at machine version 2 (the raise an earlier build wrote, between
+/// format-1 and format-2 commands) reopens under this binary at version 2, because the
+/// open raises nothing, and replays to the same answers (the whole state is compared, so
+/// an entry replayed at another index than it was applied at would show in the mark's
+/// generation). `EvictObjects` then commits on it with no raise, and a second restart
+/// replays that to the same answers again.
 #[tokio::test(start_paused = true)]
 async fn a_version_2_log_reopens_at_version_2_with_the_same_answers() {
     let evict = || Command::EvictObjects {
@@ -754,33 +728,24 @@ async fn a_version_2_log_reopens_at_version_2_with_the_same_answers() {
         "the open raised it"
     );
     assert_eq!(log.query(|m| answers(m, staged)).await, Ok(before));
-    let refused = log.commit(evict()).await;
-    assert!(
-        matches!(refused, Err(MetaLogError::Unavailable(_))),
-        "{refused:?}"
-    );
-    let before = log.query(|m| answers(m, staged)).await.expect("a query");
-    drop(log);
-
-    // The second open replays the refused evict as nothing (it was never committed),
-    // and an explicit raise then takes it.
-    let log = open(&fs.restart(), 7).await;
-    assert_eq!(log.machine_version(), MachineVersion::V2);
-    assert_eq!(log.query(|m| answers(m, staged)).await, Ok(before.clone()));
-    log.raise_machine_version(MachineVersion::V3)
-        .expect("a raise");
-    assert_eq!(log.query(|m| answers(m, staged)).await, Ok(before));
     assert!(
         matches!(log.commit(evict()).await, Ok(Applied::Evicted(e)) if e.blobs.len() == 2),
-        "the raise did not let the evict commit"
+        "the evict did not commit on a version-2 log"
     );
+    assert_eq!(log.machine_version(), MachineVersion::V2);
+    let after = log.query(|m| answers(m, staged)).await.expect("a query");
+    drop(log);
+
+    let log = open(&fs.restart(), 7).await;
+    assert_eq!(log.machine_version(), MachineVersion::V2);
+    assert_eq!(log.query(|m| answers(m, staged)).await, Ok(after));
 }
 
 /// Asserts that an `EvictObjects` entry in a log at version 2 is read and applied, not
-/// refused: decoding does not depend on the log's format. The entry is appended by hand
-/// (this binary never encodes one into a version-2 log), in format-3 bytes, after a raise
-/// to 2 and a format-2 command; both this binary (which runs 3) and one that runs only 2
-/// open the log, evict the blob the entry names, and leave the log at version 2.
+/// refused: decoding does not depend on the log's format. The entry is appended by hand,
+/// in format-3 bytes, after a raise to 2 and a format-2 command; both this binary (which
+/// runs 5) and one that runs only 2 open the log, evict the blob the entry names, and
+/// leave the log at version 2.
 #[tokio::test]
 async fn an_evict_entry_in_a_version_2_log_is_applied() {
     let fs = FaultFs::new();

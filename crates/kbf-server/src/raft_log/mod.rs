@@ -38,23 +38,17 @@
 //!   `Tick(now)` every [`TICK`] while the log is open, the first one [`TICK`] after
 //!   the open. A tick is a proposal, which
 //!   only a leader may make.
-//! - **Machine version.** A new log is at [`MachineVersion::V1`], whose entries are
-//!   format 1. [`RaftMetaLog::raise_machine_version`] commits a `MachineVersion`
-//!   entry; every entry after it is in the new version's format, so a log raised to
-//!   [`MachineVersion::V2`] takes the write tier's commands, and one raised to
-//!   [`MachineVersion::V3`] takes `EvictObjects` too, and one raised to
-//!   [`MachineVersion::V4`] node writers (`SetWriter`, and objects named by a storage
-//!   node's member and boot), and one raised to [`MachineVersion::V5`] `ReseatStaged`. A start replays the raise
-//!   with the log. A binary that does not run the version (any older one) skips the raise
-//!   (see **Skipped entries**) and keeps the version and format the log had reached before
-//!   it; decoding does not depend on the format, so every command it knows still applies.
-//!   A raise commits alone, under the host's lock; a batch is
-//!   encoded under that lock too, in the format committed when it commits, so no
-//!   batch holds a `MachineVersion` entry and a command the format does not take is
-//!   refused alone while the rest of its batch commits. A start raises a log only up to
-//!   its start ceiling ([`START_CEILING`]; [`RaftMetaLog::raise_at_start`]), and each
-//!   feature that needs a version checks the log's [`RaftMetaLog::machine_version`] where
-//!   it uses it.
+//! - **Machine version.** A new log is at [`MachineVersion::V1`]. This build raises no
+//!   log: formats change additively, so every command it knows commits to a log at any
+//!   version, and a new command needs no raise. A `MachineVersion` entry that an earlier
+//!   build committed is replayed with the log, and moves [`RaftMetaLog::machine_version`]
+//!   up to the version it names (and with it the format the log encodes under, which no
+//!   command depends on). A binary that does not run the version (any older one) skips
+//!   the raise (see **Skipped entries**) and keeps the version the log had reached before
+//!   it. [`RaftMetaLog::raise_machine_version`] commits such an entry; the server does not
+//!   call it, and the tests use it to build the log an earlier build left. A raise
+//!   commits alone, under the host's lock; a batch is encoded under that lock too, so no
+//!   batch holds a `MachineVersion` entry.
 //! - **Skipped entries.** Every format changes additively, and a binary skips what it does
 //!   not know instead of refusing it. An entry that holds a command this binary does not
 //!   know, a control command (which this log does not use), or a raise to a machine
@@ -113,14 +107,18 @@ pub use self::recorded::{RECORD, RECORD_TMP};
 /// directory is refused.
 pub const LOCK: &str = "log.lock";
 
-/// The highest machine version this binary runs: [`MachineVersion::V5`], the write
-/// tier's commands, `EvictObjects`, node writers (`SetWriter`) and `ReseatStaged`. A log
-/// stays at the version it was raised to; a new one starts at [`MachineVersion::V1`].
+/// The highest machine version this binary runs: [`MachineVersion::V5`], and it stays
+/// there. It is frozen and gates nothing new: this build raises no log and writes every
+/// command it knows (the write tier's, `EvictObjects`, node writers and `ReseatStaged`
+/// included) to a log of any version, so a new command does not raise it. It only says
+/// which `MachineVersion` entries an earlier build left in a log this binary applies (one
+/// past it is skipped), and `kbf --version --json` prints it as `meta_log`, which is
+/// informational. A log stays at the version it was raised to; a new one starts at
+/// [`MachineVersion::V1`].
 pub const RUNS: MachineVersion = MachineVersion::V5;
 
-/// The highest machine version a start raises a log to: what the previous release runs.
-/// A release that adds a new machine version sets this one below [`RUNS`], so the raise
-/// waits for `kbf finalize`. It is [`RUNS`] today, so every start raises as it always has.
+/// The highest machine version [`RaftMetaLog::raise_at_start`] raises a log to. No start
+/// of the server calls it any more, so nothing in the server reads this; it is [`RUNS`].
 pub const START_CEILING: MachineVersion = RUNS;
 
 // A ceiling past what the binary runs would have every start ask for a version the log
@@ -424,11 +422,11 @@ where
 
     /// Raises the log's machine version to `to` by committing a `MachineVersion`
     /// entry, unless the log is there already (a version is never lowered). Every
-    /// entry after it is encoded in `to`'s format: raising to
-    /// [`MachineVersion::V2`] lets the write tier's commands commit
-    /// (docs/design/metadata-snapshots.md, section 4). It is one-way: a binary that
-    /// runs only an earlier version skips the raise and keeps the version the log had
-    /// reached before it.
+    /// entry after it is encoded in `to`'s format, which changes no command's bytes.
+    /// Nothing in the server calls it: it builds the log an earlier build left (those
+    /// raised their logs to the version a feature needed), which the tests open as an
+    /// older binary and as this one. It is one-way: a binary that runs only an earlier
+    /// version skips the raise and keeps the version the log had reached before it.
     ///
     /// # Errors
     /// [`MetaLogError::Unavailable`] if `to` is past what this binary runs, or the
@@ -460,8 +458,7 @@ where
     /// Raises the log's machine version to `target` or `ceiling`, whichever is lower, and
     /// never above `ceiling`: [`RaftMetaLog::raise_machine_version`] to the lower of the
     /// two, so a log already there (or past it, as a log finalized to a higher version
-    /// is) commits nothing and is never lowered. Every raise a start makes goes through
-    /// here, with the log's own ceiling ([`RaftMetaLog::raise_at_start`]).
+    /// is) commits nothing and is never lowered.
     ///
     /// # Errors
     /// As [`RaftMetaLog::raise_machine_version`].
@@ -474,9 +471,7 @@ where
     }
 
     /// [`RaftMetaLog::raise_up_to`] `target`, up to the log's start ceiling
-    /// ([`START_CEILING`]). What the log's machine version is after it is the caller's to
-    /// check ([`RaftMetaLog::machine_version`]): a feature that needs more than the
-    /// ceiling lets is off, or takes its degraded path.
+    /// ([`START_CEILING`]). No start of the server calls it.
     ///
     /// # Errors
     /// As [`RaftMetaLog::raise_machine_version`].
@@ -496,7 +491,7 @@ where
 impl<F: Fs> RaftMetaLog<F> {
     /// This log with `ceiling` as its start ceiling in place of [`START_CEILING`]: how a
     /// test stands in for a release whose ceiling is below [`RUNS`]. It is not a flag; a
-    /// server always starts at [`START_CEILING`].
+    /// server always starts at [`START_CEILING`], and raises nothing at a start.
     #[must_use]
     pub fn with_start_ceiling(mut self, ceiling: MachineVersion) -> Self {
         self.start_ceiling = ceiling;
@@ -535,8 +530,10 @@ impl<F: Fs> RaftMetaLog<F> {
         self.shared.lock().machine().applied().0
     }
 
-    /// The machine version the log has committed: [`MachineVersion::V1`] until
-    /// [`RaftMetaLog::raise_machine_version`] raises it.
+    /// The machine version the log has committed: [`MachineVersion::V1`] until a
+    /// `MachineVersion` entry raises it (an earlier build's, or
+    /// [`RaftMetaLog::raise_machine_version`]'s in a test). No feature of the server
+    /// reads it.
     #[must_use]
     pub fn machine_version(&self) -> MachineVersion {
         self.shared.lock().machine().version()
@@ -703,51 +700,34 @@ where
         }
     }
 
-    /// Encodes `commands` in the log's committed format, proposes the ones that
-    /// encode as one batch, and returns each command's answer, in order: a command the
-    /// format does not take (a write tier command before the raise to
-    /// [`MachineVersion::V2`]) is refused and the rest commit. A single voter commits
-    /// and applies its own proposals before `propose_batch` returns, so every answer is
-    /// there unless the batch failed.
+    /// Encodes `commands` in the log's committed format, proposes them as one batch, and
+    /// returns each command's answer, in order. A single voter commits and applies its own
+    /// proposals before `propose_batch` returns, so every answer is there unless the batch
+    /// failed. Encoding cannot fail for a format the machine holds, so no command is
+    /// refused alone: if encoding did fail, the whole batch would answer with that error.
     ///
     /// The format is read under the host's lock, which a raise also commits under, so
     /// no raise falls between encoding a batch and committing it, and a batch holds no
     /// `MachineVersion` entry: every entry in it is encoded in the format read
-    /// above.
+    /// above (which changes no command's bytes).
     fn commit_batch(&self, commands: Vec<Command>) -> Vec<Answer> {
         let mut host = self.lock();
         let format = host.machine().format();
-        let mut entries = Vec::with_capacity(commands.len());
-        let encoded: Vec<Result<(), MetaLogError>> = commands
-            .into_iter()
-            .map(|command| {
-                let entry = kbf_log::encode(format, &LogCommand::Meta(command));
-                entries.push(entry.map_err(unavailable)?);
-                Ok(())
-            })
-            .collect();
-        let count = entries.len();
+        let count = commands.len();
+        let encode = |command| kbf_log::encode(format, &LogCommand::Meta(command));
+        let entries: Result<Vec<_>, _> = commands.into_iter().map(encode).collect();
         // Checked under `host`, which the drop takes after setting `closed`.
         let batch = still_open(&self.closed)
-            .and_then(|()| host.propose_batch(entries).map_err(unavailable));
-        let proposed: Vec<Answer> = match batch {
+            .and_then(|()| entries.map_err(unavailable))
+            .and_then(|entries| host.propose_batch(entries).map_err(unavailable));
+        match batch {
             Ok(first) => (first.0..)
                 .take(count)
                 .map(|index| host.machine_mut().take_answer(LogIndex(index)))
                 .map(|answer| answer.ok_or(MetaLogError::Unavailable(NOT_APPLIED.to_owned())))
                 .collect(),
             Err(e) => vec![Err(e); count],
-        };
-        let mut proposed = proposed.into_iter();
-        encoded
-            .into_iter()
-            .map(|encoded| {
-                encoded.and_then(|()| {
-                    let missing = MetaLogError::Unavailable(NOT_APPLIED.to_owned());
-                    proposed.next().unwrap_or(Err(missing))
-                })
-            })
-            .collect()
+        }
     }
 
     async fn tick(self: &Arc<Self>) -> Result<FarmTime, MetaLogError> {

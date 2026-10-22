@@ -88,8 +88,7 @@ pub struct Args {
     /// Without it, or when it has no room, a daemon's blob over 16 MiB
     /// (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is streamed to the cold store as it
     /// arrives (a ByteStream Write, or the in-process plane's own stream), never held
-    /// whole and never refused for its size. The first start with a hot store raises
-    /// the metadata log to machine version 5, once; a binary that runs only an earlier version no longer reads it.
+    /// whole and never refused for its size.
     /// The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise.
     #[arg(long, value_name = "URI")]
     pub hot_store: Option<StoreUri>,

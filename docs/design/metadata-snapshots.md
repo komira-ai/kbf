@@ -247,19 +247,21 @@ so it adds only the place to keep it:
 - `MetaMachine::snapshot` writes its current `format` in the header. It is the format
   in force at the base, which is the one the next entry is decoded under.
 
-PR 4 (format 2) adds the raise. When the binary writes format 2 and the committed
-format is 1, the open commits one `MachineVersion` entry after the `Bootstrap` check,
-before it serves. Applying it sets `format = 2` for every later entry. Which value the
-entry carries (the machine version alone, with the format implied, or a format field
-beside it) is `ha.md` 4.7's to settle; PR 4 follows it. As built (write-path.md
-section 6.8): the entry carries the machine version alone, version 2 implies format 2,
-and the raise is committed when the tier is attached
-(`RaftMetaLog::raise_machine_version`), not by every open, so a log that never ran the
-tier stays readable by an older binary. From this build on, a binary that runs only
-version 1 opens that log: it skips the `MachineVersion` entry, which its machine does
-not run, counts it and goes on at version 1 (section 1); a shipped build from before
-skipping refuses the log at that entry. It still refuses a format-2 snapshot header
-(`UnknownFormat(2)`).
+PR 4 (format 2) planned a raise. When the binary wrote format 2 and the committed
+format was 1, the open would commit one `MachineVersion` entry after the `Bootstrap`
+check, before it served; applying it sets `format = 2` for every later entry. As built
+(write-path.md section 6.8) an earlier build did this: the entry carried the machine
+version alone, version 2 implied format 2, and the raise was committed when the tier was
+attached (`RaftMetaLog::raise_machine_version`), not by every open. **No build raises a log
+any more.** Formats change additively, so a command needs no raise: the tier's commands,
+`EvictObjects`, node writers and `ReseatStaged` commit to a log at any machine version,
+and encode and decode do not depend on the committed format (write-path.md section
+6.5). The machine still replays a `MachineVersion` entry an earlier build left (the
+version moves, and the entries after it are decoded as before, which changes nothing),
+and a binary that runs only version 1 skips such an entry, counts it and goes on at
+version 1 (section 1); a shipped build from before skipping refuses the log at that
+entry. A snapshot header still names a format, and a reader still refuses one it does not
+know (`UnknownFormat(2)` for a format-2 header read by a format-1 binary).
 
 ## 5. Taking a snapshot and compacting
 
@@ -711,11 +713,10 @@ under log format 2, and the commit of format 2 (section 4). Tests:
 - A pin, its accumulated closure and its hold-until survive a snapshot and a restart,
   and a `Collect` after the restore keeps every digest of the live pin's closure.
   Plant: leave out the `Pins` frame; red.
-- A format-2 binary over a format-1 log commits one format raise at open, and only
-  once: a second open commits none, and every entry after the raise decodes as
-  format 2. Plant: raise at every open; red. Plant: keep decoding as V1 after the
-  raise; red (the pin command does not decode).
-- A snapshot taken after the raise names format 2, and a restart from it decodes the
-  entries after the base as format 2. Plant: write `Format::V1` in the header; red.
-- A format-1 reader refuses a format-2 snapshot (`UnknownFormat(2)`) and a log that
-  holds the raise entry. Plant: accept it; red.
+- A format-2 binary over a format-1 log commits no format raise at open (section 4),
+  and decodes every entry of the log, the pin command included, whatever format the
+  log is at.
+- A snapshot taken by a format-2 binary names format 2, and a restart from it decodes
+  the entries after the base as it decoded them before.
+- A format-1 reader refuses a format-2 snapshot (`UnknownFormat(2)`), and skips a
+  `MachineVersion` entry in a log that holds one (section 4).

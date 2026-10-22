@@ -9,6 +9,10 @@
 //! these tests count as skipped is the raises past the version, and not the commands an older
 //! build lacks. Entries a binary does not know are the subject of `raft_log_unknown.rs`.
 //!
+//! This build raises no log. The logs an earlier build left, which hold the raises it
+//! wrote, are made here with `raise_machine_version`; the logs this build writes are made
+//! with none, and hold no `MachineVersion` entry.
+//!
 //! The log is an in-memory raft directory (`FaultFs`). Between two opens it is restarted.
 
 use std::num::NonZeroU64;
@@ -190,9 +194,9 @@ fn stages() -> Vec<(MachineVersion, Vec<Command>)> {
     ]
 }
 
-/// Writes a new log in `fs` that holds one entry of every metadata command this build
-/// writes: the log is raised through machine versions 2 to 5, and each version's commands are
-/// committed after its raise. It ends at version 5.
+/// Writes a new log in `fs` as an earlier build left it: it holds one entry of every
+/// metadata command this build writes, the log is raised through machine versions 2 to 5, and
+/// each version's commands are committed after its raise. It ends at version 5.
 async fn write_every_command(fs: &mut FaultFs) {
     let log = open_running(fs, MachineVersion::V5).await;
     for (version, commands) in stages() {
@@ -205,8 +209,58 @@ async fn write_every_command(fs: &mut FaultFs) {
     assert_eq!(log.machine_version(), MachineVersion::V5);
 }
 
-/// Asserts that a binary that runs only machine version 1, 2, 3 or 4 opens a log written with
-/// one entry of every command this build writes (raised through versions 2 to 5): it counts
+/// Writes a new log in `fs` as this build does: one entry of every metadata command this
+/// build writes, committed to a log that is never raised. It stays at version 1.
+async fn write_every_command_unraised(fs: &mut FaultFs) {
+    let log = open_running(fs, MachineVersion::V5).await;
+    for (_, commands) in stages() {
+        for command in commands {
+            let answered = log.commit(command.clone()).await;
+            assert!(answered.is_ok(), "{command:?}: {answered:?}");
+        }
+    }
+    assert_eq!(log.machine_version(), MachineVersion::V1);
+}
+
+/// Asserts that this build writes a log holding one entry of every metadata command it
+/// writes with no `MachineVersion` entry in it, and that an older binary opens that log: each
+/// binary that runs only machine version 1, 2, 3 or 4 skips nothing (there is no raise to
+/// skip), stays at version 1, holds the same metadata state as this build and finds the log's
+/// first command; and that this build then opens the same log again at version 1 with
+/// nothing skipped.
+#[tokio::test]
+async fn this_build_writes_every_command_with_no_raise_and_an_older_binary_opens_it() {
+    let mut fs = FaultFs::new();
+    write_every_command_unraised(&mut fs).await;
+    let newest = open_running(&mut fs, MachineVersion::V5).await;
+    assert_eq!(newest.skipped_entries(), 0);
+    assert_eq!(newest.machine_version(), MachineVersion::V1);
+    let state = state_of(&newest).await;
+    drop(newest);
+    let older = [
+        MachineVersion::V1,
+        MachineVersion::V2,
+        MachineVersion::V3,
+        MachineVersion::V4,
+    ];
+    for runs in older {
+        let log = open_running(&mut fs, runs).await;
+        let n = runs.get();
+        assert_eq!(log.skipped_entries(), 0, "runs {n}");
+        assert_eq!(log.machine_version(), MachineVersion::V1, "runs {n}");
+        assert_eq!(log.bootstraps(), 1, "runs {n}");
+        assert_eq!(state_of(&log).await, state, "runs {n}");
+        drop(log);
+    }
+    let log = open_running(&mut fs, MachineVersion::V5).await;
+    assert_eq!(log.skipped_entries(), 0);
+    assert_eq!(log.machine_version(), MachineVersion::V1);
+    assert_eq!(state_of(&log).await, state);
+}
+
+/// Asserts that a binary that runs only machine version 1, 2, 3 or 4 opens a log an earlier
+/// build left, written with one entry of every command this build writes (raised through
+/// versions 2 to 5): it counts
 /// each raise past the version it runs as skipped (the raises only: it applies every command),
 /// stays at its version, holds the same metadata state as this build and finds the log's first
 /// command; and that this build then opens the same log again at version 5 with nothing
@@ -242,9 +296,9 @@ async fn an_older_binary_opens_a_log_that_holds_every_command_this_build_writes(
 
 /// Asserts that a log goes both ways between this build and a binary that runs only machine
 /// version 1: this build opens what that binary wrote and holds the same state; after this
-/// build raised the log to version 5 and committed a tier command, the older binary opens it,
-/// skips the raise (one entry), applies the tier command and appends an epoch in format 1; and
-/// this build then opens the log again, applies that epoch and continues from it.
+/// build committed a tier command with no raise, the older binary opens it, skips nothing,
+/// applies the tier command and appends an epoch; and this build then opens the log again,
+/// applies that epoch and continues from it, the log still at version 1 throughout.
 #[tokio::test]
 async fn a_log_goes_both_ways_between_this_build_and_an_older_binary() {
     let mut fs = FaultFs::new();
@@ -259,26 +313,24 @@ async fn a_log_goes_both_ways_between_this_build_and_an_older_binary() {
     let newest = open_running(&mut fs, MachineVersion::V5).await;
     assert_eq!(newest.skipped_entries(), 0);
     assert_eq!(state_of(&newest).await, written);
-    newest
-        .raise_machine_version(MachineVersion::V5)
-        .expect("a raise");
     let tier = Command::AddTier {
         server: ServerId::new(1),
         tier: TierId::new(1),
     };
     assert_eq!(newest.commit(tier).await, Ok(Applied::Tier(Ok(()))));
-    let raised = state_of(&newest).await;
+    assert_eq!(newest.machine_version(), MachineVersion::V1);
+    let committed = state_of(&newest).await;
     drop(newest);
 
     let older = open_running(&mut fs, MachineVersion::V1).await;
-    assert_eq!(older.skipped_entries(), 1);
+    assert_eq!(older.skipped_entries(), 0);
     assert_eq!(older.machine_version(), MachineVersion::V1);
-    assert_eq!(state_of(&older).await, raised);
+    assert_eq!(state_of(&older).await, committed);
     let appended = epoch(&older).await;
     drop(older);
 
     let newest = open_running(&mut fs, MachineVersion::V5).await;
     assert_eq!(newest.skipped_entries(), 0);
-    assert_eq!(newest.machine_version(), MachineVersion::V5);
+    assert_eq!(newest.machine_version(), MachineVersion::V1);
     assert_eq!(epoch(&newest).await, appended + 1);
 }

@@ -6,12 +6,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime};
 
-use kbf_meta::{Applied, Command, ObjectId, UnreachableReason, Writer as ObjectWriter};
+use kbf_meta::{Applied, Command, ObjectId, Writer as ObjectWriter};
 use kbf_objstore::{FsStore, ObjectStore};
 use tokio::time::Instant;
 
 use super::{Cache, CacheError, unexpected};
-use crate::meta_log::{MetaLog, MetaLogError};
+use crate::meta_log::MetaLog;
 
 /// How many object files the pass opens a second, on average, while the file system
 /// has room: enough to walk a million objects in under 20 minutes without taking the
@@ -23,26 +23,6 @@ pub const PASS_OPENS_PER_SEC: NonZeroU32 = NonZeroU32::new(1000).expect("not zer
 /// index and action cache, about the same time for 1 object as for 256 on a million
 /// of each, so the pass batches.
 pub const EVICT_BATCH: usize = 256;
-
-/// What the pass and the evictor log, once each per start, when the log cannot take
-/// [`Command::EvictObjects`] and they may not ready it ([`EvictReady::NeedsV3`]).
-pub const NEEDS_V3: &str = "evict/forget needs log V3";
-
-/// Whether the metadata log takes [`Command::EvictObjects`], as the hook the pass and
-/// the evictor are given answers it, called only when there is something to forget.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EvictReady {
-    /// It does: it did already, or the hook readied it.
-    Ready,
-    /// It does not, and the hook may not ready it: a cell of `voters` voters, whose
-    /// machine version an operator raises once every replica runs one that takes the
-    /// command, or a single voter whose log the release's start ceiling holds below 3.
-    /// Nothing is forgotten until then.
-    NeedsV3 {
-        /// The cell's voters.
-        voters: usize,
-    },
-}
 
 /// What the pass logs when the guard holds the index side back.
 const NOT_THIS_DIRECTORY: &str = "start-up pass: no file of any indexed object is in the \
@@ -82,11 +62,6 @@ pub struct PassReport {
     pub evicted_blobs: u64,
     /// Action-cache entries removed because they needed one of those blobs.
     pub evicted_actions: u64,
-    /// Indexed objects with no file marked missing ([`UnreachableReason::Missing`])
-    /// instead of forgotten, because the log does not take [`Command::EvictObjects`]
-    /// yet ([`EvictReady::NeedsV3`]): their blobs read as missing and their action-cache
-    /// entries miss; a pass under a log that takes the command forgets them.
-    pub marked_missing: u64,
     /// Indexed objects with no file left in the index because the walk found no
     /// indexed file at all (the guard: a directory that is not the one the index was
     /// written over).
@@ -123,26 +98,23 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// - Then every indexed object that is not staged and whose file the walk did not
     ///   find, and still is not there, is forgotten with [`Command::EvictObjects`] in
     ///   batches of [`EVICT_BATCH`], with the action-cache entries that need its
-    ///   blobs, after `ready_to_evict` readies the log for the command. If it answers
-    ///   [`EvictReady::NeedsV3`], each is marked missing instead
-    ///   ([`Command::ObjectUnreachable`], which every log takes), and the pass logs
-    ///   [`NEEDS_V3`] once, with their number. Only if the walk found the file of at
-    ///   least one indexed object: otherwise this is not the directory the index was
-    ///   written over (a missing mount, which `FsStore::open` would have created
-    ///   empty), and nothing is forgotten or marked.
+    ///   blobs. The command commits to the log as it is, whatever machine version it
+    ///   holds, and whatever the number of its voters. Only if the walk found the file
+    ///   of at least one indexed object: otherwise this is not the directory the index
+    ///   was written over (a missing mount, which `FsStore::open` would have created
+    ///   empty), and nothing is forgotten.
     ///
     /// The shards are walked at `opens_per_sec` ([`PASS_OPENS_PER_SEC`]), unpaced while
     /// the store is under its free-space floor. The index is read once before the walk:
     /// only objects of the current writer can be named after that, and those are kept.
     ///
     /// # Errors
-    /// A shard cannot be read, an orphan cannot be deleted, or the metadata log fails
-    /// or refuses to be readied. What was done before stays done.
+    /// A shard cannot be read, an orphan cannot be deleted, or the metadata log fails.
+    /// What was done before stays done.
     pub async fn consistency_pass(
         &self,
         files: &FsStore,
         opens_per_sec: NonZeroU32,
-        ready_to_evict: fn(&M) -> Result<EvictReady, MetaLogError>,
     ) -> Result<PassReport, CacheError> {
         let started = Instant::now();
         let writer = self.writer();
@@ -203,21 +175,20 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             pace.after(scan.opened(), files).await;
         }
         report.kept = report.held.len() as u64;
-        self.evict_missing(files, &seen, indexed_present, ready_to_evict, &mut report)
+        self.evict_missing(files, &seen, indexed_present, &mut report)
             .await?;
         report.duration = started.elapsed();
         Ok(report)
     }
 
-    /// The index side of [`Cache::consistency_pass`]: forgets (or marks missing) the
-    /// indexed objects that are not staged, were not `seen`, and have no file now, if
-    /// `indexed_present` (the guard) is not zero.
+    /// The index side of [`Cache::consistency_pass`]: forgets the indexed objects that are
+    /// not staged, were not `seen`, and have no file now, if `indexed_present` (the guard)
+    /// is not zero.
     async fn evict_missing(
         &self,
         files: &FsStore,
         seen: &BTreeSet<ObjectId>,
         indexed_present: u64,
-        ready_to_evict: fn(&M) -> Result<EvictReady, MetaLogError>,
         report: &mut PassReport,
     ) -> Result<(), CacheError> {
         let unseen: Vec<ObjectId> = self
@@ -242,16 +213,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         if indexed_present == 0 {
             report.withheld = gone.len() as u64;
             tracing::error!(objects = report.withheld, "{NOT_THIS_DIRECTORY}");
-            return Ok(());
-        }
-        if let EvictReady::NeedsV3 { voters } = ready_to_evict(&self.writer.meta)? {
-            for &id in &gone {
-                self.mark_unreachable(id, UnreachableReason::Missing)
-                    .await?;
-            }
-            report.marked_missing = gone.len() as u64;
-            let held = report.marked_missing;
-            tracing::warn!(voters, "{NEEDS_V3}: {held} objects held");
             return Ok(());
         }
         let gone: Vec<ObjectId> = gone.into_iter().collect();

@@ -1,7 +1,7 @@
 //! The start ceiling of `RaftMetaLog` ([`RaftMetaLog::raise_up_to`] and
-//! [`RaftMetaLog::raise_at_start`]): a start raises the log's machine version to a
-//! target but never past the ceiling, and never lowers it. Each test names the defect it
-//! catches.
+//! [`RaftMetaLog::raise_at_start`]): `raise_at_start` raises the log's machine version to
+//! a target but never past the ceiling, and never lowers it. No start of the server calls
+//! either. Each test names the defect it catches.
 
 use std::num::NonZeroU64;
 

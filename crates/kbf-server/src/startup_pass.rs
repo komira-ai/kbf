@@ -10,11 +10,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_front::{Cache, EVICT_EVERY, EvictReady, MetaLog, MetaLogError, PASS_OPENS_PER_SEC};
-use kbf_log::MachineVersion;
+use kbf_front::{Cache, EVICT_EVERY, MetaLog, PASS_OPENS_PER_SEC};
 use kbf_objstore::{FsStore, ObjectStore};
-
-use crate::RaftMetaLog;
 
 /// What a failed pass logs.
 const PASS_FAILED: &str = "start-up pass over the cold store directory failed; the next start runs it again, and \
@@ -24,12 +21,11 @@ const PASS_FAILED: &str = "start-up pass over the cold store directory failed; t
 const ROUND_FAILED: &str = "eviction round failed; the next one tries again";
 
 /// A pass to run over the file store `files` once the server is assembled, and the
-/// evictor after it.
-pub(crate) struct StartPass<M> {
+/// evictor after it. Both commit `EvictObjects` to the log as it is, when there is
+/// something to forget: nothing raises the log's machine version first, and the count of
+/// its voters changes nothing.
+pub(crate) struct StartPass {
     files: FsStore,
-    /// Readies the log for `EvictObjects`, if it may, called only when there is
-    /// something to forget.
-    ready_to_evict: fn(&M) -> Result<EvictReady, MetaLogError>,
     /// How long after its last use an object is never evicted.
     grace: Duration,
     /// What the pass waits for before it starts: nothing in the server; a test holds
@@ -37,47 +33,16 @@ pub(crate) struct StartPass<M> {
     hold: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
-/// Readies a Raft log for `EvictObjects` ([`ready_among`] its own voters).
-fn ready_to_evict(log: &RaftMetaLog) -> Result<EvictReady, MetaLogError> {
-    ready_among(log, log.voters())
-}
-
-/// Whether a Raft log in a cell of `voters` voters takes `EvictObjects`: one at
-/// machine version 3 (whose format carries the command) does. One below it is raised
-/// to it here only if `voters` is one (a single-host farm): a raise in a cell of more
-/// would leave every replica that does not run version 3 yet skipping its commands, so there
-/// the operator raises it once every replica does, and until then the answer is
-/// [`EvictReady::NeedsV3`]. Called only when something is to be forgotten, so a log
-/// with nothing to forget stays one an older binary reads. The raise stops at the log's
-/// start ceiling: a log still below version 3 after it is not ready either.
-fn ready_among(log: &RaftMetaLog, voters: usize) -> Result<EvictReady, MetaLogError> {
-    if log.machine_version() >= MachineVersion::V3 {
-        return Ok(EvictReady::Ready);
-    }
-    if voters > 1 {
-        return Ok(EvictReady::NeedsV3 { voters });
-    }
-    log.raise_at_start(MachineVersion::V3)?;
-    if log.machine_version() < MachineVersion::V3 {
-        return Ok(EvictReady::NeedsV3 { voters });
-    }
-    Ok(EvictReady::Ready)
-}
-
-impl StartPass<RaftMetaLog> {
-    /// The pass and evictor over `files` under a Raft log ([`ready_to_evict`]),
-    /// sparing objects used within `grace`.
-    pub(crate) fn over_raft(files: FsStore, grace: Duration) -> Self {
+impl StartPass {
+    /// The pass and evictor over `files`, sparing objects used within `grace`.
+    pub(crate) fn new(files: FsStore, grace: Duration) -> Self {
         Self {
             files,
-            ready_to_evict,
             grace,
             hold: Box::pin(std::future::ready(())),
         }
     }
-}
 
-impl<M> StartPass<M> {
     /// The same pass, started only once `hold` completes: the rebuild of the index, in
     /// the server; in a test, a release the test sends.
     pub(crate) fn held(mut self, hold: impl Future<Output = ()> + Send + 'static) -> Self {
@@ -91,21 +56,13 @@ impl<M> StartPass<M> {
 /// leaves eviction off; the next start runs it again.
 pub(crate) fn spawn<M: MetaLog, O: ObjectStore + 'static>(
     cache: Arc<Cache<M, O>>,
-    pass: StartPass<M>,
+    pass: StartPass,
 ) -> tokio::task::JoinHandle<()> {
     cache.track_recency();
     tokio::spawn(async move {
-        let StartPass {
-            files,
-            ready_to_evict,
-            grace,
-            hold,
-        } = pass;
+        let (files, grace, hold) = (pass.files, pass.grace, pass.hold);
         hold.await;
-        match cache
-            .consistency_pass(&files, PASS_OPENS_PER_SEC, ready_to_evict)
-            .await
-        {
+        match cache.consistency_pass(&files, PASS_OPENS_PER_SEC).await {
             Ok(report) => {
                 tracing::info!(
                     files = report.files,
@@ -116,7 +73,6 @@ pub(crate) fn spawn<M: MetaLog, O: ObjectStore + 'static>(
                     evicted_objects = report.evicted_objects,
                     evicted_blobs = report.evicted_blobs,
                     evicted_actions = report.evicted_actions,
-                    marked_missing = report.marked_missing,
                     withheld = report.withheld,
                     held_bytes = report.held_bytes(),
                     duration_ms = report.duration.as_millis() as u64,
@@ -124,7 +80,7 @@ pub(crate) fn spawn<M: MetaLog, O: ObjectStore + 'static>(
                 );
                 cache.seed_recency(&report.held);
                 loop {
-                    if let Err(error) = cache.evict_round(&files, grace, ready_to_evict).await {
+                    if let Err(error) = cache.evict_round(&files, grace).await {
                         tracing::error!(%error, "{ROUND_FAILED}");
                     }
                     let _woken = tokio::time::timeout(EVICT_EVERY, files.refused_full()).await;
@@ -138,13 +94,14 @@ pub(crate) fn spawn<M: MetaLog, O: ObjectStore + 'static>(
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, PoisonError};
     use std::time::Duration;
 
     use bytes::Bytes;
     use clap::Parser;
-    use kbf_front::{EVICT_GRACE, NEEDS_V3};
+    use kbf_front::EVICT_GRACE;
+    use kbf_log::MachineVersion;
     use kbf_meta::{Applied, Command, Epoch, Location, ObjectId, Retention, StoreId};
     use kbf_objstore::{Floor, KeyPrefix, ObjectKey, Space};
     use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
@@ -154,8 +111,8 @@ mod tests {
     use tonic::transport::Channel;
 
     use super::*;
-    use crate::Args;
     use crate::start::assemble;
+    use crate::{Args, RaftMetaLog};
 
     /// How long the test waits for the server to bind, or for the pass to finish.
     const BOUND: Duration = Duration::from_secs(10);
@@ -185,13 +142,11 @@ mod tests {
         missing.map(|d| d.hash).collect()
     }
 
-    /// Catches a server that waits for the start-up pass before it binds (mutant: the
-    /// pass awaited in the assembly), so a large directory holds up every start: with
-    /// the pass held, the server must bind and answer FindMissing, which still reports
-    /// a blob whose object file is gone. Released, the pass must delete the old
-    /// epoch's orphan and forget the lost blob over the Raft log, which proves the log
-    /// is raised to the format that carries `EvictObjects` (mutant: no raise), and log
-    /// what it did.
+    /// Asserts that a server does not wait for the start-up pass before it binds, so a
+    /// large directory holds up no start: with the pass held, the server binds and
+    /// answers FindMissing, which still reports a blob whose object file is gone.
+    /// Released, the pass deletes the old epoch's orphan and forgets the lost blob over
+    /// the Raft log, as the log is (it is never raised), and logs what it did.
     #[tokio::test(flavor = "current_thread")]
     async fn serves_before_pass_finishes() {
         let logs = Capture::waiting_for(PASS_LINES);
@@ -231,7 +186,7 @@ mod tests {
             files.put_new(key, body, None).await.expect("plant");
         }
         let (release, held) = tokio::sync::oneshot::channel::<()>();
-        let pass = StartPass::over_raft(files.clone(), EVICT_GRACE).held(async {
+        let pass = StartPass::new(files.clone(), EVICT_GRACE).held(async {
             let _ = held.await;
         });
 
@@ -275,16 +230,17 @@ mod tests {
         drop(files);
     }
 
-    /// Asserts that in a cell of three voters the pass does not raise the log's machine
-    /// version, which would leave every replica that does not run version 3 yet skipping
-    /// its commands: the log stays at version 1, nothing is forgotten, the two lost
-    /// objects' blobs read as missing, and one line says so, not one per object. Once the
-    /// operator raises the log, the next pass forgets them.
+    /// Asserts that the pass forgets the objects whose files are gone over a Raft log that
+    /// was never raised, with no raise of its machine version first: the log stays at
+    /// version 1, the two lost objects are forgotten (their blobs read as missing), the
+    /// kept object stays, and the pass logs what it evicted. The log has one voter; no
+    /// count of voters is an input to the pass, so a cell of more would be treated the
+    /// same.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_cell_of_three_marks_missing_until_the_operator_raises() {
+    async fn the_pass_forgets_lost_objects_on_a_log_never_raised() {
         let logs = Capture::waiting_for(PASS_LINES);
         let _default = logs.subscribe();
-        let root = crate::test_dir::scratch_dir("kbf-server-pass-three");
+        let root = crate::test_dir::scratch_dir("kbf-server-pass-no-raise");
         let files = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
         let meta = RaftMetaLog::open_dir(&root.join("raft"), Retention::default(), "kbf/")
             .await
@@ -314,101 +270,75 @@ mod tests {
                 .await
                 .expect("a cache"),
         );
-        let three = || StartPass {
-            files: files.clone(),
-            ready_to_evict: |log| ready_among(log, 3),
-            grace: EVICT_GRACE,
-            hold: Box::pin(std::future::ready(())),
-        };
 
         // The task goes on as the evictor, which has nothing to do here.
-        let task = spawn(Arc::clone(&cache), three());
+        let task = spawn(
+            Arc::clone(&cache),
+            StartPass::new(files.clone(), EVICT_GRACE),
+        );
         logs.ended().await;
         task.abort();
 
         let text = logs.text();
-        assert_eq!(text.matches(NEEDS_V3).count(), 1, "{text}");
-        assert!(
-            text.contains(&format!("{NEEDS_V3}: 2 objects held")),
-            "{text}"
-        );
-        assert!(text.contains("marked_missing=2"), "{text}");
-        assert!(text.contains("evicted_objects=0"), "{text}");
+        assert!(text.contains("evicted_objects=2"), "{text}");
         assert_eq!(cache.meta().machine_version(), MachineVersion::V1);
         let present = cache.present(&[lost, gone, kept]).await.expect("present");
         assert_eq!(present, [false, false, true]);
-        let blobs = cache.meta().query(|s| s.blob_count()).await;
-        assert_eq!(blobs, Ok(3), "forgotten below version 3");
-
-        cache
-            .meta()
-            .raise_machine_version(MachineVersion::V3)
-            .expect("the operator's raise");
-        logs.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        let task = spawn(Arc::clone(&cache), three());
-        logs.ended().await;
-        task.abort();
-
-        let text = logs.text();
-        assert!(!text.contains(NEEDS_V3), "{text}");
-        assert!(text.contains("evicted_objects=2"), "{text}");
         let blobs = cache.meta().query(|s| s.blob_count()).await;
         assert_eq!(blobs, Ok(1));
         drop((cache, files));
     }
 
-    /// Catches a readiness that counts the log at version 3 as not ready in a cell of
-    /// many (mutant: the version check dropped), or the boundary moved (mutants: `>= 1`
-    /// or `> 2` for `> 1`): two voters need the operator, one is raised here.
+    /// Asserts that the pass forgets lost objects the same way over a Raft log an earlier
+    /// build raised to machine version 3, which it leaves at version 3: the log it reads
+    /// is the log it commits to.
     #[tokio::test(flavor = "current_thread")]
-    async fn only_a_single_voter_is_raised_here() {
-        let root = crate::test_dir::scratch_dir("kbf-server-pass-voters");
-        let log = RaftMetaLog::open_dir(&root, Retention::default(), "kbf/")
+    async fn the_pass_forgets_lost_objects_on_a_log_an_earlier_build_raised() {
+        let logs = Capture::waiting_for(PASS_LINES);
+        let _default = logs.subscribe();
+        let root = crate::test_dir::scratch_dir("kbf-server-pass-earlier-raise");
+        let files = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
+        let meta = RaftMetaLog::open_dir(&root.join("raft"), Retention::default(), "kbf/")
             .await
             .expect("open the log");
-        let two = ready_among(&log, 2);
-        assert_eq!(two, Ok(EvictReady::NeedsV3 { voters: 2 }));
-        assert_eq!(log.machine_version(), MachineVersion::V1);
-        assert_eq!(ready_to_evict(&log), Ok(EvictReady::Ready));
-        assert_eq!(log.machine_version(), MachineVersion::V3);
-        assert_eq!(ready_among(&log, 2), Ok(EvictReady::Ready));
-        drop(log);
-    }
+        meta.raise_machine_version(MachineVersion::V3)
+            .expect("the earlier build's raise");
+        assert_eq!(
+            meta.commit(Command::AllocEpoch).await,
+            Ok(Applied::Epoch(Epoch::new(1)))
+        );
+        let prefix = meta.store_prefix();
+        let at = |seq| Location {
+            store: StoreId::CONFIGURED,
+            object: ObjectId::new(Epoch::new(1), seq),
+            offset: 0,
+        };
+        let lost = kbf_segments::sha256(b"lost");
+        let kept = kbf_segments::sha256(b"kept");
+        let put = meta.commit(Command::PutBlobs(vec![(lost, at(1)), (kept, at(2))]));
+        assert!(matches!(put.await, Ok(Applied::Blobs(Ok(_)))));
+        let body = Bytes::from_static(b"some bytes");
+        let stored = files.put_new(&object_key(&prefix, 2), body, None).await;
+        stored.expect("write the object file");
+        let cache = Arc::new(
+            Cache::open(meta, files.clone(), prefix)
+                .await
+                .expect("a cache"),
+        );
 
-    /// Catches a readiness that raises the log past its start ceiling (mutant: the
-    /// ceiling ignored by the raise); one that calls a log still below version 3 ready
-    /// because the raise returned (mutant: the version check after the raise dropped),
-    /// which would commit `EvictObjects` to a log that refuses it; one that refuses a
-    /// log an operator raised past the ceiling (mutant: the ceiling checked before the
-    /// log's own version); and a ceiling that holds back a raise it allows (mutant: the
-    /// target lowered by one). A single voter with its ceiling at 2 is raised to 2 and
-    /// no further, and says `NeedsV3`; raised to 3 by the operator it is ready; with its
-    /// ceiling at 3 it is raised to 3 and ready.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_start_ceiling_below_version_3_keeps_eviction_off() {
-        let below = crate::test_dir::scratch_dir("kbf-server-pass-ceiling-below");
-        let log = RaftMetaLog::open_dir(&below, Retention::default(), "kbf/")
-            .await
-            .expect("open the log")
-            .with_start_ceiling(MachineVersion::V2);
-        assert_eq!(ready_to_evict(&log), Ok(EvictReady::NeedsV3 { voters: 1 }));
-        assert_eq!(log.machine_version(), MachineVersion::V2);
-        log.raise_machine_version(MachineVersion::V3)
-            .expect("the operator's raise");
-        assert_eq!(ready_to_evict(&log), Ok(EvictReady::Ready));
-        drop(log);
+        let task = spawn(
+            Arc::clone(&cache),
+            StartPass::new(files.clone(), EVICT_GRACE),
+        );
+        logs.ended().await;
+        task.abort();
 
-        let at = crate::test_dir::scratch_dir("kbf-server-pass-ceiling-at");
-        let log = RaftMetaLog::open_dir(&at, Retention::default(), "kbf/")
-            .await
-            .expect("open the log")
-            .with_start_ceiling(MachineVersion::V3);
-        assert_eq!(ready_to_evict(&log), Ok(EvictReady::Ready));
-        assert_eq!(log.machine_version(), MachineVersion::V3);
-        drop(log);
+        let text = logs.text();
+        assert!(text.contains("evicted_objects=1"), "{text}");
+        assert_eq!(cache.meta().machine_version(), MachineVersion::V3);
+        let present = cache.present(&[lost, kept]).await.expect("present");
+        assert_eq!(present, [false, true]);
+        drop((cache, files));
     }
 
     /// What every line the pass ends with says.
@@ -465,9 +395,9 @@ mod tests {
         }
     }
 
-    /// Catches a pass whose failure is dropped without a word (mutant: the error arm
-    /// logs nothing) or brings its task down: a log that cannot be readied for the
-    /// eviction fails the pass, which must log that it failed, with the cause, and end.
+    /// Asserts that a pass that fails is logged and ends: a shard of the store that cannot
+    /// be listed (its directory is gone) fails the pass, which logs that it failed, with
+    /// the cause, and its task ends without a panic.
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_pass_is_logged() {
         let mut logs = Capture::waiting_for(PASS_LINES);
@@ -478,51 +408,42 @@ mod tests {
         let meta = RaftMetaLog::open_dir(&root.join("raft"), Retention::default(), "kbf/")
             .await
             .expect("open the log");
-        assert_eq!(
-            meta.commit(Command::AllocEpoch).await,
-            Ok(Applied::Epoch(Epoch::new(1)))
-        );
         let prefix = meta.store_prefix();
-        let at = |seq| Location {
-            store: StoreId::CONFIGURED,
-            object: ObjectId::new(Epoch::new(1), seq),
-            offset: 0,
-        };
-        let (lost, kept) = (kbf_segments::sha256(b"lost"), kbf_segments::sha256(b"kept"));
-        let put = meta.commit(Command::PutBlobs(vec![(lost, at(1)), (kept, at(2))]));
-        assert!(matches!(put.await, Ok(Applied::Blobs(Ok(_)))));
-        let body = Bytes::from_static(b"some bytes");
-        let planted = files.put_new(&object_key(&prefix, 2), body, None).await;
-        planted.expect("plant");
         let cache = Cache::open(meta, files.clone(), prefix)
             .await
             .expect("a cache");
-        let pass = StartPass {
-            files,
-            ready_to_evict: |_| Err(MetaLogError::Unavailable("not raised".to_owned())),
-            grace: EVICT_GRACE,
-            hold: Box::pin(std::future::ready(())),
-        };
+        let shard = std::fs::read_dir(root.join("blobs").join("objects"))
+            .expect("list the shards")
+            .map(|e| e.expect("a shard").path())
+            .find(|p| std::fs::remove_dir(p).is_ok());
+        assert!(shard.is_some(), "no empty shard to remove");
 
-        spawn(Arc::new(cache), pass)
+        spawn(Arc::new(cache), StartPass::new(files, EVICT_GRACE))
             .await
             .expect("the pass task ends without a panic");
 
         io::Write::flush(&mut logs).expect("flush");
         let text = logs.text();
         assert!(text.contains(PASS_FAILED), "{text}");
-        assert!(text.contains("not raised"), "{text}");
+        assert!(text.contains("No such file or directory"), "{text}");
     }
 
     /// A cache over a Raft log whose earlier epoch indexed the blob `kept` in object
     /// 2, whose file is in a store that sees a file system with nothing free (its
-    /// floor 1000 bytes): what the pass keeps, and the evictor must then evict.
-    async fn short_of_room(name: &str) -> (TestDir, FsStore, Cache<RaftMetaLog, FsStore>) {
+    /// floor 1000 bytes): what the pass keeps, and the evictor must then evict. While
+    /// `broken` is set the file system cannot be asked how much room it has.
+    async fn short_of_room(
+        name: &str,
+        broken: Arc<AtomicBool>,
+    ) -> (TestDir, FsStore, Cache<RaftMetaLog, FsStore>) {
         let root = crate::test_dir::scratch_dir(&format!("kbf-server-{name}"));
         // Room to plant the object file, then none.
         let room = Arc::new(AtomicBool::new(true));
         let fake = Arc::clone(&room);
         let none_free = Arc::new(move |_: &std::path::Path| -> io::Result<Space> {
+            if broken.load(Ordering::Relaxed) {
+                return Err(io::Error::other("the file system cannot be asked"));
+            }
             let available = if fake.load(Ordering::Relaxed) {
                 1 << 20
             } else {
@@ -561,17 +482,16 @@ mod tests {
         (root, files, cache)
     }
 
-    /// Catches a server whose evictor is never armed after the pass (mutant: the loop
-    /// removed), is not seeded with what the pass kept (mutant: no seed; the object is
-    /// then of unknown length and never evicted), or evicts without raising the Raft
-    /// log to the format that carries `EvictObjects` (the commit is refused): with no
-    /// room on the file system, the object the pass kept is forgotten, its file
-    /// deleted, and the round logged.
+    /// Asserts that the evictor is armed after the pass and seeded with what the pass
+    /// kept (an object of unknown length is never evicted): with no room on the file
+    /// system, the object the pass kept is forgotten, its file deleted, and the round
+    /// logged. The Raft log is never raised for it: it is at machine version 1 when the
+    /// round is done.
     #[tokio::test(flavor = "current_thread")]
     async fn the_evictor_runs_after_the_pass() {
         let logs = Capture::waiting_for(b"evicted the least recently used objects");
         let _default = logs.subscribe();
-        let (_root, files, cache) = short_of_room("evictor").await;
+        let (_root, files, cache) = short_of_room("evictor", Arc::default()).await;
         let key = cache
             .object_key(ObjectId::new(Epoch::new(1), 2))
             .expect("a key");
@@ -579,7 +499,7 @@ mod tests {
 
         let task = spawn(
             Arc::clone(&cache),
-            StartPass::over_raft(files.clone(), EVICT_GRACE),
+            StartPass::new(files.clone(), EVICT_GRACE),
         );
         logs.ended().await;
         task.abort();
@@ -587,86 +507,12 @@ mod tests {
         let kept = kbf_segments::sha256(b"kept");
         assert_eq!(cache.present(&[kept]).await.expect("present"), [false]);
         assert!(!files.may_hold(&key).await.expect("may_hold"));
+        assert_eq!(cache.meta().machine_version(), MachineVersion::V1);
         let text = logs.text();
         assert!(
             text.contains("objects=1 bytes=10 blobs=1 actions=0"),
             "{text}"
         );
-        drop(files);
-    }
-
-    /// How many times [`three_voters_counted`] was asked.
-    static ASKED: AtomicUsize = AtomicUsize::new(0);
-
-    /// [`ready_among`] three voters, counting the rounds that ask.
-    fn three_voters_counted(log: &RaftMetaLog) -> Result<EvictReady, MetaLogError> {
-        ASKED.fetch_add(1, Ordering::Relaxed);
-        ready_among(log, 3)
-    }
-
-    /// Catches an evictor that raises the log's machine version in a cell of more
-    /// than one voter (mutant: always raise), evicts there anyway (mutant: `NeedsV3`
-    /// taken as ready), or says it is off every round (mutant: no once-per-start
-    /// check): with no room and three voters, rounds woken by refused writes evict
-    /// nothing, the log stays at version 1, and one line says eviction is off. Once
-    /// the operator raises the log, the next round evicts.
-    #[tokio::test(flavor = "current_thread")]
-    async fn the_evictor_of_a_cell_of_three_waits_for_the_operator() {
-        let logs = Capture::waiting_for(b"evicted the least recently used objects");
-        let _default = logs.subscribe();
-        let (_root, files, cache) = short_of_room("evict-three").await;
-        let key = cache
-            .object_key(ObjectId::new(Epoch::new(1), 2))
-            .expect("a key");
-        let refused = cache
-            .object_key(ObjectId::new(Epoch::new(2), 9))
-            .expect("a key");
-        let cache = Arc::new(cache);
-        let pass = StartPass {
-            files: files.clone(),
-            ready_to_evict: three_voters_counted,
-            grace: EVICT_GRACE,
-            hold: Box::pin(std::future::ready(())),
-        };
-        let refuse = || async {
-            let body = Bytes::from_static(b"no room");
-            let put = files.put_new(&refused, body, None).await;
-            assert!(put.is_err(), "{put:?}");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-
-        let task = spawn(Arc::clone(&cache), pass);
-        let rounds = async {
-            while ASKED.load(Ordering::Relaxed) < 3 {
-                refuse().await;
-            }
-        };
-        tokio::time::timeout(BOUND, rounds)
-            .await
-            .expect("three rounds");
-
-        let text = logs.text();
-        assert_eq!(text.matches(NEEDS_V3).count(), 1, "{text}");
-        assert!(
-            text.contains(&format!("{NEEDS_V3}: eviction off")),
-            "{text}"
-        );
-        assert_eq!(cache.meta().machine_version(), MachineVersion::V1);
-        assert!(files.may_hold(&key).await.expect("may_hold"));
-        let kept = kbf_segments::sha256(b"kept");
-        assert_eq!(cache.present(&[kept]).await.expect("present"), [true]);
-
-        cache
-            .meta()
-            .raise_machine_version(MachineVersion::V3)
-            .expect("the operator's raise");
-        refuse().await;
-        logs.ended().await;
-        task.abort();
-
-        assert!(!files.may_hold(&key).await.expect("may_hold"));
-        assert_eq!(cache.present(&[kept]).await.expect("present"), [false]);
-        assert_eq!(logs.text().matches(NEEDS_V3).count(), 1);
         drop(files);
     }
 
@@ -712,14 +558,12 @@ mod tests {
         };
         let one = std::num::NonZeroU64::MIN;
         let writer = NodeWriter::new(one, one);
-        meta.raise_machine_version(MachineVersion::V4)
-            .expect("a node's log takes format 4");
         let cache = Cache::open_node(meta, files.clone(), keys, writer)
             .await
             .expect("a node's cache");
         let cache = Arc::new(cache);
         let catch_up = CatchUp::rebuilding();
-        let pass = StartPass::over_raft(files.clone(), EVICT_GRACE);
+        let pass = StartPass::new(files.clone(), EVICT_GRACE);
         let _background =
             crate::rebuild::spawn(&cache, &catch_up, Some(pass), RebuildConfig::default());
         logs.ended().await;
@@ -744,30 +588,26 @@ mod tests {
         drop((cache, old, files));
     }
 
-    /// Catches a failed round of eviction dropped without a word or ending the
-    /// evictor (mutant: the error arm logs nothing): a log that cannot be readied for
-    /// `EvictObjects` fails the round, which is logged with the cause; nothing is
-    /// forgotten and the file stays.
+    /// Asserts that a round of eviction that fails is logged: a file system that cannot
+    /// be asked how much room it has fails the round, which is logged with the cause;
+    /// nothing is forgotten and the file stays.
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_eviction_round_is_logged() {
         let logs = Capture::waiting_for(ROUND_FAILED.as_bytes());
         let _default = logs.subscribe();
-        let (_root, files, cache) = short_of_room("evict-fails").await;
+        let broken = Arc::new(AtomicBool::new(false));
+        let (_root, files, cache) = short_of_room("evict-fails", Arc::clone(&broken)).await;
         let key = cache
             .object_key(ObjectId::new(Epoch::new(1), 2))
             .expect("a key");
-        let pass = StartPass {
-            files: files.clone(),
-            ready_to_evict: |_| Err(MetaLogError::Unavailable("not raised".to_owned())),
-            grace: EVICT_GRACE,
-            hold: Box::pin(std::future::ready(())),
-        };
+        broken.store(true, Ordering::Relaxed);
 
-        let task = spawn(Arc::new(cache), pass);
+        let task = spawn(Arc::new(cache), StartPass::new(files.clone(), EVICT_GRACE));
         logs.ended().await;
         task.abort();
 
-        assert!(logs.text().contains("not raised"), "{}", logs.text());
+        let cause = "the file system cannot be asked";
+        assert!(logs.text().contains(cause), "{}", logs.text());
         assert!(files.may_hold(&key).await.expect("may_hold"));
         drop(files);
     }
