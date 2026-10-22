@@ -153,8 +153,17 @@ impl State {
             self.unwritten_floors.clear();
             return;
         };
+        let sched = &self.sched;
+        let learned = &self.learned;
+        // A pending row is written only while the scheduler still holds the floor it
+        // lowered to: a kill that raised it since has written the higher row (a restart
+        // loses what is pending, and the higher row it leaves is the safe side).
+        self.unwritten_floors
+            .retain(|row| sched.key_floor(row.key).unwrap_or(0) == row.ask);
         self.unwritten_floors.retain(|row| {
-            let refused = durable.put_key_floor(row).err();
+            let refused = durable
+                .put_key_floor(row, learned.summary_key(row.key).as_ref())
+                .err();
             if let Some(error) = &refused {
                 tracing::warn!(%error, "a lowered key floor was not written");
             }
@@ -169,7 +178,14 @@ impl State {
             return Vec::new();
         }
         if let RequeueReason::OutOfMemory { raised, .. } = requeue.reason {
-            let bounds = self.bounds_on(&requeue.worker);
+            let mut bounds = self.bounds_on(&requeue.worker);
+            // With `on` the estimator's floor is bounded as the scheduler bounds its own
+            // (the largest node that could run the request, not the node that killed
+            // the run), so the two agree on what a kill raised.
+            let bound = self.sched.key_floor_bound_of(requeue.operation);
+            if self.learned.keys() && bound > 0 {
+                bounds.host_memory = bound;
+            }
             let rows = self.learned.requeued(requeue.lease, raised, &bounds);
             self.lower_key_floors();
             return rows;

@@ -263,6 +263,7 @@ fn a_submitted_operation_is_loaded_queued() {
             }],
             floors: Vec::new(),
             key_floors: Vec::new(),
+            key_names: Vec::new(),
             cordons: Vec::new(),
         }
     );
@@ -1825,8 +1826,16 @@ fn a_store_with_size_key_rows_reads_as_it_did_without_them() {
 #[test]
 fn a_key_floor_row_that_is_not_one_is_refused() {
     let floor = a_key_floor(7, 5);
-    let row = floor::encode_key(&floor);
-    assert_eq!(floor::decode_key(&row), Ok(floor));
+    let row = floor::encode_key(&floor, Some("est/6d61696e/6c696e7578/c/0000000000000001/-"));
+    assert_eq!(
+        floor::decode_key(&row),
+        Ok((
+            floor.clone(),
+            Some("est/6d61696e/6c696e7578/c/0000000000000001/-".to_owned())
+        ))
+    );
+    let bare = floor::encode_key(&floor, None);
+    assert_eq!(floor::decode_key(&bare), Ok((floor, None)));
     let mut other = row.clone();
     other[0] = 2;
     assert!(floor::decode_key(&other).is_err());
@@ -1836,6 +1845,9 @@ fn a_key_floor_row_that_is_not_one_is_refused() {
     let mut longer = row.clone();
     longer.push(0);
     assert!(floor::decode_key(&longer).is_err());
+    let mut mislen = bare.clone();
+    mislen[25..27].copy_from_slice(&5_u16.to_be_bytes());
+    assert!(floor::decode_key(&mislen).is_err());
 
     let store = Flaky::new();
     let durable = open(&store);

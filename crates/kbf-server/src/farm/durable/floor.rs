@@ -65,17 +65,22 @@ pub(super) fn key_row(key: u64) -> String {
 }
 
 /// `floor` as a row value: a version byte (1), the key, the ask and the stamp (8 bytes
-/// each, big-endian).
-pub(super) fn encode_key(floor: &KeyFloor) -> Vec<u8> {
+/// each, big-endian), then the name of the size summary the key's floor decays with (the
+/// key of its `est/` row, behind a two-byte length; empty for none).
+pub(super) fn encode_key(floor: &KeyFloor, summary: Option<&str>) -> Vec<u8> {
+    let name = summary.unwrap_or("").as_bytes();
     let mut row = vec![VERSION];
     row.extend(floor.key.to_be_bytes());
     row.extend(floor.ask.to_be_bytes());
     row.extend(floor.stamp.to_be_bytes());
+    row.extend(u16::try_from(name.len()).unwrap_or(0).to_be_bytes());
+    row.extend(name);
     row
 }
 
-/// A `keyfloor/` row value as a [`KeyFloor`], or what is wrong with it.
-pub(super) fn decode_key(row: &[u8]) -> Result<KeyFloor, &'static str> {
+/// A `keyfloor/` row value as a [`KeyFloor`] and the name of its size summary, or what is
+/// wrong with it.
+pub(super) fn decode_key(row: &[u8]) -> Result<(KeyFloor, Option<String>), &'static str> {
     let (version, rest) = row.split_first().ok_or("the row ends early")?;
     if *version != VERSION {
         return Err("not a version 1 key floor");
@@ -83,12 +88,15 @@ pub(super) fn decode_key(row: &[u8]) -> Result<KeyFloor, &'static str> {
     let (key, rest) = rest.split_first_chunk::<8>().ok_or("the row ends early")?;
     let (ask, rest) = rest.split_first_chunk::<8>().ok_or("the row ends early")?;
     let (stamp, rest) = rest.split_first_chunk::<8>().ok_or("the row ends early")?;
-    if !rest.is_empty() {
-        return Err("the row is longer than a key floor");
+    let (len, rest) = rest.split_first_chunk::<2>().ok_or("the row ends early")?;
+    if rest.len() != usize::from(u16::from_be_bytes(*len)) {
+        return Err("the row is not the length it says");
     }
-    Ok(KeyFloor {
+    let name = std::str::from_utf8(rest).map_err(|_| "a summary name is not text")?;
+    let floor = KeyFloor {
         key: u64::from_be_bytes(*key),
         ask: u64::from_be_bytes(*ask),
         stamp: u64::from_be_bytes(*stamp),
-    })
+    };
+    Ok((floor, (!name.is_empty()).then(|| name.to_owned())))
 }

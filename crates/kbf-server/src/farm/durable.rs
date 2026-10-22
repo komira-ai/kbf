@@ -189,6 +189,8 @@ pub(super) struct Stored {
     pub floors: Vec<Floor>,
     /// Every key floor, in key order.
     pub key_floors: Vec<KeyFloor>,
+    /// The size summary each key floor decays with, for those whose row names one.
+    pub key_names: Vec<(u64, kbf_estimator::Key)>,
     /// Every node an operator placed, in node-id order.
     pub cordons: Vec<(WorkerId, StoredCordon)>,
 }
@@ -551,6 +553,7 @@ impl Durable {
             floors.push(floor);
         }
         let mut key_floors = Vec::new();
+        let mut key_names = Vec::new();
         let mut key_stamps = std::collections::BTreeSet::new();
         for (key, row) in self
             .store
@@ -558,7 +561,10 @@ impl Durable {
             .into_iter()
             .filter(|_| read_size_keys)
         {
-            let floor = floor::decode_key(&row.value).map_err(|why| corrupt(&key, why))?;
+            let (floor, name) = floor::decode_key(&row.value).map_err(|why| corrupt(&key, why))?;
+            if let Some(summary) = name.as_deref().and_then(estimate::parse_key) {
+                key_names.push((floor.key, summary));
+            }
             if key != floor::key_row(floor.key) {
                 return Err(corrupt(&key, "not the key of the key floor it holds"));
             }
@@ -588,6 +594,7 @@ impl Durable {
             operations,
             floors,
             key_floors,
+            key_names,
             cordons: self.cordons()?,
         })
     }
@@ -811,13 +818,19 @@ impl Durable {
 
     /// Writes the key floor `floor` as it now stands, or deletes its row when it was
     /// forgotten (an `ask` of 0): outside any requeue, after the estimator's decay lowered
-    /// it. Best effort for the caller; the row keeps its stamp.
-    pub(super) fn put_key_floor(&self, floor: &KeyFloor) -> Result<(), StateError> {
+    /// it. Best effort for the caller; the row keeps its stamp and names the size summary
+    /// `summary` that its floor decays with.
+    pub(super) fn put_key_floor(
+        &self,
+        floor: &KeyFloor,
+        summary: Option<&kbf_estimator::Key>,
+    ) -> Result<(), StateError> {
         let row = floor::key_row(floor.key);
+        let name = summary.map(estimate::row_key);
         let txn = if floor.ask == 0 {
             Txn::new().delete(row, Cond::Any)
         } else {
-            Txn::new().put(row, floor::encode_key(floor), Cond::Any)
+            Txn::new().put(row, floor::encode_key(floor, name.as_deref()), Cond::Any)
         };
         self.commit(txn)
     }
@@ -831,12 +844,26 @@ impl Durable {
     /// one ([`kbf_sched::RequeueReason::is_loss`]). `fate` is what the operation's faults
     /// changed so far, if they changed anything: it goes in the same transaction as the
     /// queue row.
+    #[cfg(test)]
     pub(super) fn requeued(
         &self,
         requeue: &Requeue,
         losses: Option<u32>,
         fate: Option<&Fate>,
         floors: &FloorChange,
+    ) -> Result<(), StateError> {
+        self.requeued_named(requeue, losses, fate, floors, None)
+    }
+
+    /// [`Durable::requeued`], with the size summary the raised key floor decays with, if
+    /// it is known: its row names it.
+    pub(super) fn requeued_named(
+        &self,
+        requeue: &Requeue,
+        losses: Option<u32>,
+        fate: Option<&Fate>,
+        floors: &FloorChange,
+        summary: Option<&kbf_estimator::Key>,
     ) -> Result<(), StateError> {
         let mut txn = Txn::new();
         // The floor outlives the operation: a kill raises it, and the operation may end
@@ -859,9 +886,10 @@ impl Durable {
         // The same for the key floor, in the same transaction.
         let key_raised = floors.key_raised.as_ref();
         if let Some(floor) = key_raised {
+            let name = summary.map(estimate::row_key);
             txn = txn.put(
                 floor::key_row(floor.key),
-                floor::encode_key(floor),
+                floor::encode_key(floor, name.as_deref()),
                 Cond::Any,
             );
         }
@@ -1326,14 +1354,23 @@ impl State {
                 FloorChange::default()
             };
             kills.extend(self.learned_requeue(requeue));
+            // A raise makes any lowered row still waiting for the store stale: the
+            // requeue writes the floor as it stands.
+            if let Some(raised) = &floors.key_raised {
+                self.unwritten_floors.retain(|f| f.key != raised.key);
+            }
             self.unsettled.push((requeue.clone(), losses, fate, floors));
         }
         let pending = std::mem::take(&mut self.unsettled);
         let refused: Vec<_> = pending
             .into_iter()
             .filter(|(requeue, losses, fate, floors)| {
+                let summary = floors
+                    .key_raised
+                    .as_ref()
+                    .and_then(|f| self.learned.summary_key(f.key));
                 !self.durably("a requeue", |d| {
-                    d.requeued(requeue, *losses, fate.as_ref(), floors)
+                    d.requeued_named(requeue, *losses, fate.as_ref(), floors, summary.as_ref())
                 })
             })
             .collect();
@@ -1421,6 +1458,7 @@ impl State {
         let next_operation = OperationId(stored.next_operation);
         self.sched.restore_floors(stored.floors);
         self.sched.restore_key_floors(stored.key_floors);
+        let stored_names = stored.key_names;
         // Off reads no size summaries and leaves them as they are.
         if !self.learned.off() {
             self.learned.restore(&durable.estimates()?);
@@ -1432,6 +1470,12 @@ impl State {
         // raises only the operations queued after it.
         for (operation, key) in keyed {
             self.sched.set_size_key(operation, key);
+        }
+        // A key whose operations have all finished still has its floor and its decay.
+        if self.learned.keys() {
+            for (size_key, summary) in &stored_names {
+                self.learned.register(summary, *size_key);
+            }
         }
         self.restore_cordons(stored.cordons);
         self.durable = Some(durable);

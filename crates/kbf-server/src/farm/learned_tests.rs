@@ -285,6 +285,11 @@ fn a_bad_size_key_row_stops_a_start_only_when_on() {
 
 /// A worker `name` with room for a 16 GiB lease registered with `farm`.
 fn register(farm: &Farm, name: &str) -> kbf_types::WorkerId {
+    register_sized(farm, name, 64)
+}
+
+/// A worker `name` of `gib` GiB registered with `farm`.
+fn register_sized(farm: &Farm, name: &str, gib: u64) -> kbf_types::WorkerId {
     let worker = kbf_types::WorkerId::new(name);
     let caps = kbf_caps::NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
         .expect("caps")
@@ -296,7 +301,7 @@ fn register(farm: &Farm, name: &str) -> kbf_types::WorkerId {
         &worker,
         kbf_sched::DaemonInstance::new(name),
         kbf_sched::DaemonInstance::new(""),
-        crate::farm::phase::Reported::serving(kbf_types::Resources::new(4_000, 64 << 30), caps),
+        crate::farm::phase::Reported::serving(kbf_types::Resources::new(4_000, gib << 30), caps),
         outbound,
         kbf_proto::worker::ServerMessage::default(),
     );
@@ -400,10 +405,20 @@ struct Killed {
 }
 
 fn killed_farm(store: Arc<dyn Store>, rows: &Arc<Fake>) -> Killed {
+    killed_farm_on(store, rows, &[("node-a", 64)])
+}
+
+/// [`killed_farm`] over workers of the given sizes (name, GiB): the first by name takes
+/// the job, and the kill happens there.
+fn killed_farm_on(store: Arc<dyn Store>, rows: &Arc<Fake>, nodes: &[(&str, u64)]) -> Killed {
     use kbf_estimator::GIB;
 
     let farm = over(store, LearnedSizes::On);
-    let node = register(&farm, "node-a");
+    let workers: Vec<_> = nodes
+        .iter()
+        .map(|(name, gib)| register_sized(&farm, name, *gib))
+        .collect();
+    let node = workers[0].clone();
     Job::new(1).submit(&farm);
     let size_key = keys(rows)[0].expect("keyed");
     let (operation, lease) = {
@@ -436,13 +451,18 @@ fn killed_farm(store: Arc<dyn Store>, rows: &Arc<Fake>) -> Killed {
 impl Killed {
     /// 257 quiet runs of the key, shown at farm time `days` days in.
     fn quiet(&mut self, days: u64) {
+        self.quiet_runs(days, 257);
+    }
+
+    /// `runs` quiet runs of the key, shown at farm time `days` days in.
+    fn quiet_runs(&mut self, days: u64, runs: u64) {
         use crate::learned::Attempt;
         use kbf_types::{FarmTime, LeaseId};
         let mut state = self.farm.lock();
         state
             .learned
             .clock(FarmTime::from_millis(days * 86_400_000));
-        for _ in 0..257 {
+        for _ in 0..runs {
             self.seq += 1;
             let lease = LeaseId::new(9, self.seq);
             let attempt = Attempt {
@@ -608,6 +628,12 @@ fn a_fenced_farm_lowers_the_floor_and_writes_no_row() {
     killed.quiet(8);
     assert_eq!(killed.farm.lock().sched.key_floor(size_key), Some(8 * GIB));
     assert_eq!(row_ask(&rows), Some(16 * GIB));
+    killed.farm.lock().flush_learned();
+    assert_eq!(
+        row_ask(&rows),
+        Some(16 * GIB),
+        "a later tick writes nothing either"
+    );
 }
 
 /// A key the scheduler holds no floor for (another keyed operation under the same
@@ -619,9 +645,15 @@ fn a_decay_for_a_key_without_a_floor_writes_nothing() {
     killed.farm.lock().learned.register(&killed.key, 999);
     killed.quiet(8);
     assert_eq!(killed.farm.lock().sched.key_floor(999), None);
+    let names: Vec<String> = rows
+        .scan_prefix("keyfloor/")
+        .expect("scan")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
     assert_eq!(
-        rows.scan_prefix("keyfloor/").expect("scan").len(),
-        1,
+        names,
+        vec![format!("keyfloor/{:016x}", killed.size_key)],
         "the one row is the killed key's"
     );
 }
@@ -646,4 +678,233 @@ fn a_decay_does_not_lower_a_floor_a_newer_kill_raised() {
     killed.quiet(8);
     assert_eq!(killed.farm.lock().sched.key_floor(size_key), Some(32 * GIB));
     assert_eq!(row_ask(&rows), Some(16 * GIB));
+}
+
+/// What a quiet cgroup-measured success of `peak` bytes carried, as the farm reads it.
+fn measured(peak: u64) -> crate::action_usage::Measured {
+    use kbf_proto::reapi::{ActionResult, ExecutedActionMetadata};
+    use kbf_proto::worker::{CgroupUsage, ResourceUsage, UsageBasis};
+    let usage = ResourceUsage {
+        wall_micros: 2_000_000,
+        cgroup: Some(CgroupUsage {
+            memory_peak_bytes: Some(peak),
+            cpu_usage_micros: Some(500),
+            ..CgroupUsage::default()
+        }),
+        basis: UsageBasis::Cgroup.into(),
+        ..ResourceUsage::default()
+    };
+    let result = kbf_proto::worker::Result {
+        action_result: Some(ActionResult {
+            execution_metadata: Some(ExecutedActionMetadata {
+                auxiliary_metadata: vec![usage.to_any()],
+                ..ExecutedActionMetadata::default()
+            }),
+            ..ActionResult::default()
+        }),
+        ..kbf_proto::worker::Result::default()
+    };
+    crate::action_usage::Measured::of(&result).expect("a usage")
+}
+
+/// The farm takes the success of `lease` (operation `operation`) measured at `peak`.
+fn succeed(
+    farm: &Farm,
+    node: &kbf_types::WorkerId,
+    operation: kbf_types::OperationId,
+    lease: kbf_types::LeaseId,
+    peak: u64,
+) {
+    let report = super::Report {
+        lease,
+        outcome: kbf_types::Outcome::Completed {
+            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+        },
+        measured: Some(measured(peak)),
+        exit_code: Some(0),
+        run: None,
+    };
+    let now = farm.now();
+    farm.lock().take_report(now, node, operation, report);
+}
+
+/// The operation and lease of the newest operation the node holds.
+fn newest(farm: &Farm, node: &kbf_types::WorkerId) -> (kbf_types::OperationId, kbf_types::LeaseId) {
+    let mut state = farm.lock();
+    // A requeued operation is placed at the next tick.
+    state.feed_quiet(farm.now(), kbf_sched::Event::Tick);
+    let operation = state.sched.unfinished().max().expect("an operation");
+    let lease = state
+        .sched
+        .leases_on(node)
+        .into_iter()
+        .find(|lease| {
+            matches!(
+                state.sched.state(operation),
+                Some(kbf_sched::OpState::Leased { lease: held, .. }) if held == lease
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "its lease: {operation:?} {:?} {:?}",
+                state.sched.state(operation),
+                state.sched.leases_on(node)
+            )
+        });
+    (operation, lease)
+}
+
+/// The kill-raised floor and the estimator's floor agree when the kill happens on a
+/// worker smaller than the largest one that could run the action, so the decay is not
+/// held back by a scheduler floor the estimator's older, lower value cannot match.
+#[test]
+fn a_floor_killed_on_a_smaller_worker_decays_like_any_other() {
+    use kbf_estimator::GIB;
+    let rows = store();
+    let mut killed = killed_farm_on(rows.clone(), &rows, &[("a-small", 16), ("b-big", 64)]);
+    let size_key = killed.size_key;
+    let summary = killed
+        .farm
+        .lock()
+        .learned
+        .summary_key(size_key)
+        .expect("named");
+    let estimator_floor = |killed: &Killed| {
+        let state = killed.farm.lock();
+        state
+            .learned
+            .summaries()
+            .get(&summary)
+            .map(kbf_estimator::Summary::oom_floor)
+    };
+    assert_eq!(
+        estimator_floor(&killed),
+        Some(16 * GIB),
+        "not clamped to 16 GiB less 256 MiB"
+    );
+    killed.quiet(8);
+    assert_eq!(killed.farm.lock().sched.key_floor(size_key), Some(8 * GIB));
+    assert_eq!(row_ask(&rows), Some(8 * GIB));
+}
+
+/// A lowered row waiting for the store is dropped when a kill raises the floor again: the
+/// requeue writes the higher floor, and the late lower row must not overwrite it. What is
+/// pending is lost at a restart, which leaves the higher row: the safe side.
+#[test]
+fn a_pending_lowered_row_does_not_overwrite_a_floor_raised_since() {
+    use kbf_estimator::GIB;
+    let rows = store();
+    let refusing = Arc::new(Refusing {
+        inner: rows.clone(),
+        refuse: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut killed = killed_farm(refusing.clone(), &rows);
+    let size_key = killed.size_key;
+    refusing
+        .refuse
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    killed.quiet(8);
+    assert_eq!(killed.farm.lock().unwritten_floors.len(), 1, "pending");
+
+    // A new digest books the lowered floor and is killed while the store still refuses:
+    // the floor rises to 16 GiB, and the requeue's row waits for the store too.
+    Job::new(2).submit(&killed.farm);
+    let (operation, lease) = newest(&killed.farm, &killed.node);
+    let report = super::Report {
+        lease,
+        outcome: kbf_types::Outcome::Failed(kbf_types::Failure::OutOfMemory),
+        measured: None,
+        exit_code: None,
+        run: None,
+    };
+    let now = killed.farm.now();
+    killed
+        .farm
+        .lock()
+        .take_report(now, &killed.node, operation, report);
+    assert_eq!(killed.farm.lock().sched.key_floor(size_key), Some(16 * GIB));
+    assert!(killed.farm.lock().unwritten_floors.is_empty(), "dropped");
+    refusing
+        .refuse
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    // The worst order: the requeue's higher row first, then the tick that would write a
+    // stale lowered one.
+    killed.farm.lock().flush_step();
+    assert_eq!(row_ask(&rows), Some(16 * GIB));
+    killed.farm.lock().flush_learned();
+    assert_eq!(row_ask(&rows), Some(16 * GIB), "a later tick leaves it");
+}
+
+/// The row names the summary its floor decays with, so after a restart in which every
+/// operation of the key has finished, attempts of the key (any, hinted ones included)
+/// still lower the floor.
+#[test]
+fn a_floor_whose_operations_have_all_finished_still_decays_after_a_restart() {
+    use kbf_estimator::GIB;
+    let rows = store();
+    let killed = killed_farm(rows.clone(), &rows);
+    let size_key = killed.size_key;
+    // The killed action's retry runs to the end: no operation is left in the store.
+    let (operation, lease) = newest(&killed.farm, &killed.node);
+    succeed(&killed.farm, &killed.node, operation, lease, 500 << 20);
+    killed.farm.lock().flush_learned();
+    let (node, key, run) = (killed.node.clone(), killed.key.clone(), killed.run);
+    drop(killed);
+    assert!(rows.scan_prefix("op/").expect("scan").is_empty());
+    assert!(rows.scan_prefix("opkey/").expect("scan").is_empty());
+
+    let restarted = farm_over(&rows, LearnedSizes::On);
+    assert_eq!(restarted.lock().learned.named(&key), vec![size_key]);
+    let mut again = Killed {
+        farm: restarted,
+        node,
+        size_key,
+        key,
+        run,
+        seq: 3_000,
+    };
+    again.quiet(8);
+    assert_eq!(again.farm.lock().sched.key_floor(size_key), Some(8 * GIB));
+    assert_eq!(row_ask(&rows), Some(8 * GIB));
+}
+
+/// A keyed operation still in the store registers its estimator key at restart, with no
+/// floor row to name it.
+#[test]
+fn a_restart_registers_the_keys_of_the_operations_it_restores() {
+    let rows = store();
+    let farm = farm_over(&rows, LearnedSizes::On);
+    Job::new(1).submit(&farm);
+    let size_key = keys(&rows)[0].expect("keyed");
+    drop(farm);
+    assert!(rows.scan_prefix("keyfloor/").expect("scan").is_empty());
+    let restarted = farm_over(&rows, LearnedSizes::On);
+    let (key, _) = estimator_key_and_run();
+    assert_eq!(restarted.lock().learned.named(&key), vec![size_key]);
+    // Without `on` nothing is registered.
+    drop(restarted);
+    let off = farm_over(&rows, LearnedSizes::Shadow);
+    assert!(off.lock().learned.named(&key).is_empty());
+}
+
+/// An attempt the client sized (never keyed) is the one that crosses the threshold, as the
+/// farm runs it end to end: the keyed floor of the same shape is lowered.
+#[test]
+fn a_client_sized_attempt_that_crosses_the_threshold_lowers_the_keyed_floor() {
+    use kbf_estimator::GIB;
+    let rows = store();
+    let mut killed = killed_farm(rows.clone(), &rows);
+    let size_key = killed.size_key;
+    // 255 quiet runs leave the key one short of the threshold.
+    killed.quiet_runs(8, 255);
+    assert_eq!(killed.farm.lock().sched.key_floor(size_key), Some(16 * GIB));
+    let hinted = Job {
+        memory: BookSource::Hint,
+        ..Job::new(3)
+    };
+    hinted.submit(&killed.farm);
+    let (operation, lease) = newest(&killed.farm, &killed.node);
+    assert_eq!(keys(&rows)[1], None, "the client sized it: not keyed");
+    succeed(&killed.farm, &killed.node, operation, lease, 500 << 20);
+    assert_eq!(killed.farm.lock().sched.key_floor(size_key), Some(8 * GIB));
 }

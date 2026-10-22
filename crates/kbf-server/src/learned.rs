@@ -150,6 +150,8 @@ pub struct Learned {
     /// key floors a decay of that key's summary lowers, whichever attempt causes it
     /// ([`Learned::register`]).
     named: BTreeMap<Key, BTreeSet<u64>>,
+    /// The estimator key (level 2) of each size key in `named`, for the row of its floor.
+    names: BTreeMap<u64, Key>,
     /// Key floors the estimator's decay has lowered since they were last taken: the size
     /// key, the floor the summary held before and the one it holds now.
     lowered: Vec<(u64, u64, u64)>,
@@ -176,6 +178,7 @@ impl Learned {
             swept: None,
             sweeping: None,
             named: BTreeMap::new(),
+            names: BTreeMap::new(),
             lowered: Vec::new(),
         }
     }
@@ -290,10 +293,28 @@ impl Learned {
         if !self.keys() {
             return;
         }
-        if self.named.len() >= STARTED_CAP {
-            self.named.pop_first();
+        if self.named.len() >= STARTED_CAP
+            && let Some((_, gone)) = self.named.pop_first()
+        {
+            self.names.retain(|size_key, _| !gone.contains(size_key));
         }
         self.named.entry(key.l2()).or_default().insert(size_key);
+        self.names.insert(size_key, key.l2());
+    }
+
+    /// The estimator key (level 2) the keyed operations with `size_key` were registered
+    /// under, if any.
+    #[must_use]
+    pub fn summary_key(&self, size_key: u64) -> Option<Key> {
+        self.names.get(&size_key).cloned()
+    }
+
+    /// The size keys registered under the estimator key `key`, for a test.
+    #[must_use]
+    pub fn named(&self, key: &Key) -> Vec<u64> {
+        self.named
+            .get(&key.l2())
+            .map_or_else(Vec::new, |keys| keys.iter().copied().collect())
     }
 
     /// The key floors the estimator's decay lowered since the last call: the size key, the
