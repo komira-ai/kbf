@@ -482,7 +482,8 @@ const LEASE_LOOK: Duration = Duration::from_millis(20);
 
 /// SIGTERM to every process of `uid`, then `live` (the pids to wait for) every `look`
 /// until none is left or `grace` has passed ([`grace::term_first`]): the processes
-/// still alive then, named before the kill that follows. Nothing is sent for a grace of
+/// still alive then, named before the kill that follows; the system's own helpers
+/// ([`procs::is_system_binary`]) are not counted. Nothing is sent for a grace of
 /// zero.
 ///
 /// # Errors
@@ -494,10 +495,17 @@ pub(crate) fn term_uid(
     look: Duration,
 ) -> Result<Vec<Survivor>, String> {
     let started = Instant::now();
+    // The system's own helpers (an attached disk image's) do not end on SIGTERM and are
+    // not the action's: neither waited for nor named ([`procs::is_system_binary`]).
+    let mut actions = || {
+        let mut pids = live()?;
+        pids.retain(|pid| !procs::executable_of(*pid).is_some_and(|p| procs::is_system_binary(&p)));
+        Ok(pids)
+    };
     grace::term_first(
         grace,
         &mut || uid::term(uid).map_err(|e| e.to_string()),
-        live,
+        &mut actions,
         &mut |pid| Survivor::of(pid, procs::command_of(pid)),
         &mut || started.elapsed(),
         &mut || std::thread::sleep(look),

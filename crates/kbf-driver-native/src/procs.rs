@@ -210,9 +210,26 @@ pub struct Rusage {
     pub lifetime: Option<crate::usage::Lifetime>,
 }
 
-#[cfg(target_os = "macos")]
-pub use platform::timebase;
+/// The folders of the macOS system volume that hold the helpers the system starts as a
+/// user (`diskimages-helper` for an attached disk image, for one).
+pub const SYSTEM_FOLDERS: [&str; 3] = ["/System/", "/usr/libexec/", "/usr/sbin/"];
+
+/// Whether `path`, the executable of a process, is a system binary: under
+/// [`SYSTEM_FOLDERS`]. Such a process is the system's, not the action's, and does not
+/// end on SIGTERM; it is left out of the SIGTERM wait and the survivor report (the
+/// SIGKILL still takes it). An action cannot make its own binary look like one: those
+/// folders are on the sealed, read-only system volume, which no user (root included)
+/// can write to, and a path is compared as `proc_pidpath` gives it, never as an
+/// argument the action chose.
+#[must_use]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn is_system_binary(path: &str) -> bool {
+    SYSTEM_FOLDERS.iter().any(|folder| path.starts_with(folder))
+}
+
 pub use platform::{command_of, process, rusage, snapshot};
+#[cfg(target_os = "macos")]
+pub use platform::{executable_of, timebase};
 
 #[cfg(target_os = "linux")]
 mod platform {
@@ -331,6 +348,20 @@ mod platform {
             start: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
             zombie: info.pbi_status == SZOMB,
         })
+    }
+
+    /// The path of the executable `pid` runs (`proc_pidpath`); `None` once it is gone.
+    #[must_use]
+    pub fn executable_of(pid: i32) -> Option<String> {
+        let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let size = u32::try_from(path.len()).ok()?;
+        // FFI-BOUNDARY: `path` is this frame's; proc_pidpath writes at most `size` bytes
+        // into it and keeps no pointer past the call.
+        // SAFETY: `path` holds `size` writable bytes; the pointer outlives the call.
+        let len = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), size) };
+        let len = usize::try_from(len).ok().filter(|len| *len > 0)?;
+        path.truncate(len);
+        String::from_utf8(path).ok()
     }
 
     /// The name and the arguments (one line) of `pid` (`KERN_PROCARGS2`); `None` once it
@@ -530,6 +561,35 @@ mod tests {
             pgid,
             start,
             zombie: false,
+        }
+    }
+
+    /// Catches a system helper counted as the action's (it ignores SIGTERM: every lease
+    /// that attached a disk image would wait the whole grace and name
+    /// `diskimages-helper`), and a path that only looks like a system folder (a sibling
+    /// folder, a relative path, a lease's own directory) taken for one.
+    #[test]
+    fn a_binary_under_the_system_folders_is_the_systems() {
+        for system in [
+            "/System/Library/PrivateFrameworks/DiskImages.framework/Resources/diskimages-helper",
+            "/usr/libexec/xpcproxy",
+            "/usr/sbin/cfprefsd",
+        ] {
+            assert!(is_system_binary(system), "{system}");
+        }
+        for other in [
+            "",
+            "/usr/bin/python3",
+            "/usr/local/libexec/tool",
+            "/usr/libexec",
+            "/System",
+            "/Systems/x",
+            "/usr/sbinx/tool",
+            "usr/sbin/tool",
+            "/private/var/folders/x/System/tool",
+            "/Users/slot/System/tool",
+        ] {
+            assert!(!is_system_binary(other), "{other}");
         }
     }
 
