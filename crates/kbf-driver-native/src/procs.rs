@@ -579,7 +579,7 @@ mod tests {
         }
         for other in [
             "",
-            "/usr/bin/python3",
+            "/usr/bin/tar",
             "/usr/local/libexec/tool",
             "/usr/libexec",
             "/System",
@@ -587,7 +587,7 @@ mod tests {
             "/usr/sbinx/tool",
             "usr/sbin/tool",
             "/private/var/folders/x/System/tool",
-            "/Users/slot/System/tool",
+            "/private/var/slot/System/tool",
         ] {
             assert!(!is_system_binary(other), "{other}");
         }
