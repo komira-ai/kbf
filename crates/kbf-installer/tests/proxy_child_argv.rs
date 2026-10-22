@@ -5,7 +5,9 @@
 #![cfg(target_os = "linux")]
 
 use std::ffi::OsString;
+use std::fs::Permissions;
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use kbf_installer::proxy::model::{Slot, Start};
@@ -134,14 +136,14 @@ fn no_two_listeners_of_the_two_slots_share_a_port() {
 /// golden), named by `--config=`, is all a child needs beyond its listeners (the sibling as its
 /// storage node, the state database), and the listeners still parse where the table dials. The
 /// same command line without the file is refused, so the file is what completed it.
-///
-/// Mutants to plant: `--config=` dropped from the command line (red: the parse is refused for
-/// the storage node the file supplied).
 #[test]
 fn the_frontend_file_of_an_all_in_one_host_completes_the_command_line() {
     let dir = kbf_host::testkit::scratch("proxy-child-argv-config");
     let file = dir.join("frontend.toml");
     std::fs::write(&file, ALL_IN_ONE_FRONTEND).expect("write the golden");
+    // The config check refuses a group-writable file, so the mode is set here rather than left
+    // to the umask (0002 makes the file 0664).
+    std::fs::set_permissions(&file, Permissions::from_mode(0o600)).expect("mode");
     let table = UpstreamTable { base_port: 18_000 };
     let with = |config: Option<&Path>| {
         let argv = frontend_argv(Path::new(SECRET), table, config);

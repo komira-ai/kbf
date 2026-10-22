@@ -272,12 +272,14 @@ impl Records {
                 action,
                 command,
                 shape,
+                evidence,
             } => {
                 if let Some(key) = self.find(&id, &owner)
                     && let Some(i) = self.record(&key).row_of(&action)
                 {
                     // A digest, held in the row: nothing to admit.
                     self.record(&key).rows[i].command = Some(command);
+                    self.record(&key).rows[i].evidence = evidence;
                     if let Some(shape) = shape {
                         self.fill_shape(&key, i, shape);
                     }
@@ -592,7 +594,8 @@ impl Records {
             }
         };
         // A row shows the last Execute of its action: a later one replaces it.
-        let row = ActionRow::new(action, call, how, Some(name.clone()));
+        let mut row = ActionRow::new(action, call, how, Some(name.clone()));
+        row.operation_id = operation.ok();
         let index = match inv.row_of(&action) {
             Some(i) => self.replace_row(key, i, row),
             None => self.add_row(key, row),

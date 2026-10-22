@@ -48,6 +48,7 @@ fn shape(inv: &str, action: u8, cfg_bytes: usize) -> Event {
             }),
             test: false,
         })),
+        evidence: None,
     }
 }
 

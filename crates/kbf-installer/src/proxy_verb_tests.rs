@@ -12,7 +12,7 @@ use crate::proxy::api::traits::RestartPending;
 use crate::proxy::orders::SpoolError;
 use crate::testkit::A;
 
-const PROXY: &str = r#"
+pub(super) const PROXY: &str = r#"
 database = "postgres:///kbf?host=/nonexistent"
 [proxy]
 operator_token_file = "/etc/kbf/operator.token"
@@ -25,13 +25,13 @@ base_port = 18000
 "#;
 
 /// An `installer.toml` with this text, in a scratch directory of its own.
-fn file(name: &str, text: &[u8]) -> PathBuf {
+pub(super) fn file(name: &str, text: &[u8]) -> PathBuf {
     let path = kbf_host::testkit::scratch(&format!("proxy-verb-{name}")).join("installer.toml");
     fs::write(&path, text).expect("write");
     path
 }
 
-fn usage_of(result: Result<impl std::fmt::Debug, VerbError>) -> String {
+pub(super) fn usage_of(result: Result<impl std::fmt::Debug, VerbError>) -> String {
     match result {
         Err(VerbError::Usage(text)) => text,
         other => panic!("not a usage error: {other:?}"),
@@ -108,6 +108,7 @@ fn the_update_apis_numbers_and_places_come_from_the_file_and_the_flags() {
         update_dir: Some("/srv/root-half".into()),
         orders_dir: Some("/srv/orders".into()),
         check: false,
+        kbf_binary: None,
     };
     let (layout, _) = crate::testkit::host_root_on("places", Platform::Linux);
     let cfg = handover_config(&args, &loaded, &layout);
@@ -157,6 +158,7 @@ fn the_update_apis_places_default_to_the_layouts_on_every_platform() {
         check: false,
         update_dir: None,
         orders_dir: None,
+        kbf_binary: None,
     };
     for (platform, state) in [
         (Platform::Linux, "/var/lib/kbf-installer"),
@@ -187,6 +189,7 @@ fn the_update_apis_places_default_to_the_layouts_on_every_platform() {
             check: false,
             update_dir: Some("/srv/u".into()),
             orders_dir: Some("/srv/o".into()),
+            kbf_binary: None,
         };
         let cfg = handover_config(&given, &loaded, &layout);
         assert_eq!(cfg.status_file, PathBuf::from("/srv/u/status.json"));
@@ -436,7 +439,7 @@ fn the_update_apis_start_up_errors_map_to_exit_codes() {
 
 /// The update API's seams over a scratch directory: the state directory exists, the spool and
 /// the root half's `status.json` do not.
-fn handover(name: &str) -> HandoverConfig {
+pub(super) fn handover(name: &str) -> HandoverConfig {
     let root = kbf_host::testkit::scratch(&format!("proxy-verb-api-{name}"));
     let state_dir = root.join("state");
     fs::create_dir(&state_dir).expect("state dir");
@@ -444,6 +447,7 @@ fn handover(name: &str) -> HandoverConfig {
         state_dir,
         orders_dir: root.join("orders"),
         status_file: root.join("status.json"),
+        local: None,
         confirm_window_s: 900,
         fetch_timeout_s: 900,
         slots: SlotAddrs {
@@ -521,6 +525,7 @@ fn check_stops_at_the_table_and_a_run_needs_its_socket() {
         update_dir: Some(path.with_file_name("update")),
         orders_dir: Some(path.with_file_name("orders")),
         check,
+        kbf_binary: None,
     };
     assert_eq!(run(&args(true), Path::new("/")), Ok(()));
     let text = usage_of(run(&args(false), Path::new("/")));
@@ -542,6 +547,7 @@ fn a_root_that_is_not_absolute_is_a_usage_error() {
         update_dir: Some(path.with_file_name("update")),
         orders_dir: Some(path.with_file_name("orders")),
         check: false,
+        kbf_binary: None,
     };
     let result = run(&args, Path::new("relative"));
     assert!(usage_of(result).starts_with("--root: "));
@@ -929,6 +935,7 @@ fn proxy_reads_the_installer_toml_setup_wrote_on_the_platform() {
         check: true,
         update_dir: Some("/nonexistent".into()),
         orders_dir: Some("/nonexistent/orders".into()),
+        kbf_binary: None,
     };
     assert_eq!(
         config_path(&args(None), Platform::Linux),
@@ -1004,6 +1011,7 @@ fn check_refuses_a_file_without_a_database() {
         check: true,
         update_dir: Some("/nonexistent".into()),
         orders_dir: Some("/nonexistent/orders".into()),
+        kbf_binary: None,
     };
     assert!(usage_of(run(&args, Path::new("/"))).contains("state database"));
 }
@@ -1072,7 +1080,9 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
         upstream: config.upstream,
         operator_token_file: config.operator_token_file.clone(),
         status,
+        local: None,
         frontend_config: None,
+        watch: None,
     };
     let retry = Retry {
         attempts: 1,

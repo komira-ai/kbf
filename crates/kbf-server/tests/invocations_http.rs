@@ -496,6 +496,7 @@ async fn an_action_answers_its_row_with_attempts_outputs_logs_and_usage() {
             action,
             command,
             shape: None,
+            evidence: None,
         }])
         .await;
     let row = server.ok(&path).await;

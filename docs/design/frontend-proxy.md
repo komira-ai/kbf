@@ -287,7 +287,7 @@ Stated limits, written in the docs rather than enforced in v1: the member-map fl
 
 While every build declares the same numbers (all 1 today) a pair cannot be incompatible, the order cannot fail, and the lower edge of the window is protocol 0, which any server refuses: the run says each is not exercised. The cell's own checks run in the pull-request gate against fakes (`crates/kbf-integration-test/tests/cross_version.rs`), each red on the defect it names: a raised `min_protocol`, a daemon whose oldest is past the server's newest, a mixed directory, a server that refuses a newer daemon or welcomes it at a version it does not speak, an installer older than the kbf it stages in each of the three numbers, for the frontend's build and for the daemon's, a session that logs a heartbeat gap, an ended session or a message that did not parse. Not covered yet: any message after the heartbeat (`Start`, `Result`, `NodeStatus`, `UpdateStatus`: the cell offers no work, so the fake driver never runs an action), the real `kbf-installer` binary (an installer's numbers are modelled by its release's `kbf --version --json`, and an old installer's `supported()` is assumed equal to that), and the first-crossing case of a daemon whose certificate carries no role (re-enrolment).
 
-**First crossing.** The first update to a release with this layout cannot be a swap. It is a stop and start with a fresh Postgres (section 11), done by `kbf-installer migrate` (#1083) without any state copy.
+**First crossing.** The first update to a release with this layout cannot be a swap. It is a stop and start with a fresh Postgres (section 11), done by installing the kbf and kbf-proxy packages (package-update design; the `kbf-installer migrate` verb is deleted) without any state copy.
 
 ## 10. The proxy's own update
 
@@ -347,7 +347,7 @@ Owners are left blank. Order: U0, then U1/U2, U3a and the farm cutover, then U4a
 | #1062 `POST /v1/update/frontend` in kbf-server | Obsolete. Close after confirming nothing is stacked on its branch. |
 | #1054 slots and `frontend_update` | Change. Slots and `pending_confirm` for frontends go away; confirm and undo become the `confirm`/`revert` orders sent by the proxy supervisor; `handover_protocol` becomes `admin_protocol`. Do not merge as is. Name the salvageable tests first. |
 | #1047 gamma `deploy` | Change. Targets the proxy route, frontend-first, no `--order`. Stacked on #1039: read it first. |
-| #1083 `migrate` | Change. Becomes the first-crossing stop and start on a fresh Postgres; no state copy. |
+| #1083 `migrate` | Deleted (s12 plan PR #8): adoption = installing the packages; the first crossing is a stop and start on a fresh Postgres, no state copy. |
 | #1091 drop Envoy unit | Keep, but blocked until U4b to U7b land, or a host has no front door. Mark it so nobody merges it. |
 | #1088 GitHub OIDC | Keep, reworked on this seam: `kbf-oidc` plus `remote_operator_file` in the proxy, for the two update calls only (section 4a). It no longer adds a `kbf-server` listener or a Kubernetes design. |
 | Merged #937, #930, #984, #1042 | Drain endpoint and `done/` follower stay. Baton, `EnvoyCheck`, the +10 block and `kbf-cli frontend handover` are deleted (U7, U3b). |

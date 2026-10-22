@@ -311,6 +311,14 @@ pub struct Args {
         default_values_t = kbf_sched::MemoryLadder::DEFAULT_GIB
     )]
     pub memory_ladder_gib: Vec<u64>,
+    /// What the farm does with `kbf-estimator`, which predicts an action's memory from
+    /// what its earlier runs used. `off` calls it never. `shadow` shows it every attempt
+    /// that finishes and logs, for every new operation, a `size estimate:` line with what
+    /// it would book, and counts how the attempts fall against its estimates
+    /// (`kbf_estimator_shadow_total`); it books exactly what `off` books. The size
+    /// summaries are kept in the state store; `off` neither reads nor deletes them.
+    #[arg(long, value_enum, default_value_t = crate::LearnedSizes::Off)]
+    pub learned_sizes: crate::LearnedSizes,
     /// How long, in seconds, a finished operation is kept after its callers are
     /// answered. Within it, WaitExecution on the operation's name streams its result
     /// (a client whose Execute stream broke gets a result the action cache does not
@@ -799,6 +807,7 @@ impl Args {
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             default_platform: self.default_platform,
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
+            learned_sizes: self.learned_sizes,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {
                 0 => Duration::MAX,

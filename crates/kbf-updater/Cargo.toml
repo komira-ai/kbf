@@ -10,10 +10,12 @@ publish.workspace = true
 # The optional package that rolls a new kbf version over the hosts of a farm, one host at a
 # time, behind kbf-proxy's local socket. This crate is the core: the API model, the host
 # inventory, the roll state machine over ports (safe-to-stop, install, health, clock) and
-# the durable roll record. It has no listener, no ssh and no HTTP client; those are adapters
-# of the ports, in later changes. Synchronous on purpose: a caller runs `Updater::drive` on
-# its own thread.
+# the durable roll record. On top of it: the API on a unix socket (`server`), the safe-to-stop
+# adapter (an HTTP client of the frontend's loopback operator API) and the binary's wiring
+# (`daemon`). Synchronous on purpose, threads and blocking sockets, no async runtime: HTTP is
+# read with httparse, which the workspace already uses for its loopback calls.
 [dependencies]
+httparse.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

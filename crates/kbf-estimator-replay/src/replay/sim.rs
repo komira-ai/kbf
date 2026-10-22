@@ -493,22 +493,8 @@ impl Sim<'_> {
             self.out.samples.no_key += 1;
             return;
         };
-        let limit = memory_max(booked).unwrap_or(0);
-        let run = Run {
-            outcome: if killed {
-                RunOutcome::OwnLimitKill
-            } else {
-                RunOutcome::Success
-            },
-            wall_us: (self.now_ms - started_ms).saturating_mul(1_000),
-            peak_memory_bytes: Some(op.need.min(limit)),
-            booked_memory_bytes: booked,
-            raised_memory_bytes: raised,
-            limit_hits: 0,
-            swap_peak_bytes: 0,
-            cpu_usage_us: op.cpu_usage_us,
-            node_cpu_pressure_permille: None,
-        };
+        let wall_us = (self.now_ms - started_ms).saturating_mul(1_000);
+        let run = attempt_run(op.need, op.cpu_usage_us, wall_us, booked, killed, raised);
         let seen = self.summaries.observe(key, &run, self.day(), &self.bounds);
         let samples = &mut self.out.samples;
         match seen.memory {
@@ -531,6 +517,36 @@ impl Sim<'_> {
             rec.finished_ms = Some(self.now_ms);
             rec.refused = refused;
         }
+    }
+}
+
+/// What the estimator is shown of an attempt that needed `need` bytes and ran `wall_us`
+/// under a booking of `booked`: its peak is cut at the limit, a kill is an own-limit kill.
+/// The server's shadow builds the same `Run` from a lease's usage
+/// ([`kbf_server::learned::run_of`]); a test holds the two to the same estimates.
+pub fn attempt_run(
+    need: u64,
+    cpu_usage_us: u64,
+    wall_us: u64,
+    booked: u64,
+    killed: bool,
+    raised: Option<u64>,
+) -> Run {
+    let limit = memory_max(booked).unwrap_or(0);
+    Run {
+        outcome: if killed {
+            RunOutcome::OwnLimitKill
+        } else {
+            RunOutcome::Success
+        },
+        wall_us,
+        peak_memory_bytes: Some(need.min(limit)),
+        booked_memory_bytes: booked,
+        raised_memory_bytes: raised,
+        limit_hits: 0,
+        swap_peak_bytes: 0,
+        cpu_usage_us,
+        node_cpu_pressure_permille: None,
     }
 }
 

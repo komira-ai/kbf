@@ -1,6 +1,6 @@
 //! `kbf-updater`: roll a new kbf version over the hosts of a farm, one host at a time.
 //!
-//! This crate is the core, with no listener; the one adapter in it is the ssh installer:
+//! The core:
 //!
 //! - [`api`]: the request, the roll as a poller sees it, the closed set of error codes;
 //! - [`version`]: the one rule for a version, shared with the host-side wrapper;
@@ -12,14 +12,29 @@
 //!   first, the first failure stops it, a restart asks the host before it installs again;
 //! - [`fakes`]: a scripted fake of every port.
 //!
-//! The listener on a unix socket behind kbf-proxy, and the adapters that make the other ports
-//! real (an HTTP client for safe-to-stop and health), come in later changes.
+//! And around it:
+//!
+//! - [`server`] and [`http`]: the roll API on a unix socket behind kbf-proxy;
+//! - [`listener`]: where that socket comes from (systemd socket activation in production);
+//! - [`safe_http`]: the real safe-to-stop, a call to the frontend's loopback operator API;
+//! - [`not_built`]: the installer and health check this build does not have yet, which
+//!   refuse, so that a roll fails at its first step with no host touched;
+//! - [`daemon`]: the flags and the wiring of all of it.
+//!
+//! The health check comes in a later change. The daemon still wires `not_built` for the
+//! installer; switching it to `ssh_installer` is a later change.
 
 pub mod api;
+pub mod daemon;
 pub mod fakes;
+pub mod http;
 pub mod inventory;
+pub mod listener;
+pub mod not_built;
 pub mod ports;
 pub mod record;
+pub mod safe_http;
+pub mod server;
 pub mod ssh_installer;
 pub mod version;
 
@@ -27,6 +42,16 @@ mod updater;
 
 pub use updater::{Ports, Started, Timing, Updater};
 
+#[cfg(test)]
+mod daemon_tests;
+#[cfg(test)]
+mod listener_tests;
+#[cfg(test)]
+mod safe_http_tests;
+#[cfg(test)]
+mod server_tests;
+#[cfg(test)]
+mod testutil;
 #[cfg(test)]
 mod updater_followup_tests;
 #[cfg(test)]
@@ -40,34 +65,24 @@ pub fn version_line() -> String {
 }
 
 /// The binary, as a function so that it is tested: the argument list in, the exit code and the
-/// text out. No verb does anything yet; the listener is a later change.
-pub fn run(args: &[String]) -> (u8, String) {
-    match args.get(1).map(String::as_str) {
-        Some("--version") => (0, format!("{}\n", version_line())),
-        _ => (
-            2,
-            "usage: kbf-updater --version\nThe roll API listener is not part of this build.\n"
-                .to_owned(),
-        ),
+/// text out. `--version` prints the version; the flags of [`daemon`] start the updater,
+/// call `ready` with a handle that stops it, and return when it is stopped. Anything else is
+/// a usage error (exit 2); a start that fails is exit 1 with the reason.
+pub fn run_with(args: &[String], ready: impl FnOnce(daemon::Stopper)) -> (u8, String) {
+    if args.get(1).map(String::as_str) == Some("--version") {
+        return (0, format!("{}\n", version_line()));
     }
+    let cfg = match daemon::parse_flags(
+        args.get(1..).unwrap_or_default(),
+        &listener::Activation::from_env(),
+    ) {
+        Ok(cfg) => cfg,
+        Err(why) => return (2, format!("kbf-updater: {why}\n{}", daemon::USAGE)),
+    };
+    daemon::run_config(&cfg, ready)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Catches a binary that claims to serve: with no listener yet, anything but `--version`
-    /// is a usage error with a non-zero exit.
-    #[test]
-    fn the_stub_answers_version_and_refuses_everything_else() {
-        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-        let (code, out) = run(&args(&["kbf-updater", "--version"]));
-        assert_eq!((code, out), (0, format!("{}\n", version_line())));
-        assert!(version_line().starts_with("kbf-updater 0."));
-        for a in [&["kbf-updater"][..], &["kbf-updater", "serve"]] {
-            let (code, out) = run(&args(a));
-            assert_eq!(code, 2);
-            assert!(out.contains("usage"));
-        }
-    }
+/// [`run_with`], for the binary: nothing to do once started.
+pub fn run(args: &[String]) -> (u8, String) {
+    run_with(args, |_| {})
 }

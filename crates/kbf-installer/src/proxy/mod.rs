@@ -18,7 +18,10 @@
 //! - [`supervisor_swap`], the update API's `Supervisor`: the swap on its own thread;
 //! - [`migrator::DbMigrator`], the `Migrator` over the state database;
 //! - [`releases`], the proxy's own copies of the `kbf` it runs and the [`ports::RootOrders`] that
-//!   goes with them (a status file the proxy writes itself); nothing calls it yet.
+//!   goes with them (a status file the proxy writes itself): what `kbf-installer proxy
+//!   --kbf-binary PATH` turns on (see [`handover`]); without the flag nothing uses it;
+//! - [`binary_watch`], which polls the kbf at that path and starts the swap to a new one (the
+//!   trigger of a package upgrade, in place of the update API).
 //!
 //! Child control over HTTP: [`child_http`] is the blocking loopback client that the real
 //! child control and the fleet read call a child's ports with (U8b); [`admin`] is the
@@ -42,7 +45,8 @@
 //! [`handover_swap::StateDbMigrator`], the same [`migrator::DbMigrator`] built per migration
 //! (see [`handover_swap`]). `Admin::ready` reports `health` and `capabilities` as not ready
 //! until their probes exist, so a swap on a real child stops at `ready`.
-//! [`root_orders::SpoolRootOrders`] is the swap's order port ([`handover_swap`] builds it).
+//! [`root_orders::SpoolRootOrders`] is the swap's order port ([`handover_swap`] builds it), or,
+//! with `--kbf-binary`, [`releases::LocalOrders`].
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
@@ -128,6 +132,7 @@
 pub mod admin;
 mod aio;
 pub mod api;
+pub mod binary_watch;
 #[cfg(target_os = "linux")]
 pub mod boot;
 pub mod child_http;

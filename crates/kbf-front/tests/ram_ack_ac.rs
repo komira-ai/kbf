@@ -119,9 +119,7 @@ async fn parked_at(cluster: &Cluster, i: usize, commit: &mut CommitTask) {
 /// the commit parks at the barrier on the primary; with it parked both owners are killed
 /// and the commit is refused. After the restart there is no entry: `action_result` is a
 /// miss (the action runs again), never a hit whose outputs are gone. Catches an entry
-/// written over blobs that are only in RAM. Mutant: barrier (a) deleted (`commit_closed_at`
-/// skips the `find_durable(.., wait)` call): the commit finishes while both owners hold
-/// the output in RAM and `parked_at` fails.
+/// written over blobs that are only in RAM.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_entry_is_not_written_over_blobs_that_only_the_owners_ram_holds() {
     let mut cluster = Cluster::start(3, Setup::new(64 << 20)).await;
@@ -183,8 +181,7 @@ async fn an_entry_is_not_written_over_blobs_that_only_the_owners_ram_holds() {
 /// result the commit goes through (a blob durable on an owner is enough, the replica is
 /// still in RAM), the entry exists, and after both owners are killed and restarted it is
 /// still a hit with its output readable from the primary's disk. Catches a barrier that
-/// never lets the commit through, and an entry whose blobs are not on a disk. Mutant: the
-/// barrier asks the replica only (the commit stays parked after the primary's drain).
+/// never lets the commit through, and an entry whose blobs are not on a disk.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_entry_is_written_once_the_primary_has_the_blobs_on_its_disk() {
     let mut cluster = Cluster::start(3, Setup::new(64 << 20)).await;

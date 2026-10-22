@@ -1727,6 +1727,7 @@ dependencies = [
  "clap",
  "kbf-caps",
  "kbf-estimator",
+ "kbf-invocation",
  "kbf-sched",
  "kbf-server",
  "kbf-testkit",
@@ -2347,6 +2348,7 @@ dependencies = [
  "kbf-caps",
  "kbf-enroll",
  "kbf-enroll-registry",
+ "kbf-estimator",
  "kbf-front",
  "kbf-history",
  "kbf-installer",
@@ -2606,6 +2608,7 @@ dependencies = [
 name = "kbf-updater"
 version = "0.1.0"
 dependencies = [
+ "httparse",
  "kbf-host-install",
  "kbf-testkit",
  "libc",

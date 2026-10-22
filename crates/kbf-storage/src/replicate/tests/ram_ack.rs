@@ -91,9 +91,7 @@ async fn leg(
 
 /// Catches `--ram-ack-bytes` at its default changing a write: with no node acknowledging
 /// from RAM, both owners commit `Durable`, neither registers a digest with its confirmer,
-/// and no blob is held in RAM. Mutant: the primary asks for a held answer whatever the
-/// storage says (`ram` forced true in `write_blob`): the replica then commits `Held` and
-/// both confirmers keep the digest.
+/// and no blob is held in RAM.
 #[tokio::test]
 async fn at_the_default_no_write_is_held_or_confirmed() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -112,10 +110,9 @@ async fn at_the_default_no_write_is_held_or_confirmed() {
 /// Catches the replica not being asked for a held answer, an owner that does not register
 /// the other with its confirmer, and a gauge that is not told: with the primary
 /// acknowledging from RAM and the replica's own flag off, both commit `Held` (the replica
-/// because the leg asked), the blob is held and not durable on both, the primary's confirmer
-/// keeps it for member 2 and the replica's for member 1, and each store was told it keeps
-/// one. Mutants: the header not sent (the replica commits `Durable`); the replica's
-/// `confirm` left `None`; the primary's likewise.
+/// because the leg asked), the blob is held and not durable on both, the primary's
+/// confirmer keeps it for member 2 and the replica's for member 1, and each store was told
+/// it keeps one.
 #[tokio::test]
 async fn both_owners_hold_and_each_confirms_the_other() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -144,11 +141,8 @@ async fn both_owners_hold_and_each_confirms_the_other() {
 }
 
 /// Catches the order replica, primary, client: the replica's commit is parked at its gate
-/// (a positive event: it arrived), and then the primary has committed nothing and the write
-/// is not answered; released, both commit `Held` and the write is answered. Mutant: the
-/// primary commits before it waits for the replica's answer (`staged.commit` moved above
-/// the join in `receive`): the primary's gate then sees a commit while the replica's is
-/// parked, which the first assertion forbids.
+/// (a positive event: it arrived), and then the primary has committed nothing and the
+/// write is not answered; released, both commit `Held` and the write is answered.
 #[tokio::test]
 async fn the_replica_holds_before_the_primary_and_the_client_hear() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -179,10 +173,8 @@ async fn the_replica_holds_before_the_primary_and_the_client_hear() {
 
 /// Catches a replica that is down being asked for a held answer, a write through that is
 /// not counted for its reason, and a digest registered for a peer that never held it: the
-/// replica is cut off, so the primary commits `Through(ReplicaLost)` after it journaled the
-/// debt, holds nothing in RAM, and registers no digest. Mutant: `Held` for a lost replica
-/// (the `lost` arm of the mode match removed): the primary's blob is then RAM-only with one
-/// copy.
+/// replica is cut off, so the primary commits `Through(ReplicaLost)` after it journaled
+/// the debt, holds nothing in RAM, and registers no digest.
 #[tokio::test]
 async fn a_lost_replica_is_a_write_through_with_its_debt() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -217,9 +209,9 @@ async fn a_replica_the_map_names_down_is_a_write_through_with_its_debt() {
     assert_eq!(farm.nodes[0].repairs.open_records().len(), 1);
 }
 
-/// Catches a one-owner write acknowledged from RAM, which would be one copy: with R = 1 the
-/// node commits `Through(SingleOwner)`, nothing is held in RAM and nothing is registered.
-/// Mutant: `Held` for `Plan::Local` without a sender.
+/// Catches a one-owner write acknowledged from RAM, which would be one copy: with R = 1
+/// the node commits `Through(SingleOwner)`, nothing is held in RAM and nothing is
+/// registered.
 #[tokio::test]
 async fn a_blob_with_one_owner_is_a_write_through() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -250,10 +242,8 @@ async fn a_blob_with_one_owner_is_a_write_through() {
 
 /// Catches a copy from the repair worker (a leg that does not ask) being held in RAM, and
 /// its dedup counting a RAM blob: the replica holds the blob in RAM only; a plain leg
-/// writes it (`Durable`, no longer RAM-only) and registers nothing; a leg that asks
-/// finds it held and writes nothing. Mutants: the replica dedups every leg on the plain
-/// question (the plain leg then writes nothing and the blob stays RAM-only); dedups every
-/// leg on the durable question (the asking leg then writes a second time).
+/// writes it (`Durable`, no longer RAM-only) and registers nothing; a leg that asks finds
+/// it held and writes nothing.
 #[tokio::test]
 async fn only_a_leg_that_asks_dedups_on_a_blob_held_in_ram() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -340,10 +330,8 @@ async fn the_held_header_is_read_from_a_leg_only_and_only_its_one_value() {
 /// Catches a confirmer pass that asks the peer before this node's own copy is on its disk,
 /// or never learns that it is: a registered digest whose own blob is still held in RAM is
 /// not asked about, even long after the grace; once the blob is on this node's disk the
-/// pass notes it (starting the grace), and after the grace asks the peer, which holds it on
-/// its disk: forgotten, nothing owed, and the store is told the set is empty. Mutants:
-/// `confirm_pass` skips the own durable question (the digest is never due: stays);
-/// asks without waiting for it (the pass asks while the own copy is RAM-only).
+/// pass notes it (starting the grace), and after the grace asks the peer, which holds it
+/// on its disk: forgotten, nothing owed, and the store is told the set is empty.
 #[tokio::test]
 async fn the_pass_asks_the_peer_only_after_this_node_has_written_the_blob() {
     let farm = Farm::start(2, ChainConfig::default()).await;

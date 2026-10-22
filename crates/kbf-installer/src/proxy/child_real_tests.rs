@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::proxy::child_rig::{Cleanup, Rig, alive, await_gone, refused, rig, running, wait_for};
-use crate::testkit::{A, B, c};
+use crate::testkit::{A, B, C, c};
 use std::time::{Duration, Instant};
 
 /// Catches a spawn that runs another file than the release's (the `current` link, a stale
@@ -748,4 +748,31 @@ fn a_child_caught_while_exiting_is_identified_not_refused() {
         0,
         "children refused while exiting, of 2000"
     );
+}
+
+/// Catches a child control that ignores the directory it was given for the releases (the
+/// proxy's copies would never be run) or that still looks under the layout: with a directory,
+/// the program of a release is its file there, a release that only that directory has is
+/// started from it, and the layout's own is not looked at.
+///
+/// Asserts that `with_releases` sets the directory; that `program` joins that directory and
+/// not the layout's releases once it is set; and that `program` includes the commit's
+/// directory.
+#[test]
+fn with_releases_runs_the_programs_of_that_directory_and_not_the_layouts() {
+    let rig = rig("child-real-releases");
+    let copies = rig.layout_root.join("copies");
+    let release = copies.join(C);
+    fs::create_dir_all(&release).expect("copy dir");
+    let exe = std::env::current_exe().expect("test binary");
+    std::os::unix::fs::symlink(exe, release.join("kbf-act")).expect("link");
+    let child = rig.restarted().with_releases(copies);
+
+    assert_eq!(child.program(&c(C)), release.join("kbf-act"));
+    assert!(!rig.child.program(&c(C)).exists(), "the layout has no C");
+    let ident = child.spawn(Slot::A, &c(C), Start::Active).expect("spawn");
+    let _stop = Cleanup(&child, vec![ident.clone()]);
+
+    assert_eq!(child.recorded(Slot::A).map(|r| r.commit), Some(c(C)));
+    assert_eq!(child.exited(&ident), None);
 }
