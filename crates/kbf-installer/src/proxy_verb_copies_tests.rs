@@ -210,7 +210,7 @@ fn check_refuses_a_kbf_binary_that_is_not_an_absolute_path() {
 /// it: with a file where `orders/` would be, the seams are built and the start fails only at
 /// the bind (a failure, not the usage error of a spool the service user cannot use).
 ///
-/// Mutant it catches: the update API's seams built whatever `local` says.
+/// Asserts that the update API's seams are not built when `local` holds the copies.
 #[test]
 fn a_proxy_with_its_own_copies_opens_no_order_spool() {
     let loaded = load(&file("cp-spool", PROXY.as_bytes())).expect("valid");

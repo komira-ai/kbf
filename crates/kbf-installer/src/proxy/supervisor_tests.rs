@@ -837,8 +837,8 @@ fn serve_once(listener: TcpListener) -> std::thread::JoinHandle<String> {
 /// Catches an admin client wired to the wrong place: the admin calls of each slot go to that
 /// slot's admin port with the proxy's secret, and the readiness read to its operator port.
 ///
-/// Mutants it catches: the slot ignored (every call to slot A's ports); the two ports of a slot
-/// swapped; the secret left off an admin call.
+/// Asserts that each call goes to the ports of its own slot, that a slot's admin and operator
+/// ports are not interchanged, and that every admin call carries the secret.
 #[test]
 fn the_child_admin_reaches_the_ports_of_its_slot() {
     let (gate, _runner) = gate();

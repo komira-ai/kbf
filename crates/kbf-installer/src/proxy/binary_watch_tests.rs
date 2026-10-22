@@ -831,9 +831,9 @@ fn blocking_apply() -> (ApplyHook, Schemas, mpsc::Sender<()>) {
 /// `releases.json` and the rig saw exactly one candidate start, and the file, still `B`, is the
 /// release that serves.
 ///
-/// Mutants it catches: a handover that is cloned into a second swap supervisor (the clone
-/// shows no update); `busy` that does not look at the update going on (a second swap is
-/// started or refused); the migration asked for another schema than the kbf printed.
+/// Asserts that a clone of the handover shares the swap supervisor (the clone shows the
+/// update), that `busy` looks at the update going on (a second swap is refused), and that the
+/// migration is asked for the schema the kbf printed.
 #[test]
 fn the_real_handover_runs_the_swap_the_watch_starts_and_a_clone_sees_it() {
     let mut bench = Bench::new("real", Some(A), usize::MAX);
@@ -903,8 +903,8 @@ fn the_real_handover_runs_the_swap_the_watch_starts_and_a_clone_sees_it() {
 /// through the wiring is shown by a clone of the swap). The swap runs on the defaults, so only
 /// what `start` records at once is looked at, not how the update ends.
 ///
-/// Mutant it catches: a swap built over a gate of its own (it never learns the proxy is bound
-/// and shows no update).
+/// Asserts that the swap is built over the gate of the config (it learns the proxy is bound
+/// and shows the update).
 #[test]
 fn the_wiring_assembled_from_a_config_waits_for_that_configs_gate() {
     let bench = Bench::new("shared", Some(A), usize::MAX);

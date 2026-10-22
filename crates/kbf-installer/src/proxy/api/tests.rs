@@ -116,8 +116,8 @@ fn a_supervisor_that_cannot_start_refuses_the_post_before_anything_is_saved_or_w
 /// refused with a 400 `nodes_retired` before the request id is saved, an order written or the
 /// supervisor asked, and the same id is still free for the frontend-only request.
 ///
-/// Mutants it catches: the refusal dropped (the request is accepted); the refusal made after the
-/// request id is saved (the retry is a reused id) or the order written.
+/// Asserts that the refusal is made before the request id is saved or the order written, so a
+/// retry of the same id is not a reused id.
 #[test]
 fn a_request_for_the_nodes_is_refused_and_nothing_is_saved_or_written() {
     let rig = Rig::new("u8a-nodes-retired");

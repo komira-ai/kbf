@@ -479,8 +479,8 @@ fn a_spool_that_cannot_be_opened_is_a_usage_error_before_anything_is_bound() {
 /// and a descriptor that fails the bind, the refusal is the bind's, a failure to start, so the
 /// verb asked [`assemble`] for the seams and not the API.
 ///
-/// Mutants it catches: `serve` building the update API's seams whatever `local` says (the
-/// spool's usage error comes first).
+/// Asserts that `serve` does not build the update API's seams when `local` holds the copies
+/// (the spool's usage error does not come first).
 #[test]
 fn with_copies_the_verb_does_not_open_the_order_spool() {
     let loaded = load(&file("copies", PROXY.as_bytes())).expect("valid");

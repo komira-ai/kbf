@@ -1,8 +1,6 @@
 //! What the verb is given to supervise the swap with, and what answers on the update route:
 //! with the proxy's own copies of `kbf` the swap is wired to them and the route answers 410;
-//! without them the update API is built as it has always been. Each "Mutants it catches" line
-//! names a change to the code that the test is written to turn red. They are the reason the
-//! test exists, not a record that anyone ran them.
+//! without them the update API is built as it has always been.
 
 use std::fs;
 use std::net::SocketAddr;
@@ -76,9 +74,9 @@ fn names_in(dir: &std::path::Path) -> Vec<String> {
 /// nothing is made in the state directory but the copies' own directory (no counter, no request
 /// map, no record).
 ///
-/// Mutants it catches: the wiring over a `Local` opened again (its orders are not the config's);
-/// the spool opened whatever `local` says (the file in the way is an error); the request map or
-/// the counter opened.
+/// Asserts that the wiring is over the `Local` it was given (its orders are the config's), that
+/// the spool is not opened (the file in the way is not an error), and that the request map and
+/// the counter are not opened.
 #[test]
 fn with_copies_the_swap_is_wired_to_them_and_no_spool_or_api_is_made() {
     let cfg = config_local("copies");
@@ -102,8 +100,7 @@ fn with_copies_the_swap_is_wired_to_them_and_no_spool_or_api_is_made() {
 /// unbuilt for one that does not: the seams are the API's (its order spool is opened where the
 /// config says, and the line the verb logs says what the API will do), and there is no watch.
 ///
-/// Mutants it catches: a wiring made whatever `local` says; the arm for copies taken whatever
-/// `local` says (no spool is opened).
+/// Asserts that no wiring is made when `local` is absent, and that the spool is opened for it.
 #[test]
 fn without_copies_the_update_api_is_built_and_no_watch_is_wired() {
     let cfg = config("api");
@@ -122,7 +119,8 @@ fn without_copies_the_update_api_is_built_and_no_watch_is_wired() {
 /// `orders/` should be is a usage error with the API's words, and it is the error of a proxy
 /// without copies only (the test above has the same file under a proxy with them).
 ///
-/// Mutant it catches: the error mapped to `Failed`, which the unit restarts for ever.
+/// Asserts that the error is a usage error, not a failure, which the unit would restart for
+/// ever.
 #[test]
 fn a_spool_that_cannot_be_opened_is_a_usage_error_naming_it() {
     let cfg = config("spool");
@@ -148,8 +146,8 @@ fn a_spool_that_cannot_be_opened_is_a_usage_error_naming_it() {
 /// nothing is written (the state directory holds the copies' directory and nothing else), and
 /// starting the route never stops the proxy.
 ///
-/// Mutants it catches: the API's route served (a `GET` is a 200 and a `POST` a 503 or 202); a
-/// status other than 410; the body of another answer; a call that writes a request map.
+/// Asserts that the API's route is not served (a `GET` is not a 200, a `POST` not a 503 or 202),
+/// that the status is 410 with the body of [`GONE`], and that no call writes a request map.
 #[tokio::test]
 async fn with_copies_every_call_on_the_update_route_is_answered_410_and_nothing_is_written() {
     let cfg = config_local("gone");

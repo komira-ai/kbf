@@ -163,8 +163,8 @@ fn a_malformed_file_is_an_error() {
 /// also type-checked `state`, `refusal` and `acked_order_id`): the swap and the cold start read
 /// three keys, and a wrong type in a key they do not read is not an error.
 ///
-/// Mutants it catches: the reader taking more keys than those three, so that a wrong type in
-/// one of the others is an error again.
+/// Asserts that the reader takes only those three keys, so a wrong type in one of the others
+/// is not an error.
 #[test]
 fn a_wrong_type_in_a_key_the_swap_does_not_read_is_not_an_error() {
     let rig = rig("other-keys");
