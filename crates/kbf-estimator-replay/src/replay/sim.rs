@@ -357,7 +357,10 @@ impl Sim<'_> {
         self.place();
         if !self.beating {
             self.beating = true;
-            self.at(self.now_ms + self.params.heartbeat_ms, Ev::Beat);
+            self.at(
+                self.now_ms.saturating_add(self.params.heartbeat_ms),
+                Ev::Beat,
+            );
         }
     }
 
@@ -385,7 +388,10 @@ impl Sim<'_> {
         if self.active.is_empty() {
             self.beating = false;
         } else {
-            self.at(self.now_ms + self.params.heartbeat_ms, Ev::Beat);
+            self.at(
+                self.now_ms.saturating_add(self.params.heartbeat_ms),
+                Ev::Beat,
+            );
         }
     }
 
@@ -422,7 +428,7 @@ impl Sim<'_> {
             .entry(start.worker.clone())
             .or_default()
             .insert(start.lease);
-        let end = self.now_ms + (micros / 1_000).max(1);
+        let end = self.now_ms.saturating_add((micros / 1_000).max(1));
         self.at(
             end,
             Ev::Finish(Ending {
@@ -494,7 +500,7 @@ impl Sim<'_> {
             } else {
                 RunOutcome::Success
             },
-            wall_us: (self.now_ms - started_ms) * 1_000,
+            wall_us: (self.now_ms - started_ms).saturating_mul(1_000),
             peak_memory_bytes: Some(op.need.min(limit)),
             booked_memory_bytes: booked,
             raised_memory_bytes: raised,

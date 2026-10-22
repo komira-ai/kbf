@@ -318,3 +318,49 @@ fn the_key_carries_the_instance() {
     );
     assert_eq!(booked("da2"), 16 * GIB, "instance a is");
 }
+
+/// Catches a first booking assumed without saying so: a success with no recorded booking
+/// is counted in the funnel, a kill with one is not.
+#[test]
+fn an_assumed_first_booking_is_counted() {
+    let rows = vec![
+        attempt("a", 0, 5, "ok", Some(GIB)),
+        kill("b", 0, 5, 4 * GIB, Some(16 * GIB)),
+        attempt("b", 7, 5, "ok", Some(GIB)),
+    ];
+    let t = build(rows, &params());
+    assert_eq!(t.funnel.assumed_first_rung, 1);
+}
+
+/// Catches arithmetic that overflows on absurd rows: times and bookings near u64::MAX
+/// must load, chain, replay and report without a panic.
+#[test]
+fn absurd_numbers_do_not_panic() {
+    let mut k = kill("a", 0, 5, u64::MAX, Some(u64::MAX));
+    k.queued_us = u64::MAX - 10;
+    k.started_us = Some(u64::MAX - 9);
+    k.ended_us = Some(u64::MAX - 1);
+    let mut ok = attempt("a", 0, 5, "ok", Some(u64::MAX));
+    ok.queued_us = u64::MAX - 5;
+    ok.started_us = Some(u64::MAX - 4);
+    ok.ended_us = Some(u64::MAX);
+    ok.cgroup.as_mut().unwrap().wall_us = Some(u64::MAX);
+    let mut early = attempt("b", 0, 5, "ok", Some(GIB));
+    early.queued_us = 0;
+    early.started_us = Some(1);
+    early.ended_us = Some(2);
+    let p = Params {
+        train_days: u32::MAX,
+        score_days: u32::MAX,
+        heartbeat_ms: u64::MAX,
+        ..params()
+    };
+    let t = build(vec![k, ok, early], &p);
+    assert_eq!(t.ops.len(), 2);
+    let runs: Vec<_> = [Arm::Null, Arm::KeyFloor]
+        .iter()
+        .filter_map(|a| simulate(&t, *a, &p).ok())
+        .collect();
+    let text = kbf_estimator_replay::replay::report::render(&t, &p, &runs);
+    assert!(text.contains("scored days"));
+}

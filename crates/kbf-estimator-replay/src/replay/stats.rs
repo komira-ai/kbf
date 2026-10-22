@@ -156,7 +156,14 @@ pub fn section(run: &ArmRun, w: Window) -> Section {
         .zip(percentile(&waits, 95))
         .zip(percentile(&waits, 99))
         .map(|((p50, p95), p99)| Waits { p50, p95, p99 });
-    for day in w.first..=w.last {
+    // Days after the last arrival have no backlog; a window past the trace costs nothing.
+    let horizon = run
+        .ops
+        .iter()
+        .map(|o| 1 + o.arrives_ms / DAY_MS)
+        .max()
+        .unwrap_or(0);
+    for day in w.first..=w.last.min(u32::try_from(horizon).unwrap_or(u32::MAX)) {
         let end = u64::from(day) * DAY_MS;
         let last_done = run
             .ops

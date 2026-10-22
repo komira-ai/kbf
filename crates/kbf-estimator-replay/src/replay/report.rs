@@ -8,7 +8,7 @@ use super::trace::Trace;
 use super::{Arm, Params};
 
 /// What the replay cannot see. Printed with every report.
-pub const LIMITS: [&str; 8] = [
+pub const LIMITS: [&str; 9] = [
     "Memory only: a run is killed iff its modelled need exceeds the limit of its booking (1.5 x booking + 512 MiB). The swap-kill and reclaim paths of the container driver are not modelled.",
     "A killed run's recorded peak stops at its limit, so a need above it is taken as one byte more; a run under 4 GiB shows a peak of at most 6.5 GiB. Heavy tails are invisible.",
     "Recorded wall hides contention: attempts run for the time they took on the recorded farm, whatever the replay's farm looks like.",
@@ -16,6 +16,7 @@ pub const LIMITS: [&str; 8] = [
     "Queue wait is the scheduler's on the recorded nodes as they are now (capacity from the export), alone: no other load, no node churn.",
     "Only Linux attempts with a shape, a node capacity and an own-limit or no memory kill are replayed; the funnel counts the rest.",
     "A hint is taken to be an operation whose first booking is not the default rung.",
+    "An operation whose first attempt has no recorded booking (a success: the record keeps a booking only for killed runs) is assumed to have booked the first rung. If it really booked more through a hint, the null arm's kills are overstated; the funnel counts these operations.",
     "Day 1 starts with no learned state. Phase 1 has no samples-based lowering: the third arm is an upper bound for it, not a proposal. Only a concurrent farm holdout supports a claim.",
 ];
 
@@ -103,8 +104,8 @@ pub fn render(trace: &Trace, params: &Params, runs: &[ArmRun]) -> String {
         "parameters (frozen before scoring): ladder {:?} GiB, train days 1-{}, scored days {}-{}, chain gap {} s, heartbeat {} s",
         params.ladder_gib,
         params.train_days,
-        params.train_days + 1,
-        params.train_days + params.score_days,
+        params.train_days.saturating_add(1),
+        params.train_days.saturating_add(params.score_days),
         params.chain_gap_us / 1_000_000,
         params.heartbeat_ms / 1_000
     );
@@ -131,16 +132,16 @@ pub fn render(trace: &Trace, params: &Params, runs: &[ArmRun]) -> String {
     );
     let _ = writeln!(
         out,
-        "operations with no shape key: {}; completed with no recorded peak: {}",
-        f.no_shape, f.no_peak
+        "operations with no shape key: {}; completed with no recorded peak: {}; first booking not recorded (assumed first rung): {}",
+        f.no_shape, f.no_peak, f.assumed_first_rung
     );
     let train = Window {
         first: 1,
         last: params.train_days,
     };
     let scored = Window {
-        first: params.train_days + 1,
-        last: params.train_days + params.score_days,
+        first: params.train_days.saturating_add(1),
+        last: params.train_days.saturating_add(params.score_days),
     };
     let cold_start = Window { first: 1, last: 1 };
     let mut climbs = Vec::new();

@@ -113,6 +113,9 @@ pub struct Funnel {
     pub no_shape: u64,
     /// Completed operations whose record has no peak (their need is taken as 0).
     pub no_peak: u64,
+    /// Operations whose first attempt has no recorded booking: success with no recorded
+    /// booking, assumed to have booked the first rung.
+    pub assumed_first_rung: u64,
 }
 
 impl Funnel {
@@ -219,7 +222,8 @@ fn continues(last: &Attempt, next: &Attempt, gap_us: u64) -> bool {
     if let (Some(a), Some(b)) = (&last.operation, &next.operation) {
         return a == b;
     }
-    next.queued_us + SECOND_US >= last.ended_us && next.queued_us <= last.ended_us + gap_us
+    next.queued_us.saturating_add(SECOND_US) >= last.ended_us
+        && next.queued_us <= last.ended_us.saturating_add(gap_us)
 }
 
 /// The attempt `row` records, or why the replay leaves it out.
@@ -263,6 +267,7 @@ fn admit(row: &Row, capacity: &BTreeMap<&str, Capacity>) -> Result<Attempt, &'st
 
 fn op_of(chain: &[(&Row, Attempt)], first_default: u64, funnel: &mut Funnel) -> Op {
     let (row, head) = &chain[0];
+    funnel.assumed_first_rung += u64::from(head.booked.is_none());
     let (_, last) = &chain[chain.len() - 1];
     // The booking of each attempt: what the record says, else what the previous kill was
     // retried with, else the front's first rung.
@@ -278,7 +283,7 @@ fn op_of(chain: &[(&Row, Attempt)], first_default: u64, funnel: &mut Funnel) -> 
         .collect();
     let beyond_last_kill = kills
         .last()
-        .map_or(0, |&i| memory_max(booked[i]).unwrap_or(0) + 1);
+        .map_or(0, |&i| memory_max(booked[i]).unwrap_or(0).saturating_add(1));
     let completes = last.kind != Kind::Kill;
     let peak = last.peak.filter(|_| completes);
     if completes && peak.is_none() {
