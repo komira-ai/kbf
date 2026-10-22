@@ -195,3 +195,180 @@ impl Transport for &Fake {
         (**self).call(method, path)
     }
 }
+
+// ---- the replay ----
+
+use kbf_estimator::{Basis, Cfg, Instance, Key, PlatformClass, Shape};
+use kbf_estimator_replay::replay::trace::{Op, Recorded, Trace};
+use kbf_estimator_replay::row::{Capacity, Row, Usage};
+
+pub const MIB: u64 = 1 << 20;
+pub const HOUR_S: u64 = 3_600;
+pub const DAY_S: u64 = 86_400;
+
+pub fn key(instance: &str, shape: u64, cfg: Option<u64>) -> Key {
+    Key::new(
+        Instance::new(instance),
+        PlatformClass::new("linux"),
+        Basis::Cgroup,
+        Shape(shape),
+        cfg.map(Cfg),
+    )
+}
+
+/// An operation of `instance` and `shape` arriving `at_s` seconds in, needing `need` bytes,
+/// that runs `run_s` seconds when it completes and `kill_s` when it is killed; first
+/// booking 4 GiB, one core. The digest is unique to the arrival.
+pub fn op(instance: &str, shape: u64, at_s: u64, need: u64, run_s: u64, kill_s: u64) -> Op {
+    Op {
+        instance: instance.to_owned(),
+        digest: format!("d-{instance}-{shape}-{at_s}"),
+        key: Some(key(instance, shape, None)),
+        arrives_us: at_s * 1_000_000,
+        first_booked: 4 * GIB,
+        cpu_millis: 1_000,
+        need,
+        run_us: run_s * 1_000_000,
+        kill_us: kill_s * 1_000_000,
+        cpu_usage_us: run_s * 500_000,
+        recorded_kills: 0,
+        recorded_attempts: 1,
+    }
+}
+
+/// A trace of `ops` on nodes of `(name, cores, GiB)`.
+pub fn trace(ops: Vec<Op>, nodes: &[(&str, u64, u64)]) -> Trace {
+    Trace {
+        ops,
+        nodes: nodes
+            .iter()
+            .map(|(n, cores, gib)| {
+                (
+                    (*n).to_owned(),
+                    Capacity {
+                        cpu_millis: cores * 1_000,
+                        memory_bytes: gib * GIB,
+                    },
+                )
+            })
+            .collect(),
+        funnel: Default::default(),
+        recorded: Recorded::default(),
+    }
+}
+
+/// A recorded attempt on node `n1`, queued at `queued_s` seconds after 2026-10-01, that
+/// ran `run_s` seconds.
+pub fn attempt(digest: &str, queued_s: u64, run_s: u64, outcome: &str, peak: Option<u64>) -> Row {
+    let queued_us = OCT_1 + queued_s * 1_000_000;
+    Row {
+        run_id: format!("run-{digest}-{queued_s}"),
+        instance: "main".into(),
+        platform: "linux".into(),
+        node: "n1".into(),
+        shape: "00000000000000aa".into(),
+        cfg: "-".into(),
+        digest: digest.into(),
+        outcome: outcome.into(),
+        memory_kill: "none".into(),
+        booked_memory_bytes: None,
+        raised_memory_bytes: None,
+        memory_used_bytes: None,
+        cgroup: Some(Usage {
+            cpu_usage_us: run_s * 500_000,
+            wall_us: Some(run_s * 1_000_000),
+            memory_peak_bytes: peak,
+            ..Usage::default()
+        }),
+        queued_us,
+        started_us: Some(queued_us + 1_000_000),
+        ended_us: Some(queued_us + (run_s + 1) * 1_000_000),
+        node_capacity: Some(Capacity {
+            cpu_millis: 16_000,
+            memory_bytes: 64 * GIB,
+        }),
+        basis: None,
+        operation: None,
+        booked_millicpus: None,
+        node_cpu_pressure_centi: None,
+    }
+}
+
+/// An own-limit kill of `digest` booked at `booked`, retried at `raised`.
+pub fn kill(digest: &str, queued_s: u64, run_s: u64, booked: u64, raised: Option<u64>) -> Row {
+    let mut r = attempt(digest, queued_s, run_s, "memory_killed", None);
+    r.memory_kill = "own_limit".into();
+    r.booked_memory_bytes = Some(booked);
+    r.raised_memory_bytes = raised;
+    r.memory_used_bytes = Some(0);
+    r.cgroup = None;
+    r
+}
+
+/// A deterministic synthetic history: 60 operations over four days on three nodes, eight
+/// shapes with a memory need each, climbing the 4, 16, 32 GiB ladder as the farm does.
+pub fn synthetic() -> Vec<Row> {
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = move |n: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) % n
+    };
+    // Needs of the eight shapes in MiB: five fit the first rung, one needs the second, one the
+    // third, and one needs the whole 64 GiB host.
+    let needs_mib: [u64; 8] = [900, 2_048, 3_072, 5_120, 6_000, 14_000, 30_000, 60_000];
+    let mut rows = Vec::new();
+    for i in 0..60_u64 {
+        let shape = next(8) as usize;
+        let need = needs_mib[shape] * MIB + next(MIB);
+        let digest = format!("{:064x}-{}", i + 1, 100 + i);
+        let mut t = 5_760 * i + next(3_000);
+        let run_s = 20 + next(200);
+        let mut booked = 4 * GIB;
+        loop {
+            let limit = booked + booked / 2 + 512 * MIB;
+            let mut row = if need > limit {
+                let raised = [16 * GIB, 32 * GIB, 64 * GIB]
+                    .into_iter()
+                    .find(|r| *r > booked);
+                kill(
+                    &digest,
+                    t,
+                    run_s / 2,
+                    booked,
+                    raised.filter(|_| booked < 64 * GIB),
+                )
+            } else {
+                attempt(&digest, t, run_s, "ok", Some(need))
+            };
+            row.shape = format!("{:016x}", shape + 1);
+            row.node = ["n1", "n2", "n3"][next(3) as usize].to_owned();
+            row.node_capacity = Some(match row.node.as_str() {
+                "n1" => Capacity {
+                    cpu_millis: 16_000,
+                    memory_bytes: 64 * GIB,
+                },
+                "n2" => Capacity {
+                    cpu_millis: 8_000,
+                    memory_bytes: 32 * GIB,
+                },
+                _ => Capacity {
+                    cpu_millis: 8_000,
+                    memory_bytes: 16 * GIB,
+                },
+            });
+            let killed = row.outcome == "memory_killed";
+            rows.push(row);
+            if !killed || booked >= 64 * GIB {
+                break;
+            }
+            t += run_s / 2 + 2;
+            booked = [16 * GIB, 32 * GIB, 64 * GIB]
+                .into_iter()
+                .find(|r| *r > booked)
+                .unwrap_or(booked);
+        }
+    }
+    rows
+}

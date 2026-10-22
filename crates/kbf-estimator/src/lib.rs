@@ -4,7 +4,8 @@
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed
 //! collections. The layering test in `kbf-integration-test` and the lists in `clippy.toml` enforce it.
 //! Time enters as a [`Day`] argument; the crate has its own small input types
-//! ([`Run`], [`Bounds`], [`Hint`]) and depends on no other kbf crate. Nothing calls it
+//! ([`Run`], [`Bounds`], [`Hint`]) and depends on no other kbf crate. Only the offline
+//! replay (`kbf-estimator-replay`) calls it
 //! yet: the server adapts its run records to these types in a later change.
 //!
 //! # What it computes

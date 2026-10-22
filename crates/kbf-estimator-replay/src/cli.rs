@@ -13,6 +13,7 @@ use kbf_server::api_client::OperatorClient;
 
 use crate::export::{Export, Window, export};
 use crate::readonly::{Api, ReadOnly, Transport};
+use crate::replay::{Arm, Params, report, sim, trace};
 use crate::row::Row;
 
 #[derive(Debug, Parser)]
@@ -30,6 +31,27 @@ enum Command {
     /// Reads run records through the operator API (GET only) and writes one JSON line per
     /// attempt into one file per UTC day.
     Export(ExportArgs),
+    /// Replays an export through the real scheduler, memory only, and prints the report.
+    Replay(ReplayArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ReplayArgs {
+    /// A directory of `runs-*.jsonl` files (an export), or one such file.
+    #[arg(long)]
+    from: PathBuf,
+    /// Days that only teach the estimator.
+    #[arg(long, default_value_t = 20)]
+    train_days: u32,
+    /// Days that are scored, after the training days.
+    #[arg(long, default_value_t = 10)]
+    score_days: u32,
+    /// The memory ladder of the farm that made the export, in GiB.
+    #[arg(long, value_delimiter = ',', default_values_t = [4, 16, 32])]
+    ladder_gib: Vec<u64>,
+    /// Also run the sample-lowering arm, which phase 1 does not include (an upper bound).
+    #[arg(long)]
+    with_upper_bound: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -98,7 +120,30 @@ where
             let api = ReadOnly::new(Api::new(args.api, token));
             export_to(&api, &args, out).map_err(Failure::Run)
         }
+        Command::Replay(args) => replay(&args, out).map_err(Failure::Run),
     }
+}
+
+fn replay(args: &ReplayArgs, out: &mut impl Write) -> Result<(), String> {
+    let params = Params {
+        ladder_gib: args.ladder_gib.clone(),
+        train_days: args.train_days,
+        score_days: args.score_days,
+        ..Params::default()
+    };
+    let trace =
+        trace::load(&args.from, &params).map_err(|e| format!("{}: {e}", args.from.display()))?;
+    let mut arms = vec![Arm::Null, Arm::KeyFloor];
+    if args.with_upper_bound {
+        arms.push(Arm::SampleUpperBound);
+    }
+    let runs = arms
+        .into_iter()
+        .map(|arm| sim::simulate(&trace, arm, &params))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    out.write_all(report::render(&trace, &params, &runs).as_bytes())
+        .map_err(|e| e.to_string())
 }
 
 fn export_to<T: Transport>(
