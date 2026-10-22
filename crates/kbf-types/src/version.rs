@@ -44,9 +44,10 @@ impl VersionFault {
 /// adds fields, and an installer that refused them would be unable to stage any build after
 /// it (adding `seq` did that). A field named twice, a required one missing and a wrong type
 /// are still refused (serde's derive rejects a repeated known field). `platform` (the
-/// installer derives it from the binary's header), `admin_protocol`, `meta_log`, `relay` and
-/// `seq` (builds before them lack them) may be absent and are then `None`; `meta_log: None` means
-/// not reversible.
+/// installer derives it from the binary's header), `admin_protocol`, `commit_full`, `meta_log`,
+/// `relay` and `seq` (builds before them lack them) may be absent and are then `None`;
+/// `meta_log: None` means not reversible. `commit_full` is also absent from a build that does
+/// not know its full commit.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Version {
     /// The version of the admin calls between a proxy and the frontend processes it
@@ -54,6 +55,10 @@ pub struct Version {
     #[serde(default)]
     pub admin_protocol: Option<u64>,
     pub commit: String,
+    /// The 40 hex digits of the commit built, when the build knows them. `None` for a build
+    /// that predates the field or did not know its full commit (no git checkout).
+    #[serde(default)]
+    pub commit_full: Option<String>,
     /// The highest metadata-log machine version the build runs. Going from release N to
     /// N-1 is reversible only if `meta_log(N) <= meta_log(N-1)`; `None` (a build that
     /// predates the field) is unknown, and unknown is not reversible.
@@ -145,6 +150,7 @@ mod tests {
                 admin_protocol: Some(1),
                 meta_log: Some(4),
                 commit: COMMIT[..12].to_owned(),
+                commit_full: None,
                 min_protocol: 3,
                 protocol: 4,
                 profile: "release".to_owned(),
@@ -271,6 +277,27 @@ mod tests {
         }
         let text = json(COMMIT, "release").replace('}', ",\"relay\":\"1\"}");
         let err = Version::parse(text.as_bytes()).expect_err("a relay that is text");
+        assert_eq!(err.code(), "version-unreadable");
+    }
+
+    /// Catches the `commit_full` that `kbf --version --json` prints (the 40 hex digits of the
+    /// build's commit) not being read, a build that predates it or does not know its commit
+    /// refused instead of read as `None`, and a value that is not text accepted.
+    ///
+    /// Mutants to plant: `#[serde(skip)]` or a misspelled `#[serde(rename = "commit_ful")]` on
+    /// the field (the value is then lost: red on the `Some(COMMIT)` line); the field typed
+    /// `Option<serde_json::Value>` (the number is then accepted: red on the last assertion).
+    #[test]
+    fn the_version_object_may_carry_the_full_commit() {
+        let before = Version::parse(json(COMMIT, "release").as_bytes()).expect("pre-field");
+        assert_eq!(before.commit_full, None);
+        let extra = format!(",\"commit_full\":\"{COMMIT}\"}}");
+        let said = json(COMMIT, "release").replace('}', &extra);
+        let v = Version::parse(said.as_bytes()).expect("a build with the full commit parses");
+        assert_eq!(v.commit_full.as_deref(), Some(COMMIT));
+        assert_eq!(v.commit, COMMIT[..12], "the short commit is read as before");
+        let text = json(COMMIT, "release").replace('}', ",\"commit_full\":12}");
+        let err = Version::parse(text.as_bytes()).expect_err("a number");
         assert_eq!(err.code(), "version-unreadable");
     }
 

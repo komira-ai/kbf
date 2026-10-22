@@ -25,11 +25,11 @@ name = "kbf-cli-fake-crun"
 path = "../kbf-driver-container/tests/bin/fake_crun.rs"
 test = false
 
-# The stand-in `systemctl` for tests/frontend_handover.rs: `kbf frontend handover` run
-# against it, in Rust like the stand-in `crun` (no shell in test code). Not shipped.
+# A program that exits at once, in place of `kbf`, for tests/beta_b0.rs (a farm that cannot
+# start). Not shipped.
 [[bin]]
-name = "kbf-cli-fake-systemctl"
-path = "tests/bin/fake_systemctl.rs"
+name = "kbf-cli-fake-exits"
+path = "tests/bin/fake_exits.rs"
 test = false
 
 [dependencies]

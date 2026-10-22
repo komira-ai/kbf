@@ -78,5 +78,5 @@ pub use proposal::{PROPOSED, Proposal, proposal_key};
 pub use report::{CommandError, ControllerError, Moved, Tick};
 pub use rows::{RowError, Rows, Stored};
 pub use runner::spawn as spawn_controller;
-pub use session::{FarmFacts, SessionTransport, ports};
+pub use session::{FarmFacts, SessionTransport, member_facts, ports, storage_half};
 pub use slot::{Holder, Slot, SlotClass};

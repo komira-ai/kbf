@@ -430,13 +430,47 @@ fn link<'a>(
     }
 }
 
+/// The address each enrolled node advertised (node id to address; empty for a node with no
+/// storage role), from the enrollment registry in the store of `rows`.
+fn advertised(rows: &Rows) -> Result<BTreeMap<String, String>, String> {
+    let nodes = kbf_enroll_registry::list_nodes(&**rows.store())
+        .map_err(|e| format!("the enrollment registry could not be read: {e}"))?;
+    Ok(nodes
+        .into_iter()
+        .map(|node| (node.id.to_string(), node.advertise))
+        .collect())
+}
+
+/// The storage member that is the storage half of the host `host`, joined by the address it
+/// enrolled with as the controller joins it (see the module docs); `None` if it has no
+/// storage half.
+/// The operator API's safe-to-stop query asks it of a node id (`crate::api`).
+///
+/// # Errors
+/// Why the host cannot be told from a daemon-only host: the registry could not be read, does
+/// not know it, or its address is no member's or more than one member's.
+pub fn storage_half(
+    rows: &Rows,
+    host: &WorkerId,
+    members: &MembersLook,
+) -> Result<Option<MemberLook>, String> {
+    match link(host, &advertised(rows)?, members) {
+        Link::NoStorage => Ok(None),
+        Link::Member(member) => Ok(Some(member.clone())),
+        Link::Unlinked(why) => Err(why),
+    }
+}
+
 /// `now` less `ago`.
 fn before(now: FarmTime, ago: std::time::Duration) -> FarmTime {
     let ms = u64::try_from(ago.as_millis()).unwrap_or(u64::MAX);
     FarmTime::from_millis(now.as_millis().saturating_sub(ms))
 }
 
-fn member_facts(look: &MembersLook, now: FarmTime) -> Vec<MemberFacts> {
+/// The members of `look` as the gate reads them, ages taken from `now`. The operator API's
+/// safe-to-stop query reads them the same way (`crate::api`).
+#[must_use]
+pub fn member_facts(look: &MembersLook, now: FarmTime) -> Vec<MemberFacts> {
     look.members
         .iter()
         .map(|m| MemberFacts {
@@ -667,14 +701,7 @@ impl FactsSource for FarmFacts {
             .members
             .look()
             .map_err(|e| SourceError(format!("the members could not be read: {e}")))?;
-        let adverts: BTreeMap<String, String> =
-            kbf_enroll_registry::list_nodes(&**self.rows.store())
-                .map_err(|e| {
-                    SourceError(format!("the enrollment registry could not be read: {e}"))
-                })?
-                .into_iter()
-                .map(|node| (node.id.to_string(), node.advertise))
-                .collect();
+        let adverts = advertised(&self.rows).map_err(SourceError)?;
         let mut unlinked = BTreeMap::new();
         let mut hosts = Vec::new();
         for look in looks {

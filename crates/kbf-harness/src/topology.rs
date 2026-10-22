@@ -3,7 +3,7 @@
 //! the records of a start or a failure to start. Re-exported by [`crate::farm`], where the
 //! farm itself is.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -113,6 +113,9 @@ pub struct Topology {
     pub limits: Limits,
     /// Flags to set on one role after everything else (a mutant's, or a test's).
     pub overrides: Vec<(Role, Vec<String>)>,
+    /// The `kbf` to run for a role in place of [`Bins::kbf`]: an older release's, for a farm
+    /// of two versions. A role not listed runs [`Bins::kbf`].
+    pub binaries: Vec<(Role, PathBuf)>,
     /// Whether the run was asked to stop: every wait of the farm looks at it.
     pub interrupt: Interrupt,
 }
@@ -129,6 +132,7 @@ impl Topology {
             driver: Driver::StandInContainer,
             limits: Limits::none(),
             overrides: Vec::new(),
+            binaries: Vec::new(),
             interrupt: Interrupt::new(),
         }
     }
@@ -145,8 +149,17 @@ impl Topology {
             driver: Driver::Native,
             limits: Limits::small(),
             overrides: Vec::new(),
+            binaries: Vec::new(),
             interrupt: Interrupt::new(),
         }
+    }
+
+    /// The `kbf` that runs `role`: its entry of [`Topology::binaries`], else `default`
+    /// (the farm's [`Bins::kbf`]).
+    #[must_use]
+    pub fn kbf_of<'a>(&'a self, role: Role, default: &'a Path) -> &'a Path {
+        let named = self.binaries.iter().find(|(r, _)| *r == role);
+        named.map_or(default, |(_, kbf)| kbf.as_path())
     }
 }
 

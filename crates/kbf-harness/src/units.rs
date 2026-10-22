@@ -2,7 +2,7 @@
 //! with the settings in a `kbf.toml` the harness writes and `--config` names.
 //!
 //! The command line is the shape of the packaged unit (`packaging/linux/units/kbf-<mode>.service`,
-//! `kbf-frontend@.service` for the frontend): its `--mode=<name>` word, read with
+//! `kbf-frontend.service` for the frontend): its `--mode=<name>` word, read with
 //! `kbf_unitfile`, and the test's `kbf` in place of `releases/current/kbf`. Every other
 //! setting is a key of the process's `kbf.toml`, and a [`Unit`] is that file while a farm
 //! builds it.
@@ -28,7 +28,7 @@ use crate::topology::{Driver, NodeMode, Role, Topology};
 
 /// The packaged unit of each mode the farm starts, and the `kbf.toml` of each with every
 /// setting of the mode (`kbf-cli`'s golden files, generated from the flag definitions).
-const FRONTEND_UNIT: &str = include_str!("../../../packaging/linux/units/kbf-frontend@.service");
+const FRONTEND_UNIT: &str = include_str!("../../../packaging/linux/units/kbf-frontend.service");
 const STORAGE_UNIT: &str = include_str!("../../../packaging/linux/units/kbf-storage.service");
 const STORAGE_AND_DAEMON_UNIT: &str =
     include_str!("../../../packaging/linux/units/kbf-storage-and-daemon.service");
