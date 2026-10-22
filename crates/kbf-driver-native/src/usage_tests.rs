@@ -197,3 +197,20 @@ fn the_report_is_made_on_macos_only() {
     let report = report(&meter, SECOND);
     assert_eq!(report.is_some(), cfg!(target_os = "macos"));
 }
+
+/// Catches: a reused pid that is told only by its CPU time. The new process holds a
+/// smaller high-water mark than the old one but has run at least as long (equal or more
+/// CPU), so only the footprint clause of the check can see the reuse; without it the old
+/// process's 100 MiB is overwritten and the peak reads 30 MiB. Mutant seen red: the
+/// footprint clause dropped from `record`.
+#[test]
+fn a_reused_pid_with_a_smaller_peak_and_no_less_cpu_is_still_a_new_process() {
+    for (new_cpu, want_user_us) in [(4_000_000, 8000), (6_000_000, 10_000)] {
+        let mut meter = Meter::default();
+        meter.record(10, life(100, 4_000_000, 0));
+        meter.record(10, life(30, new_cpu, 0));
+        let f = footprint(&meter.usage(SECOND, ONE_TO_ONE));
+        assert_eq!(f.peak_footprint_bytes, Some(130 * MIB), "cpu {new_cpu}");
+        assert_eq!(f.cpu_user_micros, Some(want_user_us), "cpu {new_cpu}");
+    }
+}

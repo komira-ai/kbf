@@ -54,11 +54,11 @@ pub const WARM_UP_DIR: &str = "lease-warm-up";
 /// [`WARM_UP_DIR`]. Surveys run one after another, so they share it.
 pub const SURVEY_DIR: &str = "lease-survey";
 
-/// How long a spawn retries a program file that is still open for writing.
 /// Most results of failed leases kept for [`Runtime::failed_usage`] at once: the daemon
 /// takes each at once, so more than a few means it never will.
 const MAX_FAILED: usize = 256;
 
+/// How long a spawn retries a program file that is still open for writing.
 const BUSY_WAIT: Duration = Duration::from_secs(2);
 /// The pause between two rounds of SIGKILL while ending an action's processes.
 pub(crate) const KILL_PAUSE: Duration = Duration::from_millis(10);
