@@ -6,13 +6,14 @@ fn json(outcome: &Outcome) -> Value {
     serde_json::from_str(&outcome.json_line()).unwrap()
 }
 
-const ALL_REFUSALS: [(Refusal, &str); 7] = [
+const ALL_REFUSALS: [(Refusal, &str); 8] = [
     (Refusal::BadCommand, "bad_command"),
     (Refusal::ChannelNotAllowed, "channel_not_allowed"),
     (Refusal::ConfigInvalid, "config_invalid"),
     (Refusal::ConfigUnsafe, "config_unsafe"),
     (Refusal::ChannelUnsigned, "channel_unsigned"),
     (Refusal::KeyUntrusted, "key_untrusted"),
+    (Refusal::ChannelInsecure, "channel_insecure"),
     (Refusal::OlderThanInstalled, "older_than_installed"),
 ];
 
@@ -102,7 +103,8 @@ fn json_shapes() {
     }
 }
 
-/// The query line is exactly the three fields, in this order, with nulls spelled out.
+/// The query line is `result` and then the three fields, in this order, with nulls spelled
+/// out: every answer of the program has a `result`.
 #[test]
 fn query_line_shape_and_order() {
     let full = Outcome::Queried(QueryReport {
@@ -112,7 +114,7 @@ fn query_line_shape_and_order() {
     });
     assert_eq!(
         full.json_line(),
-        r#"{"installed_version":"1.0-1","running_commit":"abc","in_progress":true}"#
+        r#"{"result":"query","installed_version":"1.0-1","running_commit":"abc","in_progress":true}"#
     );
     let empty = Outcome::Queried(QueryReport {
         installed_version: None,
@@ -121,7 +123,7 @@ fn query_line_shape_and_order() {
     });
     assert_eq!(
         empty.json_line(),
-        r#"{"installed_version":null,"running_commit":null,"in_progress":false}"#
+        r#"{"result":"query","installed_version":null,"running_commit":null,"in_progress":false}"#
     );
 }
 
@@ -208,4 +210,112 @@ fn stderr_detail_is_cleaned_and_bounded() {
     assert_eq!(long.len(), 2048);
     let multibyte = failed(&"\u{e9}".repeat(2000)).stderr_detail().unwrap();
     assert!(multibyte.len() <= 2048 && multibyte.chars().all(|c| c == '\u{e9}'));
+}
+
+/// Catches a code table that drifted from the enums: `ALL` lists each variant once, in the
+/// order of the contract, and a code reads back to the variant that wrote it.
+#[test]
+fn codes_round_trip() {
+    assert_eq!(
+        Refusal::ALL.map(Refusal::code),
+        ALL_REFUSALS.map(|(_, code)| code)
+    );
+    assert_eq!(
+        FailureCode::ALL.map(FailureCode::code),
+        ALL_FAILURES.map(|(_, code)| code)
+    );
+    for refusal in Refusal::ALL {
+        assert_eq!(Refusal::from_code(refusal.code()), Some(refusal));
+    }
+    for failure in FailureCode::ALL {
+        assert_eq!(FailureCode::from_code(failure.code()), Some(failure));
+    }
+    for text in [
+        "",
+        "nope",
+        "Busy",
+        "busy ",
+        "bad_command\n",
+        "install_failed",
+    ] {
+        assert_eq!(Refusal::from_code(text), None, "{text:?}");
+    }
+    for text in ["", "nope", "BUSY", " busy", "bad_command"] {
+        assert_eq!(FailureCode::from_code(text), None, "{text:?}");
+    }
+}
+
+/// Catches an install unit's answer that is lost or changed on the way back: each line the
+/// unit can print reads back to the outcome that wrote it (a failure without its detail).
+#[test]
+fn a_unit_line_reads_back() {
+    let mut outcomes = vec![
+        Outcome::Installed {
+            version: "1.2.3-1".into(),
+        },
+        Outcome::AlreadyInstalled {
+            version: "1.2.3-01".into(),
+        },
+    ];
+    outcomes.extend(Refusal::ALL.map(Outcome::Refused));
+    outcomes.extend(FailureCode::ALL.map(|code| {
+        Outcome::Failed(Failure {
+            code,
+            detail: String::new(),
+        })
+    }));
+    for outcome in outcomes {
+        assert_eq!(
+            Outcome::from_unit_line(&outcome.json_line()),
+            Some(outcome.clone()),
+            "{outcome:?}"
+        );
+    }
+    let detailed = Outcome::Failed(Failure {
+        code: FailureCode::InstallFailed,
+        detail: "E: x".into(),
+    });
+    assert_eq!(
+        Outcome::from_unit_line(&detailed.json_line()),
+        Some(Outcome::Failed(Failure {
+            code: FailureCode::InstallFailed,
+            detail: String::new()
+        }))
+    );
+}
+
+/// Catches a unit line that is believed when it is not one of ours: anything but the exact
+/// closed lines is none.
+#[test]
+fn other_lines_are_not_a_units_answer() {
+    for line in [
+        "",
+        "installed",
+        "[]",
+        "null",
+        "{}",
+        r#"{"result":"installed"}"#,
+        r#"{"result":"installed","installed_version":"1"}"#,
+        r#"{"result":"installed","installed_version":"1","unit_state":"not_run"}"#,
+        r#"{"result":"already_installed","installed_version":"1","unit_state":"finished"}"#,
+        r#"{"result":"installed","installed_version":1,"unit_state":"finished"}"#,
+        r#"{"result":"installed","installed_version":"1","unit_state":"finished","x":1}"#,
+        r#"{"result":"refused"}"#,
+        r#"{"result":"refused","reason":"bad_command","installed_version":"1"}"#,
+        r#"{"result":"failed","reason":"busy","installed_version":"1"}"#,
+        r#"{"result":"refused","reason":"bad_command","unit_state":"finished"}"#,
+        r#"{"result":"installed","unit_state":"finished"}"#,
+        r#"{"result":"already_installed","unit_state":"not_run"}"#,
+        r#"{"result":"installed","reason":"busy","installed_version":"1","unit_state":"finished"}"#,
+        r#"{"result":"refused","reason":"nope"}"#,
+        r#"{"result":"refused","reason":"busy"}"#,
+        r#"{"result":"failed","reason":"bad_command"}"#,
+        r#"{"result":"failed"}"#,
+        r#"{"result":"failed","reason":"busy","extra":true}"#,
+        r#"{"result":"query","installed_version":null,"running_commit":null,"in_progress":false}"#,
+        r#"{"result":"other","reason":"busy"}"#,
+        r#"{"reason":"busy"}"#,
+    ] {
+        assert_eq!(Outcome::from_unit_line(line), None, "{line:?}");
+    }
 }

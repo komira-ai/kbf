@@ -6,8 +6,12 @@ use kbf_testkit::dir::TestDir;
 
 use super::{MAX_FILE_LEN, Trust, TrustError};
 
+/// A scratch directory only its owner can write, whatever the umask: the walk upward from a
+/// file refuses a directory others can write.
 fn scratch(name: &str) -> TestDir {
-    TestDir::under(std::env::temp_dir(), name)
+    let dir = TestDir::under(std::env::temp_dir(), name);
+    chmod(&dir, 0o755);
+    dir
 }
 
 fn file(dir: &Path, name: &str, mode: u32, text: &str) -> PathBuf {
@@ -18,7 +22,7 @@ fn file(dir: &Path, name: &str, mode: u32, text: &str) -> PathBuf {
 }
 
 fn me(dir: &Path) -> Trust {
-    Trust::owned_by(fs::metadata(dir).unwrap().uid())
+    Trust::owned_by(fs::metadata(dir).unwrap().uid(), dir)
 }
 
 /// A file of the trusted user that only it can write is read; 0644 and 0600 are both fine.
@@ -39,7 +43,7 @@ fn a_trusted_file_is_read() {
 fn another_owner_is_refused() {
     let dir = scratch("trust-owner");
     let path = file(&dir, "f", 0o644, "x");
-    let stranger = Trust::owned_by(fs::metadata(&dir).unwrap().uid() + 1);
+    let stranger = Trust::owned_by(fs::metadata(&dir).unwrap().uid() + 1, &dir);
     assert!(matches!(stranger.read(&path), Err(TrustError::NotOwned)));
     assert!(matches!(
         stranger.check_file(&path),
@@ -113,13 +117,136 @@ fn size_cap_and_encoding() {
 #[test]
 fn root_is_uid_zero_and_errors_read_aloud() {
     assert_eq!(Trust::root().uid, 0);
+    assert_eq!(Trust::root().anchor, Path::new("/"), "the walk goes to /");
     for (error, word) in [
         (TrustError::NotRegular, "regular"),
         (TrustError::NotOwned, "owned"),
         (TrustError::Writable, "writable"),
         (TrustError::TooLarge, "larger"),
+        (TrustError::ParentNotOwned, "owned"),
+        (TrustError::ParentWritable, "writable"),
         (TrustError::Io(std::io::Error::other("boom")), "boom"),
     ] {
         assert!(error.to_string().contains(word), "{error}");
     }
+}
+
+fn chmod(path: &Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Catches a check that looks at the file and not at the way to it: a directory above the
+/// file that its group or others can write lets them replace the file, whatever the file's
+/// own mode. Each of the parent, the grandparent and the top of the walk is made writable
+/// in turn, by group alone and by others alone, and each is refused, by `read` and by
+/// `check_file`.
+#[test]
+fn a_writable_directory_above_is_refused() {
+    let dir = scratch("trust-parents");
+    let trust = me(&dir);
+    let middle = dir.join("a");
+    let deep = middle.join("b");
+    fs::create_dir_all(&deep).unwrap();
+    let path = file(&deep, "f", 0o644, "x");
+    for d in [&*dir, &*middle, &*deep] {
+        chmod(d, 0o755);
+    }
+    assert_eq!(trust.read(&path).unwrap(), "x");
+    trust.check_file(&path).unwrap();
+    for (which, d) in [
+        ("parent", &*deep),
+        ("grandparent", &*middle),
+        ("top", &*dir),
+    ] {
+        for mode in [0o775, 0o757, 0o770, 0o707, 0o777, 0o730, 0o703] {
+            chmod(d, mode);
+            assert!(
+                matches!(trust.read(&path), Err(TrustError::ParentWritable)),
+                "read, {which} {mode:o}"
+            );
+            assert!(
+                matches!(trust.check_file(&path), Err(TrustError::ParentWritable)),
+                "check_file, {which} {mode:o}"
+            );
+            chmod(d, 0o755);
+        }
+    }
+    chmod(&deep, 0o700);
+    trust.check_file(&path).unwrap();
+}
+
+/// Catches a walk that goes on past its anchor: the directories above the anchor (here
+/// `/tmp`, which anyone can write) are not looked at, so a trust anchored at the fixture
+/// accepts a file in it; the anchor is where the walk ends, not where it begins.
+#[test]
+fn the_walk_ends_at_the_anchor() {
+    let dir = scratch("trust-anchor");
+    chmod(&dir, 0o755);
+    let path = file(&dir, "f", 0o644, "x");
+    let trust = me(&dir);
+    assert!(trust.check_file(&path).is_ok());
+    // A walk to / meets a directory of another owner on the way (/ itself at the latest).
+    let uid = fs::metadata(&*dir).unwrap().uid();
+    if uid != 0 {
+        let to_root = Trust::owned_by(uid, Path::new("/"));
+        assert!(matches!(
+            to_root.check_file(&path),
+            Err(TrustError::ParentNotOwned)
+        ));
+        assert!(matches!(
+            to_root.read(&path),
+            Err(TrustError::ParentNotOwned)
+        ));
+    }
+}
+
+/// Catches a check that stops at a link: `check_file` follows a link, and the directories
+/// above the target are the ones that matter. A link in a safe directory to a file in a
+/// writable one is refused.
+#[test]
+fn the_way_to_a_links_target_is_checked() {
+    let dir = scratch("trust-link-target");
+    chmod(&dir, 0o755);
+    let open = dir.join("open");
+    fs::create_dir(&open).unwrap();
+    let target = file(&open, "t", 0o644, "x");
+    chmod(&open, 0o777);
+    let safe = dir.join("safe");
+    fs::create_dir(&safe).unwrap();
+    chmod(&safe, 0o755);
+    let link = safe.join("link");
+    symlink(&target, &link).unwrap();
+    let trust = me(&dir);
+    assert!(matches!(
+        trust.check_file(&link),
+        Err(TrustError::ParentWritable)
+    ));
+    chmod(&open, 0o755);
+    trust.check_file(&link).unwrap();
+}
+
+/// A path with `..` in it is judged by where it really leads, not by how it is spelled.
+#[test]
+fn dot_dot_is_resolved() {
+    let dir = scratch("trust-dotdot");
+    chmod(&dir, 0o755);
+    let open = dir.join("open");
+    let safe = dir.join("safe");
+    fs::create_dir(&open).unwrap();
+    fs::create_dir(&safe).unwrap();
+    chmod(&safe, 0o755);
+    file(&safe, "f", 0o644, "x");
+    chmod(&open, 0o777);
+    let trust = me(&dir);
+    // safe/../open/../safe/f is safe/f; `open` is not above it.
+    let spelled = dir.join("safe/../open/../safe/f");
+    assert_eq!(trust.read(&spelled).unwrap(), "x");
+    // open/../safe/f also; but a file inside `open` is not, however it is spelled.
+    file(&open, "g", 0o644, "y");
+    let spelled = dir.join("safe/../open/g");
+    assert!(matches!(
+        trust.read(&spelled),
+        Err(TrustError::ParentWritable)
+    ));
+    chmod(&open, 0o755);
 }

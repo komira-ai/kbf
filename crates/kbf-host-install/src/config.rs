@@ -9,7 +9,11 @@
 //! The file, and each source file, must be root's alone to write ([`crate::trust`]). A
 //! channel is usable only when its source names a `signed-by` key on every entry, as an
 //! absolute path to a file that is itself root's alone to write: an unsigned source, a key
-//! given as a fingerprint or inline, or a key a user could replace is refused. The source
+//! given as a fingerprint or inline, or a key a user could replace is refused. So is a source
+//! that names a key and still switches the check off or weakens it (`trusted=yes`,
+//! `allow-insecure=yes`, `allow-weak=yes`, `allow-downgrade-to-insecure=yes`, or the deb822
+//! fields of those names). Every directory above the allowlist, a source and a key must also
+//! be root's alone to write ([`crate::trust`]). The source
 //! is either a deb822 file (`Types:`, `Signed-By:`) or a one-line apt list
 //! (`deb [signed-by=/path] ...`).
 
@@ -101,32 +105,66 @@ impl Allowlist {
 /// written it, invalid when it could not be read.
 fn refusal(error: TrustError) -> Refusal {
     match error {
-        TrustError::NotOwned | TrustError::Writable => Refusal::ConfigUnsafe,
+        TrustError::NotOwned
+        | TrustError::Writable
+        | TrustError::ParentNotOwned
+        | TrustError::ParentWritable => Refusal::ConfigUnsafe,
         TrustError::Io(_) | TrustError::NotRegular | TrustError::TooLarge => Refusal::ConfigInvalid,
     }
+}
+
+/// The options and fields that switch signature checking off or weaken it, in apt's
+/// spelling (compared without regard to case): `trusted` takes the source as signed without
+/// looking, the others let unsigned, weakly signed or downgraded data through.
+const WEAKENING: [&str; 4] = [
+    "trusted",
+    "allow-insecure",
+    "allow-weak",
+    "allow-downgrade-to-insecure",
+];
+
+/// Whether `value` is apt's plain "no". Anything else (yes, true, 1, on, a typo, nothing)
+/// counts as switching the option on: the check is closed to what it does not recognise.
+fn is_off(value: &str) -> bool {
+    ["no", "false", "without", "off", "disable", "0"]
+        .iter()
+        .any(|off| value.trim().eq_ignore_ascii_case(off))
+}
+
+/// Whether `name` (a deb822 field or a one-line option, any case) is a weakening one and
+/// `value` does not switch it off.
+fn weakens(name: &str, value: &str) -> bool {
+    WEAKENING.iter().any(|w| name.eq_ignore_ascii_case(w)) && !is_off(value)
+}
+
+/// One entry of an apt source: the `signed-by` it names and whether it weakens the check.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Source {
+    signed_by: Option<String>,
+    weakened: bool,
 }
 
 /// What one stanza of a deb822 file has collected so far.
 #[derive(Default)]
 struct Stanza {
     is_entry: bool,
-    signed_by: Option<String>,
+    source: Source,
 }
 
 impl Stanza {
-    /// End the stanza: an entry (one with `Types`) is recorded with its key, if any.
-    fn finish(&mut self, found: &mut Vec<Option<String>>) {
+    /// End the stanza: an entry (one with `Types`) is recorded.
+    fn finish(&mut self, found: &mut Vec<Source>) {
         let stanza = std::mem::take(self);
         if stanza.is_entry {
-            found.push(stanza.signed_by);
+            found.push(stanza.source);
         }
     }
 }
 
-/// The `signed-by` value of each entry of an apt source file, `None` for an entry with
-/// none. Both formats: a one-line entry is `deb[-src] [options] uri suite components`; a
-/// deb822 stanza is `Field: value` lines, continued on lines that start with white space.
-fn entries(text: &str) -> Vec<Option<String>> {
+/// The entries of an apt source file, with their `signed-by` values. Both formats: a
+/// one-line entry is `deb[-src] [options] uri suite components`; a deb822 stanza is
+/// `Field: value` lines, continued on lines that start with white space.
+fn entries(text: &str) -> Vec<Source> {
     let mut found = Vec::new();
     let mut stanza = Stanza::default();
     let mut in_signed_by = false;
@@ -138,19 +176,20 @@ fn entries(text: &str) -> Vec<Option<String>> {
             continue;
         } else if line.starts_with([' ', '\t']) {
             // A continuation line belongs to the field above it.
-            if let Some(value) = stanza.signed_by.as_mut().filter(|_| in_signed_by) {
+            if let Some(value) = stanza.source.signed_by.as_mut().filter(|_| in_signed_by) {
                 value.push(' ');
                 value.push_str(line.trim());
             }
         } else if matches!(line.split_whitespace().next(), Some("deb" | "deb-src")) {
             stanza.finish(&mut found);
-            found.push(one_line_signed_by(line));
+            found.push(one_line(line));
             in_signed_by = false;
         } else if let Some((field, value)) = line.split_once(':') {
             in_signed_by = field.eq_ignore_ascii_case("Signed-By");
             stanza.is_entry |= field.eq_ignore_ascii_case("Types");
+            stanza.source.weakened |= weakens(field, value);
             if in_signed_by {
-                stanza.signed_by = Some(value.trim().to_owned());
+                stanza.source.signed_by = Some(value.trim().to_owned());
             }
         }
     }
@@ -158,25 +197,43 @@ fn entries(text: &str) -> Vec<Option<String>> {
     found
 }
 
-/// The `signed-by=` option of a one-line entry.
-fn one_line_signed_by(line: &str) -> Option<String> {
-    let rest = line.split_once(char::is_whitespace)?.1.trim_start();
-    let options = rest.strip_prefix('[')?.split_once(']')?.0;
-    options.split_whitespace().find_map(|option| {
-        let (key, value) = option.split_once('=')?;
-        key.eq_ignore_ascii_case("signed-by")
-            .then(|| value.to_owned())
-    })
+/// The `signed-by=` option of a one-line entry, and whether another option weakens the
+/// check. An option may be written `name+=value` or `name-=value`; a bare name is read as
+/// an empty value.
+fn one_line(line: &str) -> Source {
+    let mut source = Source::default();
+    let Some(rest) = line
+        .split_once(char::is_whitespace)
+        .map(|(_, r)| r.trim_start())
+    else {
+        return source;
+    };
+    let Some(options) = rest.strip_prefix('[').and_then(|r| r.split_once(']')) else {
+        return source;
+    };
+    for option in options.0.split_whitespace() {
+        let (key, value) = option.split_once('=').unwrap_or((option, ""));
+        let key = key.trim_end_matches(['+', '-']);
+        if key.eq_ignore_ascii_case("signed-by") {
+            source.signed_by = Some(value.to_owned());
+        }
+        source.weakened |= weakens(key, value);
+    }
+    source
 }
 
-/// Every entry of the source must name keys, and every key must be an absolute path to a
-/// file the trusted user alone can write.
+/// Every entry of the source must name keys and must not weaken the check, and every key
+/// must be an absolute path to a file the trusted user alone can write.
 fn check_signing(trust: &Trust, text: &str) -> Result<(), Refusal> {
     let found = entries(text);
-    if found.is_empty() || found.iter().any(Option::is_none) {
+    if found.is_empty() || found.iter().any(|source| source.signed_by.is_none()) {
         return Err(Refusal::ChannelUnsigned);
     }
-    for value in found.iter().flatten() {
+    // A key does not make `trusted=yes` harmless: apt skips the check the key is for.
+    if found.iter().any(|source| source.weakened) {
+        return Err(Refusal::ChannelInsecure);
+    }
+    for value in found.iter().filter_map(|source| source.signed_by.as_ref()) {
         let keys: Vec<&str> = value
             .split(|c: char| c == ',' || c.is_whitespace())
             .filter(|k| !k.is_empty())

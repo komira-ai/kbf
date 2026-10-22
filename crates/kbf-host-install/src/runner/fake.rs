@@ -6,11 +6,15 @@ use std::io;
 
 use super::{Cmd, Exec, Runner};
 
+/// A look at the host as a command is about to run.
+type Hook = Box<dyn Fn(&Cmd)>;
+
 /// Replies in order, one per call; a call past the script is an error the test shows.
 #[derive(Default)]
 pub struct FakeRunner {
     replies: RefCell<VecDeque<io::Result<Exec>>>,
     calls: RefCell<Vec<Cmd>>,
+    before: Option<Hook>,
 }
 
 impl FakeRunner {
@@ -19,7 +23,16 @@ impl FakeRunner {
         Self {
             replies: RefCell::new(replies.into()),
             calls: RefCell::default(),
+            before: None,
         }
+    }
+
+    /// Run `hook` at the start of every call, before the reply: a test looks at the host
+    /// while a command is about to run.
+    #[must_use]
+    pub fn before_each(mut self, hook: impl Fn(&Cmd) + 'static) -> Self {
+        self.before = Some(Box::new(hook));
+        self
     }
 
     /// Every command run so far.
@@ -44,6 +57,9 @@ pub fn ok(stdout: &str) -> io::Result<Exec> {
 
 impl Runner for FakeRunner {
     fn run(&self, cmd: &Cmd) -> io::Result<Exec> {
+        if let Some(hook) = &self.before {
+            hook(cmd);
+        }
         self.calls.borrow_mut().push(cmd.clone());
         self.replies
             .borrow_mut()
