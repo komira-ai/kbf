@@ -47,10 +47,10 @@
 //!   not reversible; the waivers; the tag's Beta record in a line), then the commits since the
 //!   previous release, the record, its escapes and what is withdrawn. Without the
 //!   identity of the previous release, when there is one, it refuses (fail closed).
-//! - `release plan --repo <owner/repo> --sha <sha> (--before <sha> | --before-file <file>)
+//! - `release plan --repo <owner/repo> --sha <sha>
 //!   [--repo-dir <checkout>]
 //!   [--freeze <text>] [--output <file>] [--gh <program>]` ([`plan`]): the next version
-//!   (`VERSION` and the release tags), the push's class (code, site, pipeline), and the
+//!   (`VERSION` and the release tags), the class of what changed since the last release (code, site, pipeline), and the
 //!   refusals: a freeze, a base below an existing tag, a superseded commit ([`tags::superseded`]).
 //!   Prints `key=value` lines and appends them to `--output`.
 //! - `release fetch-previous --repo <owner/repo> --sha <sha> --platform <p> --binary <name>...

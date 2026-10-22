@@ -492,15 +492,15 @@ One run of `release.yml` cuts a release; nobody tags. A push to `main` runs one 
 tests the `kbf` of the files `artifacts` built in that same run, each stage needing the one before it. `release.yml`
 is started by the completion of a pipeline run (`workflow_run`, `branches: [main]`) and acts only when that run
 succeeded for a push to `main`; it reads the files from that run's artifacts by the run's id and publishes those same
-files. It is a workflow of its own so that a newer push, which cancels the pipeline run it replaces, can never cancel a
-release that has started: its group never cancels, and a pipeline run that was cancelled or red starts it only to skip
+files. It is a workflow of its own so that nothing a push does can cancel a
+release that has started: its group never cancels, and a pipeline run that is red starts it only to skip
 every job. There is no hand-started run: a failed job is re-run from the run's page (failed jobs only). A tag pushed by hand
 starts nothing, and only the release bot (a GitHub App, the one bypass of the `v*` tag ruleset)
 can create one. The jobs, each with the least token it needs:
 
 | job | does | scopes |
 |---|---|---|
-| `plan` | the next version from `VERSION` and the tags, and whether the push is code, the site or the pipeline itself (`release plan`, from the commit the push replaced, which the pipeline left as the artifact `push-before`); the stop switch `RELEASE_FREEZE` is read here | `contents`, `actions`: read |
+| `plan` | the next version from `VERSION` and the tags, and whether the push is code, the site or the pipeline itself (`release plan`, measured from the highest release tag that is an ancestor of the commit); the stop switch `RELEASE_FREEZE` is read here | `contents`, `actions`: read |
 | `verify` | refuses a commit not on `main` and a run that is not the successful push run for it (`release locate`), checks the files of that run and every attestation (below), before anything is tagged | `contents`, `actions`, `attestations`: read |
 | `tag` | writes the Beta record and creates the annotated tag at the commit, create-only, with the release bot's token (`release verdict-write`, `release tag`) | `contents: read`; environment `release` |
 | `notes` | checks the tag (`release verify`), the identity of this release and of the one before it, and writes the notes | read |
@@ -511,9 +511,9 @@ Every job after `plan` runs only when `plan` says the push ships code and does n
 pipeline (`.github/`, `infra/`, `crates/xtask/` and the like): a push of docs only releases
 nothing and the run is green, and a push that changes the pipeline is released by the next one
 that does not. `tag`, `notes`, `publish` and `bump` also repeat the condition on the run that started the
-workflow (conclusion `success`, event `push`, branch `main`, this repository). A push whose pipeline run a newer push
-cancels is not released by `release.yml`, and `plan` classifies each push from the commit it replaced, so the code of the
-cancelled push is released with the next push that changes code. No job runs after a red one (no `always()`, no
+workflow (conclusion `success`, event `push`, branch `main`, this repository). The pipeline run is never cancelled
+and the newest waiting push queues behind it; `plan` measures from the highest release tag that is an ancestor of the
+commit, so the code of a push that was replaced while waiting is released with the next one. No job runs after a red one (no `always()`, no
 `continue-on-error`). `release tag` and `release publish` both refuse a commit that is behind the
 highest release tag, so a re-run of an old run releases nothing; re-run the failed jobs only.
 `verify`, with read-only scopes, fails the run (and nothing is tagged) when:

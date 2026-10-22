@@ -5,8 +5,7 @@
 //!
 //! - **One pipeline, in order.** `pipeline.yml` runs on a push to `branches: [main]` and on
 //!   nothing else, with the jobs [`JOBS`]: `ci`, `artifacts` and `beta` call `ci.yml`,
-//!   `artifacts.yml` and `beta.yml`, each `needs` exactly the one before it, and `push` (which
-//!   leaves the commit the push replaced for the release) comes last. No job can pass or run
+//!   `artifacts.yml` and `beta.yml`, each `needs` exactly the one before it. No job can pass or run
 //!   after a red one, so a red or cancelled stage stops the stages after it.
 //! - **Each check once.** The three called workflows have a `workflow_call` trigger and no
 //!   `push` trigger; `ci.yml` and `artifacts.yml` keep `pull_request` and `merge_group`;
@@ -16,14 +15,15 @@
 //!   `sha256sums` artifacts without a `run-id` (the run it is part of), checks them with
 //!   `verify-assets sums`, takes the `kbf` of the linux-x86_64 tarball and runs the farm from
 //!   it; the job that runs the farm builds no `kbf` of its own.
-//! - **A newer push cancels the checks and never a release.** The pipeline's concurrency is
-//!   `pipeline-${{ github.ref }}` with `cancel-in-progress: true`; nothing in it writes (no job
+//! - **A running pipeline finishes; a release is never cancelled.** The pipeline's concurrency is
+//!   `pipeline-${{ github.ref }}` with `cancel-in-progress: false`: the run in progress is
+//!   never cancelled, and of the pushes that wait GitHub keeps the newest; nothing in it writes (no job
 //!   holds a write scope but the two signing scopes of the `artifacts` call, under the exact
 //!   `if:` of a push to main; no environment, no secret, no token of the release bot). The
 //!   release is another workflow, in a group of its own that never cancels (`release_workflow`
 //!   holds that rule), started by the success of a run of this one.
 //! - **Least privilege.** Every job has `contents: read` and nothing else but the signing
-//!   scopes of `artifacts` and no scope at all for `push`; a called workflow gets at most
+//!   scopes of `artifacts`; a called workflow gets at most
 //!   what its caller job grants.
 
 use super::workflows;
@@ -32,7 +32,7 @@ use super::workflows;
 const NAME: &str = "pipeline";
 
 /// The jobs, in file order.
-const JOBS: [&str; 4] = ["ci", "artifacts", "beta", "push"];
+const JOBS: [&str; 3] = ["ci", "artifacts", "beta"];
 
 /// `(job, workflow file, the job it needs)`: the stages, in order.
 const STAGES: [(&str, &str, Option<&str>); 3] = [
@@ -137,9 +137,9 @@ fn pipeline(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
         ));
     }
     let concurrency = workflows::concurrency(text)?;
-    if concurrency != Some((GROUP.to_owned(), "true".to_owned())) {
+    if concurrency != Some((GROUP.to_owned(), "false".to_owned())) {
         out.push(format!(
-            "the pipeline's concurrency is {concurrency:?}, not `group: {GROUP}` with `cancel-in-progress: true`: a newer push must cancel the older run"
+            "the pipeline's concurrency is {concurrency:?}, not `group: {GROUP}` with `cancel-in-progress: false`: a running pipeline always finishes, and only the newest waiting push queues behind it"
         ));
     }
     for (job, file, needs) in STAGES {
@@ -174,23 +174,6 @@ fn pipeline(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
     permissions(text, out)?;
     callee_scopes(files, out)?;
     no_secrets_passed(text, out)?;
-    let last = workflows::job_needs(text, "push")?;
-    if last != ["beta"] {
-        out.push(format!("the job `push` needs {last:?}, not [\"beta\"]"));
-    }
-    let steps = workflows::job_steps(text, "push")?;
-    let uploads = steps.iter().any(|s| {
-        s.uses
-            .as_deref()
-            .is_some_and(|u| u.starts_with("actions/upload-artifact@"))
-            && s.with
-                .iter()
-                .any(|(k, v)| k == "name" && v == "push-before")
-            && s.with.iter().any(|(k, v)| k == "path" && v == "before")
-    });
-    if !uploads {
-        out.push("the job `push` does not upload `before` as `push-before`: the release could not tell what the push changed".to_owned());
-    }
     let all = code(text);
     for word in CONTINUING {
         if all.contains(word) {
@@ -226,7 +209,6 @@ fn permissions(text: &str, out: &mut Vec<String>) -> Result<(), String> {
                 ("id-token", "write"),
                 ("attestations", "write"),
             ],
-            "push" => Vec::new(),
             "beta" => vec![("contents", "read"), ("attestations", "read")],
             _ => vec![("contents", "read")],
         };

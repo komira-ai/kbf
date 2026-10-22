@@ -57,8 +57,6 @@ stages:
 jobs:
   - job: pipeline.yml#ci
     stage: ci
-  - job: pipeline.yml#push
-    stage: ci
   - job: pipeline.yml#artifacts
     stage: build
     signing: true

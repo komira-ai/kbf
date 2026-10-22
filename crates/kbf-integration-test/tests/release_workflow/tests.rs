@@ -614,43 +614,14 @@ fn the_release_bots_key_is_read_in_tag_and_bump_only() {
 }
 
 #[test]
-fn the_plan_job_sees_the_push_and_the_freeze_and_hands_on_the_class() {
-    // Catches: a plan that cannot diff the push or see the tags, that diffs from the wrong
-    // commit, that ignores the stop switch, or whose classification never reaches the jobs
-    // that act on it. No full history; the commit before the push not downloaded, or from
-    // another run; `--before-file` another file; the commit planned not the pipeline's; the
+fn the_plan_job_sees_the_history_and_the_freeze_and_hands_on_the_class() {
+    // Catches: a plan that cannot see the history or the tags (it measures from the last
+    // release tag), that ignores the stop switch, or whose classification never reaches the
+    // jobs that act on it. No full history; the commit planned not the pipeline's; the
     // freeze dropped, then the variable; each output dropped.
     red(
         &plant("plan", "          fetch-depth: 0\n", ""),
         "does not check out with `fetch-depth: 0`",
-    );
-    red(
-        &plant(
-            "plan",
-            "          name: push-before\n",
-            "          name: other\n",
-        ),
-        "does not download `push-before` into `push`",
-    );
-    red(
-        &plant(
-            "plan",
-            "          run-id: ${{ github.event.workflow_run.id }}\n",
-            "          run-id: 1\n",
-        ),
-        "a download of `plan` is not of run",
-    );
-    red(
-        &plant("plan", "          github-token: ${{ github.token }}\n", ""),
-        "a download of `plan` names a `run-id` without `github-token",
-    );
-    red(
-        &plant(
-            "plan",
-            "--before-file push/before",
-            "--before-file other/before",
-        ),
-        "not given `--before-file push/before`",
     );
     red(
         &plant("plan", "--sha \"$COMMIT\"", "--sha \"$GITHUB_SHA\""),

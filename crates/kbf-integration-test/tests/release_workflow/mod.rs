@@ -708,20 +708,11 @@ fn downloads_of_this_run(release: &str, out: &mut Vec<String>) -> Result<(), Str
 fn plan_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     let steps = workflows::job_steps(release, "plan")?;
     if !full_history(&steps) {
-        out.push("the job `plan` does not check out with `fetch-depth: 0`: it could not diff the push or see the tags".to_owned());
-    }
-    let before = steps.iter().any(|s| {
-        uses(s, "actions/download-artifact@")
-            && input(s, NAME_KEY) == Some("push-before")
-            && input(s, "path") == Some("push")
-    });
-    if !before {
-        out.push("the job `plan` does not download `push-before` into `push`: it could not tell what the push changed".to_owned());
+        out.push("the job `plan` does not check out with `fetch-depth: 0`: it could not see the history or the tags".to_owned());
     }
     let verb = "cargo xtask release plan";
     if let Some((_, step, words)) = run_of("plan", &steps, "cargo xtask release plan ", out) {
         flag_is(&words, verb, "--sha", "$COMMIT", out);
-        flag_is(&words, verb, "--before-file", "push/before", out);
         flag_is(&words, verb, "--freeze", "$FREEZE", out);
         flag_is(&words, verb, "--output", "$GITHUB_OUTPUT", out);
         env_is("plan", step, "FREEZE", "${{ vars.RELEASE_FREEZE }}", out);

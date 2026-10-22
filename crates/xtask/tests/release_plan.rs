@@ -12,7 +12,6 @@ use xtask::release::tags::{Base, Version};
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
 const REPO: &str = "komira-ai/kbf";
-const ZERO: &str = "0000000000000000000000000000000000000000";
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/release-plan.txt");
 const VERSION_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../VERSION");
 
@@ -122,14 +121,17 @@ impl Fx {
         std::fs::read_to_string(self.root.join("gh/gh-args")).unwrap_or_default()
     }
 
-    /// `release plan` for `sha` pushed over `before`, with `extra` flags.
-    fn plan(&self, sha: &str, before: &str, extra: &[&str]) -> (Option<i32>, String, String) {
+    /// Tags `commit` with the release tag `tag` in the checkout.
+    fn tag(&self, tag: &str, commit: &str) {
+        git(&self.repo(), &["tag", tag, commit]);
+    }
+
+    /// `release plan` for `sha`, with `extra` flags.
+    fn plan(&self, sha: &str, extra: &[&str]) -> (Option<i32>, String, String) {
         let repo = self.repo();
         let gh = self.root.join("gh/gh");
         let out = Command::new(XTASK)
-            .args([
-                "release", "plan", "--repo", REPO, "--sha", sha, "--before", before,
-            ])
+            .args(["release", "plan", "--repo", REPO, "--sha", sha])
             .arg("--repo-dir")
             .arg(&repo)
             .arg("--gh")
@@ -142,28 +144,10 @@ impl Fx {
         (out.status.code(), text(&out.stdout), text(&out.stderr))
     }
 
-    /// `release plan` for `sha` with exactly the flags in `flags` for the push.
-    fn plan_args(&self, sha: &str, flags: &[&str]) -> (Option<i32>, String, String) {
-        let repo = self.repo();
-        let gh = self.root.join("gh/gh");
-        let out = Command::new(XTASK)
-            .args(["release", "plan", "--repo", REPO, "--sha", sha])
-            .args(flags)
-            .arg("--repo-dir")
-            .arg(&repo)
-            .arg("--gh")
-            .arg(&gh)
-            .env_remove("XTASK_FAKE_DEFECT")
-            .output()
-            .expect("run xtask");
-        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-        (out.status.code(), text(&out.stdout), text(&out.stderr))
-    }
-
-    /// The pushed commit is the head and the push is a code change over `before`.
+    /// The pushed commit is the head.
     fn plan_head(&self) -> (Option<i32>, String, String) {
         let head = git(&self.repo(), &["rev-parse", "HEAD"]);
-        self.plan(&head, ZERO, &[])
+        self.plan(&head, &[])
     }
 }
 
@@ -192,7 +176,7 @@ fn the_patch_is_one_above_the_highest_numerically_not_as_text() {
         &[],
         &[("v0.0.10", &sha, "ahead")],
     );
-    let (code, out, err) = fx.plan(&sha, ZERO, &[]);
+    let (code, out, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(value(&out, "version"), "0.0.11", "{out}");
     assert_eq!(value(&out, "tag"), "v0.0.11");
@@ -204,7 +188,7 @@ fn nine_is_followed_by_ten() {
     let fx = fx("nine-ten", "0.0\n");
     let sha = fx.commit(&[("src/a.rs", Some("a"))]);
     fx.github(&["v0.0.8", "v0.0.9"], &[], &[("v0.0.9", &sha, "ahead")]);
-    let (code, out, err) = fx.plan(&sha, ZERO, &[]);
+    let (code, out, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(value(&out, "version"), "0.0.10", "{out}");
 }
@@ -230,7 +214,7 @@ fn tags_of_another_base_do_not_count() {
         &["v0.1.9"],
         &[("v0.1.7", &sha, "ahead")],
     );
-    let (code, out, err) = fx.plan(&sha, ZERO, &[]);
+    let (code, out, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(value(&out, "version"), "0.2.1", "{out}");
 }
@@ -242,7 +226,7 @@ fn a_higher_base_than_version_stops_the_run() {
     let fx = fx("backwards", "0.1\n");
     let sha = fx.commit(&[("src/a.rs", Some("a"))]);
     fx.github(&["v0.1.4", "v0.2.1"], &[], &[("v0.2.1", &sha, "ahead")]);
-    let (code, out, err) = fx.plan(&sha, ZERO, &[]);
+    let (code, out, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(1), "{out}");
     assert!(
         err.contains("VERSION is 0.1 but a release of 0.2 exists: the base never goes backwards"),
@@ -257,12 +241,12 @@ fn a_draft_of_a_higher_base_stops_the_run_and_a_draft_takes_its_number() {
     let fx = fx("drafts", "0.1\n");
     let sha = fx.commit(&[("src/a.rs", Some("a"))]);
     fx.github(&["v0.1.2"], &["v0.2.0"], &[("v0.1.2", &sha, "ahead")]);
-    let (code, _, err) = fx.plan(&sha, ZERO, &[]);
+    let (code, _, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(1));
     assert!(err.contains("never goes backwards"), "{err}");
 
     fx.github(&["v0.1.2"], &["v0.1.4"], &[("v0.1.2", &sha, "ahead")]);
-    let (code, out, err) = fx.plan(&sha, ZERO, &[]);
+    let (code, out, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(value(&out, "version"), "0.1.5", "{out}");
 }
@@ -292,7 +276,7 @@ fn suffixed_and_odd_tags_are_not_counted() {
         &["v0.0.6-rc2", "nightly"],
         &[("v0.0.3", &sha, "ahead")],
     );
-    let (code, out, err) = fx.plan(&sha, ZERO, &[]);
+    let (code, out, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(value(&out, "version"), "0.0.4", "{out}");
 }
@@ -304,7 +288,7 @@ fn a_rerun_of_the_tagged_commit_reports_its_version_again() {
     let fx = fx("reuse", "0.0\n");
     let sha = fx.commit(&[("src/a.rs", Some("a"))]);
     fx.github(&["v0.0.1", "v0.0.2"], &[], &[("v0.0.2", &sha, "identical")]);
-    let (code, out, err) = fx.plan(&sha, ZERO, &[]);
+    let (code, out, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(value(&out, "version"), "0.0.2", "{out}");
     assert_eq!(value(&out, "reused"), "true");
@@ -314,7 +298,7 @@ fn a_rerun_of_the_tagged_commit_reports_its_version_again() {
         &["v0.0.3"],
         &[("v0.0.2", &sha, "identical")],
     );
-    let (_, out, _) = fx.plan(&sha, ZERO, &[]);
+    let (_, out, _) = fx.plan(&sha, &[]);
     assert_eq!(value(&out, "version"), "0.0.4", "{out}");
     assert_eq!(value(&out, "reused"), "false");
 }
@@ -326,14 +310,14 @@ fn a_bumped_base_does_not_reuse_the_old_base_tag() {
     let fx = fx("bump", "0.1\n");
     let sha = git(&fx.repo(), &["rev-parse", "HEAD"]);
     fx.github(&["v0.0.5"], &[], &[("v0.0.5", &sha, "identical")]);
-    let (code, out, err) = fx.plan(&sha, ZERO, &[]);
+    let (code, out, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(value(&out, "version"), "0.1.1", "{out}");
     assert_eq!(value(&out, "reused"), "false");
 
     // And with a draft of the new base: the old tag is the highest of all, not of the base.
     fx.github(&["v0.0.5"], &["v0.1.1"], &[("v0.0.5", &sha, "identical")]);
-    let (_, out, _) = fx.plan(&sha, ZERO, &[]);
+    let (_, out, _) = fx.plan(&sha, &[]);
     assert_eq!(value(&out, "version"), "0.1.2", "{out}");
     assert_eq!(value(&out, "reused"), "false");
 }
@@ -346,7 +330,7 @@ fn a_commit_behind_or_beside_the_highest_tag_is_superseded() {
     let sha = fx.commit(&[("src/a.rs", Some("a"))]);
     for status in ["behind", "diverged", "weird"] {
         fx.github(&["v0.0.4"], &[], &[("v0.0.4", &sha, status)]);
-        let (code, out, err) = fx.plan(&sha, ZERO, &[]);
+        let (code, out, err) = fx.plan(&sha, &[]);
         assert_eq!(code, Some(1), "{status}: {out}");
         assert!(
             err.contains(&format!(
@@ -358,7 +342,7 @@ fn a_commit_behind_or_beside_the_highest_tag_is_superseded() {
         assert_eq!(out, "", "{status}");
     }
     fx.github(&["v0.0.4"], &[], &[]);
-    let (code, _, err) = fx.plan(&sha, ZERO, &[]);
+    let (code, _, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(1));
     assert!(err.contains("compare says nothing"), "{err}");
 }
@@ -370,7 +354,7 @@ fn the_freeze_refuses_before_anything_is_asked_of_github() {
     let fx = fx("freeze", "0.0\n");
     let sha = fx.commit(&[("src/a.rs", Some("a"))]);
     fx.github(&[], &[], &[]);
-    let (code, out, err) = fx.plan(&sha, ZERO, &["--freeze", "incident 42"]);
+    let (code, out, err) = fx.plan(&sha, &["--freeze", "incident 42"]);
     assert_eq!(code, Some(1), "{out}");
     assert!(
         err.contains("frozen: RELEASE_FREEZE is \"incident 42\": nothing is released"),
@@ -378,12 +362,12 @@ fn the_freeze_refuses_before_anything_is_asked_of_github() {
     );
     assert_eq!(fx.gh_args(), "");
     // Catches: a freeze trimmed before the test, so a variable of spaces lets it through.
-    let (code, _, err) = fx.plan(&sha, ZERO, &["--freeze", " "]);
+    let (code, _, err) = fx.plan(&sha, &["--freeze", " "]);
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("frozen: RELEASE_FREEZE is \" \""), "{err}");
-    let (code, _, err) = fx.plan(&sha, ZERO, &["--freeze", ""]);
+    let (code, _, err) = fx.plan(&sha, &["--freeze", ""]);
     assert_eq!(code, Some(0), "{err}");
-    let (code, _, err) = fx.plan(&sha, ZERO, &[]);
+    let (code, _, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(0), "{err}");
 }
 
@@ -415,7 +399,7 @@ fn a_commit_with_no_version_file_fails_the_run() {
     let fx = fx("no-version", "0.0\n");
     let sha = fx.commit(&[("VERSION", None)]);
     fx.github(&[], &[], &[]);
-    let (code, _, err) = fx.plan(&sha, ZERO, &[]);
+    let (code, _, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(1));
     assert!(err.contains("VERSION"), "{err}");
 }
@@ -429,7 +413,7 @@ fn version_comes_from_the_commit_pushed() {
     fx.commit(&[("VERSION", Some("0.4\n"))]);
     std::fs::write(fx.repo().join("VERSION"), "9.9\n").expect("edit");
     fx.github(&[], &[], &[]);
-    let (_, out, _) = fx.plan(&sha, ZERO, &[]);
+    let (_, out, _) = fx.plan(&sha, &[]);
     assert_eq!(value(&out, "version"), "0.3.1", "{out}");
 }
 
@@ -451,7 +435,7 @@ fn tag_lists_are_read_page_after_page() {
         json!({ "status": "ahead" }),
     );
     fx.write_answers(map);
-    let (code, out, err) = fx.plan(&sha, ZERO, &[]);
+    let (code, out, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(value(&out, "version"), "0.0.102", "{out}");
     let asked = fx.gh_args();
@@ -465,14 +449,14 @@ fn a_list_github_does_not_give_fails_the_run_rather_than_reading_as_empty() {
     let fx = fx("no-list", "0.0\n");
     let sha = fx.commit(&[("src/a.rs", Some("a"))]);
     fx.write_answers(serde_json::Map::new());
-    let (code, _, err) = fx.plan(&sha, ZERO, &[]);
+    let (code, _, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(1));
     assert!(err.contains("no list of entries"), "{err}");
 
     let mut map = serde_json::Map::new();
     map.insert(refs_path(1), json!({ "message": "not a list" }));
     fx.write_answers(map);
-    let (code, _, err) = fx.plan(&sha, ZERO, &[]);
+    let (code, _, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(1));
     assert!(err.contains("no list of entries"), "{err}");
 }
@@ -555,7 +539,8 @@ fn the_push_is_classified_by_the_files_it_changed() {
         (&[("src/\u{e9}t\u{e9}.rs", "x")], [true, false, false]),
     ];
     for (i, (files, [code, site, pipeline])) in cases.iter().enumerate() {
-        let before = git(&fx.repo(), &["rev-parse", "HEAD"]);
+        // The release before this case: only what the case changes is in the range.
+        fx.tag(&format!("v0.0.{}", i + 1), "HEAD");
         // Each case writes contents no earlier case did, so every file it names changes.
         let unique = i.to_string();
         let files: Vec<(&str, Option<&str>)> = files
@@ -563,7 +548,7 @@ fn the_push_is_classified_by_the_files_it_changed() {
             .map(|(p, t)| (*p, Some(if *p == "VERSION" { *t } else { unique.as_str() })))
             .collect();
         let sha = fx.commit(&files);
-        let (status, out, err) = fx.plan(&sha, &before, &[]);
+        let (status, out, err) = fx.plan(&sha, &[]);
         assert_eq!(status, Some(0), "{files:?}: {err}");
         let got = [
             value(&out, "code"),
@@ -581,11 +566,12 @@ fn a_move_from_code_to_docs_is_still_code() {
     let fx = fx("rename", "0.0\n");
     fx.github(&[], &[], &[]);
     let before = fx.commit(&[("src/big.rs", Some("fn main() {}\n".repeat(20).as_str()))]);
+    fx.tag("v0.0.1", &before);
     std::fs::create_dir_all(fx.repo().join("docs")).expect("docs");
     git(&fx.repo(), &["mv", "src/big.rs", "docs/big.rs"]);
     git(&fx.repo(), &["commit", "-q", "-m", "move"]);
     let sha = git(&fx.repo(), &["rev-parse", "HEAD"]);
-    let (code, out, err) = fx.plan(&sha, &before, &[]);
+    let (code, out, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(value(&out, "code"), "true", "{out}");
     assert_eq!(value(&out, "site"), "true");
@@ -596,9 +582,9 @@ fn a_push_that_changed_no_file_is_neither_code_nor_site() {
     // Catches: an empty diff read as code (a version burned on nothing).
     let fx = fx("empty", "0.0\n");
     fx.github(&[], &[], &[]);
-    let before = git(&fx.repo(), &["rev-parse", "HEAD"]);
+    fx.tag("v0.0.1", "HEAD");
     let sha = fx.commit(&[]);
-    let (code, out, err) = fx.plan(&sha, &before, &[]);
+    let (code, out, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(
         [
@@ -611,12 +597,12 @@ fn a_push_that_changed_no_file_is_neither_code_nor_site() {
 }
 
 #[test]
-fn a_first_push_is_code_and_site_but_no_pipeline_change() {
-    // Catches: an all-zero `before` diffed (an error), read as docs, or as a change to
-    // the pipeline that would block the first release. The last commit alone is docs,
-    // so only the rule for a zero `before` makes it code.
-    let fx = fx("zero", "0.0\n");
+fn with_no_release_tag_the_first_release_is_everything() {
+    // Catches: a first release measured over the last commit only (here docs), which
+    // would release nothing, or a first release read as a change to the pipeline.
+    let fx = fx("first", "0.0\n");
     fx.github(&[], &[], &[]);
+    fx.commit(&[("crates/a/src/lib.rs", Some("x"))]);
     fx.commit(&[("README.md", Some("x"))]);
     let (code, out, err) = fx.plan_head();
     assert_eq!(code, Some(0), "{err}");
@@ -631,13 +617,32 @@ fn a_first_push_is_code_and_site_but_no_pipeline_change() {
 }
 
 #[test]
-fn a_before_the_checkout_does_not_hold_is_code_site_and_pipeline() {
-    // Catches: a forced push (or a shallow checkout) failing the run, or read as docs,
-    // or as a change that cannot have touched the pipeline.
-    let fx = fx("lost", "0.0\n");
+fn code_since_the_last_tag_releases_even_when_the_latest_commit_is_docs() {
+    // Catches: the range cut at the previous push, so the code of a superseded or
+    // queued push is dropped by the docs-only push after it.
+    let fx = fx("code-then-docs", "0.0\n");
     fx.github(&[], &[], &[]);
-    let sha = fx.commit(&[("README.md", Some("x"))]);
-    let (code, out, err) = fx.plan(&sha, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", &[]);
+    fx.tag("v0.0.1", "HEAD");
+    fx.commit(&[("crates/a/src/lib.rs", Some("x"))]);
+    fx.commit(&[("docs/a.txt", Some("x"))]);
+    let (code, out, err) = fx.plan_head();
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(value(&out, "code"), "true", "{out}");
+    assert_eq!(value(&out, "site"), "true");
+}
+
+#[test]
+fn only_docs_since_the_last_tag_releases_nothing() {
+    // Catches: a docs-only range read as code (a version burned on nothing), and a tag
+    // that is not the highest one used as the base (the code before the newest tag).
+    let fx = fx("docs-only", "0.0\n");
+    fx.github(&[], &[], &[]);
+    fx.tag("v0.0.1", "HEAD");
+    fx.commit(&[("crates/a/src/lib.rs", Some("x"))]);
+    fx.tag("v0.0.2", "HEAD");
+    fx.commit(&[("docs/a.txt", Some("x"))]);
+    fx.commit(&[("README.md", Some("x"))]);
+    let (code, out, err) = fx.plan_head();
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(
         [
@@ -645,81 +650,67 @@ fn a_before_the_checkout_does_not_hold_is_code_site_and_pipeline() {
             value(&out, "site"),
             value(&out, "pipeline")
         ],
-        ["true", "true", "true"]
+        ["false", "true", "false"]
     );
 }
 
 #[test]
-fn a_sha_or_before_that_is_not_a_commit_is_a_usage_error() {
-    let fx = fx("usage", "0.0\n");
+fn the_base_is_the_highest_tag_that_is_an_ancestor_not_a_tag_beside_it() {
+    // Catches: a tag on another branch (higher, but not an ancestor) taken as the base,
+    // which would hide the code after the real last release.
+    let fx = fx("beside", "0.0\n");
     fx.github(&[], &[], &[]);
-    let sha = git(&fx.repo(), &["rev-parse", "HEAD"]);
-    let (code, _, err) = fx.plan("abc", ZERO, &[]);
-    assert_eq!(code, Some(2), "{err}");
-    assert!(err.contains("--sha"), "{err}");
-    for before in ["xyz", "", "ABCDEF123456"] {
-        let (code, _, err) = fx.plan(&sha, before, &[]);
-        assert_eq!(code, Some(2), "{before:?}: {err}");
-        assert!(err.contains("--before"), "{err}");
-    }
-    assert_eq!(fx.gh_args(), "");
+    fx.tag("v0.0.1", "HEAD");
+    git(&fx.repo(), &["checkout", "-q", "-b", "other"]);
+    let other = fx.commit(&[("docs/o.txt", Some("o"))]);
+    fx.tag("v0.0.9", &other);
+    git(&fx.repo(), &["checkout", "-q", "main"]);
+    fx.commit(&[("crates/a/src/lib.rs", Some("x"))]);
+    let (code, out, err) = fx.plan_head();
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(value(&out, "code"), "true", "{out}");
 }
 
 #[test]
-fn before_can_be_read_from_a_file_and_means_the_same() {
-    // Catches: `--before-file` read differently from `--before` (a newline kept, so a
-    // good commit refused; the file ignored), which would classify the release run's push
-    // from the wrong commit.
-    let fx = fx("before-file", "0.1\n");
-    fx.github(&[], &[], &[]);
-    let before = git(&fx.repo(), &["rev-parse", "HEAD"]);
+fn a_rerun_of_the_tagged_commit_is_measured_over_the_release_before_it() {
+    // Catches: the tag on the commit itself taken as the base (an empty range, so the
+    // re-run of a release that failed half way would publish nothing).
+    let fx = fx("rerun-range", "0.0\n");
+    fx.tag("v0.0.1", "HEAD");
     let sha = fx.commit(&[("crates/a/src/lib.rs", Some("x"))]);
-    let file = fx.root.join("before");
-    std::fs::write(&file, format!("{before}\n")).expect("before file");
-    let by_flag = fx.plan(&sha, &before, &[]);
-    let (code, out, err) =
-        fx.plan_args(&sha, &["--before-file", file.to_str().expect("utf-8 path")]);
+    fx.tag("v0.0.2", &sha);
+    fx.github(&["v0.0.1", "v0.0.2"], &[], &[("v0.0.2", &sha, "identical")]);
+    let (code, out, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(0), "{err}");
-    assert_eq!(code, by_flag.0, "{err}");
-    assert_eq!(out, by_flag.1);
+    assert_eq!(value(&out, "reused"), "true", "{out}");
     assert_eq!(value(&out, "code"), "true");
 }
 
 #[test]
-fn a_before_file_that_is_missing_or_holds_no_commit_is_refused() {
-    // Catches: an unreadable or garbage file read as a first push (all code), which would
-    // release a docs-only push.
-    let fx = fx("before-file-bad", "0.1\n");
+fn the_pipeline_flag_is_the_commits_own_change_not_the_range() {
+    // Catches: a pipeline file anywhere since the last tag blocking every later release
+    // (it stays in the range until a release clears it, and none is made); and the
+    // reverse, the head commit's own pipeline change not blocking.
+    let fx = fx("pipeline-own", "0.0\n");
     fx.github(&[], &[], &[]);
-    let sha = git(&fx.repo(), &["rev-parse", "HEAD"]);
-    let missing = fx.root.join("absent");
-    let (code, _, err) = fx.plan_args(
-        &sha,
-        &["--before-file", missing.to_str().expect("utf-8 path")],
-    );
-    assert_eq!(code, Some(1), "{err}");
-    assert!(err.contains("absent"), "{err}");
-    let junk = fx.root.join("junk");
-    std::fs::write(&junk, "not a commit\n").expect("junk file");
-    let (code, _, err) = fx.plan_args(&sha, &["--before-file", junk.to_str().expect("utf-8 path")]);
-    assert_eq!(code, Some(2), "{err}");
-    assert!(err.contains("--before"), "{err}");
-    assert_eq!(fx.gh_args(), "");
+    fx.tag("v0.0.1", "HEAD");
+    fx.commit(&[(".github/workflows/x.yml", Some("x"))]);
+    let sha = fx.commit(&[("crates/a/src/lib.rs", Some("x"))]);
+    let (_, out, err) = fx.plan(&sha, &[]);
+    assert_eq!(value(&out, "pipeline"), "false", "{out}{err}");
+    assert_eq!(value(&out, "code"), "true");
+    let sha = fx.commit(&[("crates/a/src/lib.rs", Some("y")), ("deny.toml", Some("y"))]);
+    let (_, out, err) = fx.plan(&sha, &[]);
+    assert_eq!(value(&out, "pipeline"), "true", "{out}{err}");
 }
 
 #[test]
-fn before_and_before_file_together_or_neither_are_a_usage_error() {
-    // Catches: two answers to "what did the push replace" taken silently, or none.
-    let fx = fx("before-both", "0.1\n");
+fn a_sha_that_is_not_a_commit_is_a_usage_error() {
+    let fx = fx("usage", "0.0\n");
     fx.github(&[], &[], &[]);
-    let sha = git(&fx.repo(), &["rev-parse", "HEAD"]);
-    let file = fx.root.join("before");
-    std::fs::write(&file, format!("{ZERO}\n")).expect("before file");
-    let path = file.to_str().expect("utf-8 path");
-    let (code, _, err) = fx.plan_args(&sha, &["--before", ZERO, "--before-file", path]);
+    let (code, _, err) = fx.plan("abc", &[]);
     assert_eq!(code, Some(2), "{err}");
-    let (code, _, err) = fx.plan_args(&sha, &[]);
-    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("--sha"), "{err}");
     assert_eq!(fx.gh_args(), "");
 }
 
@@ -728,7 +719,7 @@ fn output_is_appended_to_the_file_and_printed_as_the_golden_has_it() {
     // Catches: a changed output (the workflow reads these keys), an output that
     // replaces the file's earlier lines, and one that differs from what is printed.
     let fx = fx("golden", "0.1\n");
-    let before = git(&fx.repo(), &["rev-parse", "HEAD"]);
+    fx.tag("v0.1.2", "HEAD");
     let sha = fx.commit(&[("crates/a/src/lib.rs", Some("x"))]);
     fx.github(
         &["v0.1.1", "v0.1.2", "v0.0.9"],
@@ -737,7 +728,7 @@ fn output_is_appended_to_the_file_and_printed_as_the_golden_has_it() {
     );
     let file = fx.root.join("github-output");
     std::fs::write(&file, "earlier=line\n").expect("output");
-    let (code, out, err) = fx.plan(&sha, &before, &["--output", file.to_str().expect("utf-8")]);
+    let (code, out, err) = fx.plan(&sha, &["--output", file.to_str().expect("utf-8")]);
     assert_eq!(code, Some(0), "{err}");
     let golden = std::fs::read_to_string(GOLDEN).expect("golden file");
     assert_eq!(out, golden);
@@ -753,7 +744,7 @@ fn an_output_file_that_cannot_be_written_fails_the_run() {
     fx.github(&[], &[], &[]);
     let missing = fx.root.join("no-such-dir/out");
     let head = git(&fx.repo(), &["rev-parse", "HEAD"]);
-    let (code, _, err) = fx.plan(&head, ZERO, &["--output", missing.to_str().expect("utf-8")]);
+    let (code, _, err) = fx.plan(&head, &["--output", missing.to_str().expect("utf-8")]);
     assert_eq!(code, Some(1));
     assert!(err.contains("append to"), "{err}");
 }

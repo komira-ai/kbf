@@ -194,8 +194,9 @@ Two layers, because "on every merge" and "a merge must not wait an hour" pull ap
 Neither runs on `pull_request`: they start a farm with root-level helpers and attest results, and a pull request from a
 fork must not run either. The lint of section 2.1 enforces the absence.
 
-A newer push cancels an older push's run (the whole pipeline of section 8.0, beta included); a cancelled beta is "not run",
-never "passed". The offer takes the newest commit with a green beta, so skipped commits cost nothing.
+A pipeline that has started is never cancelled (section 8.0, beta included); the pushes that arrive meanwhile wait, and only
+the newest waiting one runs. A commit that never ran its beta has no result, which is "not run", never "passed". The offer
+takes the newest commit with a green beta, so skipped commits cost nothing.
 
 ### 4.2 Runner shape: does a whole farm fit on a hosted runner
 
@@ -555,8 +556,9 @@ A push to `main` runs one sequential pipeline, `pipeline.yml`, in this order, ea
   pipeline run and checks them again).
 - **A red or cancelled stage stops the rest.** Every stage `needs` the one before it, none can be skipped, and the workflow
   has no `always()` or `continue-on-error`.
-- **A newer push cancels the older pipeline.** The workflow's group is `pipeline-<ref>` with `cancel-in-progress: true`. A
-  workflow-level cancel stops every job of the run, so nothing that writes may be a job of this run: it holds no tag, no
+- **A running pipeline finishes; the newest waiting push queues behind it.** The workflow's group is `pipeline-<ref>` with
+  `cancel-in-progress: false`: the run in progress is never cancelled, and of the pushes that wait GitHub keeps the newest
+  (a pending run is replaced by a newer one). Nothing that writes is a job of this run anyway: it holds no tag, no
   release, no push to another repository, no environment and no secret. The only write scopes it grants are the signing
   scopes of the `artifacts` call, under the exact `if:` of a push to `main` (the `beta` call grants `attestations: read`
   for its `mixed-version` job); a called workflow gets at most what the caller grants, and GitHub refuses the whole
@@ -571,22 +573,24 @@ A push to `main` runs one sequential pipeline, `pipeline.yml`, in this order, ea
 **The guarantee.** A release job is never cancelled by a push: tag, notes, publish and bump are jobs of a workflow no push
 cancels, and a release starts only from a pipeline run that finished with `success`, which no push can then change.
 A push that arrives while a release runs starts a new pipeline; its release waits for the running one (one pending run per
-group, a newer pending one replacing an older). The workflow-level cancel can interrupt only checks: an unfinished build, an
-unfinished beta, never a half-made tag or release. **The residual risks, stated:** (1) the code of a push whose pipeline a
-newer push cancels is not released by that push; `release plan` classifies each push from the commit it replaced
-(`push-before`, which the pipeline's last job leaves), so a docs-only push after a cancelled code push releases nothing, and the
-cancelled code is released with the next push that changes code; the same holds for a pending release a newer one replaces;
-(2) the run that started the release is read by id (`github.event.workflow_run.id`): `release locate` refuses a run that is not
-the successful push run on `main` for the commit, and one that no longer holds the artifacts (they expire after 90 days);
-(3) a release job a person cancels, or that fails, is re-run from the run's page (failed jobs only), and `release tag` and
-`release publish` are idempotent, so a half-made release is completed, not repeated;
-(4) merges that arrive faster than a pipeline finishes keep cancelling it, so no beta run and no release completes while
-they last, and `release plan` diffs only the one push; whether `plan` should compare with the highest release tag, or the
-pipeline should wait for a running run instead of cancelling it, is open for the maintainers to decide.
+group, a newer pending one replacing an older). The pipeline is never cancelled, so a busy `main` cannot starve it.
+`release plan` measures from the highest release tag that is an ancestor of the commit (the newest `v*` release tag, not
+the tag of the commit being re-run), not from the one push: code from a push that was replaced while it waited, or that
+queued behind a running pipeline, is always in the next release, and a docs-only push after code changes still releases that
+code. With no release tag yet, the first release is everything. **Releases therefore happen at least once per pipeline
+length**: as long as a pipeline can finish, the commit it finishes on releases everything since the last release. `code`
+and `site` are classified over that whole range; `pipeline` is the commit's own change (its diff over its first parent),
+because a range keeps a pipeline file until a release clears it, and a release that waits for no pipeline file in the range
+would never be made. **The residual risks, stated:** (1) the run that started the release is read by id
+(`github.event.workflow_run.id`): `release locate` refuses a run that is not the successful push run on `main` for the
+commit, and one that no longer holds the artifacts (they expire after 90 days); (2) a release job a person cancels, or that
+fails, is re-run from the run's page (failed jobs only), and `release tag` and `release publish` are idempotent, so a
+half-made release is completed, not repeated; (3) a commit that changes the pipeline does not release itself, and the
+next commit that does not releases both.
 
 The workflow lints hold all of it (`crates/kbf-integration-test/tests/pipeline_workflow`, `release_workflow` and
 `workflows`): the order of the stages and their `needs`, the triggers of the called workflows, the single call of each,
-the cancel of the pipeline and the absence of a write in it, the scopes granted to each stage, the shape of the one
+the concurrency of the pipeline (never cancelled) and the absence of a write in it, the scopes granted to each stage, the shape of the one
 `workflow_run` trigger the repository allows (`workflows: [pipeline]`, `types: [completed]`, `branches: [main]`, in
 `release.yml` alone), the group of the release, and that beta reads the artifacts of its own run.
 

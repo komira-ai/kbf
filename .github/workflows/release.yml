@@ -27,8 +27,9 @@
 #
 # plan     reads VERSION and the tags: the next version, and whether the push is code (it
 #          ships in a release), the site, or the pipeline itself (cargo xtask release plan).
-#          A push of docs only makes no release and the run stays green; a push that changes
-#          the pipeline does not release itself, the next push that does not releases both.
+#          A range of docs only (since the last release tag) makes no release and the run stays
+#          green; a commit that changes the pipeline does not release itself, the next one that
+#          does not releases both.
 # verify   refuses a commit not on main, downloads the files of the pipeline run that started
 #          this one, checks the files against SHA256SUMS and the commit's assets, and verifies
 #          every attestation as a deployment does and every bundle offline as a host does.
@@ -52,10 +53,9 @@
 # both refuse otherwise). Re-run the failed jobs only: a re-run of all jobs writes another
 # Beta record, and a tag that exists must carry the record it was made with.
 #
-# A push that a newer push cancels before its pipeline finishes is not released by this
-# workflow, and a docs-only push after it releases nothing: `plan` classifies each push from the
-# commit it replaced, so the code of the cancelled push is released with the next push that
-# changes code.
+# `plan` measures from the highest release tag that is an ancestor of the commit, not from the
+# push: the code of a push that was queued behind another or replaced while waiting is released
+# with the next one, and a docs-only push after code still releases that code.
 name: release
 
 on:
@@ -104,7 +104,7 @@ jobs:
       site: ${{ steps.plan.outputs.site }}
       pipeline: ${{ steps.plan.outputs.pipeline }}
     steps:
-      # The whole history and every tag: the files the push changed, and the highest tag.
+      # The whole history and every tag: the files changed since the highest release tag.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
@@ -112,21 +112,13 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install
       - run: cargo build -p xtask --locked
-      # The commit this push replaced, which the pipeline run left (a run started by
-      # `workflow_run` has no push event to read it from).
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: push-before
-          path: push
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ github.token }}
       - name: The next version, and what the push is
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
           # The stop switch: any value refuses every release until an admin clears it.
           FREEZE: ${{ vars.RELEASE_FREEZE }}
-        run: cargo xtask release plan --repo "$GITHUB_REPOSITORY" --sha "$COMMIT" --before-file push/before --freeze "$FREEZE" --output "$GITHUB_OUTPUT"
+        run: cargo xtask release plan --repo "$GITHUB_REPOSITORY" --sha "$COMMIT" --freeze "$FREEZE" --output "$GITHUB_OUTPUT"
 
   verify:
     needs: [plan]

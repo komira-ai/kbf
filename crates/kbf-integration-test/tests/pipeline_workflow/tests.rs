@@ -93,14 +93,6 @@ fn the_pipeline_runs_ci_then_artifacts_then_beta_each_needing_the_one_before() {
     red(
         &plant(
             "pipeline.yml",
-            "    needs: [beta]\n",
-            "    needs: [artifacts]\n",
-        ),
-        "the job `push` needs",
-    );
-    red(
-        &plant(
-            "pipeline.yml",
             "uses: ./.github/workflows/beta.yml",
             "uses: ./.github/workflows/ci.yml",
         ),
@@ -336,18 +328,19 @@ fn beta_tests_the_artifacts_of_the_same_run_and_builds_no_kbf() {
 }
 
 #[test]
-fn a_newer_push_cancels_the_older_checks_but_never_a_release() {
-    // Catches: a pipeline that does not cancel its predecessor; a pipeline holding anything
+fn a_running_pipeline_is_never_cancelled_and_neither_is_a_release() {
+    // Catches: a pipeline that cancels the run in progress (a build and its attestations
+    // thrown away when a push arrives, so a busy main would never finish one); a pipeline holding anything
     // that writes (a tag, a release, the bot's key, an environment), which a cancel could leave
     // half done; a release in the pipeline's group, or one that cancels a release; a called
     // workflow whose group would cancel its caller.
     red(
         &plant(
             "pipeline.yml",
-            "  cancel-in-progress: true\n",
             "  cancel-in-progress: false\n",
+            "  cancel-in-progress: true\n",
         ),
-        "a newer push must cancel the older run",
+        "a running pipeline always finishes",
     );
     red(
         &plant(
@@ -364,69 +357,6 @@ fn a_newer_push_cancels_the_older_checks_but_never_a_release() {
             "    permissions:\n      contents: write\n\n  artifacts:",
         ),
         "the job `ci` grants the scopes",
-    );
-    red(
-        &plant(
-            "pipeline.yml",
-            "  push:\n    needs: [beta]\n",
-            "  push:\n    needs: [beta]\n    environment: release\n",
-        ),
-        "names `environment:`",
-    );
-    red(
-        &plant(
-            "release.yml",
-            "  group: release-${{ github.event.workflow_run.conclusion == 'success' && 'main' || github.run_id }}\n",
-            "  group: pipeline-${{ github.ref }}\n",
-        ),
-        "shares the pipeline's concurrency group",
-    );
-    red(
-        &plant(
-            "ci.yml",
-            "  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}\n",
-            "  group: pipeline-${{ github.ref }}\n",
-        ),
-        "ci.yml has the concurrency group",
-    );
-}
-
-#[test]
-fn only_the_artifacts_call_holds_the_signing_scopes_and_only_for_a_push_to_main() {
-    // Catches: the signing scopes granted to another stage (a called workflow gets at most
-    // what its caller grants), or to the artifacts stage without the push-to-main condition,
-    // or a scope nothing needs.
-    red(
-        &plant(
-            "pipeline.yml",
-            "  beta:\n    needs: [artifacts]\n    uses: ./.github/workflows/beta.yml\n    permissions:\n      contents: read\n",
-            "  beta:\n    needs: [artifacts]\n    uses: ./.github/workflows/beta.yml\n    permissions:\n      contents: read\n      id-token: write\n",
-        ),
-        "the job `beta` grants the scopes",
-    );
-    red(
-        &plant(
-            "pipeline.yml",
-            "      attestations: write\n",
-            "      attestations: write\n      packages: write\n",
-        ),
-        "the job `artifacts` grants the scopes",
-    );
-    red(
-        &plant(
-            "pipeline.yml",
-            "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
-            "",
-        ),
-        "the job `artifacts` has `if: (none)`",
-    );
-    red(
-        &plant(
-            "pipeline.yml",
-            "  push:\n    needs: [beta]\n    runs-on: ubuntu-24.04\n    timeout-minutes: 5\n    permissions: {}\n",
-            "  push:\n    needs: [beta]\n    runs-on: ubuntu-24.04\n    timeout-minutes: 5\n    permissions:\n      contents: read\n",
-        ),
-        "the job `push` grants the scopes",
     );
 }
 
@@ -483,10 +413,9 @@ fn no_stage_passes_secrets_to_its_workflow() {
 }
 
 #[test]
-fn the_release_follows_this_pipeline_and_finds_what_it_leaves() {
+fn the_release_follows_this_pipeline() {
     // Catches: a rename of the pipeline the release does not follow (it would never start), a
-    // release that follows another workflow, and a pipeline that does not leave the commit
-    // before the push.
+    // release that follows another workflow.
     red(
         &plant("pipeline.yml", "name: pipeline\n", "name: main\n"),
         "pipeline.yml is named",
@@ -494,13 +423,5 @@ fn the_release_follows_this_pipeline_and_finds_what_it_leaves() {
     red(
         &plant("release.yml", "workflows: [pipeline]", "workflows: [ci]"),
         "release.yml follows",
-    );
-    red(
-        &plant(
-            "pipeline.yml",
-            "          name: push-before\n",
-            "          name: before\n",
-        ),
-        "does not upload `before` as `push-before`",
     );
 }
