@@ -246,6 +246,10 @@ impl Managed {
             Some(handle) => handle,
             None => {
                 tokio::select! {
+                    // A takeover's answer wins over a stop that is also ready: the
+                    // answer is sent before the call is answered, so a stop that follows
+                    // a refused takeover must still end the process with its reason.
+                    biased;
                     // The sender lives in the control this process holds: it is never
                     // dropped before the answer.
                     taken = &mut self.takeover => match taken? {
