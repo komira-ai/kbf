@@ -86,6 +86,7 @@ fn the_start_with_copies_runs_the_copy_of_the_installed_release_and_migrates_it_
         status: state_dir.join(releases::STATUS),
         local: Some(local),
         frontend_config: None,
+        watch: None,
     };
     let retry = Retry {
         attempts: 1,

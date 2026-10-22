@@ -92,11 +92,17 @@ impl ObjectStore for Store {
 #[derive(Default)]
 struct Queue {
     submitted: Mutex<Vec<watch::Sender<Stage>>>,
+    /// The evidence each submission carried, in order.
+    evidence: Mutex<Vec<kbf_invocation::Evidence>>,
 }
 
 impl Dispatch for Queue {
     fn submit(&self, submission: Submission) -> Result<Ticket, Status> {
         let (tx, stage) = watch::channel(Stage::Queued);
+        self.evidence
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(submission.evidence);
         let mut held = self
             .submitted
             .lock()
@@ -238,12 +244,20 @@ impl Farm {
 
     /// An Execute service routed by the map, and the backend it reads, for its metrics.
     fn service(self: &Arc<Self>) -> (Arc<ExecutionService<Queue>>, Backend) {
+        self.service_over(Arc::new(Queue::default()))
+    }
+
+    /// [`Farm::service`] over `queue`, which the caller keeps to read what was submitted.
+    fn service_over(
+        self: &Arc<Self>,
+        queue: Arc<Queue>,
+    ) -> (Arc<ExecutionService<Queue>>, Backend) {
         let routed = Arc::new(Routed::new(self.clone(), self.clone(), self.clone()));
         let backend = Backend::routed(routed, Arc::clone(&self.nodes[&MemberId(1)]));
         let (_, closing) = kbf_front::closing();
         let service = ExecutionService::with_authorizers(
             backend.clone(),
-            Arc::new(Queue::default()),
+            queue,
             closing,
             Arc::new(Authorizers::allow_all()),
         );
@@ -608,4 +622,31 @@ fn log_lines() -> Vec<String> {
         .lines()
         .map(str::to_owned)
         .collect()
+}
+
+/// Catches, over an Execute: the input totals of a full walk wrong (summed from the
+/// Directories instead of the distinct files, a file counted twice, size and count
+/// swapped), or a walk that skipped a verified subtree reporting a total of what it did
+/// see (a lower bound that reads as a size) instead of nothing. The cold Execute reads
+/// both Directories: four files of six bytes. The warm one skips the verified root and
+/// saw no file, so its totals are absent, not 0.
+#[tokio::test(start_paused = true)]
+async fn the_input_totals_are_those_of_a_full_walk_and_absent_after_a_skip() {
+    let farm = Farm::new().await;
+    // Another action than the other tests': they read the process's log by action.
+    let job = job_running("totals");
+    farm.store(&[&job.action]).await;
+    farm.store(&job.blobs.iter().collect::<Vec<_>>()).await;
+    let queue = Arc::new(Queue::default());
+    let (service, _) = farm.service_over(Arc::clone(&queue));
+
+    execute(&service, &job).await;
+    execute(&service, &job).await;
+
+    let seen = queue.evidence.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].input_files, Some(4), "four distinct files");
+    assert_eq!(seen[0].input_bytes, Some(24), "'file n' is six bytes");
+    assert_eq!(seen[1].input_files, None, "the root was skipped");
+    assert_eq!(seen[1].input_bytes, None, "not 0: unknown");
 }

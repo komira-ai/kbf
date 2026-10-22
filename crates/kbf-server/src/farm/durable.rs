@@ -50,6 +50,11 @@
 //! - `cordon/<worker>`: how an operator placed a node (cordoned, or draining until a
 //!   wall-clock deadline), kept until it is returned to placement, so a successor
 //!   process serves the node as the operator left it;
+//! - `est/<instance>/<platform>/<basis>/<shape>/<cfg>`: one size summary of the learned-sizes
+//!   shadow ([`crate::learned`]): a version byte and the estimator's own checksummed row.
+//!   Never in the transaction of a requeue or a finish: a summary an own-limit kill changed
+//!   is written right after it, best effort, and the rest is written behind, in batches;
+//!   a sweep deletes the stale. Read only when the shadow is on;
 //! - `meta/epoch`, `meta/next_op`, `meta/next_seq`: the store incarnation and the first
 //!   operation id and lease sequence no earlier start used;
 //! - `meta/generation`: the writer generation ([`kbf_state::Fenced`]); every write of the
@@ -64,6 +69,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use kbf_estimator::{Day, Summaries};
 use kbf_front::{Described, Finished, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
@@ -85,6 +91,7 @@ use super::{
     refused_as,
 };
 use crate::action_usage::Subject;
+use crate::learned::Row;
 use crate::machine::Platform;
 use crate::state_store::StateStore;
 
@@ -102,6 +109,10 @@ const NEXT_SEQ: &str = "meta/next_seq";
 const CORDON: &str = "cordon/";
 const FATE: &str = "fate/";
 const FLOOR: &str = "floor/";
+const ESTIMATE: &str = "est/";
+/// Rows of one transaction of the size sweep, and the most transactions of one call.
+pub(super) const SWEEP_ROWS: usize = 256;
+pub(super) const SWEEP_TXNS: usize = 4;
 const SUBJECT: &str = "subject/";
 
 /// The least time a `done/` row is kept, whatever the finished retention: a process that
@@ -258,6 +269,7 @@ impl StoredOperation {
     }
 }
 
+mod estimate;
 mod fate;
 mod floor;
 mod inflight;
@@ -516,6 +528,78 @@ impl Durable {
             floors,
             cordons: self.cordons()?,
         })
+    }
+
+    /// The size summaries the store holds. A row that cannot be read is skipped (and
+    /// counted in the log): its action starts cold.
+    pub(super) fn estimates(&self) -> Result<Vec<Row>, StateError> {
+        let mut rows = Vec::new();
+        for (key, row) in self.store.scan_prefix(ESTIMATE)? {
+            match estimate::decode(&key, &row.value) {
+                Some(row) => rows.push(row),
+                None => tracing::warn!(%key, "a size summary row cannot be read: skipped"),
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Writes `rows`, size summaries, in one transaction.
+    pub(super) fn put_estimates(&self, rows: &[Row]) -> Result<(), StateError> {
+        let mut txn = Txn::new();
+        for (key, summary) in rows {
+            txn = txn.put(estimate::row_key(key), estimate::encode(summary), Cond::Any);
+        }
+        self.commit(txn)
+    }
+
+    /// Deletes the size summaries idle past [`kbf_estimator::STALE_DAYS`] on `today`,
+    /// and strips the samples from those that hold a floor, as the estimator itself
+    /// does in memory. At most [`SWEEP_TXNS`] transactions of [`SWEEP_ROWS`] rows are
+    /// committed per call. Returns how many rows it changed and whether more are left
+    /// for another call. A transaction the store refuses is logged and the rest go on. The scan
+    /// reads every row (at most the estimator's key bound) whatever the cap.
+    pub(super) fn sweep_estimates(&self, today: Day) -> Result<(usize, bool), StateError> {
+        let mut changes = Vec::new();
+        for (name, row) in self.store.scan_prefix(ESTIMATE)? {
+            let Some((key, summary)) = estimate::decode(&name, &row.value) else {
+                continue;
+            };
+            let mut held = Summaries::default();
+            if held.insert_encoded(&key, &summary).is_err() {
+                continue;
+            }
+            held.expire(today);
+            match held.get(&key) {
+                None => changes.push((name, None, row.version)),
+                Some(kept) if kept.encode() != summary => {
+                    changes.push((name, Some(estimate::encode(&kept.encode())), row.version));
+                }
+                Some(_) => {}
+            }
+        }
+        let left = changes.len() > SWEEP_TXNS * SWEEP_ROWS;
+        let mut changed = 0;
+        for chunk in changes.chunks(SWEEP_ROWS).take(SWEEP_TXNS) {
+            let mut txn = Txn::new();
+            for (name, value, version) in chunk {
+                txn = match value {
+                    None => txn.delete(name.clone(), Cond::Version(*version)),
+                    Some(value) => txn.put(name.clone(), value.clone(), Cond::Version(*version)),
+                };
+            }
+            match self.commit(txn) {
+                Ok(()) => changed += chunk.len(),
+                Err(error) => {
+                    tracing::warn!(%error, "a batch of size summaries was not swept");
+                    if self.superseded_by(&error) {
+                        break;
+                    }
+                }
+            }
+        }
+        // A sweep that committed nothing does not ask for another tick: a store that
+        // refuses every batch is not scanned again until the next hour.
+        Ok((changed, left && changed > 0))
     }
 
     /// The nodes an operator placed.
@@ -835,6 +919,16 @@ impl Durable {
         }
     }
 
+    /// Whether `error` says a newer writer holds the store; if so, this handle is fenced
+    /// from now on, as after any other write the store refused for it.
+    pub(super) fn superseded_by(&self, error: &StateError) -> bool {
+        let fenced = matches!(error, StateError::Store(StoreError::Fenced));
+        if fenced {
+            self.fenced.store(true, Ordering::SeqCst);
+        }
+        fenced
+    }
+
     /// Whether a write was refused because a newer writer holds the store: nothing this
     /// handle writes can succeed any more.
     pub(super) fn superseded(&self) -> bool {
@@ -1093,6 +1187,8 @@ impl State {
     /// a requeue the store missed is made up before the grant that follows it, or that
     /// grant is refused and the operation never runs.
     pub(super) fn settle_requeues(&mut self, given_up: &[Requeue]) {
+        // What the kills among them taught the estimator, written once the requeues are.
+        let mut kills = Vec::new();
         for requeue in given_up {
             // A grant the store has not taken for a lease the scheduler has given up
             // is never written: it would put the lease back in the store, held by no
@@ -1115,6 +1211,7 @@ impl State {
             } else {
                 FloorChange::default()
             };
+            kills.extend(self.learned_requeue(requeue));
             self.unsettled.push((requeue.clone(), losses, fate, floors));
         }
         let pending = std::mem::take(&mut self.unsettled);
@@ -1127,6 +1224,7 @@ impl State {
             })
             .collect();
         self.unsettled = refused;
+        self.write_estimates(&kills);
     }
 
     /// Renews `worker`'s session row if its last write is a renewal interval old: one
@@ -1200,6 +1298,10 @@ impl State {
         }
         let next_operation = OperationId(stored.next_operation);
         self.sched.restore_floors(stored.floors);
+        // Off reads no size summaries and leaves them as they are.
+        if !self.learned.off() {
+            self.learned.restore(&durable.estimates()?);
+        }
         self.sched
             .recover(epoch, next_operation, stored.next_seq, recovered);
         self.restore_cordons(stored.cordons);

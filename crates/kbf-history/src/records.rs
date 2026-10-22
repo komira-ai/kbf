@@ -367,6 +367,38 @@ pub struct RunRecord {
     /// did not report it.
     #[prost(uint64, optional, tag = "42")]
     pub booked_millicpus: Option<u64>,
+    /// The scheduler's operation the attempt belonged to: every attempt of one operation
+    /// (a ladder of memory bookings) carries the same one, so they can be regrouped.
+    /// Absent: a record written before the field, or a row that named none. Fields 43 on
+    /// follow the estimator's usage fields (39 to 42).
+    #[prost(uint64, optional, tag = "43")]
+    pub operation_id: Option<u64>,
+    /// Where the booked cores came from.
+    #[prost(enumeration = "BookSource", tag = "44")]
+    pub cpu_source: i32,
+    /// Where the booked memory came from.
+    #[prost(enumeration = "BookSource", tag = "45")]
+    pub memory_source: i32,
+    /// The summed size of the distinct files of the input tree, bytes. Absent, not 0:
+    /// the front's walk did not total it (it skipped a verified subtree, or never ran).
+    #[prost(uint64, optional, tag = "46")]
+    pub input_bytes: Option<u64>,
+    /// The number of distinct files of the input tree; absent as `input_bytes` is.
+    #[prost(uint64, optional, tag = "47")]
+    pub input_files: Option<u64>,
+}
+
+/// Where one axis of an attempt's booking came from. A record written before the field
+/// reads `Unspecified`: nobody recorded it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum BookSource {
+    /// Not recorded.
+    Unspecified = 0,
+    /// The client named no size: the farm's default booked it.
+    Default = 1,
+    /// The client named a size, whatever it was (a size equal to the default included).
+    Hint = 2,
 }
 
 impl RunRecord {

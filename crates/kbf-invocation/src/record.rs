@@ -7,10 +7,10 @@ use std::fmt;
 use std::time::Duration;
 
 use kbf_sched::RequeueReason;
-use kbf_types::{Digest, Failure, LeaseId, WorkerId};
+use kbf_types::{Digest, Failure, LeaseId, OperationId, WorkerId};
 
 use crate::event::{Call, InvocationId, Listing, Metadata, Outcome, Output, Owner, WallTime};
-use crate::run::{ActionShape, Run};
+use crate::run::{ActionShape, Evidence, Run};
 
 /// Rows one record keeps; past it, actions are counted but not rowed (section 3.3).
 pub const ROW_CAP: usize = 1_000_000;
@@ -187,6 +187,13 @@ pub struct ActionRow {
     /// The shape the server read from the Command; `None` until then, and for an
     /// action that was not queued (a cache hit).
     pub shape: Option<Box<ActionShape>>,
+    /// The scheduler's operation this call was queued on or joined; the same for every
+    /// attempt of the operation, and for the callers that joined it. `None` for a cache
+    /// answer and for a row restored from a record that kept none.
+    pub operation_id: Option<OperationId>,
+    /// What the front knew at submit (booking source, input size); `None` until the
+    /// recorder has been told, and for a cache answer.
+    pub evidence: Option<Evidence>,
 }
 
 impl ActionRow {
@@ -207,6 +214,8 @@ impl ActionRow {
             outputs_truncated: false,
             command: None,
             shape: None,
+            operation_id: None,
+            evidence: None,
         }
     }
 

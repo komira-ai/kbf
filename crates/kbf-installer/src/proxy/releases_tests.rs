@@ -788,3 +788,58 @@ fn a_kbf_that_cannot_be_named_or_copied_is_not_adopted() {
     chmod(&state, 0o755);
     assert!(err.0.starts_with("cannot write "), "{}", err.0);
 }
+
+const D: &str = "dddddddddddddddddddddddddddddddddddddddd";
+const E: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+/// Catches a prune that removes what it was told to keep, keeps what it was not told to, or
+/// touches what is not a copy: of four copies the two named stay and the other two go (and are
+/// the ones returned), while a `.partial-*` entry, a stray file (one of them named like a
+/// commit, which does not stop the removal of the copies after it) and a directory that is not
+/// a commit are left, and nothing of the removal itself is left behind. A removed commit can be
+/// copied again, which a copy with some of its files gone could not.
+///
+/// Asserts that the keep list is honoured, that entries that are not commits are not removed,
+/// that a file named like a commit is not taken for a copy (its removal would fail and end the
+/// prune), and that the move to `.partial-gone-*` is followed by the removal (the entry does
+/// not stay in the listing).
+#[test]
+fn a_prune_removes_the_copies_not_kept_and_nothing_that_is_not_a_copy() {
+    let rig = rig("prune");
+    for commit in [A, B, C, D] {
+        rig.copy(commit);
+    }
+    mkdir(&rig.releases.join(".partial-1-1"));
+    write(&rig.releases.join("notes"), b"not a copy");
+    write(&rig.releases.join(E), b"not a copy either");
+    mkdir(&rig.releases.join("not-a-commit"));
+
+    let mut removed = rig.copies.prune(&[c(A), c(C)]).expect("pruned");
+
+    removed.sort();
+    assert_eq!(removed, [c(B), c(D)]);
+    let left = [".partial-1-1", A, C, E, "not-a-commit", "notes"];
+    assert_eq!(names(&rig.releases), left);
+    assert!(rig.copies.verified(&c(A)) & rig.copies.verified(&c(C)));
+    assert!(!rig.copies.verified(&c(B)) & !rig.copies.verified(&c(D)));
+    rig.copy(B);
+    assert!(rig.copies.verified(&c(B)));
+}
+
+/// Catches a prune that cannot be told from one that worked: with nothing to keep every copy
+/// goes, and with the root gone the listing fails and says so.
+///
+/// Asserts that the listing's error is returned, and that an empty keep list keeps nothing.
+#[test]
+fn a_prune_keeps_nothing_when_told_nothing_and_fails_when_the_root_is_gone() {
+    let rig = rig("prune-all");
+    rig.copy(A);
+    rig.copy(B);
+
+    let removed = rig.copies.prune(&[]).expect("pruned");
+
+    assert_eq!(removed.len(), 2);
+    assert!(names(&rig.releases).is_empty());
+    fs::remove_dir_all(&rig.releases).expect("remove the root");
+    assert!(rig.copies.prune(&[]).is_err());
+}

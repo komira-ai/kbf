@@ -20,6 +20,7 @@ async fn started() -> (Disk, TestFarm, Inbox, LeaseId, kbf_front::Ticket) {
             request: request(1),
             call: None,
             described: Described::default(),
+            evidence: Default::default(),
         })
         .expect("submitted");
     let lease = starts(&mut inbox)[0];
@@ -148,6 +149,7 @@ fn restarted(
             request: request(tag),
             call: None,
             described: Described::default(),
+            evidence: Default::default(),
         })
         .expect("submitted");
     let leases = starts(&mut inbox);

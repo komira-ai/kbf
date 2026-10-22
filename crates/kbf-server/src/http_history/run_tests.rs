@@ -73,6 +73,11 @@ fn a_run_says_what_the_record_has_and_leaves_out_what_it_has_not() {
         "partition",
         "presubmit_us",
         "usage",
+        "operation_id",
+        "cpu_source",
+        "memory_source",
+        "input_bytes",
+        "input_files",
     ] {
         assert!(v.get(absent).is_none(), "{absent}: {v}");
     }
@@ -111,6 +116,11 @@ fn a_killed_run_says_how_and_a_shape_what_it_names() {
     r.wait_reason = "no node".to_owned();
     r.partition = "linux/large".to_owned();
     r.presubmit_us = 15;
+    r.operation_id = Some(0);
+    r.cpu_source = kbf_history::records::BookSource::Hint.into();
+    r.memory_source = kbf_history::records::BookSource::Default.into();
+    r.input_bytes = Some(0);
+    r.input_files = Some(16);
     r.reason = "killed".to_owned();
     r.action = Some(wire(1));
     r.command = Some(wire(2));
@@ -134,9 +144,14 @@ fn a_killed_run_says_how_and_a_shape_what_it_names() {
         ("farm_runs", 1),
         ("farm_budget", 2),
         ("presubmit_us", 15),
+        ("operation_id", 0),
+        ("input_bytes", 0),
+        ("input_files", 16),
     ] {
         assert_eq!(v[key], want, "{key}");
     }
+    assert_eq!(v["cpu_source"], "hint");
+    assert_eq!(v["memory_source"], "default");
     assert_eq!(v["wait_reason"], "no node");
     assert_eq!(v["partition"], "linux/large");
     assert_eq!(v["reason"], "killed");
