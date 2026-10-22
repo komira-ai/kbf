@@ -1,7 +1,7 @@
 # The units of each `kbf` mode
 
 Each mode of `kbf` has one static systemd unit, shipped in the `kbf-installer` package
-(`packaging/linux/units/`: `kbf-frontend@.service`, `kbf-storage.service`,
+(`packaging/linux/units/`: `kbf-frontend.service`, `kbf-storage.service`,
 `kbf-daemon.service`, `kbf-storage-and-daemon.service`, `kbf-all-in-one.service` and the
 shared `kbf.slice`; the modes are described in [All-in-one vs distributed](kbf-modes.md);
 [architecture-v2.md](../design/architecture-v2.md), sections 1 and 11). The files carry no
@@ -188,32 +188,21 @@ socket or by the server user's own role. The database and its schema are `kbf-in
 The unit gives no `--handover-socket` (nor a `RuntimeDirectory=` for one): `kbf frontend`
 refuses a Postgres `--state-store` together with it (`HandoverError::PostgresStore`: a Postgres
 store cannot give up its writer role), and the bundled proxy of `docs/design/frontend-proxy.md`
-replaces the handover. An update of a Postgres frontend is a restart, not
-`kbf frontend handover`.
+replaces the handover. An update of a Postgres frontend is a restart.
 
-### Updating a frontend without failing a build: `kbf-frontend@.service`
+### Updating a frontend without failing a build
 
-The frontend's unit is a template with two instances, `kbf-frontend@a` and
-`kbf-frontend@b`, that run the same command line; only one serves, and only `@a` is
-enabled at boot. To update, put the new release in place with `kbf-installer` (it restarts no
-service), then run, on the frontend's host:
-
-```
-kbf frontend handover --wait
-```
-
-It starts the idle instance with `systemctl start`; the unit is `Type=notify`, so the start
-returns when the new frontend has taken the state store and the daemons over and serves on
-listeners of its own (`--instance`, behind Envoy). The old instance then goes not ready once
-Envoy has seen the new one, answers the builds it holds and exits by itself (`--wait` looks
-at it until it has). Buck2's open streams are not broken, a call that still reaches the old
-frontend is forwarded to the new one, daemons reconnect and keep their runs. A new instance that fails before it is
-ready leaves the old one serving, and the command exits 1 and says so. With both instances
-active (the old one still draining) it refuses. What each party sees, and every failure:
-`docs/design/frontend-handover.md`. Rule `handover` of the package test
-refuses a unit that is not `Type=notify`, whose `--handover-socket` is outside a
-`RuntimeDirectory=` kept with `RuntimeDirectoryPreserve=yes`, or that has `Conflicts=`
-(starting an instance would stop the one draining).
+The socket-handover template (two instances, `kbf-frontend@a` and `kbf-frontend@b`, and the
+`kbf frontend handover` command that started the idle one) was retired by a maintainer
+decision: the kbf-installer package no longer ships it, `kbf` no longer has the command, and
+no step of this guide enables it. A frontend keeps its state in Postgres, and `kbf
+frontend` refuses a Postgres `--state-store` together with `--handover-socket`
+(`HandoverError::PostgresStore`), so the template could not start on a host kbf-installer
+set up. A host without the proxy runs `kbf-frontend.service` (one process; an update is a
+restart, and the stop drains, below); a host with the proxy lets kbf-installer's proxy swap
+frontend children (`docs/design/frontend-proxy.md`). `kbf-server`'s own control socket
+stays for the test farm. The retired design is kept as history in
+`docs/design/frontend-handover.md`.
 
 ### Stopping a frontend: TimeoutStopSec=infinity
 
