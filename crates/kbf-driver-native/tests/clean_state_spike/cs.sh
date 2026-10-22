@@ -182,7 +182,8 @@ p_shared() {
   rm -f "/private/var/db/com.apple.xpc.launchd/disabled.$ID.plist" "/private/var/db/com.apple.xpc.launchd/loginitems.$ID.plist"
 }
 p_attrs() { chflags nouchg,nouappnd,nohidden "$H" "$F" 2>/dev/null; chmod 700 "$H"; chown "$ID:$GID" "$H"; }
-p_crash() { find /Library/Logs/DiagnosticReports /Library/Logs/DiagnosticReports/Retired /cores -newer "$MK" -type f -name 'canary*' -delete 2>/dev/null; }
+crash_dirs() { echo /Library/Logs/DiagnosticReports /Library/Logs/DiagnosticReports/Retired /cores "$H/Library/Logs/DiagnosticReports" /private/var/root/Library/Logs/DiagnosticReports /Users/*/Library/Logs/DiagnosticReports /Users/*/Library/Logs/DiagnosticReports/Retired; }
+p_crash() { find $(crash_dirs) -newer "$MK" -type f -name 'canary*' -delete 2>/dev/null; }
 
 cs_clean_p() { # MODE: P | P-kill-first | P-rm-first | P-noflags | P-nounmount
   _t0=$(now_ms)
@@ -397,8 +398,8 @@ probe_CH32() {
 do_CH33() { "$K" crash-segv; "$K" crash-abort; sleep 40; echo "reports-dir-entries: $(ls /Library/Logs/DiagnosticReports 2>/dev/null | wc -l | tr -d ' ') home-dir: $(ls "$H/Library/Logs/DiagnosticReports" 2>&1 | head -3 | tr '\n' ' ')"; true; }
 plant_CH33() { p CH33 do_CH33; }
 probe_CH33() {
-  echo "INFO CH33 reports: $(find /Library/Logs/DiagnosticReports "$H/Library/Logs/DiagnosticReports" /cores -newer "$MK" -type f 2>/dev/null | head -4 | tr '\n' ';') newest-in-system-dir: $(ls -t /Library/Logs/DiagnosticReports 2>/dev/null | head -2 | tr '\n' ';')"
-  pr '[ -n "$(find /Library/Logs/DiagnosticReports "$H/Library/Logs/DiagnosticReports" /cores -newer "$MK" -type f \( -name "canary*" -o -name "*.ips" -o -name "*.crash" \) 2>/dev/null | head -1)" ]'
+  echo "INFO CH33 found: $(find $(crash_dirs) -newer "$MK" -type f -name 'canary*' 2>/dev/null | head -4 | tr '\n' ';')"
+  pr '[ -n "$(find $(crash_dirs) -newer "$MK" -type f -name "canary*" 2>/dev/null | head -1)" ]'
 }
 
 do_CH34() {
