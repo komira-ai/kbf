@@ -130,6 +130,7 @@ fn usage() -> ResourceUsage {
                     bytes: 400,
                 },
             ],
+            ..CgroupUsage::default()
         }),
         ..ResourceUsage::default()
     }

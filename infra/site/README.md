@@ -139,7 +139,7 @@ deployed: nothing to change; just run the steps in order.
 
 `release verify` reads no verdict (the tag's message is the Beta record, which nothing gates on), so the first tag needs
 no hand-written one and no waiver: it passes the checks every tag passes. Gamma is a farm build check
-(`gamma.yml`); it does not gate the release.
+(the retired `gamma.yml`; gamma moves to kbf-updater); it does not gate the release.
 
 ### Undo
 

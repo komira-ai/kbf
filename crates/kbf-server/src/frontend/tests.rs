@@ -2,8 +2,10 @@
 
 use std::sync::Arc;
 
+use kbf_front::Owner;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
+use tonic::transport::Endpoint;
 
 use super::store_of;
 use crate::StateStore;
@@ -505,4 +507,19 @@ fn the_members_of_a_frontend_carry_the_setting_it_was_given() {
         None
     );
     assert!(members_of(None, Some(setting)).is_none());
+}
+
+/// Catches a frontend whose raw ByteStream pass-through does not wait for a storage node
+/// that restarts: owners are made holding nothing, so a Read or Write whose owners are all
+/// away fails at once, and the proxy must be given the default bound. Mutant: `proxy_owners`
+/// without `with_hold`. The routed and the single-node owners share that one call after the
+/// match, so the farm of one node stands for both.
+#[tokio::test]
+async fn the_proxys_owners_hold_for_the_default_bound() {
+    let bootstrap = Owner::new(
+        "storage",
+        Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+    );
+    let owners = super::proxy_owners(None, bootstrap);
+    assert_eq!(owners.hold().bound(), kbf_route::DEFAULT_HOLD);
 }

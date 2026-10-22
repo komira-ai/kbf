@@ -120,6 +120,12 @@ message RegisterRequest {
   // known instance keeps the id the frontend holds for it; the report only raises its boot.
   uint64 last_member_id = 8;
   uint64 last_boot = 9;
+  // What the node runs and what its metadata log is at, as on HeartbeatRequest (fields 24
+  // to 26). Each has presence: unset says "I cannot say", never "zero". Information only:
+  // no decision of the frontend depends on it yet. A registration replaces all three.
+  optional uint32 runs_log = 10;
+  optional uint32 log_version = 11;
+  optional string build_commit = 12;
 }
 
 message RegisterResponse {
@@ -217,6 +223,21 @@ message HeartbeatRequest {
   // held another object, since the node started. Volatile: a restarted node counts again.
   optional uint64 flush_failures = 22;
   optional uint64 flush_conflicts = 23;
+  // What the node runs and what its metadata log is at. Each field has presence: unset says
+  // "I cannot say", never "zero". An older node sends none of them, and a node with no
+  // metadata log sends none of the first two. Information only: no decision of the frontend
+  // depends on it yet.
+  //
+  // The newest metadata-log machine version this build can raise its log to.
+  optional uint32 runs_log = 24;
+  // The metadata-log machine version the node's log is at now. Changes when the log is
+  // raised; every heartbeat carries the current value.
+  optional uint32 log_version = 25;
+  // The commit this binary was built from: the 40-hex commit, or the 12-hex one when the
+  // build knows no more, or the text `unknown` when the build had no git checkout. The
+  // frontend keeps at most 64 bytes of it, and keeps the value the registration sent; a
+  // heartbeat's value is used only when the row holds none.
+  optional string build_commit = 26;
 }
 
 // A closed set: a node never sends free text about its store, so a credential cannot ride

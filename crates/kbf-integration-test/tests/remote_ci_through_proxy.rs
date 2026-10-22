@@ -139,7 +139,6 @@ impl Rig {
             token: Some(ApiToken::from_file(&operator).expect("a usable token")),
             local_cache: None,
             releases: Some(releases),
-            poll: None,
         };
         let state = StateStore {
             store: Arc::new(Fake::with_flaw(

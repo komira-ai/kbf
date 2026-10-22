@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 
 use kbf_history::records::{
-    BookSource, HitHow, HitRecord, MemoryKill, RunOutcome, RunRecord, WireDigest,
+    BookSource, HitHow, HitRecord, MemoryKill, RunOutcome, RunRecord, UsageBasis, WireDigest,
 };
 use kbf_invocation::{
     ActionRow, ActionShape, Attempt, AttemptEnd, Evidence, How, Listing, NumaBytes, Outcome,
@@ -250,23 +250,7 @@ fn run(r: &RunRecord) -> Option<Box<Run>> {
     };
     let measured = times.named().iter().skip(1).any(|(_, t)| t.is_some());
     let bytes = |b: u64| (b != 0).then_some(b);
-    let usage = r.cgroup.as_ref().map(|c| RunUsage {
-        wall_micros: c.wall_us,
-        cpu_usage_micros: Some(c.cpu_usage_us),
-        cpu_user_micros: Some(c.cpu_user_us),
-        cpu_system_micros: Some(c.cpu_system_us),
-        cpu_periods: Some(c.periods),
-        cpu_throttled_periods: Some(c.throttled_periods),
-        cpu_throttled_micros: Some(c.throttled_us),
-        memory_peak_bytes: Some(c.memory_peak_bytes),
-        numa: c
-            .numa_bytes
-            .iter()
-            .zip(0..)
-            .filter(|(b, _)| **b != 0)
-            .map(|(b, node)| NumaBytes { node, bytes: *b })
-            .collect(),
-    });
+    let usage = usage(r);
     let booked = bytes(r.booked_memory_bytes);
     let cap = bytes(r.cap_bytes);
     (measured || usage.is_some() || booked.is_some() || cap.is_some()).then(|| {
@@ -277,6 +261,61 @@ fn run(r: &RunRecord) -> Option<Box<Run>> {
             cap_bytes: cap,
         })
     })
+}
+
+/// The usage `r` carries: the block its basis names (a record without a basis takes its
+/// `cgroup` block), never both. The CPU pressure and booking ride on either.
+fn usage(r: &RunRecord) -> Option<RunUsage> {
+    let carried = |u: RunUsage| RunUsage {
+        node_cpu_pressure_centi: r.node_cpu_pressure_centi,
+        booked_millicpus: r.booked_millicpus,
+        ..u
+    };
+    let none = r.node_cpu_pressure_centi.is_none() && r.booked_millicpus.is_none();
+    match (r.basis(), &r.footprint, &r.cgroup) {
+        (UsageBasis::MacFootprint, f, _) => Some(carried(RunUsage {
+            wall_micros: f.as_ref().and_then(|f| f.wall_us).unwrap_or(0),
+            basis: kbf_invocation::UsageBasis::MacFootprint,
+            footprint: f.as_ref().map(|f| kbf_invocation::FootprintUsage {
+                peak_footprint_bytes: f.peak_footprint_bytes,
+                cpu_user_micros: f.cpu_user_us,
+                cpu_system_micros: f.cpu_system_us,
+                wall_micros: f.wall_us,
+            }),
+            ..RunUsage::default()
+        })),
+        (UsageBasis::Cgroup | UsageBasis::Unspecified, _, Some(c)) => Some(carried(RunUsage {
+            wall_micros: c.wall_us.unwrap_or(0),
+            cpu_usage_micros: Some(c.cpu_usage_us),
+            cpu_user_micros: Some(c.cpu_user_us),
+            cpu_system_micros: Some(c.cpu_system_us),
+            cpu_periods: Some(c.periods),
+            cpu_throttled_periods: Some(c.throttled_periods),
+            cpu_throttled_micros: Some(c.throttled_us),
+            memory_peak_bytes: c.memory_peak_bytes,
+            memory_events_max: c.memory_events_max,
+            memory_events_oom_kill: c.memory_events_oom_kill,
+            memory_swap_peak_bytes: c.memory_swap_peak_bytes,
+            memory_anon_swap_peak_bytes: c.memory_anon_swap_peak_bytes,
+            cpu_pressure_some_micros: c.cpu_pressure_some_us,
+            memory_pressure_some_micros: c.memory_pressure_some_us,
+            memory_pressure_full_micros: c.memory_pressure_full_us,
+            cpus_effective: c.cpus_effective,
+            numa: c
+                .numa_bytes
+                .iter()
+                .zip(0..)
+                .filter(|(b, _)| **b != 0)
+                .map(|(b, node)| NumaBytes { node, bytes: *b })
+                .collect(),
+            basis: match r.basis() {
+                UsageBasis::Cgroup => kbf_invocation::UsageBasis::Cgroup,
+                _ => kbf_invocation::UsageBasis::Unspecified,
+            },
+            ..RunUsage::default()
+        })),
+        _ => (!none).then(|| carried(RunUsage::default())),
+    }
 }
 
 /// What the front knew at submit, as `r` kept it; `None` for a record that kept none of

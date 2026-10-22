@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::offer::{Attester, Gh};
+use super::attest_gh::{Attester, Gh};
 use super::tags::tag_versions;
 use crate::Error;
 use crate::build_commit::{full_commit, write_executable};

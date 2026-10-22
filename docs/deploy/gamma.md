@@ -1,5 +1,7 @@
 # The gamma trigger: what a person sets up once
 
+> RETIRED: `gamma.yml` is deleted and no release workflow run starts a gamma deploy; gamma moves to kbf-updater (package-update design, section 13). Nothing below is needed for a release any more; the page stays until the xtask `gamma` verbs are deleted.
+
 `.github/workflows/gamma.yml` follows a cut release to the one gamma host, the frontend of our own build farm. The
 design is `docs/design/kbf-cicd.md`, section 5.4; the command it runs on the host is `kbf-installer deploy`
 (`docs/design/gamma-deploy.md`). The workflow is inert until the settings below exist: while any of the repository

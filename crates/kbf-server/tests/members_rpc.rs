@@ -13,7 +13,7 @@ use hooked::Hooked;
 use kbf_map::MemberState;
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
-use kbf_server::members::{Members, MembershipConfig, PROTOCOL};
+use kbf_server::members::{Members, MembershipConfig, NodeFacts, PROTOCOL};
 use kbf_server::members_rpc::{MembershipService, sweep};
 use kbf_state::{Cond, Store, Txn};
 use kbf_storage::service::{Admission, ROLE_URI_PREFIX};
@@ -397,6 +397,67 @@ async fn a_heartbeat_carries_the_writes_the_node_has_open() {
     };
     client.heartbeat(older).await.expect("beats");
     assert_eq!(node().open_writes, None, "an older node does not count");
+}
+
+/// Catches: the wire's node facts not reaching the rows, or reaching them wrong. A
+/// registration that says it runs log version 5, has its log at 1 and was built from a
+/// commit shows those; a heartbeat that says the log is at 4 changes that one fact, and its
+/// `runs_log` and `build_commit` do not replace the registration's; a log version of 0 is
+/// 0, not absent; a heartbeat that says none of them (an older node) leaves the log version
+/// `None`; and a registration of a node that says none (restarted on an older build) clears
+/// all three. Mutants: the service reading the facts of neither call (the rows stay `None`),
+/// of the registration only, or of the heartbeat only (`log_version` stays at 1); a
+/// heartbeat that takes over the registration's `runs_log`; an absent version read as 0.
+#[tokio::test]
+async fn the_wire_carries_what_a_node_runs_and_where_its_log_is() {
+    let store = Hooked::new();
+    let (members, mut client) = serve(&store).await;
+    let facts = || {
+        let mut all = members.node_facts().expect("facts");
+        all.remove(&kbf_map::MemberId(1)).expect("a live row")
+    };
+    client
+        .register(pb::RegisterRequest {
+            runs_log: Some(5),
+            log_version: Some(1),
+            build_commit: Some("abc".to_owned()),
+            ..request(1)
+        })
+        .await
+        .expect("registers");
+    let registered = NodeFacts {
+        runs_log: Some(5),
+        log_version: Some(1),
+        build_commit: Some("abc".to_owned()),
+    };
+    assert_eq!(facts(), registered);
+
+    let with_version = |log_version| NodeFacts {
+        log_version,
+        ..registered.clone()
+    };
+    let beat = |log_version| pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        runs_log: Some(9),
+        log_version,
+        build_commit: Some("xyz".to_owned()),
+        ..Default::default()
+    };
+    client.heartbeat(beat(Some(4))).await.expect("beats");
+    assert_eq!(facts(), with_version(Some(4)));
+    client.heartbeat(beat(Some(0))).await.expect("beats");
+    assert_eq!(facts(), with_version(Some(0)));
+    let older = pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        ..Default::default()
+    };
+    client.heartbeat(older).await.expect("beats");
+    assert_eq!(facts(), with_version(None));
+
+    client.register(request(1)).await.expect("registers again");
+    assert_eq!(facts(), NodeFacts::default());
 }
 
 /// Catches: expired rows nobody frees (session rows, the results of finished operations

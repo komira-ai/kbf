@@ -71,7 +71,7 @@ use std::io::{self, Read};
 use std::num::NonZeroU64;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
@@ -205,6 +205,9 @@ struct Shared<F: Fs> {
     queue: Mutex<Queue>,
     /// The machine's applied state ([`MetaMachine::state`]), read without `host`.
     state: Arc<RwLock<MetaState>>,
+    /// The machine version committed, as [`RaftMetaLog::version_handle`] lends it: read
+    /// without `host`, which a commit holds across its sync.
+    version: Arc<AtomicU32>,
     log_id: FarmLogId,
     /// The term the open elected this server in.
     term: u64,
@@ -370,6 +373,7 @@ where
             bootstraps: host.machine().bootstraps(),
             term: host.core().hard_state().term.0,
             state: host.machine().state(),
+            version: Arc::new(AtomicU32::new(host.machine().version().get())),
             host: Mutex::new(host),
             queue: Mutex::default(),
             log_id,
@@ -412,7 +416,11 @@ where
         let entry = kbf_log::encode(machine.format(), &LogCommand::MachineVersion(to))
             .map_err(unavailable)?;
         // A single voter applies its own proposal before `propose` returns.
-        host.propose(entry).map(|_| ()).map_err(unavailable)
+        host.propose(entry).map_err(unavailable)?;
+        self.shared
+            .version
+            .store(host.machine().version().get(), Ordering::Relaxed);
+        Ok(())
     }
 
     /// Commits `Tick(now)` and returns the committed farm time after it.
@@ -456,6 +464,17 @@ impl<F: Fs> RaftMetaLog<F> {
     #[must_use]
     pub fn machine_version(&self) -> MachineVersion {
         self.shared.lock().machine().version()
+    }
+
+    /// A handle on the machine version the log has committed, as [`MachineVersion::get`]
+    /// numbers it: the number [`RaftMetaLog::machine_version`] answers, kept current by
+    /// every raise ([`RaftMetaLog::raise_machine_version`]) and read with no lock (that one
+    /// takes the host's, which a commit holds across its sync). It outlives the log and then
+    /// stays at the last version the log committed; a reader only reads it. A node reports
+    /// it to its frontend at every heartbeat ([`crate::join::Joiner::with_log`]).
+    #[must_use]
+    pub fn version_handle(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.shared.version)
     }
 
     /// How many servers vote in the log's cell: its Raft membership's voters. One
