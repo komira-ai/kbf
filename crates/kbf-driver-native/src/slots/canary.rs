@@ -316,6 +316,36 @@ mod tests {
         }
     }
 
+    /// A log sink the tests read back.
+    #[derive(Clone, Default)]
+    struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl io::Write for Log {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("log").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Log {
+        /// Runs `f` with this log as the subscriber (a `tracing` macro evaluates its
+        /// fields only with one), and returns the text logged.
+        fn during<T>(&self, f: impl FnOnce() -> T) -> (T, String) {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish();
+            let out = tracing::subscriber::with_default(subscriber, f);
+            io::Write::flush(&mut self.clone()).expect("flush");
+            let text = String::from_utf8(self.0.lock().expect("log").clone()).expect("utf8");
+            (out, text)
+        }
+    }
+
     fn errno(n: i32) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(n))
     }
@@ -346,10 +376,10 @@ mod tests {
         assert_eq!(classify(errno(libc::EPERM)), Seen::Refused(libc::EPERM));
         assert_eq!(classify(errno(libc::EACCES)), Seen::Refused(libc::EACCES));
         assert_eq!(classify(Ok(())), Seen::Allowed);
-        let Seen::Failed(why) = classify(errno(libc::ENOENT)) else {
-            panic!("ENOENT is not a refusal");
-        };
-        assert!(why.contains("No such file"), "{why}");
+        assert_eq!(
+            classify(errno(libc::ENOENT)),
+            Seen::Failed(io::Error::from_raw_os_error(libc::ENOENT).to_string())
+        );
         assert!(matches!(
             classify(Err(io::Error::other("no errno"))),
             Seen::Failed(_)
@@ -401,7 +431,7 @@ mod tests {
         RealFs.remove(&linked);
         RealFs.remove(&file);
         RealFs.remove(&file);
-        assert!(!linked.exists() && !file.exists());
+        assert_eq!([linked.exists(), file.exists()], [false, false]);
     }
 
     /// Catches a probe mode that answers a process that did not ask for it, that runs a
@@ -483,34 +513,50 @@ mod tests {
     #[test]
     fn check_passes_only_when_every_canary_is_refused() {
         let refused = |c: &Canary| Ok(ran(REFUSED, &format!("canary {} refused errno=1", c.name)));
-        let passed = check(CANARIES, &mut |c| refused(c)).expect("all refused");
+        let (passed, log) = Log::default().during(|| check(CANARIES, &mut |c| refused(c)));
+        let passed = passed.expect("all refused");
         assert_eq!(passed.len(), CANARIES.len());
         assert_eq!(passed[0].name, "write-outside");
         assert_eq!(passed[0].took, Duration::from_millis(80));
+        assert!(log.contains("profile canary refused"), "{log}");
+        assert!(log.contains("link-outside"), "{log}");
 
-        let open = check(CANARIES, &mut |c| {
-            if c.name == "link-outside" {
-                Ok(ran(ALLOWED, "canary link-outside allowed"))
-            } else {
-                refused(c)
-            }
-        })
-        .expect_err("a door is open");
+        let (open, log) = Log::default().during(|| {
+            check(CANARIES, &mut |c| {
+                if c.name == "link-outside" {
+                    Ok(ran(ALLOWED, "canary link-outside allowed"))
+                } else {
+                    refused(c)
+                }
+            })
+        });
+        let open = open.expect_err("a door is open");
         assert_eq!(open.name, "link-outside");
         assert_eq!(open.verdict, Verdict::Allowed);
         assert_eq!(
             open.to_string(),
             "canary link-outside ((deny file-write*)): NOT refused: the call succeeded"
         );
+        for want in [
+            "ERROR",
+            "profile canary failed",
+            "link-outside",
+            "NOT refused",
+        ] {
+            assert!(log.contains(want), "{want} not in {log}");
+        }
 
         let mut seen = 0;
-        let cannot = check(CANARIES, &mut |_| {
-            seen += 1;
-            Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"))
-        })
-        .expect_err("cannot run");
+        let (cannot, log) = Log::default().during(|| {
+            check(CANARIES, &mut |_| {
+                seen += 1;
+                Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"))
+            })
+        });
+        let cannot = cannot.expect_err("cannot run");
         assert_eq!(seen, 1, "stops at the first failure");
         assert_eq!(cannot.verdict, Verdict::CannotRun("timed out".to_owned()));
+        assert!(log.contains("could not run: timed out"), "{log}");
         assert_eq!(check(&[], &mut |_| unreachable!()), Ok(vec![]));
     }
 }

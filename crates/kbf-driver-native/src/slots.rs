@@ -365,17 +365,23 @@ impl Runner {
 #[must_use]
 pub fn dispatch() -> Option<std::process::ExitCode> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if let Some(code) = canary_exit(&args) {
-        return Some(std::process::ExitCode::from(
-            u8::try_from(code).unwrap_or(1),
-        ));
+    canary_exit(&args)
+        .map(|code| std::process::ExitCode::from(u8::try_from(code).unwrap_or(1)))
+        .or_else(|| as_user_mode(&args))
+}
+
+/// [`AS_USER_ARG`]'s mode for `args`, on macOS.
+#[cfg(target_os = "macos")]
+fn as_user_mode(args: &[std::ffi::OsString]) -> Option<std::process::ExitCode> {
+    if args.get(1).is_some_and(|a| a == AS_USER_ARG) {
+        return Some(kbf_mac_session::macos::gui::as_user(&args[2..]));
     }
-    #[cfg(target_os = "macos")]
-    {
-        if args.get(1).is_some_and(|a| a == AS_USER_ARG) {
-            return Some(kbf_mac_session::macos::gui::as_user(&args[2..]));
-        }
-    }
+    None
+}
+
+/// [`AS_USER_ARG`]'s mode: none off macOS.
+#[cfg(not(target_os = "macos"))]
+fn as_user_mode(_args: &[std::ffi::OsString]) -> Option<std::process::ExitCode> {
     None
 }
 
@@ -392,13 +398,8 @@ fn canary_exit(args: &[std::ffi::OsString]) -> Option<i32> {
 #[doc(hidden)]
 pub fn hook() {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if let Some(code) = canary_exit(&args) {
-        std::process::exit(code);
-    }
-    #[cfg(target_os = "macos")]
-    if dispatch().is_some() {
-        std::process::exit(127);
-    }
+    let _ = canary_exit(&args).map(|code| std::process::exit(code));
+    let _ = as_user_mode(&args).map(|_| std::process::exit(127));
 }
 
 /// Makes the test binary it is expanded in answer [`AS_USER_ARG`] as `kbf-daemon`
