@@ -564,8 +564,11 @@ together.
 ### `ResourceUsage`
 
 A runtime may report what an action used as a `ResourceUsage` message (user and system
-CPU time in microseconds, peak resident memory of any one process in bytes, wall time in
-microseconds; zero means not measured). It travels inside the `ActionResult`, in
+CPU time in microseconds, peak memory in bytes, wall time in microseconds; zero means
+not measured). `peak_memory_bytes` is the largest resident memory of any one process
+where the runtime reaps with `wait4` (the local runtime), and the lease cgroup's
+`memory.peak` (the whole action's peak) where the runtime gives the action a cgroup (the
+container driver). It travels inside the `ActionResult`, in
 `execution_metadata.auxiliary_metadata`, as an `Any` with type URL
 `type.googleapis.com/kbf.worker.v1.ResourceUsage`, so it reaches the server and the
 action cache with the result.

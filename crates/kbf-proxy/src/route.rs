@@ -123,6 +123,7 @@ const ENROLL_PREFIX: &str = "/kbf.enroll.v1.Enroll/";
 const UPDATE_PREFIX: &str = "/v1/update/frontend";
 const BYTESTREAM_PREFIX: &str = "/google.bytestream.ByteStream/";
 const UI_PREFIX: &str = "/ui";
+const WAIT_EXECUTION: &str = "/build.bazel.remote.execution.v2.Execution/WaitExecution";
 
 /// The path with any query string removed.
 fn bare(path: &str) -> &str {
@@ -232,10 +233,16 @@ pub const fn bypasses_hold(route: Route) -> bool {
 #[must_use]
 pub fn idle_of(path: &str) -> Idle {
     match bare(path) {
-        "/build.bazel.remote.execution.v2.Execution/Execute"
-        | "/build.bazel.remote.execution.v2.Execution/WaitExecution" => Idle::Never,
+        "/build.bazel.remote.execution.v2.Execution/Execute" | WAIT_EXECUTION => Idle::Never,
         _ => Idle::After(IDLE_DEFAULT),
     }
+}
+
+/// Whether `path` is `WaitExecution`: the one call whose request names the operation it
+/// waits on, and so the child that holds it (design note, section 3, "Routing").
+#[must_use]
+pub fn is_wait_execution(path: &str) -> bool {
+    bare(path) == WAIT_EXECUTION
 }
 
 /// Whether `path` is a ByteStream call, which is never retried.
@@ -485,5 +492,22 @@ mod tests {
         );
         assert!(is_bytestream("/google.bytestream.ByteStream/Write"));
         assert!(!is_bytestream(&format!("{exec}Execute")));
+    }
+
+    /// Only the full `WaitExecution` method path is the call whose request is read for a
+    /// term; a query string does not hide it, and a neighbour does not pass for it.
+    ///
+    /// Catches: a prefix match that reads the request of `Execute` or of another call of the
+    /// service; a path with a query that escapes the read.
+    #[test]
+    fn only_wait_execution_is_read_for_a_term() {
+        let exec = "/build.bazel.remote.execution.v2.Execution/";
+        assert!(is_wait_execution(&format!("{exec}WaitExecution")));
+        assert!(is_wait_execution(&format!("{exec}WaitExecution?x=1")));
+        for other in ["Execute", "WaitExecutionX", "waitexecution", ""] {
+            assert!(!is_wait_execution(&format!("{exec}{other}")), "{other}");
+        }
+        assert!(!is_wait_execution("/google.bytestream.ByteStream/Read"));
+        assert!(!is_wait_execution(""));
     }
 }

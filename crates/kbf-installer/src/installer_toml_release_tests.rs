@@ -218,10 +218,11 @@ fn a_file_written_before_the_new_keys_still_parses_to_the_same_values() {
 
 /// The closed reader (`parse`) refuses a key or a value it does not know, because the installer
 /// that fetches must understand the whole file; the tolerant reader (`parse_tolerant`) takes the
-/// three things a reader that fetches nothing needs (the confirm window, the fetch timeout and
-/// the `[proxy]` table) and ignores every other key, whatever its value, so a file a later
-/// build wrote does not stop the proxy after a package downgrade. What the tolerant reader does
-/// read it checks as the closed one does, and it reads the same values from the same text.
+/// four things a reader that fetches nothing needs (the confirm window, the fetch timeout, the
+/// `[proxy]` table and `frontend_config`) and ignores every other key, whatever its value, so a
+/// file a later build wrote does not stop the proxy after a package downgrade. What the tolerant
+/// reader does read it checks as the closed one does, and it reads the same values from the same
+/// text.
 ///
 /// Catches the closed reader made tolerant (an old installer would read `bundled` as nothing and
 /// fetch from a default source), and the tolerant one left closed (the proxy refusing to start
@@ -253,9 +254,44 @@ fn the_closed_reader_refuses_what_it_does_not_know_and_the_tolerant_one_ignores_
         Tolerant {
             confirm_window_s: 900,
             fetch_timeout_s: 900,
-            proxy: None
+            proxy: None,
+            frontend_config: None,
         }
     );
+}
+
+/// `frontend_config` names the file the proxy's children read: an absolute path of plain
+/// characters, kept by `render` and read back by the closed reader and by the tolerant one (the
+/// proxy's), and absent when the host has no sibling. A relative path is refused naming the key
+/// and not the text.
+///
+/// Catches the key written and not read back (a rerun of `setup` would drop it), read by the
+/// closed reader and ignored by the tolerant one (the proxy would start its children on the
+/// default `kbf.toml`), and a relative path let through (the children are started from a
+/// directory of the proxy's, not the operator's).
+///
+/// Mutants to plant: the key left out of `render`; left out of `TOLERANT_KEYS`; `absolute` not
+/// asked of it in `from_raw`.
+#[test]
+fn frontend_config_is_an_absolute_path_that_both_readers_take() {
+    let with = InstallerToml {
+        frontend_config: Some("/etc/kbf/frontend.toml".into()),
+        ..InstallerToml::default()
+    };
+    let text = with.render();
+    assert!(
+        text.ends_with("\nfrontend_config = \"/etc/kbf/frontend.toml\"\n"),
+        "{text}"
+    );
+    assert_eq!(parsed(&text), with);
+    let tolerant = InstallerToml::parse_tolerant(&text).expect("tolerated");
+    assert_eq!(tolerant.frontend_config, with.frontend_config);
+    let plain = InstallerToml::default().render();
+    assert!(!plain.contains("frontend_config"), "{plain}");
+    assert_eq!(parsed("").frontend_config, None);
+    let err = problems("frontend_config = \"frontend.toml\"\n");
+    assert!(err.contains("frontend_config"), "{err}");
+    assert!(!err.contains("frontend.toml"), "{err}");
 }
 
 /// What the tolerant reader does read is refused when it is wrong, as the closed reader refuses

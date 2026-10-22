@@ -291,10 +291,32 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-impl MetaLog for Log {
-    async fn commit(&self, command: Command) -> Result<Applied, MetaLogError> {
+impl Log {
+    /// [`MetaLog::commit`] for a process that can die: `alive` is asked after the hold and
+    /// before the command is applied, with nothing awaited in between, so a process killed
+    /// while its proposal is parked never applies it, however the release and the kill
+    /// interleave.
+    #[allow(dead_code, reason = "only the chain rig kills a node")]
+    pub async fn commit_while(
+        &self,
+        command: Command,
+        alive: impl Fn() -> bool + Send + Sync,
+    ) -> Result<Applied, MetaLogError> {
+        self.commit_checked(command, Some(&alive)).await
+    }
+
+    async fn commit_checked(
+        &self,
+        command: Command,
+        alive: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    ) -> Result<Applied, MetaLogError> {
         let label = COMMANDS[kbf_front::metrics::command_label(&command)];
         self.wait_at_hold(label).await;
+        if alive.is_some_and(|alive| !alive()) {
+            return Err(MetaLogError::Unavailable(format!(
+                "{label} proposed by a process that died"
+            )));
+        }
         {
             let mut refuse = lock(&self.0.refuse);
             if let Some(n) = refuse.get_mut(label).filter(|n| **n > 0) {
@@ -326,6 +348,12 @@ impl MetaLog for Log {
             )));
         }
         applied
+    }
+}
+
+impl MetaLog for Log {
+    async fn commit(&self, command: Command) -> Result<Applied, MetaLogError> {
+        self.commit_checked(command, None).await
     }
 
     async fn query<R, F>(&self, f: F) -> Result<R, MetaLogError>

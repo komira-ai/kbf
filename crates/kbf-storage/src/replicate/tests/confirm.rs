@@ -1,7 +1,8 @@
 //! Peer confirmation (`docs/design/storage-ram-ack.md`): a node that acknowledged a blob
 //! from RAM asks the other owner, once its own write and the grace are over, whether the
-//! blob is on its disk, and journals a debt if it is not. Nothing puts a digest in the set
-//! in a running node yet; the tests register digests through `PeerConfirmer::track`, and
+//! blob is on its disk, and journals a debt if it is not. The tests register digests through
+//! `PeerConfirmer::track` (the service's write path does it for a blob it may hold; see
+//! `ram_ack.rs`), and
 //! take the instant to confirm at as an argument, so none waits for the grace.
 
 use std::sync::Arc;

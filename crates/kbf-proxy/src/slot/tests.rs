@@ -578,3 +578,79 @@ fn a_closed_active_slot_that_never_moves_is_no_active_not_a_spin() {
     s.inner.slots[Slot::A.index()].store(CLOSED, Ordering::Release);
     assert!(matches!(s.bind(), Bind::NoActive));
 }
+
+fn bound_preferring(s: &ActiveSlot, prefer: Option<Slot>) -> Permit {
+    match s.bind_preferring(prefer) {
+        Bind::Bound(p) => p,
+        other => panic!("expected a permit, got {other:?}"),
+    }
+}
+
+/// A stream that prefers a slot binds there while the slot is open, active or not (the old
+/// child after a swap), and follows the active slot when the preference is absent, never
+/// opened or retired.
+///
+/// Catches: the preference ignored (the old child's stream bound to the new one); a
+/// preference for a retired slot bound there or refused; a preference for the active slot
+/// bound twice.
+#[test]
+fn a_preferred_slot_binds_while_it_is_open_and_the_active_slot_otherwise() {
+    let s = live();
+    assert_eq!(bound_preferring(&s, None).slot(), Slot::A);
+    assert_eq!(bound_preferring(&s, Some(Slot::A)).slot(), Slot::A);
+    // B was never opened.
+    assert_eq!(bound_preferring(&s, Some(Slot::B)).slot(), Slot::A);
+    s.open(Slot::B);
+    assert_eq!(bound_preferring(&s, Some(Slot::B)).slot(), Slot::B);
+    // After the flip A is the old child, and a stream that belongs to it binds there.
+    s.set_active(Slot::B).expect("open");
+    assert_eq!(bound_preferring(&s, Some(Slot::A)).slot(), Slot::A);
+    assert_eq!(bound_preferring(&s, Some(Slot::B)).slot(), Slot::B);
+    assert_eq!(bound_preferring(&s, None).slot(), Slot::B);
+    assert_eq!(s.open_permits(Slot::A), 0);
+    // Retired: the stream follows the active slot.
+    assert_eq!(s.retire(Slot::A), Retire::Closed);
+    assert_eq!(bound_preferring(&s, Some(Slot::A)).slot(), Slot::B);
+    assert_eq!(s.open_permits(Slot::A), 0);
+}
+
+/// The gate decides before the preference does: a hold holds the stream that prefers a slot,
+/// and with no active slot there is nothing to follow even if the preferred slot is open.
+///
+/// Catches: a preferred slot bound through a hold, or when the supervisor cleared the
+/// active slot because the child behind it is gone.
+#[test]
+fn a_preference_does_not_bypass_the_gate() {
+    let s = live();
+    s.open(Slot::B);
+    let guard = s.hold(HOLD_MAX).expect("hold");
+    assert!(matches!(
+        s.bind_preferring(Some(Slot::B)),
+        Bind::Held { hold_max, .. } if hold_max == HOLD_MAX
+    ));
+    s.release_into(Slot::A).expect("open");
+    drop(guard);
+    s.clear_active();
+    assert!(matches!(s.bind_preferring(Some(Slot::B)), Bind::NoActive));
+    assert_eq!(s.open_permits(Slot::B), 0);
+}
+
+/// A slot is open from `open` until `retire` closes it, and `open` again reopens it.
+///
+/// Catches: `is_open` true for a never-opened slot (the CLOSED bit initial state), still true
+/// after `retire`, or false for the other slot or for a reopened one.
+#[test]
+fn a_slot_is_open_from_its_open_until_it_is_retired() {
+    let s = ActiveSlot::new();
+    assert!(!s.is_open(Slot::A), "never opened");
+    s.open(Slot::A);
+    assert!(s.is_open(Slot::A));
+    assert!(!s.is_open(Slot::B));
+    s.open(Slot::B);
+    s.set_active(Slot::B).expect("open");
+    assert_eq!(s.retire(Slot::A), Retire::Closed);
+    assert!(!s.is_open(Slot::A), "retired");
+    assert!(s.is_open(Slot::B));
+    s.open(Slot::A);
+    assert!(s.is_open(Slot::A), "opened again");
+}

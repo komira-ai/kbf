@@ -4,7 +4,7 @@
 //!
 //! - `GET /v1/update` is open like `GET /v1/nodes`: the desired release (`null` before any),
 //!   and the commits the release store holds with whether each platform is complete. Its
-//!   `proposals` are the releases the poller (`release::poll`) found, oldest first: a
+//!   `proposals` are the `update/proposed/` rows (written by the removed release poller), oldest first: a
 //!   proposal starts nothing.
 //! - `POST /v1/update/desired {"commit": "<40 hex>"}` offers the commit: the store must hold
 //!   it complete (tarball and attestation) for at least one platform, else `409` naming

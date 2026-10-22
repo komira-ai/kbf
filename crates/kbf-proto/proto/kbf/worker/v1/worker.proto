@@ -525,7 +525,9 @@ message ResourceUsage {
   // CPU time the kernel spent on the action's behalf, in microseconds.
   uint64 cpu_system_micros = 2;
   // The largest resident memory of any one process of the action, in bytes (for a
-  // runtime that gives the action a cgroup, the cgroup's `memory.peak`).
+  // runtime that gives the action a cgroup, the cgroup's `memory.peak`; for the macOS
+  // native driver, the sum over the action's processes of each one's lifetime peak
+  // physical footprint, the same number as `footprint.peak_footprint_bytes`).
   uint64 peak_memory_bytes = 3;
   // Wall time from the action's start to its exit, in microseconds.
   uint64 wall_micros = 4;

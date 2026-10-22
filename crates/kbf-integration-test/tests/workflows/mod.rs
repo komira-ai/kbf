@@ -4,12 +4,9 @@
 //! request code with repository write access. The lint parses each workflow with a
 //! YAML parser (`saphyr-parser`, through [`yaml`]) and evaluates the document. It
 //! refuses a workflow if:
-//! - `on` names the `pull_request_target` trigger, or the `workflow_run` trigger other
-//!   than in the one shape [`workflow_run`] describes (both run with the base
-//!   repository's secrets and token), in any form (a string, a list or a mapping,
-//!   block or flow). That shape is `gamma.yml`: the workflow named `gamma`, following
-//!   the workflow `release` on `main`, with three jobs of exact conditions, permissions
-//!   and steps;
+//! - `on` names the `pull_request_target` or the `workflow_run` trigger (both run with the
+//!   base repository's secrets and token), in any form (a string, a list or a mapping,
+//!   block or flow);
 //! - a job's `runs-on` is not exactly one GitHub-hosted runner label from
 //!   [`HOSTED_LABELS`], written out literally: a string, a one-entry list, or a
 //!   mapping holding only `labels:` with such a value. A runner group, an expression
@@ -80,16 +77,14 @@
 //! anything else, so that review has less to catch.
 
 #[cfg(test)]
-mod gamma_tests;
-#[cfg(test)]
 mod stages;
 mod workflow_run;
 mod yaml;
 
 mod jobs;
 pub use jobs::{
-    dispatch_inputs, job_env, job_environment, job_has_key, job_needs, job_outputs,
-    job_permission_levels, push_filters, workflow_has_key, workflow_name, workflow_run_filters,
+    dispatch_inputs, job_env, job_environment, job_needs, job_outputs, job_permission_levels,
+    push_filters,
 };
 
 use yaml::{Node, Value};
@@ -178,8 +173,8 @@ const ISSUE_SCOPES: &[&str] = &["issues"];
 const ISSUES_MAIN_ONLY: &str = "${{ github.ref == 'refs/heads/main' }}";
 
 /// Triggers that run with the base repository's secrets and token on behalf of code
-/// or events from outside it. (`workflow_run` is the same, and is allowed in the one shape
-/// [`workflow_run::rules`] describes.)
+/// or events from outside it. (`workflow_run` is the same, and is refused by
+/// [`workflow_run::rules`].)
 const REFUSED_TRIGGERS: &[&str] = &["pull_request_target"];
 
 /// Parses one workflow text and returns one message per problem, each prefixed with

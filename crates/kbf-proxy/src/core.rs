@@ -13,6 +13,7 @@ use crate::pool::{Connector, Pool};
 use crate::probe::Readiness;
 use crate::security::Security;
 use crate::slot::{ActiveSlot, Slot};
+use crate::term::Terms;
 
 /// The clock every stream reads. It is tokio's, so a test under paused time moves it; the
 /// hold queue takes `std` instants, which tokio's convert to and from exactly.
@@ -29,6 +30,9 @@ pub(crate) struct Core {
     pub(crate) security: Security,
     /// What `/readyz` says: the poll of the active child writes it (`crate::probe`).
     pub(crate) ready: Readiness,
+    /// The term of each slot's child, for a `WaitExecution` that names the old child's
+    /// operation (`crate::term`).
+    pub(crate) terms: Terms,
     /// Whether `/ui` is served (the `ui` key of the `[proxy]` table, fixed at start; an atomic
     /// only so a test can switch it on a running rig); off, it is a 404 like any path
     /// outside the table.
@@ -74,6 +78,7 @@ impl Core {
             slots,
             queue: HoldQueue::new(HoldLimits::default()),
             ready: Readiness::new(connector.clone()),
+            terms: Terms::new(connector.clone()),
             pool: Pool::new(table, Arc::clone(&metrics), connector),
             metrics,
             limits,

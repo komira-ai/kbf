@@ -1,4 +1,4 @@
-//! The proposals of the release poller (`release::poll`): `update/proposed/<commit>`, one row
+//! The proposals of the removed release poller: `update/proposed/<commit>`, one row
 //! per release the poller found that could be run, for the operator to read in `GET
 //! /v1/update`.
 //!

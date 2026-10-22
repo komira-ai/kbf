@@ -11,7 +11,7 @@ use kbf_gate::{ResultDoc, Verdict, reversible};
 use serde_json::Value;
 
 use super::git;
-use super::offer::{identity_of, whole_field};
+use super::identity_file::{identity_of, whole_field};
 use super::verify::{Subject, verify};
 use crate::Error;
 
