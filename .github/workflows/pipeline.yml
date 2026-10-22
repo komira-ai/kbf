@@ -57,6 +57,7 @@ jobs:
     uses: ./.github/workflows/beta.yml
     permissions:
       contents: read
+      attestations: read
 
   # Leaves the commit this push replaced for the release run, which diffs the push from it
   # (a run started by `workflow_run` has no push event of its own).

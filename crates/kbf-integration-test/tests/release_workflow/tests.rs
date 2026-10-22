@@ -744,8 +744,8 @@ fn verify_reads_the_artifacts_of_the_pipeline_run_that_started_the_release() {
 #[test]
 fn tag_writes_the_record_then_mints_the_token_then_tags_the_commit_of_the_run() {
     // Catches: a tag of another commit or version, a token held longer or wider than the one
-    // step needs, a record that names another run than the pipeline run that started this. Mutants: the record's
-    // inputs from the wrong place; the order changed; the token given `issues: write`, no
+    // step needs, a record that names another run than the pipeline run that started this, a
+    // record whose inputs come from the wrong place; the order changed; the token given `issues: write`, no
     // repository scope, or the wrong one; a build after it; the tag step on the workflow's
     // own token, with another message file, tag or sha; another step holding the token.
     let record = "--commit \"$COMMIT\" --tag \"$TAG\" --run-id";

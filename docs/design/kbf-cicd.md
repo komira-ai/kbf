@@ -550,16 +550,18 @@ A push to `main` runs one sequential pipeline, `pipeline.yml`, in this order, ea
   merge queue are unchanged; `beta.yml` has `workflow_call` alone (it never ran for a pull request). In a called workflow
   `github.event_name` and `github.ref` are the caller's, so the jobs that attest still read as a push to `main`.
 - **Beta tests the files that will be released.** `beta` runs after `artifacts` in the same run and downloads that run's
-  `assets-*` and `sha256sums` artifacts (no run id), checks them with `verify-assets sums`, and the smoke farm runs the `kbf`
-  out of the linux-x86_64 tarball. The release then publishes those same files (`release.yml` downloads them from the same
+  `assets-*` and `sha256sums` artifacts (no run id), checks them with `verify-assets sums`, checks the tarball's `kbf` with `build-commit check-asset` (this commit, a
+  release build), and the smoke farm runs the `kbf` out of the linux-x86_64 tarball. The release then publishes those same files (`release.yml` downloads them from the same
   pipeline run and checks them again).
 - **A red or cancelled stage stops the rest.** Every stage `needs` the one before it, none can be skipped, and the workflow
   has no `always()` or `continue-on-error`.
 - **A newer push cancels the older pipeline.** The workflow's group is `pipeline-<ref>` with `cancel-in-progress: true`. A
   workflow-level cancel stops every job of the run, so nothing that writes may be a job of this run: it holds no tag, no
   release, no push to another repository, no environment and no secret. The only write scopes it grants are the signing
-  scopes of the `artifacts` call, under the exact `if:` of a push to `main`; a called workflow gets at most what the
-  caller grants.
+  scopes of the `artifacts` call, under the exact `if:` of a push to `main` (the `beta` call grants `attestations: read`
+  for its `mixed-version` job); a called workflow gets at most what the caller grants, and GitHub refuses the whole
+  workflow at startup when one asks for more, so the workflow lint compares every job of each called workflow with its
+  caller's grant. No stage call passes `secrets:`.
 - **The release is another workflow, started by the pipeline's success.** `release.yml` runs on `workflow_run` of
   `pipeline`, `completed`, `branches: [main]`, and every job requires the conclusion `success`, the event `push`, the branch
   `main` and this repository. Its concurrency group is `release-main` and never cancels; a pipeline run that was cancelled
@@ -577,7 +579,10 @@ cancelled code is released with the next push that changes code; the same holds 
 (2) the run that started the release is read by id (`github.event.workflow_run.id`): `release locate` refuses a run that is not
 the successful push run on `main` for the commit, and one that no longer holds the artifacts (they expire after 90 days);
 (3) a release job a person cancels, or that fails, is re-run from the run's page (failed jobs only), and `release tag` and
-`release publish` are idempotent, so a half-made release is completed, not repeated.
+`release publish` are idempotent, so a half-made release is completed, not repeated;
+(4) merges that arrive faster than a pipeline finishes keep cancelling it, so no beta run and no release completes while
+they last, and `release plan` diffs only the one push; whether `plan` should compare with the highest release tag, or the
+pipeline should wait for a running run instead of cancelling it, is open for the maintainers to decide.
 
 The workflow lints hold all of it (`crates/kbf-integration-test/tests/pipeline_workflow`, `release_workflow` and
 `workflows`): the order of the stages and their `needs`, the triggers of the called workflows, the single call of each,

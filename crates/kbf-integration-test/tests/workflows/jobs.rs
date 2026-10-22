@@ -75,6 +75,12 @@ pub fn job_permission_levels(text: &str, job: &str) -> Result<Vec<(String, Strin
         .collect()
 }
 
+/// Whether the job `job` has the key `key` at all (`secrets`, for a job that calls a workflow).
+pub fn job_has_key(text: &str, job: &str, key: &str) -> Result<bool, String> {
+    let root = yaml::load(text)?;
+    Ok(get(job_of(&root, job)?, key).is_some())
+}
+
 /// The names of the keys under the job `job`'s `outputs:`; empty without any.
 pub fn job_outputs(text: &str, job: &str) -> Result<Vec<(String, String)>, String> {
     let root = yaml::load(text)?;

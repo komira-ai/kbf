@@ -172,6 +172,8 @@ fn pipeline(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
         }
     }
     permissions(text, out)?;
+    callee_scopes(files, out)?;
+    no_secrets_passed(text, out)?;
     let last = workflows::job_needs(text, "push")?;
     if last != ["beta"] {
         out.push(format!("the job `push` needs {last:?}, not [\"beta\"]"));
@@ -225,6 +227,7 @@ fn permissions(text: &str, out: &mut Vec<String>) -> Result<(), String> {
                 ("attestations", "write"),
             ],
             "push" => Vec::new(),
+            "beta" => vec![("contents", "read"), ("attestations", "read")],
             _ => vec![("contents", "read")],
         };
         let mut got: Vec<String> = have.iter().map(|(s, l)| format!("{s}: {l}")).collect();
@@ -234,6 +237,54 @@ fn permissions(text: &str, out: &mut Vec<String>) -> Result<(), String> {
         if got != wanted {
             out.push(format!(
                 "the job `{job}` grants the scopes {got:?}, not exactly {wanted:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// How much a permission level allows: `write` includes `read`; an unknown level allows
+/// nothing it can be compared with, so it counts as the most.
+fn level_rank(level: &str) -> u8 {
+    match level {
+        "none" => 0,
+        "read" => 1,
+        "write" => 2,
+        _ => 3,
+    }
+}
+
+/// A called workflow gets at most what its caller job grants: GitHub refuses the whole
+/// calling workflow (a startup failure, no job runs) when a job of the called one asks for
+/// more. Checks every job of each called workflow against the grant of the job that calls it.
+fn callee_scopes(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
+    for (stage, file, _) in STAGES {
+        let grant = workflows::job_permission_levels(&files.pipeline, stage)?;
+        let text = files.called(file);
+        for job in workflows::job_names(text)? {
+            for (scope, level) in workflows::job_permission_levels(text, &job)? {
+                let granted = grant
+                    .iter()
+                    .find(|(s, _)| *s == scope)
+                    .map_or("none", |(_, l)| l.as_str());
+                if level_rank(&level) > level_rank(granted) {
+                    out.push(format!(
+                        "the job `{job}` of {file} asks for `{scope}: {level}`, but the job `{stage}` of pipeline.yml that calls it grants `{scope}: {granted}`: a called workflow cannot exceed its caller, and GitHub would refuse the whole pipeline at startup"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// No stage call passes secrets (`secrets: inherit` or a list): the release bot's key is
+/// readable only by the release workflow, and a run a newer push cancels holds none.
+fn no_secrets_passed(text: &str, out: &mut Vec<String>) -> Result<(), String> {
+    for (stage, _, _) in STAGES {
+        if workflows::job_has_key(text, stage, "secrets")? {
+            out.push(format!(
+                "the job `{stage}` passes `secrets:` to its workflow: no stage may read a secret"
             ));
         }
     }
@@ -337,6 +388,9 @@ fn beta_consumes_the_run(beta: &str, out: &mut Vec<String>) -> Result<(), String
             .position(|s| s.run.as_deref().is_some_and(|r| r.trim() == command))
     };
     let checked = exact("cargo xtask verify-assets sums dist");
+    let asset_checked = exact(
+        "cargo xtask build-commit check-asset \"dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz\" \"$GITHUB_SHA\"",
+    );
     let extracted =
         exact("tar -xzf \"dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz\" -C \"$RUNNER_TEMP/bin\" kbf");
     let ran = steps.iter().position(|s| {
@@ -350,9 +404,12 @@ fn beta_consumes_the_run(beta: &str, out: &mut Vec<String>) -> Result<(), String
                 .to_owned(),
         );
     }
-    match (checked, extracted, ran) {
-        (Some(c), Some(e), Some(r)) if c < e && e < r => {}
-        _ => out.push("the job `smoke` does not check the files, then take `kbf` out of the linux-x86_64 tarball into `$RUNNER_TEMP/bin`, then run the farm, in that order".to_owned()),
+    if asset_checked.is_none() {
+        out.push("the job `smoke` does not run `build-commit check-asset` on the linux-x86_64 tarball for this commit: a kbf of another commit or a debug build could be the one tested".to_owned());
+    }
+    match (checked, asset_checked, extracted, ran) {
+        (Some(c), Some(a), Some(e), Some(r)) if c < a && a < e && e < r => {}
+        _ => out.push("the job `smoke` does not check the files, then check the tarball's kbf with `build-commit check-asset`, then take `kbf` out of the linux-x86_64 tarball into `$RUNNER_TEMP/bin`, then run the farm, in that order".to_owned()),
     }
     if let Some(r) = ran
         && !steps[r]

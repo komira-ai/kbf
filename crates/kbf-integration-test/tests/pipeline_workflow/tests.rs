@@ -304,10 +304,18 @@ fn beta_tests_the_artifacts_of_the_same_run_and_builds_no_kbf() {
     red(
         &plant(
             "beta.yml",
+            "run: cargo xtask build-commit check-asset",
+            "run: echo check-asset",
+        ),
+        "does not run `build-commit check-asset`",
+    );
+    red(
+        &plant(
+            "beta.yml",
             "-C \"$RUNNER_TEMP/bin\" kbf",
             "-C \"$RUNNER_TEMP/bin\" kbf-deploy",
         ),
-        "does not check the files, then take `kbf` out of the linux-x86_64 tarball",
+        "does not check the files, then check the tarball's kbf",
     );
     red(
         &plant(
@@ -420,6 +428,58 @@ fn only_the_artifacts_call_holds_the_signing_scopes_and_only_for_a_push_to_main(
         ),
         "the job `push` grants the scopes",
     );
+}
+
+#[test]
+fn a_called_workflow_never_asks_for_more_than_its_caller_grants() {
+    // Catches: a job of ci.yml, artifacts.yml or beta.yml with a scope (or a level) its calling
+    // job in pipeline.yml does not grant, which GitHub refuses at startup for the whole
+    // pipeline: no ci, artifacts, beta or release on a push to main. Pull-request runs cannot
+    // show it, because the pipeline has no pull-request trigger.
+    red(
+        &plant(
+            "pipeline.yml",
+            "    uses: ./.github/workflows/beta.yml\n    permissions:\n      contents: read\n      attestations: read\n",
+            "    uses: ./.github/workflows/beta.yml\n    permissions:\n      contents: read\n",
+        ),
+        "the job `mixed-version` of beta.yml asks for `attestations: read`",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "      attestations: write\n",
+            "      attestations: read\n",
+        ),
+        "the job `attest-linux` of artifacts.yml asks for `attestations: write`",
+    );
+    red(
+        &plant(
+            "ci.yml",
+            "      contents: read\n    env:\n      DENY_VERSION",
+            "      contents: read\n      packages: read\n    env:\n      DENY_VERSION",
+        ),
+        "of ci.yml asks for `packages: read`",
+    );
+}
+
+#[test]
+fn no_stage_passes_secrets_to_its_workflow() {
+    // Catches: `secrets: inherit` (or a list of secrets) on the call of ci, artifacts or beta,
+    // which would put the release bot's key in a run a newer push cancels.
+    for (call, next) in [
+        ("  ci:\n    uses: ./.github/workflows/ci.yml\n", "ci"),
+        ("  artifacts:\n    needs: [ci]\n", "artifacts"),
+        ("  beta:\n    needs: [artifacts]\n", "beta"),
+    ] {
+        red(
+            &plant(
+                "pipeline.yml",
+                call,
+                &format!("{call}    secrets: inherit\n"),
+            ),
+            &format!("the job `{next}` passes `secrets:`"),
+        );
+    }
 }
 
 #[test]
