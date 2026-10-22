@@ -4,8 +4,6 @@
 //!
 //! Catches:
 //! - an encoding that changes under a committed log (golden bytes);
-//! - a rebuild command written into, or read from, a log before format 4: a reader
-//!   without it must refuse the entry;
 //! - an object id that names no one writer (a log with no epoch, a log with a member), or
 //!   a `RebuildProgress` with no key, accepted;
 //! - a conversion that loses an entry, its offset, the log id or the epoch.
@@ -111,12 +109,12 @@ fn rebuild_commands_have_their_golden_bytes() {
     }
 }
 
-/// Catches: a rebuild command, or an object of another log, written into a log before
-/// format 4, and a reader of one that takes it. Mutant seen red: `since_v4` leaving
-/// `AdoptSegment` out (format 3 then encodes it, and an older replica reads it as
-/// unknown fields).
+/// Asserts that the encoder refuses a rebuild command, or an object of another log,
+/// under every format before format 4, and that the decoder reads the format-4 bytes
+/// under those formats as the same command as under format 4, because decoding does not
+/// depend on the committed format.
 #[test]
-fn rebuild_commands_are_refused_below_v4() {
+fn rebuild_commands_are_written_from_v4_and_read_under_every_format() {
     for (name, command, hex) in golden() {
         let bytes = hex::decode(&hex).expect("hex");
         for format in [Format::V1, Format::V2, Format::V3] {
@@ -126,8 +124,8 @@ fn rebuild_commands_are_refused_below_v4() {
                 "{name} under {format:?}"
             );
             assert_eq!(
-                dec(format, &bytes),
-                Err(DecodeError::UnknownCommand("MetaCommand")),
+                dec(format, &bytes).as_ref(),
+                Ok(&command),
                 "{name} under {format:?}"
             );
         }
@@ -144,10 +142,9 @@ fn wrap(command: proto::meta_command::Command) -> Vec<u8> {
 }
 
 /// Catches: an object id naming a log without an epoch, a log and a member, or a log
-/// and a boot, read as an epoch or a node (one value, two encodings; or an object no
-/// writer owns), and a progress mark with no key (which would never move the resume
-/// point). Each case is refused by name; the well-formed other-log id decodes, so the
-/// cases are not vacuous.
+/// and a boot, read as an epoch or a node (an object no writer owns), and a progress
+/// mark with no key (which would never move the resume point). Each case is refused by
+/// name; the well-formed other-log id decodes, so the cases are not vacuous.
 #[test]
 fn an_other_logs_object_id_names_one_writer_or_is_refused() {
     let id = |epoch, member, boot, log| proto::ObjectId {

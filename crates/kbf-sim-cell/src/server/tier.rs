@@ -30,7 +30,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use kbf_front::{FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, MetaLog};
-use kbf_log::{DecodeError, Format, LogCommand, MachineVersion};
+use kbf_log::{Format, LogCommand, MachineVersion};
 use kbf_meta::{
     Applied, BlobAnswer, Command, Location, ObjectId, Retention, ServerId, StagedPut, StagedState,
     TierId, UnreachableReason,
@@ -804,7 +804,11 @@ impl Server {
                 Ok(LogCommand::MachineVersion(_)) => {
                     raised_at.get_or_insert(index);
                 }
-                Err(DecodeError::UnknownCommand("MetaCommand")) => {
+                // A metadata command the encoder refuses under format 1 (a command that
+                // joined a later format).
+                Ok(command @ LogCommand::Meta(_))
+                    if kbf_log::encode(Format::V1, &command).is_err() =>
+                {
                     first_tier_command.get_or_insert(index);
                 }
                 _ => {}

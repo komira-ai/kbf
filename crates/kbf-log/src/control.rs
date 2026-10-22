@@ -546,8 +546,8 @@ fn from_node_caps(
             });
         }
     };
-    // Maps and sets are collected as given; `decode`'s re-encoding refuses any that
-    // were out of order or repeated a key.
+    // Maps and sets are collected as given: a map keeps its last value for a repeated
+    // key, and an order the encoder would not write is read as the same value.
     Ok(NodeCaps {
         cpu: CpuCaps::new(arch, cpu.features.into_iter().collect()),
         exact: caps.exact.into_iter().map(|p| (p.key, p.value)).collect(),
