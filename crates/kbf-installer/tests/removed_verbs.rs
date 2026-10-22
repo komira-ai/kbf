@@ -8,8 +8,6 @@ const BIN: &str = env!("CARGO_BIN_EXE_kbf-installer");
 /// Catches a removed verb coming back, or one swallowed by another: each of `migrate` and
 /// `uninstall` (bare, and with a flag an old operator's script passed) is an unrecognized
 /// subcommand, exit 2, and says so on stderr; nothing goes to stdout.
-///
-/// Mutants seen red: `Status` given the alias `migrate` (exit 1, not 2).
 #[test]
 fn migrate_and_uninstall_are_unrecognized_subcommands() {
     for args in [

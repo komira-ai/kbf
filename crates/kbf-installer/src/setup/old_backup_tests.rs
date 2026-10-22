@@ -95,14 +95,10 @@ fn a_host_that_never_had_the_backup_timer_gets_no_step_for_it() {
     assert!(!said.contains("kbf-backup"), "{said}");
 }
 
-/// Catches the cleanup keyed to the timer alone: a host whose timer was already disabled by
+/// The cleanup is not keyed to the timer alone: a host whose timer was already disabled by
 /// hand still has the drop-in (or just its empty directory) an earlier setup made, and the
 /// drop-in would go on giving the retired backup unit a user. Each leftover is removed and
 /// reported without a `disable` step, and systemd reloads.
-///
-/// Mutants to plant: the removal made conditional on the timer being enabled (red: the file or
-/// the directory stays); the `disable` made unconditional (red: a disable step on a host whose
-/// timer is already off).
 #[test]
 fn a_leftover_dropin_or_directory_is_removed_when_the_timer_is_already_off() {
     let dir = || Entry::Dir {
