@@ -556,7 +556,8 @@ impl Durable {
     /// and strips the samples from those that hold a floor, as the estimator itself
     /// does in memory. At most [`SWEEP_TXNS`] transactions of [`SWEEP_ROWS`] rows are
     /// committed per call. Returns how many rows it changed and whether more are left
-    /// for another call. A transaction the store refuses is logged and the rest go on.
+    /// for another call. A transaction the store refuses is logged and the rest go on. The scan
+    /// reads every row (at most the estimator's key bound) whatever the cap.
     pub(super) fn sweep_estimates(&self, today: Day) -> Result<(usize, bool), StateError> {
         let mut changes = Vec::new();
         for (name, row) in self.store.scan_prefix(ESTIMATE)? {
@@ -576,7 +577,7 @@ impl Durable {
                 Some(_) => {}
             }
         }
-        let more = changes.len() > SWEEP_TXNS * SWEEP_ROWS;
+        let left = changes.len() > SWEEP_TXNS * SWEEP_ROWS;
         let mut changed = 0;
         for chunk in changes.chunks(SWEEP_ROWS).take(SWEEP_TXNS) {
             let mut txn = Txn::new();
@@ -588,10 +589,17 @@ impl Durable {
             }
             match self.commit(txn) {
                 Ok(()) => changed += chunk.len(),
-                Err(error) => tracing::warn!(%error, "a batch of size summaries was not swept"),
+                Err(error) => {
+                    tracing::warn!(%error, "a batch of size summaries was not swept");
+                    if self.superseded_by(&error) {
+                        break;
+                    }
+                }
             }
         }
-        Ok((changed, more))
+        // A sweep that committed nothing does not ask for another tick: a store that
+        // refuses every batch is not scanned again until the next hour.
+        Ok((changed, left && changed > 0))
     }
 
     /// The nodes an operator placed.
@@ -909,6 +917,16 @@ impl Durable {
             };
             flag.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Whether `error` says a newer writer holds the store; if so, this handle is fenced
+    /// from now on, as after any other write the store refused for it.
+    pub(super) fn superseded_by(&self, error: &StateError) -> bool {
+        let fenced = matches!(error, StateError::Store(StoreError::Fenced));
+        if fenced {
+            self.fenced.store(true, Ordering::SeqCst);
+        }
+        fenced
     }
 
     /// Whether a write was refused because a newer writer holds the store: nothing this

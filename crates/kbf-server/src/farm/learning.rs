@@ -106,8 +106,8 @@ impl State {
         self.write_estimates(&rows);
     }
 
-    /// The scheduler gave up `requeue`'s lease: the rows to write in the transaction of
-    /// the requeue (the summaries an own-limit kill changed).
+    /// The scheduler gave up `requeue`'s lease: the rows to write once the requeues are
+    /// settled (the summaries an own-limit kill changed), separately from them.
     pub(super) fn learned_requeue(&mut self, requeue: &Requeue) -> Vec<Row> {
         if self.learned.off() {
             return Vec::new();
@@ -181,6 +181,10 @@ impl State {
         let mut refused = Vec::new();
         for chunk in rows.chunks(BATCH) {
             if let Err(error) = durable.put_estimates(chunk) {
+                // A newer writer holds the store: nothing more is written, nor kept.
+                if durable.superseded_by(&error) {
+                    return;
+                }
                 tracing::warn!(%error, "size summaries were not written");
                 refused.extend_from_slice(chunk);
             }

@@ -277,7 +277,7 @@ impl Learned {
 
     /// The scheduler gave up `lease` after an own-limit kill and will book `raised` next:
     /// the staged attempt is observed with that, and the rows of the summaries it changed
-    /// are returned for the requeue's transaction.
+    /// are returned, for the caller to write after the requeue is settled.
     pub fn requeued(&mut self, lease: LeaseId, raised: u64, bounds: &Bounds) -> Vec<Row> {
         self.forget(lease);
         let Some(mut attempt) = self.staged.remove(&lease) else {

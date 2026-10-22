@@ -389,7 +389,7 @@ async fn size_rows_are_a_fenced_family_the_old_child_cannot_write_after_a_takeov
     let mut daemon = client.daemon("node-size", 4, 64).await;
     let job = Job::new("compile for the size rows", &[("OSFamily", "linux")]);
     client.upload(&job.blobs()).await;
-    let ops = execute_as_build(&client, &job).await;
+    let mut ops = execute_as_build(&client, &job).await;
     let start = daemon.start().await;
     let usage = ResourceUsage {
         wall_micros: 2_000_000,
@@ -418,6 +418,26 @@ async fn size_rows_are_a_fenced_family_the_old_child_cannot_write_after_a_takeov
         ..Default::default()
     };
     assert!(daemon.report(result).await.accepted);
+    // The retry succeeds: its key's summary changes and waits for the write-behind.
+    let rerun = daemon.start().await;
+    let mut ok = support::output(&client, "built", 0).await;
+    ok.execution_metadata = Some(kbf_proto::reapi::ExecutedActionMetadata {
+        auxiliary_metadata: vec![
+            ResourceUsage {
+                wall_micros: 2_000_000,
+                basis: UsageBasis::Cgroup as i32,
+                cgroup: Some(CgroupUsage {
+                    memory_peak_bytes: Some(1 << 20),
+                    ..CgroupUsage::default()
+                }),
+                ..ResourceUsage::default()
+            }
+            .to_any(),
+        ],
+        ..Default::default()
+    });
+    assert!(daemon.report(ran(rerun.lease_id, &ok)).await.accepted);
+    done(&mut ops).await;
     let root = IndexRoot::default();
     let writes = swap.a_store.writes();
     let size: Vec<_> = writes
@@ -433,9 +453,15 @@ async fn size_rows_are_a_fenced_family_the_old_child_cannot_write_after_a_takeov
         assert_eq!(kind.rule, Rule::Fenced, "{}", write.key);
     }
 
+    let before = swap.base.scan_prefix("est/").expect("scan");
+    assert!(!before.is_empty());
     // The build's caller and the node let go, as the swap's other tests' do, so A can stop.
     drop((ops, daemon, client));
     swap.take_over().await;
+    // Past the write-behind interval: A holds a changed summary it is not to write (it is
+    // fenced, and the store would refuse it if it tried).
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    assert_eq!(swap.base.scan_prefix("est/").expect("scan"), before);
     swap.stop_a().await;
     for (key, _) in swap.base.scan_prefix("").expect("scan") {
         assert!(classify(&key, &root).is_some(), "{key} is of no family");

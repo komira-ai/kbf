@@ -31,6 +31,12 @@ struct Flaky {
     before_op_read: std::sync::Mutex<Option<Txn>>,
     /// Every transaction that writes an `est/` row is refused (not as an outage).
     refuse_est: AtomicBool,
+    /// The next this many transactions that write an `est/` row are refused.
+    refuse_est_first: std::sync::atomic::AtomicU32,
+    /// Transactions that write an `est/` row are refused as the work of a superseded writer.
+    fence_est: AtomicBool,
+    /// Transactions that write an `est/` row, refused or not.
+    est_writes: std::sync::atomic::AtomicU32,
     /// Scans of the `est/` prefix, and whether they fail.
     est_scans: std::sync::atomic::AtomicU32,
     fail_est_scan: AtomicBool,
@@ -45,6 +51,9 @@ impl Flaky {
             touch_lease: AtomicBool::new(false),
             before_op_read: std::sync::Mutex::new(None),
             refuse_est: AtomicBool::new(false),
+            refuse_est_first: std::sync::atomic::AtomicU32::new(0),
+            fence_est: AtomicBool::new(false),
+            est_writes: std::sync::atomic::AtomicU32::new(0),
             est_scans: std::sync::atomic::AtomicU32::new(0),
             fail_est_scan: AtomicBool::new(false),
         })
@@ -64,8 +73,19 @@ impl Store for Flaky {
             op.key_cond()
                 .is_some_and(|(key, _)| key.starts_with("est/"))
         });
-        if writes_est && self.refuse_est.load(Ordering::SeqCst) {
-            return Err(StoreError::Failed("est rows refused".to_owned()));
+        if writes_est {
+            self.est_writes.fetch_add(1, Ordering::SeqCst);
+            if self.fence_est.load(Ordering::SeqCst) {
+                return Err(StoreError::Fenced);
+            }
+            let first = self.refuse_est_first.load(Ordering::SeqCst);
+            if first > 0 {
+                self.refuse_est_first.store(first - 1, Ordering::SeqCst);
+                return Err(StoreError::Failed("est rows refused".to_owned()));
+            }
+            if self.refuse_est.load(Ordering::SeqCst) {
+                return Err(StoreError::Failed("est rows refused".to_owned()));
+            }
         }
         self.inner.apply_batch(batch)
     }
@@ -2110,19 +2130,95 @@ fn the_sweep_commits_a_bounded_number_of_rows_a_call_and_resumes() {
     assert!(store.scan_prefix("est/").expect("scan").is_empty());
 }
 
-/// Catches: one refused transaction of the sweep aborting the rest of it.
+/// Catches: one refused transaction of the sweep aborting the rest of it (the first batch
+/// is refused, the second must still be swept), the refused rows lost instead of left for
+/// the next sweep.
 #[test]
 fn a_refused_sweep_batch_does_not_stop_the_others() {
     let store = Flaky::new();
     let durable = open(&store);
-    let key = size_key("stale", None);
-    durable
-        .put_estimates(&[(key.clone(), size_row(&key, 1))])
-        .expect("a row");
+    let rows: Vec<_> = (0..SWEEP_ROWS + 10)
+        .map(|i| {
+            let key = size_key(&format!("stale-{i:05}"), None);
+            let row = size_row(&key, 1);
+            (key, row)
+        })
+        .collect();
+    durable.put_estimates(&rows).expect("rows");
+    store.refuse_est_first.store(1, Ordering::SeqCst);
+    assert_eq!(
+        durable.sweep_estimates(Day(200)).expect("sweep"),
+        (10, false)
+    );
+    assert_eq!(store.scan_prefix("est/").expect("scan").len(), SWEEP_ROWS);
     store.refuse_est.store(true, Ordering::SeqCst);
     assert_eq!(
         durable.sweep_estimates(Day(200)).expect("sweep"),
         (0, false)
     );
-    assert_eq!(store.scan_prefix("est/").expect("scan").len(), 1);
+    store.refuse_est.store(false, Ordering::SeqCst);
+    assert_eq!(
+        durable.sweep_estimates(Day(200)).expect("sweep"),
+        (SWEEP_ROWS, false)
+    );
+    assert!(store.scan_prefix("est/").expect("scan").is_empty());
+}
+
+/// Catches: an idle old writer that goes on trying to write size rows to a store a newer
+/// writer holds (every tick would send a refused transaction), and its refused rows kept
+/// for a retry that cannot succeed.
+#[test]
+fn a_fenced_refusal_of_size_rows_ends_the_writing() {
+    let store = Flaky::new();
+    let (farm, key) = farm_with_a_kill(&store);
+    let row = (key.clone(), size_row(&key, today()));
+    store.fence_est.store(true, Ordering::SeqCst);
+    farm.lock().write_estimates(std::slice::from_ref(&row));
+    assert_eq!(store.est_writes.load(Ordering::SeqCst), 1);
+    let fenced = farm
+        .lock()
+        .durable
+        .as_ref()
+        .expect("a store")
+        .fenced
+        .load(Ordering::SeqCst);
+    assert!(fenced, "the refusal is remembered");
+    // Later ticks send nothing, and nothing is waiting to be written.
+    let mut state = farm.lock();
+    state
+        .learned
+        .clock(kbf_types::FarmTime::from_millis(60_000));
+    state.flush_learned();
+    state.write_estimates(std::slice::from_ref(&row));
+    assert!(state.learned.due().is_empty());
+    drop(state);
+    assert_eq!(store.est_writes.load(Ordering::SeqCst), 1);
+}
+
+/// Catches: a sweep that commits nothing, because the store refuses every batch, asking to
+/// be called again at the next tick (it would scan every row every tick for an hour).
+#[test]
+fn a_sweep_that_commits_nothing_does_not_ask_for_another_call() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    let rows: Vec<_> = (0..SWEEP_TXNS * SWEEP_ROWS + 5)
+        .map(|i| {
+            let key = size_key(&format!("stale-{i:05}"), None);
+            let row = size_row(&key, 1);
+            (key, row)
+        })
+        .collect();
+    for chunk in rows.chunks(SWEEP_ROWS) {
+        durable.put_estimates(chunk).expect("rows");
+    }
+    store.refuse_est.store(true, Ordering::SeqCst);
+    assert_eq!(
+        durable.sweep_estimates(Day(200)).expect("sweep"),
+        (0, false)
+    );
+    store.refuse_est.store(false, Ordering::SeqCst);
+    assert_eq!(
+        durable.sweep_estimates(Day(200)).expect("sweep"),
+        (SWEEP_TXNS * SWEEP_ROWS, true)
+    );
 }

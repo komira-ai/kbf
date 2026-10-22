@@ -562,10 +562,11 @@ async fn a_kill_that_ends_the_operation_is_written_at_once() {
     until("the kill is in the store", || !rows(&store).is_empty()).await;
 }
 
-/// Catches: a kill by the node (not by the action's own limit) writing a size summary or
-/// teaching the estimator a floor.
+/// Catches: a kill by the node (not by the action's own limit) teaching the estimator a
+/// floor. The run's later success is written behind after the write-behind interval, and
+/// no row the store holds then has a floor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_node_pressure_kill_writes_no_summary() {
+async fn a_node_pressure_kill_sets_no_floor() {
     log();
     let (store, state) = state();
     let cell = Cell::start_learned(LearnedSizes::Shadow, ladder(), Some(state)).await;
@@ -582,5 +583,17 @@ async fn a_node_pressure_kill_writes_no_summary() {
     let result = with_usage(output(&cell, "pressure", 0).await, &usage(MIB));
     assert!(daemon.report(ran(rerun.lease_id, &result)).await.accepted);
     done(&mut ops).await;
-    assert!(rows(&store).is_empty());
+    // Past the write-behind interval the success's summary is in the store.
+    for _ in 0..400 {
+        if !rows(&store).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let held = rows(&store);
+    assert!(!held.is_empty(), "the write-behind has run");
+    for row in &held {
+        let summary = kbf_estimator::Summary::decode(&row.1[1..]).expect("a summary");
+        assert_eq!(summary.oom_floor(), 0, "{}", row.0);
+    }
 }
