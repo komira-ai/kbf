@@ -3,8 +3,7 @@
 //! the lease, and the door must be refused (`EPERM` or `EACCES`). A slot with a canary not
 //! refused is set aside, not offered and not counted among the node's action slots until
 //! its next offer ([`first_passing`]); the lease takes the next slot, or waits as when
-//! none is free. The profile is asserted, not trusted
-//! (`~/workplace/mac-pool-experiments-scratch/08_revised_design.md`, section 1.6).
+//! none is free. The profile is asserted, not trusted.
 //!
 //! A canary is a row of [`CANARIES`]: its name, the profile rule it stands for
 //! (`deny`) and its [`Op`]. The probe is this binary's `__canary <name> <lease>` mode

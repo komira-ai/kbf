@@ -1,8 +1,8 @@
-//! The profile canaries for real (`~/workplace/mac-pool-experiments-scratch/08_revised_design.md`,
-//! section 1.6): a pool user, under the exact profile generated for a lease, is refused
-//! a write outside the four allowed paths and a hard link of a root-owned file into the
-//! lease directory; a profile that lacks `(deny file-write*)` fails them, and one that
-//! only lets a link through fails the link canary alone; a slot that fails is set aside.
+//! The profile canaries for real: a pool user, under the exact profile generated for a
+//! lease, is refused a write outside the four allowed paths and a hard link of a
+//! root-owned file into the lease directory; a profile that lacks `(deny file-write*)`
+//! fails them, and one that only lets a link through fails the link canary alone; a slot
+//! that fails is set aside.
 //!
 //! The canary latency is printed as `CANARY-LATENCY` lines (the design measured 64 to 125
 //! ms for a run).
