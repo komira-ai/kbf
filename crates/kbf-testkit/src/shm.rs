@@ -283,17 +283,9 @@ fn tracker(prefix: &str, count: u32) -> Result<(), Error> {
             // A signal (SIGTERM, whose handler has woken the pipe) interrupted the wait.
             continue;
         }
-        if fds[1].revents != 0 {
-            break;
-        }
-        if fds[0].revents != 0 {
-            let mut byte = 0_u8;
-            // SAFETY: reads at most one byte into `byte`, which is writable.
-            let read = unsafe { libc::read(0, (&raw mut byte).cast(), 1) };
-            if read <= 0 {
-                break;
-            }
-        }
+        // Ready to read is the end of the pipe (the owner never writes to it) or the
+        // wake-up from the SIGTERM handler: either way the names go.
+        break;
     }
     drop(writer);
     unlink(prefix, count);
