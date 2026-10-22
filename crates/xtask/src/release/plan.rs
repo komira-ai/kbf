@@ -115,25 +115,17 @@ pub fn classify(paths: &[String]) -> Class {
     }
 }
 
-/// The files `before..sha` changed, renames as the two paths they touch, or none when
-/// `before` is not a commit this checkout holds.
-fn changed(repo_dir: &Path, before: &str, sha: &str) -> Result<Option<Vec<String>>, Error> {
-    let probe = format!("{before}^{{commit}}");
-    let known = git_output(repo_dir, &["rev-parse", "--verify", "--quiet", &probe])?;
-    if !known.status.success() {
-        return Ok(None);
-    }
+/// The files `from..sha` changed, renames as the two paths they touch.
+fn changed(repo_dir: &Path, from: &str, sha: &str) -> Result<Vec<String>, Error> {
     let listed = git(
         repo_dir,
-        &["diff", "--name-only", "-z", "--no-renames", before, sha],
+        &["diff", "--name-only", "-z", "--no-renames", from, sha],
     )?;
-    Ok(Some(
-        listed
-            .split('\0')
-            .filter(|p| !p.is_empty())
-            .map(str::to_owned)
-            .collect(),
-    ))
+    Ok(listed
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 /// The highest release tag in this checkout that names an ancestor of `sha` other than
@@ -165,7 +157,7 @@ fn own_change(repo_dir: &Path, sha: &str) -> Result<Vec<String>, Error> {
     {
         return Ok(Vec::new());
     }
-    Ok(changed(repo_dir, &format!("{sha}^1"), sha)?.unwrap_or_default())
+    changed(repo_dir, &format!("{sha}^1"), sha)
 }
 
 /// The `release plan` verb: the lines to print.
@@ -214,13 +206,7 @@ pub fn run(a: &PlanArgs) -> Result<Vec<String>, Error> {
     let (code, site) = match base_tag(&a.repo_dir, &a.sha)? {
         None => (true, true),
         Some(tag) => {
-            let class = classify(
-                &changed(&a.repo_dir, &format!("refs/tags/{tag}"), &a.sha)?.ok_or_else(|| {
-                    Error::Failed(format!(
-                        "release tag {tag} is not a commit of this checkout"
-                    ))
-                })?,
-            );
+            let class = classify(&changed(&a.repo_dir, &format!("refs/tags/{tag}"), &a.sha)?);
             (class.code, class.site)
         }
     };

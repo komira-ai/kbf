@@ -661,6 +661,8 @@ fn the_base_is_the_highest_tag_that_is_an_ancestor_not_a_tag_beside_it() {
     let fx = fx("beside", "0.0\n");
     fx.github(&[], &[], &[]);
     fx.tag("v0.0.1", "HEAD");
+    // A suffixed tag is no release tag, however high.
+    fx.tag("v0.0.99-rc1", "HEAD");
     git(&fx.repo(), &["checkout", "-q", "-b", "other"]);
     let other = fx.commit(&[("docs/o.txt", Some("o"))]);
     fx.tag("v0.0.9", &other);
