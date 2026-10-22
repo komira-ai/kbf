@@ -371,8 +371,8 @@ echo "T=$(cat "${t}kbf-ci-same") H=$(cat "$h/kbf-ci-same") D=$(defaults read kbf
 /// The pool path's usage. Catches: a lease of a pool slot reporting no usage (the
 /// uid watch not feeding the meter), a peak taken from the daemon's own processes, CPU
 /// read from the wrong uid, and a footprint block beside a cgroup one. The action runs
-/// as the slot's user, holds 208 MiB and burns CPU for 1.5 s. Mutants seen red: the
-/// `UidWatch` meter left unfed; `Watch::usage` returning `None` for `Watch::Uid`.
+/// as the slot's user, holds 208 MiB and burns CPU for 1.5 s. Green on a macOS
+/// runner (peak 226 MB, user CPU 2.0 s); no mutant was run against it.
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slots"]
 #[tokio::test]
 async fn a_pool_lease_reports_its_usage() {

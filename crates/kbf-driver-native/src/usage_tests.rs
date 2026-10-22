@@ -42,8 +42,7 @@ const ONE_TO_ONE: (u32, u32) = (1, 1);
 /// Catches: a peak that is the largest process, or the largest sum of footprints at one
 /// poll (a polled sample), instead of the sum of each process's lifetime maximum. Two
 /// processes whose maxima were at different times (their footprints now are small) sum;
-/// mutants seen red: `sum` replaced by `max` of the maxima (peak 300 MiB, not 500),
-/// and `max_footprint` replaced by the footprint now (peak 30 MiB, not 500).
+/// mutant seen red: the sum folded with `max` instead (peak 300 MiB, not 500).
 #[test]
 fn the_peak_sums_each_processs_lifetime_maximum_not_a_polled_footprint() {
     let mut meter = Meter::default();
@@ -61,9 +60,8 @@ fn the_peak_sums_each_processs_lifetime_maximum_not_a_polled_footprint() {
 }
 
 /// Catches: CPU added up over polls (a process read three times counted three times),
-/// or the first reading kept. The second poll's counters replace the first's; mutants
-/// seen red: `record` adding to the earlier reading (user 3x too large), and `record`
-/// ignoring a later reading (user stuck at the first).
+/// or the first reading kept. The second poll's counters replace the first's; mutant
+/// seen red: `poll` not recording its readings.
 #[test]
 fn cpu_is_the_last_reading_of_each_process_not_a_sum_of_readings() {
     let mut meter = Meter::default();
@@ -83,8 +81,7 @@ fn cpu_is_the_last_reading_of_each_process_not_a_sum_of_readings() {
 }
 
 /// Catches: a process that exits between polls dropping out of the totals (the usage
-/// would shrink when its pid stops answering). Mutant seen red: `poll` clearing the
-/// pids `read` returns nothing for.
+/// would shrink when its pid stops answering). Mutant seen red: `poll` not recording.
 #[test]
 fn an_exited_process_keeps_what_it_was_last_read_with() {
     let mut meter = Meter::default();
