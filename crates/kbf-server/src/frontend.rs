@@ -533,6 +533,13 @@ fn transport(url: &Endpoint, tls: bool) -> Result<(), String> {
 }
 
 impl FrontendFlags {
+    /// What a handover compares of the enroll flags ([`EnrollFlags::handover_key`]); `None`
+    /// without `--enroll-listen`.
+    fn enroll_key(&self) -> Option<String> {
+        let instance = self.handover.as_ref().and_then(|h| h.instance);
+        self.enroll.as_ref().map(|e| e.handover_key(instance))
+    }
+
     /// The CA and the client identity the TLS flags name, or `None` without them.
     ///
     /// # Errors
@@ -966,6 +973,7 @@ impl<'a> Prepared<'a> {
             instance: self.flags.handover.as_ref().and_then(|h| h.instance),
             reapi: self.sockets.reapi.local,
             state: state_uri(self.flags)?.identity(),
+            enroll: self.flags.enroll_key(),
         })
     }
 
@@ -1253,6 +1261,7 @@ impl<'a> Prepared<'a> {
                         .state_store
                         .as_ref()
                         .map_or_else(PathBuf::new, crate::StateStoreUri::identity),
+                    enroll: flags.enroll_key(),
                 };
                 let peer = Peer {
                     successor,
