@@ -523,7 +523,6 @@ const MAY_NAME_THE_PROXY: &[&str] = &[
     "proxy_verb.rs",
     "proxy_verb_copies_tests.rs",
     "proxy_verb_tests.rs",
-    "proxy_verb_copies_tests.rs",
     "installer_toml.rs",
     "setup/proxy.rs",
 ];
