@@ -681,7 +681,7 @@ fn attestations_refuse_a_foreign_workflow_an_unknown_file_and_a_missing_gh() {
 #[test]
 fn a_kbf_tarball_without_its_version_facts_fails_the_sums_check() {
     // Catches: a release set that does not need the facts of its `kbf` (a build job that
-    // lost the step would publish a platform with nothing for an offer to read), and the
+    // lost the step would publish a platform with nothing for a reader of the platform's facts), and the
     // message not naming the tarball and the file missing. The second half is the control:
     // with the facts listed and present the same set passes, so the refusal was for them
     // and for nothing else, and `kbf-daemon`'s tarball (no facts) is not named. Mutant:

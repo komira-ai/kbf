@@ -403,6 +403,10 @@ fn an_identity_file_that_is_not_text_is_refused() {
     );
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("previous.json"), "{err}");
+    // The read error is returned: swallowed, the file parses as empty text and fails as
+    // "not JSON", which would also be a refusal.
+    assert!(!err.contains("not JSON"), "{err}");
+    assert!(err.contains("valid UTF-8"), "{err}");
     assert!(!out.exists(), "notes were written");
 }
 
