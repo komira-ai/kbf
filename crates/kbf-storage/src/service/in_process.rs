@@ -126,7 +126,7 @@ impl Called {
             let messages = stream::iter(write_messages(name, bytes).map(Ok)).boxed();
             self.this
                 .service
-                .write_in(self.generation, None, unowned, messages)
+                .write_in(self.generation, (None, false), unowned, messages)
                 .await
                 .map_err(|status| lift(&status, None))?;
             Ok(digest)

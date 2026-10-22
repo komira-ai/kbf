@@ -59,6 +59,13 @@ impl Born {
         *self.gate.lock().unwrap_or_else(PoisonError::into_inner) = Some(gate);
     }
 
+    /// The generation the gate holds now, else 0 (not known): what a staged object, and a
+    /// blob held in RAM, is dated by.
+    pub(super) fn generation(&self) -> u64 {
+        let gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        gate.as_ref().and_then(|g| g.generation()).unwrap_or(0)
+    }
+
     /// Records that `object` is staged now: the generation held, else 0 (not known). The
     /// first record of an object stands: a block takes several `PutStaged`s, and is as
     /// old as the first.
@@ -181,8 +188,16 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 (staged, mine, bytes)
             })
             .await?;
+        // A blob acknowledged from RAM and not yet written is not staged, but it will be, and
+        // it was acknowledged under the map it is dated by: until it is in the index the
+        // node has not flushed everything from before that map. A node holding nothing
+        // (always, without `--ram-ack-bytes`) is as before.
+        let unwritten = self.held.oldest_born();
         Ok(FlushReport {
-            clear_gen: held.map(|held| self.writer.born.clear(held, mark, &staged, &mine)),
+            clear_gen: held.map(|held| {
+                let clear = self.writer.born.clear(held, mark, &staged, &mine);
+                unwritten.map_or(clear, |born| clear.min(born))
+            }),
             staged_objects: staged.len() as u64,
             staged_bytes: bytes,
         })

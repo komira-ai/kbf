@@ -151,6 +151,12 @@ impl VerifiedBlob {
         })
     }
 
+    /// `bytes` the caller has hashed to `digest` already (the store's streamed put checks
+    /// the hash as the bytes pass), so they are not hashed a second time.
+    pub(crate) const fn trusted(digest: Digest, bytes: Bytes) -> Self {
+        Self { digest, bytes }
+    }
+
     /// Hashes bytes the server made itself.
     #[must_use]
     pub fn hashed(bytes: Bytes) -> Self {

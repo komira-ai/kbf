@@ -2,9 +2,9 @@
 //! disk while it serves, and the bounded drain when it stops
 //! (`docs/design/storage-ram-ack.md`, "Drain and shutdown").
 //!
-//! With `--ram-ack-bytes` at 0 nothing is held: no task is started and a stop drains
-//! nothing. Nothing holds a blob in a running node yet either way, so this changes no
-//! behaviour until the acknowledgement point lands.
+//! With `--ram-ack-bytes` at 0 nothing is held (the acknowledgement point holds no blob at
+//! 0): no task is started and a stop drains nothing, so the flag's default changes no
+//! behaviour.
 
 use std::future::Future;
 use std::sync::Arc;

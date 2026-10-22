@@ -470,10 +470,10 @@ pub(crate) fn holder_of<M: MetaLog + 'static, O: ObjectStore + 'static>(
 }
 
 impl StorageHandle {
-    /// Holds `blob` in this node's RAM as the acknowledgement point will (`Cache::hold`),
-    /// and says what became of it (`None`: the node's cache is gone). Nothing in a running
-    /// node calls it yet; the tests of the node's wiring do (`--ram-ack-bytes` reaches the
-    /// cache, and the stop drains what it holds).
+    /// Holds `blob` in this node's RAM without a write (`Cache::hold`), and says what
+    /// became of it (`None`: the node's cache is gone). For the tests of the node's wiring
+    /// (`--ram-ack-bytes` reaches the cache, and the stop drains what it holds); a write
+    /// reaches the set through `StreamedPut::commit` with `Held`.
     #[doc(hidden)]
     pub fn hold(&self, blob: &VerifiedBlob) -> Option<Hold> {
         (self.holder)(blob)
