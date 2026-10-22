@@ -41,8 +41,6 @@
 //!   confirmed; the writer of the file [`seed`] reads.
 //! - [`archive`], [`binary`] and [`darwin`]: the tarball, the kind of executable and its
 //!   `--version --json`, and on macOS the quarantine attribute and the code signature.
-//! - [`envoy`]: the Envoy of a frontend host, rendered from settings and checked (a library
-//!   for the frontend-update path, with no command line).
 //! - [`proxy_verb`]: `kbf-installer proxy`, the host of the `kbf-proxy` runtime (the one
 //!   public port of a frontend host); it shares nothing with the root helper above.
 //! - [`proxy`]: the frontend proxy's update machinery, against traits (no socket, no child):
@@ -66,7 +64,6 @@ pub mod cli;
 pub mod darwin;
 pub mod database;
 pub mod deploy;
-pub mod envoy;
 pub mod exit;
 pub mod fetch;
 #[cfg(any(test, feature = "testkit"))]

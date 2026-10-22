@@ -71,7 +71,7 @@ addition (storage and daemon).
 | a cordon is durable | **Yes for an operator's cordon.** `farm/durable.rs` keeps a `cordon/<worker>` row (written by `Durable::cordoned` on cordon, drain and uncordon) and recovery reads it back (`cordons`, `restore_cordons`), so a restarted process serves a node as the operator left it. The `kbf-sched/src/cordon.rs` module doc still says "gone after a server restart" and is stale. **Still new for this design**: the takeover writes the predecessor's cordon row, and deletes the successor's own node id's row, in the takeover's state-store transaction (section 6.2); today no takeover path writes a cordon. | `kbf-server/src/farm/durable.rs`, `kbf-server/src/farm/handover.rs`, `kbf-sched/src/cordon.rs` |
 | the Welcome epoch is the state store's | The Welcome carries `Farm::lease_epoch` ("this process's term, or the Raft log's id"); `SqliteStore::open` also bumps its own recorded epoch. Which one `Keep` must hold constant is checked in T-7 (section 6.2). | `kbf-server/src/worker.rs`, `kbf-state/src/sqlite/mod.rs` |
 | the REAPI listener advertises unlimited streams | **No.** `max_concurrent_streams` is `StreamTiming`'s `streams`, at most `MAX_STREAMS` (`i32::MAX / 65536`, 32767); the configured value is what Envoy sees. Section 3.1 derives the breaker from it. | `kbf-server/src/serve.rs`, `streams.rs` |
-| a real Envoy is available to tests | Yes: CI fetches a pinned Envoy and validates the kit's render with `--mode validate`. | `.github/workflows/beta.yml`, `crates/kbf-deploy/tests/envoy_validate.rs` (retired with the kit; the installer's box render is still validated by `crates/kbf-integration-test/tests/envoy_validate.rs`) |
+| a real Envoy is available to tests | No longer: the pinned-Envoy CI steps were removed with the installer's `envoy` module and the kit. | `.github/workflows/beta.yml`, `crates/kbf-deploy/tests/envoy_validate.rs` (retired with the kit; the installer's box render and its validation test were deleted with the installer's `envoy` module) |
 
 ## 3. Topology on one box
 
@@ -120,7 +120,7 @@ that overlap it answers through the successor (section 5.2).
 
 - `kbf_reapi`: the kit's existing `grpc.health.v1` check on the REAPI port, empty service
   name. It is `/readyz`'s evaluation (`grpc_health.rs`); reusing it keeps the checker and the
-  kbf-integration-test test that pins the service names (`crates/kbf-integration-test/tests/envoy_check.rs`).
+  kbf-integration-test test that pinned the service names (deleted with the installer's `envoy` module).
 - `kbf_workers`: an HTTP check of `/readyz` on the instance's API port (`health_check_config.port_value`),
   plain loopback HTTP, since the worker cluster has no TLS of its own. `--api-listen` is already in
   the unit and is required here.
@@ -166,7 +166,7 @@ mutant (section 10).
 
 ## 4. Building on kbf-deploy's envoy kit
 
-No parallel renderer. `envoy/render.rs` already holds the parts to reuse: `ROUTES`,
+No parallel renderer. `envoy/render.rs` (deleted with the installer's `envoy` module) held the parts to reuse: `ROUTES`,
 `ROUTE_TIMEOUT`, `LONG_STREAM`, `upstream_tls`, the cluster builder, the JSON writer that
 makes equal settings equal bytes, and `check.rs` with its route model. Changes:
 

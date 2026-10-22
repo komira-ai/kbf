@@ -21,7 +21,7 @@ the command are here.
 Both instances run the same command line but for `--instance=a|b`. Instance a listens where
 `--listen`, `--worker-listen` and `--api-listen` say; instance b listens ten ports above each
 (port 0, which the system chooses, stays 0), so the two blocks are `base+0..2` and `base+10..12`,
-the ones the installer's Envoy box render (`kbf-installer`, `envoy` module) names. A handover
+the ones `aio-handover.md` (section 3) names. A handover
 goes to the other instance. The two REAPI listeners must be on loopback, since the old one
 forwards the calls that still reach it to the new one. If the REAPI listener has a
 certificate, `--handover-peer-name` (the DNS name the other instance's certificate carries) and
@@ -29,7 +29,7 @@ certificate, `--handover-peer-name` (the DNS name the other instance's certifica
 A frontend without `--instance` refuses every handover.
 
 Envoy's health-check settings are flags (`--envoy-check-interval-ms`, `--envoy-check-timeout-ms`,
-`--envoy-unhealthy-threshold`, defaults 1000, 1000 and 2, the box render's), because the old
+`--envoy-unhealthy-threshold`, defaults 1000, 1000 and 2), because the old
 instance derives from them how long Envoy takes to see the new one healthy and to stop choosing
 the old one: `interval x threshold + timeout + interval`, four seconds by default.
 
