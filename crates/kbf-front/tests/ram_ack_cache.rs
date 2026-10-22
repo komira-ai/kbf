@@ -106,8 +106,7 @@ fn through(reason: &str) -> String {
 /// Gap (b) of the earlier verifiers: a late duplicate of a blob that is already in the
 /// index is not held again. The blob is held, drained and indexed; a second write of it,
 /// committed `Held`, is answered, takes no entry and no budget, and queues nothing for the
-/// drain (the pool is not asked to write it a second time). Mutant: `hold_write` without
-/// the index look (`hold` alone): the duplicate is held, `unwritten().blobs` is 1.
+/// drain (the pool is not asked to write it a second time).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_late_duplicate_of_a_blob_on_disk_is_not_held_again() {
     let rig = Rig::new();
@@ -133,12 +132,10 @@ async fn a_late_duplicate_of_a_blob_on_disk_is_not_held_again() {
     assert_eq!(rig.fs.syncs(), syncs, "and wrote nothing");
 }
 
-/// T10. Two writes of one digest that are both committed before the drain run: the second is
-/// answered without a second entry or a second permit. With room for one blob, the second
-/// write is not counted as a full budget; the drain writes the blob once and gives the
-/// budget back, so a different blob is then held. Mutant: `hold_write` skips the
-/// held-set look and the insert overwrites (a second permit is asked: `writethrough{budget}`
-/// is counted).
+/// T10. Two writes of one digest that are both committed before the drain run: the second
+/// is answered without a second entry or a second permit. With room for one blob, the
+/// second write is not counted as a full budget; the drain writes the blob once and gives
+/// the budget back, so a different blob is then held.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_writes_of_one_digest_hold_it_once() {
     let rig = Rig::new();
@@ -165,8 +162,7 @@ async fn two_writes_of_one_digest_hold_it_once() {
 /// row (the others read 0): a blob over 4 MiB (`large`), a blob the budget has no room for
 /// (`budget`, with the blob written and indexed), one with no replica (`single_owner`) and
 /// one whose replica was lost (`replica_lost`). Catches a reason counted under another
-/// label or not at all. Mutant: `WriteThrough::Large` and `StorePath` swapped in
-/// `commit_held`.
+/// label or not at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_write_through_is_counted_for_its_own_reason() {
     let rig = Rig::new();
@@ -219,8 +215,7 @@ async fn each_write_through_is_counted_for_its_own_reason() {
 /// `store_path`; with the pool's one place taken behind a writer parked in `sync` it is
 /// `queue_full`. The second write is queued by polling its commit once (the pool takes the
 /// job before the first await), so the third finds the queue full without a race. Catches
-/// the two counted as one, and either not counted. Mutant: `store_reason` always
-/// `StorePath`.
+/// the two counted as one, and either not counted.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_blob_that_goes_straight_to_the_store_is_counted_for_why() {
     let rig = Rig::new();
@@ -286,7 +281,7 @@ async fn a_blob_that_goes_straight_to_the_store_is_counted_for_why() {
 /// acknowledged under, as it is for a staged object, so the handoff does not read a node
 /// that holds acknowledged blobs as flushed through the new map. Held at map 5 and the map
 /// moved to 7, the report says 5; once the blob is drained and flushed it says 7. Catches
-/// a report that ignores the set. Mutant: `flush_report` without the `oldest_born` minimum.
+/// a report that ignores the set.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_holding_blobs_does_not_report_itself_flushed_through_the_newer_map() {
     #[derive(Debug)]
@@ -327,9 +322,8 @@ async fn a_node_holding_blobs_does_not_report_itself_flushed_through_the_newer_m
 /// A drain between the report's two looks (the set, then the staged objects) does not lose
 /// the cap. The report reads the set first; the hook between the looks drains the blob
 /// (staged, entry gone) and the query then finds the staged object, dated by the
-/// acknowledgement: 5. Read the other way round (the query, the hook's drain, then the set),
-/// the object is not in the query and the set is empty, and the report says 7. Mutant:
-/// `flush_report` reads `oldest_born` after the query.
+/// acknowledgement: 5. Read the other way round (the query, the hook's drain, then the
+/// set), the object is not in the query and the set is empty, and the report says 7.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drain_between_the_flush_reports_looks_does_not_lose_the_cap() {
     #[derive(Debug)]
@@ -380,8 +374,8 @@ async fn a_drain_between_the_flush_reports_looks_does_not_lose_the_cap() {
 }
 
 /// A node with the producer off (budget 0, the default) holds nothing whatever the storage
-/// layer asks: `Held` is committed to disk, uncounted, and `Through` rows read 0.
-/// Catches the default changing a write. Mutant: `ram_ack_enabled` true at 0.
+/// layer asks: `Held` is committed to disk, uncounted, and `Through` rows read 0. Catches
+/// the default changing a write.
 #[tokio::test(flavor = "multi_thread")]
 async fn at_a_zero_budget_held_is_a_plain_commit_and_nothing_is_counted() {
     let rig = Rig::new();
