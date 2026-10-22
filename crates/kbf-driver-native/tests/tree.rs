@@ -15,6 +15,8 @@ use std::time::Duration;
 
 use kbf_daemon::{Runtime, RuntimeError};
 use kbf_driver_native::MemoryPolicy;
+use kbf_proto::worker::{ResourceUsage, UsageBasis};
+use kbf_types::LeaseId;
 use support::{
     MemoryCas, PROMPT, Spec, alive, config, no_leases, pid_in, run, runtime, scratch, work,
 };
@@ -211,4 +213,92 @@ async fn an_action_within_its_limit_runs_to_the_end() {
         let result = rt.run(work(seq, action, booked)).await.expect("ran");
         assert_eq!(result.exit_code, 0, "booked {booked}");
     }
+}
+
+const MIB: u64 = 1 << 20;
+
+/// An action that holds 208 MiB (13 chunks of 16) and burns CPU for 1.5 s: the usage a
+/// lease of it must report on macOS.
+const HEAVY: &str = "alloc 208 ; burn 1.5";
+
+/// What a lease of [`HEAVY`] reported, as the footprint block says it.
+fn assert_heavy(usage: &ResourceUsage, least_wall: Duration) {
+    assert_eq!(usage.basis(), UsageBasis::MacFootprint);
+    assert_eq!(
+        usage.cgroup, None,
+        "a footprint basis never carries a cgroup block"
+    );
+    let f = usage.footprint.expect("a footprint block");
+    let peak = f.peak_footprint_bytes.expect("a peak");
+    assert!(
+        peak >= 200 * MIB,
+        "peak {peak} is under what the action touched"
+    );
+    let user = f.cpu_user_micros.expect("user cpu");
+    assert!(user >= 500_000, "user cpu {user} us after burning 1.5 s");
+    assert!(f.cpu_system_micros.is_some());
+    let wall = f.wall_micros.expect("wall");
+    assert!(
+        wall >= u64::try_from(least_wall.as_micros()).expect("micros"),
+        "wall {wall} us"
+    );
+    // The legacy fields carry the same numbers.
+    assert_eq!(usage.peak_memory_bytes, peak);
+    assert_eq!(usage.cpu_user_micros, user);
+    eprintln!(
+        "USAGE tree peak={peak} user_us={user} system_us={:?} wall_us={wall}",
+        f.cpu_system_micros
+    );
+}
+
+/// Catches: a successful lease whose usage is not in its result metadata, a peak that
+/// is a footprint sampled at the end (the action's memory is gone by then) rather than
+/// its high-water mark, CPU time not read (zero or the time of one poll), a wall time
+/// that is not the action's, and, off macOS, a usage invented for a platform with no
+/// footprint counters. Green on a macOS runner (peak 224 MB, user CPU 1.5 s to 1.9 s
+/// for 208 MiB and a 1.5 s burn); no mutant was run against it (macOS only).
+#[tokio::test]
+async fn a_lease_reports_its_usage_on_macos_only() {
+    let dir = scratch("usage-success");
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config(&dir), &cas);
+    let result = run(&rt, &cas, 1, &Spec::act(HEAVY)).await.expect("ran");
+    assert_eq!(result.exit_code, 0, "{}", support::stderr(&cas, &result));
+    let usage = ResourceUsage::in_result(&result);
+    if cfg!(target_os = "macos") {
+        assert_heavy(&usage.expect("a usage"), Duration::from_millis(1400));
+    } else {
+        assert_eq!(usage, None, "no basis is invented off macOS");
+    }
+    assert_eq!(
+        rt.failed_usage(LeaseId::new(1, 1)),
+        None,
+        "a result has none"
+    );
+}
+
+/// Catches: a lease that ended in an error (here a timeout) reporting no usage through
+/// `failed_usage`, the usage handed out twice, and one kept under another lease's id.
+/// The action held its memory and burned CPU for over a second before the timeout.
+/// Mutant seen red (Linux unit test of the same map): `remove` replaced by `get().cloned()`;
+/// this test itself ran green on a macOS runner.
+#[tokio::test]
+async fn a_timed_out_lease_tells_its_usage_once() {
+    let dir = scratch("usage-timeout");
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config(&dir), &cas);
+    let spec = Spec::act("alloc 208 ; burn 30").timeout(Duration::from_millis(2000));
+    let outcome = run(&rt, &cas, 3, &spec).await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::TimedOut { .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(rt.failed_usage(LeaseId::new(1, 4)), None, "another lease's");
+    let usage = rt.failed_usage(LeaseId::new(1, 3));
+    if cfg!(target_os = "macos") {
+        assert_heavy(&usage.expect("a usage"), Duration::from_millis(1900));
+    } else {
+        assert_eq!(usage, None);
+    }
+    assert_eq!(rt.failed_usage(LeaseId::new(1, 3)), None, "taken once");
 }

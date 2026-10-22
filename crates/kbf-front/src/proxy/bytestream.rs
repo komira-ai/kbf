@@ -19,6 +19,24 @@
 //! failure after it ends the call with that error, and the client resumes with
 //! `read_offset`.
 //!
+//! **The hold.** A storage node that restarts is away for a while, so a call that no owner
+//! could answer is held and tried again, as the router holds the whole-blob calls
+//! ([`kbf_route::Hold`]: the same pauses, 250 ms doubling to 5 s, and the same bound, which
+//! is [`Owners::with_hold`]'s). Every try reads the placement again, so an owner that the
+//! map marked down and then took back is found. A Read is held while it has not sent a
+//! byte: when every owner is down in the map, or when none answered and one of them failed
+//! UNAVAILABLE (the others may lack the blob only because the one that is away holds it; a
+//! blob every owner said it lacks is NOT_FOUND at once). A Read that has sent its first
+//! frame is the node's, as above: the client holds part of the stream and resumes it with
+//! `read_offset`, which this does not wait for. A Write is held while it can still be sent
+//! whole (below): when the map has no writer for the blob, or every write owner could not
+//! be reached before the call went on. Once the client's bytes past the request's first
+//! frames have been passed to a node they cannot be sent again (the proxy holds no blob),
+//! so a Write in that state is not held. Nothing here waits beyond what the proxy already
+//! keeps for failover: those first frames. A QueryWriteStatus is not held: it only says
+//! where an upload stands, and a client whose query fails starts the upload again, which is
+//! held.
+//!
 //! **STALE_MAP.** A node that holds a newer map answers FAILED_PRECONDITION with its
 //! generation; on this raw path that answer goes to the client as it is, with no refetch
 //! of the map and no second try (the whole-blob calls, which go through the router, do
@@ -46,7 +64,8 @@
 //! answer from a node that was reached (INVALID_ARGUMENT, a map generation that is stale,
 //! a digest that does not match), and nothing is remembered of the node that failed: the
 //! next upload of a blob it owns tries it first again. If every owner fails, the first
-//! one's failure is the client's. Without a map there is one writer, and no next one.
+//! one's failure is the client's, once the hold has ended (also if the map has no writer
+//! left by then). Without a map there is one writer, and no next one.
 //!
 //! **QueryWriteStatus** asks the writer.
 //!
@@ -62,7 +81,9 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use kbf_auth::{Authorizers, authorize};
+use kbf_route::Waiting;
 use kbf_storage::service::MAP_GENERATION_HEADER;
+use kbf_types::Digest;
 use tonic::body::Body;
 use tonic::codegen::{Service, http};
 use tonic::server::NamedService;
@@ -111,6 +132,25 @@ const fn next_owner_may_answer(code: Code) -> bool {
 
 fn unreachable_node(owner: &Owner, error: &dyn std::fmt::Display) -> Status {
     Status::unavailable(format!("storage node {}: {error}", owner.id()))
+}
+
+/// A round of asking the owners of a blob that none of them answered.
+struct Unanswered {
+    /// What the client is told if the round is the last.
+    status: Status,
+    /// Whether an owner was away (the map has none to ask, or one failed UNAVAILABLE), so
+    /// that another round may find the blob where this one could not.
+    away: bool,
+}
+
+impl Unanswered {
+    /// A node's refusal of the request, which no other round would answer differently.
+    fn refused(status: Status) -> Self {
+        Self {
+            status,
+            away: false,
+        }
+    }
 }
 
 impl RawByteStream {
@@ -166,7 +206,10 @@ impl RawByteStream {
         // What was read to find the name is the part of the upload that can be sent again.
         upload.seal();
         let resource = self.authorized(parts, Method::Write, &name).await?;
-        let mut owner = self.owners.writer(&resource.digest)?;
+        // The upload waits for an owner while it can be sent whole: nothing of it but the
+        // frames above has been read from the client.
+        let mut waiting = self.owners.waiting();
+        let mut owner = self.writer_held(&resource.digest, &mut waiting).await?;
         // The nodes this upload could not reach, and the first failure.
         let mut skipped: Vec<Arc<str>> = Vec::new();
         let mut first_failure: Option<Status> = None;
@@ -200,12 +243,30 @@ impl RawByteStream {
                 // went past the first frames, the next owner is sent the same upload.
                 skipped.push(Arc::from(owner.id()));
                 let next = self.owners.writer_after(&resource.digest, &skipped);
-                if let (Ok(next), Some(body)) = (next, upload.again()) {
-                    tracing::warn!(node = owner.id(), status = %unreached, "storage node could not take the upload; sending it to the next owner");
-                    first_failure.get_or_insert(unreached);
-                    owner = next;
-                    up = Pass::new(body, &self.meter, Method::Write, Direction::ToStorage);
-                    continue;
+                if let Some(body) = upload.again() {
+                    if let Ok(next) = next {
+                        tracing::warn!(node = owner.id(), status = %unreached, "storage node could not take the upload; sending it to the next owner");
+                        first_failure.get_or_insert(unreached);
+                        owner = next;
+                        up = Pass::new(body, &self.meter, Method::Write, Direction::ToStorage);
+                        continue;
+                    }
+                    // Every owner has been tried and the upload can still be sent whole:
+                    // wait, then try them all again, first the writer of the map as it is
+                    // by then.
+                    if waiting.again().await {
+                        tracing::warn!(node = owner.id(), status = %unreached, "no storage node could take the upload; holding it");
+                        first_failure.get_or_insert(unreached);
+                        skipped.clear();
+                        // A map that loses its writers meanwhile leaves the node's failure
+                        // the client's, not the lookup's.
+                        owner = match self.writer_held(&resource.digest, &mut waiting).await {
+                            Ok(writer) => writer,
+                            Err(status) => return Err(first_failure.unwrap_or(status)),
+                        };
+                        up = Pass::new(body, &self.meter, Method::Write, Direction::ToStorage);
+                        continue;
+                    }
                 }
                 if let Some(first) = first_failure {
                     return Err(first);
@@ -217,8 +278,28 @@ impl RawByteStream {
         }
     }
 
+    /// The node an upload of `digest` goes to, waiting for one while the map has none
+    /// (every write owner is down, or the map is gone for the moment). The last answer is
+    /// the lookup's own once the hold has ended; a write that has already been refused by
+    /// a node is told that node's failure instead (`write`).
+    async fn writer_held(
+        &self,
+        digest: &Digest,
+        waiting: &mut Waiting<'_>,
+    ) -> Result<Owner, Status> {
+        loop {
+            let status = match self.owners.writer(digest) {
+                Ok(owner) => return Ok(owner),
+                Err(status) => status,
+            };
+            if !waiting.again().await {
+                return Err(status);
+            }
+        }
+    }
+
     /// `Read` and `QueryWriteStatus`: one small request message, replayed to each owner
-    /// tried.
+    /// tried. A read is held before its first byte, as above.
     async fn unary(
         &self,
         parts: &http::request::Parts,
@@ -230,31 +311,66 @@ impl RawByteStream {
             Status::invalid_argument("the request is shorter than its resource_name")
         })?;
         let resource = self.authorized(parts, method, &name).await?;
-        // A read asks every owner in turn; the status of an upload is the writer's alone.
-        let owners = if method == Method::Read {
-            self.owners.for_digest(&resource.digest)
-        } else {
-            Arc::from(vec![self.owners.writer(&resource.digest)?])
-        };
-        // NOT_FOUND is the answer only if every owner said it: an owner that could not say
-        // (down, broken) may hold the blob, so the first of those is what the client is
-        // told, as the router does for a whole-blob read.
+        // The status of an upload is the writer's alone, and not held.
+        if method != Method::Read {
+            let owners = [self.owners.writer(&resource.digest)?];
+            let answered = self.ask_all(&owners, parts, &request, method).await;
+            return answered.map_err(|unanswered| unanswered.status);
+        }
+        // A read asks every owner in turn, and while none answers and one is away, again
+        // after a pause, against the placement as it is by then.
+        let mut waiting = self.owners.waiting();
+        loop {
+            let owners = self.owners.for_digest(&resource.digest);
+            let unanswered = match self.ask_all(&owners, parts, &request, method).await {
+                Ok(response) => return Ok(response),
+                Err(unanswered) => unanswered,
+            };
+            // A blob every owner lacks is not there; it is not worth the wait.
+            if !unanswered.away {
+                return Err(unanswered.status);
+            }
+            if !waiting.again().await {
+                return Err(unanswered.status);
+            }
+        }
+    }
+
+    /// The first answer of `owners`, asked in turn. NOT_FOUND is the answer only if every
+    /// owner said it: an owner that could not say (down, broken) may hold the blob, so the
+    /// first of those is what the client is told, as the router does for a whole-blob read.
+    async fn ask_all(
+        &self,
+        owners: &[Owner],
+        parts: &http::request::Parts,
+        request: &Bytes,
+        method: Method,
+    ) -> Result<http::Response<Body>, Unanswered> {
         let (mut failure, mut missed) = (None, None);
-        for owner in owners.iter() {
-            match self.ask(owner, parts, &request, method).await {
+        // No owner at all (every one is down in the map, or the map is lost for the moment)
+        // is an owner away too.
+        let mut away = owners.is_empty();
+        for owner in owners {
+            match self.ask(owner, parts, request, method).await {
                 Ok(response) => return Ok(response),
                 Err(status) if next_owner_may_answer(status.code()) => {
                     tracing::warn!(node = owner.id(), %status, "storage node failed before its first byte");
+                    away |= status.code() == Code::Unavailable;
                     if status.code() == Code::NotFound {
                         missed = Some(status);
                     } else {
                         failure.get_or_insert(status);
                     }
                 }
-                Err(status) => return Err(status),
+                // A refusal of the request itself is the same everywhere: no other round
+                // would answer it.
+                Err(status) => return Err(Unanswered::refused(status)),
             }
         }
-        Err(failure.or(missed).unwrap_or_else(no_storage))
+        Err(Unanswered {
+            status: failure.or(missed).unwrap_or_else(no_storage),
+            away,
+        })
     }
 
     /// One owner's answer, once it has failed or sent its first byte.

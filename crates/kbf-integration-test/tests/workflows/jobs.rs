@@ -96,12 +96,6 @@ pub fn push_filters(text: &str) -> Result<Vec<(String, Vec<String>)>, String> {
     trigger_filters(text, "push")
 }
 
-/// The filters under the workflow's `workflow_run` trigger (`workflows`, `types`,
-/// `branches`), as [`push_filters`] reads those of `push`.
-pub fn workflow_run_filters(text: &str) -> Result<Vec<(String, Vec<String>)>, String> {
-    trigger_filters(text, "workflow_run")
-}
-
 fn trigger_filters(text: &str, trigger: &str) -> Result<Vec<(String, Vec<String>)>, String> {
     let root = yaml::load(text)?;
     let on = get(top_of(&root)?, "on").ok_or("the workflow has no `on:`")?;
@@ -131,19 +125,6 @@ fn trigger_filters(text: &str, trigger: &str) -> Result<Vec<(String, Vec<String>
         .collect()
 }
 
-/// The workflow's own `name:` (its key matched ignoring ASCII case): `None` without one.
-/// An error when the text does not parse or the name is not a string.
-pub fn workflow_name(text: &str) -> Result<Option<String>, String> {
-    let root = yaml::load(text)?;
-    match get(top_of(&root)?, "name") {
-        None => Ok(None),
-        Some(name) => name
-            .as_str()
-            .map(|n| Some(n.to_owned()))
-            .ok_or_else(|| "the workflow's `name` is not a string".to_owned()),
-    }
-}
-
 /// The job `job`'s own `env:` as `(name, value)`; empty without one. An error when it is
 /// not a mapping of strings.
 pub fn job_env(text: &str, job: &str) -> Result<Vec<(String, String)>, String> {
@@ -162,18 +143,6 @@ pub fn job_env(text: &str, job: &str) -> Result<Vec<(String, String)>, String> {
             .collect(),
         Some(_) => Err(format!("the `env` of job `{job}` is not a mapping")),
     }
-}
-
-/// Whether the workflow has the top-level key `key` (matched ignoring ASCII case).
-pub fn workflow_has_key(text: &str, key: &str) -> Result<bool, String> {
-    let root = yaml::load(text)?;
-    Ok(get(top_of(&root)?, key).is_some())
-}
-
-/// Whether the job `job` has the key `key` (matched ignoring ASCII case).
-pub fn job_has_key(text: &str, job: &str, key: &str) -> Result<bool, String> {
-    let root = yaml::load(text)?;
-    Ok(get(job_of(&root, job)?, key).is_some())
 }
 
 /// The inputs of the `workflow_dispatch` trigger as `(name, required)`: none when the trigger

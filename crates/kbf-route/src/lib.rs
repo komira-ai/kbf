@@ -62,8 +62,9 @@
 //!   and a read before its first byte. A read that fails after bytes have passed on is
 //!   resumed ([`MAX_RESUMES`]) without a hold. A router made by [`Router::new`] holds
 //!   nothing; the frontend and the daemon use [`DEFAULT_HOLD`]. A caller that talks to the
-//!   nodes itself from a [`Placement`] (the frontend's pass-through of a ByteStream) is not
-//!   held by this.
+//!   nodes itself from a [`Placement`] (the frontend's pass-through of a ByteStream) holds
+//!   with the same primitives: a [`Hold`] of its own, begun for each call, and its
+//!   [`Waiting::again`] between tries, which pauses and ends as the router's hold does.
 //!
 //! # What it does not do
 //!
@@ -97,7 +98,7 @@ mod source;
 mod write;
 
 pub use closure::{ClosureStats, DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL};
-pub use hold::{DEFAULT_HOLD, HoldClock};
+pub use hold::{DEFAULT_HOLD, Hold, HoldClock, Waiting};
 pub use nodes::{Liveness, Nodes, TlsNodes};
 pub use repair::{MAX_REPAIRS_IN_FLIGHT, ReadRepair, RepairLimit};
 pub use resume::MAX_RESUMES;

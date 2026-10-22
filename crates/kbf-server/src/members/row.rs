@@ -9,6 +9,7 @@ use kbf_state::{StoreTime, Version, Versioned};
 use prost::Message as _;
 
 use super::MembershipError;
+use super::facts::{NodeFacts, capped};
 use super::handoff::Fill;
 use crate::storage_health::{Debts, Report, Reported, Writes};
 use crate::vitals::{StoredVitals, Vitals};
@@ -39,6 +40,17 @@ pub(super) struct Row {
     /// absent from a row written by a registration, and by a frontend built before it.
     #[prost(message, optional, tag = "6")]
     fill: Option<StoredFill>,
+    /// What the node said of the build it runs and its metadata log ([`NodeFacts`]): tags 7
+    /// to 9, each with presence, so a row that names none (written before the tags existed,
+    /// or by a node that says none of it) reads `None`, never 0. A frontend built before
+    /// them drops them when it rewrites the row; the node's next heartbeat to a frontend
+    /// that knows them brings them back (`facts.rs`).
+    #[prost(uint32, optional, tag = "7")]
+    runs_log: Option<u32>,
+    #[prost(uint32, optional, tag = "8")]
+    log_version: Option<u32>,
+    #[prost(string, optional, tag = "9")]
+    build_commit: Option<String>,
 }
 
 /// [`Fill`] as stored.
@@ -140,6 +152,9 @@ pub(super) struct Live {
     pub(super) planned_until: Option<StoreTime>,
     /// What its newest heartbeat said of the handoff ([`Fill::default`]: nothing).
     pub(super) fill: Fill,
+    /// What its registration and heartbeats said of its build and log ([`NodeFacts`]); all
+    /// `None` for a row that names none.
+    pub(super) facts: NodeFacts,
     pub(super) version: Version,
 }
 
@@ -159,13 +174,20 @@ pub(super) fn decode_row(stored: &Versioned) -> Result<Live, MembershipError> {
         planned_until: (row.planned_until_nanos > 0)
             .then(|| StoreTime::from_duration(Duration::from_nanos(row.planned_until_nanos))),
         fill: row.fill.map_or_else(Fill::default, Fill::from),
+        facts: NodeFacts {
+            runs_log: row.runs_log,
+            log_version: row.log_version,
+            build_commit: row.build_commit,
+        },
         version: stored.version,
     })
 }
 
 /// The value of the row of `member` at `boot`, for a node that registered naming
 /// `protocol`, with `report` as its newest debts report and `planned_until` the end of an
-/// operator's planned restart, and `fill` what its newest heartbeat said of the handoff.
+/// operator's planned restart, `fill` what its newest heartbeat said of the handoff and
+/// `facts` what the node said of its build and log (its `build_commit` cut to
+/// [`super::facts::MAX_BUILD_COMMIT`] bytes).
 pub(super) fn encode_row(
     member: &Member,
     boot: u64,
@@ -173,6 +195,7 @@ pub(super) fn encode_row(
     report: Option<&Report>,
     planned_until: Option<StoreTime>,
     fill: Fill,
+    facts: &NodeFacts,
 ) -> Vec<u8> {
     Row {
         member: Some(pb::Member::from(member)),
@@ -186,6 +209,9 @@ pub(super) fn encode_row(
         }),
         // A row that has heard nothing stores nothing, as before the field existed.
         fill: (fill != Fill::default()).then(|| StoredFill::from(fill)),
+        runs_log: facts.runs_log,
+        log_version: facts.log_version,
+        build_commit: facts.build_commit.as_deref().map(capped),
     }
     .encode_to_vec()
 }

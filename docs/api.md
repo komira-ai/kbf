@@ -236,9 +236,12 @@ frontend, a daemon opens a worker stream.
 ```json
 { "generation": 7,
   "members": [
-    { "id": 1, "addr": "192.0.2.11:8982", "state": "active", "weight": 1, "protocol": 1 },
-    { "id": 2, "addr": "192.0.2.12:8982", "state": "draining", "weight": 1, "protocol": 2 },
-    { "id": 3, "addr": "192.0.2.13:8982", "state": "down", "weight": 2, "protocol": null }
+    { "id": 1, "addr": "192.0.2.11:8982", "state": "active", "weight": 1, "protocol": 1,
+      "runs_log": 5, "log_version": 4, "build_commit": "0123456789abcdef0123456789abcdef01234567" },
+    { "id": 2, "addr": "192.0.2.12:8982", "state": "draining", "weight": 1, "protocol": 2,
+      "runs_log": null, "log_version": null, "build_commit": null },
+    { "id": 3, "addr": "192.0.2.13:8982", "state": "down", "weight": 2, "protocol": null,
+      "runs_log": null, "log_version": null, "build_commit": null }
 ],
   "oldest_protocol": 1, "protocol_unknown": 1 }
 ```
@@ -251,12 +254,22 @@ frontend, a daemon opens a worker stream.
 | `state` | `joining` (registered, a write owner, read last), `catching_up`, `active` (a full owner), `draining` (takes no new writes) or `down` (its lease lapsed; kept in the map for the dwell, then it leaves the list) |
 | `weight` | its share of the digests relative to the others |
 | `protocol` | the protocol version in the `RegisterRequest` that wrote the member's row (a heartbeat and a state change keep it; a new registration of the member replaces it). `null` when the row names none, as a row written before this field existed, and for a `down` member: its row expires with its heartbeats, and the version went with it |
+| `runs_log` | the newest metadata-log machine version the node's build can raise its log to, as the `RegisterRequest` that wrote the row said (a heartbeat never replaces it; it fills it only when the row holds none) |
+| `log_version` | the machine version the node's metadata log was at in its newest heartbeat (a registration says it too); it rises when the log is raised |
+| `build_commit` | the commit the node's binary was built from, as its registration said (a heartbeat never replaces it; it fills it only when the row holds none): 40 hex digits, or the 12-digit commit when the build did not know the full one, or the text `unknown` when the build had no git checkout; at most 64 bytes are kept |
 | `oldest_protocol` | the least `protocol` among the members whose `protocol` is not `null`; `null` if none is |
 | `protocol_unknown` | how many members have a `null` `protocol`. Never counted in `oldest_protocol`: read the two together, as for [`GET /v1/nodes`](#get-v1nodes) |
 
 The registration is judged against the map's floor once, when it is made
 ([design/frontend-proxy.md](design/frontend-proxy.md) section 9); `protocol` is what it
 named, and nothing judges it again.
+
+`runs_log`, `log_version` and `build_commit` are information only: nothing in the frontend
+decides on them yet. Each is `null`, never `0` or `""`, when the node did not say it (a node
+of an older build sends none of them), and for a `down` member, whose row went with its
+heartbeats. A frontend built before these fields drops them when it rewrites a member's row;
+they read `null` until the node's next heartbeat to a frontend that knows them brings them back
+(while an older frontend still receives the node's heartbeats, they stay `null`).
 
 A node that registers for the first time in a farm formed more than a minute ago is
 `joining` until the operator promotes it with `POST /v1/members/{id}`; unless the frontend runs
@@ -1358,14 +1371,6 @@ could not keep. Without the flag these families are absent and nothing is record
 | `kbf_history_pending_rows` | gauge | index rows the writer has not applied yet |
 | `kbf_history_open_invocations` | gauge | invocations the writer holds state for |
 
-The release poller (`--release-poll-every-secs`, on the active frontend) adds these families
-while it runs; without it they are absent.
-
-| Family | Type | What it measures |
-|---|---|---|
-| `kbf_release_poll_polls_total`, `kbf_release_poll_not_modified_total`, `kbf_release_poll_proposals_total`, `kbf_release_poll_errors_total` | counter | the release poller's polls begun, polls answered "not modified", proposals written and polls that failed (the request, the feed or the update rows); present only when the poller runs |
-| `kbf_release_poll_ignored_total{reason}` | counter | feed entries that were not candidates, by the first reason met: `malformed`, `draft`, `prerelease`, `not_version_tag`, `no_commit`, `ref_not_allowed`, `no_checksums`, `unattested` |
-
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
 nodes' slots means work is waiting that placement cannot use (look at the node's booking and
 `GET /v1/nodes`). `kbf_sched_queued` low while buck2 has many Executes open means they have not
@@ -2055,7 +2060,8 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
 
 - `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms"},
   "paused": bool, "policy": null | {...}, "proposals": [...], "releases": <the body of GET /v1/releases>}`.
-  `proposals` are the releases the release poller found (`--release-poll-every-secs`), oldest
+  `proposals` are the rows under `update/proposed/` (the release poller that wrote them was
+  removed; the list is empty on a new farm and keeps the rows an older one wrote), oldest
   first, each `{"commit", "tag", "published_at_secs", "proposed_at_ms"}`: the newest published
   GitHub release of a `v*` tag whose notes name an allowed ref and a commit and that lists
   `SHA256SUMS` and a provenance bundle for each tarball. Nothing is verified and nothing is

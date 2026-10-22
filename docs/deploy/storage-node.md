@@ -541,6 +541,50 @@ kubelet's default `failSwapOn` would take the node out of its cluster at its nex
 restart; `--kubelet-allows-swap` says its config sets `failSwapOn: false`. `--remove`
 turns it off, drops the line and removes the file.
 
+## Acknowledging writes from RAM: `--ram-ack-bytes`
+
+By default (`--ram-ack-bytes=0`) a storage node acknowledges a write after the blob is
+synced on its hot disk and indexed, and the second owner has done the same. With
+`--ram-ack-bytes=N` a node acknowledges a blob of at most 4 MiB once **both owners hold it
+verified in RAM**, the second owner first, and writes it to its own disk afterwards. The
+design, the rules it keeps and the crash tests are
+[storage-ram-ack.md](../design/storage-ram-ack.md). Set it on every storage node of a
+farm, or on none: a node with 0 still holds the blob its peer asks it to (it writes it to
+disk before it answers), and the farm then acknowledges from RAM on one side only.
+
+What the flags mean, per storage node (`kbf storage`, and the storage half of
+`kbf storage-and-daemon`; `kbf all-in-one` refuses them):
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--ram-ack-bytes` | 0 (off) | The most bytes of acknowledged blobs the node holds in RAM and has not yet written to its disk. A blob that finds the budget full is written to the disk before it is acknowledged, never waited for on the budget. The node can hold this beside `--write-bytes-in-flight`. |
+| `--ram-drain-deadline` | 30 s | How long a stopping node waits for its held blobs to reach its disk, after its calls have ended. What is left is lost to the stop and logged at error level. `SIGKILL` and a power loss do not drain. |
+| `--ram-peer-grace` | 5 s | How long after its own write a node waits before it asks the other owner whether the blob is on that owner's disk; a no, or no answer, is a repair debt. |
+| `--durable-wait` | 10 s | How long an action-cache write waits for the blobs it names to reach an owner's disk. Under half the 120 s a chain waits for a replica's commit. |
+
+What is not acknowledged from RAM, and is counted in
+`kbf_storage_ram_writethrough_total{reason}` when the node has the flag on: a blob over
+4 MiB (`large`), a blob with one owner (`single_owner`), a replica that cannot be reached
+(`replica_lost`, with its repair debt journaled first), a full budget (`budget`), a full
+write-pool queue (`queue_full`) and a blob that goes straight to the object store
+(`store_path`). A `Segments` upload from a daemon is always acknowledged from the disk.
+
+The loss window: a blob acknowledged from RAM is lost if **both** owners lose their RAM
+before either has written it (both processes killed, or both hosts losing power, inside
+the write-behind window, which is milliseconds when the disk keeps up and grows with a slow
+or failing disk). The writer then uploads it again; no action-cache entry names it, so the
+action reruns and a missing output is never served. One owner lost loses nothing: the
+other serves the blob, writes it, and owes the lost one a copy (`under_replicated_blobs`).
+
+Metrics, beside the write tier's: `kbf_storage_ram_unwritten_bytes` and
+`kbf_storage_ram_unwritten_blobs` (what is acknowledged and not yet in the index),
+`kbf_storage_ram_unwritten_oldest_seconds` (watch it: it grows when the disk stops taking
+the write-behind), `kbf_storage_ram_budget_bytes`, `kbf_storage_ram_drain_failures_total`,
+`kbf_storage_ram_writethrough_total{reason}` and `kbf_storage_ram_unconfirmed_blobs` (blobs
+whose other owner is not yet known to have them on its disk). `meta-backup` refuses while
+`unwritten_bytes` is above 0. A draining member that still holds blobs does not report
+itself flushed for the handoff.
+
 ## Metadata backup and restore
 
 kbf-server has no snapshot or backup command yet. The metadata directory (`--meta-dir`,
@@ -565,8 +609,8 @@ kbf-deploy linux meta-verify --archive FILE --into DIR
   `kbf_write_tier_unflushed_bytes` and `kbf_write_tier_unflushed_blocks` are 0 and
   `kbf_write_tier_flush_conflicts_total` is 0, and refuses while
   `kbf_storage_ram_unwritten_bytes` (blobs acknowledged from RAM and not yet written to the
-  disk; always 0 until a node acknowledges from RAM) is above 0; an answer it cannot read
-  is a refusal. A server that does not print the RAM family holds none.
+  disk; 0 unless the node runs with `--ram-ack-bytes` over 0) is above 0; an answer it
+  cannot read is a refusal. A server that does not print the RAM family holds none.
   A stop that passes `--ram-drain-deadline` loses the blobs that were acknowledged but are
   held only in RAM (the stop logs them at error level, with their count and bytes); that is
   why `meta-backup` refuses while any are held.

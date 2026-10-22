@@ -84,7 +84,6 @@ fn start() -> Frontend {
         token: None,
         local_cache: None,
         releases: None,
-        poll: None,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let bound = bind_server_with_state(

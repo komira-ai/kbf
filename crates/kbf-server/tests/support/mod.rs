@@ -355,7 +355,6 @@ impl Cell {
             token: None,
             local_cache: None,
             releases: None,
-            poll: None,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         Self::serve_with_map(
@@ -427,7 +426,6 @@ impl Cell {
             token: Some(api_token()),
             local_cache: None,
             releases: None,
-            poll: None,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let cache = Self::cold_cache(&store, None).await;

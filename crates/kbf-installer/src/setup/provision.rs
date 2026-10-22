@@ -24,7 +24,7 @@ use kbf_state::postgres::Unreached;
 
 use super::SetupError;
 use super::os::Os;
-use super::plan::service_user_name;
+use super::plan::database_user_name;
 use super::validate::LocalDatabase;
 use crate::cli::Mode;
 use crate::layout::Platform;
@@ -308,7 +308,7 @@ pub fn check_service_login(
     local: &LocalDatabase,
     mode: Mode,
 ) -> Result<(), SetupError> {
-    let service = service_user_name(mode);
+    let service = database_user_name(mode);
     let Some(user) = os.user(service)? else {
         return Ok(());
     };
@@ -323,7 +323,7 @@ pub fn check_service_login(
 /// The refusal for a login the server did not admit, saying what to do and naming no value
 /// the operator wrote. The recipe's rules are in the docs with their names filled in.
 pub fn unreached(why: &Unreached, mode: Mode) -> SetupError {
-    let service = service_user_name(mode);
+    let service = database_user_name(mode);
     let text = match why {
         Unreached::NoServer => format!(
             "no Postgres server answered at the Unix socket --database names: install and start one (apt install postgresql; the kbf-installer package only suggests it, because node hosts need none) and run setup again, or correct host= in --database ({DOCS})"

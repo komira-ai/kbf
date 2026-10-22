@@ -60,6 +60,30 @@ fn the_proxy_table_is_read_from_installer_toml() {
     );
 }
 
+/// Catches the children's file read and dropped (a host with a sibling beside the proxy would
+/// start its frontend children on the default `kbf.toml`, which is the sibling's there):
+/// `frontend_config` reaches `Loaded`, a file without the key leaves it none, and a relative
+/// path is a usage error naming the key.
+///
+/// Mutants to plant: `frontend_config` left out of `Loaded` (red: none); the key left out of
+/// `TOLERANT_KEYS` (red: none).
+#[test]
+fn the_children_s_file_is_read_from_installer_toml() {
+    let text = format!("frontend_config = \"/etc/kbf/frontend.toml\"\n{PROXY}");
+    let path = file("frontend-config", text.as_bytes());
+    let loaded = load(&path).expect("valid");
+    assert_eq!(
+        loaded.frontend_config,
+        Some(PathBuf::from("/etc/kbf/frontend.toml"))
+    );
+    let path = file("no-frontend-config", PROXY.as_bytes());
+    assert_eq!(load(&path).expect("valid").frontend_config, None);
+    let relative = format!("frontend_config = \"frontend.toml\"\n{PROXY}");
+    let path = file("relative-frontend-config", relative.as_bytes());
+    let said = usage_of(load(&path));
+    assert!(said.contains("frontend_config"), "{said}");
+}
+
 /// Catches the update API's two numbers read and dropped (they used to be: `load` returned the
 /// `[proxy]` table alone): a file that sets them hands them on, and the places the API reads
 /// and writes are the flags and the proxy's state directory.
@@ -449,6 +473,7 @@ fn a_descriptor_the_runtime_cannot_use_is_a_failure_to_start() {
         &handover("serve"),
         regular,
         &kbf_host::Root::host(),
+        None,
     ) {
         Err(VerbError::Failed(text)) => {
             assert!(text.starts_with("cannot start the proxy: "), "{text}");
@@ -474,6 +499,7 @@ fn a_spool_that_cannot_be_opened_is_a_usage_error_before_anything_is_bound() {
         &handover,
         regular,
         &kbf_host::Root::host(),
+        None,
     ));
     assert!(
         text.starts_with("update API: the order spool at "),
@@ -1046,6 +1072,7 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
         upstream: config.upstream,
         operator_token_file: config.operator_token_file.clone(),
         status,
+        frontend_config: None,
     };
     let retry = Retry {
         attempts: 1,
@@ -1055,7 +1082,7 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
     let child = ProcChild::new(
         layout,
         children_dir(&with.state_dir),
-        frontend_argv(&with.proxy_auth_file, with.upstream),
+        frontend_argv(&with.proxy_auth_file, with.upstream, None),
     );
     let started = start_with(&handle, &gate, &SystemClock::new(), &child, with, retry);
     let line = startup_line(started);

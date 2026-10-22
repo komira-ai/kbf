@@ -8,5 +8,6 @@ mod farm;
 mod generation;
 mod leg;
 mod plan;
+mod ram_ack;
 mod tls;
 mod worker;

@@ -213,13 +213,17 @@ impl Counting {
     /// it from a thread that may block (`spawn_blocking`, or a test thread outside the
     /// runtime's workers); the syncs' own threads are the ones it waits for.
     pub fn wait_waiting(&self, n: usize) {
+        // The bound only ends a hang (a defect that parks no writer, or answers the write
+        // without the disk); no test asserts how long a writer takes to park.
         let mut gate = self.probe.gate();
         while gate.waiting != n {
-            gate = self
+            let (next, timeout) = self
                 .probe
                 .changed
-                .wait(gate)
+                .wait_timeout(gate, std::time::Duration::from_secs(20))
                 .unwrap_or_else(PoisonError::into_inner);
+            gate = next;
+            assert!(!timeout.timed_out(), "no writer parked in sync");
         }
     }
 
