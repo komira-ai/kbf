@@ -132,7 +132,7 @@ Claims the verifier requires, in the order it checks them (`crates/kbf-oidc/src/
 
 The issuer's keys are fetched on the first token and again when a token names an unknown `kid` (at most every 30 s), and a key set older than one hour is fetched again by the next token, so a key the issuer withdrew stops verifying within the hour. If that fetch fails the keys held stay in use (an issuer outage does not stop deploys; the cost is that a withdrawn key is trusted until a fetch succeeds), and a failed first fetch is a 503. A token whose key is held never waits for a fetch that is under way.
 
-Example, the gamma deploy (`gamma.yml`, which runs from a `workflow_run` of the release workflow on main, so its token's `event_name` is `workflow_run`). `/etc/kbf/remote-ci.toml`:
+Example, the gamma deploy (RETIRED: `gamma.yml` is deleted and gamma moves to kbf-updater; the example stays as a `workflow_run` token shape) (`gamma.yml`, which runs from a `workflow_run` of the release workflow on main, so its token's `event_name` is `workflow_run`). `/etc/kbf/remote-ci.toml`:
 
 ```toml
 [remote_operator]

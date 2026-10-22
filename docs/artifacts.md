@@ -557,7 +557,7 @@ them.)
 (a dispatch only), the job graph and the scopes, `if:` and environment of each job, the halt on
 red, a checkout of the run's commit alone, the release bot's key read in `tag` and `bump` only,
 the data that flows from job to job, pinned actions and an empty top-level `permissions`. The
-workflow is named `release` and its job `publish`, because `gamma.yml` follows both. On every
+job list is pinned, `publish` among them (`gamma.yml`, which followed the workflow, is deleted). On every
 pull request into `main`, CI asks GitHub the same on-`main` question for the pull request's base
 commit (which must pass) and its merge commit (which must be refused), so a check that
 accepts every commit, or none, fails there (`cargo xtask release main-control`).

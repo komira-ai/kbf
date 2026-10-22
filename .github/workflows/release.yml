@@ -31,8 +31,7 @@
 #          again), and the notes. Read-only.
 # publish  the one job that holds `contents: write`: the GitHub release with those files and
 #          those notes. A re-run adds the files the release lacks and replaces none. The job
-#          is named `publish` because gamma.yml looks for a job of that name in this
-#          workflow, named `release`.
+#          is named `publish`; the release lint pins the job list.
 # bump     opens the pull request in the internal repository that moves its submodule to the
 #          released commit, with a token of the release bot scoped to that repository.
 #

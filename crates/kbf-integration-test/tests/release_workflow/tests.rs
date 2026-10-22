@@ -144,14 +144,9 @@ fn a_push_trigger_needs_the_whole_chain_of_jobs() {
 }
 
 #[test]
-fn the_names_gamma_follows_are_pinned() {
-    // Catches: a rename that silently stops every deploy to gamma (`workflows: [release]`
-    // matches by name; `gamma evidence` reads the job `publish`). Mutants: the workflow
-    // renamed; the job renamed; a job added or dropped; two jobs swapped.
-    red(
-        &plant_top("name: release\n", "name: releases\n"),
-        "is not named `release`",
-    );
+fn the_job_list_is_pinned() {
+    // Catches: the chain changed without its rule. Mutants: the job `publish` renamed; a job
+    // renamed; a job added.
     red(
         &plant_top("  publish:\n", "  publish-release:\n"),
         "no job `publish`",
