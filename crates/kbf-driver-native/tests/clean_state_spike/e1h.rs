@@ -14,7 +14,7 @@ const PBS_SHA: &str = "d8975d7df4f08f7b1c7aafcdfacbddcec3d366415f2c1a72b2466b685
 /// D: ran to completion; T: killed by the clean's SIGTERM-first; KP: parent SIGKILLed mid-run, then the clean; K: SIGKILL of every process (control).
 const MODES: [&str; 4] = ["D", "T", "KP", "K"];
 /// Whether the reboot job really runs `launchctl reboot userspace` (it may take the runner job with it).
-const REBOOT_GO: bool = false;
+const REBOOT_GO: bool = true;
 
 fn root(body: &str, secs: u64) -> Out {
     let o = base_env(&user_of(CELL_USER)).root(body, secs);
@@ -58,6 +58,10 @@ fn e1h_py() {
     for i in 0..52u32 {
         let (arm, tag) = if i % 13 >= 10 { (Arm::R, "R") } else { (Arm::IpcRep, "D") };
         lease(&cs, "HP", arm, tag, i, i % 3, MODES[(i % 4) as usize]);
+    }
+    // The documented hole: a SharedMemory(track=False) segment, under the SIGTERM-first clean (one lease per uid).
+    for i in 52..55u32 {
+        lease(&cs, "HP", Arm::IpcRep, "D", i, i % 3, "UT");
     }
     root("h_final", 300);
     cs.finish();

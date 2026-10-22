@@ -113,6 +113,7 @@ def cmd_show(path, limit):
 
 def norm(name):
     s = re.sub(r'[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}', '<UUID>', name)
+    s = re.sub(r'sim\.not\.[A-Z0-9]+', 'sim.not.<RAND>', s)
     s = re.sub(r'\d{3,}', '<N>', s)
     return s
 

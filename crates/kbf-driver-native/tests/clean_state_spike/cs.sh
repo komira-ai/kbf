@@ -1776,6 +1776,10 @@ def main(mode, d):
     pool.map(sq, [1, 2, 3])
     shm = shared_memory.SharedMemory(create=True, size=64)
     names.append("shm " + shm.name)
+    if mode == "UT":
+        # the documented hole: a segment the resource tracker is told not to track
+        ut = shared_memory.SharedMemory(create=True, size=64, track=False)
+        names.append("shm " + ut.name)
     ex = ProcessPoolExecutor(2, mp_context=ctx)
     list(ex.map(sq, [1, 2, 3]))
     open(d + "/hp.names", "w").write("\n".join(names) + "\n")
@@ -1801,6 +1805,8 @@ if __name__ == "__main__":
     main(sys.argv[1], sys.argv[2])
 PY
   rm -f "$L/hp.ready" "$L/hp.done"
+  # a preference write and read: the lease touches CFPreferences, so cfprefsd runs as the uid (an Apple-created name per uid)
+  BT=60 build_env /usr/bin/defaults write kbf.e1h.hp k v >/dev/null 2>&1; BT=60 build_env /usr/bin/defaults read kbf.e1h.hp k >/dev/null 2>&1
   ( BT=400 build_env env PYTHONDONTWRITEBYTECODE=1 "$PBS" -I "$L/hp.py" "$HMODE" "$L" >"$L/hp.out" 2>&1 </dev/null & )
   for _i in $(seq 1 600); do [ -e "$L/hp.ready" ] && break; sleep 0.2; done
   [ -e "$L/hp.ready" ] || { echo "workload never ready: $(tail -c 300 "$L/hp.out" | tr '\n' ' ')"; return 1; }
@@ -1819,7 +1825,7 @@ midplant_HP() {
   echo "HPROCS mode=$HMODE parent=$PPID_ py_procs=$(h_pyprocs | wc -l | tr -d ' ') uid_procs=$(h_uidprocs | wc -l | tr -d ' ') tracker_pids=$(ps -axo pid=,ruid=,args= | awk -v id="$ID" '$2==id && /resource_tracker/ {print $1}' | tr '\n' ',')"
   sleep 1
   case "$HMODE" in
-    D|T) h_clean_term ;;
+    D|T|UT) h_clean_term ;;
     KP)
       kill -KILL "$PPID_" 2>/dev/null; T_KP=$(d_t)
       sleep 3
