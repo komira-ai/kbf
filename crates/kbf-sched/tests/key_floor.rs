@@ -383,6 +383,10 @@ fn the_bound_is_the_largest_live_node_that_could_run_it() {
     );
     wants.resources = Resources::new(1_000, 4 * GIB);
     assert_eq!(f.s.key_floor_bound(&wants), 128 * GIB);
+    // A request for a GPU no worker has has no bound.
+    wants.resources = wants.resources.with_gpus(1);
+    assert_eq!(f.s.key_floor_bound(&wants), 0);
+    wants.resources = Resources::new(1_000, 4 * GIB);
     // A silent node is not live.
     f.advance(LEASE_GRACE + Duration::from_secs(1));
     f.heartbeat("small", &[]);

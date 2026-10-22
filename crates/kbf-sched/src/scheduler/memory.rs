@@ -618,9 +618,10 @@ impl Scheduler {
         };
         let live = kbf_estimator::floor_ceiling(self.key_floor_bound(&op.request));
         let to = applied.applied.min(live).max(applied.base);
-        if to >= applied.applied {
-            return false;
-        }
+        // Whether it was lowered. A raise is lowered here only when no live worker is
+        // large enough for it, so `to` is below it; were it not, the write below changes
+        // nothing and the caller is told so.
+        let lowered = to < applied.applied;
         let op = self.ops.get_mut(&id).expect("checked above");
         op.request.resources.memory_bytes = to;
         op.key_applied = (to > applied.base).then_some(KeyApplied {
@@ -628,7 +629,7 @@ impl Scheduler {
             applied: to,
             undone: false,
         });
-        true
+        lowered
     }
 
     /// Takes back the raise a key floor made to a queued operation that only a worker it
