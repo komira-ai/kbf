@@ -35,7 +35,13 @@
 //! the installed one and `revert` drops it. The file is replaced by a rename, so a read sees
 //! one whole version.
 //!
-//! Nothing calls this module yet; it is public so that the wiring can follow in its own change.
+//! # Wiring
+//!
+//! [`Local`] is what `kbf-installer proxy --kbf-binary PATH` turns on: the copies and the orders
+//! in the proxy's state directory (`releases/` and `releases.json`, [`RELEASES`] and [`STATUS`])
+//! for the kbf the package installed at `PATH`. A start that finds no installed release
+//! recorded adopts that kbf ([`Local::adopt`]): it is copied, and the copy is recorded as the
+//! installed release.
 
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
@@ -60,6 +66,12 @@ const PARTIAL: &str = ".partial-";
 
 /// How many bytes are read from the source at a time.
 const CHUNK: usize = 64 * 1024;
+
+/// The directory of the copies, in the proxy's state directory.
+pub const RELEASES: &str = "releases";
+
+/// The status file of [`LocalOrders`], in the proxy's state directory.
+pub const STATUS: &str = "releases.json";
 
 /// Why a copy was not made. The text of each starts with its word.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -118,6 +130,12 @@ impl Copies {
             root,
             next: AtomicU64::new(0),
         })
+    }
+
+    /// The directory the copies are in.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// The binary of `commit`'s copy, whether or not it exists.
@@ -295,6 +313,7 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 ///
 /// One lock covers every read-modify-write, so the proxy's threads (the swap and the one that
 /// stages) cannot lose each other's change. The file's directory must exist.
+#[derive(Debug)]
 pub struct LocalOrders {
     file: PathBuf,
     copies: Arc<Copies>,
@@ -347,12 +366,35 @@ impl LocalOrders {
     /// # Errors
     /// The commit has no verified copy, the file cannot be read, or it cannot be written.
     pub fn stage(&self, facts: &StagedFacts) -> Result<(), PortError> {
-        if !self.copies.verified(&facts.commit) {
-            return Err(PortError(format!("no verified copy of {}", facts.commit)));
-        }
+        self.require_copy(&facts.commit)?;
         let _held = self.held();
         let installed = StatusFacts::installed(&self.status())?;
         self.write(installed, Some(facts))
+    }
+
+    /// Record `commit` as the installed release when none is recorded, keeping what is staged;
+    /// the installed release afterwards, which is the one that was recorded if there was one.
+    /// A start that finds nothing installed is the only caller.
+    ///
+    /// # Errors
+    /// The commit has no verified copy, the file cannot be read, or it cannot be written.
+    pub fn adopt(&self, commit: &CommitId) -> Result<CommitId, PortError> {
+        self.require_copy(commit)?;
+        let _held = self.held();
+        let status = self.status();
+        if let Some(recorded) = StatusFacts::installed(&status)? {
+            return Ok(recorded);
+        }
+        let staged = StatusFacts::staged(&status)?;
+        self.write(Some(commit.clone()), staged.as_ref())?;
+        Ok(commit.clone())
+    }
+
+    fn require_copy(&self, commit: &CommitId) -> Result<(), PortError> {
+        if self.copies.verified(commit) {
+            return Ok(());
+        }
+        Err(PortError(format!("no verified copy of {commit}")))
     }
 
     fn status(&self) -> StatusFile {
@@ -433,5 +475,56 @@ impl RootOrders for LocalOrders {
             return self.write(StatusFacts::installed(&status)?, None);
         }
         Ok(())
+    }
+}
+
+/// What `proxy --kbf-binary` turns on: the proxy's copies of `kbf` and its orders over them,
+/// both in its state directory, and the kbf the package installed. One of these is made at
+/// start and shared (a clone shares the copies and the one lock of the orders).
+#[derive(Clone, Debug)]
+pub struct Local {
+    /// The kbf the package installs (`/usr/bin/kbf`): it is copied, and a start that finds no
+    /// installed release recorded adopts it ([`Local::adopt`]).
+    pub binary: PathBuf,
+    pub copies: Arc<Copies>,
+    pub orders: Arc<LocalOrders>,
+}
+
+impl Local {
+    /// The copies and orders in `state_dir` ([`RELEASES`] and [`STATUS`]) for the kbf at
+    /// `binary`.
+    ///
+    /// # Errors
+    /// The copies' root cannot be made, listed, or swept (see [`Copies::new`]).
+    pub fn open(binary: PathBuf, state_dir: &Path) -> io::Result<Local> {
+        let copies = Arc::new(Copies::new(state_dir.join(RELEASES))?);
+        let orders = LocalOrders::new(state_dir.join(STATUS), Arc::clone(&copies));
+        Ok(Local {
+            binary,
+            copies,
+            orders: Arc::new(orders),
+        })
+    }
+
+    /// The release a start runs when none is recorded as installed: the kbf at
+    /// [`binary`](Self::binary), copied (it names itself with `commit_full`, and the copy must
+    /// name the same 12-digit commit) and recorded as installed. A release that is recorded
+    /// already is left as it is and returned: the caller asks only when it found none, and a
+    /// record made since is not undone.
+    ///
+    /// # Errors
+    /// The binary does not run, does not print `commit_full`, cannot be copied, or the record
+    /// cannot be written; the text says what could not be done to the binary.
+    pub fn adopt(&self, runner: &dyn Runner) -> Result<CommitId, PortError> {
+        let at = self.binary.display();
+        let refuse = |why: String| PortError(format!("cannot adopt {at}: {why}"));
+        let probed = probe_version(runner, &self.binary);
+        let version = probed.map_err(|e| refuse(probe_failed(e).to_string()))?;
+        let absent = || refuse("it prints no commit_full".to_owned());
+        let full = version.commit_full.as_deref().ok_or_else(absent)?;
+        let commit = CommitId::new(full).map_err(|e| refuse(e.to_string()))?;
+        let ensured = self.copies.ensure(runner, &self.binary, &commit);
+        ensured.map_err(|e| refuse(e.to_string()))?;
+        self.orders.adopt(&commit)
     }
 }

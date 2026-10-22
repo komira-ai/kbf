@@ -43,7 +43,8 @@ pub(super) const BOOT_SLOT: Slot = Slot::A;
 pub enum Reason {
     /// `status.json` names no installed release.
     NoInstalledRelease,
-    /// `status.json` cannot be read.
+    /// `status.json` cannot be read; with `--kbf-binary`, also the kbf the package installed
+    /// cannot be adopted (the log line says why).
     StatusUnreadable,
     /// `releases/<sha>/kbf` is not a file.
     BinaryMissing,
@@ -92,9 +93,11 @@ impl Reason {
                 "record the release this host runs in the installer state \
                  (docs/design/frontend-proxy.md, hand-placed releases), then restart kbf-proxy",
             ),
-            Reason::StatusUnreadable => {
-                Some("start the installer service so it writes status.json, then restart kbf-proxy")
-            }
+            Reason::StatusUnreadable => Some(
+                "start the installer service so it writes status.json (with --kbf-binary: check \
+                 that the binary runs and prints commit_full, and read the log line), then \
+                 restart kbf-proxy",
+            ),
             Reason::BinaryMissing | Reason::BinaryNotExecutable => Some(
                 "restore releases/<installed commit>/kbf (0755), or roll back with \
                  kbf-installer rollback, then restart kbf-proxy",

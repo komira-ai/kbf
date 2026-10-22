@@ -415,6 +415,14 @@ pub struct ProxyArgs {
     /// `/var/db/kbf-installer` on a Mac).
     #[arg(long)]
     pub update_dir: Option<std::path::PathBuf>,
+    /// The kbf the package installed (`/usr/bin/kbf`; an absolute path). With it the proxy keeps
+    /// a verified copy of each kbf it runs in `releases` of its state directory, starts its
+    /// children only from those copies, and keeps its installed and staged releases in
+    /// `releases.json` there: root's `status.json` and order spool are not used (`--update-dir`
+    /// and `--orders-dir` are ignored) and the update API orders nothing. Without it the proxy
+    /// works as before.
+    #[arg(long)]
+    pub kbf_binary: Option<std::path::PathBuf>,
 }
 
 impl ProxyArgs {

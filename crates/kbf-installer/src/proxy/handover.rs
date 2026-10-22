@@ -4,8 +4,8 @@
 //!
 //! | seam | here |
 //! |---|---|
-//! | `status` | [`JsonFileStatus`] over the root half's `status.json`, read when a call needs it (a file that is not there yet is an unreadable status, not a failure to start) |
-//! | `orders` | the [`OrderSpool`] of `orders/`, opened here, once |
+//! | `status` | [`JsonFileStatus`] over the root half's `status.json` (with [`HandoverConfig::local`], the proxy's own `releases.json`), read when a call needs it (a file that is not there yet is an unreadable status, not a failure to start) |
+//! | `orders` | the [`OrderSpool`] of `orders/`, opened here, once; with [`HandoverConfig::local`] none is opened and the writer refuses every order |
 //! | `requests` | [`Idempotency`] in the proxy's state directory (`requests.json`) |
 //! | `restart` | the [`RunningBinary`] captured at start |
 //! | `clock`, `hook` | the system clock; no crash points |
@@ -36,17 +36,29 @@
 //! hides that until the first update. The alternative is to serve and answer 503 on the update
 //! route only; take it by returning a `Parts` over a spool that refuses, not by skipping the
 //! error here.
+//!
+//! **Without a spool.** A proxy that keeps its own copies of `kbf` (`--kbf-binary`,
+//! [`HandoverConfig::local`]) owns no `orders/` and opens none, so there is nothing to fail:
+//! the swap's orders are the [`Local::orders`] over the proxy's `releases.json`, which
+//! `status_file` names, and the API's writer is one that refuses every order with the reason.
 
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use kbf_update::Source;
+
 use super::api::core::{Config, NoCrash, Parts, StagingDeadline};
 use super::api::idempotency::Idempotency;
-use super::api::traits::{JsonFileStatus, StubGate, SystemClock};
+use super::api::traits::{
+    JsonFileStatus, OrderError, OrderWriter, StubGate, Supervisor, SystemClock,
+};
 use super::handover_swap::{GateSlot, Handover, SlotAddrs};
+use super::model::{Locator, Verb};
 use super::orders::{OrderSpool, SpoolError};
+use super::releases::Local;
 use super::running_binary::RunningBinary;
+use crate::CommitId;
 
 /// What [`parts`] is built from.
 #[derive(Clone, Debug)]
@@ -54,10 +66,18 @@ pub struct HandoverConfig {
     /// The proxy's state directory: `requests.json` (the API's request map) and `orders.json`
     /// (the spool's counter) are written here.
     pub state_dir: PathBuf,
-    /// The order spool, `orders/`: owned by the service user, read by the root half.
+    /// The order spool, `orders/`: owned by the service user, read by the root half. Not opened
+    /// when [`local`](Self::local) is set.
     pub orders_dir: PathBuf,
-    /// The root half's `status.json`.
+    /// The root half's `status.json`; with [`local`](Self::local), the proxy's own
+    /// `releases.json`, which has the same shape.
     pub status_file: PathBuf,
+    /// The proxy's own copies of `kbf` and its orders over them (`--kbf-binary`). When set, the
+    /// swap's orders are [`Local::orders`] (the staged and installed releases are read from, and
+    /// confirm and revert are written to, `status_file`), no order spool is opened, and the
+    /// update API's order writer refuses. When not, the root half's spool and `status.json` are
+    /// used as ever.
+    pub local: Option<Local>,
     /// The confirm window the orders ask for (`confirm_window_s` of `installer.toml`).
     pub confirm_window_s: u32,
     /// How long the root half's fetch may take (`fetch_timeout_s` of `installer.toml`).
@@ -102,27 +122,82 @@ pub fn staging_deadline(fetch_timeout_s: u32) -> StagingDeadline {
 }
 
 /// The seams of the update API, real where there is an implementation. Opens the order spool
-/// and the request map; reads no file (`status.json` is read when a call needs it).
+/// (unless the proxy keeps its own copies, [`HandoverConfig::local`]: there is none then) and
+/// the request map; reads no file (`status.json` is read when a call needs it).
 ///
 /// # Errors
 /// [`HandoverError`]: the order spool cannot be opened, or the running program cannot be
 /// identified.
 pub fn parts(cfg: &HandoverConfig) -> Result<Parts, HandoverError> {
-    let spool = OrderSpool::open(&cfg.orders_dir, &cfg.state_dir).map_err(|source| {
-        HandoverError::Orders {
-            dir: cfg.orders_dir.clone(),
-            source,
+    match &cfg.local {
+        Some(local) => {
+            let binary = RunningBinary::capture().map_err(HandoverError::Binary)?;
+            Ok(assemble_local(cfg, local, binary))
         }
-    })?;
-    let binary = RunningBinary::capture().map_err(HandoverError::Binary)?;
-    Ok(assemble(cfg, spool, binary))
+        None => {
+            let spool = OrderSpool::open(&cfg.orders_dir, &cfg.state_dir).map_err(|source| {
+                HandoverError::Orders {
+                    dir: cfg.orders_dir.clone(),
+                    source,
+                }
+            })?;
+            let binary = RunningBinary::capture().map_err(HandoverError::Binary)?;
+            Ok(assemble(cfg, spool, binary))
+        }
+    }
+}
+
+/// The update API's order writer when the proxy keeps its own copies: there is no order spool
+/// to write to, so every order is refused, with the reason.
+struct NoOrders;
+
+/// Why [`NoOrders`] refuses.
+const NO_ORDERS: &str =
+    "this proxy installs from its own copy of kbf (--kbf-binary): there is no order spool";
+
+impl OrderWriter for NoOrders {
+    fn write(
+        &mut self,
+        _verb: Verb,
+        _commit: &CommitId,
+        _window_s: u32,
+    ) -> Result<Locator, OrderError> {
+        Err(OrderError(NO_ORDERS.to_owned()))
+    }
+
+    fn write_update(
+        &mut self,
+        _commit: &CommitId,
+        _window_s: u32,
+        _source: Source,
+    ) -> Result<Locator, OrderError> {
+        Err(OrderError(NO_ORDERS.to_owned()))
+    }
+}
+
+/// [`parts`] over the proxy's own copies and a binary identity it is given: the swap's orders
+/// are `local`'s, and the API's order writer refuses.
+fn assemble_local(cfg: &HandoverConfig, local: &Local, binary: RunningBinary) -> Parts {
+    let supervisor = Handover::local(cfg, Arc::clone(&local.orders));
+    wired(cfg, Box::new(supervisor), Box::new(NoOrders), binary)
 }
 
 /// [`parts`] over a spool and a binary identity it is given.
 fn assemble(cfg: &HandoverConfig, spool: OrderSpool, binary: RunningBinary) -> Parts {
+    let supervisor = Handover::new(cfg, spool.clone());
+    wired(cfg, Box::new(supervisor), Box::new(spool), binary)
+}
+
+/// The seams that do not depend on where the orders go.
+fn wired(
+    cfg: &HandoverConfig,
+    supervisor: Box<dyn Supervisor>,
+    orders: Box<dyn OrderWriter>,
+    binary: RunningBinary,
+) -> Parts {
     Parts {
-        supervisor: Box::new(Handover::new(cfg, spool.clone())),
-        orders: Box::new(spool),
+        supervisor,
+        orders,
         status: Box::new(JsonFileStatus::new(&cfg.status_file)),
         compat: Box::new(StubGate),
         clock: Arc::new(SystemClock::new()),

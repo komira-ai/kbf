@@ -44,9 +44,10 @@ impl VersionFault {
 /// adds fields, and an installer that refused them would be unable to stage any build after
 /// it (adding `seq` did that). A field named twice, a required one missing and a wrong type
 /// are still refused (serde's derive rejects a repeated known field). `platform` (the
-/// installer derives it from the binary's header), `admin_protocol`, `meta_log`, `relay` and
-/// `seq` (builds before them lack them) may be absent and are then `None`; `meta_log: None` means
-/// not reversible.
+/// installer derives it from the binary's header), `admin_protocol`, `commit_full`, `meta_log`,
+/// `relay` and `seq` (builds before them lack them) may be absent and are then `None`;
+/// `meta_log: None` means not reversible. `commit_full` is also absent from a build that does
+/// not know its full commit.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Version {
     /// The version of the admin calls between a proxy and the frontend processes it
@@ -54,6 +55,10 @@ pub struct Version {
     #[serde(default)]
     pub admin_protocol: Option<u64>,
     pub commit: String,
+    /// The 40 hex digits of the commit built, when the build knows them. `None` for a build
+    /// that predates the field or did not know its full commit (no git checkout).
+    #[serde(default)]
+    pub commit_full: Option<String>,
     /// The highest metadata-log machine version the build runs. Going from release N to
     /// N-1 is reversible only if `meta_log(N) <= meta_log(N-1)`; `None` (a build that
     /// predates the field) is unknown, and unknown is not reversible.
@@ -114,6 +119,56 @@ impl Version {
     }
 }
 
+/// The newest of each version number an installer understands: a release that declares more
+/// is refused (`installer_too_old`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Supported {
+    pub protocol: u64,
+    pub min_protocol: u64,
+    pub state_schema: u64,
+}
+
+/// A number a release declares that is past what an installer understands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{field} {got}; this installer understands up to {most}")]
+pub struct TooNew {
+    /// The number: `protocol`, `min_protocol` or `state_schema`.
+    pub field: &'static str,
+    /// What the release declares.
+    pub got: u64,
+    /// The most the installer understands.
+    pub most: u64,
+}
+
+/// Whether an installer that understands `supported` may take a component that declared
+/// `declared`: `Err` when any of its numbers is past what the installer understands, the first
+/// in the order `protocol`, `min_protocol`, `state_schema` (the rule behind upgrading the
+/// installer before a kbf that raises one).
+///
+/// # Errors
+/// [`TooNew`], naming the number.
+pub fn understood(supported: Supported, declared: Supported) -> Result<(), TooNew> {
+    let newer = [
+        ("protocol", declared.protocol, supported.protocol),
+        (
+            "min_protocol",
+            declared.min_protocol,
+            supported.min_protocol,
+        ),
+        (
+            "state_schema",
+            declared.state_schema,
+            supported.state_schema,
+        ),
+    ];
+    for (field, got, most) in newer {
+        if got > most {
+            return Err(TooNew { field, got, most });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +200,7 @@ mod tests {
                 admin_protocol: Some(1),
                 meta_log: Some(4),
                 commit: COMMIT[..12].to_owned(),
+                commit_full: None,
                 min_protocol: 3,
                 protocol: 4,
                 profile: "release".to_owned(),
@@ -333,5 +389,56 @@ mod tests {
             VersionFault::Failed(None).to_string(),
             "it did not exit 0 (status None)"
         );
+    }
+
+    fn numbers(protocol: u64, min_protocol: u64, state_schema: u64) -> Supported {
+        Supported {
+            protocol,
+            min_protocol,
+            state_schema,
+        }
+    }
+
+    /// Catches an installer that takes a component declaring more than it understands, in any
+    /// one of the three numbers (each tried alone, the others equal), and one that refuses a
+    /// component declaring no more (equal, or less: an installer ahead of the kbf it takes is
+    /// the order the rule asks for). The refusal names the number and both values.
+    ///
+    /// Mutants it catches: one of the three comparisons dropped; `>` made `>=`; `got` and
+    /// `most` swapped in the refusal; the numbers of `declared` and `supported` swapped.
+    #[test]
+    fn a_component_is_understood_when_it_declares_no_more_than_the_installer_does() {
+        let ceiling = numbers(2, 2, 4);
+        for declared in [ceiling, numbers(1, 1, 3), numbers(0, 0, 0)] {
+            assert_eq!(understood(ceiling, declared), Ok(()));
+        }
+        for (declared, field, got, most) in [
+            (numbers(3, 2, 4), "protocol", 3, 2),
+            (numbers(2, 3, 4), "min_protocol", 3, 2),
+            (numbers(2, 2, 5), "state_schema", 5, 4),
+        ] {
+            let refused = understood(ceiling, declared).expect_err(field);
+            let said = (refused.field, refused.got, refused.most);
+            assert_eq!(said, (field, got, most));
+        }
+        let refused = understood(ceiling, numbers(3, 2, 4)).expect_err("protocol");
+        assert_eq!(
+            refused.to_string(),
+            "protocol 3; this installer understands up to 2"
+        );
+    }
+
+    /// Catches the order of the checks changing under a refusal an operator reads: when more
+    /// than one number is past the installer's, the first of `protocol`, `min_protocol`,
+    /// `state_schema` is the one named.
+    ///
+    /// Mutant it catches: the three checks run in another order.
+    #[test]
+    fn the_first_number_past_the_installer_is_the_one_named() {
+        let ceiling = numbers(1, 1, 1);
+        let all = understood(ceiling, numbers(2, 2, 2)).expect_err("all three");
+        assert_eq!(all.field, "protocol");
+        let later = understood(ceiling, numbers(1, 2, 2)).expect_err("two");
+        assert_eq!(later.field, "min_protocol");
     }
 }

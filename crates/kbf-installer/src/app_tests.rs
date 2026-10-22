@@ -232,6 +232,7 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
             check: true,
             update_dir: Some("/var/lib/kbf-installer".into()),
             orders_dir: Some("/var/lib/kbf-installer/orders".into()),
+            kbf_binary: None,
         })
         .needs_root()
     );

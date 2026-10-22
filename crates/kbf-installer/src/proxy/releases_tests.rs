@@ -17,10 +17,10 @@ use sha2::{Digest, Sha256};
 
 use super::model::{Locator, Source, StagedFacts, Verb};
 use super::ports::{RootOrders, StatusFacts};
-use super::releases::{Copies, CopyError, LocalOrders};
+use super::releases::{Copies, CopyError, Local, LocalOrders, RELEASES, STATUS};
 use super::root_orders::StatusFile;
 use crate::CommitId;
-use crate::fixtures::{FakeRunner, ran, scratch_dir, version_json};
+use crate::fixtures::{FakeRunner, ran, scratch_dir, version_json, version_json_full};
 use crate::testkit::{A, B, C, c};
 
 type Made = Result<PathBuf, CopyError>;
@@ -630,4 +630,157 @@ fn an_unreadable_file_is_an_error_and_is_not_overwritten_and_a_failed_write_is_o
     let orders = LocalOrders::new(file, Arc::clone(&o.rig.copies));
     let err = orders.stage(&facts(A)).expect_err("no directory");
     assert!(err.0.starts_with("cannot write "), "{err}");
+}
+
+/// Catches an adoption that replaces a release that is recorded, drops what is staged, writes
+/// the file when it has nothing to change, or lets a release without a copy be called
+/// installed: with `B` staged and nothing installed `A` is adopted and `B` stays staged; a
+/// second adoption (of another release) answers `A` and leaves the file as it is; a commit
+/// with no verified copy, and a file that cannot be read, are errors that change nothing.
+///
+/// Mutants it catches: `adopt` that overwrites the installed release; `adopt` that writes
+/// without the staged facts; `adopt` that rewrites the file when the release is recorded;
+/// `adopt` without the check for the copy; an unreadable file read as no record.
+#[test]
+fn adopt_records_the_installed_release_only_when_none_is_recorded() {
+    let o = orders("adopt");
+    let err = o.orders.adopt(&c(A)).expect_err("no copy");
+    assert_eq!(err.0, format!("no verified copy of {}", c(A)));
+    assert!(!o.status_file.exists(), "a file for nothing");
+    o.rig.copy(A);
+    o.rig.copy(B);
+    o.orders.stage(&facts(B)).expect("stage B");
+
+    let adopted = o.orders.adopt(&c(A)).expect("adopt A");
+
+    assert_eq!(adopted, c(A));
+    assert_eq!(read(&o.status_file), (Some(facts(B)), Some(c(A))));
+    let landed = fs::metadata(&o.status_file).expect("meta").ino();
+    let other = o.orders.adopt(&c(B));
+    let again = other.expect("another release is not adopted");
+    assert_eq!(again, c(A));
+    assert_eq!(fs::metadata(&o.status_file).expect("meta").ino(), landed);
+    assert_eq!(read(&o.status_file), (Some(facts(B)), Some(c(A))));
+
+    write(&o.status_file, b"{");
+    assert!(o.orders.adopt(&c(A)).is_err());
+    assert_eq!(fs::read(&o.status_file).expect("file"), b"{");
+}
+
+/// A runner whose program prints the version of a `release` build of `commit`, with its full
+/// commit (`commit_full`).
+fn says_full(commit: &str) -> FakeRunner {
+    let stdout = version_json_full(commit, "release");
+    FakeRunner::new(move |_| Ok(ran(0, &stdout, "")))
+}
+
+/// Catches the copies and the orders of a `Local` not being where the proxy looks for them:
+/// `releases/` and `releases.json` in the state directory, the kbf it was told, and a root
+/// that cannot be made refused.
+///
+/// Mutants it catches: the copies in the state directory itself; the status file under the
+/// copies; the binary dropped; the root's error ignored.
+#[test]
+fn a_local_keeps_its_copies_and_its_orders_in_the_state_directory() {
+    let rig = rig("local-open");
+    let state = rig.dir.join("state");
+    mkdir(&state);
+    let binary = rig.dir.join("kbf-package");
+
+    let local = Local::open(binary.clone(), &state).expect("open");
+
+    assert_eq!(local.binary, binary);
+    assert_eq!(local.copies.root(), state.join(RELEASES));
+    assert!(state.join(RELEASES).is_dir());
+    let src = rig.source("src", b"bytes");
+    let runner = says(A, "release");
+    local.copies.ensure(&runner, &src, &c(A)).expect("a copy");
+    local.orders.adopt(&c(A)).expect("adopt");
+    assert_eq!(read(&state.join(STATUS)), (None, Some(c(A))));
+    write(&state.join("file"), b"x");
+    assert!(Local::open(binary, &state.join("file")).is_err());
+}
+
+/// Catches the package's kbf being adopted wrongly: it is probed where it is, copied under the
+/// full commit it names, probed again as a copy, recorded as installed, and a repeat does not
+/// copy or record again (it asks the package's kbf and no more).
+///
+/// Mutants it catches: the copy named by the short commit; the record not written; the copy
+/// made again; the package's kbf not probed.
+#[test]
+fn the_package_kbf_is_copied_under_its_full_commit_and_recorded_as_installed() {
+    let rig = rig("local-adopt");
+    let state = rig.dir.join("state");
+    mkdir(&state);
+    let binary = rig.source("kbf-package", b"the package's kbf");
+    let local = Local::open(binary.clone(), &state).expect("open");
+    let runner = says_full(A);
+
+    let adopted = local.adopt(&runner).expect("adopt");
+
+    assert_eq!(adopted, c(A));
+    let copy = fs::read(local.copies.program(&c(A))).expect("copy");
+    assert_eq!(copy, b"the package's kbf");
+    assert_eq!(read(&state.join(STATUS)), (None, Some(c(A))));
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].program, binary);
+    assert_ne!(calls[1].program, binary);
+    let again = local.adopt(&runner).expect("adopt again");
+    assert_eq!(again, c(A));
+    assert_eq!(runner.calls().len(), 3, "only the package's kbf is asked");
+}
+
+/// Catches an adoption that goes on when the package's kbf cannot be vouched for, and an
+/// error that does not say which kbf: one that does not run, one that prints no full commit (a
+/// build before the field, or without a checkout), one that prints something that is not a
+/// commit, one whose copy is another build, and a record that cannot be written. Each is an
+/// error that starts with the path and, but for the last, leaves no copy and no record.
+///
+/// Mutants it catches: a probe failure carried on; a missing `commit_full` taken for the short
+/// commit; the full commit not checked for its shape; the copy's probe skipped; the record's
+/// error dropped.
+#[test]
+fn a_kbf_that_cannot_be_named_or_copied_is_not_adopted() {
+    let rig = rig("local-adopt-refused");
+    let state = rig.dir.join("state");
+    mkdir(&state);
+    let binary = rig.source("kbf-package", b"bytes");
+    let local = Local::open(binary.clone(), &state).expect("open");
+    let prefix = format!("cannot adopt {}: ", binary.display());
+    let broken = FakeRunner::new(|_| Ok(ran(1, "", "boom")));
+    let short = says(A, "release");
+    let odd = version_json(A, "release").replacen('}', ",\"commit_full\":\"ABC\"}", 1);
+    let odd = FakeRunner::new(move |_| Ok(ran(0, &odd, "")));
+    let source_says = version_json_full(A, "release");
+    let copy_says = version_json(B, "release");
+    let program = binary.clone();
+    let lying = FakeRunner::new(move |spawn| {
+        let said = if spawn.program == program {
+            &source_says
+        } else {
+            &copy_says
+        };
+        Ok(ran(0, said, ""))
+    });
+
+    let cases = [
+        (&broken, "probe_failed: --version --json did not finish cleanly"),
+        (&short, "it prints no commit_full"),
+        (&odd, "\"ABC\" is not a commit id"),
+        (&lying, "commit_mismatch: "),
+    ];
+    for (runner, want) in cases {
+        let err = local.adopt(runner).expect_err(want);
+        assert!(err.0.starts_with(&prefix), "{}", err.0);
+        assert!(err.0[prefix.len()..].starts_with(want), "{}", err.0);
+        assert!(names(&state.join(RELEASES)).is_empty(), "{}", err.0);
+        assert!(!state.join(STATUS).exists(), "{}", err.0);
+    }
+
+    let honest = says_full(A);
+    chmod(&state, 0o555);
+    let err = local.adopt(&honest).expect_err("a closed state directory");
+    chmod(&state, 0o755);
+    assert!(err.0.starts_with("cannot write "), "{}", err.0);
 }

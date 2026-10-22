@@ -28,6 +28,16 @@
 //! with 503 and nothing is written. If the actor or the swap thread dies the proxy is stopped
 //! as a stop signal stops it and the verb exits 1, so the service manager starts it again.
 //!
+//! **`--kbf-binary PATH`** names the kbf the package installed (`/usr/bin/kbf`) and makes the
+//! proxy keep its own copies ([`crate::proxy::releases`]). The copies are `releases/<commit>/`
+//! in the proxy's `state_dir` (it runs as the service user and owns only that), the children
+//! are run from them, and the installed and staged releases are in `releases.json` there, a
+//! file of the shape of the root half's `status.json`: the order spool is not opened
+//! (`--orders-dir` and `--update-dir` are not looked at), the swap's confirm and revert touch
+//! no file of the root half, and the update API refuses to order a release. A start that
+//! finds no installed release recorded copies the kbf at `PATH` and records it as the
+//! installed one. Without the flag nothing of this exists and the proxy works as before.
+//!
 //! The start migrates before it runs anything: the installed release is brought to the
 //! `state_schema` it declares on the database `installer.toml` names (`database`, a URL
 //! without a password) before its child starts ([`crate::proxy::supervisor::host_migrator`]).
@@ -42,7 +52,8 @@
 //! `LISTEN_PID` and `LISTEN_FDS`; everything else is the `[proxy]` table.
 //!
 //! `--check` loads the file the way a run does, so a bad value of a key the verb reads (the
-//! two windows, the fetch timeout, `database`, `[proxy]`) is refused (exit 2) too. It does
+//! two windows, the fetch timeout, `database`, `[proxy]`) is refused (exit 2) too, and so is a
+//! `--kbf-binary` that is not an absolute path. It does
 //! not check the rest of the file: `setup` and the fetcher refuse a bad key there, not this
 //! verb. A stop signal drains for at most 5 s; the process ends within
 //! [`STOP_BOUND`] of the first one is seen, whatever the drain is doing, and at once on a
@@ -81,6 +92,7 @@ use crate::proxy::handover::{self, HandoverConfig, HandoverError};
 use crate::proxy::handover_swap::{GateSlot, SlotAddrs};
 #[cfg(target_os = "linux")]
 use crate::proxy::handover_swap::{Host, admin_secret};
+use crate::proxy::releases::{self, Local};
 
 /// The first descriptor a service manager passes (`SD_LISTEN_FDS_START`).
 pub const FIRST_FD: RawFd = 3;
@@ -192,12 +204,18 @@ fn loaded_from(path: &Path, text: &str) -> Result<Loaded, VerbError> {
     })
 }
 
-/// Where the update API reads and writes: the flags and the file.
+/// Where the update API reads and writes: the flags and the file. With `--kbf-binary` the
+/// status file is the proxy's own `releases.json` (in its state directory) and `--update-dir`
+/// is not looked at; [`open_local`] adds the copies.
 fn handover_config(args: &ProxyArgs, loaded: &Loaded, layout: &Layout) -> HandoverConfig {
     let table = loaded.proxy.upstream;
     let at = |port: u16| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let admin = |slot| at(table.admin_port(slot));
     let operator = |slot| at(table.port(slot, Target::Operator));
+    let status_file = match &args.kbf_binary {
+        Some(_) => loaded.proxy.state_dir.join(releases::STATUS),
+        None => args.update_dir_in(layout).join("status.json"),
+    };
     HandoverConfig {
         slots: SlotAddrs {
             admin: [admin(Slot::A), admin(Slot::B)],
@@ -208,10 +226,48 @@ fn handover_config(args: &ProxyArgs, loaded: &Loaded, layout: &Layout) -> Handov
         gate: GateSlot::new(),
         state_dir: loaded.proxy.state_dir.clone(),
         orders_dir: args.orders_dir_in(layout),
-        status_file: args.update_dir_in(layout).join("status.json"),
+        status_file,
+        local: None,
         confirm_window_s: loaded.confirm_window_s,
         fetch_timeout_s: loaded.fetch_timeout_s,
     }
+}
+
+/// The kbf `--kbf-binary` names, `None` without the flag. The path must be absolute (it is
+/// run, and copied, by the proxy's user); `--check` asks this too.
+///
+/// # Errors
+/// [`VerbError::Usage`]: the path is not absolute.
+fn kbf_binary(args: &ProxyArgs) -> Result<Option<&Path>, VerbError> {
+    let Some(binary) = &args.kbf_binary else {
+        return Ok(None);
+    };
+    if !binary.is_absolute() {
+        return Err(VerbError::Usage(format!(
+            "--kbf-binary: {} is not an absolute path",
+            binary.display()
+        )));
+    }
+    Ok(Some(binary.as_path()))
+}
+
+/// The proxy's own copies of `kbf` and its orders over them, when `--kbf-binary` names the kbf
+/// the package installed: `releases/` and `releases.json` in `state_dir`. `None` without the
+/// flag.
+///
+/// # Errors
+/// [`VerbError::Usage`]: the path is not absolute ([`kbf_binary`]), or the directory of the
+/// copies cannot be made, listed or swept (the operator's to fix, as an order spool the
+/// service user cannot use is).
+fn open_local(args: &ProxyArgs, state_dir: &Path) -> Result<Option<Local>, VerbError> {
+    let Some(binary) = kbf_binary(args)? else {
+        return Ok(None);
+    };
+    let opened = Local::open(binary.to_path_buf(), state_dir);
+    opened.map(Some).map_err(|e| {
+        let dir = state_dir.join(releases::RELEASES);
+        VerbError::Usage(format!("{}: {e}", dir.display()))
+    })
 }
 
 /// The state database `installer.toml` at `path` names: every host that runs the proxy has
@@ -466,10 +522,13 @@ fn update_line(parts: &Parts, handover: &HandoverConfig) -> String {
         .map_or("handover ready".to_owned(), |why| {
             format!("a POST is refused: {why}")
         });
+    let orders = match &handover.local {
+        Some(_) => "none, the proxy keeps its own copies".to_owned(),
+        None => handover.orders_dir.display().to_string(),
+    };
     format!(
-        "update API on (status {}, orders {}, staging deadline {} s); {driver}",
+        "update API on (status {}, orders {orders}, staging deadline {} s); {driver}",
         handover.status_file.display(),
-        handover.orders_dir.display(),
         parts.config.staging_deadline.secs(),
     )
 }
@@ -493,6 +552,7 @@ fn serve(
         upstream: config.upstream,
         operator_token_file: config.operator_token_file.clone(),
         status: handover.status_file.clone(),
+        local: handover.local.clone(),
     };
     // Off Linux nothing supervises the proxy, so neither the database nor the host root is used.
     #[cfg(not(target_os = "linux"))]
@@ -573,8 +633,11 @@ struct Supervise {
     proxy_auth_file: std::path::PathBuf,
     upstream: kbf_proxy::config::UpstreamTable,
     operator_token_file: std::path::PathBuf,
-    /// The root half's `status.json`.
+    /// The root half's `status.json`; with `local`, the proxy's own `releases.json`.
     status: std::path::PathBuf,
+    /// The proxy's own copies of `kbf` (`--kbf-binary`): the children are run from them and a
+    /// start with no installed release recorded adopts the package's kbf.
+    local: Option<Local>,
 }
 
 /// The supervisor, on a thread of its own: starting a first child waits for it to be ready,
@@ -614,7 +677,9 @@ fn supervise(
     use crate::proxy::boot::Retry;
     use crate::proxy::child_real::ProcChild;
     use crate::proxy::runtime::SystemClock;
-    use crate::proxy::supervisor::{Startup, children_dir, frontend_argv};
+    use crate::proxy::supervisor::{
+        Startup, children_dir, frontend_argv, releases_of, run_from_copies,
+    };
 
     let clock = Arc::new(SystemClock::new());
     let (handle, wait) = (handle.clone(), Arc::clone(&clock));
@@ -624,12 +689,13 @@ fn supervise(
         .spawn(move || {
             let gate = Arc::new(crate::proxy::gate_real::ProxyGate::new(handle.clone()));
             let layout = Layout::linux(root);
-            let releases_dir = layout.join(&layout.releases());
-            let child = Arc::new(ProcChild::new(
+            let releases_dir = releases_of(with.local.as_ref(), &layout);
+            let child = ProcChild::new(
                 layout,
                 children_dir(&with.state_dir),
                 frontend_argv(&with.proxy_auth_file, with.upstream),
-            ));
+            );
+            let child = Arc::new(run_from_copies(child, with.local.as_ref()));
             let started = start_with(&handle, &gate, &*wait, &child, with, Retry::boot());
             let (active, held) = match &started {
                 Ok(Startup::Adopted { active }) => (*active, None),
@@ -670,12 +736,17 @@ fn start_with(
     use crate::proxy::boot::FileReport;
     use crate::proxy::model::Timing;
     use crate::proxy::root_orders::StatusFile;
-    use crate::proxy::supervisor::{Boot, adopt_children, child_admin, host_migrator};
+    use crate::proxy::supervisor::{Adopt, Boot, adopt_children, child_admin, host_migrator};
+    use crate::run::SystemRunner;
 
     child_admin(handle, with.upstream, with.operator_token_file).map(|admin| {
         let report = FileReport::new(&with.state_dir);
         let facts = StatusFile::new(&with.status);
         let migrator = host_migrator(with.database, &facts, child);
+        let adopt = with.local.as_ref().map(|local| Adopt {
+            local,
+            runner: &SystemRunner,
+        });
         let boot = Boot {
             admin: &admin,
             clock,
@@ -684,6 +755,7 @@ fn start_with(
             status: &with.status,
             timing: Timing::frontend(),
             retry,
+            adopt,
         };
         adopt_children(gate, child, &with.state_dir, &boot)
     })
@@ -754,6 +826,7 @@ pub fn run(args: &ProxyArgs, root: &Path) -> Result<(), VerbError> {
         &text,
     ))?;
     if args.check {
+        kbf_binary(args)?;
         return loaded
             .proxy
             .check_remote_file()
@@ -768,14 +841,19 @@ pub fn run(args: &ProxyArgs, root: &Path) -> Result<(), VerbError> {
         std::process::id(),
         FIRST_FD,
     )?;
-    let handover = handover_config(
+    let mut handover = handover_config(
         args,
         &loaded,
         &Layout::new(root.clone(), Platform::current()),
     );
+    handover.local = open_local(args, &handover.state_dir)?;
     serve(loaded.proxy, database, &handover, listener, &root)
 }
 
 #[cfg(test)]
 #[path = "proxy_verb_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "proxy_verb_copies_tests.rs"]
+mod copies_tests;

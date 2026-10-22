@@ -10,15 +10,20 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use hyper::StatusCode;
 use kbf_update::record::parse_file_name;
 
 use super::*;
+use crate::fixtures::{FakeRunner, ran, version_json};
 use crate::helper::memory::{Memory, StagedFacts as KeptFacts};
 use crate::helper::status;
-use crate::proxy::api::model::UpdateId;
+use crate::proxy::api::core::{Core, Fault};
+use crate::proxy::api::model::{UpdateId, UpdateRequest};
+use crate::proxy::handover::parts;
 use crate::proxy::model::{Intent, Locator, Plan, StagedFacts, Step, Verb};
-use crate::proxy::ports::{ChildAdmin, Recorder, RootOrders};
-use crate::proxy::supervisor_swap::rig::Rig;
+use crate::proxy::ports::{ChildAdmin, Recorder, RootOrders, StatusFacts};
+use crate::proxy::releases::{self, Local};
+use crate::proxy::supervisor_swap::rig::{Rig, quick};
 use crate::state::State;
 use crate::testkit::{A, B, c};
 use kbf_state::postgres::schema::{Outcome, SchemaError};
@@ -42,6 +47,7 @@ fn config(name: &str) -> (HandoverConfig, OrderSpool, PathBuf) {
         state_dir: state_dir.clone(),
         orders_dir: root.join("orders"),
         status_file: root.join("status.json"),
+        local: None,
         confirm_window_s: 900,
         fetch_timeout_s: 900,
         slots: ports_of([addr(1), addr(1)], [addr(1), addr(1)]),
@@ -365,6 +371,7 @@ fn a_migration_the_database_refuses_ends_the_update_at_migrate_with_its_word() {
         Seams {
             apply: Some(hook),
             admin: None,
+            timing: None,
         },
     );
     let rig = Rig::new(None);
@@ -450,6 +457,7 @@ fn a_kept_release_is_migrated_taken_over_and_the_old_child_stood_down() {
         Seams {
             apply: Some(hook),
             admin: Some(admin),
+            timing: None,
         },
     );
     let deaths = Arc::new(Mutex::new(Vec::new()));
@@ -676,4 +684,204 @@ fn a_release_reads_as_staged_only_once_the_root_half_has_kept_it() {
     // Kept, with the facts not yet in the file.
     let (_, orders) = root_half_status(&staged_state, &Memory::default());
     assert_eq!(orders.staged().expect("readable"), None);
+}
+
+// ----- the swap over the proxy's own copies -----
+
+/// A configuration for a proxy that keeps its own copies: the status file is its
+/// `releases.json`, the copies are in the state directory, and there is no `orders/`.
+fn config_local(name: &str) -> (HandoverConfig, Local, PathBuf) {
+    let root = kbf_host::testkit::scratch(&format!("handover-local-{name}"));
+    let state_dir = root.join("state");
+    fs::create_dir(&state_dir).expect("state dir");
+    let local = Local::open(root.join("package-kbf"), &state_dir).expect("copies");
+    let cfg = HandoverConfig {
+        state_dir: state_dir.clone(),
+        orders_dir: root.join("orders"),
+        status_file: state_dir.join(releases::STATUS),
+        local: Some(local.clone()),
+        confirm_window_s: 900,
+        fetch_timeout_s: 900,
+        slots: ports_of([addr(1), addr(1)], [addr(1), addr(1)]),
+        operator_token_file: root.join("operator.token"),
+        installer_toml: root.join("installer.toml"),
+        gate: GateSlot::new(),
+    };
+    fs::write(
+        &cfg.installer_toml,
+        "database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n",
+    )
+    .expect("installer.toml");
+    (cfg, local, root)
+}
+
+/// Removes a scratch directory with the test: the copies in it are 0755 files named `kbf`,
+/// which the coverage report takes for the binary if they are left under the target directory.
+struct Gone(PathBuf);
+
+impl Drop for Gone {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A verified copy in `local` of each of `commits`, each a build of its own commit.
+fn copied(local: &Local, root: &Path, commits: &[&str]) {
+    for commit in commits {
+        let src = root.join(format!("src-{commit}"));
+        fs::write(&src, commit.as_bytes()).expect("source");
+        let stdout = version_json(commit, "release");
+        let runner = FakeRunner::new(move |_| Ok(ran(0, &stdout, "")));
+        local
+            .copies
+            .ensure(&runner, &src, &c(commit))
+            .expect("a copy");
+    }
+}
+
+/// What the proxy's `releases.json` says: the staged facts and the installed commit.
+fn recorded(cfg: &HandoverConfig) -> (Option<StagedFacts>, Option<CommitId>) {
+    let file = StatusFile::new(&cfg.status_file);
+    let staged = StatusFacts::staged(&file).expect("staged");
+    let installed = StatusFacts::installed(&file).expect("installed");
+    (staged, installed)
+}
+
+fn staged_b(state_schema: u32) -> StagedFacts {
+    StagedFacts {
+        commit: c(B),
+        protocol: 7,
+        min_protocol: 5,
+        state_schema,
+        profile: None,
+    }
+}
+
+/// The whole swap over the proxy's copies, with no spool and no file of the root half: `A`
+/// is installed and `B` staged in `releases.json` (the facts a stage of the copy wrote), the
+/// migration is asked for the schema those facts carry, the candidate starts, takes over, the
+/// bake passes and the confirm lands in `releases.json`: installed `B`, nothing staged. No
+/// `orders/` was made, and the swap thread did not die.
+///
+/// Mutants it catches: the swap's orders still the spool's (`orders/` appears, and the confirm
+/// is not in `releases.json`); the migrator reading the root half's `status.json` (the update
+/// ends at `migrate` as `not_staged`); the confirm that does not clear what is staged; the
+/// confirm that does not install `B`.
+#[test]
+fn a_swap_over_the_proxys_copies_reads_confirms_and_migrates_through_releases_json() {
+    let (cfg, local, root) = config_local("full");
+    let _gone = Gone(root.clone());
+    copied(&local, &root, &[A, B]);
+    local.orders.adopt(&c(A)).expect("A is installed");
+    local.orders.stage(&staged_b(3)).expect("B is staged");
+    assert_eq!(recorded(&cfg), (Some(staged_b(3)), Some(c(A))));
+    let (hook, seen) = applying(Ok(migrated()));
+    let rig = Rig::new(None);
+    let admin: Arc<dyn ChildAdmin + Send + Sync> = rig.clone();
+    let mut handover = Handover::local_with_seams(
+        &cfg,
+        Arc::clone(&local.orders),
+        Seams {
+            apply: Some(hook),
+            admin: Some(admin),
+            timing: Some(quick()),
+        },
+    );
+    let deaths = Arc::new(Mutex::new(Vec::new()));
+    cfg.gate
+        .fill(host_over(&rig, local.copies.root().to_owned(), &deaths));
+    assert_eq!(handover.start_blocked(), None);
+
+    handover.start(&spec("u1")).expect("accepted");
+    until("the update to end", || {
+        handover
+            .status()
+            .update
+            .is_some_and(|u| matches!(u.phase, Phase::Done | Phase::Failed))
+    });
+
+    let update = handover.status().update.expect("shown");
+    assert_eq!(update.phase, Phase::Done, "{:?}", update.failure);
+    assert_eq!(update.active_slot, Slot::B);
+    assert_eq!(*seen.lock().unwrap(), [(3, DbMigrator::LOCK_WAIT)]);
+    assert_eq!(recorded(&cfg), (None, Some(c(B))));
+    assert!(!cfg.orders_dir.exists(), "no order spool was made");
+    assert!(deaths.lock().unwrap().is_empty());
+}
+
+/// A swap that fails before the switch drops the staged release from `releases.json` and
+/// leaves the installed one: here the migration is refused, which ends the update at
+/// `migrate`, after the revert.
+///
+/// Mutants it catches: the revert sent to the spool (`orders/` appears, `releases.json` still
+/// shows `B` staged); the revert that clears the installed release too.
+#[test]
+fn a_swap_that_fails_reverts_the_staged_release_in_releases_json() {
+    let (cfg, local, root) = config_local("revert");
+    let _gone = Gone(root.clone());
+    copied(&local, &root, &[A, B]);
+    local.orders.adopt(&c(A)).expect("A is installed");
+    local.orders.stage(&staged_b(3)).expect("B is staged");
+    let (hook, seen) = applying(Err(SchemaError::Busy));
+    let mut handover = Handover::local_with_seams(
+        &cfg,
+        Arc::clone(&local.orders),
+        Seams {
+            apply: Some(hook),
+            admin: None,
+            timing: None,
+        },
+    );
+    let rig = Rig::new(None);
+    let deaths = Arc::new(Mutex::new(Vec::new()));
+    cfg.gate
+        .fill(host_over(&rig, local.copies.root().to_owned(), &deaths));
+
+    handover.start(&spec("u1")).expect("accepted");
+    let failure = failed_update(&handover);
+
+    assert_eq!(failure.step, Step::Migrate);
+    assert_eq!(*seen.lock().unwrap(), [(3, DbMigrator::LOCK_WAIT)]);
+    assert_eq!(recorded(&cfg), (None, Some(c(A))));
+    assert_eq!(rig.count("spawn"), 0, "no candidate was started");
+    assert!(!cfg.orders_dir.exists(), "no order spool was made");
+}
+
+/// The update API over the seams of `parts` with the proxy's copies: a `POST` that passes
+/// every check (the host runs `A`, per `releases.json`, and the proxy is bound) is refused
+/// where the order would be written, as 503 `order_unwritable` with the reason, and no
+/// `orders/` is made.
+///
+/// Mutants it catches: the API's writer being a spool (the order is written); the writer
+/// accepting the order and writing nothing.
+#[test]
+fn the_update_api_orders_nothing_when_the_proxy_keeps_its_own_copies() {
+    let (cfg, local, root) = config_local("api");
+    let _gone = Gone(root.clone());
+    copied(&local, &root, &[A]);
+    local.orders.adopt(&c(A)).expect("A is installed");
+    let rig = Rig::new(None);
+    let deaths = Arc::new(Mutex::new(Vec::new()));
+    cfg.gate
+        .fill(host_over(&rig, local.copies.root().to_owned(), &deaths));
+    let mut core = Core::new(parts(&cfg).expect("the seams"));
+    let request = UpdateRequest {
+        commit: c(B),
+        request_id: "r1".to_owned(),
+        nodes: false,
+        rollback: false,
+        source: kbf_update::Source::Fetch,
+    };
+
+    let refused = match core.post(request) {
+        Err(Fault::Api(e)) => e,
+        other => panic!("not refused: {other:?}"),
+    };
+
+    assert_eq!(
+        (refused.status, refused.code),
+        (StatusCode::SERVICE_UNAVAILABLE, "order_unwritable")
+    );
+    assert!(refused.message.contains("no order spool"), "{refused:?}");
+    assert!(!cfg.orders_dir.exists(), "no order spool was made");
 }
