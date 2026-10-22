@@ -2593,6 +2593,7 @@ version = "0.1.0"
 dependencies = [
  "kbf-host-install",
  "kbf-testkit",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",

@@ -28,6 +28,8 @@ mod updater;
 pub use updater::{Ports, Started, Timing, Updater};
 
 #[cfg(test)]
+mod updater_followup_tests;
+#[cfg(test)]
 mod updater_restart_tests;
 #[cfg(test)]
 mod updater_tests;

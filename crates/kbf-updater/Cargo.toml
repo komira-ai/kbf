@@ -14,6 +14,7 @@ publish.workspace = true
 # of the ports, in later changes. Synchronous on purpose: a caller runs `Updater::drive` on
 # its own thread.
 [dependencies]
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

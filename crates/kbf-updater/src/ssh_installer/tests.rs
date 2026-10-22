@@ -187,7 +187,7 @@ fn the_config_and_the_multiplexing_are_switched_off() {
     let r = rig();
     r.fake.says(exited(
         0,
-        "{\"installed_version\":\"1\",\"running_commit\":null,\"in_progress\":false}\n",
+        "{\"result\":\"query\",\"installed_version\":\"1\",\"running_commit\":null,\"in_progress\":false}\n",
     ));
     r.ssh.query(&host()).expect("ok");
     let args = strs(&r.fake.calls()[0].spawn.args).join(" ");
@@ -211,7 +211,7 @@ fn a_query_is_the_bare_word_and_the_last_argument() {
     let r = rig();
     r.fake.says(exited(
         0,
-        "{\"installed_version\":\"1\",\"running_commit\":null,\"in_progress\":false}\n",
+        "{\"result\":\"query\",\"installed_version\":\"1\",\"running_commit\":null,\"in_progress\":false}\n",
     ));
     r.ssh.query(&host()).expect("ok");
     let args = strs(&r.fake.calls()[0].spawn.args)
@@ -677,10 +677,10 @@ fn exit_255_is_unreachable_and_never_failed() {
             .install(&host(), &version("1"))
             .expect_err("unreachable");
         assert!(install.is_unreachable(), "{stderr}");
-        assert_eq!(install.text(), text);
+        assert_eq!(install.to_string(), text);
         let query = r.ssh.query(&host()).expect_err("unreachable");
         assert!(query.is_unreachable());
-        assert_eq!(query.text(), text);
+        assert_eq!(query.to_string(), text);
     }
 }
 
@@ -718,7 +718,9 @@ fn raw_stderr_never_reaches_an_error() {
 #[test]
 fn every_query_answer_maps() {
     let q = |v: &str, p: bool| {
-        format!("{{\"installed_version\":{v},\"running_commit\":\"abc123\",\"in_progress\":{p}}}\n")
+        format!(
+            "{{\"result\":\"query\",\"installed_version\":{v},\"running_commit\":\"abc123\",\"in_progress\":{p}}}\n"
+        )
     };
     let r = rig();
     r.fake.says(exited(0, &q("\"1.2.3-1\"", false)));
@@ -743,7 +745,12 @@ fn every_query_answer_maps() {
         .says(exited(0, &q(&format!("\"{}\"", "1".repeat(256)), false)));
     r.fake
         .says(exited(0, &q(&format!("\"{}\"", "1".repeat(257)), false)));
-    let got: Vec<_> = (0..14).map(|_| r.ssh.query(&host())).collect();
+    // The host's query line carries `result: "query"`; a line without it is not its answer.
+    r.fake.says(exited(
+        0,
+        "{\"installed_version\":\"1\",\"running_commit\":null,\"in_progress\":false}\n",
+    ));
+    let got: Vec<_> = (0..15).map(|_| r.ssh.query(&host())).collect();
     assert_eq!(got[0], Ok(Installed::Version("1.2.3-1".into())));
     assert_eq!(got[1], Ok(Installed::InProgress));
     assert_eq!(got[2], Ok(Installed::InProgress));
@@ -758,6 +765,7 @@ fn every_query_answer_maps() {
     assert_eq!(got[11], Err(PortError::other("bad answer")));
     assert_eq!(got[12], Ok(Installed::Version("1".repeat(256))));
     assert_eq!(got[13], Err(PortError::other("bad answer")));
+    assert_eq!(got[14], Err(PortError::other("bad answer")));
 }
 
 /// Catches a non-whole-second connect timeout rounded down, and a work directory whose

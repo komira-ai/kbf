@@ -82,11 +82,20 @@ enum ReasonResult {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Report {
+    // The host's query line says what it is; any other word is not its answer.
+    #[serde(rename = "result")]
+    _result: QueryResult,
     installed_version: Option<String>,
     // The commit the host runs is for the health check; here it only has to be a string.
     #[serde(rename = "running_commit")]
     _running_commit: Option<String>,
     in_progress: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum QueryResult {
+    Query,
 }
 
 fn parse<'a, T: Deserialize<'a>>(line: &'a str) -> Result<T, PortError> {
@@ -192,5 +201,5 @@ pub fn unreachable_error(stderr: &[u8]) -> PortError {
     } else {
         "ssh"
     };
-    PortError::unreachable(format!("unreachable: {class}"))
+    PortError::unreachable(class)
 }

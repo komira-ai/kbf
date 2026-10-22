@@ -20,6 +20,7 @@ fn refusals() -> Vec<Refusal> {
         Refusal::ConfigUnsafe,
         Refusal::ChannelUnsigned,
         Refusal::KeyUntrusted,
+        Refusal::ChannelInsecure,
         Refusal::OlderThanInstalled,
     ];
     for r in &all {
@@ -30,6 +31,7 @@ fn refusals() -> Vec<Refusal> {
             | Refusal::ConfigUnsafe
             | Refusal::ChannelUnsigned
             | Refusal::KeyUntrusted
+            | Refusal::ChannelInsecure
             | Refusal::OlderThanInstalled => {}
         }
     }
@@ -146,7 +148,7 @@ fn every_query_outcome_of_the_host_is_read() {
     // A query the host refuses or fails is read like an install's.
     for refusal in refusals() {
         let got = read(&Outcome::Refused(refusal)).expect_err("refused");
-        assert_eq!(got.text(), format!("refused: {}", refusal.code()));
+        assert_eq!(got.to_string(), format!("refused: {}", refusal.code()));
     }
     for failure in failures() {
         let got = read(&Outcome::Failed(Failure {
@@ -154,7 +156,7 @@ fn every_query_outcome_of_the_host_is_read() {
             detail: String::new(),
         }))
         .expect_err("failed");
-        assert_eq!(got.text(), format!("failed: {}", failure.code()));
+        assert_eq!(got.to_string(), format!("failed: {}", failure.code()));
     }
 }
 

@@ -164,7 +164,7 @@ impl SafeToStop for FakeSafeToStop {
     }
 }
 
-type Hook = Box<dyn Fn(&Host) + Send + Sync>;
+type Hook = Arc<dyn Fn(&Host) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct FakeInstaller {
@@ -217,7 +217,7 @@ impl FakeInstaller {
 
     /// Call `f` at the start of every install (a test reads the record from it).
     pub fn on_install(&self, f: impl Fn(&Host) + Send + Sync + 'static) {
-        *lock(&self.hook) = Some(Box::new(f));
+        *lock(&self.hook) = Some(Arc::new(f));
     }
 }
 
@@ -225,7 +225,9 @@ impl Installer for FakeInstaller {
     fn install(&self, host: &Host, version: &Version) -> Result<(), PortError> {
         self.log
             .push(Event::Install(host.alias.clone(), version.to_string()));
-        if let Some(hook) = lock(&self.hook).as_ref() {
+        // Cloned out, so a hook that re-enters the installer does not deadlock on the slot.
+        let hook = lock(&self.hook).clone();
+        if let Some(hook) = hook {
             hook(host);
         }
         let result = self.installs.next(&host.alias);

@@ -12,7 +12,7 @@ use crate::fakes::{
 };
 use crate::inventory::Inventory;
 use crate::ports::{Health, PortError, Stop};
-use crate::record::RollStore;
+use crate::record::{Fsync, RollStore};
 use crate::{Ports, Timing, Updater};
 
 pub(crate) const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample";
@@ -83,7 +83,7 @@ impl Rig {
     }
 
     pub fn store(&self) -> RollStore {
-        RollStore::new(&self.dir)
+        RollStore::with_sync(&self.dir, Box::new(Fsync))
     }
 
     pub fn open(&self) -> Updater {
@@ -395,7 +395,7 @@ fn a_second_roll_is_409_while_one_is_active() {
     assert_eq!((err.code, err.code.status()), (ErrorCode::RollActive, 409));
     assert_eq!(err.roll_id.as_deref(), Some("roll-1"));
     assert_eq!(
-        u.current().expect("current"),
+        u.current().expect("live").expect("current"),
         first,
         "the second left no trace"
     );
@@ -464,7 +464,7 @@ fn the_same_key_with_a_different_body_is_an_error() {
         assert_eq!(err.code.status(), 409);
         assert_eq!(err.roll_id.as_deref(), Some("roll-1"));
     }
-    assert_eq!(u.current().expect("c").id, "roll-1");
+    assert_eq!(u.current().expect("live").expect("c").id, "roll-1");
 }
 
 /// Catches an unknown alias getting past the door: it is a 400 before any record is written
@@ -479,7 +479,7 @@ fn an_unknown_alias_is_a_400_before_anything_runs() {
         (err.code, err.code.status()),
         (ErrorCode::UnknownAlias, 400)
     );
-    assert_eq!(u.current(), None);
+    assert_eq!(u.current().expect("live"), None);
     assert!(rig.log.events().is_empty());
     assert!(
         rig.store().load().expect("load").is_none(),
@@ -503,13 +503,26 @@ fn drive_and_get_by_id_and_a_second_driver_is_refused() {
         u.get("roll-9").expect_err("none").code,
         ErrorCode::UnknownRoll
     );
-    assert_eq!(u.current(), None);
+    assert_eq!(u.current().expect("live"), None);
     let started = u.start(&all("2.0", "k")).expect("start");
+    assert_eq!(
+        u.drive("roll-9").expect_err("other id").code,
+        ErrorCode::UnknownRoll,
+        "a roll exists, but not this one"
+    );
 
     let inside = Arc::new(std::sync::Mutex::new(None));
     let (u2, sink) = (Arc::clone(&u), Arc::clone(&inside));
+    let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     rig.inst.on_install(move |h| {
         if h.alias == "fe" {
+            // Without the guard the second drive installs `fe` again and lands here again,
+            // for ever: fail on the second entry instead of hanging.
+            let n = entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                n, 0,
+                "the second driver was let in and re-entered the install"
+            );
             let second = u2.drive("roll-1").expect_err("second driver");
             let seen = u2.get("roll-1").expect("get while driving");
             *sink.lock().expect("sink") = Some((second, seen.state));
@@ -566,22 +579,11 @@ fn an_abort_during_a_roll_takes_effect_between_hosts() {
     assert_eq!(rig.store().load().expect("load").expect("rec").roll, roll);
 }
 
-/// Catches an abort request on the last host turning a finished roll into an aborted one,
-/// and abort of a roll nobody drives not taking effect.
+/// Catches abort of a roll nobody drives not taking effect, and abort of an unknown id (the
+/// abort during the last host is in `updater_followup_tests`).
 #[test]
-fn abort_after_the_last_host_leaves_done_and_an_idle_roll_aborts_at_once() {
-    let rig = Rig::new("abort-last");
-    let u = Arc::new(rig.open());
-    let id = u.start(&all("2.0", "k")).expect("start").roll.id;
-    let u2 = Arc::clone(&u);
-    let id2 = id.clone();
-    rig.inst.on_install(move |h| {
-        if h.alias == "st2" {
-            u2.abort(&id2).expect("abort");
-        }
-    });
-    assert_eq!(u.drive(&id).expect("drive").state, RollState::Done);
-
+fn an_idle_roll_aborts_at_once() {
+    let rig = Rig::new("abort-idle");
     let idle = rig.open();
     let next = idle.start(&all("2.0", "k2")).expect("start").roll.id;
     assert_eq!(
@@ -632,10 +634,10 @@ fn a_record_that_cannot_be_written_stops_the_updater() {
     let rig = Rig::new("unwritable");
     // The directory is gone: every write fails.
     let gone = rig.dir.join("missing");
-    let u = rig.open_with(RollStore::new(&gone));
+    let u = rig.open_with(RollStore::with_sync(&gone, Box::new(Fsync)));
     let err = u.start(&all("2.0", "k")).expect_err("state lost");
     assert_eq!((err.code, err.code.status()), (ErrorCode::StateLost, 503));
-    assert_eq!(u.current(), None);
+    assert_eq!(u.memory(), None);
     assert!(rig.log.events().is_empty());
 }
 

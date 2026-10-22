@@ -16,7 +16,8 @@
 //! of hosts than the operator wrote.
 
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use crate::api::{ApiError, ErrorCode, Hosts};
@@ -59,10 +60,16 @@ pub struct Host {
 pub enum InventoryError {
     #[error("cannot read the inventory: {0}")]
     Io(#[from] std::io::Error),
-    #[error("the inventory is owned by uid {found}, not {expected}")]
-    Owner { found: u32, expected: u32 },
-    #[error("the inventory is writable by group or others (mode {mode:o})")]
-    Mode { mode: u32 },
+    #[error("the inventory is not a regular file (a symlink, a directory or a device)")]
+    NotRegular,
+    #[error("the inventory {what} is owned by uid {found}, not {expected}")]
+    Owner {
+        what: &'static str,
+        found: u32,
+        expected: u32,
+    },
+    #[error("the inventory {what} is writable by group or others (mode {mode:o})")]
+    Mode { what: &'static str, mode: u32 },
     #[error("line {line}: {reason}")]
     Line { line: usize, reason: String },
     #[error("the inventory has no hosts")]
@@ -84,21 +91,34 @@ pub struct Inventory {
 }
 
 impl Inventory {
-    /// Read the file at `path`, which must be owned by `owner_uid` and not writable by group
-    /// or others.
+    /// Read the file at `path`, which must be a regular file (a symlink is refused) owned by
+    /// `owner_uid` and not writable by group or others, in a directory owned by `owner_uid`
+    /// and not writable by group or others (else anyone who may write there may swap the
+    /// file). The file is opened once and every check is on the open handle, so the bytes
+    /// read are the bytes checked; the directory is checked on its own open handle.
     pub fn load(path: &Path, owner_uid: u32) -> Result<Inventory, InventoryError> {
-        let meta = fs::metadata(path)?;
-        if meta.uid() != owner_uid {
-            return Err(InventoryError::Owner {
-                found: meta.uid(),
-                expected: owner_uid,
-            });
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|e| match e.raw_os_error() {
+                Some(libc::ELOOP) => InventoryError::NotRegular,
+                _ => InventoryError::Io(e),
+            })?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(InventoryError::NotRegular);
         }
-        let mode = meta.mode() & 0o777;
-        if mode & 0o022 != 0 {
-            return Err(InventoryError::Mode { mode });
-        }
-        Inventory::parse(&fs::read_to_string(path)?)
+        check_owner_and_mode(&meta, owner_uid, "file")?;
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let dir = fs::File::open(parent)?.metadata()?;
+        check_owner_and_mode(&dir, owner_uid, "directory")?;
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        Inventory::parse(&text)
     }
 
     pub fn parse(text: &str) -> Result<Inventory, InventoryError> {
@@ -162,6 +182,25 @@ impl Inventory {
         chosen.sort_by_key(|h| h.role != Role::Frontend);
         Ok(chosen)
     }
+}
+
+fn check_owner_and_mode(
+    meta: &fs::Metadata,
+    owner_uid: u32,
+    what: &'static str,
+) -> Result<(), InventoryError> {
+    if meta.uid() != owner_uid {
+        return Err(InventoryError::Owner {
+            what,
+            found: meta.uid(),
+            expected: owner_uid,
+        });
+    }
+    let mode = meta.mode() & 0o777;
+    if mode & 0o022 != 0 {
+        return Err(InventoryError::Mode { what, mode });
+    }
+    Ok(())
 }
 
 fn parse_line(line: &str) -> Result<Host, String> {
@@ -375,6 +414,7 @@ mod tests {
             .join("../../target/updater-scratch")
             .join(format!("inv-{name}-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("scratch");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod");
         dir
     }
 
@@ -391,7 +431,8 @@ mod tests {
             let got = Inventory::load(&path, mine);
             assert_eq!(got.is_ok(), ok, "mode {mode:o}: {got:?}");
             if !ok {
-                let want = format!("the inventory is writable by group or others (mode {mode:o})");
+                let want =
+                    format!("the inventory file is writable by group or others (mode {mode:o})");
                 assert_eq!(got.expect_err("refused").to_string(), want);
             }
         }
@@ -399,9 +440,65 @@ mod tests {
         let other = Inventory::load(&path, mine + 1).expect_err("owner");
         assert_eq!(
             other.to_string(),
-            format!("the inventory is owned by uid {mine}, not {}", mine + 1)
+            format!(
+                "the inventory file is owned by uid {mine}, not {}",
+                mine + 1
+            )
         );
         let missing = Inventory::load(&path.with_extension("none"), mine).expect_err("missing");
         assert!(matches!(missing, InventoryError::Io(_)));
+    }
+
+    /// Catches the check-then-read race and a file that is not a file: a symlink (even to a
+    /// good inventory), a directory and a device are each `NotRegular` and never read.
+    #[test]
+    fn load_refuses_a_symlink_and_anything_that_is_not_a_regular_file() {
+        let dir = scratch("kinds");
+        let good = dir.join("inventory");
+        fs::write(&good, format!("a a.example storage {KEY}\n")).expect("write");
+        fs::set_permissions(&good, fs::Permissions::from_mode(0o644)).expect("chmod");
+        let mine = fs::metadata(&good).expect("meta").uid();
+        assert!(Inventory::load(&good, mine).is_ok());
+        let link = dir.join("link");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&good, &link).expect("symlink");
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).expect("sub");
+        for path in [link.as_path(), sub.as_path(), Path::new("/dev/null")] {
+            let got = Inventory::load(path, mine);
+            assert!(
+                matches!(got, Err(InventoryError::NotRegular)),
+                "{path:?}: {got:?}"
+            );
+        }
+    }
+
+    /// Catches an inventory whose directory anyone may write to (they could swap the file):
+    /// group or world write on the parent is refused, with the directory named.
+    #[test]
+    fn load_refuses_a_writable_parent_directory() {
+        let dir = scratch("parent");
+        let path = dir.join("inventory");
+        fs::write(&path, format!("a a.example storage {KEY}\n")).expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+        let mine = fs::metadata(&path).expect("meta").uid();
+        for (mode, ok) in [(0o755, true), (0o775, false), (0o757, false)] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).expect("chmod");
+            let got = Inventory::load(&path, mine);
+            assert_eq!(got.is_ok(), ok, "mode {mode:o}: {got:?}");
+            if !ok {
+                let want = format!(
+                    "the inventory directory is writable by group or others (mode {mode:o})"
+                );
+                assert_eq!(got.expect_err("refused").to_string(), want);
+            }
+        }
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod");
+        // A bare file name has the current directory as its parent.
+        let cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&dir).expect("cd");
+        let bare = Inventory::load(Path::new("inventory"), mine);
+        std::env::set_current_dir(cwd).expect("back");
+        assert!(bare.is_ok(), "{bare:?}");
     }
 }
