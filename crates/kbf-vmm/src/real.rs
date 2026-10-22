@@ -153,7 +153,7 @@ impl System for RealSystem {
             paths.extend(spec.automount_dir.clone());
             paths.extend(spec.tagged.as_ref().map(|t| t.path.clone()));
             for p in paths {
-                chown_tree(&p, uid)?;
+                chown_tree(&p, uid, uid)?;
             }
         }
         let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;

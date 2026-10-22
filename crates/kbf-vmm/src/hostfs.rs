@@ -71,12 +71,12 @@ fn entry_names(dir: RawFd) -> io::Result<Vec<CString>> {
     Ok(names)
 }
 
-/// Gives `uid` (and group `uid`) the directory open as `dir` and everything below it.
+/// Gives `uid` and `gid` the directory open as `dir` and everything below it.
 /// Every step is relative to a descriptor and none follows a symbolic link, so a link
 /// planted in the tree while this runs is itself chowned, never what it points at.
-fn walk(dir: RawFd, uid: u32) -> io::Result<()> {
+fn walk(dir: RawFd, uid: u32, gid: u32) -> io::Result<()> {
     // SAFETY: `dir` is an open descriptor.
-    cvt(unsafe { libc::fchown(dir, uid, uid) })?;
+    cvt(unsafe { libc::fchown(dir, uid, gid) })?;
     for name in entry_names(dir)? {
         let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
         // SAFETY: `name` is NUL-terminated and `st` is a stat buffer.
@@ -102,23 +102,23 @@ fn walk(dir: RawFd, uid: u32) -> io::Result<()> {
             })?;
             // SAFETY: `fd` was just opened and nothing else owns it.
             let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-            walk(owned.as_raw_fd(), uid)?;
+            walk(owned.as_raw_fd(), uid, gid)?;
         } else {
             // SAFETY: `name` is NUL-terminated; the flag makes this chown a link itself.
             cvt(unsafe {
-                libc::fchownat(dir, name.as_ptr(), uid, uid, libc::AT_SYMLINK_NOFOLLOW)
+                libc::fchownat(dir, name.as_ptr(), uid, gid, libc::AT_SYMLINK_NOFOLLOW)
             })?;
         }
     }
     Ok(())
 }
 
-/// Gives `uid` ownership of `path` and of everything under it. `path` itself must not be
+/// Gives `uid` and `gid` ownership of `path` and of everything under it. `path` itself must not be
 /// a symbolic link.
 ///
 /// # Errors
 /// A step failed (not root, or `path` is a link or does not exist); the message names `path`.
-pub fn chown_tree(path: &Path, uid: u32) -> Result<(), String> {
+pub fn chown_tree(path: &Path, uid: u32, gid: u32) -> Result<(), String> {
     let describe = |e: io::Error| format!("chown {}: {e}", path.display());
     let c = cstring(path).map_err(describe)?;
     // SAFETY: `c` is a NUL-terminated path; `O_NOFOLLOW` refuses a symbolic link.
@@ -139,10 +139,10 @@ pub fn chown_tree(path: &Path, uid: u32) -> Result<(), String> {
     // SAFETY: `fstat` succeeded, so `st` is initialised.
     let is_dir = unsafe { st.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFDIR;
     if is_dir {
-        walk(owned.as_raw_fd(), uid).map_err(describe)
+        walk(owned.as_raw_fd(), uid, gid).map_err(describe)
     } else {
         // SAFETY: `owned` is open.
-        cvt(unsafe { libc::fchown(owned.as_raw_fd(), uid, uid) })
+        cvt(unsafe { libc::fchown(owned.as_raw_fd(), uid, gid) })
             .map(|_| ())
             .map_err(describe)
     }
@@ -157,6 +157,11 @@ mod tests {
     fn me() -> u32 {
         // SAFETY: getuid cannot fail.
         unsafe { libc::getuid() }
+    }
+
+    fn my_group() -> u32 {
+        // SAFETY: getgid cannot fail.
+        unsafe { libc::getgid() }
     }
 
     /// Catches two bundles whose names differ after a dot sharing one spec path.
@@ -192,19 +197,23 @@ mod tests {
         std::fs::write(root.join("a/b/f"), "x").expect("f");
         std::os::unix::fs::symlink(dir.join("outside"), root.join("a/link")).expect("dangling");
         std::os::unix::fs::symlink(&root, root.join("loop")).expect("loop");
-        chown_tree(&root, me()).expect("walk");
+        chown_tree(&root, me(), my_group()).expect("walk");
         assert_eq!(
             std::fs::metadata(root.join("a/b/f")).expect("f").uid(),
             me()
         );
         // A file as the root is chowned alone.
-        chown_tree(&root.join("a/b/f"), me()).expect("file");
+        chown_tree(&root.join("a/b/f"), me(), my_group()).expect("file");
         // A link as the root, and a path that is not there, are refused.
         let link = dir.join("rootlink");
         std::os::unix::fs::symlink(&root, &link).expect("link");
-        assert!(chown_tree(&link, me()).unwrap_err().contains("chown"));
-        assert!(chown_tree(&dir.join("none"), me()).is_err());
-        assert!(chown_tree(Path::new("a\0b"), me()).is_err());
+        assert!(
+            chown_tree(&link, me(), my_group())
+                .unwrap_err()
+                .contains("chown")
+        );
+        assert!(chown_tree(&dir.join("none"), me(), my_group()).is_err());
+        assert!(chown_tree(Path::new("a\0b"), me(), my_group()).is_err());
     }
 
     /// Catches a failure of the chown itself being swallowed (a user who is not root
@@ -217,8 +226,11 @@ mod tests {
         std::fs::write(root.join("f"), "x").expect("f");
         // Only root may give files to someone else.
         let refused = me() != 0;
-        assert_eq!(chown_tree(&root, me() + 1).is_err(), refused);
-        assert_eq!(chown_tree(&root.join("f"), me() + 1).is_err(), refused);
+        assert_eq!(chown_tree(&root, me() + 1, my_group()).is_err(), refused);
+        assert_eq!(
+            chown_tree(&root.join("f"), me() + 1, my_group()).is_err(),
+            refused
+        );
     }
 
     /// Catches descriptor and directory-stream failures being ignored: a descriptor that
@@ -252,7 +264,7 @@ mod tests {
         std::fs::create_dir_all(root.join("sealed")).expect("dirs");
         std::fs::set_permissions(root.join("sealed"), std::fs::Permissions::from_mode(0o000))
             .expect("seal");
-        let failed = chown_tree(&root, me()).is_err();
+        let failed = chown_tree(&root, me(), my_group()).is_err();
         std::fs::set_permissions(root.join("sealed"), std::fs::Permissions::from_mode(0o700))
             .expect("unseal");
         assert_eq!(failed, me() != 0);
