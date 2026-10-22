@@ -251,7 +251,7 @@ frontend, a daemon opens a worker stream.
 | `generation` | the map's generation; `0` with an empty `members` before the first member has registered |
 | `id` | the member id the store assigned at registration (the `member_id` of `RegisterResponse`) |
 | `addr` | the address callers dial |
-| `state` | `joining` (registered, a write owner, read last), `catching_up`, `active` (a full owner), `draining` (takes no new writes) or `down` (its lease lapsed; kept in the map for the dwell, then it leaves the list) |
+| `state` | `joining` (registered, a write owner, read last), `catching_up`, `active` (a full owner), `draining` (takes no new writes), `down` (its lease lapsed; kept in the map for the dwell, then it leaves the list) or `unknown` (a state a later build wrote that this one does not name; the member stays listed, takes no writes, is never read from and is not counted as `active`) |
 | `weight` | its share of the digests relative to the others |
 | `protocol` | the protocol version in the `RegisterRequest` that wrote the member's row (a heartbeat and a state change keep it; a new registration of the member replaces it). `null` when the row names none, as a row written before this field existed, and for a `down` member: its row expires with its heartbeats, and the version went with it |
 | `runs_log` | the newest metadata-log machine version the node's build can raise its log to, as the `RegisterRequest` that wrote the row said (a heartbeat never replaces it; it fills it only when the row holds none) |

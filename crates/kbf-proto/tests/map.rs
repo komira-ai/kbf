@@ -1,10 +1,12 @@
-//! `kbf.map.v1` and `kbf_map`: lossless both ways, strict on the way in.
+//! `kbf.map.v1` and `kbf_map`: lossless both ways, and tolerant of what this build does not
+//! name.
+//!
+//! A member state or rule this build does not name reads as an inert value that keeps its
+//! number. A replication factor that does not fit a `u8` is refused.
 //!
 //! Catches:
 //! - a state, rule or field lost or swapped in either direction (every state round trips,
 //!   a whole map round trips);
-//! - an unspecified or unknown enum value, or a replication factor that does not fit a
-//!   `u8`, read as a default instead of refused;
 //! - a map the domain refuses getting in through the wire;
 //! - the generation moving off field 1;
 //! - the heartbeat's debts report moving off fields 5 and 6, or an older node's heartbeat
@@ -13,7 +15,9 @@
 use kbf_map::{DenyEntry, Map, MapError, Member, MemberId, MemberState, Rule};
 use kbf_proto::MapDecodeError;
 use kbf_proto::kbf::map::v1 as pb;
+use kbf_types::{Digest, DigestFunction};
 use prost::Message;
+use sha2::{Digest as _, Sha256};
 
 const STATES: [MemberState; 5] = [
     MemberState::Joining,
@@ -58,42 +62,105 @@ fn map_of_all_states() -> Map {
     .unwrap()
 }
 
+fn digests() -> Vec<Digest> {
+    (0_u64..100)
+        .map(|i| {
+            let hash: [u8; 32] = Sha256::digest(i.to_be_bytes()).into();
+            Digest::new(DigestFunction::Sha256, hash, 1000 + i)
+        })
+        .collect()
+}
+
+/// Asserts that every state this build names, and a whole map holding them all, are the
+/// same after a trip through the wire bytes.
 #[test]
 fn every_state_and_the_whole_map_round_trip_through_bytes() {
     let map = map_of_all_states();
     let wire = pb::Map::from(&map);
     for (wire_member, state) in wire.members.iter().zip(STATES) {
-        assert_eq!(Member::try_from(wire_member.clone()).unwrap().state, state);
+        assert_eq!(Member::from(wire_member.clone()).state, state);
     }
     let decoded = pb::Map::decode(wire.encode_to_vec().as_slice()).unwrap();
     assert_eq!(Map::try_from(decoded).unwrap(), map);
 }
 
+/// Asserts that the states this build names keep their wire numbers.
 #[test]
 fn distinct_states_have_distinct_numbers() {
     let numbers: Vec<i32> = STATES
         .iter()
-        .map(|s| pb::MemberState::from(*s) as i32)
+        .map(|s| pb::Member::from(&member(1, *s)).state)
         .collect();
     assert_eq!(numbers, [1, 2, 3, 4, 5]);
 }
 
+/// Asserts that a member state the wire carries as 0 or as a number this build does not
+/// name reads as an unknown state that keeps the number, and goes back out as that number.
 #[test]
-fn an_unspecified_or_unknown_state_is_refused() {
-    for bad in [0, 6, -1, 99] {
+fn an_unspecified_or_unknown_state_reads_as_unknown_and_keeps_its_number() {
+    for number in [0, 6, -1, 99] {
         let mut m = pb::Member::from(&member(1, MemberState::Active));
-        m.state = bad;
-        assert_eq!(Member::try_from(m), Err(MapDecodeError::UnknownState(bad)));
+        m.state = number;
+        let read = Member::from(m);
+        assert_eq!(read.state, MemberState::Unknown(number));
+        assert_eq!(pb::Member::from(&read).state, number);
     }
 }
 
+/// Asserts that a map placed under a rule the wire carries as 0 or as a number this build
+/// does not name decodes, with the rule ignored and everything else in the map as it came:
+/// the generation, replication factor, protocol floor, members and deny list apply, no
+/// digest has an owner, and the rule goes back out as the number it came with.
 #[test]
-fn an_unspecified_or_unknown_rule_is_refused() {
-    for bad in [0, 2, 77] {
-        let mut m = pb::Map::from(&map_of_all_states());
-        m.rule = bad;
-        assert_eq!(Map::try_from(m), Err(MapDecodeError::UnknownRule(bad)));
+fn an_unspecified_or_unknown_rule_is_ignored_and_the_rest_of_the_map_applies() {
+    let known = map_of_all_states();
+    let all = digests();
+    for number in [0, 2, 77] {
+        let mut wire = pb::Map::from(&known);
+        wire.rule = number;
+        let read = Map::try_from(wire).expect("the map decodes");
+        assert_eq!(read.rule(), Rule::Unknown(number));
+        assert_eq!(pb::Map::from(&read).rule, number);
+        assert_eq!(read.generation(), 9);
+        assert_eq!(read.r(), 2);
+        assert_eq!(read.min_protocol(), 4);
+        assert_eq!(read.members(), known.members());
+        assert_eq!(read.denied(), known.denied());
+        for d in &all {
+            assert!(read.write_owners(d).is_empty());
+            assert!(read.read_order(d).is_empty());
+        }
     }
+}
+
+/// Asserts that a map in which one member is in a state this build does not name decodes
+/// whole, that the member stays in it as an unknown state, and that it is given no work:
+/// for every digest it is neither a write owner nor read from.
+#[test]
+fn a_map_with_a_member_in_an_unknown_state_decodes_and_that_member_gets_no_work() {
+    let mut wire = pb::Map::from(&map_of_all_states());
+    wire.members[2].state = 42;
+    let map = Map::try_from(wire).expect("the map decodes");
+    let kept = map.member(MemberId(3)).expect("kept");
+    assert_eq!(kept.state, MemberState::Unknown(42));
+    assert_eq!(map.members().len(), STATES.len());
+    for d in &digests() {
+        assert!(!map.write_owners(d).contains(&MemberId(3)));
+        assert!(!map.read_order(d).contains(&MemberId(3)));
+    }
+}
+
+/// Asserts that a map holding states and a rule this build does not name is written back
+/// byte for byte as it came, so a build that does not know them passes them on unchanged.
+#[test]
+fn an_unknown_state_and_rule_are_written_back_as_they_came() {
+    let mut wire = pb::Map::from(&map_of_all_states());
+    wire.rule = 5;
+    wire.members[0].state = 0;
+    wire.members[1].state = 31;
+    let bytes = wire.encode_to_vec();
+    let read = Map::try_from(pb::Map::decode(bytes.as_slice()).unwrap()).unwrap();
+    assert_eq!(pb::Map::from(&read).encode_to_vec(), bytes);
 }
 
 #[test]
@@ -101,13 +168,6 @@ fn a_replication_factor_above_255_is_refused() {
     let mut m = pb::Map::from(&map_of_all_states());
     m.replication = 256;
     assert_eq!(Map::try_from(m), Err(MapDecodeError::Replication(256)));
-}
-
-#[test]
-fn a_member_with_a_bad_state_refuses_the_map() {
-    let mut m = pb::Map::from(&map_of_all_states());
-    m.members[2].state = 42;
-    assert_eq!(Map::try_from(m), Err(MapDecodeError::UnknownState(42)));
 }
 
 #[test]
@@ -119,14 +179,6 @@ fn a_map_the_domain_refuses_is_refused_with_the_reason() {
     assert_eq!(
         e.to_string(),
         "invalid map: generation 0 is reserved for \"no map seen\""
-    );
-    assert_eq!(
-        MapDecodeError::UnknownState(8).to_string(),
-        "unknown member state 8"
-    );
-    assert_eq!(
-        MapDecodeError::UnknownRule(8).to_string(),
-        "unknown placement rule 8"
     );
     assert_eq!(
         MapDecodeError::Replication(300).to_string(),
@@ -229,7 +281,7 @@ fn a_members_boot_round_trips_and_an_older_map_without_it_reads_as_zero() {
     let wire = pb::Member::from(&m);
     assert_eq!(wire.boot, 7);
     let decoded = pb::Member::decode(wire.encode_to_vec().as_slice()).unwrap();
-    assert_eq!(Member::try_from(decoded).unwrap().boot, 7);
+    assert_eq!(Member::from(decoded).boot, 7);
 
     // The bytes an older frontend wrote: the Member as it was, fields 1 to 5 only.
     let old = [
@@ -239,7 +291,7 @@ fn a_members_boot_round_trips_and_an_older_map_without_it_reads_as_zero() {
         0x28, 0x03, // state = ACTIVE
     ];
     let decoded = pb::Member::decode(old.as_slice()).unwrap();
-    let read = Member::try_from(decoded).unwrap();
+    let read = Member::from(decoded);
     assert_eq!(read.boot, 0, "no field reads as unknown");
     assert_eq!(read.state, MemberState::Active);
 
