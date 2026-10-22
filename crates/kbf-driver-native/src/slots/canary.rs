@@ -23,7 +23,7 @@ use std::time::Duration;
 /// The argument after argv0 that selects this binary's canary probe mode.
 pub const ARG: &str = "__canary";
 
-/// How long one canary may take, launch included (a run took 45 to 125 ms on the macOS runner).
+/// How long one canary may take, launch included (a run took about 50 to 125 ms on the macOS runner).
 pub const WITHIN: Duration = Duration::from_secs(10);
 
 /// The probe's exit code when the door was refused.
@@ -301,39 +301,67 @@ pub enum Probe {
     Aside(String),
 }
 
-/// The slots a lease is offered, for [`first_passing`].
+/// The slots a lease is offered, for [`first_passing`]. The offer holds the slot it has
+/// taken until it is set aside or handed out ([`acquire`]), so that a failure of any
+/// step leaves the slot with the caller, which removes the lease directory before it
+/// lets the slot go.
 pub trait Offer {
     type Slot: Send;
     type Err;
 
-    /// The next free slot (waiting when none is), or why the lease ends instead (a kill
-    /// while waiting).
-    fn next(&mut self) -> impl Future<Output = Result<Self::Slot, Self::Err>> + Send;
+    /// Takes the next free slot (waiting when none is) and holds it; or says why the
+    /// lease ends instead (a kill while waiting, or while the lease was prepared with
+    /// the slot held).
+    fn next(&mut self) -> impl Future<Output = Result<(), Self::Err>> + Send;
 
-    /// Hands the lease's directory to `slot` and runs its canaries.
-    fn probe(&mut self, slot: &Self::Slot)
-    -> impl Future<Output = Result<Probe, Self::Err>> + Send;
+    /// Hands the lease's directory to the held slot and runs its canaries.
+    fn probe(&mut self) -> impl Future<Output = Result<Probe, Self::Err>> + Send;
 
-    /// Sets `slot` aside; `why` says which canaries failed.
-    fn aside(&mut self, slot: Self::Slot, why: &str);
+    /// Takes the lease's directory back from the held slot and sets the slot aside;
+    /// `why` says which canaries failed. No slot is held afterwards.
+    fn aside(&mut self, why: &str) -> impl Future<Output = ()> + Send;
+
+    /// The slot held now, if any.
+    fn take_held(&mut self) -> Option<Self::Slot>;
 }
 
 /// Takes slots until one passes its probe, setting each one that does not aside (it is
 /// not offered again until its next offer). A canary failure never fails the action: the
 /// next slot is taken, and with none free [`Offer::next`] waits, as it does when every
-/// slot is held.
+/// slot is held. The slot that passes is held by the offer.
 ///
 /// # Errors
-/// What [`Offer::next`] or [`Offer::probe`] returns (a kill while waiting, a hand-over
-/// that failed).
-pub async fn first_passing<O: Offer + Send>(offer: &mut O) -> Result<O::Slot, O::Err> {
+/// What [`Offer::next`] or [`Offer::probe`] returns (a kill, a hand-over that failed).
+pub async fn first_passing<O: Offer + Send>(offer: &mut O) -> Result<(), O::Err> {
     loop {
-        let slot = offer.next().await?;
-        match offer.probe(&slot).await? {
-            Probe::Pass => return Ok(slot),
-            Probe::Aside(why) => offer.aside(slot, &why),
+        offer.next().await?;
+        match offer.probe().await? {
+            Probe::Pass => return Ok(()),
+            Probe::Aside(why) => offer.aside(&why).await,
         }
     }
+}
+
+/// [`first_passing`], then moves the slot the offer holds into `hold`, whether it passed
+/// or a step failed: the caller owns the slot from the moment it was taken, so on every
+/// error and kill it removes the lease directory first and releases the slot after.
+///
+/// # Errors
+/// As [`first_passing`].
+pub async fn acquire<O: Offer + Send>(
+    offer: &mut O,
+    hold: &mut Option<O::Slot>,
+) -> Result<(), O::Err> {
+    let result = first_passing(offer).await;
+    *hold = offer.take_held();
+    result
+}
+
+/// What a canary can leave in the lease directory: the link the link canary made. The
+/// daemon removes it itself after the canaries, without following it, so that a link to
+/// a file of the daemon's is never left in a tree that is handed to the slot's user.
+pub fn remove_leftovers(fs: &dyn Fs, lease: &Path) {
+    fs.remove(&lease.join(LINK_NAME));
 }
 
 #[cfg(test)]
@@ -631,87 +659,198 @@ mod tests {
         assert_eq!(check(&[], &mut |_| unreachable!()), Report::default());
     }
 
-    /// Catches a lease that fails, or runs on a slot that failed its canaries, when a
-    /// later slot would pass: the bad slot must be set aside (not offered again, here
-    /// not handed out twice), the next one taken, and the probe's own error (a failed
-    /// hand-over) or the wait's (a kill) still fails the lease. With every slot bad the
-    /// wait does not end.
-    #[test]
-    fn a_failed_canary_sets_the_slot_aside_and_the_lease_takes_the_next() {
-        /// Slots from a queue; the probe passes the slots in `good`.
-        struct Fake {
-            queue: Vec<u32>,
-            good: Vec<u32>,
-            probe_error: bool,
-            probed: Vec<u32>,
-            aside: Vec<(u32, String)>,
-        }
+    /// A slot that records when it is released (dropped), unless it was set aside.
+    struct TestSlot {
+        id: u32,
+        events: Events,
+        asided: bool,
+    }
 
-        impl Offer for Fake {
-            type Slot = u32;
-            type Err = String;
+    type Events = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
-            async fn next(&mut self) -> Result<u32, String> {
-                self.queue.pop().ok_or_else(|| "none free".to_owned())
-            }
-
-            async fn probe(&mut self, slot: &u32) -> Result<Probe, String> {
-                self.probed.push(*slot);
-                if self.probe_error {
-                    return Err("hand over failed".to_owned());
-                }
-                Ok(if self.good.contains(slot) {
-                    Probe::Pass
-                } else {
-                    Probe::Aside(format!("slot {slot} bad"))
-                })
-            }
-
-            fn aside(&mut self, slot: u32, why: &str) {
-                self.aside.push((slot, why.to_owned()));
+    impl Drop for TestSlot {
+        fn drop(&mut self) {
+            if !self.asided {
+                let event = format!("released {}", self.id);
+                self.events.lock().expect("events").push(event);
             }
         }
+    }
 
-        let fake = |queue: Vec<u32>, good: Vec<u32>, probe_error| Fake {
-            queue,
-            good,
-            probe_error,
-            probed: Vec::new(),
-            aside: Vec::new(),
-        };
+    /// Where the offer fails, for the slot taken first.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Fail {
+        Never,
+        /// A kill while the lease is prepared, with the slot held.
+        Prepare,
+        /// The hand-over of the lease directory fails.
+        HandOver,
+        /// A canary could not be started.
+        Canary,
+    }
+
+    /// Slots from a queue (taken from the back); the probe passes the slots in `good`.
+    struct TestOffer {
+        events: Events,
+        queue: Vec<u32>,
+        good: Vec<u32>,
+        fail: Fail,
+        current: Option<TestSlot>,
+    }
+
+    impl TestOffer {
+        fn new(queue: &[u32], good: &[u32], fail: Fail) -> Self {
+            Self {
+                events: Events::default(),
+                queue: queue.to_vec(),
+                good: good.to_vec(),
+                fail,
+                current: None,
+            }
+        }
+
+        fn push(&self, event: &str) {
+            self.events.lock().expect("events").push(event.to_owned());
+        }
+    }
+
+    impl Offer for TestOffer {
+        type Slot = TestSlot;
+        type Err = String;
+
+        async fn next(&mut self) -> Result<(), String> {
+            let Some(id) = self.queue.pop() else {
+                return Err("killed while waiting".to_owned());
+            };
+            self.current = Some(TestSlot {
+                id,
+                events: Events::clone(&self.events),
+                asided: false,
+            });
+            if self.fail == Fail::Prepare {
+                return Err("killed during prepare".to_owned());
+            }
+            Ok(())
+        }
+
+        async fn probe(&mut self) -> Result<Probe, String> {
+            let id = self.current.as_ref().expect("held").id;
+            match self.fail {
+                Fail::HandOver => return Err("hand over failed".to_owned()),
+                Fail::Canary => return Err("canary could not start".to_owned()),
+                Fail::Never | Fail::Prepare => {}
+            }
+            Ok(if self.good.contains(&id) {
+                Probe::Pass
+            } else {
+                Probe::Aside(format!("slot {id} bad"))
+            })
+        }
+
+        async fn aside(&mut self, why: &str) {
+            self.push("reclaim the lease directory");
+            let mut slot = self.current.take().expect("held");
+            slot.asided = true;
+            self.push(&format!("aside {}: {why}", slot.id));
+        }
+
+        fn take_held(&mut self) -> Option<TestSlot> {
+            self.current.take()
+        }
+    }
+
+    /// The lease as `run` does it: acquire, then remove the lease directory, then release
+    /// the slot. What happened, in order.
+    fn lease(mut offer: TestOffer) -> (Result<(), String>, Vec<String>, bool) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime");
+        let mut hold = None;
+        let result = rt.block_on(acquire(&mut offer, &mut hold));
+        offer.push("lease directory removed");
+        let held = hold.is_some();
+        drop(hold);
+        let events = offer.events.lock().expect("events").clone();
+        (result, events, held)
+    }
 
-        let mut offer = fake(vec![3, 2, 1], vec![3], false);
-        assert_eq!(rt.block_on(first_passing(&mut offer)), Ok(3));
-        assert_eq!(offer.probed, [1, 2, 3]);
+    /// Catches a lease whose slot is freed before its directory is removed (another
+    /// lease could then take the uid while the failed lease's half-written inputs, owned
+    /// by that uid, are still there): on a kill during prepare, a failed hand-over and a
+    /// canary that could not start, the slot stays with the caller, which removes the
+    /// directory and only then releases it; and after a kill while waiting for the next
+    /// slot, with one set aside, no slot is held and the directory is removed. Seen red
+    /// with `acquire` not moving the held slot out (the slot is released inside it,
+    /// before the directory event).
+    #[test]
+    fn on_every_failure_the_directory_goes_before_the_slot_is_released() {
+        for fail in [Fail::Prepare, Fail::HandOver, Fail::Canary] {
+            let (result, events, held) = lease(TestOffer::new(&[1], &[1], fail));
+            assert!(result.is_err());
+            assert!(held, "the caller holds the slot");
+            assert_eq!(events, ["lease directory removed", "released 1"]);
+        }
+        // Slot 1 fails its canaries and is set aside; the wait for the next ends in a kill.
+        let (result, events, held) = lease(TestOffer::new(&[1], &[], Fail::Never));
+        assert_eq!(result, Err("killed while waiting".to_owned()));
+        assert!(!held);
         assert_eq!(
-            offer.aside,
-            [(1, "slot 1 bad".to_owned()), (2, "slot 2 bad".to_owned())]
+            events,
+            [
+                "reclaim the lease directory",
+                "aside 1: slot 1 bad",
+                "lease directory removed"
+            ]
         );
+    }
 
-        // A probe error is the lease's failure, and sets nothing aside.
-        let mut offer = fake(vec![1], vec![1], true);
-        let failed = rt.block_on(first_passing(&mut offer));
-        assert_eq!(failed, Err("hand over failed".to_owned()));
-        assert!(offer.aside.is_empty());
+    /// Catches a lease that fails, or runs on a slot that failed its canaries, when a
+    /// later slot would pass: the bad slots are set aside, each after the directory is
+    /// taken back from it, and the lease runs on the good one, which the caller holds.
+    #[test]
+    fn a_failed_canary_sets_the_slot_aside_and_the_lease_takes_the_next() {
+        let (result, events, held) = lease(TestOffer::new(&[3, 2, 1], &[3], Fail::Never));
+        assert_eq!(result, Ok(()));
+        assert!(held);
+        assert_eq!(
+            events,
+            [
+                "reclaim the lease directory",
+                "aside 1: slot 1 bad",
+                "reclaim the lease directory",
+                "aside 2: slot 2 bad",
+                "lease directory removed",
+                "released 3"
+            ]
+        );
+    }
 
-        // Every slot bad: the wait for the next reports (here, ends) with all set aside.
-        let mut offer = fake(vec![1, 2], vec![], false);
-        let all_bad = rt.block_on(first_passing(&mut offer));
-        assert_eq!(offer.aside.len(), 2);
-        assert_eq!(all_bad, Err("none free".to_owned()));
+    /// Catches a removal of the link canary's leftovers that follows the link, or misses
+    /// it: a hard link to a file outside is removed from the lease directory and the
+    /// file outside is untouched.
+    #[test]
+    fn the_daemon_removes_the_link_a_canary_left() {
+        let scratch = crate::unit_dir("canary-leftovers");
+        let outside = scratch.path().join("outside");
+        std::fs::write(&outside, b"x").expect("outside");
+        let lease = scratch.path().join("lease");
+        std::fs::create_dir(&lease).expect("lease");
+        let link = lease.join(LINK_NAME);
+        std::fs::hard_link(&outside, &link).expect("link");
+        remove_leftovers(&RealFs, &lease);
+        assert!(!link.exists(), "the link stayed");
+        assert!(outside.exists(), "the file outside was removed");
+        remove_leftovers(&RealFs, &lease);
     }
 
     /// Catches a failed canary that does not make the slot dirty in the book (it would
     /// stay offered and counted), a lease that fails or runs on that slot instead of the
     /// next one, a recovery that offers the slot again without running its canaries at
     /// the next hand-out, and a slot that stays dirty after its canaries pass. Changes
-    /// seen to turn it red: `Book::set_aside` giving the permit back instead of making the slot
-    /// dirty (the dirty-set and count assertions); `first_passing` returning a slot
-    /// whose probe said aside (the lease runs on slot 0); `first_passing` skipping the
-    /// probe (slot 0 is handed out without its canaries).
+    /// seen to turn it red: `Book::set_aside` giving the permit back instead of making
+    /// the slot dirty (the dirty-set and count assertions); `first_passing` returning a
+    /// slot whose probe said aside (the lease runs on slot 0); `first_passing` skipping
+    /// the probe (slot 0 is handed out without its canaries).
     #[test]
     fn a_failed_canary_makes_the_slot_dirty_and_recovery_offers_it_with_its_canaries_run_again() {
         use std::collections::BTreeSet;
@@ -727,24 +866,29 @@ mod tests {
             }
         }
 
+        type Held = (usize, tokio::sync::OwnedSemaphorePermit);
+
         /// The book's slots offered to one lease; the canaries of `failing` fail.
         struct BookOffer {
             book: Arc<Book<Stub>>,
             failing: Arc<Mutex<BTreeSet<usize>>>,
             probed: Vec<usize>,
+            current: Option<Held>,
         }
 
         impl Offer for BookOffer {
-            type Slot = (usize, tokio::sync::OwnedSemaphorePermit);
+            type Slot = Held;
             type Err = String;
 
-            async fn next(&mut self) -> Result<Self::Slot, String> {
-                self.book.take().await
+            async fn next(&mut self) -> Result<(), String> {
+                self.current = Some(self.book.take().await?);
+                Ok(())
             }
 
-            async fn probe(&mut self, slot: &Self::Slot) -> Result<Probe, String> {
-                self.probed.push(slot.0);
-                let bad = self.failing.lock().expect("failing").contains(&slot.0);
+            async fn probe(&mut self) -> Result<Probe, String> {
+                let index = self.current.as_ref().expect("held").0;
+                self.probed.push(index);
+                let bad = self.failing.lock().expect("failing").contains(&index);
                 Ok(if bad {
                     Probe::Aside(
                         "canary write-outside ((deny file-write*)): NOT refused".to_owned(),
@@ -754,8 +898,13 @@ mod tests {
                 })
             }
 
-            fn aside(&mut self, slot: Self::Slot, why: &str) {
-                self.book.set_aside(slot.0, slot.1, why);
+            async fn aside(&mut self, why: &str) {
+                let (index, permit) = self.current.take().expect("held");
+                self.book.set_aside(index, permit, why);
+            }
+
+            fn take_held(&mut self) -> Option<Held> {
+                self.current.take()
             }
         }
 
@@ -773,10 +922,13 @@ mod tests {
             book: Arc::clone(&book),
             failing: Arc::clone(&failing),
             probed: Vec::new(),
+            current: None,
         };
+        let mut hold = None;
 
         // Slot 0 fails its canaries: dirty, uncounted; the lease runs on slot 1.
-        let (index, permit) = rt.block_on(first_passing(&mut offer)).expect("a slot");
+        rt.block_on(acquire(&mut offer, &mut hold)).expect("a slot");
+        let (index, permit) = hold.take().expect("held");
         assert_eq!(index, 1, "the lease takes the next slot");
         assert_eq!(offer.probed, [0, 1]);
         assert_eq!(book.dirty(), BTreeSet::from([0]));
@@ -788,7 +940,8 @@ mod tests {
         assert_eq!(book.retry(), 1);
         assert_eq!(book.count(), 2);
         offer.probed.clear();
-        let (index, permit) = rt.block_on(first_passing(&mut offer)).expect("a slot");
+        rt.block_on(acquire(&mut offer, &mut hold)).expect("a slot");
+        let (index, permit) = hold.take().expect("held");
         assert_eq!((index, offer.probed.clone()), (1, vec![0, 1]));
         assert_eq!(book.dirty(), BTreeSet::from([0]));
         book.held(index, permit).give();
@@ -797,7 +950,8 @@ mod tests {
         failing.lock().expect("failing").clear();
         assert_eq!(book.retry(), 1);
         offer.probed.clear();
-        let (index, permit) = rt.block_on(first_passing(&mut offer)).expect("a slot");
+        rt.block_on(acquire(&mut offer, &mut hold)).expect("a slot");
+        let (index, permit) = hold.take().expect("held");
         assert_eq!((index, offer.probed.clone()), (0, vec![0]));
         assert!(book.dirty().is_empty());
         book.held(index, permit).give();

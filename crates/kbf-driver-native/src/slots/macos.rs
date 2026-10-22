@@ -326,7 +326,22 @@ impl Slot {
         handed
             .map_err(io::Error::other)
             .and_then(|done| done)
+            .map(drop)
             .map_err(|e| RuntimeError::Failed(format!("hand {} over: {e}", dir.display())))
+    }
+
+    /// Takes the lease directory `dir` and everything in it back from the slot's user
+    /// (to root, 0700), as it must be before the slot is set aside: the slot is cleaned
+    /// and offered again while the lease still waits for another. Logged, not failed: the
+    /// slot is set aside either way.
+    pub async fn reclaim(&self, dir: &Path) {
+        let path = dir.to_owned();
+        let why = match tokio::task::spawn_blocking(move || super::hand_tree(&path, 0, 0)).await {
+            Ok(Ok(_)) => return,
+            Ok(Err(e)) => e.to_string(),
+            Err(e) => e.to_string(),
+        };
+        tracing::warn!(%why, dir = %dir.display(), "the lease directory was not taken back from a slot");
     }
 
     /// The watch over the action's processes: every process of the slot's uid.

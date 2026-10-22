@@ -250,20 +250,32 @@ pub(crate) async fn make_lease_dir(dir: &Path, private: bool) -> std::io::Result
 
 /// Gives `root` and everything under it to `uid`:`gid`, never following a link, then
 /// closes `root` itself to everyone else ([`LEASE_DIR_MODE`], whatever its mode was),
-/// which is what keeps another slot out of the tree.
+/// which is what keeps another slot out of the tree. A file with more than one name is
+/// not given (its owner is the owner of every name): the result counts those.
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn hand_tree(root: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
+pub(crate) fn hand_tree(root: &Path, uid: u32, gid: u32) -> std::io::Result<usize> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let mut pending: Vec<PathBuf> = vec![root.to_owned()];
+    let mut skipped = 0;
     while let Some(path) = pending.pop() {
+        let meta = std::fs::symlink_metadata(&path)?;
+        // A file with another name (a hard link) is not given: changing its owner would
+        // change the owner of the file under the other name, which may be a file of
+        // the daemon's or of another user's.
+        if !meta.is_dir() && meta.nlink() > 1 {
+            skipped += 1;
+            tracing::warn!(path = %path.display(), links = meta.nlink(), "not handed over: it has another name");
+            continue;
+        }
         std::os::unix::fs::lchown(&path, Some(uid), Some(gid))?;
-        if std::fs::symlink_metadata(&path)?.is_dir() {
+        if meta.is_dir() {
             for entry in std::fs::read_dir(&path)? {
                 pending.push(entry?.path());
             }
         }
     }
-    std::fs::set_permissions(root, std::fs::Permissions::from_mode(LEASE_DIR_MODE))
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(LEASE_DIR_MODE))?;
+    Ok(skipped)
 }
 
 /// How a lease's action runs: as the daemon's own user, its processes followed by
@@ -340,6 +352,15 @@ impl Runner {
         match self {
             Self::Daemon => Ok(canary::Report::default()),
             Self::Slot(slot) => slot.canary(isolation, network, lease).await,
+        }
+    }
+
+    /// Takes the lease directory `dir` back from the slot's user ([`macos::Slot::reclaim`]).
+    #[cfg(target_os = "macos")]
+    pub async fn reclaim(&self, dir: &Path) {
+        match self {
+            Self::Daemon => {}
+            Self::Slot(slot) => slot.reclaim(dir).await,
         }
     }
 
@@ -629,6 +650,31 @@ mod tests {
         let missing = base.join("missing");
         assert!(hand_tree(&missing, me.uid(), me.gid()).is_err());
         assert!(!missing.exists(), "a failed hand-over made something");
+    }
+
+    /// Catches a hand-over that changes the owner of a file that has another name (a
+    /// hard link to a file outside the lease would make that file the slot user's):
+    /// both names are skipped and counted, a file with one name and a directory are
+    /// given, and the link's other name is still there.
+    #[test]
+    fn a_file_with_another_name_is_not_handed_over() {
+        let base = crate::unit_dir("slots-hand-tree-links");
+        let lease = base.join("lease");
+        std::fs::create_dir_all(lease.join("sub")).expect("tree");
+        std::fs::write(lease.join("plain"), b"x").expect("plain");
+        let outside = base.join("outside");
+        std::fs::write(&outside, b"x").expect("outside");
+        std::fs::hard_link(&outside, lease.join("sub/linked")).expect("link");
+        let me = std::fs::metadata(&lease).expect("lease");
+        use std::os::unix::fs::MetadataExt as _;
+        let skipped = hand_tree(&lease, me.uid(), me.gid()).expect("handed over");
+        assert_eq!(skipped, 1, "the name in the lease");
+        assert_eq!(
+            [outside.exists(), lease.join("sub/linked").exists()],
+            [true, true]
+        );
+        std::fs::remove_file(lease.join("sub/linked")).expect("unlink");
+        assert_eq!(hand_tree(&lease, me.uid(), me.gid()).expect("again"), 0);
     }
 
     /// Catches a slot's lease directory made with the process's default mode, which

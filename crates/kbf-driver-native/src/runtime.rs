@@ -173,9 +173,9 @@ impl<C: Cas> NativeRuntime<C> {
         skipped: Option<crate::slots::clean::Skipped>,
     ) -> std::io::Result<Self> {
         let root = rustix::process::geteuid().is_root();
-        crate::slots::check_daemon_user(root, config.pool.as_ref())
-            .map_err(std::io::Error::other)?;
         crate::slots::check_pool_isolation(config.pool.as_ref(), &config.isolation)
+            .map_err(std::io::Error::other)?;
+        crate::slots::check_daemon_user(root, config.pool.as_ref())
             .map_err(std::io::Error::other)?;
         // Only a Mac has slots to clean.
         #[cfg(not(target_os = "macos"))]
@@ -471,9 +471,16 @@ impl<C: Cas> NativeRuntime<C> {
             stop,
             killer,
             prepared: std::sync::OnceLock::new(),
+            current: None,
         };
-        let slot = crate::slots::canary::first_passing(&mut offer).await?;
-        *runner = slot;
+        // The runner owns the slot from the moment it is taken, whatever happens next, so
+        // that `run` removes the lease directory before the slot is released.
+        let mut held = None;
+        let result = crate::slots::canary::acquire(&mut offer, &mut held).await;
+        if let Some(slot) = held {
+            *runner = slot;
+        }
+        result?;
         (offer.prepared)
             .into_inner()
             .ok_or_else(|| RuntimeError::Failed("no prepared lease".to_owned()))
@@ -899,6 +906,8 @@ struct SlotOffer<'a, C: Cas> {
     killer: &'a mut Option<Stop>,
     /// Made once, with the first slot taken.
     prepared: std::sync::OnceLock<Prepared>,
+    /// The slot taken last, until it is set aside or handed to the caller.
+    current: Option<Runner>,
 }
 
 #[cfg(target_os = "macos")]
@@ -906,16 +915,18 @@ impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
     type Slot = Runner;
     type Err = RuntimeError;
 
-    async fn next(&mut self) -> Result<Runner, RuntimeError> {
-        let slot = tokio::select! {
+    async fn next(&mut self) -> Result<(), RuntimeError> {
+        let taken = tokio::select! {
             slot = self.slots.take() => Runner::Slot(slot?),
             Ok(by) = &mut *self.stop => {
                 *self.killer = Some(by);
                 return Err(RuntimeError::Killed);
             }
         };
+        // Held from here on: every failure below leaves it with the caller.
+        let private = taken.private_lease();
+        self.current = Some(taken);
         if self.prepared.get().is_none() {
-            let private = slot.private_lease();
             let made = tokio::select! {
                 made = self.runtime.prepare(self.cas, self.work, self.dir, private) => made?,
                 Ok(by) = &mut *self.stop => {
@@ -925,17 +936,29 @@ impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
             };
             let _ = self.prepared.set(made);
         }
-        Ok(slot)
+        Ok(())
     }
 
-    async fn probe(&mut self, slot: &Runner) -> Result<crate::slots::canary::Probe, RuntimeError> {
+    async fn probe(&mut self) -> Result<crate::slots::canary::Probe, RuntimeError> {
         use crate::slots::canary::Probe;
-        slot.hand_over(self.dir).await?;
-        let Some(made) = self.prepared.get() else {
-            return Err(RuntimeError::Failed("no prepared lease".to_owned()));
+        let (Some(slot), Some(made)) = (self.current.as_ref(), self.prepared.get()) else {
+            return Err(RuntimeError::Failed("no slot or lease to probe".to_owned()));
         };
+        tokio::select! {
+            handed = slot.hand_over(self.dir) => handed?,
+            Ok(by) = &mut *self.stop => {
+                *self.killer = Some(by);
+                return Err(RuntimeError::Killed);
+            }
+        }
         let isolation = &self.runtime.config.isolation;
-        let report = slot.canary(isolation, made.network, &made.lease).await?;
+        let report = tokio::select! {
+            report = slot.canary(isolation, made.network, &made.lease) => report?,
+            Ok(by) = &mut *self.stop => {
+                *self.killer = Some(by);
+                return Err(RuntimeError::Killed);
+            }
+        };
         Ok(if report.all_refused() {
             Probe::Pass
         } else {
@@ -943,9 +966,18 @@ impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
         })
     }
 
-    fn aside(&mut self, slot: Runner, why: &str) {
-        // The book logs it, in the shape of a failed clean.
-        slot.set_aside(why);
+    async fn aside(&mut self, why: &str) {
+        // The slot's user owns the lease directory until it is taken back: a slot that
+        // is cleaned and offered again must not find it.
+        if let Some(slot) = self.current.take() {
+            slot.reclaim(self.dir).await;
+            // The book logs it, in the shape of a failed clean.
+            slot.set_aside(why);
+        }
+    }
+
+    fn take_held(&mut self) -> Option<Runner> {
+        self.current.take()
     }
 }
 
@@ -1672,12 +1704,33 @@ mod tests {
         let scratch = dir.join("root");
         let mut config = NativeConfig::new(scratch.to_path_buf());
         config.pool = crate::slots::Pool::provisioned(1, 700).ok();
+        config.isolation = network::Isolation::Sandbox("/usr/bin/sandbox-exec".into());
         let refused = NativeRuntime::new(config, Arc::new(NoCas)).expect_err("started");
         #[cfg(target_os = "macos")]
         let want = "needs a daemon running as root";
         #[cfg(not(target_os = "macos"))]
         let want = "macOS only";
         assert!(refused.to_string().contains(want), "{refused}");
+        assert!(!scratch.exists(), "a scratch root made before the refusal");
+    }
+
+    /// Catches a node with a pool and no `sandbox-exec` starting (the check exists but
+    /// `NativeRuntime::new` does not call it, or calls it after something is made): the
+    /// start is refused for that reason, before the scratch root is made. Seen red with
+    /// the call removed from `build`: the start succeeds on macOS and is refused for the
+    /// wrong reason elsewhere.
+    #[test]
+    fn a_pool_without_sandbox_exec_is_refused_by_the_runtime_before_it_makes_anything() {
+        let dir = crate::unit_dir("runtime-pool-no-sandbox");
+        let scratch = dir.join("root");
+        let mut config = NativeConfig::new(scratch.to_path_buf());
+        config.pool = crate::slots::Pool::provisioned(1, 700).ok();
+        config.isolation = network::Isolation::None;
+        let refused = NativeRuntime::new(config, Arc::new(NoCas)).expect_err("started");
+        assert!(
+            refused.to_string().contains("needs sandbox-exec"),
+            "{refused}"
+        );
         assert!(!scratch.exists(), "a scratch root made before the refusal");
     }
 

@@ -4,7 +4,7 @@
 //! fails them, and one that only lets a link through fails the link canary alone; a slot
 //! that fails is set aside.
 //!
-//! The canary latency is printed as `CANARY-LATENCY` lines (a run took 45 to 125
+//! The canary latency is printed as `CANARY-LATENCY` lines (a run took about 50 to 125
 //! ms on the macOS runner).
 //!
 //! Every test is `#[ignore]`: each needs root and real users. The macOS CI job runs them
@@ -15,7 +15,7 @@
 
 mod support;
 
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -191,6 +191,18 @@ async fn a_slot_that_fails_its_canaries_is_dirty_and_recovery_offers_it_to_be_ca
         .await
         .expect("ran");
     assert!(!report.all_refused());
+    // The runtime takes the lease directory back from the slot's user first.
+    slot.hand_over(&lease).await.expect("hand over");
+    assert_eq!(
+        std::fs::metadata(&lease).expect("lease").uid(),
+        slot.ready().user.uid
+    );
+    slot.reclaim(&lease).await;
+    assert_eq!(
+        std::fs::metadata(&lease).expect("lease").uid(),
+        0,
+        "taken back"
+    );
     slot.set_aside(&report.failures());
     assert_eq!(slots.count(), 0, "a dirty slot is not counted");
     let waited = tokio::time::timeout(Duration::from_secs(1), slots.take()).await;

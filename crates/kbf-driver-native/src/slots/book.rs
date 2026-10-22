@@ -2,8 +2,8 @@
 //! Mac in it so that it runs under test on every platform.
 //!
 //! A slot is free, held by one lease, or dirty. A slot is **dirty** when its clean
-//! failed ([`Outcome::Dirty`]), its profile canaries failed ([`Book::set_aside`]), or it never finished (the clean panicked, or its thread or
-//! task never ran): it is not offered to a lease, the node reports one slot fewer
+//! failed ([`Outcome::Dirty`]), its profile canaries failed ([`Book::set_aside`]), or it
+//! never finished (the clean panicked, or its thread or task never ran): it is not offered to a lease, the node reports one slot fewer
 //! ([`Book::count`]), and nothing is written to disk about it.
 //!
 //! A dirty slot is cleaned again, and offered when that clean passes, by the **recovery

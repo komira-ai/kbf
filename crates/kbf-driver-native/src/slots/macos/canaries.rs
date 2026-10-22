@@ -44,14 +44,19 @@ impl Slot {
             commands.push((canary.name, launch));
         }
         let started = Instant::now();
+        let lease = lease.to_owned();
         let report = tokio::task::spawn_blocking(move || {
-            canary::check(CANARIES, &mut |c: &Canary| {
+            let report = canary::check(CANARIES, &mut |c: &Canary| {
                 let (_, (program, args)) = commands
                     .iter()
                     .find(|(name, _)| *name == c.name)
                     .ok_or_else(|| io::Error::other("no command for the canary"))?;
                 run(program, args, uid)
-            })
+            });
+            // Whatever a canary left in the lease directory, removed by the daemon
+            // itself, without following it, before the tree is handed to the user.
+            canary::remove_leftovers(&canary::RealFs, &lease);
+            report
         })
         .await
         .map_err(|e| RuntimeError::Failed(format!("profile canaries did not finish: {e}")))?;
@@ -68,7 +73,9 @@ impl Slot {
 }
 
 /// Starts `program` with `args`, waits for it at most [`canary::WITHIN`] (ending every
-/// process of `uid` if it takes longer) and returns its exit code and output.
+/// process of `uid` if it takes longer) and returns its exit code and output. The output
+/// is read on a thread of its own and waited for at most [`END_WITHIN`] after the exit:
+/// a process of the uid that kept the pipe open does not hold the daemon.
 fn run(program: &Path, args: &[String], uid: u32) -> io::Result<Ran> {
     let started = Instant::now();
     let mut child = Command::new(program)
@@ -78,6 +85,15 @@ fn run(program: &Path, args: &[String], uid: u32) -> io::Result<Ran> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
+    let (send, read) = std::sync::mpsc::channel();
+    if let Some(mut pipe) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut stdout = String::new();
+            let _ = pipe.read_to_string(&mut stdout);
+            let _ = send.send(stdout);
+        });
+    }
+    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "timed out");
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -86,14 +102,14 @@ fn run(program: &Path, args: &[String], uid: u32) -> io::Result<Ran> {
             let _ = child.kill();
             let _ = uid::end(uid, END_WITHIN);
             let _ = child.wait();
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"));
+            return Err(timed_out());
         }
         std::thread::sleep(Duration::from_millis(2));
     };
-    let mut stdout = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_string(&mut stdout);
-    }
+    let Ok(stdout) = read.recv_timeout(END_WITHIN) else {
+        let _ = uid::end(uid, END_WITHIN);
+        return Err(timed_out());
+    };
     Ok(Ran {
         code: status.code(),
         stdout,

@@ -209,7 +209,7 @@ impl WeakenedProfile {
         match self {
             Self::Drop(line) => profile
                 .split_inclusive('\n')
-                .filter(|l| l.trim_end() != line)
+                .filter(|l| l.trim() != line)
                 .collect(),
             Self::Add(line) => format!("{profile}{line}\n"),
         }
@@ -750,6 +750,12 @@ mod tests {
     fn a_weakened_profile_adds_or_drops_exactly_its_line() {
         let base = "(a)\n(b)\n(a)\n";
         assert_eq!(WeakenedProfile::Drop("(a)").apply(base), "(b)\n");
+        // A whole line, not a substring or a prefix of one.
+        let near = "(a)\n(a) (b)\n  (a)  \n((a))\n(ab)\n";
+        assert_eq!(
+            WeakenedProfile::Drop("(a)").apply(near),
+            "(a) (b)\n((a))\n(ab)\n"
+        );
         assert_eq!(
             WeakenedProfile::Add("(c)").apply(base),
             "(a)\n(b)\n(a)\n(c)\n"
