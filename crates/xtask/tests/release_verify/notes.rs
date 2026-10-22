@@ -323,6 +323,11 @@ fn notes_refuse_when_what_is_not_reversible_cannot_be_determined() {
         ),
         ("not JSON", Some("meta_log=3".to_owned()), "not JSON"),
         (
+            "over the size cap",
+            Some(format!("{:width$}{{}}", "", width = 8192)),
+            "over 8192 bytes",
+        ),
+        (
             "not a number",
             Some(format!(
                 r#"{{"commit":"{}","meta_log":"3"}}"#,
@@ -369,6 +374,36 @@ fn notes_refuse_when_what_is_not_reversible_cannot_be_determined() {
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("names commit"), "{err}");
     assert!(!out.exists());
+}
+
+#[test]
+fn an_identity_file_that_is_not_text_is_refused() {
+    // Catches: an identity file that cannot be read as text taken as an empty or an absent
+    // one, so the notes would be written without the previous release's log version.
+    let fx = with_notes("notes-not-text", |_| {});
+    let cur = identity(RELEASE, Some(3), Some(1));
+    let prev = fx.root.join("previous.json");
+    std::fs::write(&prev, [0xff, 0xfe, 0x7b, 0x7d]).unwrap();
+    let out = fx.root.join("notes.md");
+    let cur_file = fx.root.join("version.json");
+    std::fs::write(&cur_file, &cur).unwrap();
+    let (code, _, err) = run(
+        &fx,
+        "notes",
+        TAG,
+        RELEASE,
+        &[
+            "--version-json",
+            cur_file.to_str().unwrap(),
+            "--previous-version-json",
+            prev.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("previous.json"), "{err}");
+    assert!(!out.exists(), "notes were written");
 }
 
 #[test]
