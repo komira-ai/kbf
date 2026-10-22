@@ -875,6 +875,7 @@ pub use consistency::{
 pub use evict::{EVICT_EVERY, EVICT_GRACE, EvictRound};
 pub use flush::{
     FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
+    ShutdownFlush,
 };
 #[cfg(feature = "testkit")]
 pub use held::BetweenHook;

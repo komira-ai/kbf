@@ -510,14 +510,18 @@ impl StorageHandle {
     }
 
     /// Serves until the shutdown future given to [`start_storage`] completes and the
-    /// calls in flight end. With a `file://` cold store it then waits for the store's
-    /// lock to be released, so a start over the same directories can follow at once: the
-    /// node's tasks are aborted and the cache they and the service held is closed, but
-    /// its own background tasks and writer threads end after it is dropped, not before.
-    /// The wait is bounded by [`COLD_RELEASE_DEADLINE`]; past it this logs one warning
-    /// (the store's directory and how many handles are alive) and returns, because the
-    /// process's exit releases the lock whatever still holds it, and the units run this
-    /// with `TimeoutStopSec=infinity`, where a wait with no end would be a stop with none.
+    /// calls in flight end; no new call is taken once it has completed. It then writes
+    /// the blobs held in RAM to the disk and flushes the blocks staged on the hot store to
+    /// the cold store, both within `--ram-drain-deadline` (`RamDrain::after`); what the
+    /// deadline leaves is logged, and is on the hot store's disk for the next start.
+    /// With a `file://` cold store it then waits for the store's lock to be released, so a
+    /// start over the same directories can follow at once: the node's tasks are aborted
+    /// and the cache they and the service held is closed, but its own background tasks and
+    /// writer threads end after it is dropped, not before. The wait is bounded by
+    /// [`COLD_RELEASE_DEADLINE`]; past it this logs one warning (the store's directory and
+    /// how many handles are alive) and returns, because the process's exit releases the
+    /// lock whatever still holds it, and the units run this with `TimeoutStopSec=infinity`,
+    /// where a wait with no end would be a stop with none.
     ///
     /// The other serve paths (`storage_half::serve`, `start::serve`) wait for nothing: the
     /// process exits when they return, and its exit frees the lock.

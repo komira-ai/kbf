@@ -203,6 +203,49 @@ async fn a_node_with_a_ram_budget_writes_what_it_holds_when_it_stops() {
     assert!(on_disk(&dir, &bytes), "the stop wrote the held blob");
 }
 
+/// Catches `kbf storage` not flushing at its stop what its write tier has staged. With a
+/// hot store the node stages an acknowledged write in the open block of its tier, which
+/// the flusher seals only 30 s after it opened, so the cold store holds none of its bytes
+/// until the stop and holds them when `serve` returns, with no RAM budget set. Mutants:
+/// the assembly leaves out `ram.after(node.serving)`; the stop flushes only when
+/// `--ram-ack-bytes` is set. The flush itself, and that it begins only once the calls
+/// have ended, is pinned by `ram_drain/tests.rs` and kbf-front's `write_tier_stop.rs`;
+/// this one pins the assembly.
+#[tokio::test]
+async fn a_node_with_a_hot_store_flushes_what_it_staged_when_it_stops() {
+    let dir = dir("hot-stop");
+    let hot = format!("--hot-store=file://{}", dir.join("hot").display());
+    let f = flags(&dir, &[hot]).expect("flags");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let node = start_storage(&f, || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .await
+    .expect("starts");
+    let addr = node.addr;
+    let serving = tokio::spawn(node.serve());
+    let channel = Channel::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let (_, bytes) = marked(10);
+    RemoteStorage::new(channel, 0)
+        .put(bytes.clone())
+        .await
+        .expect("acknowledged");
+    let cold = dir.join("cold");
+    assert!(
+        !on_disk(&cold, &bytes),
+        "staged on the hot store, not flushed"
+    );
+    stop.send(()).expect("stop");
+    serving.await.expect("task").expect("serves to the end");
+    assert!(on_disk(&cold, &bytes), "the stop flushed the staged block");
+}
+
 /// Catches flags that do not make a node: the three certificate flags must come
 /// together, a segment upload cap over the write bound is refused as the server refuses
 /// it, a certificate file that is not there is an error (not plain text), and a start
