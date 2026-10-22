@@ -107,8 +107,7 @@
 //! `bundle-any-file` (a bundle verifies any file whose flags it lists) or
 //! `bundle-any-commit` (`--source-digest` is not compared) or `bundle-deb-bundle-any` (a
 //! bundle named for a `.deb` verifies any file whose flags it lists). Of the API:
-//! `api-fails` (every `gh api` exits 1 with an HTTP 502), `api-jobs-fail` (the same for a
-//! path with `/jobs` in it, the list of a run's jobs, alone) or `api-garbage` (every `gh
+//! `api-fails` (every `gh api` exits 1 with an HTTP 502) or `api-garbage` (every `gh
 //! api` prints something that is not JSON). Of releases: `release-fails` (every `gh
 //! release` command exits 1). Of the trusted root: `trusted-root-fails` (`gh attestation
 //! trusted-root` exits 1). Of sudo:
@@ -517,7 +516,7 @@ fn api_store(dir: &Path) -> serde_json::Map<String, serde_json::Value> {
 }
 
 fn api(dir: &Path, path: &str) -> ExitCode {
-    if defect("api-fails") || (defect("api-jobs-fail") && path.contains("/jobs")) {
+    if defect("api-fails") {
         eprintln!("gh: Server Error (HTTP 502)");
         return ExitCode::FAILURE;
     }
