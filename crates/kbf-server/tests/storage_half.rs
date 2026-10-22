@@ -218,8 +218,8 @@ impl kbf_storage::Storage for Watched {
 /// call the node takes. A listener that no longer accepts leaves the call unanswered.
 async fn takes_a_call(addr: std::net::SocketAddr) -> bool {
     let call = async {
-        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-            .expect("endpoint");
+        let endpoint =
+            tonic::transport::Endpoint::from_shared(format!("http://{addr}")).expect("endpoint");
         match endpoint.connect().await {
             Ok(channel) => {
                 let blob = Bytes::from_static(b"a late call");
