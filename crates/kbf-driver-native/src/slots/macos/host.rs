@@ -399,6 +399,10 @@ fn unmount_all(ready: &Ready) -> Vec<String> {
 /// through `find`, never through a link and on one filesystem): an entry of another
 /// owner, such as a hard link to a system file, keeps its own.
 fn remove_acls(root: &Path, uid: u32) -> Result<(), String> {
+    // A root that is not there holds no ACL.
+    if matches!(std::fs::symlink_metadata(root), Err(e) if e.kind() == io::ErrorKind::NotFound) {
+        return Ok(());
+    }
     let root = root.to_string_lossy();
     let uid = uid.to_string();
     run(

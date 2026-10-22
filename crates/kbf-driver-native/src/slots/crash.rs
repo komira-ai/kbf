@@ -79,7 +79,15 @@ fn each(
     for dir in dirs {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
-            Err(why) if why.kind() == std::io::ErrorKind::NotFound => continue,
+            // Not there, or under a file (`/Users/.localized` is one): it holds nothing.
+            Err(why)
+                if matches!(
+                    why.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
             Err(why) => {
                 errors.push(format!("{}: {why}", dir.display()));
                 continue;

@@ -85,7 +85,11 @@ fn the_sweep_removes_what_the_uid_owns_or_the_header_names_and_nothing_else() {
     fs::write(&outside, IPS).unwrap();
     symlink(&outside, reports.join("link.ips")).unwrap();
     fs::write(reports.join("Retired/old-771.ips"), IPS).unwrap();
+    // `/Users/.localized` is a file: the folder under it is not there.
+    let under_a_file = dir.join("file");
+    fs::write(&under_a_file, "x").unwrap();
     let dirs = [
+        under_a_file.join("Library/Logs/DiagnosticReports"),
         reports.clone(),
         reports.join("Retired"),
         cores.clone(),
