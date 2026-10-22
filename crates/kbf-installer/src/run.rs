@@ -228,7 +228,6 @@ impl Inherited {
     fn choose(first: u32, probe: io::Result<()>, dir: &Path) -> io::Result<Inherited> {
         match probe {
             Ok(()) => Ok(Inherited::Range(first)),
-            Err(_) if cfg!(target_os = "macos") => Ok(Inherited::Sweep(Sweep::new(first, dir))),
             Err(_) => Ok(Inherited::Listed(listed_in(dir, first)?)),
         }
     }
