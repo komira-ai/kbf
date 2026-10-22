@@ -102,7 +102,7 @@ pub const LOCK: &str = "log.lock";
 /// The highest machine version this binary runs: [`MachineVersion::V5`], the write
 /// tier's commands, `EvictObjects`, node writers (`SetWriter`) and `ReseatStaged`. A log
 /// stays at the version it was raised to; a new one starts at [`MachineVersion::V1`].
-pub const RUNS: MachineVersion = MachineVersion::V6;
+pub const RUNS: MachineVersion = MachineVersion::V5;
 
 /// How often the log commits farm time.
 pub const TICK: Duration = Duration::from_secs(1);

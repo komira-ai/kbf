@@ -42,7 +42,6 @@ fn request(qos: Qos, kind: LeaseKind) -> Request {
         needs: kbf_caps::Request::parse([("arch", "arm64")]).expect("request"),
         hermetic: true,
         do_not_cache: true,
-        size_key: None,
     }
 }
 
@@ -476,77 +475,4 @@ fn every_enum_value_has_its_number() {
         &format!("12230a01771200 1a1c0a020801{consumables}").replace(' ', ""),
     );
     check("arch and consumables", &capacity, &hex);
-}
-
-/// The format-6 bytes of a request with a `size_key`: field 8 (`40`), a varint, after
-/// `do_not_cache`. The request without one is the format-1 golden above, byte for byte,
-/// so a log written before the field decodes unchanged, and one that carries it is not
-/// a format-1 entry.
-///
-/// Catches: the field renumbered or written as a fixed width, an absent key written as
-/// 0, a key of 0 dropped, and a format below 6 that writes or reads the field (an older
-/// binary would stop on bytes it does not know, or silently drop a floor key).
-#[test]
-fn a_size_key_is_field_8_and_belongs_to_format_6() {
-    use kbf_log::{DecodeError, EncodeError, Format, decode, encode};
-
-    // 300 is `ac 02`; the request grows by 3 bytes, the submit, input and batch with it.
-    let with = |key: u64, tail: &str| {
-        let mut r = request(Qos::Batch, LeaseKind::WholeMachine);
-        r.size_key = Some(key);
-        let body = [
-            format!("0a2b0a01691226{}", digest_hex(3)),
-            "12020803".to_owned(),
-            "18022204080110 02".replace(' ', ""),
-            "2a0d0a046172636812056172 6d3634".replace(' ', ""),
-            "30013801".to_owned(),
-            tail.to_owned(),
-        ]
-        .concat();
-        (batch(FarmInput::Submit(r)), body)
-    };
-    let (command, body) = with(300, "40ac02");
-    // Request 79 (0x4f); Submit 81 (0x51); input 83 (0x53); batch 4 + 2 + 83 = 89 (0x59).
-    let hex = batch_hex(0x59, 0x53, &format!("22510a4f{body}"));
-    let bytes = hex::decode(&hex).expect("hex");
-    assert_eq!(
-        hex::encode(encode(Format::V6, &command).expect("format 6")),
-        hex
-    );
-    assert_eq!(decode(Format::V6, &bytes), Ok(command.clone()));
-    // Zero is a key, not an absent one: it is written (`40 00`).
-    let (zero, body) = with(0, "4000");
-    let hex = batch_hex(0x58, 0x52, &format!("22500a4e{body}"));
-    assert_eq!(
-        hex::encode(encode(Format::V6, &zero).expect("format 6")),
-        hex
-    );
-    assert_eq!(decode(Format::V6, &hex::decode(&hex).unwrap()), Ok(zero));
-    // Before format 6 neither side takes it.
-    for format in [Format::V1, Format::V2, Format::V3, Format::V4, Format::V5] {
-        assert_eq!(
-            encode(format, &command),
-            Err(EncodeError::Command(format)),
-            "{format:?}"
-        );
-        assert_eq!(
-            decode(format, &bytes),
-            Err(DecodeError::UnknownCommand("Request")),
-            "{format:?}"
-        );
-    }
-    // A request without one is the same bytes under every format.
-    let none = batch(FarmInput::Submit(request(
-        Qos::Batch,
-        LeaseKind::WholeMachine,
-    )));
-    let hex = request_hex("0803", 2);
-    for n in 1..=6 {
-        let format = Format::new(n);
-        assert_eq!(hex::encode(encode(format, &none).expect("encode")), hex);
-        assert_eq!(
-            decode(format, &hex::decode(&hex).unwrap()),
-            Ok(none.clone())
-        );
-    }
 }

@@ -53,7 +53,6 @@ fn request(n: u32, resources: Resources, platform: &[(&str, &str)]) -> Request {
         resources,
         hermetic: true,
         do_not_cache: false,
-        size_key: None,
         needs: kbf_caps::Request::from_platform(platform.iter().copied()).unwrap(),
     }
 }

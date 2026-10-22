@@ -106,7 +106,6 @@ fn a_report_the_scheduler_does_not_take_is_refused() {
         resources: kbf_types::Resources::new(1_000, 1 << 30),
         hermetic: true,
         do_not_cache: false,
-        size_key: None,
         needs: kbf_caps::Request::default(),
     };
     farm.submit(Submission {

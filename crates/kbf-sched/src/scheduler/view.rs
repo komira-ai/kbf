@@ -73,10 +73,10 @@ impl Scheduler {
         self.ops.get(&operation).map(|op| op.waiters.as_slice())
     }
 
-    /// The size key `operation` was submitted with, if it has one.
+    /// The size key `operation` was given ([`Scheduler::set_size_key`]), if it has one.
     #[must_use]
     pub fn size_key(&self, operation: OperationId) -> Option<u64> {
-        self.ops.get(&operation)?.request.size_key
+        self.ops.get(&operation)?.size_key
     }
 
     /// The QoS level `operation` is queued at (raised when a more urgent caller joins).

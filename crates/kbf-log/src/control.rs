@@ -176,11 +176,6 @@ impl MachineVersion {
     /// enters it as it enters version 2.
     pub const V5: Self = Self(NonZeroU32::MIN.saturating_add(4));
 
-    /// Version 6: version 5 plus `Request::size_key` in a scheduler `Submit` (the key of
-    /// a kill-driven memory floor), whose entries are [`Format::V6`]. A log enters it as
-    /// it enters version 2.
-    pub const V6: Self = Self(NonZeroU32::MIN.saturating_add(5));
-
     /// The entry format a log at this version writes and reads; `None` for a version
     /// this binary does not know (a later binary's).
     #[must_use]
@@ -191,7 +186,6 @@ impl MachineVersion {
             3 => Some(Format::V3),
             4 => Some(Format::V4),
             5 => Some(Format::V5),
-            6 => Some(Format::V6),
             _ => None,
         }
     }
@@ -207,15 +201,6 @@ impl MachineVersion {
     pub const fn get(self) -> u32 {
         self.0.get()
     }
-}
-
-/// Whether `format` takes the batch: before format 6 no request carries a `size_key`.
-pub(crate) fn takes(format: Format, batch: &FarmBatch) -> bool {
-    format >= Format::V6
-        || !batch
-            .inputs
-            .iter()
-            .any(|i| matches!(i, FarmInput::Submit(r) if r.size_key.is_some()))
 }
 
 // ---- Encoding. ----
@@ -368,7 +353,6 @@ fn request(r: &Request) -> Result<proto::Request, EncodeError> {
         needs: r.needs.properties().into_iter().map(property).collect(),
         hermetic: r.hermetic,
         do_not_cache: r.do_not_cache,
-        size_key: r.size_key,
     })
 }
 
@@ -632,7 +616,6 @@ fn from_request(r: proto::Request) -> Result<Request, DecodeError> {
         needs,
         hermetic: r.hermetic,
         do_not_cache: r.do_not_cache,
-        size_key: r.size_key,
     })
 }
 
