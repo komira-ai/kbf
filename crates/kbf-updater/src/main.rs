@@ -1,4 +1,4 @@
-//! The `kbf-updater` binary: a stub until the listener lands. See [`kbf_updater::run`].
+//! The `kbf-updater` binary: the roll API on a unix socket. See [`kbf_updater::run`].
 
 use std::process::ExitCode;
 

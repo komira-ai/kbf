@@ -117,11 +117,7 @@ fn held(cluster: &Cluster, i: usize, blob: &TestBlob) -> bool {
 /// both nodes the write returns: both caches hold the blob (and say so in
 /// `unwritten_bytes`), neither index has it, no writer has begun and no sync has happened.
 /// The drain then parks a writer in `sync` on each node (still no sync, still not indexed)
-/// and, released, puts the blob in both indexes and empties the set. Mutants: the
-/// producer disabled (`commit_held` always `commit`): the write then parks in the gate and
-/// the first await never returns; the replica's leg not asking (`asks_held` false): the
-/// replica's writer parks, the write never returns; the drain hook never called: the set
-/// never empties.
+/// and, released, puts the blob in both indexes and empties the set.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_is_acknowledged_from_ram_before_either_disk_has_it() {
     let cluster = Cluster::start(2, Setup::new(64 << 20)).await;
@@ -170,9 +166,7 @@ async fn a_write_is_acknowledged_from_ram_before_either_disk_has_it() {
 /// node and the sync gates closed, the replica's writer parks in `sync` and the write is
 /// not answered; nothing is held, nothing is tracked, no `writethrough` row is counted;
 /// released, the write is answered and both indexes have the blob. This is the existing
-/// behaviour, asserted through the new path. Mutant: the node treats a zero budget as
-/// "acknowledge from RAM" (`ram_ack_enabled` always true, `hold` unbudgeted): the write
-/// returns with the gates closed and the first assertion fails.
+/// behaviour, asserted through the new path.
 #[tokio::test(flavor = "multi_thread")]
 async fn at_the_default_a_write_waits_for_the_disk_and_nothing_is_held() {
     let cluster = Cluster::start(2, Setup::new(0)).await;
@@ -218,16 +212,13 @@ async fn at_the_default_a_write_waits_for_the_disk_and_nothing_is_held() {
     }
 }
 
-/// T1. Catches an acknowledgement that depends on the primary's disk, a replica that does not
-/// hold what it acknowledged, and a survivor that owes nothing. The primary is killed after
-/// the answer, before either disk has the blob, and starts again over its log: it says
-/// missing; a router read is served by the replica from RAM; once the replica's gate opens
-/// its drain puts the blob in its index and the set is empty; the confirmation, after the
-/// replica's own write and the grace, finds the restarted primary missing and journals
-/// exactly one debt, naming the primary. Mutants: the replica registers nothing with its
-/// confirmer (`confirm` left `None` for a copy that asked): no debt, the last assertion
-/// fails; the primary acknowledges before the replica holds the blob (the leg's answer not
-/// awaited): the router read finds nothing.
+/// T1. Catches an acknowledgement that depends on the primary's disk, a replica that does
+/// not hold what it acknowledged, and a survivor that owes nothing. The primary is killed
+/// after the answer, before either disk has the blob, and starts again over its log: it
+/// says missing; a router read is served by the replica from RAM; once the replica's gate
+/// opens its drain puts the blob in its index and the set is empty; the confirmation,
+/// after the replica's own write and the grace, finds the restarted primary missing and
+/// journals exactly one debt, naming the primary.
 #[tokio::test(flavor = "multi_thread")]
 async fn killing_the_primary_after_the_ack_leaves_the_replica_serving_and_owing() {
     let mut cluster = Cluster::start(2, Setup::new(64 << 20)).await;
@@ -267,8 +258,7 @@ async fn killing_the_primary_after_the_ack_leaves_the_replica_serving_and_owing(
 
 /// T2, the mirror: the replica is killed after the answer and restarts; the primary serves
 /// the blob, writes it when its gate opens, and its confirmation finds the replica missing
-/// and journals one debt naming it. Mutant: the primary registers nothing with its
-/// confirmer (`confirm` left `None` for `Plan::Primary`): no debt.
+/// and journals one debt naming it.
 #[tokio::test(flavor = "multi_thread")]
 async fn killing_the_replica_after_the_ack_leaves_the_primary_serving_and_owing() {
     let mut cluster = Cluster::start(2, Setup::new(64 << 20)).await;
@@ -301,10 +291,9 @@ async fn killing_the_replica_after_the_ack_leaves_the_primary_serving_and_owing(
 
 /// T3, the data. Both owners are killed after the answer, before either disk: the blob is
 /// lost, as the design accepts. Both restart and say missing, a router read is `NotFound`
-/// (never bytes that are not there), a FindMissing reports it so a client uploads it again,
-/// and the upload is acknowledged and read back. Catches a lost blob reported present, and
-/// a restart that cannot take the re-upload. Mutant: `present` answers from the tier's
-/// files rather than the index (an unindexed block reads as present).
+/// (never bytes that are not there), a FindMissing reports it so a client uploads it
+/// again, and the upload is acknowledged and read back. Catches a lost blob reported
+/// present, and a restart that cannot take the re-upload.
 #[tokio::test(flavor = "multi_thread")]
 async fn killing_both_owners_after_the_ack_loses_the_blob_and_the_client_uploads_it_again() {
     let mut cluster = Cluster::start(2, Setup::new(64 << 20)).await;
@@ -347,12 +336,10 @@ async fn killing_both_owners_after_the_ack_loses_the_blob_and_the_client_uploads
 }
 
 /// Restart mid-drain (T5). The primary's `PutStaged` is held after the blob's block was
-/// synced; the node is killed there and starts again. The orphan block is removed, the index
-/// lacks the blob, and the node says missing; the replica still holds it (served from RAM)
-/// and, drained, has it intact. Catches a restart that indexes an unacknowledged block, one
-/// that keeps the orphan, and a replica that loses its copy with its peer. Mutant: the drain
-/// applies `PutStaged` before it syncs the block (the index would then name bytes the
-/// restart does not find: this test's `indexed` is true before the kill).
+/// synced; the node is killed there and starts again. The orphan block is removed, the
+/// index lacks the blob, and the node says missing; the replica still holds it (served
+/// from RAM) and, drained, has it intact. Catches a restart that indexes an unacknowledged
+/// block, one that keeps the orphan, and a replica that loses its copy with its peer.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restart_mid_drain_removes_the_orphan_and_the_peer_keeps_the_blob() {
     let mut cluster = Cluster::start(2, Setup::new(64 << 20)).await;
@@ -404,9 +391,7 @@ async fn a_restart_mid_drain_removes_the_orphan_and_the_peer_keeps_the_blob() {
 /// synced, the index lacks the blob, the entry is held), the primary answers a FindMissing
 /// present and serves the bytes, both asked of it directly (a router asks the primary
 /// alone for FindMissing, and falls over to the replica for a read, which would hide a
-/// miss); released, the same after the index has it. Mutant: the pass removes the entry
-/// before `put_staged` returns (the `held.remove` moved above the await): the primary
-/// answers missing at the hold.
+/// miss); released, the same after the index has it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_blob_is_served_by_the_primary_while_its_index_commit_is_in_flight() {
     let cluster = Cluster::start(2, Setup::new(64 << 20)).await;
@@ -464,8 +449,7 @@ async fn a_blob_is_served_by_the_primary_while_its_index_commit_is_in_flight() {
 /// blob and before the entry is removed: both the index and the set have it, and the
 /// primary answers present and serves it; after the pass the set is empty and the index
 /// alone answers. Catches a hook that runs before the apply, and an entry removed by the
-/// writer instead of the pass. Mutant: the pass removes the entry at the hook (inside
-/// `drain_one`): `is_held_for_test` is false while parked.
+/// writer instead of the pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_blob_is_in_the_index_and_the_set_at_the_same_time_while_the_drain_finishes() {
     let (parked_tx, mut parked) = tokio::sync::mpsc::unbounded_channel();
@@ -516,10 +500,7 @@ async fn a_blob_is_in_the_index_and_the_set_at_the_same_time_while_the_drain_fin
 /// the disk is asked. The replica is cut off and the primary's gate closed: the primary's
 /// writer parks in `sync`, the write is not answered, the debt is already in the journal
 /// naming the replica, nothing is held in RAM, and the write-through is counted for its
-/// reason. Released, the write is answered and the blob is on the disk. Mutants: a lost
-/// replica commits `Held` (the write is answered with the gate closed; the test fails in
-/// `parked_unanswered`); the debt journaled after the commit (the journal is empty at the
-/// park).
+/// reason. Released, the write is answered and the blob is on the disk.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_replica_that_is_down_is_a_write_through_with_the_debt_journaled_first() {
     let cluster = Cluster::start(2, Setup::new(64 << 20)).await;
@@ -553,9 +534,9 @@ async fn a_replica_that_is_down_is_a_write_through_with_the_debt_journaled_first
 }
 
 /// Q4. The second owner takes a client write as the primary while the first owner is dead
-/// but not down in the map: the leg to the first owner fails as unreachable, which is a lost
-/// replica, so the write goes through with a debt naming the first owner. Catches a second
-/// owner that acknowledges from RAM with one live copy. Mutant as the test above.
+/// but not down in the map: the leg to the first owner fails as unreachable, which is a
+/// lost replica, so the write goes through with a debt naming the first owner. Catches a
+/// second owner that acknowledges from RAM with one live copy.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_second_owner_taking_the_write_while_the_first_is_dead_writes_through() {
     let cluster = Cluster::start(2, Setup::new(64 << 20)).await;
@@ -581,8 +562,7 @@ async fn the_second_owner_taking_the_write_while_the_first_is_dead_writes_throug
 /// T8. A blob over 4 MiB stays acknowledged from the disk: with the gates closed the
 /// replica's writer parks in `sync`, the write is not answered, nothing is held, the
 /// replica counts it as `large`; released, it is answered and indexed on both owners.
-/// Catches a producer that holds a streamed blob. Mutant: the `large` arm of
-/// `commit_held` removed (the count is 0).
+/// Catches a producer that holds a streamed blob.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_blob_over_four_mib_is_acknowledged_from_the_disk() {
     let cluster = Cluster::start(2, Setup::new(64 << 20)).await;
@@ -607,8 +587,8 @@ async fn a_blob_over_four_mib_is_acknowledged_from_the_disk() {
 }
 
 /// T8, R = 1. A blob with one owner is a single copy, so it stays acknowledged from the
-/// disk: the owner's writer parks in `sync`, the write is not answered, nothing is held, the
-/// write is counted as `single_owner`. Mutant: `Held` for a write with no replica.
+/// disk: the owner's writer parks in `sync`, the write is not answered, nothing is held,
+/// the write is counted as `single_owner`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_blob_with_one_owner_is_acknowledged_from_the_disk() {
     let mut setup = Setup::new(64 << 20);
@@ -634,9 +614,8 @@ async fn a_blob_with_one_owner_is_acknowledged_from_the_disk() {
 /// answered: the replica has no budget left, commits to its disk and its writer parks in
 /// `sync` (the backpressure), counted as `budget`; the bytes held never exceed the budget.
 /// Released, the third is answered, the drains empty the sets and the gauge returns to 0.
-/// Catches a budget that is exceeded, a write that is dropped or answered without its
-/// disk when the budget is full, and a gauge that does not return to 0. Mutant:
-/// `try_acquire` ignores the cap (the third is held too: answered with the gates closed).
+/// Catches a budget that is exceeded, a write that is dropped or answered without its disk
+/// when the budget is full, and a gauge that does not return to 0.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_budget_makes_the_write_wait_for_its_disk_and_the_gauge_returns_to_zero() {
     let cluster = Cluster::start(2, Setup::new(2 * KIB4 as u64)).await;
@@ -683,8 +662,7 @@ async fn a_full_budget_makes_the_write_wait_for_its_disk_and_the_gauge_returns_t
 /// Disk full on the write-behind (T4). The drain's disk refuses to create a block and the
 /// store refuses the upload: the pass fails, the blob stays held (counted as a drain
 /// failure) and is still served; once the disk is back the next pass writes it. Catches an
-/// entry dropped on a failed write and a failure that is not counted. Mutant: the pass
-/// removes the entry whatever the write did.
+/// entry dropped on a failed write and a failure that is not counted.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_write_behind_keeps_the_blob_held_and_served() {
     let cluster = Cluster::start(2, Setup::new(64 << 20)).await;
@@ -732,11 +710,10 @@ async fn a_failed_write_behind_keeps_the_blob_held_and_served() {
     assert!(cluster.indexed(0, &blob.digest));
 }
 
-/// The unconfirmed gauge (`kbf_storage_ram_unconfirmed_blobs`): both owners keep the digest
-/// after the answer, the gauge says so, and after both drained and the confirmation found
-/// the peer durable it is back to 0 with no debt written. Catches a gauge that is never set
-/// and a confirmation that journals on the normal path. Mutant: the storage's
-/// `unconfirmed` is not told (the gauge stays 0 after the write).
+/// The unconfirmed gauge (`kbf_storage_ram_unconfirmed_blobs`): both owners keep the
+/// digest after the answer, the gauge says so, and after both drained and the confirmation
+/// found the peer durable it is back to 0 with no debt written. Catches a gauge that is
+/// never set and a confirmation that journals on the normal path.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_unconfirmed_gauge_counts_until_the_peer_is_known_durable() {
     let cluster = Cluster::start(2, Setup::new(64 << 20)).await;

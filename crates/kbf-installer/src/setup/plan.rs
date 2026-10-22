@@ -160,9 +160,6 @@ pub struct Ctx {
     /// The user of the proxy and its frontend children when the host also runs a sibling as
     /// `service` (all-in-one): `kbf-server`. None elsewhere, where `service` is that user.
     pub frontend: Option<RunUser>,
-    /// The migration's journal says a Mac the kit installed was adopted (kit, phase done):
-    /// its `kbf.toml` is the kit's and `setup` only adds to it.
-    pub kit_adopted: bool,
     /// The `kbf.toml` of the earlier all-in-one layout, when the host has it: this run splits it
     /// (`aio_migrate`) instead of deciding on it as on any file that is there.
     pub earlier: Option<Earlier>,
@@ -228,7 +225,6 @@ pub fn context(os: &dyn Os, mode: Mode) -> Result<Ctx, SetupError> {
         root: os.root_owner(),
         service,
         frontend,
-        kit_adopted: false,
         earlier: None,
     })
 }
@@ -392,23 +388,13 @@ fn check_fetch_shape(os: &dyn Os, user: &RunUser) -> Result<(), SetupError> {
 }
 
 /// The fetch account is there with the right shape, or its creation is a step of `p`. One
-/// function for `setup` and for `migrate` (which needs the account for the version probe
-/// before `setup` can have run), so there is one definition of the account.
+/// function, so there is one definition of the account.
 pub fn ensure_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os) -> Result<(), SetupError> {
     let name = fetch_user(os.platform());
     match os.user(name)? {
         Some(user) => check_fetch_shape(os, &user),
         None => create_fetch_user(p, os, name),
     }
-}
-
-/// The plan that makes the fetch account, empty when it is there already; reads the host,
-/// changes nothing.
-pub fn fetch_user_plan(os: &dyn Os, exec: &dyn Exec) -> Result<Plan, SetupError> {
-    let view = View(exec);
-    let mut p = Planner::new(&view);
-    ensure_fetch_user(&mut p, os)?;
-    Ok(p.finish())
 }
 
 fn create_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os, name: &str) -> Result<(), SetupError> {
@@ -612,23 +598,6 @@ fn operator_token(
     Ok(())
 }
 
-/// Take the unit files `shadows` out of `/etc/systemd/system`, each after a copy of its
-/// bytes is in the migration's backup directory (root's 0700, where the originals of the
-/// migration are): a crash between the two leaves the file in place and the copy made, and a
-/// run again finishes. Nothing is deleted that was not first kept.
-pub fn retire(exec: &dyn Exec, ctx: &Ctx, shadows: &[super::Shadow]) -> Result<Plan, SetupError> {
-    let view = View(exec);
-    let mut p = Planner::new(&view);
-    let backup = ctx.layout.migration_units().to_string();
-    dir(&mut p, &backup, 0o700, ctx.root)?;
-    for shadow in shadows {
-        let kept = format!("{backup}/{}", crate::migrate::retired_name(shadow.unit));
-        file(&mut p, &kept, 0o600, ctx.root, shadow.bytes.clone())?;
-        p.absent(hp(&shadow.path)?)?;
-    }
-    Ok(p.finish())
-}
-
 /// A setting `setup` writes without a flag of its own: `[table] key = "value"`.
 fn setting(table: &'static str, key: &'static str, value: String) -> Setting {
     Setting { table, key, value }
@@ -729,6 +698,8 @@ fn frontend_file(
 /// The part after the first release: `kbf.toml` (on an all-in-one host `frontend.toml` before
 /// it), then the units. `released` says whether a release is installed (or, in a dry run, would
 /// be). Reads the host, changes nothing.
+/// The part after the first release: `kbf.toml`, then the units. `released` says whether a
+/// release is installed (or, in a dry run, would be). Reads the host, changes nothing.
 pub fn after_release(
     os: &dyn Os,
     exec: &dyn Exec,
@@ -736,7 +707,6 @@ pub fn after_release(
     ctx: &Ctx,
     released: bool,
     no_start: bool,
-    retired: &[&str],
 ) -> Result<Outcome, SetupError> {
     let view = View(exec);
     let mut p = Planner::new(&view);
@@ -778,12 +748,11 @@ pub fn after_release(
                 .map_err(SetupError::NeedsOperator)?;
         }
     }
-    let decision = match (&ctx.earlier, &current, ctx.kit_adopted) {
-        // The earlier layout's file is split, not decided on: its settings came in as flags, so
-        // `ours` has them, and the original is kept below before this file is replaced.
-        (Some(_), _, _) => Decision::Write(ours.render()),
-        (None, Some(text), true) => kbf_toml::decide_adopted(text, &ours, kbf_toml_path),
-        _ => kbf_toml::decide(current.as_deref(), &ours, kbf_toml_path),
+    // The earlier layout's file is split, not decided on: its settings came in as flags, so
+    // `ours` has them, and the original is kept below before this file is replaced.
+    let decision = match &ctx.earlier {
+        Some(_) => Decision::Write(ours.render()),
+        None => kbf_toml::decide(current.as_deref(), &ours, kbf_toml_path),
     };
     if let Some(earlier) = &ctx.earlier {
         earlier.plan(&mut p, ctx, &mut notes)?;
@@ -812,7 +781,7 @@ pub fn after_release(
         &mut notes,
     )?;
 
-    notes.extend(units(&mut p, os, v, ctx, released, no_start, retired)?);
+    notes.extend(units(&mut p, os, v, ctx, released, no_start)?);
     Ok(Outcome {
         plan: p.finish(),
         notes,
@@ -874,7 +843,6 @@ fn units(
     ctx: &Ctx,
     released: bool,
     no_start: bool,
-    retired: &[&str],
 ) -> Result<Vec<String>, SetupError> {
     let mut notes = Vec::new();
     // The mode's units are started when the operator did not forbid it and a release is
@@ -943,14 +911,11 @@ fn units(
                 .iter()
                 .map(|u| (*u, start_mode))
                 .chain([(INSTALLER_UNIT, !no_start)]);
-            // A unit file was taken out of `/etc/systemd/system`: systemd reads the packaged
-            // unit of that name from the next reload, and it is enabled whatever was said of
-            // the old file (the enable symlink of the old file named the same unit).
-            if !retired.is_empty() || backup_gone {
+            if backup_gone {
                 p.run(Cmd::new(hp(SYSTEMCTL)?).arg("daemon-reload"));
             }
             for (unit, now) in wanted {
-                if retired.contains(&unit) || !os.unit_enabled(unit)? {
+                if !os.unit_enabled(unit)? {
                     let mut cmd = Cmd::new(hp(SYSTEMCTL)?).arg("enable");
                     if now {
                         cmd = cmd.arg("--now");

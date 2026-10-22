@@ -10,7 +10,7 @@ use kbf_host::{Entry, Exec, HostPath, Owner, Perms, Step};
 use kbf_state::postgres::Unreached;
 use kbf_state::postgres::schema::Outcome;
 
-use super::backend::{Backend, Migrations, Releases, Schemas};
+use super::backend::{Backend, Releases, Schemas};
 use super::fake::{FakeOs, user};
 use super::validate::Raw;
 use super::{Options, SetupError, run};
@@ -21,7 +21,6 @@ use crate::exit::Exit;
 use crate::helper::fetcher::FetchError;
 use crate::installer_toml::Source;
 use crate::layout::{Layout, Platform};
-use crate::migrate::{MigrateError, Unit};
 
 const DATABASE: &str = "postgres:///kbf?host=/run/postgresql&user=kbf-server";
 
@@ -176,42 +175,6 @@ impl Releases for Unwired {
     }
 }
 
-/// What the migration journal says on the fake host.
-#[derive(Clone, Copy)]
-enum Standing {
-    /// No old layout: nothing to say.
-    Fresh,
-    /// The old layout's state is the host's and no migration finished.
-    Unmigrated,
-    /// A finished migration repointed these units.
-    Done(&'static [&'static str]),
-    /// A finished migration adopted a host the Mac kit installed.
-    DoneKit(&'static [&'static str]),
-    /// The journal cannot be read.
-    Damaged,
-}
-
-impl Migrations for Standing {
-    fn units(&self) -> Result<Vec<Unit>, MigrateError> {
-        match self {
-            Standing::Fresh => Ok(Vec::new()),
-            Standing::Unmigrated => Err(MigrateError::Unmigrated("/var/lib/kbf-deploy".into())),
-            Standing::Done(units) | Standing::DoneKit(units) => Ok(units
-                .iter()
-                .map(|u| Unit::new(u).expect("a unit"))
-                .collect()),
-            Standing::Damaged => Err(MigrateError::Corrupt {
-                file: "migration.json",
-                why: "planted".into(),
-            }),
-        }
-    }
-
-    fn kit_adopted(&self) -> Result<bool, MigrateError> {
-        Ok(matches!(self, Standing::DoneKit(_)))
-    }
-}
-
 /// What the fake server was asked, in order: `plan` and `setup`, each with the URL.
 type Asked = Rc<RefCell<Vec<String>>>;
 
@@ -308,24 +271,10 @@ fn go_on(
     raw: &Raw,
     options: Options,
 ) -> Result<String, SetupError> {
-    go_after(os, exec, releases, server, Standing::Fresh, raw, options)
-}
-
-/// [`go_on`] on a host whose migration journal says `standing`.
-fn go_after(
-    os: &FakeOs,
-    exec: &mut FakeExec,
-    releases: &dyn Releases,
-    server: &Server,
-    standing: Standing,
-    raw: &Raw,
-    options: Options,
-) -> Result<String, SetupError> {
     let mut out = Vec::new();
     let backend = Backend {
         releases,
         schemas: server,
-        migrations: &standing,
     };
     run(os, exec, &backend, raw, options, &mut out)?;
     Ok(String::from_utf8(out).expect("text"))
@@ -1400,27 +1349,6 @@ fn each_failure_has_its_exit_code_and_word() {
             "fetch",
         ),
         (
-            SetupError::Unmigrated {
-                path: "/x".into(),
-                fetch_user: "kbf-fetch",
-            },
-            Exit::NeedsOperator,
-            "unmigrated",
-        ),
-        (
-            SetupError::Migrate(MigrateError::NoJournal),
-            Exit::NeedsOperator,
-            "migrate",
-        ),
-        (
-            SetupError::Migrate(MigrateError::Io {
-                what: "x".into(),
-                source: std::io::Error::other("y"),
-            }),
-            Exit::Failed,
-            "migrate",
-        ),
-        (
             SetupError::ShadowUnit {
                 path: "/x".into(),
                 unit: "u",
@@ -1721,17 +1649,6 @@ fn every_failure_reads_as_a_sentence() {
             "no release fetcher",
         ),
         (
-            SetupError::Unmigrated {
-                path: "/usr/local/kbf".into(),
-                fetch_user: "kbf-fetch",
-            },
-            "/usr/local/kbf",
-        ),
-        (
-            SetupError::Migrate(MigrateError::NoJournal),
-            "no migration.json",
-        ),
-        (
             SetupError::ShadowUnit {
                 path: "/etc/systemd/system/a.service".into(),
                 unit: "a.service",
@@ -1800,49 +1717,6 @@ mod proxy_listen;
 
 #[path = "old_backup_tests.rs"]
 mod old_backup;
-
-/// Catches the journal's `kit` flag not reaching the `kbf.toml` decision: on the same Mac with
-/// the same kit file, a finished kit migration (`DoneKit`) lets setup add its keys and keep the
-/// kit's, and a finished migration of any other host (`Done`) refuses the file as before.
-///
-/// Mutant seen red: `ctx.kit_adopted` left false.
-#[test]
-fn the_journals_kit_flag_picks_the_kbf_toml_decision() {
-    const KIT: &str = "mode = \"daemon\"\n\n[identity]\nnode-id = \"mac-a\"\n\n[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n";
-    let mut os = FakeOs::mac();
-    os.users.push(user("_kbf-fetch", 303));
-    os.users.last_mut().expect("user").home = "/var/empty".to_owned();
-    let go_kit = |standing: Standing| {
-        let mut exec = released(host(), Platform::MacOs);
-        put(&mut exec, "/usr/local/etc/kbf/kbf.toml", 0o640, ROOT, KIT);
-        let r = go_after(
-            &os,
-            &mut exec,
-            &Unwired,
-            &Server::fresh(),
-            standing,
-            &raw(Mode::Daemon),
-            APPLY,
-        );
-        (r, exec)
-    };
-    let (ok, exec) = go_kit(Standing::DoneKit(&[]));
-    ok.expect("kit host");
-    let written = text(&exec, "/usr/local/etc/kbf/kbf.toml");
-    assert!(written.starts_with(KIT.trim_end()), "{written}");
-    assert!(written.contains("[frontend]"), "{written}");
-    assert!(
-        !written.contains("orders-dir"),
-        "a Mac's keys are not written: {written}"
-    );
-    let (refused, _) = go_kit(Standing::Done(&[]));
-    assert!(
-        refused
-            .expect_err("not a kit host")
-            .to_string()
-            .contains("holds other settings"),
-    );
-}
 
 #[path = "update_dirs_tests.rs"]
 mod update_dirs;

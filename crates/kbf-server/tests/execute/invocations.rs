@@ -10,7 +10,7 @@
 use std::io::Write as _;
 
 use kbf_front::REQUEST_METADATA_HEADER;
-use kbf_invocation::{AttemptEnd, How, Invocation, InvocationId, Outcome, RecordKey};
+use kbf_invocation::{AttemptEnd, BookSource, How, Invocation, InvocationId, Outcome, RecordKey};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::google::bytestream::{ReadRequest, WriteRequest};
 use kbf_proto::google::longrunning::Operation;
@@ -148,7 +148,8 @@ async fn a_build_records_a_hit_a_run_a_requeue_and_a_failure() {
     assert_eq!(miss, Err(Code::NotFound));
 
     let run = Job::new("runs once", &[]);
-    let requeue = Job::new("runs twice", &[]);
+    // Names the memory the default books: still a hint.
+    let requeue = Job::new("runs twice", &[("kbf-book-mem-gib", "4")]);
     let fail = Job::new("fails", &[]);
     let mut uploaded = 0;
     for job in [&run, &requeue, &fail] {
@@ -250,6 +251,28 @@ async fn a_build_records_a_hit_a_run_a_requeue_and_a_failure() {
     let (lost, rerun) = (&requeue_row.attempts[0], &requeue_row.attempts[1]);
     assert_ne!(lost.lease, rerun.lease);
     assert_eq!(Some(rerun.queued), lost.ended, "queued again when given up");
+
+    // What the front knew at submit, and the operation, ride with each row: the hint
+    // equal to the default is a hint; the in-process cache's walk totals no input.
+    let sources = |row: &kbf_invocation::ActionRow| {
+        row.evidence
+            .map(|e| (e.cpu_source, e.memory_source, e.input_bytes, e.input_files))
+    };
+    assert_eq!(
+        sources(run_row),
+        Some((BookSource::Default, BookSource::Default, None, None))
+    );
+    assert_eq!(
+        sources(requeue_row),
+        Some((BookSource::Default, BookSource::Hint, None, None))
+    );
+    let ops = [run_row, requeue_row, fail_row].map(|r| r.operation_id);
+    assert!(ops.iter().all(Option::is_some), "{ops:?}");
+    assert!(
+        ops[0] != ops[1] && ops[1] != ops[2] && ops[0] != ops[2],
+        "one operation each, whatever its attempts: {ops:?}"
+    );
+    assert_eq!(hit_row.operation_id, None, "a cache hit waits on none");
 
     // The failure: the client's status, and the daemon's reason on the attempt.
     assert_eq!(

@@ -8,11 +8,8 @@
 //! (`--commit`), `kbf.toml` (both in `/etc/kbf`, `/usr/local/etc/kbf` on a Mac), and last the units enabled for the mode.
 //!
 //! - It is root's: [`Os::euid`] is checked first, so only a fake that says 0 gets past it
-//!   without root. It refuses while the retired `kbf-helper`/`kbf-deploy` layout is the
-//!   host's, that is, its state is there and `migrate` has not finished it ([`backend::Migrations`]:
-//!   the journal decides, not the old paths, which a migrated host keeps). It retires a unit
-//!   file `migrate` repointed where it shadows the mode's packaged unit, keeping its bytes,
-//!   and refuses any other file there. Envoy is not its business: the bundled proxy owns
+//!   without root. It refuses a regular file in `/etc/systemd/system` that shadows the
+//!   mode's packaged unit. Envoy is not its business: the bundled proxy owns
 //!   a frontend's port, and a load balancer in front is the operator's.
 //! - Files are written by `kbf-host` steps, each a temporary name, fsync, rename and a sync
 //!   of the directory. Without `--apply` the steps are printed as `DRY-RUN:` and nothing
@@ -66,8 +63,6 @@ pub(crate) mod fake;
 #[cfg(test)]
 mod fetch_user_tests;
 #[cfg(test)]
-mod kit_adopted_tests;
-#[cfg(test)]
 mod tests;
 
 use std::io::{self, Write};
@@ -75,7 +70,7 @@ use std::path::PathBuf;
 
 use kbf_host::{Entry, Exec, HostError, HostExec, HostPath, PathError, Root, Untrusted};
 
-use self::backend::{Backend, Fetching, Journaled, Postgres};
+use self::backend::{Backend, Fetching, Postgres};
 use self::os::{Os, SystemOs};
 use self::validate::{Raw, Valid, mode_name};
 use crate::cli::{Mode, SetupArgs};
@@ -86,7 +81,6 @@ use crate::helper::fetcher_host::HostFetcher;
 use crate::helper::leases;
 use crate::installer_toml::{InstallerToml, Source};
 use crate::layout::{Layout, Platform};
-use crate::migrate::MigrateError;
 use crate::release::ReleaseError;
 
 /// Why setup stopped.
@@ -110,16 +104,6 @@ pub enum SetupError {
     SubIdSpace(&'static str),
     #[error("no free id between 300 and 399 for the fetch account")]
     NoFreeId,
-    #[error(
-        "the old layout's state is still the host's ({path}) and no migration finished: kbf-installer and the retired kbf-helper/kbf-deploy never both manage a host; run `kbf-installer migrate --apply --fetch-user {fetch_user} [--unit UNIT]` (without --apply it is a dry run), then run setup again"
-    )]
-    Unmigrated {
-        path: String,
-        fetch_user: &'static str,
-    },
-    /// The migration's journal or the old layout could not be read.
-    #[error("{0}")]
-    Migrate(#[from] MigrateError),
     #[error(
         "{path} is a regular file and shadows the packaged unit {unit} (systemd reads /etc before /usr/lib, so enabling would keep its old flags): move it aside (mv {path} {path}.old; systemctl daemon-reload) and run setup again; setup never deletes a unit"
     )]
@@ -152,10 +136,7 @@ impl SetupError {
             | SetupError::Unsupported(_)
             | SetupError::NoUser { .. } => Exit::Usage,
             SetupError::Fetch(FetchError::Rejected(_) | FetchError::Order { .. }) => Exit::Refused,
-            SetupError::NeedsOperator(_)
-            | SetupError::Unmigrated { .. }
-            | SetupError::ShadowUnit { .. } => Exit::NeedsOperator,
-            SetupError::Migrate(e) => e.exit(),
+            SetupError::NeedsOperator(_) | SetupError::ShadowUnit { .. } => Exit::NeedsOperator,
             SetupError::SubIdSpace(_)
             | SetupError::NoFreeId
             | SetupError::Fetch(_)
@@ -178,8 +159,6 @@ impl SetupError {
             SetupError::NoUser { .. } => "no_user",
             SetupError::SubIdSpace(_) | SetupError::NoFreeId => "no_room",
             SetupError::NeedsOperator(_) => "needs_operator",
-            SetupError::Unmigrated { .. } => "unmigrated",
-            SetupError::Migrate(_) => "migrate",
             SetupError::ShadowUnit { .. } => "unit_shadow",
             SetupError::Fetch(FetchError::NotWired) => "not_implemented",
             SetupError::Fetch(_) => "fetch",
@@ -285,56 +264,19 @@ fn present(exec: &dyn Exec, path: &HostPath) -> Result<bool, SetupError> {
     Ok(exec.stat(path)?.is_some() || exec.inspect(path)?.is_some())
 }
 
-/// The old layout's state is the host's until a migration finished: the journal says so, not
-/// the paths (a migrated host keeps `/usr/local/kbf` and `/var/lib/kbf-deploy` as its
-/// rollback path). Returns the units that migration repointed.
-fn migrated_units(
-    backend: &Backend<'_>,
-    platform: Platform,
-) -> Result<Vec<crate::migrate::Unit>, SetupError> {
-    backend.migrations.units().map_err(|e| match e {
-        MigrateError::Unmigrated(path) => SetupError::Unmigrated {
-            path,
-            fetch_user: plan::fetch_user(platform),
-        },
-        other => SetupError::Migrate(other),
-    })
-}
-
-/// A regular file in `/etc/systemd/system` with the name of the mode's packaged unit that
-/// `setup` retires: the unit file of the old layout, which a finished migration repointed.
-pub struct Shadow {
-    pub path: String,
-    pub unit: &'static str,
-    pub bytes: Vec<u8>,
-}
-
 /// Where a regular file in `/etc/systemd/system` has the name of the mode's packaged unit:
 /// systemd reads `/etc` before `/usr/lib`, and `setup` does not enable a unit that is already
 /// enabled, so the host would go on running the old file's flags. A link is what
-/// `systemctl link` makes and is not a shadow with other flags.
-///
-/// A file the migration journalled by name is the old layout's unit and is returned, to be
-/// retired with its bytes kept. Any other is refused, naming it: `setup` never removes a unit
-/// it did not see the migration take over.
-fn find_shadows(
-    exec: &dyn Exec,
-    mode: Mode,
-    journalled: &[crate::migrate::Unit],
-    proxy: bool,
-) -> Result<Vec<Shadow>, SetupError> {
-    let mut found = Vec::new();
+/// `systemctl link` makes and is not a shadow with other flags. Refused, naming the file:
+/// `setup` never removes a unit it did not write.
+fn find_shadows(exec: &dyn Exec, mode: Mode, proxy: bool) -> Result<(), SetupError> {
     for unit in plan::mode_units(mode, proxy) {
         let path = format!("/etc/systemd/system/{unit}");
-        let Some(Entry::File { bytes, .. }) = exec.inspect(&HostPath::new(&path)?)? else {
-            continue;
-        };
-        if !journalled.iter().any(|j| j.as_str() == *unit) {
+        if let Some(Entry::File { .. }) = exec.inspect(&HostPath::new(&path)?)? {
             return Err(SetupError::ShadowUnit { path, unit });
         }
-        found.push(Shadow { path, unit, bytes });
     }
-    Ok(found)
+    Ok(())
 }
 
 /// Print the steps of `plan` and, when applying, carry them out. Returns how many there were.
@@ -406,13 +348,9 @@ pub fn run(
     {
         return Err(SetupError::Unsupported(NO_RELAY.to_owned()));
     }
-    let journalled = migrated_units(backend, ctx.platform)?;
-    ctx.kit_adopted = backend.migrations.kit_adopted()?;
-    let shadows = if ctx.platform == Platform::Linux {
-        find_shadows(&*exec, valid.mode, &journalled, valid.proxy.is_some())?
-    } else {
-        Vec::new()
-    };
+    if ctx.platform == Platform::Linux {
+        find_shadows(&*exec, valid.mode, valid.proxy.is_some())?;
+    }
     let service_uid = ctx.service.as_ref().map(|u| u.uid);
     let mut problems = Vec::new();
     kbf_settings::push_problems(&*exec, &valid.kbf, service_uid, &mut problems);
@@ -435,23 +373,6 @@ pub fn run(
     let before = plan::before_release(os, &*exec, &valid, &ctx)?;
     let mut steps = emit(&before.plan, exec, options.apply, out)?;
     notes.extend(before.notes);
-
-    // The migrated unit file stands in the way of the packaged unit: it is taken out, a copy
-    // kept in the migration's backup first, and the packaged unit is enabled below.
-    if !shadows.is_empty() {
-        let mark = if options.apply { "+" } else { "DRY-RUN:" };
-        for shadow in &shadows {
-            let path = &shadow.path;
-            let line = format!("{mark} retire {path} (shadows the packaged unit; original kept)");
-            writeln!(out, "{line}")?;
-        }
-        let retire = plan::retire(&*exec, &ctx, &shadows)?;
-        steps += emit(&retire, exec, options.apply, out)?;
-        notes.push(
-            "retired unit files are kept in the migration's backup; `kbf-installer migrate --rollback` puts them back"
-                .to_owned(),
-        );
-    }
 
     // The schema is made after `installer.toml` is in place and before anything is fetched or
     // enabled: a database that cannot be reached stops setup with no release and no unit.
@@ -522,16 +443,7 @@ pub fn run(
         notes.extend(written.notes);
     }
 
-    let retired: Vec<&str> = shadows.iter().map(|s| s.unit).collect();
-    let after = plan::after_release(
-        os,
-        &*exec,
-        &valid,
-        &ctx,
-        have_release,
-        options.no_start,
-        &retired,
-    )?;
+    let after = plan::after_release(os, &*exec, &valid, &ctx, have_release, options.no_start)?;
     steps += emit(&after.plan, exec, options.apply, out)?;
     notes.extend(after.notes);
 
@@ -594,14 +506,9 @@ pub fn cli(
     let layout = Layout::new(Root::new(&root)?, platform);
     let fetcher = first_release_fetcher(layout.clone(), args.installer_config.clone());
     let releases = Fetching::new(&fetcher, layout, HostExec::new(Root::new(&root)?));
-    let journal = Journaled::new(
-        Layout::new(Root::new(&root)?, platform),
-        crate::app::owner_uid(root != std::path::Path::new("/"), exec.euid()),
-    );
     let backend = Backend {
         releases: &releases,
         schemas: &Postgres,
-        migrations: &journal,
     };
     run(&os, &mut exec, &backend, &raw, options, out)
 }

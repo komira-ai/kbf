@@ -1,22 +1,23 @@
-//! The fetch account's one definition, shared by `setup` and `migrate`: its plan, its shape
+//! The fetch account's one definition, its plan, its shape
 //! check, and the production `Os` reading a login shell. Each test says the defect it catches.
 
 use kbf_host::testkit::{FakeExec, reply};
 
 use super::SetupError;
 use super::fake::{FakeOs, user};
+use super::os::View;
 use super::os::{Os, SystemOs};
-use super::plan::fetch_user_plan;
+use super::plan::ensure_fetch_user;
 use crate::exit::Exit;
 use crate::layout::Platform;
+use kbf_host::Planner;
 
 fn steps(os: &FakeOs) -> Result<Vec<String>, SetupError> {
     let exec = FakeExec::new(0);
-    Ok(fetch_user_plan(os, &exec)?
-        .steps()
-        .iter()
-        .map(ToString::to_string)
-        .collect())
+    let view = View(&exec);
+    let mut p = Planner::new(&view);
+    ensure_fetch_user(&mut p, os)?;
+    Ok(p.finish().steps().iter().map(ToString::to_string).collect())
 }
 
 fn account(name: &str, uid: u32, home: &str) -> kbf_host::RunUser {

@@ -178,6 +178,7 @@ pub(super) fn submit(farm: &Farm, request: Request) -> Result<kbf_front::Ticket,
         request,
         call: None,
         described: Described::default(),
+        evidence: Default::default(),
     })
 }
 

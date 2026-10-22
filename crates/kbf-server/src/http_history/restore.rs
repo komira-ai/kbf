@@ -21,14 +21,14 @@
 use std::collections::BTreeMap;
 
 use kbf_history::records::{
-    HitHow, HitRecord, MemoryKill, RunOutcome, RunRecord, UsageBasis, WireDigest,
+    BookSource, HitHow, HitRecord, MemoryKill, RunOutcome, RunRecord, UsageBasis, WireDigest,
 };
 use kbf_invocation::{
-    ActionRow, ActionShape, Attempt, AttemptEnd, How, Listing, NumaBytes, Outcome, Output,
-    ReapiTimes, Run, RunUsage, Target, TargetKind, Text, WallTime,
+    ActionRow, ActionShape, Attempt, AttemptEnd, Evidence, How, Listing, NumaBytes, Outcome,
+    Output, ReapiTimes, Run, RunUsage, Target, TargetKind, Text, WallTime,
 };
 use kbf_sched::RequeueReason;
-use kbf_types::{Digest, DigestFunction, Failure, LeaseId, LostWhy, WorkerId};
+use kbf_types::{Digest, DigestFunction, Failure, LeaseId, LostWhy, OperationId, WorkerId};
 
 /// gRPC `INVALID_ARGUMENT`: what a run the farm could not run as written was answered.
 const INVALID_ARGUMENT: i32 = 3;
@@ -108,6 +108,8 @@ fn new_row(action: Digest, instance: &str, how: How) -> ActionRow {
         outputs_truncated: false,
         command: None,
         shape: None,
+        operation_id: None,
+        evidence: None,
     }
 }
 
@@ -135,6 +137,8 @@ fn fill(row: &mut ActionRow, runs: &[&RunRecord]) {
     row.command = digest(last.command.as_ref());
     row.shape = shape(last);
     row.listing = listing(last);
+    row.operation_id = last.operation_id.map(OperationId);
+    row.evidence = evidence(last);
 }
 
 /// How the attempt of `r` ended, and, when it is the last of its action, what its callers
@@ -312,6 +316,26 @@ fn usage(r: &RunRecord) -> Option<RunUsage> {
         })),
         _ => (!none).then(|| carried(RunUsage::default())),
     }
+}
+
+/// What the front knew at submit, as `r` kept it; `None` for a record that kept none of
+/// it (written before the fields).
+fn evidence(r: &RunRecord) -> Option<Evidence> {
+    let source = |s: BookSource| match s {
+        BookSource::Unspecified => None,
+        BookSource::Default => Some(kbf_invocation::BookSource::Default),
+        BookSource::Hint => Some(kbf_invocation::BookSource::Hint),
+    };
+    let (cpu, memory) = (source(r.cpu_source()), source(r.memory_source()));
+    if cpu.is_none() && memory.is_none() && r.input_bytes.is_none() && r.input_files.is_none() {
+        return None;
+    }
+    Some(Evidence {
+        cpu_source: cpu.unwrap_or_default(),
+        memory_source: memory.unwrap_or_default(),
+        input_bytes: r.input_bytes,
+        input_files: r.input_files,
+    })
 }
 
 /// The shape `r` names; `None` when it names none (no key, no configuration, no target).
