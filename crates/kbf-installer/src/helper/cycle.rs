@@ -37,13 +37,13 @@ use self::notice::Notice;
 use self::staged::{Held, refusal_of};
 use crate::database::SchemaStep;
 use crate::helper::fetcher::{Fetcher, InstalledRelease};
-use crate::helper::host_mode;
 use crate::helper::leases::{self, LeaseSource};
 use crate::helper::memory::{Event, Memory, StagedFacts};
 use crate::helper::order::{self, Claims, Order, Verb};
 use crate::helper::restart::{self, Restart};
 use crate::helper::service::{self, Procs};
 use crate::helper::status;
+use crate::host_mode;
 
 /// The most names looked at in the order spool in one pass; more is said, not followed.
 const SCAN_LIMIT: usize = 256;

@@ -9,10 +9,10 @@ use kbf_map::MemberState;
 use kbf_types::FarmTime;
 
 use super::command::{Alert, Command, GiveBack, HoldReason, SlotOp};
-use super::facts::{HelperStatus, HostRecord, MemberFacts, Observations, SlotView, Source, Work};
-use super::gate::{GateFail, GateMode};
+use super::facts::{HelperStatus, HostRecord, Observations, SlotView, Source, Work};
 use super::node_step::{HostPhase, Transition};
 use super::policy::Policy;
+use crate::storage_gate::{GateFail, GateMode, MemberFacts};
 
 /// What one call reads, besides the observations.
 struct Ctx<'a> {

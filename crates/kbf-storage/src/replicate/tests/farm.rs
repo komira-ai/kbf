@@ -14,7 +14,9 @@ use kbf_types::Digest;
 use tonic::transport::Channel;
 
 use crate::Storage;
-use crate::repair::{Options, RepairLedger, RepairRecord, Repairs};
+use crate::repair::{
+    Options, PeerConfirmer, RepairConfig, RepairLedger, RepairRecord, RepairWorker, Repairs,
+};
 use crate::replicate::{Chain, ChainConfig, MapSource, Peers};
 use crate::service::tests::fake::{Mem, patterned, serve_routes, sha};
 use crate::service::tests::roles::Pki;
@@ -85,6 +87,11 @@ pub(crate) struct Node {
     pub fs: FaultFs,
     pub repairs: Arc<Repairs>,
     pub ledger: Arc<TestLedger>,
+    /// The node's peer confirmer, which its service registers acknowledged blobs with.
+    pub confirmer: Arc<PeerConfirmer>,
+    /// The node's repair worker, whose confirmer is the one above: `confirm_pass` is its
+    /// tick.
+    pub worker: Arc<RepairWorker>,
 }
 
 /// Nodes numbered from 0; member ids are their numbers plus 1.
@@ -133,6 +140,13 @@ impl Farm {
                 config,
             ));
             let storage: Arc<dyn Storage> = Arc::clone(&mem) as Arc<dyn Storage>;
+            let worker = Arc::new(RepairWorker::new(
+                Arc::clone(&storage),
+                Arc::clone(&chain),
+                Arc::clone(&repairs),
+                RepairConfig::default(),
+            ));
+            let confirmer = worker.confirmer();
             let service = StorageService::new(
                 storage,
                 Admission::Certified,
@@ -142,7 +156,8 @@ impl Farm {
             )
             .with_refetch_wait(Duration::from_secs(5))
             .with_chain(Arc::clone(&chain))
-            .expect("a certified service");
+            .expect("a certified service")
+            .with_confirmer(Arc::clone(&confirmer));
             let served = serve_routes(service.routes(), Some(server)).await;
             nodes.push(Node {
                 id,
@@ -153,6 +168,8 @@ impl Farm {
                 fs,
                 repairs,
                 ledger,
+                confirmer,
+                worker,
             });
         }
         let farm = Self { nodes, pki };

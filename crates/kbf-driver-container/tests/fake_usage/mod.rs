@@ -320,3 +320,42 @@ async fn a_timed_out_lease_reports_its_cpu_and_peak_memory() {
     );
     assert!(!line.contains("oom="), "{line}");
 }
+
+/// Catches: the lease path not recording what the lease started under (the mutant that
+/// replaces the start's reading with the default): the CPU booked for the lease and the
+/// node's CPU pressure at its start must ride in the result's usage, on the cgroup basis;
+/// and a node without a pressure file must report the pressure absent, not zero.
+#[tokio::test]
+async fn a_lease_reports_its_booked_cpu_and_the_node_cpu_pressure_at_its_start() {
+    use kbf_proto::worker::UsageBasis;
+    use kbf_types::Resources;
+
+    let fake = Fake::with("usage-start", |c| {
+        c.cpu_pressure_file = c.scratch.join("cpu-pressure");
+    });
+    std::fs::write(
+        fake.scratch.join("cpu-pressure"),
+        "some avg10=12.34 avg60=3.20 avg300=1.05 total=123456\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+    )
+    .expect("pressure file");
+    let spec = Spec::new(&image(), "unused");
+    let action = words(&["exit", "0"]);
+    let result = fake
+        .run_with(1, &spec, &action, Resources::new(1500, 1 << 30))
+        .await
+        .expect("ran");
+    let usage = ResourceUsage::in_result(&result).expect("the result carries usage");
+    assert_eq!(usage.basis(), UsageBasis::Cgroup);
+    assert_eq!(usage.booked_millicpus, Some(1500));
+    assert_eq!(usage.node_cpu_pressure_centi, Some(1234));
+
+    // The same node with no pressure file: the booking stands, the pressure is absent.
+    std::fs::remove_file(fake.scratch.join("cpu-pressure")).expect("remove");
+    let result = fake
+        .run_with(2, &spec, &action, Resources::new(2000, 1 << 30))
+        .await
+        .expect("ran");
+    let usage = ResourceUsage::in_result(&result).expect("usage");
+    assert_eq!(usage.booked_millicpus, Some(2000));
+    assert_eq!(usage.node_cpu_pressure_centi, None);
+}

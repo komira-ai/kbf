@@ -125,6 +125,7 @@ impl Chain {
             view.map.generation(),
             view.me,
             size,
+            false,
             self.config.stall,
             self.config.commit,
         ))
@@ -245,7 +246,8 @@ impl Chain {
         }
     }
 
-    /// The call that carries a blob of `size` bytes to `replica`; for a replica the map says
+    /// The call that carries a blob of `size` bytes to `replica`, asking it for a held
+    /// answer when `asks_held` ([`super::leg::LEG_HELD_HEADER`]); for a replica the map says
     /// is down, one that was never made (it is the copy owed at once).
     ///
     /// # Errors
@@ -255,6 +257,7 @@ impl Chain {
         view: &View,
         replica: &Member,
         size: u64,
+        asks_held: bool,
     ) -> Result<ReplicaLeg, StorageError> {
         if replica.state == MemberState::Down {
             return Ok(ReplicaLeg::lost(StorageError::Unavailable(Arc::new(
@@ -267,6 +270,7 @@ impl Chain {
             view.map.generation(),
             view.me,
             size,
+            asks_held,
             self.config.stall,
             self.config.commit,
         ))

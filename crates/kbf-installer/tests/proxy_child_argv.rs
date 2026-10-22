@@ -16,6 +16,10 @@ use kbf_proxy::slot::Slot as GateSlot;
 
 const SECRET: &str = "/run/kbf-proxy/proxy-auth";
 
+/// The `frontend.toml` that `setup` writes for an all-in-one host (the golden the installer's
+/// own tests hold its output to).
+const ALL_IN_ONE_FRONTEND: &str = include_str!("golden/kbf_toml/all-in-one-frontend.toml");
+
 /// What a child's `kbf.toml` supplies on a real host and a parse without a file needs.
 const FROM_CONFIG: [&str; 2] = [
     "--storage=http://127.0.0.1:19000",
@@ -25,7 +29,7 @@ const FROM_CONFIG: [&str; 2] = [
 /// The command line `kbf` is run with, as the spawner builds it.
 fn command_line(table: UpstreamTable, slot: Slot, start: Start) -> Vec<OsString> {
     let mut words = vec![OsString::from("kbf")];
-    words.extend(frontend_argv(Path::new(SECRET), table)(slot, start));
+    words.extend(frontend_argv(Path::new(SECRET), table, None)(slot, start));
     words
 }
 
@@ -42,6 +46,11 @@ struct Parsed {
 
 fn parse(mut words: Vec<OsString>) -> Result<Parsed, clap::Error> {
     words.extend(FROM_CONFIG.map(OsString::from));
+    parse_as_given(words)
+}
+
+/// `words` parsed as they are: what the child needs beyond them is theirs to supply.
+fn parse_as_given(words: Vec<OsString>) -> Result<Parsed, clap::Error> {
     match kbf_cli::parse_from(words)? {
         kbf_cli::Invocation::Frontend(flags) => {
             let admin = flags.admin.expect("--admin-listen was given");
@@ -118,6 +127,39 @@ fn no_two_listeners_of_the_two_slots_share_a_port() {
         distinct.dedup();
         assert_eq!(distinct.len(), 8, "base {base_port}: {ports:?}");
     }
+}
+
+/// Catches a children's file the `kbf` parser cannot take beside the command line the proxy
+/// builds: the `frontend.toml` that `setup` writes for an all-in-one host (the installer's
+/// golden), named by `--config=`, is all a child needs beyond its listeners (the sibling as its
+/// storage node, the state database), and the listeners still parse where the table dials. The
+/// same command line without the file is refused, so the file is what completed it.
+///
+/// Mutants to plant: `--config=` dropped from the command line (red: the parse is refused for
+/// the storage node the file supplied).
+#[test]
+fn the_frontend_file_of_an_all_in_one_host_completes_the_command_line() {
+    let dir = kbf_host::testkit::scratch("proxy-child-argv-config");
+    let file = dir.join("frontend.toml");
+    std::fs::write(&file, ALL_IN_ONE_FRONTEND).expect("write the golden");
+    let table = UpstreamTable { base_port: 18_000 };
+    let with = |config: Option<&Path>| {
+        let argv = frontend_argv(Path::new(SECRET), table, config);
+        let mut words = vec![OsString::from("kbf")];
+        words.extend(argv(Slot::A, Start::Active));
+        words
+    };
+    let words = with(Some(file.as_path()));
+    let got = parse_as_given(words).expect("the file completes it");
+    let at = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+    assert_eq!(got.reapi, at(18_000));
+    assert_eq!(got.worker, at(18_001));
+    assert_eq!(got.api, Some(at(18_002)));
+    assert_eq!(got.admin, at(18_003));
+    assert!(
+        parse_as_given(with(None)).is_err(),
+        "nothing else supplies them"
+    );
 }
 
 /// The control for the two tests above: the parser really does refuse the `--instance` flag

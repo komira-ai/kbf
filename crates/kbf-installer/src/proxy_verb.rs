@@ -167,6 +167,9 @@ pub struct Loaded {
     /// `fetch_timeout_s`: how long the root half's fetch may take, which sizes the update
     /// API's staging deadline.
     pub fetch_timeout_s: u32,
+    /// `frontend_config`: the file the frontend children read (`--config=`) instead of the
+    /// default `kbf.toml`; none on a host that has no sibling beside the proxy.
+    pub frontend_config: Option<PathBuf>,
 }
 
 /// Reads `path` and returns what the verb takes from it, checked: the keys it reads
@@ -201,6 +204,7 @@ fn loaded_from(path: &Path, text: &str) -> Result<Loaded, VerbError> {
         proxy,
         confirm_window_s: installer.confirm_window_s,
         fetch_timeout_s: installer.fetch_timeout_s,
+        frontend_config: installer.frontend_config,
     })
 }
 
@@ -543,6 +547,7 @@ fn serve(
     handover: &HandoverConfig,
     listener: OwnedFd,
     root: &kbf_host::Root,
+    frontend_config: Option<PathBuf>,
 ) -> Result<(), VerbError> {
     #[cfg(target_os = "linux")]
     let supervise_with = Supervise {
@@ -553,10 +558,12 @@ fn serve(
         operator_token_file: config.operator_token_file.clone(),
         status: handover.status_file.clone(),
         local: handover.local.clone(),
+        frontend_config,
     };
-    // Off Linux nothing supervises the proxy, so neither the database nor the host root is used.
+    // Off Linux nothing supervises the proxy, so neither the database, the host root nor the
+    // children's file is used.
     #[cfg(not(target_os = "linux"))]
-    let _ = (database, root);
+    let _ = (database, root, frontend_config);
     let parts = handover::parts(handover)?;
     unblock_stop_signals();
     let (handle, runner) = Proxy::bind(config, listener).map_err(VerbError::starting)?;
@@ -638,6 +645,8 @@ struct Supervise {
     /// The proxy's own copies of `kbf` (`--kbf-binary`): the children are run from them and a
     /// start with no installed release recorded adopts the package's kbf.
     local: Option<Local>,
+    /// The file the frontend children read instead of the default `kbf.toml`, if any.
+    frontend_config: Option<std::path::PathBuf>,
 }
 
 /// The supervisor, on a thread of its own: starting a first child waits for it to be ready,
@@ -693,7 +702,11 @@ fn supervise(
             let child = ProcChild::new(
                 layout,
                 children_dir(&with.state_dir),
-                frontend_argv(&with.proxy_auth_file, with.upstream),
+                frontend_argv(
+                    &with.proxy_auth_file,
+                    with.upstream,
+                    with.frontend_config.as_deref(),
+                ),
             );
             let child = Arc::new(run_from_copies(child, with.local.as_ref()));
             let started = start_with(&handle, &gate, &*wait, &child, with, Retry::boot());
@@ -847,7 +860,14 @@ pub fn run(args: &ProxyArgs, root: &Path) -> Result<(), VerbError> {
         &Layout::new(root.clone(), Platform::current()),
     );
     handover.local = open_local(args, &handover.state_dir)?;
-    serve(loaded.proxy, database, &handover, listener, &root)
+    serve(
+        loaded.proxy,
+        database,
+        &handover,
+        listener,
+        &root,
+        loaded.frontend_config,
+    )
 }
 
 #[cfg(test)]

@@ -8,17 +8,15 @@ mod harness;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use futures::future::BoxFuture;
 use futures::stream;
 use harness::{
-    CHUNK, Fake, blob, eventually, front_over, node, pattern, routed_owners, routed_owners_over,
-    upload,
+    CHUNK, Fake, Switch, blob, eventually, front_over, node, pattern, routed_owners,
+    routed_owners_over, upload,
 };
 use kbf_auth::Authorizers;
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::google::bytestream::{QueryWriteStatusRequest, ReadRequest, WriteRequest};
-use kbf_route::{MapSource, MapView, RefetchError};
 use kbf_types::{Digest, DigestFunction};
 use tonic::Request;
 use tonic::transport::Channel;
@@ -462,28 +460,6 @@ async fn a_map_lost_mid_call_is_unavailable() {
         .expect_err("no map");
     assert_eq!(refused.code(), tonic::Code::Unavailable);
     assert_eq!(fake.calls.load(SeqCst), 0);
-}
-
-/// A map the test moves, and never has anything newer to fetch.
-struct Switch(Mutex<Arc<Map>>);
-
-impl MapSource for Switch {
-    fn current(&self) -> Option<MapView> {
-        Some(MapView {
-            map: Arc::clone(&self.0.lock().unwrap_or_else(PoisonError::into_inner)),
-            previous: None,
-            earlier: Vec::new(),
-        })
-    }
-
-    fn refetch(&self, at_least: u64) -> BoxFuture<'_, Result<MapView, RefetchError>> {
-        Box::pin(async move {
-            Err(RefetchError {
-                at_least,
-                reason: "nothing newer".to_owned(),
-            })
-        })
-    }
 }
 
 /// Catches an upload that goes on to a node that is no longer the blob's writer: the

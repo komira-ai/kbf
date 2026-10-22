@@ -63,7 +63,11 @@ slow store off the path that acknowledges an upload.
 - The three answers (`Present`, `Unavailable`, `Absent`), the closure check, and
   "never report a blob present before its bytes are durable" all hold. Section 6.3
   changes what *durable* means while the tier holds a segment. That is the one real
-  trade in this design, stated there plainly.
+  trade in this design, stated there plainly. One more, behind `--ram-ack-bytes` (off by
+  default): a blob of at most 4 MiB written to a chain of two owners is *present* once
+  both hold it verified in RAM, and is written to each disk afterwards. Present then means
+  "this node can serve exactly these bytes now", not "durable"; what a durable record may
+  name is [storage-ram-ack.md](storage-ram-ack.md) (rule 2).
 
 ## 3. Write grouping (REAPI clients)
 
@@ -91,7 +95,10 @@ tier on, the shared block's sync.
 
 No caller is answered before its segment's `PutBlobs` has committed. Without the tier
 the guarantee is today's: **an acknowledged blob is in the object store and indexed in
-the committed metadata log**.
+the committed metadata log**. This holds for every write on this grouped path
+(`store_blobs`, `Segments`) whatever `--ram-ack-bytes` says; that flag changes only the
+streamed ByteStream and `BatchUpdateBlobs` write of a blob of at most 4 MiB to two owners
+([storage-ram-ack.md](storage-ram-ack.md)).
 
 ### 3.2 Large blobs
 
@@ -531,6 +538,20 @@ Losing that host already loses metadata committed since the last copied snapshot
 ([storage.md](storage.md#planned)). The tier adds a second thing on that host that a
 disk loss takes, and no new host whose failure loses data.
 
+**With `--ram-ack-bytes` over 0** (off by default), a ByteStream or `BatchUpdateBlobs`
+write of a blob of at most 4 MiB to a chain of two owners is acknowledged once **both
+owners hold it verified in RAM**, before either has synced it: the replica registers it
+in its held set, then the primary, then the client is answered, and each node writes it to
+its disk afterwards (`kbf_storage_ram_unwritten_bytes` is what is not on a disk yet). One
+lost node loses nothing: the other serves it and, once it is on its disk, owes the lost
+node a copy. **Losing both owners' RAM before either has written it loses the blob**: both
+then answer missing, a read is `NOT_FOUND`, the client uploads it again, and no
+action-cache entry names it (an entry is written only once every blob it names is on an
+owner's disk, [storage-ram-ack.md](storage-ram-ack.md), rule 2). A blob over 4 MiB, a
+blob with one owner, a replica that cannot be reached, a full RAM budget and a `Segments`
+upload are all acknowledged from the disk, as above, and counted in
+`kbf_storage_ram_writethrough_total{reason}`.
+
 **Later, with three servers** ([deployment-topology.md](deployment-topology.md)): the
 receiving server sends each block's bytes to the tiers of two others before it
 commits; `PutStaged` names every tier that synced them, and the ack waits for two, so
@@ -554,7 +575,9 @@ never gets another append. At open, the server checks `<dir>/TIER` first:
   marks only that object `ObjectUnreachable { Missing }`, with an alert.
 - **Orphans.** Then every `<epoch>-<seq>.blk` from an older epoch whose object is not
   staged is deleted and the directory synced: an upload open at the restart, a block
-  synced before its `PutStaged` committed (neither was acknowledged), and a flushed
+  synced before its `PutStaged` committed (neither was acknowledged; with
+  `--ram-ack-bytes` a blob acknowledged from RAM may be in such a block: it is lost on
+  this node by design, and its other owner holds it), and a flushed
   object's `.blk` from a crash before the rename (the store holds it). `.seg` files stay.
 
 Crash and conflict points in the flusher:
@@ -812,9 +835,11 @@ Where it differs from the sections above, and why:
   grouped block. Not covered: `Segments` uploads (`reserve_range`) and `store_blobs`
   segments, which have their own bounds. `kbf_storage_open_write_fds` is the tier's whole
   count (`WriteTier::open_write_files`), as of the last pool step.
-- **Not changed.** Nothing is acknowledged before the sync (no RAM acknowledgement here),
-  and one `PutStaged` still goes through the Raft log before any blob of its batch is
-  answered.
+- **Not changed.** Nothing is acknowledged before the sync on this path (the RAM
+  acknowledgement of [storage-ram-ack.md](storage-ram-ack.md) is a different path: it
+  registers the blob in a held set and the drain then writes it through this pool, so the
+  sync and the one `PutStaged` per batch are unchanged), and one `PutStaged` still goes
+  through the Raft log before any blob of its batch is answered.
 
 ### 6.11 Where records are verified
 

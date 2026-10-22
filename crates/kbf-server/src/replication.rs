@@ -116,8 +116,12 @@ pub(crate) fn replicate(
         Arc::clone(&repairs),
         ChainConfig::default(),
     ));
-    let service = service.with_chain(Arc::clone(&chain))?;
-    let worker = RepairWorker::new(storage, chain, Arc::clone(&repairs), config);
+    let worker = RepairWorker::new(storage, Arc::clone(&chain), Arc::clone(&repairs), config);
+    // The service registers each blob it acknowledged from RAM with the worker's confirmer,
+    // which the worker asks the other owner about on every tick.
+    let service = service
+        .with_chain(chain)?
+        .with_confirmer(worker.confirmer());
     Ok(Replicated {
         service,
         worker: Some(worker),

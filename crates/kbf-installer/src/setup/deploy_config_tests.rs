@@ -78,6 +78,9 @@ fn exists(exec: &FakeExec, path: &str) -> bool {
 }
 
 const GOLDEN: &str = "{\n  \"api\": \"127.0.0.1:8443\",\n  \"api_ca\": \"/etc/kbf/api-ca.pem\",\n  \"api_server_name\": \"farm.example\",\n  \"token_file\": \"/etc/kbf/operator.token\",\n  \"stage\": \"gamma\"\n}\n";
+/// The same for a host behind the proxy, which an all-in-one host always is: the proxy table
+/// places the children the gates observe.
+const GOLDEN_PROXY: &str = "{\n  \"api\": \"127.0.0.1:8443\",\n  \"api_ca\": \"/etc/kbf/api-ca.pem\",\n  \"api_server_name\": \"farm.example\",\n  \"token_file\": \"/etc/kbf/operator.token\",\n  \"stage\": \"gamma\",\n  \"observe_base_port\": \"18000\"\n}\n";
 
 /// Catches a key written under the wrong name, a missing key, or the wrong mode or owner: the
 /// whole file of each serving mode against its bytes, root's 0644 in a root's 0755 directory,
@@ -89,10 +92,10 @@ const GOLDEN: &str = "{\n  \"api\": \"127.0.0.1:8443\",\n  \"api_ca\": \"/etc/kb
 /// dropped.
 #[test]
 fn setup_writes_deploy_json_from_the_flags() {
-    for mode in [Mode::Frontend, Mode::AllInOne] {
+    for (mode, golden) in [(Mode::Frontend, GOLDEN), (Mode::AllInOne, GOLDEN_PROXY)] {
         let mut exec = rig();
         let out = go_ok(&FakeOs::linux(), &mut exec, &with(mode, all_flags()));
-        assert_eq!(text(&exec, CONFIG), GOLDEN, "{mode:?}");
+        assert_eq!(text(&exec, CONFIG), golden, "{mode:?}");
         assert_eq!(file_meta(&exec, CONFIG), (0o644, ROOT), "{mode:?}");
         assert!(
             matches!(exec.entries.get(&hp("/etc/kbf-installer")), Some(Entry::Dir { perms, owner })
@@ -628,6 +631,31 @@ fn a_file_the_service_user_owns_is_accepted() {
         &with(Mode::Frontend, all_flags()),
     );
     assert_eq!(text(&exec, CONFIG), GOLDEN);
+}
+
+/// Catches the owner of the deploy token judged against the sibling's user on an all-in-one host:
+/// the operator token is the proxy's (`kbf-server`'s, as the one `setup` makes is), so a token
+/// that `kbf-server` owns is accepted, and one that only `kbf` (the sibling's user) owns is
+/// refused, as one of another user is on a frontend.
+///
+/// Mutant to plant: the owner compared with `ctx.service` instead of the proxy's user.
+#[test]
+fn on_an_all_in_one_host_the_token_may_belong_to_the_proxys_user_and_not_the_siblings() {
+    let mut exec = rig();
+    put(&mut exec, TOKEN, 0o600, KBF_SERVER, SECRET);
+    let raw = with(Mode::AllInOne, all_flags());
+    go_ok(&FakeOs::linux(), &mut exec, &raw);
+    assert_eq!(text(&exec, CONFIG), GOLDEN_PROXY);
+
+    let mut exec = rig();
+    put(&mut exec, TOKEN, 0o600, KBF, SECRET);
+    let err = go(&FakeOs::linux(), &mut exec, &raw, APPLY).expect_err("refused");
+    assert_eq!(err.exit(), Exit::NeedsOperator);
+    assert!(
+        err.to_string()
+            .contains("owned by neither root nor the service user"),
+        "{err}"
+    );
 }
 
 /// The token setup makes on this run: `host()` has none, as a fresh host has none.

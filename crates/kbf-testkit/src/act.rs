@@ -31,6 +31,7 @@
 //!   process group already);
 //! - `alloc MIB`: touches `MIB` MiB (rounded up to 16 MiB) of distinct, incompressible
 //!   memory and holds it until the program exits;
+//! - `burn SECS`: computes in user mode, on one thread, for `SECS` seconds of wall time;
 //! - `upper OUT IN`: writes `IN`, ASCII upper-cased, to `OUT`;
 //! - `rename FROM TO`: renames `FROM` to `TO`, as rename(2) does;
 //! - `symlink TARGET LINK`: makes `LINK` a symbolic link to `TARGET`;
@@ -174,6 +175,7 @@ pub(crate) enum Step<'a> {
     Run(&'a [String]),
     Setsid,
     Alloc(u64),
+    Burn(Duration),
     Upper {
         out: &'a str,
         input: &'a str,
@@ -308,6 +310,7 @@ fn step(words: &[String]) -> Result<Step<'_>, Error> {
         ["run", ..] if words.len() > 1 => Step::Run(&words[1..]),
         ["setsid"] => Step::Setsid,
         ["alloc", mib] => Step::Alloc(number(mib)?),
+        ["burn", secs] => Step::Burn(seconds(secs)?),
         ["upper", out, input] => Step::Upper { out, input },
         ["rename", from, to] => Step::Rename { from, to },
         ["symlink", target, link] => Step::Symlink { target, link },
@@ -481,6 +484,17 @@ pub(crate) fn perform(steps: &[Step<'_>]) -> Result<Option<u8>, Error> {
                 rustix::process::setsid().map_err(failed("setsid"))?;
             }
             Step::Alloc(mib) => held.extend(crate::touch(*mib, Duration::ZERO)),
+            Step::Burn(time) => {
+                let end = std::time::Instant::now() + *time;
+                let mut x = 1_u64;
+                while std::time::Instant::now() < end {
+                    for _ in 0..10_000 {
+                        x = std::hint::black_box(
+                            x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1),
+                        );
+                    }
+                }
+            }
             Step::Upper { out, input } => create(out, &read(input)?.to_ascii_uppercase())?,
             Step::Rename { from, to } => {
                 std::fs::rename(from, to).map_err(failed(format!("rename {from} to {to}")))?;
@@ -692,7 +706,7 @@ mod tests {
             "exit 7 ; sleep 0.25 ; echo a b ; echo --stderr c ; append f x y ; env A ; \
              env B dflt ; pwd ; id ; kill-self 9 ; spawn-child sleep 1 ; \
              spawn-child --pid - setsid ;; sleep 1 ;; exit 0 ; spawn-child --pid f spawn-child id ; \
-             run /bin/x a b ; setsid ; alloc 32 ; upper o i ; rename a b ; symlink t l ; chmod 750 p ; \
+             run /bin/x a b ; setsid ; alloc 32 ; burn 0.5 ; upper o i ; rename a b ; symlink t l ; chmod 750 p ; \
              chmod 7777 q ; wait-for w 1.5 ; sleep-once o 0.5 ; mkdir m/n ; cat c ; mtime t 946684800 ; pgid ; \
              leads ; write-lines w ; write-lines w a b ; copy o i j ; remove r ; mkfifo p ; \
              truncate t 2048 ; zeros 3 ; zeros --stderr 4 ; ignore-signal 15 ; test -e e ; \
@@ -742,6 +756,7 @@ mod tests {
             Step::Run(&run),
             Step::Setsid,
             Step::Alloc(32),
+            Step::Burn(Duration::from_millis(500)),
             Step::Upper {
                 out: "o",
                 input: "i",
@@ -869,6 +884,8 @@ mod tests {
             "spawn-child",
             "spawn-child nope",
             "alloc x",
+            "burn",
+            "burn x",
             "upper o",
             "rename a",
             "symlink t",

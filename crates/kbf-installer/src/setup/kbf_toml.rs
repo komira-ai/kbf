@@ -10,6 +10,11 @@
 //! and ignores every order. `all-in-one` has neither, as its in-process daemon refuses
 //! `--update-dir`. The installer's own settings are `installer.toml`, never here.
 //!
+//! An `all-in-one` host has two such files, both rendered and decided by this module: `kbf.toml`
+//! is the sibling's (`mode = "storage-and-daemon"`, no enrollment table, so `kbf` reads it as
+//! plain flags) and `frontend.toml` is the frontend children's (`mode = "frontend"`, the
+//! operator token and the state database).
+//!
 //! A file that exists is not overwritten blindly: when every key in it is one `setup`
 //! writes, `setup` rewrites it; when it holds other settings, `setup` leaves it alone if
 //! its own keys already say what the flags say, and refuses (exit 5) if they differ, naming
@@ -80,6 +85,16 @@ pub fn check_provisioned(table: &Table, update_dir: &str, orders_dir: &str) -> R
         }
     }
     Ok(())
+}
+
+/// Whether `text` is a `kbf.toml` whose top-level `mode` is `all-in-one`: the layout of one
+/// process for everything, which an all-in-one host no longer has. A text that is not TOML says
+/// no (`decide` names that fault).
+pub fn says_all_in_one(text: &str) -> bool {
+    let Ok(table) = text.parse::<Table>() else {
+        return false;
+    };
+    lookup(&table, "", "mode").and_then(Value::as_str) == Some("all-in-one")
 }
 
 /// The tables of the file, in the order they are written: every table a setting can be in

@@ -84,11 +84,18 @@ pub fn run_from_copies(child: ProcChild, local: Option<&Local>) -> ProcChild {
 
 /// The command line of a frontend child after its program: its mode, the four loopback
 /// listeners at the slot's ports in `table` (`kbf-proxy`'s upstream table: REAPI, worker,
-/// operator and admin), the proxy's secret file, and `--await-takeover` for a candidate. The
-/// child's own configuration (stores, TLS) is its `kbf.toml`. Nothing here names an
-/// instance: `--instance` needs a handover socket, and the two slots do not hand over.
-pub fn frontend_argv(proxy_auth_file: &Path, table: UpstreamTable) -> Argv {
+/// operator and admin), the proxy's secret file, `--config=` when `installer.toml` names a
+/// file for the children (`frontend_config`) and `--await-takeover` for a candidate. The
+/// child's own configuration (stores, TLS) is that file, else the default `kbf.toml`. Nothing
+/// here names an instance: `--instance` needs a handover socket, and the two slots do not hand
+/// over.
+pub fn frontend_argv(
+    proxy_auth_file: &Path,
+    table: UpstreamTable,
+    config_file: Option<&Path>,
+) -> Argv {
     let secret = proxy_auth_file.to_owned();
+    let config = config_file.map(Path::to_owned);
     Box::new(move |slot, start| {
         let slot = gate_slot(slot);
         let mut proxy_auth = OsString::from("--proxy-auth-file=");
@@ -102,6 +109,11 @@ pub fn frontend_argv(proxy_auth_file: &Path, table: UpstreamTable) -> Argv {
             listen("admin-listen", table.admin_port(slot)),
             proxy_auth,
         ];
+        if let Some(file) = &config {
+            let mut flag = OsString::from("--config=");
+            flag.push(file);
+            argv.push(flag);
+        }
         if start == Start::Candidate {
             argv.push(OsString::from("--await-takeover"));
         }

@@ -374,6 +374,14 @@ impl Storage for Mem {
             Ok(())
         })
     }
+
+    fn ram_ack(&self) -> bool {
+        self.knobs.ram_ack.load(Ordering::SeqCst)
+    }
+
+    fn unconfirmed(&self, blobs: usize) {
+        self.knobs.unconfirmed.store(blobs, Ordering::SeqCst);
+    }
 }
 
 /// What a streamed write of [`Mem`] does, and what it has seen.
@@ -396,6 +404,15 @@ pub(crate) struct Knobs {
     pub asked: AtomicUsize,
     /// `find_missing` never answers while this is true: a node that is up and not answering.
     pub hang_find_missing: AtomicBool,
+    /// [`Storage::ram_ack`]: the node acknowledges from RAM.
+    pub ram_ack: AtomicBool,
+    /// The mode of every streamed commit that reached the store, in order.
+    pub modes: Mutex<Vec<crate::CommitMode>>,
+    /// What [`Storage::unconfirmed`] was last told.
+    pub unconfirmed: AtomicUsize,
+    /// A permit for each streamed commit that has reached the store and may be parked at
+    /// the commit gate: a positive event for a test to wait on.
+    pub commit_arrived: tokio::sync::Semaphore,
 }
 
 impl Default for Knobs {
@@ -411,6 +428,10 @@ impl Default for Knobs {
             fault: Mutex::new(StreamFault::None),
             asked: AtomicUsize::new(0),
             hang_find_missing: AtomicBool::new(false),
+            ram_ack: AtomicBool::new(false),
+            modes: Mutex::new(Vec::new()),
+            unconfirmed: AtomicUsize::new(0),
+            commit_arrived: tokio::sync::Semaphore::new(0),
         }
     }
 }
@@ -522,18 +543,25 @@ struct MemStreamed {
 }
 
 impl crate::StreamedPut for MemStreamed {
-    fn commit(self: Box<Self>, _mode: crate::CommitMode) -> Answer<'static, ()> {
+    fn commit(self: Box<Self>, mode: crate::CommitMode) -> Answer<'static, ()> {
         Box::pin(async move {
+            self.knobs.commit_arrived.add_permits(1);
             let _permit = self.knobs.commit_gate.acquire().await.expect("open");
             if *self.knobs.fault.lock().expect("lock") == StreamFault::CommitFails {
                 return Err(StorageError::Internal("the disk".into()));
             }
+            self.knobs.modes.lock().expect("lock").push(mode);
             self.blobs
                 .lock()
                 .expect("lock")
                 .insert(self.digest, self.data);
-            // Written to the disk: durable from here.
-            self.ram_only.lock().expect("lock").remove(&self.digest);
+            if mode == crate::CommitMode::Held {
+                // Held in RAM: present, not durable, until a test drains it.
+                self.ram_only.lock().expect("lock").insert(self.digest);
+            } else {
+                // Written to the disk: durable from here.
+                self.ram_only.lock().expect("lock").remove(&self.digest);
+            }
             self.puts.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })
