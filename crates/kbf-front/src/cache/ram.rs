@@ -411,7 +411,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         };
         let outcomes =
             futures::future::join_all(claimed.into_iter().map(|(digest, bytes)| async move {
-                (digest, self.drain_one(digest, bytes).await)
+                let written = match self.drain_one(digest, bytes).await {
+                    Ok(()) => self.date_by_acknowledgement(&digest).await,
+                    Err(error) => Err(error),
+                };
+                (digest, written)
             }))
             .await;
         let mut report = DrainReport {
@@ -441,6 +445,27 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         drop(guard);
         report.retry_at = self.held.next_due();
         report
+    }
+
+    /// Dates the staged object that now holds `digest` by the map the blob was acknowledged
+    /// under, before the entry leaves the set (the flush report caps its clear generation by
+    /// the entry, then by the object, so the cap is never lost in between).
+    async fn date_by_acknowledgement(&self, digest: &Digest) -> Result<(), super::CacheError> {
+        let Some(born) = self.held.born_of(digest) else {
+            return Ok(());
+        };
+        let wanted = *digest;
+        let object = self
+            .writer
+            .query(move |s| match s.blob(&wanted) {
+                kbf_meta::BlobAnswer::Present { location, .. } => Some(location.object),
+                _ => None,
+            })
+            .await?;
+        if let Some(object) = object {
+            self.writer.born.lower(object, born);
+        }
+        Ok(())
     }
 
     /// Writes `bytes` as `digest` through the pool, or to the store if there is no pool.
@@ -513,5 +538,31 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     #[must_use]
     pub fn is_held_for_test(&self, digest: &Digest) -> bool {
         self.held.has(digest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::*;
+
+    /// The empty blob is always present, so the producer holds nothing for it: with a budget
+    /// above 0 and a blob of no bytes, `hold_write` answers `Duplicate`, takes no budget and
+    /// leaves the set empty. (A stream of 0 bytes never reaches the producer, so this is
+    /// the arm's only caller.) Mutant: the arm removed (the empty blob is held, and its
+    /// zero bytes counted as a blob).
+    #[tokio::test]
+    async fn the_empty_blob_is_never_held() {
+        let cache = Cache::memory().with_ram_ack_bytes(1024);
+        let empty = VerifiedBlob::hashed(Bytes::new());
+        assert_eq!(
+            cache.hold_write(&empty).await.expect("asked"),
+            Hold::Duplicate
+        );
+        assert_eq!(cache.unwritten().blobs, 0);
+        let other = VerifiedBlob::hashed(Bytes::from_static(b"not empty"));
+        assert_eq!(cache.hold_write(&other).await.expect("asked"), Hold::Held);
+        assert_eq!(cache.unwritten().blobs, 1);
     }
 }

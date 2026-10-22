@@ -267,7 +267,10 @@ The producer. With `--ram-ack-bytes` over 0, the default 0 changing nothing.
   it asks this node's own store which tracked digests are durable (`drained`, which starts
   the grace), then asks the peers. `kbf_storage_ram_unconfirmed_blobs` is the set's size.
 - **Handoff.** `flush_report` holds `clear_gen` at the map generation the oldest held blob
-  was acknowledged under, so a member holding entries does not count as filled.
+  was acknowledged under, so a member holding entries does not count as filled. The set is
+  read before the staged objects, and a drain dates the object it staged by the
+  acknowledgement (`Born::lower`, before the entry leaves), so the cap stays until the
+  object is flushed and a drain between the two looks loses nothing.
 - **Per-batch delivery and `prepare`.** `Farm::report` and `Farm::tick` deliver a batch of
   answers one after another, so a barrier that waits up to `--durable-wait` delays the
   answers behind it. Evidence: the farm's `prepare_action_result` is the router's

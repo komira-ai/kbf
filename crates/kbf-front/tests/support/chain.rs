@@ -98,10 +98,13 @@ impl MetaLog for Mortal {
         }
         // Biased: a proposal the process died holding is dropped even if the hold it is
         // parked at ends in the same instant.
+        // The log asks the flag itself, after the hold and before it applies anything, so
+        // a release that races the kill cannot get the proposal applied.
+        let dead = Arc::clone(&self.dead);
         tokio::select! {
             biased;
             () = &mut gone => Err(Self::gone()),
-            applied = MetaLog::commit(&self.log, command) => applied,
+            applied = self.log.commit_while(command, move || !dead.flag.load(Ordering::SeqCst)) => applied,
         }
     }
 

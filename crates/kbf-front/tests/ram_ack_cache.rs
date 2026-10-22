@@ -271,6 +271,14 @@ async fn a_blob_that_goes_straight_to_the_store_is_counted_for_why() {
         .expect("written");
     assert_eq!(metric(&bare, &through("store_path")), 1.0);
     assert_eq!(metric(&bare, &through("queue_full")), 0.0);
+
+    // Over 4 MiB the reason is the size, whichever way the blob is written.
+    let big = TestBlob::new(17, (4 << 20) + 1);
+    commit(&bare_store, &big, CommitMode::Held)
+        .await
+        .expect("written");
+    assert_eq!(metric(&bare, &through("large")), 1.0);
+    assert_eq!(metric(&bare, &through("store_path")), 1.0);
 }
 
 /// Gap (c) of PR 5. A Draining member does not count as filled while it holds entries: the
@@ -305,11 +313,70 @@ async fn a_node_holding_blobs_does_not_report_itself_flushed_through_the_newer_m
 
     let report = cache.drain_held(Instant::now()).await;
     assert_eq!(report.written, 1);
+    // The drain staged it under map 7 and dropped the entry, but it was acknowledged under
+    // map 5: the staged object keeps that date until it is flushed.
+    let report = cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(5), 1));
     cache.flush_tier(support::later()).await.expect("round");
     assert_eq!(
         cache.flush_report().await.expect("report").clear_gen,
         Some(7)
     );
+}
+
+/// A drain between the report's two looks (the set, then the staged objects) does not lose
+/// the cap. The report reads the set first; the hook between the looks drains the blob
+/// (staged, entry gone) and the query then finds the staged object, dated by the
+/// acknowledgement: 5. Read the other way round (the query, the hook's drain, then the set),
+/// the object is not in the query and the set is empty, and the report says 7. Mutant:
+/// `flush_report` reads `oldest_born` after the query.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_between_the_flush_reports_looks_does_not_lose_the_cap() {
+    #[derive(Debug)]
+    struct Gate(AtomicU64);
+    impl FlushGate for Gate {
+        fn flushes(&self, _: &Digest) -> bool {
+            true
+        }
+        fn generation(&self) -> Option<u64> {
+            Some(self.0.load(Ordering::SeqCst))
+        }
+    }
+    let gate = Arc::new(Gate(AtomicU64::new(5)));
+    let rig = Rig::new();
+    let cell: Arc<std::sync::OnceLock<Arc<TierCache>>> = Arc::default();
+    let hook: kbf_front::BetweenHook = {
+        let cell = Arc::clone(&cell);
+        Arc::new(move || {
+            let cell = Arc::clone(&cell);
+            Box::pin(async move {
+                if let Some(cache) = cell.get() {
+                    cache.drain_held(Instant::now()).await;
+                }
+            })
+        })
+    };
+    let (opened, _) = Cache::open(rig.log.clone(), rig.store.clone(), KeyPrefix::default())
+        .await
+        .expect("open")
+        .with_segment_limit(SEGMENT)
+        .with_ram_ack_bytes(64 << 20)
+        .with_flush_gate(Arc::clone(&gate) as _)
+        .with_between_hook(hook)
+        .with_write_pool(pool(1, 16))
+        .attach_tier(rig.fs.clone(), TierOptions::new(GIB), SERVER, None)
+        .await
+        .expect("attach");
+    let cache = Arc::new(opened);
+    cell.set(Arc::clone(&cache)).ok();
+    let store = Arc::new(storage(&cache));
+    let blob = TestBlob::new(16, KIB4);
+    commit(&store, &blob, CommitMode::Held).await.expect("held");
+    gate.0.store(7, Ordering::SeqCst);
+
+    let report = cache.flush_report().await.expect("report");
+    assert!(!cache.is_held_for_test(&blob.digest), "the hook drained it");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(5), 1));
 }
 
 /// A node with the producer off (budget 0, the default) holds nothing whatever the storage

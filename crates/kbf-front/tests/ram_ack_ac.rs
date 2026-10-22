@@ -110,7 +110,7 @@ async fn commit(cluster: &Cluster, entry: &Entry) -> CommitTask {
 /// first.
 async fn parked_at(cluster: &Cluster, i: usize, commit: &mut CommitTask) {
     tokio::select! {
-        () = cluster.nodes[i].cache().parked_for_test(1) => {}
+        () = within("the barrier to park", cluster.nodes[i].cache().parked_for_test(1)) => {}
         done = commit => panic!("committed before the blobs were on an owner's disk: {done:?}"),
     }
 }
@@ -152,6 +152,30 @@ async fn an_entry_is_not_written_over_blobs_that_only_the_owners_ram_holds() {
             .expect("asked")
             .is_none(),
         "no entry after both owners lost their RAM"
+    );
+
+    // The action runs again, its outputs are uploaded again and the same entry is
+    // committed: it heals, and the output reads back.
+    let mut again = commit(&cluster, &entry).await;
+    parked_at(&cluster, 0, &mut again).await;
+    let report = cluster.nodes[0].cache().drain_held(Instant::now()).await;
+    assert_eq!(report.failed, 0);
+    within("the commit", again)
+        .await
+        .expect("join")
+        .expect("committed");
+    let router = cluster.router();
+    assert!(
+        router
+            .action_result(&entry.action)
+            .await
+            .expect("asked")
+            .is_some(),
+        "the entry is a hit"
+    );
+    assert_eq!(
+        router.read_blob(&entry.output.digest).await.expect("read"),
+        entry.output.bytes
     );
 }
 

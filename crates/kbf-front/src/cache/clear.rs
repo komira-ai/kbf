@@ -79,6 +79,22 @@ impl Born {
         at.by_object.entry(object).or_insert((held, seq));
     }
 
+    /// Dates `object` no later than `born`: the staged object a drain made of a blob
+    /// acknowledged under map `born` is as old as the acknowledgement, not as the drain. A
+    /// note, so a prune whose query began before it keeps it.
+    pub(super) fn lower(&self, object: ObjectId, born: u64) {
+        let mut at = self.at.lock().unwrap_or_else(PoisonError::into_inner);
+        at.seq += 1;
+        let seq = at.seq;
+        at.by_object
+            .entry(object)
+            .and_modify(|(held, noted)| {
+                *held = (*held).min(born);
+                *noted = seq;
+            })
+            .or_insert((born, seq));
+    }
+
     /// Moves the date of `from` to `to`, the object a re-seat staged in its place: it
     /// holds the same records, staged at the same time. A `from` with no date leaves `to`
     /// with none either (generation 0). The move is a note, so a prune whose query
@@ -161,6 +177,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     pub async fn flush_report(&self) -> Result<FlushReport, CacheError> {
         // Before the query, so a map taken in between only lowers what is said.
         let held = self.gate.as_ref().and_then(|g| g.generation());
+        // The set before the staged objects, as every reader looks (a drain stages a blob
+        // and dates it by its acknowledgement before it drops the entry): a blob drained
+        // between the two looks is among the staged objects, never in neither.
+        let unwritten = self.held.oldest_born();
+        self.between_steps().await;
         let mark = self.writer.born.mark();
         let Some(staging) = self.writer.tier.get() else {
             return Ok(FlushReport {
@@ -192,7 +213,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         // it was acknowledged under the map it is dated by: until it is in the index the
         // node has not flushed everything from before that map. A node holding nothing
         // (always, without `--ram-ack-bytes`) is as before.
-        let unwritten = self.held.oldest_born();
         Ok(FlushReport {
             clear_gen: held.map(|held| {
                 let clear = self.writer.born.clear(held, mark, &staged, &mine);

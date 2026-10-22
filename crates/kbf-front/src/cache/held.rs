@@ -157,6 +157,11 @@ impl Held {
         self.blobs().values().map(|e| e.born).min()
     }
 
+    /// The generation `digest` was acknowledged under, if it is held.
+    pub(super) fn born_of(&self, digest: &Digest) -> Option<u64> {
+        self.blobs().get(digest).map(|e| e.born)
+    }
+
     /// Whether nothing is held.
     pub(super) fn is_empty(&self) -> bool {
         self.blobs().is_empty()
