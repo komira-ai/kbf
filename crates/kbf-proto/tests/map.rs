@@ -498,3 +498,35 @@ fn the_node_facts_fields_are_pinned_and_have_presence() {
     assert_eq!((old.runs_log, old.log_version), (None, None));
     assert_eq!(old.build_commit, None);
 }
+
+/// Asserts that `finalize_to` is field 7 of `RegisterResponse` and field 6 of
+/// `HeartbeatResponse`, a varint with presence: a version is written as its tag and the
+/// number, a version of 0 is read back as `Some(0)`, an answer that names none writes no
+/// bytes, and an answer of a build that predates the field decodes with `None`.
+#[test]
+fn the_finalize_field_is_pinned_and_has_presence() {
+    let register = pb::RegisterResponse {
+        finalize_to: Some(5),
+        ..Default::default()
+    };
+    assert_eq!(register.encode_to_vec(), [0x38, 5], "field 7");
+    let answer = pb::HeartbeatResponse {
+        finalize_to: Some(5),
+        ..Default::default()
+    };
+    assert_eq!(answer.encode_to_vec(), [0x30, 5], "field 6");
+    let zero = pb::HeartbeatResponse::decode(&[0x30, 0][..]).expect("decodes");
+    assert_eq!(zero.finalize_to, Some(0), "zero is a version");
+    assert_eq!(
+        pb::RegisterResponse::default().encode_to_vec(),
+        Vec::<u8>::new()
+    );
+    assert_eq!(
+        pb::HeartbeatResponse::default().encode_to_vec(),
+        Vec::<u8>::new()
+    );
+    let older = pb::RegisterResponse::decode(&[0x28, 9][..]).expect("decodes");
+    assert_eq!(older.finalize_to, None);
+    let older = pb::HeartbeatResponse::decode(&[0x18, 9][..]).expect("decodes");
+    assert_eq!(older.finalize_to, None);
+}

@@ -51,6 +51,8 @@ http_invocations,http_sched,http_history,enroll/api,managed/http,ui_mount}.rs` a
 | deny an entry (serial, SPKI hash, node id) | `POST /v1/denied` | [F] | write |
 | allow an entry again | `DELETE /v1/denied` | [F] | write |
 | list the denied entries | `GET /v1/denied` | [N] unit F | write |
+| raise every storage node's metadata log to the new build's version (the one irreversible step of an upgrade) | `POST /v1/finalize` | [F] | write |
+| the finalize target and each node against it | `GET /v1/finalize` | [F] | write |
 | frontend drain status | `GET /v1/frontend/drain` | [F] | open |
 | begin the frontend's drain | `POST /v1/frontend/drain` | [F] | write |
 | storage health (under-replicated blobs) | `GET /v1/storage` | [F] | open |

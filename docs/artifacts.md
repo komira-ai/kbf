@@ -179,7 +179,10 @@ sorted by name.
 - `meta_log`: the highest metadata-log machine version the binary runs
   (`kbf_server::raft_log::RUNS`). Going from release N to N-1 is reversible only if
   `meta_log(N) <= meta_log(N-1)`; a build that prints no `meta_log` is unknown, and
-  unknown is not reversible.
+  unknown is not reversible. A start raises a node's log only up to the build's start
+  ceiling (`kbf_server::raft_log::START_CEILING`, today `RUNS`); the rest waits for `kbf cluster finalize` (`POST /v1/finalize`, `docs/api.md`),
+  which is the only irreversible step of an upgrade. There is no backup before that raise
+  yet: copy a node's metadata directory first if you may need to go back.
 - `profile`: `release` for every asset here (the workflow refuses a `debug` one).
 - `protocol` and `min_protocol`: the newest and the oldest `kbf.worker.v1` version the
   binary speaks. The daemon half speaks exactly `protocol`; the server half accepts

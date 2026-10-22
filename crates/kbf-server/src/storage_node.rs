@@ -38,6 +38,9 @@
 //! whose metadata directory was wiped never reuses a key (the state store hands each boot
 //! out once). A node without `--frontend` names its objects in a writer epoch of its log,
 //! `<root><log id>/cas/<epoch>/<seq>`, as a server does. Either reads both kinds.
+//!
+//! **Finalize.** A start raises the log only up to the start ceiling; a registered node is
+//! raised further by its frontend's target (`crate::finalize`), one with none by `--finalize-log`.
 
 use std::error::Error;
 use std::future::Future;
@@ -151,6 +154,8 @@ pub struct StorageFlags {
     pub weight: u32,
     /// How the repair worker of a node that registered with a frontend is paced.
     pub repair: RepairConfig,
+    /// `--finalize-log`: raise the metadata log to this version at start.
+    pub finalize_log: Option<u32>,
     /// Where the S3 key pair comes from (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`):
     /// the process environment, unless a test says otherwise.
     pub env: fn(&str) -> Option<String>,
@@ -260,6 +265,7 @@ pub fn command() -> Command {
         [TLS[0], TLS[1]],
         "The CA callers' certificates chain to; each must name a role (frontend, storage, daemon).",
     ))
+    .arg(crate::finalize::flag(REGISTRATION[0]))
 }
 
 /// The flags `m`, matched by [`command`], make.
@@ -318,6 +324,7 @@ pub fn parse(m: &ArgMatches) -> Result<StorageFlags, clap::Error> {
         zone: text(REGISTRATION[2]).unwrap_or_default(),
         weight: m.get_one::<u32>(REGISTRATION[3]).copied().unwrap_or(1),
         repair,
+        finalize_log: crate::finalize::flag_of(m),
         env: process_env,
     })
 }
@@ -447,6 +454,7 @@ pub struct StorageHandle {
     _background: Background,
     /// The flush report and tail passes a registered node's heartbeats carry ([`crate::fill`]).
     _fill: Option<AbortOnDrop>,
+    _finalize: Option<AbortOnDrop>,
     /// When the cold store is a directory: completes when its lock is released.
     cold_released: Option<kbf_objstore::Released>,
     maps: Arc<MapHolder>,
@@ -563,6 +571,7 @@ impl StorageHandle {
             _flusher,
             _background,
             _fill,
+            _finalize,
             cold_released,
             maps,
             catch_up,
@@ -578,6 +587,7 @@ impl StorageHandle {
             _flusher,
             _background,
             _fill,
+            _finalize,
             maps,
             catch_up,
             repairs,
@@ -658,6 +668,7 @@ where
 {
     let args = &flags.server;
     let meta = RaftMetaLog::open_dir(&stores.meta_dir, Retention::default(), prefix_root).await?;
+    crate::finalize::at_start_if(&meta, flags.finalize_log)?;
     let (prefix, log) = (meta.store_prefix(), meta.log_id());
     let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
     let cold_released = files.as_ref().map(kbf_objstore::FsStore::released);
@@ -737,6 +748,7 @@ where
         );
         AbortOnDrop(tokio::spawn(fill))
     });
+    let _finalize = crate::finalize::spawn(&cache, registered.joiner.as_ref());
     let ram = RamDrain::start(
         Arc::clone(&cache),
         flags.server.ram_ack_bytes(),
@@ -757,6 +769,7 @@ where
         _flusher,
         _background,
         _fill,
+        _finalize,
         cold_released,
         maps: node.maps,
         catch_up,

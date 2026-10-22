@@ -15,6 +15,7 @@
 //! | `meta/members_forming` | nothing | a minute from the first `Active` member |
 //! | `unfilled/<id>` | nothing, or the fill phase of [`Handoff`] (module `handoff`) | for ever, until the member is made `Active` |
 //! | `meta/tail_epoch` | the tail epoch, 8 bytes | for ever (written only with [`Members::with_handoff`]) |
+//! | `meta/finalize` | the metadata-log machine version the operator asked the farm's logs to be raised to, 4 bytes, only rising (module `finalize`) | for ever (written only by `POST /v1/finalize`) |
 //! | `deny/<kind>/<value>` | the reason and the time it was added | for ever, until [`Members::allow`] |
 //!
 //! and the counters `member-id` and `boot/<id>`. The store assigns both numbers, so no
@@ -53,9 +54,10 @@
 //! metadata log: the newest log version its build can raise it to, the version the log is at,
 //! and the commit built ([`NodeFacts`]; row tags 7 to 9, [`Members::node_facts`], `GET
 //! /v1/members`). A registration replaces them, a heartbeat updates the log version and keeps
-//! the rest, and a node that says nothing reads as `None`, never 0. Nothing decides on them
-//! yet. A frontend built before them drops them when it rewrites a row, and they return with
-//! the node's next heartbeat to a frontend that knows them (module `facts`).
+//! the rest, and a node that says nothing reads as `None`, never 0. Only `POST /v1/finalize`
+//! decides on them (module `finalize`). A frontend built before them drops them when it
+//! rewrites a row, and they return with the node's next heartbeat to a frontend that knows
+//! them (module `facts`).
 //!
 //! **The map** is a function of the rows: [`Members::refresh`] reads `map`, `member/` and
 //! the `down/` marks, builds the next member list, and if it differs commits generation
@@ -133,6 +135,7 @@ mod assign;
 mod blocked;
 mod facts;
 mod fence;
+mod finalize;
 mod handoff;
 mod join;
 mod pins;
@@ -140,6 +143,7 @@ mod promote;
 mod row;
 pub use assign::{LastBoot, MAX_SEED};
 pub use facts::{MAX_BUILD_COMMIT, NodeFacts};
+pub use finalize::{FinalizeNode, FinalizeState};
 pub use handoff::{Block, Fill, Handoff, fill_fp};
 use pins::pin_key;
 use row::{Live, decode_row, encode_row};

@@ -27,6 +27,9 @@
 //!   stopped now (`safe_to_stop`): the storage gate, behind the write gates; it changes no
 //!   member, row or placement. `{id}` may be a node id: the member that is its storage half.
 //!
+//! - `POST /v1/finalize` and `GET /v1/finalize`: raise the farm's finalize target, and show
+//!   it with each node's state against it (`finalize`). Both pass the write gates.
+//!
 //! - `POST /v1/denied` with `{"entry": "node X"|"serial S"|"spki-sha256 H", "reason": "..."}`
 //!   and `DELETE /v1/denied?entry=...`: add an entry to the storage deny list, or take it
 //!   off ([`Members::deny`], [`Members::allow`]). Each runs a refresh before it answers, so
@@ -84,9 +87,11 @@ use crate::release::desired::blocking;
 use crate::token::ApiToken;
 use crate::update::Rows;
 
+mod finalize;
 mod node_detail;
 mod safe_to_stop;
 
+pub use finalize::{FinalizeView, Finalized};
 pub use safe_to_stop::{Verdict, safe_to_stop_path};
 
 /// The media type of every body this API returns, and of every write it accepts.
@@ -107,6 +112,9 @@ pub const MEMBERS: &str = "/v1/members";
 
 /// The path of `POST /v1/denied` (add an entry) and `DELETE /v1/denied?entry=...`.
 pub const DENIED: &str = "/v1/denied";
+
+/// The path of `POST /v1/finalize` (raise the farm's finalize target) and `GET /v1/finalize`.
+pub const FINALIZE: &str = "/v1/finalize";
 
 /// The path of `POST /v1/nodes/{node}:{verb}`, with `node` percent-encoded (every byte
 /// but an ASCII letter, digit, `-`, `.`, `_` or `~`), so a node id that holds a `/`, a
@@ -169,6 +177,7 @@ pub fn router(
         .route("/v1/members/{id}", post(set_member_state))
         .route("/v1/members/{id}/safe-to-stop", get(safe_to_stop::check))
         .route(DENIED, post(deny_entry).delete(allow_entry))
+        .route(FINALIZE, get(finalize::status).post(finalize::start))
         .route(FRONTEND_DRAIN, get(drain_status).post(begin_drain))
         .with_state(Arc::new(ApiState {
             farm,

@@ -85,6 +85,7 @@ pub mod enroll;
 pub mod farm;
 mod fault;
 pub mod fill;
+pub mod finalize;
 mod flag_set;
 pub mod fleet;
 pub mod front_maps;

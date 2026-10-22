@@ -154,3 +154,13 @@ fn what_enrollment_writes_is_fenced() {
     bump_ca_generation(store.as_ref()).expect("a CA generation");
     assert!(assert_all_fenced(store.as_ref(), "enrollment") >= 2);
 }
+
+/// Asserts that the finalize target is a key of a fenced family: only the generation holder
+/// may write it, so a frontend that a takeover replaced cannot raise the farm's target.
+#[test]
+fn the_finalize_target_is_fenced() {
+    let store = store();
+    let members = Members::new(Arc::clone(&store), MembershipConfig::default());
+    assert!(members.raise_finalize(5).expect("a target"));
+    assert_eq!(assert_all_fenced(store.as_ref(), "the finalize target"), 1);
+}

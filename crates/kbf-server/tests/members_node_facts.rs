@@ -2,7 +2,7 @@
 //! keeps it (`Members::register_reporting`, `Members::heartbeat_reporting`,
 //! `Members::node_facts`; `GET /v1/members` shows them, `api_members.rs`): the newest log
 //! version its build can raise the log to, the version the log is at, and the commit built.
-//! Nothing decides on them yet.
+//! Only the finalize check decides on them (`members_finalize.rs`).
 
 #[path = "support/hooked.rs"]
 mod hooked;

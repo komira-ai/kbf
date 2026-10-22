@@ -425,3 +425,6 @@ Options:
 
       --storage-client-ca <PATH>
           The CA callers' certificates chain to; each must name a role (frontend, storage, daemon).
+
+      --finalize-log <VERSION>
+          For a node with no --frontend: raises the metadata log to this machine version before serving, if it is below. One-way: an older kbf no longer reads the log. At most the newest version this build runs. A registered node is raised by kbf cluster finalize instead.

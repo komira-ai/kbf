@@ -180,6 +180,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         "storage-node",
         &[
             "auto-promote",
+            "finalize-log",
             "handoff-allow-degraded",
             "handoff-settle-secs",
             "member-dwell-secs",

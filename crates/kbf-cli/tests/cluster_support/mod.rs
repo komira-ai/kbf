@@ -1,5 +1,6 @@
-//! The helpers of `tests/cluster.rs` and `tests/cluster_object_store.rs`: a one-shot HTTP
-//! server that keeps the request it was sent, and `kbf cluster` run against it.
+//! The helpers of `tests/cluster.rs`, `tests/cluster_finalize.rs` and
+//! `tests/cluster_object_store.rs`: a one-shot HTTP server that keeps the request it was
+//! sent, and `kbf cluster` run against it.
 
 #![allow(dead_code)]
 
@@ -43,53 +44,79 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_kbf");
 /// How long a test waits for the binary to call the server: a hang deadline.
 pub const HANG: Duration = Duration::from_secs(20);
 
-/// Answers one request with `status` and `body`; the thread returns the request as it
+/// Takes one call on `listener` and answers it with `status` and `body`; the request as it
 /// was sent (head and body).
-pub fn serve_once(status: &'static str, body: &'static str) -> (SocketAddr, JoinHandle<String>) {
+fn answer_one(listener: &TcpListener, status: &str, body: &str) -> String {
+    let deadline = Instant::now() + HANG;
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("kbf never called the server: {e}"),
+        }
+    };
+    stream.set_nonblocking(false).expect("blocking");
+    stream.set_read_timeout(Some(HANG)).expect("timeout");
+    let mut request = Vec::new();
+    let mut buf = [0u8; 4096];
+    let wanted = loop {
+        let n = stream.read(&mut buf).expect("read the request");
+        request.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&request);
+        if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+            let length = head
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().expect("a length"))
+                })
+                .unwrap_or(0);
+            if rest.len() >= length {
+                break request.len();
+            }
+        }
+        assert!(n > 0, "the request ended early");
+    };
+    assert_eq!(wanted, request.len());
+    let reply = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(reply.as_bytes()).expect("reply");
+    String::from_utf8(request).expect("UTF-8")
+}
+
+/// A listener on a port of its own, non-blocking, and its address.
+fn listener() -> (TcpListener, SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.set_nonblocking(true).expect("non-blocking");
     let addr = listener.local_addr().expect("addr");
+    (listener, addr)
+}
+
+/// Answers one request with `status` and `body`; the thread returns the request as it
+/// was sent (head and body).
+pub fn serve_once(status: &'static str, body: &'static str) -> (SocketAddr, JoinHandle<String>) {
+    let (listener, addr) = listener();
+    let thread = std::thread::spawn(move || answer_one(&listener, status, body));
+    (addr, thread)
+}
+
+/// Answers the calls it is made, one connection each, with the `(status, body)` of
+/// `answers` in turn; the thread returns the requests in the order they came.
+pub fn serve_each(
+    answers: Vec<(&'static str, &'static str)>,
+) -> (SocketAddr, JoinHandle<Vec<String>>) {
+    let (listener, addr) = listener();
     let thread = std::thread::spawn(move || {
-        let deadline = Instant::now() + HANG;
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(e) => panic!("kbf never called the server: {e}"),
-            }
-        };
-        stream.set_nonblocking(false).expect("blocking");
-        stream.set_read_timeout(Some(HANG)).expect("timeout");
-        let mut request = Vec::new();
-        let mut buf = [0u8; 4096];
-        let wanted = loop {
-            let n = stream.read(&mut buf).expect("read the request");
-            request.extend_from_slice(&buf[..n]);
-            let text = String::from_utf8_lossy(&request);
-            if let Some((head, rest)) = text.split_once("\r\n\r\n") {
-                let length = head
-                    .lines()
-                    .find_map(|l| {
-                        l.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .map(|v| v.trim().parse::<usize>().expect("a length"))
-                    })
-                    .unwrap_or(0);
-                if rest.len() >= length {
-                    break request.len();
-                }
-            }
-            assert!(n > 0, "the request ended early");
-        };
-        assert_eq!(wanted, request.len());
-        let reply = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(reply.as_bytes()).expect("reply");
-        String::from_utf8(request).expect("UTF-8")
+        let mut requests = Vec::new();
+        for (status, body) in answers {
+            requests.push(answer_one(&listener, status, body));
+        }
+        requests
     });
     (addr, thread)
 }
@@ -152,4 +179,19 @@ pub fn cluster_stdin(
     argv.extend_from_slice(args);
     let (code, out, err) = kbf_stdin(&argv, stdin);
     (code, out, err, request.join().expect("the server thread"))
+}
+
+/// Runs `kbf cluster --api <server> <args>` against a server that answers its calls in turn
+/// with `answers` ([`serve_each`]); the exit status, stdout, stderr and the requests the
+/// server saw, in order.
+pub fn cluster_each(
+    answers: Vec<(&'static str, &'static str)>,
+    args: &[&str],
+) -> (Option<i32>, String, String, Vec<String>) {
+    let (addr, requests) = serve_each(answers);
+    let api = addr.to_string();
+    let mut argv = vec!["cluster", "--api", &api];
+    argv.extend_from_slice(args);
+    let (code, out, err) = kbf(&argv);
+    (code, out, err, requests.join().expect("the server thread"))
 }

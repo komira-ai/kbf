@@ -37,6 +37,10 @@
 //! applied generation and status go into the acks once the heartbeat is accepted, and a
 //! registration clears the member's acks (a new boot has applied nothing). Without a
 //! source the answers carry 0 and the fields of a request are ignored.
+//!
+//! **The finalize target** ([`Members::finalize_target`]): both answers carry it as
+//! `finalize_to` while the farm's `meta/finalize` key is set, and leave it unset before, so
+//! a node learns it from its own beat and a node that restarts learns it when it registers.
 
 use std::sync::Arc;
 
@@ -289,14 +293,15 @@ impl Membership for MembershipService {
             .store_config
             .as_ref()
             .map(|(source, _)| Arc::clone(source));
-        let (joined, objstore_generation) = blocking(move || {
+        let (joined, objstore_generation, finalize_to) = blocking(move || {
             // The rows, not the map: an entry counts from the moment it is written, and a
             // refusal comes before the member is assigned an id or a boot.
             if let Some(peer) = &peer {
                 refuse_denied(peer, &members.denied()?)?;
             }
             let joined = members.register_reporting(&who, last, &facts)?;
-            Ok((joined, announced(source.as_ref())))
+            let finalize_to = members.finalize_target()?;
+            Ok((joined, announced(source.as_ref()), finalize_to))
         })
         .await?;
         if let Some((_, acks)) = &self.store_config {
@@ -314,6 +319,7 @@ impl Membership for MembershipService {
             retained_previous: retained(&self.members, joined.map.generation()),
             map: Some(pb::Map::from(&joined.map)),
             objstore_generation,
+            finalize_to,
         }))
     }
 
@@ -344,7 +350,7 @@ impl Membership for MembershipService {
             .store_config
             .as_ref()
             .map(|(source, _)| Arc::clone(source));
-        let (map_generation, map, objstore_generation, retained_previous, tail_epoch) =
+        let (map_generation, map, objstore_generation, retained_previous, tail_epoch, finalize) =
             blocking(move || {
                 if let Some(peer) = &peer {
                     // The map's list, read before the row is touched: a refused beat must not
@@ -380,6 +386,7 @@ impl Membership for MembershipService {
                     announced(source.as_ref()),
                     earlier,
                     members.tail_epoch()?,
+                    members.finalize_target()?,
                 ))
             })
             .await?;
@@ -397,6 +404,7 @@ impl Membership for MembershipService {
             objstore_generation,
             retained_previous,
             tail_epoch,
+            finalize_to: finalize,
         }))
     }
 }

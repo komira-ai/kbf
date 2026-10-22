@@ -77,6 +77,8 @@ pub struct StorageHalf {
     repairs: Option<Arc<Repairs>>,
     _flusher: Option<AbortOnDrop>,
     _background: Background,
+    /// The task that raises the log to the target the frontend names ([`crate::finalize`]).
+    _finalize: Option<AbortOnDrop>,
     _joiner: Option<AbortOnDrop>,
     _repair: Option<AbortOnDrop>,
     _metrics: Option<AbortOnDrop>,
@@ -208,6 +210,7 @@ where
 {
     let args = &flags.server;
     let meta = RaftMetaLog::open_dir(&stores.meta_dir, Retention::default(), prefix_root).await?;
+    crate::finalize::at_start_if(&meta, flags.finalize_log)?;
     let (prefix, log) = (meta.store_prefix(), meta.log_id());
     let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
     let pass = files.map(|files| StartPass::over_raft(files, grace));
@@ -244,6 +247,8 @@ where
     });
     let _background =
         crate::rebuild::spawn(&cache, &registered.catch_up, pass, RebuildConfig::default());
+    // A target the frontend names raises the node's log ([`crate::finalize`]).
+    let _finalize = crate::finalize::spawn(&cache, registered.joiner.as_ref());
     let segments = SegmentsConfig {
         max_bytes: args.segment_upload_max_bytes,
         idle: Duration::from_secs(args.segment_upload_idle_secs),
@@ -272,6 +277,7 @@ where
         repairs: node.repairs,
         _flusher,
         _background,
+        _finalize,
         _joiner: node.joiner,
         _repair: node.repair,
         _metrics,

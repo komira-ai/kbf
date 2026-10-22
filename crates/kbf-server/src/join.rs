@@ -17,7 +17,12 @@
 //! **What the node runs.** Every call also says the newest metadata-log version the node's
 //! build can raise its log to, the version the log is at now, and the commit the binary was
 //! built from ([`Joiner::with_log`], [`reported_commit`]). The frontend shows them in
-//! `GET /v1/members` and decides nothing on them (`members::NodeFacts`).
+//! `GET /v1/members` and decides on them only for `POST /v1/finalize`
+//! (`members::NodeFacts`).
+//!
+//! **Finalize.** Every answer may carry `finalize_to`, the log version the operator asked the
+//! farm to be raised to; the joiner keeps the highest ([`Joiner::finalize`],
+//! [`crate::finalize::FinalizeTarget`]) and the node's task acts on it ([`crate::finalize`]).
 
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
@@ -38,6 +43,7 @@ use tonic::{Code, Status};
 
 use crate::cold_apply::Applied;
 use crate::fill::FillState;
+use crate::finalize::FinalizeTarget;
 use crate::members::{LastBoot, PROTOCOL};
 use crate::node_map::NodeMap;
 use crate::storage_health::{Debts, Writes};
@@ -137,6 +143,8 @@ pub struct Joiner {
     /// The newest machine version the node's build runs for its metadata log, and the
     /// handle on the one the log is at ([`Joiner::with_log`]); `None`: it says neither.
     log: Option<(u32, Arc<AtomicU32>)>,
+    /// The highest `finalize_to` the frontend's answers carried ([`Joiner::finalize`]).
+    finalize: Arc<FinalizeTarget>,
 }
 
 impl Joiner {
@@ -159,7 +167,16 @@ impl Joiner {
             announced: 0,
             fill: FillState::new(),
             log: None,
+            finalize: FinalizeTarget::new(),
         }
+    }
+
+    /// The finalize target this joiner has been told: the highest `finalize_to` of the
+    /// frontend's answers to its registrations and heartbeats, which the node's
+    /// [`crate::finalize::run`] raises its log to.
+    #[must_use]
+    pub fn finalize(&self) -> Arc<FinalizeTarget> {
+        Arc::clone(&self.finalize)
     }
 
     /// What this joiner's heartbeats say of the node's flush and tail, and which the node's
@@ -338,6 +355,7 @@ impl Joiner {
             .await?
             .into_inner();
         self.take(answer.map.clone(), answer.retained_previous);
+        self.finalize.learn(answer.finalize_to);
         self.node.registered(MemberId(answer.member_id));
         // A new boot has done no pass under it.
         self.fill.registered();
@@ -394,6 +412,7 @@ impl Joiner {
             .await?
             .into_inner();
         self.fill.learn(answer.tail_epoch);
+        self.finalize.learn(answer.finalize_to);
         self.announced = answer.objstore_generation;
         self.take(answer.map, answer.retained_previous);
         Ok(answer.map_generation)

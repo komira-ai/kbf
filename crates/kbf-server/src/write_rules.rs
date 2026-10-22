@@ -164,6 +164,11 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
             "meta/members_forming",
         ),
         fenced(
+            Keys::Exactly("meta/finalize"),
+            "members (finalize target)",
+            "meta/finalize",
+        ),
+        fenced(
             Keys::Under("unfilled/"),
             "members (joiner mark)",
             "unfilled/3",

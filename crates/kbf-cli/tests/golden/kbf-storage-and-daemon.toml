@@ -164,6 +164,8 @@ storage-ping-interval-ms = 10000
 storage-ping-timeout-ms = 10000
 
 [storage-node]
+# For a node with no --frontend: raises the metadata log to this machine version before serving, if it is below. One-way: an older kbf no longer reads the log. At most the newest version this build runs. A registered node is raised by kbf cluster finalize instead.
+# finalize-log = "VERSION"
 # The node's share of the digests relative to the others. Default: 1.
 # storage-weight = "N"
 # The zone label to register with. Default: none.

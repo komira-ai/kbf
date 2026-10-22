@@ -459,6 +459,74 @@ The answer is about the members as the server sees them now: a heartbeat is up t
 to live old, so the updater asks again just before it stops, and a `false` is retried
 rather than overridden.
 
+## `POST /v1/finalize` and `GET /v1/finalize`
+
+Finalize raises every storage node's metadata log to the newest machine version the new
+build runs. **It is the only irreversible step of an upgrade.** A start raises a log only
+as far as the build's start ceiling (today equal to the newest version the build runs), so
+a release that sets the ceiling below the newest version changes no log that the previous
+build cannot read when it is installed and started; a version above the ceiling waits for
+this call. Finalize raises any log that is below the target, whatever the ceiling: a node
+that does not use the newest version's features stays below it after a start, and `GET
+/v1/finalize` shows it `pending` until finalize raises it. After the raise, a build that
+runs only an older version refuses the log. **There is no backup before the raise yet:**
+copy a node's `--meta-dir` before finalizing if you may need to go back.
+
+Both routes pass every gate of [Who may write](#who-may-write), the `GET` included, because
+its answer names each node's build. `kbf cluster finalize --token-file F [--target N]
+[--wait [--timeout-secs S]]` calls `POST /v1/finalize`, and `kbf cluster finalize --status
+--token-file F` calls `GET /v1/finalize`.
+
+`POST /v1/finalize` takes `{"target": N}`; no body, or `{}`, is the newest version this
+frontend's build runs. It reads every member of the map and every live member row, and
+writes the farm's target (the state store's `meta/finalize` key, which only rises) only
+if no member blocks it:
+
+| Answer | Meaning |
+|---|---|
+| `200` `{"target": 5, "written": true}` | the farm's target is now 5. A node whose build runs 5 raises its log to 5 at its next heartbeat (a node that starts later raises when it registers) and reports the new `log_version` on the beat after |
+| `200` `{"target": 5, "written": false}` | the target was 5 or higher already; nothing changed |
+| `400` | `N` is 0, or past the newest version this frontend's build runs, or the body is not `{"target": N}` |
+| `409` `{"error": ..., "target": 5, "blocked": [...]}` | a member blocks it; nothing was written. `blocked` has one entry per member, as `GET /v1/finalize` lists them (below) |
+| `404` | this server keeps no storage members (no state store) |
+| `503`, `500` | the state store cannot be read or written, or a stored row does not decode |
+
+A member blocks when its `state` is `blocked` or `unknown`. There is no override flag: a
+member that cannot answer is dealt with first (a member that is down is restarted, or leaves
+the map when its dwell, `--member-dwell-secs`, runs out; a node on an older build is
+updated).
+
+`GET /v1/finalize` answers the farm's target (`null` before anyone asked) and every member
+against it (against the newest version this frontend's build runs when there is no target):
+
+```json
+{ "target": 5,
+  "nodes": [
+    { "member": 1, "build_commit": "9f3c...", "runs_log": 5, "log_version": 5,
+      "state": "done", "reason": "" },
+    { "member": 2, "build_commit": "9f3c...", "runs_log": 5, "log_version": 4,
+      "state": "pending", "reason": "" } ] }
+```
+
+| `state` | Meaning |
+|---|---|
+| `done` | the node's log is at the target or past it |
+| `pending` | the node's build runs the target and its log is below it: it raises at its next heartbeat |
+| `blocked` | the node's build runs less than the target (`reason` says how much), or the member has no live row: it is down, or its row lapsed |
+| `unknown` | the node's row says nothing of its build or log: an older build, or a node with no log. It blocks, like `blocked` |
+
+`runs_log`, `log_version` and `build_commit` are the node's own report (as `GET
+/v1/members` shows them), `null` when it reports none or has no live row.
+
+A standalone `kbf storage` or `kbf storage-and-daemon` with no `--frontend` has no frontend to
+tell it: it raises its log to a version only when started with `--finalize-log VERSION`.
+
+Finalize covers the logs of registered storage members. The metadata log of a `kbf-server`
+or an `all-in-one` is not raised by it, and those modes have no `--finalize-log` yet.
+
+A raise that fails on a node (its disk failed, or its log stopped) is logged and tried again
+when the target next rises or when the node restarts; the node stays `pending` until then.
+
 ## `GET /v1/denied`, `POST /v1/denied` and `DELETE /v1/denied`
 
 An operator adds an entry to the storage deny list, or takes one off. A denied
@@ -595,7 +663,7 @@ the drain, and the unit templates in `kbf-deploy` set it.
 `--api` for the listener (default `127.0.0.1:8982`). A frontend drain has no undrain:
 restart it. `kbf cluster member <id> --state active|draining|planned-down [--for-secs N] --token-file F` calls
 `POST /v1/members/{id}`, and `kbf cluster denied --token-file F` calls `GET /v1/denied`.
-`kbf cluster object-store ...` calls the `/v1/object-stores/...` routes (below).
+`kbf cluster finalize ...` calls `/v1/finalize` (above). `kbf cluster object-store ...` calls the `/v1/object-stores/...` routes (below).
 
 ## `/v1/enroll/tokens` and `/v1/enroll/nodes`
 

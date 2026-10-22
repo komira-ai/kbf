@@ -286,7 +286,8 @@ What changes in the flags: the frontend gains `--storage`, `--storage-ca` and it
 pair, `--enroll-listen` and its companions, and `--object-store-secrets-dir`, and loses
 every flag of a store. The daemon moves to its own process and takes `--server` for the
 worker listener and no `--cas` when it is in a `storage-and-daemon` process. The storage
-half gains `--frontend`, `--advertise-addr`, `--storage-zone` and `--storage-weight`.
+half gains `--frontend`, `--advertise-addr`, `--storage-zone`, `--storage-weight` and, for
+a half with no `--frontend`, `--finalize-log`.
 
 **Planned:** a conversion of the blobs, the action cache and the queue of an `all-in-one`
 host into a farm. Today the farm starts with an empty cache and its own scheduler state;

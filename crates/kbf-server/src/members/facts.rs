@@ -1,7 +1,7 @@
 //! What a storage node says of the build it runs and of its metadata log
 //! (`RegisterRequest` fields 10 to 12, `HeartbeatRequest` fields 24 to 26): kept in its
 //! member row (tags 7 to 9), shown by `GET /v1/members` and read by [`Members::node_facts`].
-//! Information only: no decision of the frontend depends on it yet.
+//! Only the finalize check decides on them (`finalize.rs`); nothing else does.
 //!
 //! **Absent is not zero.** A node that says nothing of a fact (an older build, or a node
 //! with no log) leaves it `None`, and so does a row written before the fields existed.

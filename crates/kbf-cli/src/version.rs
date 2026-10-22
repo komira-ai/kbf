@@ -18,7 +18,11 @@
 //!   number). A rollout compares it across two builds: going from N to N-1 is reversible
 //!   only if `meta_log(N) <= meta_log(N-1)`, because a log raised past what N-1 runs
 //!   cannot be opened by it. A build that does not print the field is unknown, and
-//!   unknown is not reversible;
+//!   unknown is not reversible. A start raises a log only up to the build's start ceiling
+//!   ([`kbf_server::raft_log::START_CEILING`], today equal to `RUNS`); the rest is
+//!   raised by `kbf cluster finalize`, the only irreversible step of an upgrade, and until a
+//!   backup is taken before that raise (not built yet) a rollback past it needs a copy the
+//!   operator took of each node's metadata directory (`docs/api.md`, `POST /v1/finalize`);
 //! - `min_protocol` and `protocol`: the oldest and the newest `kbf.worker.v1` protocol
 //!   version this binary speaks ([`kbf_server::worker`]); the daemon half speaks exactly
 //!   `protocol` (a test pins the two halves equal);
