@@ -453,6 +453,24 @@ pub struct Facts {
 }
 
 impl Facts {
+    /// The facts of no run: only the storage `members`, with no host and the defaults for
+    /// the rest. It is what the storage gate is asked over when no run is under way (the
+    /// operator API's safe-to-stop query), so that the API names none of the fields.
+    #[must_use]
+    pub fn of_members(members: Vec<MemberFacts>) -> Self {
+        Self {
+            target: Release::new(""),
+            source: Source::default(),
+            generation: Generation(0),
+            next_order: OrderId::new(0, 0),
+            hosts: Vec::new(),
+            members,
+            slot: Slot::default(),
+            queued_classes: None,
+            wait_since: FarmTime::from_millis(0),
+        }
+    }
+
     /// The host `id`, if the run has it.
     #[must_use]
     pub fn host(&self, id: &WorkerId) -> Option<&HostFacts> {
