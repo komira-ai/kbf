@@ -1,7 +1,7 @@
 //! Rule 2 of `docs/design/storage-ram-ack.md`, on real caches: a durable record that names
-//! a blob is written only once the blob is on a disk (the index) of an owner. Nothing puts
-//! a blob in the Held set in a running node yet; every test puts one there through
-//! `Cache::hold_for_test`, and waits for the barrier to park through
+//! a blob is written only once the blob is on a disk (the index) of an owner. Every test
+//! here puts a blob in the Held set through `Cache::hold_for_test` (`ram_ack_ac.rs` runs
+//! the same barrier over the producer), and waits for the barrier to park through
 //! `Cache::parked_for_test` (a positive event), never by sleeping or polling. The time the
 //! barrier waits is the paused clock's.
 //!

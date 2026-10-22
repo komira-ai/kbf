@@ -60,10 +60,10 @@ use std::collections::BTreeSet;
 use kbf_types::{FarmTime, WorkerId};
 
 use super::facts::{Facts, HostFacts, Platform, PlatformClass, Release, Source};
-use super::gate::{GateFail, GateMode, storage_gate};
 use super::node_step::HostPhase;
 use super::policy::Policy;
 use super::slot::SlotClass;
+use crate::storage_gate::{GateFail, GateMode, storage_gate};
 use crate::update_status::ReleaseSource;
 
 /// The picker's answer.
@@ -422,7 +422,7 @@ fn verdict<'a>(
     let mut idle = load.is_idle();
     if host.is_storage() {
         let own = host.member.ok_or(Skip::Gate(GateFail::Unlinked))?;
-        storage_gate(facts, own, GateMode::Pick, policy, now).map_err(Skip::Gate)?;
+        storage_gate(&facts.members, own, GateMode::Pick, policy.ttl, now).map_err(Skip::Gate)?;
         if !host.writes_reported() {
             return Err(Skip::WritesUnknown);
         }
