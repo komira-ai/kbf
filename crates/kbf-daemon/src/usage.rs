@@ -143,6 +143,8 @@ impl Child {
                     wall_micros: u64::try_from(self.started.elapsed().as_micros())
                         .unwrap_or(u64::MAX),
                     cgroup: None,
+                    // No instrument to name: the basis stays unspecified.
+                    ..ResourceUsage::default()
                 },
             })),
         }
@@ -220,6 +222,7 @@ mod tests {
             peak_memory_bytes: 3,
             wall_micros: 4,
             cgroup: None,
+            ..ResourceUsage::default()
         };
         let other = Any {
             type_url: "type.googleapis.com/other".to_owned(),

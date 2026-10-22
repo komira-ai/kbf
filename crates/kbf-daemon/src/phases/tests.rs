@@ -85,6 +85,7 @@ fn the_cgroup_counters_follow_the_existing_keys() {
                     bytes: 400,
                 },
             ],
+            ..CgroupUsage::default()
         }),
         ..ResourceUsage::default()
     };
