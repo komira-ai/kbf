@@ -19,6 +19,8 @@ const MIB: u64 = 1 << 20;
 const OOM: Outcome = Outcome::Failed(Failure::OutOfMemory);
 /// The key every action of these tests shares unless a test says otherwise.
 const KEY: u64 = 0x5eed;
+/// The seed of the generated farms.
+const SEED: u64 = 0x0f41_7bd3;
 
 fn action(n: u8, instance: &str) -> ActionKey {
     ActionKey {
@@ -385,6 +387,11 @@ fn the_bound_is_the_largest_live_node_that_could_run_it() {
     f.advance(LEASE_GRACE + Duration::from_secs(1));
     f.heartbeat("small", &[]);
     assert_eq!(f.s.key_floor_bound(&wants), 16 * GIB);
+    // The same bound by operation, and none for one the scheduler does not hold.
+    f.submit(1, request(1, 4 * GIB));
+    let op = f.s.twin(&request(1, 4 * GIB)).expect("queued");
+    assert_eq!(f.s.key_floor_bound_of(op), 16 * GIB);
+    assert_eq!(f.s.key_floor_bound_of(OperationId(99)), 0);
     // No node at all: no bound, hence no floor.
     let mut empty = Farm::new();
     assert_eq!(empty.s.key_floor_bound(&wants), 0);
@@ -399,7 +406,7 @@ fn the_bound_is_the_largest_live_node_that_could_run_it() {
 /// floor.
 #[test]
 fn generated_farms_never_book_a_whole_host_from_a_key_floor() {
-    let mut rng = SimRng::from_seed(0xe6);
+    let mut rng = SimRng::from_seed(SEED);
     let mut floors = 0;
     for round in 0..300 {
         let mut f = Farm::new();

@@ -534,6 +534,15 @@ impl Scheduler {
             .unwrap_or(0)
     }
 
+    /// [`Scheduler::key_floor_bound`] for the request of `operation`; 0 for one the
+    /// scheduler does not hold.
+    #[must_use]
+    pub fn key_floor_bound_of(&self, operation: OperationId) -> u64 {
+        self.ops
+            .get(&operation)
+            .map_or(0, |op| self.key_floor_bound(&op.request))
+    }
+
     /// Raises the queued or leased `operation`'s memory to its key's floor, kept under
     /// `bound` (the live bound of [`Scheduler::key_floor_bound`] when `None`;
     /// [`kbf_estimator::floor_ceiling`]), and remembers what it booked before so
