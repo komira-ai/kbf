@@ -585,3 +585,150 @@ fn a_vanished_entry_does_not_hide_a_real_error() {
     assert!(swept.errors[0].contains("Shared/locked: "), "{swept:?}");
     assert!(!swept.errors[0].contains("No such file"), "{swept:?}");
 }
+
+/// A `/var/folders` entry as macOS makes it: the kept folders `0`, `C`, `T` and `X`,
+/// each holding a file and a tree, and the stray `junk` file, `stray` directory and
+/// `T`-named link the entry root must not keep.
+fn entry_root(dir: &Path) -> PathBuf {
+    let entry = dir.join("entry");
+    fs::create_dir(&entry).unwrap();
+    for kept in ["0", "C", "T", "X"] {
+        fs::create_dir_all(entry.join(kept).join("sub/deeper")).unwrap();
+        fs::write(entry.join(kept).join("file"), "x").unwrap();
+        fs::write(entry.join(kept).join("sub/deeper/leaf"), "x").unwrap();
+    }
+    fs::write(entry.join("junk"), "x").unwrap();
+    fs::create_dir_all(entry.join("stray/inside")).unwrap();
+    fs::write(entry.join("stray/inside/f"), "x").unwrap();
+    entry
+}
+
+/// Catches the entry sweep that removes the kept folders themselves (the next lease's
+/// `getconf DARWIN_USER_TEMP_DIR` would name a folder that is gone), the one that
+/// empties only the kept folders and leaves a file or folder of another name in the
+/// entry root (a pool user's file there survived the clean: the mutant "entry sweep
+/// limited to 0 C T" fails here on `junk` and `stray`), one that keeps a folder that is
+/// not named, and one that walks through a link planted under a kept name.
+#[test]
+fn empty_keeping_empties_the_named_folders_and_removes_everything_else() {
+    let dir = scratch("keeping");
+    let entry = entry_root(&dir);
+    let outside = dir.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("kept"), "x").unwrap();
+    // `Y` is not named: a link under a kept name is not a folder either.
+    fs::remove_dir_all(entry.join("X")).unwrap();
+    symlink(&outside, entry.join("X")).unwrap();
+    let swept = empty_keeping(&entry, me(), &["0", "C", "T", "X"]);
+    assert_eq!(swept.errors, Vec::<String>::new());
+    assert_eq!(names(&entry), ["0", "C", "T"]);
+    for kept in ["0", "C", "T"] {
+        assert_eq!(names(&entry.join(kept)), Vec::<String>::new(), "{kept}");
+    }
+    assert!(outside.join("kept").exists(), "the link was followed");
+    // Nothing named: the entry is emptied whole.
+    let swept = empty_keeping(&entry, me(), &[]);
+    assert_eq!(swept.errors, Vec::<String>::new());
+    assert!(names(&entry).is_empty());
+}
+
+/// Catches a kept folder whose contents the sweep cannot remove hiding behind the
+/// removal of the rest: the error names the kept folder's entry and the other entries
+/// still go.
+#[test]
+fn a_kept_folder_that_cannot_be_emptied_is_an_error_and_the_rest_goes() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("keeping-error");
+    let entry = entry_root(&dir);
+    fs::create_dir(entry.join("T/locked")).unwrap();
+    fs::write(entry.join("T/locked/f"), "x").unwrap();
+    chmod(&entry.join("T/locked"), 0o000);
+    let swept = empty_keeping(&entry, me(), &["0", "C", "T", "X"]);
+    chmod(&entry.join("T/locked"), 0o700);
+    assert_eq!(swept.errors.len(), 1, "{swept:?}");
+    assert!(swept.errors[0].contains("entry/T/locked:"), "{swept:?}");
+    assert_eq!(names(&entry), ["0", "C", "T", "X"]);
+    assert_eq!(names(&entry.join("T")), ["locked"]);
+    assert!(names(&entry.join("C")).is_empty());
+}
+
+/// Catches a kept folder removed under the sweep (gone since it was examined) read as an
+/// error, as the plain walk treats a vanished entry.
+#[test]
+fn a_kept_folder_gone_since_it_was_examined_holds_nothing() {
+    let dir = scratch("keeping-gone");
+    let entry = entry_root(&dir);
+    let gone = entry.join("C");
+    let swept = vanishing(after_examining("C", gone), || {
+        empty_keeping(&entry, me(), &["C"])
+    });
+    assert_eq!(swept.errors, Vec::<String>::new(), "{swept:?}");
+    assert!(names(&entry).is_empty());
+}
+
+/// Catches a mode that stays 0 (the owner's `u+rwx` is not set on what the departing
+/// uid owns, so the removal that follows could not enter it as that uid), a clear that
+/// changes what another uid owns (a hard link to a system file keeps its mode: here an
+/// entry the walk does not count as the uid's), one that follows a link out of the
+/// tree, one that walks into another mode's folder without listing it, and a walk that
+/// stops at the first error.
+#[test]
+fn clear_flags_makes_the_uids_entries_rwx_and_leaves_other_owners_alone() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("clear");
+    let home = dir.join("home");
+    fs::create_dir_all(home.join("a/b")).unwrap();
+    fs::write(home.join("a/b/f"), "x").unwrap();
+    fs::write(home.join("g"), "x").unwrap();
+    let outside = dir.join("outside");
+    fs::write(&outside, "x").unwrap();
+    chmod(&outside, 0o600);
+    symlink(&outside, home.join("link")).unwrap();
+    chmod(&home.join("a/b/f"), 0o000);
+    chmod(&home.join("g"), 0o400);
+    chmod(&home.join("a/b"), 0o500);
+    chmod(&home, 0o500);
+    let swept = clear_flags(&home, me());
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    let modes = [
+        mode(&home.join("a/b/f")),
+        mode(&home.join("g")),
+        mode(&home.join("a/b")),
+        mode(&outside),
+    ];
+    // Another uid's entries: counted nowhere, changed nowhere.
+    let others = clear_flags(&home, other());
+    chmod(&home, 0o700);
+    chmod(&home.join("a/b"), 0o700);
+    assert_eq!(swept.errors, Vec::<String>::new());
+    assert_eq!(modes, [0o700, 0o700, 0o700, 0o600]);
+    assert_eq!(swept.removed, 5, "a, b, f, g and the link: {swept:?}");
+    assert_eq!(others.removed, 0, "{others:?}");
+    assert_eq!(clear_flags(&dir.join("absent"), me()), Swept::default());
+}
+
+/// Catches a flag clear that ignores the depth bound (the uid's own tree built deeper
+/// than the walk fails closed, as the removal does), one that goes on silently, and one
+/// that fails on another owner's deep tree.
+#[test]
+fn clear_flags_fails_closed_on_a_tree_deeper_than_the_bound() {
+    let dir = scratch("clear-deep");
+    let home = dir.join("home");
+    fs::create_dir(&home).unwrap();
+    let mut deep = home.clone();
+    for _ in 0..=MAX_DEPTH + 1 {
+        deep.push("d");
+    }
+    fs::create_dir_all(&deep).unwrap();
+    let swept = clear_flags(&home, me());
+    assert_eq!(swept.errors.len(), 1, "{swept:?}");
+    assert!(swept.errors[0].contains("nested deeper"), "{swept:?}");
+    // Another owner's deep tree is nobody's to fail on: searched to the limit, no error.
+    assert_eq!(clear_flags(&home, other()), Swept::default());
+}

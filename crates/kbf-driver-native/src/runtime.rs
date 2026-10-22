@@ -81,6 +81,9 @@ pub struct NativeRuntime<C> {
     /// The slots of a root daemon's lease-user pool, one lease each.
     #[cfg(target_os = "macos")]
     slots: Option<crate::slots::macos::Slots>,
+    /// Whether the slot count reaches the daemon through a part of its own
+    /// ([`Self::report_slots_through`]) and so is left out of the Xcode survey's report.
+    slots_apart: std::sync::atomic::AtomicBool,
 }
 
 /// Everything `prepare` works out for `execute` and `finish`.
@@ -223,6 +226,7 @@ impl<C: Cas> NativeRuntime<C> {
             warm_up: Mutex::new(None),
             #[cfg(target_os = "macos")]
             slots,
+            slots_apart: std::sync::atomic::AtomicBool::new(false),
         };
         sweep_user_folders(&runtime.config);
         Ok(runtime)
@@ -296,6 +300,29 @@ impl<C: Cas> NativeRuntime<C> {
         entries
     }
 
+    /// Sends the daemon the number of free slots through `part` now and whenever it
+    /// changes (a slot went dirty, or was cleaned again), so the node reports its slots
+    /// without waiting for the Xcode survey to change. The survey's own report then
+    /// leaves the `action_slots` entry out: this part owns it. Without a pool, or off a
+    /// Mac, it sends nothing.
+    pub fn report_slots_through(&self, part: kbf_daemon::DriverPart) {
+        // Set whether or not there is a pool: with none, there is no entry to leave out.
+        self.slots_apart
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(target_os = "macos")]
+        if let Some(slots) = &self.slots {
+            let part = Arc::new(part);
+            slots.on_count(Arc::new(move |free| {
+                part.send(DriverReport {
+                    entries: vec![(crate::slots::CAPABILITY.to_owned(), free.to_string())],
+                    xcodes: Vec::new(),
+                });
+            }));
+        }
+        #[cfg(not(target_os = "macos"))]
+        drop(part);
+    }
+
     /// Makes the ready Xcodes of `installed` the ones actions may name, and returns
     /// what the daemon reports for them: [`Self::capabilities`] (one `xcode` entry per
     /// ready build), and every installed Xcode with its state for `NodeStatus`. Once
@@ -342,8 +369,12 @@ impl<C: Cas> NativeRuntime<C> {
             _ => None,
         };
         drop(warm_up);
+        let mut entries = self.capabilities();
+        if self.slots_apart.load(std::sync::atomic::Ordering::SeqCst) {
+            entries.retain(|(key, _)| key != crate::slots::CAPABILITY);
+        }
         let report = DriverReport {
-            entries: self.capabilities(),
+            entries,
             xcodes: installed.iter().map(xcode::Xcode::status).collect(),
         };
         (report, warming)
@@ -880,8 +911,8 @@ impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
     }
 
     fn aside(&mut self, slot: Runner, why: &str) {
-        tracing::error!(%why, "a slot failed its profile canaries; set aside, the lease takes another");
-        slot.set_aside();
+        // The book logs it, in the shape of a failed clean.
+        slot.set_aside(why);
     }
 }
 
@@ -1587,6 +1618,24 @@ mod tests {
         let want = "macOS only";
         assert!(refused.to_string().contains(want), "{refused}");
         assert!(!scratch.exists(), "a scratch root made before the refusal");
+    }
+
+    /// Catches a report-through that fails or sends something without a pool, and one that
+    /// changes the survey's other entries (the slot entry itself is left out of the survey
+    /// only on a Mac with a pool, which the runner tests): with the part taken, a node
+    /// with no pool sends the part nothing and the survey's report is the same.
+    #[test]
+    fn the_slots_part_owns_the_slot_entry_of_the_report() {
+        let scratch = crate::unit_dir("runtime-slots-part");
+        let runtime = NativeRuntime::new(NativeConfig::new(scratch.to_path_buf()), Arc::new(NoCas))
+            .expect("runtime");
+        let (driver, reports) = kbf_daemon::DriverWatch::new();
+        let part = driver.part(crate::slots::SOURCE).expect("the part");
+        let before = runtime.apply_xcodes(&[]).entries;
+        runtime.report_slots_through(part);
+        let after = runtime.apply_xcodes(&[]).entries;
+        assert_eq!(after, before, "no pool, no slot entry either way");
+        assert_eq!(*reports.borrow(), DriverReport::default());
     }
 
     /// Catches (issue #164): a survey that leaves the runtime selecting the Xcodes of

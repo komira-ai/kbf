@@ -172,13 +172,15 @@ async fn a_profile_that_allows_writes_to_the_link_source_fails_the_link_canary_a
     slot.release().await;
 }
 
-/// Catches a slot that fails its canaries and stays offered, stays counted, or is never
-/// canaried again: it is set aside (the count of slots drops to 0 and a lease waits, as
-/// when none is free), and offered again it is cleaned and canaried again, and set aside
-/// again by the same mutant.
+/// Catches a slot that fails its canaries and stays offered, stays counted, is never
+/// cleaned again, or is handed out again without its canaries run: it is marked dirty as
+/// a failed clean marks it (the count of slots drops to 0 and a lease waits, as when none
+/// is free), the recovery thread cleans it and offers it again (the count is 1 again),
+/// and the canaries run again at the next hand-out, where the same mutant fails them
+/// again.
 #[ignore = "needs root and real users: cargo xtask sudo-test"]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_slot_that_fails_its_canaries_is_set_aside_and_canaried_again_when_offered() {
+async fn a_slot_that_fails_its_canaries_is_dirty_and_recovery_offers_it_to_be_canaried_again() {
     let mutant = ProfileMutant::Drop("(deny file-write*)");
     let (_users, scratch, slots) = start("canary-aside", Some(mutant));
     let (slot, lease) = leased(&slots, &scratch).await;
@@ -189,12 +191,19 @@ async fn a_slot_that_fails_its_canaries_is_set_aside_and_canaried_again_when_off
         .await
         .expect("ran");
     assert!(!report.all_refused());
-    slot.set_aside();
-    assert_eq!(slots.count(), 0, "a slot set aside is not counted");
+    slot.set_aside(&report.failures());
+    assert_eq!(slots.count(), 0, "a dirty slot is not counted");
     let waited = tokio::time::timeout(Duration::from_secs(1), slots.take()).await;
-    assert!(waited.is_err(), "a slot set aside must not be offered");
-    slots.reoffer().await;
-    assert_eq!(slots.count(), 1, "cleaned and offered again");
+    assert!(waited.is_err(), "a dirty slot must not be offered");
+    // The recovery thread (5 s, then doubling) cleans it and offers it again.
+    let until = Instant::now() + Duration::from_secs(60);
+    while slots.count() == 0 {
+        assert!(
+            Instant::now() < until,
+            "the recovery thread never freed the slot"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     // The clean removed the uid's files under /private/tmp, the lease directory too.
     std::fs::create_dir_all(&lease).expect("lease dir again");
     let again = tokio::time::timeout(Duration::from_secs(5), slots.take()).await;
@@ -205,7 +214,7 @@ async fn a_slot_that_fails_its_canaries_is_set_aside_and_canaried_again_when_off
         .await
         .expect("ran");
     assert!(!report.all_refused(), "canaried again, and failed again");
-    again.set_aside();
+    again.set_aside(&report.failures());
     assert_eq!(slots.count(), 0);
     assert!(left_in_tmp().is_empty(), "{:?}", left_in_tmp());
 }

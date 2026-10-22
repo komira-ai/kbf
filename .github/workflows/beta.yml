@@ -550,8 +550,8 @@ jobs:
       # The native driver's lease-user pool as root, with throwaway users from uid 690:
       # actions as pool users through `launchctl asuser`, the kill by uid, the keeper's,
       # parallel leases (crates/kbf-driver-native/tests/slots.rs); then the clean of a
-      # slot between two leases, its deadline, the user made again and the quarantine
-      # (tests/slot_clean.rs). One test at a time: they make users at free uids.
+      # slot between two leases in one pass, its deadline, and a failed clean leaving the
+      # user dirty (tests/slot_clean.rs). One test at a time: they make users at free uids.
       - run: cargo xtask sudo-test -p kbf-driver-native --test slots -- --test-threads=1 --nocapture
       - run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture
       # The profile canaries (tests/slot_canary.rs): as a pool user under the generated

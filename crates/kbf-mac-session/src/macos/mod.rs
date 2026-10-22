@@ -90,7 +90,18 @@ pub(crate) fn clear_user_flags(
     name: &std::ffi::OsStr,
     flags: u32,
 ) -> io::Result<()> {
-    if flags & LOCKING_FLAGS == 0 {
+    clear_flags_of(dir, name, flags, LOCKING_FLAGS)
+}
+
+/// Clears the `mask` bits of `name` in `dir`, whose flags are `flags`, without following
+/// a link; nothing is called when none of them is set.
+pub(crate) fn clear_flags_of(
+    dir: &OwnedFd,
+    name: &std::ffi::OsStr,
+    flags: u32,
+    mask: u32,
+) -> io::Result<()> {
+    if flags & mask == 0 {
         return Ok(());
     }
     let name = std::ffi::CString::new(name.as_bytes())?;
@@ -103,7 +114,7 @@ pub(crate) fn clear_user_flags(
         fileattr: 0,
         forkattr: 0,
     };
-    let mut value: u32 = flags & !LOCKING_FLAGS;
+    let mut value: u32 = flags & !mask;
     // SAFETY: `name` is NUL-terminated, `list` an attrlist that asks for the common
     // flags only, and `value` the u32 that attribute is; all three outlive the call.
     let set = unsafe {
@@ -117,6 +128,19 @@ pub(crate) fn clear_user_flags(
         )
     };
     if set != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Clears the `mask` bits of the flags of the open directory `dir`.
+pub(crate) fn clear_dir_flags(dir: &OwnedFd, mask: u32) -> io::Result<()> {
+    let flags = rustix::fs::fstat(dir)?.st_flags;
+    if flags & mask == 0 {
+        return Ok(());
+    }
+    // SAFETY: a plain call on a descriptor this function borrows.
+    if unsafe { libc::fchflags(dir.as_raw_fd(), flags & !mask) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())

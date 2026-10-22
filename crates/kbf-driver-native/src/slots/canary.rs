@@ -704,4 +704,103 @@ mod tests {
         assert_eq!(offer.aside.len(), 2);
         assert_eq!(all_bad, Err("none free".to_owned()));
     }
+
+    /// Catches a failed canary that does not make the slot dirty in the book (it would
+    /// stay offered and counted), a lease that fails or runs on that slot instead of the
+    /// next one, a recovery that offers the slot again without running its canaries at
+    /// the next hand-out, and a slot that stays dirty after its canaries pass. Mutants
+    /// seen red: `Book::set_aside` giving the permit back instead of making the slot
+    /// dirty (the dirty-set and count assertions); `first_passing` returning a slot
+    /// whose probe said aside (the lease runs on slot 0); `first_passing` skipping the
+    /// probe (slot 0 is handed out without its canaries).
+    #[test]
+    fn a_failed_canary_makes_the_slot_dirty_and_recovery_offers_it_with_its_canaries_run_again() {
+        use std::collections::BTreeSet;
+        use std::sync::{Arc, Mutex};
+
+        use super::super::book::{Backoff, Book, Cleaner, Slotted};
+        use super::super::clean::Outcome;
+
+        struct Stub(u32);
+        impl Slotted for Stub {
+            fn uid(&self) -> u32 {
+                700 + self.0
+            }
+        }
+
+        /// The book's slots offered to one lease; the canaries of `failing` fail.
+        struct BookOffer {
+            book: Arc<Book<Stub>>,
+            failing: Arc<Mutex<BTreeSet<usize>>>,
+            probed: Vec<usize>,
+        }
+
+        impl Offer for BookOffer {
+            type Slot = (usize, tokio::sync::OwnedSemaphorePermit);
+            type Err = String;
+
+            async fn next(&mut self) -> Result<Self::Slot, String> {
+                self.book.take().await
+            }
+
+            async fn probe(&mut self, slot: &Self::Slot) -> Result<Probe, String> {
+                self.probed.push(slot.0);
+                let bad = self.failing.lock().expect("failing").contains(&slot.0);
+                Ok(if bad {
+                    Probe::Aside(
+                        "canary write-outside ((deny file-write*)): NOT refused".to_owned(),
+                    )
+                } else {
+                    Probe::Pass
+                })
+            }
+
+            fn aside(&mut self, slot: Self::Slot, why: &str) {
+                self.book.set_aside(slot.0, slot.1, why);
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let cleaner: Cleaner<Stub> = Arc::new(|_: &Stub| Outcome::Clean);
+        let never = Backoff {
+            first: Duration::from_secs(3600),
+            max: Duration::from_secs(3600),
+        };
+        let book = Book::start(vec![Stub(0), Stub(1)], cleaner, never);
+        let failing = Arc::new(Mutex::new(BTreeSet::from([0_usize])));
+        let mut offer = BookOffer {
+            book: Arc::clone(&book),
+            failing: Arc::clone(&failing),
+            probed: Vec::new(),
+        };
+
+        // Slot 0 fails its canaries: dirty, uncounted; the lease runs on slot 1.
+        let (index, permit) = rt.block_on(first_passing(&mut offer)).expect("a slot");
+        assert_eq!(index, 1, "the lease takes the next slot");
+        assert_eq!(offer.probed, [0, 1]);
+        assert_eq!(book.dirty(), BTreeSet::from([0]));
+        assert_eq!(book.count(), 1, "a dirty slot is not counted");
+        book.held(index, permit).give();
+
+        // The recovery pass cleans slot 0 and frees it; its canaries run again at the next
+        // hand-out and fail again: dirty again, the lease runs on slot 1.
+        assert_eq!(book.retry(), 1);
+        assert_eq!(book.count(), 2);
+        offer.probed.clear();
+        let (index, permit) = rt.block_on(first_passing(&mut offer)).expect("a slot");
+        assert_eq!((index, offer.probed.clone()), (1, vec![0, 1]));
+        assert_eq!(book.dirty(), BTreeSet::from([0]));
+        book.held(index, permit).give();
+
+        // Its canaries pass now: recovered, probed once, handed out.
+        failing.lock().expect("failing").clear();
+        assert_eq!(book.retry(), 1);
+        offer.probed.clear();
+        let (index, permit) = rt.block_on(first_passing(&mut offer)).expect("a slot");
+        assert_eq!((index, offer.probed.clone()), (0, vec![0]));
+        assert!(book.dirty().is_empty());
+        book.held(index, permit).give();
+    }
 }

@@ -77,9 +77,10 @@
 //! keeper and the start-up are each "every process of the slot's uid"
 //! ([`kbf_daemon::uid`]), so the process-tree gaps below do not apply to it. A root
 //! daemon without a pool refuses to start. Between two leases the slot is cleaned
-//! ([`slots::clean`]): its home, folders, keychains, preferences, crontab, `at` jobs,
-//! disk images and IPC objects, checked after, with the user made again or the slot
-//! quarantined when the check fails. What the pool does not do yet: make simulators
+//! ([`slots::clean`]): its launchd domain, home, folders, keychains, preferences,
+//! crontab, `at` jobs, disk images, IPC objects and crash reports, in one pass, checked
+//! after; a slot whose clean fails is dirty (not offered, the node reports one slot
+//! fewer) and is cleaned again before it is offered. What the pool does not do yet: make simulators
 //! in the slot user's device set (a lease that asks for one fails).
 //!
 //! Known gaps, all of them closed only by running each lease as its own user:

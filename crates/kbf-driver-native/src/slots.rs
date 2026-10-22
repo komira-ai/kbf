@@ -11,9 +11,9 @@
 //!   once the lease has ended and the clean of its directory has run; the slot is
 //!   cleaned first ([`clean`]: its launchd domain, crontab, `at` jobs, processes, disk
 //!   images, System V IPC objects, home, `/var/folders` entry and files in the shared
-//!   temporary places), the clean is checked, the user is made again if the check
-//!   fails twice, and the slot is quarantined (the node reports one fewer) if that
-//!   fails too;
+//!   temporary places, crash reports), the clean is checked, and a clean that fails
+//!   leaves the slot dirty: not offered to a lease, the node reports one fewer, and it
+//!   is cleaned again before it is offered ([`book`]); the user is never made again;
 //! - its lease directory is the slot user's alone (mode 0700, from the moment it is made:
 //!   another pool user cannot read, list or connect into it, and the root of the leases is
 //!   searchable by others, `LEASES_ROOT_MODE`, so the slot user can reach it), and its
@@ -36,10 +36,10 @@
 //! ([`crate::procs`]); a pool there is refused.
 //!
 //! Not yet: the scheduler does not book slots (a lease past `N` waits here for a free
-//! one); a quarantined slot lowers the runtime's `action_slots` entry, which reaches
-//! the server with the driver's next report (the next Xcode survey, every
-//! `--xcode-recheck-secs`), not at once; and nothing drains and reboots a node with a
-//! quarantined slot (section 1 of the design).
+//! one); and nothing drains and reboots a node with a dirty slot (section 1 of the
+//! design). A dirty slot lowers the runtime's `action_slots` entry at once, through its
+//! own part of the driver watch ([`SOURCE`]), and a recovery thread cleans it again
+//! ([`book`]) with no Xcode survey and no lease needed.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -50,9 +50,19 @@ use crate::network::{Isolation, Network};
 use crate::record::KeeperFor;
 
 pub mod canary;
+// The bookkeeping and the clean's rules over text and a fake `launchctl` run on every
+// platform; only a Mac uses them outside tests.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod book;
 pub mod clean;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod crash;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod domain;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod probe;
 
 /// The lowest uid a pool user may have: every uid below it is root's, a system
 /// account's, or (from 501) one a Mac gives its first human users. The pool's uids
@@ -73,6 +83,10 @@ pub const LEASES_ROOT_MODE: u32 = 0o711;
 /// primary group and a Mac's default is 0755, so any other mode lets another slot read
 /// the lease's files, list them and connect to a socket in them.
 pub const LEASE_DIR_MODE: u32 = 0o700;
+
+/// The name of the slots' part of the daemon's driver watch: the `action_slots` entry,
+/// pushed whenever the number of free slots changes.
+pub const SOURCE: &str = "slots";
 
 /// The node report entry that says how many actions run at once.
 pub const CAPABILITY: &str = "action_slots";
@@ -330,13 +344,13 @@ impl Runner {
         }
     }
 
-    /// Sets the slot aside after a failed canary ([`macos::Slot::set_aside`]): not
-    /// offered, not counted, cleaned and canaried again at its next offer.
+    /// Marks the slot dirty after a failed canary ([`macos::Slot::set_aside`]): not
+    /// offered, not counted, cleaned again by the recovery thread.
     #[cfg(target_os = "macos")]
-    pub fn set_aside(self) {
+    pub fn set_aside(self, why: &str) {
         match self {
             Self::Daemon => {}
-            Self::Slot(slot) => slot.set_aside(),
+            Self::Slot(slot) => slot.set_aside(why),
         }
     }
 
