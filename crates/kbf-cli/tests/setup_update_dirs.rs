@@ -1,7 +1,7 @@
 //! The `kbf.toml` that `kbf-installer setup` writes for a node, read by `kbf` itself: the
-//! update client starts, so the node takes the orders the frontend sends, where without the
-//! two keys it updates by hand and ignores them (`kbf-node`'s update link). The installer's
-//! side (which modes get the keys, their values, the Keep rules) is its own tests'.
+//! node's update client is gone, but a host set up before that still carries the two keys,
+//! and `kbf` must keep accepting them (`kbf-node`'s retired flags). The installer's side
+//! (which modes get the keys, their values, the Keep rules) is its own tests'.
 
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt as _;
@@ -60,9 +60,9 @@ fn daemon(dir: &Path, text: &str) -> Box<kbf_node::Cli> {
     }
 }
 
-/// Catches a file whose keys `kbf` does not read as the installer's directories: the values
-/// `setup` writes for a Linux and a Mac node reach the daemon's `--update-dir` and
-/// `--orders-dir` as the layout's paths (the Debug of the parsed flags names them).
+/// Catches a file whose keys `kbf` refuses: the values `setup` writes for a Linux and a Mac
+/// node are still taken as the daemon's retired `--update-dir` and `--orders-dir` (the Debug
+/// of the parsed flags names them).
 ///
 /// Not run as a mutant: the key written with an underscore, which `kbf` refuses.
 #[test]
@@ -91,36 +91,4 @@ fn the_layouts_directories_reach_the_daemons_flags() {
             "{shown}"
         );
     }
-}
-
-/// Catches a node that still updates by hand: started on the file `setup` wrote, the node's
-/// update link has a client (it takes orders) and its order spool exists; started on a file
-/// without the keys, the link is the manual one and nothing is made. The first is the failure
-/// this change fixes.
-///
-/// Not run as a mutant: `setup` writing no keys (the first half's file is the second's).
-#[tokio::test]
-async fn a_node_started_on_the_written_file_takes_orders_and_one_without_does_not() {
-    let dir = scratch("link");
-    let (update, orders) = (
-        dir.path().join("installer"),
-        dir.path().join("installer/orders"),
-    );
-    let (update_s, orders_s) = (update.display().to_string(), orders.display().to_string());
-    let cli = daemon(
-        dir.path(),
-        &rendered(Some(UpdateDirs {
-            update_dir: &update_s,
-            orders_dir: &orders_s,
-        })),
-    );
-    let link = kbf_node::update::link(&cli).expect("link");
-    assert!(link.takes_orders());
-    assert!(orders.is_dir(), "the spool is made at the key's path");
-
-    let bare = scratch("link-bare");
-    let cli = daemon(bare.path(), &rendered(None));
-    let link = kbf_node::update::link(&cli).expect("link");
-    assert!(!link.takes_orders(), "no keys: the node updates by hand");
-    assert!(!bare.path().join("installer").exists());
 }
