@@ -76,7 +76,7 @@ impl Scheduler {
     /// The size key `operation` was given ([`Scheduler::set_size_key`]), if it has one.
     #[must_use]
     pub fn size_key(&self, operation: OperationId) -> Option<u64> {
-        self.ops.get(&operation)?.size_key
+        self.size_keys.get(&operation).copied()
     }
 
     /// The QoS level `operation` is queued at (raised when a more urgent caller joins).

@@ -98,20 +98,6 @@ struct Operation {
     /// ([`Scheduler::reclamp_key_floor`] undoes the raise when no live worker is large
     /// enough for it).
     key_applied: Option<KeyApplied>,
-    /// The key its kill-driven memory floor is kept under, fed by the caller
-    /// ([`Scheduler::set_size_key`]); `None` for an operation that has none. Not part of
-    /// the request: it is in no log record or row the scheduler writes.
-    size_key: Option<u64>,
-}
-
-impl Operation {
-    /// The key of the floor this operation is subject to: its size key, for a plain
-    /// `action` without GPUs. Other kinds book a share of the worker or all of it, not
-    /// a size learned from earlier runs.
-    fn floor_key(&self) -> Option<u64> {
-        self.size_key
-            .filter(|_| self.request.kind == LeaseKind::Action && self.request.resources.gpus == 0)
-    }
 }
 
 /// A memory raise a key floor made to a queued operation.
@@ -121,6 +107,9 @@ struct KeyApplied {
     base: u64,
     /// The memory the raise gave it.
     applied: u64,
+    /// The raise was taken back because no worker could take it without owning the worker
+    /// whole: the operation books what it asked for, and the floor does not raise it again.
+    undone: bool,
 }
 
 /// A queued operation no live worker can run: since when, why, and whether the wait
@@ -308,6 +297,9 @@ pub struct Scheduler {
     /// kills ([`memory`]). Boxed: most schedulers hold none, and the scheduler is
     /// moved by value.
     memory: Box<MemoryState>,
+    /// The size key of each operation the caller named one for ([`Scheduler::set_size_key`]),
+    /// until the operation is retired. Not in the request, the log or the `Eq` memory state.
+    size_keys: BTreeMap<OperationId, u64>,
     /// The rungs of an action's memory booking ([`memory`]).
     ladder: MemoryLadder,
     /// Workers a recovered scheduler holds leases for that have not registered yet, and
@@ -344,6 +336,7 @@ impl Scheduler {
             requeues: None,
             reservations: BTreeMap::new(),
             memory: Box::default(),
+            size_keys: BTreeMap::new(),
             ladder: MemoryLadder::default(),
             awaited: BTreeMap::new(),
             store_down: false,
@@ -404,6 +397,7 @@ impl Scheduler {
             self.finished.pop_front();
             self.ops.remove(&id);
             self.memory.forget(id);
+            self.size_keys.remove(&id);
         }
     }
 
@@ -459,7 +453,6 @@ impl Scheduler {
                 avoid: BTreeSet::new(),
                 queued_at: self.now,
                 key_applied: None,
-                size_key: None,
             },
         );
         Vec::new()
@@ -551,14 +544,20 @@ impl Scheduler {
         let mut servable = Servable::new(&self.workers, &self.cordons, now);
         let mut placed = Vec::new();
         let mut verdicts = Vec::new();
+        let mut stuck = Vec::new();
         let mut reserved = BTreeSet::new();
         let mut reservations = BTreeMap::new();
         for &(_, id) in &self.queue {
             let op = &self.ops[&id];
             let request = &op.request;
+            // A memory a key floor gave it never owns a worker whole while another could
+            // take it.
+            let key_raised = op
+                .key_applied
+                .is_some_and(|a| !a.undone && a.applied == request.resources.memory_bytes);
             let fitted = placed.len() < PLACEMENT_ROUND
                 && servable
-                    .fit(&mut self.workers, request, &reserved, &op.avoid)
+                    .fit(&mut self.workers, request, &reserved, &op.avoid, key_raised)
                     .map(|(name, booked, device)| placed.push((id, name, booked, device)))
                     .is_some();
             let verdict = if fitted {
@@ -580,9 +579,21 @@ impl Scheduler {
                 reserved.insert(name.clone());
                 reservations.insert(id, name);
             }
+            if !fitted
+                && key_raised
+                && verdict == Verdict::Servable
+                && !servable.roomy(&self.workers, request)
+            {
+                // Only a worker the raise would own whole is left: it books what it
+                // asked for before the floor instead.
+                stuck.push(id);
+            }
             if op.unservable.is_some() || verdict != Verdict::Servable {
                 verdicts.push((id, verdict));
             }
+        }
+        for id in stuck {
+            self.undo_key_raise(id);
         }
         self.reservations = reservations;
         for (id, verdict) in verdicts {

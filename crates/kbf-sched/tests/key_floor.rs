@@ -7,9 +7,7 @@ use std::time::Duration;
 
 use kbf_caps::NodeCaps;
 use kbf_sched::fence::LEASE_GRACE;
-use kbf_sched::{
-    DaemonInstance, Event, KeyFloor, OpState, Recovered, RecoveredLease, Request, Scheduler,
-};
+use kbf_sched::{DaemonInstance, Event, KeyFloor, Recovered, RecoveredLease, Request, Scheduler};
 use kbf_sim::SimRng;
 use kbf_types::{
     ActionKey, Digest, DigestFunction, Effect, Failure, FarmTime, LeaseKind, OperationId, Outcome,
@@ -108,13 +106,14 @@ impl Farm {
         assert!(self.feed(Event::Submit { waiter, request }).is_empty());
     }
 
-    /// [`Farm::submit`], then names `size_key` as the new operation's key, as the server
-    /// does once it has queued the operation.
+    /// [`Farm::submit`] of a request that starts a new operation, which is named `size_key`
+    /// before the submit is fed, as the server does: the first placement round sees it.
     fn submit_keyed(&mut self, waiter: u64, request: Request, size_key: u64) {
-        let before = self.s.next_operation();
+        assert!(self.s.twin(&request).is_none(), "joins a twin");
+        let next = self.s.next_operation();
+        self.s.set_size_key(next, size_key);
         self.submit(waiter, request);
-        assert_ne!(self.s.next_operation(), before, "joined a twin");
-        self.s.set_size_key(before, size_key);
+        assert_ne!(self.s.next_operation(), next);
     }
 
     /// A placement round: every `Start` it makes.
@@ -407,7 +406,11 @@ fn generated_farms_never_book_a_whole_host_from_a_key_floor() {
         let nodes = 1 + rng.below(3);
         let mut largest = 0;
         for i in 0..nodes {
-            let memory = 6 + rng.below(195);
+            let memory = if rng.below(2) == 0 {
+                [16, 32, 64][rng.below(3) as usize]
+            } else {
+                6 + rng.below(195)
+            };
             largest = largest.max(memory);
             f.node(&format!("n{i}"), 1 + rng.below(16), memory);
         }
@@ -439,77 +442,121 @@ fn generated_farms_never_book_a_whole_host_from_a_key_floor() {
                     "round {round}: {} >= {largest} GiB",
                     s.resources.memory_bytes / GIB
                 );
+                // And no worker is owned whole by it, whichever the farm placed it on.
+                let node = f.s.capacity(&s.worker).expect("its worker").memory_bytes;
+                assert!(
+                    s.resources.memory_bytes < node,
+                    "round {round}: {} GiB on a {} GiB worker",
+                    s.resources.memory_bytes / GIB,
+                    node / GIB
+                );
             }
         }
     }
     assert!(floors > 100, "the property is vacuous: {floors} floors");
 }
 
-/// Catches a floor raised for the successor to forget: after a leader change the
-/// successor, over the same rows, books the raise the first leader's lease ran under
-/// (the Start carried 16 GiB; a ledger that says 4 would book the lease's next kill from
-/// the wrong rung), and a queued operation is raised at its first round.
+/// A floor equal to a smaller worker's memory would book that worker whole: placement
+/// takes the larger worker instead (the smaller one wins every tie by name here), and
+/// with only the smaller one left to run on the operation books what it asked for.
 #[test]
-fn a_successor_books_the_raise_the_lease_ran_under() {
-    let mut f = farm_with_floor_16();
+fn a_key_floor_never_books_a_smaller_worker_whole() {
+    let mut f = Farm::new();
+    f.node("a-small", 8, 32);
+    f.node("b-big", 8, 64);
+    f.submit_keyed(1, request(1, 4 * GIB), KEY);
+    let first = only(f.tick());
+    let second = f.killed(&first);
+    let third = f.killed(&second);
+    assert_eq!(third.resources.memory_bytes, 32 * GIB);
+    assert!(f.end(&third, ok()).is_empty());
+    assert_eq!(f.s.key_floor(KEY), Some(32 * GIB));
+
+    f.submit_keyed(2, request(2, 4 * GIB), KEY);
+    let placed = only(f.tick());
+    assert_eq!(placed.resources.memory_bytes, 32 * GIB);
+    assert_eq!(
+        placed.worker,
+        w("b-big"),
+        "not the worker it would own whole"
+    );
+    assert!(f.end(&placed, ok()).is_empty());
+
+    // The larger worker is cordoned: the smaller cannot hold the raise without being
+    // owned whole, so the operation runs there as it asked.
+    f.feed(Event::Cordon { worker: w("b-big") });
+    f.submit_keyed(3, request(3, 4 * GIB), KEY);
+    assert!(f.tick().is_empty(), "the raise is taken back in this round");
+    let last = only(f.tick());
+    assert_eq!(last.worker, w("a-small"));
+    assert_eq!(last.resources.memory_bytes, 4 * GIB);
+}
+
+/// After a leader change a recovered lease books the request the store holds, not the
+/// key floor: a sibling's kill may have set the floor after the lease was granted, and
+/// the lease runs under its own limit. Its kill then steps the ladder from there and is
+/// part of the event that set the floor (the floor does not rise again), and a queued
+/// operation is raised at the successor's first round.
+#[test]
+fn a_recovered_lease_books_what_the_store_holds_and_its_kill_is_no_new_event() {
+    let mut f = Farm::new();
+    f.node("big", 8, 64);
+    f.submit_keyed(1, request(1, 4 * GIB), KEY);
     f.submit_keyed(2, request(2, 4 * GIB), KEY);
     f.submit_keyed(3, request(3, 4 * GIB), KEY);
     let running = f.tick();
-    assert_eq!(running.len(), 2);
-    assert!(running.iter().all(|s| s.resources.memory_bytes == 16 * GIB));
-    assert_eq!(f.s.booked(&w("big")).unwrap().memory_bytes, 32 * GIB);
+    assert_eq!(running.len(), 3);
+    assert!(running.iter().all(|s| s.resources.memory_bytes == 4 * GIB));
+    // A sibling's kill sets the floor after the others were granted.
+    let rerun = f.killed(&running[0]);
+    assert_eq!(rerun.resources.memory_bytes, 16 * GIB);
+    assert_eq!(f.s.key_floor(KEY), Some(16 * GIB));
 
-    // What the state store holds: the submitted requests, the lease of the first, the
-    // key floor.
-    let rows = vec![KeyFloor {
+    // What the state store holds: the submitted requests, the lease of the second, the
+    // key floor; the third is queued.
+    let mut successor = Scheduler::new(2);
+    successor.restore_key_floors(vec![KeyFloor {
         key: KEY,
         ask: 16 * GIB,
         stamp: 0,
-    }];
-    let mut successor = Scheduler::new(2);
-    successor.restore_key_floors(rows);
-    let held = &running[0];
-    let recovered = vec![
-        Recovered {
-            operation: held.operation,
-            request: request(2, 4 * GIB),
-            waiter: WaiterId(2),
-            lease: Some(RecoveredLease {
-                lease: held.lease,
-                worker: w("big"),
-            }),
-            losses: 0,
-            fate: None,
-        },
-        Recovered {
-            operation: running[1].operation,
-            request: request(3, 4 * GIB),
-            waiter: WaiterId(3),
-            lease: None,
-            losses: 0,
-            fate: None,
-        },
-    ];
-    successor.recover(7, OperationId(10), 20, recovered);
-    // The server names the keys again from its own rows.
+    }]);
+    let held = &running[1];
+    let recovered = |op: &StartLease, tag: u8, lease: bool| Recovered {
+        operation: op.operation,
+        request: request(tag, 4 * GIB),
+        waiter: WaiterId(u64::from(tag)),
+        lease: lease.then(|| RecoveredLease {
+            lease: op.lease,
+            worker: w("big"),
+        }),
+        losses: 0,
+        fate: None,
+    };
+    let queued = &running[2];
+    successor.recover(
+        7,
+        OperationId(10),
+        20,
+        vec![recovered(held, 2, true), recovered(queued, 3, false)],
+    );
     successor.set_size_key(held.operation, KEY);
-    successor.set_size_key(running[1].operation, KEY);
+    successor.set_size_key(queued.operation, KEY);
     let mut g = Farm::over(successor);
     g.node("big", 8, 64);
     assert_eq!(
         g.s.booked(&w("big")).unwrap().memory_bytes,
-        16 * GIB,
-        "the adopted lease books what it ran under"
+        4 * GIB,
+        "the adopted lease books its stored request"
     );
     g.heartbeat("big", &[held]);
     let next = only(g.tick());
-    assert_eq!(next.operation, running[1].operation);
+    assert_eq!(next.operation, queued.operation);
     assert_eq!(next.resources.memory_bytes, 16 * GIB);
-    assert_eq!(
-        g.s.state(held.operation)
-            .map(|s| matches!(s, OpState::Leased { .. })),
-        Some(true)
-    );
+
+    // The adopted lease is killed at its own limit: one rung up, the floor unchanged.
+    let again = g.killed(held);
+    assert_eq!(again.resources.memory_bytes, 16 * GIB);
+    assert_eq!(g.s.key_floor(KEY), Some(16 * GIB));
 }
 
 /// Catches a key floor missing from the value two schedulers are compared by, and one
