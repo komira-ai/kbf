@@ -98,7 +98,7 @@ Freshness: **static** (loaded once) or **refresh N** (`?refresh=N`, 3.1). All pa
 | Log | `/ui/runs/{run_id}/logs/{stream}` | The last 1 MiB of a log (`?from=start`: the first) as escaped text (controls and bidi marks inert), a note that names the end shown when the log is cut, a link to the other end, link to the attachment download, one-line "unredacted" note | `/v1/runs/{id}/logs/{stream}` (one suffix-range read, or one span read for `?from=start`) | static | **built**; reads the log route only, not `/v1/blobs/{digest}`; the Action page links each attempt's logs |
 | Targets | `/ui/targets` | Shapes and tests, filter by status, each with a strip of its latest outcomes | `/v1/tests`, `/v1/grid` | static | **built** (1.2); needs `--history-objects` |
 | Target | `/ui/targets/{key}` | A target's recent runs (last 16) as a pass/fail strip, oldest left, each cell a link to its run; the server's label | `/v1/shapes/{key}`, `/v1/grid` | static | **built** (1.2); the strip is the last builds, not `/runs` |
-| Nodes | `/ui/nodes` | Connected, placement, phase, software, update state, `needs_attention`, lease count, booked | `/v1/nodes` | opt-in refresh | **built** |
+| Nodes | `/ui/nodes` | Connected, placement, phase, software, `needs_attention`, lease count, booked | `/v1/nodes` | opt-in refresh | **built** |
 | Node | `/ui/nodes/{id}` | Capacity, booked, free, leases, recent failed runs (today only) | `/v1/nodes/{id}` | opt-in refresh | **built**; no recent failed runs |
 | Leases | `/ui/leases` | Lease, node, age, phase, operation | `/v1/leases` | static | **built**; `?node=` filter |
 | Queue | `/ui/queue` | Depth, oldest age, per platform and QoS, why nothing can run it | `/v1/queue` | static | **built** |

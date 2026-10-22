@@ -46,7 +46,6 @@ fn the_list_shows_each_node_with_its_state_leases_and_booking() {
         "<span class=\"pill pending\">draining</span>",
         "<span class=\"pill ok\">serving</span>",
         "macOS 15.1, daemon 0.1.0",
-        "up to date, step confirmed",
         "<td>7</td>",
         "3500 mCPU, 2.0 GiB, 1 GPU, 4 VM",
         "<td>none</td>",
@@ -65,7 +64,6 @@ fn the_list_shows_each_node_with_its_state_leases_and_booking() {
         ),
         &format!("<span class=\"pill pending\">{}</span>", escape(HOSTILE)),
         &format!("<li>{}</li>", escape(HOSTILE)),
-        &format!("not judged, step {}", escape(HOSTILE)),
         "<td>1</td>",
         "500 mCPU",
     ] {
@@ -75,7 +73,7 @@ fn the_list_shows_each_node_with_its_state_leases_and_booking() {
 }
 
 /// Catches: markup from a node's strings (its id, software, attention items, phase
-/// reason, update state) written as markup on either page (mutant: `Html::text` writing
+/// reason) written as markup on either page (mutant: `Html::text` writing
 /// raw), and a node id not encoded as one path segment in its link and in the route read.
 #[test]
 fn hostile_node_strings_render_as_text() {
@@ -135,17 +133,13 @@ fn an_empty_list_says_so_and_both_pages_say_the_list_is_in_memory() {
 }
 
 /// Catches: an absent value shown as a value: software never reported is "not
-/// reported", an update verdict the server cannot give is "not judged", with its
-/// availability, never "up to date".
+/// reported".
 #[test]
-fn absent_software_and_update_verdicts_are_not_guessed() {
+fn absent_software_is_not_guessed() {
     let mut node = fleet_node("old-1", "serving", 0, 0);
     node["software"] = serde_json::Value::Null;
-    node["update"] = json!({"state": null, "up_to_date": null, "availability": "unsupported"});
     let (_, html) = page(&list_of(&[node]), "/ui/nodes");
     assert!(html.contains("<td>not reported</td>"), "{html}");
-    assert!(html.contains("<td>not judged (unsupported)</td>"), "{html}");
-    assert!(!html.contains("up to date"), "{html}");
 }
 
 /// Catches: the detail reading a route but `/v1/nodes/{id}`; capacity, booked and free
