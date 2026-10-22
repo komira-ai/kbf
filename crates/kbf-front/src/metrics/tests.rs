@@ -263,6 +263,7 @@ fn every_family_is_printed_once_with_its_type() {
             "kbf_sched_queued gauge",
             "kbf_sched_leases gauge",
             "kbf_estimator_shadow_total counter",
+            "kbf_estimator_shadow_skipped_total counter",
             "kbf_frontend_relay_untraced gauge",
             "kbf_handover_relayed_total counter",
             "kbf_handover_relays_open gauge",
@@ -417,4 +418,13 @@ fn the_shadow_totals_print_each_level_and_bucket_under_its_own_label() {
     assert!(rows.contains(&r#"kbf_estimator_shadow_total{level="none",bucket="cold"} 3"#));
     assert!(rows.contains(&r#"kbf_estimator_shadow_total{level="l1",bucket="covered"} 0"#));
     assert!(rows.contains(&r#"kbf_estimator_shadow_total{level="l2",bucket="censored"} 0"#));
+    m.estimator_shadow.set_skipped(1, 4);
+    m.estimator_shadow.set_skipped(99, 1);
+    assert_eq!(m.estimator_shadow.skipped(1), 4);
+    assert_eq!(m.estimator_shadow.skipped(99), 0);
+    let text = m.render();
+    let skips = lines(&text, "kbf_estimator_shadow_skipped_total{");
+    assert_eq!(skips.len(), SHADOW_SKIPS.len());
+    assert!(skips.contains(&r#"kbf_estimator_shadow_skipped_total{reason="no_os"} 4"#));
+    assert!(skips.contains(&r#"kbf_estimator_shadow_skipped_total{reason="kind"} 0"#));
 }

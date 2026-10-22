@@ -52,9 +52,9 @@
 //!   process serves the node as the operator left it;
 //! - `est/<instance>/<platform>/<basis>/<shape>/<cfg>`: one size summary of the learned-sizes
 //!   shadow ([`crate::learned`]): a version byte and the estimator's own checksummed row.
-//!   A summary an own-limit kill changed is written in the transaction of the requeue the
-//!   kill causes, as a floor is; the rest is written behind, in batches, and a sweep deletes
-//!   the stale. Read only when the shadow is on;
+//!   Never in the transaction of a requeue or a finish: a summary an own-limit kill changed
+//!   is written right after it, best effort, and the rest is written behind, in batches;
+//!   a sweep deletes the stale. Read only when the shadow is on;
 //! - `meta/epoch`, `meta/next_op`, `meta/next_seq`: the store incarnation and the first
 //!   operation id and lease sequence no earlier start used;
 //! - `meta/generation`: the writer generation ([`kbf_state::Fenced`]); every write of the
@@ -110,6 +110,9 @@ const CORDON: &str = "cordon/";
 const FATE: &str = "fate/";
 const FLOOR: &str = "floor/";
 const ESTIMATE: &str = "est/";
+/// Rows of one transaction of the size sweep, and the most transactions of one call.
+pub(super) const SWEEP_ROWS: usize = 256;
+pub(super) const SWEEP_TXNS: usize = 4;
 const SUBJECT: &str = "subject/";
 
 /// The least time a `done/` row is kept, whatever the finished retention: a process that
@@ -551,9 +554,11 @@ impl Durable {
 
     /// Deletes the size summaries idle past [`kbf_estimator::STALE_DAYS`] on `today`,
     /// and strips the samples from those that hold a floor, as the estimator itself
-    /// does in memory. Returns how many rows it changed.
-    pub(super) fn sweep_estimates(&self, today: Day) -> Result<usize, StateError> {
-        let mut changed = 0;
+    /// does in memory. At most [`SWEEP_TXNS`] transactions of [`SWEEP_ROWS`] rows are
+    /// committed per call. Returns how many rows it changed and whether more are left
+    /// for another call. A transaction the store refuses is logged and the rest go on.
+    pub(super) fn sweep_estimates(&self, today: Day) -> Result<(usize, bool), StateError> {
+        let mut changes = Vec::new();
         for (name, row) in self.store.scan_prefix(ESTIMATE)? {
             let Some((key, summary)) = estimate::decode(&name, &row.value) else {
                 continue;
@@ -563,20 +568,30 @@ impl Durable {
                 continue;
             }
             held.expire(today);
-            let txn = Txn::new();
-            let txn = match held.get(&key) {
-                None => txn.delete(name, Cond::Version(row.version)),
-                Some(kept) if kept.encode() != summary => txn.put(
-                    name,
-                    estimate::encode(&kept.encode()),
-                    Cond::Version(row.version),
-                ),
-                Some(_) => continue,
-            };
-            self.commit(txn)?;
-            changed += 1;
+            match held.get(&key) {
+                None => changes.push((name, None, row.version)),
+                Some(kept) if kept.encode() != summary => {
+                    changes.push((name, Some(estimate::encode(&kept.encode())), row.version));
+                }
+                Some(_) => {}
+            }
         }
-        Ok(changed)
+        let more = changes.len() > SWEEP_TXNS * SWEEP_ROWS;
+        let mut changed = 0;
+        for chunk in changes.chunks(SWEEP_ROWS).take(SWEEP_TXNS) {
+            let mut txn = Txn::new();
+            for (name, value, version) in chunk {
+                txn = match value {
+                    None => txn.delete(name.clone(), Cond::Version(*version)),
+                    Some(value) => txn.put(name.clone(), value.clone(), Cond::Version(*version)),
+                };
+            }
+            match self.commit(txn) {
+                Ok(()) => changed += chunk.len(),
+                Err(error) => tracing::warn!(%error, "a batch of size summaries was not swept"),
+            }
+        }
+        Ok((changed, more))
     }
 
     /// The nodes an operator placed.
@@ -720,13 +735,8 @@ impl Durable {
         losses: Option<u32>,
         fate: Option<&Fate>,
         floors: &FloorChange,
-        estimates: &[Row],
     ) -> Result<(), StateError> {
         let mut txn = Txn::new();
-        // Like the floor, the summaries a kill changed outlive the operation.
-        for (key, summary) in estimates {
-            txn = txn.put(estimate::row_key(key), estimate::encode(summary), Cond::Any);
-        }
         // The floor outlives the operation: a kill raises it, and the operation may end
         // before the write is taken.
         let raised = floors.raised.as_ref();
@@ -745,7 +755,7 @@ impl Durable {
             txn = txn.delete(floor::row_key(key), Cond::Any);
         }
         if self.store.get(&op_key(requeue.operation))?.is_none() {
-            return if raised.is_some() || !floors.evicted.is_empty() || !estimates.is_empty() {
+            return if raised.is_some() || !floors.evicted.is_empty() {
                 self.commit(txn)
             } else {
                 Ok(())
@@ -1159,6 +1169,8 @@ impl State {
     /// a requeue the store missed is made up before the grant that follows it, or that
     /// grant is refused and the operation never runs.
     pub(super) fn settle_requeues(&mut self, given_up: &[Requeue]) {
+        // What the kills among them taught the estimator, written once the requeues are.
+        let mut kills = Vec::new();
         for requeue in given_up {
             // A grant the store has not taken for a lease the scheduler has given up
             // is never written: it would put the lease back in the store, held by no
@@ -1181,20 +1193,20 @@ impl State {
             } else {
                 FloorChange::default()
             };
-            let estimates = self.learned_requeue(requeue);
-            self.unsettled
-                .push((requeue.clone(), losses, fate, floors, estimates));
+            kills.extend(self.learned_requeue(requeue));
+            self.unsettled.push((requeue.clone(), losses, fate, floors));
         }
         let pending = std::mem::take(&mut self.unsettled);
         let refused: Vec<_> = pending
             .into_iter()
-            .filter(|(requeue, losses, fate, floors, estimates)| {
+            .filter(|(requeue, losses, fate, floors)| {
                 !self.durably("a requeue", |d| {
-                    d.requeued(requeue, *losses, fate.as_ref(), floors, estimates)
+                    d.requeued(requeue, *losses, fate.as_ref(), floors)
                 })
             })
             .collect();
         self.unsettled = refused;
+        self.write_estimates(&kills);
     }
 
     /// Renews `worker`'s session row if its last write is a renewal interval old: one

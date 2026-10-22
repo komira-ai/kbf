@@ -11,7 +11,9 @@
 //! names its instrument (`basis`); a run with none, or whose daemon predates the tag, is
 //! counted as skipped and teaches nothing. Only `LeaseKind::Action` leases with no GPU
 //! are shown, and only when the request's `needs` pin the OS (the key's platform class
-//! would otherwise be a guess).
+//! would otherwise be a guess). An own-limit kill that carries no usage still counts: its
+//! basis is its node's OS and its peak the limit it died at. An operation whose subject
+//! was lost (restored from a row written without one) has no key.
 //!
 //! # The buckets
 //!
@@ -36,11 +38,14 @@
 //! # State
 //!
 //! The summaries live in memory and in the state store, one `est/` row per key (a version
-//! byte, then the estimator's own checksummed row). A summary that gained a floor or a
-//! raise-only window by an own-limit kill is written in the transaction of the requeue
-//! that kill causes, as a digest floor is. The rest is written behind: dirty keys are
-//! batched every few seconds, and an hourly sweep drops the rows (and the samples) the
-//! estimator calls stale. Time is the farm's: the day of a result is the wall time the
+//! byte, then the estimator's own checksummed row). They are never part of a requeue's
+//! transaction: an error of the estimator's rows must not change what the scheduler
+//! does. A summary an own-limit kill changed is written right after the requeue (or the
+//! final failure) commits, on a best-effort basis: a refused write is logged, never
+//! retried into the requeue, and the key is written again with its newest summary by the
+//! write-behind; only a crash in that window loses the kill's floor. The rest is written
+//! behind: dirty keys are batched every few seconds, and an hourly sweep, a few hundred
+//! rows at a tick, drops the rows (and the samples) the estimator calls stale. Time is the farm's: the day of a result is the wall time the
 //! farm was built at plus its [`FarmTime`], never a clock read here, and it never runs
 //! backward.
 //!
@@ -48,6 +53,7 @@
 //! wrote, untouched, and a later `shadow` takes it up again.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
 use kbf_estimator::{
     Basis, Bounds, Cfg, Day, Estimate, Fallback, Hint, Instance, Key, Level, Outcome as RunOutcome,
@@ -57,7 +63,9 @@ use kbf_front::metrics::{ShadowBucket, ShadowLevel, ShadowTotals};
 use kbf_invocation::{BookSource, Evidence, RunUsage, UsageBasis};
 use kbf_types::{Failure, FarmTime, LeaseId, LeaseKind, Outcome, StartLease};
 
-use crate::action_usage::Subject;
+use kbf_front::Described;
+
+use crate::action_usage::{ShapeKey, Subject};
 use crate::machine::Platform;
 
 /// What `--learned-sizes` does with the estimator.
@@ -108,6 +116,9 @@ pub enum Skip {
     NoBooking,
     /// The run carried no usage, or its daemon did not say which instrument measured it.
     NoBasis,
+    /// The operation's subject is unknown (restored from a row that kept none), so every
+    /// such action would share one key.
+    NoSubject,
 }
 
 /// A summary's row, as the state store keeps it.
@@ -129,6 +140,8 @@ pub struct Learned {
     calls: u64,
     flushed: FarmTime,
     swept: Option<FarmTime>,
+    /// A sweep of the store that has more to do at the next tick, for this day.
+    sweeping: Option<Day>,
 }
 
 impl Learned {
@@ -150,6 +163,7 @@ impl Learned {
             calls: 0,
             flushed: FarmTime::default(),
             swept: None,
+            sweeping: None,
         }
     }
 
@@ -277,13 +291,19 @@ impl Learned {
 
     /// The scheduler has answered the report of `lease`: if it took it, the staged
     /// attempt is observed; if not, it is dropped.
-    pub fn finish(&mut self, lease: LeaseId, taken: bool, bounds: &Bounds) {
+    ///
+    /// Returns the rows of the summaries an own-limit kill changed (a kill that ended the
+    /// operation, with no requeue), for the caller to write at once.
+    pub fn finish(&mut self, lease: LeaseId, taken: bool, bounds: &Bounds) -> Vec<Row> {
         self.forget(lease);
-        if let Some(attempt) = self.staged.remove(&lease)
-            && taken
-        {
-            self.observe(&attempt, bounds);
+        let Some(attempt) = self.staged.remove(&lease).filter(|_| taken) else {
+            return Vec::new();
+        };
+        self.observe(&attempt, bounds);
+        if attempt.run.outcome != RunOutcome::OwnLimitKill {
+            return Vec::new();
         }
+        self.rows_of(BTreeSet::from([attempt.key.clone(), attempt.key.l2()]))
     }
 
     /// Shows the estimator `attempt`: asks it first what it would have booked, then
@@ -335,6 +355,9 @@ impl Learned {
 
     /// Copies the tally into the scrape.
     pub fn publish(&self, totals: &ShadowTotals) {
+        for skip in SKIPS {
+            totals.set_skipped(skip as usize, self.skipped(skip));
+        }
         for (l, level) in LEVELS.into_iter().enumerate() {
             for (b, bucket) in BUCKETS.into_iter().enumerate() {
                 totals.set(level, bucket, self.tally[l][b]);
@@ -381,12 +404,15 @@ impl Learned {
         self.dirty.extend(rows.iter().map(|(key, _)| key.clone()));
     }
 
-    /// The day to sweep stale rows of the store for, if a sweep is due (an hour after
-    /// the last; the first look only starts the hour). Drops the stale summaries from
-    /// memory when it is.
+    /// The day to sweep stale rows of the store for, if a sweep is due (an hour after the
+    /// last; the first look only starts the hour) or one is still going. Drops the stale
+    /// summaries from memory when a new one starts.
     pub fn sweep_due(&mut self) -> Option<Day> {
         if self.off() {
             return None;
+        }
+        if self.sweeping.is_some() {
+            return self.sweeping;
         }
         let due = self
             .swept
@@ -398,10 +424,25 @@ impl Learned {
         self.swept = Some(self.now);
         let day = self.day();
         self.summaries.expire(day);
+        self.sweeping = Some(day);
         Some(day)
+    }
+
+    /// The sweep for [`Learned::sweep_due`]'s day: `more` it has left for the next tick.
+    pub fn swept(&mut self, more: bool) {
+        if !more {
+            self.sweeping = None;
+        }
     }
 }
 
+const SKIPS: [Skip; 5] = [
+    Skip::Kind,
+    Skip::NoOs,
+    Skip::NoBooking,
+    Skip::NoBasis,
+    Skip::NoSubject,
+];
 const LEVELS: [ShadowLevel; 3] = [ShadowLevel::L1, ShadowLevel::L2, ShadowLevel::None];
 const BUCKETS: [ShadowBucket; 4] = [
     ShadowBucket::Covered,
@@ -462,12 +503,19 @@ pub fn basis_of_os(os_family: &str) -> Option<Basis> {
 }
 
 /// The estimator's key for an action of `instance` described by `subject`, to run on
-/// `platform` and be measured with `basis`. `None` when the request's `needs` do not pin
-/// the OS.
-#[must_use]
-pub fn key_of(instance: &str, platform: &Platform, basis: Basis, subject: &Subject) -> Option<Key> {
+/// `platform` and be measured with `basis`; why not when the request's `needs` do not pin
+/// the OS, or its subject is unknown.
+pub fn key_of(
+    instance: &str,
+    platform: &Platform,
+    basis: Basis,
+    subject: &Subject,
+) -> Result<Key, Skip> {
     if platform.os_family == "-" {
-        return None;
+        return Err(Skip::NoOs);
+    }
+    if subject.key == *UNKNOWN_SUBJECT {
+        return Err(Skip::NoSubject);
     }
     let class = if platform.isa == "-" {
         platform.os_family.to_owned()
@@ -479,13 +527,34 @@ pub fn key_of(instance: &str, platform: &Platform, basis: Basis, subject: &Subje
         .as_deref()
         .filter(|c| !c.is_empty() && *c != "-")
         .map(|c| Cfg(cfg_hash(c)));
-    Some(Key::new(
+    Ok(Key::new(
         Instance::new(instance),
         PlatformClass::new(class),
         basis,
         Shape(u64::from_be_bytes(subject.key.bytes())),
         cfg,
     ))
+}
+
+/// The shape key of an action described by nothing: what an operation restored from a
+/// row that kept no subject is given.
+static UNKNOWN_SUBJECT: LazyLock<ShapeKey> =
+    LazyLock::new(|| Subject::of(Described::default()).0.key);
+
+/// The run of an own-limit kill that carried no usage: it died at its limit.
+#[must_use]
+pub fn kill_run(booked: u64) -> Run {
+    Run {
+        outcome: RunOutcome::OwnLimitKill,
+        wall_us: 0,
+        peak_memory_bytes: None,
+        booked_memory_bytes: booked,
+        raised_memory_bytes: None,
+        limit_hits: 0,
+        swap_peak_bytes: 0,
+        cpu_usage_us: 0,
+        node_cpu_pressure_permille: None,
+    }
 }
 
 /// The estimator's view of a finished attempt: how it ended, what its usage block says

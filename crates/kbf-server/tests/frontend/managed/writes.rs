@@ -91,6 +91,11 @@ struct Swap {
 
 impl Swap {
     async fn start(name: &str) -> Swap {
+        Self::start_with(name, &[]).await
+    }
+
+    /// A swap whose two children also take `extra` flags.
+    async fn start_with(name: &str, extra: &[&str]) -> Swap {
         let node = Node::start().await;
         let base = shared();
         let scratch = Scratch::new(name);
@@ -101,14 +106,28 @@ impl Swap {
         let b_store = Arc::new(RecordingStore::new(Arc::clone(&base) as Arc<dyn Store>));
         let (stop_a, stopped_a) = oneshot::channel();
         let (a, a_serving) = child_until(
-            &managed_flags(&node, &[&token, &history("history-a")]),
+            &managed_flags(
+                &node,
+                &[&[token.as_str(), history("history-a").as_str()], extra].concat(),
+            ),
             a_store.clone(),
             stopped_a,
         )
         .await;
         let (stop_b, stopped_b) = oneshot::channel();
         let (b, b_serving) = child_until(
-            &managed_flags(&node, &["--await-takeover", &token, &history("history-b")]),
+            &managed_flags(
+                &node,
+                &[
+                    &[
+                        "--await-takeover",
+                        token.as_str(),
+                        history("history-b").as_str(),
+                    ],
+                    extra,
+                ]
+                .concat(),
+            ),
             b_store.clone(),
             stopped_b,
         )
@@ -353,4 +372,81 @@ async fn the_next_generation_reads_the_history_of_both_children_as_one() {
         .await
         .expect("a list");
     assert_eq!(listed.items.len(), 1, "the build is listed once");
+}
+
+/// With the size shadow on, a kill's summary row is written by the child that holds the
+/// generation, and the table names the `est/` family: the row is classified, fenced, and
+/// refused once the generation has moved, like every other row of the scheduler.
+///
+/// Catches: a key the table does not name (the shadow's rows would panic every check that
+/// asks for a key's family), a size row committed by the old child after the takeover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn size_rows_are_a_fenced_family_the_old_child_cannot_write_after_a_takeover() {
+    use kbf_proto::worker::{CgroupUsage, MemoryKill, ResourceUsage, UsageBasis};
+    let mut swap = Swap::start_with("size-rows", &["--learned-sizes=shadow"]).await;
+    let worker = Child::worker_of(&swap.a.role().await).expect("a worker listener");
+    let client = Client::connect(swap.a.reapi, worker).await;
+    let mut daemon = client.daemon("node-size", 4, 64).await;
+    let job = Job::new("compile for the size rows", &[("OSFamily", "linux")]);
+    client.upload(&job.blobs()).await;
+    let ops = execute_as_build(&client, &job).await;
+    let start = daemon.start().await;
+    let usage = ResourceUsage {
+        wall_micros: 2_000_000,
+        basis: UsageBasis::Cgroup as i32,
+        cgroup: Some(CgroupUsage {
+            memory_peak_bytes: Some(5 << 30),
+            ..CgroupUsage::default()
+        }),
+        ..ResourceUsage::default()
+    };
+    let result = kbf_proto::worker::Result {
+        lease_id: start.lease_id,
+        status: Some(kbf_proto::google::rpc::Status {
+            code: tonic::Code::ResourceExhausted as i32,
+            message: "memory".to_owned(),
+            details: Vec::new(),
+        }),
+        action_result: Some(kbf_proto::reapi::ActionResult {
+            execution_metadata: Some(kbf_proto::reapi::ExecutedActionMetadata {
+                auxiliary_metadata: vec![usage.to_any()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        memory_kill: MemoryKill::OwnLimit as i32,
+        ..Default::default()
+    };
+    assert!(daemon.report(result).await.accepted);
+    let root = IndexRoot::default();
+    let writes = swap.a_store.writes();
+    let size: Vec<_> = writes
+        .iter()
+        .filter(|w| w.key.starts_with("est/"))
+        .collect();
+    assert!(
+        size.iter().any(|w| w.committed),
+        "the kill's summary was written: {writes:?}"
+    );
+    for write in &size {
+        let kind = classify(&write.key, &root).expect("the table names the size rows");
+        assert_eq!(kind.rule, Rule::Fenced, "{}", write.key);
+    }
+
+    // The build's caller and the node let go, as the swap's other tests' do, so A can stop.
+    drop((ops, daemon, client));
+    swap.take_over().await;
+    swap.stop_a().await;
+    for (key, _) in swap.base.scan_prefix("").expect("scan") {
+        assert!(classify(&key, &root).is_some(), "{key} is of no family");
+    }
+    assert!(
+        swap.a_store
+            .writes()
+            .iter()
+            .filter(|w| w.key.starts_with("est/"))
+            .all(|w| !w.committed),
+        "the old child wrote a size row after the takeover"
+    );
+    swap.stop_b().await;
 }

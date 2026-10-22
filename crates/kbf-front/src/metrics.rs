@@ -400,21 +400,41 @@ const SHADOW_BUCKETS: [(ShadowBucket, &str); 4] = [
     (ShadowBucket::Cold, "cold"),
 ];
 
-/// One count for each level and bucket the shadow reports, set by the owner of the tally
-/// each time it publishes.
+/// Why the shadow did not show an attempt or an operation to the estimator, as the label
+/// of `kbf_estimator_shadow_skipped_total` spells it.
+pub const SHADOW_SKIPS: [&str; 5] = ["kind", "no_os", "no_booking", "no_basis", "no_subject"];
+
+/// One count for each level and bucket the shadow reports, and for each reason it skipped
+/// something, set by the owner of the tally each time it publishes.
 #[derive(Debug, Default)]
-pub struct ShadowTotals([[Level; 4]; 3]);
+pub struct ShadowTotals {
+    buckets: [[Level; 4]; 3],
+    skipped: [Level; 5],
+}
 
 impl ShadowTotals {
+    /// Sets the count of the skips of reason number `reason` ([`SHADOW_SKIPS`]).
+    pub fn set_skipped(&self, reason: usize, total: u64) {
+        if let Some(level) = self.skipped.get(reason) {
+            level.set(total);
+        }
+    }
+
+    /// The count of the skips of reason number `reason`.
+    #[must_use]
+    pub fn skipped(&self, reason: usize) -> u64 {
+        self.skipped.get(reason).map_or(0, Level::get)
+    }
+
     /// Sets the count of `level` and `bucket`.
     pub fn set(&self, level: ShadowLevel, bucket: ShadowBucket, total: u64) {
-        self.0[level as usize][bucket as usize].set(total);
+        self.buckets[level as usize][bucket as usize].set(total);
     }
 
     /// The count of `level` and `bucket`.
     #[must_use]
     pub fn get(&self, level: ShadowLevel, bucket: ShadowBucket) -> u64 {
-        self.0[level as usize][bucket as usize].get()
+        self.buckets[level as usize][bucket as usize].get()
     }
 
     fn render(&self, out: &mut Families) {
@@ -433,6 +453,19 @@ impl ShadowTotals {
                     self.get(level, bucket)
                 );
             }
+        }
+        let name = "kbf_estimator_shadow_skipped_total";
+        out.head(
+            name,
+            "counter",
+            "Attempts and operations the learned-sizes shadow did not show the estimator, by why",
+        );
+        for (reason, label) in SHADOW_SKIPS.iter().enumerate() {
+            let _ = writeln!(
+                out.0,
+                "{name}{{reason=\"{label}\"}} {}",
+                self.skipped(reason)
+            );
         }
     }
 }

@@ -1,5 +1,5 @@
 //! The server's shadow (`kbf_server::learned`) and the replay learn from the same
-//! ordered records and answer alike (M8c). The server hears of an attempt as its result
+//! ordered records and answer alike. The server hears of an attempt as its result
 //! commits and builds the estimator's `Run` from the lease's usage block; the replay
 //! builds it from the exported row. This test feeds both the same attempts, in the order
 //! their results committed (by end time), and holds their estimates and floors equal
@@ -245,13 +245,13 @@ fn keys(recs: &[Rec]) -> Vec<Key> {
     keys
 }
 
-/// Catches (M8c): the server's adapter and the replay's reading one record two ways: a
+/// Catches: the server's adapter and the replay's reading one record two ways: a
 /// different key (instance, platform, basis, shape or configuration hash), a different
 /// run (outcome, peak, wall time, booking, raise), or a different clock, so that the
-/// estimator answers differently for the same history; and, by the second half, a test
-/// that could not tell the order results commit in from the order operations were
-/// queued in (a learner that listened at submit would have heard the same records in
-/// another order, and answered differently for some key after some record).
+/// estimator answers differently for the same history. The second half shows the history
+/// is sensitive to order: the same records heard in queue order leave a different stored
+/// summary. (That the farm itself hears results in commit order is held by
+/// `learned_sizes.rs` in kbf-server, through a daemon.)
 #[test]
 fn the_server_and_the_replay_answer_alike_for_the_same_ordered_records() {
     let recs = history();
@@ -317,6 +317,17 @@ fn the_keys_of_the_two_sides_agree_and_separate_what_they_must() {
     let rec = &history()[0];
     let server = server_attempt(rec).key;
     assert_eq!(Some(server.clone()), key_of(&rec.row()));
+    // An empty configuration is no configuration on both sides.
+    let empty = Rec {
+        cfg: "",
+        ..rec.clone()
+    };
+    let none = Rec {
+        cfg: "-",
+        ..rec.clone()
+    };
+    assert_eq!(key_of(&empty.row()), key_of(&none.row()));
+    assert_eq!(server_attempt(&empty).key, server_attempt(&none).key);
     let other = Rec {
         instance: "elsewhere",
         ..rec.clone()
@@ -334,13 +345,13 @@ fn the_keys_of_the_two_sides_agree_and_separate_what_they_must() {
         isa: "arm64".to_owned(),
     };
     let on_arm = kbf_server::learned::key_of(rec.instance, &arm, Basis::Cgroup, &subject);
-    assert_ne!(on_arm, Some(server));
+    assert_ne!(on_arm, Ok(server));
     let unpinned = Platform {
         os_family: "-",
         isa: "-".to_owned(),
     };
     assert_eq!(
         kbf_server::learned::key_of(rec.instance, &unpinned, Basis::Cgroup, &subject),
-        None
+        Err(kbf_server::learned::Skip::NoOs)
     );
 }

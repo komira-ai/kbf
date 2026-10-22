@@ -81,7 +81,7 @@ use self::durable::Durable;
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
 use crate::fleet::{NodeView, SoftwareView, attention_changes};
-use crate::learned::{Learned, LearnedSizes, Row};
+use crate::learned::{Learned, LearnedSizes};
 use crate::machine::{FarmMachine, Platform, Sent, Waiter};
 use crate::memory;
 use crate::missing;
@@ -276,7 +276,7 @@ struct State {
     /// Until it has, it still holds the lease and no queue row for the operation, so
     /// every one is written again before anything that follows it is
     /// ([`State::log_requeues`]).
-    unsettled: Vec<Unsettled>,
+    unsettled: Vec<(Requeue, Option<u32>, Option<Fate>, FloorChange)>,
     /// The effects of committed records whose rows the state store has not taken, one
     /// batch per record, oldest first. A batch leaves only when the store has taken every
     /// row of it, in order, and nothing is carried out (no `Start`, no answer) before its
@@ -336,10 +336,6 @@ struct Settled {
     /// stream to send it on ([`State::owed`]).
     ack: Option<(Outbound, ResultAck)>,
 }
-
-/// A lease given up, with what its requeue writes besides the queue row: the loss count,
-/// the fate, the floor change and the size summaries a kill changed.
-type Unsettled = (Requeue, Option<u32>, Option<Fate>, FloorChange, Vec<Row>);
 
 /// What a `Result` the scheduler was fed is acknowledged with ([`State::take_report`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1157,7 +1153,7 @@ impl State {
         } = report;
         // Before the feed: an own-limit kill's requeue writes what it taught the
         // estimator in its own transaction.
-        self.stage_learning(operation, lease, outcome, measured.as_ref());
+        self.stage_learning(operation, lease, worker, outcome, measured.as_ref());
         // Taken first: a report that finishes the operation may drop its callers.
         let usage = measured.and_then(|measured| {
             let (_, waiter) = self.first_waiter(operation)?;

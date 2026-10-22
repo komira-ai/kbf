@@ -1,5 +1,5 @@
 //! Each rule of the shadow has a test here that goes red when the rule is broken; the
-//! doc comment of a test names it. The pull request lists the planted mutant of each.
+//! doc comment of a test names it.
 
 use kbf_estimator::{GIB, MIB};
 use kbf_front::Described;
@@ -28,7 +28,10 @@ fn linux() -> Platform {
 }
 
 fn subject(cfg: Option<&str>) -> Subject {
-    let (mut subject, _) = Subject::of(Described::default());
+    let (mut subject, _) = Subject::of(Described {
+        arguments: vec!["compile".to_owned()],
+        ..Described::default()
+    });
     subject.cfg = cfg.map(str::to_owned);
     subject
 }
@@ -304,7 +307,16 @@ fn a_key_names_instance_platform_basis_shape_and_configuration() {
         os_family: "-",
         isa: "-".to_owned(),
     };
-    assert_eq!(key_of("main", &none, Basis::Cgroup, &subject(None)), None);
+    assert_eq!(
+        key_of("main", &none, Basis::Cgroup, &subject(None)),
+        Err(Skip::NoOs)
+    );
+    // An operation restored from a row that kept no subject has no key of its own.
+    let unknown = Subject::of(Described::default()).0;
+    assert_eq!(
+        key_of("main", &linux(), Basis::Cgroup, &unknown),
+        Err(Skip::NoSubject)
+    );
     let arm = Platform {
         os_family: "linux",
         isa: "arm64".to_owned(),
@@ -318,7 +330,7 @@ fn a_key_names_instance_platform_basis_shape_and_configuration() {
     for cfg in ["-", ""] {
         assert_eq!(
             key_of("main", &linux(), Basis::Cgroup, &subject(Some(cfg))),
-            Some(a.clone())
+            Ok(a.clone())
         );
     }
     let with = key_of("main", &linux(), Basis::Cgroup, &subject(Some("7a3c"))).expect("a key");
@@ -542,10 +554,10 @@ fn the_booking_table_is_bounded_and_forgets_the_oldest() {
 fn a_report_the_scheduler_did_not_take_teaches_nothing() {
     let mut learned = shadow();
     learned.stage(lease(1), Some(success(MIB)));
-    learned.finish(lease(1), false, &bounds());
+    assert_eq!(learned.finish(lease(1), false, &bounds()), Vec::new());
     assert_eq!(learned.calls(), 0);
     learned.stage(lease(2), Some(success(MIB)));
-    learned.finish(lease(2), true, &bounds());
+    assert_eq!(learned.finish(lease(2), true, &bounds()), Vec::new());
     assert_eq!(learned.calls(), 1);
     learned.finish(lease(2), true, &bounds());
     assert_eq!(learned.calls(), 1);
@@ -631,6 +643,7 @@ fn stale_rows_are_swept_an_hour_after_the_last_look() {
     learned.clock(FarmTime::from_millis(SWEEP_EVERY_MS));
     let day = learned.sweep_due().expect("due");
     assert_eq!(day, Day(20_000));
+    learned.swept(false);
     assert_eq!(learned.sweep_due(), None);
     // 61 days on, the summary is stale and the sweep takes it out of memory.
     learned.clock(FarmTime::from_millis(61 * DAY));
@@ -656,4 +669,59 @@ fn the_day_is_the_wall_time_the_farm_was_built_at_plus_farm_time() {
     assert_eq!(seen, Day(20_001));
     let far = Learned::new(LearnedSizes::Shadow, GIB, u64::MAX);
     assert_eq!(far.day(), Day(u32::MAX));
+}
+
+/// Catches: an own-limit kill that ended the operation (no requeue) left to the
+/// write-behind, so that a crash in the next seconds loses the floor it set; and a
+/// success returning rows (only a kill has safety state to hurry).
+#[test]
+fn a_final_kill_hands_back_the_rows_it_changed() {
+    let mut learned = shadow();
+    let mut hit = kill(Some(5 * GIB));
+    hit.run.raised_memory_bytes = Some(16 * GIB);
+    learned.stage(lease(1), Some(hit.clone()));
+    let rows = learned.finish(lease(1), true, &bounds());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, key());
+    // Written: not waiting for the write-behind.
+    learned.clock(FarmTime::from_millis(FLUSH_EVERY_MS));
+    assert_eq!(learned.due(), Vec::new());
+    learned.stage(lease(2), Some(success(MIB)));
+    assert_eq!(learned.finish(lease(2), true, &bounds()), Vec::new());
+}
+
+/// Catches: a kill with no usage block given a peak it did not measure, or a limit other
+/// than the one it died at: it is a sample of at least `memory_max(booked)`.
+#[test]
+fn a_kill_with_no_usage_died_at_its_limit() {
+    let run = kill_run(4 * GIB);
+    assert_eq!(run.outcome, RunOutcome::OwnLimitKill);
+    assert_eq!(
+        (run.peak_memory_bytes, run.booked_memory_bytes),
+        (None, 4 * GIB)
+    );
+    let mut learned = shadow();
+    let seen = learned.observe(&Attempt { key: key(), run }, &bounds());
+    assert_eq!(seen, Some((ShadowLevel::None, ShadowBucket::Cold)));
+    let sample = learned
+        .summaries()
+        .get(&key())
+        .expect("a summary")
+        .long_max();
+    assert_eq!(sample, memory_max(4 * GIB).expect("a limit"));
+}
+
+/// Catches: a sweep that forgets it has more to do (a backlog waits an hour per slice),
+/// one that keeps going once it is done, and a new sweep started while one is going.
+#[test]
+fn a_sweep_with_more_to_do_goes_on_at_the_next_tick() {
+    let mut learned = shadow();
+    assert_eq!(learned.sweep_due(), None);
+    learned.clock(FarmTime::from_millis(SWEEP_EVERY_MS));
+    let day = learned.sweep_due().expect("due");
+    learned.swept(true);
+    learned.clock(FarmTime::from_millis(SWEEP_EVERY_MS + 1_000));
+    assert_eq!(learned.sweep_due(), Some(day));
+    learned.swept(false);
+    assert_eq!(learned.sweep_due(), None);
 }

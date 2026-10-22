@@ -319,6 +319,10 @@ fn op_of(chain: &[(&Row, Attempt)], first_default: u64, funnel: &mut Funnel) -> 
 /// The estimator key of an action on a Linux node: its instance, platform class, the
 /// cgroup basis the replay measures with, its shape and its configuration.
 ///
+/// The export knows no CPU architecture, so a replay key's platform class is the OS alone;
+/// the server's carries the architecture when the request names one, so on a farm that
+/// pins it a key reaches its first estimate later than the replay predicts.
+///
 /// The server's shadow keys its summaries the same way ([`kbf_server::learned::key_of`]),
 /// the configuration hashed by the same function; a test holds the two to the same
 /// estimates.
@@ -326,7 +330,8 @@ pub fn key_of(row: &Row) -> Option<Key> {
     let shape = u64::from_str_radix(&row.shape, 16)
         .ok()
         .filter(|s| *s != 0)?;
-    let cfg = (row.cfg != "-").then(|| Cfg(kbf_server::learned::cfg_hash(&row.cfg)));
+    let cfg = (row.cfg != "-" && !row.cfg.is_empty())
+        .then(|| Cfg(kbf_server::learned::cfg_hash(&row.cfg)));
     Some(Key::new(
         Instance::new(row.instance.clone()),
         PlatformClass::new(row.platform.clone()),

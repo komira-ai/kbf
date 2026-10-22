@@ -167,7 +167,7 @@ async fn until(what: &str, mut holds: impl FnMut() -> bool) {
     panic!("{what}");
 }
 
-/// Catches (M8a, the test that must be able to fail): `shadow` booking the estimate (the
+/// Catches: `shadow` booking the estimate (the
 /// first six `Start`s would show 1 GiB, not 4), `shadow` not logging it, the estimate at
 /// five samples not being the 1 GiB the quiet runs earn and different from the 4 GiB
 /// default the farm books (so that applying it would show), the fallback of the first two
@@ -212,7 +212,7 @@ async fn shadow_books_the_default_and_logs_what_it_would_book() {
     assert_eq!(tally(&cell, ShadowLevel::L2, ShadowBucket::WouldOom), 0);
 }
 
-/// Catches (M8a, the other half): `off` calling the estimator: a `size estimate:` line, a
+/// Catches: `off` calling the estimator: a `size estimate:` line, a
 /// count in any of the twelve cells, or a booking other than the default. Its twin above
 /// shows the same runs do all three in `shadow`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -246,7 +246,7 @@ async fn off_calls_nothing() {
     }
 }
 
-/// Catches (N6): a caller that joined a twin counted as a new operation: two Executes of
+/// Catches: a caller that joined a twin counted as a new operation: two Executes of
 /// one action while it runs are one operation and get one line.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_joined_twin_is_not_a_new_operation() {
@@ -266,27 +266,72 @@ async fn a_joined_twin_is_not_a_new_operation() {
     assert_eq!(estimates(argv).len(), 1);
 }
 
-/// Catches (M6a, S14): an estimate asked for an action whose `needs` do not pin the OS,
-/// or that asks for a GPU.
+/// Catches: an estimate asked for an action whose `needs` do not pin the OS, or that
+/// asks for a GPU, and skips that are not counted. A Linux action with no GPU in the same
+/// cell is the control: it is asked about.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_actions_that_pin_the_os_and_ask_no_gpu_are_asked_about() {
     log();
     let cell = Cell::start_learned(LearnedSizes::Shadow, ladder(), None).await;
+    let skipped = |reason: &str| {
+        let at = kbf_front::metrics::SHADOW_SKIPS
+            .iter()
+            .position(|r| *r == reason)
+            .expect("a reason");
+        cell.cache.metrics().estimator_shadow.skipped(at)
+    };
+    let submit = |argv: &'static str, platform: &'static [(&'static str, &'static str)]| {
+        let cell = &cell;
+        async move {
+            let job = job(argv, "a", platform);
+            cell.upload(&job.blobs()).await;
+            cell.execute(&job.action).await
+        }
+    };
 
-    // No OS named (the cell gives such an action no default platform).
-    let argv = "compile no os";
-    cell.upload(&job(argv, "a", &[]).blobs()).await;
-    drop(cell.execute(&job(argv, "a", &[]).action).await);
-    assert_eq!(estimates(argv), Vec::<String>::new());
-
-    let argv = "compile gpu";
-    let gpu = job(argv, "a", &[("OSFamily", "linux"), ("gpu", "1")]);
-    cell.upload(&gpu.blobs()).await;
-    drop(cell.execute(&gpu.action).await);
-    assert_eq!(estimates(argv), Vec::<String>::new());
+    let _no_os = submit("compile no os", &[]).await;
+    let _gpu = submit("compile gpu", &[("OSFamily", "linux"), ("gpu", "1")]).await;
+    let _control = submit("compile control", LINUX).await;
+    until("the control is asked about", || {
+        estimates("compile control").len() == 1
+    })
+    .await;
+    until("the skips are counted", || {
+        skipped("no_os") == 1 && skipped("kind") == 1
+    })
+    .await;
+    assert_eq!(estimates("compile no os"), Vec::<String>::new());
+    assert_eq!(estimates("compile gpu"), Vec::<String>::new());
+    // Nothing of the three has a node: the control is asked about with no bound.
+    assert!(estimates("compile control")[0].contains("fallback=Missing"));
 }
 
-/// Catches (M6b): a size the client named not passed as a hint (the line would say 1 GiB
+/// Catches: a Mac action asked about with the bounds of the Linux nodes (or with none at
+/// all once a Mac node is there), and a request for an OS no node has registered failing
+/// instead of being asked about without a bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mac_action_is_asked_about_with_or_without_a_mac_node() {
+    log();
+    let cell = Cell::start_learned(LearnedSizes::Shadow, ladder(), None).await;
+    let argv = "compile for the mac";
+    let mac = [("OSFamily", "macos")];
+    let _linux_node = cell.daemon("node-linux", 4, 8).await;
+    let first = job(argv, "a", &mac);
+    cell.upload(&first.blobs()).await;
+    let _first = cell.execute(&first.action).await;
+    until("asked with no Mac node", || estimates(argv).len() == 1).await;
+
+    let hello = support::hello_on("node-mac", 4, 8, &[("os", "macos"), ("arch", "arm64")]);
+    let _mac_node = FakeDaemon::connect(cell.worker_addr, hello)
+        .await
+        .expect("registered");
+    let second = job(argv, "b", &mac);
+    cell.upload(&second.blobs()).await;
+    let _second = cell.execute(&second.action).await;
+    until("asked with a Mac node", || estimates(argv).len() == 2).await;
+}
+
+/// Catches: a size the client named not passed as a hint (the line would say 1 GiB
 /// for an action that asked for 8).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_size_the_client_named_is_a_hint() {
@@ -319,7 +364,7 @@ async fn a_size_the_client_named_is_a_hint() {
     );
 }
 
-/// Catches (M8c): attempts learned in the order the operations were submitted rather
+/// Catches: attempts learned in the order the operations were submitted rather
 /// than the order their results commit. Two operations of one shape are in flight; the
 /// one submitted second reports first. Learned in commit order the first report is the
 /// fifth sample and the second is judged against the 1 GiB the five earn (its 1.95 GiB is
@@ -408,7 +453,7 @@ fn rows(store: &kbf_state::fake::Fake) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// Catches: the floor an own-limit kill sets not committed with its requeue (it is in the
+/// Catches: the floor an own-limit kill sets not written when its requeue is (it is in the
 /// store by the time the daemon is acknowledged, before the write-behind is due), a
 /// floor below the booking the retry runs at, and `off` writing a summary at all. A kill
 /// at 4 GiB retries at 16.
@@ -447,4 +492,95 @@ async fn a_kills_floor_is_in_the_store_with_its_requeue_and_off_writes_nothing()
         assert!(daemon.report(ran(rerun.lease_id, &result)).await.accepted);
         done(&mut ops).await;
     }
+}
+
+fn killed_bare(lease: Option<worker::LeaseId>, kill: MemoryKill) -> worker::Result {
+    worker::Result {
+        lease_id: lease,
+        status: Some(kbf_proto::google::rpc::Status {
+            code: Code::ResourceExhausted as i32,
+            message: "memory".to_owned(),
+            details: Vec::new(),
+        }),
+        memory_kill: kill as i32,
+        ..worker::Result::default()
+    }
+}
+
+fn floor_in(rows: &[(String, Vec<u8>)]) -> u64 {
+    let summary = kbf_estimator::Summary::decode(&rows[0].1[1..]).expect("a summary");
+    summary.oom_floor()
+}
+
+/// Catches: an own-limit kill whose report carries no usage dropped (the one event that
+/// must raise a floor never reaches the estimator), and one given a basis or a limit it
+/// did not have: its summary is written with the requeue's, with a floor at the rung the
+/// retry runs at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_with_no_usage_still_teaches_the_estimator() {
+    log();
+    let (store, state) = state();
+    let cell = Cell::start_learned(LearnedSizes::Shadow, ladder(), Some(state)).await;
+    let mut daemon = cell.daemon("node-bare", 8, 64).await;
+    let blob = job("compile bare kill", "a", LINUX);
+    cell.upload(&blob.blobs()).await;
+    let mut ops = cell.execute(&blob.action).await;
+    let start = daemon.start().await;
+    let ack = daemon
+        .report(killed_bare(start.lease_id, MemoryKill::OwnLimit))
+        .await;
+    assert!(ack.accepted);
+    until("the kill is in the store", || !rows(&store).is_empty()).await;
+    assert!(floor_in(&rows(&store)) >= 16 * GIB);
+    let rerun = daemon.start().await;
+    let result = with_usage(output(&cell, "bare", 0).await, &usage(MIB));
+    assert!(daemon.report(ran(rerun.lease_id, &result)).await.accepted);
+    done(&mut ops).await;
+}
+
+/// Catches: an own-limit kill that ends the operation (the ladder is spent: no requeue
+/// carries it) left to the write-behind, so that its floor is lost to a crash in the
+/// next seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_that_ends_the_operation_is_written_at_once() {
+    log();
+    let (store, state) = state();
+    let one_rung = MemoryLadder::from_gib(&[4]).expect("a ladder");
+    let cell = Cell::start_learned(LearnedSizes::Shadow, one_rung, Some(state)).await;
+    let mut daemon = cell.daemon("node-final", 4, 4).await;
+    let blob = job("compile final kill", "a", LINUX);
+    cell.upload(&blob.blobs()).await;
+    let mut ops = cell.execute(&blob.action).await;
+    let start = daemon.start().await;
+    assert!(
+        daemon
+            .report(killed(start.lease_id, 5 * GIB))
+            .await
+            .accepted
+    );
+    done(&mut ops).await;
+    until("the kill is in the store", || !rows(&store).is_empty()).await;
+}
+
+/// Catches: a kill by the node (not by the action's own limit) writing a size summary or
+/// teaching the estimator a floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_pressure_kill_writes_no_summary() {
+    log();
+    let (store, state) = state();
+    let cell = Cell::start_learned(LearnedSizes::Shadow, ladder(), Some(state)).await;
+    let mut daemon = cell.daemon("node-pressure", 8, 64).await;
+    let blob = job("compile pressure kill", "a", LINUX);
+    cell.upload(&blob.blobs()).await;
+    let mut ops = cell.execute(&blob.action).await;
+    let start = daemon.start().await;
+    let mut hit = killed(start.lease_id, 5 * GIB);
+    hit.memory_kill = MemoryKill::NodePressure as i32;
+    assert!(daemon.report(hit).await.accepted);
+    let rerun = daemon.start().await;
+    assert_eq!(rerun.memory_bytes, 4 * GIB, "the same booking");
+    let result = with_usage(output(&cell, "pressure", 0).await, &usage(MIB));
+    assert!(daemon.report(ran(rerun.lease_id, &result)).await.accepted);
+    done(&mut ops).await;
+    assert!(rows(&store).is_empty());
 }
