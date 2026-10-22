@@ -264,6 +264,9 @@ const SSH_FAILED: i32 = 255;
 /// The host and the port of an inventory address (already checked).
 fn split_address(address: &str) -> (&str, Option<&str>) {
     match address.rsplit_once(':') {
+        // Port 22 is the default: OpenSSH looks such a host up under the bare name, so the
+        // entry and the argv must not spell it out.
+        Some((host, "22")) => (host, None),
         Some((host, port)) => (host, Some(port)),
         None => (address, None),
     }
@@ -318,11 +321,11 @@ impl KnownHosts {
             dir,
             file: file.clone(),
         };
-        // `ssh -o Key=value` splits on blanks and quotes: a path that has either is refused
-        // rather than escaped.
+        // `ssh -o Key=value` splits on blanks and quotes, and expands `%` tokens in this
+        // option: a path that has any of them is refused rather than escaped.
         let plain = file
             .to_str()
-            .is_some_and(|p| !p.chars().any(|c| c.is_whitespace() || "\"'\\".contains(c)));
+            .is_some_and(|p| !p.chars().any(|c| c.is_whitespace() || "\"'\\%".contains(c)));
         if !plain {
             return Err(std::io::ErrorKind::InvalidInput.into());
         }

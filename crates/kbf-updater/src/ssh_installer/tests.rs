@@ -282,6 +282,50 @@ fn a_port_becomes_dash_p_and_a_bracketed_known_hosts_name() {
     );
 }
 
+/// Catches port 22 written as `[host]:22`: OpenSSH looks a port-22 host up under the bare
+/// name, so the pinned key would never match. The entry is the bare form and `-p` is omitted.
+#[test]
+fn port_22_is_the_bare_known_hosts_name_and_no_dash_p() {
+    let r = rig();
+    r.fake.says(exited(0, INSTALLED));
+    let mut h = host();
+    h.address = "st1.farm.example:22".into();
+    r.ssh.install(&h, &version("1.2.3-1")).expect("ok");
+    let seen = &r.fake.calls()[0];
+    let args = strs(&seen.spawn.args);
+    assert!(!args.contains(&"-p"));
+    assert!(args.contains(&"kbf-update@st1.farm.example"));
+    assert_eq!(
+        seen.known_hosts_text.as_deref(),
+        Some(&*format!("st1.farm.example {KEY}\n"))
+    );
+}
+
+/// Catches a `%` in the work directory: ssh expands `%` tokens in `UserKnownHostsFile`, so
+/// the pinned file would not be found. The path is refused like one with a blank.
+#[test]
+fn a_percent_in_the_work_directory_is_refused() {
+    let r = rig();
+    let odd = r.dir.path().join("a%d");
+    fs::create_dir(&odd).expect("dir");
+    let ssh = SshInstaller::new(
+        PathBuf::from("/k"),
+        "u",
+        "stable",
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    )
+    .expect("installer")
+    .with_work_dir(odd.clone())
+    .with_exec(r.fake.clone());
+    assert_eq!(
+        ssh.query(&host()),
+        Err(PortError::other("cannot write known hosts"))
+    );
+    assert!(r.fake.calls().is_empty(), "no process");
+    assert_eq!(leftovers(&odd), 0);
+}
+
 /// Catches an environment that carries more than the three variables, or a missing `LANG=C`.
 #[test]
 fn the_environment_is_path_home_and_lang() {
