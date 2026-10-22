@@ -775,8 +775,9 @@ where
 ///
 /// The [`CatchUp`] in [`Registered`] says whether the node owes a rebuild of its index: a
 /// registered node whose log has not finished one does, and tells the frontend so in its
-/// registration, so the map ranks it last until it is done. A node without `--frontend`
-/// owes none: it keeps its objects under its log's own prefix, which no other log's loss
+/// registration, so the map ranks it last until it is done ([`catch_up_for`]: none, if the
+/// start ceiling holds the log below the version that takes a rebuild). A node without
+/// `--frontend` owes none: it keeps its objects under its log's own prefix, which no other log's loss
 /// can orphan.
 /// `kbf storage` and the storage half of `kbf storage-and-daemon` both open theirs here.
 ///
@@ -796,11 +797,7 @@ pub(crate) async fn open_cache<C: ColdPick>(
     Ok(match flags.joiner(socket.addr(), Arc::clone(&node))? {
         Some(joiner) => {
             let done = meta.query(|state| state.rebuild().is_done()).await?;
-            let catch_up = if done {
-                CatchUp::caught_up()
-            } else {
-                CatchUp::rebuilding()
-            };
+            let catch_up = catch_up_for(done, &meta);
             // The member and boot the log last wrote as: a store that counts from 1 gives
             // the node a boot above it, so the open below is not refused.
             let last = last_boot(&meta).await?;
@@ -841,6 +838,18 @@ pub(crate) async fn open_cache<C: ColdPick>(
     })
 }
 
+/// Whether a registered node owes a rebuild of its index: its log has not finished one
+/// (`done`) and takes the rebuild's commands, which are machine version 4's. A log the
+/// start ceiling holds below 4 refuses them, so a rebuild would fail for good and keep
+/// the node catching up: it owes none, as a node that names its objects by an epoch.
+fn catch_up_for(done: bool, meta: &RaftMetaLog<StdFs>) -> CatchUp {
+    let reach = meta.machine_version().max(meta.start_ceiling());
+    match (done, reach >= MachineVersion::V4) {
+        (false, true) => CatchUp::rebuilding(),
+        _ => CatchUp::caught_up(),
+    }
+}
+
 /// The member and boot `meta` last wrote as (the node writer it set last), which the node
 /// tells the frontend when it registers; `None` for a log that has set none.
 ///
@@ -870,6 +879,8 @@ fn prefix_root(prefix: &KeyPrefix, log: FarmLogId) -> Result<KeyPrefix, Box<dyn 
 /// The cache of a node registered as `joined`: its log raised to machine version 4 (a
 /// storage node's log has one voter, so no other replica must run it first) and the
 /// node writer set, so every object it writes is named by `joined`'s member and boot.
+/// The raise stops at the log's start ceiling: a log left below 4 takes no node writer,
+/// so the node names its objects by an epoch of its log until the log is raised.
 ///
 /// # Errors
 /// The registration names a zero member or boot; the log has more than one voter, will
@@ -905,7 +916,13 @@ async fn open_among<O: ObjectStore>(
     voters: usize,
 ) -> Result<Cache<RaftMetaLog<StdFs>, O>, Box<dyn Error>> {
     one_voter(voters)?;
-    meta.raise_machine_version(MachineVersion::V4)?;
+    meta.raise_at_start(MachineVersion::V4)?;
+    if meta.machine_version() < MachineVersion::V4 {
+        // The start ceiling is below 4 and the log was not raised past it: the log takes no
+        // `SetWriter`, so the node names its objects by an epoch of its log, as one that
+        // never registered does.
+        return Ok(Cache::open_under(meta, store, keys).await?);
+    }
     Ok(Cache::open_node(meta, store, keys, NodeWriter::new(member, boot)).await?)
 }
 
