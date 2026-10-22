@@ -74,7 +74,7 @@ const RUNTIME: [&str; 6] = [
 ];
 
 /// The rules, by the tag a violation starts with.
-const RULES: [&str; 35] = [
+const RULES: [&str; 34] = [
     "install",
     "network",
     "positional",
