@@ -320,3 +320,35 @@ fn a_window_is_two_times_in_order() {
     assert!(same.to_string().contains("is not after"), "{same}");
     assert!(Window::parse(UNTIL, SINCE).is_err());
 }
+
+/// Catches a `next_page` from the server put in the request line unchecked: one holding a
+/// line break (a second request), a space, or not under /v1/ is refused before anything is
+/// sent for it.
+#[test]
+fn a_next_page_that_is_not_a_plain_api_path_is_refused() {
+    for bad in [
+        "/v1/x\r\nPOST /v1/nodes/n1:drain HTTP/1.1",
+        "/v1/x\n",
+        "/v1/a b",
+        "http://elsewhere/v1/x",
+        "/other",
+    ] {
+        let mut routes = base();
+        put(
+            &mut routes,
+            INVOCATIONS,
+            &json!({"invocations": [], "next_page": bad}),
+        );
+        let fake = Fake::new(routes);
+        let err = export(&ReadOnly::new(&fake), window()).expect_err(bad);
+        assert!(matches!(err, ExportError::Shape { .. }), "{bad:?}: {err:?}");
+        assert!(err.to_string().contains("next_page"), "{err}");
+        assert!(
+            fake.seen
+                .borrow()
+                .iter()
+                .all(|(m, p)| m == "GET" && p != bad),
+            "{bad:?}"
+        );
+    }
+}
