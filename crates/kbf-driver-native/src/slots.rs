@@ -251,23 +251,47 @@ pub(crate) async fn make_lease_dir(dir: &Path, private: bool) -> std::io::Result
 /// Gives `root` and everything under it to `uid`:`gid`, never following a link, then
 /// closes `root` itself to everyone else ([`LEASE_DIR_MODE`], whatever its mode was),
 /// which is what keeps another slot out of the tree. A file with more than one name is
-/// not given (its owner is the owner of every name): the result counts those.
+/// not given (its owner is the owner of every name): the result counts those. Stops at
+/// the next entry, with [`std::io::ErrorKind::Interrupted`], once `cancel` is set, so
+/// that nothing is given after the caller has been told it stopped.
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn hand_tree(root: &Path, uid: u32, gid: u32) -> std::io::Result<usize> {
+pub(crate) fn hand_tree(
+    root: &Path,
+    (uid, gid): (u32, u32),
+    cancel: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<usize> {
+    hand_tree_with(root, cancel, &mut |path| {
+        std::os::unix::fs::lchown(path, Some(uid), Some(gid))
+    })
+}
+
+/// [`hand_tree`] with the owner change made by `chown`, so a test sees which entries it
+/// is made for.
+#[cfg(any(target_os = "macos", test))]
+fn hand_tree_with(
+    root: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+    chown: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<usize> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::sync::atomic::Ordering;
+    /// How many names a log line carries.
+    const NAMED: usize = 5;
     let mut pending: Vec<PathBuf> = vec![root.to_owned()];
-    let mut skipped = 0;
+    let mut skipped: Vec<PathBuf> = Vec::new();
     while let Some(path) = pending.pop() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
         let meta = std::fs::symlink_metadata(&path)?;
         // A file with another name (a hard link) is not given: changing its owner would
         // change the owner of the file under the other name, which may be a file of
         // the daemon's or of another user's.
         if !meta.is_dir() && meta.nlink() > 1 {
-            skipped += 1;
-            tracing::warn!(path = %path.display(), links = meta.nlink(), "not handed over: it has another name");
+            skipped.push(path);
             continue;
         }
-        std::os::unix::fs::lchown(&path, Some(uid), Some(gid))?;
+        chown(&path)?;
         if meta.is_dir() {
             for entry in std::fs::read_dir(&path)? {
                 pending.push(entry?.path());
@@ -275,7 +299,19 @@ pub(crate) fn hand_tree(root: &Path, uid: u32, gid: u32) -> std::io::Result<usiz
         }
     }
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(LEASE_DIR_MODE))?;
-    Ok(skipped)
+    if !skipped.is_empty() {
+        let names: Vec<_> = skipped
+            .iter()
+            .take(NAMED)
+            .map(|p| p.display().to_string())
+            .collect();
+        tracing::warn!(
+            count = skipped.len(),
+            ?names,
+            "not handed over: these files have another name"
+        );
+    }
+    Ok(skipped.len())
 }
 
 /// How a lease's action runs: as the daemon's own user, its processes followed by
@@ -319,8 +355,8 @@ impl Runner {
         }
     }
 
-    /// Makes the lease directory `dir` the slot user's ([`macos::Slot::hand_over`]);
-    /// nothing for the daemon's user, whose it is.
+    /// Makes the lease directory `dir` the slot user's ([`macos::Slot::hand_over_until`]);
+    /// nothing for the daemon's user, whose it is. Stops once `cancel` is set.
     ///
     /// # Errors
     /// It could not be handed over.
@@ -328,11 +364,15 @@ impl Runner {
         not(target_os = "macos"),
         expect(unused_variables, reason = "no slots off macOS")
     )]
-    pub async fn hand_over(&self, dir: &Path) -> Result<(), RuntimeError> {
+    pub async fn hand_over(
+        &self,
+        dir: &Path,
+        cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), RuntimeError> {
         match self {
             Self::Daemon => Ok(()),
             #[cfg(target_os = "macos")]
-            Self::Slot(slot) => slot.hand_over(dir).await,
+            Self::Slot(slot) => slot.hand_over_until(dir, cancel).await,
         }
     }
 
@@ -348,18 +388,22 @@ impl Runner {
         isolation: &Isolation,
         network: Network,
         lease: &Path,
+        cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<canary::Report, RuntimeError> {
         match self {
             Self::Daemon => Ok(canary::Report::default()),
-            Self::Slot(slot) => slot.canary(isolation, network, lease).await,
+            Self::Slot(slot) => slot.canary_until(isolation, network, lease, cancel).await,
         }
     }
 
     /// Takes the lease directory `dir` back from the slot's user ([`macos::Slot::reclaim`]).
     #[cfg(target_os = "macos")]
-    pub async fn reclaim(&self, dir: &Path) {
+    ///
+    /// # Errors
+    /// The directory could not be taken back.
+    pub async fn reclaim(&self, dir: &Path) -> Result<(), RuntimeError> {
         match self {
-            Self::Daemon => {}
+            Self::Daemon => Ok(()),
             Self::Slot(slot) => slot.reclaim(dir).await,
         }
     }
@@ -636,7 +680,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
         }
         let me = std::fs::metadata(&lease).expect("lease");
-        hand_tree(&lease, me.uid(), me.gid()).expect("handed over");
+        hand_tree(&lease, (me.uid(), me.gid()), &no_cancel()).expect("handed over");
         assert_eq!(mode_of(&lease), LEASE_DIR_MODE, "the lease directory");
         assert_eq!(mode_of(&lease), 0o700, "the documented mode");
         assert_eq!(mode_of(&lease.join("root")), 0o755, "inside keeps its mode");
@@ -648,8 +692,66 @@ mod tests {
             "the link was followed or replaced"
         );
         let missing = base.join("missing");
-        assert!(hand_tree(&missing, me.uid(), me.gid()).is_err());
+        assert!(hand_tree(&missing, (me.uid(), me.gid()), &no_cancel()).is_err());
         assert!(!missing.exists(), "a failed hand-over made something");
+    }
+
+    fn no_cancel() -> std::sync::atomic::AtomicBool {
+        std::sync::atomic::AtomicBool::new(false)
+    }
+
+    /// Catches an owner change made for a hard-linked file (deleting the skip leaves
+    /// the count right and the file given, which a hand-over to the same user does not
+    /// show): the names of the entries `chown` is called for are recorded, and the
+    /// linked file is not among them while the plain file and the directories are.
+    #[test]
+    fn the_owner_of_a_file_with_another_name_is_never_changed() {
+        let base = crate::unit_dir("slots-hand-tree-seam");
+        let lease = base.join("lease");
+        std::fs::create_dir_all(lease.join("sub")).expect("tree");
+        std::fs::write(lease.join("plain"), b"x").expect("plain");
+        let outside = base.join("outside");
+        std::fs::write(&outside, b"x").expect("outside");
+        std::fs::hard_link(&outside, lease.join("sub/linked")).expect("link");
+        let mut given = Vec::new();
+        let skipped = hand_tree_with(&lease, &no_cancel(), &mut |path| {
+            given.push(path.strip_prefix(&lease).expect("inside").to_owned());
+            Ok(())
+        })
+        .expect("handed over");
+        given.sort();
+        let want: Vec<PathBuf> = ["", "plain", "sub"].map(PathBuf::from).to_vec();
+        assert_eq!((skipped, given), (1, want));
+    }
+
+    /// Catches a hand-over that goes on after it was told to stop (a stray chown after
+    /// the lease was answered as killed): with the flag set after the second entry no
+    /// third is given, the root is not closed, and the call says it was interrupted.
+    #[test]
+    fn a_hand_over_stops_at_the_next_entry_once_cancelled() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = crate::unit_dir("slots-hand-tree-cancel");
+        let lease = base.join("lease");
+        std::fs::create_dir_all(&lease).expect("lease");
+        for name in ["a", "b", "c", "d"] {
+            std::fs::write(lease.join(name), b"x").expect("file");
+        }
+        std::fs::set_permissions(&lease, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let cancel = no_cancel();
+        let mut given = 0;
+        let stopped = hand_tree_with(&lease, &cancel, &mut |_| {
+            given += 1;
+            if given == 2 {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        });
+        assert_eq!(
+            stopped.expect_err("stopped").kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert_eq!(given, 2, "nothing was given after the flag was set");
+        assert_eq!(mode_of(&lease), 0o755, "the root was not closed");
     }
 
     /// Catches a hand-over that changes the owner of a file that has another name (a
@@ -667,14 +769,17 @@ mod tests {
         std::fs::hard_link(&outside, lease.join("sub/linked")).expect("link");
         let me = std::fs::metadata(&lease).expect("lease");
         use std::os::unix::fs::MetadataExt as _;
-        let skipped = hand_tree(&lease, me.uid(), me.gid()).expect("handed over");
+        let skipped = hand_tree(&lease, (me.uid(), me.gid()), &no_cancel()).expect("handed over");
         assert_eq!(skipped, 1, "the name in the lease");
         assert_eq!(
             [outside.exists(), lease.join("sub/linked").exists()],
             [true, true]
         );
         std::fs::remove_file(lease.join("sub/linked")).expect("unlink");
-        assert_eq!(hand_tree(&lease, me.uid(), me.gid()).expect("again"), 0);
+        assert_eq!(
+            hand_tree(&lease, (me.uid(), me.gid()), &no_cancel()).expect("again"),
+            0
+        );
     }
 
     /// Catches a slot's lease directory made with the process's default mode, which

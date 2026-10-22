@@ -265,8 +265,20 @@ impl Report {
 /// its own. A canary that could not be started or timed out is a failure too. Every
 /// result is logged with the canary's name and how long it took.
 pub fn check(canaries: &[Canary], run: &mut dyn FnMut(&Canary) -> io::Result<Ran>) -> Report {
+    check_until(canaries, &|| false, run)
+}
+
+/// [`check`] that starts no canary once `cancelled` says so: the report holds what ran.
+pub fn check_until(
+    canaries: &[Canary],
+    cancelled: &dyn Fn() -> bool,
+    run: &mut dyn FnMut(&Canary) -> io::Result<Ran>,
+) -> Report {
     let mut report = Report::default();
     for canary in canaries {
+        if cancelled() {
+            break;
+        }
         let verdict = match run(canary) {
             Ok(ran) => match judge(canary, &ran) {
                 Verdict::Refused(errno) => {
@@ -318,8 +330,10 @@ pub trait Offer {
     fn probe(&mut self) -> impl Future<Output = Result<Probe, Self::Err>> + Send;
 
     /// Takes the lease's directory back from the held slot and sets the slot aside;
-    /// `why` says which canaries failed. No slot is held afterwards.
-    fn aside(&mut self, why: &str) -> impl Future<Output = ()> + Send;
+    /// `why` says which canaries failed. No slot is held afterwards. If the directory
+    /// cannot be taken back the slot stays held and the lease ends with the error, so
+    /// that the directory is removed before the slot is released.
+    fn aside(&mut self, why: &str) -> impl Future<Output = Result<(), Self::Err>> + Send;
 
     /// The slot held now, if any.
     fn take_held(&mut self) -> Option<Self::Slot>;
@@ -337,7 +351,7 @@ pub async fn first_passing<O: Offer + Send>(offer: &mut O) -> Result<(), O::Err>
         offer.next().await?;
         match offer.probe().await? {
             Probe::Pass => return Ok(()),
-            Probe::Aside(why) => offer.aside(&why).await,
+            Probe::Aside(why) => offer.aside(&why).await?,
         }
     }
 }
@@ -355,6 +369,38 @@ pub async fn acquire<O: Offer + Send>(
     let result = first_passing(offer).await;
     *hold = offer.take_held();
     result
+}
+
+/// How `work` ended when it was raced against a kill.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Raced<T, K> {
+    /// It finished first, with this.
+    Done(T),
+    /// The kill came first; `work` has stopped (it saw `cancel` and returned).
+    Killed(K),
+}
+
+/// Runs `work`, which does blocking work that cannot be cancelled from outside and
+/// checks `cancel` between its steps, until it finishes or `killed` resolves. On a
+/// kill it sets `cancel` and **waits for `work` to return**, so that nothing it does
+/// (a canary launched as the slot's user, an owner change) happens after the caller
+/// has been told the lease stopped and goes on to remove the directory and release the
+/// slot.
+pub async fn until_killed<T, K>(
+    work: impl Future<Output = T>,
+    cancel: &std::sync::atomic::AtomicBool,
+    killed: impl Future<Output = Option<K>>,
+) -> Raced<T, K> {
+    tokio::pin!(work);
+    tokio::pin!(killed);
+    tokio::select! {
+        done = &mut work => Raced::Done(done),
+        Some(by) = &mut killed => {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = work.await;
+            Raced::Killed(by)
+        }
+    }
 }
 
 /// What a canary can leave in the lease directory: the link the link canary made. The
@@ -687,6 +733,8 @@ mod tests {
         HandOver,
         /// A canary could not be started.
         Canary,
+        /// The lease directory cannot be taken back from a slot that failed its canaries.
+        Reclaim,
     }
 
     /// Slots from a queue (taken from the back); the probe passes the slots in `good`.
@@ -738,7 +786,7 @@ mod tests {
             match self.fail {
                 Fail::HandOver => return Err("hand over failed".to_owned()),
                 Fail::Canary => return Err("canary could not start".to_owned()),
-                Fail::Never | Fail::Prepare => {}
+                Fail::Never | Fail::Prepare | Fail::Reclaim => {}
             }
             Ok(if self.good.contains(&id) {
                 Probe::Pass
@@ -747,11 +795,15 @@ mod tests {
             })
         }
 
-        async fn aside(&mut self, why: &str) {
+        async fn aside(&mut self, why: &str) -> Result<(), String> {
+            if self.fail == Fail::Reclaim {
+                return Err("reclaim failed".to_owned());
+            }
             self.push("reclaim the lease directory");
             let mut slot = self.current.take().expect("held");
             slot.asided = true;
             self.push(&format!("aside {}: {why}", slot.id));
+            Ok(())
         }
 
         fn take_held(&mut self) -> Option<TestSlot> {
@@ -790,6 +842,12 @@ mod tests {
             assert!(held, "the caller holds the slot");
             assert_eq!(events, ["lease directory removed", "released 1"]);
         }
+        // The directory cannot be taken back from a slot that failed its canaries: it is
+        // not set aside, the lease fails with the slot held, and the directory goes first.
+        let (result, events, held) = lease(TestOffer::new(&[1], &[], Fail::Reclaim));
+        assert_eq!(result, Err("reclaim failed".to_owned()));
+        assert!(held);
+        assert_eq!(events, ["lease directory removed", "released 1"]);
         // Slot 1 fails its canaries and is set aside; the wait for the next ends in a kill.
         let (result, events, held) = lease(TestOffer::new(&[1], &[], Fail::Never));
         assert_eq!(result, Err("killed while waiting".to_owned()));
@@ -823,6 +881,80 @@ mod tests {
                 "released 3"
             ]
         );
+    }
+
+    /// Catches a canary loop that starts another canary after it was told to stop (a
+    /// canary launched as the slot's user after the slot was released): with the flag set
+    /// after the first, the second is not run and the report holds the first.
+    #[test]
+    fn no_canary_starts_once_cancelled() {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut runs = 0;
+        let report = check_until(
+            CANARIES,
+            &|| cancel.load(std::sync::atomic::Ordering::SeqCst),
+            &mut |c| {
+                runs += 1;
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(ran(REFUSED, &format!("canary {} refused errno=1", c.name)))
+            },
+        );
+        assert_eq!(runs, 1);
+        assert_eq!(report.passed.len(), 1);
+        assert!(report.failed.is_empty());
+    }
+
+    /// Catches a kill that is answered while blocking work of the slot goes on (a canary
+    /// launched as the slot's user, or an owner change, after the lease was reported
+    /// killed and its slot released): the work records a step every 20 ms and stops at
+    /// its next step once the flag is set; after `until_killed` returns, no step is
+    /// recorded, and fewer than all of them ran. A run that finishes first is `Done`.
+    /// Seen red with `until_killed` returning on the kill without awaiting the work.
+    #[test]
+    fn a_kill_waits_for_the_blocking_work_to_stop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let steps = Arc::new(Mutex::new(0_u32));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (work_steps, work_cancel) = (Arc::clone(&steps), Arc::clone(&cancel));
+        let work = async move {
+            tokio::task::spawn_blocking(move || {
+                while !work_cancel.load(Ordering::SeqCst) && *work_steps.lock().expect("steps") < 50
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                    *work_steps.lock().expect("steps") += 1;
+                }
+            })
+            .await
+            .expect("work")
+        };
+        let killed = async {
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            Some("kill")
+        };
+        let raced = rt.block_on(until_killed(work, &cancel, killed));
+        assert_eq!(raced, Raced::Killed("kill"));
+        let at_ack = *steps.lock().expect("steps");
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            *steps.lock().expect("steps"),
+            at_ack,
+            "work after the kill was answered"
+        );
+        assert!(at_ack < 50, "the work was not stopped");
+
+        let cancel = AtomicBool::new(false);
+        let done = rt.block_on(until_killed(
+            async { 7 },
+            &cancel,
+            std::future::pending::<Option<()>>(),
+        ));
+        assert_eq!(done, Raced::Done(7));
+        assert!(!cancel.load(Ordering::SeqCst));
     }
 
     /// Catches a removal of the link canary's leftovers that follows the link, or misses
@@ -898,9 +1030,10 @@ mod tests {
                 })
             }
 
-            async fn aside(&mut self, why: &str) {
+            async fn aside(&mut self, why: &str) -> Result<(), String> {
                 let (index, permit) = self.current.take().expect("held");
                 self.book.set_aside(index, permit, why);
+                Ok(())
             }
 
             fn take_held(&mut self) -> Option<Held> {

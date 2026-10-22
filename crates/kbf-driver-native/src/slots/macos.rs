@@ -11,6 +11,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -320,9 +321,23 @@ impl Slot {
     /// # Errors
     /// An entry could not be read or given to the user.
     pub async fn hand_over(&self, dir: &Path) -> Result<(), RuntimeError> {
-        let (uid, gid) = (self.ready().user.uid, self.ready().user.gid);
-        let path = dir.to_owned();
-        let handed = tokio::task::spawn_blocking(move || super::hand_tree(&path, uid, gid)).await;
+        self.hand_over_until(dir, &Arc::default()).await
+    }
+
+    /// [`Slot::hand_over`] that stops at the next entry once `cancel` is set, and returns
+    /// only when the blocking work has stopped: nothing is given after it returns.
+    ///
+    /// # Errors
+    /// An entry could not be read or given to the user, or `cancel` was set.
+    pub async fn hand_over_until(
+        &self,
+        dir: &Path,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), RuntimeError> {
+        let ids = (self.ready().user.uid, self.ready().user.gid);
+        let (path, cancel) = (dir.to_owned(), Arc::clone(cancel));
+        let handed =
+            tokio::task::spawn_blocking(move || super::hand_tree(&path, ids, &cancel)).await;
         handed
             .map_err(io::Error::other)
             .and_then(|done| done)
@@ -332,16 +347,22 @@ impl Slot {
 
     /// Takes the lease directory `dir` and everything in it back from the slot's user
     /// (to root, 0700), as it must be before the slot is set aside: the slot is cleaned
-    /// and offered again while the lease still waits for another. Logged, not failed: the
-    /// slot is set aside either way.
-    pub async fn reclaim(&self, dir: &Path) {
+    /// and offered again while the lease still waits for another.
+    ///
+    /// # Errors
+    /// It could not be taken back: the caller keeps the slot, so that the lease
+    /// directory is removed before the slot is released.
+    pub async fn reclaim(&self, dir: &Path) -> Result<(), RuntimeError> {
         let path = dir.to_owned();
-        let why = match tokio::task::spawn_blocking(move || super::hand_tree(&path, 0, 0)).await {
-            Ok(Ok(_)) => return,
-            Ok(Err(e)) => e.to_string(),
-            Err(e) => e.to_string(),
-        };
-        tracing::warn!(%why, dir = %dir.display(), "the lease directory was not taken back from a slot");
+        let taken = tokio::task::spawn_blocking(move || {
+            super::hand_tree(&path, (0, 0), &AtomicBool::new(false))
+        })
+        .await;
+        taken
+            .map_err(io::Error::other)
+            .and_then(|done| done)
+            .map(drop)
+            .map_err(|e| RuntimeError::Failed(format!("reclaim {}: {e}", dir.display())))
     }
 
     /// The watch over the action's processes: every process of the slot's uid.

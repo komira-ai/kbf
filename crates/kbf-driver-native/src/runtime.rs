@@ -447,7 +447,7 @@ impl<C: Cas> NativeRuntime<C> {
                 return Err(RuntimeError::Killed);
             }
         };
-        runner.hand_over(dir).await?;
+        runner.hand_over(dir, &Arc::default()).await?;
         Ok(prepared)
     }
 
@@ -940,21 +940,30 @@ impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
     }
 
     async fn probe(&mut self) -> Result<crate::slots::canary::Probe, RuntimeError> {
-        use crate::slots::canary::Probe;
+        use crate::slots::canary::{Probe, Raced, until_killed};
         let (Some(slot), Some(made)) = (self.current.as_ref(), self.prepared.get()) else {
             return Err(RuntimeError::Failed("no slot or lease to probe".to_owned()));
         };
-        tokio::select! {
-            handed = slot.hand_over(self.dir) => handed?,
-            Ok(by) = &mut *self.stop => {
+        // The hand-over and the canaries are blocking work that cannot be dropped: on a
+        // kill they are told to stop and awaited, so that nothing of the slot runs after
+        // the lease is answered as killed (the directory is removed and the slot
+        // released next).
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let killed = async { (&mut *self.stop).await.ok() };
+        tokio::pin!(killed);
+        let handed = until_killed(slot.hand_over(self.dir, &cancel), &cancel, &mut killed).await;
+        match handed {
+            Raced::Done(done) => done?,
+            Raced::Killed(by) => {
                 *self.killer = Some(by);
                 return Err(RuntimeError::Killed);
             }
         }
         let isolation = &self.runtime.config.isolation;
-        let report = tokio::select! {
-            report = slot.canary(isolation, made.network, &made.lease) => report?,
-            Ok(by) = &mut *self.stop => {
+        let ran = slot.canary(isolation, made.network, &made.lease, &cancel);
+        let report = match until_killed(ran, &cancel, &mut killed).await {
+            Raced::Done(done) => done?,
+            Raced::Killed(by) => {
                 *self.killer = Some(by);
                 return Err(RuntimeError::Killed);
             }
@@ -966,14 +975,19 @@ impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
         })
     }
 
-    async fn aside(&mut self, why: &str) {
+    async fn aside(&mut self, why: &str) -> Result<(), RuntimeError> {
         // The slot's user owns the lease directory until it is taken back: a slot that
-        // is cleaned and offered again must not find it.
+        // is cleaned and offered again must not find it. If it cannot be taken back the
+        // slot stays held and the lease fails, so `run` removes the directory first.
+        let Some(slot) = self.current.as_ref() else {
+            return Ok(());
+        };
+        slot.reclaim(self.dir).await?;
         if let Some(slot) = self.current.take() {
-            slot.reclaim(self.dir).await;
             // The book logs it, in the shape of a failed clean.
             slot.set_aside(why);
         }
+        Ok(())
     }
 
     fn take_held(&mut self) -> Option<Runner> {
@@ -993,6 +1007,11 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
     async fn run(&self, work: Work) -> Result<ActionResult, RuntimeError> {
         let (stop_tx, mut stop) = oneshot::channel();
         let _registered = Registered::new(self, work.lease_id, stop_tx);
+        // Declared before `dir`, so that a dropped run (the future cancelled, or a
+        // panic) drops `dir` first and the runner's slot after: the slot is cleaned and
+        // offered again as soon as it drops, and must not be while the lease directory,
+        // owned by its user, still exists.
+        let mut runner = Runner::Daemon;
         let dir = LeaseDir {
             path: self.config.scratch.join(lease_name(work.lease_id)),
             simctl: Arc::clone(&self.simctl),
@@ -1000,7 +1019,6 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
             armed: true,
         };
         let mut killer = None;
-        let mut runner = Runner::Daemon;
         let mut measured = None;
         let outcome = (self.attempt(
             &work,

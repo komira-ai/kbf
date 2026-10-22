@@ -197,7 +197,7 @@ async fn a_slot_that_fails_its_canaries_is_dirty_and_recovery_offers_it_to_be_ca
         std::fs::metadata(&lease).expect("lease").uid(),
         slot.ready().user.uid
     );
-    slot.reclaim(&lease).await;
+    slot.reclaim(&lease).await.expect("reclaim");
     assert_eq!(
         std::fs::metadata(&lease).expect("lease").uid(),
         0,

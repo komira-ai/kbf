@@ -7,6 +7,8 @@
 use std::io::{self, Read as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use kbf_daemon::RuntimeError;
@@ -32,6 +34,23 @@ impl Slot {
         network: Network,
         lease: &Path,
     ) -> Result<Report, RuntimeError> {
+        self.canary_until(isolation, network, lease, &Arc::default())
+            .await
+    }
+
+    /// [`Slot::canary`] that starts no canary, and ends the one running, once `cancel` is
+    /// set, and returns only when the blocking work has stopped: nothing of the slot's
+    /// user runs after it returns.
+    ///
+    /// # Errors
+    /// As [`Slot::canary`].
+    pub async fn canary_until(
+        &self,
+        isolation: &Isolation,
+        network: Network,
+        lease: &Path,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Report, RuntimeError> {
         let uid = self.ready().user.uid;
         let mut commands = Vec::new();
         for canary in CANARIES {
@@ -45,13 +64,15 @@ impl Slot {
         }
         let started = Instant::now();
         let lease = lease.to_owned();
+        let cancel = Arc::clone(cancel);
         let report = tokio::task::spawn_blocking(move || {
-            let report = canary::check(CANARIES, &mut |c: &Canary| {
+            let cancelled = || cancel.load(Ordering::SeqCst);
+            let report = canary::check_until(CANARIES, &cancelled, &mut |c: &Canary| {
                 let (_, (program, args)) = commands
                     .iter()
                     .find(|(name, _)| *name == c.name)
                     .ok_or_else(|| io::Error::other("no command for the canary"))?;
-                run(program, args, uid)
+                run(program, args, uid, &cancelled)
             });
             // Whatever a canary left in the lease directory, removed by the daemon
             // itself, without following it, before the tree is handed to the user.
@@ -76,7 +97,7 @@ impl Slot {
 /// process of `uid` if it takes longer) and returns its exit code and output. The output
 /// is read on a thread of its own and waited for at most [`END_WITHIN`] after the exit:
 /// a process of the uid that kept the pipe open does not hold the daemon.
-fn run(program: &Path, args: &[String], uid: u32) -> io::Result<Ran> {
+fn run(program: &Path, args: &[String], uid: u32, cancelled: &dyn Fn() -> bool) -> io::Result<Ran> {
     let started = Instant::now();
     let mut child = Command::new(program)
         .args(args)
@@ -98,7 +119,7 @@ fn run(program: &Path, args: &[String], uid: u32) -> io::Result<Ran> {
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if started.elapsed() > canary::WITHIN {
+        if started.elapsed() > canary::WITHIN || cancelled() {
             let _ = child.kill();
             let _ = uid::end(uid, END_WITHIN);
             let _ = child.wait();
