@@ -95,6 +95,7 @@ mod seed_fixture;
 pub mod seq_floor;
 pub mod settings;
 pub mod setup;
+pub mod sha256_hex;
 pub mod spool;
 pub mod stage;
 pub mod state;
