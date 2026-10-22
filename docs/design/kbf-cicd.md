@@ -616,6 +616,20 @@ window of `split-mode-updates.md` 3.1 allows. Two checks run on every merge, bef
   the previous release's golden, and the previous release's binary opens a file the commit wrote (the expand-only case); a
   contract change is refused while a previous-release frontend is configured. T11 **[F, unbuilt]**.
 
+Both serve one rule: every on-disk and wire format changes only by adding (an optional field, a record kind, a command), so
+each release starts on the data the release before it wrote, the release before it starts on the data the new one wrote, and a
+reader skips what it does not know. A change to a format names the test that covers it. Every pull request runs, with no
+previous binary, the codec fixture (`crates/kbf-log/tests/n_minus_1.rs`: an entry of every kind round-trips and a later field
+after it is skipped), the metadata log opened as an earlier machine version
+(`crates/kbf-server/tests/n_minus_1_log.rs`: the raises past that version are skipped; commands an earlier build lacks are
+`raft_log_unknown.rs`), rows that carry a field their reader does not name (`crates/kbf-server/tests/n_minus_1_rows.rs`), and
+two golden corpora of entries (`crates/kbf-log/tests/golden/`) and rows (`crates/kbf-server/tests/golden/rows/`) that every
+later build must read as the same values. A corpus is append-only: a file is added when a release adds a kind, and a file that
+exists is never rewritten or deleted. Beta runs the rule with a real N-1: `n_minus_1_restarts_on_data_n_wrote` and
+`n_restarts_on_data_n_minus_1_wrote` (`crates/kbf-integration-test/tests/mixed_version.rs`, the `mixed-version` job of
+`beta.yml`) stop each storage node of a farm and start it again as the other version on the same files, and say SKIPPED while
+no release exists.
+
 Then B9 runs real processes: N frontend with N-1 nodes, N-1 frontend with N nodes (the downgrade order), a handover N-1 to N
 and back, each with a build in flight (T10). The previous release comes from section 3. A release whose N-1 is unavailable
 does not skip the check: the beta is red ("not run" is not "passed").

@@ -812,11 +812,15 @@ jobs:
   # docs/design/kbf-cicd.md, N/N-1 compatibility in CI): real kbf processes of the tip (N) and of
   # the release before this commit (N-1) in one farm, a frontend of one version over the nodes and
   # the daemon of the other both ways, two storage nodes of different versions replicating to each
-  # other, and a loaded node restarted under the other version. N-1 is not built here: `cargo xtask
-  # release fetch-previous` downloads the previous release's assets, verifies them as a deployment
-  # does (SHA256SUMS, one bundle per tarball, provenance and SBOM attestations, the bundles again
-  # offline against the Sigstore trusted root) and only then unpacks its `kbf` into
-  # target/tmp/n-1, where the test looks for it. This is a push job and not a pull-request job: it
+  # other, a loaded node restarted under the other version, and (every format changes additively)
+  # each storage node of a farm of one version stopped and started again as the other on the files
+  # it had, so that N-1 starts on the data N wrote and N on the data N-1 wrote
+  # (`n_minus_1_restarts_on_data_n_wrote`, `n_restarts_on_data_n_minus_1_wrote`). N-1 is not built
+  # here: `cargo xtask release fetch-previous` downloads the previous release's assets, verifies
+  # them as a deployment does (SHA256SUMS, one bundle per tarball, provenance and SBOM
+  # attestations, the bundles again offline against the Sigstore trusted root) and only then
+  # unpacks its `kbf` into target/tmp/n-1, where the test looks for it. This is a push job and
+  # not a pull-request job: it
   # needs the token's attestations scope and GitHub's release API, a pull request from a fork has
   # neither, and the farm takes minutes. A release is cut only from a commit whose beta run
   # succeeded (release.yml, `gates`), so a break in N/N-1 stops the release it would ship in.
@@ -867,7 +871,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask release fetch-previous --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --platform linux-x86_64 --binary kbf --out target/tmp/n-1 --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --output target/n-1.source
       # One test at a time: each starts a farm of its own, and the output says what each did (or
-      # that it was skipped).
+      # that it was skipped). The two N/N-1 data-restart tests are among them, run by this same
+      # command.
       - name: The farm of N and N-1
         run: cargo test -p kbf-integration-test --test mixed_version --locked -- --test-threads=1 --nocapture
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

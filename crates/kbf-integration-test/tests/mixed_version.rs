@@ -23,6 +23,17 @@
 //! or the repair worker's if it owed one; a copy owed is not forced); a node restarted under
 //! the other version in the middle of a load fails no action.
 //!
+//! Every format changes additively, so each release starts on the data the other wrote. Two
+//! tests restart the storage nodes of a farm under the other version, one at a time, on the
+//! files they had: `n_minus_1_restarts_on_data_n_wrote` writes blobs and runs an action on a
+//! farm of N and restarts each node as N-1, and `n_restarts_on_data_n_minus_1_wrote` does the
+//! same from a farm of N-1, restarting each node as N. After the restarts the blobs read back
+//! through the frontend and are on both nodes, every member is `active`, a new session runs,
+//! and no process of either version has ended with status 2 (a start the binary refused).
+//! The pull-request gate holds the same rule without a previous binary: the fixture and
+//! golden tests of `kbf-log` and `kbf-server` (`n_minus_1.rs`, `golden_corpus.rs`,
+//! `n_minus_1_log.rs`, `n_minus_1_rows.rs`).
+//!
 //! Not under coverage: the pull-request gate has no N-1 to give it, and its lines would
 //! count against the 99% of the crate.
 
@@ -31,6 +42,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use kbf_harness::api;
 use kbf_harness::farm::{Bins, Farm, Role, Topology};
 use kbf_harness::node_support::scratch_root;
 use kbf_harness::procs::HANG;
@@ -120,9 +132,20 @@ fn blob(i: usize) -> Vec<u8> {
     format!("mixed version {i:04} {}", "x".repeat(80)).into_bytes()
 }
 
-/// Writes 24 blobs through the frontend and reads them back; returns them.
-async fn write_and_read(cas: &Transfers) -> Vec<Vec<u8>> {
-    let blobs: Vec<Vec<u8>> = (0..24).map(blob).collect();
+/// Reads each of `blobs` through the frontend; each must be the bytes that were written.
+async fn read_back(cas: &Transfers, blobs: &[Vec<u8>]) {
+    for bytes in blobs {
+        let read = cas
+            .get(&digest_of(bytes))
+            .await
+            .expect("read through the frontend");
+        assert_eq!(&read, bytes);
+    }
+}
+
+/// Writes 24 blobs, `blob(first)` on, through the frontend and reads them back; returns them.
+async fn write_and_read(cas: &Transfers, first: usize) -> Vec<Vec<u8>> {
+    let blobs: Vec<Vec<u8>> = (first..first + 24).map(blob).collect();
     for bytes in &blobs {
         let digest = cas
             .put(bytes.clone())
@@ -135,13 +158,7 @@ async fn write_and_read(cas: &Transfers) -> Vec<Vec<u8>> {
         cas.missing(&digests).await.is_empty(),
         "a written blob is missing"
     );
-    for bytes in &blobs {
-        let read = cas
-            .get(&digest_of(bytes))
-            .await
-            .expect("read through the frontend");
-        assert_eq!(&read, bytes);
-    }
+    read_back(cas, &blobs).await;
     blobs
 }
 
@@ -187,11 +204,17 @@ fn failure(response: &ExecuteResponse) -> Option<String> {
 /// frontend, then an `Execute` (the action's input a blob of its own) whose output is read
 /// back through the frontend. Returns the blobs written.
 async fn session(farm: &Farm) -> Vec<Vec<u8>> {
+    session_of(farm, 0, 1000).await
+}
+
+/// [`session`] with its blobs from `blob(first)` on and its action's input `blob(input)`: a
+/// second session on a farm that ran one takes other numbers, or its action is a cache hit.
+async fn session_of(farm: &Farm, first: usize, input: usize) -> Vec<Vec<u8>> {
     let channel = connect(farm.ca_pem(), farm.reapi()).await;
     let cas = Arc::new(Transfers::over(channel.clone(), TransferConfig::default()));
-    let blobs = write_and_read(&cas).await;
+    let blobs = write_and_read(&cas, first).await;
     let image = farm.image().to_owned();
-    let response = run_one(channel, cas.clone(), image, 1000).await;
+    let response = run_one(channel, cas.clone(), image, input).await;
     let why = failure(&response);
     assert!(why.is_none(), "{}", why.unwrap_or_default());
     let read = cas
@@ -396,4 +419,122 @@ fn node_with_a_lease(farm: &Farm) -> Option<usize> {
     let (file, _) = hits.first()?.split_once(": ")?;
     let rest = file.strip_prefix("node-")?;
     rest.split('.').next()?.parse().ok()
+}
+
+/// Runs `work` to its end, or panics once [`HANG`] has passed: a node that accepts a
+/// connection and never answers fails the test and not the job's timeout.
+async fn within<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(HANG, work)
+        .await
+        .unwrap_or_else(|_| panic!("{what} did not finish in time"))
+}
+
+/// Stops storage node `node` and starts it again under the `kbf` at `kbf`, on the command line
+/// and files it had, as an update restarts a host: its member is marked `planned_down` (and
+/// listed `down`), SIGTERM, then (once the frontend no longer lists the node as connected) the
+/// new process. Returns when the frontend lists every node connected and every member
+/// `active` again, which the member of the node does only once it has registered anew.
+fn restart_node(farm: &mut Farm, node: usize, kbf: &Path) {
+    let role = Role::Node(node);
+    let member = farm
+        .wait("the node's member to be listed", |f| f.member_of(node))
+        .id;
+    let body = r#"{"state":"planned_down","for_secs":300}"#;
+    let (code, answer) = farm
+        .post(&format!("/v1/members/{member}"), body)
+        .expect("the API answers");
+    assert_eq!(code, 200, "planned_down: {answer}");
+    farm.wait("the node's member to be listed down", |f| {
+        (f.member_of(node)?.state == "down").then_some(())
+    });
+    let status = farm.term(role).expect("SIGTERM was answered");
+    assert!(status.success(), "{role} ended {status:?}");
+    let (port, ids) = (farm.api_port(), farm.node_ids().to_vec());
+    let dropped = |_: &Farm| (api::connected(port)? != ids).then_some(());
+    farm.wait("the frontend to drop the node", dropped);
+    farm.restart_with(role, kbf);
+    let program = &farm.spec(role).program;
+    assert_eq!(program, kbf, "{role} is not on the build asked for");
+    farm.wait_ready().unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// Asserts that no process of the farm, of any generation, ended with status 2 (the status of
+/// a start the binary refused, which its unit does not restart) and that none ended on its own.
+fn none_refused_to_start(farm: &mut Farm) {
+    let refused: Vec<String> = farm
+        .process_table()
+        .into_iter()
+        .filter(|p| p.ended.as_deref() == Some("exit 2"))
+        .map(|p| format!("{} generation {}", p.role, p.generation))
+        .collect();
+    assert!(refused.is_empty(), "{refused:?}\n{}", farm.logs());
+    let crashed: Vec<String> = farm
+        .unexpected_exits()
+        .into_iter()
+        .map(|(role, how)| format!("{role}: {how}"))
+        .collect();
+    assert!(crashed.is_empty(), "{crashed:?}\n{}", farm.logs());
+}
+
+/// The body of the two restart tests: a farm of two storage nodes and a daemon, whose roles
+/// `older` run the `kbf` at `previous` and the rest the tip's, writes 24 blobs and runs an
+/// action; then each storage node in turn is stopped and started again under the `kbf` at
+/// `then`, on the files it had. Afterwards the blobs read back through the frontend and are on
+/// both nodes, the frontend lists every node connected and both members `active` (neither
+/// `catching_up`), a new session (other blobs, another action) runs, no process ended with
+/// status 2 or on its own, and every process stops with exit 0.
+fn restart_each_node(name: &str, older: &[Role], previous: &Path, then: &Path) {
+    let (mut farm, _) = start(name, Topology::rehearsal(2), older, previous);
+    farm.wait_ready().unwrap_or_else(|e| panic!("{e}"));
+    let tokio = tokio::runtime::Runtime::new().expect("runtime");
+    let first = session(&farm);
+    let written = tokio.block_on(within("the first session", first));
+    held_by_both(&mut farm, &written);
+    for node in 1..=farm.storage_nodes() {
+        restart_node(&mut farm, node, then);
+    }
+    let dial = connect(farm.ca_pem(), farm.reapi());
+    let channel = tokio.block_on(within("the connection", dial));
+    let cas = Transfers::over(channel, TransferConfig::default());
+    let reading = read_back(&cas, &written);
+    tokio.block_on(within("the read back of the blobs", reading));
+    held_by_both(&mut farm, &written);
+    assert_eq!(farm.whole(), Ok(()), "{}", farm.logs());
+    let members = farm.members().expect("the frontend lists its members");
+    let states: Vec<&str> = members.iter().map(|m| m.state.as_str()).collect();
+    assert_eq!(states, ["active", "active"], "{}", farm.logs());
+    let next = session_of(&farm, 100, 2000);
+    let fresh = tokio.block_on(within("the new session", next));
+    held_by_both(&mut farm, &fresh);
+    none_refused_to_start(&mut farm);
+    farm.stop();
+}
+
+/// Asserts that the two storage nodes of a farm of N, each stopped and started again as N-1 on
+/// the files N wrote (the downgrade of a rollback), keep what N wrote and the farm stays whole:
+/// the 24 blobs N wrote read back through the frontend and are on both nodes, both members are
+/// `active`, a new session runs and no process ended with status 2. With no N-1 `kbf` the test
+/// says SKIPPED and returns, as the others do.
+#[test]
+fn n_minus_1_restarts_on_data_n_wrote() {
+    let Some(previous) = previous_kbf() else {
+        return;
+    };
+    restart_each_node("n-minus-1-on-n-data", &[], &previous, &previous);
+}
+
+/// Asserts that the two storage nodes of a farm of N-1 (the frontend and the daemon included),
+/// each stopped and started again as N on the files N-1 wrote (the first step of an update),
+/// keep what N-1 wrote and the farm stays whole: the 24 blobs N-1 wrote read back through the
+/// frontend and are on both nodes, both members are `active`, a new session runs and no process
+/// ended with status 2. With no N-1 `kbf` the test says SKIPPED and returns, as the others do.
+#[test]
+fn n_restarts_on_data_n_minus_1_wrote() {
+    let Some(previous) = previous_kbf() else {
+        return;
+    };
+    let mut older = behind_the_frontend(2);
+    older.push(Role::Frontend);
+    let tip = sibling_bin("kbf");
+    restart_each_node("n-on-n-minus-1-data", &older, &previous, &tip);
 }
