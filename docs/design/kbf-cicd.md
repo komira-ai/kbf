@@ -542,13 +542,24 @@ and the notes (items 1 to 3) are built. It has no dependency on any earlier stag
 The additions:
 
 1. **No verdict gates the release (CEO ruling).** Release gating is `release gates` (the `ci`, `beta` and `artifacts` push runs
-   green for the commit) and `release verify` in the `verify` job: the attestations and the release set, and the tag (annotated,
+   green for the commit; see "Superseded commits" below) and `release verify` in the `verify` job: the attestations and the release set, and the tag (annotated,
    on main, naming this commit). This is a release-process check in GitHub; it is **not host-update trust** (hosts never read
    the tag, and verify only the artifact attestation). Nothing judges a verdict document: the annotated tag's message carries
    the **Beta record** `release verdict-write` wrote (commit, set hash, tag, the run ids), as an audit record. A tag with no
    record, or one that says it failed, passes `verify` the same. The gamma farm's build check (the retired `gamma.yml`, now kbf-updater) does not gate the release. **No signing key**: who may push a `v*` tag is
    limited by the tag-protection ruleset on main (M19), and the `publish` job is gated by the `prod` environment's
    required reviewer (item 2). A signing key would add key custody without adding protection beyond those two.
+   **Superseded commits.** When several pushes merge in a burst, each newer push makes GitHub cancel the older commit's pending
+   `ci`, `beta` and `artifacts` runs (their concurrency groups), so the older commit's release run would end red
+   with "concluded cancelled, not success" although nothing failed. `release gates` therefore ends **green with
+   `superseded=true`** when every run that is not green concluded `cancelled` **and** the head of `main` is no longer the
+   commit but a commit ahead of it (`branches/main`, then `compare/<sha>...<head>`; the log line is "superseded: <sha> was
+   replaced on main by <newer sha>; the release of the newer commit includes it"). Every later job (`plan`, `verify`, `tag`,
+   `notes`, `publish`, `bump`) is skipped on `needs.gates.outputs.superseded`, and the workflow lint refuses a version of
+   the file in which one of them is not. Everything else stays red: a conclusion other than `cancelled` (failure,
+   `timed_out`, ...) even on a superseded commit, a `cancelled` run while the commit is still the head of `main` (someone
+   cancelled the current commit's checks), a head that is not ahead of the commit, a head GitHub does not report, and a run
+   that is absent. The check only reads (`contents: read`, `actions: read`).
 2. **A `prod` environment with a required reviewer**, as kci's prod, on the `publish` job. **One approval per release:** the
    kbf.dev deploy job (the only one with `id-token: write`) `needs` `publish` and runs in a second environment, `prod-site`,
    which has no reviewer and admits `v*` tags only; the AWS role trusts `prod-site`, so the approved `publish` job (which

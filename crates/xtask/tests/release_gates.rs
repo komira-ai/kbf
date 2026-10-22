@@ -137,6 +137,32 @@ impl Fx {
         self.gates_with(&[])
     }
 
+    /// The branch head is `head`, and comparing `SHA` with it says `status`.
+    fn main_is_at(&self, head: &str, status: &str) {
+        self.put(vec![
+            (
+                format!("repos/{REPO}/branches/{BRANCH}"),
+                json!({ "commit": { "sha": head } }),
+            ),
+            (
+                format!("repos/{REPO}/compare/{SHA}...{head}"),
+                json!({ "status": status }),
+            ),
+        ]);
+    }
+
+    /// `file`'s run concluded `conclusion`, the others are green.
+    fn concluded(&self, file: &str, conclusion: &str) {
+        self.green_but(
+            file,
+            vec![with(
+                run(file, id_of(file)),
+                "conclusion",
+                json!(conclusion),
+            )],
+        );
+    }
+
     fn gh_args(&self) -> String {
         std::fs::read_to_string(self.root.join("gh/gh-args")).unwrap_or_default()
     }
@@ -163,7 +189,7 @@ fn three_green_push_runs_print_their_ids_and_append_them_to_the_output() {
     let file = fx.root.join("out");
     let (code, out, err) = fx.gates_with(&[("--output", file.to_str().unwrap())]);
     assert_eq!(code, Some(0), "{err}");
-    let want = "ci_run=11\nbeta_run=22\nartifacts_run=33\n";
+    let want = "ci_run=11\nbeta_run=22\nartifacts_run=33\nsuperseded=false\n";
     assert_eq!(out, want);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), want);
 }
@@ -485,7 +511,10 @@ fn it_polls_until_every_run_completed_then_judges() {
     let started = Instant::now();
     let (code, out, err) = fx.gates_with(&[("--timeout-s", "60")]);
     assert_eq!(code, Some(0), "{err}");
-    assert_eq!(out, "ci_run=11\nbeta_run=22\nartifacts_run=33\n");
+    assert_eq!(
+        out,
+        "ci_run=11\nbeta_run=22\nartifacts_run=33\nsuperseded=false\n"
+    );
     assert!(started.elapsed().as_secs() >= 2, "it did not wait");
     let beta_looks = fx
         .gh_args()
@@ -680,4 +709,193 @@ fn a_full_page_of_runs_is_refused_not_judged_as_the_whole_list() {
     fx2.green_but("ci.yml", page(99));
     let (code, _, err) = fx2.gates();
     assert_eq!(code, Some(0), "{err}");
+}
+
+const NEWER: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+#[test]
+fn a_cancelled_run_on_a_commit_main_has_moved_past_ends_green_as_superseded() {
+    // Each workflow in turn is the cancelled one, the other two green.
+    for (_, file) in GATES {
+        let fx = fx(&format!("superseded-{}", file.trim_end_matches(".yml")));
+        fx.concluded(file, "cancelled");
+        fx.main_is_at(NEWER, "ahead");
+        let output = fx.root.join("out");
+        let (code, out, err) = fx.gates_with(&[("--output", output.to_str().unwrap())]);
+        assert_eq!(code, Some(0), "{file}: {err}");
+        assert_eq!(
+            out, "superseded=true\n",
+            "no run ids for a superseded commit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "superseded=true\n"
+        );
+        assert!(
+            err.contains(&format!(
+                "superseded: {SHA} was replaced on {BRANCH} by {NEWER}; the release of the newer commit includes it"
+            )),
+            "{file}: {err}"
+        );
+    }
+}
+
+#[test]
+fn several_cancelled_runs_on_a_replaced_commit_end_green_as_superseded() {
+    let fx = fx("superseded-all");
+    for (_, file) in GATES {
+        fx.lists(
+            file,
+            vec![with(
+                run(file, id_of(file)),
+                "conclusion",
+                json!("cancelled"),
+            )],
+        );
+    }
+    fx.main_is_at(NEWER, "ahead");
+    let (code, out, err) = fx.gates();
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(out, "superseded=true\n");
+}
+
+#[test]
+fn the_superseded_check_only_reads() {
+    let fx = fx("superseded-reads");
+    fx.concluded("beta.yml", "cancelled");
+    fx.main_is_at(NEWER, "ahead");
+    assert_eq!(fx.gates().0, Some(0));
+    let args = fx.gh_args();
+    assert!(
+        args.contains(&format!("api repos/{REPO}/branches/{BRANCH}")),
+        "{args}"
+    );
+    assert!(
+        args.contains(&format!("api repos/{REPO}/compare/{SHA}...{NEWER}")),
+        "{args}"
+    );
+    assert!(
+        !args.contains(" -X ") && !args.contains("--input"),
+        "{args}"
+    );
+}
+
+#[test]
+fn a_cancelled_run_on_the_head_of_main_stays_red() {
+    for (_, file) in GATES {
+        let fx = fx(&format!("cancelled-head-{}", file.trim_end_matches(".yml")));
+        fx.concluded(file, "cancelled");
+        fx.main_is_at(SHA, "identical");
+        let (code, out, err) = fx.gates();
+        assert_eq!(code, Some(1), "{file}: {out}{err}");
+        assert!(err.contains(&format!("{file}: run")), "{err}");
+        assert!(err.contains("concluded cancelled, not success"), "{err}");
+        assert!(!err.contains("superseded"), "{err}");
+        assert!(out.is_empty(), "{out}");
+    }
+}
+
+#[test]
+fn a_cancelled_run_stays_red_when_main_is_not_ahead_of_the_commit() {
+    // The head is another commit but not a descendant: the commit is not on main's history,
+    // so the newer commit's release would not include it.
+    for status in ["diverged", "behind", "identical"] {
+        let fx = fx(&format!("cancelled-{status}"));
+        fx.concluded("ci.yml", "cancelled");
+        fx.main_is_at(NEWER, status);
+        let (code, out, err) = fx.gates();
+        assert_eq!(code, Some(1), "{status}: {out}{err}");
+        assert!(out.is_empty(), "{out}");
+    }
+}
+
+#[test]
+fn a_cancelled_run_stays_red_when_github_does_not_say_where_main_is() {
+    // The fake answers 404 for the branch: nothing says a newer commit landed.
+    let fx = fx("cancelled-no-head");
+    fx.concluded("artifacts.yml", "cancelled");
+    let (code, out, err) = fx.gates();
+    assert_eq!(code, Some(1), "{out}{err}");
+    assert!(err.contains("artifacts.yml:"), "{err}");
+}
+
+#[test]
+fn a_cancelled_run_stays_red_when_the_head_is_not_a_full_commit() {
+    let fx = fx("cancelled-odd-head");
+    fx.concluded("ci.yml", "cancelled");
+    fx.main_is_at("main", "ahead");
+    assert_eq!(fx.gates().0, Some(1));
+}
+
+#[test]
+fn a_failed_run_stays_red_even_when_the_commit_is_superseded() {
+    for (_, file) in GATES {
+        let fx = fx(&format!(
+            "failed-superseded-{}",
+            file.trim_end_matches(".yml")
+        ));
+        fx.concluded(file, "failure");
+        fx.main_is_at(NEWER, "ahead");
+        let (code, out, err) = fx.gates();
+        assert_eq!(code, Some(1), "{file}: {out}{err}");
+        assert!(err.contains(&format!("{file}: run")), "{err}");
+        assert!(err.contains("concluded failure, not success"), "{err}");
+        assert!(out.is_empty(), "{out}");
+    }
+}
+
+#[test]
+fn a_timed_out_run_stays_red_even_when_the_commit_is_superseded() {
+    for (_, file) in GATES {
+        let fx = fx(&format!(
+            "timed-out-superseded-{}",
+            file.trim_end_matches(".yml")
+        ));
+        fx.concluded(file, "timed_out");
+        fx.main_is_at(NEWER, "ahead");
+        let (code, out, err) = fx.gates();
+        assert_eq!(code, Some(1), "{file}: {out}{err}");
+        assert!(err.contains("concluded timed_out, not success"), "{err}");
+        assert!(out.is_empty(), "{out}");
+    }
+}
+
+#[test]
+fn a_failure_beside_a_cancelled_run_stays_red_and_reports_both() {
+    let fx = fx("failed-and-cancelled");
+    fx.green_but(
+        "ci.yml",
+        vec![with(run("ci.yml", 11), "conclusion", json!("failure"))],
+    );
+    fx.lists(
+        "beta.yml",
+        vec![with(run("beta.yml", 22), "conclusion", json!("cancelled"))],
+    );
+    fx.main_is_at(NEWER, "ahead");
+    let (code, _, err) = fx.gates();
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("ci.yml: run 11"), "{err}");
+    assert!(err.contains("beta.yml: run 22"), "{err}");
+}
+
+#[test]
+fn an_absent_run_stays_red_even_when_another_was_cancelled_and_the_commit_is_superseded() {
+    let fx = fx("absent-and-cancelled");
+    fx.concluded("ci.yml", "cancelled");
+    fx.lists("beta.yml", vec![]);
+    fx.main_is_at(NEWER, "ahead");
+    let (code, out, err) = fx.gates();
+    assert_eq!(code, Some(1), "{out}{err}");
+    assert!(err.contains("beta.yml: no push run"), "{err}");
+}
+
+#[test]
+fn all_green_runs_release_and_say_so_without_asking_where_main_is() {
+    let fx = fx("green-not-superseded");
+    fx.green_but("ci.yml", vec![run("ci.yml", 11)]);
+    fx.main_is_at(NEWER, "ahead");
+    let (code, out, err) = fx.gates();
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.ends_with("superseded=false\n"), "{out}");
+    assert!(!fx.gh_args().contains("/branches/"), "{}", fx.gh_args());
 }

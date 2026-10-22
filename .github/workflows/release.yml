@@ -12,7 +12,12 @@
 # main, so a dispatch is a dry run through `verify`.
 #
 # gates    waits for the push runs of ci, beta and artifacts for this commit on main to have
-#          succeeded (cargo xtask release gates). Read-only.
+#          succeeded (cargo xtask release gates). Read-only. When a newer push to main cancelled
+#          a run of this commit (the concurrency group of ci, beta or artifacts replaces the
+#          older commit's pending run), and main's head is now a commit ahead of this one, the
+#          job ends green with `superseded=true`: the release of the newer commit includes this
+#          one, and every job below is skipped on that output. A cancelled run while this commit
+#          is still main's head, a failure of any kind, and a run that is absent stay red.
 # plan     reads VERSION and the tags: the next version, and whether the push is code (it
 #          ships in a release), the site, or the pipeline itself (cargo xtask release plan).
 #          A push of docs only makes no release and the run stays green; a push that changes
@@ -35,7 +40,8 @@
 # bump     opens the pull request in the internal repository that moves its submodule to the
 #          released commit, with a token of the release bot scoped to that repository.
 #
-# A run releases one commit; a run of an old commit tags and publishes nothing (the highest
+# A run releases one commit; a run of a superseded commit ends at `gates` (above), and a run of
+# an old commit that was not superseded tags and publishes nothing (the highest
 # release tag must name this commit or an ancestor of it: `release tag` and `release publish`
 # both refuse otherwise). Re-run the failed jobs only: a re-run of all jobs writes another
 # Beta record, and a tag that exists must carry the record it was made with.
@@ -77,6 +83,7 @@ jobs:
       ci-run: ${{ steps.gates.outputs.ci_run }}
       beta-run: ${{ steps.gates.outputs.beta_run }}
       artifacts-run: ${{ steps.gates.outputs.artifacts_run }}
+      superseded: ${{ steps.gates.outputs.superseded }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -92,6 +99,8 @@ jobs:
 
   plan:
     needs: [gates]
+    # Not for a commit a newer push to main replaced.
+    if: ${{ needs.gates.outputs.superseded != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -123,7 +132,7 @@ jobs:
   verify:
     needs: [gates, plan]
     # Not for a push that ships nothing, nor one that changes the pipeline.
-    if: ${{ needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
+    if: ${{ needs.gates.outputs.superseded != 'true' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -190,7 +199,7 @@ jobs:
 
   tag:
     needs: [gates, plan, verify]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
+    if: ${{ needs.gates.outputs.superseded != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     # The release bot's key is read only by jobs of this environment; a branch policy that
@@ -234,7 +243,7 @@ jobs:
 
   notes:
     needs: [gates, plan, verify, tag]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
+    if: ${{ needs.gates.outputs.superseded != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -329,7 +338,7 @@ jobs:
   # The files the earlier jobs checked, as a release of the tag.
   publish:
     needs: [gates, plan, verify, tag, notes]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
+    if: ${{ needs.gates.outputs.superseded != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: release
@@ -362,8 +371,8 @@ jobs:
         run: cargo xtask release publish dist --repo "$GITHUB_REPOSITORY" --tag "$TAG" --commit "$GITHUB_SHA" --run-id "$RUN_ID" --set-hash "$SET_HASH" --notes-file release-notes.md
 
   bump:
-    needs: [plan, tag, publish]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
+    needs: [gates, plan, tag, publish]
+    if: ${{ needs.gates.outputs.superseded != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: release

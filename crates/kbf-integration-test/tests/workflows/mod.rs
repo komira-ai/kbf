@@ -158,10 +158,11 @@ const SIGNING_PUSH_ONLY: &str =
 /// the repository's contents, which creating a release and uploading its assets need.
 const RELEASE_SCOPES: &[&str] = &["contents"];
 
-/// The one `if:` spelling under which a job may hold [`RELEASE_SCOPES`] for writing: a push
+/// The one `if:` spelling under which a job may hold [`RELEASE_SCOPES`] for writing: a commit
+/// `release gates` did not find superseded by a newer push, a push
 /// to `main` (never a dispatch, a pull request or a tag), of code, that is not a change to the
 /// release pipeline itself (`release plan` outputs, read through the job's `needs`).
-const RELEASE_PUSH_ONLY: &str = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
+const RELEASE_PUSH_ONLY: &str = "${{ needs.gates.outputs.superseded != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
 
 /// Token scopes a job may set to `write` when it runs only on `main`'s ref: the issues
 /// API, which the advisories workflow uses to open, update and close its one issue.

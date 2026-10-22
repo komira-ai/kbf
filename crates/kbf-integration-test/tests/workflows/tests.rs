@@ -538,7 +538,7 @@ fn signing_scopes_are_allowed_for_a_push_to_main_only() {
 }
 
 /// The `if:` line under which a job may create a release, as the lint requires it.
-const TAG_PUSH_IF: &str = "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}\n";
+const TAG_PUSH_IF: &str = "    if: ${{ needs.gates.outputs.superseded != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}\n";
 
 #[test]
 fn contents_write_needs_a_job_that_runs_only_for_a_release_push_to_main() {
@@ -551,6 +551,8 @@ fn contents_write_needs_a_job_that_runs_only_for_a_release_push_to_main() {
     for cond in [
         "",
         SIGNING_PUSH_IF,
+        // The spelling without the superseded clause: a superseded run could reach the write.
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}\n",
         "    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true'\n",
         "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
         "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}\n",

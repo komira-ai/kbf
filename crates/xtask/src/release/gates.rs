@@ -10,12 +10,23 @@
 //! `--poll-s`, and refuses at once when one is already red, without waiting for the rest.
 //!
 //! Red, each with its line: a run that concluded anything but `success` (failure,
-//! cancelled, skipped, neutral, ...); no run at all (beta's concurrency group replaces a
+//! cancelled, skipped, neutral, ...), with the one exception below; no run at all (beta's concurrency group replaces a
 //! pending run, so a commit's beta may never have run); and the end of `--timeout-s` with
 //! a run still going. A GitHub error is red too: run the job again.
 //!
-//! Prints `ci_run`, `beta_run` and `artifacts_run` as `key=<id>` lines, and appends them to
-//! `--output` (on Actions, `GITHUB_OUTPUT`); `release verdict-write` takes the three ids.
+//! The exception, superseded: when a newer commit lands on `--branch`, GitHub cancels the
+//! pending `ci`, `beta` and `artifacts` runs of the older one (their concurrency groups), so a
+//! run that concluded `cancelled` is not the commit's own verdict. If every run that is not
+//! green or going concluded `cancelled`, and the branch head is no longer `--sha` but a commit
+//! ahead of it, the verb ends green with `superseded=true`, and the release of the newer commit
+//! includes this one. A `cancelled` run while `--sha` is still the head stays red (someone
+//! cancelled the current commit's checks), and so does any other conclusion, beside it or not.
+//! The head is read with two more GETs (`branches/<branch>`, `compare/<sha>...<head>`), made
+//! only when a run was cancelled.
+//!
+//! Prints `ci_run`, `beta_run` and `artifacts_run` as `key=<id>` lines, then `superseded=false`,
+//! and appends them to `--output` (on Actions, `GITHUB_OUTPUT`); `release verdict-write` takes
+//! the three ids. A superseded commit prints `superseded=true` alone, and no ids.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -70,6 +81,8 @@ enum Standing {
     Green(u64),
     /// It is red, and why.
     Red(String),
+    /// Its latest run concluded `cancelled`: red unless the commit was superseded.
+    Cancelled(String),
 }
 
 /// Whether `name` is a branch name this verb puts in a URL: no byte that needs escaping.
@@ -125,13 +138,34 @@ fn standing(runs: &[Value], file: &str, sha: &str, branch: &str) -> Standing {
     if run["status"] != "completed" {
         return Standing::Going(id);
     }
+    let why = |conclusion: &str| {
+        format!("{file}: run {id} for {sha} on {branch} concluded {conclusion}, not success")
+    };
     match run["conclusion"].as_str() {
         Some("success") => Standing::Green(id),
-        other => Standing::Red(format!(
-            "{file}: run {id} for {sha} on {branch} concluded {}, not success",
-            other.unwrap_or("nothing")
-        )),
+        Some("cancelled") => Standing::Cancelled(why("cancelled")),
+        other => Standing::Red(why(other.unwrap_or("nothing"))),
     }
+}
+
+/// The head of `branch` when it is a commit ahead of `sha`: the commit that replaced it. `None`
+/// when `sha` is still the head, when the head is not a descendant of `sha` (`sha` is not in
+/// the branch's history, so a later release would not include it), and when GitHub does not
+/// say.
+fn replaced_by(gh: &Path, repo: &str, sha: &str, branch: &str) -> Result<Option<String>, Error> {
+    let Some(branch_json) = api(gh, &format!("repos/{repo}/branches/{branch}"))? else {
+        return Ok(None);
+    };
+    let Some(head) = branch_json["commit"]["sha"].as_str() else {
+        return Ok(None);
+    };
+    if head == sha || full_commit("the branch head", head).is_err() {
+        return Ok(None);
+    }
+    let compare = api(gh, &format!("repos/{repo}/compare/{sha}...{head}"))?;
+    Ok(compare
+        .filter(|c| c["status"] == "ahead")
+        .map(|_| head.to_owned()))
 }
 
 /// The most runs one request asks for. One commit's push runs of one workflow are a handful
@@ -163,6 +197,19 @@ fn listed(gh: &Path, repo: &str, file: &str, sha: &str, branch: &str) -> Result<
     Ok(runs)
 }
 
+/// The end of a superseded commit: green, with `superseded=true` and no run ids.
+fn superseded(a: &GatesArgs, newer: &str) -> Result<Vec<String>, Error> {
+    eprintln!(
+        "superseded: {} was replaced on {} by {newer}; the release of the newer commit includes it",
+        a.sha, a.branch
+    );
+    let lines = vec!["superseded=true".to_owned()];
+    if let Some(output) = &a.output {
+        append_output(output, &lines)?;
+    }
+    Ok(lines)
+}
+
 /// The `release gates` verb: the lines to print.
 pub fn run(a: &GatesArgs) -> Result<Vec<String>, Error> {
     if !is_repo(&a.repo) {
@@ -192,11 +239,15 @@ pub fn run(a: &GatesArgs) -> Result<Vec<String>, Error> {
         let red: Vec<String> = states
             .iter()
             .filter_map(|s| match s {
-                Standing::Red(why) => Some(why.clone()),
+                Standing::Red(why) | Standing::Cancelled(why) => Some(why.clone()),
                 _ => None,
             })
             .collect();
         if !red.is_empty() {
+            let only_cancelled = states.iter().all(|s| !matches!(s, Standing::Red(_)));
+            if only_cancelled && let Some(newer) = replaced_by(&a.gh, &a.repo, &a.sha, &a.branch)? {
+                return superseded(a, &newer);
+            }
             return Err(Error::Refused(red));
         }
         let green: Vec<u64> = states
@@ -231,6 +282,7 @@ pub fn run(a: &GatesArgs) -> Result<Vec<String>, Error> {
         .iter()
         .zip(&ids)
         .map(|((name, _), id)| format!("{name}_run={id}"))
+        .chain(["superseded=false".to_owned()])
         .collect();
     if let Some(output) = &a.output {
         append_output(output, &lines)?;

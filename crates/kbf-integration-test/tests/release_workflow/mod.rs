@@ -11,6 +11,11 @@
 //!   `verify`, directly or through another. Only `publish` holds a write scope (`contents`),
 //!   `id-token` is in no job ([`ID_TOKEN`]), and the jobs that tag, publish or bump run only
 //!   under [`RELEASE_IF`]: a push to `main` of code that is not a change to the pipeline.
+//! - **Superseded.** `gates` outputs `superseded` (`true` when a newer push to main replaced
+//!   the commit and its cancelled checks are not a failure), it is run for `--branch main`
+//!   alone (a branch or a dispatch has no push run of main to be replaced in), and every job
+//!   after it reads `needs.gates.outputs.superseded != 'true'` in its `if:` ([`PLAN_IF`],
+//!   [`VERIFY_IF`], [`RELEASE_IF`]), so a superseded run cannot reach `tag` or `publish`.
 //! - **Halt on red.** No `always()`, `failure()`, `cancelled()` or `continue-on-error`, and no
 //!   step under `if:` but the ones of `notes` that read the previous release.
 //! - **One commit.** Every checkout is of `github.sha` (no `ref`, `repository` or `token`), and
@@ -49,13 +54,19 @@ const CHAIN: &[&str] = &["gates", "plan", "verify", "tag", PUBLISH, "bump"];
 /// The environment of the jobs that hold the release bot's key or write.
 const ENVIRONMENT: &str = "release";
 
-/// The `if:` of `verify`: a push that ships code and does not change the pipeline.
-pub const VERIFY_IF: &str =
-    "${{ needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
+/// The `if:` of `plan`: a commit the gates did not find superseded (`release gates` ends green
+/// with `superseded=true` when a newer push to main replaced the commit; the release of the newer
+/// commit includes it, so nothing below `gates` runs).
+pub const PLAN_IF: &str = "${{ needs.gates.outputs.superseded != 'true' }}";
 
-/// The `if:` of every job that tags, publishes or bumps: a push to `main` (never a dispatch,
-/// so a dry run writes nothing), of code, that is not a change to the release pipeline itself.
-pub const RELEASE_IF: &str = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
+/// The `if:` of `verify`: a commit not superseded, and a push that ships code and does not
+/// change the pipeline.
+pub const VERIFY_IF: &str = "${{ needs.gates.outputs.superseded != 'true' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
+
+/// The `if:` of every job that tags, publishes or bumps: a commit not superseded, a push to
+/// `main` (never a dispatch, so a dry run writes nothing), of code, that is not a change to the
+/// release pipeline itself.
+pub const RELEASE_IF: &str = "${{ needs.gates.outputs.superseded != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
 
 /// The jobs that may hold `id-token: write`: none (the kbf.dev upload is a later change that
 /// adds its job here).
@@ -91,7 +102,7 @@ const RULES: [Rule; 7] = [
         job: "plan",
         needs: &["gates"],
         permissions: &[("contents", "read")],
-        condition: None,
+        condition: Some(PLAN_IF),
         environment: None,
     },
     Rule {
@@ -124,7 +135,7 @@ const RULES: [Rule; 7] = [
     },
     Rule {
         job: "bump",
-        needs: &["plan", "tag", PUBLISH],
+        needs: &["gates", "plan", "tag", PUBLISH],
         permissions: &[("contents", "read")],
         condition: Some(RELEASE_IF),
         environment: Some(ENVIRONMENT),
@@ -655,6 +666,7 @@ fn gates_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             ("ci-run", "ci_run"),
             ("beta-run", "beta_run"),
             ("artifacts-run", "artifacts_run"),
+            ("superseded", "superseded"),
         ] {
             output_is(release, "gates", name, id, from, out)?;
         }

@@ -215,7 +215,11 @@ fn every_job_needs_exactly_what_the_graph_says() {
         ),
         "`publish` needs",
     );
-    let found = plant("bump", "needs: [plan, tag, publish]\n", "needs: [plan]\n");
+    let found = plant(
+        "bump",
+        "needs: [gates, plan, tag, publish]\n",
+        "needs: [plan]\n",
+    );
     red(&found, "`bump` needs");
     red(
         &found,
@@ -315,8 +319,8 @@ fn the_jobs_that_write_run_only_for_a_push_to_main_that_releases() {
     red(
         &plant(
             "plan",
-            "    needs: [gates]\n",
-            "    needs: [gates]\n    if: ${{ false }}\n",
+            &format!("    if: {PLAN_IF}\n"),
+            "    if: ${{ false }}\n",
         ),
         "the job `plan` has `if:",
     );
@@ -354,7 +358,7 @@ fn a_red_job_stops_the_release() {
     // `if:` on a step of tag, of verify and of notes (not the previous release's).
     red(
         &plant_top(
-            "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}\n    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n",
+            "    if: ${{ needs.gates.outputs.superseded != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}\n    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n",
             "    if: ${{ always() && github.event_name == 'push' }}\n    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n",
         ),
         "uses `always()`",
@@ -1269,4 +1273,83 @@ fn the_gates_job_outlasts_its_own_wait() {
             "the job `gates` has no `timeout-minutes` above 180",
         );
     }
+}
+
+#[test]
+fn a_superseded_gates_run_skips_every_later_job() {
+    // Catches: a job after `gates` that does not read `superseded`, so a run of a commit a
+    // newer push replaced still plans, tags, publishes or bumps; the output dropped or read
+    // from another step, so the jobs would read an empty value.
+    let clause = "needs.gates.outputs.superseded != 'true'";
+    for job in ["verify", "tag", "notes", "publish", "bump"] {
+        red(
+            &plant(job, &format!("{clause} && "), ""),
+            &format!("the job `{job}` has `if:"),
+        );
+    }
+    red(
+        &plant("plan", &format!("    if: {PLAN_IF}\n"), ""),
+        "the job `plan` has `if: (none)`",
+    );
+    for job in ["tag", "publish", "bump"] {
+        red(
+            &plant(job, clause, "needs.gates.outputs.superseded == 'false'"),
+            &format!("the job `{job}` has `if:"),
+        );
+    }
+}
+
+#[test]
+fn the_gates_job_outputs_superseded_from_the_gates_step() {
+    // Catches: the output missing or taken from a step that is not `release gates`.
+    red(
+        &plant(
+            "gates",
+            "      superseded: ${{ steps.gates.outputs.superseded }}\n",
+            "",
+        ),
+        "does not output `superseded`",
+    );
+    red(
+        &plant(
+            "gates",
+            "steps.gates.outputs.superseded",
+            "steps.other.outputs.superseded",
+        ),
+        "does not output `superseded`",
+    );
+}
+
+#[test]
+fn bump_reads_superseded_so_it_needs_gates_directly() {
+    // Catches: `bump` reading `needs.gates` without listing `gates` (an empty value, so the
+    // condition would be true for a superseded run).
+    red(
+        &plant(
+            "bump",
+            "needs: [gates, plan, tag, publish]\n",
+            "needs: [plan, tag, publish]\n",
+        ),
+        "`bump` needs",
+    );
+}
+
+#[test]
+fn the_superseded_output_comes_only_from_a_gates_run_for_main() {
+    // Catches: `release gates` run for a branch or a dispatch ref, whose commit could be
+    // judged superseded against a branch it was never pushed to.
+    for to in [
+        "--branch \"$GITHUB_REF_NAME\"",
+        "--branch dev",
+        "--branch \"$BRANCH\"",
+    ] {
+        red(
+            &plant("gates", "--branch main", to),
+            "is not given `--branch main`",
+        );
+    }
+    red(
+        &plant("gates", "--sha \"$GITHUB_SHA\"", "--sha \"$OTHER\""),
+        "is not given `--sha $GITHUB_SHA`",
+    );
 }

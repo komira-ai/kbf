@@ -495,7 +495,7 @@ can create one. The jobs, each with the least token it needs:
 
 | job | does | scopes |
 |---|---|---|
-| `gates` | waits for the push runs of `ci`, `beta` and `artifacts` for the commit on `main` to succeed (`cargo xtask release gates`) | `contents: read`, `actions: read` |
+| `gates` | waits for the push runs of `ci`, `beta` and `artifacts` for the commit on `main` to succeed (`cargo xtask release gates`); ends green as `superseded` when the cancelled runs are those of a commit a newer push to `main` replaced, and every job below is then skipped | `contents: read`, `actions: read` |
 | `plan` | the next version from `VERSION` and the tags, and whether the push is code, the site or the pipeline itself (`release plan`); the stop switch `RELEASE_FREEZE` is read here | `contents: read` |
 | `verify` | finds the artifacts run, refuses a commit not on `main`, checks the files and every attestation (below), before anything is tagged | `contents`, `actions`, `attestations`: read |
 | `tag` | writes the Beta record and creates the annotated tag at the commit, create-only, with the release bot's token (`release verdict-write`, `release tag`) | `contents: read`; environment `release` |
