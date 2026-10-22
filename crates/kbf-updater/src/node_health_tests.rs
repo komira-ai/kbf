@@ -426,7 +426,9 @@ fn the_daemon_is_asked_by_its_alias() {
 
 /// Catches a version tied to the wrong commit: the 12 digits after `+g` of a package version,
 /// bare after `+` for the older form, up to a `-`; none for a version without them, with fewer
-/// or more digits than a commit has, or with other text after them. A reported commit matches
+/// or more digits than a commit has, or with other text after them. The commit is the text after
+/// the last `+`: an earlier `+` belongs to the upstream part, and a `+` suffix after the commit
+/// (`+b1`) leaves a version whose commit cannot be verified. A reported commit matches
 /// by prefix, in either case, and a shorter report or a non-ASCII one does not.
 #[test]
 fn a_version_names_its_commit_and_a_report_matches_by_prefix() {
@@ -448,6 +450,8 @@ fn a_version_names_its_commit_and_a_report_matches_by_prefix() {
         ("0.1.7+git9ba38c2-2", None),
         ("0.1.7+", None),
         ("0.1.7+g", None),
+        ("0.1.7+g0123456789ab-3+b1", None),
+        ("1.0+dfsg+g0123456789ab-2", Some("0123456789ab")),
     ] {
         let v = Version::parse(version).expect(version);
         assert_eq!(v.commit(), commit, "{version}");
