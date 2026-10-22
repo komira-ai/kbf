@@ -373,7 +373,7 @@ fn take_owned(from: &ProxyConfig, to: &mut ProxyConfig) {
 #[cfg(test)]
 mod layout_tests {
     use super::{MAX_BASE_PORT, SLOT_STRIDE};
-    use crate::deploy::observe;
+    use crate::observe;
     use kbf_proxy::route::Target;
 
     #[test]
