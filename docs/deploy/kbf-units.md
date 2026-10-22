@@ -74,7 +74,7 @@ checked by the package test.
 | `stop` | a mode that drains on SIGTERM (every mode but `daemon`, which has a finite stop) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
 
 The test has more rules than these (`install`, `network`, `gate-*`, `user`, `nofile`,
-`notify`, `handover`, `conflicts`, `envoy`, `memory`, ...); its header lists what each catches.
+`notify`, `handover`, `conflicts`, `memory`, ...); its header lists what each catches.
 
 **`delegate`.** systemd reads `Delegate=` this way (systemd.resource-control(5), and
 `config_parse_delegate` in systemd's `src/core/load-fragment.c`): a boolean delegates
