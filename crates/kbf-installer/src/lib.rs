@@ -98,7 +98,6 @@ pub mod status_v2;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod trust;
-pub mod utc_stamp;
 pub mod version;
 
 use std::fmt;

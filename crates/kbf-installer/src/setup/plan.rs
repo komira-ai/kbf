@@ -328,15 +328,6 @@ pub fn ensure_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os) -> Result<(), SetupErr
     }
 }
 
-/// The plan that makes the fetch account, empty when it is there already; reads the host,
-/// changes nothing.
-pub fn fetch_user_plan(os: &dyn Os, exec: &dyn Exec) -> Result<Plan, SetupError> {
-    let view = View(exec);
-    let mut p = Planner::new(&view);
-    ensure_fetch_user(&mut p, os)?;
-    Ok(p.finish())
-}
-
 fn create_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os, name: &str) -> Result<(), SetupError> {
     match os.platform() {
         Platform::Linux => p.run(
