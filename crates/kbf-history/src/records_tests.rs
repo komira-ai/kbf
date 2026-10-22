@@ -34,6 +34,47 @@ fn the_test_flag_is_field_33_and_older_records_read_false() {
 }
 
 #[test]
+fn the_submit_evidence_fields_are_43_to_47_and_older_records_read_absent() {
+    // Catches: a field renumbered into E1a's usage fields (39 to 42) or onto another
+    // (the wire would read one value as another), `optional` lost on the operation id or
+    // a total (a 0 on the wire would read as "measured 0", where absent is "unknown"),
+    // and a record written before the fields failing to decode or reading a value.
+    use prost::Message as _;
+    let r = RunRecord {
+        operation_id: Some(0),
+        cpu_source: BookSource::Hint.into(),
+        memory_source: BookSource::Default.into(),
+        input_bytes: Some(0),
+        input_files: Some(0),
+        ..RunRecord::default()
+    };
+    // Tag 43 varint: key 344 (0xd8 0x02); 44: 352 (0xe0 0x02); 45: 360 (0xe8 0x02);
+    // 46: 368 (0xf0 0x02); 47: 376 (0xf8 0x02). A present 0 is written, an absent field
+    // is not.
+    assert_eq!(
+        r.encode_to_vec(),
+        [
+            0xd8, 0x02, 0x00, 0xe0, 0x02, 0x02, 0xe8, 0x02, 0x01, 0xf0, 0x02, 0x00, 0xf8, 0x02,
+            0x00
+        ]
+    );
+    assert_eq!(RunRecord::decode(r.encode_to_vec().as_slice()).unwrap(), r);
+    let older = RunRecord {
+        seq: 3,
+        ..RunRecord::default()
+    };
+    let read = RunRecord::decode(older.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(
+        (read.operation_id, read.input_bytes, read.input_files),
+        (None, None, None)
+    );
+    assert_eq!(
+        (read.cpu_source(), read.memory_source()),
+        (BookSource::Unspecified, BookSource::Unspecified)
+    );
+}
+
+#[test]
 fn a_digest_prefix_is_its_first_eight_bytes() {
     // Catches: a little-endian prefix, which would not match the 16 hex digits the
     // digest is shown with.

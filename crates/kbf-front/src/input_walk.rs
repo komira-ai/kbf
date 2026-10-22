@@ -478,6 +478,17 @@ pub(crate) async fn walk_bounded(
             trees.record(epoch, &held_dirs, verified_at);
         }
     }
+    // The whole tree was seen only if no subtree was skipped and nothing was absent; any
+    // other total would be a lower bound that reads as a size.
+    if walked.dirs_skipped == 0 && absent.is_empty() {
+        walked.input_files = Some(found.files.len() as u64);
+        walked.input_bytes = Some(
+            found
+                .files
+                .iter()
+                .fold(0_u64, |sum, f| sum.saturating_add(f.size_bytes)),
+        );
+    }
     walked.absent = absent;
     walked.files_checked = found.files.len() as u64;
     walked.file_asks = asking.len().div_ceil(FILES_PER_ASK) as u64;

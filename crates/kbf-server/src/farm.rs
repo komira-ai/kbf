@@ -1046,7 +1046,8 @@ impl Dispatch for Farm {
         });
         let name = state.machine.name(waiter);
         if let Some((call, shape)) = submission.call.take().zip(shape) {
-            state.record_submit(call.with_shape(shape), &name, &submission.request);
+            let call = call.with_shape(shape).with_evidence(submission.evidence);
+            state.record_submit(call, &name, &submission.request);
         }
         let (stage, receiver) = watch::channel(Stage::Queued);
         state.stages.insert(waiter, stage);

@@ -53,6 +53,8 @@ fn row(attempts: Vec<Attempt>, outcome: Option<Outcome>) -> ActionRow {
         outputs_truncated: false,
         command: None,
         shape: None,
+        operation_id: None,
+        evidence: None,
     }
 }
 
@@ -629,6 +631,66 @@ fn a_target_keeps_its_kind_and_a_run_without_one_keeps_none() {
     );
     let (rec, _) = record_of(&plain, 0, EndedKind::Finished);
     assert_eq!((rec.target.as_str(), rec.target_kind), ("", 0));
+}
+
+/// Catches: the operation id or the submit evidence dropped on the way to the record, an
+/// attempt of a ladder carrying another operation's id (the attempts could not be
+/// regrouped), a hint read as a default or the axes crossed (cpu's source in memory's
+/// field), an absent walk total written as 0, and a row nobody told written as if the
+/// client had named nothing (`Default`) instead of `Unspecified`.
+#[test]
+fn the_operation_and_the_submit_evidence_reach_the_record_and_absent_stays_absent() {
+    use kbf_history::records::BookSource as Wire;
+    use kbf_invocation::{BookSource, Evidence};
+    use kbf_types::OperationId;
+
+    let mut told = row(
+        vec![
+            attempt(Some(AttemptEnd::Requeued(RequeueReason::Infra))),
+            attempt(Some(AttemptEnd::Accepted)),
+        ],
+        Some(Outcome::Ok { exit_code: 0 }),
+    );
+    told.operation_id = Some(OperationId(41));
+    told.evidence = Some(Evidence {
+        cpu_source: BookSource::Default,
+        memory_source: BookSource::Hint,
+        input_bytes: Some(24),
+        input_files: Some(4),
+    });
+    for (i, kind) in [(0, EndedKind::Requeued), (1, EndedKind::Finished)] {
+        let (rec, _) = record_of(&told, i, kind);
+        assert_eq!(rec.operation_id, Some(41), "attempt {i}");
+        assert_eq!(rec.cpu_source(), Wire::Default, "attempt {i}");
+        assert_eq!(rec.memory_source(), Wire::Hint, "attempt {i}");
+        assert_eq!((rec.input_bytes, rec.input_files), (Some(24), Some(4)));
+    }
+
+    let mut unmeasured = told.clone();
+    unmeasured.evidence = Some(Evidence {
+        cpu_source: BookSource::Hint,
+        memory_source: BookSource::Default,
+        input_bytes: None,
+        input_files: None,
+    });
+    let (rec, _) = record_of(&unmeasured, 1, EndedKind::Finished);
+    assert_eq!(
+        (rec.cpu_source(), rec.memory_source()),
+        (Wire::Hint, Wire::Default)
+    );
+    assert_eq!((rec.input_bytes, rec.input_files), (None, None), "not 0");
+
+    let nobody = row(
+        vec![attempt(Some(AttemptEnd::Accepted))],
+        Some(Outcome::Ok { exit_code: 0 }),
+    );
+    let (rec, _) = record_of(&nobody, 0, EndedKind::Finished);
+    assert_eq!(rec.operation_id, None);
+    assert_eq!(
+        (rec.cpu_source(), rec.memory_source()),
+        (Wire::Unspecified, Wire::Unspecified)
+    );
+    assert_eq!((rec.input_bytes, rec.input_files), (None, None));
 }
 
 /// Catches: a run id the tap minted that the live record cannot be found by (the run
