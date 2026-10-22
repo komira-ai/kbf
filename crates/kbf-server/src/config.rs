@@ -468,8 +468,8 @@ pub struct Args {
     /// How long, in seconds, after its own write of a blob it acknowledged from RAM a
     /// storage node waits before it asks the blob's other owner whether the blob is on its
     /// disk too, and journals a repair debt if it is not. Long enough that the usual answer
-    /// is yes and nothing is journalled. Nothing acknowledges from RAM yet, so no node
-    /// asks. At least 1.
+    /// is yes and nothing is journalled. Only a node that acknowledges from RAM
+    /// (`--ram-ack-bytes`) asks. At least 1.
     #[arg(
         long,
         default_value_t = kbf_storage::repair::RepairConfig::default().peer_grace.as_secs(),
@@ -478,10 +478,12 @@ pub struct Args {
     pub ram_peer_grace: u64,
     /// How many bytes of blobs a storage node may hold in RAM, acknowledged to the writer
     /// and not yet written to its disk. 0, the default, is off: a write is acknowledged
-    /// from disk, as before. Nothing acknowledges from RAM yet, so with any value no blob
-    /// is held and the node behaves as with 0. A blob that finds the budget full is
-    /// written through to the disk before it is acknowledged, never waited for. A node
-    /// that does hold blobs counts them in `kbf_storage_ram_unwritten_bytes`, writes them
+    /// from disk, as before. Over 0, a blob of at most 4 MiB written to two owners is
+    /// acknowledged once both hold it verified in RAM, and written to each disk
+    /// afterwards: losing both owners' RAM before then loses the blob. A blob that finds
+    /// the budget full is written through to the disk before it is acknowledged, never
+    /// waited for. Set it on every storage node or none. A node that does hold blobs
+    /// counts them in `kbf_storage_ram_unwritten_bytes`, writes them
     /// to its disk in the background and, when it stops, within `--ram-drain-deadline`. A
     /// node can hold this many bytes beside the `--write-bytes-in-flight` it receives.
     /// Storage nodes only: a server with no replica to hold a second copy holds nothing.
