@@ -721,7 +721,9 @@ async fn a_version_2_log_reopens_at_version_2_with_the_same_answers() {
     let before = log.query(|m| answers(m, staged)).await.expect("a query");
     drop(log);
 
-    let log = open(&fs.restart(), 7).await;
+    // Each restart is of the directory the last process left, not of the first one.
+    let fs = fs.restart();
+    let log = open(&fs, 7).await;
     assert_eq!(
         log.machine_version(),
         MachineVersion::V2,
@@ -739,6 +741,11 @@ async fn a_version_2_log_reopens_at_version_2_with_the_same_answers() {
     let log = open(&fs.restart(), 7).await;
     assert_eq!(log.machine_version(), MachineVersion::V2);
     assert_eq!(log.query(|m| answers(m, staged)).await, Ok(after));
+    assert_eq!(
+        log.query(|m| m.blob(&blob_digest(1))).await,
+        Ok(BlobAnswer::Absent),
+        "the replayed evict removed nothing"
+    );
 }
 
 /// Asserts that an `EvictObjects` entry in a log at version 2 is read and applied, not

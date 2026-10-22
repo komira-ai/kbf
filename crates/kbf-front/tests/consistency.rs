@@ -78,8 +78,7 @@ impl Log {
 
 impl MetaLog for Log {
     async fn commit(&self, command: Command) -> Result<Applied, MetaLogError> {
-        if self.0.refuses.load(Ordering::Relaxed)
-            && matches!(command, Command::EvictObjects { .. })
+        if self.0.refuses.load(Ordering::Relaxed) && matches!(command, Command::EvictObjects { .. })
         {
             return Err(MetaLogError::Unavailable("stopped".to_owned()));
         }
