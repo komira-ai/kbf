@@ -100,10 +100,9 @@ fn no_update_after_the_install_ends_at_the_frontend_bound_with_the_reason() {
 }
 
 /// Catches a failed swap being waited out: an abandoned or a refused update fails the roll at
-/// the first read with `swap_abandoned` and the proxy's reason; so does a proxy that cannot
-/// answer at all (404, no `--kbf-binary`).
+/// the first read with `swap_abandoned` and the proxy's reason.
 #[test]
-fn a_failed_swap_and_a_proxy_without_the_status_fail_the_roll_at_once() {
+fn a_failed_swap_fails_the_roll_at_once() {
     for (state, reason) in [
         ("abandoned", "start: not ready"),
         ("refused", "fetch: no copy"),
@@ -116,13 +115,37 @@ fn a_failed_swap_and_a_proxy_without_the_status_fail_the_roll_at_once() {
         assert!(failure.detail.contains(reason), "{}", failure.detail);
         assert_eq!((asked, rig.elapsed()), (1, Duration::ZERO));
     }
-    let (roll, asked, _) = roll("fr-404", |_| http(404, "{}"));
+}
+
+/// Catches a 404 ending the roll early or without its reason: the roll keeps asking until the
+/// frontend bound of 300 s, then fails with `health_timeout` and the 404 reason.
+#[test]
+fn a_404_that_persists_ends_at_the_frontend_bound_with_the_reason() {
+    let (roll, asked, rig) = roll("fr-404", |_| http(404, "{}"));
+    assert_eq!(roll.state, RollState::Failed);
     let failure = roll.failure.expect("failure");
-    assert_eq!(failure.code, ErrorCode::SwapAbandoned);
+    assert_eq!(failure.code, ErrorCode::HealthTimeout);
     assert!(
-        failure.detail.contains("--kbf-binary"),
+        failure.detail.contains(
+            "the proxy does not serve /v1/proxy/swap (404): an old proxy build, or \
+             --kbf-binary missing"
+        ),
         "{}",
         failure.detail
     );
-    assert_eq!(asked, 1);
+    assert_eq!(rig.elapsed(), Duration::from_secs(300));
+    assert_eq!(asked, 61);
+}
+
+/// Catches a 404 failing the roll before the proxy can answer: two 404s, then the swap done
+/// for the target, and the roll succeeds.
+#[test]
+fn a_404_that_turns_into_done_is_healthy() {
+    let (roll, asked, rig) = roll("fr-404-done", |n| match n {
+        0 | 1 => http(404, "{}"),
+        _ => http(200, &status(Some(("done", None)))),
+    });
+    assert_eq!(roll.state, RollState::Done, "{:?}", roll.failure);
+    assert_eq!(asked, 3);
+    assert_eq!(rig.elapsed(), Duration::from_secs(10));
 }

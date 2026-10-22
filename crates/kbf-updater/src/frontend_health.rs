@@ -22,9 +22,9 @@
 //! **fails** at once when the update since the install call, to the target, is `abandoned`
 //! or `refused`, with the reason the proxy gave.
 //!
-//! The proxy's design doc reads a 404 (a proxy without `--kbf-binary`) as "not healthy yet".
-//! This adapter fails at once instead: without `--kbf-binary` the proxy will never answer
-//! the question, and waiting out the bound only delays the same failure.
+//! A 404 is "not healthy yet" (the proxy's design doc, section 4b): the roll waits, and its
+//! frontend bound ends the wait with the reason. A proxy without `--kbf-binary` answers 404,
+//! and so does an old proxy build, which forwards the path to its child.
 //!
 //! `started_at` has whole seconds, so it is compared with the install call in whole seconds.
 
@@ -103,9 +103,9 @@ impl HealthCheck for FrontendHealth {
         match reply.status {
             200 => {}
             404 => {
-                return Ok(Health::Abandoned(format!(
-                    "{WHAT} has no swap status: it runs without --kbf-binary, so it cannot \
-                     say whether the swap is done"
+                return Ok(Health::Waiting(format!(
+                    "the proxy does not serve {PATH} (404): an old proxy build, or \
+                     --kbf-binary missing"
                 )));
             }
             _ => return Err(reply.failure(WHAT, CHECK)),

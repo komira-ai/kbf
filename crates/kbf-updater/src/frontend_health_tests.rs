@@ -378,16 +378,19 @@ fn abandoned_and_refused_fail_with_the_reason_but_only_for_this_install() {
     }
 }
 
-/// Catches a proxy without `--kbf-binary` (404) being waited on: it can never answer, so the
-/// roll fails at once with a reason that names the flag.
+/// Catches a 404 taken as an answer: it is "not healthy yet" (an old proxy build, or no
+/// `--kbf-binary`), so the check waits and names the reason.
 #[test]
-fn a_404_fails_the_host_with_a_clear_reason() {
+fn a_404_waits_with_the_reason() {
     let proxy = fake_proxy(NAME, true, |_, _| Some(http(404, "{}")));
     let health = adapter(&proxy, "fe-404");
-    let Ok(Health::Abandoned(why)) = check(&health) else {
-        panic!("expected a failure");
+    let Ok(Health::Waiting(why)) = check(&health) else {
+        panic!("expected to wait");
     };
-    assert!(why.contains("without --kbf-binary"), "{why}");
+    assert_eq!(
+        why,
+        "the proxy does not serve /v1/proxy/swap (404): an old proxy build, or --kbf-binary missing"
+    );
 }
 
 /// Catches the wrong kind for each way the proxy is not answering or says no: nothing
