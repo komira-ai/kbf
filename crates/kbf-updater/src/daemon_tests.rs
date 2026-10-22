@@ -12,12 +12,13 @@ use crate::daemon::{
 };
 use crate::fakes::{Event, FakeClock, FakeHealth, FakeInstaller, FakeSafeToStop, Log};
 use crate::inventory::{Host, Role};
+use crate::listener::{Activation, Listen};
 use crate::not_built::{NOT_BUILT, NotBuiltHealth, NotBuiltInstaller};
 use crate::ports::{HealthCheck, Installer, PortErrorKind};
 use crate::record::RollStore;
 use crate::server::Recent;
 use crate::testutil::{
-    FakeApi, KEY, Lines, TOKEN, call, eventually, fake_api, file, http, own_uid, scratch,
+    FakeApi, KEY, Lines, TOKEN, call, eventually, fake_api, file, http, own_uid, scratch, sock,
 };
 use crate::version::Version;
 use crate::{Ports, Timing, Updater, run_with};
@@ -41,17 +42,22 @@ const FLAGS: [&str; 12] = [
     "/t",
 ];
 
-/// Catches a flag that is not read, read from the wrong place, or accepted twice, and each of
-/// the six being optional: every flag is required, `--flag=value` works, an unknown argument
-/// and a flag with no value are errors, and the inventory owner is root.
+fn parse(list: &[&str]) -> Result<Config, String> {
+    parse_flags(&args(list), &Activation::default())
+}
+
+/// Catches a flag that is not read, read from the wrong place, or accepted twice, and a
+/// required one being optional: the flags are required except the socket and the proxy
+/// secret file, `--flag=value` works, an unknown argument and a flag with no value are errors,
+/// and the inventory owner is root.
 #[test]
-fn the_six_flags_are_required_and_exact() {
-    let cfg = parse_flags(&args(&FLAGS)).expect("flags");
+fn the_flags_are_required_and_exact() {
+    let cfg = parse(&FLAGS).expect("flags");
     assert_eq!(
         (
             cfg.state_dir.to_str(),
             cfg.inventory.to_str(),
-            cfg.socket.to_str(),
+            sock(&cfg).to_str(),
             cfg.token_file.to_str()
         ),
         (Some("/s"), Some("/i"), Some("/sock"), Some("/t"))
@@ -60,38 +66,111 @@ fn the_six_flags_are_required_and_exact() {
         (cfg.proxy_uid, cfg.inventory_owner, cfg.operator_api.port()),
         (993, 0, 8080)
     );
+    assert_eq!(cfg.operator_proxy_auth_file, None);
     let eq: Vec<String> = FLAGS
         .chunks(2)
         .map(|p| format!("{}={}", p[0], p[1]))
         .collect();
-    assert_eq!(parse_flags(&eq).expect("= form").socket, cfg.socket);
+    let eq: Vec<&str> = eq.iter().map(String::as_str).collect();
+    assert_eq!(parse(&eq).expect("= form").listen, cfg.listen);
     for (i, name) in FLAGS.iter().step_by(2).enumerate() {
+        if *name == "--socket" {
+            continue;
+        }
         let mut without = FLAGS.to_vec();
         without.drain(i * 2..i * 2 + 2);
-        let e = parse_flags(&args(&without)).expect_err(name);
-        assert_eq!(e, format!("{name} is required"));
+        assert_eq!(
+            parse(&without).expect_err(name),
+            format!("{name} is required")
+        );
     }
     let twice = [&FLAGS[..], &["--socket", "/other"]].concat();
+    assert_eq!(parse(&twice).expect_err("twice"), "--socket is given twice");
     assert_eq!(
-        parse_flags(&args(&twice)).expect_err("twice"),
-        "--socket is given twice"
-    );
-    assert_eq!(
-        parse_flags(&args(&["serve"])).expect_err("unknown"),
+        parse(&["serve"]).expect_err("unknown"),
         "unknown argument serve"
     );
     assert_eq!(
-        parse_flags(&args(&["--state-dir"])).expect_err("no value"),
+        parse(&["--state-dir"]).expect_err("no value"),
         "--state-dir needs a value"
     );
     let mut bad_uid = FLAGS.to_vec();
     bad_uid[7] = "root";
     assert_eq!(
-        parse_flags(&args(&bad_uid)).expect_err("uid"),
+        parse(&bad_uid).expect_err("uid"),
         "--proxy-uid must be a number"
     );
     bad_uid[7] = "-1";
-    assert!(parse_flags(&args(&bad_uid)).is_err());
+    assert!(parse(&bad_uid).is_err());
+}
+
+fn without_socket() -> Vec<&'static str> {
+    let mut list = FLAGS.to_vec();
+    list.drain(4..6);
+    list
+}
+
+fn activation(pid: &str, fds: Option<&str>) -> Activation {
+    Activation {
+        pid: Some(pid.to_owned()),
+        fds: fds.map(str::to_owned),
+    }
+}
+
+/// Catches the socket coming from the wrong place or from two places: a descriptor passed to
+/// this process (LISTEN_PID is our pid, LISTEN_FDS is 1) is fd 3 and needs no `--socket`;
+/// `--socket` alone binds; both, or neither, is an error; a LISTEN_PID of another process,
+/// a LISTEN_FDS other than 1 or none, and an unparsable pid are refused, with `--socket`
+/// given or not (a stale environment must not pick the socket). Unset is not activation.
+#[test]
+fn the_socket_is_a_flag_or_an_activated_descriptor_and_never_both() {
+    let me = std::process::id().to_string();
+    let flags = without_socket();
+    let cfg = parse_flags(&args(&flags), &activation(&me, Some("1"))).expect("activated");
+    assert_eq!(cfg.listen, Listen::Activated(3));
+    let both = parse_flags(&args(&FLAGS), &activation(&me, Some("1"))).expect_err("both");
+    assert!(both.contains("use one"), "{both}");
+    let neither = parse_flags(&args(&flags), &Activation::default()).expect_err("neither");
+    assert!(
+        neither.starts_with("--socket is required unless"),
+        "{neither}"
+    );
+    assert!(neither.contains("LISTEN_FDS"), "{neither}");
+    let other = (std::process::id() + 1).to_string();
+    for (pid, fds, why) in [
+        (other.as_str(), Some("1"), "another process"),
+        ("abc", Some("1"), "another process"),
+        (me.as_str(), Some("2"), "exactly one socket"),
+        (me.as_str(), Some("0"), "exactly one socket"),
+        (me.as_str(), None, "LISTEN_FDS is not"),
+    ] {
+        for list in [&flags[..], &FLAGS[..]] {
+            let e = parse_flags(&args(list), &activation(pid, fds)).expect_err(why);
+            assert!(e.contains(why), "{pid} {fds:?}: {e}");
+        }
+    }
+    // LISTEN_FDS alone, without a LISTEN_PID, passes nothing.
+    let stray = Activation {
+        pid: None,
+        fds: Some("1".to_owned()),
+    };
+    assert_eq!(
+        parse_flags(&args(&FLAGS), &stray).expect("bind").listen,
+        Listen::Bind("/sock".into())
+    );
+}
+
+/// Catches the optional proxy secret file being unread or required.
+#[test]
+fn the_operator_proxy_auth_file_is_an_optional_flag() {
+    let with = [&FLAGS[..], &["--operator-proxy-auth-file", "/p"]].concat();
+    let cfg = parse(&with).expect("flags");
+    assert_eq!(
+        cfg.operator_proxy_auth_file
+            .as_deref()
+            .and_then(|p| p.to_str()),
+        Some("/p")
+    );
 }
 
 /// Catches the operator token being sent anywhere but loopback in clear: a non-loopback IP, a
@@ -136,10 +215,11 @@ fn config(name: &str, inventory: &str, api: &FakeApi) -> Config {
         state_dir: state,
         inventory: file(&dir, "inventory", &inventory.replace("KEY", KEY), 0o644),
         inventory_owner: own_uid(),
-        socket: dir.join("api.sock"),
+        listen: Listen::Bind(dir.join("api.sock")),
         proxy_uid: own_uid(),
         operator_api: api.addr,
         token_file: file(&dir, "token", TOKEN, 0o600),
+        operator_proxy_auth_file: None,
     }
 }
 
@@ -177,9 +257,9 @@ fn the_binary_wiring_accepts_a_roll_and_fails_safe_at_the_first_install() {
         &api,
     );
     let daemon = start(&cfg).expect("start");
-    let (status, body) = post(&cfg.socket);
+    let (status, body) = post(&sock(&cfg));
     assert_eq!((status, &body["state"]), (202, &json!("running")), "{body}");
-    let roll = wait_failed(&cfg.socket);
+    let roll = wait_failed(&sock(&cfg));
     assert_eq!(roll.state, RollState::Failed);
     let failure = roll.failure.expect("failure");
     assert_eq!(
@@ -218,8 +298,8 @@ fn a_node_is_checked_with_the_token_and_then_refused_by_the_installer() {
     ))]);
     let cfg = config("unbuilt2", "st1 st1.farm.example storage KEY\n", &api);
     let daemon = start(&cfg).expect("start");
-    assert_eq!(post(&cfg.socket).0, 202);
-    let roll = wait_failed(&cfg.socket);
+    assert_eq!(post(&sock(&cfg)).0, 202);
+    let roll = wait_failed(&sock(&cfg));
     let failure = roll.failure.expect("failure");
     assert_eq!(
         (failure.alias.as_str(), failure.code),
@@ -231,7 +311,7 @@ fn a_node_is_checked_with_the_token_and_then_refused_by_the_installer() {
     assert!(seen[0].contains(&format!("Bearer {TOKEN}")));
     // The token is in no audit line and no answer.
     assert!(
-        !call(&cfg.socket, "GET", "/v1/updater/rolls", "")
+        !call(&sock(&cfg), "GET", "/v1/updater/rolls", "")
             .1
             .to_string()
             .contains(TOKEN)
@@ -296,12 +376,12 @@ fn start_up_refuses_what_it_cannot_trust() {
     let e = start(&cfg).err().expect("corrupt");
     assert!(e.starts_with("roll record in "), "{e}");
     assert!(
-        !cfg.socket.exists(),
+        !sock(&cfg).exists(),
         "nothing is bound when the record is bad"
     );
 
     let mut cfg = config("bad3", good, &api);
-    let _live = UnixListener::bind(&cfg.socket).expect("someone listens");
+    let _live = UnixListener::bind(sock(&cfg)).expect("someone listens");
     let e = start(&cfg).err().expect("live socket");
     assert!(e.starts_with("socket ") && e.contains("listens"), "{e}");
 
@@ -386,6 +466,7 @@ fn the_process_entry_points() {
     // Valid flags, but the inventory does not exist: exit 1 and the reason.
     let api = fake_api(vec![Some(http(200, "{}"))]);
     let cfg = config("entry", "st1 st1.farm.example storage KEY\n", &api);
+    let socket_path = sock(&cfg);
     let a = [
         "kbf-updater",
         "--state-dir",
@@ -393,7 +474,7 @@ fn the_process_entry_points() {
         "--inventory",
         "/nonexistent/inventory",
         "--socket",
-        cfg.socket.to_str().expect("utf8"),
+        socket_path.to_str().expect("utf8"),
         "--proxy-uid",
         "1",
         "--operator-api",
@@ -407,9 +488,9 @@ fn the_process_entry_points() {
         out.starts_with("kbf-updater: inventory /nonexistent/inventory"),
         "{out}"
     );
-    assert!(!cfg.socket.exists());
+    assert!(!sock(&cfg).exists());
     // A run that serves.
-    let socket = cfg.socket.clone();
+    let socket = sock(&cfg).clone();
     let (code, out) = run_config(&cfg, |stopper| {
         let socket = socket.clone();
         std::thread::spawn(move || {
@@ -418,6 +499,6 @@ fn the_process_entry_points() {
         });
     });
     assert_eq!((code, out.as_str()), (0, ""));
-    assert!(!cfg.socket.exists(), "the socket is removed on exit");
+    assert!(!sock(&cfg).exists(), "the socket is removed on exit");
     stderr_sink()("{\"event\":\"test\"}");
 }

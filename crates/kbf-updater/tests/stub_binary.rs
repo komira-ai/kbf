@@ -58,8 +58,5 @@ fn a_bad_start_exits_nonzero_with_the_reason_on_stderr() {
     assert!(err.contains("loopback"), "{err}");
     let (code, out, err) = run(&flags("http://127.0.0.1:8080"));
     assert_eq!((code, out.as_str()), (Some(1), ""));
-    assert!(
-        err.starts_with("kbf-updater: token file /nonexistent/token"),
-        "{err}"
-    );
+    assert!(err.starts_with("kbf-updater: --token-file: "), "{err}");
 }

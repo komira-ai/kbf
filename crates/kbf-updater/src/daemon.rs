@@ -1,14 +1,25 @@
 //! The binary's wiring: flags, the ports, the listener and the thread that drives rolls.
 //!
-//! Every setting is a flag (configuration is flags, not environment), all required:
+//! Every setting is a flag (configuration is flags, not environment). Required:
 //!
 //! - `--state-dir`: where `roll.json` lives (`RollStore` takes an exclusive lock on it);
 //! - `--inventory`: the root-owned host file;
-//! - `--socket`: where to bind the API (mode 0600);
 //! - `--proxy-uid`: the one uid whose connections are served;
 //! - `--operator-api`: `http://<loopback ip>:<port>`, the frontend's operator API, for
 //!   safe-to-stop; a host that is not a loopback address is refused;
 //! - `--token-file`: the file holding the operator bearer token.
+//!
+//! Optional: `--operator-proxy-auth-file`, the file holding the proxy's per-boot secret,
+//! for a frontend that runs behind kbf-proxy (`--proxy-auth-file` there): its operator API
+//! refuses a call without it. It is read on every call, like the token.
+//!
+//! And the socket, one of two (never both):
+//!
+//! - **production**: socket activation. systemd binds the socket (`SocketUser=<proxy user>`,
+//!   `SocketMode=0600`) and passes it as fd 3 with `LISTEN_PID` and `LISTEN_FDS=1`
+//!   ([`crate::listener::Activation`]); the updater serves it as it is;
+//! - **tests and development**: `--socket`, a path the updater binds itself, mode 0600, its
+//!   own user.
 //!
 //! This build has no host installer and no health check ([`crate::not_built`]): a roll is
 //! accepted and fails at the first install, with no host touched.
@@ -26,23 +37,28 @@ use serde_json::json;
 
 use crate::api::RollState;
 use crate::inventory::Inventory;
+use crate::listener::{Activation, Listen, open};
 use crate::not_built::{NotBuiltHealth, NotBuiltInstaller};
 use crate::ports::SystemClock;
 use crate::record::RollStore;
 use crate::safe_http::HttpSafeToStop;
-use crate::server::{AuditSink, Recent, Server, Settings, bind_socket};
+use crate::server::{AuditSink, Recent, Server, Settings};
 use crate::{Ports, Timing, Updater};
 
 pub const USAGE: &str = "usage: kbf-updater --version\n       kbf-updater --state-dir DIR \
---inventory FILE --socket PATH --proxy-uid UID --operator-api http://IP:PORT --token-file FILE\n";
+--inventory FILE --proxy-uid UID --operator-api http://IP:PORT --token-file FILE \
+[--operator-proxy-auth-file FILE] [--socket PATH]\n\
+the socket comes from systemd socket activation (LISTEN_PID, LISTEN_FDS=1) or from --socket, \
+which is for tests and development\n";
 
-const FLAGS: [&str; 6] = [
+const FLAGS: [&str; 7] = [
     "--state-dir",
     "--inventory",
     "--socket",
     "--proxy-uid",
     "--operator-api",
     "--token-file",
+    "--operator-proxy-auth-file",
 ];
 
 /// The settings of a run.
@@ -52,15 +68,19 @@ pub struct Config {
     pub inventory: PathBuf,
     /// The uid that must own the inventory: root, for the binary. A test says otherwise.
     pub inventory_owner: u32,
-    pub socket: PathBuf,
+    pub listen: Listen,
     pub proxy_uid: u32,
     pub operator_api: SocketAddr,
     pub token_file: PathBuf,
+    /// The proxy's per-boot secret, if the frontend is behind kbf-proxy.
+    pub operator_proxy_auth_file: Option<PathBuf>,
 }
 
-/// The settings from the command line (without the program name). All six flags are
-/// required, each once, as `--flag value` or `--flag=value`.
-pub fn parse_flags(args: &[String]) -> Result<Config, String> {
+/// The settings from the command line (without the program name) and from what the service
+/// manager passed. Each flag is given once, as `--flag value` or `--flag=value`; all but
+/// `--socket` and `--operator-proxy-auth-file` are required, and the socket is either
+/// `--socket` or the activated descriptor.
+pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, String> {
     let mut found: BTreeMap<&str, String> = BTreeMap::new();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -89,20 +109,41 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
     };
     let state_dir = PathBuf::from(take("--state-dir")?);
     let inventory = PathBuf::from(take("--inventory")?);
-    let socket = PathBuf::from(take("--socket")?);
     let proxy_uid = take("--proxy-uid")?
         .parse::<u32>()
         .map_err(|_| "--proxy-uid must be a number".to_owned())?;
     let operator_api = parse_operator_url(&take("--operator-api")?)?;
     let token_file = PathBuf::from(take("--token-file")?);
+    let operator_proxy_auth_file = found
+        .remove("--operator-proxy-auth-file")
+        .map(PathBuf::from);
+    let listen = match (
+        found.remove("--socket"),
+        activation.passed_to(std::process::id())?,
+    ) {
+        (Some(path), None) => Listen::Bind(PathBuf::from(path)),
+        (None, Some(fd)) => Listen::Activated(fd),
+        (Some(_), Some(_)) => {
+            return Err(
+                "--socket is given and systemd passed a socket (LISTEN_FDS): use one".to_owned(),
+            );
+        }
+        (None, None) => {
+            return Err(
+                "--socket is required unless systemd passes the socket (LISTEN_PID, LISTEN_FDS)"
+                    .to_owned(),
+            );
+        }
+    };
     Ok(Config {
         state_dir,
         inventory,
         inventory_owner: 0,
-        socket,
+        listen,
         proxy_uid,
         operator_api,
         token_file,
+        operator_proxy_auth_file,
     })
 }
 
@@ -127,10 +168,14 @@ pub fn parse_operator_url(url: &str) -> Result<SocketAddr, String> {
 pub struct Stopper {
     flag: Arc<AtomicBool>,
     socket: PathBuf,
+    /// Whether the updater made the socket file, and so removes it.
+    owned: bool,
 }
 
 impl Stopper {
-    /// Ask the accept loop to end: set the flag and make one connection to wake it.
+    /// Ask the accept loop to end: set the flag and make one connection to wake it. (An
+    /// activated socket that only the proxy's user may connect to cannot be woken by the
+    /// updater's user; the process then ends by signal, as a service does.)
     pub fn stop(&self) {
         self.flag.store(true, Ordering::SeqCst);
         let _ = UnixStream::connect(&self.socket);
@@ -150,11 +195,13 @@ impl Daemon {
     }
 
     /// Block until the listener has been stopped and the roll in hand (if any) is over;
-    /// remove the socket.
+    /// remove the socket if the updater made it.
     pub fn wait(self) {
         let _ = self.accept.join();
         let _ = self.worker.join();
-        let _ = std::fs::remove_file(&self.stopper.socket);
+        if self.stopper.owned {
+            let _ = std::fs::remove_file(&self.stopper.socket);
+        }
     }
 }
 
@@ -170,6 +217,7 @@ pub fn build_ports(cfg: &Config) -> Result<Ports, String> {
         safe: Box::new(HttpSafeToStop::new(
             cfg.operator_api,
             cfg.token_file.clone(),
+            cfg.operator_proxy_auth_file.clone(),
         )?),
         installer: Box::new(NotBuiltInstaller),
         health: Box::new(NotBuiltHealth),
@@ -217,8 +265,7 @@ pub fn start_with(
     let updater = Updater::open(inventory, store, ports, timing)
         .map_err(|e| format!("roll record in {}: {e}", cfg.state_dir.display()))?;
     let updater = Arc::new(updater);
-    let listener =
-        bind_socket(&cfg.socket).map_err(|e| format!("socket {}: {e}", cfg.socket.display()))?;
+    let opened = open(&cfg.listen)?;
     let (drive, queue) = channel();
     if let Ok(Some(roll)) = updater.current()
         && roll.state == RollState::Running
@@ -233,11 +280,12 @@ pub fn start_with(
     let server = Arc::new(Server::new(updater, settings, audit, drive, recent));
     let stopper = Stopper {
         flag: Arc::new(AtomicBool::new(false)),
-        socket: cfg.socket.clone(),
+        socket: opened.path,
+        owned: opened.owned,
     };
     let flag = Arc::clone(&stopper.flag);
     let accept = std::thread::spawn(move || {
-        let listener: UnixListener = listener;
+        let listener: UnixListener = opened.listener;
         server.serve(&listener, &flag);
     });
     Ok(Daemon {

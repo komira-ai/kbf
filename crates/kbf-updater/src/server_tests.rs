@@ -15,9 +15,10 @@ use crate::daemon::{Config, Daemon, Stopper, start_with};
 use crate::fakes::{
     Event, FakeClock, FakeHealth, FakeInstaller, FakeSafeToStop, Log, unsafe_because,
 };
-use crate::server::{Recent, Server, Settings, bind_socket, peer_allowed};
+use crate::listener::{Listen, bind_socket};
+use crate::server::{Recent, Server, Settings, peer_allowed};
 use crate::testutil::{
-    KEY, Lines, call, eventually, exchange, file, locked, own_uid, parsed, raw, scratch,
+    KEY, Lines, call, eventually, exchange, file, locked, own_uid, parsed, raw, scratch, sock,
 };
 use crate::{Ports, Timing};
 
@@ -34,10 +35,11 @@ fn prepare(name: &str, proxy_uid: u32) -> Config {
         state_dir: state,
         inventory,
         inventory_owner: own_uid(),
-        socket: dir.join("api.sock"),
+        listen: Listen::Bind(dir.join("api.sock")),
         proxy_uid,
         operator_api: "127.0.0.1:1".parse().expect("addr"),
         token_file: dir.join("unused"),
+        operator_proxy_auth_file: None,
     }
 }
 
@@ -62,6 +64,12 @@ impl Farm {
     }
 
     fn launch(cfg: &Config, tune: impl FnOnce(Settings) -> Settings) -> Farm {
+        Farm::launch_on(cfg, sock(cfg), tune)
+    }
+
+    /// [`Farm::launch`] where the socket's path is `socket` (the config may name a
+    /// descriptor instead).
+    fn launch_on(cfg: &Config, socket: PathBuf, tune: impl FnOnce(Settings) -> Settings) -> Farm {
         let log = Log::default();
         let (stop, inst, health, clock) = (
             FakeSafeToStop::new(&log),
@@ -80,7 +88,7 @@ impl Farm {
         let daemon =
             start_with(cfg, ports, Timing::default(), settings, audit.sink()).expect("start");
         Farm {
-            socket: cfg.socket.clone(),
+            socket,
             log,
             stop,
             inst,
@@ -561,11 +569,9 @@ fn slow_clients_time_out_and_the_connection_cap_holds() {
     eventually(|| call(&farm.socket, "GET", "/v1/updater/rolls", "").0 == 200);
 }
 
-/// Catches a driver that has gone away being silent: the roll is recorded, the reply is
-/// still 202, and the audit says that nothing will run it.
-#[test]
-fn a_dead_driver_is_audited() {
-    let cfg = prepare("nodriver", own_uid());
+/// A server over fakes with no thread behind it, and the queue its driver would read.
+fn bare_server(name: &str) -> (Server, std::sync::mpsc::Receiver<String>, Lines) {
+    let cfg = prepare(name, own_uid());
     let log = Log::default();
     let ports = Ports {
         safe: Box::new(FakeSafeToStop::new(&log)),
@@ -581,7 +587,6 @@ fn a_dead_driver_is_audited() {
     )
     .expect("open");
     let (tx, rx): (Sender<String>, _) = channel();
-    drop(rx);
     let audit = Lines::default();
     let server = Server::new(
         Arc::new(updater),
@@ -590,6 +595,11 @@ fn a_dead_driver_is_audited() {
         tx,
         Arc::new(Recent::default()),
     );
+    (server, rx, audit)
+}
+
+/// POST the roll `{version 2.0, key k}` to `server` over a socket pair; the status.
+fn post_k(server: &Server) -> u16 {
     let (ours, theirs) = UnixStream::pair().expect("pair");
     let body = json!({"package": "kbf", "version": "2.0", "idempotency_key": "k"}).to_string();
     std::io::Write::write_all(
@@ -600,8 +610,96 @@ fn a_dead_driver_is_audited() {
     server.connection(theirs);
     let mut answer = Vec::new();
     std::io::Read::read_to_end(&mut &ours, &mut answer).expect("read");
-    assert_eq!(parsed(&answer).0, 202);
+    parsed(&answer).0
+}
+
+/// Catches a driver that has gone away being silent: the roll is recorded, the reply is
+/// still 202, and the audit says that nothing will run it.
+#[test]
+fn a_dead_driver_is_audited() {
+    let (server, rx, audit) = bare_server("nodriver");
+    drop(rx);
+    assert_eq!(post_k(&server), 202);
     assert_eq!(audit.events("driver_gone", 1)[0]["roll_id"], "roll-1");
+}
+
+/// Catches a replayed POST (same key and body: 200, `created` false) queueing the roll for
+/// the driver again. A driver handed a roll it already ran would at best be told it is over;
+/// the queue is where it shows, so it is read directly: the first POST queues `roll-1`, the
+/// replay queues nothing, and a driver that is gone is not audited for the replay.
+#[test]
+fn a_replayed_post_queues_nothing_for_the_driver() {
+    let (server, rx, audit) = bare_server("replay");
+    assert_eq!(post_k(&server), 202);
+    assert_eq!(rx.try_recv().as_deref(), Ok("roll-1"));
+    assert_eq!(post_k(&server), 200);
+    assert_eq!(post_k(&server), 200);
+    assert!(rx.try_recv().is_err(), "a replay queued a roll");
+    drop(rx);
+    assert_eq!(post_k(&server), 200);
+    assert!(audit.all().iter().all(|l| l["event"] != "driver_gone"));
+}
+
+/// Catches a sender that stays under the per-read timeout with every byte holding a
+/// connection for ever: a valid request sent a byte at a time, each well inside the read
+/// timeout, is cut off by the deadline on the whole request, and the audit says so; a
+/// deadline of zero cuts it off before the first read. A request that arrives in time is
+/// still served.
+#[test]
+fn a_slow_sender_is_cut_off_by_the_request_deadline() {
+    let farm = Farm::with("deadline", own_uid(), |mut s| {
+        s.io_timeout = Duration::from_secs(5);
+        s.request_deadline = Duration::from_millis(300);
+        s
+    });
+    let request = raw("GET", "/v1/updater/rolls", &[], "");
+    let mut slow = UnixStream::connect(&farm.socket).expect("connect");
+    for byte in request.as_bytes() {
+        if std::io::Write::write_all(&mut slow, &[*byte]).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let lost = farm.audit.events("connection_lost", 1);
+    let why = lost[0]["why"].as_str().expect("why");
+    assert!(why.contains("deadline"), "{why}");
+    assert!(
+        farm.audit.all().iter().all(|l| l["event"] != "request"),
+        "the slow request was served"
+    );
+    // One that arrives whole, in time, is served.
+    assert_eq!(call(&farm.socket, "GET", "/v1/updater/rolls", "").0, 200);
+    let none = Farm::with("deadline0", own_uid(), |mut s| {
+        s.request_deadline = Duration::ZERO;
+        s
+    });
+    assert_eq!(call(&none.socket, "GET", "/v1/updater/rolls", "").0, 0);
+    let lost = none.audit.events("connection_lost", 1);
+    assert!(
+        lost[0]["why"]
+            .as_str()
+            .is_some_and(|w| w.contains("deadline"))
+    );
+}
+
+/// Catches a socket that systemd bound being touched or mistaken: with an activated
+/// descriptor the updater serves the socket as it was given (mode 0660, which it does not
+/// change to 0600 or anything), answers on it, and does NOT remove the file when it stops;
+/// the file belongs to the service manager.
+#[test]
+fn an_activated_socket_is_served_as_given_and_left_in_place() {
+    use std::os::fd::IntoRawFd;
+    let mut cfg = prepare("activated", own_uid());
+    let path = sock(&cfg);
+    let listener = UnixListener::bind(&path).expect("bind");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).expect("chmod");
+    cfg.listen = Listen::Activated(listener.into_raw_fd());
+    let farm = Farm::launch_on(&cfg, path.clone(), |s| s);
+    assert_eq!(call(&path, "GET", "/v1/updater/rolls", "").0, 200);
+    let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+    assert_eq!(mode & 0o7777, 0o660, "the mode is the manager's");
+    drop(farm);
+    assert!(path.exists(), "the activated socket was removed");
 }
 
 /// Catches a roll left `running` by a crash not being resumed at start-up: a new process over
@@ -707,7 +805,7 @@ fn the_socket_is_0600_and_binding_is_careful() {
             .to_string()
             .contains("file name")
     );
-    // The temporary name is gone after a bind.
+    // The private directory it was bound in is gone after a bind, and after a failed one.
     let names: Vec<_> = std::fs::read_dir(&dir)
         .expect("dir")
         .flatten()

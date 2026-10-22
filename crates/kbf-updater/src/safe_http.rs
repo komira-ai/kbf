@@ -5,7 +5,12 @@
 //! The host's alias is the id (a node's id; the API accepts a member's number as well). The
 //! token is secret material: it is read from the file on every call (so a rotated token needs
 //! no restart), held only in the request buffer, and never in an error text, a `Debug` or a
-//! log. The file must be a regular file owned by the updater's user with mode `0600` or
+//! log. An error names the flag of the file (`--token-file`), not its path.
+//!
+//! A frontend that runs behind kbf-proxy (`--proxy-auth-file`) refuses an operator call that
+//! lacks the proxy's per-boot secret, 403 (`kbf-server` `api.rs` `operator_gate`). With
+//! `--operator-proxy-auth-file` the adapter reads that secret on every call (it changes at
+//! each proxy boot) and sends it as `x-kbf-proxy-auth`, 64 hex digits. The file must be a regular file owned by the updater's user with mode `0600` or
 //! `0400`, as the server demands of its own copy, and holds one token of 32 to 4096 visible
 //! ASCII characters; a byte that could end a header line is therefore never sent.
 //!
@@ -14,7 +19,7 @@
 //! - 200: the [`Verdict`]; an answer that is no verdict is an error, never "safe".
 //! - 404: [`Stop::Unknown`].
 //! - 401, 403, 415: the API refused the call (a wrong token, or a server behind the proxy's
-//!   secret); an error that says so, which the roll retries until its bound and then fails at.
+//!   secret that was not sent); an error that says so, which the roll retries until its bound and then fails at.
 //! - 409: the server cannot tell whether the node runs a storage member; an error.
 //! - 5xx, a refused or timed-out connection: [`PortError::unreachable`].
 //!
@@ -39,21 +44,28 @@ const TOKEN_MAX: u64 = 4096;
 /// The most bytes of an answer that are read.
 const REPLY_MAX: u64 = 1024 * 1024;
 
+/// The flag that names the token file, which error texts name instead of its path.
+pub const TOKEN_FLAG: &str = "--token-file";
+
+/// The flag that names the proxy's secret file.
+pub const PROXY_AUTH_FLAG: &str = "--operator-proxy-auth-file";
+
+/// The size of the proxy's per-boot secret, in bytes (`kbf-server`'s `SECRET_BYTES`).
+const PROXY_SECRET_BYTES: usize = 32;
+
+/// The header the proxy's secret travels in, as 64 lower-case hex digits.
+const PROXY_AUTH_HEADER: &str = "x-kbf-proxy-auth";
+
 /// Read the token in the file at `path`: a regular file (not followed if it is a symlink,
 /// not opened if it is a FIFO) owned by this process's user with mode exactly `0600` or
 /// `0400`, one token of visible ASCII, 32 bytes or more, surrounding whitespace dropped. The
-/// error text names the path and the rule, never the content.
+/// error text names the flag and the rule, never the path or the content (it reaches
+/// `GET /rolls/{id}`).
 pub fn read_token(path: &Path) -> Result<String, String> {
-    let fail = |why: &str| format!("token file {}: {why}", path.display());
-    let io = |e: std::io::Error| fail(&e.kind().to_string());
-    let (file, meta) = open_checked(path).map_err(io)?;
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let me = unsafe { libc::geteuid() };
-    file_rule(meta.is_file(), meta.uid(), meta.mode(), me).map_err(fail)?;
-    let mut text = String::new();
-    file.take(TOKEN_MAX + 1)
-        .read_to_string(&mut text)
-        .map_err(io)?;
+    let bytes = read_secret(path, TOKEN_FLAG, TOKEN_MAX)?;
+    let fail = |why: &str| format!("{TOKEN_FLAG}: {why}");
+    let text = String::from_utf8(bytes)
+        .map_err(|_| fail("it must hold one token of 32 to 4096 visible ASCII characters"))?;
     let token = text.trim();
     let visible = token.bytes().all(|b| b.is_ascii_graphic());
     if text.len() as u64 > TOKEN_MAX || token.len() < TOKEN_MIN || !visible {
@@ -62,6 +74,33 @@ pub fn read_token(path: &Path) -> Result<String, String> {
         ));
     }
     Ok(token.to_owned())
+}
+
+/// Read the proxy's secret from the file at `path`, under the same file rule as the token:
+/// exactly 32 bytes, as `kbf-server` reads its own copy. The result is what the frontend
+/// compares, the bytes as 64 lower-case hex digits. Errors name the flag only.
+pub fn read_proxy_secret(path: &Path) -> Result<String, String> {
+    let bytes = read_secret(path, PROXY_AUTH_FLAG, PROXY_SECRET_BYTES as u64)?;
+    if bytes.len() != PROXY_SECRET_BYTES {
+        return Err(format!(
+            "{PROXY_AUTH_FLAG}: it must hold exactly {PROXY_SECRET_BYTES} bytes"
+        ));
+    }
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The bytes of a secret file that passes the file rule, at most `limit` of them (and one
+/// more, so that a longer file is seen to be too long). The error text names `flag`.
+fn read_secret(path: &Path, flag: &str, limit: u64) -> Result<Vec<u8>, String> {
+    let fail = |why: &str| format!("{flag}: {why}");
+    let io = |e: std::io::Error| fail(&e.kind().to_string());
+    let (file, meta) = open_checked(path).map_err(io)?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    file_rule(meta.is_file(), meta.uid(), meta.mode(), me).map_err(fail)?;
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes).map_err(io)?;
+    Ok(bytes)
 }
 
 /// Open without following a symlink and without blocking on a FIFO; the metadata is of the
@@ -93,17 +132,28 @@ pub(crate) fn file_rule(is_file: bool, uid: u32, mode: u32, me: u32) -> Result<(
 pub struct HttpSafeToStop {
     addr: SocketAddr,
     token_file: PathBuf,
+    /// The proxy's secret, for a frontend behind kbf-proxy.
+    proxy_auth_file: Option<PathBuf>,
     timeout: Duration,
 }
 
 impl HttpSafeToStop {
-    /// An adapter for the API at `addr`. The token file is read once now, so that a start-up
-    /// with a bad file fails at once and not at the first roll.
-    pub fn new(addr: SocketAddr, token_file: PathBuf) -> Result<HttpSafeToStop, String> {
+    /// An adapter for the API at `addr`. The token file, and the proxy's secret file if
+    /// there is one, are read once now, so that a start-up with a bad file fails at once and
+    /// not at the first roll; each call reads them again.
+    pub fn new(
+        addr: SocketAddr,
+        token_file: PathBuf,
+        proxy_auth_file: Option<PathBuf>,
+    ) -> Result<HttpSafeToStop, String> {
         read_token(&token_file)?;
+        if let Some(path) = &proxy_auth_file {
+            read_proxy_secret(path)?;
+        }
         Ok(HttpSafeToStop {
             addr,
             token_file,
+            proxy_auth_file,
             timeout: TIMEOUT,
         })
     }
@@ -114,14 +164,22 @@ impl HttpSafeToStop {
     }
 
     /// One request, one answer: the raw bytes, up to [`REPLY_MAX`].
-    fn exchange(&self, alias: &str, token: &str) -> std::io::Result<Vec<u8>> {
+    fn exchange(
+        &self,
+        alias: &str,
+        token: &str,
+        proxy_secret: Option<&str>,
+    ) -> std::io::Result<Vec<u8>> {
         let mut stream = TcpStream::connect_timeout(&self.addr, self.timeout)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
+        let proxy = proxy_secret
+            .map(|secret| format!("{PROXY_AUTH_HEADER}: {secret}\r\n"))
+            .unwrap_or_default();
         let request = format!(
             "GET /v1/members/{alias}/safe-to-stop HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
              Accept: application/json\r\nAuthorization: Bearer {token}\r\n\
-             Content-Type: application/json\r\nContent-Length: 0\r\n\r\n",
+             {proxy}Content-Type: application/json\r\nContent-Length: 0\r\n\r\n",
             self.addr
         );
         stream.write_all(request.as_bytes())?;
@@ -134,8 +192,12 @@ impl HttpSafeToStop {
 impl SafeToStop for HttpSafeToStop {
     fn check(&self, host: &Host) -> Result<Stop, PortError> {
         let token = read_token(&self.token_file).map_err(PortError::other)?;
+        let secret = match &self.proxy_auth_file {
+            Some(path) => Some(read_proxy_secret(path).map_err(PortError::other)?),
+            None => None,
+        };
         let raw = self
-            .exchange(&host.alias, &token)
+            .exchange(&host.alias, &token, secret.as_deref())
             .map_err(|e| PortError::unreachable(format!("the operator API: {}", e.kind())))?;
         interpret(&raw)
     }
@@ -181,8 +243,8 @@ fn interpret(raw: &[u8]) -> Result<Stop, PortError> {
             }),
         404 => Ok(Stop::Unknown),
         401 | 403 | 415 => Err(PortError::other(format!(
-            "the operator API refused the call ({status}); check the token file and the \
-             API's gates"
+            "the operator API refused the call ({status}); check {TOKEN_FLAG}, {PROXY_AUTH_FLAG} and \
+             the API's gates"
         ))),
         409 => Err(PortError::other(
             "the operator API cannot tell whether the host runs a storage member (409)",

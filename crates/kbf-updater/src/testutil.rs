@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::daemon::Config;
+use crate::listener::Listen;
 use crate::server::AuditSink;
 
 pub(crate) const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample";
@@ -163,6 +165,22 @@ pub(crate) struct FakeApi {
 }
 
 pub(crate) fn fake_api(script: Vec<Option<Vec<u8>>>) -> FakeApi {
+    fake_api_by(move |n, _| script[n.min(script.len() - 1)].clone())
+}
+
+/// The path a config binds.
+pub(crate) fn sock(cfg: &Config) -> PathBuf {
+    match &cfg.listen {
+        Listen::Bind(path) => path.clone(),
+        Listen::Activated(fd) => panic!("descriptor {fd} is activated, not bound"),
+    }
+}
+
+/// A fake operator API that answers connection `n`, having read its request head, with what
+/// `answer(n, head)` returns (`None`: never answer).
+pub(crate) fn fake_api_by(
+    answer: impl Fn(usize, &str) -> Option<Vec<u8>> + Send + 'static,
+) -> FakeApi {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -176,10 +194,12 @@ pub(crate) fn fake_api(script: Vec<Option<Vec<u8>>>) -> FakeApi {
             while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
                 head.push(byte[0]);
             }
-            locked(&log).push(String::from_utf8_lossy(&head).into_owned());
-            match &script[n.min(script.len() - 1)] {
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let reply = answer(n, &head);
+            locked(&log).push(head);
+            match reply {
                 Some(answer) => {
-                    let _ = stream.write_all(answer);
+                    let _ = stream.write_all(&answer);
                 }
                 None => held.push(stream),
             }

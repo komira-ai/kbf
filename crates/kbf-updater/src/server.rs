@@ -15,15 +15,15 @@
 //!   of the roll the caller asked about.
 //!
 //! One request per connection, one thread per connection (at most
-//! [`Settings::max_connections`] at once), read and write timeouts on every socket.
+//! [`Settings::max_connections`] at once), a timeout on every read and write and a deadline
+//! on the whole request.
 
 use std::collections::VecDeque;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -53,8 +53,11 @@ const RECENT_MAX: usize = 16;
 pub struct Settings {
     /// The one uid whose connections are served.
     pub proxy_uid: u32,
-    /// How long a read or a write on a connection may take.
+    /// How long one read or one write on a connection may take.
     pub io_timeout: Duration,
+    /// How long the whole request, head and body, may take to arrive: a sender that stays
+    /// under `io_timeout` with every read does not hold a connection for longer than this.
+    pub request_deadline: Duration,
     /// Connections served at once; the next one is closed unread.
     pub max_connections: usize,
 }
@@ -64,6 +67,7 @@ impl Settings {
         Settings {
             proxy_uid,
             io_timeout: Duration::from_secs(10),
+            request_deadline: Duration::from_secs(30),
             max_connections: 16,
         }
     }
@@ -128,6 +132,38 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
 #[cfg(not(target_os = "linux"))]
 fn peer_uid(_stream: &UnixStream) -> Option<u32> {
     None
+}
+
+/// A stream whose every read is bounded by the time left to the whole request.
+struct Deadline<'a> {
+    stream: &'a UnixStream,
+    per_read: Duration,
+    end: Instant,
+}
+
+impl Deadline<'_> {
+    fn exceeded() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the request deadline passed before the request arrived",
+        )
+    }
+}
+
+impl std::io::Read for Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(Deadline::exceeded());
+        }
+        self.stream
+            .set_read_timeout(Some(left.min(self.per_read)))?;
+        let read = (&*self.stream).read(buf);
+        if read.is_err() && Instant::now() >= self.end {
+            return Err(Deadline::exceeded());
+        }
+        read
+    }
 }
 
 /// An answer to give, and what to write down about it.
@@ -238,9 +274,13 @@ impl Server {
             self.audit(&json!({"event": "peer_refused", "peer_uid": peer}));
             return;
         }
-        let _ = stream.set_read_timeout(Some(self.settings.io_timeout));
         let _ = stream.set_write_timeout(Some(self.settings.io_timeout));
-        let (request, answer) = match read_request(&mut stream) {
+        let mut reader = Deadline {
+            stream: &stream,
+            per_read: self.settings.io_timeout,
+            end: Instant::now() + self.settings.request_deadline,
+        };
+        let (request, answer) = match read_request(&mut reader) {
             Ok(request) => {
                 let answer = self.answer(&request);
                 (Some(request), answer)
@@ -366,34 +406,4 @@ impl Server {
             Err(ApiError::new(ErrorCode::UnknownRoll, "no such roll"))
         }
     }
-}
-
-/// Bind the API socket at `path`: a stale socket file left by a dead updater is replaced, a
-/// live one or any other kind of file is an error, and the socket appears at `path` with mode
-/// 0600 already set: it is bound under a temporary name in the same directory, `chmod`ed and
-/// renamed. (For that instant the temporary one has the process's umask mode; a peer that
-/// connects to it is still checked by uid.)
-pub fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-    let other = |text: &str| std::io::Error::other(text.to_owned());
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => {
-            if UnixStream::connect(path).is_ok() {
-                return Err(other("another process listens at the socket path"));
-            }
-            std::fs::remove_file(path)?;
-        }
-        Ok(_) => return Err(other("the socket path exists and is not a socket")),
-        // Missing, or unreadable: the bind says which.
-        Err(_) => {}
-    }
-    // Short, so that the temporary name fits where `path` fits.
-    path.file_name()
-        .ok_or_else(|| other("the socket path has no file name"))?;
-    let tmp = path.with_file_name(format!(".{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-    let listener = UnixListener::bind(&tmp)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, path)?;
-    Ok(listener)
 }
