@@ -188,6 +188,32 @@ impl SchemaStep for Database {
     }
 }
 
+/// A [`Database`] whose step waits at most `lock_wait` for any lock
+/// ([`Database::migrate_within`]), for a caller that must end inside a time it was given (a
+/// unit's start): a busy schema is a refusal, not a wait without end.
+#[derive(Debug)]
+pub struct Bounded {
+    database: Database,
+    lock_wait: Duration,
+}
+
+impl Database {
+    /// This database with every lock wait of its [`SchemaStep`] bounded by `lock_wait`.
+    #[must_use]
+    pub fn bounded(self, lock_wait: Duration) -> Bounded {
+        Bounded {
+            database: self,
+            lock_wait,
+        }
+    }
+}
+
+impl SchemaStep for Bounded {
+    fn before_start(&mut self, schema: u32) -> Result<String, String> {
+        step_line(self.database.migrate_within(schema, self.lock_wait))
+    }
+}
+
 /// What the database step needs of the schema: `Database` is the one real implementation; a
 /// test's fake stands in for a server, so the lines `setup` prints after the schema runner
 /// answers are tested without one. The errors are their text: that is all `setup` prints.

@@ -59,6 +59,7 @@ pub mod app;
 pub mod archive;
 pub mod attest;
 pub mod binary;
+pub mod boot_schema;
 pub mod cli;
 pub mod darwin;
 pub mod database;
