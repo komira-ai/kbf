@@ -145,19 +145,21 @@ async fn a_profile_without_its_write_deny_fails_the_canaries() {
 
 /// Catches a link canary that cannot fail on its own (it only follows the write canary's
 /// result, or the check stops at the first failure): the profile keeps
-/// `(deny file-write*)` but lets `file-link` through, so the write canary must still be
-/// refused and the link canary alone reported.
+/// `(deny file-write*)` but allows writes under `/private/etc`, where the link's source
+/// is (the runner showed the link is refused through its source's write rule: an
+/// `(allow file-link)` changed nothing), so the write canary must still be refused and
+/// the link canary alone reported.
 #[ignore = "needs root and real users: cargo xtask sudo-test"]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_profile_that_lets_a_link_through_fails_the_link_canary_alone() {
-    let mutant = ProfileMutant::Add("(allow file-link)");
+async fn a_profile_that_allows_writes_to_the_link_source_fails_the_link_canary_alone() {
+    let mutant = ProfileMutant::Add("(allow file-write* (subpath \"/private/etc\"))");
     let (_users, scratch, slots) = start("canary-link", Some(mutant));
     let (slot, lease) = leased(&slots, &scratch).await;
     let isolation = Isolation::detect();
     for network in [Network::On, Network::Off] {
         let report = slot.canary(&isolation, network, &lease).await.expect("ran");
         println!(
-            "CANARY-MUTANT allow-file-link network={network:?}: {}",
+            "CANARY-MUTANT allow-write-to-the-link-source network={network:?}: {}",
             report.failures()
         );
         assert_eq!(failed(&report), ["link-outside"], "{}", report.failures());
@@ -206,35 +208,4 @@ async fn a_slot_that_fails_its_canaries_is_set_aside_and_canaried_again_when_off
     again.set_aside();
     assert_eq!(slots.count(), 0);
     assert!(left_in_tmp().is_empty(), "{:?}", left_in_tmp());
-}
-
-/// Which profile change lets the link through while the write stays refused: prints, for
-/// each candidate, the canaries that were not refused (a measurement, asserts nothing).
-#[ignore = "needs root and real users: cargo xtask sudo-test"]
-#[tokio::test(flavor = "multi_thread")]
-async fn which_rule_refuses_the_link() {
-    let candidates = [
-        "(allow file-link)",
-        "(allow file-link (subpath \"/private/etc\"))",
-        "(allow file-write-create)",
-        "(allow file-write-create (subpath \"/private/etc\"))",
-        "(allow file-write-mode)",
-        "(allow file-write-owner)",
-        "(allow file-write-unlink)",
-        "(allow file-write-setugid)",
-        "(allow file-write-flags)",
-        "(allow file-read-metadata)",
-        "(allow file-write* (subpath \"/private/etc\"))",
-    ];
-    for (i, line) in candidates.into_iter().enumerate() {
-        let (_users, scratch, slots) =
-            start(&format!("canary-which{i}"), Some(ProfileMutant::Add(line)));
-        let (slot, lease) = leased(&slots, &scratch).await;
-        let report = slot
-            .canary(&Isolation::detect(), Network::On, &lease)
-            .await
-            .expect("ran");
-        println!("WHICH {line} -> not refused: {:?}", failed(&report));
-        slot.release().await;
-    }
 }
