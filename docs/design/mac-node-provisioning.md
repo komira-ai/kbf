@@ -369,6 +369,23 @@ listed, and step 3 checks that they print it.
 
 ### 4.1 Build and attest on `main`
 
+> The build and attestation workflow is `.github/workflows/artifacts.yml`; [docs/artifacts.md](../artifacts.md)
+> is the authority for what it does. Beyond what this section says:
+>
+> - **Signing is ad hoc with the hardened runtime** (`--options runtime`). CI checks
+>   the flag, runs the signed binary, and verifies the signature again on the binary
+>   taken out of its tarball. The hardened runtime's behaviour is checked only on a
+>   runner with SIP enabled, and hosted runners do not enforce code signing on a
+>   running process, so the kernel's page checks are not shown in CI.
+> - **Still planned:** the deployment job that verifies an asset before it reaches a
+>   node, and the node's SHA-256 check in `apply`.
+> - **The release workflow** (`.github/workflows/release.yml`, docs/artifacts.md): a
+>   person pushes a tag on a commit of `main` (the soak is their judgment, not a check
+>   the workflow makes), and the workflow attaches the files of that commit's `main` run
+>   of `artifacts.yml`, checked against the attestations and never rebuilt. They come
+>   from that run's workflow artifacts, not the deployment's copy, so a release is cut
+>   within the 90 days GitHub keeps them.
+
 The model:
 
 - **Every green commit on `main` is built and attested** by CI, and is a candidate for
