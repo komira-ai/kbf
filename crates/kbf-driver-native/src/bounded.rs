@@ -4,12 +4,11 @@ use std::io::Read as _;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// How long a killed child is waited for to be reaped, and its output read.
+/// How long the output of a child that has exited is waited for.
 const REAP: Duration = Duration::from_secs(2);
 
 /// The stdout of `command` (stdin closed, stderr dropped) if it exits with success within
-/// `within`; `Err(true)` if it was still running then (it is killed and reaped, for up to
-/// two seconds), `Err(false)` if it could not be started, failed, or exited with an error.
+/// `within`; `Err(true)` if it was still running then (it is killed and reaped on another thread), `Err(false)` if it could not be started, failed, or exited with an error.
 pub(crate) fn stdout_within(command: &mut Command, within: Duration) -> Result<Vec<u8>, bool> {
     let mut child = command
         .stdin(Stdio::null())
@@ -19,13 +18,11 @@ pub(crate) fn stdout_within(command: &mut Command, within: Duration) -> Result<V
         .map_err(|_| false)?;
     // Read as it is written: a listing is larger than a pipe holds. The reader reports
     // through a channel, so that no wait for it is unbounded.
-    let stdout = child.stdout.take();
+    let mut stdout = child.stdout.take().expect("stdout is piped");
     let (sent, received) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut text = Vec::new();
-        if let Some(mut stdout) = stdout {
-            let _ = stdout.read_to_end(&mut text);
-        }
+        let _ = stdout.read_to_end(&mut text);
         let _ = sent.send(text);
     });
     let give_up = Instant::now() + within;
@@ -37,11 +34,12 @@ pub(crate) fn stdout_within(command: &mut Command, within: Duration) -> Result<V
             Ok(Some(_)) | Err(_) => return Err(false),
             Ok(None) if Instant::now() < give_up => std::thread::sleep(Duration::from_millis(10)),
             Ok(None) => {
-                let _ = child.kill();
-                let reaped = Instant::now() + REAP;
-                while child.try_wait().is_ok_and(|s| s.is_none()) && Instant::now() < reaped {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
+                // Reaped off this thread: a process stuck in the kernel is waited for
+                // there, not here.
+                std::thread::spawn(move || {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                });
                 return Err(true);
             }
         }
@@ -63,6 +61,17 @@ mod tests {
         let took = started.elapsed();
         assert!(took >= Duration::from_millis(300), "{took:?}");
         assert!(took < Duration::from_secs(5), "not cut off: {took:?}");
+    }
+
+    /// Catches a command that cannot be started taken for a timeout (a caller would
+    /// log a hang that was a missing program).
+    #[test]
+    fn a_command_that_cannot_start_is_not_a_timeout() {
+        let got = stdout_within(
+            &mut Command::new("/nonexistent/kbf-program"),
+            Duration::from_secs(1),
+        );
+        assert_eq!(got, Err(false));
     }
 
     /// Catches output lost or a failure taken for success: a command that finishes in
