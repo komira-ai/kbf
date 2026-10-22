@@ -245,8 +245,7 @@ async fn a_storage_with_nothing_in_ram_answers_the_durable_question_as_the_plain
 /// absent one missing and reaches the store's `find_durable_waiting` once, and neither
 /// `find_durable` nor `find_missing`; the other two questions do not reach it. While the
 /// node is catching up a waiting answer with a digest missing is UNAVAILABLE as the others
-/// are. Mutants: the header value `wait` mapped to the `only` question; the client sends
-/// `only` for a waiting question.
+/// are.
 #[tokio::test]
 async fn the_wait_header_selects_the_waiting_question_over_the_wire_and_in_process() {
     let mem = Arc::new(Mem::default());

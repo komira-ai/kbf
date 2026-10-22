@@ -127,6 +127,15 @@ pub enum ErrorCode {
     RollTerminal,
     /// The roll record cannot be read or written, so the updater will not act on it.
     StateLost,
+    /// No such route.
+    NotFound,
+    /// The route exists, with another method.
+    MethodNotAllowed,
+    /// The body is longer than [`MAX_BODY`].
+    BodyTooLarge,
+    /// The request carries an `Authorization` header: the proxy must strip it, so one that
+    /// arrives means the proxy failed, and the updater will not act on the request.
+    CredentialsPresent,
     /// The cluster does not know the host (safe-to-stop answered 404).
     UnknownMember,
     /// The host may not be stopped, and did not become stoppable within the bound.
@@ -145,8 +154,13 @@ impl ErrorCode {
     /// The HTTP status a request refused with this code is answered with.
     pub fn status(self) -> u16 {
         match self {
-            ErrorCode::BadRequest | ErrorCode::BadVersion | ErrorCode::UnknownAlias => 400,
-            ErrorCode::UnknownRoll => 404,
+            ErrorCode::BadRequest
+            | ErrorCode::BadVersion
+            | ErrorCode::UnknownAlias
+            | ErrorCode::CredentialsPresent => 400,
+            ErrorCode::UnknownRoll | ErrorCode::NotFound => 404,
+            ErrorCode::MethodNotAllowed => 405,
+            ErrorCode::BodyTooLarge => 413,
             ErrorCode::RollActive | ErrorCode::KeyReused | ErrorCode::RollTerminal => 409,
             ErrorCode::StateLost => 503,
             // Failure codes of a roll; they are never the status of a request.
@@ -358,6 +372,10 @@ mod tests {
             (ErrorCode::UnknownRoll, "unknown_roll", 404),
             (ErrorCode::RollTerminal, "roll_terminal", 409),
             (ErrorCode::StateLost, "state_lost", 503),
+            (ErrorCode::NotFound, "not_found", 404),
+            (ErrorCode::MethodNotAllowed, "method_not_allowed", 405),
+            (ErrorCode::BodyTooLarge, "body_too_large", 413),
+            (ErrorCode::CredentialsPresent, "credentials_present", 400),
             (ErrorCode::UnknownMember, "unknown_member", 500),
             (ErrorCode::UnsafeToStop, "unsafe_to_stop", 500),
             (

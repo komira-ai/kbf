@@ -168,13 +168,12 @@ async fn a_node_with_a_ram_budget_starts_and_stops() {
 }
 
 /// Catches `kbf storage` not wiring `--ram-ack-bytes` into its cache and not draining at
-/// its stop. A node started with a budget holds a blob (`Hold::Held`; with the budget
-/// not passed to the cache the answer is `Budget`), and when the node stops its cold
-/// store has the blob's bytes (with the drain not run after serving, or dropped, the
-/// bytes never reach the disk). The disk has none of them before the hold. Mutants: the
-/// assembly leaves out `with_ram_ack_bytes`; it leaves out `ram.after(node.serving)`.
-/// The stop's own drain is pinned apart from the background task by the unit test of
-/// `RamDrain::after` (`ram_drain/tests.rs`); this one pins the assembly.
+/// its stop. A node started with a budget holds a blob (`Hold::Held`; with the budget not
+/// passed to the cache the answer is `Budget`), and when the node stops its cold store has
+/// the blob's bytes (with the drain not run after serving, or dropped, the bytes never
+/// reach the disk). The disk has none of them before the hold. The stop's own drain is
+/// pinned apart from the background task by the unit test of `RamDrain::after`
+/// (`ram_drain/tests.rs`); this one pins the assembly.
 #[tokio::test]
 async fn a_node_with_a_ram_budget_writes_what_it_holds_when_it_stops() {
     let dir = dir("ram-stop");

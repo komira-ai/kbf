@@ -971,10 +971,7 @@ fn in_ram_only(farm: &Farm, node: usize, digest: &Digest) -> bool {
 /// Catches a debt settled against a peer that holds the blob only in RAM (T12): the peer
 /// has it in RAM and not on its disk, so the worker's probe (`kbf-durable: only`) says it
 /// is missing, the copy is sent, the peer (a copy asks for a durable one) writes it, and
-/// only then is the debt settled, the blob now on the peer's disk. Mutants: the worker's
-/// probe asks the plain question (no copy is sent, the debt is settled on a RAM copy and
-/// the blob is still RAM-only); the peer answers a copy of a blob it holds in RAM "already
-/// held" (the same).
+/// only then is the debt settled, the blob now on the peer's disk.
 #[tokio::test]
 async fn a_peer_holding_the_blob_only_in_ram_is_given_the_copy_before_the_debt_is_settled() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -1001,8 +998,7 @@ async fn a_peer_holding_the_blob_only_in_ram_is_given_the_copy_before_the_debt_i
 /// Catches a debt settled on the peer's RAM copy when the copy it was sent cannot be
 /// written: the peer holds the blob in RAM only and its disk refuses the write, so the
 /// pass leaves the debt owed (the peer is still not durable); with the disk back the next
-/// pass settles it and the blob is on the peer's disk. Mutant: the probe asks the plain
-/// question (the RAM copy counts: the debt is settled with nothing written).
+/// pass settles it and the blob is on the peer's disk.
 #[tokio::test]
 async fn a_debt_stays_while_the_peer_that_holds_the_blob_in_ram_cannot_write_it() {
     let farm = Farm::start(2, ChainConfig::default()).await;

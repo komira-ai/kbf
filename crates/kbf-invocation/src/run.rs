@@ -38,6 +38,34 @@ impl ActionShape {
     }
 }
 
+/// Where one axis of an action's booking came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BookSource {
+    /// The client named no size for the axis: the farm's default booked it.
+    #[default]
+    Default,
+    /// The client named a size (`kbf-book-cpus`, `kbf-book-mem-gib`), whatever it was:
+    /// naming the default's own value is still a hint.
+    Hint,
+}
+
+/// What the front knew of an Execute at submit that the booking alone does not say, kept
+/// per caller on its row and on the run record: history cannot be filled in later.
+/// Behaviour-free: nothing reads it to decide anything.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Evidence {
+    /// Where the booked cores came from.
+    pub cpu_source: BookSource,
+    /// Where the booked memory came from.
+    pub memory_source: BookSource,
+    /// The summed size of the distinct files of the input tree; `None` when the walk
+    /// did not total it (a subtree verified earlier, or a walk that totals nothing),
+    /// never 0 for "unknown".
+    pub input_bytes: Option<u64>,
+    /// The number of distinct files of the input tree; `None` as `input_bytes` is.
+    pub input_files: Option<u64>,
+}
+
 /// The owner an action's paths name: `cell//pkg:name`, and its kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {

@@ -123,6 +123,7 @@ fn submit(farm: &Farm, request: Request) {
             request,
             call: None,
             described: Described::default(),
+            evidence: Default::default(),
         },
     )
     .expect("submitted");

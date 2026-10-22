@@ -16,8 +16,7 @@ use support::{Front, blob};
 /// read a range of an object the held copy is not in yet, or one the drain is about to
 /// make): a blob held and also indexed (the drain's window between the index taking it and
 /// the set dropping it) and one only held are both located nowhere, so the caller reads
-/// each whole; a blob only indexed is located, and an absent one is not. Mutant: `locate`
-/// answers from the index alone (the held-and-indexed blob is then located).
+/// each whole; a blob only indexed is located, and an absent one is not.
 #[tokio::test]
 async fn a_held_blob_has_no_location() {
     let front = Front::start(SegmentsConfig::DEFAULT).await;

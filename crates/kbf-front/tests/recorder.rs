@@ -113,6 +113,7 @@ async fn drops_mark_the_record_the_event_was_for() {
         action: d(3),
         command: d(4),
         shape: None,
+        evidence: None,
     });
     recorder.emit(Event::Finished(Finished {
         operation: OperationId(8),

@@ -66,9 +66,7 @@ impl Rig {
 /// and nowhere else. The commit is refused UNAVAILABLE (never `Ok`), nothing is committed
 /// on the action's owner, and the owners were asked the **waiting** durable question (not
 /// the plain one, not the non-waiting one). Once the primary has written the blob the same
-/// commit succeeds. Mutants: barrier (a) deleted (the commit succeeds on the RAM-only
-/// blob); the barrier asks `find_durable` without waiting (the waiting log is empty);
-/// asks the plain question (the blob counts).
+/// commit succeeds.
 #[tokio::test]
 async fn a_commit_is_refused_while_a_closure_blob_is_only_in_ram_and_goes_through_once_written() {
     let rig = rig();
@@ -102,8 +100,6 @@ async fn a_commit_is_refused_while_a_closure_blob_is_only_in_ram_and_goes_throug
 /// Catches a barrier that accepts the action's owner's own copy: the output is held (on
 /// disk) by member 3 only, which is not an owner of it, so no reader would ask member 3
 /// for it. The commit is refused `Absent` naming the output, nothing is committed.
-/// Mutant: barrier (a) deleted (the commit succeeds and the entry is a permanent miss once
-/// the owners lose the blob), or the barrier counts a non-owner.
 #[tokio::test]
 async fn a_blob_only_the_actions_owner_holds_does_not_satisfy_the_barrier() {
     let rig = rig();
@@ -128,7 +124,7 @@ async fn a_blob_only_the_actions_owner_holds_does_not_satisfy_the_barrier() {
 /// Catches a barrier that asks only the primary: a blob durable on the replica (its
 /// primary restarted and lost it) satisfies "durable on an owner". The commit succeeds,
 /// the replica was asked only for what the primary lacked, and the primary was asked
-/// first. Mutant: the barrier is `Router::find_durable` (primary only).
+/// first.
 #[tokio::test]
 async fn a_blob_durable_on_the_replica_only_satisfies_the_barrier() {
     let rig = rig();
@@ -150,7 +146,6 @@ async fn a_blob_durable_on_the_replica_only_satisfies_the_barrier() {
 
 /// Catches a barrier that costs more than the doc says: five blobs all held on disk by
 /// their primary are one batched waiting call to that primary and none to the replica.
-/// Mutant: a call per blob, or the replica asked as well.
 #[tokio::test]
 async fn the_barrier_is_one_batched_call_per_primary() {
     let rig = rig();
@@ -195,8 +190,7 @@ async fn an_owner_that_cannot_answer_is_not_a_blob_that_is_absent() {
 
 /// Catches a barrier that fails the commit for an owner that could not answer when another
 /// owner holds every blob durably: the primary fails the barrier's call, the replica holds
-/// the output, so the commit goes through. Mutant: an owner's failure fails the call
-/// whatever the later owners say.
+/// the output, so the commit goes through.
 #[tokio::test]
 async fn an_owner_that_cannot_answer_does_not_fail_a_blob_another_owner_holds() {
     let rig = rig();
@@ -216,7 +210,7 @@ async fn an_owner_that_cannot_answer_does_not_fail_a_blob_another_owner_holds() 
 
 /// Catches a barrier that does not follow the stale-map rule: the primary answers
 /// STALE_MAP to the barrier's call, the router fetches the new map and the commit goes
-/// through against it. Mutant: the stale answer counted as an owner that could not answer.
+/// through against it.
 #[tokio::test]
 async fn a_stale_map_in_the_barrier_is_followed() {
     let one = map(1, 2, active(&[1, 2, 3]));
