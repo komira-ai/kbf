@@ -2,10 +2,12 @@
 //! dispatch to the pool, carry the bytes both ways, and dispatch again after a safe failure.
 //!
 //! The permit rule (design note section 5): a stream binds to the slot active when its
-//! headers arrived and keeps the permit until both upstream halves are finished.
+//! headers arrived (a `WaitExecution` naming the old child's term, to the old child) and keeps
+//! the permit until both upstream halves are finished.
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use h2::{Reason, RecvStream};
 use http::{HeaderMap, Method, Request, Response, Uri, Version};
@@ -21,8 +23,14 @@ use crate::metrics::Metrics;
 use crate::pool::TargetPool;
 use crate::replay::Failure;
 use crate::reply::{refused, unavailable};
-use crate::route::{Idle, Target, idle_of};
+use crate::route::{Idle, Target, idle_of, is_wait_execution};
 use crate::slot::{Bind, Pending, Permit};
+use crate::term::{Probe, decided, probe};
+
+/// How long the start of a `WaitExecution` request is waited for, to read the operation it
+/// names. A client sends the message with its headers; one that sends it later is dispatched
+/// without being read, to the active child, and loses nothing else.
+pub(crate) const PEEK_FOR: Duration = Duration::from_secs(2);
 
 /// Why a stream was refused before it reached a child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +65,9 @@ struct Stream {
     count: Arc<StreamCount>,
     idle: Idle,
     grpc: bool,
+    /// The term of the operation a `WaitExecution` names, if it names one: the stream binds
+    /// to the child with that term while it lives, and to the active child otherwise.
+    term: Option<u64>,
 }
 
 /// Serves a request that goes to a backend. `pending` counts the stream from accept.
@@ -91,6 +102,13 @@ pub(crate) async fn proxy_child(
         return refused(grpc, AuthRefusal::PermissionDenied);
     }
     let path = parts.uri.path().to_owned();
+    let source = Source::new(body);
+    // Only a `WaitExecution` is read ahead; any other call is dispatched at its headers.
+    let term = if is_wait_execution(&path) {
+        wait_term(&source).await
+    } else {
+        None
+    };
     let stream = Stream {
         idle: idle_of(&path),
         path,
@@ -98,13 +116,28 @@ pub(crate) async fn proxy_child(
         method: parts.method,
         uri: parts.uri,
         headers,
-        source: Source::new(body),
+        source,
         activity: Activity::new(),
         count: Arc::new(count),
         grpc,
+        term,
         core,
     };
     stream.run(pending).await
+}
+
+/// The term of the operation a `WaitExecution` names, read from the first message of its
+/// request body (`crate::term`): `None` when that message is not whole within [`PEEK_FOR`]
+/// or names nothing to route by. What was read stays in `source`, so the request is sent
+/// upstream whole.
+async fn wait_term(source: &Source) -> Option<u64> {
+    let head = tokio::time::timeout(PEEK_FOR, source.peek(decided))
+        .await
+        .ok()?;
+    match probe(&head) {
+        Probe::Term(term) => Some(term),
+        Probe::More | Probe::Skip => None,
+    }
 }
 
 impl Stream {
@@ -117,7 +150,7 @@ impl Stream {
         // out what is left of the first bound, not a new one.
         let mut since = None;
         loop {
-            let permit = match admit(&self.core, &mut since).await {
+            let permit = match admit(&self.core, self.term, &mut since).await {
                 Ok(permit) => permit,
                 Err(refusal) => return self.refuse(refusal),
             };
@@ -236,11 +269,21 @@ fn classify(error: &h2::Error) -> Failure {
 
 /// Binds the stream through the gate. While the gate holds it waits in the hold queue; a
 /// release wakes it to bind again, and its bound answers it `UNAVAILABLE`.
-async fn admit(core: &Core, since: &mut Option<std::time::Instant>) -> Result<Permit, Refusal> {
+///
+/// A stream that names an operation of `term` binds to the slot whose child has that term if
+/// that slot is open and not the active one (the old child during a swap), and otherwise to the
+/// active slot. The slot is looked up at each bind, so a stream that waited out a hold binds
+/// by the children as they are after it.
+async fn admit(
+    core: &Core,
+    term: Option<u64>,
+    since: &mut Option<std::time::Instant>,
+) -> Result<Permit, Refusal> {
     // `since` is the first hold's start, kept across holds and across retries so chained holds
     // cannot keep one stream longer than one bound.
     loop {
-        match core.slots.bind() {
+        let prefer = term.and_then(|term| core.terms.slot_of(&core.slots, term));
+        match core.slots.bind_preferring(prefer) {
             Bind::Bound(permit) => return Ok(permit),
             Bind::NoActive => return Err(Refusal::NoActive),
             Bind::Held { epoch, hold_max } => {
