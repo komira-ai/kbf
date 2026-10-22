@@ -153,6 +153,8 @@ async fn processes_that_outlive_the_kill_wait_fail_the_lease() {
     let dir = scratch("survivors");
     let mut config = config(&dir);
     config.kill_wait = Duration::ZERO;
+    // Without the grace, the first thing the lease sends is SIGKILL.
+    config.term_grace = Duration::ZERO;
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
     let outcome = run(&rt, &cas, 1, &Spec::act("spawn-child sleep 300 ; exit 0")).await;
@@ -301,4 +303,119 @@ async fn a_timed_out_lease_tells_its_usage_once() {
         assert_eq!(usage, None);
     }
     assert_eq!(rt.failed_usage(LeaseId::new(1, 3)), None, "taken once");
+}
+
+/// A fresh name prefix for the shared-memory names of one test.
+fn shm_prefix(tag: &str) -> String {
+    format!("kd{}{tag}", std::process::id() % 100_000)
+}
+
+/// Starts `shm-owner` as lease `1.1`, waits until its four names exist, and kills the
+/// lease; returns how the run ended and the names left once the kill has returned.
+async fn kill_an_owner(
+    config: kbf_driver_native::NativeConfig,
+    tag: &str,
+) -> (String, Vec<String>) {
+    let cas = Arc::new(MemoryCas::default());
+    let rt = Arc::new(runtime(config.clone(), &cas));
+    let prefix = shm_prefix(tag);
+    kbf_testkit::shm::unlink(&prefix, 2);
+    let action = Spec::act(&format!("shm-owner {prefix} 2")).store(&cas);
+    let running = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.run(work(1, action, 0)).await }
+    });
+    let until = tokio::time::Instant::now() + PROMPT;
+    while kbf_testkit::shm::present(&prefix, 2).len() < 4 {
+        assert!(tokio::time::Instant::now() < until, "the names never came");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The tracker is ready before the owner says so; give the action's first poll time.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    rt.kill(kbf_types::LeaseId::new(1, 1)).await;
+    let left = kbf_testkit::shm::present(&prefix, 2);
+    kbf_testkit::shm::unlink(&prefix, 2);
+    let outcome = running.await.expect("run task");
+    assert!(no_leases(&config));
+    (format!("{outcome:?}"), left)
+}
+
+/// Catches: a lease that sends SIGKILL to its whole tree at once, which leaves a
+/// resource tracker no time to unlink the shared memory and semaphores the workload
+/// made. With the default grace, SIGTERM goes first and every name is gone when the
+/// kill returns.
+#[tokio::test]
+async fn a_tracker_unlinks_its_names_when_the_lease_ends() {
+    let dir = scratch("tracker-term");
+    let (outcome, left) = kill_an_owner(config(&dir), "a").await;
+    assert!(outcome.contains("Killed"), "{outcome}");
+    assert_eq!(left, Vec::<String>::new());
+}
+
+/// Catches: a grace of zero that still waits or sends SIGTERM (zero must mean SIGKILL at
+/// once), and a test double that cannot show a leak: with nothing to unlink them, all
+/// four names are left.
+#[tokio::test]
+async fn a_grace_of_zero_kills_at_once_and_leaves_the_names() {
+    let dir = scratch("tracker-kill");
+    let mut config = config(&dir);
+    config.term_grace = Duration::ZERO;
+    let (outcome, left) = kill_an_owner(config, "b").await;
+    assert!(outcome.contains("Killed"), "{outcome}");
+    assert_eq!(left.len(), 4, "{left:?}");
+}
+
+/// Catches: a process that ignores SIGTERM left out of the result, one that ends on
+/// SIGTERM named as if it had not, a count or a pid that is not the survivor's, a note
+/// missing the program's name and arguments, a survivor left alive after the lease, an
+/// action failed for it (its exit code stands), and a grace that is waited past its
+/// bound or not at all.
+#[tokio::test]
+async fn a_process_that_ignores_sigterm_is_named_in_the_result() {
+    let dir = scratch("ignores");
+    let mut config = config(&dir);
+    config.term_grace = Duration::from_millis(400);
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let spec = Spec::act(
+        "spawn-child sleep 300 ; \
+         spawn-child --pid - ignore-signal 15 ;; sleep 300 ; sleep 0.5 ; exit 3",
+    );
+    let started = std::time::Instant::now();
+    let result = run(&rt, &cas, 1, &spec).await.expect("ran");
+    let took = started.elapsed();
+    let pid = pid_of(&cas, &result);
+    let stderr = support::stderr(&cas, &result);
+    assert_eq!(result.exit_code, 3, "{stderr}");
+    assert!(!alive(pid), "the process {pid} outlived the lease");
+    assert!(
+        stderr.contains(&format!(
+            "kbf: 1 process(es) ignored SIGTERM and were killed: pid {pid} "
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[kbf-act ignore-signal 15 ; sleep 300]"),
+        "{stderr}"
+    );
+    assert!(took >= Duration::from_millis(900), "no grace: {took:?}");
+    assert!(
+        took < Duration::from_secs(5),
+        "the grace was not bounded: {took:?}"
+    );
+    assert!(no_leases(&config));
+}
+
+/// Catches: a note added for an action whose processes all ended on SIGTERM, which
+/// would name every lease that leaves a background process.
+#[tokio::test]
+async fn processes_that_end_on_sigterm_are_not_reported() {
+    let dir = scratch("obeys");
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config(&dir), &cas);
+    let spec = Spec::act("spawn-child --pid - sleep 300 ; sleep 0.3 ; echo --stderr done");
+    let result = run(&rt, &cas, 1, &spec).await.expect("ran");
+    let stderr = support::stderr(&cas, &result);
+    assert_eq!(stderr, "done\n");
+    assert!(!alive(pid_of(&cas, &result)));
 }

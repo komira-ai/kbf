@@ -72,6 +72,9 @@ const DIRECTORY: OFlags = OFlags::RDONLY
 pub struct MacSlot<'a> {
     pub ready: &'a Ready,
     pub within: Duration,
+    /// How long C3 gives the processes to end after SIGTERM, before the kill
+    /// ([`crate::grace`]); zero kills at once.
+    pub grace: Duration,
     /// The uids of the pool's users: C9 does not walk a folder one of them owns a
     /// directory on the path of.
     pub pool: std::ops::RangeInclusive<u32>,
@@ -309,22 +312,34 @@ impl MacSlot<'_> {
         }
     }
 
-    /// C3: SIGKILL by real and effective uid until two scans 200 ms apart find nothing,
+    /// C3: SIGTERM, `grace` for the uid's processes to end (the ones that ignore it are
+    /// named in the log), then SIGKILL by real and effective uid until two scans 200 ms apart find nothing,
     /// within `within` and 100 scans ([`probe::kill_until_quiet`]). A scan does not count
     /// launchd's own agents, which launchd starts again on demand.
     fn kill(&self) -> Result<(), String> {
         let uid = self.ready.user.uid;
+        let mut scan = || {
+            let pids = uid::processes(uid).map_err(|e| e.to_string())?;
+            if pids.is_empty() {
+                return Ok(pids);
+            }
+            Ok(not_launchds_own(pids, &services_of(uid)))
+        };
+        let ignored = super::term_uid(
+            uid,
+            self.grace.min(self.within),
+            &mut scan,
+            probe::SCAN_PAUSE,
+        )?;
+        if let Some(note) = crate::grace::note(&ignored) {
+            tracing::warn!(uid, "slot clean: {}", note.trim_end());
+        }
+        // The grace is extra to `within`, which bounds the kill alone.
         let give_up = Instant::now() + self.within;
         probe::kill_until_quiet(
             &mut || Instant::now() >= give_up,
             &mut || uid::kill(uid).map_err(|e| e.to_string()),
-            &mut || {
-                let pids = uid::processes(uid).map_err(|e| e.to_string())?;
-                if pids.is_empty() {
-                    return Ok(pids);
-                }
-                Ok(not_launchds_own(pids, &services_of(uid)))
-            },
+            &mut scan,
             &mut || std::thread::sleep(probe::SCAN_PAUSE),
         )
     }

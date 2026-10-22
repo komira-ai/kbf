@@ -279,6 +279,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         "macos",
         &[
             "mac-session-socket",
+            "native-term-grace-ms",
             "pool-first-uid",
             "pool-users",
             "require-metal-toolchain",

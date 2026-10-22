@@ -12,7 +12,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kbf_daemon::RuntimeError;
 use kbf_daemon::uid;
@@ -22,6 +22,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use super::book::{Backoff, Book, Cleaner, CountHook, Held, Slotted};
 use super::clean::{self, Skipped, WithSkipped};
 use super::{AS_USER_ARG, Pool, SlotUser, probe};
+use crate::grace::{self, Survivor};
 use crate::network::{Isolation, Network};
 use crate::procs;
 
@@ -110,6 +111,22 @@ impl Slots {
         within: Duration,
         skipped: Option<Skipped>,
     ) -> io::Result<Self> {
+        Self::start_with_grace(pool, within, Duration::ZERO, skipped)
+    }
+
+    /// [`Slots::start_skipping`] with the clean sending SIGTERM first and giving the
+    /// processes of the uid `grace` to end before it kills them ([`crate::grace`]); what
+    /// the daemon starts with. [`Slots::start`] kills at once.
+    ///
+    /// # Errors
+    /// As [`Slots::start`].
+    #[doc(hidden)]
+    pub fn start_with_grace(
+        pool: &Pool,
+        within: Duration,
+        grace: Duration,
+        skipped: Option<Skipped>,
+    ) -> io::Result<Self> {
         let program = kbf_daemon::keeper::program()?;
         let mut ready = Vec::new();
         for user in pool.users() {
@@ -130,7 +147,7 @@ impl Slots {
         }
         let pool = pool.users().iter().map(|u| u.uid);
         let pool = pool.clone().min().unwrap_or(0)..=pool.max().unwrap_or(0);
-        let cleaner = mac_cleaner(within, pool, skipped);
+        let cleaner = mac_cleaner(within, grace, pool, skipped);
         Ok(Self::with(ready, cleaner, program))
     }
 
@@ -177,6 +194,7 @@ impl Slots {
 /// wrapped in [`WithSkipped`] when `skipped` is given (only a test gives one).
 fn mac_cleaner(
     within: Duration,
+    grace: Duration,
     pool: std::ops::RangeInclusive<u32>,
     skipped: Option<Skipped>,
 ) -> Cleaner<Ready> {
@@ -184,6 +202,7 @@ fn mac_cleaner(
         let slot = host::MacSlot {
             ready,
             within,
+            grace,
             pool: pool.clone(),
         };
         match skipped {
@@ -393,26 +412,43 @@ impl UidWatch {
             .map_err(|e| RuntimeError::Failed(format!("memory of uid {uid}: {e}")))
     }
 
-    /// Ends every process of the uid ([`uid::end`], `wait` at most), then reaps the
+    /// Ends every process of the uid: [`uid::bootout`] of its domain, SIGTERM and up to
+    /// `grace` for them to end ([`term_uid`]), then [`uid::kill_all`] (`wait` at most),
+    /// then reaps the
     /// leader, `child`: once nothing of the uid is left the leader has exited too, or
     /// it is `launchctl`, which exits once its child has; one still there after `wait`
     /// is SIGKILLed by pid, safe because it is this process's unreaped child. Removes
-    /// the run record. Survivors fail the lease and keep their record; the slot's clean
-    /// kills again, and leaves the slot dirty if they still survive.
+    /// the run record. Survivors of the SIGKILL fail the lease and keep their record;
+    /// the slot's clean kills again, and leaves the slot dirty if they still survive.
+    /// Returns the processes that were alive when the grace ended.
     ///
     /// # Errors
     /// Processes of the uid survived, or the leader could not be reaped.
-    pub async fn end(&mut self, child: &mut Child, wait: Duration) -> Result<(), RuntimeError> {
+    pub async fn end(
+        &mut self,
+        child: &mut Child,
+        wait: Duration,
+        grace: Duration,
+    ) -> Result<Vec<Survivor>, RuntimeError> {
         let uid = self.uid;
-        let ended = tokio::task::spawn_blocking(move || uid::end(uid, wait)).await;
-        let ended = ended
-            .map_err(|e| e.to_string())
-            .and_then(|e| e.map_err(|e| e.to_string()));
+        let ended = tokio::task::spawn_blocking(move || {
+            // The domain first, so that launchd starts none of its jobs again while the
+            // processes are asked to end: those would be taken for ones that ignored it.
+            uid::bootout(uid, wait.min(uid::BOOTOUT_WITHIN));
+            let survivors = term_uid(
+                uid,
+                grace,
+                &mut || uid::processes(uid).map_err(|e| e.to_string()),
+                LEASE_LOOK,
+            )?;
+            uid::kill_all(uid, wait).map_err(|e| e.to_string())?;
+            Ok::<_, String>(survivors)
+        })
+        .await;
+        let ended = ended.map_err(|e| e.to_string()).and_then(|e| e);
         // Ended or not, the drop does not kill again: the slot's clean does.
         self.armed = false;
-        if let Err(why) = ended {
-            return Err(RuntimeError::Failed(why));
-        }
+        let survivors = ended.map_err(RuntimeError::Failed)?;
         let _ = std::fs::remove_file(&self.record);
         if tokio::time::timeout(wait, child.wait()).await.is_err() {
             tracing::warn!(
@@ -424,9 +460,37 @@ impl UidWatch {
         child
             .wait()
             .await
-            .map(drop)
+            .map(|_| survivors)
             .map_err(|e| RuntimeError::Failed(format!("reap the action: {e}")))
     }
+}
+
+/// The wait between two looks at the uid's processes while a lease's end waits for them
+/// to answer SIGTERM.
+const LEASE_LOOK: Duration = Duration::from_millis(20);
+
+/// SIGTERM to every process of `uid`, then `live` (the pids to wait for) every `look`
+/// until none is left or `grace` has passed ([`grace::term_first`]): the processes
+/// still alive then, named before the kill that follows. Nothing is sent for a grace of
+/// zero.
+///
+/// # Errors
+/// The signal could not be sent, or `live` failed.
+pub(crate) fn term_uid(
+    uid: u32,
+    grace: Duration,
+    live: &mut dyn FnMut() -> Result<Vec<i32>, String>,
+    look: Duration,
+) -> Result<Vec<Survivor>, String> {
+    let started = Instant::now();
+    grace::term_first(
+        grace,
+        &mut || uid::term(uid).map_err(|e| e.to_string()),
+        live,
+        &mut |pid| Survivor::of(pid, procs::command_of(pid)),
+        &mut || started.elapsed(),
+        &mut || std::thread::sleep(look),
+    )
 }
 
 impl Drop for UidWatch {

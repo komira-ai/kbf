@@ -172,6 +172,34 @@ pub fn parse_linux_status(text: &str) -> Option<u64> {
     Some(total * 1024)
 }
 
+/// The arguments of a process as one line, from the NUL-separated `/proc/<pid>/cmdline`
+/// (or the argument strings after the path in a macOS `KERN_PROCARGS2` block): the
+/// strings joined by a space, lossily decoded.
+#[must_use]
+pub fn join_args(raw: &[u8]) -> String {
+    let raw = raw.strip_suffix(&[0]).unwrap_or(raw);
+    String::from_utf8_lossy(raw).replace('\0', " ")
+}
+
+/// The program name and the arguments from a macOS `KERN_PROCARGS2` block: an `int`
+/// argument count, the executable path and its NUL padding, then `argc` argument
+/// strings (the environment follows them and is not read). `None` for a block too
+/// short to hold the count.
+#[must_use]
+pub fn parse_procargs2(raw: &[u8]) -> Option<(String, String)> {
+    let argc = u32::from_ne_bytes(raw.get(..4)?.try_into().ok()?) as usize;
+    let rest = &raw[4..];
+    let path_end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    let path = String::from_utf8_lossy(&rest[..path_end]);
+    let name = path.rsplit('/').next().unwrap_or_default().to_owned();
+    let after = &rest[path_end..];
+    let first = after.iter().position(|&b| b != 0).unwrap_or(after.len());
+    let args: Vec<String> = (after[first..].split(|&b| b == 0).take(argc))
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect();
+    Some((name, args.join(" ")))
+}
+
 /// What one read of a process gives: its footprint now, and, where the platform keeps
 /// them, the counters of its whole life ([`crate::usage`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,7 +212,7 @@ pub struct Rusage {
 
 #[cfg(target_os = "macos")]
 pub use platform::timebase;
-pub use platform::{process, rusage, snapshot};
+pub use platform::{command_of, process, rusage, snapshot};
 
 #[cfg(target_os = "linux")]
 mod platform {
@@ -220,6 +248,15 @@ mod platform {
             .ok()
             .as_deref()
             .and_then(parse_linux_stat)
+    }
+
+    /// The name and the arguments (one line) of `pid`, from `/proc`; `None` once it is
+    /// gone. A process with no arguments (a kernel thread, a zombie) has an empty line.
+    #[must_use]
+    pub fn command_of(pid: i32) -> Option<(String, String)> {
+        let name = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        let args = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        Some((name.trim_end().to_owned(), super::join_args(&args)))
     }
 
     /// What `pid` holds, in bytes; `None` once it is gone. No lifetime counters: the
@@ -296,6 +333,50 @@ mod platform {
         })
     }
 
+    /// The name and the arguments (one line) of `pid` (`KERN_PROCARGS2`); `None` once it
+    /// is gone or when the kernel does not show them to this user.
+    #[must_use]
+    pub fn command_of(pid: i32) -> Option<(String, String)> {
+        let mut limit: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        // SAFETY: `limit` is a writable int of `size` bytes, the length KERN_ARGMAX
+        // answers with; the pointers outlive the call.
+        let done = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&raw mut limit).cast(),
+                &raw mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if done != 0 || limit <= 0 {
+            return None;
+        }
+        let mut buffer = vec![0u8; usize::try_from(limit).ok()?];
+        let mut size = buffer.len();
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        // SAFETY: `buffer` holds `size` writable bytes, which the call shortens to what it
+        // wrote; the pointers outlive the call.
+        let done = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buffer.as_mut_ptr().cast(),
+                &raw mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if done != 0 {
+            return None;
+        }
+        buffer.truncate(size);
+        super::parse_procargs2(&buffer)
+    }
+
     /// The physical footprint of `pid` (what Activity Monitor calls its memory), in
     /// bytes, with its lifetime high-water mark and CPU time; `None` once it is gone.
     #[must_use]
@@ -366,18 +447,28 @@ mod platform {
 /// or less (every process of its user, or init's group), its own group or its parent's
 /// group, nor its parent ([`Guards`]).
 pub fn kill_all(tracker: &Tracker, members: &[Proc]) {
+    signal_all(tracker, members, libc::SIGKILL);
+}
+
+/// [`kill_all`] with SIGTERM: asks the action's processes to end, and leaves the ones
+/// that ignore it to a later [`kill_all`].
+pub fn term_all(tracker: &Tracker, members: &[Proc]) {
+    signal_all(tracker, members, libc::SIGTERM);
+}
+
+fn signal_all(tracker: &Tracker, members: &[Proc], signal: libc::c_int) {
     let guards = Guards::now();
     if guards.may_signal_group_of(tracker) {
         // SAFETY: kill(2) takes plain integers. The group id is the leader's pid, and
         // the last snapshot showed the group still had members.
         unsafe {
-            libc::kill(-tracker.leader(), libc::SIGKILL);
+            libc::kill(-tracker.leader(), signal);
         }
     }
     for p in members.iter().filter(|p| guards.may_kill(p)) {
         // SAFETY: as above; `p` was in the snapshot just taken, pid and start time.
         unsafe {
-            libc::kill(p.pid, libc::SIGKILL);
+            libc::kill(p.pid, signal);
         }
     }
 }
@@ -581,6 +672,67 @@ mod tests {
         // SAFETY: getpgrp and getppid take nothing and cannot fail.
         assert_eq!(now.own_group, unsafe { libc::getpgrp() });
         assert_eq!(now.parent, unsafe { libc::getppid() });
+    }
+
+    /// Catches: SIGTERM sent as SIGKILL (a process that ignores SIGTERM would die), and
+    /// SIGTERM not sent at all: a `sleep` dies of it with the signal's number, and the
+    /// group is signalled by the leader's id like the kill is.
+    #[test]
+    fn term_all_sends_sigterm_to_the_group_and_not_sigkill() {
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        let mut leader = std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .expect("spawn");
+        let pid = i32::try_from(leader.id()).expect("pid");
+        let me = i32::try_from(std::process::id()).expect("pid");
+        let mut t = Tracker::new(pid, me);
+        let members = t.members(&process(pid).into_iter().collect::<Vec<_>>());
+        assert_eq!(members.len(), 1);
+        term_all(&t, &members);
+        let status = leader.wait().expect("reap");
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+
+    /// Catches: arguments run together (a NUL kept or dropped), a last argument that
+    /// keeps its terminator, and lossy text refused.
+    #[test]
+    fn arguments_are_joined_by_spaces() {
+        assert_eq!(join_args(b"sleep\x00300\x00"), "sleep 300");
+        assert_eq!(join_args(b""), "");
+        assert_eq!(join_args(b"a\xffb\0"), "a\u{fffd}b");
+    }
+
+    /// Catches: the path's NUL padding read as arguments, more arguments than the count
+    /// (the environment follows them), the name taken from the wrong end of the path,
+    /// and a block too short for its count read anyway.
+    #[test]
+    fn a_procargs_block_gives_the_name_and_the_counted_arguments() {
+        let mut block = 2_u32.to_ne_bytes().to_vec();
+        block.extend_from_slice(b"/usr/bin/foo\0\0\0foo\0bar baz\0HOME=/x\0");
+        assert_eq!(
+            parse_procargs2(&block),
+            Some(("foo".to_owned(), "foo bar baz".to_owned()))
+        );
+        assert_eq!(parse_procargs2(&[1, 0]), None);
+        let mut bare = 0_u32.to_ne_bytes().to_vec();
+        bare.extend_from_slice(b"/bin/x");
+        assert_eq!(
+            parse_procargs2(&bare),
+            Some(("x".to_owned(), String::new()))
+        );
+    }
+
+    /// Catches: a command read of the wrong process, one that is empty for a live
+    /// process, and one invented for a pid that does not exist.
+    #[test]
+    fn the_command_of_this_process_is_read() {
+        let me = i32::try_from(std::process::id()).expect("pid");
+        let (name, args) = command_of(me).expect("this process");
+        assert!(!name.is_empty());
+        assert!(args.contains(&name[..name.len().min(8)]), "{name} {args}");
+        assert_eq!(command_of(i32::MAX), None);
     }
 
     /// Catches a group signalled by its id once a snapshot showed it empty (the id may

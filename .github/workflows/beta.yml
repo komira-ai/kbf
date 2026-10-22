@@ -559,6 +559,11 @@ jobs:
       # sockets, the process table), measured and printed, not asserted, with and without
       # the sandbox (crates/kbf-driver-native/tests/slot_reach.rs).
       - run: cargo xtask sudo-test -p kbf-driver-native --test slot_reach -- --test-threads=1 --nocapture
+      # SIGTERM before SIGKILL when a pool lease or a slot clean ends the user's processes: a
+      # workload's resource tracker unlinks its POSIX shared memory and semaphores, which a
+      # Mac cannot list afterwards; a process that ignores SIGTERM is named in the lease's
+      # stderr (crates/kbf-driver-native/tests/slot_term.rs).
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_term -- --test-threads=1 --nocapture
       # What this runner can do for the Mac legs of the isolation suites (T018, M0; a spike that
       # asserts nothing about isolation): two pool users made with dscl, the real `kbf daemon
       # --driver native --pool-users 2` as root behind a fake front, one action per question
