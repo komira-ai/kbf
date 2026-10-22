@@ -185,11 +185,13 @@ impl Summaries {
     }
 
     /// Puts a summary where it belongs. A key with safety state goes to the safety
-    /// table, which is never evicted from; when that table is full the key stays in
+    /// table, which is never evicted from and holds at most a quarter of its slots per
+    /// instance; when the table or the instance's share is full the key stays in
     /// the main table (still answering, but evictable) and the refusal is counted in
     /// [`Summaries::unpinned`]: a floor is never dropped silently.
     fn place(&mut self, key: Key, summary: Summary) {
-        let room = self.pinned.len() < self.max_pinned;
+        let room = self.pinned.len() < self.max_pinned
+            && self.pinned.count(key.instance()) < (self.max_pinned / 4).max(1);
         if summary.holds_safety_state() && room {
             self.pinned.put(key, summary);
         } else {
@@ -219,7 +221,9 @@ impl Summaries {
         self.pinned.expire(now);
     }
 
-    /// Stores a row read back from the durable store. A row that does not decode, or
+    /// Stores a row read back from the durable store, replacing the in-memory row of
+    /// the key unconditionally: the caller must not load a stored row over a newer
+    /// in-memory floor. A row that does not decode, or
     /// whose basis is not the key's, is not stored (the key stays cold) and is reported
     /// as [`Fallback::Corrupt`].
     pub fn insert_encoded(&mut self, key: &Key, bytes: &[u8]) -> Result<(), Fallback> {
@@ -235,7 +239,8 @@ impl Summaries {
     }
 
     /// The memory floor to apply to every operation of `key`'s shape that is not yet
-    /// granted: the L2 floor, strictly below `bounds.host_memory`; 0 when none. A floor
+    /// granted, on every path, including when [`Summaries::estimate`] answers
+    /// [`Fallback::Stale`] or [`Fallback::OverCap`]: the L2 floor, strictly below `bounds.host_memory`; 0 when none. A floor
     /// does not expire by idleness, only by decay.
     pub fn key_floor(&self, key: &Key, bounds: &Bounds) -> u64 {
         // Idleness does not expire a floor.

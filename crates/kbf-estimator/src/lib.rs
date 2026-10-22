@@ -64,6 +64,21 @@
 //!   the main table and [`Summaries::unpinned`] counts the refusal. Missing, stale or
 //!   undecodable summaries are a [`Fallback`], never a guess. Time is an input and
 //!   never runs backward inside a summary.
+//! * **Caller duties and known limits.**
+//!   1. Apply `max(key_floor, ..)` to the booking on every path, including
+//!      [`Fallback::Stale`], [`Fallback::OverCap`] and any other fallback:
+//!      [`Summaries::key_floor`] still returns the floor there.
+//!   2. The crate lowers an estimate below the default once a key has [`N_MIN`] samples,
+//!      unless the key is raise-only or mixed. "Never lower below the default" in a
+//!      phase that must not is therefore the caller's guarantee: the adapter clamps the
+//!      estimate to at least the default or passes it raise-only.
+//!   3. A floor never leaves by idleness (`expire` strips samples only), so the safety
+//!      table fills slowly, over months. [`Summaries::unpinned`] counts the refusals and
+//!      is the signal. An idle horizon for floors (for example 365 days) is a follow-up,
+//!      not done here. The safety table holds at most a quarter of its slots per
+//!      instance.
+//!   4. [`Summaries::insert_encoded`] replaces the in-memory row unconditionally; do not
+//!      load a stored row over a newer in-memory floor.
 //! * **Calibration.** The test `the_kill_rate_stays_within_the_declared_bound` draws
 //!   peaks from a lognormal around 1 GiB (sigma in rows) and from the same with a 3%
 //!   tail four times larger, gives the crate `n` samples, and counts how often the next

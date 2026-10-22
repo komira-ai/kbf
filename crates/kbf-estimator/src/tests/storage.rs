@@ -294,7 +294,7 @@ fn a_key_with_a_floor_outlives_eviction() {
 #[test]
 fn a_full_safety_table_refuses_and_counts_never_drops() {
     let b = Bounds::default();
-    let mut s = Summaries::with_limits(10, 10, 2);
+    let mut s = Summaries::with_limits(10, 10, 8);
     for shape in 1..=3 {
         s.observe(
             &shape_key("main", shape),
@@ -336,4 +336,58 @@ fn an_instance_cannot_flush_another() {
         .count();
     assert_eq!(held, 3);
     assert_eq!(s.len(), 5);
+}
+
+/// One tenant cannot fill the safety table: an instance holds at most a quarter of its
+/// slots, so another instance's new floor is still pinned (and survives eviction).
+#[test]
+fn an_instance_cannot_fill_the_safety_table() {
+    let b = Bounds::default();
+    let mut s = Summaries::with_limits(3, 3, 8);
+    for shape in 0..8 {
+        s.observe(
+            &shape_key("a", shape),
+            &heavy_kill(),
+            Day(1 + shape as u32),
+            &b,
+        );
+    }
+    assert_eq!(s.unpinned(), 6, "a holds two of the eight slots");
+    let theirs = shape_key("b", 1);
+    s.observe(&theirs, &heavy_kill(), Day(20), &b);
+    assert_eq!(s.unpinned(), 6, "b's floor was pinned");
+    for shape in 0..10 {
+        s.observe(
+            &shape_key("c", shape),
+            &success(GIB),
+            Day(30 + shape as u32),
+            &b,
+        );
+    }
+    assert_eq!(s.key_floor(&theirs, &b), 16 * GIB);
+}
+
+/// When every slot is taken, by several instances within their shares, one more
+/// instance's floor is refused and counted, not dropped.
+#[test]
+fn a_full_table_refuses_another_instance() {
+    let b = Bounds::default();
+    let mut s = Summaries::with_limits(10, 10, 8);
+    for (instance, shape) in [
+        ("a", 0),
+        ("a", 1),
+        ("b", 0),
+        ("b", 1),
+        ("c", 0),
+        ("c", 1),
+        ("d", 0),
+        ("d", 1),
+    ] {
+        s.observe(&shape_key(instance, shape), &heavy_kill(), DAY, &b);
+    }
+    assert_eq!(s.unpinned(), 0);
+    let late = shape_key("e", 0);
+    s.observe(&late, &heavy_kill(), DAY, &b);
+    assert_eq!((s.unpinned(), s.len()), (1, 9));
+    assert_eq!(s.key_floor(&late, &b), 16 * GIB);
 }
