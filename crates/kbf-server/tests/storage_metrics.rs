@@ -165,10 +165,24 @@ fn sample(body: &str, name: &str) -> Option<f64> {
 }
 
 /// A first life of a storage node over `d` with the write tier `hot`: it starts, takes a
-/// blob into the tier over a channel, is told to stop, and `serve()` returns.
+/// blob into the tier over a channel, is told to stop, and `serve()` returns. The stop
+/// flushes the tier to the cold store, so the blob ends the life flushed.
 async fn first_life(d: &Path, hot: &str) {
+    first_life_with(d, &[hot], || {}).await;
+}
+
+/// Sets the permission bits of `path`.
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let perms = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(path, perms).expect("mode");
+}
+
+/// [`first_life`] over the flags `more`, with `before_stop` run after the blob is put and
+/// before the node is told to stop.
+async fn first_life_with(d: &Path, more: &[&str], before_stop: impl FnOnce()) {
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let first = start_storage(&flags(d, &[hot]), || {
+    let first = start_storage(&flags(d, more), || {
         Ok(async move {
             let _ = stopped.await;
         })
@@ -186,6 +200,7 @@ async fn first_life(d: &Path, hot: &str) {
         .put(Bytes::from_static(b"staged on the tier, never flushed"))
         .await
         .expect("put");
+    before_stop();
     stop.send(()).expect("stop");
     let (served, released) = serving.await.expect("task");
     served.expect("serves to the end");
@@ -196,15 +211,23 @@ async fn first_life(d: &Path, hot: &str) {
 /// Catches a `/metrics` route that renders another cache than the node's, or a fresh one
 /// (the series present, always 0): a blob written to the node's write tier, whose tier is
 /// then abandoned at the next start (the loss the cache records itself), must show in
-/// that node's scrape as a lost blob and a loss. The first life writes one blob to the
-/// hot store, which seals after thirty seconds and so is still unflushed when the life
-/// ends; the second start abandons that tier. Mutant: the route renders `Losses::default()`.
+/// that node's scrape as a lost blob and a loss. A stop flushes the tier to the cold
+/// store, so the first life must not be able to: it writes one blob to the hot store
+/// (which seals after thirty seconds, so the flusher has not touched it), then makes the
+/// cold store's `tmp` directory read-only, which refuses every flush with a permission
+/// error (a flush creates its file there), and stops with `--ram-drain-deadline=1`: the
+/// flush fails until the one second ends, and the blob is left on the tier. The mode is
+/// restored before the second start, which abandons that tier. Needs a user the mode
+/// binds (not root). Mutant: the route renders `Losses::default()`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_blob_the_nodes_cache_lost_is_scraped_from_its_metrics_listener() {
     let d = dir("loss");
     let hot = format!("--hot-store=file://{}", d.join("hot").display());
+    let cold_tmp = d.join("cold/tmp");
+    let more = [hot.as_str(), "--ram-drain-deadline=1"];
 
-    first_life(&d, &hot).await;
+    first_life_with(&d, &more, || set_mode(&cold_tmp, 0o555)).await;
+    set_mode(&cold_tmp, 0o755);
 
     let tier = std::fs::read_to_string(d.join("hot/TIER")).expect("the tier file");
     let second = flags(

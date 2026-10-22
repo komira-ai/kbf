@@ -42,8 +42,9 @@ use crate::metrics::{Counter, Families};
 pub const PASS_BLOBS: usize = 1024;
 
 /// How long a shutdown drain waits before it takes the blobs a failed pass left, so a
-/// disk that keeps failing is not asked in a tight loop.
-const SHUTDOWN_RETRY: Duration = Duration::from_millis(100);
+/// disk that keeps failing is not asked in a tight loop. The final flush of the write
+/// tier ([`Cache::flush_for_shutdown`]) pauses as long after a round that moved nothing.
+pub(super) const SHUTDOWN_RETRY: Duration = Duration::from_millis(100);
 
 /// The bytes a node may hold in RAM as acknowledged and not yet on its disk
 /// (`--ram-ack-bytes`). Shared by the permits it gives out.

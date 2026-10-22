@@ -183,9 +183,11 @@ holds within `--ram-drain-deadline`; `SIGKILL` and a power loss do not.
 The flush starts at most about 31 seconds after the block is opened (the 30-second seal
 delay plus the next once-a-second flusher round; a block that reaches 128 MiB is sealed
 sooner), then takes one put, and longer while the cold store is down. No flag changes these
-timings. The tier is not flushed at shutdown: a block left on the hot store holds
-acknowledged bytes the cold store does not have yet, so do not delete a hot store you have
-not drained.
+timings. `kbf storage` and `kbf storage-and-daemon` flush the tier when they stop, after
+their calls end, within `--ram-drain-deadline`; what the deadline leaves is flushed by the
+next start. `kbf-server` and `kbf-all-in-one` do not flush it at shutdown. A block left on
+the hot store holds acknowledged bytes the cold store does not have yet, so do not delete a
+hot store you have not drained.
 
 A hot store carries a `TIER` file. If it is missing or names another tier while objects are
 staged on this node, the node refuses to start, so that a wrong mount does not destroy the

@@ -457,7 +457,7 @@ Options:
           [default: 180]
 
       --ram-drain-deadline <RAM_DRAIN_DEADLINE>
-          How long, in seconds, a storage node that is stopping waits for the blobs it holds in RAM to be written to its disk (`--ram-ack-bytes`), after its calls have ended. The blobs left when it ends are lost to the stop and are counted in the log. At least 1
+          How long, in seconds, a storage node that is stopping waits, after its calls have ended, for the blobs it holds in RAM to be written to its disk (`--ram-ack-bytes`) and then for the blocks staged on its hot store to be flushed to the cold store: one bound for both. The blobs left in RAM when it ends are lost to the stop; the blocks left on the hot store are on its disk, flushed by the next start. Both are counted in the log. At least 1
           
           [default: 30]
 

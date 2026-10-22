@@ -307,7 +307,7 @@ fn a_node_killed_midway_fails_the_liveness_gate() {
 fn a_farm_that_cannot_start_is_red_with_the_reason() {
     let mut args = b0("no-farm", "ok", 3);
     // A program that exits at once, in place of `kbf`.
-    args.kbf = PathBuf::from(env!("CARGO_BIN_EXE_kbf-cli-fake-systemctl"));
+    args.kbf = PathBuf::from(env!("CARGO_BIN_EXE_kbf-cli-fake-exits"));
     assert_eq!(run(&args).expect("a run"), Ended::Failed);
     let doc = document(&args);
     assert_eq!(doc["status"], "FAILED");

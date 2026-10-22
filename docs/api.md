@@ -383,6 +383,69 @@ rebuild (a new cluster, a cache), or have it hold the slice first; and promote o
 member at a time. `draining` is the reverse: the member takes no new writes, its
 successor takes its slot at once, and it is read first.
 
+## `GET /v1/members/{id}/safe-to-stop`
+
+Whether the host of a storage member may be stopped now without leaving a blob with one
+copy. The updater of a host asks it before it stops the host's process. It is a read that
+changes no member, row or placement, and it passes the same gates as the member write above
+([Who may write](#who-may-write): a loopback peer, no `Origin`, the token, a JSON content
+type), because its answer decides whether to stop a host. `kbf cluster safe-to-stop <id>
+--token-file F` calls it.
+
+```json
+{ "safe": false,
+  "reasons": ["member m2 owes 5 blobs"],
+  "planned_down": false }
+```
+
+| Field | Meaning |
+|---|---|
+| `safe` | `true` if the member can go out without a blob being left with one copy |
+| `reasons` | why `safe` is `false`: the worst thing found, one line. Empty when `safe` is `true` for a storage member; for a daemon, one line that says only the daemon was judged |
+| `planned_down` | whether the member is already planned down (`POST /v1/members/{id}` with `planned_down`). It does not make the stop unsafe: the member is already out of the write path |
+
+`{id}` is a storage member's number (`GET /v1/members` lists them; `2` for member `m2`)
+or the id of the node that runs it. The answer is the storage
+gate of the update controller, asked with this member out: every **other** member must be
+`active`, heard within the membership's time to live (15 s by default), not planned down,
+and report a repair debt that is zero (a debt that is not reported is not zero, and a
+report older than two heartbeat intervals is not a report); and at
+least one other member must exist to hold the second copy. The member's own state is not
+asked, so a member that is already planned down, or already down, is safe to stop; its own
+repair debt is. Each way the gate is shut is its own line in `reasons`:
+
+| `reasons` line | Meaning |
+|---|---|
+| `member mN is Down`, `is Draining` or `is Joining` | a second member is not `active` |
+| `member mN is catching up` | a second member is rebuilding its index |
+| `member mN is planned down` | a second member is already out for a planned restart |
+| `member mN was not heard within the time to live` | a second member counts as down |
+| `member mN does not report its repair debt` | its debt is unknown |
+| `member mN owes B blobs` | a member, the one asked about included, owes copies |
+| `no other member holds the second copy` | the member is the only one |
+
+`mN` is the member's id as the server writes it (`m2`). When several things are wrong, the
+line is the worst one: a second member down before a debt.
+
+A node id is judged by the storage member that is the node's storage half, joined as the
+update controller joins a host to its member: the address the node advertised when it
+enrolled (`GET /v1/enroll/nodes`) is the address one member registered. That member's
+answer is the node's, the same body as asking by the member's number. A node that has no
+storage half is a daemon, which drains in its own stop and needs no permit: a Mac, a Linux
+node enrolled with no storage address, and any node of a server without a state store
+(such a server keeps no storage members) answer `200` with `"safe": true` and a `reasons`
+line that says only the daemon was judged. A Linux node that cannot be told from one with a
+member answers `409` with `{"error": ...}` saying why, never safe: the enrollment registry
+does not know it or cannot be read, or its address is no member's or two members'. A
+number is a member's number first, then a node id. `404` with `{"error": ...}` for an
+`{id}` that is neither a member nor a node that has registered with this server
+(`GET /v1/nodes`). `503` when the state store cannot be read, `500` when a stored row does
+not decode; `401`, `403` or `415` from the gates.
+
+The answer is about the members as the server sees them now: a heartbeat is up to a time
+to live old, so the updater asks again just before it stops, and a `false` is retried
+rather than overridden.
+
 ## `GET /v1/denied`, `POST /v1/denied` and `DELETE /v1/denied`
 
 An operator adds an entry to the storage deny list, or takes one off. A denied

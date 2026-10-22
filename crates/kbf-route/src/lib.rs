@@ -54,6 +54,16 @@
 //! - **`STALE_MAP`**: a node that holds a newer map answers [`StorageError::StaleMap`].
 //!   The router fetches the newer map through the [`MapSource`] and runs the call again,
 //!   once; a second answer, or a fetch that brings no newer map, is `UNAVAILABLE`.
+//! - **The hold** ([`Router::with_hold`]): a storage node that restarts is away for a while,
+//!   so a call that no owner could answer (every owner `Down` in the map, or every attempt
+//!   `UNAVAILABLE`) is held and tried again, with growing pauses, against the map as it
+//!   is by then, until an owner answers or the bound has passed; then it is `UNAVAILABLE`
+//!   as it always was. It covers every call that takes a blob or an entry to its owners
+//!   and a read before its first byte. A read that fails after bytes have passed on is
+//!   resumed ([`MAX_RESUMES`]) without a hold. A router made by [`Router::new`] holds
+//!   nothing; the frontend and the daemon use [`DEFAULT_HOLD`]. A caller that talks to the
+//!   nodes itself from a [`Placement`] (the frontend's pass-through of a ByteStream) is not
+//!   held by this.
 //!
 //! # What it does not do
 //!
@@ -76,6 +86,7 @@ mod closure;
 mod durable;
 mod find;
 mod flights;
+mod hold;
 mod nodes;
 mod read;
 mod repair;
@@ -86,6 +97,7 @@ mod source;
 mod write;
 
 pub use closure::{ClosureStats, DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL};
+pub use hold::{DEFAULT_HOLD, HoldClock};
 pub use nodes::{Liveness, Nodes, TlsNodes};
 pub use repair::{MAX_REPAIRS_IN_FLIGHT, ReadRepair, RepairLimit};
 pub use resume::MAX_RESUMES;

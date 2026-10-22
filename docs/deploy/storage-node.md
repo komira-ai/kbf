@@ -614,9 +614,15 @@ kbf-deploy linux meta-verify --archive FILE --into DIR
   A stop that passes `--ram-drain-deadline` loses the blobs that were acknowledged but are
   held only in RAM (the stop logs them at error level, with their count and bytes); that is
   why `meta-backup` refuses while any are held.
-  The write tier is not flushed at shutdown, so a block left on the hot store holds
-  acknowledged bytes the object store does not have. A server with a write tier needs
-  `--hot-dir` (its `--hot-store` directory); one without needs none.
+  `kbf-server` and `kbf-all-in-one` do not flush their write tier at shutdown (the latter
+  refuses `--ram-drain-deadline`), so a block left on the hot store holds acknowledged
+  bytes the object store does not have. (`kbf storage` and
+  `kbf storage-and-daemon` do: after their calls end and the blobs held in RAM are
+  written, they flush the staged blocks to the cold store, within the same
+  `--ram-drain-deadline`; what the deadline leaves is logged at error level with its
+  block count and bytes, stays on the hot store, and is flushed by the next start.) A
+  server with a write tier needs `--hot-dir` (its `--hot-store` directory); one without
+  needs none.
 - It then stops the unit (`--unit`, default `kbf-server`), refuses if the hot store
   holds a `*.blk` block (written between the read and the stop; a flushed copy is
   `*.seg`), and writes `--out`: an uncompressed tar of every file of the directory

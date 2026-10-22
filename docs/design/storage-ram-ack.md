@@ -211,6 +211,18 @@ reads 0.
   error level with the blob and byte counts. A stop that passes the deadline loses the
   blobs that were acknowledged but are held only in RAM; the meta-backup refuses while any
   are held.
+  The same deadline also bounds the flush of the write tier that follows the drain, and
+  takes what the drain used: `flush_for_shutdown` seals the open block and flushes the
+  staged blocks to the cold store until none is left or the deadline ends. A flush that
+  failed before the stop began is retried at once; one that fails during it waits its
+  backoff, 1 s doubling to 60 s, within the deadline. What it leaves is on the hot store's
+  disk (an acknowledgement follows `fdatasync` and the committed log), is logged at error
+  level with the block and byte counts, and is flushed by the next start. With no budget
+  (`--ram-ack-bytes` 0) the flush still runs.
+  The units set `TimeoutStopSec=infinity`, so the deadline is the only bound on a stop:
+  its 30 s default is not derived from a unit timeout. The bound is one for both phases,
+  not one each: a drain that takes 25 s leaves the flush 5 s, and a drain that ends at the
+  deadline leaves the flush one poll.
   Only `kbf storage` and the storage half of `storage-and-daemon` run it; a server with
   no replica holds nothing. (PR 6 keeps a member from counting as filled while it holds
   entries, below.)

@@ -36,7 +36,7 @@ const SCRIPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packaging/insta
 /// Where the package puts things, and so the payload.
 const PAYLOAD: [&str; 9] = [
     "usr/bin/kbf-installer",
-    "usr/lib/systemd/system/kbf-frontend@.service",
+    "usr/lib/systemd/system/kbf-frontend.service",
     "usr/lib/systemd/system/kbf-installer.service",
     "usr/lib/systemd/system/kbf.slice",
     "usr/lib/sysusers.d/kbf-installer.conf",
@@ -96,7 +96,7 @@ fn release() -> &'static Release {
         std::fs::create_dir_all(&trust).expect("trust");
         for (d, name) in [
             (&units, "kbf-installer.service"),
-            (&units, "kbf-frontend@.service"),
+            (&units, "kbf-frontend.service"),
             (&units, "kbf.slice"),
             (&trust, "gh"),
             (&trust, "installer.conf"),

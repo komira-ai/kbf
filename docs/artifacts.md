@@ -163,7 +163,7 @@ words, in either order): one JSON object on one line of stdout, exit 0, the fiel
 sorted by name.
 
 ```text
-{"admin_protocol":1,"commit":"0123456789ab","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"relay":1,"seq":812,"state_schema":1,"version":"0.1.0"}
+{"admin_protocol":1,"commit":"0123456789ab","commit_full":"0123456789abcdef0123456789abcdef01234567","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"relay":1,"seq":812,"state_schema":1,"version":"0.1.0"}
 ```
 
 - `admin_protocol`: the version of the admin calls of `kbf --mode frontend` (`GET role`,
@@ -172,6 +172,10 @@ sorted by name.
   changes meaning raises it.
 - `commit`: the first 12 hex digits of the commit built (`unknown` for a build with no
   git checkout); compare it with the first 12 of the commit in the asset's name.
+- `commit_full`: the 40 hex digits of the commit built (`kbf_server::BUILD_COMMIT_FULL`);
+  `commit` is its first 12. It is absent, not empty, from a build that did not know them (no
+  git checkout, or a `KBF_BUILD_COMMIT_OVERRIDE` stamp), and a build before this field prints
+  none. `kbf_types::Version` reads it as optional.
 - `meta_log`: the highest metadata-log machine version the binary runs
   (`kbf_server::raft_log::RUNS`). Going from release N to N-1 is reversible only if
   `meta_log(N) <= meta_log(N-1)`; a build that prints no `meta_log` is unknown, and

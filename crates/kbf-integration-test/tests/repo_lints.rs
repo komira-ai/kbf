@@ -914,7 +914,7 @@ fn every_test_that_starts_kbf_gives_it_a_config_of_its_own_or_is_a_listed_allowa
     );
     assert_eq!(
         kbf_spawns::ALLOWANCE.len(),
-        17,
+        16,
         "the allowance only shrinks"
     );
 }

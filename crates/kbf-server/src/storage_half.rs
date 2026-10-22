@@ -131,7 +131,10 @@ impl StorageHalf {
     }
 
     /// Serves until the shutdown future given to [`start`] completes and the calls in
-    /// flight end; the flusher and the pass stop then.
+    /// flight end; no new call is taken once it has completed. The blobs held in RAM are
+    /// then written to the disk and the blocks staged on the hot store flushed to the cold
+    /// store, within `--ram-drain-deadline` (`RamDrain::after`); the flusher and the
+    /// pass stop after that.
     ///
     /// # Errors
     /// The listener fails while serving.
