@@ -2334,6 +2334,7 @@ name = "kbf-sched"
 version = "0.1.0"
 dependencies = [
  "kbf-caps",
+ "kbf-estimator",
  "kbf-sim",
  "kbf-types",
 ]
