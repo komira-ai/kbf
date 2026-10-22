@@ -92,8 +92,7 @@ fn plist(path: &str) -> Said {
     exited(0, &format!("x = {{\n\tpath = {path}\n}}\n"))
 }
 
-/// Catches a per-label bootout (the mutant "per-label bootout" fails the `asked` list
-/// here): the domains `user/700` and `gui/700` are booted out whole, in that order, once
+/// Catches a per-label bootout (the `asked` list below has none): the domains `user/700` and `gui/700` are booted out whole, in that order, once
 /// each, and only then is the domain printed; a job in the domain gets a `print` of its
 /// own and never a `bootout`.
 #[test]

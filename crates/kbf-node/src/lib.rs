@@ -977,17 +977,7 @@ fn native_runtime<C: Cas>(
         }
         report
     };
-    // One part per source, so none overwrites another's entries.
-    let (driver, reports) = DriverWatch::new();
-    // The slots' part, before the survey's: the number of free slots reaches the daemon
-    // whenever it changes, whether or not a survey does.
-    let slots = driver
-        .part(kbf_driver_native::slots::SOURCE)
-        .ok_or("the slots part of the driver watch is taken")?;
-    runtime.report_slots_through(slots);
-    let xcodes = driver
-        .part(xcode_watch::SOURCE)
-        .ok_or("the Xcode part of the driver watch is taken")?;
+    let (_driver, reports, xcodes) = watch_parts(&runtime)?;
     // Returns at once: the survey runs on the watch's thread.
     let _ = xcode_watch::watch(
         xcodes,
@@ -997,6 +987,24 @@ fn native_runtime<C: Cas>(
         Box::new(apply),
     );
     Ok((runtime, reports))
+}
+
+/// The native driver's driver watch, with a part per source so none overwrites another's
+/// entries: the slots' (the number of slots that can run a lease reaches the daemon
+/// whenever it changes, whether or not a survey does) wired to `runtime` before the
+/// Xcodes', whose part is returned for the survey.
+fn watch_parts<C: Cas>(
+    runtime: &NativeRuntime<C>,
+) -> Result<(DriverWatch, Reports, kbf_daemon::DriverPart), Error> {
+    let (driver, reports) = DriverWatch::new();
+    let slots = driver
+        .part(kbf_driver_native::slots::SOURCE)
+        .ok_or("the slots part of the driver watch is taken")?;
+    runtime.report_slots_through(slots);
+    let xcodes = driver
+        .part(xcode_watch::SOURCE)
+        .ok_or("the Xcode part of the driver watch is taken")?;
+    Ok((driver, reports, xcodes))
 }
 
 /// What the native driver's surveys send the daemon, merged.
@@ -1315,6 +1323,51 @@ mod tests {
             .expect("the first survey ends in time")
             .expect("the watch runs")
             .clone()
+    }
+
+    /// A CAS no test here reaches.
+    #[derive(Debug)]
+    struct NoCas;
+
+    impl Cas for NoCas {
+        type Lease = Arc<Self>;
+
+        fn lease(self: &Arc<Self>, _: &kbf_types::LeaseId) -> Arc<Self> {
+            Arc::clone(self)
+        }
+
+        async fn get(
+            &self,
+            digest: &kbf_proto::reapi::Digest,
+        ) -> Result<Vec<u8>, kbf_transfer::CasError> {
+            Err(kbf_transfer::CasError::Missing(digest.hash.clone()))
+        }
+
+        async fn put(
+            &self,
+            _: Vec<u8>,
+        ) -> Result<kbf_proto::reapi::Digest, kbf_transfer::CasError> {
+            Err(kbf_transfer::CasError::Unavailable(
+                "-".into(),
+                "no CAS".into(),
+            ))
+        }
+    }
+
+    /// Catches a driver watch whose slots' part is not wired to the runtime (the number of
+    /// slots that can run a lease would again wait for an Xcode survey to change): both
+    /// parts are taken by the wiring, the slots' first, so another taker finds neither.
+    #[test]
+    fn the_slots_part_and_the_xcodes_part_are_both_taken_by_the_wiring() {
+        let dir = std::env::temp_dir().join(format!("kbf-node-watch-parts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let runtime =
+            NativeRuntime::new(NativeConfig::new(dir.clone()), Arc::new(NoCas)).expect("runtime");
+        let (driver, _reports, _xcodes) = watch_parts(&runtime).expect("the parts");
+        assert!(driver.part(kbf_driver_native::slots::SOURCE).is_none());
+        assert!(driver.part(xcode_watch::SOURCE).is_none());
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// With the host's memory above the actions cgroup's cap, the placer's whole-host

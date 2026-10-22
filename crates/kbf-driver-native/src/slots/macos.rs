@@ -20,7 +20,7 @@ use tokio::process::Child;
 use tokio::sync::OwnedSemaphorePermit;
 
 use super::book::{Backoff, Book, Cleaner, CountHook, Held, Slotted};
-use super::clean::{self, Mutant, Mutated};
+use super::clean::{self, Skipped, WithSkipped};
 use super::{AS_USER_ARG, Pool, SlotUser, probe};
 use crate::network::{Isolation, Network};
 use crate::procs;
@@ -95,20 +95,20 @@ impl Slots {
     /// # Errors
     /// A user cannot be resolved, or its home lies in a place the clean sweeps.
     pub fn start(pool: &Pool, within: Duration) -> io::Result<Self> {
-        Self::start_mutated(pool, within, None)
+        Self::start_skipping(pool, within, None)
     }
 
-    /// [`Slots::start`] with the clean made wrong on purpose when `mutant` is given
-    /// ([`clean::Mutant`]): for the mutant tests of `tests/slot_clean.rs` alone. `None`
-    /// is [`Slots::start`].
+    /// [`Slots::start`] with one step left out of the clean when `skipped` is given
+    /// ([`clean::Skipped`]): for the tests of `tests/slot_clean.rs` alone. `None` is
+    /// [`Slots::start`].
     ///
     /// # Errors
     /// As [`Slots::start`].
     #[doc(hidden)]
-    pub fn start_mutated(
+    pub fn start_skipping(
         pool: &Pool,
         within: Duration,
-        mutant: Option<Mutant>,
+        skipped: Option<Skipped>,
     ) -> io::Result<Self> {
         let program = kbf_daemon::keeper::program()?;
         let mut ready = Vec::new();
@@ -128,7 +128,9 @@ impl Slots {
             }
             warn_if_indexed(&slot.home);
         }
-        let cleaner = mac_cleaner(within, mutant);
+        let pool = pool.users().iter().map(|u| u.uid);
+        let pool = pool.clone().min().unwrap_or(0)..=pool.max().unwrap_or(0);
+        let cleaner = mac_cleaner(within, pool, skipped);
         Ok(Self::with(ready, cleaner, program))
     }
 
@@ -172,13 +174,21 @@ impl Slots {
 }
 
 /// The cleaner of a root daemon's slots: [`host::MacSlot`] through [`clean::clean`],
-/// wrapped in [`Mutated`] when `mutant` is given (only a test gives one).
-fn mac_cleaner(within: Duration, mutant: Option<Mutant>) -> Cleaner<Ready> {
+/// wrapped in [`WithSkipped`] when `skipped` is given (only a test gives one).
+fn mac_cleaner(
+    within: Duration,
+    pool: std::ops::RangeInclusive<u32>,
+    skipped: Option<Skipped>,
+) -> Cleaner<Ready> {
     Arc::new(move |ready: &Ready| {
-        let slot = host::MacSlot { ready, within };
-        match mutant {
+        let slot = host::MacSlot {
+            ready,
+            within,
+            pool: pool.clone(),
+        };
+        match skipped {
             None => clean::clean(&slot),
-            Some(mutant) => clean::clean(&Mutated::new(&slot, mutant)),
+            Some(skipped) => clean::clean(&WithSkipped::new(&slot, skipped)),
         }
     })
 }
@@ -620,7 +630,10 @@ mod tests {
         // second look at slot 0 dirty again.
         let (slots, calls) = bookkeeping(2, vec![dirty(), Outcome::Clean, Outcome::Clean, dirty()]);
         assert_eq!(slots.count(), 1);
-        let slot = slots.take().await.expect("the other slot");
+        let slot = tokio::time::timeout(Duration::from_secs(10), slots.take())
+            .await
+            .expect("a slot was offered in time")
+            .expect("the other slot");
         assert_eq!(slot.ready().user.uid, 701);
         assert!(format!("{slot:?}").contains("kbf-unit-slot-1"), "{slot:?}");
         assert!(format!("{slots:?}").contains("dirty: {0}"), "{slots:?}");
@@ -643,7 +656,12 @@ mod tests {
     #[tokio::test]
     async fn a_slot_lease_is_refused_a_simulator() {
         let (slots, _) = bookkeeping(1, Vec::new());
-        let runner = crate::slots::Runner::Slot(slots.take().await.expect("slot"));
+        let runner = crate::slots::Runner::Slot(
+            tokio::time::timeout(Duration::from_secs(10), slots.take())
+                .await
+                .expect("a slot was offered in time")
+                .expect("slot"),
+        );
         let refused = runner.allows_simulator(true).expect_err("a simulator");
         assert!(refused.to_string().contains("pool user"), "{refused}");
         assert!(runner.allows_simulator(false).is_ok());

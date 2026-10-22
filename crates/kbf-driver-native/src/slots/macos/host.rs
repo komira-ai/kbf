@@ -56,6 +56,10 @@ const CHMOD: &str = "/bin/chmod";
 const IPCS: &str = "/usr/bin/ipcs";
 const IPCRM: &str = "/usr/bin/ipcrm";
 
+/// How long a `launchctl` that was killed, or has exited, is waited for to be reaped and
+/// its output read.
+const READ_GRACE: Duration = Duration::from_secs(2);
+
 /// The wait between the check's two looks.
 const LOOK_PAUSE: Duration = Duration::from_millis(200);
 
@@ -68,6 +72,9 @@ const DIRECTORY: OFlags = OFlags::RDONLY
 pub struct MacSlot<'a> {
     pub ready: &'a Ready,
     pub within: Duration,
+    /// The uids of the pool's users: C9 does not walk a folder one of them owns a
+    /// directory on the path of.
+    pub pool: std::ops::RangeInclusive<u32>,
 }
 
 /// `launchctl`, run for real: each call is killed at its alarm.
@@ -86,20 +93,22 @@ impl Launchd for Launchctl {
             Ok(child) => child,
             Err(why) => return Said::Missing(why.to_string()),
         };
-        // Read as it is written: a domain's listing is larger than a pipe holds.
+        // Read as it is written: a domain's listing is larger than a pipe holds. The reader
+        // reports through a channel, so no wait for it is unbounded.
         let stdout = child.stdout.take();
-        let reader = std::thread::spawn(move || {
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
             let mut text = Vec::new();
             if let Some(mut stdout) = stdout {
                 let _ = stdout.read_to_end(&mut text);
             }
-            text
+            let _ = sent.send(text);
         });
         let give_up = Instant::now() + alarm;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    let text = reader.join().unwrap_or_default();
+                    let text = received.recv_timeout(READ_GRACE).unwrap_or_default();
                     return Said::Exited {
                         code: status.code().unwrap_or(-1),
                         stdout: String::from_utf8_lossy(&text).into_owned(),
@@ -110,8 +119,12 @@ impl Launchd for Launchctl {
                 }
                 _ => {
                     let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = reader.join();
+                    // Reaped within a bound too: a process stuck in the kernel is left to
+                    // the OS, and the step reports the timeout.
+                    let reaped = Instant::now() + READ_GRACE;
+                    while child.try_wait().is_ok_and(|s| s.is_none()) && Instant::now() < reaped {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                     return Said::TimedOut;
                 }
             }
@@ -178,7 +191,7 @@ impl Os for MacSlot<'_> {
                 joined(failed)
             }
             Step::Shared => complete(&sweep::sweep(&probe::shared_plan(), &user.name, user.uid)),
-            Step::Crashes => joined(crash::sweep(&crash_dirs(), user.uid)),
+            Step::Crashes => joined(crash::sweep(&crash_dirs(), &self.crash_scope())),
             Step::Restore => restore(ready),
             Step::Look => {
                 for look in 0..2 {
@@ -272,7 +285,7 @@ impl Os for MacSlot<'_> {
                 format!("{}: {why}", self.ready.folders.display()),
             ),
         }
-        let crashes = crash::found(&crash_dirs(), user.uid);
+        let crashes = crash::found(&crash_dirs(), &self.crash_scope());
         if !crashes.is_empty() {
             note(Step::Crashes, format!("{crashes:?}"));
         }
@@ -288,6 +301,14 @@ impl Os for MacSlot<'_> {
 }
 
 impl MacSlot<'_> {
+    /// C9's scope: this slot's uid, and the pool's.
+    fn crash_scope(&self) -> crash::Scope {
+        crash::Scope {
+            uid: self.ready.user.uid,
+            pool: self.pool.clone(),
+        }
+    }
+
     /// C3: SIGKILL by real and effective uid until two scans 200 ms apart find nothing,
     /// within `within` and 100 scans ([`probe::kill_until_quiet`]). A scan does not count
     /// launchd's own agents, which launchd starts again on demand.

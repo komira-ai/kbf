@@ -79,6 +79,14 @@ fn counts(book: &Book<Stub>) -> mpsc::Receiver<usize> {
     receive
 }
 
+/// A free slot of `book`, or a failure of the test (never a hang) after [`LONG`].
+async fn take(book: &Arc<Book<Stub>>) -> (usize, OwnedSemaphorePermit) {
+    tokio::time::timeout(LONG, book.take())
+        .await
+        .expect("no slot was offered in time")
+        .expect("taken")
+}
+
 /// Reads counts until one equals `want`; the ones before it.
 fn until(receive: &mpsc::Receiver<usize>, want: usize) -> Result<Vec<usize>, Vec<usize>> {
     let mut seen = Vec::new();
@@ -108,7 +116,7 @@ async fn a_dirty_slot_is_not_offered_and_is_reported_one_fewer() {
         1,
         "the start cleans each slot"
     );
-    let (index, permit) = book.take().await.expect("a clean slot is taken");
+    let (index, permit) = take(&book).await;
     assert_eq!(index, 0);
     book.held(index, permit).give();
     assert_eq!(calls.load(Ordering::SeqCst), 2, "giving back cleans");
@@ -125,8 +133,7 @@ async fn a_dirty_slot_is_not_offered_and_is_reported_one_fewer() {
 /// Catches a node whose slots are all dirty that never recovers (it takes no lease, so no
 /// lease would trigger a re-clean, and its report does not change): with no lease, no
 /// runtime and no report, the recovery thread cleans the slot again and the hook is told
-/// the count. The mutants "no recovery thread" and "the count not pushed to the hook"
-/// both time out here: the hook never hears 1.
+/// the count: the hook hears the slots can run a lease again.
 #[test]
 fn a_dirty_node_recovers_by_itself_and_says_so() {
     quiet();
@@ -149,11 +156,10 @@ fn a_dirty_node_recovers_by_itself_and_says_so() {
     assert_eq!(book.count(), 2);
     assert!(book.dirty().is_empty());
     let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .expect("runtime");
-    let (index, _permit) = runtime
-        .block_on(book.take())
-        .expect("a recovered slot is offered");
+    let (index, _permit) = runtime.block_on(take(&book));
     assert!(index < 2);
 }
 
@@ -232,7 +238,7 @@ async fn a_waiting_lease_gets_the_slot_once_the_recovery_has_cleaned_it() {
 #[tokio::test]
 async fn one_pass_cleans_every_dirty_slot_while_another_is_held() {
     let (book, _) = book(3, vec![Outcome::Clean, dirty(), dirty()], NEVER);
-    let (_held, _permit) = book.take().await.expect("slot 0");
+    let (_held, _permit) = take(&book).await;
     assert_eq!(book.count(), 1);
     assert_eq!(book.retry(), 2);
     assert_eq!(book.count(), 3);
@@ -257,7 +263,7 @@ async fn a_slot_whose_clean_did_not_finish_is_dirty() {
         Outcome::Clean
     });
     let book = Book::start(stubs(1), cleaner, NEVER);
-    let (index, permit) = book.take().await.expect("taken");
+    let (index, permit) = take(&book).await;
     let held = book.held(index, permit);
     assert_eq!(format!("{held:?}"), "Held { index: 0, .. }");
     let gave = std::thread::spawn(move || held.give()).join();
@@ -282,8 +288,8 @@ async fn a_slot_whose_clean_did_not_finish_is_dirty() {
 
 /// Catches two re-cleans of one slot at once (the recovery thread and another caller
 /// would clean the same user beside each other): while one is cleaning, another does
-/// nothing and returns. The cleaner times out its wait, so the mutant "no guard" fails
-/// here (a second clean starts) instead of hanging.
+/// nothing and returns. The cleaner times out its wait, so a regression fails here (a
+/// second clean starts) instead of hanging.
 #[test]
 fn only_one_re_clean_runs_at_a_time() {
     let (entered, entered_rx) = mpsc::channel::<()>();
@@ -357,11 +363,110 @@ fn the_recovery_thread_ends_with_its_book() {
 #[tokio::test]
 async fn a_slot_given_back_clean_is_free_again() {
     let (book, calls) = book(1, Vec::new(), NEVER);
-    let (index, permit) = book.take().await.expect("taken");
+    let (index, permit) = take(&book).await;
     book.held(index, permit).give();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(book.count(), 1);
     assert!(book.dirty().is_empty());
-    let (again, _permit) = book.take().await.expect("taken again");
+    let (again, _permit) = take(&book).await;
     assert_eq!(again, 0);
+}
+
+/// Catches a slot that goes dirty at run time and is not cleaned again for a minute (the
+/// recovery thread asleep with nothing to wake it): a lease's clean fails, and the thread, idle until then,
+/// cleans the slot again promptly and the count comes back.
+#[tokio::test]
+async fn a_slot_that_goes_dirty_at_run_time_is_recovered_promptly() {
+    // Clean at the start, dirty at the lease's clean, clean at every clean after.
+    let (book, _) = book(1, vec![Outcome::Clean, dirty()], FAST);
+    let reported = counts(&book);
+    assert_eq!(reported.recv_timeout(LONG), Ok(1));
+    let (index, permit) = take(&book).await;
+    book.held(index, permit).give();
+    let seen = until(&reported, 1).expect("the slot never came back");
+    assert_eq!(
+        seen,
+        [0, 1],
+        "down at the lease's clean, up at the recovery"
+    );
+}
+
+/// Catches a start-up clean that panics taking the daemon down with it: a slot whose first
+/// clean panics starts dirty, and the recovery thread brings it back.
+#[test]
+fn a_clean_that_panics_at_the_start_leaves_the_slot_dirty_and_it_recovers() {
+    quiet();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let cleaner: Cleaner<Stub> = Arc::new(move |_: &Stub| {
+        assert!(
+            counted.fetch_add(1, Ordering::SeqCst) > 0,
+            "the first clean panics"
+        );
+        Outcome::Clean
+    });
+    let book = Book::start(stubs(1), cleaner, FAST);
+    let reported = counts(&book);
+    until(&reported, 1).expect("the slot never came back");
+    assert!(calls.load(Ordering::SeqCst) >= 2);
+}
+
+/// Catches an older count overwriting a newer one at the receiver (the count read
+/// outside the hook's lock): one change is held inside the hook,
+/// after its count was read, while another happens; the receiver's last count is the
+/// newest.
+#[test]
+fn a_stale_count_never_overwrites_a_newer_one() {
+    quiet();
+    // Slot 0 clean, slot 1 dirty: one slot can run a lease.
+    let (book, _) = book(2, vec![Outcome::Clean, dirty()], NEVER);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let (index, permit) = runtime.block_on(take(&book));
+    let held = book.held(index, permit);
+    let (entered, entered_rx) = mpsc::channel::<()>();
+    let (release, release_rx) = mpsc::channel::<()>();
+    let (entered, release_rx) = (Mutex::new(entered), Mutex::new(release_rx));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    let calls = AtomicUsize::new(0);
+    book.on_count(Arc::new(move |n| {
+        // The call after the initial one stays inside the hook, its count already read,
+        // until released; it reaches the receiver (the log) when it ends.
+        if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+            let _ = lock(&entered).send(());
+            let _ = lock(&release_rx).recv_timeout(LONG);
+        }
+        lock(&log).push(n);
+    }));
+    // A re-clean frees the dirty slot: two can run a lease, and that call is held.
+    let retrying = std::thread::spawn({
+        let book = Arc::clone(&book);
+        move || book.retry()
+    });
+    entered_rx
+        .recv_timeout(LONG)
+        .expect("the first change reached the hook");
+    // Meanwhile the held slot goes dirty: the newest truth is one.
+    let (done, done_rx) = mpsc::channel();
+    let dropping = std::thread::spawn(move || {
+        drop(held);
+        let _ = done.send(());
+    });
+    // With the count and the call under one lock this waits for the first; without, it
+    // finishes at once. Either way the release below ends it.
+    let _ = done_rx.recv_timeout(Duration::from_millis(500));
+    release.send(()).expect("release");
+    assert_eq!(retrying.join().expect("retry"), 1);
+    dropping.join().expect("drop");
+    let last = *lock(&seen).last().expect("a call");
+    assert_eq!(
+        last,
+        book.count(),
+        "the receiver's last count is stale: {:?}",
+        lock(&seen)
+    );
+    assert_eq!(last, 1);
 }

@@ -128,21 +128,21 @@ impl<C: Cas> NativeRuntime<C> {
         Self::with_remover(config, cas, &crate::mounts::remove_lease_dir)
     }
 
-    /// [`NativeRuntime::new`] with the clean of every pool slot made wrong on purpose
-    /// ([`clean::Mutant`](crate::slots::clean::Mutant): one step skipped, the check
-    /// honest or blind): for the mutant tests of `tests/slot_clean.rs` alone, which run
-    /// the freshness scenario over it and see the skipped step's residue.
+    /// [`NativeRuntime::new`] with one step left out of the clean of every pool slot
+    /// ([`clean::Skipped`](crate::slots::clean::Skipped): the step, and the check honest
+    /// or blind): for the tests of `tests/slot_clean.rs` alone, which run the freshness
+    /// scenario over it and see what the step is needed for.
     ///
     /// # Errors
     /// As [`NativeRuntime::new`].
     #[cfg(target_os = "macos")]
     #[doc(hidden)]
-    pub fn with_clean_mutant(
+    pub fn with_skipped_step(
         config: NativeConfig,
         cas: Arc<C>,
-        mutant: crate::slots::clean::Mutant,
+        skipped: crate::slots::clean::Skipped,
     ) -> std::io::Result<Self> {
-        Self::build(config, cas, &crate::mounts::remove_lease_dir, Some(mutant))
+        Self::build(config, cas, &crate::mounts::remove_lease_dir, Some(skipped))
     }
 
     /// [`NativeRuntime::new`], sweeping the scratch root with `remove`: a test hands
@@ -155,25 +155,25 @@ impl<C: Cas> NativeRuntime<C> {
         Self::build(config, cas, remove, None)
     }
 
-    /// [`NativeRuntime::with_remover`], with the pool's clean mutated when `mutant` is
-    /// given.
+    /// [`NativeRuntime::with_remover`], with a step left out of the pool's clean when
+    /// `skipped` is given.
     fn build(
         config: NativeConfig,
         cas: Arc<C>,
         remove: &dyn Fn(&Path) -> std::io::Result<()>,
-        mutant: Option<crate::slots::clean::Mutant>,
+        skipped: Option<crate::slots::clean::Skipped>,
     ) -> std::io::Result<Self> {
         let root = rustix::process::geteuid().is_root();
         crate::slots::check_daemon_user(root, config.pool.as_ref())
             .map_err(std::io::Error::other)?;
         // Only a Mac has slots to clean.
         #[cfg(not(target_os = "macos"))]
-        let _ = mutant;
+        let _ = skipped;
         // Before the sweep: the keepers of a killed daemon's slots have ended them, and
         // this ends what is left, as every lease's end does.
         #[cfg(target_os = "macos")]
         let slots = (config.pool.as_ref())
-            .map(|pool| crate::slots::macos::Slots::start_mutated(pool, config.kill_wait, mutant))
+            .map(|pool| crate::slots::macos::Slots::start_skipping(pool, config.kill_wait, skipped))
             .transpose()?;
         std::fs::create_dir_all(&config.scratch)?;
         let rules = config
