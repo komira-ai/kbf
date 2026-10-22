@@ -326,7 +326,6 @@ fn start(args: &[String]) -> Running {
         token: None,
         local_cache: None,
         releases: None,
-        poll: None,
     };
     let bound = bind_server_with_api(Arc::new(Cache::memory()), listeners, Some(api), pending())
         .expect("bind");

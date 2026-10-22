@@ -1094,7 +1094,6 @@ fn frontend_releasing(worker_tls: Option<WorkerTls>, store: Arc<ReleaseStore>) -
         token: None,
         local_cache: None,
         releases: Some(store),
-        poll: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::memory()),

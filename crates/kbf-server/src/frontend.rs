@@ -935,6 +935,7 @@ impl<'a> Prepared<'a> {
         ) -> Result<Bound, ServeError>,
     ) -> Result<Self, Box<dyn Error>> {
         let args = &flags.server;
+        args.release_poll.warn();
         let listeners = args.listeners()?;
         let proxy = args.proxy()?;
         let policy = args.reapi_auth_policy()?;
@@ -1068,10 +1069,7 @@ impl<'a> Prepared<'a> {
         let (worker_incoming, worker_latch) = worker.grpc(worker_tls)?;
         worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
-        let (token, releases, poll) = api.map_or((None, None, None), |api| {
-            (api.token, api.releases, api.poll)
-        });
-        let poll_stats = poll.as_ref().map(|_| Arc::default());
+        let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
         // The enroll listener (which is closed the moment the drain begins, like the
         // others) and the operator API's enrollment routes, which need the CA's pin: both
         // are off without `--enroll-listen`, and the routes then answer 404.
@@ -1140,7 +1138,6 @@ impl<'a> Prepared<'a> {
         .merge(metrics_route(
             backend.clone(),
             history.as_ref().map(crate::history::History::stats),
-            poll_stats.clone(),
             members.clone(),
             tls_sources,
         ));
@@ -1278,16 +1275,6 @@ impl<'a> Prepared<'a> {
             let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
             // The rolling-update controller; it starts hosts for the desired release unless the
             // operator wrote `auto_nodes` false or paused it.
-            let _poller = poll_stats
-                .and_then(|stats| {
-                    crate::release::poll::spawn(
-                        Arc::clone(&farm),
-                        update_store.clone(),
-                        poll,
-                        stats,
-                    )
-                })
-                .map(AbortOnDrop);
             let _updates = crate::update::spawn_controller(
                 Arc::clone(&farm),
                 update_store,
@@ -1472,21 +1459,17 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
 fn metrics_route(
     backend: Backend,
     history: Option<Arc<crate::history::Stats>>,
-    poll: Option<Arc<crate::release::poll::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
 ) -> axum::Router {
     let tls = Arc::new(tls);
     let render = move || {
         let (backend, members, tls) = (backend.clone(), members.clone(), Arc::clone(&tls));
-        let (history, poll) = (history.clone(), poll.clone());
+        let history = history.clone();
         async move {
             let mut text = backend.render_metrics();
             if let Some(history) = history {
                 history.render(&mut text);
-            }
-            if let Some(poll) = poll {
-                poll.render(&mut text);
             }
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);

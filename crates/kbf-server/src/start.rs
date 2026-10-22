@@ -283,6 +283,7 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
+    args.release_poll.warn();
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
     let state = with_members(
