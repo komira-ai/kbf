@@ -3,13 +3,12 @@
 //! It reads `GET /v1/health` (readiness and the failing checks, nodes by state, the queue's
 //! depth, the leases held, the storage summary) and `GET /v1/invocations` (the latest
 //! builds), and adds nothing of its own: every number is one the API sent. A value the API
-//! does not know is "unknown" or "not measured", never zero. Update state is not in the
-//! health answer; the page links the Updates page for it.
+//! does not know is "unknown" or "not measured", never zero.
 
 use serde::Deserialize;
 
 use super::started::{self, Started};
-use super::{BUILDS_PATH, UPDATES_PATH, build_page, definitions, pill, refresh};
+use super::{BUILDS_PATH, build_page, definitions, pill, refresh};
 use crate::html::{Href, Html, attr};
 use crate::layout;
 use crate::read::{Page, Reader};
@@ -185,12 +184,6 @@ fn farm(h: &mut Html, health: &Health) {
     let storage = Href::root_relative("/ui/storage").expect("the Storage path is root-relative");
     h.el("p", &[], |h| {
         h.link(&storage, "Storage");
-    });
-    let updates = Href::root_relative(UPDATES_PATH).expect("the Updates path is root-relative");
-    h.el("p", &[attr("class", "hint")], |h| {
-        h.text("Update state is not part of this summary: see ")
-            .link(&updates, "Updates")
-            .text(".");
     });
 }
 

@@ -20,6 +20,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::CommitId;
 
+/// The digest type lives in `crate::sha256_hex`; this keeps the old path `record::Sha256Hex`
+/// for the users that have not moved.
+pub use crate::sha256_hex::Sha256Hex;
+
 /// The largest record the installer reads.
 pub const MAX_RECORD_BYTES: usize = 1 << 20;
 /// The largest attestation bundle one component carries.
@@ -50,36 +54,6 @@ pub enum TargetPlatform {
     LinuxArm64,
     #[serde(rename = "darwin-arm64")]
     DarwinArm64,
-}
-
-/// A SHA-256 digest: 64 lowercase hex characters.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct Sha256Hex(String);
-
-impl TryFrom<String> for Sha256Hex {
-    type Error = String;
-
-    fn try_from(s: String) -> Result<Self, String> {
-        if s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-            Ok(Sha256Hex(s))
-        } else {
-            Err(format!("{s:?} is not 64 lowercase hex characters"))
-        }
-    }
-}
-
-impl From<Sha256Hex> for String {
-    fn from(h: Sha256Hex) -> String {
-        h.0
-    }
-}
-
-impl Sha256Hex {
-    /// The digest as text: 64 lowercase hex characters.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 /// An activation: the order that started a swap, `<epoch>-<order id>`.

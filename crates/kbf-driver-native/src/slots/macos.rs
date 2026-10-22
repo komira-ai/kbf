@@ -11,6 +11,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -22,9 +23,10 @@ use tokio::sync::OwnedSemaphorePermit;
 use super::book::{Backoff, Book, Cleaner, CountHook, Held, Slotted};
 use super::clean::{self, Skipped, WithSkipped};
 use super::{AS_USER_ARG, Pool, SlotUser, probe};
-use crate::network::{Isolation, Network};
+use crate::network::{Isolation, Network, WeakenedProfile, slot_profile, slot_write_rules};
 use crate::procs;
 
+mod canaries;
 pub mod host;
 
 /// The program that starts a process in a user's bootstrap namespace.
@@ -73,6 +75,8 @@ pub struct Slots {
     book: Arc<Book<Ready>>,
     /// This binary, which a launch runs in its `__as-user` mode.
     program: PathBuf,
+    /// A change made to the profile every launch generates: a test's weakened profile only.
+    profile_change: Option<WeakenedProfile>,
 }
 
 impl std::fmt::Debug for Slots {
@@ -134,12 +138,29 @@ impl Slots {
         Ok(Self::with(ready, cleaner, program))
     }
 
+    /// [`Slots::start`] whose launches (the canaries' and the actions') run under the
+    /// profile with `change` applied: for `tests/slot_canary.rs` alone.
+    ///
+    /// # Errors
+    /// As [`Slots::start`].
+    #[doc(hidden)]
+    pub fn start_with_profile_change(
+        pool: &Pool,
+        within: Duration,
+        change: WeakenedProfile,
+    ) -> io::Result<Self> {
+        let mut slots = Self::start(pool, within)?;
+        slots.profile_change = Some(change);
+        Ok(slots)
+    }
+
     /// Slots over `ready`, each cleaned by `cleaner` first: a slot whose clean leaves
     /// it dirty is not free.
     fn with(ready: Vec<Ready>, cleaner: Cleaner<Ready>, program: PathBuf) -> Self {
         Self {
             book: Book::start(ready, cleaner, Backoff::DAEMON),
             program,
+            profile_change: None,
         }
     }
 
@@ -169,6 +190,7 @@ impl Slots {
             index,
             permit: Some(permit),
             program: self.program.clone(),
+            profile_change: self.profile_change,
         })
     }
 }
@@ -222,6 +244,8 @@ pub struct Slot {
     /// `None` once the slot has been given back.
     permit: Option<OwnedSemaphorePermit>,
     program: PathBuf,
+    /// See [`Slots`].
+    profile_change: Option<WeakenedProfile>,
 }
 
 impl std::fmt::Debug for Slot {
@@ -234,6 +258,15 @@ impl std::fmt::Debug for Slot {
 }
 
 impl Slot {
+    /// Marks the slot dirty after a failed profile canary, as a failed clean does
+    /// ([`Book::set_aside`]): not offered, not counted, cleaned again by the recovery
+    /// thread. Its canaries run again at the next lease it is handed to.
+    pub fn set_aside(mut self, why: &str) {
+        if let Some(permit) = self.permit.take() {
+            self.book.set_aside(self.index, permit, why);
+        }
+    }
+
     /// The slot's user, home and folders.
     #[must_use]
     pub fn ready(&self) -> &Ready {
@@ -242,7 +275,7 @@ impl Slot {
 
     /// The program and arguments that run `program` with `args` as the slot's user:
     /// `launchctl asuser <uid> <this binary> __as-user <uid> <gid> -- ` and then the
-    /// sandbox's wrap ([`Isolation::wrap_slot`]), whose write rules add the slot's home
+    /// sandbox's wrap ([`Isolation::wrap_in`] with [`slot_profile`]), whose write rules add the slot's home
     /// and folders.
     ///
     /// # Errors
@@ -263,7 +296,10 @@ impl Slot {
                 "refusing to run an action as root".to_owned(),
             ));
         }
-        let (program, args) = isolation.wrap_slot(network, lease, &ready.rules, program, args);
+        let profile = slot_profile(network);
+        let profile = (self.profile_change)
+            .map_or_else(|| profile.to_owned(), |change| change.apply(profile));
+        let (program, args) = isolation.wrap_in(&profile, lease, &ready.rules, program, args);
         let mut launch = vec![
             "asuser".to_owned(),
             uid.to_string(),
@@ -285,13 +321,48 @@ impl Slot {
     /// # Errors
     /// An entry could not be read or given to the user.
     pub async fn hand_over(&self, dir: &Path) -> Result<(), RuntimeError> {
-        let (uid, gid) = (self.ready().user.uid, self.ready().user.gid);
-        let path = dir.to_owned();
-        let handed = tokio::task::spawn_blocking(move || super::hand_tree(&path, uid, gid)).await;
+        self.hand_over_until(dir, &Arc::default()).await
+    }
+
+    /// [`Slot::hand_over`] that stops at the next entry once `cancel` is set, and returns
+    /// only when the blocking work has stopped: nothing is given after it returns.
+    ///
+    /// # Errors
+    /// An entry could not be read or given to the user, or `cancel` was set.
+    pub async fn hand_over_until(
+        &self,
+        dir: &Path,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), RuntimeError> {
+        let ids = (self.ready().user.uid, self.ready().user.gid);
+        let (path, cancel) = (dir.to_owned(), Arc::clone(cancel));
+        let handed =
+            tokio::task::spawn_blocking(move || super::hand_tree(&path, ids, &cancel)).await;
         handed
             .map_err(io::Error::other)
             .and_then(|done| done)
+            .map(drop)
             .map_err(|e| RuntimeError::Failed(format!("hand {} over: {e}", dir.display())))
+    }
+
+    /// Takes the lease directory `dir` and everything in it back from the slot's user
+    /// (to root, 0700), as it must be before the slot is set aside: the slot is cleaned
+    /// and offered again while the lease still waits for another.
+    ///
+    /// # Errors
+    /// It could not be taken back: the caller keeps the slot, so that the lease
+    /// directory is removed before the slot is released.
+    pub async fn reclaim(&self, dir: &Path) -> Result<(), RuntimeError> {
+        let path = dir.to_owned();
+        let taken = tokio::task::spawn_blocking(move || {
+            super::hand_tree(&path, (0, 0), &AtomicBool::new(false))
+        })
+        .await;
+        taken
+            .map_err(io::Error::other)
+            .and_then(|done| done)
+            .map(drop)
+            .map_err(|e| RuntimeError::Failed(format!("reclaim {}: {e}", dir.display())))
     }
 
     /// The watch over the action's processes: every process of the slot's uid.
@@ -498,11 +569,7 @@ fn resolve(user: &SlotUser, program: &Path) -> io::Result<Ready> {
                 String::from_utf8_lossy(&out.stderr).trim()
             ))
         })?;
-    let rules = format!(
-        "(allow file-write* (subpath {}) (subpath {}))\n",
-        quoted(&home)?,
-        quoted(&folders)?
-    );
+    let rules = slot_write_rules(&home, &folders)?;
     let entry = entry_of(&folders)?;
     Ok(Ready {
         user: user.clone(),
@@ -531,18 +598,6 @@ fn entry_of(folders: &Path) -> io::Result<Entry> {
         }
     }
     Ok(entry)
-}
-
-/// `path` as a sandbox profile string literal.
-fn quoted(path: &Path) -> io::Result<String> {
-    let text = path.to_str().unwrap_or("\"");
-    if text.contains(['"', '\\']) {
-        return Err(io::Error::other(format!(
-            "{} cannot be named in a sandbox profile",
-            path.display()
-        )));
-    }
-    Ok(format!("\"{text}\""))
 }
 
 /// The name and home directory the user database gives `uid`.
