@@ -322,6 +322,8 @@ struct State {
     /// The learned-sizes shadow ([`crate::learned`]); off unless `--learned-sizes`
     /// says otherwise.
     learned: Learned,
+    /// Lowered key floors the state store has not taken yet ([`State::lower_key_floors`]).
+    unwritten_floors: Vec<kbf_sched::KeyFloor>,
 }
 
 /// How many committed records the farm holds for a state store that refuses them.
@@ -423,6 +425,7 @@ impl Farm {
                 untraced_kept: BTreeMap::new(),
                 untraced_relayed: BTreeMap::new(),
                 learned: Learned::new(LearnedSizes::Off, 0, 0),
+                unwritten_floors: Vec::new(),
             }),
         }
     }
@@ -1087,7 +1090,13 @@ impl Dispatch for Farm {
             platform,
         });
         let name = state.machine.name(waiter);
-        state.learn_submit(&name, &submission.request, &submission.evidence, joined);
+        state.learn_submit(
+            &name,
+            &submission.request,
+            &submission.evidence,
+            joined,
+            size_key,
+        );
         if let Some((call, shape)) = submission.call.take().zip(shape) {
             let call = call.with_shape(shape).with_evidence(submission.evidence);
             state.record_submit(call, &name, &submission.request);

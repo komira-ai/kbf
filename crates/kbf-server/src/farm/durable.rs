@@ -1412,11 +1412,10 @@ impl State {
         let mut recovered = Vec::new();
         let mut keyed = Vec::new();
         for op in stored.operations {
-            keyed.extend(
-                op.size_key
-                    .filter(|_| self.learned.keys())
-                    .map(|key| (op.operation, key)),
-            );
+            if let Some(size_key) = op.size_key.filter(|_| self.learned.keys()) {
+                keyed.push((op.operation, size_key));
+                self.register_stored(&op, size_key);
+            }
             recovered.push(self.take_stored(op, now));
         }
         let next_operation = OperationId(stored.next_operation);
@@ -1429,8 +1428,8 @@ impl State {
         self.sched
             .recover(epoch, next_operation, stored.next_seq, recovered);
         // The size keys come from the store's own rows, not from the requests: only `on`
-        // reads them, and a recovered lease is raised to its key's floor when its worker
-        // registers.
+        // reads them. A recovered lease keeps the request the store holds; a key floor
+        // raises only the operations queued after it.
         for (operation, key) in keyed {
             self.sched.set_size_key(operation, key);
         }

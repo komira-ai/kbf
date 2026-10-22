@@ -21,7 +21,10 @@ fn store() -> Arc<Fake> {
 }
 
 fn farm_over(store: &Arc<Fake>, mode: LearnedSizes) -> Farm {
-    let store: Arc<dyn Store> = store.clone();
+    over(store.clone(), mode)
+}
+
+fn over(store: Arc<dyn Store>, mode: LearnedSizes) -> Farm {
     Farm::new(
         Arc::new(kbf_front::Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
@@ -352,41 +355,15 @@ fn a_kill_through_the_farm_leaves_a_floor_the_next_start_books() {
     assert_eq!(off.lock().sched.key_floor(key), None);
 }
 
-/// The estimator's decay of a key floor reaches the scheduler and the store: after 256
-/// runs of the key and 7 days quiet the floor halves in the scheduler and its `keyfloor/`
-/// row, a restart books the lower floor, and a floor that falls to the first rung or below
-/// is forgotten (row deleted) so a new digest books the default.
-#[test]
-fn a_decayed_key_floor_is_lowered_in_the_scheduler_and_the_store() {
+/// The estimator's key for `Job::new(_)`, and the run of a quiet success booked at 16 GiB.
+fn estimator_key_and_run() -> (kbf_estimator::Key, kbf_estimator::Run) {
     use crate::action_usage::Subject;
-    use crate::learned::{Attempt, key_of, kill_run, run_of};
+    use crate::learned::{key_of, run_of};
     use crate::machine::Platform;
     use kbf_estimator::{Basis, GIB};
     use kbf_front::Described;
-    use kbf_types::{FarmTime, LeaseId, Outcome};
+    use kbf_types::Outcome;
 
-    let store = store();
-    let farm = farm_over(&store, LearnedSizes::On);
-    let node = register(&farm, "node-a");
-    Job::new(1).submit(&farm);
-    let size_key = keys(&store)[0].expect("keyed");
-    let (operation, lease) = {
-        let state = farm.lock();
-        let operation = state.sched.unfinished().next().expect("queued");
-        (operation, state.sched.leases_on(&node)[0])
-    };
-    let report = super::Report {
-        lease,
-        outcome: kbf_types::Outcome::Failed(kbf_types::Failure::OutOfMemory),
-        measured: None,
-        exit_code: None,
-        run: None,
-    };
-    let now = farm.now();
-    farm.lock().take_report(now, &node, operation, report);
-    assert_eq!(farm.lock().sched.key_floor(size_key), Some(16 * GIB));
-
-    // The same key, as the estimator knows it.
     let (subject, _) = Subject::of(Described {
         arguments: vec!["cc".to_owned()],
         ..Described::default()
@@ -407,39 +384,100 @@ fn a_decayed_key_floor_is_lowered_in_the_scheduler_and_the_store() {
         ..Default::default()
     };
     let (_, run) = run_of(ok, Some(&usage), 16 * GIB).expect("a run");
-    let _ = kill_run;
-    let mut seq = 1_000;
-    let mut quiet = |farm: &Farm, days: u64| {
-        let mut state = farm.lock();
+    (key, run)
+}
+
+/// A farm in `on` mode over `store` whose one keyed action has been killed at its own
+/// limit: its key floor is 16 GiB. Returns the farm, its worker, the size key, the
+/// estimator's key and the run of a quiet success to show it.
+struct Killed {
+    farm: Farm,
+    node: kbf_types::WorkerId,
+    size_key: u64,
+    key: kbf_estimator::Key,
+    run: kbf_estimator::Run,
+    seq: u64,
+}
+
+fn killed_farm(store: Arc<dyn Store>, rows: &Arc<Fake>) -> Killed {
+    use kbf_estimator::GIB;
+
+    let farm = over(store, LearnedSizes::On);
+    let node = register(&farm, "node-a");
+    Job::new(1).submit(&farm);
+    let size_key = keys(rows)[0].expect("keyed");
+    let (operation, lease) = {
+        let state = farm.lock();
+        let operation = state.sched.unfinished().next().expect("queued");
+        (operation, state.sched.leases_on(&node)[0])
+    };
+    let report = super::Report {
+        lease,
+        outcome: kbf_types::Outcome::Failed(kbf_types::Failure::OutOfMemory),
+        measured: None,
+        exit_code: None,
+        run: None,
+    };
+    let now = farm.now();
+    farm.lock().take_report(now, &node, operation, report);
+    assert_eq!(farm.lock().sched.key_floor(size_key), Some(16 * GIB));
+
+    let (key, run) = estimator_key_and_run();
+    Killed {
+        farm,
+        node,
+        size_key,
+        key,
+        run,
+        seq: 1_000,
+    }
+}
+
+impl Killed {
+    /// 257 quiet runs of the key, shown at farm time `days` days in.
+    fn quiet(&mut self, days: u64) {
+        use crate::learned::Attempt;
+        use kbf_types::{FarmTime, LeaseId};
+        let mut state = self.farm.lock();
         state
             .learned
             .clock(FarmTime::from_millis(days * 86_400_000));
         for _ in 0..257 {
-            seq += 1;
-            let lease = LeaseId::new(9, seq);
-            state.learned.stage(
-                lease,
-                Some(Attempt {
-                    key: key.clone(),
-                    run,
-                }),
-            );
-            state.learned.name(lease, size_key);
-            state.finish_learning(lease, &node, true);
+            self.seq += 1;
+            let lease = LeaseId::new(9, self.seq);
+            let attempt = Attempt {
+                key: self.key.clone(),
+                run: self.run,
+            };
+            state.learned.stage(lease, Some(attempt));
+            state.finish_learning(lease, &self.node, true);
         }
-    };
-    let row_ask = |store: &Arc<Fake>| {
-        let rows = store.scan_prefix("keyfloor/").expect("scan");
-        rows.first()
-            .map(|(_, row)| u64::from_be_bytes(row.value[9..17].try_into().expect("ask")))
-    };
+    }
+}
 
-    quiet(&farm, 8);
-    assert_eq!(farm.lock().sched.key_floor(size_key), Some(8 * GIB));
+/// The ask the one `keyfloor/` row holds.
+fn row_ask(store: &Arc<Fake>) -> Option<u64> {
+    let rows = store.scan_prefix("keyfloor/").expect("scan");
+    rows.first()
+        .map(|(_, row)| u64::from_be_bytes(row.value[9..17].try_into().expect("ask")))
+}
+
+/// The estimator's decay of a key floor reaches the scheduler and the store: after 256
+/// runs of the key and 7 days quiet the floor halves in the scheduler and its `keyfloor/`
+/// row, a restart books the lower floor, and a floor that falls to the first rung or below
+/// is forgotten (row deleted) so a new digest books the default.
+#[test]
+fn a_decayed_key_floor_is_lowered_in_the_scheduler_and_the_store() {
+    use kbf_estimator::GIB;
+    let store = store();
+    let mut killed = killed_farm(store.clone(), &store);
+    let size_key = killed.size_key;
+    killed.quiet(8);
+    assert_eq!(killed.farm.lock().sched.key_floor(size_key), Some(8 * GIB));
     assert_eq!(row_ask(&store), Some(8 * GIB), "the row is lowered too");
     // The summaries are written behind; a restart takes up what was written.
-    farm.lock().flush_learned();
-    drop(farm);
+    killed.farm.lock().flush_learned();
+    drop(killed);
 
     let restarted = farm_over(&store, LearnedSizes::On);
     assert_eq!(restarted.lock().sched.key_floor(size_key), Some(8 * GIB));
@@ -455,11 +493,157 @@ fn a_decayed_key_floor_is_lowered_in_the_scheduler_and_the_store() {
             .map(|b| b.memory_bytes),
         Some((16 + 8) << 30),
     );
-    quiet(&restarted, 16);
+    let (key, run) = estimator_key_and_run();
+    let mut again = Killed {
+        farm: restarted,
+        node: other,
+        size_key,
+        key,
+        run,
+        seq: 2_000,
+    };
+    again.quiet(16);
     assert_eq!(
-        restarted.lock().sched.key_floor(size_key),
+        again.farm.lock().sched.key_floor(size_key),
         None,
         "a floor at the first rung is forgotten"
     );
     assert_eq!(row_ask(&store), None, "and its row is deleted");
+}
+
+/// A store over the fake that refuses the writes of `keyfloor/` rows while told to.
+struct Refusing {
+    inner: Arc<Fake>,
+    refuse: std::sync::atomic::AtomicBool,
+}
+
+impl Store for Refusing {
+    fn apply_batch(
+        &self,
+        batch: Vec<kbf_state::Txn>,
+    ) -> Result<Vec<Result<kbf_state::Commit, kbf_state::Conflict>>, kbf_state::StoreError> {
+        let rows = batch.iter().flat_map(kbf_state::Txn::ops).any(|op| {
+            op.key_cond()
+                .is_some_and(|(key, _)| key.starts_with("keyfloor/"))
+        });
+        if rows && self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(kbf_state::StoreError::Failed("refused".to_owned()));
+        }
+        self.inner.apply_batch(batch)
+    }
+
+    fn get(&self, key: &str) -> Result<Option<kbf_state::Versioned>, kbf_state::StoreError> {
+        self.inner.get(key)
+    }
+
+    fn scan_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, kbf_state::Versioned)>, kbf_state::StoreError> {
+        self.inner.scan_prefix(prefix)
+    }
+
+    fn scan_range(
+        &self,
+        scan: kbf_state::ScanRange<'_>,
+    ) -> Result<kbf_state::ScanPage, kbf_state::StoreError> {
+        self.inner.scan_range(scan)
+    }
+
+    fn changes(
+        &self,
+        after: kbf_state::Revision,
+        limit: usize,
+    ) -> Result<kbf_state::Changes, kbf_state::StoreError> {
+        self.inner.changes(after, limit)
+    }
+
+    fn reap_expired(&self) -> Result<usize, kbf_state::StoreError> {
+        self.inner.reap_expired()
+    }
+
+    fn commit_stats(&self) -> kbf_state::CommitStats {
+        self.inner.commit_stats()
+    }
+
+    fn now(&self) -> kbf_state::StoreTime {
+        self.inner.now()
+    }
+}
+
+/// A row the store refuses is not lost: the scheduler floor is lowered at once, the farm
+/// does not fail, and a later tick writes the row.
+#[test]
+fn a_decay_row_the_store_refuses_is_written_at_a_later_tick() {
+    use kbf_estimator::GIB;
+    let rows = store();
+    let refusing = Arc::new(Refusing {
+        inner: rows.clone(),
+        refuse: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut killed = killed_farm(refusing.clone(), &rows);
+    let size_key = killed.size_key;
+    refusing
+        .refuse
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    killed.quiet(8);
+    assert_eq!(killed.farm.lock().sched.key_floor(size_key), Some(8 * GIB));
+    assert_eq!(row_ask(&rows), Some(16 * GIB), "the store kept the old row");
+    refusing
+        .refuse
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    killed.farm.lock().flush_learned();
+    assert_eq!(row_ask(&rows), Some(8 * GIB), "written at the next tick");
+}
+
+/// With a newer writer holding the store nothing is written, but the scheduler's floor is
+/// lowered all the same.
+#[test]
+fn a_fenced_farm_lowers_the_floor_and_writes_no_row() {
+    use kbf_estimator::GIB;
+    let rows = store();
+    let mut killed = killed_farm(rows.clone(), &rows);
+    let size_key = killed.size_key;
+    killed.farm.lock().fenced = true;
+    killed.quiet(8);
+    assert_eq!(killed.farm.lock().sched.key_floor(size_key), Some(8 * GIB));
+    assert_eq!(row_ask(&rows), Some(16 * GIB));
+}
+
+/// A key the scheduler holds no floor for (another keyed operation under the same
+/// estimator key, never killed) has nothing lowered and nothing written.
+#[test]
+fn a_decay_for_a_key_without_a_floor_writes_nothing() {
+    let rows = store();
+    let mut killed = killed_farm(rows.clone(), &rows);
+    killed.farm.lock().learned.register(&killed.key, 999);
+    killed.quiet(8);
+    assert_eq!(killed.farm.lock().sched.key_floor(999), None);
+    assert_eq!(
+        rows.scan_prefix("keyfloor/").expect("scan").len(),
+        1,
+        "the one row is the killed key's"
+    );
+}
+
+/// A floor the scheduler raised after the estimator last saw the key (a kill it never
+/// saw) is not lowered to the estimator's older value.
+#[test]
+fn a_decay_does_not_lower_a_floor_a_newer_kill_raised() {
+    use kbf_estimator::GIB;
+    let rows = store();
+    let mut killed = killed_farm(rows.clone(), &rows);
+    let size_key = killed.size_key;
+    killed
+        .farm
+        .lock()
+        .sched
+        .restore_key_floors(vec![kbf_sched::KeyFloor {
+            key: size_key,
+            ask: 32 * GIB,
+            stamp: 99,
+        }]);
+    killed.quiet(8);
+    assert_eq!(killed.farm.lock().sched.key_floor(size_key), Some(32 * GIB));
+    assert_eq!(row_ask(&rows), Some(16 * GIB));
 }

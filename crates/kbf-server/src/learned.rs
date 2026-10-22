@@ -78,8 +78,8 @@ pub enum LearnedSizes {
     /// operation; the answers are logged and counted. Bookings are unchanged.
     Shadow,
     /// `shadow`, and one change to a booking: a kill at an action's own memory limit leaves
-    /// a floor under the action's key ([`kbf_sched::Scheduler::key_floor`]) that its later
-    /// digests book at least, until the estimator's decay lowers it.
+    /// a floor under the action's key that its later digests book at least, until the
+    /// estimator's decay lowers it.
     On,
 }
 
@@ -146,11 +146,13 @@ pub struct Learned {
     swept: Option<FarmTime>,
     /// A sweep of the store that has more to do at the next tick, for this day.
     sweeping: Option<Day>,
-    /// The size key of each lease whose attempt may lower that key's floor ([`Learned::name`]).
-    keyed: BTreeMap<LeaseId, u64>,
-    /// Key floors the estimator's decay has lowered since they were last taken, as the
-    /// size key and the floor the summary now holds ([`Learned::take_lowered`]).
-    lowered: Vec<(u64, u64)>,
+    /// The size keys of the keyed operations seen under each estimator key (level 2): the
+    /// key floors a decay of that key's summary lowers, whichever attempt causes it
+    /// ([`Learned::register`]).
+    named: BTreeMap<Key, BTreeSet<u64>>,
+    /// Key floors the estimator's decay has lowered since they were last taken: the size
+    /// key, the floor the summary held before and the one it holds now.
+    lowered: Vec<(u64, u64, u64)>,
 }
 
 impl Learned {
@@ -173,7 +175,7 @@ impl Learned {
             flushed: FarmTime::default(),
             swept: None,
             sweeping: None,
-            keyed: BTreeMap::new(),
+            named: BTreeMap::new(),
             lowered: Vec::new(),
         }
     }
@@ -278,27 +280,32 @@ impl Learned {
     /// A lease the scheduler gave up or finished: its booking is no longer needed.
     pub fn forget(&mut self, lease: LeaseId) {
         self.started.remove(&lease);
-        self.keyed.remove(&lease);
     }
 
-    /// Names the size key of the operation `lease` runs, so that a decay of the floor its
-    /// attempt causes can be reported for it ([`Learned::take_lowered`]). Only with `on`.
-    pub fn name(&mut self, lease: LeaseId, size_key: u64) {
-        if self.keys() {
-            self.keyed.insert(lease, size_key);
+    /// Records that a keyed operation with size key `size_key` was submitted for the
+    /// estimator key `key` (any level): when the decay lowers that key's floor, the floor
+    /// under `size_key` is reported, whichever attempt of the key causes the decay (one the
+    /// client sized, which is never keyed, included). Only with `on`.
+    pub fn register(&mut self, key: &Key, size_key: u64) {
+        if !self.keys() {
+            return;
         }
+        if self.named.len() >= STARTED_CAP {
+            self.named.pop_first();
+        }
+        self.named.entry(key.l2()).or_default().insert(size_key);
     }
 
-    /// The key floors the estimator's decay lowered since the last call, as the size key
-    /// and the floor to keep: `0` when what is left is no more than the first rung (a
-    /// floor that low changes no booking). The decay is the estimator's: a floor halves
-    /// only once its key has run 256 times and 7 days have passed without a kill or a
-    /// sample above half of it, so it never falls while the heavy mode recurs.
-    pub fn take_lowered(&mut self) -> Vec<(u64, u64)> {
+    /// The key floors the estimator's decay lowered since the last call: the size key, the
+    /// floor the summary held before, and the floor to keep, which is `0` when what is
+    /// left is no more than the first rung (a floor that low changes no booking). The
+    /// decay is the estimator's: a floor halves only once its key has run 256 times and 7
+    /// days have passed without a kill or a sample above half of it.
+    pub fn take_lowered(&mut self) -> Vec<(u64, u64, u64)> {
         let default = self.default_memory;
         std::mem::take(&mut self.lowered)
             .into_iter()
-            .map(|(key, floor)| (key, if floor > default { floor } else { 0 }))
+            .map(|(key, before, after)| (key, before, if after > default { after } else { 0 }))
             .collect()
     }
 
@@ -318,13 +325,12 @@ impl Learned {
     /// the staged attempt is observed with that, and the rows of the summaries it changed
     /// are returned, for the caller to write after the requeue is settled.
     pub fn requeued(&mut self, lease: LeaseId, raised: u64, bounds: &Bounds) -> Vec<Row> {
-        let size_key = self.keyed.get(&lease).copied();
         self.forget(lease);
         let Some(mut attempt) = self.staged.remove(&lease) else {
             return Vec::new();
         };
         attempt.run.raised_memory_bytes = Some(raised);
-        self.observe_keyed(size_key, &attempt, bounds);
+        self.observe_keyed(&attempt, bounds);
         let touched = BTreeSet::from([attempt.key.clone(), attempt.key.l2()]);
         self.rows_of(touched)
     }
@@ -335,28 +341,28 @@ impl Learned {
     /// Returns the rows of the summaries an own-limit kill changed (a kill that ended the
     /// operation, with no requeue), for the caller to write at once.
     pub fn finish(&mut self, lease: LeaseId, taken: bool, bounds: &Bounds) -> Vec<Row> {
-        let size_key = self.keyed.get(&lease).copied();
         self.forget(lease);
         let Some(attempt) = self.staged.remove(&lease).filter(|_| taken) else {
             return Vec::new();
         };
-        self.observe_keyed(size_key, &attempt, bounds);
+        self.observe_keyed(&attempt, bounds);
         if attempt.run.outcome != RunOutcome::OwnLimitKill {
             return Vec::new();
         }
         self.rows_of(BTreeSet::from([attempt.key.clone(), attempt.key.l2()]))
     }
 
-    /// [`Learned::observe`] for the attempt of an operation with `size_key`, noting a key floor its decay
-    /// lowered.
-    fn observe_keyed(&mut self, size_key: Option<u64>, attempt: &Attempt, bounds: &Bounds) {
+    /// [`Learned::observe`], noting the key floors its decay lowered.
+    fn observe_keyed(&mut self, attempt: &Attempt, bounds: &Bounds) {
         let l2 = attempt.key.l2();
         let floor = |learned: &Self| learned.summaries.get(&l2).map_or(0, Summary::oom_floor);
         let before = floor(self);
         self.observe(attempt, bounds);
         let after = floor(self);
-        if let Some(size_key) = size_key.filter(|_| after < before) {
-            self.lowered.push((size_key, after));
+        if after < before {
+            let named = self.named.get(&l2).into_iter().flatten().copied();
+            let lowered: Vec<_> = named.map(|size_key| (size_key, before, after)).collect();
+            self.lowered.extend(lowered);
         }
     }
 

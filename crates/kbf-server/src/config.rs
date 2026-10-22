@@ -319,11 +319,16 @@ pub struct Args {
     /// plus one change to a booking: a kill at an action's own memory limit leaves a floor
     /// under the action's key (instance, platform class, instrument and shape), which every
     /// later digest of the key, queued or new, books at least, strictly below the memory of
-    /// the largest node that could run it; the floor falls only after 256 runs of the key
-    /// and 7 days without a run near the heavy mode. Only an action whose memory the client
-    /// did not name, on a platform that pins the OS, is keyed. The size summaries and the
-    /// keys are kept in the state store, in rows of their own that a release without this
-    /// flag never reads; `off` neither reads nor deletes the summaries.
+    /// the largest node that could run it. The floor falls only by the estimator's decay:
+    /// it halves once the key has run 256 times and 7 days have passed without an
+    /// own-limit kill or a sample above half of it, and a floor that falls to the first
+    /// rung or below is dropped; a kill raises it again. Only an action whose memory the
+    /// client did not name, on a platform that pins the OS, is keyed. The size summaries
+    /// and the keys are kept in the state store, in rows of their own that a release
+    /// without this flag never reads; `off` neither reads nor deletes the summaries, and
+    /// ignores the keys. The memory a floor raised a queued operation to is not stored: a
+    /// restart, or a rollback to `off`, books such an operation at its submitted memory
+    /// until it ends.
     #[arg(long, value_enum, default_value_t = crate::LearnedSizes::Off)]
     pub learned_sizes: crate::LearnedSizes,
     /// How long, in seconds, a finished operation is kept after its callers are

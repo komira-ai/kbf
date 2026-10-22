@@ -13,6 +13,7 @@ use kbf_types::{Failure, LeaseId, LeaseKind, OperationId, Outcome, WorkerId};
 use super::State;
 use crate::action_usage::Measured;
 use crate::learned::{Attempt, BATCH, Row, Skip, basis_of_os, hint_of, key_of, kill_run, run_of};
+use crate::machine::Platform;
 use crate::run_record;
 
 impl State {
@@ -93,9 +94,6 @@ impl State {
             Ok(key) => self.learned.stage(lease, Some(Attempt { key, run })),
             Err(why) => self.learned.skip(why),
         }
-        if let Some(size_key) = self.sched.size_key(operation) {
-            self.learned.name(lease, size_key);
-        }
     }
 
     /// The scheduler has answered the report of `lease`, run by `worker`; `taken`: it
@@ -110,26 +108,58 @@ impl State {
         self.lower_key_floors();
     }
 
+    /// Names the estimator key of a keyed operation read back from the store, so that the
+    /// decay of its summary reaches the operation's key floor again after a restart.
+    pub(super) fn register_stored(&mut self, op: &super::durable::StoredOperation, size_key: u64) {
+        let platform = Platform::of(&op.request.needs);
+        let Some(subject) = &op.subject else {
+            return;
+        };
+        let Some(basis) = basis_of_os(platform.os_family) else {
+            return;
+        };
+        if let Ok(key) = key_of(&op.request.key.instance, &platform, basis, subject) {
+            self.learned.register(&key, size_key);
+        }
+    }
+
     /// Takes the key floors the estimator's decay lowered to the scheduler, and writes them
-    /// down on a best-effort basis, as the size summaries are: a store that refuses the
-    /// row keeps the higher floor, which the next start books until a later decay writes
-    /// it again.
+    /// down on a best-effort basis, as the size summaries are: a row the store refuses is
+    /// kept and written again at a later tick (until then a restart books the higher
+    /// floor). A floor the scheduler holds above what the estimator saw before the decay
+    /// is left alone: a kill the estimator never saw raised it since.
     pub(super) fn lower_key_floors(&mut self) {
-        for (size_key, ask) in self.learned.take_lowered() {
+        for (size_key, before, ask) in self.learned.take_lowered() {
+            if self.sched.key_floor(size_key).is_some_and(|f| f > before) {
+                continue;
+            }
             let Some(row) = self.sched.lower_key_floor(size_key, ask) else {
                 continue;
             };
-            let Some(durable) = self
-                .durable
-                .as_ref()
-                .filter(|d| !self.fenced && !d.fenced.load(Ordering::SeqCst))
-            else {
-                continue;
-            };
-            if let Err(error) = durable.put_key_floor(&row) {
+            self.unwritten_floors.retain(|f| f.key != size_key);
+            self.unwritten_floors.push(row);
+        }
+        self.write_key_floors();
+    }
+
+    /// Writes the lowered key floors waiting for the store; those it refuses stay.
+    fn write_key_floors(&mut self) {
+        let Some(durable) = self
+            .durable
+            .as_ref()
+            .filter(|d| !self.fenced && !d.fenced.load(Ordering::SeqCst))
+        else {
+            // No store to write to, or a newer writer holds it: nothing is kept.
+            self.unwritten_floors.clear();
+            return;
+        };
+        self.unwritten_floors.retain(|row| {
+            let refused = durable.put_key_floor(row).err();
+            if let Some(error) = &refused {
                 tracing::warn!(%error, "a lowered key floor was not written");
             }
-        }
+            refused.is_some()
+        });
     }
 
     /// The scheduler gave up `requeue`'s lease: the rows to write once the requeues are
@@ -156,6 +186,7 @@ impl State {
         request: &Request,
         evidence: &Evidence,
         joined: bool,
+        size_key: Option<u64>,
     ) {
         if self.learned.off() || joined {
             return;
@@ -182,6 +213,9 @@ impl State {
                 return;
             }
         };
+        if let Some(size_key) = size_key {
+            self.learned.register(&key, size_key);
+        }
         let bounds = self.bounds_for_os(platform.os_family);
         let hint = hint_of(
             evidence,
@@ -228,6 +262,9 @@ impl State {
         }
         let rows = self.learned.due();
         self.write_estimates(&rows);
+        if !self.unwritten_floors.is_empty() {
+            self.write_key_floors();
+        }
         let Some(today) = self.learned.sweep_due() else {
             return;
         };

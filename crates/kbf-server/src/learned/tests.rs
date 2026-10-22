@@ -734,8 +734,8 @@ const SIZE_KEY: u64 = 77;
 
 fn killed_once() -> Learned {
     let mut learned = Learned::new(LearnedSizes::On, 4 * GIB, EPOCH);
+    learned.register(&key(), SIZE_KEY);
     learned.stage(lease(1), Some(kill(None)));
-    learned.name(lease(1), SIZE_KEY);
     learned.requeued(lease(1), 16 * GIB, &bounds());
     assert!(learned.take_lowered().is_empty(), "a kill lowers nothing");
     assert_eq!(l2_floor(&learned), 16 * GIB);
@@ -754,7 +754,6 @@ fn l2_floor(learned: &Learned) -> u64 {
 fn run_success(learned: &mut Learned, seq: u64, peak: u64, booked: u64) {
     let (_, run) = run_of(ok(), Some(&cgroup(Some(peak))), booked).expect("a run");
     learned.stage(lease(seq), Some(Attempt { key: key(), run }));
-    learned.name(lease(seq), SIZE_KEY);
     learned.finish(lease(seq), true, &bounds());
 }
 
@@ -787,7 +786,7 @@ fn a_key_floor_halves_after_256_quiet_runs_and_7_days() {
         assert!(learned.take_lowered().is_empty(), "lowered at run {seq}");
     }
     run_success(&mut learned, 257, 500 * MIB, 16 * GIB);
-    assert_eq!(learned.take_lowered(), vec![(SIZE_KEY, 8 * GIB)]);
+    assert_eq!(learned.take_lowered(), vec![(SIZE_KEY, 16 * GIB, 8 * GIB)]);
     assert_eq!(l2_floor(&learned), 8 * GIB);
     // And once: the next quiet run lowers nothing more.
     run_success(&mut learned, 258, 500 * MIB, 16 * GIB);
@@ -824,7 +823,7 @@ fn a_decayed_key_floor_is_never_kept_below_the_default() {
         for _ in 0..257 {
             run_success(&mut learned, seq, 500 * MIB, 16 * GIB);
             seq += 1;
-            kept.extend(learned.take_lowered().into_iter().map(|(_, ask)| ask));
+            kept.extend(learned.take_lowered().into_iter().map(|(_, _, ask)| ask));
         }
     }
     // 16 -> 8 GiB is kept; 4 GiB is the default and 2 GiB is below it: nothing is kept.
@@ -840,10 +839,54 @@ fn a_kill_after_a_key_floor_decayed_raises_it_again() {
     for seq in 2..258 {
         run_success(&mut learned, seq, 500 * MIB, 16 * GIB);
     }
-    assert_eq!(learned.take_lowered(), vec![(SIZE_KEY, 8 * GIB)]);
+    assert_eq!(learned.take_lowered(), vec![(SIZE_KEY, 16 * GIB, 8 * GIB)]);
     learned.stage(lease(300), Some(kill(None)));
-    learned.name(lease(300), SIZE_KEY);
     learned.requeued(lease(300), 16 * GIB, &bounds());
     assert_eq!(l2_floor(&learned), 16 * GIB);
+    assert!(learned.take_lowered().is_empty());
+}
+
+/// The decay is reported for the key whichever attempt of it crosses the threshold: the
+/// attempts here carry no size key of their own (an attempt whose client sized its memory
+/// is never keyed), and the floor of the keyed operation registered under the same
+/// estimator key is the one lowered.
+#[test]
+fn a_decay_caused_by_an_unkeyed_attempt_lowers_the_keyed_floor() {
+    let mut learned = killed_once();
+    // Another keyed operation under the same key, and one under another key.
+    learned.register(&key(), SIZE_KEY + 1);
+    let (other, _) = Subject::of(Described {
+        arguments: vec!["link".to_owned()],
+        ..Described::default()
+    });
+    let other = key_of("main", &linux(), Basis::Cgroup, &other).expect("a key");
+    learned.register(&other, SIZE_KEY + 2);
+    at_day(&mut learned, 8);
+    for seq in 2..258 {
+        run_success(&mut learned, seq, 500 * MIB, 16 * GIB);
+    }
+    let mut lowered = learned.take_lowered();
+    lowered.sort_unstable();
+    assert_eq!(
+        lowered,
+        vec![
+            (SIZE_KEY, 16 * GIB, 8 * GIB),
+            (SIZE_KEY + 1, 16 * GIB, 8 * GIB)
+        ]
+    );
+}
+
+/// Only `on` keeps the registry: with `shadow` a decay reports nothing.
+#[test]
+fn only_on_reports_a_decay() {
+    let mut learned = Learned::new(LearnedSizes::Shadow, 4 * GIB, EPOCH);
+    learned.register(&key(), SIZE_KEY);
+    learned.stage(lease(1), Some(kill(None)));
+    learned.requeued(lease(1), 16 * GIB, &bounds());
+    at_day(&mut learned, 8);
+    for seq in 2..258 {
+        run_success(&mut learned, seq, 500 * MIB, 16 * GIB);
+    }
+    assert_eq!(l2_floor(&learned), 8 * GIB, "the estimator still decays");
     assert!(learned.take_lowered().is_empty());
 }
