@@ -353,7 +353,10 @@ async fn a_node_owes_a_rebuild_only_when_its_log_takes_one() {
     let (v3, v4) = (MachineVersion::V3, MachineVersion::V4);
     assert!(!owes_rebuild(&dir, v3, false).await, "held below 4");
     assert!(owes_rebuild(&dir, v4, false).await, "raisable to 4");
-    assert!(!owes_rebuild(&dir, v4, true).await, "a rebuild that finished");
+    assert!(
+        !owes_rebuild(&dir, v4, true).await,
+        "a rebuild that finished"
+    );
 
     let bucket = Bucket::default();
     let (_, version) = start_and_write_under(&dir, &bucket, &joined(7, 1), 0, v4).await;
