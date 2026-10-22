@@ -665,7 +665,8 @@ fn a_release_reads_as_staged_only_once_the_root_half_has_kept_it() {
     };
 
     let (_, orders) = root_half_status(&staged_state, &with_facts);
-    let facts = orders.staged().expect("readable").expect("staged");
+    let staged = RootOrders::staged(&orders);
+    let facts = staged.expect("readable").expect("staged");
     assert_eq!(
         (
             facts.commit,
@@ -675,15 +676,16 @@ fn a_release_reads_as_staged_only_once_the_root_half_has_kept_it() {
         ),
         (c(B), 7, 5, 3)
     );
-    assert_eq!(orders.installed().expect("readable"), Some(c(A)));
+    let installed = RootOrders::installed(&orders);
+    assert_eq!(installed.expect("readable"), Some(c(A)));
 
     // Fetched and verified, not kept: the facts are there, the state does not name it.
     let (_, orders) = root_half_status(&running, &with_facts);
-    assert_eq!(orders.staged().expect("readable"), None);
+    assert_eq!(RootOrders::staged(&orders).expect("readable"), None);
 
     // Kept, with the facts not yet in the file.
     let (_, orders) = root_half_status(&staged_state, &Memory::default());
-    assert_eq!(orders.staged().expect("readable"), None);
+    assert_eq!(RootOrders::staged(&orders).expect("readable"), None);
 }
 
 // ----- the swap over the proxy's own copies -----
