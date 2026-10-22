@@ -193,6 +193,8 @@ async fn a_slot_that_fails_its_canaries_is_set_aside_and_canaried_again_when_off
     assert!(waited.is_err(), "a slot set aside must not be offered");
     slots.reoffer().await;
     assert_eq!(slots.count(), 1, "cleaned and offered again");
+    // The clean removed the uid's files under /private/tmp, the lease directory too.
+    std::fs::create_dir_all(&lease).expect("lease dir again");
     let again = tokio::time::timeout(Duration::from_secs(5), slots.take()).await;
     let again = again.expect("offered").expect("a slot");
     again.hand_over(&lease).await.expect("hand over");
@@ -204,4 +206,35 @@ async fn a_slot_that_fails_its_canaries_is_set_aside_and_canaried_again_when_off
     again.set_aside();
     assert_eq!(slots.count(), 0);
     assert!(left_in_tmp().is_empty(), "{:?}", left_in_tmp());
+}
+
+/// Which profile change lets the link through while the write stays refused: prints, for
+/// each candidate, the canaries that were not refused (a measurement, asserts nothing).
+#[ignore = "needs root and real users: cargo xtask sudo-test"]
+#[tokio::test(flavor = "multi_thread")]
+async fn which_rule_refuses_the_link() {
+    let candidates = [
+        "(allow file-link)",
+        "(allow file-link (subpath \"/private/etc\"))",
+        "(allow file-write-create)",
+        "(allow file-write-create (subpath \"/private/etc\"))",
+        "(allow file-write-mode)",
+        "(allow file-write-owner)",
+        "(allow file-write-unlink)",
+        "(allow file-write-setugid)",
+        "(allow file-write-flags)",
+        "(allow file-read-metadata)",
+        "(allow file-write* (subpath \"/private/etc\"))",
+    ];
+    for (i, line) in candidates.into_iter().enumerate() {
+        let (_users, scratch, slots) =
+            start(&format!("canary-which{i}"), Some(ProfileMutant::Add(line)));
+        let (slot, lease) = leased(&slots, &scratch).await;
+        let report = slot
+            .canary(&Isolation::detect(), Network::On, &lease)
+            .await
+            .expect("ran");
+        println!("WHICH {line} -> not refused: {:?}", failed(&report));
+        slot.release().await;
+    }
 }
