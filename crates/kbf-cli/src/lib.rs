@@ -36,7 +36,7 @@
 //! cannot work. A start that gives mode flags runs on them and does not read the file.
 //! There is no `node` mode and no `enroll` word: the host's config states what it is.
 //!
-//! And words that are not modes: `kbf cluster status|drain|undrain|member|denied|object-store` ([`cluster`]), a
+//! And words that are not modes: `kbf cluster status|drain|undrain|member|safe-to-stop|denied|object-store` ([`cluster`]), a
 //! client of the frontend's operator API that starts nothing. It is outside
 //! [`names::MODES`]; `kbf --help` ends with a line naming it.
 //!
@@ -278,7 +278,7 @@ pub fn command() -> Command {
         cmd = cmd.subcommand(mode_command(mode.name, mode.entry));
     }
     cmd.after_help(format!(
-        "Not a mode: `kbf {CLUSTER} status|drain|undrain|member|denied|object-store` calls a frontend's operator API \
+        "Not a mode: `kbf {CLUSTER} status|drain|undrain|member|safe-to-stop|denied|object-store` calls a frontend's operator API \
          (`kbf {CLUSTER} --help`); `kbf {} {HANDOVER}` updates a frontend without failing a \
          build (`kbf {} {HANDOVER} --help`).",
         names::FRONTEND,
