@@ -2,9 +2,6 @@
 //! action killed at its own limit leaves a floor under its `size_key`, which every
 //! operation of the key picks up at the next placement round, strictly below the memory
 //! of the largest live node, and which a successor books the same way.
-//!
-//! Each test names the defect it catches and the mutant that was planted to see it go
-//! red (see the pull request).
 
 use std::time::Duration;
 
@@ -172,8 +169,7 @@ fn farm_with_floor_16() -> Farm {
 
 /// Catches the certain win's absence: a changed digest of a key that was killed starts
 /// the ladder again at 4 GiB (the digest floor does not know it), so it is killed again
-/// and climbs 4 -> 16 once more. Mutant: the kill leaves no key floor (nothing is
-/// raised in `rerun_after_memory_kill`).
+/// and climbs 4 -> 16 once more.
 #[test]
 fn a_new_digest_of_a_killed_key_starts_at_the_floor() {
     let mut f = farm_with_floor_16();
@@ -194,7 +190,6 @@ fn a_new_digest_of_a_killed_key_starts_at_the_floor() {
 /// Catches a key floor applied only when an operation is queued: operations of the key
 /// already waiting when the kill happens still start at their old booking (and are
 /// killed, one by one, for what the first kill taught). One core, so two of them wait.
-/// Mutant: the raise happens in `submit` and not in the placement round.
 #[test]
 fn queued_operations_pick_up_the_floor_at_placement() {
     let mut f = Farm::new();
@@ -221,8 +216,7 @@ fn queued_operations_pick_up_the_floor_at_placement() {
 /// (instance, platform class, basis, shape), so an action under another key (another
 /// instance, or another platform) is untouched, and so is one with no key. The
 /// scheduler keeps floors per key value; hashing the instance in is the front door's
-/// job (and tested there). Mutant: `floor_key` ignores the key and floors every
-/// request of the same action digest.
+/// job (and tested there).
 #[test]
 fn another_key_and_no_key_are_unchanged() {
     let mut f = farm_with_floor_16();
@@ -241,7 +235,6 @@ fn another_key_and_no_key_are_unchanged() {
 /// Catches a key floor for a request that is not an ordinary action: a request for GPUs
 /// books by another measure, and a whole-machine lease books the machine. Both ignore a
 /// `size_key` they carry, in what they book and in what they leave behind when killed.
-/// Mutant: `floor_key` drops the kind and GPU check.
 #[test]
 fn only_an_action_without_gpus_has_a_key_floor() {
     let mut f = farm_with_floor_16();
@@ -297,8 +290,7 @@ fn only_an_action_without_gpus_has_a_key_floor() {
 /// Catches 50 concurrent kills of one key counted as 50 events: each kill of an
 /// operation booked below the floor already in force belongs to the event that set it,
 /// so the floor is one rung (16 GiB), not a rung per kill, and every retry and every
-/// later digest books exactly it. Mutant: the kill's rung is taken from `max(booked,
-/// floor)`, so each of the 50 climbs the floor again.
+/// later digest books exactly it.
 #[test]
 fn a_burst_of_kills_is_one_event() {
     let mut f = Farm::new();
@@ -335,8 +327,7 @@ fn a_burst_of_kills_is_one_event() {
 /// step is the whole host (an exclusive lease that runs alone), and a floor there would
 /// put every digest of the key on a whole host. On a 16 GiB farm the kill at 4 GiB
 /// retries at the cap, 16 GiB, and the key floor stays at 15.75 GiB, so a new digest
-/// runs beside another lease. Mutant: the floor is not clamped
-/// (`kill_floor(.., u64::MAX)`).
+/// runs beside another lease.
 #[test]
 fn a_key_floor_stays_below_the_largest_node() {
     let mut f = Farm::new();
@@ -399,7 +390,7 @@ fn the_bound_is_the_largest_live_node_that_could_run_it() {
 /// and generated kill chains, a key floor is never at or above the memory of the
 /// largest node that matches, so no booking it makes owns a host; and a new digest of
 /// the key starts at the floor, at the raised size, or at its own, never above the
-/// floor. Mutant: the clamp removed.
+/// floor.
 #[test]
 fn generated_farms_never_book_a_whole_host_from_a_key_floor() {
     let mut rng = SimRng::from_seed(0xe6);
@@ -450,8 +441,7 @@ fn generated_farms_never_book_a_whole_host_from_a_key_floor() {
 /// Catches a floor raised for the successor to forget: after a leader change the
 /// successor, over the same rows, books the raise the first leader's lease ran under
 /// (the Start carried 16 GiB; a ledger that says 4 would book the lease's next kill from
-/// the wrong rung), and a queued operation is raised at its first round. Mutant:
-/// `adopt` does not make the raise again.
+/// the wrong rung), and a queued operation is raised at its first round.
 #[test]
 fn a_successor_books_the_raise_the_lease_ran_under() {
     let mut f = farm_with_floor_16();
@@ -568,8 +558,7 @@ fn key_floors_are_in_the_memory_state_and_the_floor_change() {
 /// Catches a floor that outlives the node that made it possible: the big node leaves
 /// while an operation raised to 32 GiB waits, and the only node left has 16. Without
 /// the re-clamp the operation would wait for a node that is not coming and be refused
-/// "all smaller than its request" after the unservable wait. Mutant: no re-clamp on an
-/// unservable verdict.
+/// "all smaller than its request" after the unservable wait.
 #[test]
 fn an_operation_raised_beyond_the_remaining_nodes_is_lowered_not_refused() {
     let mut f = Farm::new();
