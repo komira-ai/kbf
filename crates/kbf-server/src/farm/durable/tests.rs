@@ -109,6 +109,7 @@ fn request(tag: u8) -> Request {
         resources: Resources::new(1_000, 1 << 30),
         hermetic: true,
         do_not_cache: false,
+        size_key: None,
         needs: kbf_caps::Request::default(),
     }
 }
@@ -1130,6 +1131,7 @@ fn raising(tag: u8, stamp: u64, evicted: &[u8]) -> FloorChange {
     FloorChange {
         raised: Some(a_floor(tag, stamp)),
         evicted: evicted.iter().map(|tag| key_of(*tag)).collect(),
+        ..FloorChange::default()
     }
 }
 
@@ -1237,6 +1239,7 @@ fn a_floor_is_written_though_its_operation_has_ended() {
     let evicted_only = FloorChange {
         raised: None,
         evicted: vec![key_of(2)],
+        ..FloorChange::default()
     };
     durable
         .requeued(&killed(7, 0), None, None, &evicted_only)
@@ -1301,6 +1304,7 @@ fn a_floor_row_that_is_not_one_is_refused() {
     let change = FloorChange {
         raised: Some(long),
         evicted: Vec::new(),
+        ..FloorChange::default()
     };
     let error = durable
         .requeued(&killed(1, 0), None, None, &change)

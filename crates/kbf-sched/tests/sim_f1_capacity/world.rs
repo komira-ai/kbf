@@ -108,6 +108,7 @@ pub fn request(key: u64, qos: Qos, resources: Resources, platform: usize) -> Req
         resources,
         hermetic: true,
         do_not_cache: false,
+        size_key: None,
         needs: kbf_caps::Request::from_platform(PLATFORMS[platform].iter().copied()).unwrap(),
     }
 }

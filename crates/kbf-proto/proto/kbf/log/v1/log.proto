@@ -493,6 +493,9 @@ message Request {
   repeated Property needs = 5;
   bool hermetic = 6;
   bool do_not_cache = 7;
+  // The key a kill-driven memory floor is kept under (`Request::size_key`). Present only
+  // in log format 6 and later: an earlier format refuses a request that carries it.
+  optional uint64 size_key = 8;
 }
 
 // An instance name and an action digest.

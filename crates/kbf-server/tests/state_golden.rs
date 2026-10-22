@@ -112,6 +112,7 @@ fn request(tag: u8, resources: Resources) -> Request {
         resources,
         hermetic: true,
         do_not_cache: false,
+        size_key: None,
         needs: kbf_caps::Request::default(),
     }
 }

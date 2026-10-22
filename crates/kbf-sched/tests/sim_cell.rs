@@ -429,6 +429,7 @@ fn request(n: u64) -> Request {
         // actions and had no hermetic lease to hide.
         hermetic: !n.is_multiple_of(4),
         do_not_cache: false,
+        size_key: None,
         needs: kbf_caps::Request::default(),
     }
 }

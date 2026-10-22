@@ -348,6 +348,7 @@ impl Sim<'_> {
             needs: self.needs.clone(),
             hermetic: true,
             do_not_cache: false,
+            size_key: None,
         };
         let effects = self.feed(Event::Submit {
             waiter: WaiterId(i as u64),

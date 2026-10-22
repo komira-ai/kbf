@@ -94,6 +94,19 @@ struct Operation {
     /// When it last entered the queue: its submission, or the give-up of its lease
     /// ([`Scheduler::queue_snapshot`] ages the queue from it).
     queued_at: FarmTime,
+    /// While its memory is one a key floor raised: what it booked before and the raise
+    /// ([`Scheduler::reclamp_key_floor`] undoes the raise when no live worker is large
+    /// enough for it).
+    key_applied: Option<KeyApplied>,
+}
+
+/// A memory raise a key floor made to a queued operation.
+#[derive(Clone, Copy, Debug)]
+struct KeyApplied {
+    /// The memory the operation booked before the first raise.
+    base: u64,
+    /// The memory the raise gave it.
+    applied: u64,
 }
 
 /// A queued operation no live worker can run: since when, why, and whether the wait
@@ -431,6 +444,7 @@ impl Scheduler {
                 losses: 0,
                 avoid: BTreeSet::new(),
                 queued_at: self.now,
+                key_applied: None,
             },
         );
         Vec::new()
@@ -516,6 +530,8 @@ impl Scheduler {
             return;
         }
         self.refuse_lost(effects);
+        // Before any operation is fitted: a floor raised since it was queued applies.
+        self.apply_key_floors();
         let now = self.now;
         let mut servable = Servable::new(&self.workers, &self.cordons, now);
         let mut placed = Vec::new();
@@ -555,6 +571,11 @@ impl Scheduler {
         }
         self.reservations = reservations;
         for (id, verdict) in verdicts {
+            // A size a key floor gave it and no live worker can hold is lowered, not
+            // waited on: the next round judges the smaller request.
+            if matches!(verdict, Verdict::Unservable(_)) && self.reclamp_key_floor(id) {
+                continue;
+            }
             self.note(id, verdict, effects);
         }
         for (id, worker, booked, device) in placed {

@@ -765,6 +765,7 @@ impl<D> ExecutionService<D> {
                 resources: booked,
                 hermetic: true,
                 do_not_cache: decoded.do_not_cache,
+                size_key: None,
                 needs,
             },
             call: None,

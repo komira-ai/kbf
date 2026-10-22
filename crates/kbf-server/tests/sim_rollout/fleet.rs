@@ -303,6 +303,7 @@ impl Cell {
             needs: kbf_caps::Request::from_platform(PLATFORMS[p].iter().copied()).expect("valid"),
             hermetic: true,
             do_not_cache: false,
+            size_key: None,
         };
         self.feed(Event::Submit {
             waiter: WaiterId(n),

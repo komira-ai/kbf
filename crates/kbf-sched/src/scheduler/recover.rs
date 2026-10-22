@@ -215,6 +215,7 @@ impl Scheduler {
                 not_started,
                 losses,
                 queued_at: self.now,
+                key_applied: None,
             },
         );
     }
@@ -223,6 +224,18 @@ impl Scheduler {
     pub(super) fn adopt(&mut self, id: &WorkerId, worker: &mut Worker) {
         if self.awaited.remove(id).is_none() {
             return;
+        }
+        // A lease a key floor raised before the handover ran under that raise: the
+        // store holds the submitted request, so the raise is made again, under the node
+        // the lease runs on.
+        let leased: Vec<OperationId> = self
+            .held
+            .values()
+            .map(|held| held.operation)
+            .filter(|op| self.ops[op].state.holding().is_some_and(|(_, w)| w == id))
+            .collect();
+        for op in leased {
+            self.raise_to_key_floor(op, Some(worker.capacity.memory_bytes));
         }
         for held in self.held.values_mut() {
             let op = &self.ops[&held.operation];

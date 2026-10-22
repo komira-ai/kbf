@@ -26,6 +26,7 @@ fn request(n: u8, gpus: u64) -> Request {
         resources: Resources::new(1_000, GIB).with_gpus(gpus),
         hermetic: true,
         do_not_cache: false,
+        size_key: None,
         needs: kbf_caps::Request::default(),
     }
 }

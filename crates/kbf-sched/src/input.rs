@@ -28,9 +28,24 @@ pub struct Request {
     pub hermetic: bool,
     /// The client asked for the result not to be cached.
     pub do_not_cache: bool,
+    /// The key a kill-driven memory floor is kept under, from the instance, the platform
+    /// class, the instrument and the action's shape: set by the front door only for an
+    /// action whose memory the client did not name and whose platform pins the OS, and
+    /// only while the farm learns sizes. `None` for every other request; the scheduler
+    /// also ignores it on a request that is not an `action` without GPUs. See
+    /// [`crate::Scheduler::key_floor`].
+    pub size_key: Option<u64>,
 }
 
 impl Request {
+    /// The key of the memory floor this request is subject to: its `size_key`, for a
+    /// plain `action` without GPUs. Other kinds book a share of the worker or all of it,
+    /// not a size learned from earlier runs.
+    pub(crate) fn floor_key(&self) -> Option<u64> {
+        self.size_key
+            .filter(|_| self.kind == LeaseKind::Action && self.resources.gpus == 0)
+    }
+
     /// The fence policy of the lease that runs it: `RunOn` if hermetic, else `SelfFence`.
     #[must_use]
     pub fn fence(&self) -> FencePolicy {

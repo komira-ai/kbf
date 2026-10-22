@@ -417,6 +417,7 @@ fn request(tag: u8) -> Request {
         resources: Resources::new(1_000, GIB),
         hermetic: true,
         do_not_cache: false,
+        size_key: None,
         needs: kbf_caps::Request::default(),
     }
 }

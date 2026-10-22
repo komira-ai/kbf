@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 kbf-caps.workspace = true
+kbf-estimator.workspace = true
 kbf-types.workspace = true
 
 [dev-dependencies]

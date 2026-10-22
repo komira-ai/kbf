@@ -10,7 +10,8 @@
 //! (docs/design/write-path.md, section 6.5); [`Format::V3`], which adds
 //! `EvictObjects`; or [`Format::V4`], which adds node writers (`SetWriter`, and object
 //! ids naming a storage node's member and boot) and the commands of a rebuild of the
-//! index; or [`Format::V5`], which adds `ReseatStaged`. Any other format is refused on both sides, and so is a command under a format
+//! index; or [`Format::V5`], which adds `ReseatStaged`; or [`Format::V6`], which adds
+//! `Request::size_key` to a scheduler `Submit`. Any other format is refused on both sides, and so is a command under a format
 //! before the one it joined, so a binary never writes or reads an encoding the log does
 //! not allow.
 //!
@@ -69,6 +70,11 @@ impl Format {
     /// Format 4 plus `ReseatStaged`.
     pub const V5: Self = Self(5);
 
+    /// Format 5 plus `Request::size_key` in a scheduler `Submit`: the key a kill-driven
+    /// memory floor is kept under. Under an earlier format a request that carries one is
+    /// refused on both sides, so a binary that does not know the field never meets it.
+    pub const V6: Self = Self(6);
+
     /// Format number `n`, which may not be one this binary supports.
     #[must_use]
     pub const fn new(n: u32) -> Self {
@@ -83,7 +89,10 @@ impl Format {
 
     /// Whether this binary writes and reads the format.
     const fn known(self) -> bool {
-        matches!(self, Self::V1 | Self::V2 | Self::V3 | Self::V4 | Self::V5)
+        matches!(
+            self,
+            Self::V1 | Self::V2 | Self::V3 | Self::V4 | Self::V5 | Self::V6
+        )
     }
 }
 
@@ -158,7 +167,7 @@ pub enum EncodeError {
     Format(Format),
     /// The command is not part of the format (a tier command under format 1,
     /// `EvictObjects` under format 1 or 2, `SetWriter` or a node writer's object before
-    /// format 4).
+    /// format 4, a request's `size_key` before format 6).
     #[error("the command is not part of log format {}", .0.get())]
     Command(Format),
     /// A digest names a hash function the format has no value for.
@@ -242,6 +251,9 @@ pub fn encode(format: Format, command: &LogCommand) -> Result<Vec<u8>, EncodeErr
             log_id: b.log_id.get(),
             store_prefix: b.store_prefix.clone(),
         }),
+        LogCommand::Farm(b) if !control::takes(format, b) => {
+            return Err(EncodeError::Command(format));
+        }
         LogCommand::Farm(b) => P::Farm(control::batch_to_proto(b)?),
         LogCommand::Report(r) => P::Report(control::report_to_proto(r)?),
         LogCommand::Takeover(t) => P::Takeover(control::takeover_to_proto(t)),
@@ -286,6 +298,13 @@ pub fn decode(format: Format, bytes: &[u8]) -> Result<LogCommand, DecodeError> {
         && !meta::takes(format, c)
     {
         return Err(DecodeError::UnknownCommand("MetaCommand"));
+    }
+    // A request's `size_key` joined at format 6: an older reader sees a field it does
+    // not know, so bytes that are not canonical.
+    if let LogCommand::Farm(b) = &command
+        && !control::takes(format, b)
+    {
+        return Err(DecodeError::UnknownCommand("Request"));
     }
     // One value, one encoding: refuse anything prost accepted that `encode` would not
     // have written (an unknown field, a non-minimal varint, a reordered field).
