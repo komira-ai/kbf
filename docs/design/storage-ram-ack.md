@@ -1,11 +1,14 @@
 # Acknowledging a storage write from RAM on both owners
 
-**Planned. Nothing in this document is built.** Every statement under "Today" describes
-the code; every other section describes a design. Until the change lands, a write is
-acknowledged after it is durable on the primary and, unless the replica is lost (a repair
-debt is journaled first), on the replica; a blob with no hot-disk room is durable in the
-object store, and with one owner (R=1) there is one copy. [storage.md](storage.md),
-[write-path.md](write-path.md) and [architecture-v2.md](architecture-v2.md) describe this.
+**Built behind `--ram-ack-bytes`, which defaults to 0 (off).** PRs 1 to 6 of the plan below
+are in; turning it on by default is PR 7 and waits for an explicit go. With the flag at 0,
+the default, "Today" is exactly what the code does: a write is acknowledged after it is
+durable on the primary and, unless the replica is lost (a repair debt is journaled first),
+on the replica; a blob with no hot-disk room is durable in the object store, and with one
+owner (R=1) there is one copy. With the flag over 0, the sections "The new acknowledgement
+point" and "As built (PR 6 of the plan)" describe what a write of at most 4 MiB to two
+owners does. [storage.md](storage.md), [write-path.md](write-path.md) and
+[architecture-v2.md](architecture-v2.md) describe both.
 
 The rules the design must keep:
 
@@ -20,7 +23,7 @@ Names: an **owner** is a node the map names for a blob; the **primary** is rank 
 `kbf-storage/src/replicate/chain.rs`). **Hot disk** is the write tier (`kbf-tier`;
 `PutStaged` in the node's metadata log); **cold** is the object store.
 
-## Today: where a write is acknowledged
+## Today: where a write is acknowledged (with `--ram-ack-bytes` at 0)
 
 1. The client's write reaches the first non-Down write owner through the frontend
    (`kbf-front/src/proxy/bytestream.rs`, `kbf-route/src/write.rs`). The frontend neither
@@ -170,21 +173,22 @@ node yet, so each of them answers as it did and the tests put a blob there throu
   touched, and neither is an absent one.
 - The repair worker asks the owner `kbf-durable: only`. A node that receives a copy from a
   peer (a chain leg or the worker) dedups on the durable question, so a copy sent to an
-  owner that holds the blob only in RAM is written. **PR 6** refines this with the leg
-  header that asks for a Held answer: only a leg that asks for it dedups on Held.
+  owner that holds the blob only in RAM is written. PR 6 refined this with the leg header
+  that asks for a Held answer: only a leg that asks for it dedups on Held (below).
 - Not switched, on purpose: `settle_evicted` asks this node's own store the plain question
   (a Held blob is not evicted, and the debt stays); read repair's probe and
   `find_missing_anywhere` (the Execute input check) stay plain, as rule 1 and the table
   above say.
 - Peer confirmation is `PeerConfirmer` (`kbf-storage/src/repair/confirm.rs`), run on the
   repair worker's ticks. `--ram-peer-grace` is 5 s. A peer that is down in the map, does
-  not answer, or answers missing is owed a debt; a full set journals at once. Nothing calls
-  `track` until PR 6.
+  not answer, or answers missing is owed a debt; a full set journals at once. PR 6 calls
+  `track` from the write path.
 
 ### As built (PR 5 of the plan)
 
-Still no producer: nothing in a running node calls `Cache::hold`, and `--ram-ack-bytes`
-is 0, so with the flag at its default the set is empty and every number below reads 0.
+PR 5 alone had no producer: nothing in a running node called `Cache::hold`. PR 6 is the
+producer; with the flag at its default 0 the set is still empty and every number below
+reads 0.
 
 - `Cache::hold(&VerifiedBlob)` is the producer's entry and the only place a permit is
   taken: a non-blocking try-acquire of the blob's bytes (`Hold::Held`), `Hold::Duplicate`
@@ -220,16 +224,65 @@ is 0, so with the flag at its default the set is empty and every number below re
   not one each: a drain that takes 25 s leaves the flush 5 s, and a drain that ends at the
   deadline leaves the flush one poll.
   Only `kbf storage` and the storage half of `storage-and-daemon` run it; a server with
-  no replica holds nothing. A Draining member is **not yet** kept from counting as filled
-  while it holds entries: that belongs with the producer.
+  no replica holds nothing. (PR 6 keeps a member from counting as filled while it holds
+  entries, below.)
 - Metrics, in `Cache::render_metrics`: `kbf_storage_ram_unwritten_bytes`,
   `kbf_storage_ram_unwritten_blobs`, `kbf_storage_ram_unwritten_oldest_seconds`,
   `kbf_storage_ram_budget_bytes`, `kbf_storage_ram_drain_failures_total` and
-  `kbf_storage_ram_writethrough_total{reason}` (all six reasons printed; only `budget` is
-  counted until the producer). `kbf_storage_ram_unconfirmed_blobs` waits for the producer
-  too: nothing calls the peer confirmer's `track` before it.
+  `kbf_storage_ram_writethrough_total{reason}` (all six reasons printed; PR 5 counted only
+  `budget`). `kbf_storage_ram_unconfirmed_blobs` came with the producer (PR 6).
 - `kbf-deploy linux meta-backup` refuses while `kbf_storage_ram_unwritten_bytes` is above
   0 (a server that does not print it holds none).
+
+### As built (PR 6 of the plan)
+
+The producer. With `--ram-ack-bytes` over 0, the default 0 changing nothing.
+
+- **The ack point.** `write_blob` (`kbf-storage/src/service/write.rs`) picks the commit
+  mode after the bytes are received and the replica has answered: the primary of a chain
+  on a node that acknowledges from RAM (`Storage::ram_ack`) asks its replica for a held
+  answer with the leg header `kbf-chain-held: 1` (`LEG_HELD_HEADER`), waits for it, and
+  commits `CommitMode::Held`. The replica reads the header from a leg only, commits `Held`
+  and answers; so the order is replica holds, primary holds, client. `Written::commit`
+  (`kbf-front/src/storage.rs`) reaches `StreamedRecord::commit_held`
+  (`kbf-front/src/cache/stream.rs`): a blob the pool holds whole (at most 4 MiB) goes to
+  `Cache::hold_write` (`cache/ram.rs`) and the call returns; the drain of PR 5 writes it.
+  The bytes were hashed against the digest by `Writing::finish` before the commit.
+- **Write through** (committed to the disk first, counted when the node has the flag on;
+  at 0 nothing is counted): `replica_lost` (replica down in the map or unreachable, debt
+  journaled first, includes the second owner taking the write while the first is dead),
+  `single_owner` (R=1, and a copy outside the chain), `large` (over 4 MiB; also a record
+  that went to the store), `queue_full` and `store_path` (the blob streams to the store:
+  the pool's queue is at its bound, or there is no tier or room), `budget` (counted by
+  `Cache::hold`). `Segments` uploads never reach `commit`.
+- **The leg dedup.** A leg that asks for a held answer dedups on `find_missing` (a blob
+  held in RAM answers it); every other copy (the repair worker's) dedups on `find_durable`.
+- **Late duplicates.** `hold_write` looks at the set, then the index (the readers' order),
+  and answers `Duplicate` for a blob the index has; a drain that finishes between the two
+  looks leaves the blob in the index.
+- **Peer confirmation.** Each owner that may have the blob in RAM (the primary when it
+  asked for a held answer and the replica answered; the replica when asked) calls
+  `PeerConfirmer::track` before the client is answered, whether or not its own commit fell
+  back to disk (the peer may hold it in RAM). `RepairWorker::confirm_pass` is the tick:
+  it asks this node's own store which tracked digests are durable (`drained`, which starts
+  the grace), then asks the peers. `kbf_storage_ram_unconfirmed_blobs` is the set's size.
+- **Handoff.** `flush_report` holds `clear_gen` at the map generation the oldest held blob
+  was acknowledged under, so a member holding entries does not count as filled. The set is
+  read before the staged objects, and a drain dates the object it staged by the
+  acknowledgement (`Born::lower`, before the entry leaves), so the cap stays until the
+  object is flushed and a drain between the two looks loses nothing.
+- **Per-batch delivery and `prepare`.** `Farm::report` and `Farm::tick` deliver a batch of
+  answers one after another, so a barrier that waits up to `--durable-wait` delays the
+  answers behind it. Evidence: the farm's `prepare_action_result` is the router's
+  (`backend.rs`), which asks plain FindMissing and never waits for a held blob, so it
+  cannot fail the Execute for one; the `Infra` failure at `outcome` is reachable only
+  through the bootstrap cache, which has no RAM budget (`--ram-ack-bytes` reaches storage
+  nodes only). The barrier is barrier (a) inside `deliver`'s `commit_action_record`; its
+  timeout is logged and the callers are still answered with the result, which is "not
+  cached" already. A batch with two answers that each write an entry is the only case that
+  waits twice, and only while a drain is failing. Left as is.
+- **Not changed.** Default 0: no blob is held on the write path (`at_a_zero_budget_...`,
+  `at_the_default_...`), the commit modes are `Durable` or counted-and-`Durable`.
 
 ## Rule 3: budget, backpressure and metrics
 
@@ -341,11 +394,13 @@ sync gates on both nodes, let the write return, then assert that writers are par
 - T12 the repair worker copies in `Durable` mode and `settle_evicted` leaves a Held digest
   alone.
 
-The harness these need does not exist yet. The existing helpers in
-`kbf-front/tests/write_pool.rs` are private to that file, and its `until` and `bounded`
-helpers poll or use a wall-clock timeout and are not used by the new tests. The work is
-split across the PRs below: shared test support and a test-only drain seam first; the
-two-real-`Cache` chain rig with the producer. The simulation cell has one server and
+As built: the chain rig is `kbf-front/tests/support/chain.rs` (real caches behind real
+storage services over mutual TLS, killable and restartable), the tests are
+`ram_ack_chain.rs` (T1, T2, T3 data, T4, T5, T6, T7, T8, T9 and the unconfirmed gauge),
+`ram_ack_ac.rs` (T3 with an action-cache commit), `ram_ack_cache.rs` (T10, the reasons,
+the late duplicate, the flush report) and `kbf-storage/src/replicate/tests/ram_ack.rs`
+(modes, header, dedup, confirmation). T11 and T12 are PR 4's (`rule2.rs`, the closure
+check and repair tests); this PR does not repeat them. The simulation cell has one server and
 cannot host a two-owner seeded sweep (not planned); a one-node point (acknowledged from
 RAM, crash, the client sees missing and re-uploads, no AC entry names it) is.
 

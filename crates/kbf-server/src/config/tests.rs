@@ -267,7 +267,7 @@ fn the_durable_wait_and_the_peer_grace_are_flags_and_the_wait_is_bounded() {
 #[test]
 fn the_ram_budget_and_its_stop_deadline_are_flags() {
     let defaults = Args::parse_from(["kbf-server"]);
-    assert_eq!(defaults.ram_ack_bytes(), 0, "off until the producer ships");
+    assert_eq!(defaults.ram_ack_bytes(), 0, "off by default");
     assert_eq!(defaults.ram_drain_deadline(), Duration::from_secs(30));
     let set = Args::parse_from([
         "kbf-server",

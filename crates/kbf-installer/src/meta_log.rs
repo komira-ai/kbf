@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use kbf_host::HostPath;
 
 use crate::CommitId;
-use crate::helper::host_mode;
+use crate::host_mode;
 use crate::layout::Layout;
 
 /// The copy's directory, inside the release it belongs to.

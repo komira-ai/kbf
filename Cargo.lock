@@ -1721,6 +1721,23 @@ name = "kbf-estimator"
 version = "0.1.0"
 
 [[package]]
+name = "kbf-estimator-replay"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-caps",
+ "kbf-estimator",
+ "kbf-sched",
+ "kbf-server",
+ "kbf-testkit",
+ "kbf-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "kbf-front"
 version = "0.1.0"
 dependencies = [
@@ -1741,12 +1758,14 @@ dependencies = [
  "kbf-segments",
  "kbf-storage",
  "kbf-store",
+ "kbf-testkit",
  "kbf-tier",
  "kbf-tls",
  "kbf-types",
  "prost",
  "prost-types",
  "protox",
+ "rcgen",
  "serde_json",
  "thiserror",
  "tokio",
@@ -2322,7 +2341,6 @@ dependencies = [
  "hex",
  "http-body",
  "http-body-util",
- "hyper",
  "hyper-util",
  "kbf-auth",
  "kbf-ca",
@@ -2364,8 +2382,6 @@ dependencies = [
  "prost-types",
  "rcgen",
  "rustix",
- "rustls",
- "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2373,7 +2389,6 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
- "tokio-rustls",
  "tonic",
  "tonic-prost",
  "tower-layer",

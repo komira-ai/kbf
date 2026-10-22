@@ -17,7 +17,9 @@
 //! ([`Owners::for_digest`] for a read, the writer for an upload and a status query) and
 //! tells the node the generation it routed by, but holds no blob to check and does not
 //! run a call again on `STALE_MAP`. Without a map, or with a one-member map, the nodes are
-//! the fixed list `--storage` names.
+//! the fixed list `--storage` names. A raw Read or Write that no node of its blob can answer
+//! is held and tried again for the bound [`Owners::with_hold`] sets, as the router holds
+//! the whole-blob calls (`bytestream` has the rules).
 //!
 //! **Authorization** is the cache's (`kbf_auth::Authorizers`): the tonic services ask it
 //! as the cache's services do, and the raw path asks the same authorizer, of the

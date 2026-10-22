@@ -19,9 +19,6 @@
 //!   nodes' sessions, built from the desired release and what the store holds, the platform's
 //!   version facts ([`facts`]) included. A platform without them is held and never offered.
 //!
-//! - The poller, [`poll`]: on the active frontend, proposes the newest GitHub release of a `v*`
-//!   tag as an `update/proposed/<commit>` row. It never writes `update/desired`.
-//!
 //! The frontend mounts the routers on its operator API and the service on its worker
 //! listener where it starts. Trust is the host's: the store neither opens a tarball nor
 //! checks an attestation.
@@ -33,7 +30,6 @@ pub mod grpc;
 pub mod http;
 pub mod key;
 pub mod offers;
-pub mod poll;
 pub mod store;
 pub mod target_seq;
 

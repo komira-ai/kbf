@@ -15,17 +15,16 @@
 //! controller fills them from the same heartbeat look it reads the members from.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
 
-use kbf_map::{MemberId, MemberState};
+use kbf_map::MemberId;
 use kbf_types::{FarmTime, WorkerId};
 use serde::{Deserialize, Serialize};
 
 use super::command::Command;
-use super::gate::{GateFail, GateMode, storage_gate};
 use super::node_step::HostPhase;
 use super::policy::Policy;
 use super::slot::{Slot, SlotClass};
+use crate::storage_gate::{GateFail, GateMode, MemberFacts, storage_gate};
 use crate::update_status::ReleaseSource;
 
 /// A release, by whatever the controller compares: a commit or a software-set digest.
@@ -272,38 +271,6 @@ impl HostRecord {
     #[must_use]
     pub fn entry_commands(&self) -> Vec<Command> {
         self.phase.entry_commands(self.order)
-    }
-}
-
-/// What a host's storage half is, as `Members` holds it. One per storage member.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MemberFacts {
-    /// The member's id.
-    pub id: MemberId,
-    /// Its state in the map.
-    pub state: MemberState,
-    /// Whether the `down/<id>` mark of a planned restart exists. Read as a flag of its
-    /// own, because the map can lag the mark: a member can still read `Active` after the
-    /// mark was written (section 2.6, step 4).
-    pub planned_down: bool,
-    /// When the controller last heard it (a heartbeat); `None` if never or unknown.
-    pub heard_at: Option<FarmTime>,
-    /// The blobs it owes copies of (its repair journal); `None` if it does not report.
-    pub repair_debt: Option<u64>,
-    /// When the planned-down mark was written; `None` if there is no mark.
-    pub down_since: Option<FarmTime>,
-    /// Its boot counter as it registered (larger with every process start); `None` if it
-    /// does not report one.
-    pub boot: Option<u64>,
-}
-
-impl MemberFacts {
-    /// Whether it was heard within `ttl` of `now`. A time in the future is not: it would
-    /// make a row look fresh by a clock that is wrong.
-    #[must_use]
-    pub fn is_fresh(&self, now: FarmTime, ttl: Duration) -> bool {
-        self.heard_at
-            .is_some_and(|heard| heard <= now && now.saturating_duration_since(heard) <= ttl)
     }
 }
 
@@ -604,6 +571,6 @@ impl<'a> Observations<'a> {
             return Ok(());
         }
         let own = self.host.member.ok_or(GateFail::Unlinked)?;
-        storage_gate(self.facts, own, mode, policy, now)
+        storage_gate(&self.facts.members, own, mode, policy.ttl, now)
     }
 }

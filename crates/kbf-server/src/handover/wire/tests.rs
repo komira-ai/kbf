@@ -14,6 +14,7 @@ fn hello(instance: Option<Instance>, reapi: &str, state: PathBuf) -> Message {
         instance,
         reapi: addr(reapi),
         state,
+        enroll: None,
     }
 }
 
@@ -32,6 +33,13 @@ fn every_message_is_one_line_that_parses_back() {
         ),
         hello(Some(Instance::A), "[::1]:3000", odd),
         hello(Some(Instance::B), "127.0.0.1:3010", PathBuf::from("/s")),
+        Message::Hello {
+            version: PROTOCOL,
+            instance: Some(Instance::B),
+            reapi: addr("127.0.0.1:3010"),
+            state: PathBuf::from("/s"),
+            enroll: Some("enroll-listen 127.0.0.1:3002\nca-dir /a b\n\u{e9}".to_owned()),
+        },
         Message::Offer { generation: 7 },
         Message::Offer { generation: 0 },
         Message::Serving,
@@ -68,12 +76,13 @@ fn a_line_that_is_not_a_message_is_none() {
         "",
         "launch",
         "hello",
-        "hello x a 127.0.0.1:1 00",
-        "hello 2 c 127.0.0.1:1 00",
-        "hello 2 a 127.0.0.1 00",
-        "hello 2 a nowhere 00",
-        "hello 2 a 127.0.0.1:1",
-        "hello 2 a 127.0.0.1:1 zz",
+        "hello x a 127.0.0.1:1 00 -",
+        "hello 3 c 127.0.0.1:1 00 -",
+        "hello 3 a 127.0.0.1 00 -",
+        "hello 3 a nowhere 00 -",
+        "hello 3 a 127.0.0.1:1 00",
+        "hello 3 a 127.0.0.1:1 00 zz",
+        "hello 3 a 127.0.0.1:1 zz -",
         "offer",
         "offer seven",
     ] {
@@ -118,4 +127,23 @@ async fn a_link_carries_lines_and_says_how_a_read_ended() {
 
     let io = WireError::from(io::Error::other("broken"));
     assert_eq!(io.to_string(), "control socket: broken");
+}
+
+/// Catches: a hello of another protocol version (protocol 2 has five fields, not six)
+/// parsing to nothing, so the holder drops the connection instead of refusing by name.
+/// Mutant: all six fields required before the version is read.
+#[test]
+fn a_hello_of_another_protocol_parses_to_its_version_alone() {
+    for line in [
+        "hello 2 a 127.0.0.1:1 00",
+        "hello 1",
+        "hello 4 whatever fields follow",
+    ] {
+        let version = match Message::parse(line) {
+            Some(Message::Hello { version, .. }) => version,
+            other => panic!("{line:?} parsed to {other:?}"),
+        };
+        assert_ne!(version, PROTOCOL, "{line:?}");
+    }
+    assert_eq!(Message::parse("hello x"), None);
 }

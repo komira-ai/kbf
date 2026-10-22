@@ -39,6 +39,27 @@ jobs:
       - name: Cross-slot reach of a pool action, sandboxed and not (root, real users)
         run: cargo xtask sudo-test -p kbf-driver-native --test slot_reach -- --test-threads=1 --nocapture
 
+  # The usage a native lease reports on a Mac (crates/kbf-driver-native/src/usage.rs): a lease that
+  # holds 208 MiB and burns CPU for 1.5 s, as the daemon's user (the process-tree path) and as a pool
+  # user (the uid path, root). The `USAGE` lines carry the measured peak, CPU and wall time. Also run
+  # by beta.yml's native-macos job after a push to main; here by hand on a branch first.
+  native-usage:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: Usage of a lease run as a process tree
+        run: cargo test -p kbf-driver-native --test tree --locked -- usage --nocapture
+      - name: Usage of a lease run as a pool user (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slots -- usage --test-threads=1 --nocapture
+
   pool-spike:
     runs-on: macos-latest
     timeout-minutes: 45

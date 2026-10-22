@@ -28,6 +28,8 @@ kbf-tls.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
 rustls.workspace = true
 serde.workspace = true
+# Reads the child's `role` answer (`held_generation`, the term of its operation names).
+serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
@@ -39,7 +41,6 @@ tracing.workspace = true
 [dev-dependencies]
 kbf-oidc = { workspace = true, features = ["testkit"] }
 rcgen.workspace = true
-serde_json.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "test-util"] }
 # A test that runs a `tracing` macro installs a subscriber, so the macro's fields count as run.
 tracing-subscriber.workspace = true

@@ -96,7 +96,6 @@ fn start(releases: Option<Arc<ReleaseStore>>, dir: &Dir) -> Running {
         token: Some(ApiToken::from_file(&path).expect("a usable token")),
         local_cache: None,
         releases,
-        poll: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),

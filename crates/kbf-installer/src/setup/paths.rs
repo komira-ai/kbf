@@ -2,7 +2,7 @@
 //! section 3). These are the paths of files `setup` itself writes or reads; the installer's
 //! tree (releases, links, state, `orders/`) is `layout.rs`'s, the one source of those.
 
-use crate::layout::Platform;
+use crate::layout::{FRONTEND_CONFIG, Platform};
 
 /// kbf's configuration directory (root:root 0755): `/etc/kbf`, `/usr/local/etc/kbf` on a Mac.
 pub fn etc_dir(platform: Platform) -> &'static str {
@@ -11,6 +11,10 @@ pub fn etc_dir(platform: Platform) -> &'static str {
 /// kbf's runtime config: mode, the frontend URL, the enrollment token's path.
 pub fn kbf_toml(platform: Platform) -> &'static str {
     platform.kbf_toml()
+}
+/// The frontend child's `kbf.toml` on an all-in-one host, where `kbf.toml` is the sibling's.
+pub fn frontend_toml(platform: Platform) -> String {
+    format!("{}/{FRONTEND_CONFIG}", platform.config_dir())
 }
 /// The installer's settings; `setup` is its only writer.
 pub fn installer_toml(platform: Platform) -> &'static str {
