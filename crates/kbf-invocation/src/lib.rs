@@ -49,6 +49,6 @@ pub use record::{
 };
 pub use records::{Ended, EndedKind, Records};
 pub use run::{
-    ActionShape, Durations, MemoryKillKind, NumaBytes, Phase, ReapiTimes, Run, RunUsage, Target,
-    TargetKind,
+    ActionShape, Durations, FootprintUsage, MemoryKillKind, NumaBytes, Phase, ReapiTimes, Run,
+    RunUsage, Target, TargetKind, UsageBasis,
 };

@@ -273,6 +273,20 @@ pub trait Storage: Send + Sync {
         action: Digest,
         record: ActionRecord,
     ) -> Answer<'_, ()>;
+
+    /// Whether this node acknowledges a write from RAM (`--ram-ack-bytes` over 0): the
+    /// primary of a chain then asks its replica for a held answer and commits
+    /// [`CommitMode::Held`]. The default is no: a storage that holds nothing in RAM.
+    fn ram_ack(&self) -> bool {
+        false
+    }
+
+    /// Says how many blobs the peer confirmer keeps in its unconfirmed set now
+    /// (`kbf_storage_ram_unconfirmed_blobs`). The default drops it: a storage that holds
+    /// nothing in RAM has no gauge.
+    fn unconfirmed(&self, blobs: usize) {
+        let _ = blobs;
+    }
 }
 
 /// One blob being written as its bytes arrive ([`Storage::stream`]). Dropped before it
@@ -303,15 +317,33 @@ pub enum CommitMode {
     /// Answer once the blob is durable on this node's disk and present in its index.
     #[default]
     Durable,
-    /// Answer once the node holds the blob in memory, before its disk has it. No
-    /// implementation does that yet: every one commits as [`CommitMode::Durable`].
+    /// Answer once the node holds the blob in memory, before its disk has it: the blob is
+    /// registered in the node's held set and written to the disk afterwards. A store that
+    /// cannot hold it (the blob is over the pool's buffered size, the budget is full or
+    /// off, the pool's queue is full) commits it as [`CommitMode::Durable`] and counts why.
     Held,
+    /// Answer once the blob is durable, because the write is one that is not acknowledged
+    /// from RAM, for the reason given: the store counts it
+    /// (`kbf_storage_ram_writethrough_total{reason}`) when it acknowledges from RAM at all.
+    Through(Through),
+}
+
+/// Why a write the storage layer decided to commit durably is not acknowledged from RAM.
+/// The reasons only the store can see (a blob too large to buffer, a full budget or queue)
+/// it counts itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Through {
+    /// The replica could not be reached; a repair debt was journaled first.
+    ReplicaLost,
+    /// The blob has one owner: R = 1, or a copy outside the chain.
+    SingleOwner,
 }
 
 /// A streamed blob whose bytes are written and checked, not yet committed.
 pub trait StreamedPut: Send {
-    /// Makes the blob present, as `mode` asks: present once this answers. Every
-    /// implementation commits as [`CommitMode::Durable`] whatever `mode` is.
+    /// Makes the blob present, as `mode` asks: present once this answers. A store that
+    /// does not hold blobs in memory commits as [`CommitMode::Durable`] whatever `mode`
+    /// is.
     ///
     /// # Errors
     /// The store's sync or its index commit failed.

@@ -67,33 +67,29 @@ fn the_real_release_workflow_meets_every_rule() {
 }
 
 #[test]
-fn only_a_dispatch_starts_the_workflow_until_the_push_is_added_alone() {
-    // Catches: a release started by a push, a pull request, a schedule or a tag before the
-    // change that adds the push trigger (and nothing else) lands; a dispatch that takes an
-    // input a person could point at another commit with. Mutants: a push to main added; a
-    // `pull_request`; a schedule; a tag push; the dispatch dropped; an input added.
-    let on = "on:\n  workflow_dispatch:\n";
+fn only_a_push_to_main_and_a_dispatch_start_the_workflow() {
+    // Catches: a release started by a pull request, a schedule, a tag or a push of another
+    // branch; a dispatch dropped; a dispatch that takes an input a person could point at
+    // another commit with. Mutants: the push dropped; a `pull_request`; a schedule; a tag push;
+    // an unfiltered push; the dispatch dropped; an input added.
+    let on = "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n";
+    red(
+        &plant_top(on, "on:\n  workflow_dispatch:\n"),
+        "does not run on `push`",
+    );
     red(
         &plant_top(
             on,
-            "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n",
+            "on:\n  pull_request:\n  push:\n    branches: [main]\n  workflow_dispatch:\n",
         ),
-        "runs on `push`, not only",
-    );
-    red(
-        &plant_top(on, "on:\n  pull_request:\n  workflow_dispatch:\n"),
         "runs on `pull_request`",
     );
     red(
         &plant_top(
             on,
-            "on:\n  schedule:\n    - cron: '0 0 * * *'\n  workflow_dispatch:\n",
+            "on:\n  schedule:\n    - cron: '0 0 * * *'\n  push:\n    branches: [main]\n  workflow_dispatch:\n",
         ),
         "runs on `schedule`",
-    );
-    red(
-        &plant_top(on, "on:\n  push:\n    tags: ['v*']\n  workflow_dispatch:\n"),
-        "runs on `push`",
     );
     red(
         &plant_top(on, "on:\n  push:\n    tags: ['v*']\n  workflow_dispatch:\n"),
@@ -104,27 +100,53 @@ fn only_a_dispatch_starts_the_workflow_until_the_push_is_added_alone() {
         "not exactly `branches: [main]`",
     );
     red(
-        &plant_top(on, "on:\n  workflow_call:\n"),
+        &plant_top(on, "on:\n  push:\n    branches: [main]\n"),
         "has no `workflow_dispatch:` entry",
     );
     red(
         &plant_top(
             on,
-            "on:\n  workflow_dispatch:\n    inputs:\n      commit:\n        required: true\n        type: string\n",
+            "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      commit:\n        required: true\n        type: string\n",
         ),
         "declares inputs",
     );
 }
 
 #[test]
-fn the_names_gamma_follows_are_pinned() {
-    // Catches: a rename that silently stops every deploy to gamma (`workflows: [release]`
-    // matches by name; `gamma evidence` reads the job `publish`). Mutants: the workflow
-    // renamed; the job renamed; a job added or dropped; two jobs swapped.
-    red(
-        &plant_top("name: release\n", "name: releases\n"),
-        "is not named `release`",
+fn a_push_trigger_needs_the_whole_chain_of_jobs() {
+    // Catches: the push trigger present while a gate of the chain is missing, so a push to
+    // main would tag or publish without it. Mutants: each of gates, plan, verify, tag, publish
+    // and bump renamed away in turn (each must name the missing job, as the push is present).
+    // `triggers` is read alone: the later rules stop at a missing job with an error, and the
+    // chain rule must stand on its own when they do not.
+    // The list itself is pinned here, not read back from `CHAIN`: shrinking `CHAIN` must not
+    // shrink this test with it.
+    assert_eq!(
+        CHAIN,
+        ["gates", "plan", "verify", "tag", "publish", "bump"],
+        "the jobs a push needs"
     );
+    let text = real();
+    let mut control = Vec::new();
+    triggers(&text, &mut control).expect("triggers read");
+    assert!(control.is_empty(), "{control:?}");
+    for job in CHAIN {
+        let from = format!("\n  {job}:\n");
+        assert_eq!(text.matches(&from).count(), 1, "`{job}` is not unique");
+        let mut found = Vec::new();
+        triggers(
+            &text.replace(&from, &format!("\n  {job}-gone:\n")),
+            &mut found,
+        )
+        .expect("triggers read");
+        red(&found, &format!("runs on `push` but has no job `{job}`"));
+    }
+}
+
+#[test]
+fn the_job_list_is_pinned() {
+    // Catches: the chain changed without its rule. Mutants: the job `publish` renamed; a job
+    // renamed; a job added.
     red(
         &plant_top("  publish:\n", "  publish-release:\n"),
         "no job `publish`",

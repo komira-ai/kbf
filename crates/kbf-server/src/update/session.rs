@@ -69,7 +69,6 @@ use kbf_proto::update::update_status::State;
 use kbf_types::{FarmTime, WorkerId};
 
 use super::command::{Alert, Severity};
-use super::facts::MemberFacts;
 use super::facts::{
     AvailableFact, DaemonLoad, HelperReport, HelperStatus, HostFacts, HostKind, HostRecord,
     OrderId, Platform, PlatformClass, Release, Source, Work,
@@ -77,7 +76,8 @@ use super::facts::{
 use super::ports::{FactsSource, FarmView, SourceError, Transport, TransportError};
 use super::rows::Rows;
 use crate::farm::{Farm, NodeAction, NodeLook};
-use crate::members::{MemberLook, Members, MembersLook, MembershipError};
+use crate::members::{Members, MembersLook, MembershipError};
+use crate::storage_gate::{Link, advertised, link, member_facts};
 use crate::storage_health::{Class, NotIdle};
 use crate::update_status::{ReleaseSource, UpdateReport};
 
@@ -387,104 +387,6 @@ pub struct FarmFacts {
     not_idle: BTreeMap<WorkerId, NotIdle>,
 }
 
-/// How a Linux host stands to the storage members.
-enum Link<'a> {
-    /// The registry knows the node and it advertises no address: no storage half.
-    NoStorage,
-    /// Its advertised address is the one `member` registered.
-    Member(&'a MemberLook),
-    /// No member is its own; the text says why.
-    Unlinked(String),
-}
-
-/// The member whose registered address is the address `host` advertised when it enrolled
-/// (`adverts`: node id to address), both read through [`kbf_enroll_registry::canonical_addr`],
-/// the one spelling enrollment stores and a member registers. No prefix, no port guessing: an
-/// address that is not a member's links nothing.
-fn link<'a>(
-    host: &WorkerId,
-    adverts: &BTreeMap<String, String>,
-    members: &'a MembersLook,
-) -> Link<'a> {
-    let Some(advertised) = adverts.get(host.as_str()) else {
-        return Link::Unlinked(format!(
-            "{host} is not in the enrollment registry, so its storage address is not known"
-        ));
-    };
-    if advertised.is_empty() {
-        return Link::NoStorage;
-    }
-    let advertised = &kbf_enroll_registry::canonical_addr(advertised);
-    let mut matching = members
-        .members
-        .iter()
-        .filter(|m| kbf_enroll_registry::canonical_addr(&m.addr) == *advertised);
-    match (matching.next(), matching.next()) {
-        (Some(only), None) => Link::Member(only),
-        (None, _) => Link::Unlinked(format!(
-            "{host} advertises {advertised}, which no storage member registered"
-        )),
-        (Some(_), Some(_)) => Link::Unlinked(format!(
-            "{host} advertises {advertised}, which more than one storage member registered"
-        )),
-    }
-}
-
-/// The address each enrolled node advertised (node id to address; empty for a node with no
-/// storage role), from the enrollment registry in the store of `rows`.
-fn advertised(rows: &Rows) -> Result<BTreeMap<String, String>, String> {
-    let nodes = kbf_enroll_registry::list_nodes(&**rows.store())
-        .map_err(|e| format!("the enrollment registry could not be read: {e}"))?;
-    Ok(nodes
-        .into_iter()
-        .map(|node| (node.id.to_string(), node.advertise))
-        .collect())
-}
-
-/// The storage member that is the storage half of the host `host`, joined by the address it
-/// enrolled with as the controller joins it (see the module docs); `None` if it has no
-/// storage half.
-/// The operator API's safe-to-stop query asks it of a node id (`crate::api`).
-///
-/// # Errors
-/// Why the host cannot be told from a daemon-only host: the registry could not be read, does
-/// not know it, or its address is no member's or more than one member's.
-pub fn storage_half(
-    rows: &Rows,
-    host: &WorkerId,
-    members: &MembersLook,
-) -> Result<Option<MemberLook>, String> {
-    match link(host, &advertised(rows)?, members) {
-        Link::NoStorage => Ok(None),
-        Link::Member(member) => Ok(Some(member.clone())),
-        Link::Unlinked(why) => Err(why),
-    }
-}
-
-/// `now` less `ago`.
-fn before(now: FarmTime, ago: std::time::Duration) -> FarmTime {
-    let ms = u64::try_from(ago.as_millis()).unwrap_or(u64::MAX);
-    FarmTime::from_millis(now.as_millis().saturating_sub(ms))
-}
-
-/// The members of `look` as the gate reads them, ages taken from `now`. The operator API's
-/// safe-to-stop query reads them the same way (`crate::api`).
-#[must_use]
-pub fn member_facts(look: &MembersLook, now: FarmTime) -> Vec<MemberFacts> {
-    look.members
-        .iter()
-        .map(|m| MemberFacts {
-            id: m.id,
-            state: m.state,
-            planned_down: m.planned_down,
-            heard_at: m.heard_ago.map(|ago| before(now, ago)),
-            repair_debt: m.repair_debt,
-            down_since: m.marked_ago.map(|ago| before(now, ago)),
-            boot: (m.boot > 0).then_some(m.boot),
-        })
-        .collect()
-}
-
 /// The release a host runs, given the one desired: its own commit, which the desired one
 /// stands for when it begins with it. A running commit that is not 12 lowercase hex digits
 /// (`unknown`, or any text a host chose: the report keeps its bytes as data) names no
@@ -701,7 +603,7 @@ impl FactsSource for FarmFacts {
             .members
             .look()
             .map_err(|e| SourceError(format!("the members could not be read: {e}")))?;
-        let adverts = advertised(&self.rows).map_err(SourceError)?;
+        let adverts = advertised(&**self.rows.store()).map_err(SourceError)?;
         let mut unlinked = BTreeMap::new();
         let mut hosts = Vec::new();
         for look in looks {

@@ -4,12 +4,12 @@
 # again here, so a held script can pin a release asset, which outlives the run's 90-day
 # workflow artifacts.
 #
-# The run is started by hand (workflow_dispatch) and nothing else: no tag starts it (a tag the
-# release bot makes would start a second run, and a hand-pushed `v*` tag starts nothing, since
-# only the release bot may create one), and no push yet. The change that adds `push: branches:
-# [main]` to `on:` is a later, separate one, and the workflow lint
-# (crates/kbf-integration-test/tests/release_workflow) pins the events until then. The jobs that
-# write run only for a push to main, so a dispatch is a dry run through `verify`.
+# The run is started by every push to main and by hand (workflow_dispatch), and nothing else: no
+# tag starts it (a tag the release bot makes would start a second run, and a hand-pushed `v*`
+# tag starts nothing, since only the release bot may create one). The workflow lint
+# (crates/kbf-integration-test/tests/release_workflow) pins the events, and refuses `push`
+# unless every job of the chain below is present. The jobs that write run only for a push to
+# main, so a dispatch is a dry run through `verify`.
 #
 # gates    waits for the push runs of ci, beta and artifacts for this commit on main to have
 #          succeeded (cargo xtask release gates). Read-only.
@@ -31,8 +31,7 @@
 #          again), and the notes. Read-only.
 # publish  the one job that holds `contents: write`: the GitHub release with those files and
 #          those notes. A re-run adds the files the release lacks and replaces none. The job
-#          is named `publish` because gamma.yml looks for a job of that name in this
-#          workflow, named `release`.
+#          is named `publish`; the release lint pins the job list.
 # bump     opens the pull request in the internal repository that moves its submodule to the
 #          released commit, with a token of the release bot scoped to that repository.
 #
@@ -43,6 +42,8 @@
 name: release
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions: {}

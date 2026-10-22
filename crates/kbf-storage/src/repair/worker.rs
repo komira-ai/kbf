@@ -44,10 +44,11 @@ use kbf_map::{Member, MemberId, MemberState};
 use kbf_proto::google::bytestream::WriteRequest;
 use kbf_types::Digest;
 
-use super::{PeerConfirmer, RepairRecord, Repairs};
+use super::{Confirmed, PeerConfirmer, RepairRecord, Repairs};
 use crate::replicate::{Chain, Leg, View};
 use crate::service::RemoteStorage;
 use crate::{Storage, StorageError};
+use tokio::time::Instant;
 
 /// How the worker is paced.
 #[derive(Clone, Copy, Debug)]
@@ -82,6 +83,9 @@ impl Default for RepairConfig {
         }
     }
 }
+
+/// The most digests one confirmation pass asks this node's own store about.
+const UNCONFIRMED_BATCH: usize = 4096;
 
 /// What one pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -169,12 +173,32 @@ impl RepairWorker {
                         () = &mut stop => return,
                         _ = async {
                             self.pass().await;
-                            self.confirmer.confirm(tokio::time::Instant::now()).await;
+                            self.confirm_pass(tokio::time::Instant::now()).await;
                         } => {}
                     }
                 }
             }
         }
+    }
+
+    /// One confirmation pass at `now`: notes which of the blobs this node acknowledged from
+    /// RAM it has written to its own disk (an own durable question, for at most
+    /// [`UNCONFIRMED_BATCH`] a pass; their grace starts), then asks the other owners about
+    /// the ones whose grace is over ([`PeerConfirmer::confirm`]). Also tells the store how
+    /// many digests wait, for `kbf_storage_ram_unconfirmed_blobs`.
+    pub async fn confirm_pass(&self, now: Instant) -> Confirmed {
+        let waiting = self.confirmer.undrained(UNCONFIRMED_BATCH);
+        for batch in waiting.chunks(crate::service::MAX_FIND_MISSING_DIGESTS) {
+            // An own store that cannot answer leaves the batch for the next pass.
+            if let Ok(missing) = self.storage.find_durable(batch).await {
+                for digest in batch.iter().filter(|d| !missing.contains(d)) {
+                    self.confirmer.drained(digest, now);
+                }
+            }
+        }
+        let confirmed = self.confirmer.confirm(now).await;
+        self.storage.unconfirmed(self.confirmer.len());
+        confirmed
     }
 
     /// One pass over every debt.

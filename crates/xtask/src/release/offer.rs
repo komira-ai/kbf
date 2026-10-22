@@ -37,94 +37,14 @@ use kbf_gate::{
     judge, reversible, write_atomic,
 };
 
-use super::{ARTIFACTS_WORKFLOW, MAIN, verify};
+use super::attest_gh::{Attester, Gh};
+use super::identity_file::{identity_of, whole_field};
+use super::verify;
 use crate::Error;
 use crate::build_commit::not_full_commit;
 use crate::package::Platform;
 use crate::sums::{self, SUMS};
 use crate::version_facts::{self, Pairing};
-
-/// The workflow that is to attest the beta result (planned: the beta workflow signs
-/// nothing today, so [`Gh::beta`] refuses every result until it does).
-pub const BETA_WORKFLOW: &str = "beta.yml";
-
-/// The most a `kbf --version --json` file may hold.
-pub(super) const IDENTITY_CAP: u64 = 8192;
-
-/// The attestation checks, behind a seam so tests use recorded answers.
-pub trait Attester {
-    /// The artifacts of `commit` in `dir` carry the attestations of the artifacts workflow.
-    fn artifacts(&self, dir: &Path, commit: &str) -> Result<(), Error>;
-    /// The beta result file `result` is attested by the beta workflow for `commit`.
-    fn beta(&self, result: &Path, commit: &str) -> Result<(), Error>;
-}
-
-/// The attestations as the pinned `gh` verifies them.
-pub struct Gh<'a> {
-    /// The repository, `<owner>/<repo>`.
-    pub repo: &'a str,
-    /// A `trusted_root.jsonl`, as `verify-assets attestations` takes it.
-    pub trusted_root: Option<&'a Path>,
-    /// The `gh` program.
-    pub gh: &'a Path,
-    /// An empty directory for the verification's flipped copy.
-    pub scratch: &'a Path,
-}
-
-impl Attester for Gh<'_> {
-    fn artifacts(&self, dir: &Path, commit: &str) -> Result<(), Error> {
-        let workflow_ref = format!("{}/.github/workflows/{ARTIFACTS_WORKFLOW}", self.repo);
-        let source_ref = format!("refs/heads/{MAIN}");
-        let a = sums::Attestations {
-            repo: self.repo,
-            workflow_ref: &workflow_ref,
-            source_ref: &source_ref,
-            commit,
-            trusted_root: self.trusted_root,
-            gh: self.gh,
-            scratch: self.scratch,
-        };
-        sums::verify_attestations(dir, &a).map(drop)
-    }
-
-    fn beta(&self, result: &Path, commit: &str) -> Result<(), Error> {
-        // As strict as a host's check of a tarball: the result's own bundle beside it,
-        // offline with a trusted root, the issuer, the predicate type, the commit.
-        let signer = format!("{}/.github/workflows/{BETA_WORKFLOW}", self.repo);
-        let source_ref = format!("refs/heads/{MAIN}");
-        let a = sums::Attestations {
-            repo: self.repo,
-            workflow_ref: &signer,
-            source_ref: &source_ref,
-            commit,
-            trusted_root: self.trusted_root,
-            gh: self.gh,
-            scratch: self.scratch,
-        };
-        let name = result
-            .file_name()
-            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        let bundle = result.with_file_name(crate::bundles::name_of(&name));
-        let (verified, said) = a.bundle_run(result, &bundle, &signer, commit)?;
-        if !verified {
-            return Err(Error::Failed(format!(
-                "{} is not attested by {BETA_WORKFLOW} for {commit} (bundle {}): {said}",
-                result.display(),
-                bundle.display()
-            )));
-        }
-        // The control: the same result and bundle must not verify for another commit.
-        let other = crate::bundles::other_commit(commit);
-        if a.bundle_run(result, &bundle, &signer, &other)?.0 {
-            return Err(Error::Failed(format!(
-                "control failed: the beta bundle of {} verified for commit {other}, not the \
-                 commit it attests",
-                result.display()
-            )));
-        }
-        Ok(())
-    }
-}
 
 /// What the operator gives as the beta evidence.
 pub enum Evidence<'a> {
@@ -169,43 +89,6 @@ fn lines_of(e: Error) -> Vec<String> {
     match e {
         Error::Refused(lines) => lines,
         other => vec![other.to_string()],
-    }
-}
-
-/// The identity (`kbf --version --json`) the file `path` holds for the build of `commit`.
-/// A file that is not the build's identity is a problem, not an unknown.
-pub(super) fn identity_of(
-    path: &Path,
-    commit: &str,
-    flag: &str,
-) -> Result<serde_json::Value, String> {
-    let at = |e: &dyn std::fmt::Display| format!("{flag} {}: {e}", path.display());
-    let file = std::fs::File::open(path).map_err(|e| at(&e))?;
-    let mut text = String::new();
-    std::io::Read::read_to_string(&mut std::io::Read::take(file, IDENTITY_CAP + 1), &mut text)
-        .map_err(|e| at(&e))?;
-    if text.len() as u64 > IDENTITY_CAP {
-        return Err(at(&format!("over {IDENTITY_CAP} bytes")));
-    }
-    let value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| at(&format!("not JSON: {e}")))?;
-    let stamp = value["commit"].as_str();
-    let short = &commit[..12];
-    if stamp != Some(short) {
-        return Err(at(&format!("names commit {stamp:?}, not {short}")));
-    }
-    Ok(value)
-}
-
-/// The whole number the identity `value` states under `key`: `None` when it lacks the
-/// field (a build before it), an error when the field is not a whole number.
-pub(super) fn whole_field(value: &serde_json::Value, key: &str) -> Result<Option<u64>, String> {
-    match value.get(key) {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(v) => v
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| format!("{key} {v} is not a whole number")),
     }
 }
 

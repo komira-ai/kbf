@@ -13,9 +13,15 @@
 //! Every call says whether the node is still rebuilding its index ([`CatchUp`], the state
 //! its storage service reads): a node that registers while rebuilding enters the map as
 //! `CatchingUp`, and the first heartbeat after [`CatchUp::finish`] makes it `Active`.
+//!
+//! **What the node runs.** Every call also says the newest metadata-log version the node's
+//! build can raise its log to, the version the log is at now, and the commit the binary was
+//! built from ([`Joiner::with_log`], [`reported_commit`]). The frontend shows them in
+//! `GET /v1/members` and decides nothing on them (`members::NodeFacts`).
 
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use kbf_map::{Map, MemberId};
@@ -35,6 +41,7 @@ use crate::fill::FillState;
 use crate::members::{LastBoot, PROTOCOL};
 use crate::node_map::NodeMap;
 use crate::storage_health::{Debts, Writes};
+use crate::{BUILD_COMMIT, BUILD_COMMIT_FULL};
 
 /// The first wait after a failure.
 pub const RETRY_BASE: Duration = Duration::from_secs(1);
@@ -94,6 +101,19 @@ pub fn unit_random() -> f64 {
     unit
 }
 
+/// The commit a node reports as its build: the full commit ([`BUILD_COMMIT_FULL`]) when the
+/// build knows it, else the short one ([`BUILD_COMMIT`]), which is the text `unknown` when
+/// the build had no git checkout.
+#[must_use]
+pub fn reported_commit() -> &'static str {
+    commit_of(BUILD_COMMIT_FULL, BUILD_COMMIT)
+}
+
+/// `full`, or `short` when the build did not know the full commit (it is empty then).
+fn commit_of<'a>(full: &'a str, short: &'a str) -> &'a str {
+    if full.is_empty() { short } else { full }
+}
+
 /// A node's registration with one frontend.
 pub struct Joiner {
     client: MembershipClient<Channel>,
@@ -114,6 +134,9 @@ pub struct Joiner {
     announced: u64,
     /// What the heartbeats say of the node's flush and tail ([`crate::fill`]).
     fill: Arc<FillState>,
+    /// The newest machine version the node's build runs for its metadata log, and the
+    /// handle on the one the log is at ([`Joiner::with_log`]); `None`: it says neither.
+    log: Option<(u32, Arc<AtomicU32>)>,
 }
 
 impl Joiner {
@@ -135,6 +158,7 @@ impl Joiner {
             applied: Applied::unreported(),
             announced: 0,
             fill: FillState::new(),
+            log: None,
         }
     }
 
@@ -152,6 +176,25 @@ impl Joiner {
     pub fn with_last_boot(mut self, last: Option<LastBoot>) -> Self {
         self.last = last;
         self
+    }
+
+    /// The joiner of a node whose metadata log runs machine versions up to `runs` (its build's
+    /// [`crate::raft_log::RUNS`]) and is at the one `version` holds
+    /// ([`crate::RaftMetaLog::version_handle`]): the registration and every heartbeat say
+    /// both, the handle read at each call. Without it they say neither (the frontend reads
+    /// "cannot say", never 0). The node's `build_commit` is always said.
+    #[must_use]
+    pub fn with_log(mut self, runs: u32, version: Arc<AtomicU32>) -> Self {
+        self.log = Some((runs, version));
+        self
+    }
+
+    /// `(runs_log, log_version)` as the wire carries them now.
+    fn log_facts(&self) -> (Option<u32>, Option<u32>) {
+        let Some((runs, version)) = &self.log else {
+            return (None, None);
+        };
+        (Some(*runs), Some(version.load(Ordering::Relaxed)))
     }
 
     /// Draws the jitter of every wait from `unit` (a number in `[0, 1)`) instead of the
@@ -274,6 +317,7 @@ impl Joiner {
     /// # Errors
     /// The frontend's refusal, or the call failing.
     pub async fn register(&mut self) -> Result<Joined, Status> {
+        let (runs_log, log_version) = self.log_facts();
         let who = &self.identity;
         let answer = self
             .client
@@ -287,6 +331,9 @@ impl Joiner {
                 catching_up: self.catch_up.is_catching_up(),
                 last_member_id: self.last.map_or(0, |l| l.member),
                 last_boot: self.last.map_or(0, |l| l.boot),
+                runs_log,
+                log_version,
+                build_commit: Some(reported_commit().to_owned()),
             })
             .await?
             .into_inner();
@@ -319,6 +366,7 @@ impl Joiner {
         let (debts_known, repair_debts) = self.debts().await.to_wire();
         let (applied_objstore_generation, apply_status) = self.applied.for_beat(self.announced);
         let fill = self.fill.beat();
+        let (runs_log, log_version) = self.log_facts();
         let answer = self
             .client
             .heartbeat(fill.vitals.put_on(pb::HeartbeatRequest {
@@ -338,6 +386,9 @@ impl Joiner {
                 staged_bytes: fill.staged_bytes,
                 tail_epoch_done: fill.tail_epoch_done,
                 fill_fp: fill.fill_fp,
+                runs_log,
+                log_version,
+                build_commit: Some(reported_commit().to_owned()),
                 ..pb::HeartbeatRequest::default()
             }))
             .await?

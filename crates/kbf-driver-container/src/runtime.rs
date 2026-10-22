@@ -46,7 +46,7 @@ use prost_types::Timestamp;
 use tokio::sync::oneshot;
 
 use crate::cgroup::{LeaseCgroup, SwapKill, memory_max, presses_into_swap};
-use crate::cgroup_usage::{NUMA_EVERY, NumaSample, resource_usage};
+use crate::cgroup_usage::{CPU_PSI, NUMA_EVERY, NumaSample, Start, resource_usage};
 use crate::container::{
     CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, Dirs, Ended, LEASE_PREFIX,
 };
@@ -97,6 +97,9 @@ pub struct ContainerConfig {
     /// How often the lease cgroup's `memory.numa_stat` is read while the action runs
     /// (measurement only: nothing decides on it). Tests make it short.
     pub numa_every: Duration,
+    /// The file a lease's start reads the node's CPU pressure from (`/proc/pressure/cpu`;
+    /// tests point it at a file of their own).
+    pub cpu_pressure_file: PathBuf,
     /// The node's input cache, if it has one (`<--data-dir>/cache`). Without it, a lease's
     /// input files are its own copies, as before the cache.
     pub cache: Option<CacheUse>,
@@ -161,6 +164,7 @@ impl ContainerConfig {
             limits: ContainerLimits::DEFAULT,
             swap_kill: SwapKill::DEFAULT,
             numa_every: NUMA_EVERY,
+            cpu_pressure_file: PathBuf::from(CPU_PSI),
             cache: None,
             cpu: CpuPool::new(DEFAULT_CPU_THREADS),
             placer: None,
@@ -520,6 +524,8 @@ impl<C: Cas> ContainerRuntime<C> {
         // What the lease cgroup's NUMA split is while the action runs, and the usage
         // read at its end (`cgroup_usage`): `run` reads it too when the lease fails.
         lease.ran = Some(Instant::now());
+        lease.started_under =
+            Start::read(&self.config.cpu_pressure_file, work.resources.cpu_millis);
         lease.numa = NumaSample::counting(Arc::clone(&self.numa_samples));
         lease.created = true;
         self.engine
@@ -912,6 +918,9 @@ struct Lease {
     ran: Option<Instant>,
     /// The NUMA split sampled while the action ran.
     numa: NumaSample,
+    /// The node's CPU pressure and the CPU booked, when the container was about to be
+    /// created.
+    started_under: Start,
 }
 
 impl Lease {
@@ -939,6 +948,7 @@ impl Lease {
             armed: true,
             ran: None,
             numa: NumaSample::default(),
+            started_under: Start::default(),
         }
     }
 
@@ -948,7 +958,7 @@ impl Lease {
     fn usage(&mut self) -> Option<ResourceUsage> {
         let ran = self.ran?;
         let cgroup = std::mem::take(&mut self.numa).finish(self.cgroup.dir());
-        Some(resource_usage(cgroup, ran.elapsed()))
+        Some(resource_usage(cgroup, ran.elapsed(), self.started_under))
     }
 
     /// Steps 5 and 6, off the async threads.

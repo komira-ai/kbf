@@ -17,6 +17,7 @@ use kbf_daemon::tree::{
 use kbf_daemon::{DriverReport, Runtime, RuntimeError, Work, upload_within};
 use kbf_outputs::OutputsError;
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata};
+use kbf_proto::worker::ResourceUsage;
 use kbf_types::LeaseId;
 use prost_types::Timestamp;
 use tokio::process::Child;
@@ -32,6 +33,7 @@ use crate::program::{Refused, Resolved, resolve};
 use crate::record::{Exec, KeeperFor, Spawned};
 use crate::simulator::{self, Made, Simctl, Waited};
 use crate::slots::Runner;
+use crate::usage::{self, Meter};
 use crate::user_folders::UserFolders;
 use crate::xcode;
 
@@ -52,6 +54,10 @@ pub const WARM_UP_DIR: &str = "lease-warm-up";
 /// [`WARM_UP_DIR`]. Surveys run one after another, so they share it.
 pub const SURVEY_DIR: &str = "lease-survey";
 
+/// Most results of failed leases kept for [`Runtime::failed_usage`] at once: the daemon
+/// takes each at once, so more than a few means it never will.
+const MAX_FAILED: usize = 256;
+
 /// How long a spawn retries a program file that is still open for writing.
 const BUSY_WAIT: Duration = Duration::from_secs(2);
 /// The pause between two rounds of SIGKILL while ending an action's processes.
@@ -66,6 +72,9 @@ pub struct NativeRuntime<C> {
     config: NativeConfig,
     cas: Arc<C>,
     stops: Mutex<BTreeMap<LeaseId, oneshot::Sender<Stop>>>,
+    /// What leases that ended without a result measured, until the daemon takes it
+    /// ([`Runtime::failed_usage`]); at most [`MAX_FAILED`], the oldest lease dropped first.
+    failed: Mutex<BTreeMap<LeaseId, ResourceUsage>>,
     /// The Xcodes an action may name: `config.xcodes` at first, then the ready ones of
     /// each survey ([`NativeRuntime::apply_xcodes`]).
     xcodes: RwLock<BTreeMap<String, PathBuf>>,
@@ -217,6 +226,7 @@ impl<C: Cas> NativeRuntime<C> {
             config,
             cas,
             stops: Mutex::new(BTreeMap::new()),
+            failed: Mutex::new(BTreeMap::new()),
             rules,
             warm_up: Mutex::new(None),
             #[cfg(target_os = "macos")]
@@ -356,6 +366,20 @@ impl<C: Cas> NativeRuntime<C> {
         self.xcodes.read().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn failed(&self) -> MutexGuard<'_, BTreeMap<LeaseId, ResourceUsage>> {
+        // Each update is one map operation, so the map is consistent after a panic.
+        self.failed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keeps `usage` for [`Runtime::failed_usage`] of `lease`.
+    fn keep_failed(&self, lease: LeaseId, usage: ResourceUsage) {
+        let mut failed = self.failed();
+        failed.insert(lease, usage);
+        while failed.len() > MAX_FAILED {
+            failed.pop_first();
+        }
+    }
+
     fn stops(&self) -> MutexGuard<'_, BTreeMap<LeaseId, oneshot::Sender<Stop>>> {
         // Each update is one map operation, so the map is consistent after a panic.
         self.stops.lock().unwrap_or_else(PoisonError::into_inner)
@@ -492,6 +516,7 @@ impl<C: Cas> NativeRuntime<C> {
         runner: &Runner,
         stop: &mut oneshot::Receiver<Stop>,
         killer: &mut Option<Stop>,
+        measured: &mut Option<ResourceUsage>,
     ) -> Result<i32, RuntimeError> {
         let stdout_path = dir.join("stdout");
         let stderr_path = dir.join("stderr");
@@ -566,7 +591,10 @@ impl<C: Cas> NativeRuntime<C> {
                 }
             }
         };
+        // One more read before the processes are ended: what ran since the last poll.
+        let _ = watch.measure().await;
         watch.end(&mut child, self.config.kill_wait).await?;
+        *measured = watch.usage(started.elapsed());
         let did_fail = match &ended {
             Ended::Exited(status) => status.as_ref().is_ok_and(|s| !s.success()),
             Ended::TimedOut => true,
@@ -676,6 +704,7 @@ impl<C: Cas> NativeRuntime<C> {
     }
 
     /// Every step but the clean.
+    #[allow(clippy::too_many_arguments)]
     async fn attempt(
         &self,
         work: &Work,
@@ -684,6 +713,7 @@ impl<C: Cas> NativeRuntime<C> {
         runner: &mut Runner,
         stop: &mut oneshot::Receiver<Stop>,
         killer: &mut Option<Stop>,
+        measured: &mut Option<ResourceUsage>,
     ) -> Result<ActionResult, RuntimeError> {
         let mut clock = ExecutedActionMetadata {
             worker_start_timestamp: now(),
@@ -733,7 +763,9 @@ impl<C: Cas> NativeRuntime<C> {
         clock.execution_start_timestamp = now();
         let exit_code = match &prepared.refused {
             Some(refused) => refuse(dir, refused).await?,
-            None => (self.execute(&cas, work, dir, &prepared, runner, stop, killer)).await?,
+            None => {
+                (self.execute(&cas, work, dir, &prepared, runner, stop, killer, measured)).await?
+            }
         };
         clock.execution_completed_timestamp = now();
 
@@ -776,6 +808,7 @@ impl<C: Cas> NativeRuntime<C> {
         upload_within(self.config.upload_deadline, upload).await?;
         clock.output_upload_completed_timestamp = now();
         clock.worker_completed_timestamp = now();
+        clock.auxiliary_metadata = measured.iter().map(ResourceUsage::to_any).collect();
         result.execution_metadata = Some(clock);
         Ok(result)
     }
@@ -801,6 +834,7 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
         };
         let mut killer = None;
         let mut runner = Runner::Daemon;
+        let mut measured = None;
         let outcome = (self.attempt(
             &work,
             &dir.path,
@@ -808,6 +842,7 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
             &mut runner,
             &mut stop,
             &mut killer,
+            &mut measured,
         ))
         .await;
         let cleaned = dir.clean().await;
@@ -817,6 +852,16 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
         if let Some(by) = killer.or_else(|| stop.try_recv().ok()) {
             let _ = by.send(());
         }
+        // A lease that ended without a result is told its usage by `failed_usage`; so is
+        // one whose clean failed, which turns its result into an error.
+        let told = match &outcome {
+            Ok(result) if cleaned.is_err() => ResourceUsage::in_result(result),
+            Ok(_) => None,
+            Err(_) => measured,
+        };
+        if let Some(usage) = told {
+            self.keep_failed(work.lease_id, usage);
+        }
         match (outcome, cleaned) {
             (Ok(_), Err(why)) => Err(RuntimeError::Failed(why)),
             (outcome, Err(why)) => {
@@ -825,6 +870,10 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
             }
             (outcome, Ok(())) => outcome,
         }
+    }
+
+    fn failed_usage(&self, lease_id: LeaseId) -> Option<ResourceUsage> {
+        self.failed().remove(&lease_id)
     }
 
     async fn kill(&self, lease_id: LeaseId) {
@@ -1010,6 +1059,16 @@ impl Watch {
         }
     }
 
+    /// What the watch read of the action's processes, as the lease's usage after `wall`
+    /// ([`usage::report`]).
+    fn usage(&self, wall: Duration) -> Option<ResourceUsage> {
+        match self {
+            Self::Tree(group) => usage::report(&group.meter, wall),
+            #[cfg(target_os = "macos")]
+            Self::Uid(uid) => usage::report(uid.meter(), wall),
+        }
+    }
+
     async fn end(&mut self, child: &mut Child, wait: Duration) -> Result<(), RuntimeError> {
         match self {
             Self::Tree(group) => group.end(child, wait).await,
@@ -1029,6 +1088,8 @@ fn lease_name(id: LeaseId) -> String {
 /// kills them all, blocking.
 struct Group {
     tracker: Arc<Mutex<Tracker>>,
+    /// What the polls read of the processes' lifetime counters ([`crate::usage`]).
+    meter: Arc<Mutex<Meter>>,
     record: PathBuf,
     /// How the process table is read: [`procs::snapshot`], but for tests.
     snapshot: Snapshot,
@@ -1047,6 +1108,7 @@ impl Group {
     fn reading(tracker: Tracker, record: PathBuf, snapshot: Snapshot) -> Self {
         Self {
             tracker: Arc::new(Mutex::new(tracker)),
+            meter: Arc::default(),
             record,
             snapshot,
             armed: true,
@@ -1068,11 +1130,10 @@ impl Group {
     /// The memory the action's processes hold together, in bytes.
     async fn measure(&self) -> Result<u64, RuntimeError> {
         let members = self.members().await?;
+        let meter = Arc::clone(&self.meter);
         tokio::task::spawn_blocking(move || {
-            members
-                .iter()
-                .filter_map(|p| procs::footprint(p.pid))
-                .fold(0_u64, u64::saturating_add)
+            let mut meter = meter.lock().unwrap_or_else(PoisonError::into_inner);
+            meter.poll(members.iter().map(|p| p.pid), procs::rusage)
         })
         .await
         .map_err(std::io::Error::other)
@@ -1483,6 +1544,40 @@ mod tests {
         let want = "macOS only";
         assert!(refused.to_string().contains(want), "{refused}");
         assert!(!scratch.exists(), "a scratch root made before the refusal");
+    }
+
+    /// Catches: a failed lease's usage lost (the daemon asks once, after `run` failed),
+    /// handed out twice (a second lease with the same id would report the first's),
+    /// kept for a lease that succeeded, or kept without bound. Mutants seen red: `remove`
+    /// replaced by `get().cloned()` (taken twice); the bound removed (300 kept);
+    /// `pop_first` replaced by `pop_last` (the newest lease's usage dropped).
+    #[test]
+    fn a_failed_leases_usage_is_taken_once_and_the_map_is_bounded() {
+        let scratch = crate::unit_dir("runtime-failed-usage");
+        let runtime = NativeRuntime::new(NativeConfig::new(scratch.to_path_buf()), Arc::new(NoCas))
+            .expect("runtime");
+        let usage = |wall| ResourceUsage {
+            wall_micros: wall,
+            ..ResourceUsage::default()
+        };
+        assert_eq!(
+            runtime.failed_usage(LeaseId::new(1, 1)),
+            None,
+            "nothing kept"
+        );
+        runtime.keep_failed(LeaseId::new(1, 1), usage(11));
+        assert_eq!(runtime.failed_usage(LeaseId::new(1, 1)), Some(usage(11)));
+        assert_eq!(runtime.failed_usage(LeaseId::new(1, 1)), None, "taken once");
+        for seq in 1..=300 {
+            runtime.keep_failed(LeaseId::new(1, seq), usage(seq));
+        }
+        assert_eq!(runtime.failed().len(), MAX_FAILED);
+        assert_eq!(
+            runtime.failed_usage(LeaseId::new(1, 44)),
+            None,
+            "the oldest went"
+        );
+        assert_eq!(runtime.failed_usage(LeaseId::new(1, 300)), Some(usage(300)));
     }
 
     /// Catches (issue #164): a survey that leaves the runtime selecting the Xcodes of

@@ -954,7 +954,7 @@ fn two_members_at_one_address_in_two_cases_link_nothing() {
 /// reaches the member side of that call: every row `register` writes is already canonical.
 ///
 /// Mutant seen red: `canonical_addr` removed from the member side of the comparison in
-/// `update/session.rs` `link` (`m.addr == *advertised`): the host stays unlinked, never marked.
+/// `storage_gate.rs` `link` (`m.addr == *advertised`): the host stays unlinked, never marked.
 #[test]
 fn a_host_is_linked_to_a_member_row_an_older_build_wrote_in_mixed_case() {
     let mut rig = rig();

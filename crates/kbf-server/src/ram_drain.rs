@@ -4,9 +4,10 @@
 //! flush of the blocks staged on its hot store to the cold store
 //! (`docs/design/storage-ram-ack.md`, "Drain and shutdown").
 //!
-//! With `--ram-ack-bytes` at 0 nothing is held: no task is started and a stop drains
-//! nothing from RAM. Nothing holds a blob in a running node yet either way. A stop still
-//! flushes what is staged on the hot store, with or without a budget.
+//! With `--ram-ack-bytes` at 0 nothing is held (the acknowledgement point holds no blob at
+//! 0): no task is started and a stop drains nothing from RAM, so the flag's default changes
+//! no behaviour. A stop still flushes what is staged on the hot store, with or without a
+//! budget.
 
 use std::future::Future;
 use std::sync::Arc;

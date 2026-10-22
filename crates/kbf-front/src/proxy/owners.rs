@@ -7,12 +7,17 @@
 //! rule, digest check and failover (a write goes on to the blob's next write owner when the
 //! first cannot be reached; [`Owners::writer_after`] is that for the raw upload). The list is the fallback while the map has fewer
 //! than two members yet ([`Routed::active`]).
+//!
+//! The raw ByteStream calls are held by the [`Hold`] of the owners ([`Owners::with_hold`]):
+//! the router holds the whole-blob calls itself, and this is the same wait for the calls
+//! that dial the nodes from here. Without one (the default) nothing is held.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use kbf_proto::reapi::ActionResult;
+use kbf_route::{Hold, Waiting};
 use kbf_storage::Storage as _;
 use kbf_storage::service::RemoteStorage;
 use kbf_types::Digest;
@@ -72,6 +77,8 @@ pub struct Owners {
     /// The nodes `--storage` names: every digest's, when there is no map to route by.
     nodes: Arc<RwLock<Arc<[Owner]>>>,
     routed: Option<Arc<Routed>>,
+    /// How long the raw ByteStream calls wait for a node of their blob.
+    hold: Hold,
 }
 
 impl Owners {
@@ -88,7 +95,30 @@ impl Owners {
         Self {
             nodes: Arc::new(RwLock::new(nodes.into())),
             routed: None,
+            hold: Hold::none(),
         }
+    }
+
+    /// The same nodes, with the raw ByteStream calls that no node of their blob could
+    /// answer held and tried again by `hold` (`kbf-route`'s backoff and bound), each try
+    /// against the placement as it is by then. A Read is held before its first byte, and a
+    /// Write while none of its bytes past the request's first frames has been passed on;
+    /// a QueryWriteStatus is not held. The frontend gives it [`kbf_route::DEFAULT_HOLD`].
+    #[must_use]
+    pub fn with_hold(mut self, hold: Hold) -> Self {
+        self.hold = hold;
+        self
+    }
+
+    /// The hold of the raw ByteStream calls.
+    #[must_use]
+    pub fn hold(&self) -> &Hold {
+        &self.hold
+    }
+
+    /// The start of one raw call's hold.
+    pub(super) fn waiting(&self) -> Waiting<'_> {
+        self.hold.begin()
     }
 
     /// The nodes the map `routed` names for a digest, once it has two members or more;
