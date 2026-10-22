@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -988,6 +989,29 @@ async fn a_down_primary_is_gone_around() {
 
     let read = read(&front, &[blobs[0].1]).await;
     assert_eq!(read, vec![(OK, blobs[0].0.clone())]);
+}
+
+/// Catches a frontend router that gives up on a restarting storage node at once: the only
+/// member is a closed port, and a write through a `Routed` that holds for 300 ms is tried
+/// again until the bound has passed, and is then UNAVAILABLE. Mutant: `Routed::with_hold`
+/// not passing the bound on to the router (the call fails at once).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_no_owner_answers_is_held_for_the_bound() {
+    let farm = Farm::new(None);
+    farm.set(1, &[MemberState::Active], 1);
+    farm.plain.take_down(1);
+    let bound = Duration::from_millis(300);
+    let routed = Routed::new(farm.cell.clone(), farm.plain.clone(), farm.plain.clone())
+        .with_hold(bound);
+    let started = Instant::now();
+
+    let error = routed
+        .router()
+        .put(Bytes::from_static(b"nobody home"))
+        .await
+        .expect_err("no owner answers");
+    assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
+    assert!(started.elapsed() >= bound);
 }
 
 /// Catches a CAS write failed for the whole member lease (15 s) by a writer that is dead but
