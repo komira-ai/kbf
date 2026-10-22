@@ -35,7 +35,7 @@ application), nobody logged in at the console for G5, and one APFS volume for th
 binaries and the work directory (`clonefile` does not cross volumes) with room for the
 base image and a few clones. G5 starts a helper as a throwaway user, so that user must be
 able to reach the binary and the work directory: keep both under a world-searchable path
-such as `/Users/Shared`, not under a home directory.
+such as `/usr/local`, not under a home directory.
 
 The base image is an `.ipsw` for a macOS release this Mac can run as a guest (Apple's
 restore image for the current release, or a file from an image catalog). `--sha256` is
@@ -45,8 +45,8 @@ file is copied into the new bundle directory while it is hashed, and the install
 sees that copy.
 
 ```sh
-D=/Users/Shared/kbf-vmm; sudo mkdir -p $D && sudo cp vmm/kbf-vmm vmm/kbf-guest $D/
-W=/Users/Shared/kbf-vmm-work; sudo mkdir -p $W
+D=/usr/local/kbf-vmm; sudo mkdir -p $D && sudo cp vmm/kbf-vmm vmm/kbf-guest $D/
+W=/usr/local/kbf-vmm-work; sudo mkdir -p $W
 sudo $D/kbf-vmm image base --ipsw <https-url-or-path> --sha256 <hex> --out $W/base --offline-setup | tee $W/image-base.json
 for g in g1 g2 g3 p0 p2 p6; do sudo $D/kbf-vmm probe $g --work-dir $W --guest-binary $D/kbf-guest | tee $W/$g.json; done
 sudo $D/kbf-vmm probe-bench --work-dir $W --guest-binary $D/kbf-guest --runs 20 | tee $W/bench.json

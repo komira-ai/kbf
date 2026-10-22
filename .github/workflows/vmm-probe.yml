@@ -73,9 +73,7 @@ jobs:
       - name: Tar kbf-guest
         run: tar -C "target/$TARGET/release" -czf "kbf-guest-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-guest
       - name: Sum the tarballs in the job summary
-        run: |
-          echo "These tarballs are unattested builds of $GITHUB_SHA made for a spike; they are not release artifacts." >> "$GITHUB_STEP_SUMMARY"
-          shasum -a 256 ./*.tar.gz >> "$GITHUB_STEP_SUMMARY"
+        run: shasum -a 256 ./*.tar.gz >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vmm-probe-darwin-arm64
