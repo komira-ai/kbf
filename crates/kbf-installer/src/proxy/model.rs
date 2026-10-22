@@ -375,6 +375,10 @@ pub struct Intent {
     pub source: Source,
     pub phase: Phase,
     pub phase_started: u64,
+    /// When the update began, in seconds since the epoch. Zero in a record an older build wrote
+    /// (the key is read as zero when it is missing).
+    #[serde(default)]
+    pub started_at: u64,
     pub bake_started: Option<u64>,
     /// Set by builds that posted the order for the nodes; no build sets it now. Read from an
     /// older `update.json`, and reported as the count of nodes updated.
@@ -410,6 +414,7 @@ impl Intent {
             source: plan.source,
             phase: Phase::Staged,
             phase_started: now,
+            started_at: now,
             bake_started: None,
             nodes_posted: false,
             old_slot: plan.old_slot,

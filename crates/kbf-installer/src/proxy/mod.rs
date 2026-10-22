@@ -22,10 +22,14 @@
 //!   --kbf-binary PATH` turns on (see [`assemble`]); without the flag nothing uses it;
 //! - [`binary_watch`], which polls the kbf at that path and starts the swap to a new one (the
 //!   trigger of a package upgrade, in place of the update API);
+//! - [`swap_status`], the read-only state of the swap that the update route answers with
+//!   `--kbf-binary` (`GET /v1/proxy/swap`: the host's package manager is what updates `kbf`, and
+//!   whatever drives that reads this to know the swap is over);
 //! - [`assemble`], what the verb builds to supervise the swap: with `--kbf-binary` the swap over
-//!   the copies, the binary watch and an update route that answers 410; without it the update
-//!   API (the one call into [`handover`]). [`kinds`] holds what the swap's supervisor deals in
-//!   (the update it is asked to start, its status and refusals), which the API names too.
+//!   the copies, the binary watch and an update route that answers 410 (and the swap's state);
+//!   without it the update API (the one call into [`handover`]). [`kinds`] holds what the swap's
+//!   supervisor deals in (the update it is asked to start, its status and refusals), which the
+//!   API names too.
 //!
 //! Child control over HTTP: [`child_http`] is the blocking loopback client that the real
 //! child control and the fleet read call a child's ports with (U8b); [`admin`] is the
@@ -161,6 +165,7 @@ pub mod runtime;
 pub mod supervisor;
 pub mod supervisor_swap;
 mod swap;
+pub mod swap_status;
 
 #[cfg(test)]
 mod admin_tests;

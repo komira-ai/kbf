@@ -65,11 +65,13 @@ fn config(name: &str) -> (HandoverConfig, OrderSpool, PathBuf) {
 /// The host as the verb reports it, over the rig's children, with `releases` as `releases/`.
 fn host_over(rig: &Arc<Rig>, releases: PathBuf, deaths: &Arc<Mutex<Vec<String>>>) -> Host {
     let by_slot = Arc::clone(rig);
+    let by_commit = Arc::clone(rig);
     let sink = Arc::clone(deaths);
     Host {
         gate: rig.clone(),
         child: rig.clone(),
         recorded: Arc::new(move |slot| by_slot.ident(slot)),
+        running: Arc::new(move |slot| by_commit.commit_of(slot)),
         active: Slot::A,
         held: None,
         releases_dir: releases,
@@ -213,6 +215,29 @@ fn start_blocked_names_no_migration_reason_and_still_names_a_busy_slot() {
     let why = handover.start_blocked().expect("blocked");
     assert!(why.contains("slot B is not idle"), "{why}");
     assert!(!why.contains("migrate"), "{why}");
+}
+
+/// Catches a snapshot that is built before the proxy is bound, or that does not reach the host's
+/// records: before the fill it is empty and nothing is built; after it the slot is the one the
+/// host reports as serving and the commit is the one the host's record names for that slot.
+///
+/// Mutants it catches: a snapshot that builds the supervisor before the fill; the host's
+/// `running` not handed on to the supervisor (the commit would be `None`).
+#[test]
+fn the_snapshot_is_empty_until_the_fill_and_then_reads_the_hosts_records() {
+    let (cfg, spool, root) = config("snapshot");
+    let handover = Handover::new(&cfg, spool);
+    assert_eq!(handover.snapshot(), Snapshot::default());
+    assert!(!built(&handover));
+    let rig = Rig::new(None);
+    let deaths = Arc::new(Mutex::new(Vec::new()));
+    cfg.gate.fill(host_over(&rig, root, &deaths));
+
+    let got = handover.snapshot();
+
+    assert!(built(&handover));
+    assert_eq!(got.slot, Some(Slot::A));
+    assert_eq!(got.running, Some(c(A)));
 }
 
 /// Catches a startup hold that is not seen by `start_blocked`: with no frontend child adopted

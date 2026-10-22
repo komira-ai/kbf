@@ -24,6 +24,8 @@ pub struct Proc {
     pub state: RoleState,
     pub holder: bool,
     pub ident: ProcIdent,
+    /// The release the process was started from, as its record names it.
+    pub commit: CommitId,
 }
 
 /// What a test changes while the swap runs.
@@ -102,6 +104,7 @@ impl Rig {
             state: RoleState::Active,
             holder: true,
             ident: ident_of(100, &c(A)),
+            commit: c(A),
         };
         Arc::new(Rig {
             st: Mutex::new(St {
@@ -159,6 +162,11 @@ impl Rig {
         self.st().procs[ix(slot)].as_ref().map(|p| p.ident.clone())
     }
 
+    /// The commit the process recorded for `slot` was started from.
+    pub fn commit_of(&self, slot: Slot) -> Option<CommitId> {
+        self.st().procs[ix(slot)].as_ref().map(|p| p.commit.clone())
+    }
+
     pub fn alive(&self, slot: Slot) -> bool {
         self.st().procs[ix(slot)].as_ref().is_some_and(|p| p.alive)
     }
@@ -190,6 +198,7 @@ impl Rig {
         on_death: impl Fn(&str) + Send + Sync + 'static,
     ) -> Parts {
         let rig = Arc::clone(self);
+        let by_commit = Arc::clone(self);
         Parts {
             child: self.clone(),
             admin: self.clone(),
@@ -200,6 +209,7 @@ impl Rig {
             clock: self.clone(),
             requests: Arc::clone(requests),
             old_proc: Box::new(move |slot| rig.ident(slot)),
+            running: Box::new(move |slot| by_commit.commit_of(slot)),
             on_death: Arc::new(on_death),
         }
     }
@@ -226,6 +236,7 @@ impl Rig {
             state: RoleState::Candidate,
             holder: false,
             ident: ident_of(pid, &c(B)),
+            commit: c(B),
         });
     }
 }
@@ -264,6 +275,7 @@ impl Child for Rig {
             state: RoleState::Candidate,
             holder: false,
             ident: ident.clone(),
+            commit: release.clone(),
         });
         st.log.push(format!("spawn {slot:?} Candidate"));
         Ok(ident)

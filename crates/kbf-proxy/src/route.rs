@@ -48,7 +48,8 @@ pub enum Route {
     /// The read-only web UI: `/ui` and `/ui/...`, forwarded to the active child's operator
     /// listener ([`Target::Operator`]). Open: [`AuthClass::Ui`] asks for no credential.
     Ui,
-    /// Served by the proxy: `/v1/update/frontend*`.
+    /// Served by the proxy: `/v1/update/frontend*`, and `/v1/proxy/swap`, the read-only state
+    /// of the swap. Both are answered by the update handler.
     Update,
     /// `/healthz`.
     Health,
@@ -121,6 +122,9 @@ const WORKER_PREFIXES: [&str; 4] = [
 ];
 const ENROLL_PREFIX: &str = "/kbf.enroll.v1.Enroll/";
 const UPDATE_PREFIX: &str = "/v1/update/frontend";
+/// The swap's state. Exact: nothing is served below it, and a look-alike goes to the operator
+/// API like any other `/v1/` path.
+const SWAP_PATH: &str = "/v1/proxy/swap";
 const BYTESTREAM_PREFIX: &str = "/google.bytestream.ByteStream/";
 const UI_PREFIX: &str = "/ui";
 
@@ -186,7 +190,7 @@ pub fn route_of(path: &str) -> Route {
     if path.starts_with(ENROLL_PREFIX) {
         return Route::Child(Target::Enroll);
     }
-    if at_boundary(path, UPDATE_PREFIX) {
+    if at_boundary(path, UPDATE_PREFIX) || path == SWAP_PATH {
         return Route::Update;
     }
     if path.starts_with("/v1/") {
@@ -217,10 +221,11 @@ pub const fn auth_class(route: Route) -> Option<AuthClass> {
 }
 
 /// Whether the hold gate lets the route through while it holds. Only a stream going to a
-/// backend is held; everything the proxy answers itself bypasses: the update API (so `abort`
-/// cannot deadlock), the probes, the metrics, and a path outside the table (answered 404 or
-/// `UNIMPLEMENTED` at once, never forwarded). An operator call (`/v1/*` but the update API) is
-/// held like any backend stream: it waits in the bounded hold queue during a swap hold and is
+/// backend is held; everything the proxy answers itself bypasses: the update API and the
+/// swap's state (so `abort` cannot deadlock and the state can be read during a swap), the
+/// probes, the metrics, and a path outside the table (answered 404 or `UNIMPLEMENTED` at once,
+/// never forwarded). An operator call (`/v1/*` but the update API and the swap's state) is held
+/// like any backend stream: it waits in the bounded hold queue during a swap hold and is
 /// answered 503 at the bound.
 #[must_use]
 pub const fn bypasses_hold(route: Route) -> bool {
@@ -317,6 +322,30 @@ mod tests {
             route_of("/v1/update/frontendx"),
             Route::Child(Target::Operator)
         );
+    }
+
+    /// The swap's state is the update route's: answered by the proxy, behind the update class's
+    /// credential, and never held. It is that one path and nothing near it.
+    ///
+    /// Kills: the path forwarded to a child; the path on the operator class or held; a prefix
+    /// match that takes a look-alike or a path below it for the proxy's.
+    #[test]
+    fn the_swap_state_is_the_update_routes_and_matches_one_path_exactly() {
+        for p in ["/v1/proxy/swap", "/v1/proxy/swap?x=1"] {
+            assert_eq!(route_of(p), Route::Update, "{p}");
+            assert_eq!(auth_class(route_of(p)), Some(AuthClass::Update), "{p}");
+            assert!(bypasses_hold(route_of(p)), "{p}");
+        }
+        for p in [
+            "/v1/proxy/swapx",
+            "/v1/proxy/swap/",
+            "/v1/proxy/swap/x",
+            "/v1/proxy",
+            "/v1/proxy/",
+            "/v1/proxy/Swap",
+        ] {
+            assert_eq!(route_of(p), Route::Child(Target::Operator), "{p}");
+        }
     }
 
     #[test]

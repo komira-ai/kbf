@@ -4,7 +4,7 @@ Status: design for review, unit U4b of `docs/design/frontend-proxy.md` (the desi
 
 ## 1. What U4b is
 
-`kbf-proxy` is a library; `kbf-installer proxy` (verb, U4b-3) is its only binary. It is the public port of a frontend host: one TLS terminator, per-stream routing to the active child frontend on loopback, identity headers, the hold gate, open-stream accounting, and a pluggable handler for `/v1/update/frontend*`. It supervises nothing (U7b), calls no child admin endpoint (U7a's supervisor does, through a trait that lives in `kbf-installer`), writes nothing under `current`, `slots/`, `status.json` or `update.json`, and has no control socket.
+`kbf-proxy` is a library; `kbf-installer proxy` (verb, U4b-3) is its only binary. It is the public port of a frontend host: one TLS terminator, per-stream routing to the active child frontend on loopback, identity headers, the hold gate, open-stream accounting, and a pluggable handler for `/v1/update/frontend*` and `GET /v1/proxy/swap`. It supervises nothing (U7b), calls no child admin endpoint (U7a's supervisor does, through a trait that lives in `kbf-installer`), writes nothing under `current`, `slots/`, `status.json` or `update.json`, and has no control socket.
 
 Reusable from the repo: `kbf-front/src/proxy/bytestream.rs` (peek, keep the first frames, fail over only before the first byte) is the pattern for the replay buffer. Nothing else in `kbf-front/src/proxy` applies: that proxy is the frontend talking to storage nodes. `kbf-tls` is not reusable as is: `Incoming` is a tonic stream, and `config.rs` builds the client verifier with `.build()` only (certificate mandatory) and ALPN `h2` only. U4b-2 adds to `kbf-tls` a second constructor, `server_config_optional_client(...)` (optional client certificate, ALPN `h2`, `http/1.1`, same ring provider, early data off); the existing path is untouched.
 
@@ -234,7 +234,7 @@ Design section 5 step 6.1 and 5a. `hold(hold_max)` sets the hold flag, the bound
 | Worker | `/kbf.worker.*`, `/kbf.map.v1.Membership/`, `/kbf.update.*`, `/kbf.enroll.v1.ColdStore/` | verified certificate with role Daemon or Storage; none: `UNAUTHENTICATED`; other role: `PERMISSION_DENIED` |
 | Reapi | REAPI services, ByteStream | `none`: open; `mtls`: any verified certificate; `bearer`: the right token |
 | Operator | other `/v1/*`, `/metrics` | operator token |
-| Update | `/v1/update/frontend*` | operator token now (one function, swap point for OIDC #1088) |
+| Update | `/v1/update/frontend*`, `/v1/proxy/swap` (exact) | operator token now (one function, swap point for OIDC #1088) |
 | Probe | `/healthz`, `/readyz` | open |
 | Enroll | `/kbf.enroll.v1.Enroll/` | no certificate and no token at the proxy, in every mode; the child checks the enrollment token |
 

@@ -634,6 +634,7 @@ const KEPT_SWAP_FILES: &[&str] = &[
     "proxy/supervisor_swap/mirror.rs",
     "proxy/supervisor_swap/status.rs",
     "proxy/swap.rs",
+    "proxy/swap_status.rs",
     "proxy_verb.rs",
 ];
 

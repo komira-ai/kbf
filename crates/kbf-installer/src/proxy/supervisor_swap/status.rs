@@ -4,6 +4,20 @@
 use super::super::kinds::{NewChild, OldChild, RunningUpdate, SupervisorStatus, UpdateId};
 use super::super::model::{Intent, Phase, Slot, Step};
 use super::Parts;
+use crate::CommitId;
+
+/// What the swap-state endpoint of a proxy that keeps its own copies reads, taken together.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    /// The slot whose child serves; `None` while no frontend child is known to (the start-up
+    /// hold is in force) and before the proxy is bound.
+    pub slot: Option<Slot>,
+    /// The commit that child runs: by the newest update's record when there is one, else by
+    /// the record of the process in that slot. Not the binary on disk.
+    pub running: Option<CommitId>,
+    /// The newest update's record, open or ended.
+    pub intent: Option<Intent>,
+}
 
 /// The slot that serves while the update is open: the new one from the switch on, unless
 /// a rollback is under way (the old one is taking the generation back).
@@ -53,6 +67,54 @@ pub(super) fn has_old_phase(intent: &Intent) -> bool {
     (Phase::Switched..=Phase::Draining).contains(&intent.phase)
 }
 
+/// The slot that serves: while the update is open, where its record says (an open update whose
+/// record has ended, because the swap thread has not closed it yet, serves where the ending
+/// says: `serving_live` reads a `failed` record as past the switch); else `active`.
+fn serving_slot(parts: &Parts, intent: &Intent, active: Slot, open: bool) -> Slot {
+    let holds = || parts.admin.role(intent.new_slot).is_ok_and(|r| r.holder);
+    if open {
+        active_after(intent, &holds)
+    } else {
+        active
+    }
+}
+
+/// The commit the child in `slot` runs by the record of `intent`: the new release in the new
+/// slot, the old one in the other.
+fn commit_in(intent: &Intent, slot: Slot) -> CommitId {
+    if slot == intent.new_slot {
+        intent.to.clone()
+    } else {
+        intent.from.clone()
+    }
+}
+
+/// The snapshot. With no update on record the slot is `active` (the start-up adoption's) and
+/// the commit is the one recorded for the process in it; while the start-up hold is in force
+/// (`held`) neither is known, and the update's record is shown alone.
+pub(super) fn snapshot(
+    parts: &Parts,
+    intent: Option<Intent>,
+    active: Slot,
+    open: bool,
+    held: bool,
+) -> Snapshot {
+    let serving = match &intent {
+        Some(intent) => serving_slot(parts, intent, active, open),
+        None => active,
+    };
+    let slot = (!held).then_some(serving);
+    let running = slot.and_then(|slot| match &intent {
+        Some(intent) => Some(commit_in(intent, slot)),
+        None => (parts.running)(slot),
+    });
+    Snapshot {
+        slot,
+        running,
+        intent,
+    }
+}
+
 /// The status. The blocking admin call for the old child's counts is made only while an
 /// old child is draining.
 pub(super) fn assemble(
@@ -64,19 +126,8 @@ pub(super) fn assemble(
     let Some(intent) = intent else {
         return SupervisorStatus::default();
     };
-    // An open update whose record has ended (the swap thread has not closed it yet) serves
-    // where the ending says: `serving_live` reads a `failed` record as past the switch.
-    let holds = || parts.admin.role(intent.new_slot).is_ok_and(|r| r.holder);
-    let serving = if open {
-        active_after(&intent, &holds)
-    } else {
-        active
-    };
-    let running = if serving == intent.new_slot {
-        intent.to.clone()
-    } else {
-        intent.from.clone()
-    };
+    let serving = serving_slot(parts, &intent, active, open);
+    let running = commit_in(&intent, serving);
     let old = (open && has_old_phase(&intent))
         .then(|| old_child(parts, &intent))
         .flatten();

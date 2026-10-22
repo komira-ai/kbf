@@ -35,11 +35,13 @@
 //! file of the shape of the root half's `status.json`: the order spool is not opened
 //! (`--orders-dir` and `--update-dir` are not looked at), the swap's confirm and revert touch
 //! no file of the root half, and the update API is not built: every call on the update route
-//! is answered 410. A start that finds no installed release recorded copies the kbf at `PATH`
-//! and records it as the installed one. Once the swap's slot is filled the proxy also polls the
-//! file at `PATH` every 5 s ([`crate::proxy::binary_watch`]): a package that replaced it is
-//! copied, its facts are staged and the swap to it is started, with no request. Without the
-//! flag nothing of this exists and the proxy works as before.
+//! is answered 410, except `GET /v1/proxy/swap`, which reports the state of the swap
+//! ([`crate::proxy::swap_status`]). A start that finds no installed release recorded copies
+//! the kbf at `PATH` and records it as the installed one. Once the swap's slot is filled the
+//! proxy also polls the file at `PATH` every 5 s ([`crate::proxy::binary_watch`]): a package
+//! that replaced it is copied, its facts are staged and the swap to it is started, with no
+//! request. Without the flag nothing of this exists and the proxy works as before (the
+//! update API answers 404 on `/v1/proxy/swap`).
 //!
 //! The start migrates before it runs anything: the installed release is brought to the
 //! `state_schema` it declares on the database `installer.toml` names (`database`, a URL
@@ -667,6 +669,7 @@ fn supervise(
                 gate: gate.clone(),
                 child,
                 recorded: recorded_by(&recorder),
+                running: running_by(&recorder),
                 active,
                 held,
                 releases_dir,
@@ -762,6 +765,16 @@ fn recorded_by(
 {
     let child = Arc::clone(child);
     Arc::new(move |slot| child.recorded(slot).map(|recorded| recorded.ident))
+}
+
+/// The commit the children's records name for a slot, as the swap-state endpoint asks for it:
+/// what the child serving from that slot runs.
+#[cfg(target_os = "linux")]
+fn running_by(
+    child: &Arc<crate::proxy::child_real::ProcChild>,
+) -> Arc<dyn Fn(crate::proxy::model::Slot) -> Option<crate::CommitId> + Send + Sync> {
+    let child = Arc::clone(child);
+    Arc::new(move |slot| child.recorded(slot).map(|recorded| recorded.commit))
 }
 
 /// The handover driver's swap thread died: say why, then stop the proxy as the death of the

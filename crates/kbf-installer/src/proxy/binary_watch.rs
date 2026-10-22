@@ -15,8 +15,10 @@
 //! # What acting on an identity does
 //!
 //! 1. If the swap cannot be started now ([`Swapper::busy`]: one is running or finishing, or the
-//!    proxy is not bound or is holding for want of a serving child), nothing is done and the
-//!    identity is left unconsumed: the next poll asks again, and the swap starts when it can.
+//!    proxy is not bound or is holding for want of a serving child), nothing is copied, staged
+//!    or started (the kbf is run, once for each identity, to name its commit for the status)
+//!    and the identity is left unconsumed: the next poll asks again, and the swap starts when
+//!    it can.
 //! 2. The kbf at `PATH` is run for `--version --json`; its `commit_full` names the release. If
 //!    that is the release serving ([`RootOrders::installed`] of `releases.json`) nothing is
 //!    copied, staged or started; the copies are pruned as in step 4 (which is what removes the
@@ -38,15 +40,38 @@
 //! without waiting. An identity a swap was started for is not acted on again, whatever becomes
 //! of that swap: a new file, or a new proxy, is what asks again.
 //!
+//! # What it publishes
+//!
+//! What the watch knows is shared with the swap-state endpoint through a [`WatchStatus`]
+//! ([`crate::proxy::swap_status`]):
+//!
+//! - **`pending`**, the commit of a changed kbf that holds still and for which no swap has been
+//!   started: while the swap is busy (the kbf is then run, once for each identity, only to name
+//!   its commit), and from the moment it is known not to be the release that serves until a
+//!   swap is started, which includes a copy or a start that failed and waits out its backoff.
+//!   The kbf that is the release that serves is not pending, busy or not. A kbf that cannot say
+//!   its commit is pending as nothing, and a pass that cannot read `releases.json` fails before
+//!   the kbf is known to be a change, so it is only the refusal. A kbf that waits for a swap
+//!   that is already running, one the proxy resumed to that very release, is pending until that
+//!   swap is over.
+//! - **the refusal**, the failure to copy, stage or start the swap for that kbf, with the
+//!   reason of the newest failed pass (a failed probe names no commit, so it is only logged).
+//!   The retries of one kbf are one refusal: it keeps the id, the number and the time of the
+//!   first failure.
+//!
+//! Both are dropped when the file changes or goes (they were about another file), and when the
+//! swap is started or the kbf is the release that serves.
+//!
 //! Time comes from the [`Clock`] it is given (the wait between polls, the update id) and the
 //! swap from a [`Swapper`], so a test drives [`Watch::pass`] one poll at a time.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{Builder, JoinHandle};
 use std::time::Duration;
 
@@ -128,11 +153,126 @@ impl Swapper for Handover {
 }
 
 /// What the watch needs of the proxy: the copies and orders of `--kbf-binary` (whose `binary`
-/// is the file watched) and the swap ([`super::assemble::local`] builds both).
+/// is the file watched), the swap and the status it publishes ([`super::assemble::local`]
+/// builds all three, and gives the same status to the endpoint that reads it).
 #[derive(Clone)]
 pub struct Wiring {
     pub local: Local,
     pub swap: Handover,
+    pub status: WatchStatus,
+}
+
+/// A swap the watch could not start: the newest one it was refused. A kbf that is refused again
+/// on a retry is the same refusal, with the newest `from` and `reason`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    /// The id the update would have had, at the first failure.
+    pub id: String,
+    /// Its number ([`WatchStatus::seq_of`]).
+    pub seq: u64,
+    /// The release that served, when the record could be read.
+    pub from: Option<CommitId>,
+    /// The release the kbf at the path is.
+    pub to: CommitId,
+    /// Why, in the words of the newest failed pass.
+    pub reason: String,
+    /// When the first failure was, in seconds of the watch's clock.
+    pub at: u64,
+}
+
+#[derive(Debug, Default)]
+struct Seen {
+    pending: Option<CommitId>,
+    refusal: Option<Refusal>,
+    /// The last number given to an update or a refusal.
+    issued: u64,
+    /// The number of each update the swap has run, by id.
+    numbers: BTreeMap<String, u64>,
+}
+
+/// What the watch publishes for the swap-state endpoint, and the numbers that endpoint gives
+/// to updates. A clone is the same status.
+#[derive(Clone, Debug, Default)]
+pub struct WatchStatus(Arc<Mutex<Seen>>);
+
+impl WatchStatus {
+    fn held(&self) -> MutexGuard<'_, Seen> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The commit of a changed kbf that has no swap started for it, if one waits.
+    #[must_use]
+    pub fn pending(&self) -> Option<CommitId> {
+        self.held().pending.clone()
+    }
+
+    /// The newest refusal, while the kbf it was for is still the one at the path.
+    #[must_use]
+    pub fn refusal(&self) -> Option<Refusal> {
+        self.held().refusal.clone()
+    }
+
+    /// The number of the update `id`: one more than the last number given, the first time the
+    /// id is asked about, and the same number every time after. The watch asks for the
+    /// updates it starts, the endpoint for the one it reports, so a number counts the updates
+    /// this process has started or resumed, in the order they were first seen.
+    pub fn seq_of(&self, id: &str) -> u64 {
+        let mut seen = self.held();
+        if let Some(number) = seen.numbers.get(id) {
+            return *number;
+        }
+        seen.issued += 1;
+        let number = seen.issued;
+        seen.numbers.insert(id.to_owned(), number);
+        number
+    }
+
+    /// A changed kbf waits for the swap, as `commit` (`None`: it did not name one).
+    pub(super) fn pend(&self, commit: Option<CommitId>) {
+        self.held().pending = commit;
+    }
+
+    /// The swap to `to` was refused for `reason` at `at` seconds. The first refusal of a `to`
+    /// is given the next number; a retry of the same `to` that is refused again keeps the
+    /// `id`, the number and the time of the first, and gives only its `from` and `reason`.
+    pub(super) fn refuse(
+        &self,
+        id: String,
+        from: Option<CommitId>,
+        to: CommitId,
+        reason: String,
+        at: u64,
+    ) {
+        let mut seen = self.held();
+        let first = seen.refusal.take().filter(|kept| kept.to == to);
+        let (id, seq, at) = match first {
+            Some(kept) => (kept.id, kept.seq, kept.at),
+            None => {
+                seen.issued += 1;
+                (id, seen.issued, at)
+            }
+        };
+        seen.refusal = Some(Refusal {
+            id,
+            seq,
+            from,
+            to,
+            reason,
+            at,
+        });
+    }
+
+    /// Nothing waits any more: the kbf changed, or a swap was started for it.
+    pub(super) fn clear(&self) {
+        let mut seen = self.held();
+        seen.pending = None;
+        seen.refusal = None;
+    }
+}
+
+/// The id of the update to `to` that is started at `secs` of the clock.
+fn update_id(to: &CommitId, secs: u64) -> String {
+    format!("pkg-{}-{secs}", &to.as_str()[..12])
 }
 
 /// What one poll came to.
@@ -217,10 +357,14 @@ pub struct Watch {
     swap: Box<dyn Swapper>,
     clock: Arc<dyn Clock + Send + Sync>,
     in_use: InUse,
+    status: WatchStatus,
     /// The identity the last poll read.
     seen: Option<Identity>,
     /// The identity that was acted on to the end.
     done: Option<Identity>,
+    /// The commit the kbf at an identity named when it was run while the swap was busy; `None`
+    /// for a kbf that did not say.
+    named: Option<(Identity, Option<CommitId>)>,
     retry: Retry,
 }
 
@@ -239,10 +383,19 @@ impl Watch {
             swap,
             clock,
             in_use,
+            status: WatchStatus::default(),
             seen: None,
             done: None,
+            named: None,
             retry: Retry::default(),
         }
+    }
+
+    /// The same watch, publishing to `status` (the one the swap-state endpoint reads).
+    #[must_use]
+    pub fn publishing(mut self, status: WatchStatus) -> Watch {
+        self.status = status;
+        self
     }
 
     /// One poll: read the file's identity and, when it is the second equal one of an identity
@@ -252,6 +405,8 @@ impl Watch {
         let still = now.filter(|id| self.seen == Some(*id));
         if self.seen != now {
             self.retry = Retry::default();
+            // What was published was about the file that is gone.
+            self.status.clear();
         }
         self.seen = now;
         let Some(id) = still else {
@@ -264,12 +419,19 @@ impl Watch {
             return Pass::Quiet;
         }
         if let Some(why) = self.swap.busy() {
+            let commit = self.name(runner, id);
+            // The kbf that is the release that serves is not a change waiting.
+            let serving = self.local.orders.installed().ok().flatten();
+            let waiting = commit.filter(|named| serving.as_ref() != Some(named));
+            self.status.pend(waiting);
             return Pass::Busy(why);
         }
         match self.act(runner) {
             Ok(pass) => {
                 self.done = Some(id);
                 self.retry = Retry::default();
+                // Nothing waits: a swap was started, or the kbf is the release that serves.
+                self.status.clear();
                 pass
             }
             Err(why) => {
@@ -297,30 +459,75 @@ impl Watch {
         }
     }
 
-    /// Copy the kbf at the path and start the swap to it, unless it is the release that serves.
-    fn act(&mut self, runner: &dyn Runner) -> Result<Pass, String> {
+    /// The build the kbf at the path says it is: the facts it printed and the commit it names.
+    fn probe(&self, runner: &dyn Runner) -> Result<(Version, CommitId), String> {
         let binary = self.local.binary.as_path();
         let version = probe_version(runner, binary).map_err(fail("probe"))?;
         let named = version.commit_full.as_deref();
         let full = named.ok_or_else(|| "the kbf prints no commit_full".to_owned())?;
         let to = CommitId::new(full).map_err(fail("commit_full"))?;
-        let serving = self.local.orders.installed().map_err(fail("status"))?;
-        if serving.as_ref() == Some(&to) {
-            self.prune(&to, &to);
-            return Ok(Pass::Same(to));
+        Ok((version, to))
+    }
+
+    /// The commit the kbf with identity `id` names, run once for each identity: the swap is
+    /// busy, so nothing else is done with it, and the status says which release waits.
+    fn name(&mut self, runner: &dyn Runner, id: Identity) -> Option<CommitId> {
+        let cached = self.named.as_ref().filter(|(seen, _)| *seen == id);
+        if let Some((_, commit)) = cached {
+            return commit.clone();
         }
+        let commit = self.probe(runner).ok().map(|(_, commit)| commit);
+        self.named = Some((id, commit.clone()));
+        commit
+    }
+
+    /// Copy the kbf at the path and start the swap to it, unless it is the release that serves.
+    /// Once the kbf is known not to be that release its commit is what waits, and a failure from
+    /// then on is published as the swap's refusal.
+    fn act(&mut self, runner: &dyn Runner) -> Result<Pass, String> {
+        let (version, to) = self.probe(runner)?;
+        let started = self.switch(runner, &version, &to);
+        started.inspect_err(|why| self.refuse(&to, why))
+    }
+
+    /// Start the swap to `to`, the release the kbf at the path is, which `version` printed.
+    fn switch(
+        &mut self,
+        runner: &dyn Runner,
+        version: &Version,
+        to: &CommitId,
+    ) -> Result<Pass, String> {
+        let binary = self.local.binary.as_path();
+        let serving = self.local.orders.installed().map_err(fail("status"))?;
+        if serving.as_ref() == Some(to) {
+            self.prune(to, to);
+            return Ok(Pass::Same(to.clone()));
+        }
+        self.status.pend(Some(to.clone()));
         let from = serving.ok_or_else(|| "no installed release is recorded".to_owned())?;
-        let copied = self.local.copies.ensure(runner, binary, &to);
+        let copied = self.local.copies.ensure(runner, binary, to);
         copied.map_err(fail("copy"))?;
-        let facts = facts_of(&version, &to);
+        let facts = facts_of(version, to);
         self.local.orders.stage(&facts).map_err(fail("stage"))?;
         let spec = self.spec(&from, facts);
         if let Err(refused) = self.swap.start(&spec) {
-            let _ = self.local.orders.revert(&to);
+            let _ = self.local.orders.revert(to);
             return Err(fail("swap")(refused));
         }
-        self.prune(&from, &to);
+        // The update is the proxy's to number from here on, and nothing waits or stands refused
+        // while the copies are pruned.
+        self.status.clear();
+        self.status.seq_of(&spec.update_id.0);
+        self.prune(&from, to);
         Ok(Pass::Started(spec.update_id.0))
+    }
+
+    /// Publish that the swap to `to` was refused, for `why`.
+    fn refuse(&self, to: &CommitId, why: &str) {
+        let from = self.local.orders.installed().ok().flatten();
+        let at = self.clock.now().as_secs();
+        let id = update_id(to, at);
+        self.status.refuse(id, from, to.clone(), why.to_owned(), at);
     }
 
     /// The update from `from` to the staged release `facts` describe. The locator is the
@@ -328,7 +535,7 @@ impl Watch {
     fn spec(&self, from: &CommitId, facts: StagedFacts) -> UpdateSpec {
         let to = facts.commit.clone();
         let secs = self.clock.now().as_secs();
-        let id = format!("pkg-{}-{secs}", &to.as_str()[..12]);
+        let id = update_id(&to, secs);
         UpdateSpec {
             update_id: UpdateId(id.clone()),
             request_id: id,
@@ -373,7 +580,8 @@ pub fn spawn(
     in_use: InUse,
 ) -> Option<JoinHandle<()>> {
     let wiring = wiring?;
-    let mut watch = Watch::new(wiring.local, Box::new(wiring.swap), clock, in_use);
+    let watch = Watch::new(wiring.local, Box::new(wiring.swap), clock, in_use);
+    let mut watch = watch.publishing(wiring.status);
     let thread = Builder::new().name("kbf-binary-watch".into());
     thread.spawn(move || watch.run(&SystemRunner)).ok()
 }

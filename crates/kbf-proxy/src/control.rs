@@ -57,12 +57,13 @@ pub const MAX_UPDATE_BODY: usize = 4096;
 /// handler in its own task, so a command a client gave up on is neither cut short nor run twice.
 pub const UPDATE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// A request to `/v1/update/frontend*`, after the proxy authenticated and rate limited it.
+/// A request to `/v1/update/frontend*` or `/v1/proxy/swap`, after the proxy authenticated and
+/// rate limited it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpdateRequest {
     /// `GET` or `POST`.
     pub method: String,
-    /// The path, `/v1/update/frontend` and what follows it.
+    /// The path: `/v1/update/frontend` and what follows it, or `/v1/proxy/swap`.
     pub path: String,
     /// The JSON body, at most [`MAX_UPDATE_BODY`] bytes.
     pub body: Vec<u8>,
