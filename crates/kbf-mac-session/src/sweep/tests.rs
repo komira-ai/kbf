@@ -1018,7 +1018,9 @@ fn an_entry_swapped_in_after_the_judgement_does_not_change_its_targets_mode() {
         let swept = vanishing(
             move |point, _| {
                 if matches!(point, Point::Examined(n) if *n == "b") && !done.replace(true) {
-                    fs::remove_file(&b).unwrap();
+                    // Moved away, not removed: a freed inode number can be handed to the
+                    // file made next, which would then look like the one judged.
+                    fs::rename(&b, b.with_file_name("b.judged")).unwrap();
                     if swap == "link" {
                         symlink(&other, &b).unwrap();
                     } else {
