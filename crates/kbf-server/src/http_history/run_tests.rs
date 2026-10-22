@@ -193,9 +193,10 @@ fn the_times_and_the_cgroup_block_are_what_the_daemon_reported() {
         periods: 2,
         throttled_periods: 1,
         throttled_us: 9,
-        memory_peak_bytes: 77,
+        memory_peak_bytes: Some(77),
         numa_bytes: vec![10, 0, 20],
-        wall_us: 4,
+        wall_us: Some(4),
+        ..Cgroup::default()
     });
     let v = render(&r);
     assert_eq!(

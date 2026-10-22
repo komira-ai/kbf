@@ -34,7 +34,7 @@ mod flags;
 mod reads;
 mod stats;
 mod tails;
-mod tap;
+pub(crate) mod tap;
 
 pub use driver::{History, Options, STEP_EVERY, over};
 pub(crate) use driver::{finish, spawn};

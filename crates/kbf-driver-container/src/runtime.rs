@@ -46,7 +46,7 @@ use prost_types::Timestamp;
 use tokio::sync::oneshot;
 
 use crate::cgroup::{LeaseCgroup, SwapKill, memory_max, presses_into_swap};
-use crate::cgroup_usage::{NUMA_EVERY, NumaSample, resource_usage};
+use crate::cgroup_usage::{CPU_PSI, NUMA_EVERY, NumaSample, Start, resource_usage};
 use crate::container::{
     CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, Dirs, Ended, LEASE_PREFIX,
 };
@@ -520,6 +520,7 @@ impl<C: Cas> ContainerRuntime<C> {
         // What the lease cgroup's NUMA split is while the action runs, and the usage
         // read at its end (`cgroup_usage`): `run` reads it too when the lease fails.
         lease.ran = Some(Instant::now());
+        lease.started_under = Start::read(Path::new(CPU_PSI), work.resources.cpu_millis);
         lease.numa = NumaSample::counting(Arc::clone(&self.numa_samples));
         lease.created = true;
         self.engine
@@ -912,6 +913,9 @@ struct Lease {
     ran: Option<Instant>,
     /// The NUMA split sampled while the action ran.
     numa: NumaSample,
+    /// The node's CPU pressure and the CPU booked, when the container was about to be
+    /// created.
+    started_under: Start,
 }
 
 impl Lease {
@@ -939,6 +943,7 @@ impl Lease {
             armed: true,
             ran: None,
             numa: NumaSample::default(),
+            started_under: Start::default(),
         }
     }
 
@@ -948,7 +953,7 @@ impl Lease {
     fn usage(&mut self) -> Option<ResourceUsage> {
         let ran = self.ran?;
         let cgroup = std::mem::take(&mut self.numa).finish(self.cgroup.dir());
-        Some(resource_usage(cgroup, ran.elapsed()))
+        Some(resource_usage(cgroup, ran.elapsed(), self.started_under))
     }
 
     /// Steps 5 and 6, off the async threads.

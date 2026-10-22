@@ -214,3 +214,40 @@ fn the_target_and_the_list_time_have_their_own_field_numbers() {
     assert_eq!(RunRecord::decode(&[][..]).unwrap().target, "");
     assert_eq!(InvocationHeader::decode(&[][..]).unwrap().list_ms, 0);
 }
+
+#[test]
+fn the_basis_footprint_pressure_and_booking_have_their_field_numbers() {
+    // Catches: a field renumbered or dropped from the wire, a zero written as absent
+    // (a measured zero pressure must read back as 0), and a record written before the
+    // fields existed failing to decode or reading them set.
+    use prost::Message as _;
+    let run = RunRecord {
+        basis: UsageBasis::MacFootprint.into(),
+        footprint: Some(Footprint {
+            peak_footprint_bytes: Some(9),
+            cpu_user_us: None,
+            cpu_system_us: Some(0),
+            wall_us: None,
+        }),
+        node_cpu_pressure_centi: Some(0),
+        booked_millicpus: Some(1500),
+        ..RunRecord::default()
+    };
+    // Tag 39 varint (key 312: 0xB8 0x02), tag 40 length-delimited (key 322: 0xC2 0x02)
+    // holding fields 1 and 3, tag 41 varint (key 328: 0xC8 0x02), tag 42 varint (key 336:
+    // 0xD0 0x02), 1500 is 0xDC 0x0B.
+    assert_eq!(
+        run.encode_to_vec(),
+        [
+            0xB8, 0x02, 2, 0xC2, 0x02, 4, 0x08, 9, 0x18, 0, 0xC8, 0x02, 0, 0xD0, 0x02, 0xDC, 0x0B
+        ]
+    );
+    let back = RunRecord::decode(run.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(back, run);
+    assert_eq!(back.basis(), UsageBasis::MacFootprint);
+    let older = RunRecord::decode(RunRecord::default().encode_to_vec().as_slice()).unwrap();
+    assert_eq!(older.basis(), UsageBasis::Unspecified);
+    assert_eq!(older.footprint, None);
+    assert_eq!(older.node_cpu_pressure_centi, None);
+    assert_eq!(older.booked_millicpus, None);
+}
