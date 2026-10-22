@@ -93,11 +93,12 @@ fn each(
                 continue;
             }
         };
-        for entry in entries.filter_map(Result::ok) {
+        let listed = entries.filter_map(Result::ok).filter_map(|entry| {
             let path = entry.path();
-            let Ok(meta) = fs::symlink_metadata(&path) else {
-                continue;
-            };
+            // Gone since the listing: nothing to do.
+            fs::symlink_metadata(&path).ok().map(|meta| (path, meta))
+        });
+        for (path, meta) in listed {
             let hers =
                 (!meta.is_dir() && meta.uid() == uid) || (meta.is_file() && names(&path, uid));
             if !hers {
@@ -144,8 +145,9 @@ fn names(path: &Path, uid: u32) -> bool {
         return false;
     };
     let mut head = Vec::new();
-    let read = File::take(file, HEAD as u64).read_to_end(&mut head);
-    read.is_ok() && names_uid(&head, uid)
+    // A read that fails part way leaves the head read so far.
+    let _ = File::take(file, HEAD as u64).read_to_end(&mut head);
+    names_uid(&head, uid)
 }
 
 #[cfg(test)]

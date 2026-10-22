@@ -162,3 +162,26 @@ fn a_report_that_cannot_be_removed_or_a_folder_that_cannot_be_read_is_an_error()
     );
     assert!(locked.join("a.ips").exists());
 }
+
+/// Catches a report that vanishes between the listing and the removal (the crash reporter
+/// rotating its folder) read as a failure, and a report that cannot be opened read as
+/// naming the uid: the first is no error, the second is left alone and is no error.
+#[test]
+fn a_vanished_report_is_no_error_and_an_unreadable_one_is_not_the_uids() {
+    let dir = TestDir::under(std::env::temp_dir(), "kbf-driver-native-crash-vanish");
+    fs::write(dir.join("a.ips"), IPS).unwrap();
+    let gone = each(std::slice::from_ref(&dir.to_path_buf()), me(), |_| {
+        Err(std::io::ErrorKind::NotFound.into())
+    });
+    assert_eq!(gone, Vec::<String>::new());
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(dir.join("a.ips"), fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(
+        sweep(std::slice::from_ref(&dir.to_path_buf()), 771),
+        Vec::<String>::new()
+    );
+    assert!(dir.join("a.ips").exists());
+}

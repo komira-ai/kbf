@@ -18,7 +18,7 @@
 
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -124,10 +124,10 @@ impl<R: Slotted + Send + Sync + 'static> Book<R> {
     /// Cleans every dirty slot but `skip` again; a slot that passes is free (and its
     /// permit back) at once. Does nothing while another call is cleaning.
     pub(crate) fn retry(&self, skip: Option<usize>) {
-        let _one_at_a_time = match self.retrying.try_lock() {
-            Ok(guard) => guard,
-            Err(TryLockError::Poisoned(guard)) => guard.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
+        // Nothing panics while it is held (the clean is called under `catch_unwind`), so it
+        // is never poisoned: a failed `try_lock` is another re-clean running.
+        let Ok(_one_at_a_time) = self.retrying.try_lock() else {
+            return;
         };
         let again: Vec<usize> = lock(&self.dirty)
             .iter()

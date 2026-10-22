@@ -257,7 +257,7 @@ pub fn clean(os: &dyn Os) -> Outcome {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::{BTreeSet, VecDeque};
 
     use super::*;
 
@@ -274,14 +274,14 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         calls: RefCell<Vec<Call>>,
-        fails: RefCell<BTreeMap<Step, usize>>,
+        fails: RefCell<BTreeSet<Step>>,
         looks: RefCell<VecDeque<Vec<Left>>>,
     }
 
     impl Fake {
-        fn failing(step: Step, times: usize) -> Self {
+        fn failing(step: Step) -> Self {
             let fake = Self::default();
-            fake.fails.borrow_mut().insert(step, times);
+            fake.fails.borrow_mut().insert(step);
             fake
         }
 
@@ -299,13 +299,11 @@ mod tests {
     impl Os for Fake {
         fn run(&self, step: Step) -> Result<(), String> {
             self.calls.borrow_mut().push(Call::Run(step));
-            let mut fails = self.fails.borrow_mut();
-            match fails.get_mut(&step) {
-                Some(n) if *n > 0 => {
-                    *n -= 1;
-                    Err(format!("{step} failed"))
-                }
-                _ => Ok(()),
+            // Fails once.
+            if self.fails.borrow_mut().remove(&step) {
+                Err(format!("{step} failed"))
+            } else {
+                Ok(())
             }
         }
 
@@ -412,6 +410,11 @@ mod tests {
     fn a_home_locked_by_its_user_is_cleaned_on_the_single_pass() {
         let os = Locked::default();
         os.locked.set(true);
+        // The model refuses a removal while the root is locked.
+        assert_eq!(
+            os.run(Step::Contents),
+            Err("home: Operation not permitted".to_owned())
+        );
         assert_eq!(clean(&os), Outcome::Clean);
         assert!(
             STEPS.iter().position(|s| *s == Step::Flags)
@@ -444,11 +447,11 @@ mod tests {
     /// step run, and the fake is never asked to try again.
     #[test]
     fn a_failed_step_leaves_the_user_dirty_after_one_pass() {
-        let fake = Fake::failing(Step::Images, 2);
+        let fake = Fake::failing(Step::Images);
         assert_eq!(clean(&fake), dirty("images: images failed"));
         assert_eq!(fake.calls(), whole_pass());
-        let fake = Fake::failing(Step::Crashes, 1);
-        fake.fails.borrow_mut().insert(Step::Contents, 1);
+        let fake = Fake::failing(Step::Crashes);
+        fake.fails.borrow_mut().insert(Step::Contents);
         assert_eq!(
             clean(&fake),
             dirty("contents: contents failed; crashes: crashes failed")
@@ -462,7 +465,7 @@ mod tests {
     /// are dirty too, and the pass is not repeated.
     #[test]
     fn survivors_leave_the_user_dirty_and_a_failed_kill_ends_the_pass() {
-        let fake = Fake::failing(Step::Kill, 1);
+        let fake = Fake::failing(Step::Kill);
         assert_eq!(clean(&fake), dirty("kill: kill failed"));
         let upto = [Step::Bootout, Step::Schedules, Step::Kill].map(Call::Run);
         assert_eq!(fake.calls(), upto);

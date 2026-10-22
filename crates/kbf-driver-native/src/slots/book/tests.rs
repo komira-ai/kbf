@@ -6,6 +6,15 @@ use std::time::Duration;
 
 use super::*;
 
+/// A subscriber that drops what it is told, so that the log lines of the book run (and
+/// count) in every test; the first call in the process wins.
+fn quiet() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(std::io::sink)
+        .try_init();
+}
+
 struct Stub(u32);
 
 impl Slotted for Stub {
@@ -27,6 +36,7 @@ fn dirty() -> Outcome {
 /// A book over `count` slots cleaned by a stand-in that answers `outcomes` in turn
 /// (then clean) and counts its calls.
 fn book(count: u32, outcomes: Vec<Outcome>) -> (Arc<Book<Stub>>, Arc<AtomicUsize>) {
+    quiet();
     let calls = Arc::new(AtomicUsize::new(0));
     let queue = Mutex::new(VecDeque::from(outcomes));
     let counted = Arc::clone(&calls);
@@ -172,9 +182,11 @@ async fn a_slot_whose_clean_did_not_finish_is_dirty() {
         );
         Outcome::Clean
     });
+    quiet();
     let book = Arc::new(Book::new(stubs(1), cleaner));
     let (index, permit) = book.take().await.expect("taken");
     let held = book.held(index, permit);
+    assert_eq!(format!("{held:?}"), "Held { index: 0, .. }");
     let gave = std::thread::spawn(move || held.give()).join();
     assert!(gave.is_err(), "the clean's panic reaches the caller");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -208,6 +220,7 @@ fn only_one_re_clean_runs_at_a_time() {
         lock(&release_rx).recv().expect("released");
         Outcome::Clean
     });
+    quiet();
     let book = Arc::new(Book::new(stubs(1), cleaner));
     let first = std::thread::spawn({
         let book = Arc::clone(&book);
