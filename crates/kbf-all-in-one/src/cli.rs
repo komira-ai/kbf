@@ -70,6 +70,7 @@ pub struct Flags {
 /// A `--driver` other than `container`, or `--cas`.
 pub fn parse(matches: &ArgMatches) -> Result<Flags, clap::Error> {
     refuse_remote_plane(matches, "kbf-all-in-one", "server", command)?;
+    refuse_ram_ack(matches)?;
     let daemon = kbf_node::Cli::from_arg_matches(matches)?;
     let mut server = kbf_server::Args::from_arg_matches(matches)?;
     if server.state_store.is_none() {
@@ -78,6 +79,31 @@ pub fn parse(matches: &ArgMatches) -> Result<Flags, clap::Error> {
     // The thread flags matched are the daemon's.
     server.threads = kbf_threads::PoolArgs::default();
     Ok(Flags { server, daemon })
+}
+
+/// Refuses the RAM-ack flags, which this process would accept and ignore: it keeps one
+/// copy of a blob, so there is no second owner to make a blob held in RAM safe, and its
+/// cache is built with no budget and no drain. A non-zero `--ram-ack-bytes` and an
+/// explicit `--ram-drain-deadline` or `--ram-peer-grace` are refused; `--durable-wait` is
+/// honoured here (the cache waits on it) and so is not.
+fn refuse_ram_ack(matches: &ArgMatches) -> Result<(), clap::Error> {
+    let given = |id: &str| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
+    let flag = if matches.get_one::<u64>("ram_ack_bytes").is_some_and(|b| *b > 0) {
+        "--ram-ack-bytes"
+    } else if given("ram_drain_deadline") {
+        "--ram-drain-deadline"
+    } else if given("ram_peer_grace") {
+        "--ram-peer-grace"
+    } else {
+        return Ok(());
+    };
+    Err(command().error(
+        ErrorKind::ArgumentConflict,
+        format!(
+            "kbf-all-in-one refuses {flag}: all-in-one keeps one copy of a blob, so a blob \
+             held in RAM has no second owner to cover it; ram-ack is for `kbf storage`"
+        ),
+    ))
 }
 
 /// Refuses, for a process whose daemon half reads and writes blobs through calls into

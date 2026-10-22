@@ -70,6 +70,38 @@ fn other_drivers_and_cas_are_refused() {
     }
 }
 
+/// Catches an all-in-one that accepts the RAM-ack flags and ignores them (its cache has
+/// no budget and no drain, so a blob would still be acknowledged from disk while the
+/// operator believed otherwise): a non-zero `--ram-ack-bytes`, an explicit
+/// `--ram-drain-deadline` and an explicit `--ram-peer-grace` are each refused with why;
+/// the defaults, an explicit `--ram-ack-bytes=0` and `--durable-wait` (which the cache
+/// honours) are not.
+#[test]
+fn the_ram_ack_flags_are_refused() {
+    for (extra, says) in [
+        ("--ram-ack-bytes=1048576", "--ram-ack-bytes"),
+        ("--ram-drain-deadline=30", "--ram-drain-deadline"),
+        ("--ram-peer-grace=10", "--ram-peer-grace"),
+    ] {
+        let refused = flags(&["--driver=container", extra]).expect_err("refused");
+        assert_eq!(refused.kind(), ErrorKind::ArgumentConflict, "{extra}");
+        let text = refused.to_string();
+        assert!(
+            text.contains(&format!("kbf-all-in-one refuses {says}")),
+            "{text}"
+        );
+        assert!(text.contains("all-in-one keeps one copy"), "{text}");
+        assert!(text.contains("`kbf storage`"), "{text}");
+    }
+    flags(&["--driver=container"]).expect("the defaults are taken");
+    flags(&[
+        "--driver=container",
+        "--ram-ack-bytes=0",
+        "--durable-wait=5",
+    ])
+    .expect("0 and --durable-wait are taken");
+}
+
 /// Catches an all-in-one that keeps no durable state when `--state-store` is left out
 /// (the scheduler would run in memory and a restart lose its queue), one whose default is
 /// still a SQLite file in the data directory, one that puts the default anywhere but the
