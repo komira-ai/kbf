@@ -2606,6 +2606,7 @@ dependencies = [
 name = "kbf-updater"
 version = "0.1.0"
 dependencies = [
+ "httparse",
  "libc",
  "serde",
  "serde_json",
