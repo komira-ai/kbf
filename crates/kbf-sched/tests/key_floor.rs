@@ -29,8 +29,8 @@ fn action(n: u8, instance: &str) -> ActionKey {
     }
 }
 
-/// Action `n` of instance `main`: one core and `memory` bytes on Linux, keyed `size_key`.
-fn request(n: u8, memory: u64, size_key: Option<u64>) -> Request {
+/// Action `n` of instance `main`: one core and `memory` bytes on Linux.
+fn request(n: u8, memory: u64) -> Request {
     Request {
         key: action(n, "main"),
         qos: Qos::Ci,
@@ -38,7 +38,6 @@ fn request(n: u8, memory: u64, size_key: Option<u64>) -> Request {
         resources: Resources::new(1_000, memory),
         hermetic: true,
         do_not_cache: false,
-        size_key,
         needs: kbf_caps::Request::from_platform([("OSFamily", "linux")]).unwrap(),
     }
 }
@@ -109,6 +108,15 @@ impl Farm {
         assert!(self.feed(Event::Submit { waiter, request }).is_empty());
     }
 
+    /// [`Farm::submit`], then names `size_key` as the new operation's key, as the server
+    /// does once it has queued the operation.
+    fn submit_keyed(&mut self, waiter: u64, request: Request, size_key: u64) {
+        let before = self.s.next_operation();
+        self.submit(waiter, request);
+        assert_ne!(self.s.next_operation(), before, "joined a twin");
+        self.s.set_size_key(before, size_key);
+    }
+
     /// A placement round: every `Start` it makes.
     fn tick(&mut self) -> Vec<StartLease> {
         starts(&self.feed(Event::Tick))
@@ -158,7 +166,7 @@ fn only(mut starts: Vec<StartLease>) -> StartLease {
 fn farm_with_floor_16() -> Farm {
     let mut f = Farm::new();
     f.node("big", 8, 64);
-    f.submit(1, request(1, 4 * GIB, Some(KEY)));
+    f.submit_keyed(1, request(1, 4 * GIB), KEY);
     let first = only(f.tick());
     let second = f.killed(&first);
     assert_eq!(second.resources.memory_bytes, 16 * GIB);
@@ -173,7 +181,7 @@ fn farm_with_floor_16() -> Farm {
 #[test]
 fn a_new_digest_of_a_killed_key_starts_at_the_floor() {
     let mut f = farm_with_floor_16();
-    f.submit(2, request(2, 4 * GIB, Some(KEY)));
+    f.submit_keyed(2, request(2, 4 * GIB), KEY);
     let start = only(f.tick());
     assert_eq!(start.resources.memory_bytes, 16 * GIB);
     assert_eq!(
@@ -195,7 +203,7 @@ fn queued_operations_pick_up_the_floor_at_placement() {
     let mut f = Farm::new();
     f.node("one-core", 1, 64);
     for n in 1..=3 {
-        f.submit(u64::from(n), request(n, 4 * GIB, Some(KEY)));
+        f.submit_keyed(u64::from(n), request(n, 4 * GIB), KEY);
     }
     let first = only(f.tick());
     assert_eq!(first.resources.memory_bytes, 4 * GIB);
@@ -220,10 +228,10 @@ fn queued_operations_pick_up_the_floor_at_placement() {
 #[test]
 fn another_key_and_no_key_are_unchanged() {
     let mut f = farm_with_floor_16();
-    let mut other = request(2, 4 * GIB, Some(KEY + 1));
+    let mut other = request(2, 4 * GIB);
     other.key.instance = "other".to_owned();
-    f.submit(2, other);
-    f.submit(3, request(3, 4 * GIB, None));
+    f.submit_keyed(2, other, KEY + 1);
+    f.submit(3, request(3, 4 * GIB));
     let starts = f.tick();
     assert_eq!(starts.len(), 2);
     for start in &starts {
@@ -258,12 +266,12 @@ fn only_an_action_without_gpus_has_a_key_floor() {
         caps: whole_caps,
     });
 
-    let mut gpu = request(2, 4 * GIB, Some(KEY));
+    let mut gpu = request(2, 4 * GIB);
     gpu.resources = gpu.resources.with_gpus(1);
-    let mut machine = request(3, 4 * GIB, Some(KEY));
+    let mut machine = request(3, 4 * GIB);
     machine.kind = LeaseKind::WholeMachine;
-    f.submit(2, gpu.clone());
-    f.submit(3, machine);
+    f.submit_keyed(2, gpu.clone(), KEY);
+    f.submit_keyed(3, machine, KEY);
     let started = f.tick();
     assert_eq!(started.len(), 2, "{started:?}");
     let gpu_start = started.iter().find(|s| s.worker == w("gpu")).expect("gpu");
@@ -279,8 +287,7 @@ fn only_an_action_without_gpus_has_a_key_floor() {
     assert!(f.end(gpu_start, ok()).is_empty());
     let mut other = gpu;
     other.key = action(4, "main");
-    other.size_key = Some(KEY + 1);
-    f.submit(4, other);
+    f.submit_keyed(4, other, KEY + 1);
     let start = only(f.tick());
     let rerun = f.killed(&start);
     assert_eq!(rerun.resources.memory_bytes, 16 * GIB);
@@ -296,7 +303,7 @@ fn a_burst_of_kills_is_one_event() {
     let mut f = Farm::new();
     f.node("wide", 128, 256);
     for n in 1..=50u8 {
-        f.submit(u64::from(n), request(n, 4 * GIB, Some(KEY)));
+        f.submit_keyed(u64::from(n), request(n, 4 * GIB), KEY);
     }
     let running = f.tick();
     assert_eq!(running.len(), 50);
@@ -316,7 +323,7 @@ fn a_burst_of_kills_is_one_event() {
     assert_eq!(f.s.key_floor(KEY), Some(16 * GIB));
     // The key is not disabled: the next 50 digests book the raised rung.
     for n in 51..=100u8 {
-        f.submit(u64::from(n), request(n, 4 * GIB, Some(KEY)));
+        f.submit_keyed(u64::from(n), request(n, 4 * GIB), KEY);
     }
     let next = f.tick();
     assert_eq!(next.len(), 50);
@@ -332,7 +339,7 @@ fn a_burst_of_kills_is_one_event() {
 fn a_key_floor_stays_below_the_largest_node() {
     let mut f = Farm::new();
     f.node("a", 8, 16);
-    f.submit(1, request(1, 4 * GIB, Some(KEY)));
+    f.submit_keyed(1, request(1, 4 * GIB), KEY);
     let first = only(f.tick());
     let rerun = f.killed(&first);
     assert_eq!(rerun.resources.memory_bytes, 16 * GIB, "the digest's cap");
@@ -340,10 +347,10 @@ fn a_key_floor_stays_below_the_largest_node() {
     // The digest's own retry owns the host; once it ends, a new digest of the key runs
     // beside another lease.
     assert!(f.end(&rerun, ok()).is_empty());
-    f.submit(2, request(2, 4 * GIB, Some(KEY)));
+    f.submit_keyed(2, request(2, 4 * GIB), KEY);
     let second = only(f.tick());
     assert_eq!(second.resources.memory_bytes, 16 * GIB - 256 * MIB);
-    f.submit(3, request(3, 4 * GIB, None));
+    f.submit(3, request(3, 4 * GIB));
     assert_eq!(only(f.tick()).resources.memory_bytes, 4 * GIB);
 }
 
@@ -366,7 +373,7 @@ fn the_bound_is_the_largest_live_node_that_could_run_it() {
         capacity: Resources::new(8_000, 256 * GIB),
         caps: mac,
     });
-    let mut wants = request(1, 4 * GIB, Some(KEY));
+    let mut wants = request(1, 4 * GIB);
     wants.resources = Resources::new(2_000, 4 * GIB);
     assert_eq!(
         f.s.key_floor_bound(&wants),
@@ -382,7 +389,7 @@ fn the_bound_is_the_largest_live_node_that_could_run_it() {
     // No node at all: no bound, hence no floor.
     let mut empty = Farm::new();
     assert_eq!(empty.s.key_floor_bound(&wants), 0);
-    empty.submit(1, request(1, 4 * GIB, Some(KEY)));
+    empty.submit_keyed(1, request(1, 4 * GIB), KEY);
     assert!(empty.tick().is_empty());
 }
 
@@ -404,7 +411,7 @@ fn generated_farms_never_book_a_whole_host_from_a_key_floor() {
             largest = largest.max(memory);
             f.node(&format!("n{i}"), 1 + rng.below(16), memory);
         }
-        f.submit(1, request(1, 4 * GIB, Some(KEY)));
+        f.submit_keyed(1, request(1, 4 * GIB), KEY);
         let mut start = only(f.tick());
         let mut digest = 1;
         // Kill it until the farm has no larger rung, or a few times.
@@ -424,7 +431,7 @@ fn generated_farms_never_book_a_whole_host_from_a_key_floor() {
         }
         // Whatever the chain, a fresh digest of the key books under the largest node.
         digest += 1;
-        f.submit(u64::from(digest), request(digest, 4 * GIB, Some(KEY)));
+        f.submit_keyed(u64::from(digest), request(digest, 4 * GIB), KEY);
         for s in f.tick() {
             if s.operation != start.operation {
                 assert!(
@@ -445,8 +452,8 @@ fn generated_farms_never_book_a_whole_host_from_a_key_floor() {
 #[test]
 fn a_successor_books_the_raise_the_lease_ran_under() {
     let mut f = farm_with_floor_16();
-    f.submit(2, request(2, 4 * GIB, Some(KEY)));
-    f.submit(3, request(3, 4 * GIB, Some(KEY)));
+    f.submit_keyed(2, request(2, 4 * GIB), KEY);
+    f.submit_keyed(3, request(3, 4 * GIB), KEY);
     let running = f.tick();
     assert_eq!(running.len(), 2);
     assert!(running.iter().all(|s| s.resources.memory_bytes == 16 * GIB));
@@ -465,7 +472,7 @@ fn a_successor_books_the_raise_the_lease_ran_under() {
     let recovered = vec![
         Recovered {
             operation: held.operation,
-            request: request(2, 4 * GIB, Some(KEY)),
+            request: request(2, 4 * GIB),
             waiter: WaiterId(2),
             lease: Some(RecoveredLease {
                 lease: held.lease,
@@ -476,7 +483,7 @@ fn a_successor_books_the_raise_the_lease_ran_under() {
         },
         Recovered {
             operation: running[1].operation,
-            request: request(3, 4 * GIB, Some(KEY)),
+            request: request(3, 4 * GIB),
             waiter: WaiterId(3),
             lease: None,
             losses: 0,
@@ -484,6 +491,9 @@ fn a_successor_books_the_raise_the_lease_ran_under() {
         },
     ];
     successor.recover(7, OperationId(10), 20, recovered);
+    // The server names the keys again from its own rows.
+    successor.set_size_key(held.operation, KEY);
+    successor.set_size_key(running[1].operation, KEY);
     let mut g = Farm::over(successor);
     g.node("big", 8, 64);
     assert_eq!(
@@ -512,7 +522,7 @@ fn key_floors_are_in_the_memory_state_and_the_floor_change() {
     let mut same = farm_with_floor_16();
     assert_eq!(f.s.memory_state(), same.s.memory_state());
     // A third scheduler with one more raise differs only by its key floor.
-    same.submit(9, request(9, 4 * GIB, Some(KEY + 1)));
+    same.submit_keyed(9, request(9, 4 * GIB), KEY + 1);
     let nine = only(same.tick());
     let again = same.killed(&nine);
     assert_eq!(again.resources.memory_bytes, 16 * GIB);
@@ -523,7 +533,7 @@ fn key_floors_are_in_the_memory_state_and_the_floor_change() {
     g.node("big", 8, 64);
     let mut ops = Vec::new();
     for n in 1..=2u8 {
-        g.submit(u64::from(n), request(n, 4 * GIB, Some(KEY + u64::from(n))));
+        g.submit_keyed(u64::from(n), request(n, 4 * GIB), KEY + u64::from(n));
         let start = only(g.tick());
         ops.push(start.operation);
         let next = g.killed(&start);
@@ -549,7 +559,7 @@ fn key_floors_are_in_the_memory_state_and_the_floor_change() {
     assert_eq!(successor.key_floor(KEY + 1), None);
     let mut h = Farm::over(successor);
     h.node("big", 8, 64);
-    h.submit(1, request(1, 4 * GIB, Some(KEY + 2)));
+    h.submit_keyed(1, request(1, 4 * GIB), KEY + 2);
     assert_eq!(only(h.tick()).resources.memory_bytes, 16 * GIB);
     // Nothing is held for a request that has no key.
     let _ = &mut f;
@@ -564,7 +574,7 @@ fn an_operation_raised_beyond_the_remaining_nodes_is_lowered_not_refused() {
     let mut f = Farm::new();
     f.node("big", 1, 64);
     // A floor of 32 GiB: killed at 4, then 16.
-    f.submit(1, request(1, 4 * GIB, Some(KEY)));
+    f.submit_keyed(1, request(1, 4 * GIB), KEY);
     let first = only(f.tick());
     let second = f.killed(&first);
     let third = f.killed(&second);
@@ -572,10 +582,10 @@ fn an_operation_raised_beyond_the_remaining_nodes_is_lowered_not_refused() {
     assert!(f.end(&third, ok()).is_empty());
     assert_eq!(f.s.key_floor(KEY), Some(32 * GIB));
     // One core: operation 2 holds it, operation 3 waits, raised to 32 GiB.
-    f.submit(2, request(2, 4 * GIB, Some(KEY)));
+    f.submit_keyed(2, request(2, 4 * GIB), KEY);
     let held = only(f.tick());
     assert_eq!(held.resources.memory_bytes, 32 * GIB);
-    f.submit(3, request(3, 4 * GIB, Some(KEY)));
+    f.submit_keyed(3, request(3, 4 * GIB), KEY);
     assert!(f.tick().is_empty());
 
     // The big node falls silent; a 16 GiB node joins.

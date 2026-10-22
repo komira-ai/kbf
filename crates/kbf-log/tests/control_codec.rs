@@ -203,7 +203,6 @@ impl Rng {
             needs: self.needs(),
             hermetic: self.below(2) == 0,
             do_not_cache: self.below(2) == 0,
-            size_key: None,
         }
     }
 
@@ -351,50 +350,6 @@ fn generated_control_commands_round_trip() {
     assert!(inputs.iter().all(|&n| n > 100), "{inputs:?}");
 }
 
-/// Catches a `size_key` that survives only some paths: a generated key (zero, small and
-/// large ones) that does not round-trip under format 6, that a format-5 writer encodes
-/// anyway, or that a format-5 reader (a rolled-back binary meeting a row written under
-/// format 6) accepts instead of stopping on it.
-#[test]
-fn a_generated_size_key_round_trips_under_format_6_and_no_earlier_format() {
-    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-    let mut keyed = 0;
-    for n in 0..5_000 {
-        let LogCommand::Farm(mut batch) = rng.command() else {
-            continue;
-        };
-        let mut any = false;
-        for input in &mut batch.inputs {
-            if let FarmInput::Submit(request) = input {
-                request.size_key = Some(rng.number());
-                any = true;
-            }
-        }
-        if !any {
-            continue;
-        }
-        keyed += 1;
-        let command = LogCommand::Farm(batch);
-        let bytes = kbf_log::encode(Format::V6, &command).expect("format 6");
-        assert_eq!(
-            kbf_log::decode(Format::V6, &bytes),
-            Ok(command.clone()),
-            "{n}"
-        );
-        assert_eq!(
-            kbf_log::encode(Format::V5, &command),
-            Err(EncodeError::Command(Format::V5)),
-            "{n}"
-        );
-        assert_eq!(
-            kbf_log::decode(Format::V5, &bytes),
-            Err(DecodeError::UnknownCommand("Request")),
-            "{n}"
-        );
-    }
-    assert!(keyed > 100, "{keyed}");
-}
-
 const fn kind(command: &LogCommand) -> usize {
     match command {
         LogCommand::Meta(_) | LogCommand::Bootstrap(_) | LogCommand::Farm(_) => 0,
@@ -487,7 +442,6 @@ fn prequest(qos: Option<proto::Qos>, kind: i32, needs: &[(&str, &str)]) -> proto
             .collect(),
         hermetic: false,
         do_not_cache: false,
-        size_key: None,
     }
 }
 
@@ -909,12 +863,12 @@ fn a_wall_time_outside_u64_nanoseconds_is_not_written() {
 }
 
 /// Catches a control command written or read under a format this build does not know
-/// (format 7; formats 1 to 6 all carry control commands, since formats 2 to 5 only add
-/// metadata commands and format 6 one optional field).
+/// (format 6; formats 1 to 5 all carry control commands, since formats 2 to 5 only add
+/// metadata commands).
 #[test]
 fn control_commands_refuse_an_unknown_format() {
     let command = batch(FarmInput::Tick);
-    let format = Format::new(7);
+    let format = Format::new(6);
     assert_eq!(encode(format, &command), Err(EncodeError::Format(format)));
     assert_eq!(
         kbf_log::decode(format, &enc(&command)),
@@ -939,16 +893,13 @@ fn machine_versions_name_their_entry_formats() {
     assert_eq!(MachineVersion::V4.format(), Some(Format::V4));
     assert_eq!(MachineVersion::V5.get(), 5);
     assert_eq!(MachineVersion::V5.format(), Some(Format::V5));
-    assert_eq!(MachineVersion::V6.get(), 6);
-    assert_eq!(MachineVersion::V6.format(), Some(Format::V6));
-    let v7 = MachineVersion::new(NonZeroU32::new(7).expect("non-zero"));
-    assert_eq!(v7.format(), None);
+    let v6 = MachineVersion::new(NonZeroU32::new(6).expect("non-zero"));
+    assert_eq!(v6.format(), None);
     assert!(
         MachineVersion::V1 < MachineVersion::V2
             && MachineVersion::V2 < MachineVersion::V3
             && MachineVersion::V3 < MachineVersion::V4
             && MachineVersion::V4 < MachineVersion::V5
-            && MachineVersion::V5 < MachineVersion::V6
-            && MachineVersion::V6 < v7
+            && MachineVersion::V5 < v6
     );
 }

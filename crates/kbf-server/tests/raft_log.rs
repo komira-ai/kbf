@@ -590,7 +590,7 @@ async fn a_log_raised_past_what_a_binary_runs_refuses_its_open() {
         .expect("a raise");
     let raised = log.applied_index();
     assert_eq!(log.commit(add_tier()).await, Ok(Applied::Tier(Ok(()))));
-    let v6 = MachineVersion::new(NonZeroU32::new(7).expect("non-zero"));
+    let v6 = MachineVersion::new(NonZeroU32::new(6).expect("non-zero"));
     assert!(log.raise_machine_version(v6).is_err());
     assert_eq!(log.machine_version(), MachineVersion::V2);
     drop(log);

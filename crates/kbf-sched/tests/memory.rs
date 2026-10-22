@@ -35,7 +35,6 @@ fn request(n: u8, memory: u64) -> Request {
         resources: Resources::new(1_000, memory),
         hermetic: true,
         do_not_cache: false,
-        size_key: None,
         needs: kbf_caps::Request::from_platform([("OSFamily", "linux")]).unwrap(),
     }
 }

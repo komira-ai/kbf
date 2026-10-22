@@ -42,9 +42,9 @@
 //! costs one more killed run per key, never a wrong answer. At most [`MEMORY_FLOORS`] are
 //! kept; past that the one raised longest ago is forgotten first. A floor never falls.
 //!
-//! **Key floors.** A request that carries a `size_key` (set by the front door while the
-//! farm learns sizes, `Request::size_key`) also leaves a floor under that key when it
-//! is killed at its own limit, so a changed digest of the same key starts where the
+//! **Key floors.** An operation given a size key ([`Scheduler::set_size_key`], fed by the
+//! caller while the farm learns sizes) also leaves a floor under that key when it is
+//! killed at its own limit, so a changed digest of the same key starts where the
 //! last one ended instead of climbing the ladder again. The floor is the rung the kill
 //! retries at, kept strictly below the memory of the largest live node that could run
 //! the request ([`Scheduler::key_floor_bound`]): a booking at a node's whole memory owns
@@ -203,7 +203,7 @@ impl Default for MemoryLadder {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryState {
     floors: Floors<ActionKey>,
-    /// The floors by `Request::size_key`, with the order they were raised in.
+    /// The floors by size key, with the order they were raised in.
     key_floors: Floors<u64>,
     /// The operations with a memory kill, while the scheduler holds them.
     ops: BTreeMap<OperationId, OpKills>,
@@ -357,8 +357,8 @@ pub struct Floor {
     pub stamp: u64,
 }
 
-/// One key floor as the state store keeps it: the floor a request carrying `key` as its
-/// `size_key` books at least ([`Request::size_key`]).
+/// One key floor as the state store keeps it: the floor an operation with size key `key`
+/// books at least.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyFloor {
     /// The size key.
@@ -415,7 +415,8 @@ impl Scheduler {
     /// forgotten since the last call (the caller owns those now). Empty for an operation
     /// the scheduler no longer holds.
     pub fn take_floor_change(&mut self, operation: OperationId) -> FloorChange {
-        let request = self.ops.get(&operation).map(|op| &op.request);
+        let held = self.ops.get(&operation);
+        let request = held.map(|op| &op.request);
         let raised = request.and_then(|r| {
             let (ask, stamp) = self.memory.floors.stamped(&r.key)?;
             Some(Floor {
@@ -424,7 +425,7 @@ impl Scheduler {
                 stamp,
             })
         });
-        let key_raised = request.and_then(Request::floor_key).and_then(|key| {
+        let key_raised = held.and_then(super::Operation::floor_key).and_then(|key| {
             let (ask, stamp) = self.memory.key_floors.stamped(&key)?;
             Some(KeyFloor { key, ask, stamp })
         });
@@ -450,7 +451,19 @@ impl Scheduler {
         self.memory.key_floors.restore(rows);
     }
 
-    /// The key floor of `size_key`, in bytes: the memory a queued request carrying it
+    /// Names the key `operation`'s kill-driven memory floor is kept under, which the
+    /// caller derives (from the instance, the platform class, the instrument and the
+    /// action's shape) and keeps in its own rows: no scheduler input and no log record
+    /// carries it. A no-op for an operation the scheduler does not hold. Set it once the
+    /// operation is queued, and again for one taken up after a restart (before its worker
+    /// registers: a recovered lease is raised to its key's floor then).
+    pub fn set_size_key(&mut self, operation: OperationId, size_key: u64) {
+        if let Some(op) = self.ops.get_mut(&operation) {
+            op.size_key = Some(size_key);
+        }
+    }
+
+    /// The key floor of `size_key`, in bytes: the memory a queued operation with it
     /// books at least at a placement round, within [`Scheduler::key_floor_bound`].
     #[must_use]
     pub fn key_floor(&self, size_key: u64) -> Option<u64> {
@@ -487,7 +500,6 @@ impl Scheduler {
     pub(super) fn raise_to_key_floor(&mut self, id: OperationId, bound: Option<u64>) {
         let op = &self.ops[&id];
         let Some(ask) = op
-            .request
             .floor_key()
             .and_then(|key| self.memory.key_floors.get(&key))
         else {
@@ -616,7 +628,6 @@ impl Scheduler {
                 return false;
             };
             let key_bound = op
-                .request
                 .floor_key()
                 .map(|k| (k, self.key_floor_bound(&op.request)));
             let op = self.ops.get_mut(&id).expect("checked above");
@@ -931,7 +942,6 @@ mod tests {
                 resources: Resources::new(1_000, GIB),
                 hermetic: true,
                 do_not_cache: false,
-                size_key: None,
                 needs: kbf_caps::Request::from_platform([("OSFamily", "linux")])
                     .expect("a Linux platform"),
             };

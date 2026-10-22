@@ -216,6 +216,7 @@ impl Scheduler {
                 losses,
                 queued_at: self.now,
                 key_applied: None,
+                size_key: None,
             },
         );
     }

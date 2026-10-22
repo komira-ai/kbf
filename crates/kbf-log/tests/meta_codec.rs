@@ -634,10 +634,10 @@ fn malformed_values_are_refused() {
 /// Catches: an encoder or decoder that ignores the committed format, so a binary would
 /// write or read an encoding the log does not allow.
 #[test]
-fn only_formats_1_to_6_are_written_or_read() {
+fn only_formats_1_to_5_are_written_or_read() {
     let entry = LogCommand::Meta(Command::Collect);
     let bytes = encode(Format::V1, &entry).expect("format 1");
-    for format in [Format::new(0), Format::new(7), Format::new(u32::MAX)] {
+    for format in [Format::new(0), Format::new(6), Format::new(u32::MAX)] {
         assert_eq!(encode(format, &entry), Err(EncodeError::Format(format)));
         assert_eq!(decode(format, &bytes), Err(DecodeError::Format(format)));
     }
@@ -647,12 +647,11 @@ fn only_formats_1_to_6_are_written_or_read() {
             Format::V2.get(),
             Format::V3.get(),
             Format::V4.get(),
-            Format::V5.get(),
-            Format::V6.get()
+            Format::V5.get()
         ),
-        (1, 2, 3, 4, 5, 6)
+        (1, 2, 3, 4, 5)
     );
-    for n in 1..=6 {
+    for n in 1..=5 {
         assert_eq!(decode(Format::new(n), &bytes), Ok(entry.clone()), "{n}");
     }
 }

@@ -82,7 +82,6 @@ async fn a_silent_node_past_the_budget_answers_the_callers_on_a_tick() {
         needs: kbf_caps::Request::default(),
         hermetic: true,
         do_not_cache: false,
-        size_key: None,
     };
     let ticket = farm
         .submit(Submission {
@@ -166,7 +165,6 @@ async fn a_node_that_drops_every_start_answers_the_callers_that_it_never_started
         needs: kbf_caps::Request::default(),
         hermetic: true,
         do_not_cache: false,
-        size_key: None,
     };
     let ticket = farm
         .submit(Submission {
@@ -220,7 +218,6 @@ async fn a_drain_with_a_lease_still_running_pauses_at_its_deadline() {
         needs: kbf_caps::Request::default(),
         hermetic: true,
         do_not_cache: false,
-        size_key: None,
     };
     let _ticket = farm
         .submit(Submission {
