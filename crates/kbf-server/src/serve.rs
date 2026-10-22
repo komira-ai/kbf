@@ -796,8 +796,6 @@ where
         recorder: recorder.clone(),
         history: history.as_ref().map(crate::history::History::reads),
         budget,
-        farm: Arc::clone(&farm),
-        rows: update_rows.clone(),
     };
     let offers =
         crate::release::offers::offers_of(releases.clone(), update_rows.clone(), listeners.tick);

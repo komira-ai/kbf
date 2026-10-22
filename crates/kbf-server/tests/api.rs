@@ -306,8 +306,6 @@ async fn get_nodes_lists_each_nodes_newest_software() {
             );
         }
     }
-    // None of these daemons sent an `UpdateStatus`: never idle, and no verdict.
-    let unsupported = json!({ "state": null, "up_to_date": null, "availability": "unsupported" });
     assert_eq!(
         got,
         json!({ "server": this_build, "nodes": [
@@ -317,7 +315,6 @@ async fn get_nodes_lists_each_nodes_newest_software() {
                 "xcode_builds": [], "xcodes": [],
                 "container_images": [LINUX_IMAGE] },
               "needs_attention": [],
-              "update": unsupported,
               "placement": { "state": "serving" },
               "phase": { "state": "serving" }, "lease_count": 0, "booked": { "cpu_millis": 0, "memory_bytes": 0, "gpus": 0, "vms": 0 } },
             { "node_id": "mac-1", "connected": true, "protocol": 1, "software": {
@@ -332,12 +329,10 @@ async fn get_nodes_lists_each_nodes_newest_software() {
                       "state": "ready", "reason": "", "fix": "" } ],
                 "container_images": [] },
               "needs_attention": [NOT_READY],
-              "update": unsupported,
               "placement": { "state": "serving" },
               "phase": { "state": "serving" }, "lease_count": 0, "booked": { "cpu_millis": 0, "memory_bytes": 0, "gpus": 0, "vms": 0 } },
             { "node_id": "old-1", "connected": true, "protocol": 1, "software": null,
               "needs_attention": [],
-              "update": unsupported,
               "placement": { "state": "serving" },
               "phase": { "state": "serving" }, "lease_count": 0, "booked": { "cpu_millis": 0, "memory_bytes": 0, "gpus": 0, "vms": 0 } },
         ], "oldest_protocol": 1, "protocol_unknown": 0 })
@@ -455,12 +450,9 @@ fn update_status(running: &str, state: State) -> UpdateStatus {
 
 /// Catches (`pull-updates.md` 6.4: ignored from a replaced stream exactly as `NodeStatus`
 /// is): an `UpdateStatus` from a replaced stream overwriting the newest stream's (a host
-/// that restarted onto a new release would be shown as running the old one, and judged
-/// out of date), one kept for a node that never registered, and the answer to "was it
-/// kept" being wrong. The newest stream's report is the one the detail lists, live.
-///
-/// Mutants seen red: the stream check dropped (the old stream's report wins); the
-/// report kept for an unregistered node (a ghost host listed).
+/// that restarted onto a new release would be read as running the old one), one kept for a
+/// node that never registered, and the answer to "was it kept" being wrong. The newest
+/// stream's report is the one the update controller reads.
 #[tokio::test]
 async fn an_update_status_from_a_replaced_stream_is_ignored() {
     let farm = Farm::new(
@@ -478,13 +470,15 @@ async fn an_update_status_from_a_replaced_stream_is_ignored() {
     );
     let ghost = WorkerId::new("ghost");
     assert!(!farm.update_status(&ghost, new, update_status("cccccccccccc", State::Idle)));
-    let hosts = farm.update_hosts();
-    assert_eq!(hosts.len(), 1, "{hosts:?}");
-    let host = serde_json::to_value(&hosts[0]).expect("json");
-    assert_eq!(host["node_id"], "linux-1");
-    assert_eq!(host["running_commit"], "bbbbbbbbbbbb");
-    assert_eq!(host["state"], "idle");
-    assert_eq!(host["availability"], "ok");
+    let looks = farm.update_look();
+    assert_eq!(looks.len(), 1, "{looks:?}");
+    assert_eq!(looks[0].id, node);
+    let report = looks[0]
+        .update
+        .as_ref()
+        .expect("the newest stream's report");
+    assert_eq!(report.running_commit, "bbbbbbbbbbbb");
+    assert_eq!(report.kind, State::Idle);
 }
 
 /// Catches: `connected` read from something other than the stream's response side
