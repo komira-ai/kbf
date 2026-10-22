@@ -462,6 +462,8 @@ impl<C: Cas> NativeRuntime<C> {
         runner: &mut Runner,
         (stop, killer): (&mut oneshot::Receiver<Stop>, &mut Option<Stop>),
     ) -> Result<Prepared, RuntimeError> {
+        // The offer borrows the runner, which the scope owns: the slot taken is in
+        // `runner` from the moment it is taken, whatever happens next.
         let mut offer = SlotOffer {
             runtime: self,
             slots,
@@ -471,16 +473,9 @@ impl<C: Cas> NativeRuntime<C> {
             stop,
             killer,
             prepared: std::sync::OnceLock::new(),
-            current: None,
+            runner,
         };
-        // The runner owns the slot from the moment it is taken, whatever happens next, so
-        // that `run` removes the lease directory before the slot is released.
-        let mut held = None;
-        let result = crate::slots::canary::acquire(&mut offer, &mut held).await;
-        if let Some(slot) = held {
-            *runner = slot;
-        }
-        result?;
+        crate::slots::canary::first_passing(&mut offer).await?;
         (offer.prepared)
             .into_inner()
             .ok_or_else(|| RuntimeError::Failed("no prepared lease".to_owned()))
@@ -906,13 +901,12 @@ struct SlotOffer<'a, C: Cas> {
     killer: &'a mut Option<Stop>,
     /// Made once, with the first slot taken.
     prepared: std::sync::OnceLock<Prepared>,
-    /// The slot taken last, until it is set aside or handed to the caller.
-    current: Option<Runner>,
+    /// The runner of the lease's scope: the slot taken last is put in it.
+    runner: &'a mut Runner,
 }
 
 #[cfg(target_os = "macos")]
 impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
-    type Slot = Runner;
     type Err = RuntimeError;
 
     async fn next(&mut self) -> Result<(), RuntimeError> {
@@ -923,9 +917,9 @@ impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
                 return Err(RuntimeError::Killed);
             }
         };
-        // Held from here on: every failure below leaves it with the caller.
+        // Held from here on, in the scope's runner: every failure below leaves it there.
         let private = taken.private_lease();
-        self.current = Some(taken);
+        *self.runner = taken;
         if self.prepared.get().is_none() {
             let made = tokio::select! {
                 made = self.runtime.prepare(self.cas, self.work, self.dir, private) => made?,
@@ -941,8 +935,8 @@ impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
 
     async fn probe(&mut self) -> Result<crate::slots::canary::Probe, RuntimeError> {
         use crate::slots::canary::{Probe, Raced, until_killed};
-        let (Some(slot), Some(made)) = (self.current.as_ref(), self.prepared.get()) else {
-            return Err(RuntimeError::Failed("no slot or lease to probe".to_owned()));
+        let (slot, Some(made)) = (&*self.runner, self.prepared.get()) else {
+            return Err(RuntimeError::Failed("no lease to probe".to_owned()));
         };
         // The hand-over and the canaries are blocking work that cannot be dropped: on a
         // kill they are told to stop and awaited, so that nothing of the slot runs after
@@ -979,19 +973,10 @@ impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
         // The slot's user owns the lease directory until it is taken back: a slot that
         // is cleaned and offered again must not find it. If it cannot be taken back the
         // slot stays held and the lease fails, so `run` removes the directory first.
-        let Some(slot) = self.current.as_ref() else {
-            return Ok(());
-        };
-        slot.reclaim(self.dir).await?;
-        if let Some(slot) = self.current.take() {
-            // The book logs it, in the shape of a failed clean.
-            slot.set_aside(why);
-        }
+        self.runner.reclaim(self.dir).await?;
+        // The book logs it, in the shape of a failed clean.
+        std::mem::take(self.runner).set_aside(why);
         Ok(())
-    }
-
-    fn take_held(&mut self) -> Option<Runner> {
-        self.current.take()
     }
 }
 
@@ -1007,31 +992,35 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
     async fn run(&self, work: Work) -> Result<ActionResult, RuntimeError> {
         let (stop_tx, mut stop) = oneshot::channel();
         let _registered = Registered::new(self, work.lease_id, stop_tx);
-        // Declared before `dir`, so that a dropped run (the future cancelled, or a
-        // panic) drops `dir` first and the runner's slot after: the slot is cleaned and
-        // offered again as soon as it drops, and must not be while the lease directory,
-        // owned by its user, still exists.
-        let mut runner = Runner::Daemon;
-        let dir = LeaseDir {
-            path: self.config.scratch.join(lease_name(work.lease_id)),
-            simctl: Arc::clone(&self.simctl),
-            simulator: Mutex::new(None),
-            armed: true,
+        // The lease directory and the runner (whose slot's user owns the directory) are
+        // one `Scope`, which drops the directory first and the slot after: a slot is
+        // cleaned and offered again as soon as it drops, and must not be while the
+        // directory still exists. That holds for a dropped run (the future cancelled) and
+        // for a panic too, because everything that holds the slot, the offer among it,
+        // borrows it from the scope and owns none.
+        let mut scope = crate::slots::Scope {
+            dir: LeaseDir {
+                path: self.config.scratch.join(lease_name(work.lease_id)),
+                simctl: Arc::clone(&self.simctl),
+                simulator: Mutex::new(None),
+                armed: true,
+            },
+            runner: Runner::Daemon,
         };
         let mut killer = None;
         let mut measured = None;
         let outcome = (self.attempt(
             &work,
-            &dir.path,
-            &dir.simulator,
-            &mut runner,
+            &scope.dir.path,
+            &scope.dir.simulator,
+            &mut scope.runner,
             &mut stop,
             &mut killer,
             &mut measured,
         ))
         .await;
-        let cleaned = dir.clean().await;
-        runner.release().await;
+        let cleaned = scope.dir.clean().await;
+        scope.runner.release().await;
         sweep_user_folders_after_lease(&self.config).await;
         // A kill that arrived after the work ended still waits for the clean.
         if let Some(by) = killer.or_else(|| stop.try_recv().ok()) {

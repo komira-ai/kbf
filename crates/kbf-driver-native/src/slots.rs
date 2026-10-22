@@ -314,6 +314,18 @@ fn hand_tree_with(
     Ok(skipped.len())
 }
 
+/// A lease's directory and the runner whose slot's user owns it. Fields drop in the
+/// order they are declared, so the directory goes first and the slot after, whether the
+/// run ends, is dropped or panics: a slot is cleaned and offered again as soon as it
+/// drops, and must not be while the directory still exists. Everything that holds the
+/// slot during the run borrows it from here and owns none. Reordering the fields breaks
+/// that (`the_directory_drops_before_the_slot_even_on_a_panic`); there is no `Drop` impl
+/// so that `run` can move each out to clean and release it in turn.
+pub(crate) struct Scope<D, S> {
+    pub dir: D,
+    pub runner: S,
+}
+
 /// How a lease's action runs: as the daemon's own user, its processes followed by
 /// process group ([`crate::procs`]), or as the pool user of the slot it took (macOS).
 #[derive(Debug, Default)]
@@ -694,6 +706,46 @@ mod tests {
         let missing = base.join("missing");
         assert!(hand_tree(&missing, (me.uid(), me.gid()), &no_cancel()).is_err());
         assert!(!missing.exists(), "a failed hand-over made something");
+    }
+
+    /// Records its name when dropped.
+    struct Recorded(
+        &'static str,
+        std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    );
+
+    impl Drop for Recorded {
+        fn drop(&mut self) {
+            self.1.lock().expect("log").push(self.0);
+        }
+    }
+
+    /// Catches a lease scope that frees the slot before the lease directory is removed
+    /// (a slot dropped first is cleaned and offered again while its user still owns the
+    /// directory): a scope that ends, one dropped on a panic, and one where the runner
+    /// is replaced in the middle all drop the directory first. Seen red with the fields
+    /// of `Scope` swapped.
+    #[test]
+    fn the_directory_drops_before_the_slot_even_on_a_panic() {
+        use std::sync::{Arc, Mutex};
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let scope = || Scope {
+            dir: Recorded("dir", Arc::clone(&log)),
+            runner: Recorded("slot", Arc::clone(&log)),
+        };
+        drop(scope());
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _scope = scope();
+            panic!("a run that panics");
+        }));
+        assert!(panicked.is_err());
+        let Scope { dir, runner } = scope();
+        drop(dir);
+        drop(runner);
+        assert_eq!(
+            *log.lock().expect("log"),
+            ["dir", "slot", "dir", "slot", "dir", "slot"]
+        );
     }
 
     fn no_cancel() -> std::sync::atomic::AtomicBool {
