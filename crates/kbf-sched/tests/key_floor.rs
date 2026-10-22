@@ -1,4 +1,4 @@
-//! The kill-driven key floor (failure classes, 6.1; the learned-sizes design, E6): an
+//! The kill-driven key floor (failure classes, 6.1): an
 //! action killed at its own limit leaves a floor under its `size_key`, which every
 //! operation of the key picks up at the next placement round, strictly below the memory
 //! of the largest live node, and which a successor books the same way.
