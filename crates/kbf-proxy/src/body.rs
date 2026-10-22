@@ -243,6 +243,9 @@ enum Kept {
 /// The most frames kept for a replay. A request that has more is not replayed.
 const MAX_KEPT_FRAMES: usize = 64;
 
+/// The most frames [`Source::peek`] reads before a stream is dispatched.
+const MAX_PEEK_FRAMES: usize = 8;
+
 /// What the pump does next.
 enum Next {
     /// A frame, and whether it is the last the request has (the client ended the stream with
@@ -317,6 +320,36 @@ impl Source {
     /// Closes the window: the request is never replayed again.
     pub(crate) fn close_window(&self) {
         self.state().buffer.close();
+    }
+
+    /// Reads the start of the request without sending it, until `decided` says the bytes read
+    /// are enough, the request ends or [`MAX_PEEK_FRAMES`] frames are read; returns the DATA
+    /// bytes read. A request with no body at all is not read. A trailers frame ends the read,
+    /// and so does a body that failed (the reset that fails it also drops the stream's task).
+    ///
+    /// Nothing is taken from the request: every frame read is kept, so the pump replays it
+    /// first and the upstream sees the request whole, and a read that is dropped (the caller
+    /// bounds the wait) has lost nothing, since a frame is kept in the same step it is read.
+    /// A frame is kept while the replay window is open and has room, and it has both here: the
+    /// window is fresh, at most [`MAX_PEEK_FRAMES`] frames are read (well under
+    /// [`MAX_KEPT_FRAMES`]), and `decided` stops the read after a few hundred bytes, so what
+    /// is read is that plus one frame (16 KB at most), under [`REPLAY_BYTES`].
+    pub(crate) async fn peek(&self, decided: fn(&[u8]) -> bool) -> Vec<u8> {
+        let mut cursor = 0;
+        let mut head = Vec::new();
+        if self.bodiless() {
+            return head;
+        }
+        for _ in 0..MAX_PEEK_FRAMES {
+            let Next::Frame(Kept::Data(data), last) = self.next(&mut cursor).await else {
+                break;
+            };
+            head.extend_from_slice(&data);
+            if last | decided(&head) {
+                break;
+            }
+        }
+        head
     }
 
     /// The next frame for an attempt whose position is `cursor`: a kept one first, then the

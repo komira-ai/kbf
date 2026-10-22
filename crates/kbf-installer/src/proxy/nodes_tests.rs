@@ -38,8 +38,8 @@ fn phases_after(w: &World, written: usize) -> Vec<Phase> {
 /// confirm has landed, so the restart goes straight to the drain, enters no phase for the nodes
 /// and ends the update `done` once the old child is idle and retired.
 ///
-/// Mutants it catches: the `nodes` phase entered again; a restart that does nothing for a record
-/// at `nodes`; the drain waiting for the nodes to be told.
+/// Asserts that the `nodes` phase is not entered again, that a restart acts on a record at
+/// `nodes`, and that the drain does not wait for the nodes to be told.
 #[test]
 fn a_record_at_the_retired_nodes_phase_goes_on_to_the_drain() {
     let w = left_at_nodes_by_an_older_build(None);
@@ -58,8 +58,8 @@ fn a_record_at_the_retired_nodes_phase_goes_on_to_the_drain() {
 /// on to drain and retire, and the update ends `failed` at `nodes` as it would have. The frontend
 /// was swapped and stays so: the staged release is kept and the new child serves.
 ///
-/// Mutants it catches: the end of the update ignoring a recorded failure at `nodes` (it ends
-/// `done`); the failure dropped at the restart.
+/// Asserts that the end of the update reports a recorded failure at `nodes` (it does not end
+/// `done`), and that the failure is kept through the restart.
 #[test]
 fn a_failure_an_older_build_recorded_at_nodes_still_ends_the_update_failed() {
     let failure = Failure {
@@ -81,7 +81,7 @@ fn a_failure_an_older_build_recorded_at_nodes_still_ends_the_update_failed() {
 /// `nodes`, the step word `nodes` and the flag `nodes_posted` are all still read, so a proxy
 /// that comes up on such a file resumes the update instead of refusing every start.
 ///
-/// Mutants it catches: the `nodes` variant of the phase or of the step removed.
+/// Asserts that the `nodes` variant of the phase and of the step is still read.
 #[test]
 fn an_update_json_of_a_build_that_told_the_nodes_is_still_read() {
     let dir = kbf_host::testkit::scratch("proxy-nodes-record");

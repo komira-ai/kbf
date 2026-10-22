@@ -327,8 +327,8 @@ fn an_operator_abort_while_the_candidate_starts_kills_it_and_leaves_the_old_chil
 /// after the confirm. The child's port has no call to offer a release to its nodes, so the
 /// swap has nothing to post with.
 ///
-/// Mutants it catches: the `nodes` phase entered after the bake; `nodes_posted` set; the
-/// drain waiting on the nodes.
+/// Asserts that the `nodes` phase is not entered after the bake, that `nodes_posted` stays
+/// unset, and that the drain does not wait on the nodes.
 #[test]
 fn the_bake_confirms_after_the_window_and_the_nodes_are_never_told() {
     for nodes in [true, false] {

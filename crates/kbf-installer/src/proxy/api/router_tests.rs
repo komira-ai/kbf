@@ -92,8 +92,8 @@ async fn post_answers_202_with_the_update_id_and_the_same_one_for_a_retry() {
 /// words name the key to change, and it writes no order and starts nothing; the same body with
 /// `"nodes": false` is taken, and `rollback` still defaults to false.
 ///
-/// Mutants it catches: the refusal dropped (the request is accepted with a 202); the refusal
-/// answered with another status or code; the refusal made after the order is written.
+/// Asserts that the refusal is a 400 with the code `nodes_retired`, and that no order is
+/// written when it is made.
 #[tokio::test]
 async fn a_post_that_asks_for_the_nodes_is_refused_and_one_that_does_not_is_taken() {
     let h = harness("u8a-r-defaults", quick());

@@ -775,10 +775,10 @@ fn staged_b(state_schema: u32) -> StagedFacts {
 /// bake passes and the confirm lands in `releases.json`: installed `B`, nothing staged. No
 /// `orders/` was made, and the swap thread did not die.
 ///
-/// Mutants it catches: the swap's orders still the spool's (`orders/` appears, and the confirm
-/// is not in `releases.json`); the migrator reading the root half's `status.json` (the update
-/// ends at `migrate` as `not_staged`); the confirm that does not clear what is staged; the
-/// confirm that does not install `B`.
+/// Asserts that the swap's orders are `releases.json` and not a spool (no `orders/` appears,
+/// and the confirm is in `releases.json`); that the migrator reads the facts of
+/// `releases.json` and not the root half's `status.json` (the update gets past `migrate`);
+/// that the confirm clears what is staged; and that the confirm installs `B`.
 #[test]
 fn a_swap_over_the_proxys_copies_reads_confirms_and_migrates_through_releases_json() {
     let (cfg, local, root) = config_local("full");
@@ -825,8 +825,8 @@ fn a_swap_over_the_proxys_copies_reads_confirms_and_migrates_through_releases_js
 /// leaves the installed one: here the migration is refused, which ends the update at
 /// `migrate`, after the revert.
 ///
-/// Mutants it catches: the revert sent to the spool (`orders/` appears, `releases.json` still
-/// shows `B` staged); the revert that clears the installed release too.
+/// Asserts that the revert goes to `releases.json` and not a spool (no `orders/` appears, and
+/// `B` is no longer staged); and that the revert keeps the installed release.
 #[test]
 fn a_swap_that_fails_reverts_the_staged_release_in_releases_json() {
     let (cfg, local, root) = config_local("revert");

@@ -299,7 +299,8 @@ fn a_spool_that_cannot_be_opened_is_an_error_that_names_it() {
 /// restart); a program that cannot be identified is not (a failure, exit 1). The words are the
 /// API's, with the reason after them.
 ///
-/// Mutants it catches: the two arms swapped; the reason dropped from the words.
+/// Asserts which error is a usage error and which a failure, and that the reason is in the
+/// words.
 #[test]
 fn the_apis_start_up_errors_map_to_usage_and_failure_with_the_reason() {
     let spool = HandoverError::Orders {

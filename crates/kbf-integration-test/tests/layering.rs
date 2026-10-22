@@ -453,8 +453,9 @@ fn route_reaches_neither_the_frontend_nor_the_daemon() {
 /// decodes a child's protocol (`kbf-proto`), runs none of the frontend, storage or node code
 /// (`kbf-server`, `kbf-front`, `kbf-storage`, `kbf-node`, `kbf-daemon`, the binaries
 /// `kbf-cli` and `kbf-all-in-one`), and does not know the installer, its host plan or its
-/// update types (`kbf-installer`, `kbf-host`, `kbf-update`, `kbf-deploy`): the calls to a
-/// child are the installer's, through a trait that lives there, and the installer depends on
+/// update types (`kbf-installer`, `kbf-host`, `kbf-update`, `kbf-deploy`): the admin calls to
+/// a child are the installer's, through a trait that lives there (the proxy's one is the
+/// read-only `GET role`, for the child's term, over plain HTTP), and the installer depends on
 /// the proxy, not the other way round.
 const PROXY_MUST_NOT_REACH: &[&str] = &[
     "kbf-installer",
@@ -706,9 +707,8 @@ fn names_deleted_modules(text: &str) -> Vec<&'static str> {
 /// is the seam (`proxy/assemble.rs`), and it names that and nothing else of them. Re-exports
 /// the old modules define for kept items are theirs and are not looked at.
 ///
-/// Mutants it catches: an import of `proxy::api`, of `handover::`, of the spool or of
-/// `stage::` added to a file of the swap, as a path or inside braces; the seam naming the order
-/// spool.
+/// Asserts that no file of the swap imports `proxy::api`, `handover::`, the spool or `stage::`,
+/// as a path or inside braces, and that the seam does not name the order spool.
 #[test]
 fn the_swap_names_nothing_that_is_deleted_with_the_update_api() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-installer/src");
@@ -747,10 +747,10 @@ fn the_swap_names_nothing_that_is_deleted_with_the_update_api() {
 /// `use crate::{layout, stage}`, `use super::orders;`), across lines, and a word in a comment or
 /// in code that is not a `use` is not.
 ///
-/// Mutants it catches: a needle or a word dropped from [`DELETED_WITH_THE_API`] or
-/// [`DELETED_WORDS`]; `handover::` loosened to `handover`, which would match the kept
-/// `handover_swap::`; the words matched as substrings (`LocalOrders`); the statement cut at its
-/// first line; the scan taking every line for a `use`.
+/// Asserts that every needle of [`DELETED_WITH_THE_API`] and word of [`DELETED_WORDS`] is
+/// matched, that `handover::` does not match the kept `handover_swap::`, that the words are not
+/// matched as substrings (`LocalOrders`), that a statement is read across its lines, and that a
+/// line that is not a `use` is not taken for one.
 #[test]
 fn the_scan_for_deleted_modules_sees_each_way_to_name_them() {
     for named in [

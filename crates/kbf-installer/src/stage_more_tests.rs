@@ -466,8 +466,8 @@ fn a_frontend_update_does_not_wait_for_leases_and_an_activation_does() {
 /// component, then the number and both values), and a component that declares no more is let
 /// through.
 ///
-/// Mutants it catches: the component dropped from the refusal; the refusal word changed; the
-/// check's text not carried into the refusal.
+/// Asserts that the refusal names the component; that its word is `installer_too_old`; and
+/// that the check's text is carried into the refusal.
 #[test]
 fn a_number_past_the_installers_is_refused_in_the_words_the_stage_always_used() {
     let ceiling = Supported {
