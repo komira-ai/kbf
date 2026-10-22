@@ -20,9 +20,9 @@
 //!   that sign build provenance ([`SIGNING_SCOPES`]: `id-token` and `attestations`),
 //!   which may be `write` only in a job whose `if:` is exactly [`SIGNING_PUSH_ONLY`], and
 //!   `contents` ([`RELEASE_SCOPES`]), which may be `write` only in a job whose `if:` is
-//!   exactly [`RELEASE_TAG_PUSH_ONLY`]. So no pull request or merge-queue run holds a
+//!   exactly [`RELEASE_PUSH_ONLY`]. So no pull request or merge-queue run holds a
 //!   token that can sign an attestation, every attestation this repository signs names
-//!   `refs/heads/main`, and only a pushed `v*` tag runs a job that can create a release
+//!   `refs/heads/main`, and only a push to `main` of code (never of the pipeline itself) runs a job that can create a release
 //!   (or push to the repository), and `issues` ([`ISSUE_SCOPES`]), which may be `write`
 //!   only in a job whose `if:` is exactly [`ISSUES_MAIN_ONLY`] (the advisories workflow
 //!   keeps one issue; no pull request run holds a token that can write issues);
@@ -159,13 +159,14 @@ const SIGNING_SCOPES: &[&str] = &["id-token", "attestations"];
 const SIGNING_PUSH_ONLY: &str =
     "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
 
-/// Token scopes a job may set to `write` when it runs only for a pushed release tag:
+/// Token scopes a job may set to `write` when it runs only for a push to `main` that releases:
 /// the repository's contents, which creating a release and uploading its assets need.
 const RELEASE_SCOPES: &[&str] = &["contents"];
 
-/// The one `if:` spelling under which a job may hold [`RELEASE_SCOPES`] for writing.
-const RELEASE_TAG_PUSH_ONLY: &str =
-    "${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}";
+/// The one `if:` spelling under which a job may hold [`RELEASE_SCOPES`] for writing: a push
+/// to `main` (never a dispatch, a pull request or a tag), of code, that is not a change to the
+/// release pipeline itself (`release plan` outputs, read through the job's `needs`).
+const RELEASE_PUSH_ONLY: &str = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
 
 /// Token scopes a job may set to `write` when it runs only on `main`'s ref: the issues
 /// API, which the advisories workflow uses to open, update and close its one issue.
@@ -665,7 +666,7 @@ impl Lint<'_> {
     /// A job may narrow its token to `read` or `none` scopes; it may not widen it, but
     /// for [`SIGNING_SCOPES`] set to `write` in a job whose `if:` (`condition`) is
     /// exactly [`SIGNING_PUSH_ONLY`], [`RELEASE_SCOPES`] set to `write` in one whose
-    /// `if:` is exactly [`RELEASE_TAG_PUSH_ONLY`], and [`ISSUE_SCOPES`] in one whose `if:`
+    /// `if:` is exactly [`RELEASE_PUSH_ONLY`], and [`ISSUE_SCOPES`] in one whose `if:`
     /// is exactly [`ISSUES_MAIN_ONLY`]. Scope names and levels are compared
     /// exactly, so another spelling is refused (the safe side).
     fn job_permissions(&mut self, p: &Node, condition: Option<&str>) {
@@ -685,7 +686,7 @@ impl Lint<'_> {
             let gate = if SIGNING_SCOPES.contains(&name) {
                 Some(SIGNING_PUSH_ONLY)
             } else if RELEASE_SCOPES.contains(&name) {
-                Some(RELEASE_TAG_PUSH_ONLY)
+                Some(RELEASE_PUSH_ONLY)
             } else if ISSUE_SCOPES.contains(&name) {
                 Some(ISSUES_MAIN_ONLY)
             } else {

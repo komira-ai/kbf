@@ -176,18 +176,28 @@ pub fn job_has_key(text: &str, job: &str, key: &str) -> Result<bool, String> {
     Ok(get(job_of(&root, job)?, key).is_some())
 }
 
-/// The inputs of the `workflow_dispatch` trigger as `(name, required)`. An error when
-/// `on:` has no `workflow_dispatch` mapping with an `inputs:` mapping of mappings.
+/// The inputs of the `workflow_dispatch` trigger as `(name, required)`: none when the trigger
+/// is empty (`workflow_dispatch:`) or has no `inputs:`. An error when `on:` has no
+/// `workflow_dispatch` entry, when it is neither empty nor a mapping, or when `inputs:` is not
+/// a mapping of mappings.
 pub fn dispatch_inputs(text: &str) -> Result<Vec<(String, bool)>, String> {
     let root = yaml::load(text)?;
     let on = get(top_of(&root)?, "on").ok_or("the workflow has no `on:`")?;
     let Value::Map(on) = &on.value else {
         return Err("`on:` is not a mapping".to_owned());
     };
-    let Some(Value::Map(dispatch)) = get(on, "workflow_dispatch").map(|d| &d.value) else {
-        return Err("`on:` has no `workflow_dispatch:` mapping".to_owned());
+    let Some(dispatch) = get(on, "workflow_dispatch") else {
+        return Err("`on:` has no `workflow_dispatch:` entry".to_owned());
     };
-    let Some(Value::Map(inputs)) = get(dispatch, "inputs").map(|i| &i.value) else {
+    let dispatch = match &dispatch.value {
+        Value::Map(dispatch) => dispatch,
+        Value::Scalar { .. } if dispatch.as_str().is_none() => return Ok(Vec::new()),
+        _ => return Err("`on:` has no `workflow_dispatch:` mapping".to_owned()),
+    };
+    let Some(inputs) = get(dispatch, "inputs") else {
+        return Ok(Vec::new());
+    };
+    let Value::Map(inputs) = &inputs.value else {
         return Err("`workflow_dispatch:` has no `inputs:` mapping".to_owned());
     };
     inputs
