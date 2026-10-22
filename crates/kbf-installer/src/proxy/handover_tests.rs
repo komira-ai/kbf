@@ -312,8 +312,8 @@ fn config_local(name: &str) -> HandoverConfig {
 /// there or in the state directory, the status is the proxy's `releases.json`, and both
 /// orders the API can write are refused with the reason.
 ///
-/// Mutants it catches: `parts` opening the spool whatever `local` says; the writer being a
-/// spool; either writer method answering `Ok`.
+/// Asserts that `parts` opens no spool when `local` is set; that the writer is not a spool;
+/// and that neither writer method answers `Ok`.
 #[test]
 fn with_copies_no_order_spool_is_opened_and_the_apis_writer_refuses_every_order() {
     let cfg = config_local("copies-no-spool");

@@ -24,6 +24,9 @@
 //! target) and runs the hold gate.
 //! `/readyz` is the proxy's own answer: it polls the active child's operator listener
 //! (`GET /readyz`, once a second) and is 200 only while the last poll of that child passed.
+//! A `WaitExecution` whose operation name carries the term of the old child, which the proxy
+//! learns from each child's admin `role` answer, is routed to the old child while it lives
+//! and to the active child otherwise (`term`).
 
 // The I/O modules are not part of the loom build (`--cfg kbf_loom`): the models cover only
 // `slot`, and tokio and hyper are not loom-aware.
@@ -68,6 +71,8 @@ pub mod slot;
 #[cfg(not(kbf_loom))]
 mod stream;
 mod sync;
+#[cfg(not(kbf_loom))]
+mod term;
 #[cfg(not(kbf_loom))]
 mod tls;
 

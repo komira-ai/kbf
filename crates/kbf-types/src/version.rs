@@ -425,8 +425,9 @@ mod tests {
     /// component declaring no more (equal, or less: an installer ahead of the kbf it takes is
     /// the order the rule asks for). The refusal names the number and both values.
     ///
-    /// Mutants it catches: one of the three comparisons dropped; `>` made `>=`; `got` and
-    /// `most` swapped in the refusal; the numbers of `declared` and `supported` swapped.
+    /// Asserts that each of the three comparisons is made; that equal numbers are understood;
+    /// that `got` and `most` are the declared and the supported number in the refusal; and
+    /// that `declared` and `supported` are not swapped.
     #[test]
     fn a_component_is_understood_when_it_declares_no_more_than_the_installer_does() {
         let ceiling = numbers(2, 2, 4);
@@ -453,7 +454,8 @@ mod tests {
     /// than one number is past the installer's, the first of `protocol`, `min_protocol`,
     /// `state_schema` is the one named.
     ///
-    /// Mutant it catches: the three checks run in another order.
+    /// Asserts that the three checks run in the order `protocol`, `min_protocol`,
+    /// `state_schema`.
     #[test]
     fn the_first_number_past_the_installer_is_the_one_named() {
         let ceiling = numbers(1, 1, 1);

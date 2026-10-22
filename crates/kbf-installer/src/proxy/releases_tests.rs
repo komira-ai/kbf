@@ -638,9 +638,9 @@ fn an_unreadable_file_is_an_error_and_is_not_overwritten_and_a_failed_write_is_o
 /// second adoption (of another release) answers `A` and leaves the file as it is; a commit
 /// with no verified copy, and a file that cannot be read, are errors that change nothing.
 ///
-/// Mutants it catches: `adopt` that overwrites the installed release; `adopt` that writes
-/// without the staged facts; `adopt` that rewrites the file when the release is recorded;
-/// `adopt` without the check for the copy; an unreadable file read as no record.
+/// Asserts that `adopt` keeps a recorded installed release; that it writes the staged facts
+/// with the adoption; that it leaves the file alone when a release is recorded; that it
+/// checks for the copy; and that an unreadable file is an error and not an empty record.
 #[test]
 fn adopt_records_the_installed_release_only_when_none_is_recorded() {
     let o = orders("adopt");
@@ -678,8 +678,9 @@ fn says_full(commit: &str) -> FakeRunner {
 /// `releases/` and `releases.json` in the state directory, the kbf it was told, and a root
 /// that cannot be made refused.
 ///
-/// Mutants it catches: the copies in the state directory itself; the status file under the
-/// copies; the binary dropped; the root's error ignored.
+/// Asserts that the copies are under `releases/` and not in the state directory itself; that
+/// the status file is beside the copies and not under them; that the binary is kept; and that
+/// the root's error is returned.
 #[test]
 fn a_local_keeps_its_copies_and_its_orders_in_the_state_directory() {
     let rig = rig("local-open");
@@ -705,8 +706,8 @@ fn a_local_keeps_its_copies_and_its_orders_in_the_state_directory() {
 /// full commit it names, probed again as a copy, recorded as installed, and a repeat does not
 /// copy or record again (it asks the package's kbf and no more).
 ///
-/// Mutants it catches: the copy named by the short commit; the record not written; the copy
-/// made again; the package's kbf not probed.
+/// Asserts that the copy is named by the full commit and not the short one; that the record
+/// is written; that a repeat makes no second copy; and that the package's kbf is probed.
 #[test]
 fn the_package_kbf_is_copied_under_its_full_commit_and_recorded_as_installed() {
     let rig = rig("local-adopt");
@@ -737,9 +738,9 @@ fn the_package_kbf_is_copied_under_its_full_commit_and_recorded_as_installed() {
 /// commit, one whose copy is another build, and a record that cannot be written. Each is an
 /// error that starts with the path and, but for the last, leaves no copy and no record.
 ///
-/// Mutants it catches: a probe failure carried on; a missing `commit_full` taken for the short
-/// commit; the full commit not checked for its shape; the copy's probe skipped; the record's
-/// error dropped.
+/// Asserts that a probe failure stops the adoption; that a missing `commit_full` is an error
+/// and is not read as the short commit; that the full commit is checked for its shape; that
+/// the copy is probed; and that the record's error is returned.
 #[test]
 fn a_kbf_that_cannot_be_named_or_copied_is_not_adopted() {
     let rig = rig("local-adopt-refused");

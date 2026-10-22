@@ -21,3 +21,4 @@ mod routing;
 mod secure;
 mod sni;
 mod ui;
+mod wait_term;

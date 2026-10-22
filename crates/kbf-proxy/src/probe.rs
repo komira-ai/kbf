@@ -31,7 +31,7 @@ pub(crate) const FRESH_FOR: Duration = Duration::from_secs(5);
 /// The request of a poll: the child's own readiness path, HTTP/1.1, closed after the answer.
 const REQUEST: &[u8] = b"GET /readyz HTTP/1.1\r\nHost: kbf-proxy\r\nConnection: close\r\n\r\n";
 /// The start of a 200 status line; the poll reads no more of the answer than this.
-const OK_LINE: &[u8] = b"HTTP/1.1 200";
+pub(crate) const OK_LINE: &[u8] = b"HTTP/1.1 200";
 
 /// The last poll that passed: of which child, and when.
 #[derive(Clone, Copy, Debug)]
