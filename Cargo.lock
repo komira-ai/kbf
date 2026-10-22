@@ -2586,6 +2586,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-updater"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-vmm"
 version = "0.1.0"
 dependencies = [
