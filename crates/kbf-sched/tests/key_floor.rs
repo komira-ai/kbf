@@ -416,7 +416,6 @@ fn generated_farms_never_book_a_whole_host_from_a_key_floor() {
         }
         f.submit_keyed(1, request(1, 4 * GIB), KEY);
         let mut start = only(f.tick());
-        let mut digest = 1;
         // Kill it until the farm has no larger rung, or a few times.
         for _ in 0..rng.below(5) {
             let next = f.end(&start, OOM);
@@ -433,8 +432,7 @@ fn generated_farms_never_book_a_whole_host_from_a_key_floor() {
             }
         }
         // Whatever the chain, a fresh digest of the key books under the largest node.
-        digest += 1;
-        f.submit_keyed(u64::from(digest), request(digest, 4 * GIB), KEY);
+        f.submit_keyed(2, request(2, 4 * GIB), KEY);
         for s in f.tick() {
             if s.operation != start.operation {
                 assert!(
@@ -616,7 +614,6 @@ fn key_floors_are_in_the_memory_state_and_the_floor_change() {
     h.submit_keyed(1, request(1, 4 * GIB), KEY + 2);
     assert_eq!(only(h.tick()).resources.memory_bytes, 16 * GIB);
     // Nothing is held for a request that has no key.
-    let _ = &mut f;
 }
 
 /// Catches a floor that outlives the node that made it possible: the big node leaves
