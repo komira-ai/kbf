@@ -196,13 +196,20 @@ fn pages<T: Transport>(
             .ok_or_else(|| shape(&path, &format!("no `{key}` array")))?;
         out.extend(entries.iter().cloned());
         match str_of(&page, "next_page") {
-            Some(next) => next.clone_into(&mut path),
+            Some(next) if is_api_path(next) => next.clone_into(&mut path),
+            Some(_) => return Err(shape(&path, "next_page is not a plain /v1/ path")),
             None => return Ok(out),
         }
     }
     Err(ExportError::Endless {
         path: first.to_owned(),
     })
+}
+
+/// Whether a server-supplied `next_page` is safe to put in a request line: an API path with
+/// no control character (a `\r\n` there would start another request).
+fn is_api_path(next: &str) -> bool {
+    next.starts_with("/v1/") && !next.chars().any(|c| c.is_control() || c == ' ')
 }
 
 fn nodes<T: Transport>(api: &ReadOnly<T>) -> Result<BTreeMap<String, Node>, ExportError> {
