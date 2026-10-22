@@ -1185,3 +1185,275 @@ do_B1k() { nohup sleep 3600 >/dev/null 2>&1 & sleep 1; }
 plant_B1k() { p B1k do_B1k; }
 probe_B1k() { echo "PROBE B1k none"; }
 teardown_X6() { rm -f "/cores/core.ctl-$M"; find /cores -user "$ID" -delete 2>/dev/null; }
+
+# ================================================================ E1d: POSIX shm/sem allowed with (with report), harvested from the log, unlinked as root
+E="$W/e1d"
+PY=/usr/bin/python3
+D_PRED='eventMessage CONTAINS "ipc-posix"'
+d_tag() { printf %s "$M" | tail -c 5; }
+d_t() { perl -MTime::HiRes=time -e 'printf "%.3f", time'; }
+dpy() { "$PY" -I "$W/e1d.py" "$@"; }
+
+# root, before the plant: the log stream with arrival times, dtrace as ground truth for every process of the uid, a poll of the uid's pids
+d_fixture() {
+  mkdir -p "$E"; chmod 755 "$E"
+  date '+%Y-%m-%d %H:%M:%S' >"$E/$M.t0"
+  cat >"$E/$M.d" <<DEOF
+syscall::shm_open:entry, syscall::sem_open:entry, syscall::shm_unlink:entry, syscall::sem_unlink:entry
+/uid == $ID/
+{ printf("%s %d %s %d %s\n", probefunc, arg1, execname, pid, copyinstr(arg0)); }
+DEOF
+  cat >"$E/poll.sh" <<'PEOF'
+#!/bin/bash
+echo $$ >"$1"
+while :; do
+  t=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
+  ps -axo pid=,ruid=,uid=,comm= | awk -v id="$2" -v t="$t" '$2==id||$3==id{print t, $1, $2, $3, $4}'
+  sleep 0.02
+done
+PEOF
+  sh -c 'echo $$ >"$1"; exec dtrace -q -x bufsize=64m -s "$2"' x "$E/$M.p_dt" "$E/$M.d" >"$E/$M.dt" 2>"$E/$M.dt.err" </dev/null &
+  sh -c 'echo $$ >"$1"; exec log stream --style ndjson --level debug --predicate "$2"' x "$E/$M.p_stream" "$D_PRED" 2>"$E/$M.stream.err" </dev/null |
+    perl -MTime::HiRes=time -e '$|=1; while(<STDIN>){ printf "%.3f\t%s", time, $_ }' >"$E/$M.stream" 2>/dev/null &
+  /bin/bash "$E/poll.sh" "$E/$M.p_poll" "$ID" >"$E/$M.poll" 2>/dev/null </dev/null &
+  sleep 6
+  echo "dtrace-err=[$(head -c 160 "$E/$M.dt.err" | tr '\n' ' ')] stream-err=[$(head -c 120 "$E/$M.stream.err" | tr '\n' ' ')] pids=$(cat "$E"/$M.p_* 2>/dev/null | tr '\n' ',')"
+}
+# the log-show visibility watcher (D1 only): first time each /e1dlat name shows in `log show`
+d_latwatch() {
+  cat >"$E/lat.sh" <<'LEOF'
+#!/bin/bash
+echo $$ >"$1"
+: >"$2"
+while :; do
+  out=$(log show --last 30s --info --debug --style ndjson --predicate 'eventMessage CONTAINS "e1dlat"' 2>/dev/null | grep -o 'e1dlat[0-9]*' | sort -u)
+  t=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
+  for n in $out; do grep -q "^/$n " "$2" || echo "/$n $t" >>"$2"; done
+  sleep 0.2
+done
+LEOF
+  /bin/bash "$E/lat.sh" "$E/$M.p_lat" "$E/$M.latseen" >/dev/null 2>&1 </dev/null &
+}
+d_stop() { for f in "$E/$M".p_*; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; done; sleep 2; }
+
+d_query() {
+  _a=$(now_ms)
+  alarm_run 900 log show --start "$(cat "$E/$M.t0")" --info --debug --style ndjson --predicate "$D_PRED" >"$E/$M.raw" 2>"$E/$M.raw.err"
+  _b=$(now_ms)
+  echo "QUERY rows=$(wc -l <"$E/$M.raw" | tr -d ' ') bytes=$(wc -c <"$E/$M.raw" | tr -d ' ') log_show_ms=$((_b-_a)) err=[$(head -c 140 "$E/$M.raw.err" | tr '\n' ' ')]"
+  _a=$(now_ms); dpy parse "$E/$M.raw" "$E/$M.tsv" x; _b=$(now_ms); echo "QUERY parse_ms=$((_b-_a))"
+  dpy parse "$E/$M.stream" "$E/$M.stream.tsv" stream | sed 's/^/STREAM /'
+}
+
+# root, after the plant: the common report. Truth = the workload's own gt files + dtrace.
+d_report() {
+  mkdir -p "$E/$M.gt"; cp "$L"/gt/* "$E/$M.gt/" 2>/dev/null
+  for _w in $(ls "$E/$M.gt" 2>/dev/null | sed 's/\.[0-9]*$//' | sort -u); do
+    cat "$E/$M.gt/$_w" "$E/$M.gt/$_w".[0-9]* 2>/dev/null >"$E/$M.gt.$_w"
+  done
+  chmod -R a+rX "$E"
+  d_query
+  dpy ops "$E/$M.tsv"
+  dpy dt "$E/$M.dt" "$E/$M.dtc" "$E/$M.dto"
+  echo "DTERR [$(head -c 200 "$E/$M.dt.err" | tr '\n' ' ')]"
+  for _f in "$E/$M.gt".*; do [ -f "$_f" ] || continue; dpy cmp "$E/$M.tsv" "$_f" "$(basename "$_f" | sed "s/^$M.gt.//")"; done
+  dpy cmp "$E/$M.tsv" "$E/$M.dtc" dtrace-all-creates
+  dpy cmp "$E/$M.stream.tsv" "$E/$M.dtc" stream-vs-dtrace
+  cat "$E/$M.gt".* >"$E/$M.gtall" 2>/dev/null
+  dpy extra "$E/$M.tsv" report-not-in-truth "$E/$M.gtall" "$E/$M.dtc"
+  dpy unrep "$E/$M.dt" "$E/$M.tsv" "$ROW"
+  dpy pidcov "$E/$M.tsv" "$E/$M.poll" "$ROW"
+}
+
+# root: the clean's job. Harvest from the log, find what exists, unlink each as root, probe as root and as the uid.
+d_fullloop() {
+  IC="$W/ipcc"
+  dpy harvest "$E/$M.tsv" "$E/$M.h" create
+  dpy harvest "$E/$M.tsv" "$E/$M.hany" any
+  dpy union "$E/$M.cand" "$E/$M.gtall" "$E/$M.dtc" "$E/$M.hany"
+  "$IC" probefile "$E/$M.cand" "$E/$M.exists0" | sed 's/^/BEFORE-UNLINK root /'
+  dpy sub "$E/$M.holes" "$E/$M.exists0" "$E/$M.h" | sed 's/^/HOLES /'
+  dpy show "$E/$M.holes" 8
+  _a=$(now_ms); "$IC" rmfile "$E/$M.h" | sed 's/^/UNLINK-HARVESTED /'; _b=$(now_ms); echo "UNLINK-HARVESTED wall_ms=$((_b-_a))"
+  "$IC" probefile "$E/$M.cand" "$E/$M.exists1" | sed 's/^/AFTER-UNLINK root /'
+  asu "$IC" probefile "$E/$M.cand" | sed 's/^/AFTER-UNLINK uid /'
+  echo "LEFT $ROW root_sees=$(wc -l <"$E/$M.exists1" | tr -d ' ') of_which_holes=$(wc -l <"$E/$M.holes" | tr -d ' ')"
+  dpy show "$E/$M.exists1" 8
+  "$IC" rmfile "$E/$M.exists1" | sed 's/^/CLEANUP-UNREPORTED /'
+}
+
+# ---------------------------------------------------------------- D1: M1 root unlink, M2 raw report format, M3 latency
+fixture_D1() { d_fixture; d_latwatch; }
+plant_D1() {
+  IC="$W/ipcc"; mkdir -p "$L/gt"
+  echo "INFO D1 sandbox: $(id -u) $(sysctl -n kern.posix.sem.max 2>&1 | head -c 40) $(sysctl -a 2>/dev/null | grep -i 'posix' | head -4 | tr '\n' ' ' | cut -c1-120)"
+  echo "INFO D1 $("$IC" mk shm /kbf-e1d-x "$L/gt/basic")"
+  echo "INFO D1 $("$IC" mk sem /kbf-e1d-s "$L/gt/basic")"
+  echo "INFO D1 $("$IC" mk shm /kbf-e1d-u "$L/gt/unl")"
+  echo "INFO D1 $("$IC" rm shm /kbf-e1d-u)"
+  echo "INFO D1 reopen-existing: $("$IC" mk shm /kbf-e1d-x)"
+  : >"$L/lat.times"
+  for _i in 1 2 3 4 5; do
+    sleep 2
+    "$IC" lat "/e1dlat$_i" "$L/gt/lat" | sed -n 's/^LAT \(\/e1dlat[0-9]*\) .*t_ms=\(.*\)$/\1 \2/p' >>"$L/lat.times"
+  done
+  echo "PLANTED D1"
+}
+midplant_D1() {
+  IC="$W/ipcc"
+  sleep 10; d_stop
+  echo "M1 sem.max=$(sysctl -n kern.posix.sem.max 2>&1 | head -c 30)"
+  echo "M1 before root shm: $("$IC" probe shm /kbf-e1d-x)"
+  echo "M1 before root sem: $("$IC" probe sem /kbf-e1d-s)"
+  echo "M1 before uid shm: $(asu "$IC" probe shm /kbf-e1d-x)"
+  echo "M1 before uid sem: $(asu "$IC" probe sem /kbf-e1d-s)"
+  echo "M1 other-uid probe shm: $(asu_other "$IC" probe shm /kbf-e1d-x)"
+  echo "M1 other-uid rm shm: $(asu_other "$IC" rm shm /kbf-e1d-x)"
+  echo "M1 root rm shm: $("$IC" rm shm /kbf-e1d-x)"
+  echo "M1 root rm sem: $("$IC" rm sem /kbf-e1d-s)"
+  echo "M1 after root shm: $("$IC" probe shm /kbf-e1d-x)"
+  echo "M1 after root sem: $("$IC" probe sem /kbf-e1d-s)"
+  echo "M1 after uid shm: $(asu "$IC" probe shm /kbf-e1d-x)"
+  echo "M1 after uid sem: $(asu "$IC" probe sem /kbf-e1d-s)"
+  echo "M1 uid create again: $(asu "$IC" mk shm /kbf-e1d-x2) / $(asu "$IC" mk sem /kbf-e1d-s2)"
+  echo "M1 euid-rm shm (seteuid to the uid first): $(IPCC_EUID=$ID "$IC" rm shm /kbf-e1d-x2 2>&1 | tr '\n' ' ')"
+  echo "M1 euid-rm sem: $(IPCC_EUID=$ID "$IC" rm sem /kbf-e1d-s2 2>&1 | tr '\n' ' ')"
+  echo "M1 after-euid root probe: $("$IC" probe shm /kbf-e1d-x2) $("$IC" probe sem /kbf-e1d-s2)"
+  # raw lines: the whole record of the names, with no predicate guess
+  log show --start "$(cat "$E/$M.t0")" --info --debug --style ndjson --predicate 'eventMessage CONTAINS "kbf-e1d-x"' >"$E/$M.raw.tok" 2>/dev/null
+  echo "M2 token query (kbf-e1d-x, any process): rows=$(grep -c '^{' "$E/$M.raw.tok")"
+  dpy raw "$E/$M.raw.tok" 6 | cut -c1-440 | sed 's/^/M2 /'
+  d_report
+  # latency
+  cat "$L/lat.times" | sed 's/^/LATTIMES /'
+  dpy lat "$E/$M.stream.tsv" "$L/lat.times" "$E/$M.latseen" | sed 's/^/M3 /'
+  # sandbox rule wording for this OS
+  echo "M2 syslog-count ipc lines in last 5m by sender (any): $(log show --last 5m --info --debug --style compact --predicate 'eventMessage CONTAINS "ipc-posix"' 2>/dev/null | wc -l | tr -d ' ')"
+  d_fullloop
+}
+probe_D1() { echo "PROBE D1 none"; }
+
+# ---------------------------------------------------------------- DALL: python, 10k loop, parallel, odd names; the full loop
+fixture_DALL() { d_fixture; }
+plant_DALL() {
+  IC="$W/ipcc"; TG=$(d_tag); mkdir -p "$L/gt" "$L/tmp"
+  echo "INFO DALL basic $("$IC" mk shm "/$TG-b1" "$L/gt/basic") | $("$IC" mk sem "/$TG-b2" "$L/gt/basic")"
+  write_mp
+  for _w in lock queue pool shm executor; do p "PYsys_$_w" do_mp "$_w" /usr/bin/python3; done
+  if [ -x /opt/homebrew/bin/python3 ]; then for _w in lock queue pool shm executor; do p "PYbrew_$_w" do_mp "$_w" /opt/homebrew/bin/python3; done; else echo "INFO DALL no homebrew python"; fi
+  echo "INFO DALL $("$IC" loop 10000 "/$TG-l" "$L/gt/loop" | tr '\n' '|')"
+  echo "INFO DALL $("$IC" par 8 2000 "/$TG-p" "$L/gt/par" | tr '\n' '|' | cut -c1-200)"
+  "$IC" odd "$L/gt/odd" "$TG" | sed 's/^/INFO DALL /'
+  echo "PLANTED DALL"
+}
+midplant_DALL() {
+  sleep 12; d_stop
+  d_report
+  d_fullloop
+}
+probe_DALL() { echo "PROBE DALL none"; }
+
+# ---------------------------------------------------------------- DF: flood
+fixture_DF() { d_fixture; }
+plant_DF() {
+  IC="$W/ipcc"; TG=$(d_tag); mkdir -p "$L/gt"
+  echo "INFO DF $("$IC" mk shm "/$TG-pre" "$L/gt/pre")"
+  ( "$IC" hot 60000 "/$TG-hot1" >"$L/hot1.out" 2>&1 &
+    "$IC" hot 60000 "/$TG-hot2" >"$L/hot2.out" 2>&1 &
+    "$IC" par 4 3000 "/$TG-q" "$L/gt/parq" >"$L/parq.out" 2>&1 &
+    wait )
+  cat "$L"/hot1.out "$L"/hot2.out | sed 's/^/INFO DF /'
+  tr '\n' '|' <"$L/parq.out" | cut -c1-300 | sed 's/^/INFO DF /'; echo
+  echo "INFO DF $("$IC" mk sem "/$TG-hot1" "$L/gt/hot") $("$IC" mk sem "/$TG-hot2" "$L/gt/hot")"
+  echo "INFO DF $("$IC" mk shm "/$TG-after1" "$L/gt/after") | $("$IC" mk sem "/$TG-after2" "$L/gt/after")"
+  echo "PLANTED DF"
+}
+midplant_DF() {
+  sleep 20; d_stop
+  d_report
+  _tg=$(d_tag)
+  dpy tok "$E/$M.tsv" "$_tg-hot1" | sed 's/^/FLOOD tsv /'
+  dpy tok "$E/$M.stream.tsv" "$_tg-hot1" | sed 's/^/FLOOD stream /'
+  grep -ci 'dropped\|lost\|throttl' "$E/$M.raw" "$E/$M.raw.err" "$E/$M.stream.err" 2>/dev/null | sed 's/^/FLOOD dropword-count /'
+  log stats --overview 2>&1 | head -8 | cut -c1-160 | sed 's/^/FLOOD logstats /'
+  d_fullloop
+}
+probe_DF() { echo "PROBE DF none"; }
+
+# ---------------------------------------------------------------- D5: hiding attempts
+fixture_D5() { d_fixture; }
+plant_D5() {
+  IC="$W/ipcc"; TG=$(d_tag); mkdir -p "$L/gt"
+  echo "INFO D5 h1 setuid-root copy: $("$W/ipcc_suid" mk shm "/$TG-h1" "$L/gt/h1" 2>&1 | head -c 200)"
+  echo "INFO D5 h2 nested sandbox-exec allow-all: $(/usr/bin/sandbox-exec -p '(version 1)(allow default)' "$IC" mk shm "/$TG-h2" "$L/gt/h2" 2>&1 | head -c 200)"
+  echo "INFO D5 h3 launchctl submit: $(alarm_run 20 launchctl submit -l "kbf.e1d.$TG" -- "$IC" mk shm "/$TG-h3" "$L/gt/h3" 2>&1 | head -c 160) rc=$?"
+  echo "INFO D5 h5 crontab: $(printf '* * * * * %s mk shm /%s-h5\n' "$IC" "$TG" | crontab - 2>&1 | head -c 200) rc=$?"
+  echo "INFO D5 h6 logcfg status: $(log config --status --subsystem com.apple.sandbox.reporting 2>&1 | head -c 150)"
+  echo "INFO D5 h6 logcfg set subsystem: $(log config --mode 'level:off,persist:off' --subsystem com.apple.sandbox.reporting 2>&1 | head -c 150)"
+  echo "INFO D5 h6 logcfg set global: $(log config --mode 'level:default' 2>&1 | head -c 150)"
+  echo "INFO D5 h6 logplist write: $(touch /Library/Preferences/Logging/Subsystems/kbf.e1d.plist 2>&1 | head -c 120)"
+  echo "INFO D5 h6 logplist write2: $(touch /Library/Preferences/Logging/kbf.e1d.plist 2>&1 | head -c 120)"
+  mkdir -p "$L/tmp"
+  # a kitchen sink of system tools: whatever the system creates for us is in the dtrace truth (every process of the uid)
+  for _c in "xcrun simctl list devices" "clang --version" "swift --version" "git --version" "sqlite3 :memory: 'select 1'" "curl --version" \
+            "system_profiler SPHardwareDataType" "mdls /bin/ls" "mdfind -name zzzkbfe1d" "osascript -e 'return 1'" "plutil -p /System/Library/CoreServices/SystemVersion.plist" \
+            "defaults write kbf.e1d k v" "notifyutil -p kbf.e1d" "launchctl list" "hdiutil create -size 2m -fs HFS+ -volname kbfe1d $L/x.dmg" "diskutil list" \
+            "python3 -c 'import multiprocessing as m;l=m.Lock()'" "xcodebuild -version" "ssh -V" "open -g /System/Applications/Calculator.app" "say -o $L/s.aiff hi" "sips --help" "ditto /bin/ls $L/ls"; do
+    alarm_run 40 bash -c "$_c" >/dev/null 2>&1; echo "INFO D5 sink rc=$? $_c" | cut -c1-120
+  done
+  echo "PLANTED D5"
+}
+midplant_D5() {
+  IC="$W/ipcc"; TG=$(d_tag)
+  sleep 90
+  echo "H5 crontab of the uid: [$(crontab -l -u "$U" 2>&1 | head -c 200 | tr '\n' ' ')] file=$(ls -l /var/at/tabs/ 2>&1 | head -3 | tr '\n' ' ' | cut -c1-200)"
+  echo "H5 cron-created probe: $("$IC" probe shm "/$TG-h5")"
+  crontab -r -u "$U" >/dev/null 2>&1
+  echo "H6 unsandboxed uid: logcfg set: $(asu log config --mode 'level:off,persist:off' --subsystem com.apple.sandbox.reporting 2>&1 | head -c 150)"
+  echo "H6 unsandboxed uid: logcfg global: $(asu log config --mode 'level:default' 2>&1 | head -c 150)"
+  echo "H6 unsandboxed uid: log erase: $(asu log erase --ephemeral 2>&1 | head -c 120)"
+  echo "H6 unsandboxed uid: write logging plist: $(asu touch /Library/Preferences/Logging/kbf.e1d.plist 2>&1 | head -c 120)"
+  echo "H6 root status now: $(log config --status --subsystem com.apple.sandbox.reporting 2>&1 | head -c 150) / $(log config --status 2>&1 | head -c 150)"
+  echo "H6 plists present: $(ls /Library/Preferences/Logging/ /Library/Preferences/Logging/Subsystems 2>&1 | tr '\n' ' ' | cut -c1-200)"
+  rm -f /Library/Preferences/Logging/kbf.e1d.plist /Library/Preferences/Logging/Subsystems/kbf.e1d.plist
+  sleep 5; d_stop
+  d_report
+  for _h in h1 h2 h3; do echo "H $_h truth-file=$(wc -l <"$L/gt/$_h" 2>/dev/null | tr -d ' ') root-probe=$("$IC" probe shm "/$TG-$_h")"; done
+  "$IC" rm shm "/$TG-h5" >/dev/null 2>&1
+  d_fullloop
+}
+probe_D5() { echo "PROBE D5 none"; }
+
+# ---------------------------------------------------------------- DX: xcodebuild (iOS simulator test) with the report arm
+fixture_DX() { d_fixture; }
+plant_DX() { mkdir -p "$L/gt"; p DX do_BR8i; echo "PLANTED DX"; }
+midplant_DX() {
+  sleep 12; d_stop
+  d_report
+  d_fullloop
+}
+probe_DX() { echo "PROBE DX none"; }
+
+# ---------------------------------------------------------------- DS: a process spawned into the simulator by simctl spawn (runs outside the lease profile)
+fixture_DS() { d_fixture; }
+do_DS() {
+  IC="$W/ipcc"; TG=$(d_tag)
+  _rt=$(xcrun simctl list runtimes available 2>/dev/null | awk '/iOS/ {print $NF; exit}')
+  _dt=$(xcrun simctl list devicetypes 2>/dev/null | awk '/iPhone/ {print $NF; exit}' | tr -d '()')
+  [ -n "$_rt" ] && [ -n "$_dt" ] || { echo "no iOS runtime or device type"; return 77; }
+  _u=$(build_env xcrun simctl create "$M" "$_dt" "$_rt") || { echo "simctl create failed"; return 1; }
+  build_env xcrun simctl boot "$_u" 2>&1 | head -2
+  BT=240 build_env xcrun simctl bootstatus "$_u" 2>&1 | tail -2
+  echo "spawn shm: $(BT=60 build_env xcrun simctl spawn "$_u" "$W/ipcc_sim" mk shm "/$TG-ds1" "$L/gt/ds" 2>&1 | head -c 200)"
+  echo "spawn sem: $(BT=60 build_env xcrun simctl spawn "$_u" "$W/ipcc_sim" mk sem "/$TG-ds2" "$L/gt/ds" 2>&1 | head -c 200)"
+  echo "host control (inside the lease profile): $("$IC" mk shm "/$TG-dsctl" "$L/gt/dsctl" 2>&1 | head -c 200)"
+  build_env xcrun simctl shutdown "$_u" 2>&1 | head -1
+  return 0
+}
+plant_DS() { mkdir -p "$L/gt"; p DS do_DS; echo "PLANTED DS"; }
+midplant_DS() {
+  sleep 12; d_stop
+  d_report
+  d_fullloop
+}
+probe_DS() { echo "PROBE DS none"; }

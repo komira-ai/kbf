@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  e1-xcode:
+  e1d-core:
     runs-on: macos-latest
     timeout-minutes: 170
     permissions:
@@ -25,7 +25,19 @@ jobs:
         with:
           persist-credentials: false
       - run: sw_vers
-      - run: uname -m
       - run: rustup toolchain install
-      - name: X-Bprime xcodebuild (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_xcode
+      - name: E1d POSIX IPC with report (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1d_core
+  e1d-xcode:
+    runs-on: macos-latest
+    timeout-minutes: 170
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: rustup toolchain install
+      - name: E1d xcodebuild and simulator spawn (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1d_xcode

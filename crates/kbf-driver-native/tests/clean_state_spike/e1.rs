@@ -382,3 +382,88 @@ fn e1_base() {
     }
     cs.finish();
 }
+
+// ---------------------------------------------------------------- E1d: POSIX shm and sem allowed with `(with report)`
+
+/// Does this OS accept `rule` after `(version 1)(allow default)`? Prints the answer either way.
+fn sbx_accepts(rule: &str) -> bool {
+    let mut c = Command::new("/usr/bin/sandbox-exec");
+    c.args(["-p", &format!("(version 1)(allow default){rule}"), "/usr/bin/true"]);
+    let o = run_timeout(c, 20);
+    let ok = o.code == Some(0);
+    say(format!("OPSYN {} {} :: {}", if ok { "accepted" } else { "REJECTED" }, rule, short(&o.text, 160)));
+    ok
+}
+
+/// Builds the helper and the analysis script, finds the working `(with report)` syntax, and sets `IPC_RULES`.
+fn e1d_prepare(sim: bool) {
+    let env = base_env(&user_of(CELL_USER));
+    fs::create_dir_all(WORK).expect("work dir");
+    fs::write(format!("{WORK}/ipcc.c"), IPCC_C).expect("ipcc.c");
+    fs::write(format!("{WORK}/e1d.py"), E1D_PY).expect("e1d.py");
+    let o = env.root(
+        "cd \"$W\" && clang -O1 -o ipcc ipcc.c 2>ipcc.log; echo clang-rc=$?; chmod 755 ipcc; cp ipcc ipcc_suid; chown 0:0 ipcc_suid; chmod 4755 ipcc_suid; \
+         ls -l ipcc ipcc_suid | cut -c1-80; head -c 600 ipcc.log; chmod 644 e1d.py; mkdir -p e1d; chmod 755 e1d",
+        120,
+    );
+    for l in o.text.lines() {
+        say(format!("E1D-PREP {}", short(l, 200)));
+    }
+    if sim {
+        let o = env.root(
+            "cd \"$W\" && xcrun -sdk iphonesimulator clang -arch arm64 -mios-simulator-version-min=15.0 -O1 -o ipcc_sim ipcc.c 2>ipcc_sim.log; echo sim-clang-rc=$?; chmod 755 ipcc_sim; head -c 400 ipcc_sim.log",
+            120,
+        );
+        for l in o.text.lines() {
+            say(format!("E1D-PREP {}", short(l, 200)));
+        }
+    }
+    let o = env.root("sw_vers | tr '\\n' ' '; echo; /usr/bin/python3 -I -c 'import sys;print(sys.version)'; dtrace -V | head -1; csrutil status", 30);
+    for l in o.text.lines() {
+        say(format!("E1D-PREP {}", short(l, 200)));
+    }
+    // The syntax, with the variants printed so a rejected form is on record.
+    for r in [
+        "(allow ipc-posix-shm* (with report))",
+        "(allow ipc-posix-shm (with report))",
+        "(allow ipc-posix-shm-write-create (with report))",
+        "(allow ipc-posix-sem* (with report))",
+        "(allow ipc-posix-sem (with report))",
+        "(allow ipc-posix-sem-create (with report))",
+        "(allow ipc-posix* (with report))",
+        "(report ipc-posix-shm*)",
+        "(deny ipc-posix-shm* (with no-report))",
+    ] {
+        sbx_accepts(r);
+    }
+    let pick = |cands: &[&str]| cands.iter().find(|c| sbx_accepts(c)).map(|c| (*c).to_owned());
+    let shm = pick(&["(allow ipc-posix-shm* (with report))", "(allow ipc-posix-shm (with report))"]).expect("no shm report rule accepted");
+    let sem = pick(&["(allow ipc-posix-sem* (with report))", "(allow ipc-posix-sem (with report))"]).expect("no sem report rule accepted");
+    let rules = format!("\n{shm}\n{sem}");
+    say(format!("E1D-RULES {}", short(&rules, 200)));
+    let _ = IPC_RULES.set(rules);
+}
+
+#[test]
+#[ignore = "needs root and makes real users"]
+fn e1d_core() {
+    let cs = Cs::new("e1d_core");
+    e1d_prepare(false);
+    // M1/M2/M3 under the report arm, and the shipped profile as the no-report control.
+    run(&cs, "D1", Arm::IpcRep, Clean::None, &[]);
+    run(&cs, "D1", Arm::A, Clean::None, &[]);
+    run(&cs, "DALL", Arm::IpcRep, Clean::None, &[("BENV", "lease")]);
+    run(&cs, "DF", Arm::IpcRep, Clean::None, &[]);
+    run(&cs, "D5", Arm::IpcRep, Clean::None, &[]);
+    cs.finish();
+}
+
+#[test]
+#[ignore = "needs root and makes real users"]
+fn e1d_xcode() {
+    let cs = Cs::new("e1d_xcode");
+    e1d_prepare(true);
+    run(&cs, "DS", Arm::IpcRep, Clean::None, &[("BENV", "lease")]);
+    run(&cs, "DX", Arm::IpcRep, Clean::None, &[("BENV", "lease")]);
+    cs.finish();
+}

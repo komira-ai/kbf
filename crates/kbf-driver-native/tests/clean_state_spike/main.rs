@@ -49,6 +49,13 @@ const CELL_USER: u32 = 0;
 
 const CS_SH: &str = include_str!("cs.sh");
 const CANARY_C: &str = include_str!("canary.c");
+const IPCC_C: &str = include_str!("ipcc.c");
+const E1D_PY: &str = include_str!("e1d.py");
+
+/// E1d: the allow-with-report rules that replace `(deny ipc-posix*)`, as the OS accepted them (set by `e1d_prepare`).
+static IPC_RULES: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// E1d: v2 minus the `ipc-posix*` deny.
+const D_DENIES: [&str; 4] = ["(deny mach-register)", "(deny job-creation)", "(deny lsopen)", "(deny file-mount)"];
 
 const B_RULES: &[&str] = &["(deny ipc-posix*)", "(deny ipc-sysv*)", "(deny mach-register)"];
 const C_RULES: &[&str] = &[
@@ -97,6 +104,8 @@ enum Arm {
     V2Only(usize),
     /// V2 without `V2_RULES[i]` (the profile mutant: that canary must open).
     V2No(usize),
+    /// E1d: v2 without the ipc deny, plus `(allow ipc-posix-shm* (with report))` and the sem twin.
+    IpcRep,
 }
 
 impl Arm {
@@ -111,6 +120,7 @@ impl Arm {
             Arm::V2 => "V2",
             Arm::V2Only(i) => V2_ONLY[i],
             Arm::V2No(i) => V2_NO[i],
+            Arm::IpcRep => "D",
         }
     }
 
@@ -502,7 +512,9 @@ impl Cs {
         match row {
             "W09" => 900,
             "CH19" | "CH20" | "CH23" | "CH30" | "CH33" | "CH34" | "BR1" | "BR3" | "BR5" => 240,
-            "BR8" | "BR8i" => 1700,
+            "BR8" | "BR8i" | "DX" => 1700,
+            "D1" => 400,
+            "DALL" | "DF" | "D5" | "DS" => 1500,
             "X6" => 700,
             "X5a" | "X5b" | "X5c" | "X5d" => 240,
             "BR6" | "BR7" | "XCAN" => 300,
@@ -536,6 +548,14 @@ impl Cs {
                 let cut = args[i + 1].replace("(deny file-write*)", "");
                 assert_ne!(cut, args[i + 1], "no (deny file-write*) in the profile");
                 args[i + 1] = cut;
+            }
+            Arm::IpcRep => {
+                let i = args.iter().position(|a| a == "-p").expect("-p in the launch");
+                for r in D_DENIES {
+                    args[i + 1].push('\n');
+                    args[i + 1].push_str(r);
+                }
+                args[i + 1].push_str(IPC_RULES.get().map_or("", String::as_str));
             }
             Arm::V2 | Arm::V2Only(_) | Arm::V2No(_) => {
                 let i = args.iter().position(|a| a == "-p").expect("-p in the launch");
