@@ -52,7 +52,8 @@ use std::time::Duration;
 
 use clap::{Arg, ArgMatches, Command, FromArgMatches as _};
 use kbf_front::{
-    Cache, CacheStorage, MetaLog as _, MetaLogError, ObjectKeys, RebuildConfig, SegmentsConfig,
+    Cache, CacheStorage, Hold, MetaLog, MetaLogError, ObjectKeys, RebuildConfig, SegmentsConfig,
+    VerifiedBlob,
 };
 use kbf_log::{FarmLogId, MachineVersion};
 use kbf_mapsync::MapHolder;
@@ -72,6 +73,7 @@ use crate::listen::Binder;
 use crate::members::LastBoot;
 use crate::metrics::bind_node_sockets;
 use crate::node_map::NodeMap;
+use crate::ram_drain::RamDrain;
 use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, Registered, bind_node};
 use crate::serve::{ServeError, StorageListener, StorageSocket};
@@ -107,6 +109,8 @@ pub const ALLOWED: &[&str] = &[
     "write_pool_stream_idle",
     "durable_wait",
     "ram_peer_grace",
+    "ram_ack_bytes",
+    "ram_drain_deadline",
     "store_put_attempts",
 ];
 
@@ -450,9 +454,31 @@ pub struct StorageHandle {
     _joiner: Option<AbortOnDrop>,
     _repair: Option<AbortOnDrop>,
     _metrics: Option<AbortOnDrop>,
+    /// Holds a blob in this node's cache: [`StorageHandle::hold`].
+    holder: Holder,
+}
+
+/// Holds a blob in a node's cache, or `None` once the cache is gone.
+pub(crate) type Holder = Box<dyn Fn(&VerifiedBlob) -> Option<Hold> + Send + Sync>;
+
+/// A [`Holder`] of `cache`, which it does not keep alive.
+pub(crate) fn holder_of<M: MetaLog + 'static, O: ObjectStore + 'static>(
+    cache: &Arc<Cache<M, O>>,
+) -> Holder {
+    let cache = Arc::downgrade(cache);
+    Box::new(move |blob| cache.upgrade().map(|cache| cache.hold(blob)))
 }
 
 impl StorageHandle {
+    /// Holds `blob` in this node's RAM as the acknowledgement point will (`Cache::hold`),
+    /// and says what became of it (`None`: the node's cache is gone). Nothing in a running
+    /// node calls it yet; the tests of the node's wiring do (`--ram-ack-bytes` reaches the
+    /// cache, and the stop drains what it holds).
+    #[doc(hidden)]
+    pub fn hold(&self, blob: &VerifiedBlob) -> Option<Hold> {
+        (self.holder)(blob)
+    }
+
     /// The copies this node owes: its repair journal. `None` for a node that does not
     /// replicate (no `--frontend`, or one that admits callers in plain text).
     #[must_use]
@@ -539,6 +565,7 @@ impl StorageHandle {
             _joiner,
             _repair,
             _metrics,
+            holder: _,
         } = self;
         let served = serving.await;
         // Everything the handle holds goes, so what is left holding the stores is not it.
@@ -671,7 +698,8 @@ where
     let cache = cache
         .with_writes(flags.server.write_config())
         .with_write_pool(flags.server.write_pool_config())
-        .with_durable_wait(flags.server.durable_wait());
+        .with_durable_wait(flags.server.durable_wait())
+        .with_ram_ack_bytes(flags.server.ram_ack_bytes());
     // A registered node dates what it stages by the map it holds, so it can say what it has
     // flushed ([`crate::fill`]); it flushes everything, as without the gate.
     let cache = if registered.joiner.is_some() {
@@ -704,6 +732,12 @@ where
         );
         AbortOnDrop(tokio::spawn(fill))
     });
+    let ram = RamDrain::start(
+        Arc::clone(&cache),
+        flags.server.ram_ack_bytes(),
+        flags.server.ram_drain_deadline(),
+    );
+    let holder = holder_of(&cache);
     let storage = Arc::new(CacheStorage::new(cache, flags.segments()));
     let stop = Box::pin(shutdown()?);
     let node = bind_node(flags, listener, registered, storage, repair_dir, stop)?;
@@ -714,7 +748,7 @@ where
             "kbf-storage {SERVER_VERSION} storage={} log={log}",
             node.addr
         ),
-        serving: node.serving,
+        serving: Box::pin(ram.after(node.serving)),
         _flusher,
         _background,
         _fill,
@@ -725,6 +759,7 @@ where
         _joiner: node.joiner,
         _repair: node.repair,
         _metrics,
+        holder,
     })
 }
 

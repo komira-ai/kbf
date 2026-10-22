@@ -65,7 +65,11 @@ fn a_pull_request_trigger_on_the_release_workflow_is_refused() {
     // allow. Control: the real text above.
     let (stages, workflows) = real();
     let bad = planted(&workflows, "release.yml", |t| {
-        t.replacen("on:\n  push:", "on:\n  pull_request:\n  push:", 1)
+        t.replacen(
+            "on:\n  workflow_dispatch:",
+            "on:\n  pull_request:\n  workflow_dispatch:",
+            1,
+        )
     });
     refused(
         &check(&stages, &bad),
@@ -102,11 +106,11 @@ fn id_token_in_a_non_signing_job_is_refused() {
 
 #[test]
 fn a_stage_whose_only_job_is_deleted_is_refused() {
-    // Catches: a stage left empty. Delete both prod jobs from the stage file (the rows
+    // Catches: a stage left empty. Delete every prod job from the stage file (the rows
     // go, the workflow keeps its jobs).
     let (stages, workflows) = real();
     let cut = stages
-        .split("  - job: release.yml#verify")
+        .split("  - job: release.yml#gates")
         .next()
         .expect("text");
     let found = check(cut, &workflows);

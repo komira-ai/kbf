@@ -38,7 +38,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_front::{CacheStorage, RebuildConfig, SegmentsConfig};
+use kbf_front::{CacheStorage, Hold, RebuildConfig, SegmentsConfig, VerifiedBlob};
 use kbf_mapsync::MapHolder;
 use kbf_meta::Retention;
 use kbf_objstore::FsStore;
@@ -50,11 +50,13 @@ use kbf_threads::disk::Statvfs;
 use crate::cold_apply::{ColdPick, Fixed, Registrable};
 use crate::listen::Binder;
 use crate::metrics::bind_node_sockets;
+use crate::ram_drain::RamDrain;
 use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, bind_node};
 use crate::serve::{ServeError, StorageListener};
 use crate::start::{AbortOnDrop, open_cold_file, share_storage, tier_bytes};
 use crate::startup_pass::StartPass;
+use crate::storage_node::{Holder, holder_of};
 use crate::storage_node::{StorageFlags, open_cache};
 use crate::stores::{FILE_PREFIX_ROOT, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
@@ -78,9 +80,19 @@ pub struct StorageHalf {
     _joiner: Option<AbortOnDrop>,
     _repair: Option<AbortOnDrop>,
     _metrics: Option<AbortOnDrop>,
+    /// Holds a blob in the one cache: [`StorageHalf::hold`].
+    holder: Holder,
 }
 
 impl StorageHalf {
+    /// Holds `blob` in this node's RAM as the acknowledgement point will (`Cache::hold`),
+    /// and says what became of it (`None`: the node's cache is gone). See
+    /// [`crate::storage_node::StorageHandle::hold`].
+    #[doc(hidden)]
+    pub fn hold(&self, blob: &VerifiedBlob) -> Option<Hold> {
+        (self.holder)(blob)
+    }
+
     /// The storage map the node holds ([`crate::storage_node::StorageHandle::maps`]).
     #[must_use]
     pub fn maps(&self) -> Arc<MapHolder> {
@@ -206,7 +218,8 @@ where
     let cache = cache
         .with_writes(args.write_config())
         .with_write_pool(args.write_pool_config())
-        .with_durable_wait(args.durable_wait());
+        .with_durable_wait(args.durable_wait())
+        .with_ram_ack_bytes(args.ram_ack_bytes());
     let local = args.local_cache.as_ref();
     let hot = stores.hot.as_ref();
     let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;
@@ -232,6 +245,12 @@ where
         max_bytes: args.segment_upload_max_bytes,
         idle: Duration::from_secs(args.segment_upload_idle_secs),
     };
+    let ram = RamDrain::start(
+        Arc::clone(&cache),
+        args.ram_ack_bytes(),
+        args.ram_drain_deadline(),
+    );
+    let holder = holder_of(&cache);
     let storage: Arc<dyn Storage> = Arc::new(CacheStorage::new(cache, segments));
     // After the log is open: it refuses a directory that holds files it did not write.
     let repair_dir = stores.meta_dir.join(REPAIR_DIR);
@@ -245,7 +264,7 @@ where
         storage,
         in_process: node.in_process,
         start_line: format!("kbf-storage {SERVER_VERSION} storage={addr} log={log}"),
-        serving: node.serving,
+        serving: Box::pin(ram.after(node.serving)),
         maps: node.maps,
         repairs: node.repairs,
         _flusher,
@@ -253,5 +272,6 @@ where
         _joiner: node.joiner,
         _repair: node.repair,
         _metrics,
+        holder,
     })
 }

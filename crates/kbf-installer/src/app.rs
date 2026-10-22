@@ -16,8 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use kbf_host::{HostExec, HostPath, Root};
 
 use crate::activate;
+use crate::boot_schema;
 use crate::cli::{
-    BootArgs, Cli, MigrateArgs, ReleaseSource, RunArgs, ServiceArgs, UninstallArgs, Verb,
+    BootArgs, Cli, MigrateArgs, Mode, ReleaseSource, RunArgs, ServiceArgs, UninstallArgs, Verb,
 };
 use crate::database::Database;
 use crate::exit::Exit;
@@ -294,7 +295,24 @@ fn run_from(root: PathBuf, args: &RunArgs, me: &Path, watch: FileIdentity) -> Re
     Ok(())
 }
 
+/// `boot-check` on a bundled host (the unit passed `--kbf` and `--mode`): the host has no
+/// release and no state, so [`activate::boot_check`] is never called; the database is
+/// brought to the schema `kbf` declares, for the modes that keep their state in it, and any
+/// failure ends the check non-zero so that the unit does not start.
+fn bundled_boot_check(root: PathBuf, kbf: &Path, mode: Mode) -> Result<(), Failure> {
+    let (layout, _) = host(root)?;
+    let installer_toml = layout.join(&layout.installer_toml());
+    let runner = crate::run::SystemRunner;
+    let said = boot_schema::before_start(&runner, &installer_toml, kbf, mode)
+        .map_err(|why| Failure::from(format!("boot check: {why}")))?;
+    eprintln!("kbf-installer: boot check: {said}");
+    Ok(())
+}
+
 fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), Failure> {
+    if let Some((kbf, mode)) = args.bundled() {
+        return bundled_boot_check(root, kbf, mode);
+    }
     let (layout, mut exec) = host(root)?;
     let mut out = Vec::new();
     let result = activate::boot_check(&mut exec, &layout, now(), args.window_secs, &mut out);

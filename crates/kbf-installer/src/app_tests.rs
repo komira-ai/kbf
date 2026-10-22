@@ -589,6 +589,96 @@ fn boot_check_counts_a_start_and_refuses_what_it_cannot_read() {
     }
 }
 
+/// Catches a bundled host's boot check reading a state the host does not have, or letting a
+/// unit start after its database step failed. With `--kbf` and `--mode` the verb never calls
+/// `activate::boot_check` (both state files are ruined here, which is exit 5 without the
+/// flags); a daemon passes and reads nothing (no `installer.toml` is there); a frontend with
+/// no `installer.toml` fails with exit 1 and the file named; an all-in-one whose
+/// `installer.toml` names a database, and whose kbf is not a file, fails with exit 1 and the
+/// binary named; one whose `installer.toml` names no database passes; a relative root fails
+/// with exit 1 before anything is read.
+///
+/// Mutants it catches: `activate::boot_check` called on the bundled path (the ruined state is
+/// exit 5); the failure arm returning `Ok`; the mode gate removed (the daemon fails on the
+/// missing file); the root error swallowed.
+#[test]
+fn a_bundled_boot_check_runs_the_schema_step_and_never_reads_the_state() {
+    let (layout, root) = seeded("boot-bundled");
+    for file in [layout.state_file(), layout.state_backup()] {
+        fs::write(layout.join(&file), b"not json").expect("ruin");
+    }
+    let (exit, err) = on(&root, &["boot-check"]);
+    assert_eq!(exit, Exit::NeedsOperator, "{err}");
+
+    let flag = format!("--kbf={}", root.join("no-such-kbf").display());
+    let bundled = |mode: &str| on(&root, &["boot-check", flag.as_str(), mode]);
+    let (exit, err) = bundled("--mode=daemon");
+    assert_eq!(exit, Exit::Ok, "{err}");
+    let (exit, err) = bundled("--mode=frontend");
+    assert_eq!(exit, Exit::Failed, "{err}");
+    assert!(err.contains("installer.toml"), "{err}");
+
+    let installer_toml = layout.join(&layout.installer_toml());
+    let dir = installer_toml.parent().expect("a directory");
+    crate::testkit::mkdirs(&root, dir, 0o755);
+    let database = "database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n";
+    fs::write(&installer_toml, database).expect("installer.toml");
+    let (exit, err) = bundled("--mode=all-in-one");
+    assert_eq!(exit, Exit::Failed, "{err}");
+    assert!(err.contains("no-such-kbf did not say its schema"), "{err}");
+    fs::write(&installer_toml, "release_source = \"bundled\"\n").expect("installer.toml");
+    let (exit, err) = bundled("--mode=frontend");
+    assert_eq!(exit, Exit::Ok, "{err}");
+
+    let relative = [
+        "--root",
+        "relative",
+        "boot-check",
+        "--kbf=/usr/bin/kbf",
+        "--mode=daemon",
+    ];
+    let (exit, _, _) = run_as(1000, &relative);
+    assert_eq!(exit, Exit::Failed);
+}
+
+/// Catches the bundled flags of `boot-check` being taken singly or with a mode that does not
+/// exist: `--kbf` needs `--mode` and `--mode` needs `--kbf` (a missing argument), a mode `kbf`
+/// does not have is an invalid value, neither flag is the connected host's check, and both
+/// give the path and the mode back together.
+///
+/// Mutants it catches: either `requires` dropped from the flags; `bundled` returning a fixed
+/// mode, or `Some` for a lone `--kbf`.
+#[test]
+fn the_bundled_flags_of_boot_check_come_together_or_not_at_all() {
+    use clap::error::ErrorKind;
+    let refused = |args: &[&str]| {
+        let mut full = vec!["kbf-installer", "boot-check"];
+        full.extend_from_slice(args);
+        Cli::try_parse_from(full).err().map(|e| e.kind())
+    };
+    let missing = Some(ErrorKind::MissingRequiredArgument);
+    assert_eq!(refused(&["--kbf", "/usr/bin/kbf"]), missing);
+    assert_eq!(refused(&["--mode", "frontend"]), missing);
+    let node = refused(&["--kbf", "/usr/bin/kbf", "--mode", "node"]);
+    assert_eq!(node, Some(ErrorKind::InvalidValue));
+    assert_eq!(refused(&[]), None);
+    let both = refused(&["--kbf", "/usr/bin/kbf", "--mode", "all-in-one"]);
+    assert_eq!(both, None);
+
+    let cli = parse(&["boot-check", "--kbf=/usr/bin/kbf", "--mode=all-in-one"]);
+    let Verb::BootCheck(args) = cli.verb else {
+        panic!("boot-check");
+    };
+    assert_eq!(
+        args.bundled(),
+        Some((Path::new("/usr/bin/kbf"), Mode::AllInOne))
+    );
+    let Verb::BootCheck(args) = parse(&["boot-check"]).verb else {
+        panic!("boot-check");
+    };
+    assert_eq!(args.bundled(), None);
+}
+
 /// Catches an exit that does not tell an operator's job from a retry: only an unusable state
 /// (both files damaged) ends `needs an operator` (5); every other state error, a memory file
 /// that cannot be read, and a plain message end `failed` (1). Both of the error types a verb

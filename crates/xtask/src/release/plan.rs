@@ -3,8 +3,8 @@
 //!
 //! Checks, in this order; the first that fails refuses:
 //!
-//! 1. the freeze: `--freeze` is not empty (on Actions, the `RELEASE_FREEZE` variable of
-//!    the release environment): an admin stops every later release without a code change;
+//! 1. the freeze: `--freeze` is not empty (on Actions, the `RELEASE_FREEZE` repository
+//!    variable): an admin stops every later release without a code change;
 //! 2. `VERSION` at `--sha` is `MAJOR.MINOR` and one line end ([`Base::parse_file`]);
 //! 3. the base never goes backwards: no release tag has a higher base;
 //! 4. Rule S ([`superseded`]): the highest release tag names `--sha` or an ancestor of it.

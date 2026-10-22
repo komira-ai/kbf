@@ -483,15 +483,30 @@ rebuilt. Its assets are every tarball and SBOM in the table above, for that comm
 `SHA256SUMS`, and the provenance bundle of each tarball, `<tarball>.sigstore.json`, beside
 it.
 
-To cut one, tag a commit on `main` and push the tag:
+One run of `release.yml` cuts a release; nobody tags. It is started by hand
+(`workflow_dispatch`, no inputs: it releases the commit it runs on) and, in a later change that
+adds `push: branches: [main]` and nothing else, by every push to `main`. A tag pushed by hand
+starts nothing, and only the release bot (a GitHub App, the one bypass of the `v*` tag ruleset)
+can create one. The jobs, each with the least token it needs:
 
-```text
-git tag v0.1.0 <commit on main>
-git push origin v0.1.0
-```
+| job | does | scopes |
+|---|---|---|
+| `gates` | waits for the push runs of `ci`, `beta` and `artifacts` for the commit on `main` to succeed (`cargo xtask release gates`) | `contents: read`, `actions: read` |
+| `plan` | the next version from `VERSION` and the tags, and whether the push is code, the site or the pipeline itself (`release plan`); the stop switch `RELEASE_FREEZE` is read here | `contents: read` |
+| `verify` | finds the artifacts run, refuses a commit not on `main`, checks the files and every attestation (below), before anything is tagged | `contents`, `actions`, `attestations`: read |
+| `tag` | writes the Beta record and creates the annotated tag at the commit, create-only, with the release bot's token (`release verdict-write`, `release tag`) | `contents: read`; environment `release` |
+| `notes` | checks the tag (`release verify`), the identity of this release and of the one before it, and writes the notes | read |
+| `publish` | creates the release with those files and notes (`release publish`) | `contents: write`; environment `release` |
+| `bump` | opens the pull request in the internal repository that moves its submodule to the release (`release bump-internal`) | `contents: read`; environment `release` |
 
-The tag push runs two jobs. `verify`, with read-only scopes, fails the run (and
-nothing is published) when:
+Every job after `plan` runs only when `plan` says the push ships code and does not change the
+pipeline (`.github/`, `infra/`, `crates/xtask/` and the like): a push of docs only releases
+nothing and the run is green, and a push that changes the pipeline is released by the next one
+that does not. `tag`, `notes`, `publish` and `bump` also run only for a push to `main`, so a
+dispatch is a dry run through `verify`. No job runs after a red one (no `always()`, no
+`continue-on-error`). `release tag` and `release publish` both refuse a commit that is behind the
+highest release tag, so a re-run of an old run releases nothing; re-run the failed jobs only.
+`verify`, with read-only scopes, fails the run (and nothing is tagged) when:
 
 - the commit is not on `main` (GitHub's compare of `main...<commit>` is neither
   `identical` nor `behind`);
@@ -506,12 +521,12 @@ nothing is published) when:
   one bundle of at most 256 KiB, or does not have its tarball's digest as its one subject
   (`cargo xtask release check`);
 - any file's attestations do not verify with the command below, or a tarball does not
-  verify against its bundle offline for the tag's commit (`cargo xtask verify-assets
+  verify against its bundle offline for the commit (`cargo xtask verify-assets
   attestations`, with its controls that must fail).
 
 `publish` then creates the release with those files. It is the only job with a token
 that can write (`contents: write`), and the workflow lint refuses that scope in a job
-whose `if:` is not exactly the tag-push condition it runs under. Running the workflow
+whose `if:` is not exactly the release condition it runs under. Running the workflow
 again for the same tag creates no second release and replaces no asset: each asset the
 release already holds must be one of the verified files, byte for byte, or the run
 fails and changes nothing; the files it lacks are uploaded (`cargo xtask release
@@ -520,32 +535,28 @@ publish`).
 Two further verbs read the annotated `v*` tag. Its message is the Beta record (`docs/design/kbf-cicd.md`,
 section 8.1), which `release verdict-write` wrote after `release gates` saw the `ci`, `beta` and
 `artifacts` push runs of the commit succeed. The record is an audit record: **nothing gates on it**, and
-no step of the release workflow judges a verdict. `verify` runs both verbs, on a checkout of the whole
+no step of the release workflow judges a verdict. `notes` runs both verbs, on a checkout of the whole
 history (the tag object and `origin/main` must be there): `cargo xtask release verify` refuses a
 tag that names another commit than the release, a tag object named other than its ref, and a
 commit not on main; a tag with no record, or a record that says it failed or names something else,
 verifies the same. It prints `set-hash=<hex>`, the SHA-256 of `SHA256SUMS`
 (`kbf_gate::SetHash::of_sums`). `cargo xtask release notes` runs the same checks and writes the
-notes, which show the record as information and say when the tag carries none; `verify` uploads them
-as the artifact `release-notes`, so a dry run shows them. `verify` passes the hash to `publish` as a
+notes, which show the record as information and say when the tag carries none; `notes` uploads them
+as the artifact `release-notes`. `notes` passes the hash to `publish` as a
 job output, and `release publish` takes it as `--set-hash` and publishes nothing when the files are
 another set. What gates a release is `release gates` (the three runs green for the commit), then the
 checks of the files themselves (`release check`, the attestations, the set hash) and the tag's
-commit. The `publish` job runs in the `prod` environment, whose required reviewer approves it.
+commit. (The notes are written after the tag, because they read it, so a dry run does not show
+them.)
 
-The workflow can also be run by hand (`workflow_dispatch`) with a commit SHA and the
-annotated tag to check. Only `verify` runs then: every check above, and nothing is
-published (`publish` runs only for a pushed tag, and only `publish` holds a write scope).
-`crates/kbf-integration-test/tests/release_workflow` holds the file to this: the tag-check step, the
-`prod` environment, a `v*` tag push and a dispatch as the only triggers (no pull request),
-pinned actions and an empty top-level `permissions`. On every pull request
-into `main`, CI asks GitHub the same on-`main` question for the pull request's base
+`crates/kbf-integration-test/tests/release_workflow` holds the file to all of this: the events
+(a dispatch only), the job graph and the scopes, `if:` and environment of each job, the halt on
+red, a checkout of the run's commit alone, the release bot's key read in `tag` and `bump` only,
+the data that flows from job to job, pinned actions and an empty top-level `permissions`. The
+workflow is named `release` and its job `publish`, because `gamma.yml` follows both. On every
+pull request into `main`, CI asks GitHub the same on-`main` question for the pull request's base
 commit (which must pass) and its merge commit (which must be refused), so a check that
 accepts every commit, or none, fails there (`cargo xtask release main-control`).
-
-Pushing a tag runs the workflow file as that tagged commit holds it. The checks above
-hold for a tag on a commit of `main`; who may push a tag at all is a repository
-setting, not something this workflow controls.
 
 To use an asset, download it from the release and verify it before anything runs it,
 with the command below (the release's notes give it too). A tarball also verifies

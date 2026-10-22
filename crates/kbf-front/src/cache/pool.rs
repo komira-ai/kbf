@@ -203,6 +203,11 @@ impl WritePool {
         })
     }
 
+    /// Where blobs are queued for the writers.
+    pub(super) fn jobs(&self) -> Jobs {
+        self.jobs.clone()
+    }
+
     fn full(&self, metrics: &CacheMetrics) -> bool {
         metrics.write_pool_queue.get() >= self.queue as u64
     }
@@ -688,7 +693,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 
     /// The blob `digest` held whole, straight to the object store.
-    async fn store_whole(&self, digest: Digest, bytes: Bytes) -> Result<(), CacheError> {
+    pub(super) async fn store_whole(&self, digest: Digest, bytes: Bytes) -> Result<(), CacheError> {
         let body = futures::stream::once(async move { Ok(bytes) }).boxed();
         self.store_streamed(digest, body).await
     }

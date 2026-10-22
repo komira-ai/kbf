@@ -382,6 +382,16 @@ Options:
           
           [default: 5]
 
+      --ram-ack-bytes <RAM_ACK_BYTES>
+          How many bytes of blobs a storage node may hold in RAM, acknowledged to the writer and not yet written to its disk. 0, the default, is off: a write is acknowledged from disk, as before. Nothing acknowledges from RAM yet, so with any value no blob is held and the node behaves as with 0. A blob that finds the budget full is written through to the disk before it is acknowledged, never waited for. A node that does hold blobs counts them in `kbf_storage_ram_unwritten_bytes`, writes them to its disk in the background and, when it stops, within `--ram-drain-deadline`. A node can hold this many bytes beside the `--write-bytes-in-flight` it receives. Storage nodes only: a server with no replica to hold a second copy holds nothing
+          
+          [default: 0]
+
+      --ram-drain-deadline <RAM_DRAIN_DEADLINE>
+          How long, in seconds, a storage node that is stopping waits for the blobs it holds in RAM to be written to its disk (`--ram-ack-bytes`), after its calls have ended. The blobs left when it ends are lost to the stop and are counted in the log. At least 1
+          
+          [default: 30]
+
       --store-put-attempts <STORE_PUT_ATTEMPTS>
           How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
           

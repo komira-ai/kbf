@@ -105,6 +105,9 @@ pub use crate::cache::{
 };
 #[cfg(feature = "testkit")]
 pub use crate::cache::{BetweenHook, DrainHook};
+pub use crate::cache::{
+    DrainReport, DrainState, Hold, PASS_BLOBS, ShutdownDrain, Unwritten, WriteThrough,
+};
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
 pub use crate::default_platform::{BadDefaultPlatform, DefaultPlatform};

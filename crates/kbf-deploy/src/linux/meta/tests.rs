@@ -200,6 +200,61 @@ fn the_metrics_refuse_unflushed_bytes_blocks_and_conflicts() {
     }
 }
 
+/// Catches: a backup taken while blobs acknowledged from RAM are not yet on the disk (the
+/// stop would lose them, and the copy would lack blobs their writers were told are
+/// stored). Any bytes held refuse, before any step, in a dry run as in an apply, and
+/// whether or not the server has a write tier; a held count of 0 does not refuse, and a
+/// server that does not print the family (one older than it) is not refused either (the
+/// `ZEROS` body of the other tests has none). A reading that is not a whole number or is
+/// given twice is a refusal too. Mutants: the check removed (the first row goes ahead); the
+/// check only beside a write tier (the second row goes ahead).
+#[test]
+fn bytes_held_in_ram_refuse_the_backup() {
+    let n = node("ram_held");
+    let held = format!("{ZEROS}kbf_storage_ram_unwritten_bytes 4096\n");
+    let no_tier = "kbf_storage_ram_unwritten_bytes 1\n".to_owned();
+    for (body, hot) in [(held, true), (no_tier, false)] {
+        for mode in [Mode::Apply, Mode::DryRun] {
+            let mut b = n.backup();
+            if !hot {
+                b.hot_dir = None;
+            }
+            let mut exec = FakeExec::new(0);
+            let get = |_: &HttpUrl| Ok((200, body.clone().into_bytes()));
+            let e = backup(&mut exec, &b, &get, mode, &mut Vec::new()).expect_err(&body);
+            assert!(
+                matches!(e, MetaError::RamUnwritten(4096 | 1)),
+                "{body}: {e}"
+            );
+            assert!(
+                e.to_string().contains("kbf_storage_ram_unwritten_bytes"),
+                "{e}"
+            );
+            assert_eq!(e.exit_code(), 2);
+            assert!(exec.log.is_empty(), "{body}: a step ran");
+        }
+    }
+
+    let b = n.backup();
+    for body in [
+        format!("{ZEROS}kbf_storage_ram_unwritten_bytes lots\n"),
+        format!("{ZEROS}kbf_storage_ram_unwritten_bytes 0\nkbf_storage_ram_unwritten_bytes 0\n"),
+    ] {
+        let mut exec = FakeExec::new(0);
+        let get = |_: &HttpUrl| Ok((200, body.clone().into_bytes()));
+        let e = backup(&mut exec, &b, &get, Mode::Apply, &mut Vec::new()).expect_err(&body);
+        assert!(matches!(e, MetaError::Family { .. }), "{body}: {e}");
+        assert!(exec.log.is_empty(), "{body}: a step ran");
+    }
+
+    // Nothing held: the backup goes ahead (a new node: the archive above was never made).
+    let zero = format!("{ZEROS}kbf_storage_ram_unwritten_bytes 0\n");
+    let mut exec = FakeExec::new(0);
+    let get = |_: &HttpUrl| Ok((200, zero.clone().into_bytes()));
+    backup(&mut exec, &b, &get, Mode::Apply, &mut Vec::new()).expect("nothing held");
+    assert_eq!(steps(&exec), STOP_START_WAIT);
+}
+
 /// Catches: a backup that goes ahead when it cannot tell whether the tier is flushed:
 /// no answer, a non-200, a value that does not parse, a family given twice or missing
 /// beside the others; and one that reads a longer name as the family.

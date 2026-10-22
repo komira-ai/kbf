@@ -15,6 +15,8 @@
 //! - [`release`]: the `install`, `stage`, `rollback` and `gc` verbs.
 //! - [`activate`]: the swap on trial: `activate`, `confirm`, `revert`, the start check
 //!   and the expiry, and the repair of the links after an interrupted verb.
+//! - [`meta_log`]: the node's metadata log, saved at a release's first start and put back when
+//!   the host goes back to the release that ran before (an older binary refuses a raised log).
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //!
@@ -59,6 +61,7 @@ pub mod app;
 pub mod archive;
 pub mod attest;
 pub mod binary;
+pub mod boot_schema;
 pub mod cli;
 pub mod darwin;
 pub mod database;
@@ -73,6 +76,7 @@ pub mod golden;
 pub mod helper;
 pub mod installer_toml;
 pub mod layout;
+pub mod meta_log;
 pub mod migrate;
 pub mod proxy;
 pub mod proxy_verb;
