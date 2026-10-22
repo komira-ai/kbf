@@ -45,6 +45,7 @@ struct Job {
     instance: &'static str,
     platform: Vec<(&'static str, &'static str)>,
     program: &'static str,
+    bare: bool,
     kind: LeaseKind,
     gpus: u64,
     memory: BookSource,
@@ -57,6 +58,7 @@ impl Job {
             instance: "main",
             platform: vec![("OSFamily", "linux")],
             program: "cc",
+            bare: false,
             kind: LeaseKind::Action,
             gpus: 0,
             memory: BookSource::Default,
@@ -80,7 +82,11 @@ impl Job {
             request,
             call: None,
             described: Described {
-                arguments: vec![self.program.to_owned()],
+                arguments: if self.bare {
+                    Vec::new()
+                } else {
+                    vec![self.program.to_owned()]
+                },
                 ..Described::default()
             },
             evidence: Evidence {
@@ -224,7 +230,6 @@ fn the_key_names_the_instance_the_platform_and_the_shape() {
 
 /// Catches a restart that keeps a size key it should not: `off` (and `shadow`) ignore
 /// the key of a row an `on` run queued, so the operation books as before; `on` keeps it.
-///
 #[test]
 fn a_restart_without_on_ignores_the_size_key_of_a_row() {
     let store = store();
@@ -239,4 +244,110 @@ fn a_restart_without_on_ignores_the_size_key_of_a_row() {
     }
     let farm = farm_over(&store, LearnedSizes::On);
     assert!(size_keys(&farm)[0].is_some());
+}
+
+/// Seeds a row no build reads (a version no one wrote): `off` and `shadow` neither load
+/// nor fail on it, and `on` refuses the start rather than guess.
+#[test]
+fn a_bad_size_key_row_stops_a_start_only_when_on() {
+    use kbf_state::{Cond, Txn};
+    let store = store();
+    drop(farm_over(&store, LearnedSizes::On));
+    store
+        .txn(
+            Txn::new()
+                .put("opkey/0000000000000001", vec![9], Cond::Any)
+                .put("keyfloor/0000000000000001", vec![9], Cond::Any),
+        )
+        .expect("write")
+        .expect("applied");
+    for mode in [LearnedSizes::Off, LearnedSizes::Shadow] {
+        drop(farm_over(&store, mode));
+    }
+    let on = Farm::new(
+        Arc::new(kbf_front::Cache::memory()),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    )
+    .with_learned_sizes(LearnedSizes::On);
+    let store: Arc<dyn Store> = store;
+    let refused = on.with_state(Some(StateStore {
+        store,
+        epoch: EpochPolicy::Keep,
+        members: Default::default(),
+        history: None,
+    }));
+    assert!(refused.is_err(), "on started over a bad row");
+}
+
+/// A worker `name` with room for a 16 GiB lease registered with `farm`.
+fn register(farm: &Farm, name: &str) -> kbf_types::WorkerId {
+    let worker = kbf_types::WorkerId::new(name);
+    let caps = kbf_caps::NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
+        .expect("caps")
+        .with_drivers(["container"]);
+    let (outbound, inbox) = tokio::sync::mpsc::unbounded_channel();
+    // The receiver lives as long as the test: a dropped one closes the stream.
+    std::mem::forget(inbox);
+    farm.register(
+        &worker,
+        kbf_sched::DaemonInstance::new(name),
+        kbf_sched::DaemonInstance::new(""),
+        crate::farm::phase::Reported::serving(kbf_types::Resources::new(4_000, 64 << 30), caps),
+        outbound,
+        kbf_proto::worker::ServerMessage::default(),
+    );
+    worker
+}
+
+/// The whole path: a keyed action killed at its own limit through the farm's report
+/// input writes a `keyfloor/` row with the requeue; a farm started over the same store
+/// with `on` loads it, and a new digest of the same shape books the floor on its first
+/// placement; started with `off` it loads none.
+#[test]
+fn a_kill_through_the_farm_leaves_a_floor_the_next_start_books() {
+    use kbf_types::{Failure, Outcome};
+    let store = store();
+    let farm = farm_over(&store, LearnedSizes::On);
+    let node = register(&farm, "node-a");
+    Job::new(1).submit(&farm);
+    let key = keys(&store)[0].expect("keyed");
+    let (operation, lease) = {
+        let state = farm.lock();
+        let operation = state.sched.unfinished().next().expect("queued");
+        (operation, state.sched.leases_on(&node)[0])
+    };
+    let report = super::Report {
+        lease,
+        outcome: Outcome::Failed(Failure::OutOfMemory),
+        measured: None,
+        exit_code: None,
+        run: None,
+    };
+    let now = farm.now();
+    farm.lock().take_report(now, &node, operation, report);
+    let rows = store.scan_prefix("keyfloor/").expect("scan");
+    assert_eq!(rows.len(), 1, "one key floor row");
+    assert_eq!(farm.lock().sched.key_floor(key), Some(16 << 30));
+    drop(farm);
+
+    let restarted = farm_over(&store, LearnedSizes::On);
+    assert_eq!(restarted.lock().sched.key_floor(key), Some(16 << 30));
+    let other = register(&restarted, "node-b");
+    Job::new(2).submit(&restarted);
+    // Two leases on the new node, both at 16 GiB: the killed action's retry (the store
+    // holds it queued) and the new digest, which started at the floor and not at 4 GiB.
+    assert_eq!(
+        restarted
+            .lock()
+            .sched
+            .booked(&other)
+            .map(|b| b.memory_bytes),
+        Some(32 << 30),
+        "a new digest of the shape starts at the floor"
+    );
+    drop(restarted);
+
+    let off = farm_over(&store, LearnedSizes::Off);
+    assert_eq!(off.lock().sched.key_floor(key), None);
 }

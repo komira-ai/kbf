@@ -134,7 +134,8 @@ impl Durable {
             Some(row) => Some(subject::decode(&row.value).map_err(|why| corrupt(&key, why))?),
             None => None,
         };
-        let size_key = match self.store.get(&opkey_key(operation))? {
+        let read = self.read_size_keys.load(Ordering::SeqCst);
+        let size_key = match self.store.get(&opkey_key(operation))?.filter(|_| read) {
             Some(row) => {
                 let key = opkey_key(operation);
                 Some(opkey::decode(&row.value).map_err(|why| corrupt(&key, why))?)

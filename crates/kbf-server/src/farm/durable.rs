@@ -315,8 +315,10 @@ pub(super) struct Ending {
 }
 
 impl Ending {
-    /// `txn`, then the removal of the operation's `op/`, `queue/`, `loss/`, `fate/` and
-    /// `subject/` rows and the put of its result, so one transaction carries all of it.
+    /// `txn`, then the removal of the operation's `op/`, `queue/`, `loss/`, `fate/`,
+    /// `subject/` and `opkey/` rows and the put of its result, so one transaction carries
+    /// all of it. The `opkey/` delete is made whatever `--learned-sizes` says: an operation
+    /// an `on` run queued has the row, and a later `off` run cleans it up as it ends.
     /// The result goes over whatever is there: a row from an earlier try of the same
     /// finish is its own.
     fn settle(&self, txn: Txn, operation: OperationId) -> Txn {
@@ -341,6 +343,12 @@ pub(super) struct Durable {
     /// scheduler was superseded and takes no more work. Never cleared; unlike an outage,
     /// the store coming back does not end it.
     pub(super) fenced: AtomicBool,
+    /// Whether the `opkey/` and `keyfloor/` rows are read (`--learned-sizes=on`). A store
+    /// that never had the flag on holds none, and with it off a row an earlier `on` run
+    /// left is neither loaded nor allowed to fail a start. The finish transaction deletes
+    /// an operation's `opkey/` row whatever the flag says, so rows an `on` run left are
+    /// cleaned up as its operations end.
+    pub(super) read_size_keys: AtomicBool,
 }
 
 impl std::fmt::Debug for Durable {
@@ -461,6 +469,7 @@ impl Durable {
             store,
             unreachable: AtomicBool::new(false),
             fenced: AtomicBool::new(false),
+            read_size_keys: AtomicBool::new(true),
         };
         if let Some(cond) = write {
             durable.commit(Txn::new().put(EPOCH, epoch.to_be_bytes(), cond))?;
@@ -506,8 +515,14 @@ impl Durable {
             let subject = subject::decode(&row.value).map_err(|why| corrupt(&key, why))?;
             subjects.insert(operation, subject);
         }
+        let read_size_keys = self.read_size_keys.load(Ordering::SeqCst);
         let mut opkeys = std::collections::BTreeMap::new();
-        for (key, row) in self.store.scan_prefix(OPKEY)? {
+        for (key, row) in self
+            .store
+            .scan_prefix(OPKEY)?
+            .into_iter()
+            .filter(|_| read_size_keys)
+        {
             let operation = parse_operation(&key, OPKEY)?;
             let size_key = opkey::decode(&row.value).map_err(|why| corrupt(&key, why))?;
             opkeys.insert(operation, size_key);
@@ -526,7 +541,12 @@ impl Durable {
         }
         let mut key_floors = Vec::new();
         let mut key_stamps = std::collections::BTreeSet::new();
-        for (key, row) in self.store.scan_prefix(KEY_FLOOR)? {
+        for (key, row) in self
+            .store
+            .scan_prefix(KEY_FLOOR)?
+            .into_iter()
+            .filter(|_| read_size_keys)
+        {
             let floor = floor::decode_key(&row.value).map_err(|why| corrupt(&key, why))?;
             if key != floor::key_row(floor.key) {
                 return Err(corrupt(&key, "not the key of the key floor it holds"));
@@ -1270,6 +1290,9 @@ impl State {
             return Ok(None);
         };
         let (durable, epoch) = Durable::open(store, epoch, process_term())?;
+        durable
+            .read_size_keys
+            .store(self.learned == LearnedSizes::On, Ordering::SeqCst);
         let stored = durable.load()?;
         // Operation names carry the writer generation, not the epoch: a kept epoch must
         // not let a process name an operation another one named (issue #154). A store

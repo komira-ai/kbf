@@ -11,9 +11,13 @@ use std::str::FromStr;
 /// observing an estimate beside the booking it would replace and changes none.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LearnedSizes {
-    /// The farm books as it always did. Requests carry no size key, and a size key on a
-    /// row restored from the state store is ignored (an operation queued while the flag
-    /// was `on` keeps the memory its key floor raised it to).
+    /// The farm books as it always did. No operation is given a size key, and the
+    /// `opkey/` and `keyfloor/` rows in the state store are neither read nor able to fail
+    /// a start. The memory a key floor raised a queued operation to is not stored: a
+    /// restored operation starts from the request as it was submitted (so rolling back to
+    /// `off` while operations raised by a floor are queued or leased books them at their
+    /// submitted memory until they end; a lease already running keeps the limit it was
+    /// given, and an `on` start picks the floor up again at the next placement round).
     #[default]
     Off,
     /// The estimate is computed and recorded beside the booking; the booking is the same

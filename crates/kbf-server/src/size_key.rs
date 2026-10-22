@@ -1,4 +1,4 @@
-//! The key a kill-driven memory floor is kept under (`kbf_sched::Request::size_key`).
+//! The key a kill-driven memory floor is kept under ([`kbf_sched::Scheduler::set_size_key`]).
 //!
 //! `hash(instance, platform class, basis, shape)`, never the shape alone: a shape is
 //! the first 8 bytes of a hash over argv and output patterns, which the client controls,
@@ -13,7 +13,9 @@
 //!   which can land on a cgroup node or a Mac);
 //! - the client named no memory (a hinted action follows the ladder and its digest floor;
 //!   `Evidence::memory_source` is [`BookSource::Default`]);
-//! - it is an `action` without GPUs (the scheduler checks this too).
+//! - it is an `action` without GPUs (the scheduler checks this too);
+//! - its argv or its outputs name a shape: an action with neither would share one key with
+//!   every other.
 
 use kbf_invocation::BookSource;
 use kbf_types::LeaseKind;
@@ -64,6 +66,9 @@ pub struct Keyable<'a> {
     pub platform: &'a Platform,
     /// Its shape.
     pub shape: ShapeKey,
+    /// Whether the shape was made from a program or an output (an action with neither has
+    /// the one shape every such action shares).
+    pub shaped: bool,
     /// The lease kind it books.
     pub kind: LeaseKind,
     /// The GPUs it books.
@@ -76,8 +81,10 @@ impl Keyable<'_> {
     /// The request's size key, or `None` when it must not be keyed.
     #[must_use]
     pub fn key(&self) -> Option<u64> {
-        let keyed =
-            self.kind == LeaseKind::Action && self.gpus == 0 && self.memory == BookSource::Default;
+        let keyed = self.kind == LeaseKind::Action
+            && self.gpus == 0
+            && self.memory == BookSource::Default
+            && self.shaped;
         if keyed {
             size_key(self.instance, self.platform, self.shape)
         } else {
@@ -165,6 +172,7 @@ mod tests {
             instance: "main",
             platform: &platform,
             shape: SHAPE,
+            shaped: true,
             kind: LeaseKind::Action,
             gpus: 0,
             memory: BookSource::Default,
@@ -180,6 +188,10 @@ mod tests {
                 ..keyable
             },
             Keyable { gpus: 1, ..keyable },
+            Keyable {
+                shaped: false,
+                ..keyable
+            },
             Keyable {
                 memory: BookSource::Hint,
                 ..keyable

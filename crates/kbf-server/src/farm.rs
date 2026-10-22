@@ -1041,6 +1041,10 @@ impl Farm {
 
 impl Dispatch for Farm {
     fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
+        // An action with no program and no output names no shape: all such actions would
+        // share one key.
+        let shaped =
+            !submission.described.arguments.is_empty() || !submission.described.outputs.is_empty();
         // Outside the lock: hashes the action's shape and drops its argv and paths.
         let usage = self
             .shapes
@@ -1057,6 +1061,7 @@ impl Dispatch for Farm {
                     instance: &submission.request.key.instance,
                     platform: &platform,
                     shape: usage.key,
+                    shaped,
                     kind: submission.request.kind,
                     gpus: submission.request.resources.gpus,
                     memory: submission.evidence.memory_source,
