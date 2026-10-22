@@ -208,6 +208,36 @@ fn check_refuses_a_kbf_binary_that_is_not_an_absolute_path() {
     );
 }
 
+/// Asserts that the lookup of the commit a slot's child runs asks the slot it is given: the
+/// slot the child control recorded gives the commit of its record, the other gives none.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_swap_state_asks_the_child_control_for_the_commit_recorded_for_a_slot() {
+    use crate::proxy::child_real::{ProcChild, Recorded};
+    use crate::proxy::model::{ProcIdent, Slot as Own};
+    use crate::testkit::{A, c};
+    let dir = kbf_host::testkit::scratch("proxy-verb-running");
+    let ident = ProcIdent {
+        pid: 7,
+        start_time: 9,
+        exe: "/x/kbf".into(),
+    };
+    let record = Recorded {
+        ident,
+        commit: c(A),
+    };
+    fs::write(
+        dir.join("a.json"),
+        serde_json::to_vec(&record).expect("json"),
+    )
+    .expect("record");
+    let layout = crate::layout::Layout::linux(kbf_host::Root::host());
+    let child = Arc::new(ProcChild::new(layout, dir, Box::new(|_, _| Vec::new())));
+    let running = running_by(&child);
+    assert_eq!(running(Own::A), Some(c(A)));
+    assert_eq!(running(Own::B), None);
+}
+
 /// Catches a proxy with its own copies that still opens root's order spool and fails fast on
 /// it: with a file where `orders/` would be, the seams are built and the start fails only at
 /// the bind (a failure, not the usage error of a spool the service user cannot use).

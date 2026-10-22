@@ -145,6 +145,32 @@ async fn the_update_api_calls_the_handler_even_while_the_gate_holds() {
     drop(guard);
 }
 
+/// The swap's state is the update handler's, not a child's: it is called while the gate holds,
+/// with the path as the proxy matched it (the query is not passed), and no child is asked.
+/// It is not held with the streams.
+#[tokio::test(start_paused = true)]
+async fn the_swap_state_calls_the_handler_even_while_the_gate_holds_and_no_child() {
+    let (handler, seen, _) = recording(Duration::ZERO, false);
+    let rig = with_updates(handler).await;
+    let guard = rig
+        .core
+        .slots
+        .hold(Duration::from_secs(20))
+        .expect("no hold");
+    let mut client = rig.client().await;
+
+    let reply = client.plain("GET", "/v1/proxy/swap?x=1", b"").await;
+
+    assert_eq!(reply.status, Some(202));
+    let seen = seen.lock().expect("lock");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].method, "GET");
+    assert_eq!(seen[0].path, "/v1/proxy/swap");
+    assert_eq!(rig.a.state.dispatches(), 0);
+    assert_eq!(rig.b.state.dispatches(), 0);
+    drop(guard);
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_update_body_over_4096_bytes_is_refused_by_the_proxy() {
     static EXACT: [u8; 4096] = [b'a'; 4096];

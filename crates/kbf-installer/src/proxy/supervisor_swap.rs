@@ -70,6 +70,8 @@ mod migrator_tests;
 #[cfg(test)]
 pub(in crate::proxy) mod rig;
 #[cfg(test)]
+mod snapshot_tests;
+#[cfg(test)]
 mod tests;
 
 use std::any::Any;
@@ -89,9 +91,11 @@ use super::ports::{
 use super::record::FileRecorder;
 use super::runtime::RequestQueue;
 use super::swap::Swap;
+use crate::CommitId;
 use mirror::{Mirror, Shared};
 
 pub use migrator::{ExpandOnlyDefault, RunningSchema};
+pub use status::Snapshot;
 
 /// The ports of the swap, owned: the swap thread borrows them for as long as it runs.
 pub struct Parts {
@@ -107,6 +111,9 @@ pub struct Parts {
     /// The process identity of the child serving in a slot, recorded in `update.json` so a
     /// restarted proxy can adopt it (`ProcChild::recorded` on a host).
     pub old_proc: Box<dyn Fn(Slot) -> Option<ProcIdent> + Send + Sync>,
+    /// The commit the process recorded for a slot runs (`ProcChild::recorded` on a host). It
+    /// names what the serving child runs when no update's record does ([`Snapshot`]).
+    pub running: Box<dyn Fn(Slot) -> Option<CommitId> + Send + Sync>,
     /// Runs once on the swap thread when it dies of a panic or a port it cannot do without;
     /// the verb passes what stops its process loudly. Not run for a shutdown.
     pub on_death: Arc<dyn Fn(&str) + Send + Sync>,
@@ -215,6 +222,19 @@ impl SwapSupervisor {
     /// Wait until no swap thread is alive, for at most `limit`; true if none is.
     pub fn wait_closed(&self, limit: Duration) -> bool {
         self.shared.wait_closed(limit)
+    }
+
+    /// The slot that serves, the commit its child runs and the newest update's record, read
+    /// together for the proxy's swap-state endpoint. The slot and the commit are `None` while
+    /// the start-up hold is in force.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot {
+        let (intent, active, open) = {
+            let state = self.shared.lock();
+            (state.intent.clone(), state.active, state.open.is_some())
+        };
+        let held = self.config.startup_hold.is_some();
+        status::snapshot(&self.parts, intent, active, open, held)
     }
 
     fn launch(&self, job: Job) -> Result<(), String> {

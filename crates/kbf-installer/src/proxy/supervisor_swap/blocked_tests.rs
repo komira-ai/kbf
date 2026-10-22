@@ -18,7 +18,10 @@ fn parked() -> Spawn {
     Box::new(|_work| Ok(()))
 }
 
-fn over(name: &str, edit: impl FnOnce(&Rig, &mut super::Config)) -> (SwapSupervisor, PathBuf) {
+pub(super) fn over(
+    name: &str,
+    edit: impl FnOnce(&Rig, &mut super::Config),
+) -> (SwapSupervisor, PathBuf) {
     let dir = kbf_host::testkit::scratch(name);
     let rig = Rig::new(Some(dir.clone()));
     let requests = Arc::new(RequestQueue::new());
@@ -29,7 +32,7 @@ fn over(name: &str, edit: impl FnOnce(&Rig, &mut super::Config)) -> (SwapSupervi
     (SwapSupervisor::with_spawner(parts, config, parked()), dir)
 }
 
-fn spec(id: &str) -> UpdateSpec {
+pub(super) fn spec(id: &str) -> UpdateSpec {
     UpdateSpec {
         update_id: UpdateId(id.to_owned()),
         request_id: format!("req-{id}"),

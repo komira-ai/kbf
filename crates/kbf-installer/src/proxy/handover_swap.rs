@@ -49,7 +49,7 @@ use super::ports::{ChildAdmin, Migrator, RootOrders};
 use super::record::FileRecorder;
 use super::releases::{Local, LocalOrders, StatusFile};
 use super::runtime::{RequestQueue, SystemClock};
-use super::supervisor_swap::{Config, Parts, SwapSupervisor};
+use super::supervisor_swap::{Config, Parts, Snapshot, SwapSupervisor};
 use crate::CommitId;
 use crate::database::Database;
 use kbf_state::postgres::schema::{Outcome, SchemaError};
@@ -129,6 +129,9 @@ pub struct Host {
     pub child: Arc<dyn Child + Send + Sync>,
     /// The process recorded for a slot, if any, so a restarted proxy can adopt it.
     pub recorded: Arc<dyn Fn(Slot) -> Option<ProcIdent> + Send + Sync>,
+    /// The commit the process recorded for a slot runs, if any (the same record `recorded`
+    /// reads): what the serving child runs when no update's record says.
+    pub running: Arc<dyn Fn(Slot) -> Option<CommitId> + Send + Sync>,
     /// The slot that serves now, from the start-up adoption (a recorded update decides its own).
     pub active: Slot,
     /// Why no frontend child is serving (the start-up hold is in force), if so; `active` is
@@ -219,6 +222,13 @@ impl Handover {
             seams: Seams::default(),
             inner: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The slot that serves, the commit its child runs and the newest update's record
+    /// ([`SwapSupervisor::snapshot`]); empty until the proxy is bound.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot {
+        self.with(|swap| swap.snapshot()).unwrap_or_default()
     }
 
     /// The same handover with its ports replaced by `seams`.
@@ -329,6 +339,7 @@ fn build(cfg: &HandoverConfig, orders: &Orders, host: &Host, seams: &Seams) -> S
         ..StateDbMigrator::new(&cfg.status_file, cfg.installer_toml.clone())
     };
     let recorded = Arc::clone(&host.recorded);
+    let running = Arc::clone(&host.running);
     let parts = Parts {
         child: Arc::clone(&host.child),
         admin,
@@ -339,6 +350,7 @@ fn build(cfg: &HandoverConfig, orders: &Orders, host: &Host, seams: &Seams) -> S
         clock: Arc::new(SystemClock::new()),
         requests: Arc::new(RequestQueue::new()),
         old_proc: Box::new(move |slot| recorded(slot)),
+        running: Box::new(move |slot| running(slot)),
         on_death: Arc::clone(&host.on_death),
     };
     SwapSupervisor::new(

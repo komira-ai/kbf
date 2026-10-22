@@ -374,8 +374,14 @@ async fn wrong_methods_and_unknown_paths() {
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{m} {p}");
         assert!(resp.headers().contains_key("allow"));
     }
-    // Unknown paths are 404 without a credential; known ones are not.
-    for p in ["/v1/update/frontend/nope", "/v1/other", "/"] {
+    // Unknown paths are 404 without a credential; known ones are not. The swap's state is not
+    // this API's: the proxy routes it here, and a proxy without its own copies has none.
+    for p in [
+        "/v1/update/frontend/nope",
+        "/v1/other",
+        "/",
+        "/v1/proxy/swap",
+    ] {
         let resp = h.router.call(call(Method::GET, p, Value::Null, None)).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{p}");
     }

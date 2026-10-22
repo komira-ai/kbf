@@ -32,6 +32,7 @@ const WORKER: &str = "/kbf.worker.v1.Worker/Session";
 const ENROLL: &str = "/kbf.enroll.v1.Enroll/Enroll";
 const COLD: &str = "/kbf.enroll.v1.ColdStore/GetKeys";
 const UPDATE: &str = "/v1/update/frontend";
+const SWAP: &str = "/v1/proxy/swap";
 const WRONG: &str = "wrong-token-0123456789-abcdefghijklmnopq";
 
 fn identity(role: PeerRole) -> Identity {
@@ -177,15 +178,16 @@ async fn reapi_follows_buck2_auth() {
     .await;
 }
 
-/// Operator paths, the update API and `/metrics` take the operator token in every mode,
-/// whatever the certificate says; the Buck2 key is not it.
+/// Operator paths, the update API, the swap's state and `/metrics` take the operator token in
+/// every mode, whatever the certificate says; the Buck2 key is not it.
 ///
 /// Kills: an operator path open to a certificate; the Buck2 key accepted as the operator
-/// token; the update API on a weaker rule than the operator API.
+/// token; the update API or the swap's state on a weaker rule than the operator API (the
+/// state of the swap answered to a caller with no token).
 #[tokio::test(start_paused = true)]
 async fn operator_update_and_metrics_take_the_operator_token() {
     use Buck2Auth::{Bearer, Mtls, None as Open};
-    for path in [OPERATOR, UPDATE, "/metrics"] {
+    for path in [OPERATOR, UPDATE, SWAP, "/metrics"] {
         for mode in [Open, Mtls, Bearer] {
             check(
                 path,

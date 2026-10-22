@@ -13,7 +13,7 @@ use super::*;
 use crate::proxy::handover_swap::{GateSlot, NOT_BOUND, SlotAddrs};
 use crate::proxy::kinds::Supervisor;
 use crate::proxy::releases;
-use crate::testkit::A;
+use crate::testkit::{A, B, c};
 
 fn addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
@@ -181,6 +181,64 @@ async fn with_copies_every_call_on_the_update_route_is_answered_410_and_nothing_
 
     assert_eq!(names_in(&cfg.state_dir), [releases::RELEASES]);
     assert!(!cfg.orders_dir.exists(), "no order spool was made");
+}
+
+fn request(method: &str, path: &str) -> UpdateRequest {
+    UpdateRequest {
+        method: method.to_owned(),
+        path: path.to_owned(),
+        body: Vec::new(),
+    }
+}
+
+/// Asserts that a proxy that keeps its own copies serves the swap's state, that the state and
+/// the binary watch share what the watch knows, and that the update API stays gone:
+/// `GET /v1/proxy/swap` is a 200 whose boot id ends with this process's pid, whose installed
+/// commit is the one `releases.json` says, whose active slot is `null` (the proxy is not
+/// bound) and whose pending binary is what the wiring's status holds (`null`, then `B`); and
+/// the update API's paths are 410 in the same route.
+#[tokio::test]
+async fn with_copies_the_swap_state_is_answered_and_the_update_api_stays_gone() {
+    let cfg = config_local("swap-state");
+    let installed = format!("{{\"installed_commit\":\"{A}\"}}\n");
+    fs::write(&cfg.status_file, installed).expect("releases.json");
+    let Ok(assembled) = assemble(&cfg) else {
+        panic!("the wiring");
+    };
+    let watch = assembled.watch.as_ref().expect("watched").status.clone();
+    let route = assembled
+        .pending
+        .start(Box::new(|| panic!("the route died")))
+        .expect("the route");
+
+    let reply = route.handle(request("GET", "/v1/proxy/swap")).await;
+
+    assert_eq!(reply.status, 200);
+    assert!(reply.headers.is_empty());
+    let body: serde_json::Value = serde_json::from_slice(&reply.body).expect("JSON");
+    assert_eq!(body["installed_commit"], A);
+    assert!(body["active_slot"].is_null(), "the proxy is not bound");
+    assert!(body["pending_binary"].is_null());
+    let boot = body["proxy_boot"].as_str().expect("a boot id");
+    let pid = format!("-{}", std::process::id());
+    assert!(boot.ends_with(&pid), "{boot}");
+    assert_eq!(boot.len(), "2026-10-22T08:41:16Z".len() + pid.len());
+
+    watch.pend(Some(c(B)));
+    let reply = route.handle(request("GET", "/v1/proxy/swap")).await;
+    let body: serde_json::Value = serde_json::from_slice(&reply.body).expect("JSON");
+    assert_eq!(body["pending_binary"], B);
+    assert_eq!(body["proxy_boot"], boot, "fixed for the process");
+
+    for (method, path) in [
+        ("GET", "/v1/update/frontend"),
+        ("POST", "/v1/update/frontend"),
+        ("POST", "/v1/update/frontend/abort"),
+    ] {
+        let reply = route.handle(request(method, path)).await;
+        assert_eq!(reply.status, 410, "{method} {path}");
+        assert_eq!(reply.body, GONE.as_bytes(), "{method} {path}");
+    }
 }
 
 /// Catches a body that is not the JSON error the clients of the route read: it parses, and its

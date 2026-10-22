@@ -8,12 +8,15 @@
 //!   [`Handover`] over the proxy's own copies of `kbf` ([`Local`]), shared with the binary watch
 //!   ([`Wiring`]), which is what starts a swap. The update API is not built: nothing in this
 //!   path opens an order spool or reads the root half's files, and the route answers every call
-//!   with 410 ([`Gone`]), because the package manager is what updates `kbf` there. The swap's
-//!   `abort`, `rollback` and `force_retire` are then called by nothing: a drain that never idles
-//!   cannot be seen or ended through the route, only by restarting the proxy.
+//!   with 410 ([`Gone`]), because the package manager is what updates `kbf` there, except
+//!   `GET /v1/proxy/swap`, which reports the state of the swap
+//!   ([`SwapStatus`](super::swap_status::SwapStatus)) from the same swap and the same
+//!   [`WatchStatus`] the binary watch publishes to. The swap's `abort`, `rollback` and
+//!   `force_retire` are then called by nothing: a drain that never idles cannot be seen or ended
+//!   through the route, only by restarting the proxy.
 //! - **Without it**: the update API as it has always been, built by [`super::handover::legacy`].
 //!   That call is the whole of what this module knows about the API, so a build without the API
-//!   is this module without that arm.
+//!   is this module without that arm. The API does not know `/v1/proxy/swap`: it answers 404.
 //!
 //! The route is a [`Route`]: the proxy's [`UpdateHandler`] over an [`Answer`], which takes a
 //! [`Call`] and gives an [`Answered`], plain values, so that nothing but this module names the
@@ -29,9 +32,11 @@ use async_trait::async_trait;
 use hyper::header::{HeaderName, HeaderValue};
 use kbf_proxy::control::{UpdateHandler, UpdateReply, UpdateRequest};
 
-use super::binary_watch::Wiring;
+use super::binary_watch::{WatchStatus, Wiring};
 use super::handover_swap::{Handover, HandoverConfig};
 use super::releases::Local;
+use super::runtime::SystemClock;
+use super::swap_status::{SwapStatus, boot_id};
 
 /// The body of the 410 every call on the update route gets when the proxy keeps its own copies
 /// of `kbf`.
@@ -42,7 +47,7 @@ pub const GONE: &str = r#"{"error":"the update API is retired; kbf is updated by
 pub struct Call {
     /// `GET` or `POST`.
     pub method: String,
-    /// The path, `/v1/update/frontend` and what follows it.
+    /// The path: `/v1/update/frontend` and what follows it, or `/v1/proxy/swap`.
     pub path: String,
     /// The JSON body.
     pub body: Vec<u8>,
@@ -155,10 +160,20 @@ pub fn assemble(cfg: &HandoverConfig) -> Result<Assembled, AssembleError> {
 }
 
 /// The swap over the proxy's own copies of `kbf`, for the binary watch to start, and the route
-/// that answers 410. No update API, no order spool, no file of the root half.
+/// that answers 410 and the swap's state. No update API, no order spool, no file of the root
+/// half. The binary watch and the route share one [`WatchStatus`], and the route reads the
+/// swap through a clone of the one the watch starts.
 #[must_use]
 pub fn local(cfg: &HandoverConfig, copies: &Local) -> Assembled {
     let swap = Handover::local(cfg, Arc::clone(&copies.orders));
+    let status = WatchStatus::default();
+    let boot = boot_id(&SystemClock::new(), std::process::id());
+    let route = SwapStatus::new(
+        Arc::new(swap.clone()),
+        Arc::clone(&copies.orders),
+        status.clone(),
+        boot,
+    );
     let note = format!(
         "update API retired, /v1/update/* answers 410; the swap starts when the kbf at {} is \
          replaced (status {})",
@@ -169,14 +184,16 @@ pub fn local(cfg: &HandoverConfig, copies: &Local) -> Assembled {
         watch: Some(Wiring {
             local: copies.clone(),
             swap,
+            status,
         }),
-        pending: Box::new(Retired { note }),
+        pending: Box::new(Retired { note, route }),
     }
 }
 
-/// The route of [`local`]: [`Gone`], started with nothing to start.
+/// The route of [`local`]: [`SwapStatus`], started with nothing to start.
 struct Retired {
     note: String,
+    route: SwapStatus,
 }
 
 impl Pending for Retired {
@@ -185,7 +202,7 @@ impl Pending for Retired {
     }
 
     fn start(self: Box<Self>, _on_death: Box<dyn FnOnce() + Send>) -> io::Result<Route> {
-        Ok(Route::new(Gone))
+        Ok(Route::new(self.route))
     }
 }
 

@@ -404,12 +404,14 @@ fn a_file_still_being_written_or_gone_starts_the_two_polls_over() {
 }
 
 /// Catches a change that is lost, or acted on too early, while a swap runs or the proxy cannot
-/// take one: while the swap says it is busy every poll reports why and nothing is run, copied,
-/// staged or started; when it is not busy any more the very next poll starts the swap, which
-/// it could not if the identity had been consumed meanwhile.
+/// take one: while the swap says it is busy every poll reports why, the kbf is run once (to
+/// name its commit for the status) and nothing is copied, staged or started; when it is not
+/// busy any more the very next poll starts the swap, which it could not if the identity had
+/// been consumed meanwhile.
 ///
-/// Asserts that the identity is kept while the swap is busy, that the busy answer is asked, and
-/// that the kbf is neither run nor copied before it is asked.
+/// Asserts that the identity is kept while the swap is busy, that the busy answer is asked,
+/// that the kbf is run once and not at every busy poll, and that it is not copied before the
+/// busy answer is asked.
 #[test]
 fn a_swap_in_flight_leaves_the_change_pending_until_it_can_start() {
     let mut bench = Bench::new("busy", Some(A), usize::MAX);
@@ -423,7 +425,7 @@ fn a_swap_in_flight_leaves_the_change_pending_until_it_can_start() {
         assert_eq!(bench.pass(), Pass::Busy(why.clone()));
     }
 
-    assert_eq!(bench.calls(), before, "the new kbf was run while busy");
+    assert_eq!(bench.calls(), before + 1, "run once to name its commit");
     assert!(bench.started().is_empty());
     assert_eq!(bench.staged(), None);
     assert!(!bench.local.copies.verified(&c(B)));
@@ -791,10 +793,12 @@ fn config_for(local: &Local, root: &Path) -> HandoverConfig {
 /// The host as the verb reports it, over the rig's children, with `releases` as the copies.
 fn host_over(rig: &Arc<Rig>, releases: PathBuf) -> Host {
     let by_slot = Arc::clone(rig);
+    let by_commit = Arc::clone(rig);
     Host {
         gate: rig.clone(),
         child: rig.clone(),
         recorded: Arc::new(move |slot| by_slot.ident(slot)),
+        running: Arc::new(move |slot| by_commit.commit_of(slot)),
         active: Slot::A,
         held: None,
         releases_dir: releases,
@@ -952,6 +956,7 @@ fn nothing_is_spawned_without_a_wiring_and_the_thread_ends_with_its_clock() {
     let wiring = Wiring {
         local: bench.local.clone(),
         swap,
+        status: WatchStatus::default(),
     };
     let clock = Arc::new(SystemClock::new());
     clock.stop();
@@ -960,3 +965,7 @@ fn nothing_is_spawned_without_a_wiring_and_the_thread_ends_with_its_clock() {
 
     thread.join().expect("the watch ended with its clock");
 }
+
+// What the watch publishes for the swap-state endpoint, with the same bench.
+#[path = "binary_watch_status_tests.rs"]
+mod watch_status;
