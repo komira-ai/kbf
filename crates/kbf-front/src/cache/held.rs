@@ -24,12 +24,13 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use tokio::time::Instant;
+
 use bytes::Bytes;
 use kbf_meta::Closure;
 use kbf_types::Digest;
 
-#[cfg(feature = "testkit")]
-use super::VerifiedBlob;
+use super::ram::Permit;
 use super::{Cache, CacheError};
 use crate::meta_log::MetaLog;
 use kbf_objstore::ObjectStore;
@@ -54,35 +55,89 @@ impl std::fmt::Debug for BetweenCell {
 /// be written unless [`Cache::with_durable_wait`] says otherwise (`--durable-wait`).
 pub const DEFAULT_DURABLE_WAIT: Duration = Duration::from_secs(10);
 
-/// The set: digest to the verified bytes.
+/// Where a held blob is in its way to the disk (`docs/design/storage-ram-ack.md`, "Drain
+/// and shutdown").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainState {
+    /// Waiting for a drain pass.
+    Queued,
+    /// A drain pass has it, after `failures` failed passes in a row.
+    Writing {
+        /// Failed passes before this one.
+        failures: u32,
+    },
+    /// The last pass failed `n` times in a row; the next one waits until `next`.
+    Failing {
+        /// Failed passes in a row.
+        n: u32,
+        /// The earliest the next pass takes it.
+        next: Instant,
+    },
+}
+
+/// One held blob: its bytes, the budget it holds, and where its drain is.
+#[derive(Debug)]
+pub(super) struct Entry {
+    bytes: Bytes,
+    /// Returned to the budget when the entry is dropped, which is when the blob leaves
+    /// the set (`None` for a blob held without a budget, by a test).
+    _permit: Option<Permit>,
+    state: DrainState,
+    since: Instant,
+}
+
+/// What the set holds in all: the bytes and blobs not yet in the index, and the age of
+/// the oldest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Unwritten {
+    /// Bytes of the held blobs.
+    pub bytes: u64,
+    /// How many blobs are held.
+    pub blobs: u64,
+    /// How long the oldest has been held; zero with none.
+    pub oldest: Duration,
+}
+
+/// The set: digest to the verified bytes and their drain.
 #[derive(Debug, Default)]
 pub(super) struct Held {
-    blobs: Mutex<BTreeMap<Digest, Bytes>>,
+    blobs: Mutex<BTreeMap<Digest, Entry>>,
     /// Woken when an entry has left, for a caller waiting for digests to be written.
     left: tokio::sync::Notify,
 }
 
 impl Held {
-    fn blobs(&self) -> MutexGuard<'_, BTreeMap<Digest, Bytes>> {
+    fn blobs(&self) -> MutexGuard<'_, BTreeMap<Digest, Entry>> {
         self.blobs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Holds `bytes` under `digest` unless the digest is held already; whether it did. A
     /// second writer of a digest is a dedup answer: it takes no entry and leaves the first
     /// writer's, so a removal by the first is the only one.
-    #[cfg(any(test, feature = "testkit"))]
-    pub(super) fn try_insert(&self, digest: Digest, bytes: Bytes) -> bool {
+    /// The entry owns `permit` (if any) until it leaves; a refused insert drops it.
+    pub(super) fn try_insert(
+        &self,
+        digest: Digest,
+        bytes: Bytes,
+        permit: Option<Permit>,
+        now: Instant,
+    ) -> bool {
         match self.blobs().entry(digest) {
             std::collections::btree_map::Entry::Occupied(_) => false,
             std::collections::btree_map::Entry::Vacant(slot) => {
-                slot.insert(bytes);
+                slot.insert(Entry {
+                    bytes,
+                    _permit: permit,
+                    state: DrainState::Queued,
+                    since: now,
+                });
                 true
             }
         }
     }
 
-    /// Drops `digest`; whether it was held.
-    #[cfg(any(test, feature = "testkit"))]
+    /// Drops `digest`, and with it the budget it held; whether it was held. Called only
+    /// once the index has the blob.
     pub(super) fn remove(&self, digest: &Digest) -> bool {
         let removed = self.blobs().remove(digest).is_some();
         if removed {
@@ -92,7 +147,7 @@ impl Held {
     }
 
     /// Whether nothing is held.
-    fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.blobs().is_empty()
     }
 
@@ -104,7 +159,7 @@ impl Held {
 
     /// The bytes held under `digest`.
     pub(super) fn get(&self, digest: &Digest) -> Option<Bytes> {
-        self.blobs().get(digest).cloned()
+        self.blobs().get(digest).map(|e| e.bytes.clone())
     }
 
     /// Whether `digest` is held.
@@ -143,8 +198,8 @@ impl Held {
         let mut unheld = Vec::new();
         for d in digests {
             match blobs.get(d) {
-                Some(bytes) => {
-                    held.insert(*d, bytes.clone());
+                Some(entry) => {
+                    held.insert(*d, entry.bytes.clone());
                 }
                 None => unheld.push(*d),
             }
@@ -157,17 +212,94 @@ impl Held {
         let blobs = self.blobs();
         digests.iter().map(|d| blobs.contains_key(d)).collect()
     }
+
+    /// The bytes and blobs held and the age of the oldest, as of `now`.
+    pub(super) fn unwritten(&self, now: Instant) -> Unwritten {
+        let blobs = self.blobs();
+        Unwritten {
+            bytes: blobs.values().map(|e| e.bytes.len() as u64).sum(),
+            blobs: blobs.len() as u64,
+            oldest: blobs
+                .values()
+                .map(|e| now.saturating_duration_since(e.since))
+                .max()
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Takes at most `limit` blobs for a drain pass, marking each `Writing` so no other
+    /// pass takes it: the queued ones, and a failed one whose wait has ended at `now`
+    /// (every failed one with `force`, which a shutdown drain uses: it does not wait out
+    /// a backoff).
+    pub(super) fn claim(&self, now: Instant, force: bool, limit: usize) -> Vec<(Digest, Bytes)> {
+        let mut blobs = self.blobs();
+        let mut taken = Vec::new();
+        for (digest, entry) in blobs.iter_mut() {
+            if taken.len() == limit {
+                break;
+            }
+            let failures = match entry.state {
+                DrainState::Queued => 0,
+                DrainState::Failing { n, next } if force || next <= now => n,
+                DrainState::Failing { .. } | DrainState::Writing { .. } => continue,
+            };
+            entry.state = DrainState::Writing { failures };
+            taken.push((*digest, entry.bytes.clone()));
+        }
+        taken
+    }
+
+    /// Records that the pass that had `digest` failed: the failures in a row, and when the
+    /// next pass may take it (`None` if it is not held, or no pass has it).
+    pub(super) fn failed(&self, digest: &Digest, now: Instant) -> Option<(u32, Instant)> {
+        let mut blobs = self.blobs();
+        let entry = blobs.get_mut(digest)?;
+        let before = match entry.state {
+            DrainState::Writing { failures } => failures,
+            DrainState::Queued | DrainState::Failing { .. } => 0,
+        };
+        let n = before.saturating_add(1);
+        let next = now + super::flush::flush_backoff(n);
+        entry.state = DrainState::Failing { n, next };
+        Some((n, next))
+    }
+
+    /// Gives back `digest` to the queue if a pass took it and ended without an answer (it
+    /// was cancelled): it is taken again, with the failures it had.
+    pub(super) fn unclaim(&self, digest: &Digest, now: Instant) {
+        if let Some(entry) = self.blobs().get_mut(digest)
+            && let DrainState::Writing { failures } = entry.state
+        {
+            entry.state = if failures == 0 {
+                DrainState::Queued
+            } else {
+                DrainState::Failing {
+                    n: failures,
+                    next: now,
+                }
+            };
+        }
+    }
+
+    /// The state of `digest`'s drain, if it is held.
+    #[cfg(any(test, feature = "testkit"))]
+    pub(super) fn state(&self, digest: &Digest) -> Option<DrainState> {
+        self.blobs().get(digest).map(|e| e.state)
+    }
+
+    /// The earliest a failed blob is due for another pass, if any is waiting.
+    pub(super) fn next_due(&self) -> Option<Instant> {
+        self.blobs()
+            .values()
+            .filter_map(|e| match e.state {
+                DrainState::Failing { next, .. } => Some(next),
+                _ => None,
+            })
+            .min()
+    }
 }
 
 impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
-    /// Holds `blob` as an acknowledged blob not yet on disk would be held, and whether it
-    /// did (`false`: the digest was held already, and the set is unchanged). Only for
-    /// tests: nothing holds a blob in a running node yet.
-    #[cfg(feature = "testkit")]
-    pub fn hold_for_test(&self, blob: &VerifiedBlob) -> bool {
-        self.held.try_insert(blob.digest, blob.bytes.clone())
-    }
-
     /// Drops the held blob `digest`, as the drain does once the index has it; whether it
     /// was held. Only for tests.
     #[cfg(feature = "testkit")]

@@ -8,7 +8,9 @@
 //! started over that copy opens the same log (the same log id) at the same entry.
 //!
 //! `meta-backup` ([`backup`]) refuses unless the server's `/metrics` shows no write-tier
-//! bytes or blocks left to flush and no flush conflict, stops the unit, refuses (and
+//! bytes or blocks left to flush, no flush conflict, and no bytes acknowledged from RAM
+//! and not yet written to the disk (`kbf_storage_ram_unwritten_bytes`: the stop would lose
+//! them, and a copy taken after it would lack blobs the writers were told are stored), stops the unit, refuses (and
 //! restarts) if the hot store still holds a `*.blk` block (acknowledged bytes not in the
 //! object store, which the copy would point at), writes the directory into one tar file
 //! with a sha256 manifest inside ([`archive`]), synced with its directory, starts the
@@ -60,6 +62,10 @@ pub enum MetaError {
         "the write tier holds {bytes} bytes in {blocks} blocks not yet in the object store; wait for kbf_write_tier_unflushed_bytes to reach 0"
     )]
     Unflushed { bytes: u64, blocks: u64 },
+    #[error(
+        "the server holds {0} bytes acknowledged from RAM and not yet written to its disk; wait for kbf_storage_ram_unwritten_bytes to reach 0 (the stop would lose them)"
+    )]
+    RamUnwritten(u64),
     #[error(
         "kbf_write_tier_flush_conflicts_total is {0}: a staged object met another in the store; find out why before a backup"
     )]
@@ -169,8 +175,8 @@ pub fn backup<E: Exec>(
     let target = Path::new(b.out.as_str());
     let hot = b.hot_dir.as_ref().map(|h| Path::new(h.as_str()));
     preflight(b, meta, target)?;
-    let tier = metrics::read(get, &b.metrics)?;
-    match (tier, hot) {
+    let readings = metrics::read(get, &b.metrics)?;
+    match (readings.tier, hot) {
         (Some(_), None) => {
             return Err(MetaError::NoHotDir {
                 url: b.metrics.to_string(),
@@ -188,6 +194,9 @@ pub fn backup<E: Exec>(
             return Err(MetaError::Unflushed { bytes, blocks });
         }
         _ => {}
+    }
+    if readings.ram_unwritten > 0 {
+        return Err(MetaError::RamUnwritten(readings.ram_unwritten));
     }
     if let Some(h) = hot {
         line(

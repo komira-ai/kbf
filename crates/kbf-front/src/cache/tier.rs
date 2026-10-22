@@ -300,6 +300,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     #[must_use]
     pub fn render_metrics(&self) -> String {
         let mut out = self.writer.metrics.render();
+        self.render_ram(&mut out);
         // The process's, not this cache's: what every request in the process holds.
         kbf_storage::in_flight::render(&mut out);
         if let Some(staging) = self.writer.tier.get() {

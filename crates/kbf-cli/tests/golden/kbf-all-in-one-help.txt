@@ -446,26 +446,42 @@ Options:
           
           [default: /Applications]
 
-      --store-put-attempts <STORE_PUT_ATTEMPTS>
-          How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
+      --ram-ack-bytes <RAM_ACK_BYTES>
+          How many bytes of blobs a storage node may hold in RAM, acknowledged to the writer and not yet written to its disk. 0, the default, is off: a write is acknowledged from disk, as before. Nothing acknowledges from RAM yet, so with any value no blob is held and the node behaves as with 0. A blob that finds the budget full is written through to the disk before it is acknowledged, never waited for. A node that does hold blobs counts them in `kbf_storage_ram_unwritten_bytes`, writes them to its disk in the background and, when it stops, within `--ram-drain-deadline`. A node can hold this many bytes beside the `--write-bytes-in-flight` it receives. Storage nodes only: a server with no replica to hold a second copy holds nothing
           
-          [default: 3]
+          [default: 0]
 
       --xcode-recheck-secs <XCODE_RECHECK_SECS>
           How often, in seconds, the Xcodes are asked again (native), so one fixed while the daemon runs becomes ready without a restart
           
           [default: 180]
 
-      --input-tree-cache-entries <INPUT_TREE_CACHE_ENTRIES>
-          The most decoded Directories an Execute's input check keeps in memory (`docs/design/storage.md#input-tree-check`). Least recently used go first
+      --ram-drain-deadline <RAM_DRAIN_DEADLINE>
+          How long, in seconds, a storage node that is stopping waits for the blobs it holds in RAM to be written to its disk (`--ram-ack-bytes`), after its calls have ended. The blobs left when it ends are lost to the stop and are counted in the log. At least 1
           
-          [default: 1048576]
+          [default: 30]
 
       --require-metal-toolchain
           This node's actions use Metal (native): an Xcode whose Metal toolchain is not installed (`xcodebuild -showComponent MetalToolchain`) is not ready
 
       --image <IMAGE>
           A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
+
+      --store-put-attempts <STORE_PUT_ATTEMPTS>
+          How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
+          
+          [default: 3]
+
+      --input-tree-cache-entries <INPUT_TREE_CACHE_ENTRIES>
+          The most decoded Directories an Execute's input check keeps in memory (`docs/design/storage.md#input-tree-check`). Least recently used go first
+          
+          [default: 1048576]
+
+      --lease-placement <none|numa-node>
+          Where each lease runs among the node's CPUs (container, Linux): `none`, the default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with the least CPU booked by running leases (the lowest id on a tie). `--reserve-cpus` is a quota on all leases together, so it still applies; it removes no CPU from a node. Needs the `cpuset` controller delegated to the daemon (the start fails and says how when it is not); a host with fewer than two NUMA nodes that hold CPUs runs as `none`, which the start logs. Refused with a driver other than `container` (macOS has no such driver)
+          
+          [default: none]
+          [possible values: none, numa-node]
 
       --input-tree-cache-bytes <INPUT_TREE_CACHE_BYTES>
           The most bytes of decoded Directories the input check keeps (each costs its digests, 40 bytes apiece, and 160 bytes)
@@ -477,47 +493,41 @@ Options:
           
           [default: 64]
 
-      --lease-placement <none|numa-node>
-          Where each lease runs among the node's CPUs (container, Linux): `none`, the default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with the least CPU booked by running leases (the lowest id on a tie). `--reserve-cpus` is a quota on all leases together, so it still applies; it removes no CPU from a node. Needs the `cpuset` controller delegated to the daemon (the start fails and says how when it is not); a host with fewer than two NUMA nodes that hold CPUs runs as `none`, which the start logs. Refused with a driver other than `container` (macOS has no such driver)
-          
-          [default: none]
-          [possible values: none, numa-node]
-
-      --member-ttl-secs <SECONDS>
-          How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
-          
-          [default: 15]
-
       --oci-runtime <OCI_RUNTIME>
           The OCI runtime that runs each action's container (container): `crun`, run directly. Each action gets a fresh rootless sandbox. It needs the daemon user's subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on `PATH`, and every directory down to `--data-dir` searchable by others
           
           [default: /usr/bin/crun]
-
-      --member-dwell-secs <SECONDS>
-          How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
-          
-          [default: 300]
 
       --mac-session-socket <MAC_SESSION_SOCKET>
           The socket `kbf-mac-session` serves (native-whole-machine)
           
           [default: /var/run/kbf-mac-session/socket]
 
+      --member-ttl-secs <SECONDS>
+          How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
+          
+          [default: 15]
+
       --daemon-user <DAEMON_USER>
           This daemon's own user, which keeps read and remove access to what a whole-machine lease's user writes in its lease directory (native-whole-machine)
           
           [default: _kbf]
 
+      --member-dwell-secs <SECONDS>
+          How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
+          
+          [default: 300]
+
       --pool-users <POOL_USERS>
           How many lease users the pool has (native, macOS, a daemon run as root): every action runs as one of `kbf-pool-0` .. `kbf-pool-<N-1>`, one lease per user at a time, as kbf-mac-provision makes them (`pool_users`). Required of a root daemon, which runs no action as root; refused for any other
+
+      --pool-first-uid <POOL_FIRST_UID>
+          The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid` in kbf-mac-provision's profile); at least 600
 
       --release-poll-every-secs <SECONDS>
           How often, in seconds, the active frontend asks GitHub for new releases of `--release-poll-repo` and records the newest one the farm could run as a proposal (`proposals` of `GET /v1/update`). A proposal starts nothing: only an operator's `POST /v1/update/desired` does. The question is one conditional request with no credential, so an unchanged feed costs nothing. 0 turns the poller off. Only the newest 30 releases are read (no further pages), so a `v*` release buried under more than 30 newer releases of other tags is not seen. It needs `--state-store`, which holds the proposals
           
           [default: 300]
-
-      --pool-first-uid <POOL_FIRST_UID>
-          The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid` in kbf-mac-provision's profile); at least 600
 
       --release-poll-repo <OWNER/NAME>
           The GitHub repository, `owner/name`, whose releases of `v*` tags are polled

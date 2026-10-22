@@ -37,6 +37,25 @@ fn flags(dir: &Path, more: &[String]) -> Result<StorageFlags, clap::Error> {
     parse(&command().try_get_matches_from(argv)?)
 }
 
+/// Whether any file under `dir` holds `needle`, as bytes anywhere in it.
+fn on_disk(dir: &Path, needle: &[u8]) -> bool {
+    std::fs::read_dir(dir).expect("dir").flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            return on_disk(&path, needle);
+        }
+        let body = std::fs::read(&path).unwrap_or_default();
+        body.windows(needle.len()).any(|w| w == needle)
+    })
+}
+
+/// A blob of a size and content nothing else in the directory has, and its bytes.
+fn marked(seed: u8) -> (kbf_front::VerifiedBlob, Bytes) {
+    let body: Vec<u8> = (0..4096_usize).map(|i| (i % 251) as u8 ^ seed).collect();
+    let bytes = Bytes::from(body);
+    (kbf_front::VerifiedBlob::hashed(bytes.clone()), bytes)
+}
+
 fn never() -> std::io::Result<std::future::Pending<()>> {
     Ok(std::future::pending())
 }
@@ -116,6 +135,72 @@ async fn it_serves_until_the_shutdown_future_completes() {
     let serving = tokio::spawn(node.serve());
     stop.send(()).expect("stop");
     serving.await.expect("task").expect("serves to the end");
+}
+
+/// Catches a node with a RAM budget whose stop does not complete: with `--ram-ack-bytes`
+/// the node starts the drain task and drains once more when it stops; nothing is held, so
+/// the stop ends at once and serves to the end, as it does without the flag. The flags
+/// are accepted by `kbf storage` with their values.
+#[tokio::test]
+async fn a_node_with_a_ram_budget_starts_and_stops() {
+    let dir = dir("ram-budget");
+    let f = flags(
+        &dir,
+        &[
+            "--ram-ack-bytes=1048576".to_owned(),
+            "--ram-drain-deadline=2".to_owned(),
+        ],
+    )
+    .expect("flags");
+    assert_eq!(f.server.ram_ack_bytes(), 1 << 20);
+    assert_eq!(f.server.ram_drain_deadline(), Duration::from_secs(2));
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let node = start_storage(&f, || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .await
+    .expect("starts");
+    let serving = tokio::spawn(node.serve());
+    stop.send(()).expect("stop");
+    serving.await.expect("task").expect("serves to the end");
+}
+
+/// Catches `kbf storage` not wiring `--ram-ack-bytes` into its cache and not draining at
+/// its stop. A node started with a budget holds a blob (`Hold::Held`; with the budget
+/// not passed to the cache the answer is `Budget`), and when the node stops its cold
+/// store has the blob's bytes (with the drain not run after serving, or dropped, the
+/// bytes never reach the disk). The disk has none of them before the hold. Mutants: the
+/// assembly leaves out `with_ram_ack_bytes`; it leaves out `ram.after(node.serving)`.
+/// The stop's own drain is pinned apart from the background task by the unit test of
+/// `RamDrain::after` (`ram_drain/tests.rs`); this one pins the assembly.
+#[tokio::test]
+async fn a_node_with_a_ram_budget_writes_what_it_holds_when_it_stops() {
+    let dir = dir("ram-stop");
+    let f = flags(
+        &dir,
+        &[
+            "--ram-ack-bytes=1048576".to_owned(),
+            "--ram-drain-deadline=5".to_owned(),
+        ],
+    )
+    .expect("flags");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let node = start_storage(&f, || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .await
+    .expect("starts");
+    let (blob, bytes) = marked(7);
+    assert!(!on_disk(&dir, &bytes), "not on disk before the hold");
+    assert_eq!(node.hold(&blob), Some(kbf_front::Hold::Held));
+    let serving = tokio::spawn(node.serve());
+    stop.send(()).expect("stop");
+    serving.await.expect("task").expect("serves to the end");
+    assert!(on_disk(&dir, &bytes), "the stop wrote the held blob");
 }
 
 /// Catches flags that do not make a node: the three certificate flags must come
