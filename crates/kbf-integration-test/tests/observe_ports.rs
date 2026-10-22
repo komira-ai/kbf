@@ -1,10 +1,9 @@
-//! The frontend proxy's port layout is a contract with the installer: `kbf-installer deploy
-//! --observe-base-port` computes a child's operator port from the proxy's `base_port` with
-//! its own copy of the stride and the offset (`observe`), because the installer does
-//! not link the proxy. This test links both and fails when they drift.
+//! The frontend proxy's port layout is a contract with the installer: the installer's `observe` module
+//! computes a child's operator port from the proxy's `base_port` with its own copy of the
+//! stride and the offset, because the installer does not link the proxy. This test links both and fails when they drift.
 //!
 //! Catches a proxy whose slot stride or operator offset changed while the installer's copy
-//! did not (the deploy would read a port nothing listens on, or another process's).
+//! did not (a reader of the port would find one nothing listens on, or another process's).
 
 use kbf_installer::observe::{Slot as Installer, operator_port};
 use kbf_proxy::config::UpstreamTable;

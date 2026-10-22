@@ -1826,16 +1826,8 @@ fn a_container_node_lists_its_pinned_images_in_its_status() {
     let session = front.session(PROMPT);
     session.hello();
     session.welcome();
-    // After a Welcome the node reports how it updates (a node with no --update-dir says
-    // MANUAL); the NodeStatus is the next message that is not that.
-    let status = std::iter::from_fn(|| Some(session.next(PROMPT)))
-        .find(|m| {
-            !matches!(
-                m,
-                Some(kbf_proto::worker::daemon_message::Message::UpdateStatus(_))
-            )
-        })
-        .flatten();
+    // After a Welcome the next message is the NodeStatus.
+    let status = session.next(PROMPT);
     let stopped = stop(&mut child, libc::SIGTERM);
     let log = read(&log);
     let Some(kbf_proto::worker::daemon_message::Message::NodeStatus(status)) = status else {

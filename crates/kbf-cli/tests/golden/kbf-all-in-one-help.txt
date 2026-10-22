@@ -105,12 +105,6 @@ Options:
       --reapi-tls-cert <REAPI_TLS_CERT>
           PEM certificate (chain) of the REAPI listener. With `--reapi-tls-key` it serves TLS with this server certificate only; clients present no certificate. It is meant for a certificate from the farm's own internal CA, trusted by the front's proxy (its hop to this server) and by clients that dial this server directly; TLS for the farm's client-facing name still ends at the front. `--reapi-auth-policy` applies over TLS as over plain text
 
-      --update-dir <DIR>
-          The root installer's directory: the daemon reads its `status.json` there. The frontend's orders are written to `orders/` beneath it unless `--orders-dir` says otherwise. Left out, the node updates by hand: it says so and touches no directory. Not taken by the all-in-one binary yet
-
-      --orders-dir <DIR>
-          The order spool (owned by the service user, mode 0700): where the daemon writes the order records the root installer reads. With `--update-dir` only; default `<update-dir>/orders`
-
       --reapi-tls-key <REAPI_TLS_KEY>
           PEM private key of the REAPI listener; it must match `--reapi-tls-cert`, or the server refuses to start
 

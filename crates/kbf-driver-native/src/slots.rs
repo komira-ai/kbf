@@ -11,9 +11,9 @@
 //!   once the lease has ended and the clean of its directory has run; the slot is
 //!   cleaned first ([`clean`]: its launchd domain, crontab, `at` jobs, processes, disk
 //!   images, System V IPC objects, home, `/var/folders` entry and files in the shared
-//!   temporary places), the clean is checked, the user is made again if the check
-//!   fails twice, and the slot is quarantined (the node reports one fewer) if that
-//!   fails too;
+//!   temporary places, crash reports), the clean is checked, and a clean that fails
+//!   leaves the slot dirty: not offered to a lease, the node reports one fewer, and it
+//!   is cleaned again before it is offered ([`book`]); the user is never made again;
 //! - its lease directory is the slot user's alone (mode 0700, from the moment it is made:
 //!   another pool user cannot read, list or connect into it, and the root of the leases is
 //!   searchable by others, `LEASES_ROOT_MODE`, so the slot user can reach it), and its
@@ -36,10 +36,9 @@
 //! ([`crate::procs`]); a pool there is refused.
 //!
 //! Not yet: the scheduler does not book slots (a lease past `N` waits here for a free
-//! one); a quarantined slot lowers the runtime's `action_slots` entry, which reaches
-//! the server with the driver's next report (the next Xcode survey, every
-//! `--xcode-recheck-secs`), not at once; and nothing drains and reboots a node with a
-//! quarantined slot (section 1 of the design).
+//! one); and nothing drains or reboots a node with a dirty slot. A dirty slot lowers the runtime's `action_slots` entry at once, through its
+//! own part of the driver watch ([`SOURCE`]), and a recovery thread cleans it again
+//! ([`book`]) with no Xcode survey and no lease needed.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -49,9 +48,20 @@ use kbf_daemon::RuntimeError;
 use crate::network::{Isolation, Network};
 use crate::record::KeeperFor;
 
+pub mod canary;
+// The bookkeeping and the clean's rules over text and a fake `launchctl` run on every
+// platform; only a Mac uses them outside tests.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod book;
 pub mod clean;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod crash;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod domain;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod probe;
 
 /// The lowest uid a pool user may have: every uid below it is root's, a system
 /// account's, or (from 501) one a Mac gives its first human users. The pool's uids
@@ -72,6 +82,10 @@ pub const LEASES_ROOT_MODE: u32 = 0o711;
 /// primary group and a Mac's default is 0755, so any other mode lets another slot read
 /// the lease's files, list them and connect to a socket in them.
 pub const LEASE_DIR_MODE: u32 = 0o700;
+
+/// The name of the slots' part of the daemon's driver watch: the `action_slots` entry,
+/// pushed whenever the number of free slots changes.
+pub const SOURCE: &str = "slots";
 
 /// The node report entry that says how many actions run at once.
 pub const CAPABILITY: &str = "action_slots";
@@ -203,6 +217,24 @@ pub fn check_daemon_user(root: bool, pool: Option<&Pool>) -> Result<(), String> 
     }
 }
 
+/// Whether a pool may run under `isolation`: a pool's slot profile is what keeps a lease
+/// from writing outside its own directories and its canaries ([`canary`]) run under it,
+/// so a node whose isolation is [`Isolation::None`] (no `sandbox-exec`) with a pool is
+/// refused at start, not at every lease.
+///
+/// # Errors
+/// What is refused, and why.
+pub fn check_pool_isolation(pool: Option<&Pool>, isolation: &Isolation) -> Result<(), String> {
+    match (pool, isolation) {
+        (Some(_), Isolation::None) => Err(
+            "a lease-user pool needs sandbox-exec, which this node lacks: the slot profile \
+             and its canaries cannot run"
+                .to_owned(),
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Makes the lease directory `dir` ([`LEASE_DIR_MODE`] for a slot user's, otherwise the
 /// process's default for a directory) and nothing above it.
 ///
@@ -218,20 +250,80 @@ pub(crate) async fn make_lease_dir(dir: &Path, private: bool) -> std::io::Result
 
 /// Gives `root` and everything under it to `uid`:`gid`, never following a link, then
 /// closes `root` itself to everyone else ([`LEASE_DIR_MODE`], whatever its mode was),
-/// which is what keeps another slot out of the tree.
+/// which is what keeps another slot out of the tree. A file with more than one name is
+/// not given (its owner is the owner of every name): the result counts those. Stops at
+/// the next entry, with [`std::io::ErrorKind::Interrupted`], once `cancel` is set, so
+/// that nothing is given after the caller has been told it stopped.
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn hand_tree(root: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
+pub(crate) fn hand_tree(
+    root: &Path,
+    (uid, gid): (u32, u32),
+    cancel: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<usize> {
+    hand_tree_with(root, cancel, &mut |path| {
+        std::os::unix::fs::lchown(path, Some(uid), Some(gid))
+    })
+}
+
+/// [`hand_tree`] with the owner change made by `chown`, so a test sees which entries it
+/// is made for.
+#[cfg(any(target_os = "macos", test))]
+fn hand_tree_with(
+    root: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+    chown: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<usize> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::sync::atomic::Ordering;
+    /// How many names a log line carries.
+    const NAMED: usize = 5;
     let mut pending: Vec<PathBuf> = vec![root.to_owned()];
+    let mut skipped: Vec<PathBuf> = Vec::new();
     while let Some(path) = pending.pop() {
-        std::os::unix::fs::lchown(&path, Some(uid), Some(gid))?;
-        if std::fs::symlink_metadata(&path)?.is_dir() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        let meta = std::fs::symlink_metadata(&path)?;
+        // A file with another name (a hard link) is not given: changing its owner would
+        // change the owner of the file under the other name, which may be a file of
+        // the daemon's or of another user's.
+        if !meta.is_dir() && meta.nlink() > 1 {
+            skipped.push(path);
+            continue;
+        }
+        chown(&path)?;
+        if meta.is_dir() {
             for entry in std::fs::read_dir(&path)? {
                 pending.push(entry?.path());
             }
         }
     }
-    std::fs::set_permissions(root, std::fs::Permissions::from_mode(LEASE_DIR_MODE))
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(LEASE_DIR_MODE))?;
+    if !skipped.is_empty() {
+        let names: Vec<_> = skipped
+            .iter()
+            .take(NAMED)
+            .map(|p| p.display().to_string())
+            .collect();
+        tracing::warn!(
+            count = skipped.len(),
+            ?names,
+            "not handed over: these files have another name"
+        );
+    }
+    Ok(skipped.len())
+}
+
+/// A lease's directory and the runner whose slot's user owns it. Fields drop in the
+/// order they are declared, so the directory goes first and the slot after, whether the
+/// run ends, is dropped or panics: a slot is cleaned and offered again as soon as it
+/// drops, and must not be while the directory still exists. Everything that holds the
+/// slot during the run borrows it from here and owns none. Reordering the fields breaks
+/// that (`the_directory_drops_before_the_slot_even_on_a_panic`); there is no `Drop` impl
+/// so that `run` can move each out to clean and release it in turn.
+pub(crate) struct Scope<D, S> {
+    pub dir: D,
+    pub runner: S,
 }
 
 /// How a lease's action runs: as the daemon's own user, its processes followed by
@@ -275,8 +367,8 @@ impl Runner {
         }
     }
 
-    /// Makes the lease directory `dir` the slot user's ([`macos::Slot::hand_over`]);
-    /// nothing for the daemon's user, whose it is.
+    /// Makes the lease directory `dir` the slot user's ([`macos::Slot::hand_over_until`]);
+    /// nothing for the daemon's user, whose it is. Stops once `cancel` is set.
     ///
     /// # Errors
     /// It could not be handed over.
@@ -284,11 +376,57 @@ impl Runner {
         not(target_os = "macos"),
         expect(unused_variables, reason = "no slots off macOS")
     )]
-    pub async fn hand_over(&self, dir: &Path) -> Result<(), RuntimeError> {
+    pub async fn hand_over(
+        &self,
+        dir: &Path,
+        cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), RuntimeError> {
         match self {
             Self::Daemon => Ok(()),
             #[cfg(target_os = "macos")]
-            Self::Slot(slot) => slot.hand_over(dir).await,
+            Self::Slot(slot) => slot.hand_over_until(dir, cancel).await,
+        }
+    }
+
+    /// Runs the profile canaries as the slot's user under the profile of the lease in
+    /// `lease` ([`macos::Slot::canary`]); none for the daemon's user, which has no slot
+    /// profile.
+    ///
+    /// # Errors
+    /// A canary could not be started.
+    #[cfg(target_os = "macos")]
+    pub async fn canary(
+        &self,
+        isolation: &Isolation,
+        network: Network,
+        lease: &Path,
+        cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<canary::Report, RuntimeError> {
+        match self {
+            Self::Daemon => Ok(canary::Report::default()),
+            Self::Slot(slot) => slot.canary_until(isolation, network, lease, cancel).await,
+        }
+    }
+
+    /// Takes the lease directory `dir` back from the slot's user ([`macos::Slot::reclaim`]).
+    #[cfg(target_os = "macos")]
+    ///
+    /// # Errors
+    /// The directory could not be taken back.
+    pub async fn reclaim(&self, dir: &Path) -> Result<(), RuntimeError> {
+        match self {
+            Self::Daemon => Ok(()),
+            Self::Slot(slot) => slot.reclaim(dir).await,
+        }
+    }
+
+    /// Marks the slot dirty after a failed canary ([`macos::Slot::set_aside`]): not
+    /// offered, not counted, cleaned again by the recovery thread.
+    #[cfg(target_os = "macos")]
+    pub fn set_aside(self, why: &str) {
+        match self {
+            Self::Daemon => {}
+            Self::Slot(slot) => slot.set_aside(why),
         }
     }
 
@@ -340,14 +478,31 @@ impl Runner {
 /// starts actions as pool users (`kbf-daemon`) calls this first in `main`.
 #[must_use]
 pub fn dispatch() -> Option<std::process::ExitCode> {
-    #[cfg(target_os = "macos")]
-    {
-        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-        if args.get(1).is_some_and(|a| a == AS_USER_ARG) {
-            return Some(kbf_mac_session::macos::gui::as_user(&args[2..]));
-        }
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    canary_exit(&args)
+        .map(|code| std::process::ExitCode::from(u8::try_from(code).unwrap_or(1)))
+        .or_else(|| as_user_mode(&args))
+}
+
+/// [`AS_USER_ARG`]'s mode for `args`, on macOS.
+#[cfg(target_os = "macos")]
+fn as_user_mode(args: &[std::ffi::OsString]) -> Option<std::process::ExitCode> {
+    if args.get(1).is_some_and(|a| a == AS_USER_ARG) {
+        return Some(kbf_mac_session::macos::gui::as_user(&args[2..]));
     }
     None
+}
+
+/// [`AS_USER_ARG`]'s mode: none off macOS.
+#[cfg(not(target_os = "macos"))]
+fn as_user_mode(_args: &[std::ffi::OsString]) -> Option<std::process::ExitCode> {
+    None
+}
+
+/// The profile canary's probe mode ([`canary::ARG`]) for `args`, printing to stdout:
+/// its exit code when they select it.
+fn canary_exit(args: &[std::ffi::OsString]) -> Option<i32> {
+    canary::dispatch(args, &canary::RealFs, &mut std::io::stdout())
 }
 
 /// [`dispatch`] for a test binary, which has no `main` of its own: when the arguments
@@ -356,10 +511,9 @@ pub fn dispatch() -> Option<std::process::ExitCode> {
 /// [`as_user_test_hook!`](crate::as_user_test_hook) before the test harness starts.
 #[doc(hidden)]
 pub fn hook() {
-    #[cfg(target_os = "macos")]
-    if dispatch().is_some() {
-        std::process::exit(127);
-    }
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let _ = canary_exit(&args).map(|code| std::process::exit(code));
+    let _ = as_user_mode(&args).map(|_| std::process::exit(127));
 }
 
 /// Makes the test binary it is expanded in answer [`AS_USER_ARG`] as `kbf-daemon`
@@ -477,12 +631,33 @@ mod tests {
         }
     }
 
+    /// Catches a node with a pool and no `sandbox-exec` starting (every lease would then
+    /// fail its canaries, or worse run unsandboxed): refused once at start, with the
+    /// reason; a pool with a sandbox, and no pool with none, are fine.
+    #[test]
+    fn a_pool_without_sandbox_exec_is_refused_at_start() {
+        let pool = Pool::provisioned(1, 700).expect("pool");
+        let sandbox = Isolation::Sandbox(PathBuf::from("/usr/bin/sandbox-exec"));
+        let refused = check_pool_isolation(Some(&pool), &Isolation::None).expect_err("refused");
+        assert!(refused.contains("needs sandbox-exec"), "{refused}");
+        assert_eq!(check_pool_isolation(Some(&pool), &sandbox), Ok(()));
+        assert_eq!(check_pool_isolation(None, &Isolation::None), Ok(()));
+        assert_eq!(check_pool_isolation(None, &sandbox), Ok(()));
+    }
+
     /// Catches the `as-user` mode taken for arguments that do not ask for it (the test
     /// harness's own run would end in it).
     #[test]
     fn only_the_as_user_argument_selects_the_mode() {
         assert!(dispatch().is_none());
         hook();
+        let args = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert_eq!(canary_exit(&args(&["kbf", AS_USER_ARG])), None);
+        assert_eq!(
+            canary_exit(&args(&["kbf", canary::ARG])),
+            Some(canary::USAGE),
+            "the canary mode answers for its own argument"
+        );
     }
 
     fn mode_of(path: &Path) -> u32 {
@@ -517,7 +692,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
         }
         let me = std::fs::metadata(&lease).expect("lease");
-        hand_tree(&lease, me.uid(), me.gid()).expect("handed over");
+        hand_tree(&lease, (me.uid(), me.gid()), &no_cancel()).expect("handed over");
         assert_eq!(mode_of(&lease), LEASE_DIR_MODE, "the lease directory");
         assert_eq!(mode_of(&lease), 0o700, "the documented mode");
         assert_eq!(mode_of(&lease.join("root")), 0o755, "inside keeps its mode");
@@ -529,8 +704,134 @@ mod tests {
             "the link was followed or replaced"
         );
         let missing = base.join("missing");
-        assert!(hand_tree(&missing, me.uid(), me.gid()).is_err());
+        assert!(hand_tree(&missing, (me.uid(), me.gid()), &no_cancel()).is_err());
         assert!(!missing.exists(), "a failed hand-over made something");
+    }
+
+    /// Records its name when dropped.
+    struct Recorded(
+        &'static str,
+        std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    );
+
+    impl Drop for Recorded {
+        fn drop(&mut self) {
+            self.1.lock().expect("log").push(self.0);
+        }
+    }
+
+    /// Catches a lease scope that frees the slot before the lease directory is removed
+    /// (a slot dropped first is cleaned and offered again while its user still owns the
+    /// directory): a scope that ends, one dropped on a panic, and one where the runner
+    /// is replaced in the middle all drop the directory first. Seen red with the fields
+    /// of `Scope` swapped.
+    #[test]
+    fn the_directory_drops_before_the_slot_even_on_a_panic() {
+        use std::sync::{Arc, Mutex};
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let scope = || Scope {
+            dir: Recorded("dir", Arc::clone(&log)),
+            runner: Recorded("slot", Arc::clone(&log)),
+        };
+        drop(scope());
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _scope = scope();
+            panic!("a run that panics");
+        }));
+        assert!(panicked.is_err());
+        let Scope { dir, runner } = scope();
+        drop(dir);
+        drop(runner);
+        assert_eq!(
+            *log.lock().expect("log"),
+            ["dir", "slot", "dir", "slot", "dir", "slot"]
+        );
+    }
+
+    fn no_cancel() -> std::sync::atomic::AtomicBool {
+        std::sync::atomic::AtomicBool::new(false)
+    }
+
+    /// Catches an owner change made for a hard-linked file (deleting the skip leaves
+    /// the count right and the file given, which a hand-over to the same user does not
+    /// show): the names of the entries `chown` is called for are recorded, and the
+    /// linked file is not among them while the plain file and the directories are.
+    #[test]
+    fn the_owner_of_a_file_with_another_name_is_never_changed() {
+        let base = crate::unit_dir("slots-hand-tree-seam");
+        let lease = base.join("lease");
+        std::fs::create_dir_all(lease.join("sub")).expect("tree");
+        std::fs::write(lease.join("plain"), b"x").expect("plain");
+        let outside = base.join("outside");
+        std::fs::write(&outside, b"x").expect("outside");
+        std::fs::hard_link(&outside, lease.join("sub/linked")).expect("link");
+        let mut given = Vec::new();
+        let skipped = hand_tree_with(&lease, &no_cancel(), &mut |path| {
+            given.push(path.strip_prefix(&lease).expect("inside").to_owned());
+            Ok(())
+        })
+        .expect("handed over");
+        given.sort();
+        let want: Vec<PathBuf> = ["", "plain", "sub"].map(PathBuf::from).to_vec();
+        assert_eq!((skipped, given), (1, want));
+    }
+
+    /// Catches a hand-over that goes on after it was told to stop (a stray chown after
+    /// the lease was answered as killed): with the flag set after the second entry no
+    /// third is given, the root is not closed, and the call says it was interrupted.
+    #[test]
+    fn a_hand_over_stops_at_the_next_entry_once_cancelled() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = crate::unit_dir("slots-hand-tree-cancel");
+        let lease = base.join("lease");
+        std::fs::create_dir_all(&lease).expect("lease");
+        for name in ["a", "b", "c", "d"] {
+            std::fs::write(lease.join(name), b"x").expect("file");
+        }
+        std::fs::set_permissions(&lease, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let cancel = no_cancel();
+        let mut given = 0;
+        let stopped = hand_tree_with(&lease, &cancel, &mut |_| {
+            given += 1;
+            if given == 2 {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        });
+        assert_eq!(
+            stopped.expect_err("stopped").kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert_eq!(given, 2, "nothing was given after the flag was set");
+        assert_eq!(mode_of(&lease), 0o755, "the root was not closed");
+    }
+
+    /// Catches a hand-over that changes the owner of a file that has another name (a
+    /// hard link to a file outside the lease would make that file the slot user's):
+    /// both names are skipped and counted, a file with one name and a directory are
+    /// given, and the link's other name is still there.
+    #[test]
+    fn a_file_with_another_name_is_not_handed_over() {
+        let base = crate::unit_dir("slots-hand-tree-links");
+        let lease = base.join("lease");
+        std::fs::create_dir_all(lease.join("sub")).expect("tree");
+        std::fs::write(lease.join("plain"), b"x").expect("plain");
+        let outside = base.join("outside");
+        std::fs::write(&outside, b"x").expect("outside");
+        std::fs::hard_link(&outside, lease.join("sub/linked")).expect("link");
+        let me = std::fs::metadata(&lease).expect("lease");
+        use std::os::unix::fs::MetadataExt as _;
+        let skipped = hand_tree(&lease, (me.uid(), me.gid()), &no_cancel()).expect("handed over");
+        assert_eq!(skipped, 1, "the name in the lease");
+        assert_eq!(
+            [outside.exists(), lease.join("sub/linked").exists()],
+            [true, true]
+        );
+        std::fs::remove_file(lease.join("sub/linked")).expect("unlink");
+        assert_eq!(
+            hand_tree(&lease, (me.uid(), me.gid()), &no_cancel()).expect("again"),
+            0
+        );
     }
 
     /// Catches a slot's lease directory made with the process's default mode, which

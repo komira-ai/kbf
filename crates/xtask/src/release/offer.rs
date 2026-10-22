@@ -4,8 +4,7 @@
 //! `offer` adds no way into a farm: it makes no network write, creates no key, token or
 //! setting, and sets no desired state. It reads (the release files, the beta result, the
 //! `kbf --version --json` of the two builds, and, through the pinned `gh`, the
-//! attestations) and writes one file, `offer.json` ([`kbf_gate::OfferDoc`]), which
-//! `kbf-installer deploy --offer` reads. Every check fails closed: any problem found
+//! attestations) and writes one file, `offer.json` ([`kbf_gate::OfferDoc`]). Every check fails closed: any problem found
 //! refuses the offer, all of them are listed, and nothing is written. `--plan` runs the
 //! same checks and prints the document without writing it.
 //!

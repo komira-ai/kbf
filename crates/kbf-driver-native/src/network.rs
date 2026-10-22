@@ -139,7 +139,6 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 /// are in its own home, and what it hands launchd runs as its uid, which the end of the
 /// lease kills (docs/design/macos-end-state.md, section 1, "Sandbox"). The write rule
 /// stays, as a hermeticity aid.
-#[cfg(target_os = "macos")]
 pub const SLOT_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
 (deny file-write*)\n\
@@ -147,7 +146,6 @@ pub const SLOT_PROFILE: &str = "(version 1)\n\
 
 /// [`SLOT_PROFILE`] for an action without the network: [`NO_NETWORK_PROFILE`] without
 /// the same three denies.
-#[cfg(target_os = "macos")]
 pub const SLOT_NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
 (deny file-write*)\n\
@@ -156,6 +154,67 @@ pub const SLOT_NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow network-inbound (local ip \"localhost:*\"))\n\
 (allow network* (remote ip \"localhost:*\"))\n\
 (allow network* (remote unix-socket))\n";
+
+/// The profile of a slot user's action under `network`: [`SLOT_PROFILE`] or
+/// [`SLOT_NO_NETWORK_PROFILE`].
+#[must_use]
+pub const fn slot_profile(network: Network) -> &'static str {
+    match network {
+        Network::Off => SLOT_NO_NETWORK_PROFILE,
+        Network::On => SLOT_PROFILE,
+    }
+}
+
+/// The rule that lets a slot user write its own `home` and `/var/folders` entry
+/// (`folders`), each by its real path.
+///
+/// # Errors
+/// A path holds a character a sandbox profile string cannot carry.
+pub fn slot_write_rules(home: &Path, folders: &Path) -> std::io::Result<String> {
+    Ok(format!(
+        "(allow file-write* (subpath {}) (subpath {}))\n",
+        quoted(home)?,
+        quoted(folders)?
+    ))
+}
+
+/// `path` as a sandbox profile string literal.
+fn quoted(path: &Path) -> std::io::Result<String> {
+    let text = path.to_str().unwrap_or("\"");
+    if text.contains(['"', '\\']) {
+        return Err(std::io::Error::other(format!(
+            "{} cannot be named in a sandbox profile",
+            path.display()
+        )));
+    }
+    Ok(format!("\"{text}\""))
+}
+
+/// A change made to the generated profile, to see a canary go red on a Mac: for the
+/// tests of `tests/slot_canary.rs` alone, never set in production.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeakenedProfile {
+    /// Drops every copy of this line.
+    Drop(&'static str),
+    /// Adds this line at the end of the profile constant (before the device and home
+    /// rules).
+    Add(&'static str),
+}
+
+impl WeakenedProfile {
+    /// `profile` with the change made.
+    #[must_use]
+    pub fn apply(self, profile: &str) -> String {
+        match self {
+            Self::Drop(line) => profile
+                .split_inclusive('\n')
+                .filter(|l| l.trim() != line)
+                .collect(),
+            Self::Add(line) => format!("{profile}{line}\n"),
+        }
+    }
+}
 
 /// The rules every profile carries (after the network rules): no lookup of a
 /// CoreDevice mach service or XPC service (`com.apple.CoreDevice.CoreDeviceService`,
@@ -282,15 +341,11 @@ impl Isolation {
         program: PathBuf,
         args: &[String],
     ) -> (PathBuf, Vec<String>) {
-        let profile = match network {
-            Network::Off => SLOT_NO_NETWORK_PROFILE,
-            Network::On => SLOT_PROFILE,
-        };
-        self.wrap_in(profile, lease, rules, program, args)
+        self.wrap_in(slot_profile(network), lease, rules, program, args)
     }
 
     /// `program` with `args` under `profile`, then [`NO_DEVICE_RULES`] and `rules`.
-    fn wrap_in(
+    pub fn wrap_in(
         &self,
         profile: &str,
         lease: &Path,
@@ -589,5 +644,150 @@ mod tests {
         );
         #[cfg(target_os = "linux")]
         assert_eq!(Isolation::detect(), Isolation::None);
+    }
+
+    /// The profile a slot user's lease runs under, as the driver generates it for
+    /// `network`: the text after `-p` of the sandbox command line.
+    fn generated(network: Network, weakened: Option<WeakenedProfile>) -> String {
+        let rules =
+            slot_write_rules(Path::new("/h/slot"), Path::new("/v/f/xx/yyyy")).expect("rules");
+        let text = weakened.map_or_else(
+            || slot_profile(network).to_owned(),
+            |w| w.apply(slot_profile(network)),
+        );
+        let sandbox = Isolation::Sandbox(PathBuf::from(SANDBOX_EXEC));
+        let (_, args) = sandbox.wrap_in(&text, Path::new("/lease"), &rules, "p".into(), &[]);
+        let at = args.iter().position(|a| a == "-p").expect("-p");
+        args[at + 1].clone()
+    }
+
+    /// Every rule the slot profile is meant to carry, one row each: the line, and
+    /// whether it is there only with the network off.
+    const SLOT_RULES: &[(&str, bool)] = &[
+        ("(version 1)", false),
+        ("(allow default)", false),
+        ("(deny file-write*)", false),
+        (
+            "(allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))",
+            false,
+        ),
+        (
+            "(allow file-write* (subpath \"/h/slot\") (subpath \"/v/f/xx/yyyy\"))",
+            false,
+        ),
+        ("(deny network*)", true),
+        ("(allow network-inbound (local ip \"localhost:*\"))", true),
+        ("(allow network* (remote ip \"localhost:*\"))", true),
+        ("(allow network* (remote unix-socket))", true),
+        (
+            "(deny mach-lookup (global-name-prefix \"com.apple.CoreDevice.\"))",
+            false,
+        ),
+        (
+            "(deny mach-lookup (global-name-prefix \"com.apple.remoted\"))",
+            false,
+        ),
+        (
+            "(deny network-outbound (literal \"/private/var/run/usbmuxd\"))",
+            false,
+        ),
+    ];
+
+    /// The rows of [`SLOT_RULES`] that the profile for `network` must hold.
+    fn wanted(network: Network) -> impl Iterator<Item = &'static str> {
+        SLOT_RULES
+            .iter()
+            .filter(move |(_, off_only)| !off_only || network == Network::Off)
+            .map(|(rule, _)| *rule)
+    }
+
+    /// Catches a generated slot profile that lacks a deny or allow the code means it to
+    /// carry (a dropped `(deny file-write*)` would let a pool user write anywhere, and
+    /// only the macOS canary would notice), on Linux and in every pull request. Weakening
+    /// seen red: deleting the `(deny file-write*)` line from `SLOT_PROFILE` fails the
+    /// `On` and `Off` rows for it; dropping it from `SLOT_NO_NETWORK_PROFILE` alone
+    /// fails `Off`.
+    #[test]
+    fn the_slot_profile_holds_every_rule_it_means_to() {
+        for network in [Network::On, Network::Off] {
+            let text = generated(network, None);
+            let lines: Vec<&str> = text.lines().collect();
+            for rule in wanted(network) {
+                assert!(
+                    lines.contains(&rule),
+                    "{network:?}: no line {rule:?} in\n{text}"
+                );
+            }
+            if network == Network::On {
+                assert!(!text.contains("(deny network*)"), "{text}");
+            }
+        }
+    }
+
+    /// Catches the check above passing when a rule is missing (a test that cannot go
+    /// red): drops each row in turn with [`WeakenedProfile`] and sees the rule found
+    /// missing, and that the weakening removes that line alone.
+    #[test]
+    fn dropping_any_one_rule_is_seen() {
+        for network in [Network::On, Network::Off] {
+            let whole = generated(network, None);
+            // The weakening edits the profile constants; the device and home rules are
+            // appended after it.
+            let own = |r: &&str| slot_profile(network).lines().any(|l| l == *r);
+            for rule in wanted(network).filter(|r| *r != "(version 1)").filter(own) {
+                let changed = generated(network, Some(WeakenedProfile::Drop(rule)));
+                let lines: Vec<&str> = changed.lines().collect();
+                assert!(!lines.contains(&rule), "{rule} is still there");
+                let before = whole.lines().filter(|l| *l == rule).count();
+                assert_eq!(whole.lines().count() - lines.len(), before, "{rule}");
+            }
+        }
+    }
+
+    /// Catches a profile change that does not change the profile as it says (an added rule that
+    /// is lost, or a drop that takes a neighbour).
+    #[test]
+    fn a_weakened_profile_adds_or_drops_exactly_its_line() {
+        let base = "(a)\n(b)\n(a)\n";
+        assert_eq!(WeakenedProfile::Drop("(a)").apply(base), "(b)\n");
+        // A whole line, not a substring or a prefix of one.
+        let near = "(a)\n(a) (b)\n  (a)  \n((a))\n(ab)\n";
+        assert_eq!(
+            WeakenedProfile::Drop("(a)").apply(near),
+            "(a) (b)\n((a))\n(ab)\n"
+        );
+        assert_eq!(
+            WeakenedProfile::Add("(c)").apply(base),
+            "(a)\n(b)\n(a)\n(c)\n"
+        );
+    }
+
+    /// Catches a canary that names a deny the profile does not hold (so it would test a
+    /// door nothing shuts, or a renamed rule that no canary follows).
+    #[test]
+    fn every_canary_names_a_rule_of_the_profile() {
+        for canary in crate::slots::canary::CANARIES {
+            for network in [Network::On, Network::Off] {
+                assert!(
+                    generated(network, None).lines().any(|l| l == canary.deny),
+                    "{}: {}",
+                    canary.name,
+                    canary.deny
+                );
+            }
+        }
+    }
+
+    /// Catches a write rule built from a path the profile cannot quote (a quote or
+    /// backslash would end the string early and let the rest be read as rules).
+    #[test]
+    fn a_path_that_cannot_be_quoted_makes_no_rule() {
+        assert!(slot_write_rules(Path::new("/h\"x"), Path::new("/f")).is_err());
+        assert!(slot_write_rules(Path::new("/h"), Path::new("/f\\x")).is_err());
+        let ok = slot_write_rules(Path::new("/h"), Path::new("/f")).expect("plain paths");
+        assert_eq!(
+            ok,
+            "(allow file-write* (subpath \"/h\") (subpath \"/f\"))\n"
+        );
     }
 }

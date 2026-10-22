@@ -68,8 +68,8 @@ restarts to ten seconds and writes to `/Library/Logs/kbf-installer/kbf-installer
    settings and renders the worker profile: it writes `/usr/local/etc/kbf/kbf.toml` and the daemon
    job's plist, makes `/var/db/kbf-installer` (root, 0755) and `/var/db/kbf-installer/orders` (the
    daemon account's, 0700), and starts the job. It is the one writer of the daemon's `kbf.toml` on
-   a Mac. The `kbf.toml` it renders has `[daemon] update-dir = "/var/db/kbf-installer"`, which turns
-   on the node's update client. Use the label `com.komira.kbf-daemon` for the daemon job
+   a Mac. The `kbf.toml` it renders has `[daemon] update-dir = "/var/db/kbf-installer"`, which the node
+   accepts and ignores (it has no update client). Use the label `com.komira.kbf-daemon` for the daemon job
    (`launchd_label` in the profile), because that is the label `setup` and the installer's job look
    for.
 3. **Run `setup`** as root:

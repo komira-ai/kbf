@@ -31,12 +31,11 @@ stages:
     after: [build]
     result: beta-result.json
     events: [push]
-  # Gamma has no stage here: gamma.yml is deleted, and gamma moves to kbf-updater (the
-  # package-update design, section 13). The 24 hour bake and its verdict run outside Actions.
+  # Gamma has no stage here: no workflow runs it, and the operator's farm takes releases from
+  # OS packages and kbf-updater. The 24 hour bake and its verdict run outside Actions.
   # release.yml gates, plans, verifies, tags with the release bot, publishes and bumps the
-  # internal repository, in one run. It is started by hand (a dry run through `verify`); the push
-  # event is allowed here for the change that adds `push: branches: [main]`, which the workflow
-  # lint (tests/release_workflow) pins until then.
+  # internal repository, in one run. It runs for every push to main; a hand dispatch is a dry
+  # run through `verify`. The workflow lint (tests/release_workflow) pins those two events.
   - name: prod
     runs: actions
     after: [beta]
