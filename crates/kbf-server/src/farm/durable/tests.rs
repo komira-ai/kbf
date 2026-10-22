@@ -724,7 +724,11 @@ fn an_unreadable_row_is_refused_naming_it() {
     let unknown = vec![0x0a, 0x03, 0xaa, 0x01, 0x00];
     let rows: [(&str, Vec<u8>, &str); 12] = [
         ("op/0000000000000001", vec![0xff, 0xff, 0xff], "malformed"),
-        ("op/0000000000000001", unknown, "a command this binary does not know"),
+        (
+            "op/0000000000000001",
+            unknown,
+            "a command this binary does not know",
+        ),
         ("op/0000000000000001", lease.clone(), "not a request"),
         ("op/0000000000000001", other, "not a single scheduler input"),
         ("op/0000000000000001", pair, "not a single scheduler input"),
