@@ -389,6 +389,7 @@ async fn a_pool_lease_reports_its_usage() {
     assert_eq!(usage.basis(), kbf_proto::worker::UsageBasis::MacFootprint);
     assert_eq!(usage.cgroup, None);
     let f = usage.footprint.expect("a footprint block");
+    eprintln!("DIAG {f:?}");
     let peak = f.peak_footprint_bytes.expect("a peak");
     assert!(peak >= 200 << 20, "peak {peak}");
     let user = f.cpu_user_micros.expect("user cpu");
