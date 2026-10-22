@@ -504,6 +504,7 @@ fn a_newly_dirty_slot_restarts_the_backoff() {
     assert_eq!(index, 1);
     let held = book.held(index, permit);
     let reported = counts(&book);
+    assert_eq!(reported.recv_timeout(LONG), Ok(1), "slot 1 can run a lease");
     // The start's clean, then passes after 50, 100, 200, 400 and 800 ms: the wait is now
     // 1600 ms, begun when the sixth pass ended.
     for _ in 0..6 {
@@ -511,7 +512,8 @@ fn a_newly_dirty_slot_restarts_the_backoff() {
     }
     let went_dirty = Instant::now();
     drop(held);
-    until(&reported, 1).expect("the slot never came back");
+    let seen = until(&reported, 1).expect("the slot never came back");
+    assert_eq!(seen, [0, 1]);
     assert!(
         went_dirty.elapsed() < Duration::from_millis(1000),
         "waited out the grown wait: {:?}",
@@ -531,9 +533,9 @@ fn a_book_whose_recovery_thread_cannot_be_made_still_starts() {
     assert_eq!(book.dirty(), BTreeSet::from([0]));
 }
 
-/// Catches a hook that panics ending the recovery (the thread would die with the slot
-/// still dirty, and nothing would clean it again): the panic is caught, the slot is
-/// still freed, and the book goes on.
+/// Catches a hook that panics ending the recovery (the thread would die after the first
+/// slot it freed, with the other still dirty and nothing to clean it again): the panic is
+/// caught, and both slots are freed.
 #[test]
 fn a_hook_that_panics_does_not_stop_the_recovery() {
     quiet();
@@ -546,15 +548,15 @@ fn a_hook_that_panics_does_not_stop_the_recovery() {
             dirty()
         }
     });
-    let book = Book::start(stubs(1), cleaner, FAST);
+    let book = Book::start(stubs(2), cleaner, FAST);
     let calls = AtomicUsize::new(0);
     book.on_count(Arc::new(move |_| {
         assert!(calls.fetch_add(1, Ordering::SeqCst) == 0, "the hook panics");
     }));
     gate.store(true, Ordering::SeqCst);
     let give_up = Instant::now() + LONG;
-    while book.count() == 0 {
-        assert!(Instant::now() < give_up, "the slot never came back");
+    while book.count() < 2 {
+        assert!(Instant::now() < give_up, "the slots never came back");
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(book.dirty().is_empty());
