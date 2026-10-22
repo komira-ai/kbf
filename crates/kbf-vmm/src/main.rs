@@ -1,25 +1,26 @@
-//! `kbf-vmm`: the VM helper for macOS VM leases (docs/design/macos-vm-guests.md).
-//!
-//! ```text
-//! kbf-vmm --version
-//! ```
-//!
-//! A stub. It prints its version for `--version` and refuses everything else with
-//! exit status 2, because no VM code exists yet. It is the binary `cargo xtask sign-darwin`
-//! signs with `com.apple.security.virtualization`, the one entitlement its allow list
-//! gives anything (tools/ci/darwin-entitlements.txt; design section 7).
+//! `kbf-vmm`: see the library's documentation. On a platform other than macOS every
+//! command except `--help` and `--version` refuses.
 
 use std::process::ExitCode;
 
+use clap::Parser;
+use kbf_vmm::app;
+use kbf_vmm::cli::Cli;
+use kbf_vmm::probe::Timing;
+
 fn main() -> ExitCode {
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args == ["--version"] {
-        println!("kbf-vmm {}", env!("CARGO_PKG_VERSION"));
-        return ExitCode::SUCCESS;
-    }
-    eprintln!(
-        "kbf-vmm: only --version is implemented; the VM helper is planned \
-         (docs/design/macos-vm-guests.md)"
-    );
-    ExitCode::from(2)
+    let cli = Cli::parse();
+    #[cfg(target_os = "macos")]
+    let real = kbf_vmm::real::RealSystem::new();
+    #[cfg(target_os = "macos")]
+    let sys: Option<&dyn kbf_vmm::system::System> = Some(&real);
+    #[cfg(not(target_os = "macos"))]
+    let sys: Option<&dyn kbf_vmm::system::System> = None;
+    app::run(
+        cli,
+        sys,
+        Timing::real(),
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
 }

@@ -16,7 +16,7 @@
 //! - [`runtime::SystemClock`] and [`runtime::RequestQueue`], the `Clock` and the `Requests`;
 //! - [`supervisor`] (Linux), the proxy's start: adopt the children a previous proxy left;
 //! - [`supervisor_swap`], the update API's `Supervisor`: the swap on its own thread;
-//! - [`migrator::DbMigrator`], the `Migrator` over the state database;
+//! - [`crate::migrator::DbMigrator`], the `Migrator` over the state database;
 //! - [`releases`], the proxy's own copies of the `kbf` it runs and the [`ports::RootOrders`] that
 //!   goes with them (a status file the proxy writes itself): what `kbf-installer proxy
 //!   --kbf-binary PATH` turns on (see [`handover`]); without the flag nothing uses it;
@@ -41,10 +41,11 @@
 //! Not built, stated: [`supervisor::adopt_children`] still adopts a child only when no update
 //! is in flight (the startup hold stays otherwise); choosing between two live children is not
 //! done. `Migrator` is real in the verb: the cold start's hook is [`supervisor::host_migrator`],
-//! a [`migrator::DbMigrator`] over the database `installer.toml` names. The swap's migrator is
-//! [`handover_swap::StateDbMigrator`], the same [`migrator::DbMigrator`] built per migration
-//! (see [`handover_swap`]). `Admin::ready` reports `health` and `capabilities` as not ready
-//! until their probes exist, so a swap on a real child stops at `ready`.
+//! a [`crate::migrator::DbMigrator`] over the database `installer.toml` names. The swap's
+//! migrator is [`handover_swap::StateDbMigrator`], the same [`crate::migrator::DbMigrator`]
+//! built per migration (see [`handover_swap`]). `Admin::ready` reports `health` and
+//! `capabilities` as not ready until their probes exist, so a swap on a real child stops at
+//! `ready`.
 //! [`root_orders::SpoolRootOrders`] is the swap's order port ([`handover_swap`] builds it), or,
 //! with `--kbf-binary`, [`releases::LocalOrders`].
 //!
@@ -69,7 +70,7 @@
 //!   ([`ports::ChildAdmin::open_counts`]); queued operations do not gate retire.
 //! - **Migration** (decided, FP section 8): the swap calls [`ports::Migrator::migrate_forward`]
 //!   before the candidate starts (for an all-in-one host, after the old process exits).
-//!   [`migrator::DbMigrator`] is the real one: it applies the installer's embedded,
+//!   [`crate::migrator::DbMigrator`] is the real one: it applies the installer's embedded,
 //!   expand-only migrations up to the `state_schema` the staged release reports, as the
 //!   role `installer.toml` names, and refuses with a stable word (`installer_too_old`,
 //!   `not_additive`, `database_busy`, `migration_failed`, ...) that leads
@@ -142,7 +143,6 @@ mod cold;
 pub mod gate_real;
 pub mod handover;
 pub mod handover_swap;
-pub mod migrator;
 pub mod model;
 pub mod orders;
 pub mod ports;
@@ -177,6 +177,7 @@ pub(crate) mod gate_real_tests;
 #[cfg(test)]
 mod gate_tests;
 #[cfg(test)]
+#[path = "../migrator_tests.rs"]
 mod migrator_tests;
 #[cfg(test)]
 mod nodes_tests;

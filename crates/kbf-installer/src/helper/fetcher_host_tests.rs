@@ -1,7 +1,8 @@
 //! The host fetcher: that it reads the host when asked and not before, what it takes from
 //! `installer.toml` and `installer.conf` and from where, and that each way it cannot be made
 //! is a refusal with its reason. The whole path with a stand-in child is
-//! `tests/fetcher_real.rs`; the file's own rules are in `installer_toml_tests.rs`.
+//! `tests/fetcher_real.rs`; the file's own rules are in `installer_toml_tests.rs`, and the
+//! trust rule it is read under is in `trusted_toml_tests.rs`.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -589,7 +590,8 @@ fn installer_tomls_source_refs_narrow_installer_confs_in_a_fetch() {
 /// Catches the ownership check not made on the fetch path (the reader is tested on its own;
 /// this is that it is the one used).
 ///
-/// Mutants planted: `InstallerToml::read` replaced by a plain parse of the file's bytes.
+/// Asserts that the fetch path reads the file with `read_trusted` and not with a plain parse of
+/// the file's bytes.
 #[test]
 fn a_fetch_refuses_a_file_that_is_not_roots_and_a_bad_settings_file() {
     let rig = Rig::new("host-fetcher-untrusted");

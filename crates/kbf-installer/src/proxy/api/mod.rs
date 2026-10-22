@@ -87,7 +87,7 @@
 //! - **The confirm window** the orders ask for is [`core::Config::window_s`].
 //! - **Operator port forwards.** `/v1/update/pause` and `/v1/update/resume` are the paths
 //!   of the two forwarded verbs (FP names `/pause`, `/resume` under `/v1/update`).
-//! - **The forward Postgres migration is not run here:** it is [`super::migrator`], behind
+//! - **The forward Postgres migration is not run here:** it is [`crate::migrator`], behind
 //!   the `Migrator` trait of the update driver, before a candidate child starts, and the
 //!   API only sees its effect as a `failed` phase (step `migrate`, reason led by a refusal
 //!   word) from the supervisor.

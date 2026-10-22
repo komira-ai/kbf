@@ -385,3 +385,34 @@ fn the_signed_plist_reader_accepts_one_shape_only() {
         assert_eq!(signed_keys(&xml), None, "{xml:?}");
     }
 }
+
+/// Catches Virtualization.framework reaching a crate whose binary is signed without the
+/// virtualization entitlement (it would fail at its first call on a Mac), or a second
+/// crate holding the framework bindings, and the workflow signing path for the probe
+/// binary losing kbf-vmm: only `kbf-vmm` depends on `objc2-virtualization`, and the
+/// workflow that builds it for download signs it with `sign-darwin`.
+#[test]
+fn only_kbf_vmm_depends_on_the_virtualization_bindings_and_its_workflow_signs_it() {
+    let crates = repo_root().join("crates");
+    let mut users = Vec::new();
+    for entry in std::fs::read_dir(&crates).expect("crates") {
+        let dir = entry.expect("entry").path();
+        let manifest = dir.join("Cargo.toml");
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            continue;
+        };
+        if text.contains("objc2-virtualization") {
+            users.push(
+                dir.file_name()
+                    .expect("name")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    assert_eq!(users, ["kbf-vmm"]);
+    let wf = std::fs::read_to_string(repo_root().join(".github/workflows/vmm-probe.yml"))
+        .expect("workflow");
+    assert!(wf.contains(r#"cargo xtask sign-darwin "target/$TARGET/release/kbf-vmm""#));
+    assert!(wf.contains("upload-artifact"));
+}

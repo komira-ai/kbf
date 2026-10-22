@@ -1,5 +1,7 @@
 # Pull-based updates: hosts update themselves over the session they already hold
 
+Retired: the node update client (`kbf-update`, the daemon's `update_status` reporting and the `--update-dir` and `--orders-dir` flags) was deleted; the flags parse, do nothing and warn for one release. Passages below that describe that client are history.
+
 Status: design; the wire contract (section 5) is frozen. Built or in review: `kbf-installer` (merged), `kbf-update` (the node client, #908) and `kbf-helper` (the root helper, #929). The rest is built in the units of section 11.
 **Revised for two rulings:** (1) node updates and the frontend's own update are decoupled (section 1 item 7, section 8); (2) the host's root tool pulls the release itself, in an unprivileged child, on the frontend's order, and kbf no longer stages release bytes into an inbox (sections 1, 2, 4, 5, 7 and 10). Where a built crate (`kbf-update`, `kbf-helper`) still has the inbox, this text is the target and section 7.5 lists what is removed. The root tool is `kbf-installer` as [distribution.md](distribution.md) section 6 describes; `kbf-helper` is folded into it. Where later text still says "the helper" (the as-built order rules, `helper.json`, `kbf-helper boot-check`), it means the root side of `kbf-installer`.
 Adapted from the pull-update design study; labels: **[F]** read in code at the time of writing,

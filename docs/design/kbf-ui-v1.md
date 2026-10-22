@@ -4,7 +4,7 @@ Status: approved with the CEO rulings below (amended 2026-10-21 from the proposa
 
 ## Built on main
 
-Built: all thirteen pages (Overview, Builds, Build, Action, Log, Targets, Target, Nodes, Node, Leases, Queue, Storage, Updates) in the `kbf-ui` crate; the "History is off on this farm" page; the mount in `kbf-server` (`ui_mount.rs`, `--ui` default on, GET and HEAD, the seven security headers, the stylesheet at `/ui/static/kbf.css`); the read limiter (`read_limit.rs`); the proxy `/ui` route with open class and the `[proxy] ui` setting, default on; the routes `/v1/invocations/{id}/failures`, `/v1/leases`, `/v1/queue`, `GET /v1/nodes/{id}`, `/v1/health`, and `/v1/storage` with the seven write-tier fields; the black-box suite through the real proxy (`kbf-integration-test`, `ui_through_proxy`); the operator guide (D1).
+Built: all twelve pages (Overview, Builds, Build, Action, Log, Targets, Target, Nodes, Node, Leases, Queue, Storage) in the `kbf-ui` crate; the "History is off on this farm" page; the mount in `kbf-server` (`ui_mount.rs`, `--ui` default on, GET and HEAD, the seven security headers, the stylesheet at `/ui/static/kbf.css`); the read limiter (`read_limit.rs`); the proxy `/ui` route with open class and the `[proxy] ui` setting, default on; the routes `/v1/invocations/{id}/failures`, `/v1/leases`, `/v1/queue`, `GET /v1/nodes/{id}`, `/v1/health`, and `/v1/storage` with the seven write-tier fields; the black-box suite through the real proxy (`kbf-integration-test`, `ui_through_proxy`); the operator guide (D1).
 
 Differences from the page table in 3, as built:
 
@@ -38,7 +38,7 @@ These amend the proposal. Where an older sentence below contradicts them, the ru
 
 ## Summary (decide from this screen)
 
-- **Scope.** Builds, one build's failed actions with stderr, the action and its log (from the history store); nodes, leases and the queue; storage health; a target's recent runs. Read-only. Beyond the five asked areas and listed in 1.2: the Overview and Updates pages, target history pages and a composed `/v1/health`.
+- **Scope.** Builds, one build's failed actions with stderr, the action and its log (from the history store); nodes, leases and the queue; storage health; a target's recent runs. Read-only. Beyond the five asked areas and listed in 1.2: the Overview page, target history pages and a composed `/v1/health`.
 - **Parity.** Every page reads only declared `/v1` JSON routes and lists them as links. The UI shows no number the API lacks, and a test proves it (7.2).
 - **Auth.** None for `/ui` (open, GET only, on by default). It is served on the proxy's one public port. The UI never holds the operator token and has no write path; every other route keeps its existing auth (5).
 - **Stack.** Server-rendered HTML from the built `kbf-ui` crate (typed builder, escape by construction), mounted in `kbf-server` on the operator API, so it needs `--api-listen` (6). No script, no npm, no new dependency.
@@ -57,7 +57,6 @@ These amend the proposal. Where an older sentence below contradicts them, the ru
 ### 1.2 Beyond the assignment
 
 - **Overview** (in scope): the one-screen answer to "is the farm healthy". It adds no data of its own, it reads `/readyz`, `/v1/health` and the build list.
-- **Updates** (in scope, built): the page already exists in `kbf-ui` and reads built routes only. Unchanged by v1.
 - **Targets and Target pages** (kept, re-scoped by the CEO): a target's recent runs as a pass/fail strip, to spot flakiness fast (P8). The routes are built.
 - **`GET /v1/health`** (composed summary): without it the Overview would count nodes by state in the UI, which parity forbids.
 - Cut: the Grid page (TestGrid), the proxy-update row, `/llms.txt`.
@@ -85,15 +84,14 @@ These amend the proposal. Where an older sentence below contradicts them, the ru
 | Leases, queue | `/v1/leases` (N3), `/v1/queue` (N4) |
 | Storage health | `/v1/members`, `/v1/storage` (N7), `/v1/object-stores` |
 | Overview | `/readyz`, `/v1/health` (N6) |
-| Updates (built) | `/v1/update`, `/v1/nodes`, `/v1/update/hosts` |
 
 ## 3. Pages
 
-Freshness: **static** (loaded once) or **refresh N** (`?refresh=N`, 3.1). All paths are under `/ui`. Marks: **built** (on `main`, in `kbf-ui`; all thirteen pages). The Freshness column is the design's; the Mark column says what was built.
+Freshness: **static** (loaded once) or **refresh N** (`?refresh=N`, 3.1). All paths are under `/ui`. Marks: **built** (on `main`, in `kbf-ui`; all twelve pages). The Freshness column is the design's; the Mark column says what was built.
 
 | Page | Path | Shows | Reads | Freshness | Mark |
 |---|---|---|---|---|---|
-| Overview | `/ui` | Version, ready and failing checks, nodes by state, queue depth, lease count, under-replicated blobs, last 10 builds. Update state is not in `/v1/health`; the page links `/ui/updates` for it | `/readyz`, `/v1/health`, `/v1/invocations?page_size=10` | refresh 30 | **built**; reads `/v1/health` and `/v1/invocations`, not `/readyz`; refresh is opt-in, off by default |
+| Overview | `/ui` | Version, ready and failing checks, nodes by state, queue depth, lease count, under-replicated blobs, last 10 builds. | `/readyz`, `/v1/health`, `/v1/invocations?page_size=10` | refresh 30 | **built**; reads `/v1/health` and `/v1/invocations`, not `/readyz`; refresh is opt-in, off by default |
 | Builds | `/ui/builds` | Recent invocations; filters instance, since, until, state; id lookup (GET form) | `/v1/invocations` | static | **built** (the id lookup moved here); filters are state and instance, not since and until |
 | Build | `/ui/builds/{id}` | Summary, failed actions first, slowest, banners for `restored`, `rows_capped`, `gap_from`, `complete:false` | `/v1/invocations/{id}`, `.../actions`, `.../failures` | static | **built**; no slowest list, no `restored` or `gap_from` banner, no refresh |
 | Action | `/ui/builds/{id}/actions/{digest}` | Attempts, node, timings, exit, reason, wait reason, command arguments and environment names for failed runs, log tails | `.../actions/{digest}`, `/failures`, `/v1/blobs/{digest}` | static | **built** (does not read `/v1/runs/{id}`) |
@@ -105,7 +103,6 @@ Freshness: **static** (loaded once) or **refresh N** (`?refresh=N`, 3.1). All pa
 | Leases | `/ui/leases` | Lease, node, age, phase, operation | `/v1/leases` | static | **built**; `?node=` filter |
 | Queue | `/ui/queue` | Depth, oldest age, per platform and QoS, why nothing can run it | `/v1/queue` | static | **built** |
 | Storage | `/ui/storage` | Members, debts, open writes, under-replicated blobs, flush backlog (7 heartbeat fields, N7), cache, cold store (no lost-blob count: not built) | `/v1/storage` | static | **built**; no cache or cold-store section, `/v1/members` and `/v1/object-stores` are not read |
-| Updates | `/ui/updates` | Desired release, releases, host update state | `/v1/update`, `/v1/nodes`, `/v1/update/hosts` | static | **built** |
 
 The id lookup that was once `/ui` is now on Builds (`BUILDS` declares `/v1/invocations` and `/v1/invocations/{id}`). The `kbf-ui` pages are served at `/ui` through the in-process `Source` (R5, #1373); the router in `kbf_ui::respond` is the list of pages (re-derive the marks against it before relying on one).
 

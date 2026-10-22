@@ -1,6 +1,8 @@
 # The update page: versions per host, desired version, update available (read-only)
 
-Status: design. Nothing in this file is built. Facts marked **[F]** were read from the code on three lines of work:
+Status: superseded. The Updates page this file designs was removed from `kbf-ui`; update state is driven by `kbf-updater`. The text below is kept as history of the design.
+
+Original status: design. Nothing in this file is built. Facts marked **[F]** were read from the code on three lines of work:
 **arch-v2** (`b74678f0`: `kbf-ui`, `kbf-auth`, `GET /v1/members`, `--api-listen`, `ui-data.md`, `split-mode-updates.md`),
 **pull-updates** (`6561a838`: `kbf.update.v1`, the release store, the frozen specification `pull-updates.md` 6.3, which this
 file calls "the spec") and the open change **#976** (`pu/upd5-12-desired-offers`, head `6935f7e6`, the desired release and the

@@ -85,8 +85,7 @@ impl Default for Bounds {
 impl Bounds {
     /// The largest key floor: the biggest 256 MiB step strictly below the host.
     pub(crate) fn floor_ceiling(&self) -> u64 {
-        self.host_memory.saturating_sub(1) / crate::summary::MEMORY_STEP
-            * crate::summary::MEMORY_STEP
+        crate::summary::floor_ceiling(self.host_memory)
     }
 }
 
