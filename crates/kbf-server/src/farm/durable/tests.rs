@@ -2479,3 +2479,59 @@ fn a_sweep_that_commits_nothing_does_not_ask_for_another_call() {
         (SWEEP_TXNS * SWEEP_ROWS, true)
     );
 }
+
+fn summary_key() -> kbf_estimator::Key {
+    use kbf_estimator::{Basis, Instance, Key, PlatformClass, Shape};
+    Key::new(
+        Instance::new("main"),
+        PlatformClass::new("linux"),
+        Basis::Cgroup,
+        Shape(7),
+        None,
+    )
+}
+
+/// A write that does not know the size summary a key floor decays with leaves the name its
+/// row already holds, so a floor raised by a path that cannot name it does not lose the
+/// name.
+#[test]
+fn a_write_that_does_not_know_the_summary_keeps_the_name_the_row_has() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .put_key_floor(&a_key_floor(7, 0), Some(&summary_key()))
+        .expect("write");
+    durable
+        .put_key_floor(&a_key_floor(7, 1), None)
+        .expect("write");
+    let stored = durable.load().expect("load");
+    assert_eq!(stored.key_floors, vec![a_key_floor(7, 1)]);
+    assert_eq!(stored.key_names, vec![(7, summary_key())]);
+    // A row never named stays unnamed.
+    durable
+        .put_key_floor(&a_key_floor(8, 2), None)
+        .expect("write");
+    assert_eq!(durable.load().expect("load").key_names.len(), 1);
+}
+
+/// A summary name too long for the row is left out of it: the row still reads back, so a
+/// requeue is never refused for it.
+#[test]
+fn a_summary_name_that_does_not_fit_is_left_out_of_the_row() {
+    use kbf_estimator::{Basis, Instance, Key, PlatformClass, Shape};
+    let long = Key::new(
+        Instance::new("x".repeat(40_000)),
+        PlatformClass::new("linux"),
+        Basis::Cgroup,
+        Shape(7),
+        None,
+    );
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .put_key_floor(&a_key_floor(7, 0), Some(&long))
+        .expect("written without the name");
+    let stored = durable.load().expect("the row reads back");
+    assert_eq!(stored.key_floors, vec![a_key_floor(7, 0)]);
+    assert!(stored.key_names.is_empty());
+}

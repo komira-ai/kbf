@@ -29,6 +29,40 @@ impl State {
         }
     }
 
+    /// The bounds an attempt of `operation` on `worker` is judged against. With `on`, an
+    /// operation that has a size key is bounded as the scheduler bounds its key floor (the
+    /// largest node that could run the request, not the node that ran this attempt), so
+    /// that the estimator's floor and the scheduler's agree on what a kill raised.
+    pub(super) fn bounds_of(&self, operation: OperationId, worker: &WorkerId) -> Bounds {
+        let mut bounds = self.bounds_on(worker);
+        if self.learned.keys() && self.sched.size_key(operation).is_some() {
+            let bound = self.sched.key_floor_bound_of(operation);
+            if bound > 0 {
+                bounds.host_memory = bound;
+            }
+        }
+        bounds
+    }
+
+    /// `floors` with its key-floor part as the scheduler holds it now, for a requeue
+    /// written (or written again) later than it was taken: the floor of the key as it
+    /// stands, and a key's row deleted only if it is still forgotten. A requeue retried
+    /// after a newer one therefore never puts an older floor over a higher row, nor deletes
+    /// the row of a key raised again since.
+    pub(super) fn current_key_floors(
+        &self,
+        floors: &kbf_sched::FloorChange,
+    ) -> kbf_sched::FloorChange {
+        let mut now = floors.clone();
+        now.key_raised = floors
+            .key_raised
+            .as_ref()
+            .and_then(|f| self.sched.key_floor_row(f.key));
+        now.key_evicted
+            .retain(|k| self.sched.key_floor(*k).is_none());
+        now
+    }
+
     /// The bounds a new operation for `os` is asked about: the largest registered node of
     /// that OS (the scheduler's own cap also looks at the rest of the request's `needs`).
     fn bounds_for_os(&self, os: &str) -> Bounds {
@@ -98,11 +132,17 @@ impl State {
 
     /// The scheduler has answered the report of `lease`, run by `worker`; `taken`: it
     /// took it.
-    pub(super) fn finish_learning(&mut self, lease: LeaseId, worker: &WorkerId, taken: bool) {
+    pub(super) fn finish_learning(
+        &mut self,
+        operation: OperationId,
+        lease: LeaseId,
+        worker: &WorkerId,
+        taken: bool,
+    ) {
         if self.learned.off() {
             return;
         }
-        let bounds = self.bounds_on(worker);
+        let bounds = self.bounds_of(operation, worker);
         let rows = self.learned.finish(lease, taken, &bounds);
         self.write_estimates(&rows);
         self.lower_key_floors();
@@ -178,14 +218,7 @@ impl State {
             return Vec::new();
         }
         if let RequeueReason::OutOfMemory { raised, .. } = requeue.reason {
-            let mut bounds = self.bounds_on(&requeue.worker);
-            // With `on` the estimator's floor is bounded as the scheduler bounds its own
-            // (the largest node that could run the request, not the node that killed
-            // the run), so the two agree on what a kill raised.
-            let bound = self.sched.key_floor_bound_of(requeue.operation);
-            if self.learned.keys() && bound > 0 {
-                bounds.host_memory = bound;
-            }
+            let bounds = self.bounds_of(requeue.operation, &requeue.worker);
             let rows = self.learned.requeued(requeue.lease, raised, &bounds);
             self.lower_key_floors();
             return rows;

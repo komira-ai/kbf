@@ -25,13 +25,22 @@ fn farm_over(store: &Arc<Fake>, mode: LearnedSizes) -> Farm {
 }
 
 fn over(store: Arc<dyn Store>, mode: LearnedSizes) -> Farm {
-    Farm::new(
+    over_with(store, mode, None)
+}
+
+/// [`over`], keeping at most `floors` memory floors.
+fn over_with(store: Arc<dyn Store>, mode: LearnedSizes, floors: Option<usize>) -> Farm {
+    let farm = Farm::new(
         Arc::new(kbf_front::Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
     )
-    .with_learned_sizes(mode, 4 << 30)
-    .with_state(Some(StateStore {
+    .with_learned_sizes(mode, 4 << 30);
+    let farm = match floors {
+        Some(bound) => farm.with_memory_floors(bound),
+        None => farm,
+    };
+    farm.with_state(Some(StateStore {
         store,
         epoch: EpochPolicy::Keep,
         members: Default::default(),
@@ -405,15 +414,20 @@ struct Killed {
 }
 
 fn killed_farm(store: Arc<dyn Store>, rows: &Arc<Fake>) -> Killed {
-    killed_farm_on(store, rows, &[("node-a", 64)])
+    killed_farm_on(store, rows, &[("node-a", 64)], None)
 }
 
 /// [`killed_farm`] over workers of the given sizes (name, GiB): the first by name takes
 /// the job, and the kill happens there.
-fn killed_farm_on(store: Arc<dyn Store>, rows: &Arc<Fake>, nodes: &[(&str, u64)]) -> Killed {
+fn killed_farm_on(
+    store: Arc<dyn Store>,
+    rows: &Arc<Fake>,
+    nodes: &[(&str, u64)],
+    floors: Option<usize>,
+) -> Killed {
     use kbf_estimator::GIB;
 
-    let farm = over(store, LearnedSizes::On);
+    let farm = over_with(store, LearnedSizes::On, floors);
     let workers: Vec<_> = nodes
         .iter()
         .map(|(name, gib)| register_sized(&farm, name, *gib))
@@ -470,7 +484,7 @@ impl Killed {
                 run: self.run,
             };
             state.learned.stage(lease, Some(attempt));
-            state.finish_learning(lease, &self.node, true);
+            state.finish_learning(kbf_types::OperationId(u64::MAX), lease, &self.node, true);
         }
     }
 }
@@ -535,6 +549,30 @@ fn a_decayed_key_floor_is_lowered_in_the_scheduler_and_the_store() {
 struct Refusing {
     inner: Arc<Fake>,
     refuse: std::sync::atomic::AtomicBool,
+    /// The operation (its id) whose requeue is refused, whatever `refuse` says; none for
+    /// `u64::MAX`.
+    stuck: std::sync::atomic::AtomicU64,
+}
+
+impl Refusing {
+    fn new(inner: &Arc<Fake>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: inner.clone(),
+            refuse: std::sync::atomic::AtomicBool::new(false),
+            stuck: std::sync::atomic::AtomicU64::new(u64::MAX),
+        })
+    }
+
+    /// Refuses the requeues of operation `operation` (they write its `fate/` row), until [`Self::release`].
+    fn stick(&self, operation: u64) {
+        self.stuck
+            .store(operation, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn release(&self) {
+        self.stuck
+            .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Store for Refusing {
@@ -546,6 +584,14 @@ impl Store for Refusing {
             op.key_cond()
                 .is_some_and(|(key, _)| key.starts_with("keyfloor/"))
         });
+        let stuck = self.stuck.load(std::sync::atomic::Ordering::SeqCst);
+        let queues = |op: &kbf_state::Op| {
+            op.key_cond()
+                .is_some_and(|(key, _)| key == format!("fate/{stuck:016x}"))
+        };
+        if stuck != u64::MAX && batch.iter().flat_map(kbf_state::Txn::ops).any(queues) {
+            return Err(kbf_state::StoreError::Failed("refused".to_owned()));
+        }
         if rows && self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(kbf_state::StoreError::Failed("refused".to_owned()));
         }
@@ -597,10 +643,7 @@ impl Store for Refusing {
 fn a_decay_row_the_store_refuses_is_written_at_a_later_tick() {
     use kbf_estimator::GIB;
     let rows = store();
-    let refusing = Arc::new(Refusing {
-        inner: rows.clone(),
-        refuse: std::sync::atomic::AtomicBool::new(false),
-    });
+    let refusing = Refusing::new(&rows);
     let mut killed = killed_farm(refusing.clone(), &rows);
     let size_key = killed.size_key;
     refusing
@@ -761,7 +804,7 @@ fn newest(farm: &Farm, node: &kbf_types::WorkerId) -> (kbf_types::OperationId, k
 fn a_floor_killed_on_a_smaller_worker_decays_like_any_other() {
     use kbf_estimator::GIB;
     let rows = store();
-    let mut killed = killed_farm_on(rows.clone(), &rows, &[("a-small", 16), ("b-big", 64)]);
+    let mut killed = killed_farm_on(rows.clone(), &rows, &[("a-small", 16), ("b-big", 64)], None);
     let size_key = killed.size_key;
     let summary = killed
         .farm
@@ -794,10 +837,7 @@ fn a_floor_killed_on_a_smaller_worker_decays_like_any_other() {
 fn a_pending_lowered_row_does_not_overwrite_a_floor_raised_since() {
     use kbf_estimator::GIB;
     let rows = store();
-    let refusing = Arc::new(Refusing {
-        inner: rows.clone(),
-        refuse: std::sync::atomic::AtomicBool::new(false),
-    });
+    let refusing = Refusing::new(&rows);
     let mut killed = killed_farm(refusing.clone(), &rows);
     let size_key = killed.size_key;
     refusing
@@ -907,4 +947,147 @@ fn a_client_sized_attempt_that_crosses_the_threshold_lowers_the_keyed_floor() {
     assert_eq!(keys(&rows)[1], None, "the client sized it: not keyed");
     succeed(&killed.farm, &killed.node, operation, lease, 500 << 20);
     assert_eq!(killed.farm.lock().sched.key_floor(size_key), Some(8 * GIB));
+}
+
+/// The farm kills the newest operation the node holds at its own memory limit.
+fn kill_newest(farm: &Farm, node: &kbf_types::WorkerId) {
+    let (operation, lease) = newest(farm, node);
+    let report = super::Report {
+        lease,
+        outcome: kbf_types::Outcome::Failed(kbf_types::Failure::OutOfMemory),
+        measured: None,
+        exit_code: None,
+        run: None,
+    };
+    let now = farm.now();
+    farm.lock().take_report(now, node, operation, report);
+}
+
+fn key_floor_rows(rows: &Arc<Fake>) -> Vec<String> {
+    rows.scan_prefix("keyfloor/")
+        .expect("scan")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Requeues are retried independently: an older one the store refused, retried after a
+/// newer one landed, writes the floor as the scheduler holds it now and not the one it was
+/// taken with. (The per-digest floors of the same requeues keep the pattern they had.)
+#[test]
+fn a_requeue_retried_after_a_newer_one_writes_the_floor_as_it_stands() {
+    use kbf_estimator::GIB;
+    let rows = store();
+    let refusing = Refusing::new(&rows);
+    // The first kill's requeue is refused until released, whatever lands in between.
+    refusing.stick(0);
+    let killed = killed_farm(refusing.clone(), &rows);
+    let size_key = killed.size_key;
+    assert_eq!(row_ask(&rows), None, "the first kill's row was refused");
+    Job::new(2).submit(&killed.farm);
+    kill_newest(&killed.farm, &killed.node);
+    assert_eq!(killed.farm.lock().sched.key_floor(size_key), Some(32 * GIB));
+    assert_eq!(row_ask(&rows), Some(32 * GIB), "the newer requeue landed");
+    refusing.release();
+    killed.farm.lock().flush_step();
+    assert_eq!(row_ask(&rows), Some(32 * GIB), "the older retry leaves it");
+}
+
+/// A key forgotten by one requeue and raised again by a later one: the older requeue,
+/// retried last, must not delete the live key's row nor bring back the forgotten one.
+#[test]
+fn an_eviction_retried_after_a_re_raise_does_not_delete_the_live_row() {
+    use kbf_estimator::GIB;
+    let rows = store();
+    let refusing = Refusing::new(&rows);
+    let killed = killed_farm_on(refusing.clone(), &rows, &[("node-a", 64)], Some(1));
+    let size_key = killed.size_key;
+    // Another shape's kill forgets this key (one floor is kept): its requeue is refused
+    // until released, whatever lands in between.
+    refusing.stick(1);
+    let other = Job {
+        program: "ld",
+        ..Job::new(2)
+    };
+    other.submit(&killed.farm);
+    kill_newest(&killed.farm, &killed.node);
+    assert_eq!(
+        killed.farm.lock().sched.key_floor(size_key),
+        None,
+        "evicted"
+    );
+    // A new digest of the first shape raises its floor again, forgetting the other.
+    Job::new(3).submit(&killed.farm);
+    kill_newest(&killed.farm, &killed.node);
+    assert_eq!(killed.farm.lock().sched.key_floor(size_key), Some(16 * GIB));
+    assert_eq!(
+        key_floor_rows(&rows),
+        vec![format!("keyfloor/{size_key:016x}")]
+    );
+    refusing.release();
+    killed.farm.lock().flush_step();
+    assert_eq!(
+        key_floor_rows(&rows),
+        vec![format!("keyfloor/{size_key:016x}")],
+        "the older requeue's retry neither deletes the live row nor writes the forgotten one"
+    );
+}
+
+/// A lowered row pending for the store belongs to a key another kill has since made the
+/// scheduler forget: it is not written, and the forgotten key's row stays gone.
+#[test]
+fn a_pending_lowered_row_of_a_forgotten_key_is_not_written() {
+    let rows = store();
+    let refusing = Refusing::new(&rows);
+    let mut killed = killed_farm_on(refusing.clone(), &rows, &[("node-a", 64)], Some(1));
+    let size_key = killed.size_key;
+    refusing
+        .refuse
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    killed.quiet(8);
+    assert_eq!(killed.farm.lock().unwritten_floors.len(), 1, "pending");
+    let other = Job {
+        program: "ld",
+        ..Job::new(2)
+    };
+    other.submit(&killed.farm);
+    kill_newest(&killed.farm, &killed.node);
+    assert_eq!(
+        killed.farm.lock().sched.key_floor(size_key),
+        None,
+        "forgotten"
+    );
+    refusing
+        .refuse
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    killed.farm.lock().flush_step();
+    killed.farm.lock().flush_learned();
+    assert!(
+        !key_floor_rows(&rows).contains(&format!("keyfloor/{size_key:016x}")),
+        "{:?}",
+        key_floor_rows(&rows)
+    );
+    assert_eq!(key_floor_rows(&rows).len(), 1, "only the other key's row");
+}
+
+/// With `on`, a keyed operation's attempts are judged against the largest worker that
+/// could run it, as its key floor is; an operation with no key (the client sized it)
+/// keeps the bound of the worker it ran on.
+#[test]
+fn a_keyed_operation_is_bounded_by_the_largest_worker_and_an_unkeyed_one_by_its_own() {
+    let rows = store();
+    let farm = farm_over(&rows, LearnedSizes::On);
+    let small = register_sized(&farm, "a-small", 16);
+    register_sized(&farm, "b-big", 64);
+    Job::new(1).submit(&farm);
+    Job {
+        memory: BookSource::Hint,
+        ..Job::new(2)
+    }
+    .submit(&farm);
+    let state = farm.lock();
+    let mut ops: Vec<_> = state.sched.unfinished().collect();
+    ops.sort_unstable();
+    assert_eq!(state.bounds_of(ops[0], &small).host_memory, 64 << 30);
+    assert_eq!(state.bounds_of(ops[1], &small).host_memory, 16 << 30);
 }

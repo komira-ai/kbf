@@ -1224,7 +1224,7 @@ impl State {
                 }
             }
         };
-        self.finish_learning(lease, worker, accepted || taken == Taken::Held);
+        self.finish_learning(operation, lease, worker, accepted || taken == Taken::Held);
         if accepted && let Some((subject, measured)) = &usage {
             action_usage::log(operation, subject, measured, outcome, lease, worker);
         }

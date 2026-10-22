@@ -562,8 +562,12 @@ impl Durable {
             .filter(|_| read_size_keys)
         {
             let (floor, name) = floor::decode_key(&row.value).map_err(|why| corrupt(&key, why))?;
-            if let Some(summary) = name.as_deref().and_then(estimate::parse_key) {
-                key_names.push((floor.key, summary));
+            match name.as_deref().map(estimate::parse_key) {
+                Some(Some(summary)) => key_names.push((floor.key, summary)),
+                Some(None) => {
+                    tracing::warn!(row = %key, "a key floor names a size summary that does not parse");
+                }
+                None => {}
             }
             if key != floor::key_row(floor.key) {
                 return Err(corrupt(&key, "not the key of the key floor it holds"));
@@ -816,6 +820,26 @@ impl Durable {
         )
     }
 
+    /// The value of the `keyfloor/` row of `floor`: it names the size summary `summary`
+    /// when it is known and fits, else the name the row already holds (a write that does
+    /// not know the summary leaves the name where it was).
+    fn key_floor_value(
+        &self,
+        floor: &KeyFloor,
+        summary: Option<&kbf_estimator::Key>,
+    ) -> Result<Vec<u8>, StateError> {
+        let named = summary.map(estimate::row_key);
+        let name = match named.filter(|n| n.len() <= usize::from(u16::MAX)) {
+            Some(name) => Some(name),
+            None => self
+                .store
+                .get(&floor::key_row(floor.key))?
+                .and_then(|row| floor::decode_key(&row.value).ok())
+                .and_then(|(_, name)| name),
+        };
+        Ok(floor::encode_key(floor, name.as_deref()))
+    }
+
     /// Writes the key floor `floor` as it now stands, or deletes its row when it was
     /// forgotten (an `ask` of 0): outside any requeue, after the estimator's decay lowered
     /// it. Best effort for the caller; the row keeps its stamp and names the size summary
@@ -826,11 +850,10 @@ impl Durable {
         summary: Option<&kbf_estimator::Key>,
     ) -> Result<(), StateError> {
         let row = floor::key_row(floor.key);
-        let name = summary.map(estimate::row_key);
         let txn = if floor.ask == 0 {
             Txn::new().delete(row, Cond::Any)
         } else {
-            Txn::new().put(row, floor::encode_key(floor, name.as_deref()), Cond::Any)
+            Txn::new().put(row, self.key_floor_value(floor, summary)?, Cond::Any)
         };
         self.commit(txn)
     }
@@ -886,12 +909,8 @@ impl Durable {
         // The same for the key floor, in the same transaction.
         let key_raised = floors.key_raised.as_ref();
         if let Some(floor) = key_raised {
-            let name = summary.map(estimate::row_key);
-            txn = txn.put(
-                floor::key_row(floor.key),
-                floor::encode_key(floor, name.as_deref()),
-                Cond::Any,
-            );
+            let value = self.key_floor_value(floor, summary)?;
+            txn = txn.put(floor::key_row(floor.key), value, Cond::Any);
         }
         for key in floors
             .key_evicted
@@ -1369,8 +1388,9 @@ impl State {
                     .key_raised
                     .as_ref()
                     .and_then(|f| self.learned.summary_key(f.key));
+                let floors = self.current_key_floors(floors);
                 !self.durably("a requeue", |d| {
-                    d.requeued_named(requeue, *losses, fate.as_ref(), floors, summary.as_ref())
+                    d.requeued_named(requeue, *losses, fate.as_ref(), &floors, summary.as_ref())
                 })
             })
             .collect();
