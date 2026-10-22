@@ -363,4 +363,18 @@ fn absurd_numbers_do_not_panic() {
         .collect();
     let text = kbf_estimator_replay::replay::report::render(&t, &p, &runs);
     assert!(text.contains("scored days"));
+    // Work follows the days that have rows, not the window: two lines of drain at most.
+    let drains = text.lines().filter(|l| l.contains("backlog drain")).count();
+    assert!(drains > 0);
+    assert!(text.len() < 200_000, "{} bytes", text.len());
+    for run in &runs {
+        let s = kbf_estimator_replay::replay::stats::section(
+            run,
+            kbf_estimator_replay::replay::stats::Window {
+                first: 1,
+                last: u32::MAX,
+            },
+        );
+        assert!(s.drain_ms.len() <= 2, "{:?}", s.drain_ms);
+    }
 }

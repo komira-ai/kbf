@@ -95,9 +95,9 @@ pub struct Section {
     pub climbed: Rate,
     /// Queue wait (queued to started) of every attempt; `None` for no attempts.
     pub waits: Option<Waits>,
-    /// For each day of the window, the time after its end until every operation that had
+    /// For each day of the window that had arrivals, the time after its end until every operation that had
     /// arrived by then was done, in milliseconds (0 for no backlog).
-    pub drain_ms: Vec<(u32, u64)>,
+    pub drain_ms: Vec<(u64, u64)>,
     /// Operations resolved by an estimate at L1.
     pub l1: u64,
     /// At L2.
@@ -156,15 +156,14 @@ pub fn section(run: &ArmRun, w: Window) -> Section {
         .zip(percentile(&waits, 95))
         .zip(percentile(&waits, 99))
         .map(|((p50, p95), p99)| Waits { p50, p95, p99 });
-    // Days after the last arrival have no backlog; a window past the trace costs nothing.
-    let horizon = run
-        .ops
+    // Only days that had arrivals: the work is bounded by the trace, not by the numbers
+    // a window or a time may hold.
+    let days: std::collections::BTreeSet<u64> = in_window
         .iter()
-        .map(|o| 1 + o.arrives_ms / DAY_MS)
-        .max()
-        .unwrap_or(0);
-    for day in w.first..=w.last.min(u32::try_from(horizon).unwrap_or(u32::MAX)) {
-        let end = u64::from(day) * DAY_MS;
+        .map(|&i| 1 + run.ops[i].arrives_ms / DAY_MS)
+        .collect();
+    for day in days {
+        let end = day.saturating_mul(DAY_MS);
         let last_done = run
             .ops
             .iter()

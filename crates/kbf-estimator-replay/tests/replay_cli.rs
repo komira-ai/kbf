@@ -37,7 +37,7 @@ fn the_report_names_its_arms_its_funnel_and_its_limits() {
         "own-limit kills per 1000 attempts: ",
         "operations that climbed the ladder (killed at least once), per 1000: ",
         "queue wait p50 ",
-        "backlog drain after each day: ",
+        "backlog drain after each day with arrivals: ",
         "resolved at L1 ",
         "attempts shown to the estimator: ",
         "ladder re-climbs avoided on scored days, key floor (phase 1): ",

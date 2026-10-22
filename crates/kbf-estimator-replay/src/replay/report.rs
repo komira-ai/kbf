@@ -75,7 +75,7 @@ fn write_section(out: &mut String, name: &str, s: &Section) {
         .collect();
     let _ = writeln!(
         out,
-        "    backlog drain after each day: {}",
+        "    backlog drain after each day with arrivals: {}",
         drains.join(", ")
     );
     let cold: u64 = s.cold.values().sum();
