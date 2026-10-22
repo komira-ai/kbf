@@ -355,10 +355,10 @@ def cmd_lsofgt(lsof, out):
     try:
         for l in open(lsof, 'rb').read().decode('utf-8', 'replace').split('\n'):
             f = l.split()
-            if len(f) < 9:
+            if len(f) < 7 or f[4] not in ('PSXSHM', 'PSXSEM'):
                 continue
             kind = 'shm' if f[4] == 'PSXSHM' else 'sem'
-            s.add((kind, ' '.join(f[8:]).encode('utf-8', 'surrogateescape').hex()))
+            s.add((kind, ' '.join(f[6:]).encode('utf-8', 'surrogateescape').hex()))
     except OSError:
         pass
     with open(out, 'w') as fo:
@@ -374,6 +374,73 @@ def cmd_vis(raw, name):
         if p and name in bytes.fromhex(p[3]).decode('utf-8', 'replace'):
             c += 1
     print(c)
+
+
+def _seen_names(tsv):
+    s = set()
+    for r in load_tsv(tsv):
+        if 'create' in r['op']:
+            try:
+                s.add(bytes.fromhex(r['hexname']).decode('utf-8', 'replace'))
+            except ValueError:
+                pass
+    return s
+
+
+def _times(path):
+    out = []
+    for l in open(path):
+        c = l.split()
+        if len(c) == 2:
+            out.append((float(c[1]) / 1000.0, c[0]))
+    out.sort()
+    return out
+
+
+def cmd_hb(tsv, times, phases, tag):
+    """per phase: heartbeats created / visible in the log (create reports)"""
+    seen = _seen_names(tsv)
+    hb = _times(times)
+    ph = []
+    for l in open(phases):
+        c = l.split()
+        if len(c) == 2:
+            ph.append((c[0], float(c[1])))
+    ph.sort(key=lambda x: x[1])
+    tot = [0, 0]
+    for i, (name, t0) in enumerate(ph):
+        t1 = ph[i + 1][1] if i + 1 < len(ph) else 1e18
+        inph = [(t, n) for t, n in hb if t0 <= t < t1]
+        vis = sum(1 for t, n in inph if n in seen)
+        lost = [(t, n) for t, n in inph if n not in seen]
+        tot[0] += len(inph)
+        tot[1] += vis
+        span = ''
+        if lost:
+            span = ' lost from +%.0fs to +%.0fs into the phase' % (lost[0][0] - t0, lost[-1][0] - t0)
+        print('HB %s phase=%-12s created=%d visible=%d lost=%d%s' % (tag, name, len(inph), vis, len(inph) - vis, span))
+    print('HB %s TOTAL created=%d visible=%d lost=%d' % (tag, tot[0], tot[1], tot[0] - tot[1]))
+
+
+def cmd_timeline(tsv, times, tag):
+    """runs of visible (V) / lost (L) marker names in creation order; m-labelled marks are shown"""
+    seen = _seen_names(tsv)
+    hb = _times(times)
+    if not hb:
+        print('TL %s no marks' % tag)
+        return
+    t_first = hb[0][0]
+    runs = []
+    for t, n in hb:
+        v = n in seen
+        if runs and runs[-1][0] == v:
+            runs[-1][1].append((t, n))
+        else:
+            runs.append((v, [(t, n)]))
+    for v, items in runs:
+        labels = [n.split('e1dlat')[1][:2] for t, n in items if 'e1dlatm' in n]
+        print('TL %s %s x%d from +%.1fs to +%.1fs%s' % (tag, 'VISIBLE' if v else 'LOST', len(items), items[0][0] - t_first,
+                                                       items[-1][0] - t_first, (' marks=' + ','.join(labels)) if labels else ''))
 
 
 def cmd_tok(tsv, token):

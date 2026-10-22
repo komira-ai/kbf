@@ -463,14 +463,9 @@ fn e1d_log_persist(on: bool) {
 fn e1d_core() {
     let cs = Cs::new("e1d_core");
     e1d_prepare(false);
-    // M1/M2/M3 under the report arm.
-    run(&cs, "D1", Arm::IpcRep, Clean::None, &[]);
     run(&cs, "DALL", Arm::IpcRep, Clean::None, &[("BENV", "lease")]);
-    run(&cs, "DF2", Arm::IpcRep, Clean::None, &[]);
-    // Hiding attempts with the default log config, then the retention test (which turns persist:info on), then again.
-    run(&cs, "D5", Arm::IpcRep, Clean::None, &[("BENV", "lease")]);
-    run(&cs, "DR", Arm::IpcRep, Clean::None, &[]);
-    run(&cs, "D5", Arm::IpcRep, Clean::None, &[("BENV", "lease")]);
+    run(&cs, "DT", Arm::IpcRep, Clean::None, &[]);
+    run(&cs, "DR2", Arm::IpcRep, Clean::None, &[]);
     e1d_log_persist(false);
     cs.finish();
 }
@@ -480,14 +475,7 @@ fn e1d_core() {
 fn e1d_xcode() {
     let cs = Cs::new("e1d_xcode");
     e1d_prepare(true);
-    // The same simulator-spawn cell with the default log config and with persist:info; DS keeps its names for DS2 on another uid.
+    // The simulator-spawn cell with a heartbeat of marker creations inside the lease.
     run(&cs, "DS", Arm::IpcRep, Clean::None, &[("BENV", "lease")]);
-    e1d_log_persist(true);
-    run(&cs, "DS", Arm::IpcRep, Clean::None, &[("BENV", "lease"), ("NOCLEAN", "1")]);
-    cs.cu.store(1, Ordering::SeqCst);
-    run(&cs, "DS2", Arm::IpcRep, Clean::None, &[("BENV", "lease"), ("CLEANLEFT", "1")]);
-    cs.cu.store(CELL_USER, Ordering::SeqCst);
-    run(&cs, "DX", Arm::IpcRep, Clean::None, &[("BENV", "lease")]);
-    e1d_log_persist(false);
     cs.finish();
 }
