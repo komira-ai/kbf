@@ -971,10 +971,10 @@ mkpk8() {
 do_BR8() {
   mkpk8 || return 1
   BT=900 build_env xcodebuild -scheme Pk8 -destination 'platform=macOS' -derivedDataPath "$L/dd8" -skipPackagePluginValidation build >"$L/xb.log" 2>&1; _b=$?
-  echo "xcodebuild build rc=$_b $(grep -E 'BUILD (SUCCEEDED|FAILED)|error:' "$L/xb.log" | tail -n 3 | tr '\n' ' ')"
+  echo "xcodebuild build rc=$_b $(grep -E 'BUILD (SUCCEEDED|FAILED)|error:|Could not|fatal|denied|not permitted|failed' "$L/xb.log" | head -n 8 | cut -c1-260 | tr '\n' '|')"
   [ "$_b" = 0 ] || return 1
   BT=900 build_env xcodebuild -scheme Pk8 -destination 'platform=macOS' -derivedDataPath "$L/dd8" -skipPackagePluginValidation test >"$L/xt.log" 2>&1; _t=$?
-  echo "xcodebuild test rc=$_t $(grep -E 'Executed|Test run with|TEST (SUCCEEDED|FAILED)|error:' "$L/xt.log" | tail -n 4 | tr '\n' ' ')"
+  echo "xcodebuild test rc=$_t $(grep -E 'Executed|Test run with|TEST (SUCCEEDED|FAILED)|error:|Could not|fatal|denied|not permitted|failed' "$L/xt.log" | head -n 8 | cut -c1-260 | tr '\n' '|')"
   [ "$_t" = 0 ]
 }
 plant_BR8() { p BR8 do_BR8; }
@@ -987,7 +987,7 @@ do_BR8i() {
   _u=$(build_env xcrun simctl create "$M" "$_dt" "$_rt") || { echo "simctl create failed"; return 1; }
   build_env xcrun simctl boot "$_u" 2>&1 | head -2
   BT=1200 build_env xcodebuild -scheme Pk8 -destination "platform=iOS Simulator,id=$_u" -derivedDataPath "$L/ddi" -skipPackagePluginValidation test >"$L/xi.log" 2>&1; _t=$?
-  echo "xcodebuild test (iOS simulator) rc=$_t $(grep -E 'Executed|Test run with|TEST (SUCCEEDED|FAILED)|error:' "$L/xi.log" | tail -n 4 | tr '\n' ' ')"
+  echo "xcodebuild test (iOS simulator) rc=$_t $(grep -E 'Executed|Test run with|TEST (SUCCEEDED|FAILED)|error:|Could not|fatal|denied|not permitted|failed' "$L/xi.log" | head -n 8 | cut -c1-260 | tr '\n' '|')"
   [ "$_t" = 0 ]
 }
 plant_BR8i() { p BR8i do_BR8i; }
@@ -1102,12 +1102,13 @@ cs_tcc_vol() { # an APFS volume in an image at /Volumes/kbfpool, ownership honou
 }
 cs_tcc_vol_end() { hdiutil detach -force /Volumes/kbfpool 2>&1 | head -1; rm -f "$W/pool.dmg"; }
 
-cs_daemon_sh() { # script file: run it in a system LaunchDaemon (no grants of the runner step); output in $W/dsh.out
+cs_daemon_sh() { # script file, interpreter: run it in a system LaunchDaemon (no grants of the runner step); output in $W/dsh.out
+  _sh=${2:-/bin/bash}
   _pl=/Library/LaunchDaemons/kbf.cs.dsh.plist
   rm -f "$W/dsh.done" "$W/dsh.out"
   cat >"$_pl" <<PL
 <?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>Label</key><string>kbf.cs.dsh</string>
-<key>ProgramArguments</key><array><string>/bin/bash</string><string>-c</string><string>/bin/bash $1; touch $W/dsh.done</string></array>
+<key>ProgramArguments</key><array><string>$_sh</string><string>-c</string><string>$_sh $1; touch $W/dsh.done</string></array>
 <key>StandardOutPath</key><string>$W/dsh.out</string><key>StandardErrorPath</key><string>$W/dsh.out</string>
 <key>RunAtLoad</key><true/></dict></plist>
 PL
@@ -1122,7 +1123,7 @@ cs_tcc_script() {
   _cn=$(stat -f %Su /dev/console); _ch=$(dscl . -read "/Users/$_cn" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
   { printf 'H=%q\nRH=%q\nERRF=%q\n' "$H" "${_ch:-/Users/runner}" "$W/tcc-rm.err"; cat <<'SH'
 echo "TCCCTX uid=$(id -u) console-home=$RH pool-home=$H"
-echo "TCCDB-sys: $(sqlite3 -readonly '/Library/Application Support/com.apple.TCC/TCC.db' "select service||':'||client||':'||auth_value from access where service in ('kTCCServiceSystemPolicyAllFiles','kTCCServiceSystemPolicyDesktopFolder','kTCCServiceSystemPolicyDocumentsFolder')" 2>&1 | head -12 | tr '\n' ' ')"
+sqlite3 -readonly '/Library/Application Support/com.apple.TCC/TCC.db' "select service||':'||client||':'||auth_value from access where service in ('kTCCServiceSystemPolicyAllFiles','kTCCServiceSystemPolicyDesktopFolder','kTCCServiceSystemPolicyDocumentsFolder')" 2>&1 | head -30 | sed 's/^/TCCDB-sys /' 
 echo "TCCDB-user: $(sqlite3 -readonly "$RH/Library/Application Support/com.apple.TCC/TCC.db" "select service||':'||client||':'||auth_value from access" 2>&1 | head -8 | tr '\n' ' ')"
 echo "TCCSIP: $(csrutil status 2>&1 | head -1)"
 while IFS= read -r d; do
@@ -1154,7 +1155,8 @@ SH
 midplant_TCC() {
   cs_tcc_script
   echo "TCC step-context:"; bash "$W/tcc.sh" 2>&1 | head -40
-  echo "TCC daemon-context:"; cs_daemon_sh "$W/tcc.sh" | head -40
+  echo "TCC daemon-context(bash):"; cs_daemon_sh "$W/tcc.sh" /bin/bash | head -40
+  echo "TCC daemon-context(zsh):"; cs_daemon_sh "$W/tcc.sh" /bin/zsh | head -40
 }
 plant_TCC() { p TCC do_W07; }
 probe_TCC() { probe_W07; }

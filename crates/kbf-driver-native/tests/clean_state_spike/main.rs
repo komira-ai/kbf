@@ -89,6 +89,8 @@ enum Arm {
     R,
     /// The shipped profile without its `(deny file-write*)` line (which of A's rules closes launchd).
     ANoWrite,
+    /// Only `(version 1)(allow default)`: is it the sandbox itself that stops launchd job creation.
+    AllowAll,
     /// A plus all of `V2_RULES`.
     V2,
     /// A plus the one rule `V2_RULES[i]` (bisect: does this deny alone break the build).
@@ -105,6 +107,7 @@ impl Arm {
             Arm::C => "C",
             Arm::R => "R",
             Arm::ANoWrite => "A-nowrite",
+            Arm::AllowAll => "allow-all",
             Arm::V2 => "V2",
             Arm::V2Only(i) => V2_ONLY[i],
             Arm::V2No(i) => V2_NO[i],
@@ -523,6 +526,10 @@ impl Cs {
                 let i = args.iter().position(|a| a == "-p").expect("-p in the launch");
                 let rules = if arm == Arm::B { &self.rules_b } else { &self.rules_c };
                 args[i + 1].push_str(rules);
+            }
+            Arm::AllowAll => {
+                let i = args.iter().position(|a| a == "-p").expect("-p in the launch");
+                args[i + 1] = "(version 1)\n(allow default)\n".to_owned();
             }
             Arm::ANoWrite => {
                 let i = args.iter().position(|a| a == "-p").expect("-p in the launch");

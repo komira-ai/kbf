@@ -29,20 +29,6 @@ jobs:
       - run: rustup toolchain install
       - name: X-L, X8 (root, real users)
         run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_xl
-  e1-builds:
-    runs-on: macos-latest
-    timeout-minutes: 150
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: sw_vers
-      - run: uname -m
-      - run: rustup toolchain install
-      - name: X-Bprime builds (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_builds
   e1-xcode:
     runs-on: macos-latest
     timeout-minutes: 170
@@ -57,20 +43,6 @@ jobs:
       - run: rustup toolchain install
       - name: X-Bprime xcodebuild (root, real users)
         run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_xcode
-  e1-x5:
-    runs-on: macos-latest
-    timeout-minutes: 90
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: sw_vers
-      - run: uname -m
-      - run: rustup toolchain install
-      - name: X5 mounts (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_x5
   e1-tcc:
     runs-on: macos-latest
     timeout-minutes: 150
@@ -85,17 +57,3 @@ jobs:
       - run: rustup toolchain install
       - name: TCC on an image volume
         run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_tcc_vol
-  e1-x7:
-    runs-on: macos-latest
-    timeout-minutes: 150
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: sw_vers
-      - run: uname -m
-      - run: rustup toolchain install
-      - name: X7, X9 late arrivals
-        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_x7

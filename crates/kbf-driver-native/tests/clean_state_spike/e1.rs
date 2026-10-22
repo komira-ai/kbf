@@ -116,8 +116,10 @@ fn e1_xl() {
     }
     // Which rule of A closes launchd: A without its file-write deny.
     for row in ["XL_ka", "XL_btm"] {
-        let x = run(&cs, row, Arm::ANoWrite, Clean::S, &[]);
-        say(format!("E1ROW {row} A-nowrite planted={} leased-probe={} clean={}", x.any_planted(), x.leased, x.word));
+        for arm in [Arm::ANoWrite, Arm::AllowAll] {
+            let x = run(&cs, row, arm, Clean::S, &[]);
+            say(format!("E1ROW {row} {} planted={} leased-probe={} clean={}", arm.name(), x.any_planted(), x.leased, x.word));
+        }
     }
     xl_row(&cs, "W04x", true);
     xl_row(&cs, "W11x", false);
