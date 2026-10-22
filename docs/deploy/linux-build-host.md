@@ -34,8 +34,7 @@ chosen.
 
 The daemon checks the id range, the directories' search permission, `crun` and the two id
 tools at start and refuses to start naming the one that is wrong. Lingering and
-`XDG_RUNTIME_DIR` are not needed by `crun`; `kbf-deploy linux install-units` still checks
-that `kbf` lingers because its units still set `XDG_RUNTIME_DIR`, until they are changed.
+`XDG_RUNTIME_DIR` are not needed by `crun`.
 
 ## Memory on the host
 

@@ -1,5 +1,5 @@
-//! What the host-changing `linux` verbs share: the tools they run, why they refuse,
-//! and reads of the host made while planning.
+//! What the host-changing verbs (`linux swap`, `mdm`) share: the tools they run, why they
+//! refuse, and reads of the host made while planning.
 //!
 //! Every read goes through [`Exec`] (a query, an `inspect` or a `stat`), in a dry run as
 //! in an apply, so a dry run refuses what an apply would.
@@ -8,24 +8,14 @@ use std::fmt;
 use std::io::{self, Write};
 use std::process::Output;
 
-use crate::linux::config::LinuxError;
-use crate::linux::shared::Failure;
-use crate::template::TemplateError;
-use crate::unit::UnitError;
+use crate::linux::config::SwapConfigError;
 use kbf_host::exec::{Entry, Exec, Meta, succeeded};
 use kbf_host::path::{HostPath, PathError};
 use kbf_host::plan::Planner;
-use kbf_host::step::{Cmd, Owner, Perms, Step, UrlError};
-use kbf_host::user::{self, RunUser, UserError};
-
-use super::shared::CheckError;
+use kbf_host::step::{Cmd, Owner, Perms, Step};
 
 /// The tools the verbs run, where Debian and Ubuntu put them.
 pub const SYSTEMCTL: &str = "/usr/bin/systemctl";
-/// The OCI runtime the units pass as `--oci-runtime=`, and the tools it maps ids with.
-pub const CRUN: &str = "/usr/bin/crun";
-pub const NEWUIDMAP: &str = "/usr/bin/newuidmap";
-pub const NEWGIDMAP: &str = "/usr/bin/newgidmap";
 pub const SWAPON: &str = "/usr/sbin/swapon";
 pub const SWAPOFF: &str = "/usr/sbin/swapoff";
 pub const MKSWAP: &str = "/usr/sbin/mkswap";
@@ -39,21 +29,9 @@ pub const SS: &str = "/usr/bin/ss";
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
     #[error(transparent)]
-    Config(#[from] LinuxError),
-    #[error(transparent)]
-    Template(#[from] TemplateError),
-    #[error(transparent)]
-    Render(#[from] super::modes::RenderError),
-    #[error(transparent)]
-    Check(#[from] CheckError),
+    Config(#[from] SwapConfigError),
     #[error(transparent)]
     Path(#[from] PathError),
-    #[error(transparent)]
-    User(#[from] UserError),
-    #[error(transparent)]
-    Url(#[from] UrlError),
-    #[error(transparent)]
-    Unit(#[from] UnitError),
     #[error(transparent)]
     Deploy(#[from] kbf_host::HostError),
     #[error("cannot read {path}: {source}")]
@@ -64,53 +42,6 @@ pub enum HostError {
     Output { cmd: String, out: String },
     #[error("cannot write the plan out: {0}")]
     Write(io::Error),
-
-    // install-units
-    #[error(
-        "no cgroup v2 memory controller at /sys/fs/cgroup: boot with systemd.unified_cgroup_hierarchy=1"
-    )]
-    NoMemoryController,
-    #[error("no user {0}: useradd --system --create-home {0}")]
-    NoUser(String),
-    #[error(
-        "{user} has no range in {file} (rootless containers): usermod --add-subuids 100000-165535 --add-subgids 100000-165535 {user}"
-    )]
-    NoSubIds { user: String, file: HostPath },
-    #[error(
-        "{user} does not linger, so /run/user/{uid} (the unit's XDG_RUNTIME_DIR) ends with its last session: loginctl enable-linger {user}"
-    )]
-    NoLinger { user: String, uid: u32 },
-    #[error(
-        "{path} is missing, which the daemon's containers need: apt install {package} (or the distribution's package that provides it)"
-    )]
-    NoTool {
-        path: HostPath,
-        package: &'static str,
-    },
-    #[error("{0} is missing (docs/deploy/storage-node.md, \"Files the units read\")")]
-    Missing(HostPath),
-    #[error("{path} is owned by uid {uid}, not {user}: chown {user} {path}")]
-    NotOwned {
-        path: HostPath,
-        uid: u32,
-        user: String,
-    },
-    #[error("{path} has mode {perms}: chmod 600 {path}")]
-    Readable { path: HostPath, perms: Perms },
-    #[error("port {0} is in use: free it or pick another in the config")]
-    PortInUse(u16),
-    #[error("the rendered units break the priorities; nothing was written:\n{}", lines(.0))]
-    Units(Vec<Failure>),
-    #[error("{0} is not an executable (--bin-dir DIR, or install it in KBF_BIN_DIR)")]
-    NotExecutable(HostPath),
-    #[error("{bin} has no {flag} (its --help does not list it), which its unit passes")]
-    NoFlag { bin: HostPath, flag: String },
-
-    // install-units --mode
-    #[error("{0} names no User= or root: kbf runs as a user of its own")]
-    RunsAsRoot(String),
-    #[error(transparent)]
-    ModeCheck(#[from] super::modes::ParseError),
 
     // swap
     #[error("KBF_SWAP_SIZE={0}: give it in whole GiB, as 128G")]
@@ -138,12 +69,6 @@ pub enum HostError {
         free_gib: u64,
         size: String,
     },
-}
-
-/// Failures one to a line.
-fn lines(failures: &[Failure]) -> String {
-    let lines: Vec<String> = failures.iter().map(ToString::to_string).collect();
-    lines.join("\n")
 }
 
 /// A tool's path.
@@ -209,11 +134,6 @@ pub fn stat<E: Exec>(exec: &E, path: &HostPath) -> Result<Option<Meta>, HostErro
         path: path.clone(),
         source,
     })
-}
-
-/// The user `name`, or [`HostError::NoUser`].
-pub fn user_named<E: Exec>(exec: &E, name: &str) -> Result<RunUser, HostError> {
-    user::lookup(exec, name)?.ok_or_else(|| HostError::NoUser(name.to_owned()))
 }
 
 /// `path` joined under the directory `dir`.

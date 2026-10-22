@@ -13,7 +13,7 @@ publish.workspace = true
 # a dev-dependency, so nothing here is linked into a shipped binary.
 
 [dev-dependencies]
-# The farm of real `kbf` processes, started from the units `kbf-deploy` renders, and the
+# The farm of real `kbf` processes, started as the packaged units start them, and the
 # REAPI client of its frontend (`kbf_harness::reapi`).
 kbf-harness.workspace = true
 # The REAPI response a test reads (tests/isolation).

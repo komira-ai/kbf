@@ -21,7 +21,7 @@ use kbf_objstore::MemoryStore;
 use kbf_proto::update::{UpdateOrder, UpdateStatus};
 use kbf_proto::worker::{ServerMessage, server_message};
 use kbf_server::farm::{Farm, Reported};
-use kbf_server::update::{Policy, Release, Rows, Transport, ports, spawn_controller};
+use kbf_server::update::{Policy, Release, Rows, Source, Transport, ports, spawn_controller};
 use kbf_server::{EpochPolicy, StateStore};
 use kbf_state::{Fenced, Store, Versioned};
 use kbf_types::{Resources, WorkerId};
@@ -292,7 +292,7 @@ async fn a_handed_over_farm_cordons_nobody_and_sends_no_order() {
     transport.uncordon(&mac()).expect("uncordoned");
     assert!(!rig.cordon_row());
     transport
-        .activate(&mac(), sent, &release)
+        .activate(&mac(), sent, &release, Source::Fetch)
         .expect("activation sent");
     transport
         .confirm(&mac(), sent, &release)
@@ -307,7 +307,7 @@ async fn a_handed_over_farm_cordons_nobody_and_sends_no_order() {
         ("uncordon", transport.uncordon(&mac())),
         (
             "activation",
-            transport.activate(&mac(), activation, &release),
+            transport.activate(&mac(), activation, &release, Source::Fetch),
         ),
         (
             "confirmation",
@@ -382,7 +382,7 @@ async fn a_fence_that_lands_while_an_activation_is_prepared_stops_it() {
     let farm = Arc::clone(&rig.farm);
     rig.whole.after_get("update/policy", move || farm.fence());
     let error = transport
-        .activate(&mac(), activation, &Release::new(A))
+        .activate(&mac(), activation, &Release::new(A), Source::Fetch)
         .expect_err("refused");
     assert!(error.to_string().contains("handed over"), "{error}");
     assert!(rig.farm.handed());

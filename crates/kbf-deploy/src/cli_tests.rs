@@ -223,26 +223,10 @@ fn main_runs_on_the_host() {
     assert_eq!(main(argv(&args)), ExitCode::FAILURE);
 }
 
-const LINUX_CONFIG: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/templates/linux/config.example"
-);
+const LINUX_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/templates/linux/swap.example");
 
 fn no_env(_: &str) -> Option<OsString> {
     None
-}
-
-/// A host with the cgroup v2 memory controller, which `install-units` reads first.
-fn with_memory_controller(mut exec: FakeExec) -> FakeExec {
-    exec.entries.insert(
-        HostPath::new("/sys/fs/cgroup/cgroup.controllers").expect("absolute"),
-        kbf_host::exec::Entry::File {
-            perms: kbf_host::step::Perms::new(0o444),
-            owner: kbf_host::step::Owner { uid: 0, gid: 0 },
-            bytes: b"cpuset cpu io memory pids\n".to_vec(),
-        },
-    );
-    exec
 }
 
 /// Catches a host-changing `linux` verb whose refusal does not exit 2 with a
@@ -256,18 +240,13 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
     let refused = [
         // The fake's default answer, exit 0, is every kubelet active.
         (base("swap"), "kubelet.service is active"),
-        // ... and a mode's unit for a user the host lacks.
-        (
-            [base("install-units"), vec!["--mode", "frontend"]].concat(),
-            "which is not what this kit reads",
-        ),
         (
             vec!["linux", "swap", "--config", "/srv/none/config"],
             "/srv/none/config",
         ),
     ];
     for (args, want) in refused {
-        let mut exec = with_memory_controller(FakeExec::new(501));
+        let mut exec = FakeExec::new(501);
         let (code, _, err) = cli(&mut exec, &no_env, &args);
         assert_eq!(code, ExitCode::from(2), "{args:?}");
         assert!(
@@ -284,39 +263,6 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
         assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
     }
 
-    // A mode's unit reaches its own install: on a host with no such user it asks for the
-    // user the frontend runs as and is refused before any step.
-    let mut exec = with_memory_controller(FakeExec::new(0));
-    let args = [base("install-units"), vec!["--mode", "frontend"]].concat();
-    let (code, _, err) = cli(&mut exec, &no_env, &args);
-    assert_eq!(code, ExitCode::from(2));
-    assert_eq!(
-        err,
-        "REFUSED: /usr/bin/getent passwd -- kbf-server printed \"\", which is not what this kit reads\n"
-    );
-    // The converged units' MinIO restart and rollback went with them: the flags are gone.
-    for flag in ["--restart-minio", "--uninstall"] {
-        let mut exec = FakeExec::new(0);
-        let args = [base("install-units"), vec!["--mode", "storage", flag]].concat();
-        let (code, _, _) = cli(&mut exec, &no_env, &args);
-        assert_eq!(code, ExitCode::from(2), "{args:?}");
-        assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
-    }
-    // install-units without --mode is a usage error like render-units and check-units:
-    // clap's exit 2 naming the flag, and nothing asked of the host or written, with or
-    // without --apply (a default mode would install a unit nobody asked for).
-    for apply in [false, true] {
-        let mut exec = FakeExec::new(0);
-        let mut args = base("install-units");
-        if apply {
-            args.push("--apply");
-        }
-        let (code, _, err) = cli(&mut exec, &no_env, &args);
-        assert_eq!(code, ExitCode::from(2), "{args:?}: {err}");
-        assert!(err.contains("--mode"), "{args:?}: {err}");
-        assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
-        assert!(exec.log.is_empty(), "{args:?} changed the host");
-    }
     // verify-cert reaches its kit: a CA that is not there is refused; a daemon's row
     // needs its node id.
     let mut exec = FakeExec::new(0);
@@ -412,91 +358,51 @@ fn the_rollback_stamp_is_unix_seconds() {
     assert!(stamp >= before && stamp <= before + 5, "{stamp}");
 }
 
-/// Catches the `linux` kit dropped from the merged command line (clap would exit 2 on
-/// an unknown subcommand, but on stderr with no `REFUSED:`), a linux refusal written to
-/// stdout or exiting 1 (1 means "the units are wrong"). (The binary's tests in
-/// `tests/linux_cli.rs` run the verbs end to end; this one also runs `run`'s linux arm in
-/// the lib tests' instantiation of `run`, the one the coverage ratchet counts.)
+/// Catches a retired units verb still taken by the command line (or answered by
+/// anything but clap's usage error, exit 2 with nothing asked of the host or written):
+/// an operator or script that still calls `render-units`, `check-units` or
+/// `install-units` must fail loudly, not find a verb that quietly does something else.
 #[test]
-fn a_linux_verb_runs_through_the_same_command_line() {
-    let mut exec = FakeExec::new(501);
-    let (code, out, err) = cli(
-        &mut exec,
-        &admin_env,
-        &[
-            "linux",
-            "render-units",
-            "--config",
-            "/nonexistent/kbf-deploy/config.local",
-            "--out",
-            "/nonexistent/kbf-deploy/units",
-            "--mode",
-            "daemon",
-        ],
-    );
-    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
-    assert!(
-        err.starts_with("REFUSED: cannot read /nonexistent/kbf-deploy/config.local"),
-        "{err}"
-    );
+fn the_retired_units_verbs_are_usage_errors() {
+    // Every argument the base's verb required, so that on the base each one parses.
+    let verbs: [(&str, &[&str]); 3] = [
+        ("render-units", &["--out", "/nonexistent/kbf-deploy/units"]),
+        ("check-units", &["--dir", "/nonexistent/kbf-deploy/units"]),
+        ("install-units", &["--apply"]),
+    ];
+    for (verb, rest) in verbs {
+        let mut exec = FakeExec::new(0);
+        let mut args = vec!["linux", verb, "--mode", "daemon", "--config", LINUX_CONFIG];
+        args.extend(rest);
+        let (code, out, err) = cli(&mut exec, &no_env, &args);
+        assert_eq!(
+            (code, out.as_str()),
+            (ExitCode::from(2), ""),
+            "{verb}: {err}"
+        );
+        assert!(err.contains(verb), "{verb}: {err}");
+        assert!(exec.queries.borrow().is_empty(), "{verb} asked the host");
+        assert!(exec.log.is_empty(), "{verb} changed the host");
+    }
 }
 
-/// Catches `--mode` not reaching the mode verbs through the merged command line and a
-/// broken mode unit exiting 0 (a check's FAIL lines not printed). These run the lib
-/// tests' instantiation of the `linux` arm, the one the coverage ratchet counts.
+/// Catches `linux swap` refusing an existing node.conf, or taking it without a word:
+/// the retired keys are ignored with one warning on stderr naming them.
 #[test]
-fn render_units_then_check_units_with_a_mode_exit_0_and_a_broken_unit_exits_1() {
-    let dir = kbf_host::testkit::scratch("cli-render-mode");
-    let units = dir.join("units");
-    let units = units.to_str().expect("utf-8");
+fn swap_ignores_the_retired_keys_of_an_old_node_conf_and_says_so() {
+    let dir = kbf_host::testkit::scratch("cli-swap-old-conf");
+    let file = dir.join("node.conf");
+    std::fs::write(&file, include_str!("linux/testdata/node.conf")).expect("write");
     let mut exec = FakeExec::new(501);
-    let render = [
-        "linux",
-        "render-units",
-        "--config",
-        LINUX_CONFIG,
-        "--out",
-        units,
-        "--kbf-uid",
-        "1500",
-        "--mode",
-        "daemon",
-    ];
-    let (code, out, err) = cli(&mut exec, &no_env, &render);
-    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    let args = ["linux", "swap", "--config", file.to_str().expect("utf-8")];
+    let (_, _, err) = cli(&mut exec, &no_env, &args);
+    assert!(!err.contains("unknown key"), "{err}");
+    assert_eq!(err.matches("no longer read").count(), 1, "{err}");
     assert!(
-        out.starts_with("rendered kbf.slice kbf-daemon.service into "),
-        "{out}"
+        err.contains("KBF_HOST_NAME") && err.contains("docs/deploy/kbf-units.md"),
+        "{err}"
     );
-    let check = [
-        "linux",
-        "check-units",
-        "--config",
-        LINUX_CONFIG,
-        "--dir",
-        units,
-        "--installable",
-        "--mode",
-        "daemon",
-    ];
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!(code, ExitCode::SUCCESS, "{out}{err}");
-    assert_eq!(out, "UNIT OK: kbf-daemon.service runs kbf daemon\n");
-    // The kbf is never run: kbf's own tests parse the units (`--kbf-bin` is retired).
-    assert!(exec.queries.borrow().is_empty());
-    let mut retired = check.to_vec();
-    retired.extend(["--kbf-bin", "/opt/kbf/kbf"]);
-    let (code, _, err) = cli(&mut exec, &no_env, &retired);
-    assert_eq!(code, ExitCode::from(2), "{err}");
-    assert!(err.contains("--kbf-bin"), "{err}");
-
-    let unit = format!("{units}/kbf-daemon.service");
-    let text = std::fs::read_to_string(&unit).expect("rendered");
-    std::fs::write(&unit, text.replace("Delegate=yes", "Delegate=no")).expect("plant");
-    let (code, out, _) = cli(&mut exec, &no_env, &check);
-    assert_eq!(code, ExitCode::FAILURE, "{out}");
-    assert!(out.starts_with("FAIL delegate: "), "{out}");
-    assert!(out.contains("UNIT BROKEN"), "{out}");
+    assert!(!err.contains("KBF_SWAP_FILE,"), "{err}");
 }
 
 /// The kit's settings in a file, with a LAN address filled in.

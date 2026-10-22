@@ -30,9 +30,8 @@
 //! - `gc` removes release directories, never the current, previous or staged one, nor
 //!   one the `current` or `previous` link points to.
 //!
-//! None of them restarts a service: installing and restarting the units is
-//! `linux install-units`' (see the SEAM comment in `switch`). An apply ends by saying
-//! so.
+//! None of them restarts a service: restarting the units is the operator's
+//! (`systemctl restart`; see the SEAM comment in `switch`). An apply ends by saying so.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -259,9 +258,9 @@ fn switch<E: Exec>(
     }
     execute(&plan, RunAs::Root, mode, exec, &mut &mut *out)?;
     if lock.is_some() {
-        // SEAM(unit install): no verb here installs a release's units or restarts a
-        // service; `linux install-units` does both. When it takes a release directory,
-        // the restart goes here, after the switch.
+        // SEAM(unit restart): no verb here restarts a service; the units are the
+        // packaged files (packaging/linux/units/), which name the release directory's
+        // binary. When a verb restarts them, it goes here, after the switch.
         let restart = match host.platform() {
             Platform::Linux => "systemctl restart <unit>",
             Platform::MacOs => "launchctl kickstart -k system/<label>",

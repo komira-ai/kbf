@@ -18,7 +18,7 @@ After=network-online.target
 ConditionPathExists=/etc/kbf/kbf.toml
 
 # A failure that repeats quickly (the cold store or a disk not ready) must not use up
-# systemd's start limit of 5 starts in 10 s and leave the unit down (check-units rule
+# systemd's start limit of 5 starts in 10 s and leave the unit down (package-test rule
 # `restart`).
 StartLimitIntervalSec=0
 
@@ -40,7 +40,7 @@ OOMScoreAdjust=-925
 LimitNOFILE=1048576
 CPUWeight=300
 # The cold store's key is in kbf.toml's reach, not here: no EnvironmentFile= and no key on
-# the command line (check-units rule `credential`).
+# the command line (package-test rule `credential`).
 ExecStartPre=+/usr/bin/kbf-installer boot-check
 # `--check` validates kbf.toml and what a restart cannot change (a file, a user, a flag)
 # and exits 2 for those. Anything that can become ready later (a listen address, a peer,
@@ -50,7 +50,7 @@ ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=storage --check
 ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage
 # kbf drains on SIGTERM: a Write in flight is finished and acknowledged before the node
 # exits, and a large one takes longer than systemd's 90 s default stop timeout, which
-# would SIGKILL it and fail the upload (check-units rule `stop`).
+# would SIGKILL it and fail the upload (package-test rule `stop`).
 KillSignal=SIGTERM
 TimeoutStopSec=infinity
 Restart=on-failure

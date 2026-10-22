@@ -36,10 +36,10 @@ the old one: `interval x threshold + timeout + interval`, four seconds by defaul
 ## The unit: `kbf-frontend@.service`
 
 One template, two instances, `kbf-frontend@a` and `kbf-frontend@b`, with the same command
-line. Only one serves at a time. `linux install-units --mode frontend` writes the template,
+line. Only one serves at a time. `kbf-installer` installs the template (`kbf-deploy linux install-units`, retired, did before),
 enables it (`DefaultInstance=a`: only `@a` starts at boot) and starts `@a` if neither
 instance is up. A serving instance is never restarted by an install: the plan says to run
-the handover instead. What the unit has, and why (check-units rule `handover`; rule `stop`
+the handover instead. What the unit has, and why (rule `handover` of the package test `package_units.rs`; rule `stop`
 still asks for `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`):
 
 - `Type=notify`: kbf sends `READY=1` once it serves and its state store and map probes

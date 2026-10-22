@@ -6,11 +6,13 @@
 //! **Orders.** An activation or confirmation goes out as an `UpdateOrder` on the host's
 //! newest stream, with the epoch of the order id, which must be the epoch `Welcome` named
 //! ([`Farm::lease_epoch`]): an order of another epoch is refused here, not sent, because the
-//! node would refuse it. A cordon is the scheduler's own ([`Farm::place`]); an alert is a
-//! line under the target `kbf_server::attention`. A planned-down mark is
-//! [`Members::plan_down`] for as long as the restart deadline of the policy, and its removal
-//! [`Members::undo_plan`], which promotes nothing that is not planned down (a member that
-//! registered again is left as it is). Neither is given by a farm that is handed over.
+//! node would refuse it. The activation of a staged run names its source in the order
+//! (`UpdateOrder.source`); the activation of a fetch run and every confirmation name none.
+//! A cordon is the scheduler's own ([`Farm::place`]); an alert is a line under the target
+//! `kbf_server::attention`. A planned-down mark is [`Members::plan_down`] for as long as the
+//! restart deadline of the policy, and its removal [`Members::undo_plan`], which promotes
+//! nothing that is not planned down (a member that registered again is left as it is). Neither
+//! is given by a farm that is handed over.
 //!
 //! **A handed-over farm gives no order.** Once the farm is fenced ([`Handed::handed`]: a
 //! quiesce or a stand-down) a cordon, an uncordon, an activation and a confirmation are
@@ -62,7 +64,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use kbf_front::Handed;
 use kbf_map::{MemberId, MemberState};
 use kbf_proto::update::UpdateOrder;
-use kbf_proto::update::update_order::Verb;
+use kbf_proto::update::update_order::{Source as OrderSource, Verb};
 use kbf_proto::update::update_status::State;
 use kbf_types::{FarmTime, WorkerId};
 
@@ -70,7 +72,7 @@ use super::command::{Alert, Severity};
 use super::facts::MemberFacts;
 use super::facts::{
     AvailableFact, DaemonLoad, HelperReport, HelperStatus, HostFacts, HostKind, HostRecord,
-    OrderId, Platform, PlatformClass, Release, Work,
+    OrderId, Platform, PlatformClass, Release, Source, Work,
 };
 use super::ports::{FactsSource, FarmView, SourceError, Transport, TransportError};
 use super::rows::Rows;
@@ -178,6 +180,16 @@ fn failed(why: impl std::fmt::Display) -> TransportError {
     TransportError::new(why.to_string())
 }
 
+/// What an activation writes in `UpdateOrder.source`. Only a staged release is named: a fetch
+/// is left unspecified, which a node reads as a fetch and which writes no byte, so the order
+/// of a fetch run is the one frontends sent before the field.
+const fn wire_source(source: Source) -> OrderSource {
+    match source {
+        Source::Fetch => OrderSource::Unspecified,
+        Source::Staged => OrderSource::Staged,
+    }
+}
+
 impl SessionTransport {
     /// Refuses an order whose epoch is not the one `Welcome` names.
     fn check_epoch(&self, order: OrderId) -> Result<(), TransportError> {
@@ -211,27 +223,29 @@ impl SessionTransport {
             .map_or(0, |u| u.acked_order_id)
     }
 
+    /// Sends `host` the order `order` of `verb`, with `source` as the order names it.
     fn send(
         &self,
         host: &WorkerId,
         verb: Verb,
-        order_id: u64,
-        epoch: u64,
+        order: OrderId,
         release: &Release,
         window_s: u32,
+        source: OrderSource,
     ) -> Result<(), TransportError> {
-        let order = UpdateOrder {
-            order_id,
-            epoch,
+        let wire = UpdateOrder {
+            order_id: order.seq,
+            epoch: order.epoch,
             verb: verb as i32,
             commit: release.as_str().to_owned(),
             window_s,
+            source: source as i32,
             // The generation of the desired release is sent by a later change (0 is a
             // frontend that predates the field).
             ..UpdateOrder::default()
         };
         self.not_handed()?;
-        self.farm.send_order(host, order).map_err(failed)
+        self.farm.send_order(host, wire).map_err(failed)
     }
 
     /// Places `host` as the scheduler does for an operator, unless the farm is handed over.
@@ -291,6 +305,7 @@ impl Transport for SessionTransport {
         host: &WorkerId,
         order: OrderId,
         release: &Release,
+        source: Source,
     ) -> Result<(), TransportError> {
         self.not_handed()?;
         self.check_epoch(order)?;
@@ -305,14 +320,8 @@ impl Transport for SessionTransport {
                 commit: release.as_str().to_owned(),
             },
         );
-        self.send(
-            host,
-            Verb::Activate,
-            order.seq,
-            order.epoch,
-            release,
-            window,
-        )
+        let source = wire_source(source);
+        self.send(host, Verb::Activate, order, release, window, source)
     }
 
     fn confirm(
@@ -346,7 +355,11 @@ impl Transport for SessionTransport {
                 drawn.seq
             }
         };
-        self.send(host, Verb::Confirm, id, order.epoch, release, 0)
+        // A node refuses a confirmation that names a staged source: it is about a release
+        // the host has installed, so it names none, whatever the run's source is.
+        let sent = OrderId::new(order.epoch, id);
+        let unspecified = OrderSource::Unspecified;
+        self.send(host, Verb::Confirm, sent, release, 0, unspecified)
     }
 
     fn alert(&mut self, host: &WorkerId, alert: &Alert) -> Result<(), TransportError> {
@@ -754,7 +767,9 @@ mod tests {
         for _ in 0..1_000 {
             // Every id comes from the one counter, as the controller's do.
             let order = rows.mint_order(epoch).expect("an id");
-            transport.activate(&host, order, &release).expect("sent");
+            transport
+                .activate(&host, order, &release, Source::Fetch)
+                .expect("sent");
             transport.confirm(&host, order, &release).expect("sent");
         }
         let held = |source: &FarmFacts, host: &WorkerId| {
@@ -767,13 +782,13 @@ mod tests {
         );
         // An older activation, sent late, is not recorded over the newer.
         transport
-            .activate(&host, OrderId::new(epoch, 5), &release)
+            .activate(&host, OrderId::new(epoch, 5), &release, Source::Fetch)
             .expect("sent");
         assert_eq!(held(&source, &host), 3);
         // A host that is not in the farm: the activation does not go, and the record goes.
         let ghost = WorkerId::new("ghost");
         transport
-            .activate(&ghost, OrderId::new(epoch, 7), &release)
+            .activate(&ghost, OrderId::new(epoch, 7), &release, Source::Fetch)
             .expect_err("unknown");
         assert_eq!(held(&source, &ghost), 1);
         source.look(FarmTime::from_millis(0)).expect("a look");
@@ -810,7 +825,7 @@ mod tests {
         let order = rows.mint_order(epoch).expect("an id");
         farm.fence();
         for answer in [
-            transport.activate(&host, order, &release),
+            transport.activate(&host, order, &release, Source::Fetch),
             transport.confirm(&host, order, &release),
         ] {
             let error = answer.expect_err("refused");

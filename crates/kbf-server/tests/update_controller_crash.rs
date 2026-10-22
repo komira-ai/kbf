@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use kbf_map::MemberId;
 use kbf_server::update::{
-    Alert, Controller, HoldReason, HostPhase, HostRow, OrderId, Policy, Release, Stored, Transport,
-    TransportError,
+    Alert, Controller, HoldReason, HostPhase, HostRow, OrderId, Policy, Release, Source, Stored,
+    Transport, TransportError,
 };
 use kbf_state::sqlite::{backup, restore};
 use kbf_state::{
@@ -207,9 +207,10 @@ impl Transport for FusedTransport {
         host: &WorkerId,
         order: OrderId,
         release: &Release,
+        source: Source,
     ) -> Result<(), TransportError> {
         self.go("activate", host)?;
-        self.inner.activate(host, order, release)
+        self.inner.activate(host, order, release, source)
     }
 
     fn confirm(

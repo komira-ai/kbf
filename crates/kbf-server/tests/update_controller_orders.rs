@@ -13,7 +13,9 @@ mod support;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kbf_map::MemberId;
-use kbf_server::update::{Alert, Controller, OrderId, Policy, Release, Transport, TransportError};
+use kbf_server::update::{
+    Alert, Controller, OrderId, Policy, Release, Source, Transport, TransportError,
+};
 use kbf_types::WorkerId;
 use support::harness::{Backing, Rig, finished, row_of};
 use support::world::Spec;
@@ -59,9 +61,10 @@ impl Transport for Recorder {
         host: &WorkerId,
         order: OrderId,
         release: &Release,
+        source: Source,
     ) -> Result<(), TransportError> {
         self.note(host, "activate", order);
-        self.inner.activate(host, order, release)
+        self.inner.activate(host, order, release, source)
     }
 
     fn confirm(

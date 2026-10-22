@@ -15,14 +15,18 @@ use std::sync::atomic::Ordering;
 use kbf_caps::NodeCaps;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_objstore::MemoryStore;
+use kbf_proto::update::update_order::{Source as OrderSource, Verb};
 use kbf_proto::update::{UpdateOrder, UpdateStatus};
 use kbf_proto::worker::{ServerMessage, server_message};
 use kbf_server::farm::{Farm, Reported, StreamId};
 use kbf_server::members::{Members, MembershipConfig};
-use kbf_server::update::{Controller, HostPhase, OrderId, Policy, Release, Rows, Transport, ports};
+use kbf_server::update::{
+    Controller, HostPhase, OrderId, Policy, Release, Rows, Source, Transport, ports,
+};
 use kbf_state::Store;
 use kbf_types::{FarmTime, Resources, WorkerId};
 use kbf_update::{Component, Config, Expected, Handle, Offer, Order};
+use prost::Message as _;
 use tokio::sync::mpsc;
 
 const A: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -316,7 +320,7 @@ fn an_order_of_another_epoch_is_refused_and_not_sent() {
     let release = Release::new(A);
     for wrong in [epoch + 1, epoch - 1] {
         let refused = transport
-            .activate(&node.id, OrderId::new(wrong, 7), &release)
+            .activate(&node.id, OrderId::new(wrong, 7), &release, Source::Fetch)
             .expect_err("another epoch");
         assert!(refused.0.contains("epoch"), "{refused}");
         let refused = transport
@@ -326,7 +330,7 @@ fn an_order_of_another_epoch_is_refused_and_not_sent() {
     }
     assert_eq!(node.orders(), []);
     transport
-        .activate(&node.id, OrderId::new(epoch, 7), &release)
+        .activate(&node.id, OrderId::new(epoch, 7), &release, Source::Fetch)
         .expect("sent");
     let [sent] = &node.orders()[..] else {
         panic!("one order");
@@ -353,7 +357,7 @@ fn a_replayed_order_is_dropped_at_the_node() {
     let order = OrderId::new(farm.lease_epoch(), 9);
     for _ in 0..2 {
         transport
-            .activate(&node.id, order, &Release::new(A))
+            .activate(&node.id, order, &Release::new(A), Source::Fetch)
             .expect("sent");
     }
     let sent = node.orders();
@@ -623,10 +627,10 @@ fn the_ports_read_every_state_and_refuse_the_marks() {
     // An order for a node that never registered, or whose stream is gone, does not go.
     let order = OrderId::new(farm.lease_epoch(), 3);
     let release = Release::new(A);
-    let ghost = transport.activate(&WorkerId::new("ghost"), order, &release);
+    let ghost = transport.activate(&WorkerId::new("ghost"), order, &release, Source::Fetch);
     assert!(ghost.expect_err("unknown").0.contains("no node ghost"));
     drop(mac_rx);
-    let gone = transport.activate(&host, order, &release);
+    let gone = transport.activate(&host, order, &release, Source::Fetch);
     assert!(gone.expect_err("closed").0.contains("not connected"));
 }
 
@@ -708,7 +712,7 @@ fn an_old_acknowledgement_is_not_the_answer_to_a_new_order_of_the_same_number() 
     // The new store's activation 5 goes out; the status has not changed.
     let activation = OrderId::new(epoch, 5);
     transport
-        .activate(&id, activation, &Release::new(A))
+        .activate(&id, activation, &Release::new(A), Source::Fetch)
         .expect("sent");
     assert_eq!(
         reported(&mut source).map(|r| r.order),
@@ -732,7 +736,7 @@ fn an_old_acknowledgement_is_not_the_answer_to_a_new_order_of_the_same_number() 
     );
     farm.update_status(&id, stream, status(5, A, State::Confirmed));
     again
-        .activate(&id, activation, &Release::new(A))
+        .activate(&id, activation, &Release::new(A), Source::Fetch)
         .expect("sent");
     assert_eq!(reported(&mut source).map(|r| r.order), Some(activation));
 }
@@ -796,11 +800,11 @@ fn a_repeated_activation_keeps_the_record_of_its_first_sending() {
         farm.update_status(&id, stream, status(4, State::Idle));
         let activation = OrderId::new(farm.lease_epoch(), 5);
         transport
-            .activate(&id, activation, &Release::new(A))
+            .activate(&id, activation, &Release::new(A), Source::Fetch)
             .expect("sent");
         farm.update_status(&id, stream, status(5, state));
         transport
-            .activate(&id, activation, &Release::new(A))
+            .activate(&id, activation, &Release::new(A), Source::Fetch)
             .expect("sent again");
         let hosts = source.look(FarmTime::from_millis(0)).expect("a look").hosts;
         let report = hosts[0].helper.expect("a report");
@@ -810,4 +814,79 @@ fn a_repeated_activation_keeps_the_record_of_its_first_sending() {
             "{state:?}"
         );
     }
+}
+
+/// Catches an activation that does not say where its release comes from, a fetch run's order
+/// that is not the one frontends sent before the field, and a confirmation that carries the
+/// activation's source (a node refuses a staged confirmation, so a staged host would never be
+/// confirmed). The staged activation reaches the node with source 2 (`SOURCE_STAGED`) and
+/// nothing else different: its bytes are the old order's and field 7. The fetch activation is
+/// the old order's bytes exactly: the field is not written, not even as `SOURCE_FETCH`. The
+/// confirmations of both name no source. The server sends no revert order.
+///
+/// Mutants it catches: the source dropped from the staged order (it reads 0); `SOURCE_FETCH`
+/// written for a fetch (its bytes gain field 7); the activation's source written on every
+/// verb (the confirmation of the staged activation reads 2).
+#[test]
+fn a_staged_activation_names_its_source_and_no_other_order_does() {
+    let farm = farm();
+    let store = store();
+    let mut node = Node::new(&farm, "mac-1", "fedcba987654");
+    let (mut transport, _) = ports(
+        Arc::clone(&farm),
+        Rows::new(Arc::clone(&store)),
+        members(&store),
+    );
+    let epoch = farm.lease_epoch();
+    let release = Release::new(A);
+    let (staged, fetch) = (OrderId::new(epoch, 7), OrderId::new(epoch, 8));
+    transport
+        .activate(&node.id, staged, &release, Source::Staged)
+        .expect("staged activation sent");
+    transport
+        .confirm(&node.id, staged, &release)
+        .expect("staged confirmation sent");
+    transport
+        .activate(&node.id, fetch, &release, Source::Fetch)
+        .expect("fetch activation sent");
+    transport
+        .confirm(&node.id, fetch, &release)
+        .expect("fetch confirmation sent");
+    let orders = node.orders();
+    let [act_staged, con_staged, act_fetch, con_fetch] = &orders[..] else {
+        panic!("four orders: {orders:?}");
+    };
+    let (act, con) = (Verb::Activate as i32, Verb::Confirm as i32);
+    let verbs = [act_staged, con_staged, act_fetch, con_fetch].map(|o| o.verb);
+    assert_eq!(verbs, [act, con, act, con]);
+
+    // What a frontend sent for an activation before the order had a source.
+    let before_the_field = |order_id: u64| UpdateOrder {
+        order_id,
+        epoch,
+        verb: act,
+        commit: A.to_owned(),
+        window_s: act_fetch.window_s,
+        ..UpdateOrder::default()
+    };
+    assert!(act_fetch.window_s > 0, "the window is part of the bytes");
+    assert_eq!(act_fetch.source, 0);
+    assert_eq!(
+        act_fetch.encode_to_vec(),
+        before_the_field(8).encode_to_vec(),
+        "a fetch activation is the order sent before the field"
+    );
+    assert_eq!(act_staged.source, OrderSource::Staged as i32);
+    let mut with_field = before_the_field(7).encode_to_vec();
+    // Field 7, a varint: tag 0x38, value 2.
+    with_field.extend([0x38, 2]);
+    assert_eq!(act_staged.encode_to_vec(), with_field);
+    assert_eq!(
+        con_staged.source, 0,
+        "the confirmation of a staged activation"
+    );
+    assert_eq!(
+        con_fetch.source, 0,
+        "the confirmation of a fetch activation"
+    );
 }

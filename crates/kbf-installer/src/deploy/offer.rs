@@ -198,7 +198,21 @@ pub(super) fn check_header(
     commit: &CommitId,
     now: u64,
     max_age: Duration,
+    installer_level: u32,
 ) -> Result<(), Refused> {
+    // First: an installer too old for the offer cannot be trusted to read the rest of it.
+    if let Some(min) = doc.min_installer
+        && min > installer_level
+    {
+        return Err(refuse(
+            "offer_installer_too_old",
+            format!(
+                "the offer needs kbf-installer level {min}, this host's installer is level \
+                 {installer_level}; upgrade the kbf-installer package on this host (it never \
+                 updates itself)"
+            ),
+        ));
+    }
     if doc.target != stage.target() {
         return Err(refuse(
             "offer_wrong_stage",

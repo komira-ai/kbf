@@ -11,7 +11,7 @@
 //!   reads the last, the one systemd uses for a single-valued key.
 //!
 //! The docs check in `kbf-integration-test` reads the example units in `docs/deploy/*.md` with it,
-//! and `kbf-deploy linux check-units` the rendered ones, so both read units one way. It was
+//! and the package test (`kbf-integration-test/tests/package_units.rs`) the packaged ones, so both read units one way. It was
 //! `kbf-deploy`'s `unit` module (still re-exported there as `kbf_deploy::unit`).
 
 /// One `Key=value` line, continuations joined.
