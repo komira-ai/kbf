@@ -18,7 +18,7 @@ use crate::testkit::{A, B, c};
 use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
-fn gate() -> (ProxyGate, ProxyRunner) {
+pub(super) fn gate() -> (ProxyGate, ProxyRunner) {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let name = format!(
         "supervisor-{}",
@@ -30,7 +30,7 @@ fn gate() -> (ProxyGate, ProxyRunner) {
     (ProxyGate::new(handle), runner)
 }
 
-fn state_dir(rig: &crate::proxy::child_rig::Rig) -> PathBuf {
+pub(super) fn state_dir(rig: &crate::proxy::child_rig::Rig) -> PathBuf {
     rig.dir.parent().expect("under the host").to_owned()
 }
 
@@ -356,7 +356,7 @@ impl Report for Notes {
     }
 }
 
-struct Env<'a> {
+pub(super) struct Env<'a> {
     admin: ScriptAdmin<'a>,
     clock: FastClock<'a>,
     notes: Notes,
@@ -364,7 +364,7 @@ struct Env<'a> {
 }
 
 impl<'a> Env<'a> {
-    fn new(rig: &crate::proxy::child_rig::Rig, gate: &'a ProxyGate) -> Env<'a> {
+    pub(super) fn new(rig: &crate::proxy::child_rig::Rig, gate: &'a ProxyGate) -> Env<'a> {
         Env {
             admin: ScriptAdmin {
                 role: RoleInfo {
@@ -389,7 +389,7 @@ impl<'a> Env<'a> {
         }
     }
 
-    fn boot(&self) -> Boot<'_> {
+    pub(super) fn boot(&self) -> Boot<'_> {
         Boot {
             admin: &self.admin,
             clock: &self.clock,
@@ -405,6 +405,7 @@ impl<'a> Env<'a> {
                 first_wait: Duration::from_secs(2),
                 max_wait: Duration::from_secs(4),
             },
+            adopt: None,
         }
     }
 
@@ -696,6 +697,7 @@ fn the_real_source_runs_only_a_binary_the_proxys_user_can_execute() {
     let source = HostSource {
         status: &status,
         child: &rig.child,
+        adopt: None,
     };
     let program = rig.child.program(&c(A));
     // The rig's binary is a link to the test executable: followed, and executable.

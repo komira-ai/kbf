@@ -594,8 +594,7 @@ async fn a_lower_generation_with_a_higher_boot_neither_reads_nor_adds() {
 /// is a miss (the action runs again; never a hit on a blob a restart loses), the check
 /// asked `find_durable` and never `find_missing`, and the RAM-only blob is not remembered:
 /// asked again, the primary is asked about it again, while the disk blob is cached. Once
-/// the blob is written the entry is a hit, and then the blob is remembered. Mutant:
-/// `closure_held` asks `find_missing` (the RAM-only blob counts, and the entry is a hit).
+/// the blob is written the entry is a hit, and then the blob is remembered.
 #[tokio::test]
 async fn a_closure_blob_held_only_in_ram_is_a_miss_and_is_not_remembered() {
     let rig = rig();

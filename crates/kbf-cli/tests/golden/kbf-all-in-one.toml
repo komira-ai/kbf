@@ -159,6 +159,8 @@ xcode-apps = "/Applications"
 xcode-recheck-secs = 180
 
 [memory]
+# What the farm does with `kbf-estimator`, which predicts an action's memory from what its earlier runs used. `off` calls it never. `shadow` shows it every attempt that finishes and logs, for every new operation, a `size estimate:` line with what it would book, and counts how the attempts fall against its estimates (`kbf_estimator_shadow_total`); it books exactly what `off` books. The size summaries are kept in the state store; `off` neither reads nor deletes them
+learned-sizes = "off"
 # ...plus this many MiB (native). A lease that booked nothing has no limit
 memory-headroom-mib = 512
 # The memory rungs of an action, in GiB, ascending and each at least 1. The first is what an action that names no size (`kbf-book-mem-gib`) books. An action that passes its own memory limit runs again on the next rung above what it booked, and after the last on a whole host: the memory of the largest node that could run it, so that no other lease fits there. A rung not below that node's memory is skipped for the whole host. An action that does finish keeps its rung: later runs of it start there

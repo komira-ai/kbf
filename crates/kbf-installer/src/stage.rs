@@ -85,6 +85,10 @@ use crate::state::Locked;
 /// The marker written into a release directory once every check has passed.
 pub use crate::layout::VERIFIED;
 
+/// The newest of each version number an installer understands (kept in `kbf-types`, next to
+/// the version it is compared with).
+pub use kbf_types::Supported;
+
 /// The most of an attestation bundle that is taken (the order record's own cap).
 pub const BUNDLE_CAP: u64 = 256 * 1024;
 
@@ -238,15 +242,6 @@ impl Timeouts {
     };
 }
 
-/// The newest of each version number this installer understands: a release that declares
-/// more is refused (`installer_too_old`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Supported {
-    pub protocol: u64,
-    pub min_protocol: u64,
-    pub state_schema: u64,
-}
-
 /// What this build of the installer understands, which is what [`Policy::of`] gives a host.
 ///
 /// **Decision D3 (open, with the lead):** these numbers decide which releases a host can ever
@@ -269,34 +264,17 @@ pub fn supported() -> Supported {
 /// Whether an installer that understands `supported` may stage `component`, which declared
 /// `declared`: `Err(InstallerTooOld)` when any of its numbers is past what the installer
 /// understands (the last check of step 5, and the rule behind upgrading the installer
-/// before a kbf that raises one).
+/// before a kbf that raises one). The check itself is [`kbf_types::understood`].
 pub fn understood(
     supported: Supported,
     component: &str,
     declared: Supported,
 ) -> Result<(), Refusal> {
-    let newer = [
-        ("protocol", declared.protocol, supported.protocol),
-        (
-            "min_protocol",
-            declared.min_protocol,
-            supported.min_protocol,
-        ),
-        (
-            "state_schema",
-            declared.state_schema,
-            supported.state_schema,
-        ),
-    ];
-    for (field, got, most) in newer {
-        if got > most {
-            return Err(Refusal::InstallerTooOld {
-                component: component.to_owned(),
-                what: format!("{field} {got}; this installer understands up to {most}"),
-            });
-        }
-    }
-    Ok(())
+    let checked = kbf_types::understood(supported, declared);
+    checked.map_err(|too_new| Refusal::InstallerTooOld {
+        component: component.to_owned(),
+        what: too_new.to_string(),
+    })
 }
 
 /// What the host decides about how a release is verified.

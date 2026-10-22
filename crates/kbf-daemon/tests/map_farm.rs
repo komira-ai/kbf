@@ -64,6 +64,7 @@ async fn farm(name: &str, source: Arc<dyn MapSource>) -> Arc<MapHolder> {
         unservable_wait: Duration::from_secs(300),
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: Duration::from_secs(60),
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
