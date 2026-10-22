@@ -6,6 +6,8 @@ use super::*;
 /// A descriptor number no test of this crate holds, so running the pre-exec closure in
 /// this process closes nothing that matters.
 const HIGH_FD: u32 = 600;
+/// The same for the sweep's test, which runs beside the others.
+const SWEEP_FD: u32 = 400;
 use crate::fixtures::{me, scratch_dir};
 
 fn spawn(program: &str, args: &[&str]) -> Spawn {
@@ -265,6 +267,11 @@ struct Fixed {
 
 impl Fixed {
     fn new() -> Fixed {
+        Fixed::at(HIGH_FD)
+    }
+
+    /// The pair with the upper one at `first`.
+    fn at(first: u32) -> Fixed {
         use std::os::fd::AsRawFd;
         let file = std::fs::File::open("/").expect("open");
         let at = |fd: libc::c_int| {
@@ -275,8 +282,8 @@ impl Fixed {
             fd
         };
         Fixed {
-            below: at(HIGH_FD as libc::c_int - 1),
-            first: at(HIGH_FD as libc::c_int),
+            below: at(first as libc::c_int - 1),
+            first: at(first as libc::c_int),
         }
     }
 
@@ -358,22 +365,21 @@ fn the_child_inherits_no_descriptor_from_the_first_up() {
 }
 
 /// Catches a platform without `close_range` taking the range way, which would fail every
-/// start: here the call is `ENOSYS` whatever it is asked, the probe falls back to the
-/// listing, and the listing finds the descriptors from the first up.
-#[cfg(not(target_os = "linux"))]
+/// start: here the call is `ENOSYS` whatever it is asked, and the probe falls back to the
+/// sweep in the child (not a list made in the parent, which a descriptor opened by another
+/// thread before the fork would escape).
+#[cfg(target_os = "macos")]
 #[test]
-fn macos_has_no_close_range_and_lists_the_descriptors() {
+fn macos_has_no_close_range_and_sweeps_in_the_child() {
     let err = range_cloexec(5, 3).expect_err("no close_range");
     assert_eq!(err.raw_os_error(), Some(libc::ENOSYS));
     let fixed = Fixed::new();
     let chosen = Inherited::of(HIGH_FD).expect("chosen");
-    let Inherited::Listed(found) = chosen else {
-        panic!("the range way chosen where there is none");
-    };
     assert!(
-        found.contains(&fixed.first) && !found.contains(&fixed.below),
-        "{found:?}"
+        matches!(chosen, Inherited::Sweep(_)),
+        "a way that lists in the parent, or the range way where there is none"
     );
+    drop(fixed);
 }
 
 /// The constant the runner starts from: 0, 1 and 2 are the program's own, 3 is the first it
@@ -402,11 +408,20 @@ fn a_failure_to_keep_descriptors_from_the_program_ends_the_start() {
     }
     let enosys = || Err(io::Error::from_raw_os_error(libc::ENOSYS));
     // The probe failed and the directory cannot be listed: the error.
-    let err = Inherited::choose(3, enosys(), Path::new("/no/such/descriptor/dir")).err();
-    assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::NotFound));
-    // The probe failed and the directory lists: the listed way.
-    let chosen = Inherited::choose(3, enosys(), Path::new(FD_DIR)).expect("listed");
-    assert!(matches!(chosen, Inherited::Listed(_)));
+    #[cfg(not(target_os = "macos"))]
+    {
+        let err = Inherited::choose(3, enosys(), Path::new("/no/such/descriptor/dir")).err();
+        assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::NotFound));
+        // The probe failed and the directory lists: the listed way.
+        let chosen = Inherited::choose(3, enosys(), Path::new(FD_DIR)).expect("listed");
+        assert!(matches!(chosen, Inherited::Listed(_)));
+    }
+    // The probe failed on macOS: the sweep, which needs no listing to succeed.
+    #[cfg(target_os = "macos")]
+    {
+        let chosen = Inherited::choose(3, enosys(), Path::new("/no/such/dir")).expect("swept");
+        assert!(matches!(chosen, Inherited::Sweep(_)));
+    }
     // A descriptor that is not open is skipped, not an error.
     cloexec(HIGH_FD as libc::c_int + 300).expect("a closed descriptor is fine");
 }
@@ -562,4 +577,98 @@ fn a_capture_whose_pipe_outlives_its_grace_returns_what_it_kept() {
         .expect("a pipe still open at the deadline is not an error");
     assert_eq!(kept, b"before");
     drop(writer);
+}
+
+/// A sweep with a limit small enough to walk quickly, whatever the host allows.
+fn small_sweep(first: u32) -> Sweep {
+    let mut sweep = Sweep::new(first, Path::new(FD_DIR));
+    sweep.limit = sweep.limit.min(SWEEP_FD as libc::c_int + 2);
+    sweep
+}
+
+/// Catches a sweep that marks the wrong descriptors: the one numbered `first` and those above
+/// are marked close-on-exec, the one below is left alone (`>=`, not `>`). The walk of every
+/// number is checked here in this process, the kernel's list (macOS) through a real child.
+#[test]
+fn a_sweep_marks_the_descriptors_from_the_first_up_and_none_below() {
+    let fixed = Fixed::at(SWEEP_FD);
+    small_sweep(SWEEP_FD).mark_each().expect("walks");
+    assert!(cloexec_set(fixed.first) && !cloexec_set(fixed.below));
+    fixed.unmark();
+    small_sweep(SWEEP_FD + 1).mark_each().expect("walks");
+    assert!(!cloexec_set(fixed.first) && !cloexec_set(fixed.below));
+    // A real child, swept: `first` is not inherited, below it is.
+    assert!(child_holds(
+        fixed.below,
+        Inherited::Sweep(small_sweep(SWEEP_FD))
+    ));
+    assert!(!child_holds(
+        fixed.first,
+        Inherited::Sweep(small_sweep(SWEEP_FD))
+    ));
+}
+
+/// Catches a descriptor that another thread opens while the program is being started reaching
+/// the program: one thread opens and closes descriptors without close-on-exec as fast as it
+/// can (the window between a parent's listing and the fork, and between a socket's creation
+/// and its marking), while the real start runs 200 times. The program is this test binary,
+/// which reports the descriptors it holds; each run holds 0, 1 and 2 and nothing else.
+#[test]
+fn a_descriptor_opened_by_another_thread_during_the_start_never_reaches_the_program() {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let racer = {
+        let stop = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let path = std::ffi::CString::new("/dev/null").expect("no nul");
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // SAFETY: open of a path that exists; the descriptor is closed at once.
+                let fds: Vec<libc::c_int> = (0..8)
+                    .map(|_| unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) })
+                    .collect();
+                for fd in fds {
+                    // SAFETY: closing the descriptor opened above.
+                    unsafe { libc::close(fd) };
+                }
+            }
+        })
+    };
+    let exe = std::env::current_exe().expect("this binary");
+    let args = [
+        "--ignored",
+        "--exact",
+        "run::tests::reports_its_descriptors",
+        "--nocapture",
+    ];
+    let mut leaked = Vec::new();
+    for _ in 0..200 {
+        let ran = SystemRunner
+            .run(&spawn(exe.to_str().expect("utf-8"), &args))
+            .expect("the test binary runs");
+        let out = text(&ran.stdout);
+        let held = out
+            .lines()
+            .find_map(|l| l.strip_prefix("DESCRIPTORS "))
+            .unwrap_or("none");
+        if held != "0,1,2" {
+            leaked.push(held.to_owned());
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    racer.join().expect("the racer ends");
+    assert!(leaked.is_empty(), "the program held {leaked:?}");
+}
+
+/// The program of `a_descriptor_opened_by_another_thread_during_the_start_never_reaches_the_program`:
+/// started only by that test (it is ignored in a normal run). Prints the descriptors it holds.
+#[test]
+#[ignore = "run as a child program by a_descriptor_opened_by_another_thread_during_the_start_never_reaches_the_program"]
+fn reports_its_descriptors() {
+    let open: Vec<String> = (0..1024)
+        .filter(|fd| {
+            // SAFETY: F_GETFD on a number reports its flags, or EBADF.
+            unsafe { libc::fcntl(*fd, libc::F_GETFD) >= 0 }
+        })
+        .map(|fd| fd.to_string())
+        .collect();
+    println!("DESCRIPTORS {}", open.join(","));
 }

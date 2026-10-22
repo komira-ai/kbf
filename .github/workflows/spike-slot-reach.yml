@@ -60,6 +60,29 @@ jobs:
       - name: Usage of a lease run as a pool user (root, real users)
         run: cargo xtask sudo-test -p kbf-driver-native --test slots -- usage --test-threads=1 --nocapture
 
+  # A descriptor another thread opens while a program is being started must not reach it
+  # (crates/kbf-installer/src/run.rs, the sweep in the child). The race test, then the fetch
+  # end-to-end test that once saw a stray descriptor, 20 times over.
+  child-descriptors:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: Descriptors of the child, in the run module
+        run: cargo test -p kbf-installer --locked --lib -- run::tests --nocapture
+      - name: The fetch end-to-end test that saw a stray descriptor, 20 times
+        run: |
+          for i in $(seq 1 20); do
+            cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused || exit 1
+          done
+
   pool-spike:
     runs-on: macos-latest
     timeout-minutes: 45
