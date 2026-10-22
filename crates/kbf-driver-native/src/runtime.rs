@@ -594,7 +594,7 @@ impl<C: Cas> NativeRuntime<C> {
         // One more read before the processes are ended: what ran since the last poll.
         let _ = watch.measure().await;
         watch.end(&mut child, self.config.kill_wait).await?;
-        let _ = watch.usage(started.elapsed());
+        *measured = watch.usage(started.elapsed());
         let did_fail = match &ended {
             Ended::Exited(status) => status.as_ref().is_ok_and(|s| !s.success()),
             Ended::TimedOut => true,
