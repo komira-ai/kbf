@@ -1663,3 +1663,300 @@ midplant_DT() {
   "$IC" probefile "$E/$M.tr.gt" "$E/$M.tr.ex" | sed 's/^/TRACE cleanup /'; "$IC" rmfile "$E/$M.tr.ex" | sed 's/^/TRACE cleanup /'
 }
 probe_DT() { echo "PROBE DT none"; }
+
+# ================================================================ E1h: pinned CPython + multiprocessing, killed leases, SIGTERM-first clean; simulator leases
+# One dtrace recorder for the whole job (every pool uid, all four POSIX name syscalls); each lease cell prints HLEASE lines.
+EH="$W/e1h"
+PBS="$W/pbs/python/bin/python3"
+hpy() { /usr/bin/python3 -I "$W/e1h.py" "$@"; }
+
+h_uidprocs() { ps -axo pid=,ruid=,uid= | awk -v id="$ID" '$2==id||$3==id{print $1}'; }
+h_pyprocs() { ps -axo pid=,ruid=,uid=,args= | awk -v id="$ID" -v p="$W/pbs/" '($2==id||$3==id)&&index($0,p){print $1}'; }
+h_asu() { alarm_run 180 launchctl asuser "$ID" /usr/bin/sudo -n -u "$U" -H /usr/bin/env -i HOME="$L/home" CFFIXED_USER_HOME="$L/home" TMPDIR="$L/tmp" PATH=/usr/bin:/bin:/usr/sbin:/sbin "$@"; }
+
+# the pinned interpreter: fetched by URL, sha256 checked, unpacked read-only for the pool uids
+h_fetch_pbs() { # url sha
+  mkdir -p "$W/pbs.dl"
+  if ! curl -fsSL --retry 3 --max-time 300 -o "$W/pbs.dl/pbs.tgz" "$1"; then echo "PBS download failed"; return 1; fi
+  _got=$(shasum -a 256 "$W/pbs.dl/pbs.tgz" | awk '{print $1}')
+  echo "PBS url=$1"; echo "PBS sha256 expected=$2 got=$_got"
+  [ "$_got" = "$2" ] || { echo "PBS SHA MISMATCH: not unpacking"; return 1; }
+  rm -rf "$W/pbs"; mkdir -p "$W/pbs"
+  tar -xzf "$W/pbs.dl/pbs.tgz" -C "$W/pbs" || return 1
+  chown -R 0:0 "$W/pbs"; chmod -R go-w "$W/pbs"; chmod -R a+rX "$W/pbs"
+  echo "PBS unpacked: $(ls "$W/pbs" | tr '\n' ' ') interpreter=$PBS"
+  "$PBS" -I -c 'import sys,sysconfig;print("PBS python", sys.version.replace("\n"," "));print("PBS executable", sys.executable);print("PBS prefix", sys.prefix);print("PBS start-method", __import__("multiprocessing").get_start_method())' 2>&1 | cut -c1-200
+  echo "PBS codesign: $(codesign -dv "$PBS" 2>&1 | tr '\n' ' ' | cut -c1-200)"
+  echo "PBS xattr: [$(xattr "$PBS" 2>&1 | tr '\n' ' ')] (empty = no quarantine)"
+}
+
+h_rec_start() {
+  mkdir -p "$EH"; chmod 755 "$EH"; : >"$EH/leases.txt"
+  cat >"$EH/rec.d" <<'DEOF'
+syscall::shm_open:entry, syscall::sem_open:entry, syscall::shm_unlink:entry, syscall::sem_unlink:entry
+/uid >= 61000 && uid < 61008/
+{ printf("%d|%d|%s|%d|%s|%d|%s\n", walltimestamp/1000000, uid, probefunc, arg1, execname, pid, copyinstr(arg0)); }
+DEOF
+  sh -c 'echo $$ >"$1"; exec dtrace -q -x bufsize=128m -s "$2"' x "$EH/p_dt" "$EH/rec.d" >"$EH/dt" 2>"$EH/dt.err" </dev/null &
+  sleep 6
+  echo "HREC dtrace pid=$(cat "$EH/p_dt" 2>/dev/null) err=[$(head -c 200 "$EH/dt.err" | tr '\n' ' ')]"
+}
+
+# root: names (who = py | apple | all) created by the uid in [t0,t1], probed as root; sets PRB_T (created) PRB_E (still existing)
+h_probe() { # label who t0 t1
+  sleep 2
+  hpy names "$EH/dt" "$ID" "$3" "$4" "$2" "$EH/$M.$1.nm" >/dev/null
+  _o=$("$W/ipcc" probefile "$EH/$M.$1.nm" "$EH/$M.$1.ex")
+  PRB_T=$(printf '%s\n' "$_o" | sed -n 's/.*total=\([0-9]*\).*/\1/p')
+  PRB_E=$(printf '%s\n' "$_o" | sed -n 's/.*exists=\([0-9]*\).*/\1/p')
+  PRB_T=${PRB_T:-?}; PRB_E=${PRB_E:-?}
+  echo "HPROBE $1 who=$2 uid=$ID created=$PRB_T exist_by_root_probe=$PRB_E"
+}
+
+# the clean under test: SIGTERM to every process of the uid, a grace for the python processes (the resource tracker) to finish, then SIGKILL
+h_clean_term() {
+  T_TERM=$(d_t)
+  _n0=$(h_pyprocs | wc -l | tr -d ' ')
+  for _p in $(h_uidprocs); do kill -TERM "$_p" 2>/dev/null; done
+  _g0=$(now_ms)
+  for _i in $(seq 1 60); do [ "$(h_pyprocs | wc -l | tr -d ' ')" = 0 ] && break; sleep 0.25; done
+  _g1=$(now_ms)
+  _n1=$(h_pyprocs | wc -l | tr -d ' ')
+  echo "HCLEAN term-first py_procs_before=$_n0 py_procs_after_grace=$_n1 grace_ms=$((_g1-_g0)) cap_ms=15000"
+  h_probe term_grace py "$T0" 9999999999
+  PY_TERM=$PRB_E
+  _k=0; for _p in $(h_uidprocs); do kill -KILL "$_p" 2>/dev/null; _k=$((_k+1)); done
+  T_KILL=$(d_t)
+  echo "HCLEAN sigkill sent to $_k uid processes after the grace"
+}
+h_clean_kill() { # the control: SIGKILL only, as the shipped clean does
+  T_TERM=$(d_t)
+  _n0=$(h_pyprocs | wc -l | tr -d ' ')
+  _k=0; for _p in $(h_uidprocs); do kill -KILL "$_p" 2>/dev/null; _k=$((_k+1)); done
+  T_KILL=$(d_t)
+  echo "HCLEAN kill-only py_procs_before=$_n0 sigkill_to=$_k uid processes"
+  PY_TERM=-
+}
+
+h_apple_cum() { # cumulative non-python names created by the uid since the recorder started
+  h_probe apple_cum apple 0 9999999999
+  AC_T=$PRB_T; AC_E=$PRB_E
+}
+
+fixture_HP() { mkdir -p "$EH"; chmod 755 "$EH"; d_t >"$EH/$M.t0"; }
+do_HP() {
+  mkdir -p "$L/tmp"
+  cat >"$L/hp.py" <<'PY'
+import os, sys, time, multiprocessing as mp
+from multiprocessing import shared_memory
+from concurrent.futures import ProcessPoolExecutor
+
+
+def sq(x):
+    return x * x
+
+
+def held(q):
+    q.put(os.getpid())
+    time.sleep(3600)
+
+
+def main(mode, d):
+    ctx = mp.get_context("spawn")
+    open(d + "/hp.pid", "w").write(str(os.getpid()))
+    names = []
+    lock = ctx.Lock()
+    lock.acquire()
+    names.append("sem " + lock._semlock.name)
+    q = ctx.Queue()
+    p = ctx.Process(target=held, args=(q,))
+    p.start()
+    q.get(timeout=120)
+    pool = ctx.Pool(2)
+    pool.map(sq, [1, 2, 3])
+    shm = shared_memory.SharedMemory(create=True, size=64)
+    names.append("shm " + shm.name)
+    ex = ProcessPoolExecutor(2, mp_context=ctx)
+    list(ex.map(sq, [1, 2, 3]))
+    open(d + "/hp.names", "w").write("\n".join(names) + "\n")
+    open(d + "/hp.ready", "w").write("ok")
+    print("ready", names, flush=True)
+    if mode == "D":
+        lock.release()
+        p.terminate()
+        p.join()
+        pool.close()
+        pool.join()
+        ex.shutdown()
+        shm.close()
+        shm.unlink()
+        open(d + "/hp.done", "w").write("ok")
+        print("done", flush=True)
+        return
+    while True:
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1], sys.argv[2])
+PY
+  rm -f "$L/hp.ready" "$L/hp.done"
+  ( BT=400 build_env env PYTHONDONTWRITEBYTECODE=1 "$PBS" -I "$L/hp.py" "$HMODE" "$L" >"$L/hp.out" 2>&1 </dev/null & )
+  for _i in $(seq 1 600); do [ -e "$L/hp.ready" ] && break; sleep 0.2; done
+  [ -e "$L/hp.ready" ] || { echo "workload never ready: $(tail -c 300 "$L/hp.out" | tr '\n' ' ')"; return 1; }
+  echo "workload ready mode=$HMODE pid=$(cat "$L/hp.pid") $(tr '\n' ';' <"$L/hp.names" | cut -c1-120)"
+  if [ "$HMODE" = D ]; then
+    for _i in $(seq 1 300); do [ -e "$L/hp.done" ] && break; sleep 0.2; done
+    [ -e "$L/hp.done" ] || { echo "workload did not finish: $(tail -c 300 "$L/hp.out" | tr '\n' ' ')"; return 1; }
+    sleep 1
+  fi
+  return 0
+}
+plant_HP() { p HP do_HP; echo "PLANTED HP"; }
+midplant_HP() {
+  IC="$W/ipcc"; T0=$(cat "$EH/$M.t0"); PPID_=$(cat "$L/hp.pid" 2>/dev/null)
+  PY_KP3=-; PY_TERM=-
+  echo "HPROCS mode=$HMODE parent=$PPID_ py_procs=$(h_pyprocs | wc -l | tr -d ' ') uid_procs=$(h_uidprocs | wc -l | tr -d ' ') tracker_pids=$(ps -axo pid=,ruid=,args= | awk -v id="$ID" '$2==id && /resource_tracker/ {print $1}' | tr '\n' ',')"
+  sleep 1
+  case "$HMODE" in
+    D|T) h_clean_term ;;
+    KP)
+      kill -KILL "$PPID_" 2>/dev/null; T_KP=$(d_t)
+      sleep 3
+      h_probe kp3 py "$T0" 9999999999; PY_KP3=$PRB_E
+      echo "HPROCS after-parent-SIGKILL+3s py_procs=$(h_pyprocs | wc -l | tr -d ' ') tracker_alive=$(ps -axo pid=,ruid=,args= | awk -v id="$ID" '$2==id && /resource_tracker/' | wc -l | tr -d ' ')"
+      h_clean_term ;;
+    K) h_clean_kill ;;
+  esac
+  sleep 3
+  h_probe final py "$T0" 9999999999
+  PY_FINAL=$PRB_E; PYC=$PRB_T
+  hpy events "$EH/dt" "$ID" "$T0" 9999999999 "$T_TERM" | cut -c1-215
+  if [ "${PY_FINAL:-0}" != 0 ] && [ "$PY_FINAL" != "?" ]; then
+    hpy show "$EH/$M.final.ex" 8 | sed 's/^/HLEFT /'
+    "$IC" rmfile "$EH/$M.final.ex" | sed 's/^/HLEFT-REMOVED /'
+  fi
+  h_probe apple_lease apple "$T0" 9999999999; AL_T=$PRB_T
+  h_apple_cum
+  _l="HLEASE n=$HN arm=$HARM mode=$HMODE uid=$ID py_created=$PYC py_left_kp3=$PY_KP3 py_left_term=$PY_TERM py_left_final=$PY_FINAL apple_lease_created=$AL_T apple_cum_created=$AC_T apple_cum_existing=$AC_E"
+  echo "$_l"; echo "$_l" >>"$EH/leases.txt"
+}
+probe_HP() { echo "PROBE HP none"; }
+
+# ---- the simulator cell: boot in the lease; at lease end simctl shutdown, simctl erase, then the clean (mode S); mode C skips shutdown and erase (control)
+fixture_HS() { fixture_HP; }
+do_HS() {
+  mkdir -p "$L/tmp"
+  _rt=$(xcrun simctl list runtimes available 2>/dev/null | awk '/iOS/ {print $NF; exit}')
+  _dt=$(xcrun simctl list devicetypes 2>/dev/null | awk '/iPhone/ {print $NF; exit}' | tr -d '()')
+  [ -n "$_rt" ] && [ -n "$_dt" ] || { echo "no iOS runtime or device type"; return 77; }
+  _u=$(build_env xcrun simctl create "$M" "$_dt" "$_rt") || { echo "simctl create failed"; return 1; }
+  echo "$_u" >"$L/hs.udid"
+  build_env xcrun simctl boot "$_u" 2>&1 | head -2
+  BT=300 build_env xcrun simctl bootstatus "$_u" 2>&1 | tail -2
+  sleep 10
+  echo "booted udid=$_u"
+}
+plant_HS() { mkdir -p "$L/gt"; p HS do_HS; echo "PLANTED HS"; }
+midplant_HS() {
+  IC="$W/ipcc"; T0=$(cat "$EH/$M.t0"); _u=$(cat "$L/hs.udid" 2>/dev/null)
+  S_SD=-; S_ER=-
+  sleep 2
+  h_probe sim_booted apple "$T0" 9999999999; S_BOOT=$PRB_E; S_CRE=$PRB_T
+  echo "HSIM udid=$_u uid_procs=$(h_uidprocs | wc -l | tr -d ' ') state=$(h_asu xcrun simctl list devices 2>&1 | grep "$_u" | head -1 | tr -s ' ' | cut -c1-80)"
+  if [ "$HMODE" = S ]; then
+    _o=$(h_asu xcrun simctl shutdown "$_u" 2>&1); echo "HSIM shutdown rc=$? [$(printf %s "$_o" | head -c 120 | tr '\n' ' ')]"
+    sleep 3; h_probe sim_shutdown apple "$T0" 9999999999; S_SD=$PRB_E
+    _o=$(h_asu xcrun simctl erase "$_u" 2>&1); echo "HSIM erase rc=$? [$(printf %s "$_o" | head -c 120 | tr '\n' ' ')]"
+    sleep 3; h_probe sim_erase apple "$T0" 9999999999; S_ER=$PRB_E
+    echo "HSIM state after erase: $(h_asu xcrun simctl list devices 2>&1 | grep "$_u" | head -1 | tr -s ' ' | cut -c1-80)"
+  fi
+  h_clean_term
+  sleep 3
+  h_probe sim_clean apple "$T0" 9999999999; S_CL=$PRB_E; S_CRE=$PRB_T
+  hpy show "$EH/$M.sim_clean.ex" 40 | sed 's/^/HSIMLEFT /' | cut -c1-150
+  h_apple_cum
+  _l="HLEASE n=$HN arm=$HARM mode=$HMODE uid=$ID lease_created=$S_CRE sim_booted=$S_BOOT sim_shutdown=$S_SD sim_erase=$S_ER sim_clean=$S_CL apple_cum_created=$AC_T apple_cum_existing=$AC_E"
+  echo "$_l"; echo "$_l" >>"$EH/leases.txt"
+}
+probe_HS() { echo "PROBE HS none"; }
+
+h_final() {
+  sleep 3
+  kill "$(cat "$EH/p_dt")" 2>/dev/null; sleep 2
+  echo "HFINAL dtrace-lines=$(wc -l <"$EH/dt" | tr -d ' ') err=[$(head -c 200 "$EH/dt.err" | tr '\n' ' ')]"
+  hpy sum "$EH/leases.txt"
+  hpy stages "$EH/leases.txt"
+  : >"$EH/all.ex"
+  for _id in 61000 61001 61002; do
+    ID=$_id
+    hpy names "$EH/dt" "$_id" 0 9999999999 apple "$EH/final.$_id.nm"
+    "$W/ipcc" probefile "$EH/final.$_id.nm" "$EH/final.$_id.ex" | sed "s/^/HFINAL uid=$_id apple /"
+    hpy pat "$EH/final.$_id.ex" "uid$_id-existing"
+    hpy names "$EH/dt" "$_id" 0 9999999999 py "$EH/finalpy.$_id.nm"
+    "$W/ipcc" probefile "$EH/finalpy.$_id.nm" "$EH/finalpy.$_id.ex" | sed "s/^/HFINAL uid=$_id python-names-over-the-run /"
+    cat "$EH/final.$_id.ex" >>"$EH/all.ex"
+  done
+  "$W/ipcc" ownerfile "$EH/all.ex" | sed 's/^/HFINAL owners-of-surviving-apple-names /'
+}
+
+# ---- launchctl reboot userspace
+h_rb_names() {
+  IC="$W/ipcc"; : >"$EH/rb.gt"
+  asu "$IC" mk shm /e1h-rb-uidshm "$EH/rb.gt" >/dev/null 2>&1; asu "$IC" mk sem /e1h-rb-uidsem "$EH/rb.gt" >/dev/null 2>&1
+  "$IC" mk shm /e1h-rb-rootshm "$EH/rb.gt" >/dev/null 2>&1; "$IC" mk sem /e1h-rb-rootsem "$EH/rb.gt" >/dev/null 2>&1
+  asu defaults write kbf.e1h k v >/dev/null 2>&1
+  for _n in "apple.cfprefs.${ID}v1" com.apple.AppleDatabaseChanged; do printf 'shm %s\n' "$(printf %s "$_n" | xxd -p | tr -d '\n')" >>"$EH/rb.gt"; done
+  # a python lock leaked the way the control leaks: the interpreter and its resource tracker killed together
+  ( asu /usr/bin/env -i HOME="$H" PATH=/usr/bin:/bin "$PBS" -I -c 'import multiprocessing as m,time;l=m.get_context("spawn").Lock();print(l._semlock.name,flush=True);time.sleep(120)' >"$EH/rb.py.out" 2>&1 & )
+  sleep 10
+  _pn=$(head -1 "$EH/rb.py.out" | tr -d '\r\n')
+  for _p in $(h_uidprocs); do kill -KILL "$_p" 2>/dev/null; done
+  sleep 1
+  [ -n "$_pn" ] && printf 'sem %s\n' "$(printf %s "$_pn" | xxd -p | tr -d '\n')" >>"$EH/rb.gt"
+  echo "HRB names: python-lock=[$_pn] total-listed=$(wc -l <"$EH/rb.gt" | tr -d ' ')"
+}
+h_rb_probe() { # label
+  hpy show "$EH/rb.gt" 50 | while read -r _k _n; do
+    echo "HRB $1 $("$W/ipcc" probe "$_k" "$_n" | sed 's/ rc=.*//')"
+  done
+}
+h_rb_survey() {
+  echo "HRB survey boottime=$(sysctl -n kern.boottime | tr -d '\n') uptime=$(uptime | cut -c1-90)"
+  echo "HRB launchctl help mentions: $(launchctl help 2>&1 | grep -i reboot | head -3 | tr -s ' ' | tr '\n' '|')"
+  _p=$$
+  while [ -n "$_p" ] && [ "$_p" -gt 1 ]; do echo "HRB ancestor $(ps -o pid=,ppid=,user=,comm= -p "$_p" | tr -s ' ' | cut -c1-120)"; _p=$(ps -o ppid= -p "$_p" | tr -d ' '); done
+  echo "HRB runner procs: $(ps -axo pid=,ppid=,comm= | grep -E 'Runner\.|runsvc|provjobd' | grep -v grep | tr -s ' ' | tr '\n' '|' | cut -c1-300)"
+  echo "HRB launchctl print system runner jobs: $(launchctl print system 2>&1 | grep -i -E 'runner|actions' | head -5 | tr -s ' ' | tr '\n' '|' | cut -c1-300)"
+  echo "HRB launchctl list runner: $(launchctl list 2>&1 | grep -i -E 'runner|actions' | head -5 | tr -s ' ' | tr '\n' '|' | cut -c1-300)"
+  echo "HRB LaunchDaemons: $(ls /Library/LaunchDaemons 2>&1 | head -12 | tr '\n' ' ')"
+  echo "HRB LaunchAgents: $(ls /Library/LaunchAgents 2>&1 | head -12 | tr '\n' ' ')"
+}
+h_rb_go() {
+  cat >"$EH/post.sh" <<'EOS'
+#!/bin/bash
+# runs from a LaunchDaemon after the userspace reboot (RunAtLoad); writes what it sees to the file named by $1
+sleep 20
+{
+  echo "POST $(date '+%H:%M:%S') boottime=$(sysctl -n kern.boottime | tr -d '\n') uptime=$(uptime | cut -c1-80)"
+  echo "POST procs=$(ps -axo pid= | wc -l | tr -d ' ') runner=$(ps -axo pid=,comm= | grep -c -E 'Runner\.')"
+  /usr/bin/python3 -I "$3" show "$4" 50 | while read -r k n; do echo "POST $("$2" probe "$k" "$n" | sed 's/ rc=.*//')"; done
+} >"$1" 2>&1
+EOS
+  chmod 755 "$EH/post.sh"
+  cat >/Library/LaunchDaemons/kbf.e1h.post.plist <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>kbf.e1h.post</string><key>RunAtLoad</key><true/>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>$EH/post.sh</string><string>$EH/post.out</string><string>$W/ipcc</string><string>$W/e1h.py</string><string>$EH/rb.gt</string></array></dict></plist>
+PL
+  chown 0:0 /Library/LaunchDaemons/kbf.e1h.post.plist; chmod 644 /Library/LaunchDaemons/kbf.e1h.post.plist
+  echo "HRB about to run: launchctl reboot userspace at $(d_t)"
+  launchctl reboot userspace 2>&1 | head -5
+  echo "HRB command returned rc=${PIPESTATUS[0]} at $(d_t)"
+  for _i in $(seq 1 24); do
+    sleep 5
+    echo "HRB alive +$((_i*5))s boottime=$(sysctl -n kern.boottime | tr -d '\n') post.out=$([ -e "$EH/post.out" ] && echo yes || echo no)"
+  done
+  cat "$EH/post.out" 2>&1 | sed 's/^/HRB /'
+  rm -f /Library/LaunchDaemons/kbf.e1h.post.plist
+}

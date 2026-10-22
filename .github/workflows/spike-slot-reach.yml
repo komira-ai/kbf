@@ -1,8 +1,8 @@
-# Experiment round E1 of the Mac pool plan (branch spike/mac-pool-e1 only; this file is not for main).
-# One job per slice, so the slices run on separate hosted Macs. They print the harness's lines
-# (CELL / CLEAN / E1ROW / E1DOOR / E1BUILD / ...) and assert only that the harness ran and left no
-# user behind. By hand only (workflow_dispatch); dispatch once per push, because
-# `cancel-in-progress` ends a run when a second one starts on the branch.
+# Experiment round E1h of the Mac pool plan (branch spike/mac-pool-e1 only; this file is not for main).
+# POSIX IPC hermeticity follow-up: pinned CPython leases (e1h-py), simulator leases (e1h-sim) and
+# `launchctl reboot userspace` (e1h-reboot). One job per slice, so the slices run on separate hosted Macs.
+# By hand only (workflow_dispatch); dispatch once per push, because `cancel-in-progress` ends a run
+# when a second one starts on the branch.
 name: spike-slot-reach
 
 on:
@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  e1d-core:
+  e1h-py:
     runs-on: macos-latest
     timeout-minutes: 170
     permissions:
@@ -26,9 +26,9 @@ jobs:
           persist-credentials: false
       - run: sw_vers
       - run: rustup toolchain install
-      - name: E1d POSIX IPC with report (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1d_core
-  e1d-xcode:
+      - name: E1h pinned CPython leases (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1h_py
+  e1h-sim:
     runs-on: macos-latest
     timeout-minutes: 170
     permissions:
@@ -39,5 +39,18 @@ jobs:
           persist-credentials: false
       - run: sw_vers
       - run: rustup toolchain install
-      - name: E1d xcodebuild and simulator spawn (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1d_xcode
+      - name: E1h simulator leases (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1h_sim
+  e1h-reboot:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: rustup toolchain install
+      - name: E1h launchctl reboot userspace (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1h_reboot

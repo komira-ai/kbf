@@ -518,6 +518,8 @@ impl Cs {
             "DR2" => 3300,
             "DT" => 400,
             "DALL" | "DF" | "DF2" | "D5" | "DS" | "DS2" => 1500,
+            "HP" => 600,
+            "HS" => 1200,
             "X6" => 700,
             "X5a" | "X5b" | "X5c" | "X5d" => 240,
             "BR6" | "BR7" | "XCAN" => 300,
@@ -1219,3 +1221,4 @@ fn baseline_and_builds() {
 }
 
 mod e1;
+mod e1h;
