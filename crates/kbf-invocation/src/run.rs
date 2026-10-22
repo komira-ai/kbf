@@ -144,6 +144,55 @@ pub struct RunUsage {
     pub memory_peak_bytes: Option<u64>,
     /// Bytes per NUMA node, as the daemon reported them.
     pub numa: Vec<NumaBytes>,
+    /// Which instrument measured the run. With [`UsageBasis::MacFootprint`] the cgroup
+    /// fields above are all `None` and `footprint` holds the numbers; the two blocks
+    /// are never mixed.
+    pub basis: UsageBasis,
+    /// The macOS footprint block; `Some` only with the footprint basis.
+    pub footprint: Option<FootprintUsage>,
+    /// The node's CPU pressure when the run started (`some avg10`), in hundredths of a
+    /// percent; `None` when the daemon did not read it.
+    pub node_cpu_pressure_centi: Option<u32>,
+    /// The CPU booked for the lease, in thousandths of a CPU; `None` when not reported.
+    pub booked_millicpus: Option<u64>,
+    /// `memory.events` `max` and `oom_kill` counts of the lease's cgroup. A run with a
+    /// `max` count above zero was held at its limit: its peak is a floor, not the need.
+    pub memory_events_max: Option<u64>,
+    pub memory_events_oom_kill: Option<u64>,
+    /// `memory.swap.peak`; `None` on a kernel without it.
+    pub memory_swap_peak_bytes: Option<u64>,
+    /// The largest anon + swap any in-run sample saw.
+    pub memory_anon_swap_peak_bytes: Option<u64>,
+    /// The lease's own `cpu.pressure` and `memory.pressure` stall totals, microseconds.
+    pub cpu_pressure_some_micros: Option<u64>,
+    pub memory_pressure_some_micros: Option<u64>,
+    pub memory_pressure_full_micros: Option<u64>,
+    /// The CPUs the lease's cgroup could run on.
+    pub cpus_effective: Option<u32>,
+}
+
+/// Which instrument measured a run's usage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UsageBasis {
+    /// Not said: a daemon that predates the field.
+    #[default]
+    Unspecified,
+    /// The lease's cgroup v2 counters.
+    Cgroup,
+    /// macOS physical footprint and per-uid CPU time.
+    MacFootprint,
+}
+
+/// `kbf.worker.v1.FootprintUsage`: what the macOS native driver measured. A field that
+/// is `None` was not readable: absent is not zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct FootprintUsage {
+    /// The highest physical footprint of the run's process tree, in bytes.
+    pub peak_footprint_bytes: Option<u64>,
+    pub cpu_user_micros: Option<u64>,
+    pub cpu_system_micros: Option<u64>,
+    pub wall_micros: Option<u64>,
 }
 
 impl RunUsage {

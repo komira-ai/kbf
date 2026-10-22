@@ -29,6 +29,11 @@
 // - DaemonMessage.update_status, ServerMessage.update_offer and update_order: pull-based
 //   self-update (kbf.update.v1, docs/design/pull-updates.md). A server that predates
 //   them ignores update_status; a daemon that predates them ignores the others.
+// - ResourceUsage.footprint, .basis, .node_cpu_pressure_centi and .booked_millicpus: the
+//   macOS footprint block, which instrument measured, and the CPU evidence the size
+//   estimator reads. Each is absent from a peer that predates it, and absent means no
+//   report (a reader never reads absent as zero); a peer that predates them skips the
+//   unknown fields.
 // - ResultAck.reason: why a Result was or was not accepted. A daemon that predates it
 //   reads `accepted`; a server that predates it leaves the reason unspecified, which a
 //   daemon takes as "acknowledged: forget the Result".
@@ -528,6 +533,53 @@ message ResourceUsage {
   // one. Absent for a runtime that does not, so a reader that predates this field
   // sees the four above unchanged.
   CgroupUsage cgroup = 5;
+  // What the macOS native driver measured: a phys_footprint high-water mark and the
+  // CPU time of the lease's uid. Absent for a runtime that does not report it (every
+  // Linux runtime), so a reader that predates this field sees the fields above
+  // unchanged. Set together with `basis = USAGE_BASIS_MAC_FOOTPRINT`, never beside a
+  // `cgroup` block.
+  FootprintUsage footprint = 6;
+  // Which instrument produced the memory numbers above, so a footprint peak and a cgroup
+  // `memory.peak` are never pooled: they count different memory. A runtime that measures
+  // memory sets it; it is never inferred from which block is present. Unspecified from a
+  // runtime that predates the field, or one whose numbers are not a memory sample (the
+  // daemon's own `wait4` figures): a reader makes no memory sample of such a report.
+  UsageBasis basis = 7;
+  // The node's CPU pressure when the lease started: the `some avg10` of
+  // `/proc/pressure/cpu`, in hundredths of a percent (1234 is 12.34%). Absent when the
+  // runtime did not read it (no pressure stall information, or a runtime that does not
+  // try); absent is not zero. A sample of CPU use taken on a busy node understates what
+  // the action needs, and this says how busy it was.
+  optional uint32 node_cpu_pressure_centi = 8;
+  // The CPU the scheduler booked for the lease, in thousandths of a CPU (the Start's
+  // `millicpus`). Absent when the runtime did not report it.
+  optional uint64 booked_millicpus = 9;
+}
+
+// The instrument that produced a ResourceUsage. Closed: a new instrument is a new value,
+// and a reader that does not know it reads it as unspecified.
+enum UsageBasis {
+  // Not said: a runtime that predates the field, or one with no memory sample.
+  USAGE_BASIS_UNSPECIFIED = 0;
+  // The lease's cgroup v2 counters (`CgroupUsage`).
+  USAGE_BASIS_CGROUP = 1;
+  // macOS physical footprint and per-uid CPU time (`FootprintUsage`).
+  USAGE_BASIS_MAC_FOOTPRINT = 2;
+}
+
+// What the macOS native driver measured for a lease. A field that is absent was not
+// readable: absent is not zero. Measurement only: nothing in scheduling reads these.
+// The peak is `phys_footprint`, which counts compressed and dirty pages; it is not
+// comparable with a cgroup's `memory.peak` and must not be pooled with it.
+message FootprintUsage {
+  // The highest physical footprint the lease's process tree reached, in bytes.
+  optional uint64 peak_footprint_bytes = 1;
+  // CPU time in user mode of every process the lease's uid ran, in microseconds.
+  optional uint64 cpu_user_micros = 2;
+  // CPU time in system mode of every process the lease's uid ran, in microseconds.
+  optional uint64 cpu_system_micros = 3;
+  // Wall time from the action's start to its exit, in microseconds.
+  optional uint64 wall_micros = 4;
 }
 
 // The counters of a lease's cgroup v2, read when the action ended. A field that is
@@ -551,6 +603,30 @@ message CgroupUsage {
   // most memory (the action's end, or an earlier sample while it ran: anon memory is
   // gone once the processes have exited). Empty when not readable.
   repeated NumaNodeBytes numa = 8;
+  // `memory.events` `max`: how many times usage reached the lease's `memory.max`. Above
+  // zero, `memory_peak_bytes` is a floor on what the action needed, not the need (the
+  // lease was reclaimed or swapped at its limit): the sample is censored.
+  optional uint64 memory_events_max = 9;
+  // `memory.events` `oom_kill`: processes of the lease the kernel OOM killer killed.
+  optional uint64 memory_events_oom_kill = 10;
+  // `memory.swap.peak`, in bytes: the most swap the lease held at once. Absent on a
+  // kernel before 6.5, which has no such file.
+  optional uint64 memory_swap_peak_bytes = 11;
+  // The largest anon + swap (`memory.stat` anon plus `memory.swap.current`) of any sample
+  // taken while the action ran, in bytes: what the action touched without the page
+  // cache `memory_peak_bytes` counts. A sample every second, so a floor on the true peak.
+  // Absent when either file was unreadable at every sample.
+  optional uint64 memory_anon_swap_peak_bytes = 12;
+  // `cpu.pressure` `some` total, in microseconds: how long some task of the lease waited
+  // for a CPU while it ran. Absent without pressure stall information.
+  optional uint64 cpu_pressure_some_micros = 13;
+  // `memory.pressure` `some` and `full` totals, in microseconds: how long some task, and
+  // every task, of the lease stalled on memory.
+  optional uint64 memory_pressure_some_micros = 14;
+  optional uint64 memory_pressure_full_micros = 15;
+  // How many CPUs the lease's cgroup could run on (`cpuset.cpus.effective`): fewer than
+  // the node's for a lease placed on one NUMA node. Absent when not readable.
+  optional uint32 cpus_effective = 16;
 }
 
 // Bytes of one NUMA node.

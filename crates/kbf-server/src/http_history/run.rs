@@ -440,22 +440,25 @@ fn reapi_times(t: &Timestamps) -> Value {
 /// The cgroup block of a run, with the parallelism derived from it.
 fn usage(c: &kbf_history::records::Cgroup) -> Value {
     let mut keys = Map::new();
+    // The read API keeps writing a number for the two fields the record now holds as
+    // optional (a missing peak or wall reads 0 here, as before).
+    let (wall_us, memory_peak_bytes) = (c.wall_us.unwrap_or(0), c.memory_peak_bytes.unwrap_or(0));
     for (key, value) in [
-        ("wall_us", c.wall_us),
+        ("wall_us", wall_us),
         ("cpu_usage_us", c.cpu_usage_us),
         ("cpu_user_us", c.cpu_user_us),
         ("cpu_system_us", c.cpu_system_us),
         ("cpu_periods", c.periods),
         ("cpu_throttled", c.throttled_periods),
         ("throttled_us", c.throttled_us),
-        ("memory_peak_bytes", c.memory_peak_bytes),
+        ("memory_peak_bytes", memory_peak_bytes),
     ] {
         keys.insert(key.to_owned(), value.into());
     }
-    if c.wall_us > 0 {
+    if wall_us > 0 {
         keys.insert(
             "parallelism".to_owned(),
-            (c.cpu_usage_us as f64 / c.wall_us as f64).into(),
+            (c.cpu_usage_us as f64 / wall_us as f64).into(),
         );
     }
     let numa: Vec<Value> = c

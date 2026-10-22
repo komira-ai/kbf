@@ -83,6 +83,19 @@ pub enum MemoryKill {
     NodePressure = 2,
 }
 
+/// Which instrument measured a run's usage. A footprint peak and a cgroup peak count
+/// different memory, so a reader keys them apart and never pools them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum UsageBasis {
+    /// Not said: a record written before the field, or a run with no usage.
+    Unspecified = 0,
+    /// The lease's cgroup v2 counters (the `cgroup` block).
+    Cgroup = 1,
+    /// macOS physical footprint and per-uid CPU time (the `footprint` block).
+    MacFootprint = 2,
+}
+
 /// The nine REAPI timestamps of a run plus the farm's grant, in microseconds after the
 /// Unix epoch (0: not reported).
 #[derive(Clone, PartialEq, Eq, prost::Message)]
@@ -140,16 +153,61 @@ pub struct Cgroup {
     /// Time throttled, microseconds.
     #[prost(uint64, tag = "6")]
     pub throttled_us: u64,
-    /// Peak memory, bytes.
-    #[prost(uint64, tag = "7")]
-    pub memory_peak_bytes: u64,
+    /// Peak memory, bytes (`memory.peak`). `None` when the kernel has no such file:
+    /// absent is not zero, and a zero peak is not a memory sample. A record written
+    /// before this field was optional reads 0 as `None`.
+    #[prost(uint64, optional, tag = "7")]
+    pub memory_peak_bytes: Option<u64>,
     /// Memory per NUMA node, bytes, by node number.
     #[prost(uint64, repeated, tag = "8")]
     pub numa_bytes: Vec<u64>,
-    /// Wall time from the action's start to its exit, microseconds. Added after the
-    /// first chunks were written: a record without it reads 0.
-    #[prost(uint64, tag = "9")]
-    pub wall_us: u64,
+    /// Wall time from the action's start to its exit, microseconds. `None` when the
+    /// runtime reported none (and for the first chunks, written before it existed).
+    #[prost(uint64, optional, tag = "9")]
+    pub wall_us: Option<u64>,
+    /// `memory.events` `max` count: above zero, the peak is a floor, not the need.
+    #[prost(uint64, optional, tag = "10")]
+    pub memory_events_max: Option<u64>,
+    /// `memory.events` `oom_kill` count.
+    #[prost(uint64, optional, tag = "11")]
+    pub memory_events_oom_kill: Option<u64>,
+    /// `memory.swap.peak`, bytes; `None` on a kernel without it.
+    #[prost(uint64, optional, tag = "12")]
+    pub memory_swap_peak_bytes: Option<u64>,
+    /// The largest anon + swap of any in-run sample, bytes.
+    #[prost(uint64, optional, tag = "13")]
+    pub memory_anon_swap_peak_bytes: Option<u64>,
+    /// The lease's CPU stall total (`cpu.pressure` some), microseconds.
+    #[prost(uint64, optional, tag = "14")]
+    pub cpu_pressure_some_us: Option<u64>,
+    /// The lease's memory stall totals (`memory.pressure` some and full), microseconds.
+    #[prost(uint64, optional, tag = "15")]
+    pub memory_pressure_some_us: Option<u64>,
+    /// See [`Cgroup::memory_pressure_some_us`].
+    #[prost(uint64, optional, tag = "16")]
+    pub memory_pressure_full_us: Option<u64>,
+    /// The CPUs the lease's cgroup could run on.
+    #[prost(uint32, optional, tag = "17")]
+    pub cpus_effective: Option<u32>,
+}
+
+/// The footprint block the macOS native driver reports for a run. A field that is
+/// `None` was not readable: absent is not zero.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Footprint {
+    /// The highest physical footprint of the run's process tree, bytes. Not comparable
+    /// with [`Cgroup::memory_peak_bytes`].
+    #[prost(uint64, optional, tag = "1")]
+    pub peak_footprint_bytes: Option<u64>,
+    /// User CPU time of the lease's uid, microseconds.
+    #[prost(uint64, optional, tag = "2")]
+    pub cpu_user_us: Option<u64>,
+    /// System CPU time of the lease's uid, microseconds.
+    #[prost(uint64, optional, tag = "3")]
+    pub cpu_system_us: Option<u64>,
+    /// Wall time from the action's start to its exit, microseconds.
+    #[prost(uint64, optional, tag = "4")]
+    pub wall_us: Option<u64>,
 }
 
 /// One output of a run.
@@ -289,6 +347,24 @@ pub struct RunRecord {
     /// anonymous target, 3 a BXL function.
     #[prost(uint32, tag = "38")]
     pub target_kind: u32,
+    /// Which instrument measured the run: `cgroup` for the `cgroup` block, `footprint`
+    /// for the `footprint` block. Added after the first chunks were written: a record
+    /// without it reads unspecified, and a reader takes a `cgroup` block as cgroup.
+    #[prost(enumeration = "UsageBasis", tag = "39")]
+    pub basis: i32,
+    /// The footprint block, for a run measured on macOS. Present only with the
+    /// `footprint` basis; the `cgroup` block is then absent.
+    #[prost(message, optional, tag = "40")]
+    pub footprint: Option<Footprint>,
+    /// The node's CPU pressure when the run started (`some avg10` of
+    /// `/proc/pressure/cpu`), in hundredths of a percent; absent when the daemon did
+    /// not read it. Absent is not zero.
+    #[prost(uint32, optional, tag = "41")]
+    pub node_cpu_pressure_centi: Option<u32>,
+    /// The CPU booked for the lease, in thousandths of a CPU; absent when the daemon
+    /// did not report it.
+    #[prost(uint64, optional, tag = "42")]
+    pub booked_millicpus: Option<u64>,
 }
 
 impl RunRecord {
