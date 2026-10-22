@@ -93,6 +93,9 @@ pub const ORDERS: &str = "orders";
 /// The state file's name, and the copy of the last good one.
 pub const STATE_FILE: &str = "state.json";
 pub const STATE_BACKUP: &str = "state.json.bak";
+/// The frontend child's settings on an all-in-one host: a file beside `kbf.toml` in the
+/// configuration directory (there `kbf.toml` is the storage-and-daemon sibling's).
+pub const FRONTEND_CONFIG: &str = "frontend.toml";
 
 /// The names inside a release directory: its binaries, its systemd units and the
 /// manifest that lists them. Both platforms' releases hold `kbf`; it is the only binary
@@ -104,6 +107,10 @@ pub const RELEASE_UNITS: &str = "units";
 pub const RELEASE_MANIFEST: &str = "manifest.json";
 /// Every binary a release may hold, in the order they are copied and reported.
 pub const RELEASE_BINARIES: [&str; 2] = [RELEASE_BINARY, RELEASE_DAEMON];
+/// The marker written into a release directory once every check has passed. The verify
+/// pipeline writes it with the commit; the proxy's own copies write it with the sha256 of
+/// their binary (`proxy::releases`).
+pub const VERIFIED: &str = "VERIFIED";
 
 /// The operating system a host runs: what decides where its state and lock are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

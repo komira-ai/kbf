@@ -12,7 +12,7 @@ These properties change how kbf schedules an action today:
 | `kbf-lease` | `action`, `whole_machine` | `action` | The kind of lease the action runs under (see [`kbf-lease`](#kbf-lease)). |
 | `gpu` | a whole number | `0` | Whole GPUs the action needs. |
 | `kbf-book-cpus` | a whole number, at least 1, plain digits | `1` | Whole cores the lease books. |
-| `kbf-book-mem-gib` | a whole number, at least 1, plain digits | `1` | GiB of memory the lease books. |
+| `kbf-book-mem-gib` | a whole number, at least 1, plain digits | `4` | GiB of memory the lease books. |
 | `OSFamily` | `linux`; `darwin`, `macos`, `macosx`, `osx` (any case) | any | The operating system of the worker. |
 | `ISA`, `Arch` | `x86-64`, `x86_64`, `amd64`; `arm-a64`, `arm64`, `aarch64`; an ISA level such as `x86-64-v3` (any case) | any | The CPU architecture, and level, of the worker. |
 

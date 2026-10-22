@@ -12,10 +12,10 @@
 //! (`tests/slot_clean/single_pass.rs`: a home locked by its user, a file in the entry
 //! root, `/Library/Caches`, a crash report under another user's folder, a failed clean).
 //!
-//! The mutant tests (`tests/slot_clean/mutants.rs`) run the same scenario with one step
-//! of the clean skipped and the clean's own check blind, and see which rows turn red; the
-//! table is `tests/support/slot_rows.rs`, its model `tests/slot_mutants.rs` (every
-//! platform).
+//! The tests of necessity (`tests/slot_clean/steps_needed.rs`) run the same scenario with
+//! one step of the clean left out and the clean's own check blind, and see which rows
+//! lease B then finds; the table is `tests/support/slot_rows.rs`, its model
+//! `tests/slot_steps.rs` (every platform).
 //!
 //! Every test is `#[ignore]`: each needs root and real users. The macOS CI job runs them
 //! with `cargo xtask sudo-test -p kbf-driver-native --test slot_clean`, after
@@ -37,7 +37,7 @@ use kbf_daemon::Runtime as _;
 use kbf_daemon::uid;
 use kbf_driver_native::NativeRuntime;
 use kbf_driver_native::slots::SlotUser;
-use kbf_driver_native::slots::clean::Mutant;
+use kbf_driver_native::slots::clean::Skipped;
 use support::pool::{Scratch, Users, config, home_of, ids_of};
 use support::slot_rows::ROWS;
 use support::{MemoryCas, PROMPT, Spec, stdout};
@@ -293,22 +293,22 @@ impl Fresh {
 /// root reads the process table and `hdiutil info`. Background Task Management entries
 /// of the uid, if the agent made any, are among the findings too.
 ///
-/// `mutant` makes the clean of the slot wrong on purpose ([`Mutant`]); `None` is the
+/// `skipped` leaves one step out of the clean of the slot ([`Skipped`]); `None` is the
 /// clean as the daemon runs it. `name` names the scratch directory and the user.
-async fn freshness(name: &str, mutant: Option<Mutant>) -> Fresh {
+async fn freshness(name: &str, skipped: Option<Skipped>) -> Fresh {
     assert_root();
     let scratch = Scratch::new(name);
     let users = Users::new(name, 1);
     let user = users.0[0].clone();
     let cas = Arc::new(MemoryCas::default());
     let config = config(&scratch, users.pool());
-    let rt = match mutant {
+    let rt = match skipped {
         None => NativeRuntime::new(config, Arc::clone(&cas)),
-        Some(mutant) => NativeRuntime::with_clean_mutant(config, Arc::clone(&cas), mutant),
+        Some(skipped) => NativeRuntime::with_skipped_step(config, Arc::clone(&cas), skipped),
     };
     let rt = rt.expect("runtime");
     // The test's name is in the marker: every run in this process has the same pid, and
-    // what a mutant run leaves on the runner (an attached image, files in the shared
+    // what a run without a step leaves on the runner (an attached image, files in the shared
     // places) would be found by the runs after it if their markers were the same.
     let mark = format!("kbf-fresh-{name}-{}", std::process::id());
     // Declared after `users`, so it is dropped first: the user is still there to remove
@@ -432,9 +432,9 @@ async fn freshness(name: &str, mutant: Option<Mutant>) -> Fresh {
 /// The freshness test. Lease A leaves a marker in each place of [`ROWS`], and after the
 /// clean that follows it lease B, on the same user, finds none ([`freshness`]).
 ///
-/// The test of the clean as the daemon runs it; the mutant tests below run the same
-/// scenario with one step of the clean skipped and show which rows then turn red. This
-/// one fails if a row was not planted, so a row cannot pass by never having been left.
+/// The test of the clean as the daemon runs it; the tests of necessity run the same
+/// scenario with one step of the clean left out and show which rows lease B then finds.
+/// This one fails if a row was not planted, so a row cannot pass by never having been left.
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
 async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
@@ -449,10 +449,10 @@ async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
     );
 }
 
-#[path = "slot_clean/mutants.rs"]
-mod mutants;
 #[path = "slot_clean/single_pass.rs"]
 mod single_pass;
+#[path = "slot_clean/steps_needed.rs"]
+mod steps_needed;
 
 /// `go` in lease A's directory: it ends lease A's wait.
 fn scratch_go(a_root: &Path) -> PathBuf {
@@ -636,7 +636,7 @@ fn images(uid: u32, mark: &str) -> Vec<String> {
 }
 
 /// What a run of [`freshness`] can leave on the runner when a step of the clean is
-/// skipped, removed when it is dropped (so also when the test panics): the clean that
+/// left out, removed when it is dropped (so also when the test panics): the clean that
 /// should have removed it did not run, and the next test, or the next run on the same
 /// runner, must start clean. The user's own state (its home, preferences, keychain, and
 /// its processes and jobs) goes with the user ([`Users`]); what is here is what

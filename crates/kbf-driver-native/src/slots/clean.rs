@@ -154,48 +154,47 @@ pub trait Os {
     fn pause(&self);
 }
 
-/// How the check of a [`Mutant`] answers.
+/// How the check after a clean with a [`Skipped`] step answers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verify {
-    /// The inner [`Os::left`] answers: what the skipped step left is found, so the clean
+pub enum Check {
+    /// The inner [`Os::left`] answers: what the missing step left is found, so the clean
     /// fails and the slot ends dirty, never clean.
     Honest,
     /// [`Os::left`] answers nothing is left, whatever the inner one finds (all of it,
-    /// not only the skipped step's: a skipped step can leave work for another's look,
-    /// such as a job launchd starts again after the kill). What the skipped step should
-    /// have removed reaches the next lease: the residue rows of a freshness test turn
-    /// red.
+    /// not only the missing step's: a missing step can leave work for another's look,
+    /// such as a job launchd starts again after the kill). What the missing step should
+    /// have removed reaches the next lease: the residue rows of a freshness test stay.
     Blind,
 }
 
-/// A clean made wrong on purpose: one [`Step`] skipped, and the check honest or blind.
-/// For the mutant tests (`tests/slot_mutants.rs` on every platform, `tests/slot_clean.rs`
-/// on a Mac), which show that each step's residue is seen by the tests that claim to
-/// guard it. Nothing in the daemon builds one.
+/// A test-only option: one [`Step`] left out of the clean, and the check honest or blind.
+/// For the tests that show each step is needed (`tests/slot_steps.rs` on every platform,
+/// `tests/slot_clean.rs` on a Mac): with a step left out, the rows it removes stay.
+/// Nothing in the daemon builds one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Mutant {
+pub struct Skipped {
     pub skip: Step,
-    pub verify: Verify,
+    pub check: Check,
 }
 
-/// An [`Os`] that is `inner` except as its [`Mutant`] says: [`Os::run`] of the skipped
+/// An [`Os`] that is `inner` except as its [`Skipped`] option says: [`Os::run`] of the missing
 /// step does nothing and succeeds, [`Os::left`] is empty when the check is blind. The
 /// order and the pause are `inner`'s.
-pub struct Mutated<'a> {
+pub struct WithSkipped<'a> {
     inner: &'a dyn Os,
-    mutant: Mutant,
+    skipped: Skipped,
 }
 
-impl<'a> Mutated<'a> {
+impl<'a> WithSkipped<'a> {
     #[must_use]
-    pub fn new(inner: &'a dyn Os, mutant: Mutant) -> Self {
-        Self { inner, mutant }
+    pub fn new(inner: &'a dyn Os, skipped: Skipped) -> Self {
+        Self { inner, skipped }
     }
 }
 
-impl Os for Mutated<'_> {
+impl Os for WithSkipped<'_> {
     fn run(&self, step: Step) -> Result<(), String> {
-        if step == self.mutant.skip {
+        if step == self.skipped.skip {
             return Ok(());
         }
         self.inner.run(step)
@@ -203,9 +202,9 @@ impl Os for Mutated<'_> {
 
     fn left(&self) -> Vec<Left> {
         let left = self.inner.left();
-        match self.mutant.verify {
-            Verify::Honest => left,
-            Verify::Blind => Vec::new(),
+        match self.skipped.check {
+            Check::Honest => left,
+            Check::Blind => Vec::new(),
         }
     }
 
@@ -337,14 +336,13 @@ mod tests {
         }
     }
 
-    /// Catches a step skipped, added or run out of the design's order C1 to C11 (a
+    /// Catches a step missing, added or run out of the design's order C1 to C11 (a
     /// kill before the bootout lets launchd start the uid's agents again; a removal
     /// before the kill races the uid's processes; a removal before the root flags is
     /// the defect of a locked home), a check that looks only once (a job started again
     /// after the kill is missed), a retry or a second pass on the normal path, and step
     /// codes that are not the numbers the design gives: a clean slot runs each step
-    /// once in exactly this order, looks twice a pause apart, and is clean. The mutant
-    /// "sweep before root flags" (Contents ahead of Flags in [`STEPS`]) turns this red.
+    /// once in exactly this order, looks twice a pause apart, and is clean.
     #[test]
     fn a_clean_slot_runs_c1_to_c11_in_order_once_and_looks_twice() {
         assert_eq!(
@@ -404,8 +402,7 @@ mod tests {
     /// Catches the defect of the home root with `chflags uchg` set by its user: the
     /// removal that runs before the flags are cleared cannot empty a locked directory,
     /// so the clean fails on its single pass. With the root flags first, the one pass
-    /// is clean. The mutant "sweep before root flags" (Contents ahead of Flags in
-    /// [`STEPS`]) fails here with `contents: home: Operation not permitted`.
+    /// is clean.
     #[test]
     fn a_home_locked_by_its_user_is_cleaned_on_the_single_pass() {
         let os = Locked::default();
@@ -439,9 +436,7 @@ mod tests {
         assert_eq!(fake.calls(), whole_pass());
     }
 
-    /// Catches a failed step that does not fail the clean (the mutant "a failed step
-    /// does not leave the user dirty": `clean` returning `Clean` for a failure turns
-    /// this red), a step failure that stops the steps after it (one stuck image would
+    /// Catches a failed step that does not fail the clean, a step failure that stops the steps after it (one stuck image would
     /// leave the home unemptied), a retry of the pass, and a recreate of the user: a
     /// step that fails leaves the user dirty with its reason, after one pass with every
     /// step run, and the fake is never asked to try again.
@@ -479,22 +474,22 @@ mod tests {
         assert_eq!(fake.calls().len(), STEPS.len() + 1);
     }
 
-    /// Catches a mutant that skips more or less than the one step it names (the mutant
-    /// tests would then blame the wrong step), or that reorders, drops or doubles the
-    /// rest: for every step, the inner [`Os`] is asked the other ten in [`STEPS`]' order
-    /// and never the skipped one, and the clean is whole.
+    /// Catches a skipped-step option that skips more or less than the one step it names
+    /// (the necessity tests would then blame the wrong step), or that reorders, drops or
+    /// doubles the rest: for every step, the inner [`Os`] is asked the other ten in [`STEPS`]' order
+    /// and never the missing one, and the clean is whole.
     #[test]
-    fn a_mutant_skips_exactly_its_step_and_nothing_else() {
+    fn a_skipped_step_is_the_only_one_not_run() {
         for skip in STEPS {
             let fake = Fake::default();
-            let mutated = Mutated::new(
+            let with_skip = WithSkipped::new(
                 &fake,
-                Mutant {
+                Skipped {
                     skip,
-                    verify: Verify::Blind,
+                    check: Check::Blind,
                 },
             );
-            assert_eq!(clean(&mutated), Outcome::Clean, "skipping {skip}");
+            assert_eq!(clean(&with_skip), Outcome::Clean, "skipping {skip}");
             let mut want = whole_pass();
             want.retain(|c| *c != Call::Run(skip));
             assert_eq!(fake.calls(), want, "skipping {skip}");
@@ -503,28 +498,28 @@ mod tests {
 
     /// Catches a blind check that lets the inner look through, and an honest one that
     /// blinds: what the inner look finds is hidden from the clean when blind (clean
-    /// although something is left, the mutant's whole point) and seen when honest (the
-    /// slot is dirty).
+    /// although something is left, which is what lets a test see what a missing step
+    /// leaves) and seen when honest (the slot is dirty).
     #[test]
     fn a_blind_check_hides_what_the_inner_look_finds_and_an_honest_one_does_not() {
         let looks = || vec![vec![left(Step::Contents, "a file")]; 2];
         let blind = Fake::looking(looks());
-        let mutant = Mutant {
+        let skipped = Skipped {
             skip: Step::Contents,
-            verify: Verify::Blind,
+            check: Check::Blind,
         };
-        assert_eq!(clean(&Mutated::new(&blind, mutant)), Outcome::Clean);
+        assert_eq!(clean(&WithSkipped::new(&blind, skipped)), Outcome::Clean);
         let mut want = whole_pass();
         want.retain(|c| *c != Call::Run(Step::Contents));
         assert_eq!(blind.calls(), want);
 
         let honest = Fake::looking(looks());
-        let mutant = Mutant {
-            verify: Verify::Honest,
-            ..mutant
+        let skipped = Skipped {
+            check: Check::Honest,
+            ..skipped
         };
         assert_eq!(
-            clean(&Mutated::new(&honest, mutant)),
+            clean(&WithSkipped::new(&honest, skipped)),
             dirty("left (contents): a file")
         );
     }

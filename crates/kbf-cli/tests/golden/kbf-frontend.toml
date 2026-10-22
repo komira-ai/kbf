@@ -81,12 +81,12 @@ http2-keepalive-timeout-secs = 20
 listen = "127.0.0.1:8980"
 # The most HTTP/2 streams one connection to the REAPI listener may have open. buck2 keeps one Execute stream open per outstanding action, idle until the action finishes, so this bounds how large a backlog one buck2 invocation can show the farm. The connection's flow-control window is this many streams' windows; above about 2000 streams each stream's window is smaller than 1 MiB so that the product stays under HTTP/2's largest window. At least 1, at most 32767
 reapi-max-streams = 10000
-# How often, in seconds, the active frontend asks GitHub for new releases of `--release-poll-repo` and records the newest one the farm could run as a proposal (`proposals` of `GET /v1/update`). A proposal starts nothing: only an operator's `POST /v1/update/desired` does. The question is one conditional request with no credential, so an unchanged feed costs nothing. 0 turns the poller off. Only the newest 30 releases are read (no further pages), so a `v*` release buried under more than 30 newer releases of other tags is not seen. It needs `--state-store`, which holds the proposals
-release-poll-every-secs = 300
-# The refs a polled release may have been built from, as its notes say, separated by commas; a release built from another is ignored and counted
-release-poll-refs = ["main"]
-# The GitHub repository, `owner/name`, whose releases of `v*` tags are polled
-release-poll-repo = "komira-ai/kbf"
+# Retired: no longer read, the release poller was removed. Accepted and ignored for one release
+# release-poll-every-secs = "SECONDS"
+# Retired: no longer read, the release poller was removed. Accepted and ignored for one release
+# release-poll-refs = []
+# Retired: no longer read, the release poller was removed. Accepted and ignored for one release
+# release-poll-repo = "OWNER/NAME"
 # The release store (`docs/design/pull-updates.md`, section 6): a directory where the tarballs of a release and their build attestations are kept, uploaded with `PUT /v1/releases/{commit}/{platform}/{name}` on the operator API (which needs the token) and fetched by the nodes through `ReleaseService.Fetch` on the worker listener, behind its mutual TLS. Made if missing. Without it every update endpoint answers 503 saying so
 # releases-dir = "DIR"
 # How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done. Buck2 never recovers a stream that breaks mid-action, so the default, 0, is no deadline; set one at least as long as the longest action. When it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off)
@@ -107,6 +107,8 @@ log-files = 8
 log-max-bytes = 67108864
 
 [memory]
+# What the farm does with `kbf-estimator`, which predicts an action's memory from what its earlier runs used. `off` calls it never. `shadow` shows it every attempt that finishes and logs, for every new operation, a `size estimate:` line with what it would book, and counts how the attempts fall against its estimates (`kbf_estimator_shadow_total`); it books exactly what `off` books. The size summaries are kept in the state store; `off` neither reads nor deletes them
+learned-sizes = "off"
 # The memory rungs of an action, in GiB, ascending and each at least 1. The first is what an action that names no size (`kbf-book-mem-gib`) books. An action that passes its own memory limit runs again on the next rung above what it booked, and after the last on a whole host: the memory of the largest node that could run it, so that no other lease fits there. A rung not below that node's memory is skipped for the whole host. An action that does finish keeps its rung: later runs of it start there
 memory-ladder-gib = [4, 16, 32]
 

@@ -10,9 +10,10 @@
 //! hard link to a system file, say) is unlinked as it is and never changed. The walk
 //! stays on the filesystem of the directory it starts in. It does not descend into
 //! another owner's directories nested deeper than [`MAX_DEPTH`] (so no other user's
-//! deep tree can stop a deletion), and it refuses to remove a directory of the
-//! departing uid nested deeper than that (so the departing user's own deep tree fails
-//! its deletion closed).
+//! deep tree can stop a deletion). A tree of the departing uid of any depth is removed:
+//! below a fixed depth the walk moves the subtree up under the directory it is
+//! emptying (a rename on one filesystem, nothing followed) and removes it from there,
+//! so a lease that builds a deep tree cannot leave its slot dirty for good.
 //!
 //! Callers must have ended every process of the uid first (`user-delete` refuses
 //! otherwise; `kill-uid` sweeps the crontab and `at` jobs only after its kill), so
@@ -34,10 +35,9 @@ const DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
-/// How deeply nested a directory the walk enters. Below it, another owner's
-/// directories are not searched; a directory of the departing uid that reaches below
-/// it is an error: the lease user built it to make its own deletion fail, which fails
-/// closed (the user stays, the node is looked at), never open.
+/// How deeply nested a directory the walk searches for the uid's entries in another
+/// owner's directories (the flag clear looks to [`PARK_DEPTH`], fewer descriptors). A tree
+/// of the departing uid is removed whatever its depth.
 pub const MAX_DEPTH: usize = 256;
 
 /// Where the sweep looks.
@@ -146,6 +146,7 @@ fn empty_base(path: &Path, uid: u32, keep: &[&str], swept: &mut Swept) -> io::Re
         return Ok(());
     };
     let dev = rustix::fs::fstat(&dir)?.st_dev;
+    let park = Park::new(&dir);
     for name in listed(&dir)? {
         let here = path.join(&name);
         // An entry gone since the listing is neither removed nor an error.
@@ -153,19 +154,21 @@ fn empty_base(path: &Path, uid: u32, keep: &[&str], swept: &mut Swept) -> io::Re
             Some(stat) if is_kept(&name, keep, &stat, dev) => {
                 empty_kept(&dir, &name, &here, &stat, uid, dev, swept).map(|()| 0)
             }
-            Some(stat) => remove_entry(&dir, &name, &stat, uid, dev, 1).map(|()| 1),
+            Some(stat) => remove_entry(&dir, &name, &stat, (uid, dev, 1), &park).map(|()| 1),
             None => Ok(0),
         });
         swept.removed += *result.as_ref().unwrap_or(&0);
         note(swept, &here, result.map(drop));
     }
+    note(swept, path, park.drain(uid, dev));
     Ok(())
 }
 
 /// Whether `name`, examined as `stat` in a directory on `dev`, is a directory
 /// [`empty_keeping`] keeps.
 fn is_kept(name: &OsStr, keep: &[&str], stat: &Stat, dev: StDev) -> bool {
-    is_dir(stat) && stat.st_dev == dev && keep.iter().any(|k| OsStr::new(k) == name)
+    // Without short-circuits: all three are read.
+    is_dir(stat) & (stat.st_dev == dev) & keep.iter().any(|k| OsStr::new(k) == name)
 }
 
 /// Empties the kept directory `name` of `dir`, examined as `stat`: each entry removed,
@@ -185,14 +188,16 @@ fn empty_kept(
         Err(why) if why.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(why) => return Err(why),
     };
+    let park = Park::new(&child);
     for entry in listed(&child)? {
         let result = examine(&child, &entry).and_then(|inner| match inner {
-            Some(inner) => remove_entry(&child, &entry, &inner, uid, dev, 2).map(|()| 1),
+            Some(inner) => remove_entry(&child, &entry, &inner, (uid, dev, 2), &park).map(|()| 1),
             None => Ok(0),
         });
         swept.removed += *result.as_ref().unwrap_or(&0);
         note(swept, &here.join(&entry), result.map(drop));
     }
+    note(swept, here, park.drain(uid, dev));
     Ok(())
 }
 
@@ -248,7 +253,9 @@ fn remove_named(path: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
         return Ok(());
     };
     let dev = rustix::fs::fstat(&dir)?.st_dev;
-    remove_entry(&dir, name, &stat, uid, dev, 1)?;
+    let park = Park::new(&dir);
+    remove_entry(&dir, name, &stat, (uid, dev, 1), &park)?;
+    park.drain(uid, dev)?;
     swept.removed += 1;
     Ok(())
 }
@@ -259,7 +266,10 @@ fn sweep_base(base: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
         return Ok(());
     };
     let dev = rustix::fs::fstat(&dir)?.st_dev;
-    walk_owned(&dir, base, uid, dev, 0, swept)
+    let park = Park::new(&dir);
+    let walked = walk_owned(&dir, base, (uid, dev), (0, &park), swept);
+    note(swept, base, park.drain(uid, dev));
+    walked
 }
 
 /// Removes every entry of `dir` that `uid` owns, descending into directories it does
@@ -271,14 +281,13 @@ fn sweep_base(base: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
 fn walk_owned(
     dir: &OwnedFd,
     path: &Path,
-    uid: u32,
-    dev: StDev,
-    depth: usize,
+    (uid, dev): (u32, StDev),
+    (depth, park): (usize, &Park),
     swept: &mut Swept,
 ) -> io::Result<()> {
     for name in listed(dir)? {
         let here = path.join(&name);
-        let result = visit(dir, &name, &here, uid, dev, depth, swept);
+        let result = visit(dir, &name, &here, (uid, dev), (depth, park), swept);
         note(swept, &here, result);
     }
     Ok(())
@@ -289,9 +298,8 @@ fn visit(
     dir: &OwnedFd,
     name: &OsStr,
     here: &Path,
-    uid: u32,
-    dev: StDev,
-    depth: usize,
+    (uid, dev): (u32, StDev),
+    (depth, park): (usize, &Park),
     swept: &mut Swept,
 ) -> io::Result<()> {
     let Some(stat) = examine(dir, name)? else {
@@ -300,15 +308,23 @@ fn visit(
     // Another filesystem mounted here is never entered.
     match (stat.st_dev == dev, stat.st_uid == uid, is_dir(&stat)) {
         (true, true, _) => {
-            remove_entry(dir, name, &stat, uid, dev, depth + 1)?;
+            remove_entry(dir, name, &stat, (uid, dev, depth + 1), park)?;
             swept.removed += 1;
         }
         // Another owner's directory: searched for the uid's entries, down to the limit.
-        // One gone since it was examined holds nothing.
-        (true, false, true) if depth < MAX_DEPTH => vanished(
-            open_child(dir, name, &stat)
-                .and_then(|child| walk_owned(&child, here, uid, dev, depth + 1, swept)),
-        )?,
+        // It is another lease's or user's, which may change it under the walk (a link put
+        // where the directory was, a mode that keeps us out): what cannot be searched
+        // is logged and skipped, never a failure of this uid's sweep. One gone since it
+        // was examined holds nothing.
+        (true, false, true) if depth < MAX_DEPTH => {
+            let searched =
+                vanished(open_child(dir, name, &stat).and_then(|child| {
+                    walk_owned(&child, here, (uid, dev), (depth + 1, park), swept)
+                }));
+            if let Err(why) = searched {
+                tracing::debug!(folder = %here.display(), "not searched: {why}");
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -327,11 +343,10 @@ fn remove_entry(
     dir: &OwnedFd,
     name: &OsStr,
     stat: &Stat,
-    uid: u32,
-    dev: StDev,
-    depth: usize,
+    at: (u32, StDev, usize),
+    park: &Park,
 ) -> io::Result<()> {
-    vanished(remove_present(dir, name, stat, uid, dev, depth))
+    vanished(remove_present(dir, name, stat, at, park))
 }
 
 /// [`remove_entry`] with every step's error as it is, "no such file or directory"
@@ -340,9 +355,8 @@ fn remove_present(
     dir: &OwnedFd,
     name: &OsStr,
     stat: &Stat,
-    uid: u32,
-    dev: StDev,
-    depth: usize,
+    (uid, dev, depth): (u32, StDev, usize),
+    park: &Park,
 ) -> io::Result<()> {
     if stat.st_dev != dev {
         return Err(io::Error::other(
@@ -355,22 +369,127 @@ fn remove_present(
     if !is_dir(stat) {
         return Ok(rustix::fs::unlinkat(dir, name, AtFlags::empty())?);
     }
-    if depth > MAX_DEPTH {
-        return Err(too_deep());
+    if depth > PARK_DEPTH {
+        // Too deep to go on holding a descriptor per level: moved up under the directory
+        // being emptied, to be removed from there (see [`Park`]).
+        return park.take(dir, name, stat);
     }
     let child = open_child(dir, name, stat)?;
     for entry in listed(&child)? {
         let Some(inner) = examine(&child, &entry)? else {
             continue;
         };
-        remove_entry(&child, &entry, &inner, uid, dev, depth + 1)?;
+        remove_entry(&child, &entry, &inner, (uid, dev, depth + 1), park)?;
     }
     drop(child);
     Ok(rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR)?)
 }
 
-fn too_deep() -> io::Error {
-    io::Error::other(format!("nested deeper than {MAX_DEPTH} directories"))
+/// How deep the removal recurses before it moves what is below up to the top: it holds one
+/// descriptor per level (a Mac's default is 256 in all), so this stays well under that.
+const PARK_DEPTH: usize = 64;
+
+/// How many names [`Park::take`] tries before it gives up.
+const PARK_NAMES: usize = 4096;
+
+/// Where a removal puts a subtree that is deeper than [`PARK_DEPTH`]: `dir`, the directory
+/// being emptied (same filesystem, so a rename, and the subtree is only moved, never
+/// copied or followed). The moved subtree is removed from there by [`Park::drain`]; it is
+/// [`PARK_DEPTH`] levels shallower, so a tree of any depth is gone after as many passes
+/// as it has multiples of that. A lease that builds a deep tree cannot make its slot
+/// fail, and no depth of recursion is unbounded.
+struct Park<'a> {
+    dir: &'a OwnedFd,
+    names: std::cell::RefCell<Vec<OsString>>,
+    next: std::cell::Cell<u32>,
+}
+
+impl<'a> Park<'a> {
+    fn new(dir: &'a OwnedFd) -> Self {
+        Self {
+            dir,
+            names: std::cell::RefCell::default(),
+            next: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Moves `name` of `from`, judged as `judged`, up to a name of its own in the park.
+    /// It is looked at again first: an entry replaced since it was judged is not moved
+    /// (an error), one gone is removed already. The move is exclusive, so a name made
+    /// ahead in the tree being emptied is never replaced, only skipped.
+    fn take(&self, from: &OwnedFd, name: &OsStr, judged: &Stat) -> io::Result<()> {
+        let same = examine(from, name)?
+            .is_some_and(|now| (now.st_dev, now.st_ino) == (judged.st_dev, judged.st_ino));
+        if !same {
+            return Err(io::Error::other("replaced while being examined"));
+        }
+        for _ in 0..PARK_NAMES {
+            let n = self.next.get();
+            self.next.set(n + 1);
+            let to = OsString::from(format!(".kbf-deep-{}-{n}", std::process::id()));
+            match rename_excl(from, name, self.dir, to.as_os_str()) {
+                Ok(()) => {
+                    self.names.borrow_mut().push(to);
+                    return Ok(());
+                }
+                // Taken: the next name.
+                Err(Errno::EXIST) => {}
+                Err(why) => return Err(why.into()),
+            }
+        }
+        Err(io::Error::other(
+            "no free name to move a deep tree up under",
+        ))
+    }
+
+    /// Removes what was moved up, which may move more up, until nothing is left.
+    fn drain(&self, uid: u32, dev: StDev) -> io::Result<()> {
+        loop {
+            let Some(name) = self.names.borrow_mut().pop() else {
+                return Ok(());
+            };
+            examine(self.dir, &name)?.map_or(Ok(()), |stat| {
+                remove_entry(self.dir, &name, &stat, (uid, dev, 1), self)
+            })?;
+        }
+    }
+}
+
+/// `renameat` that does not replace what is at the new name (`EEXIST` instead).
+#[cfg(target_os = "linux")]
+fn rename_excl(from: &OwnedFd, old: &OsStr, to: &OwnedFd, new: &OsStr) -> Result<(), Errno> {
+    rustix::fs::renameat_with(from, old, to, new, rustix::fs::RenameFlags::NOREPLACE)
+}
+
+/// `renameatx_np` with `RENAME_EXCL`: does not replace what is at the new name.
+#[cfg(target_os = "macos")]
+fn rename_excl(from: &OwnedFd, old: &OsStr, to: &OwnedFd, new: &OsStr) -> Result<(), Errno> {
+    use std::os::fd::AsRawFd as _;
+    let (Ok(old), Ok(new)) = (
+        std::ffi::CString::new(old.as_bytes()),
+        std::ffi::CString::new(new.as_bytes()),
+    ) else {
+        return Err(Errno::INVAL);
+    };
+    // SAFETY: both names are NUL-terminated and outlive the call, both descriptors are
+    // open directories borrowed for it.
+    let renamed = unsafe {
+        libc::renameatx_np(
+            from.as_raw_fd(),
+            old.as_ptr(),
+            to.as_raw_fd(),
+            new.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if renamed == 0 {
+        return Ok(());
+    }
+    Err(Errno::from_raw_os_error(
+        io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO),
+    ))
 }
 
 #[allow(clippy::unnecessary_cast)] // `st_mode` is u32 on Linux, u16 on macOS
@@ -504,34 +623,42 @@ fn clear_entry(
     if stat.st_uid == uid {
         clear_marked(dir, name, &stat)?;
         swept.removed += 1;
-        if !is_link(&stat) {
-            rustix::fs::chmodat(dir, name, owner_rwx(&stat), AtFlags::empty())?;
-        }
+        make_owner_rwx(dir, name, &stat)?;
     }
     if !is_dir(&stat) {
         return Ok(());
     }
-    if depth >= MAX_DEPTH {
-        // The uid's own tree that deep fails closed; another owner's is not searched.
-        return if stat.st_uid == uid {
-            Err(too_deep())
-        } else {
-            Ok(())
-        };
+    if depth >= PARK_DEPTH {
+        // Not searched deeper, so that no more than [`PARK_DEPTH`] descriptors are open
+        // (a Mac's soft limit can be 256 in all): the removal that follows clears the
+        // locks of what the uid owns as it goes, and a root removal needs nothing else.
+        return Ok(());
     }
     let child = open_child(dir, name, &stat)?;
     clear_below(&child, here, uid, dev, depth + 1, swept)
+}
+
+/// Adds the owner's `rwx` to the entry `name` of `dir`, judged as `stat`, through a
+/// descriptor opened without following a link and checked to be the entry judged: a link
+/// swapped in since is never followed (`chmod` has no no-follow form on Linux), and one
+/// that cannot be opened (a link, a socket, a file root alone may read) is left as it is,
+/// which a removal by root does not need changed.
+fn make_owner_rwx(dir: &OwnedFd, name: &OsStr, stat: &Stat) -> io::Result<()> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let Ok(file) = rustix::fs::openat(dir, name, flags, Mode::empty()) else {
+        return Ok(());
+    };
+    let opened = rustix::fs::fstat(&file)?;
+    if (opened.st_dev, opened.st_ino) != (stat.st_dev, stat.st_ino) {
+        return Ok(());
+    }
+    Ok(rustix::fs::fchmod(&file, owner_rwx(stat))?)
 }
 
 /// The permission bits of `stat` with the owner's `rwx` added.
 #[allow(clippy::unnecessary_cast)] // `st_mode` is u32 on Linux, u16 on macOS
 fn owner_rwx(stat: &Stat) -> Mode {
     Mode::from_raw_mode(((stat.st_mode as u32 & 0o7777) | 0o700) as _)
-}
-
-#[allow(clippy::unnecessary_cast)] // `st_mode` is u32 on Linux, u16 on macOS
-fn is_link(stat: &Stat) -> bool {
-    FileType::from_raw_mode(stat.st_mode as _) == FileType::Symlink
 }
 
 /// Clears [`CLEARED_FLAGS`] of the directory `dir` itself.

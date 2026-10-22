@@ -206,8 +206,7 @@ fn the_metrics_refuse_unflushed_bytes_blocks_and_conflicts() {
 /// whether or not the server has a write tier; a held count of 0 does not refuse, and a
 /// server that does not print the family (one older than it) is not refused either (the
 /// `ZEROS` body of the other tests has none). A reading that is not a whole number or is
-/// given twice is a refusal too. Mutants: the check removed (the first row goes ahead); the
-/// check only beside a write tier (the second row goes ahead).
+/// given twice is a refusal too.
 #[test]
 fn bytes_held_in_ram_refuse_the_backup() {
     let n = node("ram_held");

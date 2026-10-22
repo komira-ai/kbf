@@ -540,7 +540,7 @@ fn deploy_reports_a_missing_bundle_program_or_output() {
 }
 
 /// Proves `check_args` takes what a workflow runs and names the flag it refuses; the
-/// workflow lint feeds it every `cargo xtask` line of `gamma.yml`.
+/// (retired) workflow lint fed it every `cargo xtask` line of the deleted `gamma.yml`.
 #[test]
 fn check_args_takes_a_command_line_and_names_the_flag_it_refuses() {
     let args = ["gamma", "sudoers-line", "--user", "kbf-deploy"];

@@ -671,6 +671,7 @@ fn shaped(n: usize) -> Event {
             }),
             test: false,
         })),
+        evidence: None,
     }
 }
 

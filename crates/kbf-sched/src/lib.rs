@@ -86,6 +86,7 @@
 mod cordon;
 mod devices;
 pub mod fence;
+pub mod harness;
 mod input;
 mod load;
 mod requeue;

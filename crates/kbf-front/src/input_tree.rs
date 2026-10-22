@@ -392,6 +392,12 @@ pub(crate) struct Walked {
     /// Whether the two times above were measured (a walk over a store).
     pub(crate) phased: bool,
     pub(crate) files_time: std::time::Duration,
+    /// The summed size, and the number, of the distinct files of the whole input tree.
+    /// `None`, not 0, when the walk did not total it: it skipped a subtree an earlier
+    /// walk verified (it never saw what was under it), it stopped at an absent
+    /// Directory, or it is a walk that totals nothing (the in-process cache's).
+    pub(crate) input_bytes: Option<u64>,
+    pub(crate) input_files: Option<u64>,
 }
 
 /// The check of `digest` for this request: the request's own earlier start of it, a

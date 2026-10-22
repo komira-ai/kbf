@@ -46,7 +46,7 @@ pub use rollout::{
 };
 pub use state::{Effect, StateMachine};
 pub use time::FarmTime;
-pub use version::{VERSION_CAP, Version, VersionFault};
+pub use version::{Supported, TooNew, VERSION_CAP, Version, VersionFault, understood};
 pub use work::{
     ActionKey, Answer, ControlRecord, Failure, FarmFault, FarmRun, FencePolicy, LeaseGrant,
     LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Refusal, RefusalRecord, Resources,

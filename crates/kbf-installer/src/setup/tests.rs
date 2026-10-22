@@ -10,7 +10,7 @@ use kbf_host::{Entry, Exec, HostPath, Owner, Perms, Step};
 use kbf_state::postgres::Unreached;
 use kbf_state::postgres::schema::Outcome;
 
-use super::backend::{Backend, Migrations, Releases, Schemas};
+use super::backend::{Backend, Releases, Schemas};
 use super::fake::{FakeOs, user};
 use super::validate::Raw;
 use super::{Options, SetupError, run};
@@ -21,7 +21,6 @@ use crate::exit::Exit;
 use crate::helper::fetcher::FetchError;
 use crate::installer_toml::Source;
 use crate::layout::{Layout, Platform};
-use crate::migrate::{MigrateError, Unit};
 
 const DATABASE: &str = "postgres:///kbf?host=/run/postgresql&user=kbf-server";
 
@@ -30,6 +29,8 @@ const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const SECRET: &str = "abababababababababababababababababababababababababababababababab";
 /// What Linux `setup` writes (the Mac's are in `a_mac_node_gets_its_fetch_account_and_launchd_jobs`).
 const KBF_TOML: &str = "/etc/kbf/kbf.toml";
+/// The frontend children's file on an all-in-one host, beside the sibling's `kbf.toml`.
+const AIO_FRONTEND_TOML: &str = "/etc/kbf/frontend.toml";
 const INSTALLER_TOML: &str = "/etc/kbf/installer.toml";
 const ENROLL_TOKEN: &str = "/etc/kbf/enroll.token";
 const API_TOKEN: &str = "/etc/kbf/api-token";
@@ -51,10 +52,21 @@ fn raw(mode: Mode) -> Raw {
         commit: None,
         database: mode.keeps_state_in_database().then(|| DATABASE.to_owned()),
         kbf: serving_flags(mode),
-        proxy: Default::default(),
+        proxy: proxy_flags(mode),
         create_local_database: false,
         deploy: Default::default(),
         installer_config: None,
+    }
+}
+
+/// `--proxy`, which an all-in-one host cannot be set up without and no other fixture takes.
+fn proxy_flags(mode: Mode) -> super::proxy::ProxyFlags {
+    match mode {
+        Mode::AllInOne => super::proxy::ProxyFlags {
+            proxy: true,
+            ..Default::default()
+        },
+        _ => Default::default(),
     }
 }
 
@@ -68,6 +80,9 @@ fn serving_flags(mode: Mode) -> super::kbf_settings::KbfFlags {
             ..Default::default()
         },
         Mode::AllInOne => super::kbf_settings::KbfFlags {
+            reapi_tls_cert: some("/etc/kbf/reapi.pem"),
+            reapi_tls_key: some("/etc/kbf/reapi.key"),
+            worker_client_ca: some("/etc/kbf/ca.pem"),
             cold_store: some("file:///var/lib/kbf/cold"),
             meta_dir: some("/var/lib/kbf-meta"),
             daemon_server: some("https://farm.example:8981"),
@@ -106,10 +121,13 @@ fn put(exec: &mut FakeExec, path: &str, perms: u32, owner: Owner, bytes: &str) {
 fn host() -> FakeExec {
     let mut exec = FakeExec::new(0);
     put(&mut exec, SRC, 0o600, RUNNER, "tok-abc123\n");
-    // The all-in-one daemon half's CA, certificate and key (`serving_flags`).
+    // The all-in-one daemon half's CA, certificate and key (`serving_flags`), the sibling's: its
+    // user is `kbf`. The proxy's certificate and key are the frontend user's (`kbf-server`).
     put(&mut exec, "/etc/kbf/ca.pem", 0o644, ROOT, "ca");
     put(&mut exec, "/etc/kbf/node.pem", 0o644, ROOT, "cert");
     put(&mut exec, "/etc/kbf/node.key", 0o600, KBF, "key");
+    put(&mut exec, "/etc/kbf/reapi.pem", 0o644, ROOT, "cert");
+    put(&mut exec, "/etc/kbf/reapi.key", 0o600, KBF_SERVER, "key");
     exec
 }
 
@@ -154,42 +172,6 @@ impl Releases for Unwired {
     /// The release that runs is taken to relay: these tests are about what `setup` writes.
     fn running_relays(&self) -> Result<bool, SetupError> {
         Ok(true)
-    }
-}
-
-/// What the migration journal says on the fake host.
-#[derive(Clone, Copy)]
-enum Standing {
-    /// No old layout: nothing to say.
-    Fresh,
-    /// The old layout's state is the host's and no migration finished.
-    Unmigrated,
-    /// A finished migration repointed these units.
-    Done(&'static [&'static str]),
-    /// A finished migration adopted a host the Mac kit installed.
-    DoneKit(&'static [&'static str]),
-    /// The journal cannot be read.
-    Damaged,
-}
-
-impl Migrations for Standing {
-    fn units(&self) -> Result<Vec<Unit>, MigrateError> {
-        match self {
-            Standing::Fresh => Ok(Vec::new()),
-            Standing::Unmigrated => Err(MigrateError::Unmigrated("/var/lib/kbf-deploy".into())),
-            Standing::Done(units) | Standing::DoneKit(units) => Ok(units
-                .iter()
-                .map(|u| Unit::new(u).expect("a unit"))
-                .collect()),
-            Standing::Damaged => Err(MigrateError::Corrupt {
-                file: "migration.json",
-                why: "planted".into(),
-            }),
-        }
-    }
-
-    fn kit_adopted(&self) -> Result<bool, MigrateError> {
-        Ok(matches!(self, Standing::DoneKit(_)))
     }
 }
 
@@ -289,24 +271,10 @@ fn go_on(
     raw: &Raw,
     options: Options,
 ) -> Result<String, SetupError> {
-    go_after(os, exec, releases, server, Standing::Fresh, raw, options)
-}
-
-/// [`go_on`] on a host whose migration journal says `standing`.
-fn go_after(
-    os: &FakeOs,
-    exec: &mut FakeExec,
-    releases: &dyn Releases,
-    server: &Server,
-    standing: Standing,
-    raw: &Raw,
-    options: Options,
-) -> Result<String, SetupError> {
     let mut out = Vec::new();
     let backend = Backend {
         releases,
         schemas: server,
-        migrations: &standing,
     };
     run(os, exec, &backend, raw, options, &mut out)?;
     Ok(String::from_utf8(out).expect("text"))
@@ -636,7 +604,7 @@ fn an_existing_operator_token_is_never_replaced() {
 
     let mut again = host();
     go_ok(&FakeOs::linux(), &mut again, &raw(Mode::AllInOne));
-    assert_eq!(file_meta(&again, API_TOKEN), (0o600, KBF));
+    assert_eq!(file_meta(&again, API_TOKEN), (0o600, KBF_SERVER));
     for mode in [Mode::Storage, Mode::Daemon, Mode::StorageAndDaemon] {
         let mut node = host();
         go_ok(&FakeOs::linux(), &mut node, &raw(mode));
@@ -742,7 +710,14 @@ fn each_mode_enables_its_own_units() {
         (Mode::Storage, &["kbf-storage.service"]),
         (Mode::Daemon, &["kbf-daemon.service"]),
         (Mode::StorageAndDaemon, &["kbf-storage-and-daemon.service"]),
-        (Mode::AllInOne, &["kbf-all-in-one.service"]),
+        (
+            Mode::AllInOne,
+            &[
+                "kbf-proxy.socket",
+                "kbf-proxy.service",
+                "kbf-storage-and-daemon.service",
+            ],
+        ),
     ];
     for (mode, units) in want {
         let mut exec = released(host(), Platform::Linux);
@@ -1374,27 +1349,6 @@ fn each_failure_has_its_exit_code_and_word() {
             "fetch",
         ),
         (
-            SetupError::Unmigrated {
-                path: "/x".into(),
-                fetch_user: "kbf-fetch",
-            },
-            Exit::NeedsOperator,
-            "unmigrated",
-        ),
-        (
-            SetupError::Migrate(MigrateError::NoJournal),
-            Exit::NeedsOperator,
-            "migrate",
-        ),
-        (
-            SetupError::Migrate(MigrateError::Io {
-                what: "x".into(),
-                source: std::io::Error::other("y"),
-            }),
-            Exit::Failed,
-            "migrate",
-        ),
-        (
             SetupError::ShadowUnit {
                 path: "/x".into(),
                 unit: "u",
@@ -1695,17 +1649,6 @@ fn every_failure_reads_as_a_sentence() {
             "no release fetcher",
         ),
         (
-            SetupError::Unmigrated {
-                path: "/usr/local/kbf".into(),
-                fetch_user: "kbf-fetch",
-            },
-            "/usr/local/kbf",
-        ),
-        (
-            SetupError::Migrate(MigrateError::NoJournal),
-            "no migration.json",
-        ),
-        (
             SetupError::ShadowUnit {
                 path: "/etc/systemd/system/a.service".into(),
                 unit: "a.service",
@@ -1775,49 +1718,6 @@ mod proxy_listen;
 #[path = "old_backup_tests.rs"]
 mod old_backup;
 
-/// Catches the journal's `kit` flag not reaching the `kbf.toml` decision: on the same Mac with
-/// the same kit file, a finished kit migration (`DoneKit`) lets setup add its keys and keep the
-/// kit's, and a finished migration of any other host (`Done`) refuses the file as before.
-///
-/// Mutant seen red: `ctx.kit_adopted` left false.
-#[test]
-fn the_journals_kit_flag_picks_the_kbf_toml_decision() {
-    const KIT: &str = "mode = \"daemon\"\n\n[identity]\nnode-id = \"mac-a\"\n\n[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n";
-    let mut os = FakeOs::mac();
-    os.users.push(user("_kbf-fetch", 303));
-    os.users.last_mut().expect("user").home = "/var/empty".to_owned();
-    let go_kit = |standing: Standing| {
-        let mut exec = released(host(), Platform::MacOs);
-        put(&mut exec, "/usr/local/etc/kbf/kbf.toml", 0o640, ROOT, KIT);
-        let r = go_after(
-            &os,
-            &mut exec,
-            &Unwired,
-            &Server::fresh(),
-            standing,
-            &raw(Mode::Daemon),
-            APPLY,
-        );
-        (r, exec)
-    };
-    let (ok, exec) = go_kit(Standing::DoneKit(&[]));
-    ok.expect("kit host");
-    let written = text(&exec, "/usr/local/etc/kbf/kbf.toml");
-    assert!(written.starts_with(KIT.trim_end()), "{written}");
-    assert!(written.contains("[frontend]"), "{written}");
-    assert!(
-        !written.contains("orders-dir"),
-        "a Mac's keys are not written: {written}"
-    );
-    let (refused, _) = go_kit(Standing::Done(&[]));
-    assert!(
-        refused
-            .expect_err("not a kit host")
-            .to_string()
-            .contains("holds other settings"),
-    );
-}
-
 #[path = "update_dirs_tests.rs"]
 mod update_dirs;
 
@@ -1826,3 +1726,6 @@ mod release_config;
 
 #[path = "seed_tests.rs"]
 mod seed;
+
+#[path = "aio_tests.rs"]
+mod aio;

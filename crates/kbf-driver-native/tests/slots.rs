@@ -368,6 +368,41 @@ echo "T=$(cat "${t}kbf-ci-same") H=$(cat "$h/kbf-ci-same") D=$(defaults read kbf
     }
 }
 
+/// The pool path's usage. Catches: a lease of a pool slot reporting no usage (the
+/// uid watch not feeding the meter), a peak taken from the daemon's own processes, CPU
+/// read from the wrong uid, and a footprint block beside a cgroup one. The action runs
+/// as the slot's user, holds 208 MiB and burns CPU for 1.5 s. Green on a macOS
+/// runner (peak 226 MB, user CPU 2.0 s); no mutant was run against it.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slots"]
+#[tokio::test]
+async fn a_pool_lease_reports_its_usage() {
+    assert_root();
+    let scratch = Scratch::new("usage");
+    let users = Users::new("usage", 1);
+    let cas = Arc::new(MemoryCas::default());
+    let mut config = config(&scratch, users.pool());
+    // The pool tests poll hourly; this one needs the polls the peak and CPU come from.
+    config.poll = Duration::from_millis(20);
+    let rt = NativeRuntime::new(config, Arc::clone(&cas)).expect("runtime");
+    let act = scratch.act();
+    let spec = Spec::argv(&[&act, "alloc", "208", ";", "burn", "1.5"]);
+    let result = lease(&rt, &cas, 1, &spec).await;
+    assert_eq!(result.exit_code, 0, "{}", support::stderr(&cas, &result));
+    let usage = kbf_proto::worker::ResourceUsage::in_result(&result).expect("a usage");
+    assert_eq!(usage.basis(), kbf_proto::worker::UsageBasis::MacFootprint);
+    assert_eq!(usage.cgroup, None);
+    let f = usage.footprint.expect("a footprint block");
+    let peak = f.peak_footprint_bytes.expect("a peak");
+    assert!(peak >= 200 << 20, "peak {peak}");
+    let user = f.cpu_user_micros.expect("user cpu");
+    assert!(user >= 500_000, "user cpu {user} us");
+    assert!(f.wall_micros.expect("wall") >= 1_400_000);
+    eprintln!(
+        "USAGE pool peak={peak} user_us={user} system_us={:?} wall_us={:?}",
+        f.cpu_system_micros, f.wall_micros
+    );
+}
+
 /// Never root. Catches a root daemon that starts without a pool: it would run every
 /// action as root.
 #[ignore = "needs root: cargo xtask sudo-test -p kbf-driver-native --test slots"]

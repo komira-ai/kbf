@@ -1,6 +1,7 @@
 //! The write tier over the Raft metadata log ([`kbf_server::write_tier::attach`], as the
-//! binary calls it): the Raft log raised to machine version 2 once, only when a tier is
-//! configured, and staged, sealed and flushed objects kept across a restart.
+//! binary calls it): the Raft log raised to machine version 5 once (never past its start
+//! ceiling), only when a tier is configured, and staged, sealed and flushed objects kept
+//! across a restart.
 //!
 //! Each test runs the server's start on real directories (the raft directory and the
 //! tier's) and a store that outlives the restarts and can be taken down, so a read
@@ -13,15 +14,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
-use kbf_front::{Cache, MetaLog, TierStartup, VerifiedBlob};
+use kbf_front::{Cache, MetaLog, MetaLogError, TierStartup, VerifiedBlob};
 use kbf_log::MachineVersion;
-use kbf_meta::{BlobAnswer, ObjectId, Retention, StagedState, TierId};
+use kbf_meta::{BlobAnswer, Command, Epoch, ObjectId, Retention, StagedPut, StagedState, TierId};
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
 use kbf_server::stores::{Hot, StoreFlags, StoreUri};
-use kbf_server::write_tier::attach;
+use kbf_server::write_tier::{WriteTierError, attach};
 use kbf_server::{RaftLogError, RaftMetaLog};
 use kbf_store::StdFs;
 use kbf_threads::disk::{FreeSpace, Space};
@@ -153,6 +154,41 @@ async fn start(dirs: &Dirs, store: &Store, tier: bool) -> (TierCache, Option<Tie
         .expect("attach")
 }
 
+/// [`start`] with a tier over a log whose start ceiling is `ceiling`, and the error of
+/// the attach when it is refused.
+async fn start_below(
+    dirs: &Dirs,
+    store: &Store,
+    ceiling: MachineVersion,
+) -> Result<(TierCache, Option<TierStartup>), WriteTierError> {
+    let log = RaftMetaLog::open_dir(&dirs.raft, Retention::default(), "kbf/")
+        .await
+        .expect("open the Raft log")
+        .with_start_ceiling(ceiling);
+    let prefix = log.store_prefix();
+    let cache = Cache::open(log, store.clone(), prefix)
+        .await
+        .expect("open the cache");
+    attach(cache, dirs.hot(true).as_ref()).await
+}
+
+/// A `ReseatStaged`, the one command of the tier that only version 5 takes. It names
+/// objects no log holds: a log that takes it answers it with a refusal of its own, not
+/// an error, so only a log below 5 fails the call.
+fn reseat() -> Command {
+    Command::ReseatStaged {
+        tier: TierId::new(1),
+        from: ObjectId::new(Epoch::new(1), 1),
+        to: StagedPut {
+            object: ObjectId::new(Epoch::new(1), 2),
+            end: 0,
+            seal: true,
+            blobs: Vec::new(),
+        },
+        stored: true,
+    }
+}
+
 fn blob(seed: u8) -> (VerifiedBlob, Bytes, Digest) {
     let bytes = Bytes::from(vec![seed; 4096]);
     let blob = VerifiedBlob::hashed(bytes.clone());
@@ -240,6 +276,61 @@ async fn a_raft_server_without_a_tier_leaves_its_log_at_version_1() {
             .machine_version(),
         MachineVersion::V1
     );
+}
+
+/// Catches: a start that raises the log past its start ceiling when it attaches a tier
+/// (mutant: the raise ignores the ceiling, so the log reaches version 5), a tier that
+/// needs the newest version to stage, seal and flush (mutant: the attach refused below
+/// 5), a ceiling that forces a lower version than the default start reaches (mutant: the
+/// last start below ends at 4), and a log below 5 that takes the move of a conflicting
+/// object (`ReseatStaged` is refused by it, so that object's flush fails and is retried
+/// after the wait until the log is raised). At ceilings 2 then 4, over the same
+/// directories: the log stays at the ceiling, a blob is staged and flushed, and the
+/// command is refused. A start at the default ceiling then raises the log to 5.
+#[tokio::test]
+async fn a_tier_under_a_lower_ceiling_works_and_the_log_stays_there() {
+    let dirs = Dirs::new("ceiling-below");
+    let store = Store::new();
+    for (ceiling, seed) in [(MachineVersion::V2, 1), (MachineVersion::V4, 2)] {
+        let (cache, startup) = start_below(&dirs, &store, ceiling).await.expect("attach");
+        assert!(startup.is_some());
+        assert_eq!(cache.meta().machine_version(), ceiling);
+        let (staged, _, digest) = blob(seed);
+        cache.store_blobs(vec![staged]).await.expect("stored");
+        let object = object_of(&cache, digest).await;
+        let round = cache.flush_tier(later()).await.expect("round");
+        assert_eq!(round.flushed, [object]);
+        assert_eq!(staged_on(&cache, digest).await, Some(None), "flushed");
+        let refused = cache.meta().commit(reseat()).await;
+        assert!(
+            matches!(refused, Err(MetaLogError::Unavailable(_))),
+            "at {ceiling:?}: {refused:?}"
+        );
+        drop(cache);
+    }
+    let (cache, _) = start(&dirs, &store, true).await;
+    assert_eq!(cache.meta().machine_version(), MachineVersion::V5);
+}
+
+/// Catches: a tier attached over a log the ceiling left below version 2, whose first
+/// commit (`AddTier`) the log refuses without naming a version (mutant: the version
+/// check after the raise dropped, so the refusal is the log's own, a `Start` error), and
+/// a refused start that raises or changes the log. The refusal names the log's version
+/// and the log stays at version 1, which a binary that runs only version 1 opens.
+#[tokio::test]
+async fn a_ceiling_below_version_2_refuses_the_tier_and_names_the_version() {
+    let dirs = Dirs::new("ceiling-v1");
+    let store = Store::new();
+    let refused = start_below(&dirs, &store, MachineVersion::V1).await.err();
+    assert!(
+        matches!(&refused, Some(WriteTierError::LogTooOld(v)) if *v == MachineVersion::V1),
+        "{refused:?}"
+    );
+    let text = refused.map(|e| e.to_string()).unwrap_or_default();
+    assert!(text.contains("machine version 1"), "{text}");
+    let older = dirs.open_running(MachineVersion::V1).await;
+    let older = older.expect("a version-1 binary opens it");
+    assert_eq!(older.machine_version(), MachineVersion::V1);
 }
 
 /// Catches: a raft server that clears the tier directory at a start, as the memory

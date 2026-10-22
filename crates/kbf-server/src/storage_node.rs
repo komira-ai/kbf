@@ -73,6 +73,7 @@ use crate::listen::Binder;
 use crate::members::LastBoot;
 use crate::metrics::bind_node_sockets;
 use crate::node_map::NodeMap;
+use crate::raft_log::RUNS;
 use crate::ram_drain::RamDrain;
 use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, Registered, bind_node};
@@ -470,10 +471,10 @@ pub(crate) fn holder_of<M: MetaLog + 'static, O: ObjectStore + 'static>(
 }
 
 impl StorageHandle {
-    /// Holds `blob` in this node's RAM as the acknowledgement point will (`Cache::hold`),
-    /// and says what became of it (`None`: the node's cache is gone). Nothing in a running
-    /// node calls it yet; the tests of the node's wiring do (`--ram-ack-bytes` reaches the
-    /// cache, and the stop drains what it holds).
+    /// Holds `blob` in this node's RAM without a write (`Cache::hold`), and says what
+    /// became of it (`None`: the node's cache is gone). For the tests of the node's wiring
+    /// (`--ram-ack-bytes` reaches the cache, and the stop drains what it holds); a write
+    /// reaches the set through `StreamedPut::commit` with `Held`.
     #[doc(hidden)]
     pub fn hold(&self, blob: &VerifiedBlob) -> Option<Hold> {
         (self.holder)(blob)
@@ -510,14 +511,18 @@ impl StorageHandle {
     }
 
     /// Serves until the shutdown future given to [`start_storage`] completes and the
-    /// calls in flight end. With a `file://` cold store it then waits for the store's
-    /// lock to be released, so a start over the same directories can follow at once: the
-    /// node's tasks are aborted and the cache they and the service held is closed, but
-    /// its own background tasks and writer threads end after it is dropped, not before.
-    /// The wait is bounded by [`COLD_RELEASE_DEADLINE`]; past it this logs one warning
-    /// (the store's directory and how many handles are alive) and returns, because the
-    /// process's exit releases the lock whatever still holds it, and the units run this
-    /// with `TimeoutStopSec=infinity`, where a wait with no end would be a stop with none.
+    /// calls in flight end; no new call is taken once it has completed. It then writes
+    /// the blobs held in RAM to the disk and flushes the blocks staged on the hot store to
+    /// the cold store, both within `--ram-drain-deadline` (`RamDrain::after`); what the
+    /// deadline leaves is logged, and is on the hot store's disk for the next start.
+    /// With a `file://` cold store it then waits for the store's lock to be released, so a
+    /// start over the same directories can follow at once: the node's tasks are aborted
+    /// and the cache they and the service held is closed, but its own background tasks and
+    /// writer threads end after it is dropped, not before. The wait is bounded by
+    /// [`COLD_RELEASE_DEADLINE`]; past it this logs one warning (the store's directory and
+    /// how many handles are alive) and returns, because the process's exit releases the
+    /// lock whatever still holds it, and the units run this with `TimeoutStopSec=infinity`,
+    /// where a wait with no end would be a stop with none.
     ///
     /// The other serve paths (`storage_half::serve`, `start::serve`) wait for nothing: the
     /// process exits when they return, and its exit frees the lock.
@@ -770,8 +775,9 @@ where
 ///
 /// The [`CatchUp`] in [`Registered`] says whether the node owes a rebuild of its index: a
 /// registered node whose log has not finished one does, and tells the frontend so in its
-/// registration, so the map ranks it last until it is done. A node without `--frontend`
-/// owes none: it keeps its objects under its log's own prefix, which no other log's loss
+/// registration, so the map ranks it last until it is done ([`catch_up_for`]: none, if the
+/// start ceiling holds the log below the version that takes a rebuild). A node without
+/// `--frontend` owes none: it keeps its objects under its log's own prefix, which no other log's loss
 /// can orphan.
 /// `kbf storage` and the storage half of `kbf storage-and-daemon` both open theirs here.
 ///
@@ -791,15 +797,17 @@ pub(crate) async fn open_cache<C: ColdPick>(
     Ok(match flags.joiner(socket.addr(), Arc::clone(&node))? {
         Some(joiner) => {
             let done = meta.query(|state| state.rebuild().is_done()).await?;
-            let catch_up = if done {
-                CatchUp::caught_up()
-            } else {
-                CatchUp::rebuilding()
-            };
+            let catch_up = catch_up_for(done, &meta);
             // The member and boot the log last wrote as: a store that counts from 1 gives
             // the node a boot above it, so the open below is not refused.
             let last = last_boot(&meta).await?;
-            let mut joiner = joiner.with_catch_up(catch_up.clone()).with_last_boot(last);
+            // What the node runs and what its log is at go to the frontend in the
+            // registration and every heartbeat; the handle follows the raise `open_registered`
+            // makes below.
+            let mut joiner = joiner
+                .with_catch_up(catch_up.clone())
+                .with_last_boot(last)
+                .with_log(RUNS.get(), meta.version_handle());
             let joined = joiner.join().await;
             // The store is chosen after the registration and before the cache opens: the
             // keys the frontend registered are probed first (`crate::cold_apply`), and the
@@ -828,6 +836,18 @@ pub(crate) async fn open_cache<C: ColdPick>(
             },
         ),
     })
+}
+
+/// Whether a registered node owes a rebuild of its index: its log has not finished one
+/// (`done`) and takes the rebuild's commands, which are machine version 4's. A log the
+/// start ceiling holds below 4 refuses them, so a rebuild would fail for good and keep
+/// the node catching up: it owes none, as a node that names its objects by an epoch.
+fn catch_up_for(done: bool, meta: &RaftMetaLog<StdFs>) -> CatchUp {
+    let reach = meta.machine_version().max(meta.start_ceiling());
+    match (done, reach >= MachineVersion::V4) {
+        (false, true) => CatchUp::rebuilding(),
+        _ => CatchUp::caught_up(),
+    }
 }
 
 /// The member and boot `meta` last wrote as (the node writer it set last), which the node
@@ -859,6 +879,8 @@ fn prefix_root(prefix: &KeyPrefix, log: FarmLogId) -> Result<KeyPrefix, Box<dyn 
 /// The cache of a node registered as `joined`: its log raised to machine version 4 (a
 /// storage node's log has one voter, so no other replica must run it first) and the
 /// node writer set, so every object it writes is named by `joined`'s member and boot.
+/// The raise stops at the log's start ceiling: a log left below 4 takes no node writer,
+/// so the node names its objects by an epoch of its log until the log is raised.
 ///
 /// # Errors
 /// The registration names a zero member or boot; the log has more than one voter, will
@@ -894,7 +916,13 @@ async fn open_among<O: ObjectStore>(
     voters: usize,
 ) -> Result<Cache<RaftMetaLog<StdFs>, O>, Box<dyn Error>> {
     one_voter(voters)?;
-    meta.raise_machine_version(MachineVersion::V4)?;
+    meta.raise_at_start(MachineVersion::V4)?;
+    if meta.machine_version() < MachineVersion::V4 {
+        // The start ceiling is below 4 and the log was not raised past it: the log takes no
+        // `SetWriter`, so the node names its objects by an epoch of its log, as one that
+        // never registered does.
+        return Ok(Cache::open_under(meta, store, keys).await?);
+    }
     Ok(Cache::open_node(meta, store, keys, NodeWriter::new(member, boot)).await?)
 }
 

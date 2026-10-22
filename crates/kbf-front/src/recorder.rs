@@ -445,6 +445,8 @@ pub struct ExecuteCall {
     command: Digest,
     /// The shape the dispatcher read from the Command, if it read one.
     shape: Option<Box<kbf_invocation::ActionShape>>,
+    /// What the front knew of the call at submit, if the dispatcher was told.
+    evidence: Option<kbf_invocation::Evidence>,
 }
 
 /// What an Execute call's `RequestMetadata` says the action is: its kind (`CppCompile`)
@@ -486,6 +488,7 @@ impl ExecuteCall {
             action,
             command,
             shape: None,
+            evidence: None,
         })
     }
 
@@ -495,6 +498,16 @@ impl ExecuteCall {
     pub fn with_shape(self, shape: kbf_invocation::ActionShape) -> Self {
         Self {
             shape: Some(Box::new(shape)),
+            ..self
+        }
+    }
+
+    /// The call, with the `evidence` the front gathered at submit, which its row takes
+    /// beside the Command digest.
+    #[must_use]
+    pub fn with_evidence(self, evidence: kbf_invocation::Evidence) -> Self {
+        Self {
+            evidence: Some(evidence),
             ..self
         }
     }
@@ -509,6 +522,7 @@ impl ExecuteCall {
             action,
             command,
             shape,
+            evidence,
         } = self;
         let answer = if joined {
             ExecuteAnswer::Joined { name, operation }
@@ -522,6 +536,7 @@ impl ExecuteCall {
             action,
             command,
             shape,
+            evidence,
         };
         [Event::Call(Box::new(call)), command]
     }

@@ -36,8 +36,7 @@
 //! ([`crate::procs`]); a pool there is refused.
 //!
 //! Not yet: the scheduler does not book slots (a lease past `N` waits here for a free
-//! one); and nothing drains and reboots a node with a dirty slot (section 1 of the
-//! design). A dirty slot lowers the runtime's `action_slots` entry at once, through its
+//! one); and nothing drains or reboots a node with a dirty slot. A dirty slot lowers the runtime's `action_slots` entry at once, through its
 //! own part of the driver watch ([`SOURCE`]), and a recovery thread cleans it again
 //! ([`book`]) with no Xcode survey and no lease needed.
 

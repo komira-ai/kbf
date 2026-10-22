@@ -1721,6 +1721,24 @@ name = "kbf-estimator"
 version = "0.1.0"
 
 [[package]]
+name = "kbf-estimator-replay"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-caps",
+ "kbf-estimator",
+ "kbf-invocation",
+ "kbf-sched",
+ "kbf-server",
+ "kbf-testkit",
+ "kbf-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "kbf-front"
 version = "0.1.0"
 dependencies = [
@@ -1741,12 +1759,14 @@ dependencies = [
  "kbf-segments",
  "kbf-storage",
  "kbf-store",
+ "kbf-testkit",
  "kbf-tier",
  "kbf-tls",
  "kbf-types",
  "prost",
  "prost-types",
  "protox",
+ "rcgen",
  "serde_json",
  "thiserror",
  "tokio",
@@ -1829,6 +1849,19 @@ dependencies = [
  "libc",
  "rustix",
  "thiserror",
+]
+
+[[package]]
+name = "kbf-host-install"
+version = "0.1.0"
+dependencies = [
+ "kbf-testkit",
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "toml",
 ]
 
 [[package]]
@@ -2309,13 +2342,13 @@ dependencies = [
  "hex",
  "http-body",
  "http-body-util",
- "hyper",
  "hyper-util",
  "kbf-auth",
  "kbf-ca",
  "kbf-caps",
  "kbf-enroll",
  "kbf-enroll-registry",
+ "kbf-estimator",
  "kbf-front",
  "kbf-history",
  "kbf-installer",
@@ -2351,8 +2384,6 @@ dependencies = [
  "prost-types",
  "rcgen",
  "rustix",
- "rustls",
- "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2360,7 +2391,6 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
- "tokio-rustls",
  "tonic",
  "tonic-prost",
  "tower-layer",
@@ -2572,6 +2602,17 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "kbf-updater"
+version = "0.1.0"
+dependencies = [
+ "httparse",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

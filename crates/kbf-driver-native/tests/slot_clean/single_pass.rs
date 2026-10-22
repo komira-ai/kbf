@@ -1,5 +1,5 @@
 //! The clean in one pass, for real, on a Mac as root: no retry, no recreate, no on-disk
-//! quarantine (`src/slots/clean.rs`). One test per defect the single pass must not have.
+//! quarantine (`src/slots/clean.rs`). One test per behaviour of the single pass.
 //!
 //! - the home root locked by its user (`chflags uchg`) is cleaned on the first pass;
 //! - a file in the `/var/folders` entry outside `0 C T X` is removed;
@@ -8,11 +8,11 @@
 //! - a crash report under another user's `DiagnosticReports` that names the uid is
 //!   removed, one that names another uid is not;
 //! - a clean that fails leaves the user dirty: not offered, the node reports one slot
-//!   fewer, and the slot is cleaned again, and offered, on the next offer.
+//!   fewer, and the slot is cleaned again, and offered, by the recovery thread, with no
+//!   lease waiting.
 //!
-//! Each of the first and fourth has a companion run with the step that fixes it skipped
-//! (the clean's mutant seam), which must go the other way: the defect is real, and the
-//! test sees it.
+//! The first and the fourth also have a test of necessity: with the step that does the
+//! work left out of the clean, the slot stays dirty or the report stays.
 
 use std::os::macos::fs::MetadataExt as _;
 use std::os::unix::fs::MetadataExt as _;
@@ -23,13 +23,13 @@ use std::time::Duration;
 
 use kbf_driver_native::NativeRuntime;
 use kbf_driver_native::slots::SlotUser;
-use kbf_driver_native::slots::clean::{Mutant, Step, Verify};
+use kbf_driver_native::slots::clean::{Check, Skipped, Step};
 
 use super::{as_user, assert_root, entries, slots_reported};
 use crate::support::pool::{Scratch, Users, config, home_of};
 use crate::support::{MemoryCas, PROMPT, Spec, stdout};
 
-/// A runtime over one pool user named after the test, optionally with a clean mutant.
+/// A runtime over one pool user named after the test, optionally with a step left out of its clean.
 struct Rig {
     // Declared first, so dropped first: the runtime stops before the user goes.
     rt: NativeRuntime<MemoryCas>,
@@ -40,16 +40,16 @@ struct Rig {
 }
 
 impl Rig {
-    fn new(name: &str, mutant: Option<Mutant>) -> Self {
+    fn new(name: &str, skipped: Option<Skipped>) -> Self {
         assert_root();
         let scratch = Scratch::new(name);
         let users = Users::new(name, 1);
         let user = users.0[0].clone();
         let cas = Arc::new(MemoryCas::default());
         let config = config(&scratch, users.pool());
-        let rt = match mutant {
+        let rt = match skipped {
             None => NativeRuntime::new(config, Arc::clone(&cas)),
-            Some(mutant) => NativeRuntime::with_clean_mutant(config, Arc::clone(&cas), mutant),
+            Some(skipped) => NativeRuntime::with_skipped_step(config, Arc::clone(&cas), skipped),
         };
         Self {
             rt: rt.expect("runtime"),
@@ -117,13 +117,13 @@ struct Locked {
 /// Plants a file and a folder in the user's home, and as the user locks the home root
 /// (`chflags uchg`: no entry of it can be added or removed), runs a lease and reads the
 /// home and the node's slot count after its clean. With `next`, a second lease follows.
-async fn locked_home(name: &str, mutant: Option<Mutant>, next: bool) -> Locked {
-    let rig = Rig::new(name, mutant);
+async fn locked_home(name: &str, skipped: Option<Skipped>, next: bool) -> Locked {
+    let rig = Rig::new(name, skipped);
     let home = home_of(&rig.user);
-    std::fs::write(home.join("kbf-w10"), b"x").expect("file");
-    std::fs::create_dir(home.join("kbf-w10-dir")).expect("dir");
-    std::fs::write(home.join("kbf-w10-dir/inner"), b"x").expect("inner");
-    for path in ["kbf-w10", "kbf-w10-dir", "kbf-w10-dir/inner"] {
+    std::fs::write(home.join("kbf-locked"), b"x").expect("file");
+    std::fs::create_dir(home.join("kbf-locked-dir")).expect("dir");
+    std::fs::write(home.join("kbf-locked-dir/inner"), b"x").expect("inner");
+    for path in ["kbf-locked", "kbf-locked-dir", "kbf-locked-dir/inner"] {
         rig.give(&home.join(path));
     }
     let locked = as_user(
@@ -146,7 +146,7 @@ async fn locked_home(name: &str, mutant: Option<Mutant>, next: bool) -> Locked {
     } else {
         None
     };
-    remove(&home.join("kbf-w10-dir"));
+    remove(&home.join("kbf-locked-dir"));
     Locked {
         reported,
         flags,
@@ -155,53 +155,50 @@ async fn locked_home(name: &str, mutant: Option<Mutant>, next: bool) -> Locked {
     }
 }
 
-/// W10: the home root locked by its user. Catches a clean that sweeps the home before it
-/// clears the flags on the home root (an `uchg` directory cannot lose an entry, so the
-/// sweep failed, the shipped retry cleared the flag and hid it): with the home locked
-/// and holding a file and a folder, the lease's clean succeeds on its single pass, the
-/// home is empty with no flags, and the next lease runs on the same slot.
+/// The home root locked by its user. Catches a clean that sweeps the home before it
+/// clears the flags on the home root (an `uchg` directory cannot lose an entry): with the
+/// home locked and holding a file and a folder, the lease's clean succeeds on its single
+/// pass, the home is empty with no flags, and the next lease runs on the same slot.
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
 async fn a_home_locked_by_its_user_is_cleaned_on_the_single_pass() {
-    let seen = locked_home("w10", None, true).await;
+    let seen = locked_home("locked-home", None, true).await;
     assert_eq!(seen.reported.as_deref(), Some("1"), "the slot is dirty");
     assert_eq!(seen.flags, 0, "the home root is still locked");
     assert_eq!(seen.left, Vec::<String>::new());
     assert!(seen.second.is_some_and(|out| !out.trim().is_empty()));
 }
 
-/// W10, the mutant: the same run with the flags step skipped must fail the other way.
-/// Catches a W10 test that cannot fail (it would pass whether or not the clean needs the
-/// root flags first): without C6 the sweep cannot empty the locked home, the one pass
-/// fails, and the slot is dirty (the node reports no slot).
+/// The flags step is needed for the locked home: without it the removal cannot empty the
+/// locked home, the one pass fails, and the slot is dirty (the node reports no slot).
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
 async fn without_the_flags_step_the_locked_home_leaves_the_slot_dirty() {
-    let mutant = Mutant {
+    let skipped = Skipped {
         skip: Step::Flags,
-        verify: Verify::Honest,
+        check: Check::Honest,
     };
-    let seen = locked_home("w10-mutant", Some(mutant), false).await;
+    let seen = locked_home("locked-home-without-flags", Some(skipped), false).await;
     assert_eq!(
         seen.reported.as_deref(),
         Some("0"),
-        "the slot was clean although the home root was locked and the flags step skipped \
+        "the slot was clean although the home root was locked and the flags step left out \
          (the home holds {:?})",
         seen.left
     );
 }
 
-/// CH03: a file and a folder in the `/var/folders` entry root, outside `0 C T X`. Catches
+/// A file and a folder in the `/var/folders` entry root, outside `0 C T X`. Catches
 /// a sweep of the entry that empties only the folders it knows (what the user left in
 /// the root survived every clean): both are gone after the lease, the `0` folder is still
 /// there, and the next lease can ask for its temporary folder.
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
 async fn a_file_in_the_entry_root_outside_its_folders_is_removed() {
-    let rig = Rig::new("ch03", None);
+    let rig = Rig::new("entry-root", None);
     let entry = rig.entry();
-    let file = entry.join("kbf-ch03");
-    let stray = entry.join("kbf-ch03-dir");
+    let file = entry.join("kbf-entry-stray");
+    let stray = entry.join("kbf-entry-stray-dir");
     std::fs::write(&file, b"x").expect("file");
     std::fs::create_dir(&stray).expect("dir");
     std::fs::write(stray.join("inner"), b"x").expect("inner");
@@ -223,7 +220,7 @@ async fn a_file_in_the_entry_root_outside_its_folders_is_removed() {
     .expect("the second lease ran");
     drop(planted);
     assert!(
-        !left.iter().any(|n| n.starts_with("kbf-ch03")),
+        !left.iter().any(|n| n.starts_with("kbf-entry-stray")),
         "the entry root still holds {left:?}"
     );
     assert!(
@@ -239,17 +236,17 @@ async fn a_file_in_the_entry_root_outside_its_folders_is_removed() {
     );
 }
 
-/// CH04: a file the uid owns in `/Library/Caches`, planted raw by root (the sandbox
+/// A file the uid owns in `/Library/Caches`, planted raw by root (the sandbox
 /// refuses a pool user the write). Catches a shared sweep without `/Library/Caches`: the
 /// uid's file is gone after the lease and a root-owned file beside it, the control, is
 /// not (a sweep that removes everything in the place would pass the first half alone).
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
 async fn a_file_the_uid_owns_in_library_caches_is_removed() {
-    let rig = Rig::new("ch04", None);
+    let rig = Rig::new("library-caches", None);
     let id = std::process::id();
-    let mine = PathBuf::from(format!("/Library/Caches/kbf-ch04-{id}"));
-    let control = PathBuf::from(format!("/Library/Caches/kbf-ch04-control-{id}"));
+    let mine = PathBuf::from(format!("/Library/Caches/kbf-caches-{id}"));
+    let control = PathBuf::from(format!("/Library/Caches/kbf-caches-control-{id}"));
     let _planted = Planted(vec![mine.clone(), control.clone()]);
     std::fs::write(&mine, b"x").expect("plant");
     rig.give(&mine);
@@ -279,7 +276,7 @@ struct Reports {
 
 impl Reports {
     fn plant(rig: &Rig, id: u32) -> (Self, Planted) {
-        let user_dir = Path::new("/Users").join(format!("kbf-ch33-{id}"));
+        let user_dir = Path::new("/Users").join(format!("kbf-crash-{id}"));
         let reports = user_dir.join("Library/Logs/DiagnosticReports");
         std::fs::create_dir_all(&reports).expect("reports");
         let report = |uid: u32| {
@@ -303,8 +300,8 @@ impl Reports {
 }
 
 /// One lease on a user with [`Reports`] planted: which of them are left after its clean.
-async fn crash_reports(name: &str, mutant: Option<Mutant>) -> (bool, bool, bool) {
-    let rig = Rig::new(name, mutant);
+async fn crash_reports(name: &str, skipped: Option<Skipped>) -> (bool, bool, bool) {
+    let rig = Rig::new(name, skipped);
     let (reports, _planted) = Reports::plant(&rig, std::process::id());
     let first = rig.lease(1).await;
     assert_eq!(first.exit_code, 0);
@@ -316,7 +313,7 @@ async fn crash_reports(name: &str, mutant: Option<Mutant>) -> (bool, bool, bool)
     )
 }
 
-/// CH33: crash reports under another user's `DiagnosticReports`. Catches a clean that
+/// Crash reports under another user's `DiagnosticReports`. Catches a clean that
 /// looks for reports only in the pool user's own home (the report lands under the console
 /// user's), one that removes by file name or removes everything, and one that ignores the
 /// owner: the report that names the uid and the one the uid owns are gone, the report that
@@ -324,25 +321,26 @@ async fn crash_reports(name: &str, mutant: Option<Mutant>) -> (bool, bool, bool)
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
 async fn a_crash_report_naming_the_uid_under_another_users_reports_is_removed() {
-    let (names_uid, names_other, owned) = crash_reports("ch33", None).await;
+    let (names_uid, names_other, owned) = crash_reports("crash-reports", None).await;
     assert!(!names_uid, "the report that names the uid is still there");
     assert!(!owned, "the report the uid owns is still there");
     assert!(names_other, "a report that names another uid was removed");
 }
 
-/// CH33, the mutant: the same run with the crash step skipped. Catches a CH33 test that
-/// cannot fail: with C9 skipped the report that names the uid is still there.
+/// The crash step is needed for those reports: without it the report that names the uid
+/// is still there after the clean.
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
 async fn without_the_crash_step_the_report_naming_the_uid_stays() {
-    let mutant = Mutant {
+    let skipped = Skipped {
         skip: Step::Crashes,
-        verify: Verify::Blind,
+        check: Check::Blind,
     };
-    let (names_uid, names_other, owned) = crash_reports("ch33-mutant", Some(mutant)).await;
+    let (names_uid, names_other, owned) =
+        crash_reports("crash-reports-without-step", Some(skipped)).await;
     assert!(
         names_uid,
-        "the report that names the uid went with C9 skipped"
+        "the report that names the uid went although the crash step was left out"
     );
     assert!(names_other && owned);
 }
@@ -356,7 +354,7 @@ async fn without_the_crash_step_the_report_naming_the_uid_stays() {
 /// and a lease runs on it as that uid. Nothing on disk records the dirty state.
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
-async fn a_failed_clean_leaves_the_user_dirty_and_the_next_offer_cleans_it_again() {
+async fn a_failed_clean_leaves_the_user_dirty_and_the_recovery_cleans_it_again() {
     let rig = Rig::new("dirty", None);
     let home = home_of(&rig.user);
     let stuck = home.join("kbf-ci-stuck");

@@ -1,7 +1,8 @@
 //! Peer confirmation (`docs/design/storage-ram-ack.md`): a node that acknowledged a blob
 //! from RAM asks the other owner, once its own write and the grace are over, whether the
-//! blob is on its disk, and journals a debt if it is not. Nothing puts a digest in the set
-//! in a running node yet; the tests register digests through `PeerConfirmer::track`, and
+//! blob is on its disk, and journals a debt if it is not. The tests register digests through
+//! `PeerConfirmer::track` (the service's write path does it for a blob it may hold; see
+//! `ram_ack.rs`), and
 //! take the instant to confirm at as an argument, so none waits for the grace.
 
 use std::sync::Arc;
@@ -91,11 +92,10 @@ fn asked(farm: &Farm) -> usize {
     farm.nodes[1].mem.durable_asked.load(Ordering::SeqCst)
 }
 
-/// Catches a confirmation that journals a debt on the normal path, or one that does not ask
-/// the durable question: the peer holds the blob on its disk, so the digest is forgotten
-/// with nothing in the journal; the peer was asked once, `find_durable`, and `find_missing`
-/// never. (The normal path does no IO.) Mutant: the debt journalled whatever the peer says;
-/// the peer asked the plain question (this peer would then pass a RAM copy too, below).
+/// Catches a confirmation that journals a debt on the normal path, or one that does not
+/// ask the durable question: the peer holds the blob on its disk, so the digest is
+/// forgotten with nothing in the journal; the peer was asked once, `find_durable`, and
+/// `find_missing` never. (The normal path does no IO.)
 #[tokio::test]
 async fn a_peer_that_holds_the_blob_on_its_disk_is_forgotten_and_nothing_is_written() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -124,8 +124,7 @@ async fn a_peer_that_holds_the_blob_on_its_disk_is_forgotten_and_nothing_is_writ
 /// case as the survivor sees it): the peer holds the blob only in RAM, or has lost it (a
 /// restarted peer), and after the grace the survivor journals exactly one debt naming the
 /// blob and the peer, forgets the digest, and a second confirmation adds nothing. The
-/// worker would then copy it. Mutants: the plain question asked (the RAM copy counts, no
-/// debt); the debt journalled twice; the digest kept after the debt.
+/// worker would then copy it.
 #[tokio::test]
 async fn a_peer_without_a_durable_copy_is_owed_once_after_the_grace() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -165,10 +164,9 @@ async fn a_peer_without_a_durable_copy_is_owed_once_after_the_grace() {
     assert_eq!(owed(&farm).len(), 2, "no second debt");
 }
 
-/// Catches a confirmation that asks before the node's own write (the digest is not drained)
-/// or before the grace is over: neither asks the peer or journals anything, the digest
-/// stays; at the instant the grace ends it is asked. Mutants: `due` ignored; the grace
-/// counted from the registration instead of the drain.
+/// Catches a confirmation that asks before the node's own write (the digest is not
+/// drained) or before the grace is over: neither asks the peer or journals anything, the
+/// digest stays; at the instant the grace ends it is asked.
 #[tokio::test]
 async fn the_peer_is_asked_only_after_the_drain_and_the_grace() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -203,8 +201,7 @@ async fn the_peer_is_asked_only_after_the_drain_and_the_grace() {
 
 /// Catches a peer that cannot be asked being taken for a durable one: the peer is cut off
 /// (a crashed owner the map has not noticed), or the map names it down: the blob is owed
-/// (nobody confirmed it), and the peer that the map names down is not called. Mutants: an
-/// error counted as durable; a down peer asked.
+/// (nobody confirmed it), and the peer that the map names down is not called.
 #[tokio::test]
 async fn a_peer_that_cannot_be_asked_is_owed() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -231,7 +228,7 @@ async fn a_peer_that_cannot_be_asked_is_owed() {
 
 /// Catches a digest this node no longer has to confirm, or never had a peer for, kept or
 /// journalled: with R = 1 there is no other owner, so it is dropped with nothing asked and
-/// nothing owed. Mutant: the digest owed to a peer that does not own it.
+/// nothing owed.
 #[tokio::test]
 async fn a_digest_with_no_other_owner_is_dropped() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -267,7 +264,7 @@ async fn a_digest_with_no_other_owner_is_dropped() {
 /// Catches a set that grows without bound, or loses what it is given when full (T: "the
 /// set is capped; overflow journals the debt at once"): with room for one digest, the
 /// second is owed at once, the first is still kept, and a digest kept twice stays one
-/// entry (the first's). Mutants: no cap; the cap dropping the digest without a debt.
+/// entry (the first's).
 #[tokio::test]
 async fn a_full_set_journals_the_debt_at_once() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -300,7 +297,6 @@ async fn a_full_set_journals_the_debt_at_once() {
 /// Catches a worker that never confirms: `run` confirms on its ticks, so a digest drained
 /// long ago whose peer lost it is owed without anyone calling `confirm`, and `run` stops
 /// when told. The wait is a yield loop over the debt that must appear, bounded as a hang.
-/// Mutant: `run` does not confirm.
 #[tokio::test]
 async fn the_worker_confirms_on_its_ticks() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -337,8 +333,7 @@ async fn the_worker_confirms_on_its_ticks() {
 
 /// Catches a node with no map taking itself to have confirmed, or asking nobody and
 /// forgetting: a node that holds no map cannot ask any peer, so what it acknowledged is
-/// owed (and the digest forgotten, the debt being the record). Mutant: the digest dropped
-/// without a debt.
+/// owed (and the digest forgotten, the debt being the record).
 #[tokio::test]
 async fn a_node_with_no_map_owes_what_it_cannot_confirm() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -367,9 +362,8 @@ async fn a_node_with_no_map_owes_what_it_cannot_confirm() {
 /// Catches a digest forgotten when its debt could not be journalled (the survivor would
 /// then hold the only copy and owe nothing): the journal's disk fails once, so the
 /// confirmation keeps the digest and owes nothing (the journal has stopped after its
-/// failure, so it is not forgotten with no debt). A full set whose journal fails reports it to the caller, which must not rely on a
-/// confirmation. Mutants: the digest removed whether or not the debt was written; the
-/// failure of a full set's journal swallowed.
+/// failure, so it is not forgotten with no debt). A full set whose journal fails reports
+/// it to the caller, which must not rely on a confirmation.
 #[tokio::test]
 async fn a_debt_that_cannot_be_journalled_keeps_the_digest_for_the_next_pass() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -401,7 +395,7 @@ async fn a_debt_that_cannot_be_journalled_keeps_the_digest_for_the_next_pass() {
 
 /// Catches a peer whose address cannot be dialled being taken for durable: the map names
 /// the peer with an address no channel can be made to, so nothing can be asked, and the
-/// blob is owed. Mutant: an address that cannot be dialled skips the debt.
+/// blob is owed.
 #[tokio::test]
 async fn a_peer_that_cannot_be_dialled_is_owed() {
     let farm = Farm::start(2, ChainConfig::default()).await;

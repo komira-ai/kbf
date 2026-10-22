@@ -64,6 +64,7 @@ fn listeners() -> Listeners {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
@@ -103,7 +104,6 @@ fn start() -> Server {
         token: Some(token()),
         local_cache: None,
         releases: None,
-        poll: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),

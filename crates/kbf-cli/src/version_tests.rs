@@ -1,8 +1,11 @@
-//! The `seq` of the build identity.
+//! The `seq` and the `commit_full` of the build identity.
 
 use std::process::Command;
 
 use super::*;
+
+/// A full commit as the build embeds it: 40 lowercase hex digits.
+const FULL: &str = "0123456789abcdef0123456789abcdef01234567";
 
 /// `git args` in the checkout the tests run in: its trimmed stdout, when it succeeded.
 fn git(args: &[&str]) -> Option<String> {
@@ -43,6 +46,50 @@ fn relay_is_the_level_this_build_declares() {
     };
     assert!(at("protocol") < at("relay"), "{line}");
     assert!(at("relay") < at("seq"), "{line}");
+}
+
+/// Catches the full commit left out of `kbf --version --json` when the build knows it, or
+/// printed as something other than what the build knows (shortened, quoted twice, another
+/// field's text). The line carries it in the sorted place between `commit` and `meta_log`.
+///
+/// Mutants to plant: the key never inserted; the key written as `BUILD_COMMIT` (12 digits).
+#[test]
+fn commit_full_is_printed_when_the_build_knows_it() {
+    let said = identity_for(FULL);
+    assert_eq!(said["commit_full"], FULL);
+    assert_eq!(said["commit_full"].as_str().map(str::len), Some(40));
+    let line = said.to_string();
+    let at = |key: &str| {
+        line.find(&format!("\"{key}\":"))
+            .unwrap_or_else(|| panic!("{key} is printed: {line}"))
+    };
+    assert!(at("commit") < at("commit_full"), "{line}");
+    assert!(at("commit_full") < at("meta_log"), "{line}");
+}
+
+/// Catches an unknown full commit printed as the empty text: a reader would take `""` for a
+/// commit, where an absent field says the build does not know it. Every other field is still
+/// printed.
+///
+/// Mutant to plant: the `is_empty` test dropped (the key is then printed as `""`).
+#[test]
+fn commit_full_is_absent_when_the_build_does_not_know_it() {
+    let said = identity_for("");
+    assert!(said.get("commit_full").is_none(), "{said}");
+    assert!(said.get("commit").is_some(), "{said}");
+    let count = |v: &Value| v.as_object().map_or(0, Map::len);
+    assert_eq!(count(&said) + 1, count(&identity_for(FULL)));
+}
+
+/// Catches `identity` handing `identity_for` a full commit of its own (a literal, or the empty
+/// text) instead of the one the server library embeds. A build that stamped its commit
+/// (`KBF_BUILD_COMMIT_OVERRIDE`) embeds none, so the empty text and the constant agree there
+/// and only a build from a checkout tells them apart.
+///
+/// Mutant to plant: `identity` calling `identity_for("")` (red in a build from a checkout).
+#[test]
+fn identity_prints_the_full_commit_the_server_embeds() {
+    assert_eq!(identity(), identity_for(kbf_server::BUILD_COMMIT_FULL));
 }
 
 /// Catches `seq` written as a literal: a literal equal to today's count passes the check above

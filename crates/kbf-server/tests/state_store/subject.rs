@@ -27,6 +27,7 @@ fn submit_described(farm: &TestFarm) {
         request: request(1),
         call: None,
         described: described(),
+        evidence: Default::default(),
     })
     .map(drop)
     .expect("submitted");

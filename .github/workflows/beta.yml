@@ -1,8 +1,9 @@
 # Everything the pull-request gate (ci.yml: lint, and test on the fast set) leaves out, run
 # on a push to main and never on a pull request: the whole nextest run
 # with its slow tests, the Arm run, the jobs that need a service or a root or a Mac
-# (Postgres, S3 stores, crun, the M1, M2 and cross-version cells, macOS), the Linux packages, and the beta
-# smoke below. The stage lint (crates/kbf-integration-test/tests/workflows/stages.rs) allows `push` only.
+# (Postgres, S3 stores, crun, the M1, M2, cross-version and mixed-version cells, macOS), the Linux
+# packages, and the beta smoke below. The stage lint
+# (crates/kbf-integration-test/tests/workflows/stages.rs) allows `push` only.
 #
 # The beta smoke is a whole farm of real kbf processes (a frontend, three storage nodes, two
 # daemons; Buck2 dials the frontend's REAPI port) under real Buck2 builds, for five minutes,
@@ -809,4 +810,77 @@ jobs:
             ~/.cargo/git
             target
             old/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # The mixed-version farm (crates/kbf-integration-test/tests/mixed_version.rs;
+  # docs/design/kbf-cicd.md, N/N-1 compatibility in CI): real kbf processes of the tip (N) and of
+  # the release before this commit (N-1) in one farm, a frontend of one version over the nodes and
+  # the daemon of the other both ways, two storage nodes of different versions replicating to each
+  # other, and a loaded node restarted under the other version. N-1 is not built here: `cargo xtask
+  # release fetch-previous` downloads the previous release's assets, verifies them as a deployment
+  # does (SHA256SUMS, one bundle per tarball, provenance and SBOM attestations, the bundles again
+  # offline against the Sigstore trusted root) and only then unpacks its `kbf` into
+  # target/tmp/n-1, where the test looks for it. This is a push job and not a pull-request job: it
+  # needs the token's attestations scope and GitHub's release API, a pull request from a fork has
+  # neither, and the farm takes minutes. A release is cut only from a commit whose beta run
+  # succeeded (release.yml, `gates`), so a break in N/N-1 stops the release it would ship in.
+  # While no release exists there is no N-1: `fetch-previous` says `previous-source=none`, each test
+  # says SKIPPED and the job passes (a step condition to skip the test by is one the workflow lint
+  # beta_succeeds refuses, and a job that is skipped counts as passed). Section 9 of the design
+  # asks for a red beta when N-1 is unavailable; a red job here would block the release that
+  # creates the first N-1. A release that exists but whose `kbf` is not where the test looks is
+  # red: the test reads the lines `fetch-previous` wrote to target/n-1.source and fails on
+  # `previous-source=release` with no file. Neither that file nor target/tmp/n-1 is cached: the
+  # verb refuses a file already in --out and appends to --output, and N-1 changes with each
+  # release. x86_64 only.
+  mixed-version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            !target/tmp/n-1
+            !target/n-1.source
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      # N: the tip's kbf and the stand-in crun the farm's container driver runs, and xtask. Built
+      # before any step holds a token, so no build script runs beside one; xtask on its own, as
+      # `cargo xtask` resolves it.
+      - name: Build xtask
+        run: cargo build -p xtask --locked
+      - name: Build the tip (N) and the stand-in crun
+        run: cargo build -p kbf-cli --bins --locked
+      - name: Fetch the Sigstore trusted root, for the offline check of the bundles
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh attestation trusted-root > "$RUNNER_TEMP/trusted_root.jsonl"
+      - name: Fetch and verify the release before this commit (N-1) and unpack its kbf
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo xtask release fetch-previous --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --platform linux-x86_64 --binary kbf --out target/tmp/n-1 --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --output target/n-1.source
+      # One test at a time: each starts a farm of its own, and the output says what each did (or
+      # that it was skipped).
+      - name: The farm of N and N-1
+        run: cargo test -p kbf-integration-test --test mixed_version --locked -- --test-threads=1 --nocapture
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            !target/tmp/n-1
+            !target/n-1.source
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}

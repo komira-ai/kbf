@@ -4,7 +4,7 @@ Status: design for review, unit U4b of `docs/design/frontend-proxy.md` (the desi
 
 ## 1. What U4b is
 
-`kbf-proxy` is a library; `kbf-installer proxy` (verb, U4b-3) is its only binary. It is the public port of a frontend host: one TLS terminator, per-stream routing to the active child frontend on loopback, identity headers, the hold gate, open-stream accounting, and a pluggable handler for `/v1/update/frontend*`. It supervises nothing (U7b), calls no child admin endpoint (U7a's supervisor does, through a trait that lives in `kbf-installer`), writes nothing under `current`, `slots/`, `status.json` or `update.json`, and has no control socket.
+`kbf-proxy` is a library; `kbf-installer proxy` (verb, U4b-3) is its only binary. It is the public port of a frontend host: one TLS terminator, per-stream routing to the active child frontend on loopback, identity headers, the hold gate, open-stream accounting, and a pluggable handler for `/v1/update/frontend*`. It supervises nothing (U7b), makes one read-only admin call to a child, `GET role`, to learn the child's term (`term`; every other admin call is U7a's supervisor's, through a trait that lives in `kbf-installer`), writes nothing under `current`, `slots/`, `status.json` or `update.json`, and has no control socket.
 
 Reusable from the repo: `kbf-front/src/proxy/bytestream.rs` (peek, keep the first frames, fail over only before the first byte) is the pattern for the replay buffer. Nothing else in `kbf-front/src/proxy` applies: that proxy is the frontend talking to storage nodes. `kbf-tls` is not reusable as is: `Incoming` is a tonic stream, and `config.rs` builds the client verifier with `.build()` only (certificate mandatory) and ALPN `h2` only. U4b-2 adds to `kbf-tls` a second constructor, `server_config_optional_client(...)` (optional client certificate, ALPN `h2`, `http/1.1`, same ring provider, early data off); the existing path is untouched.
 
@@ -28,6 +28,7 @@ Reusable from the repo: `kbf-front/src/proxy/bytestream.rs` (peek, keep the firs
 | `pool` | upstream h2c pool per (slot, generation, target), on h2's own client (section 18) | U4b-1 |
 | `reply`, `metrics`, `sync` | the proxy's own answers; counters; the loom shim | U4b-1 |
 | `probe` | `Readiness`, `poll`: the once-a-second `GET /readyz` of the active child's operator listener, the one writer of the proxy's `/readyz` (connect, I/O error, timeout and non-200 each fail the poll; the generation is read before the question) | U4b-3b |
+| `term` | `operation_term`, `probe` (the operation name in the first gRPC message of a `WaitExecution`, as plain values), `Terms` and its once-a-second poll of each open child's `GET /v1/admin/role` (`held_generation`, the term its operation names carry): the old child's term routes a `WaitExecution` for its operation to it while it lives (`ActiveSlot::bind_preferring`; `frontend-proxy.md` section 3, "Routing") | WaitExecution by term |
 | `limits`, `keepalive` | the h2 builders and flood limits; PING keepalive both ways | U4b-3a |
 | `h1` | HTTP/1.1 for update, probes and `/v1/*` only | U4b-2 |
 | `proxy` | `Proxy::bind`, `ProxyRunner`, `ProxyHandle` | U4b-1 |
@@ -60,6 +61,8 @@ impl ActiveSlot {
     pub fn subscribe(&self) -> watch::Receiver<u64>;  // the doorbell: the epoch, rung by `Inner::ring`
     pub fn abandoned_holds(&self) -> u64;    // holds ended by a guard's drop (kbf_proxy_hold_abandoned_total)
     pub fn bind(&self) -> Bind;   // Bound(Permit) | Held { epoch, hold_max } | NoActive
+    pub fn bind_preferring(&self, prefer: Option<Slot>) -> Bind;   // bind(), but to prefer if that slot is open and not active
+    pub fn is_open(&self, slot: Slot) -> bool;   // opened and not retired since
     pub fn begin_stream(&self) -> Pending;   // counted from accept; a retry begins one BEFORE dropping its old permit
     pub fn open_streams(&self) -> u64;       // pending first, then both slots' permits: a hint, never 0 while one lives
     pub fn open_permits(&self, slot: Slot) -> u64;  pub fn generation(&self, slot: Slot) -> u64;
@@ -89,6 +92,7 @@ pub fn route_of(path: &str) -> Route;        // Child(Target) | Update | Health 
 pub const fn auth_class(r: Route) -> Option<AuthClass>;
 pub const fn bypasses_hold(r: Route) -> bool; // true for everything that does not go to a backend
 pub fn idle_of(path: &str) -> Idle;          // Never for Execute and WaitExecution, else 7200 s
+pub fn is_wait_execution(path: &str) -> bool; // the one call whose request is read for a term
 pub fn decide(c: AuthClass, m: Buck2Auth, t: &Tokens, p: Presented<'_>) -> Result<(), Refusal>;
 
 // identity: what the child sees.
@@ -173,7 +177,7 @@ There is no `set_ready`: readiness has one writer, the proxy's own poll. There i
 
 ## 5. Per-stream binding and the permit
 
-**Rule.** A stream binds to the slot active when its headers arrived. The bind is one atomic step on the slot word, not a load followed by an increment, because that pair races a retire.
+**Rule.** A stream binds to the slot active when its headers arrived, except a `WaitExecution` naming the old child's term, which binds to the old child's slot while that child lives (`bind_preferring`). The bind is one atomic step on the slot word, not a load followed by an increment, because that pair races a retire.
 
 **Mechanism.** Each slot is one `AtomicU64`: bit 63 `CLOSED`, bit 62 `RETIRED` (closed by a retire, as opposed to never opened), the rest count permits. `bind` loads the gate (active slot and hold flag), then `fetch_update`s the slot word: increment unless `CLOSED`. A closed slot sends it back to reload the gate; an unchanged gate on a closed slot is `NoActive` (never a spin). `retire(slot)` refuses `Current`, otherwise `compare_exchange(0, CLOSED|RETIRED)`: a stream that incremented first makes it fail (`Busy(n)`), one that comes later sees `CLOSED`. `open` of a closed or retired slot starts a new **generation**; slots are reused (A, B, A), so `open` must work on a retired slot.
 
@@ -189,7 +193,7 @@ There is no `set_ready`: readiness has one writer, the proxy's own poll. There i
 
 ## 6. The hold gate
 
-Design section 5 step 6.1 and 5a. `hold(hold_max)` sets the hold flag, the bound and a sequence number in the same word as the active slot, in one compare-and-swap, so a stream either sees the hold with its bound (`Bind::Held`) or binds before it, and a rejected `hold` changes nothing. Only a stream going to a backend is held: `bypasses_hold` is true for every route that is not `Child(_)` (the update API, probes, metrics, and a path outside the table). A held stream is accepted, its headers are read (so the route is known and bypass works), nothing is opened upstream, and no credit is returned.
+Design section 5 step 6.1 and 5a. `hold(hold_max)` sets the hold flag, the bound and a sequence number in the same word as the active slot, in one compare-and-swap, so a stream either sees the hold with its bound (`Bind::Held`) or binds before it, and a rejected `hold` changes nothing. Only a stream going to a backend is held: `bypasses_hold` is true for every route that is not `Child(_)` (the update API, probes, metrics, and a path outside the table). A held stream is accepted, its headers are read (so the route is known and bypass works), nothing is opened upstream, and no credit is returned. The exception is a `WaitExecution`: its first message is read ahead (at most 8 frames), and credit is returned for those frames, before the hold.
 
 - **Wakeup (no lost release).** A stream calls `bind()`; on `Held { epoch, hold_max }` it admits a `Ticket` (`HoldQueue::admit(now, hold_max, since)`), then waits for "release epoch differs from `epoch` or the deadline". The epoch was sampled before the gate read; every end of a hold (`release_into`, the guard's drop, a panic's drop) goes through one function, `Inner::ring`, after the gate changed: it moves the atomic epoch, then writes the `watch<u64>` doorbell (`ActiveSlot::subscribe`) that lives inside `Inner`. The waiter parks on `wait_for(*e != sampled)`, which checks the current value first, and re-reads `epoch()` on every wake (the atomic is the truth, the channel only wakes the task). On wake the stream calls `bind()` again. Arrival order is **not** guaranteed: tasks wake in any order and a stream that arrives after the release can bind ahead of the queue.
 - **One winner.** The stream decides in its own task, once, with `Ticket::wake(now, released)`: a seen release binds even if the deadline has passed too; an expiry answers trailers-only `UNAVAILABLE` and the task ends, so it can never also bind.

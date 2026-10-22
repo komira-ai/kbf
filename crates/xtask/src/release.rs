@@ -93,11 +93,13 @@
 //!   --beta-run <id> --artifacts-run <id> --out <file> [...]` ([`verdict_write`]): the
 //!   Beta record the tag's message carries, which nothing gates on.
 
+pub mod attest_gh;
 pub mod bump;
 pub mod fetch_previous;
 pub mod gates;
 mod git;
 pub mod identity;
+mod identity_file;
 pub mod notes;
 pub mod offer;
 pub mod plan;

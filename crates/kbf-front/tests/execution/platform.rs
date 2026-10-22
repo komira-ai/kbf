@@ -480,6 +480,65 @@ async fn the_default_memory_is_the_one_the_service_is_given() {
     assert_eq!(submitted[2].request.resources.memory_bytes, 1 << 30);
 }
 
+/// Catches: a named size that equals the default read as the default (the estimator
+/// would then lower an explicit client ask: the source decided by comparing the
+/// booked value to the default), one axis's key marking the other's source, a source
+/// recorded for the wrong axis, and a `whole_machine` lease, which names nothing,
+/// reading as a hint.
+#[tokio::test]
+async fn the_booking_source_is_recorded_per_axis() {
+    use kbf_invocation::BookSource::{Default as Unnamed, Hint};
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let cases = [
+        ("neither", vec![], Unnamed, Unnamed),
+        (
+            "memory equal to the default",
+            vec![(BOOK_MEM_GIB_KEY, "4")],
+            Unnamed,
+            Hint,
+        ),
+        (
+            "cpus equal to the default",
+            vec![(BOOK_CPUS_KEY, "1")],
+            Hint,
+            Unnamed,
+        ),
+        ("cpus only", vec![(BOOK_CPUS_KEY, "4")], Hint, Unnamed),
+        (
+            "both",
+            vec![(BOOK_CPUS_KEY, "2"), (BOOK_MEM_GIB_KEY, "9")],
+            Hint,
+            Hint,
+        ),
+        (
+            "a whole machine",
+            vec![("kbf-lease", "whole_machine")],
+            Unnamed,
+            Unnamed,
+        ),
+    ];
+    for (argv, props, _, _) in &cases {
+        let job = job(argv, props, false);
+        farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+        start(&farm, &job.action).await.expect(argv);
+    }
+    let submitted = script.submitted();
+    assert_eq!(submitted.len(), cases.len());
+    for (submission, (argv, _, cpu, memory)) in submitted.iter().zip(&cases) {
+        assert_eq!(submission.evidence.cpu_source, *cpu, "{argv}: cpu");
+        assert_eq!(submission.evidence.memory_source, *memory, "{argv}: memory");
+        assert_eq!(
+            (
+                submission.evidence.input_bytes,
+                submission.evidence.input_files
+            ),
+            (None, None),
+            "{argv}: the in-process cache's walk totals nothing"
+        );
+    }
+}
+
 /// The `needs` each platform makes under `default`, with the action digest it keeps.
 async fn needs_under(
     default: kbf_front::DefaultPlatform,

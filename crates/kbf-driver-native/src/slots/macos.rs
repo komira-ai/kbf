@@ -20,7 +20,7 @@ use tokio::process::Child;
 use tokio::sync::OwnedSemaphorePermit;
 
 use super::book::{Backoff, Book, Cleaner, CountHook, Held, Slotted};
-use super::clean::{self, Mutant, Mutated};
+use super::clean::{self, Skipped, WithSkipped};
 use super::{AS_USER_ARG, Pool, SlotUser, probe};
 use crate::network::{Isolation, Network, ProfileMutant, slot_profile, slot_write_rules};
 use crate::procs;
@@ -51,7 +51,7 @@ pub struct Ready {
 
 /// The `/var/folders` entry of a slot as the system made it, found when the slot was
 /// resolved, before any lease: what the clean's last step gives its roots back. The
-/// install-time record the Mac pool plan has in mind replaces this later; until then a
+/// record made at install time should replace this; until then a
 /// daemon restarted after a lease tampered with the entry would record the tampering,
 /// minus a lock or `hidden`, which are never restored.
 #[derive(Clone, Debug, Default)]
@@ -98,20 +98,20 @@ impl Slots {
     /// # Errors
     /// A user cannot be resolved, or its home lies in a place the clean sweeps.
     pub fn start(pool: &Pool, within: Duration) -> io::Result<Self> {
-        Self::start_mutated(pool, within, None)
+        Self::start_skipping(pool, within, None)
     }
 
-    /// [`Slots::start`] with the clean made wrong on purpose when `mutant` is given
-    /// ([`clean::Mutant`]): for the mutant tests of `tests/slot_clean.rs` alone. `None`
-    /// is [`Slots::start`].
+    /// [`Slots::start`] with one step left out of the clean when `skipped` is given
+    /// ([`clean::Skipped`]): for the tests of `tests/slot_clean.rs` alone. `None` is
+    /// [`Slots::start`].
     ///
     /// # Errors
     /// As [`Slots::start`].
     #[doc(hidden)]
-    pub fn start_mutated(
+    pub fn start_skipping(
         pool: &Pool,
         within: Duration,
-        mutant: Option<Mutant>,
+        skipped: Option<Skipped>,
     ) -> io::Result<Self> {
         let program = kbf_daemon::keeper::program()?;
         let mut ready = Vec::new();
@@ -131,7 +131,9 @@ impl Slots {
             }
             warn_if_indexed(&slot.home);
         }
-        let cleaner = mac_cleaner(within, mutant);
+        let pool = pool.users().iter().map(|u| u.uid);
+        let pool = pool.clone().min().unwrap_or(0)..=pool.max().unwrap_or(0);
+        let cleaner = mac_cleaner(within, pool, skipped);
         Ok(Self::with(ready, cleaner, program))
     }
 
@@ -193,13 +195,21 @@ impl Slots {
 }
 
 /// The cleaner of a root daemon's slots: [`host::MacSlot`] through [`clean::clean`],
-/// wrapped in [`Mutated`] when `mutant` is given (only a test gives one).
-fn mac_cleaner(within: Duration, mutant: Option<Mutant>) -> Cleaner<Ready> {
+/// wrapped in [`WithSkipped`] when `skipped` is given (only a test gives one).
+fn mac_cleaner(
+    within: Duration,
+    pool: std::ops::RangeInclusive<u32>,
+    skipped: Option<Skipped>,
+) -> Cleaner<Ready> {
     Arc::new(move |ready: &Ready| {
-        let slot = host::MacSlot { ready, within };
-        match mutant {
+        let slot = host::MacSlot {
+            ready,
+            within,
+            pool: pool.clone(),
+        };
+        match skipped {
             None => clean::clean(&slot),
-            Some(mutant) => clean::clean(&Mutated::new(&slot, mutant)),
+            Some(skipped) => clean::clean(&WithSkipped::new(&slot, skipped)),
         }
     })
 }
@@ -326,6 +336,7 @@ impl Slot {
             uid: self.ready().user.uid,
             record,
             seen: Arc::default(),
+            meter: Arc::default(),
             armed: true,
         }
     }
@@ -374,10 +385,19 @@ pub struct UidWatch {
     record: PathBuf,
     /// Every pid of the uid any measurement saw: whose a sandbox denial is.
     seen: Arc<Mutex<BTreeSet<i32>>>,
+    /// What each measurement read of the uid's processes' lifetime counters
+    /// ([`crate::usage`]).
+    meter: Arc<Mutex<crate::usage::Meter>>,
     armed: bool,
 }
 
 impl UidWatch {
+    /// What the measurements so far read of the uid's processes, for the lease's usage.
+    #[must_use]
+    pub fn meter(&self) -> &Mutex<crate::usage::Meter> {
+        &self.meter
+    }
+
     /// Every pid of the uid seen so far.
     #[must_use]
     pub fn seen(&self) -> BTreeSet<i32> {
@@ -393,17 +413,14 @@ impl UidWatch {
     /// # Errors
     /// The process table could not be read.
     pub async fn measure(&self) -> Result<u64, RuntimeError> {
-        let (uid, seen) = (self.uid, Arc::clone(&self.seen));
+        let (uid, seen, meter) = (self.uid, Arc::clone(&self.seen), Arc::clone(&self.meter));
         let used = tokio::task::spawn_blocking(move || {
             let pids = uid::effective(uid)?;
             seen.lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .extend(pids.iter().copied());
-            Ok::<_, io::Error>(
-                pids.into_iter()
-                    .filter_map(procs::footprint)
-                    .fold(0_u64, u64::saturating_add),
-            )
+            let mut meter = meter.lock().unwrap_or_else(PoisonError::into_inner);
+            Ok::<_, io::Error>(meter.poll(pids, procs::rusage))
         })
         .await;
         used.map_err(io::Error::other)
@@ -639,7 +656,10 @@ mod tests {
         // second look at slot 0 dirty again.
         let (slots, calls) = bookkeeping(2, vec![dirty(), Outcome::Clean, Outcome::Clean, dirty()]);
         assert_eq!(slots.count(), 1);
-        let slot = slots.take().await.expect("the other slot");
+        let slot = tokio::time::timeout(Duration::from_secs(10), slots.take())
+            .await
+            .expect("a slot was offered in time")
+            .expect("the other slot");
         assert_eq!(slot.ready().user.uid, 701);
         assert!(format!("{slot:?}").contains("kbf-unit-slot-1"), "{slot:?}");
         assert!(format!("{slots:?}").contains("dirty: {0}"), "{slots:?}");
@@ -662,7 +682,12 @@ mod tests {
     #[tokio::test]
     async fn a_slot_lease_is_refused_a_simulator() {
         let (slots, _) = bookkeeping(1, Vec::new());
-        let runner = crate::slots::Runner::Slot(slots.take().await.expect("slot"));
+        let runner = crate::slots::Runner::Slot(
+            tokio::time::timeout(Duration::from_secs(10), slots.take())
+                .await
+                .expect("a slot was offered in time")
+                .expect("slot"),
+        );
         let refused = runner.allows_simulator(true).expect_err("a simulator");
         assert!(refused.to_string().contains("pool user"), "{refused}");
         assert!(runner.allows_simulator(false).is_ok());
@@ -675,6 +700,7 @@ mod tests {
     #[tokio::test]
     async fn the_watch_measures_the_uids_processes() {
         let watch = UidWatch {
+            meter: Arc::default(),
             uid: rustix::process::geteuid().as_raw(),
             record: PathBuf::from("/nonexistent"),
             seen: Arc::default(),

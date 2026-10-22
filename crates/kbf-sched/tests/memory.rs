@@ -6,13 +6,13 @@
 use kbf_caps::NodeCaps;
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{
-    DaemonInstance, Event, FARM_RERUNS, Floor, FloorChange, Input, MemoryLadder, OpState, Request,
+    DaemonInstance, Event, FARM_RERUNS, Floor, FloorChange, MemoryLadder, OpState, Request,
     Requeue, RequeueReason, Scheduler,
 };
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmFault, FarmRun,
     FarmTime, LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Qos, Resources,
-    ResultRecord, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
+    ResultRecord, StartLease, WaiterId, Waiting, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -89,21 +89,7 @@ impl Farm {
 
     /// Feeds `event`, then every commit it asks for, and returns the other effects.
     fn feed(&mut self, event: Event) -> Vec<Effect> {
-        let mut pending = self.s.apply(Input::new(self.now, event));
-        let mut out = Vec::new();
-        while !pending.is_empty() {
-            let mut more = Vec::new();
-            for effect in pending {
-                match effect {
-                    Effect::Commit(record) => {
-                        more.extend(self.s.apply(Input::new(self.now, Event::Committed(record))));
-                    }
-                    other => out.push(other),
-                }
-            }
-            pending = more;
-        }
-        out
+        kbf_sched::harness::feed(&mut self.s, self.now, event)
     }
 
     fn node(&mut self, name: &str, memory_gib: u64, caps: NodeCaps) {

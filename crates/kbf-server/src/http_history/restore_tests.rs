@@ -147,9 +147,10 @@ fn an_attempt_carries_what_the_record_keeps() {
         periods: 14,
         throttled_periods: 15,
         throttled_us: 16,
-        memory_peak_bytes: 17,
+        memory_peak_bytes: Some(17),
         numa_bytes: vec![5, 0, 7],
-        wall_us: 18,
+        wall_us: Some(18),
+        ..Cgroup::default()
     });
     let (rows, _) = to_rows(&[r.clone()], &[]);
     let a = &rows[0].attempts[0];
@@ -583,4 +584,198 @@ fn any_one_result_makes_a_listing_and_an_exit_code_is_the_runs() {
         RunOutcome::Ok,
     );
     assert!(broken.is_none());
+}
+
+/// A one-attempt row whose attempt measured `usage`.
+fn measured_row(usage: RunUsage) -> kbf_invocation::ActionRow {
+    use kbf_invocation::{ActionRow, Attempt, ReapiTimes, Run};
+    use kbf_types::{LeaseId, WorkerId};
+    let at = WallTime::from_unix_micros;
+    ActionRow {
+        action: digest(1),
+        instance: "main".to_owned(),
+        target: None,
+        mnemonic: None,
+        configuration: None,
+        action_id: None,
+        how: How::Ran,
+        operation: Some("operations/x".to_owned()),
+        attempts: vec![Attempt {
+            lease: LeaseId::new(3, 9),
+            worker: WorkerId::new("node-a"),
+            queued: at(10_000),
+            granted: at(20_000),
+            started: Some(at(30_000)),
+            ended: Some(at(40_000)),
+            end: Some(AttemptEnd::Accepted),
+            run: Some(Box::new(Run {
+                times: ReapiTimes::default(),
+                usage: Some(usage),
+                booked_memory_bytes: None,
+                cap_bytes: None,
+            })),
+            run_id: None,
+        }],
+        outcome: Some(Outcome::Ok { exit_code: 0 }),
+        listing: None,
+        outputs_truncated: false,
+        command: None,
+        shape: None,
+        evidence: None,
+        operation_id: None,
+    }
+}
+
+/// What a usage becomes when the tap writes the run record, the record is encoded and
+/// decoded as the history chunk would hold it, and the read side restores it.
+fn through_history(usage: RunUsage) -> RunUsage {
+    use prost::Message as _;
+    let row = measured_row(usage);
+    let record = crate::history::tap::run_record(&row, &row.attempts[0]);
+    let record = RunRecord::decode(record.encode_to_vec().as_slice()).expect("decodes");
+    let (rows, _) = to_rows(&[record], &[]);
+    let run = rows[0].attempts[0].run.as_deref().expect("a run");
+    run.usage.clone().expect("usage")
+}
+
+/// Catches: the basis dropped on the write or the read side (a Mac run restored as a
+/// Linux one, so its footprint is pooled with cgroup peaks), the footprint block lost,
+/// a cgroup block written beside a footprint one, a footprint field that was absent
+/// restored as 0, and the CPU pressure or the booking lost (or made 0 when unreported).
+#[test]
+fn the_basis_the_footprint_and_the_cpu_evidence_survive_the_history_round_trip() {
+    use kbf_invocation::{FootprintUsage, UsageBasis};
+    let mac = RunUsage {
+        wall_micros: 24,
+        basis: UsageBasis::MacFootprint,
+        footprint: Some(FootprintUsage {
+            peak_footprint_bytes: Some(21),
+            cpu_user_micros: Some(22),
+            cpu_system_micros: None,
+            wall_micros: Some(24),
+        }),
+        node_cpu_pressure_centi: Some(0),
+        booked_millicpus: Some(2000),
+        ..RunUsage::default()
+    };
+    assert_eq!(through_history(mac.clone()), mac);
+
+    let linux = RunUsage {
+        wall_micros: 18,
+        basis: UsageBasis::Cgroup,
+        cpu_usage_micros: Some(11),
+        cpu_user_micros: Some(12),
+        cpu_system_micros: Some(13),
+        cpu_periods: Some(0),
+        cpu_throttled_periods: Some(0),
+        cpu_throttled_micros: Some(0),
+        memory_peak_bytes: Some(17),
+        node_cpu_pressure_centi: Some(1234),
+        booked_millicpus: Some(1500),
+        memory_events_max: Some(2),
+        memory_events_oom_kill: Some(0),
+        memory_swap_peak_bytes: Some(3),
+        memory_anon_swap_peak_bytes: Some(4),
+        cpu_pressure_some_micros: Some(5),
+        memory_pressure_some_micros: Some(6),
+        memory_pressure_full_micros: Some(7),
+        cpus_effective: Some(16),
+        ..RunUsage::default()
+    };
+    assert_eq!(through_history(linux.clone()), linux);
+
+    // A kernel without `memory.peak`: no peak comes back, not a zero one.
+    let old = RunUsage {
+        basis: UsageBasis::Cgroup,
+        cpu_usage_micros: Some(1),
+        cpu_user_micros: Some(1),
+        cpu_system_micros: Some(0),
+        cpu_periods: Some(0),
+        cpu_throttled_periods: Some(0),
+        cpu_throttled_micros: Some(0),
+        ..RunUsage::default()
+    };
+    assert_eq!(through_history(old).memory_peak_bytes, None);
+
+    // A daemon that reports neither: they come back absent, not zero.
+    let bare = RunUsage {
+        basis: UsageBasis::Cgroup,
+        ..RunUsage::default()
+    };
+    let back = through_history(bare);
+    assert_eq!(
+        (back.node_cpu_pressure_centi, back.booked_millicpus),
+        (None, None)
+    );
+    assert_eq!(back.footprint, None);
+    assert_eq!(back.basis, UsageBasis::Cgroup);
+}
+
+/// Catches: a footprint basis record restored through its (absent) cgroup block as a
+/// block of zeros, and a record written before the basis existed losing its cgroup
+/// block.
+#[test]
+fn a_footprint_record_has_no_cgroup_fields_and_an_older_record_reads_its_cgroup_block() {
+    use kbf_history::records::{Footprint, UsageBasis};
+    let mut mac = run(1, 1_000, 0, RunOutcome::Ok);
+    mac.basis = UsageBasis::MacFootprint.into();
+    mac.footprint = Some(Footprint {
+        peak_footprint_bytes: Some(5),
+        ..Footprint::default()
+    });
+    let (rows, _) = to_rows(&[mac], &[]);
+    let u = rows[0].attempts[0]
+        .run
+        .as_deref()
+        .unwrap()
+        .usage
+        .clone()
+        .unwrap();
+    assert_eq!(u.memory_peak_bytes, None);
+    assert_eq!(u.cpu_usage_micros, None);
+    assert_eq!(u.footprint.unwrap().peak_footprint_bytes, Some(5));
+
+    // Written before the basis: a cgroup block and nothing else.
+    let mut older = run(2, 2_000, 0, RunOutcome::Ok);
+    older.cgroup = Some(Cgroup {
+        memory_peak_bytes: Some(7),
+        ..Cgroup::default()
+    });
+    let (rows, _) = to_rows(&[older], &[]);
+    let u = rows[0].attempts[0]
+        .run
+        .as_deref()
+        .unwrap()
+        .usage
+        .clone()
+        .unwrap();
+    assert_eq!(u.memory_peak_bytes, Some(7));
+    assert_eq!(u.basis, kbf_invocation::UsageBasis::Unspecified);
+    assert_eq!(u.footprint, None);
+}
+
+/// Catches: the operation id or the submit evidence dropped when a record becomes a row
+/// again (the history view would lose what the live view had), an absent walk total
+/// restored as 0, the two sources swapped, and a record written before the fields
+/// (nothing set) coming back with evidence claiming the client named nothing.
+#[test]
+fn the_operation_and_the_submit_evidence_come_back_and_old_records_have_none() {
+    use kbf_history::records::BookSource;
+    use kbf_types::OperationId;
+
+    let mut told = run(1, 1_000, 0, RunOutcome::Ok);
+    told.operation_id = Some(77);
+    told.cpu_source = BookSource::Hint.into();
+    told.memory_source = BookSource::Default.into();
+    told.input_bytes = Some(5_000);
+    let (rows, _) = to_rows(&[told], &[]);
+    assert_eq!(rows[0].operation_id, Some(OperationId(77)));
+    let e = rows[0].evidence.expect("evidence");
+    assert_eq!(e.cpu_source, kbf_invocation::BookSource::Hint);
+    assert_eq!(e.memory_source, kbf_invocation::BookSource::Default);
+    assert_eq!((e.input_bytes, e.input_files), (Some(5_000), None));
+
+    let (rows, _) = to_rows(&[run(2, 1_000, 0, RunOutcome::Ok)], &[]);
+    assert_eq!(rows[0].operation_id, None);
+    assert_eq!(rows[0].evidence, None);
 }

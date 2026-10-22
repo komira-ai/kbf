@@ -9,12 +9,15 @@
 //! A dirty slot is cleaned again, and offered when that clean passes, by the **recovery
 //! thread** ([`Book::start`]): one thread of its own, with no runtime and no lease
 //! needed, so a node whose every slot is dirty (it takes no lease, and its report does
-//! not change, so nothing else would clean them) comes back by itself. While any slot is
-//! dirty it cleans the dirty ones, one at a time, after a wait that starts at
-//! [`Backoff::first`], doubles after a pass that frees nothing up to [`Backoff::max`], and
-//! starts again after a pass that frees a slot. Whenever the number of free slots changes
-//! the book calls the hook ([`Book::on_count`]), which is how the node's report reaches
-//! the daemon without waiting for anything else to change.
+//! not change, so nothing else would clean them) comes back by itself. It is the only
+//! thing that cleans a dirty slot again. While any slot is dirty it cleans the dirty ones,
+//! one at a time, after a wait that starts at [`Backoff::first`], doubles after a pass
+//! that frees nothing up to [`Backoff::max`], and starts again from [`Backoff::first`]
+//! after a pass that frees a slot and whenever another slot goes dirty. Whenever the
+//! number of slots that can run a lease changes the book calls the hook
+//! ([`Book::on_count`]) with it, which is how the node's report reaches the daemon without
+//! waiting for anything else to change; the count and the call are made under one lock,
+//! so the last call always carries the newest count.
 //!
 //! A slot that stays dirty for the same reason logs it at `ERROR` once, then at `DEBUG`
 //! until the reason changes.
@@ -67,7 +70,7 @@ pub(crate) trait Slotted {
 /// Cleans one slot.
 pub(crate) type Cleaner<R> = Arc<dyn Fn(&R) -> Outcome + Send + Sync>;
 
-/// Called with the number of free slots whenever it changes.
+/// Called with the number of slots that can run a lease whenever it changes.
 pub(crate) type CountHook = Arc<dyn Fn(usize) + Send + Sync>;
 
 /// What wakes the recovery thread: a slot went dirty, or the book is gone.
@@ -79,7 +82,8 @@ struct Wake {
 
 #[derive(Default)]
 struct WakeState {
-    dirty: bool,
+    /// A slot went dirty since the thread last looked.
+    news: bool,
     closed: bool,
 }
 
@@ -108,6 +112,17 @@ impl<R: Slotted + Send + Sync + 'static> Book<R> {
     /// The slots over `ready`, each cleaned by `cleaner` first (a slot whose clean leaves
     /// it dirty is not free), and the recovery thread started with `backoff`.
     pub(crate) fn start(ready: Vec<R>, cleaner: Cleaner<R>, backoff: Backoff) -> Arc<Self> {
+        Self::start_with(ready, cleaner, backoff, None)
+    }
+
+    /// [`Book::start`], the recovery thread given a stack of `stack` bytes if any (a test
+    /// asks for one that cannot be made).
+    fn start_with(
+        ready: Vec<R>,
+        cleaner: Cleaner<R>,
+        backoff: Backoff,
+        stack: Option<usize>,
+    ) -> Arc<Self> {
         let book = Arc::new(Self {
             permits: Arc::new(Semaphore::new(0)),
             free: Mutex::default(),
@@ -120,7 +135,9 @@ impl<R: Slotted + Send + Sync + 'static> Book<R> {
             cleaner,
         });
         for index in 0..book.ready.len() {
-            if book.settle(index) {
+            // A clean that panics leaves the slot dirty, as at every later clean.
+            let clean = catch_unwind(AssertUnwindSafe(|| book.settle(index)));
+            if clean.unwrap_or(false) {
                 lock(&book.free).insert(index);
                 book.permits.add_permits(1);
             } else {
@@ -130,12 +147,14 @@ impl<R: Slotted + Send + Sync + 'static> Book<R> {
         let weak = Arc::downgrade(&book);
         let wake = Arc::clone(&book.wake);
         // A thread that cannot be made (out of memory) leaves dirty slots dirty, as the
-        // clean leaves them.
-        drop(
-            std::thread::Builder::new()
-                .name("kbf-slot-recovery".to_owned())
-                .spawn(move || recover(&weak, &wake, backoff)),
-        );
+        // clean leaves them, and is logged.
+        let mut thread = std::thread::Builder::new().name("kbf-slot-recovery".to_owned());
+        if let Some(bytes) = stack {
+            thread = thread.stack_size(bytes);
+        }
+        if let Err(why) = thread.spawn(move || recover(&weak, &wake, backoff)) {
+            tracing::error!(%why, "no thread to clean dirty slots again: they stay dirty");
+        }
         book.wake_up();
         book
     }
@@ -160,17 +179,26 @@ impl<R: Slotted + Send + Sync + 'static> Book<R> {
         lock(&self.dirty).clone()
     }
 
-    /// Calls `hook` with the number of free slots now, and again whenever it changes.
+    /// Calls `hook` with the number of slots that can run a lease now, and again whenever
+    /// it changes.
     pub(crate) fn on_count(&self, hook: CountHook) {
-        *lock(&self.hook) = Some(Arc::clone(&hook));
+        let mut slot = lock(&self.hook);
         hook(self.count());
+        *slot = Some(hook);
     }
 
-    /// Tells the hook, if any, how many slots are free now.
+    /// Tells the hook, if any, how many slots can run a lease now. The count is read and
+    /// the hook called under the hook's lock: of two changes at once, the one that takes
+    /// the lock second reads the newer count and calls last, so an older count never
+    /// overwrites a newer one at the receiver.
     fn changed(&self) {
-        let hook = lock(&self.hook).clone();
-        if let Some(hook) = hook {
-            hook(self.count());
+        if let Some(hook) = lock(&self.hook).as_ref() {
+            // A hook that panics must not end the recovery thread, or the lease that
+            // called this: it is logged, and the next change calls it again.
+            let called = catch_unwind(AssertUnwindSafe(|| hook(self.count())));
+            if called.is_err() {
+                tracing::error!("the hook told of the slot count panicked");
+            }
         }
     }
 
@@ -180,9 +208,9 @@ impl<R: Slotted + Send + Sync + 'static> Book<R> {
         Arc::clone(&self.wake)
     }
 
-    /// Wakes the recovery thread: a slot is dirty.
+    /// Wakes the recovery thread: a slot went dirty.
     fn wake_up(&self) {
-        lock(&self.wake.state).dirty = true;
+        lock(&self.wake.state).news = true;
         self.wake.cv.notify_all();
     }
 
@@ -321,9 +349,11 @@ fn recover<R: Slotted + Send + Sync + 'static>(
             if idle {
                 wait = backoff.first;
                 due = false;
-                sleep_until_dirty(wake);
+                sleep_until_news(wake);
+            } else if sleep(wake, wait) {
+                // Another slot went dirty: its wait starts now, from the first.
+                wait = backoff.first;
             } else {
-                sleep(wake, wait);
                 due = true;
             }
             continue;
@@ -335,25 +365,25 @@ fn recover<R: Slotted + Send + Sync + 'static>(
     }
 }
 
-/// Sleeps until a slot is dirty or the book is gone (or [`IDLE`] has passed).
-fn sleep_until_dirty(wake: &Wake) {
+/// Sleeps until a slot goes dirty or the book is gone (or [`IDLE`] has passed).
+fn sleep_until_news(wake: &Wake) {
     let state = lock(&wake.state);
     let mut state = wake
         .cv
-        .wait_timeout_while(state, IDLE, |s| !s.dirty && !s.closed)
+        .wait_timeout_while(state, IDLE, |s| !s.news && !s.closed)
         .unwrap_or_else(PoisonError::into_inner)
         .0;
-    state.dirty = false;
+    state.news = false;
 }
 
-/// Sleeps `time`, or until the book is gone.
-fn sleep(wake: &Wake, time: Duration) {
+/// Sleeps `time`, or until a slot goes dirty or the book is gone; whether a slot went dirty.
+fn sleep(wake: &Wake, time: Duration) -> bool {
     let state = lock(&wake.state);
-    drop(
-        wake.cv
-            .wait_timeout_while(state, time, |s| !s.closed)
-            .unwrap_or_else(PoisonError::into_inner),
-    );
+    let (mut state, _) = wake
+        .cv
+        .wait_timeout_while(state, time, |s| !s.news && !s.closed)
+        .unwrap_or_else(PoisonError::into_inner);
+    std::mem::take(&mut state.news)
 }
 
 /// A held slot, to clean and give back. Dropped before its clean passed (the clean
