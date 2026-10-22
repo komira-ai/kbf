@@ -162,13 +162,13 @@ fn before_of(before: &str) -> Result<Option<&str>, Error> {
 /// The `release plan` verb: the lines to print.
 pub fn run(a: &PlanArgs) -> Result<Vec<String>, Error> {
     full_commit("--sha", &a.sha)?;
-    let given = match (&a.before, &a.before_file) {
-        (Some(before), _) => before.clone(),
-        (None, Some(file)) => std::fs::read_to_string(file)
+    // clap requires one of the two flags, and refuses both.
+    let given = match &a.before_file {
+        Some(file) => std::fs::read_to_string(file)
             .map_err(Error::spawn(format!("read {}", file.display())))?
             .trim_end_matches('\n')
             .to_owned(),
-        (None, None) => String::new(),
+        None => a.before.clone().unwrap_or_default(),
     };
     let before = before_of(&given)?;
     if !a.freeze.is_empty() {
