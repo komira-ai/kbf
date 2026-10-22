@@ -16,11 +16,10 @@ def pr(h):
 
 
 def load_json(path, stream=False):
-    out = []
     try:
         f = open(path, 'rb')
     except OSError:
-        return out
+        return
     with f:
         for raw in f:
             line = raw.decode('utf-8', 'replace')
@@ -41,8 +40,7 @@ def load_json(path, stream=False):
                 j = json.loads(line)
             except Exception:
                 continue
-            out.append((t, j))
-    return out
+            yield (t, j)
 
 
 def epoch(ts):
@@ -77,8 +75,12 @@ def parse_msg(j):
 
 
 def cmd_raw(path, n):
-    recs = load_json(path)
-    print('RAW records=%d' % len(recs))
+    recs = []
+    for r in load_json(path):
+        recs.append(r)
+        if len(recs) >= 4 * int(n) + 50:
+            break
+    print('RAW records>=%d' % len(recs))
     for t, j in recs[:int(n)]:
         keep = {k: j.get(k) for k in ('timestamp', 'processID', 'processImagePath', 'senderImagePath', 'subsystem', 'category',
                                       'messageType', 'eventMessage', 'eventType') if k in j}
@@ -87,17 +89,18 @@ def cmd_raw(path, n):
 
 
 def cmd_parse(path, out, stream):
-    recs = load_json(path, stream == 'stream')
     n = 0
+    nrec = 0
     with open(out, 'w') as f:
-        for t, j in recs:
+        for t, j in load_json(path, stream == 'stream'):
+            nrec += 1
             p = parse_msg(j)
             if not p:
                 continue
             ts = epoch(j.get('timestamp', ''))
             f.write('\t'.join([('%.6f' % ts), ('%.3f' % t) if t else '', p[4], p[5], p[0], p[1], p[2], p[3]]) + '\n')
             n += 1
-    print('PARSE records=%d reports=%d' % (len(recs), n))
+    print('PARSE records=%d reports=%d' % (nrec, n))
 
 
 def load_tsv(path):
@@ -122,6 +125,31 @@ def load_gt(path):
     except OSError:
         pass
     return s
+
+
+def cmd_msgs(raw, per_op):
+    """a few raw eventMessage samples per op, with subsystem/category/process"""
+    seen = {}
+    for t, j in load_json(raw):
+        p = parse_msg(j)
+        if not p:
+            continue
+        k = p[1]
+        seen[k] = seen.get(k, 0) + 1
+        if seen[k] <= int(per_op):
+            print('MSG %s | sub=%s cat=%s type=%s pid=%s | %r' % (k, j.get('subsystem'), j.get('category'), j.get('messageType'),
+                                                               j.get('processID'), j.get('eventMessage', '')[:170]))
+
+
+def cmd_grepmsg(raw, token, n):
+    c = 0
+    for t, j in load_json(raw):
+        m = j.get('eventMessage', '')
+        if token in m and 'ipc-posix' in m:
+            print('GREPMSG %r' % m[:200])
+            c += 1
+            if c >= int(n):
+                break
 
 
 def cmd_ops(tsv):
@@ -320,6 +348,23 @@ def cmd_sub(out, a, *bs):
 def cmd_show(path, n):
     for k, h in sorted(load_gt(path))[:int(n)]:
         print('NAME %s %s' % (k, pr(h)[:90]))
+
+
+def cmd_lsofgt(lsof, out):
+    s = set()
+    try:
+        for l in open(lsof, 'rb').read().decode('utf-8', 'replace').split('\n'):
+            f = l.split()
+            if len(f) < 9:
+                continue
+            kind = 'shm' if f[4] == 'PSXSHM' else 'sem'
+            s.add((kind, ' '.join(f[8:]).encode('utf-8', 'surrogateescape').hex()))
+    except OSError:
+        pass
+    with open(out, 'w') as fo:
+        for k, h in sorted(s):
+            fo.write('%s %s\n' % (k, h))
+    print('LSOFGT names=%d' % len(s))
 
 
 def cmd_tok(tsv, token):

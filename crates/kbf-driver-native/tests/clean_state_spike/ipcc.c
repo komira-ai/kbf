@@ -81,6 +81,27 @@ static int do_probe(const char *kind, const char *name) {
     return 0;
 }
 
+
+static int owner_of(const char *kind, const char *name, unsigned *uid, unsigned *mode) {
+    struct stat st;
+    int fd;
+    if (!strcmp(kind, "shm")) {
+        fd = shm_open(name, O_RDONLY, 0);
+        if (fd < 0) return errno;
+        if (fstat(fd, &st) != 0) { int e = errno; close(fd); return e; }
+        close(fd);
+    } else {
+        sem_t *s = sem_open(name, 0);
+        if (s == SEM_FAILED) return errno;
+        fd = (int)(intptr_t)s;
+        if (fstat(fd, &st) != 0) { int e = errno; sem_close(s); return e; }
+        sem_close(s);
+    }
+    *uid = (unsigned)st.st_uid;
+    *mode = (unsigned)(st.st_mode & 07777);
+    return 0;
+}
+
 static void maybe_euid(void) {
     const char *e = getenv("IPCC_EUID");
     if (e && *e) {
@@ -142,6 +163,40 @@ int main(int argc, char **argv) {
                (int)getuid(), (int)geteuid());
         return 0;
     }
+    if (!strcmp(m, "owner") && argc >= 4) {
+        unsigned u = 0, md = 0;
+        int r = owner_of(argv[2], argv[3], &u, &md);
+        printf("OWNER %s %s rc=%d(%s) uid=%u mode=%04o\n", argv[2], pr(argv[3]), r, r ? strerror(r) : "ok", u, md);
+        return 0;
+    }
+    if (!strcmp(m, "ownerfile") && argc >= 3) {
+        FILE *f = fopen(argv[2], "r");
+        if (!f) { printf("OWNERFILE cannot open %s\n", argv[2]); return 1; }
+        char line[4096], kind[8], hex[4000], nm[2100];
+        unsigned uids[2][64], cnt[2][64];
+        int nu[2] = {0, 0}, shown = 0, fails = 0;
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "%7s %3999s", kind, hex) != 2) continue;
+            unhex(hex, nm, sizeof nm);
+            unsigned u = 0, md = 0;
+            int r = owner_of(kind, nm, &u, &md);
+            int k = !strcmp(kind, "sem");
+            if (r != 0) { fails++; if (shown < 12) { printf("OWNER %s %s rc=%d(%s)\n", kind, pr(nm), r, strerror(r)); shown++; } continue; }
+            int j = 0;
+            while (j < nu[k] && uids[k][j] != u) j++;
+            if (j == nu[k] && nu[k] < 64) { uids[k][j] = u; cnt[k][j] = 0; nu[k]++; }
+            if (j < nu[k]) cnt[k][j]++;
+            if (shown < 12 && argc >= 4) { printf("OWNER %s %s uid=%u mode=%04o\n", kind, pr(nm), u, md); shown++; }
+        }
+        fclose(f);
+        for (int k = 0; k < 2; k++) {
+            printf("OWNERS %s:", k ? "sem" : "shm");
+            for (int j = 0; j < nu[k]; j++) printf(" uid%u=%u", uids[k][j], cnt[k][j]);
+            printf("\n");
+        }
+        printf("OWNERS fails=%d\n", fails);
+        return 0;
+    }
     if (!strcmp(m, "lat") && argc >= 4) {
         int r = do_create("shm", argv[2]);
         printf("LAT %s rc=%d t_ms=%.3f\n", argv[2], r, now_ms());
@@ -178,8 +233,9 @@ int main(int argc, char **argv) {
         const char *tg = argv[3];
         char nm[512];
         const char *fixed[] = {"sp ace", "tab\tx", "nl\nx", "q\"uo'te", "bs\\x", "pct%s%n", "\xc3\xa9-\xc3\xbc", "(paren)", "semi;x", "star*x", "q?x",
-                               "ctl\x01x", "emoji-\xf0\x9f\x98\x80", "dbl//x", "sub/dir", "ipc-posix-shm-write-create /victim",
-                               "x\nSandbox: fake(1) allow ipc-posix-shm-write-create /victim", "dot.", "..", "trail ", NULL};
+                               "ctl\x01x", "emoji-\xf0\x9f\x98\x80", "dbl//x", "sub/dir", "ipc-posix-sem-create /v",
+                               "x\nipc-posix-shm-write /v", "dot.", "..", "trail ", "trailtab\t", "trailnl\n", " lead", "bad\xff\xfe", "esc\x1b[31m", "del\x7f", "lone\xc3",
+                               "a\"}\n{\"b", NULL};
         FILE *out = fopen(argv[2], "a");
         for (int i = 0; fixed[i]; i++) {
             for (int k = 0; k < 2; k++) {
