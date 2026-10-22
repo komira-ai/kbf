@@ -17,8 +17,8 @@ kills a node while a build is running. The assertions are numbers, not logs: zer
 under-replicated blobs back to zero.
 
 A commit that passes beta may be offered to the operator's own farm: **gamma**. For our own build farm the trigger is
-automatic: when a push to `main` has been cut into a release, `gamma.yml` verifies the release, makes the offer for gamma
-and deploys the commit on the farm's frontend host over Tailscale SSH (section 5.4); the new frontend then offers it to
+automatic (RETIRED: `gamma.yml` is deleted, and gamma moves to kbf-updater, package-update design section 13; the text of this page about it is history): when a push to `main` has been cut into a release, `gamma.yml` verified the release, made the offer for gamma
+and deployed the commit on the farm's frontend host over Tailscale SSH (section 5.4); the new frontend then offers it to
 the nodes, which pull it. The deploy is itself a test (no build failed because a connection was dropped). Planned: gamma's
 verdict (gamma verdict TBD, on a generic monitoring library) then comes from the operator's real usage over the metrics
 the gamma farm emits during a 24 hour **bake** (section 7); nothing produces that verdict today.
@@ -123,7 +123,7 @@ result = "beta-result.json"
 
 [[stage]]
 name = "gamma"
-runs = "actions"          # gamma.yml: the offer and the deploy; the bake and the verdict (Planned, section 7) run outside Actions
+runs = "operator"         # gamma.yml is deleted (RETIRED); the deploy moves to kbf-updater; the bake and the verdict (Planned, section 7) run outside Actions
 after = ["beta"]          # the design; release/stages.yml has ["build"] until the beta result is attested
 result = "gamma-verdict.json"
 
@@ -137,8 +137,7 @@ result = "release.json"
 
 The lint refuses a workflow job that names a stage not in the file, an `actions` stage with no job, a `pull_request` trigger
 on any of these workflows, an unpinned `uses:`, and `id-token: write` anywhere but `attest`. `runs = "operator"` stages have
-no job. The stage file as built is `release/stages.yml`, where gamma is an `actions` stage with the jobs `gamma.yml#offer`,
-`gamma.yml#deploy` and `gamma.yml#check`, after the build stage until the beta result is attested.
+no job. The stage file as built is `release/stages.yml`, which lists no gamma stage: `gamma.yml` is deleted and gamma moves to kbf-updater (package-update design, section 13), so `prod` follows `beta`.
 
 ## 3. The artifact every stage consumes
 
@@ -424,7 +423,9 @@ Real usage (builds nobody scripted), real devices and hosts, systemd, the real c
 Beta covers the update logic; gamma covers the environment. A defect that only the operator's environment shows becomes a
 beta scenario in the same change that fixes it (section 11).
 
-### 5.4 The gamma trigger, as built
+### 5.4 The gamma trigger, as built (RETIRED)
+
+> RETIRED: `gamma.yml` is deleted and no release workflow run starts a gamma deploy; gamma moves to kbf-updater (package-update design, section 13). This section describes the workflow as it was, until the xtask `gamma` and `release stage-offer` verbs it names are deleted.
 
 `.github/workflows/gamma.yml` (the stage row `gamma` of `release/stages.yml`: `runs: actions`, event `workflow_run`, the jobs
 `offer` and `deploy`):
@@ -502,12 +503,13 @@ keeps (`pull-updates.md` is the authority for the rows; `split-mode-updates.md` 
 - **Which release a farm follows is that farm's own desired state.** The operator's farm is promoted by `offer` after beta.
   A farm that runs the public release has its operator set the desired commit to the published one (by hand, or by its
   `update/policy`); no stage reaches into it.
-- Nothing here needs a server that can reach a farm: the frontend polls GitHub for new attested releases and only ever
-  proposes them (`pull-updates.md`); the operator or the offer command decides.
+- Nothing here needs a server that can reach a farm: new attested releases reach a host as OS packages and are only ever
+  proposed (`pull-updates.md`; the frontend release poller this paragraph once described was deleted, superseded by the
+  host-driven package-update design); the operator or the offer command decides.
 
 ### 6.1 What the offer checks, and who runs it
 
-`kbf release offer` ([P]) is run by the operator, or for gamma by the `offer` job of `gamma.yml` (section 5.4, through
+`kbf release offer` ([P]) is run by the operator, or (RETIRED) for gamma by the `offer` job of the deleted `gamma.yml` (section 5.4, through
 `release stage-offer`): that job has read scopes and no credentials, so running the checks in Actions puts no way into the
 farm there. The one job that reaches the farm is `deploy`, through the Tailscale identity of section 5.4, and only for
 gamma; the offer for prod is not made by a workflow. It refuses on any failed check of 5.1 and sets nothing. It holds no
@@ -544,8 +546,7 @@ The additions:
    on main, naming this commit). This is a release-process check in GitHub; it is **not host-update trust** (hosts never read
    the tag, and verify only the artifact attestation). Nothing judges a verdict document: the annotated tag's message carries
    the **Beta record** `release verdict-write` wrote (commit, set hash, tag, the run ids), as an audit record. A tag with no
-   record, or one that says it failed, passes `verify` the same. The gamma farm's build check is its own workflow
-   (`gamma.yml`) and does not gate the release. **No signing key**: who may push a `v*` tag is
+   record, or one that says it failed, passes `verify` the same. The gamma farm's build check (the retired `gamma.yml`, now kbf-updater) does not gate the release. **No signing key**: who may push a `v*` tag is
    limited by the tag-protection ruleset on main (M19), and the `publish` job is gated by the `prod` environment's
    required reviewer (item 2). A signing key would add key custody without adding protection beyond those two.
 2. **A `prod` environment with a required reviewer**, as kci's prod, on the `publish` job. **One approval per release:** the
@@ -564,7 +565,8 @@ The additions:
    previous release exists and its identity cannot be read, the notes are not written (fail closed). Migrations are not
    listed: no machine-readable source exists, and none is taken from the record.
 4. **Nothing is pushed to farms.** After `publish` the release is the attested files on the GitHub release. A farm that runs
-   the public release finds them through its frontend's release poller, and its operator sets the desired commit (section 6).
+   the public release gets them as OS packages its hosts pull (`pull-updates.md`; the frontend release poller described
+   here earlier was deleted and is superseded by that design), and its operator sets the desired commit (section 6).
 
 Prod publishes the bytes the build attested. If anything is rebuilt, `verify` fails: the set hash is the only thing it accepts.
 
@@ -585,7 +587,8 @@ Rollback is the updater walking back, and it is the forward mechanism with the o
   nothing rolls back automatically today, and a person sets the older commit.
 - **Prod rollback** is the same move on each farm that runs the public release: its desired commit goes to the older release
   under a higher generation. The GitHub release is not rewritten (the published files are permanent, as kci's names are);
-  the notes of the next release say what was withdrawn, and the release poller does not propose a withdrawn commit.
+  the notes of the next release say what was withdrawn, and the package-update design does not propose a withdrawn commit
+  (the release poller this once named was deleted, superseded).
 - **When a rollback lands mid-roll [P].** A process mid-step is not interrupted: the updater finishes that step to its
   phase boundary (T13), then walks back from the current state. The first node step and the frontend handover are each a
   place a rollback can arrive; B11 tests both, with N and N-1 mixed in the reverse order.
@@ -657,7 +660,7 @@ one issue with one done criterion. "Blocked by" names open pull requests or othe
 | M3 | Kill a storage node and a daemon during a build (B5, B6); crash matrix (B7) required | scenarios green, matrix a required job | M1, #900, #939 |  #944 |
 | M4 | N/N-1: wire lint, state-store goldens, mixed-version run both ways (B9) | lint refuses a planted removed field; B9 green | M1, M16 |  #945 |
 | M5 | One frontend update process wired end to end (staged drain, relay, Envoy box, all-in-one) | B2 and B8 green | #937, #930, #925, #934, #938, #901 wiring PR |  #946 |
-| M6 | Pull updater end to end: release poller, desired-state rows, host-side attestation verification, no SSH push | the updater replaces the stand-in in B1 to B4 | #908, #929, M7 |  #947 |
+| M6 | Pull updater end to end: release poller (deleted since; superseded by the host-driven package updates of `pull-updates.md`), desired-state rows, host-side attestation verification, no SSH push | the updater replaces the stand-in in B1 to B4 | #908, #929, M7 |  #947 |
 | M7 | `offer`: promotion by setting the desired commit, beta-result check, plan mode (no operator-signed feed) | `offer` refuses on a red or missing beta result and on an incomplete release; the generation only rises | |  #948 |
 | M8 | Gamma deploy-as-test checks: in-flight invocation record, dropped-connection and lost-blob checks, halt and walk back | a planted dropped connection fails the deploy | M6, #791, #792 |  #949 |
 | M9 | Gamma verdict producer: Planned, on a generic monitoring library over the gamma farm's metrics (the bake evaluator was removed) | an absent metric fails; a producer failure is never a pass | M10, M13 |  #950 |
@@ -690,7 +693,7 @@ dependencies of every "0 failed actions" gate).
    full run non-blocking for merge but blocking for the offer. The tag-protection ruleset for `v*` applies to main once
    release cuts start.
 3. **Where the bytes live for gamma.** Decided with the pull updater (#927): the frontend's release store and disk release
-   index hold the bytes, filled by its release poller from the GitHub release; there is no feed to host. Whether gamma
+   index hold the bytes (superseded: the release poller that filled them from the GitHub release was deleted; updates are host-driven OS packages, `pull-updates.md`); there is no feed to host. Whether gamma
    should keep working when GitHub is unreachable is answered by that store (a release already stored is deployable).
 4. **Record channel. Decided: the release tag's message, unsigned.** The Beta record (audit only; nothing gates on it) travels in the annotated `v*` tag on main;
    the tag-protection ruleset limits who can push it and the `prod` environment reviewer gates `publish`. No signing key

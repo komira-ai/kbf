@@ -434,9 +434,10 @@ turns it into one of two outcomes, and the scheduler decides on the committed re
 - **The memory floor.** Each raised booking is kept as the memory floor of the
   action's key (instance name and action digest), and a later submission of that key
   books at least the floor, so a known-big action starts at the rung that ran it
-  instead of climbing from the first again; a floor never falls. The floors live in
-  the scheduler alone, so a server restart forgets them (one more killed run per key),
-  and at most `MEMORY_FLOORS` = 65 536 are kept, the one raised longest ago forgotten
+  instead of climbing from the first again; a floor never falls. A server with a
+  state store writes each raise down with the requeue that follows it and restores the
+  floors at start; one without a store forgets them at a restart (one more killed run
+  per key). At most `MEMORY_FLOORS` = 65 536 are kept, the one raised longest ago forgotten
   first.
 - **`Failed(NodeMemoryPressure)`: the node killed it while it was under its own
   limit** (a node-wide out-of-memory kill, or the node's backstop). The busy node's
@@ -486,9 +487,12 @@ answered at once; retrying it is planned (above).
 
 What exists today: a runtime may attach a `kbf.worker.v1.ResourceUsage` to the
 `ActionResult` it returns, inside `execution_metadata.auxiliary_metadata`. It carries
-user and system CPU time, the peak resident memory of any one process, and wall time,
-as the kernel measured them when the action was reaped. The test-only local runtime
-fills it; the container driver does not yet. Because it travels inside the result, it
+user and system CPU time, peak memory, and wall time, as the kernel measured them. The
+test-only local runtime fills it, with the peak resident memory of any one process
+(from `wait4`). The container driver fills it too, with the lease cgroup's
+`memory.peak` (the most memory the whole cgroup held at once) and the cgroup's own
+counters beside it. The two peaks are different quantities in the same field, so
+read `peak_memory_bytes` knowing which runtime wrote it. Because it travels inside the result, it
 reaches the server and the action cache with it.
 
 **Planned**: one usage record per lease (CPU-seconds, peak memory, wall phases, queue

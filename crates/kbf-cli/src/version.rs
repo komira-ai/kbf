@@ -10,6 +10,9 @@
 //!   `resume`, `takeover` and `stand-down` (`docs/api.md`);
 //! - `commit`: the first 12 hex digits of the commit built, or `unknown` for a build
 //!   with no git checkout ([`kbf_server::BUILD_COMMIT`]);
+//! - `commit_full`: the 40 hex digits of the commit built ([`kbf_server::BUILD_COMMIT_FULL`]).
+//!   It is absent, not empty, from a build that did not know them (no git checkout, or a
+//!   `KBF_BUILD_COMMIT_OVERRIDE` stamp), and a build before this field prints none;
 //! - `meta_log`: the highest metadata-log machine version this build runs
 //!   ([`kbf_server::raft_log::RUNS`], read through `.get()`; there is no second copy of the
 //!   number). A rollout compares it across two builds: going from N to N-1 is reversible
@@ -67,6 +70,12 @@ pub fn build_seq() -> u64 {
 /// The identity of this build.
 #[must_use]
 pub fn identity() -> Value {
+    identity_for(kbf_server::BUILD_COMMIT_FULL)
+}
+
+/// The identity of a build whose full commit is `commit_full`: the empty text when the build
+/// did not know it, and then the `commit_full` field is left out.
+fn identity_for(commit_full: &str) -> Value {
     // Inserted in the order they print: sorted, whatever map `serde_json` is built with.
     let mut fields = Map::new();
     fields.insert(
@@ -74,6 +83,9 @@ pub fn identity() -> Value {
         kbf_server::managed::ADMIN_PROTOCOL.into(),
     );
     fields.insert("commit".to_owned(), kbf_server::BUILD_COMMIT.into());
+    if !commit_full.is_empty() {
+        fields.insert("commit_full".to_owned(), commit_full.into());
+    }
     fields.insert(
         "meta_log".to_owned(),
         kbf_server::raft_log::RUNS.get().into(),

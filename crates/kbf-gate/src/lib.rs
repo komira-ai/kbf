@@ -31,9 +31,9 @@ mod run;
 
 pub use doc::{
     CommitId, DocError, Floor, Header, MinLoad, ResultDoc, SCHEMA, SetHash, Stage, Status, Waiver,
-    Window,
+    Window, reversible,
 };
 pub use gate::{GateResult, Limit, Verdict, judge};
 pub use metrics::{Metrics, MetricsError, Sample};
-pub use offer::{Beta, OFFER_VERSION, OfferDoc, Target, reversible};
+pub use offer::{Beta, OFFER_VERSION, OfferDoc, Target};
 pub use run::{Clock, GateError, Run, system_clock, write_atomic};

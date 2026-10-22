@@ -29,6 +29,10 @@ struct Progress {
 /// offset reached, through the router, so another owner may answer it; the failure
 /// reaches the caller only when the read has been resumed [`MAX_RESUMES`] times, or
 /// cannot be.
+///
+/// A resumption is not held ([`Router::with_hold`]): the caller has bytes already, and a
+/// read that fails after its first frames fails as soon as no owner can go on, as it did
+/// before the hold. Only the first stretch of a read waits for an owner.
 pub(crate) fn resumed(
     router: Router,
     digest: Digest,
@@ -37,7 +41,7 @@ pub(crate) fn resumed(
     first: ReadStream,
 ) -> ReadStream {
     let progress = Progress {
-        router,
+        router: router.unheld(),
         digest,
         next: offset,
         remaining: (limit > 0).then_some(limit),

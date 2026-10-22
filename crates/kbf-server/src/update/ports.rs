@@ -21,7 +21,8 @@ use kbf_map::MemberId;
 use kbf_types::{FarmTime, WorkerId};
 
 use super::command::Alert;
-use super::facts::{HostFacts, MemberFacts, OrderId, PlatformClass, Release, Source};
+use super::facts::{HostFacts, OrderId, PlatformClass, Release, Source};
+use crate::storage_gate::MemberFacts;
 
 /// An order the farm did not take, or a call that did not come back. The controller does
 /// not know whether it was applied, so it gives it again.

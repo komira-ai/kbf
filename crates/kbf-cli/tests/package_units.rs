@@ -23,9 +23,8 @@ fn units() -> Vec<(String, String)> {
             let mode = name
                 .strip_prefix("kbf-")?
                 .strip_suffix(".service")?
-                .trim_end_matches('@')
                 .to_owned();
-            (!["envoy", "installer", "proxy"].contains(&mode.as_str()))
+            (!["installer", "proxy"].contains(&mode.as_str()))
                 .then(|| (mode, std::fs::read_to_string(&p).expect("read")))
         })
         .collect();
@@ -51,9 +50,7 @@ fn kbf_lines(text: &str) -> Vec<Vec<String>> {
 /// Catches a package unit for a mode `kbf` lacks, and a mode of `kbf` with no unit.
 #[test]
 fn the_package_has_a_unit_for_each_kbf_mode() {
-    let mut have: Vec<String> = units().into_iter().map(|u| u.0).collect();
-    // The frontend has two units (the handover template and the plain one): one mode.
-    have.dedup();
+    let have: Vec<String> = units().into_iter().map(|u| u.0).collect();
     let mut want: Vec<String> = MODES.iter().map(|m| m.name.to_owned()).collect();
     want.sort();
     assert_eq!(have, want);
@@ -61,7 +58,7 @@ fn the_package_has_a_unit_for_each_kbf_mode() {
 
 /// Catches a unit command line `kbf <mode>` refuses: every `kbf` line of a package unit
 /// (`ExecStartPre=` `--check` and `ExecStart=`) is parsed by kbf's own parser, the words
-/// after `kbf` exactly as systemd passes them (`%i` is instance a). A unit names few
+/// after `kbf` exactly as systemd passes them. A unit names few
 /// flags and leaves the rest to `/etc/kbf/kbf.toml`, which a parser with no file reads as
 /// missing flags, so that one refusal is let through; an unknown flag, another mode's
 /// flag and a value kbf refuses are not. A line that names `--config` (the plain frontend
@@ -78,7 +75,7 @@ fn each_package_unit_command_line_parses_with_kbfs_own_parser() {
         );
         for line in lines {
             assert!(line[0].starts_with("--mode="), "{mode} {line:?}");
-            let words: Vec<String> = line.iter().map(|f| f.replace("%i", "a")).collect();
+            let words: Vec<String> = line.clone();
             let argv: Vec<OsString> = if words.iter().any(|w| w == "--config") {
                 argv_with(&words, &config)
             } else {

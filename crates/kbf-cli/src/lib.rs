@@ -36,7 +36,7 @@
 //! cannot work. A start that gives mode flags runs on them and does not read the file.
 //! There is no `node` mode and no `enroll` word: the host's config states what it is.
 //!
-//! And words that are not modes: `kbf cluster status|drain|undrain|member|denied|object-store` ([`cluster`]), a
+//! And words that are not modes: `kbf cluster status|drain|undrain|member|safe-to-stop|denied|object-store` ([`cluster`]), a
 //! client of the frontend's operator API that starts nothing. It is outside
 //! [`names::MODES`]; `kbf --help` ends with a line naming it.
 //!
@@ -52,16 +52,11 @@
 //! commit and the number of commits behind it, the build profile, the protocol versions and
 //! the state schema, so a host can check what it runs.
 //!
-//! And `kbf frontend handover` ([`handover`]): starts the idle instance of the frontend's
-//! systemd template (`kbf-frontend@a`, `kbf-frontend@b`) while the other serves, so the
-//! frontend is updated without failing a build. Like `cluster` it starts no mode: `kbf
-//! frontend` takes only flags, and the word `handover` after it is this command's.
-//!
 //! Before a mode starts, [`preflight`] checks what it needs of its host (the files its
 //! flags name, its certificate's role, the S3 key pair, the container driver's programs,
 //! ...) and refuses, with every missing piece on stderr, one line each, and exit status 2
-//! (75 for a piece that heals shortly). `cluster` and `frontend handover` read nothing of
-//! the host and skip it.
+//! (75 for a piece that heals shortly). `cluster` reads nothing of
+//! the host and skips it.
 //!
 //! Every mode also takes `--config FILE` and `--check` ([`config`]): the settings may be in
 //! `/etc/kbf/kbf.toml` (one TOML table per setting group, one key per flag, a flag on the
@@ -73,7 +68,6 @@
 pub mod cluster;
 pub mod config;
 pub mod enroll;
-pub mod handover;
 pub mod names;
 pub mod node;
 pub mod nofile;
@@ -278,11 +272,8 @@ pub fn command() -> Command {
         cmd = cmd.subcommand(mode_command(mode.name, mode.entry));
     }
     cmd.after_help(format!(
-        "Not a mode: `kbf {CLUSTER} status|drain|undrain|member|denied|object-store` calls a frontend's operator API \
-         (`kbf {CLUSTER} --help`); `kbf {} {HANDOVER}` updates a frontend without failing a \
-         build (`kbf {} {HANDOVER} --help`).",
-        names::FRONTEND,
-        names::FRONTEND,
+        "Not a mode: `kbf {CLUSTER} status|drain|undrain|member|safe-to-stop|denied|object-store` calls a frontend's operator API \
+         (`kbf {CLUSTER} --help`).",
     ))
 }
 
@@ -299,33 +290,6 @@ pub fn config_template(mode: &str) -> Option<String> {
 /// The word after `kbf` that calls the operator API ([`cluster`]) instead of starting a
 /// mode. It is not in [`names::MODES`], so the mode list stays exact.
 pub const CLUSTER: &str = "cluster";
-
-/// The word after `kbf frontend` that starts the idle instance of the frontend's unit
-/// instead of the mode ([`handover`]).
-pub const HANDOVER: &str = "handover";
-
-/// `kbf frontend handover ...`'s command line.
-#[must_use]
-pub fn handover_command() -> Command {
-    let cmd = Command::new(HANDOVER)
-        .bin_name(format!("kbf {} {HANDOVER}", names::FRONTEND))
-        .about(
-            "Start the idle instance of kbf-frontend@.service while the other serves, so the \
-             frontend is updated without failing a build.",
-        );
-    handover::Handover::augment_args(cmd)
-}
-
-/// Parses `kbf frontend handover ...`; `args` is the whole command line, its second word
-/// [`names::FRONTEND`] and its third [`HANDOVER`].
-///
-/// # Errors
-/// What `clap` refuses.
-pub fn parse_handover(args: &[std::ffi::OsString]) -> Result<handover::Handover, clap::Error> {
-    let argv = args.iter().take(1).chain(args.iter().skip(3));
-    let matches = handover_command().try_get_matches_from(argv)?;
-    handover::Handover::from_arg_matches(&matches)
-}
 
 /// `kbf cluster ...`'s command line.
 #[must_use]
@@ -808,7 +772,7 @@ pub fn run(invocation: &Invocation) -> ExitCode {
 
 /// The `kbf` binary: the daemon's helper re-execs first (a keeper or a `__chown-dirs`
 /// run of this binary never reads the command line as `kbf`'s), then [`version::line`]
-/// for `kbf --version --json`, then the command line, then [`cluster::run`] for `kbf cluster ...`, [`handover::run`] for `kbf frontend handover ...` or else
+/// for `kbf --version --json`, then the command line, then [`cluster::run`] for `kbf cluster ...` or else
 /// [`preflight::refusal`] and [`run`]. A command
 /// line that
 /// does not parse exits 2 (0 for `--help` and `--version`).
@@ -824,14 +788,6 @@ pub fn main() -> ExitCode {
     if version::asked(&args) {
         print!("{}", version::line());
         return ExitCode::SUCCESS;
-    }
-    if args.get(1).is_some_and(|word| word == names::FRONTEND)
-        && args.get(2).is_some_and(|word| word == HANDOVER)
-    {
-        return match parse_handover(&args) {
-            Ok(h) => handover::run(&h),
-            Err(e) => e.exit(),
-        };
     }
     if args.get(1).is_some_and(|word| word == CLUSTER) {
         return match parse_cluster(&args) {

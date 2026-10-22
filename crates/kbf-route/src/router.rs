@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use kbf_map::{Map, Member, MemberState};
 use kbf_storage::StorageError;
@@ -10,6 +11,7 @@ use tokio::sync::Semaphore;
 
 use crate::closure::{DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL, Verified};
 use crate::flights::Flights;
+use crate::hold::{Hold, HoldClock};
 use crate::nodes::Nodes;
 use crate::repair::{Background, Limiter, ReadRepair, RepairLimit};
 use crate::source::{MapSource, MapView};
@@ -37,6 +39,8 @@ pub struct Router {
     pub(crate) copy_kib: u32,
     /// The blobs a closure check found held, shared by every clone.
     pub(crate) verified: Arc<Verified>,
+    /// How long a call that no owner could answer is held and tried again.
+    pub(crate) hold: Hold,
 }
 
 /// The read-repair hook and its limit.
@@ -77,7 +81,51 @@ impl Router {
             copying: Arc::new(Semaphore::new(DEFAULT_COPY_KIB as usize)),
             copy_kib: DEFAULT_COPY_KIB,
             verified: Arc::new(Verified::new(DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL)),
+            hold: Hold::none(),
         }
+    }
+
+    /// The same router, holding a call that no owner of its blob could answer (every
+    /// owner `Down` in the map, or every attempt UNAVAILABLE) and trying it again, with
+    /// growing pauses, until an owner answers or `bound` has passed since the call began;
+    /// then the call is UNAVAILABLE, as it is without a hold. A router made by
+    /// [`Router::new`] holds nothing (a bound of zero). The frontend and the daemon use
+    /// [`crate::DEFAULT_HOLD`].
+    ///
+    /// The hold covers every call that takes a blob or an entry to its owners, and a read
+    /// before its first byte (an owner that accepts the read and fails as its first frame
+    /// is one that could not answer). A read that has passed bytes on and then fails goes
+    /// on ([`crate::MAX_RESUMES`]) as it always did, without a hold: the caller already
+    /// has part of the stream, and a bound that long is the caller's to wait out. A call
+    /// that fails for another reason (no map yet, a map that keeps moving) is not held.
+    /// Every try reads the map again, so an owner that is marked `Down` and then registers
+    /// again is found.
+    ///
+    /// A read of a blob that some owners could not answer and the others lack is held as
+    /// well: the blob may be on the owner that is away. A call that an owner answered, with
+    /// the blob or without the entry, is not.
+    ///
+    /// Callers of one blob share a read ([`Router::read_blob`]), which holds as the router
+    /// of the caller that started it does: a caller that joins a read begun through a
+    /// router that holds nothing (read repair) gets its answer at once.
+    #[must_use]
+    pub fn with_hold(mut self, bound: Duration) -> Self {
+        self.hold.bound = bound;
+        self
+    }
+
+    /// The same router, holding by `clock` (the time, and the sleeping between tries)
+    /// instead of Tokio's: for a test that runs a hold without real time.
+    #[must_use]
+    pub fn with_hold_clock(mut self, clock: Arc<dyn HoldClock>) -> Self {
+        self.hold = self.hold.with_clock(clock);
+        self
+    }
+
+    /// The same router, holding nothing.
+    pub(crate) fn unheld(mut self) -> Self {
+        self.hold.bound = Duration::ZERO;
+        self
     }
 
     /// The same router, holding at most `bytes` of blobs in memory at once (counted in
@@ -120,7 +168,7 @@ impl Router {
     pub fn with_background_repair(self, limit: RepairLimit) -> Self {
         // The task reads through a router without the hook, so a repair's own read is
         // never reported as a find.
-        let mut plain = self.clone();
+        let mut plain = self.clone().unheld();
         plain.repair = None;
         self.with_read_repair(Arc::new(Background::new(plain)), limit)
     }
@@ -183,16 +231,40 @@ impl Router {
             .ok_or_else(|| unavailable("no storage map has arrived yet".to_owned()))
     }
 
+    /// [`Router::attempt`], and while it answers UNAVAILABLE, again after a pause
+    /// ([`Router::with_hold`]) until it answers otherwise or the bound has passed, when the
+    /// last UNAVAILABLE is the answer. Each try is made against the map as it is then. The
+    /// UNAVAILABLE of the routing itself (no map yet, a map that keeps moving) is not held.
+    pub(crate) async fn routed<T, Fut>(
+        &self,
+        op: impl Fn(MapView) -> Fut,
+    ) -> Result<T, StorageError>
+    where
+        Fut: Future<Output = Result<T, StorageError>>,
+    {
+        let mut waiting = self.hold.begin();
+        loop {
+            let done = self.attempt(&op).await?;
+            if !matches!(done, Err(StorageError::Unavailable(_))) {
+                return done;
+            }
+            if !waiting.again().await {
+                return done;
+            }
+        }
+    }
+
     /// Runs `op` against the map as it is now. Each time a node answers `STALE_MAP`, fetches
     /// the newer map and runs it again against that: the map can move several times
     /// during one call (every member's promotion is a new generation). It stops, with
     /// UNAVAILABLE rather than a loop, when a fetch brings no map newer than the one just
     /// used (the generation has stopped moving where this process can see it), or after
-    /// [`MAX_MAP_REFETCHES`] fetches in one call.
-    pub(crate) async fn routed<T, Fut>(
+    /// [`MAX_MAP_REFETCHES`] fetches in one call. The outer error is that of the routing;
+    /// the inner is what `op` answered.
+    async fn attempt<T, Fut>(
         &self,
-        op: impl Fn(MapView) -> Fut,
-    ) -> Result<T, StorageError>
+        op: &impl Fn(MapView) -> Fut,
+    ) -> Result<Result<T, StorageError>, StorageError>
     where
         Fut: Future<Output = Result<T, StorageError>>,
     {
@@ -204,7 +276,7 @@ impl Router {
                 Err(StorageError::StaleMap { current }) => {
                     view = self.newer(used, current, &mut fetches).await?;
                 }
-                done => return done,
+                done => return Ok(done),
             }
         }
     }

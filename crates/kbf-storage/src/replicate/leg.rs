@@ -21,6 +21,17 @@ use crate::service::{MAP_GENERATION_HEADER, MAX_MESSAGE_BYTES, lift};
 /// value is the sender's member id. The receiver stores the blob and forwards nothing.
 pub const LEG_HEADER: &str = "kbf-chain-leg";
 
+/// The metadata entry, on a [`LEG_HEADER`] write, that asks the replica to answer once it
+/// holds the blob verified in RAM (`--ram-ack-bytes`; `docs/design/storage-ram-ack.md`),
+/// and lets its own dedup count a blob it holds in RAM as held. A copy without it (the
+/// repair worker's, a copy outside the chain) asks for a durable one: the replica commits
+/// to its disk and dedups on its index alone. The value is [`LEG_HELD_VALUE`]; the entry is
+/// read only from a call that is a leg.
+pub const LEG_HELD_HEADER: &str = "kbf-chain-held";
+
+/// The only value of [`LEG_HELD_HEADER`].
+pub const LEG_HELD_VALUE: &str = "1";
+
 /// Messages the call holds ahead of the replica: with the one the sender is putting
 /// down, the most a leg holds of a blob, whatever its size.
 const QUEUE: usize = 2;
@@ -59,12 +70,14 @@ pub(crate) struct Leg {
 
 impl Leg {
     /// Starts the `Write` of a blob of `size` bytes to `channel`, tagged with the map
-    /// generation the sender routed by and its own member id.
+    /// generation the sender routed by and its own member id, and with
+    /// [`LEG_HELD_HEADER`] when `asks_held`.
     pub(crate) fn open(
         channel: Channel,
         generation: u64,
         sender: MemberId,
         size: u64,
+        asks_held: bool,
         stall: Duration,
         commit: Duration,
     ) -> Self {
@@ -74,6 +87,9 @@ impl Leg {
             let metadata = request.metadata_mut();
             metadata.insert(MAP_GENERATION_HEADER, MetadataValue::from(generation));
             metadata.insert(LEG_HEADER, MetadataValue::from(sender.0));
+            if asks_held {
+                metadata.insert(LEG_HELD_HEADER, MetadataValue::from_static(LEG_HELD_VALUE));
+            }
             ByteStreamClient::new(channel)
                 .max_decoding_message_size(MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_MESSAGE_BYTES)
@@ -194,11 +210,14 @@ impl ReplicaLeg {
         generation: u64,
         sender: MemberId,
         size: u64,
+        asks_held: bool,
         stall: Duration,
         commit: Duration,
     ) -> Self {
         Self {
-            leg: Some(Leg::open(channel, generation, sender, size, stall, commit)),
+            leg: Some(Leg::open(
+                channel, generation, sender, size, asks_held, stall, commit,
+            )),
             lost: None,
         }
     }

@@ -38,6 +38,7 @@ use kbf_tier::{Reservation, Synced, TierError};
 use kbf_types::Digest;
 
 use super::pool::{PoolCommit, PoolWrite, Refused};
+use super::ram::{Hold, WriteThrough};
 use super::stream_store::{Claim, ToStore};
 use super::tier::{Staging, blocking};
 use super::{Cache, CacheError};
@@ -153,12 +154,15 @@ impl<M: MetaLog, O: ObjectStore + 'static> Cache<M, O> {
     /// all). Blocking (it may create the block's file): call it off the async runtime.
     #[must_use]
     pub fn stream(self: &Arc<Self>, size: u64) -> Option<RecordStream<M, O>> {
-        let target = match self.tier_open(size) {
-            Some(open) => Target::Tier(open),
-            None => Target::Store(ToStore::start(self, size)?),
+        let (target, why) = match self.tier_open(size) {
+            Some(open) => (Target::Tier(open), WriteThrough::StorePath),
+            None => (
+                Target::Store(ToStore::start(self, size)?),
+                self.store_reason(size),
+            ),
         };
         let cache = Arc::clone(self);
-        Some(RecordStream { cache, target })
+        Some(RecordStream { cache, target, why })
     }
 }
 
@@ -168,6 +172,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> Cache<M, O> {
 pub struct RecordStream<M, O> {
     cache: Arc<Cache<M, O>>,
     target: Target,
+    /// Why the record goes to the store, if it does, for a write acknowledged from RAM that
+    /// is committed to disk instead.
+    why: WriteThrough,
 }
 
 /// Where a [`RecordStream`] writes.
@@ -182,6 +189,8 @@ pub struct StreamedRecord<M, O> {
     cache: Arc<Cache<M, O>>,
     staged: Staged,
     digest: Digest,
+    /// [`RecordStream`]'s reason for a record that goes to the store.
+    why: WriteThrough,
 }
 
 /// Where a [`StreamedRecord`]'s bytes are.
@@ -311,6 +320,7 @@ impl<M: MetaLog, O: ObjectStore> RecordStream<M, O> {
             cache: self.cache,
             staged,
             digest,
+            why: self.why,
         })
     }
 }
@@ -338,6 +348,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Cache<M, O> {
             RecordStream {
                 cache: Arc::clone(self),
                 target: Target::Tier(open),
+                why: WriteThrough::StorePath,
             },
             RecordHasher::new(),
         );
@@ -382,5 +393,61 @@ impl<M: MetaLog, O: ObjectStore> StreamedRecord<M, O> {
             Staged::Pool(pooled) => self.cache.pool_commit(pooled, self.digest).await,
             Staged::Store(claim) => claim.commit(self.digest).await,
         }
+    }
+
+    /// [`StreamedRecord::commit`] as [`kbf_storage::CommitMode::Held`] asks
+    /// (`docs/design/storage-ram-ack.md`, "The new acknowledgement point"): on a node that
+    /// acknowledges from RAM, a blob of at most [`super::BUFFERED_BLOB_BYTES`] that the
+    /// pool holds whole is registered in the held set and answered at once, the drain
+    /// writing it to the disk afterwards. Everything else is committed to the disk as
+    /// before and counted in `writethrough{reason}`: a blob over the buffered size
+    /// (`large`), one that goes to the store (`queue_full`, `store_path`), one the budget
+    /// has no room for (`budget`). A blob the index already has is answered without a
+    /// second write.
+    ///
+    /// **The caller has checked the bytes against `digest`** (the CRC and size are checked
+    /// by [`RecordStream::finish`]; the hash is the caller's), because the held set serves
+    /// them as that digest.
+    ///
+    /// # Errors
+    /// As [`StreamedRecord::commit`], or the index could not be asked whether it has the
+    /// blob.
+    pub(crate) async fn commit_held(self) -> Result<(), CacheError> {
+        if !self.cache.ram_ack_enabled() {
+            return self.commit().await;
+        }
+        match self.staged {
+            Staged::Pool(PoolCommit::Whole { bytes, jobs }) => {
+                let blob = super::VerifiedBlob::trusted(self.digest, bytes.clone());
+                match self.cache.hold_write(&blob).await? {
+                    Hold::Held | Hold::Duplicate => Ok(()),
+                    // Counted by `Cache::hold`; the blob waits for its disk.
+                    Hold::Budget => {
+                        let whole = PoolCommit::Whole { bytes, jobs };
+                        self.cache.pool_commit(whole, self.digest).await
+                    }
+                }
+            }
+            Staged::Pool(streaming) => {
+                self.cache.wrote_through(WriteThrough::Large);
+                self.cache.pool_commit(streaming, self.digest).await
+            }
+            Staged::Store(claim) => {
+                let why = if self.digest.size_bytes > super::BUFFERED_BLOB_BYTES {
+                    WriteThrough::Large
+                } else {
+                    self.why
+                };
+                self.cache.wrote_through(why);
+                claim.commit(self.digest).await
+            }
+        }
+    }
+
+    /// [`StreamedRecord::commit`] for a write the storage layer decided is not
+    /// acknowledged from RAM, for `why`: counted, on a node that acknowledges from RAM.
+    pub(crate) async fn commit_through(self, why: WriteThrough) -> Result<(), CacheError> {
+        self.cache.wrote_through(why);
+        self.commit().await
     }
 }

@@ -9,7 +9,8 @@
 //!   those ([`ProtocolSummary`]).
 //! - `GET /v1/members`: the storage members of the current map, as the gRPC
 //!   `Membership` service keeps them ([`crate::members::Members`]), the protocol version
-//!   each registered naming, and the oldest of those.
+//!   each registered naming, and the oldest of those, and what each said of the build it
+//!   runs and of its metadata log (`runs_log`, `log_version`, `build_commit`).
 //! - `GET /v1/storage`: whether every blob is known to have its copies elsewhere, from the
 //!   storage members' heartbeats ([`crate::storage_health`]); on a frontend with a state
 //!   store.
@@ -22,6 +23,9 @@
 //!   storage member's state ([`Members::set_state`]), the operator's promotion of a joiner;
 //!   `planned_down` ([`Members::plan_down`]) takes an `Active` member out of the write path
 //!   for a planned restart at once (`409` unless it is `Active`), and `active` undoes it.
+//! - `GET /v1/members/{id}/safe-to-stop`: whether the host of storage member `id` may be
+//!   stopped now (`safe_to_stop`): the storage gate, behind the write gates; it changes no
+//!   member, row or placement. `{id}` may be a node id: the member that is its storage half.
 //!
 //! - `POST /v1/denied` with `{"entry": "node X"|"serial S"|"spki-sha256 H", "reason": "..."}`
 //!   and `DELETE /v1/denied?entry=...`: add an entry to the storage deny list, or take it
@@ -81,6 +85,9 @@ use crate::token::ApiToken;
 use crate::update::Rows;
 
 mod node_detail;
+mod safe_to_stop;
+
+pub use safe_to_stop::{Verdict, safe_to_stop_path};
 
 /// The media type of every body this API returns, and of every write it accepts.
 pub const JSON: &str = "application/json";
@@ -106,17 +113,21 @@ pub const DENIED: &str = "/v1/denied";
 /// `:` or a space still names one path segment.
 #[must_use]
 pub fn node_path(node: &str, verb: &str) -> String {
-    let mut path = format!("{NODES}/");
-    for byte in node.bytes() {
+    format!("{NODES}/{}:{verb}", encode_segment(node))
+}
+
+/// `text` percent-encoded to stand as one path segment: every byte but an ASCII letter,
+/// digit, `-`, `.`, `_` or `~` becomes `%XX`.
+pub(crate) fn encode_segment(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            path.push(char::from(byte));
+            out.push(char::from(byte));
         } else {
-            path.push_str(&format!("%{byte:02X}"));
+            out.push_str(&format!("%{byte:02X}"));
         }
     }
-    path.push(':');
-    path.push_str(verb);
-    path
+    out
 }
 
 /// What the handlers share: the farm, the token writes must present (`None`: writes
@@ -156,6 +167,7 @@ pub fn router(
         .route(MEMBERS, get(members_view))
         .route("/v1/nodes/{target}", get(node_detail::one).post(act))
         .route("/v1/members/{id}", post(set_member_state))
+        .route("/v1/members/{id}/safe-to-stop", get(safe_to_stop::check))
         .route(DENIED, post(deny_entry).delete(allow_entry))
         .route(FRONTEND_DRAIN, get(drain_status).post(begin_drain))
         .with_state(Arc::new(ApiState {
@@ -240,6 +252,15 @@ struct MemberView {
     weight: u32,
     /// What its registration named; `None` if its row names none or has lapsed.
     protocol: Option<u32>,
+    /// The newest metadata-log machine version its build can raise its log to, as its
+    /// registration said; `None` if the node says none, its row names none or has lapsed.
+    runs_log: Option<u32>,
+    /// The machine version its metadata log was at in its newest heartbeat; `None` as for
+    /// `runs_log`.
+    log_version: Option<u32>,
+    /// The commit its binary was built from, as its registration said (at most 64 bytes;
+    /// the text `unknown` for a build with no git checkout); `None` as for `runs_log`.
+    build_commit: Option<String>,
     /// Why a joiner is not promoted yet, when `--auto-promote` is on and it is one
     /// (`docs/design/rebalance-handoff.md`); absent otherwise.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -272,13 +293,15 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
         return no_members();
     };
     // The store's calls block (its trait says so). The map is read, then the rows that
-    // say which protocol each member registered naming: not one snapshot, so a member
-    // whose row lapses between the two is listed without a version.
+    // say which protocol each member registered naming and what it said of its build and
+    // log: not one snapshot, so a member whose row lapses between the two is listed
+    // without a version.
     let read = tokio::task::spawn_blocking(move || {
         let map = members.current_map()?;
-        Ok::<_, MembershipError>((map, members.protocols()?, members.blocked_joiners()?))
+        let rows = (members.protocols()?, members.node_facts()?);
+        Ok::<_, MembershipError>((map, rows, members.blocked_joiners()?))
     });
-    let (map, protocols, blocked) = match read.await {
+    let (map, (protocols, facts), blocked) = match read.await {
         Ok(Ok(read)) => read,
         Ok(Err(e)) => {
             let code = match e {
@@ -310,6 +333,9 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
                     state: state_name(m.state),
                     weight: m.weight,
                     protocol: protocols.get(&m.id).copied().flatten(),
+                    runs_log: facts.get(&m.id).and_then(|f| f.runs_log),
+                    log_version: facts.get(&m.id).and_then(|f| f.log_version),
+                    build_commit: facts.get(&m.id).and_then(|f| f.build_commit.clone()),
                     blocked_on: blocked
                         .get(&m.id)
                         .map_or_else(Vec::new, |b| b.iter().map(ToString::to_string).collect()),

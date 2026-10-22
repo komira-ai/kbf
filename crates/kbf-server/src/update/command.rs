@@ -1,7 +1,7 @@
 //! What the controller must do after a transition, and what it must tell people.
 
 use super::facts::OrderId;
-use super::gate::GateFail;
+use crate::storage_gate::GateFail;
 
 /// An operation on `update/slot`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -38,7 +38,7 @@ fn programs(unit: &str) -> Vec<(String, String)> {
 /// Catches a unit whose `kbf` is not the release the installer links as `current`
 /// (`/var/lib/kbf-installer/current/kbf` is a path the installer never makes, so the
 /// unit's start fails on every host), and a unit program under the installer's tree
-/// that is neither a release nor a frontend slot. Reads the layout's own `current()`,
+/// that is not that link. Reads the layout's own `current()`,
 /// so a change of the layout moves this with it. The count guards against the scan
 /// reading nothing (a moved directory) and passing.
 #[test]
@@ -64,19 +64,14 @@ fn every_linux_unit_runs_the_kbf_the_layout_links_as_current() {
         for (key, program) in programs(&text) {
             let in_tree = program.starts_with(&format!("{tree}/"));
             let is_kbf = program.ends_with("/kbf");
-            if name == "kbf-frontend@.service" && is_kbf {
-                // Slots are not in the layout: the frontend keeps its own link per
-                // instance under the installer's tree until the proxy replaces it.
-                assert_eq!(program, format!("{tree}/slots/%i/kbf"), "{name} {key}");
-                checked += 1;
-            } else if is_kbf || in_tree {
+            if is_kbf || in_tree {
                 assert_eq!(program, current_kbf, "{name} {key}");
                 checked += 1;
             }
         }
     }
     // kbf-daemon, kbf-storage, kbf-storage-and-daemon, kbf-all-in-one: a check and a
-    // start each; kbf-frontend@: a check and a start.
+    // start each; kbf-frontend: a check and a start.
     assert!(
         checked >= 10,
         "only {checked} kbf commands found in {dir:?}"

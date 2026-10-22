@@ -17,11 +17,13 @@ use kbf_segments::RecordHasher;
 use kbf_storage::service::OpenWrites;
 use kbf_storage::{
     ActionEntry, Answer, CommitMode, PutStream, READ_CHUNK_BYTES, ReadStream, Storage,
-    StorageError, StreamedPut,
+    StorageError, StreamedPut, Through,
 };
 use kbf_types::Digest;
 
-use crate::cache::{BlobRead, Cache, CacheError, RecordStream, StreamedRecord, VerifiedBlob};
+use crate::cache::{
+    BlobRead, Cache, CacheError, RecordStream, StreamedRecord, VerifiedBlob, WriteThrough,
+};
 use crate::meta_log::MetaLog;
 use crate::segments::{Connections, SegmentsConfig, SegmentsService};
 
@@ -197,6 +199,14 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
                 .await?)
         })
     }
+
+    fn ram_ack(&self) -> bool {
+        self.cache.ram_ack_enabled()
+    }
+
+    fn unconfirmed(&self, blobs: usize) {
+        self.cache.set_unconfirmed(blobs);
+    }
 }
 
 /// A record being written ([`Storage::stream`]): the cache's [`RecordStream`], and the
@@ -249,8 +259,21 @@ impl<M: MetaLog, O: ObjectStore + 'static> PutStream for Writing<M, O> {
 struct Written<M, O>(StreamedRecord<M, O>);
 
 impl<M: MetaLog, O: ObjectStore + 'static> StreamedPut for Written<M, O> {
-    fn commit(self: Box<Self>, _mode: CommitMode) -> Answer<'static, ()> {
-        Box::pin(async move { Ok(self.0.commit().await?) })
+    /// As `mode` asks (`StreamedRecord::commit_held`): the bytes were hashed against the
+    /// digest by [`Writing::finish`], so a held blob is served under it.
+    fn commit(self: Box<Self>, mode: CommitMode) -> Answer<'static, ()> {
+        Box::pin(async move {
+            match mode {
+                CommitMode::Durable => Ok(self.0.commit().await?),
+                CommitMode::Held => Ok(self.0.commit_held().await?),
+                CommitMode::Through(Through::ReplicaLost) => {
+                    Ok(self.0.commit_through(WriteThrough::ReplicaLost).await?)
+                }
+                CommitMode::Through(Through::SingleOwner) => {
+                    Ok(self.0.commit_through(WriteThrough::SingleOwner).await?)
+                }
+            }
+        })
     }
 }
 
