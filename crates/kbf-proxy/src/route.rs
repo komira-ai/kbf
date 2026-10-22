@@ -325,10 +325,8 @@ mod tests {
     }
 
     /// The swap's state is the update route's: answered by the proxy, behind the update class's
-    /// credential, and never held. It is that one path and nothing near it.
-    ///
-    /// Kills: the path forwarded to a child; the path on the operator class or held; a prefix
-    /// match that takes a look-alike or a path below it for the proxy's.
+    /// credential, and never held. It is that one path and nothing near it: a look-alike, or a
+    /// path below it, is not the proxy's.
     #[test]
     fn the_swap_state_is_the_update_routes_and_matches_one_path_exactly() {
         for p in ["/v1/proxy/swap", "/v1/proxy/swap?x=1"] {

@@ -193,16 +193,12 @@ fn request(method: &str, path: &str) -> UpdateRequest {
     }
 }
 
-/// Catches the swap's state missing from a proxy that keeps its own copies, the update API
-/// coming back with it, or the state and the binary watch not sharing what the watch knows:
+/// Asserts that a proxy that keeps its own copies serves the swap's state, that the state and
+/// the binary watch share what the watch knows, and that the update API stays gone:
 /// `GET /v1/proxy/swap` is a 200 whose boot id ends with this process's pid, whose installed
 /// commit is the one `releases.json` says, whose active slot is `null` (the proxy is not
 /// bound) and whose pending binary is what the wiring's status holds (`null`, then `B`); and
 /// the update API's paths are 410 in the same route.
-///
-/// Mutants it catches: the state not served (a 410 or a 404); the route over a status of its
-/// own (the pending binary stays `null`); the installed commit read from the binary at the
-/// package's path; the 410 lost for the API's paths once the state is served.
 #[tokio::test]
 async fn with_copies_the_swap_state_is_answered_and_the_update_api_stays_gone() {
     let cfg = config_local("swap-state");

@@ -88,13 +88,9 @@ mod tests {
         assert_eq!(named, sorted);
     }
 
-    /// Catches the RFC 3339 form drifting from `YYYY-MM-DDTHH:MM:SSZ`: the separators, the zero
+    /// Asserts that the RFC 3339 form is `YYYY-MM-DDTHH:MM:SSZ`: the separators, the zero
     /// padding, the `Z` of UTC, and the same date as the stamp for the same second (a leap day,
     /// a year end, a second before midnight).
-    ///
-    /// Mutants it catches: a separator dropped or a space for the `T`; an hour, minute or second
-    /// without its padding; local time or an offset instead of `Z`; a date that is not the
-    /// stamp's.
     #[test]
     fn rfc3339_is_the_stamps_date_and_time_with_separators() {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");

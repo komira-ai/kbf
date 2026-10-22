@@ -2,9 +2,6 @@
 //! update's record, as the swap-state endpoint reads them. The supervisor is the one of the
 //! blocked tests, over the rig, with its swap thread accepted and never run, so a test sets
 //! the record the swap would have written.
-//!
-//! Each "Mutants it catches" line names a change to the code that the test is written to turn
-//! red. They are the reason the test exists, not a record that anyone ran them.
 
 use super::Snapshot;
 use super::blocked_tests::{over, spec};
@@ -12,12 +9,9 @@ use crate::proxy::kinds::Supervisor;
 use crate::proxy::model::{Phase, Slot};
 use crate::testkit::{A, B, c};
 
-/// Catches a snapshot that names a slot or a commit it does not know: with no update on record
-/// the slot is the one the start-up adopted, the commit is the one recorded for the process in
-/// it, and there is no update.
-///
-/// Mutants it catches: the commit read from the update's record only (it would be `None`); the
-/// slot not the adopted one.
+/// Asserts that, with no update on record, the slot is the one the start-up adopted, the commit
+/// is the one recorded for the process in it (not read from an update's record), and there is
+/// no update.
 #[test]
 fn with_no_update_the_slot_is_the_adopted_one_and_the_commit_is_its_record() {
     let (sup, _dir) = over("snap-idle", |_, _| {});
@@ -29,10 +23,8 @@ fn with_no_update_the_slot_is_the_adopted_one_and_the_commit_is_its_record() {
     assert_eq!(got.intent, None);
 }
 
-/// Catches a commit read from a fixed slot: when the adopted slot is B, with a process started
-/// from release `B`, that is the commit, though slot A holds a process of `A`.
-///
-/// Mutant it catches: the record of slot A asked whichever slot serves.
+/// Asserts that the commit is read from the slot that serves: when the adopted slot is B, with
+/// a process started from release `B`, that is the commit, though slot A holds a process of `A`.
 #[test]
 fn the_commit_is_the_record_of_the_slot_that_serves() {
     let (sup, _dir) = over("snap-b", |rig, config| {
@@ -46,10 +38,8 @@ fn the_commit_is_the_record_of_the_slot_that_serves() {
     assert_eq!(got.running, Some(c(B)));
 }
 
-/// Catches a guess given out as a fact: while the start-up hold is in force no frontend child
-/// is known to serve, so there is no slot and no commit.
-///
-/// Mutant it catches: the hold not looked at (slot `a`, commit `A`).
+/// Asserts that while the start-up hold is in force no frontend child is known to serve, so
+/// there is no slot and no commit.
 #[test]
 fn while_the_startup_hold_is_in_force_no_slot_and_no_commit_are_named() {
     let (sup, _dir) = over("snap-hold", |_, config| {
@@ -59,13 +49,10 @@ fn while_the_startup_hold_is_in_force_no_slot_and_no_commit_are_named() {
     assert_eq!(sup.snapshot(), Snapshot::default());
 }
 
-/// Catches a snapshot that does not follow the swap: an update just started is served by the
-/// old child (slot A, release `A`), with the record of the update as the swap wrote it (its
-/// start time is set, and is the time of its first phase); from the switch the new child serves
+/// Asserts that the snapshot follows the swap: an update just started is served by the old
+/// child (slot A, release `A`), with the record of the update as the swap wrote it (its start
+/// time is set, and is the time of its first phase); from the switch the new child serves
 /// (slot B, release `B`).
-///
-/// Mutants it catches: the new child named before the switch, or still named after it; the
-/// start time not recorded; the record not shown.
 #[test]
 fn an_open_update_serves_from_the_old_child_until_the_switch_and_the_new_one_after() {
     let (mut sup, _dir) = over("snap-open", |_, _| {});
@@ -87,11 +74,8 @@ fn an_open_update_serves_from_the_old_child_until_the_switch_and_the_new_one_aft
     assert_eq!((after.slot, after.running), (Some(Slot::B), Some(c(B))));
 }
 
-/// Catches an ended update read as an open one: once the swap thread is over, the slot is the
-/// one the swap left (B, after a `done`), and the record is the ended update's.
-///
-/// Mutants it catches: the slot taken from the record's phase as for an open update; the
-/// record dropped when the update ends.
+/// Asserts that an ended update is not read as an open one: once the swap thread is over, the
+/// slot is the one the swap left (B, after a `done`), and the record is the ended update's.
 #[test]
 fn an_ended_update_serves_where_the_swap_left_the_slot() {
     let (mut sup, _dir) = over("snap-ended", |_, _| {});
@@ -106,10 +90,8 @@ fn an_ended_update_serves_where_the_swap_left_the_slot() {
     assert_eq!(got.intent.map(|intent| intent.phase), Some(Phase::Done));
 }
 
-/// Catches a hold that hides the update too: the slot and the commit are unknown, the record of
+/// Asserts that the hold hides only the slot and the commit: they are unknown, the record of
 /// the update is still shown.
-///
-/// Mutant it catches: the whole snapshot emptied under the hold.
 #[test]
 fn the_update_is_shown_when_the_hold_hides_the_slot() {
     let (mut sup, _dir) = over("snap-hold-update", |_, config| {

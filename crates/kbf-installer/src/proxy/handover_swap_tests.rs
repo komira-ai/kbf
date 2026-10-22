@@ -217,12 +217,9 @@ fn start_blocked_names_no_migration_reason_and_still_names_a_busy_slot() {
     assert!(!why.contains("migrate"), "{why}");
 }
 
-/// Catches a snapshot that is built before the proxy is bound, or that does not reach the host's
+/// Asserts that the snapshot is built only once the proxy is bound, and reaches the host's
 /// records: before the fill it is empty and nothing is built; after it the slot is the one the
 /// host reports as serving and the commit is the one the host's record names for that slot.
-///
-/// Mutants it catches: a snapshot that builds the supervisor before the fill; the host's
-/// `running` not handed on to the supervisor (the commit would be `None`).
 #[test]
 fn the_snapshot_is_empty_until_the_fill_and_then_reads_the_hosts_records() {
     let (cfg, spool, root) = config("snapshot");

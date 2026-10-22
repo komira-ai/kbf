@@ -147,9 +147,7 @@ async fn the_update_api_calls_the_handler_even_while_the_gate_holds() {
 
 /// The swap's state is the update handler's, not a child's: it is called while the gate holds,
 /// with the path as the proxy matched it (the query is not passed), and no child is asked.
-///
-/// Kills: the path forwarded to the operator listener of a child; the call held with the
-/// streams.
+/// It is not held with the streams.
 #[tokio::test(start_paused = true)]
 async fn the_swap_state_calls_the_handler_even_while_the_gate_holds_and_no_child() {
     let (handler, seen, _) = recording(Duration::ZERO, false);

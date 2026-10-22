@@ -206,11 +206,8 @@ fn check_refuses_a_kbf_binary_that_is_not_an_absolute_path() {
     );
 }
 
-/// Catches a lookup of the commit a slot's child runs that asks the wrong slot or invents one:
-/// the slot the child control recorded gives the commit of its record, the other gives none.
-///
-/// Mutants it catches: the record of the other slot asked; a commit made up for a slot with no
-/// record.
+/// Asserts that the lookup of the commit a slot's child runs asks the slot it is given: the
+/// slot the child control recorded gives the commit of its record, the other gives none.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_swap_state_asks_the_child_control_for_the_commit_recorded_for_a_slot() {

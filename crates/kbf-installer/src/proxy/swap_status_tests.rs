@@ -2,9 +2,6 @@
 //! failure, the refusal of the binary watch, the numbers of updates, and what is not the swap's
 //! state (another method, another path). The swap is a fake that holds the snapshot a test
 //! sets, and `releases.json` is a file in a scratch directory.
-//!
-//! Each "Mutants it catches" line names a change to the code that the test is written to turn
-//! red. They are the reason the test exists, not a record that anyone ran them.
 
 use std::fs;
 use std::path::PathBuf;
@@ -158,13 +155,10 @@ impl Clock for At {
     }
 }
 
-/// Catches an answer whose shape has drifted: for an update that is done, the bytes are these,
-/// with every key, in this order, the commits as strings, the times in RFC 3339 and the
-/// numbers as numbers; the status is 200 and no header is added to the body's own.
-///
-/// Mutants it catches: a key renamed, dropped or reordered; a time in another format (a
-/// number, an offset instead of `Z`); `seq` a string; `null` written as an empty string or
-/// left out; the slot in upper case.
+/// Asserts the shape of the answer: for an update that is done, the bytes are these, with
+/// every key, in this order, the commits as strings, the times in RFC 3339 (UTC, ending in
+/// `Z`) and the numbers as numbers; `null` is written as `null`, the slot is in lower case,
+/// the status is 200 and no header is added to the body's own.
 #[tokio::test]
 async fn the_answer_for_a_finished_update_is_this_json_exactly() {
     let world = World::new("golden");
@@ -178,11 +172,9 @@ async fn the_answer_for_a_finished_update_is_this_json_exactly() {
     assert_eq!(String::from_utf8(answered.body).expect("UTF-8"), golden());
 }
 
-/// Catches fields read from the wrong place or given when nothing is known: with nothing known
-/// every field but the boot id is `null`; the boot id is the proxy's.
-///
-/// Mutants it catches: a field that is not `null` when unknown (an empty string, a made-up
-/// slot); the boot id left out or changed by a call.
+/// Asserts that a field nothing is known about is `null` (not an empty string or a made-up
+/// slot): with nothing known every field but the boot id is `null`; the boot id is the
+/// proxy's and is the same on every call.
 #[tokio::test]
 async fn with_nothing_known_every_field_but_the_boot_id_is_null() {
     let world = World::new("nothing");
@@ -203,15 +195,10 @@ async fn with_nothing_known_every_field_but_the_boot_id_is_null() {
     }
 }
 
-/// Catches `active_commit` taken from where the installed release or the binary is, or the
-/// slot and the commit mixed up: the installed commit is the one `releases.json` says (`B`),
-/// the active slot and the commit that child runs are the swap's (`a` and `A`), and the kbf
-/// waiting at the path is `pending_binary` (`C`). Each is its own field.
-///
-/// Mutants it catches: `active_commit` read from `installed_commit`, from the pending kbf or
-/// from the file on disk (the installed release is `B`, and the kbf on disk is `C`);
-/// `installed_commit` read from the swap; `pending_binary` read from the installed release;
-/// the slot in the wrong field.
+/// Asserts that each field is read from its own source: the installed commit is the one
+/// `releases.json` says (`B`), the active slot and the commit that child runs are the swap's
+/// (`a` and `A`, not the installed release or the kbf on disk), and the kbf waiting at the
+/// path is `pending_binary` (`C`).
 #[tokio::test]
 async fn each_field_is_read_from_its_own_source() {
     let world = World::new("fields");
@@ -232,10 +219,8 @@ async fn each_field_is_read_from_its_own_source() {
     assert!(got["update"].is_null());
 }
 
-/// Catches a status file that cannot be read being an error of the endpoint: the answer is
-/// still 200, with `installed_commit` `null` (the other fields are the swap's).
-///
-/// Mutant it catches: the read error answered as a 500, or taken for the previous value.
+/// Asserts that a status file that cannot be read is not an error of the endpoint: the answer
+/// is still 200, with `installed_commit` `null` (the other fields are the swap's).
 #[tokio::test]
 async fn an_unreadable_releases_file_makes_the_installed_commit_null() {
     let world = World::new("torn");
@@ -248,16 +233,12 @@ async fn an_unreadable_releases_file_makes_the_installed_commit_null() {
     assert_eq!(got["active_commit"], B);
 }
 
-/// Catches a state read off the wrong phase: only a recorded `done` is `done` (which the swap
+/// Asserts the state each phase is told as: only a recorded `done` is `done` (which the swap
 /// records after the confirm and the drain), every phase before it is `running` (`baking`,
-/// where the confirm is still to come, and `draining`, where it has been sent, included), a
-/// rollback is `abandoned`, and a failure is `refused` at a step before any candidate process
-/// and `abandoned` at any later one. A failure recorded while the update still runs (a confirm
-/// that is sent again) does not end it.
-///
-/// Mutants it catches: `done` before the confirm (at `baking`, `nodes` or `draining`); `done`
-/// for a failed update; a step moved between `refused` and `abandoned`; the failure of a
-/// running update ending it.
+/// where the confirm is still to come, `nodes` and `draining`, where it has been sent,
+/// included), a rollback is `abandoned`, and a failure is `refused` at a step before any
+/// candidate process and `abandoned` at any later one. A failure recorded while the update
+/// still runs (a confirm that is sent again) does not end it.
 #[test]
 fn the_state_is_done_only_for_a_recorded_done_and_a_failure_is_told_by_its_step() {
     let running = [
@@ -305,12 +286,9 @@ fn the_state_is_done_only_for_a_recorded_done_and_a_failure_is_told_by_its_step(
     assert_eq!(confirming, State::Running);
 }
 
-/// Catches an update told wrong end to end: a running update has no end and no reason; a
+/// Asserts how an update is told end to end: a running update has no end and no reason; a
 /// failure has its step and reason and an end; a failure before any candidate is `refused`; a
 /// rollback has its words; a failure recorded while the update runs is told as it is.
-///
-/// Mutants it catches: an end time on a running update; the step left out of the reason; the
-/// state, phase or reason of one of these taken from another.
 #[tokio::test]
 async fn an_update_is_told_with_its_phase_state_reason_and_end() {
     let world = World::new("told");
@@ -366,11 +344,8 @@ async fn an_update_is_told_with_its_phase_state_reason_and_end() {
     }
 }
 
-/// Catches a start time that is lost for an update an older build recorded (no start time): the
-/// time of its newest phase stands for it, and one that has a start time keeps it.
-///
-/// Mutants it catches: the start time of the record ignored (the newest phase's time given
-/// for every update); an absent start time shown as 1970.
+/// Asserts the start time of an update an older build recorded (no start time): the time of
+/// its newest phase stands for it (not 1970), and one that has a start time keeps it.
 #[tokio::test]
 async fn an_update_without_a_start_time_starts_when_its_newest_phase_did() {
     let world = World::new("old-record");
@@ -386,12 +361,9 @@ async fn an_update_without_a_start_time_starts_when_its_newest_phase_did() {
     assert_eq!(got["update"]["started_at"], STARTED_AT);
 }
 
-/// Catches updates that are not numbered once each: the same update asked about twice has the
+/// Asserts that updates are numbered once each: the same update asked about twice has the
 /// same number, the next update has the next, and an update the watch started was numbered
 /// when it started, so it keeps its place when it is first asked about.
-///
-/// Mutants it catches: a number that goes up with every request; a number that is always 1;
-/// the numbers of two updates equal.
 #[tokio::test]
 async fn an_update_keeps_its_number_and_the_next_update_takes_the_next() {
     let world = World::new("seq");
@@ -410,13 +382,10 @@ async fn an_update_keeps_its_number_and_the_next_update_takes_the_next() {
     assert_eq!(world.watch.seq_of(ID), 1, "the first keeps its number");
 }
 
-/// Catches a refusal of the binary watch that is not shown, or shown over the wrong update:
-/// while it stands it is the update (state `refused`, phase `accepted`, its reason, its times
-/// both the time of the failure, `from` as the watch read it, its own id and number); once the
-/// watch drops it, the swap's own record is shown again.
-///
-/// Mutants it catches: the refusal ignored; the refusal shown after it is dropped; a refusal
-/// shown as `running` or `abandoned`; its time not the failure's.
+/// Asserts that a refusal of the binary watch is the update while it stands (state `refused`,
+/// phase `accepted`, its reason, its times both the time of the failure, `from` as the watch
+/// read it, its own id and number); once the watch drops it, the swap's own record is shown
+/// again.
 #[tokio::test]
 async fn a_refusal_of_the_watch_is_the_update_while_it_stands() {
     let world = World::new("refusal");
@@ -448,9 +417,8 @@ async fn a_refusal_of_the_watch_is_the_update_while_it_stands() {
     assert_eq!(got["update"]["state"], "done");
 }
 
-/// Catches a refusal that has no serving release shown as one: `from` is `null`.
-///
-/// Mutant it catches: an empty string or the target for an unknown `from`.
+/// Asserts that a refusal that has no serving release has a `null` `from` (not an empty string
+/// or the target).
 #[tokio::test]
 async fn a_refusal_without_a_serving_release_has_a_null_from() {
     let world = World::new("refusal-unserved");
@@ -463,12 +431,9 @@ async fn a_refusal_without_a_serving_release_has_a_null_from() {
     assert_eq!(got["update"]["to"], B);
 }
 
-/// Catches an endpoint that answers what is not its to answer: another method on the swap's
+/// Asserts that the endpoint answers only what is its to answer: another method on the swap's
 /// state is 405 with `Allow: GET` and a JSON error, and any other path (the update API's) is
 /// the 410 of a retired API, whatever the method, and neither reads the swap.
-///
-/// Mutants it catches: a `POST` served as a `GET`; the update API's paths answered with the
-/// swap's state; the 410 lost.
 #[tokio::test]
 async fn only_get_on_the_state_is_served_and_the_retired_api_stays_gone() {
     let world = World::new("methods");
@@ -496,13 +461,10 @@ async fn only_get_on_the_state_is_served_and_the_retired_api_stays_gone() {
     }
 }
 
-/// Catches an id that is not the start time and the pid: the id is RFC 3339 UTC of the clock's
-/// second, a dash and the pid, and two processes started in the same second have ids that
-/// differ by their pid.
-///
-/// Mutants it catches: the pid left out or put first; the time in another form; the time of
-/// the call and not of the start (it is fixed when the route is made, and the test asks the
-/// clock once).
+/// Asserts that the boot id is the start time and the pid: the id is RFC 3339 UTC of the
+/// clock's second, a dash and the pid, and two processes started in the same second have ids
+/// that differ by their pid. It is fixed when the route is made, so the test asks the clock
+/// once.
 #[test]
 fn the_boot_id_is_the_start_time_and_the_pid() {
     let first = boot_id(&At(STARTED), 1234);
