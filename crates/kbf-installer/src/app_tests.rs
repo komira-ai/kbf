@@ -375,7 +375,6 @@ fn the_visible_verbs_are_the_contracts() {
             "setup",
             "status",
             "run",
-            "update",
             "confirm",
             "revert",
             "rollback",
@@ -395,15 +394,11 @@ fn the_visible_verbs_are_the_contracts() {
     assert_eq!(hidden, ["stage", "activate", "fetch-child"]);
 }
 
-/// Catches required flags becoming optional: a frontend update without `--frontend` (node
-/// updates never come from the CLI), a confirm without the activation it names, a bad id,
-/// a short commit, an unknown mode or a mirror flag value.
+/// Catches required flags becoming optional: a confirm without the activation it names, a
+/// bad id, an unknown mode or a mirror flag value.
 #[test]
 fn flags_are_required_and_checked_by_the_parser() {
-    let bad: [&[&str]; 9] = [
-        &["update", "--commit", B],
-        &["update", "--frontend"],
-        &["update", "--commit", "abc", "--frontend"],
+    let bad: [&[&str]; 6] = [
         &["confirm"],
         &["confirm", "--id", "42"],
         &["setup"],
@@ -1071,65 +1066,6 @@ fn run_builds_its_helper_with_the_host_fetcher_not_the_unwired_one() {
         matches!(&got, Err(crate::helper::fetcher::FetchError::Unavailable(why)) if !why.is_empty()),
         "{got:?}"
     );
-}
-
-/// Catches `update` being gated on root (it is a client of the update API and runs as
-/// whoever can read the token file) or not reaching its own code: a bad address is its own
-/// usage error, as an ordinary user, and prints no summary.
-#[test]
-fn update_runs_without_root_and_reports_its_own_usage_errors() {
-    let args = ["update", "--commit", B, "--frontend", "--api", "nowhere"];
-    let (exit, out, err) = run_as(1000, &args);
-    assert_eq!(exit, Exit::Usage);
-    assert!(out.is_empty(), "{out}");
-    assert!(
-        err.contains("update: --api") && err.contains("host:port"),
-        "{err}"
-    );
-    assert!(!parse(&args).verb.needs_root());
-    assert_eq!(parse(&args).verb.name(), "update");
-}
-
-/// Catches `update` taking a caller-chosen API address and token file as root: through sudo
-/// (`SUDO_UID` of another account) it is refused as a usage error before the token file is
-/// read or any address is dialed, and says why. Fails without the refusal: the run would go to
-/// the address and report the unreadable token file instead.
-#[test]
-fn update_is_refused_through_sudo_before_it_reads_anything() {
-    let Verb::Update(args) = parse(&[
-        "update",
-        "--commit",
-        B,
-        "--frontend",
-        "--api",
-        "127.0.0.1:1",
-        "--token-file",
-        "/nonexistent/token",
-    ])
-    .verb
-    else {
-        panic!("an update");
-    };
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    assert_eq!(update_verb(&args, true, &mut out, &mut err), Exit::Usage);
-    let err = String::from_utf8(err).expect("text");
-    assert!(out.is_empty());
-    assert!(err.contains("not accepted through sudo"), "{err}");
-    assert!(!err.contains("/nonexistent"), "{err}");
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    update_verb(&args, false, &mut out, &mut err);
-    let err = String::from_utf8(err).expect("text");
-    assert!(!err.contains("through sudo"), "{err}");
-}
-
-/// Catches a sudo test that takes root's own `SUDO_UID` or an unset one for another account
-/// (an operator running as root would be refused), or a caller's uid for none.
-#[test]
-fn only_a_sudo_uid_of_another_account_is_a_sudo_caller() {
-    use std::ffi::OsStr;
-    assert!(!is_sudo_uid(None));
-    assert!(!is_sudo_uid(Some(OsStr::new("0"))));
-    assert!(is_sudo_uid(Some(OsStr::new("1000"))));
 }
 
 /// The Linux layout on `root`: the one the tests of the unit `run` derives from the mode pin,

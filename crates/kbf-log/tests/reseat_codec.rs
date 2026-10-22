@@ -3,8 +3,6 @@
 //! Catches:
 //! - an encoding that changes under a committed log (golden bytes);
 //! - a field lost or swapped in a round trip (`stored`, the order of the records);
-//! - the command written into, or read from, a log of format 4 or earlier: a reader
-//!   without it must refuse the entry, never skip it;
 //! - a required field read as a default when absent.
 
 use kbf_log::{DecodeError, EncodeError, Format, LogCommand, decode, encode};
@@ -80,15 +78,17 @@ fn the_command_round_trips_with_its_records_in_order() {
     }
 }
 
-/// Catches: the command accepted under a format that predates it, in either direction.
+/// Asserts that the encoder refuses the command under every format before format 5, and
+/// that the decoder reads its format-5 bytes under those formats as the same command as
+/// under format 5.
 #[test]
-fn formats_before_five_refuse_it() {
+fn formats_before_five_write_it_not_and_read_it() {
     for format in [Format::V1, Format::V2, Format::V3, Format::V4] {
         assert!(enc(format, &reseat(false)).is_err(), "{format:?} wrote it");
     }
     let bytes = enc(Format::V5, &reseat(false)).expect("encoded");
     for format in [Format::V1, Format::V2, Format::V3, Format::V4] {
-        assert!(dec(format, &bytes).is_err(), "{format:?} read it");
+        assert_eq!(dec(format, &bytes), Ok(reseat(false)), "{format:?}");
     }
 }
 

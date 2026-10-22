@@ -276,18 +276,6 @@ struct MembersView {
     protocols: ProtocolSummary,
 }
 
-/// A member's state as `GET /v1/members` names it. Exhaustive: a new state fails to
-/// compile here instead of reaching operators unnamed.
-const fn state_name(state: MemberState) -> &'static str {
-    match state {
-        MemberState::Joining => "joining",
-        MemberState::CatchingUp => "catching_up",
-        MemberState::Active => "active",
-        MemberState::Draining => "draining",
-        MemberState::Down => "down",
-    }
-}
-
 async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
     let Some(members) = api.members.clone() else {
         return no_members();
@@ -330,7 +318,7 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
                 .map(|m| MemberView {
                     id: m.id.0,
                     addr: m.addr.clone(),
-                    state: state_name(m.state),
+                    state: m.state.name(),
                     weight: m.weight,
                     protocol: protocols.get(&m.id).copied().flatten(),
                     runs_log: facts.get(&m.id).and_then(|f| f.runs_log),

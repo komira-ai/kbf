@@ -7,7 +7,6 @@
 //! this file is the one that changes.
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use kbf_update::Source;
 
 use crate::CommitId;
 use crate::record::ActivationId;
@@ -45,8 +44,6 @@ pub enum Verb {
     Status,
     /// Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap.
     Run(RunArgs),
-    /// Swap this host's frontend through the proxy's update API, and wait for it.
-    Update(UpdateArgs),
     /// Keep the pending swap, naming its activation.
     Confirm(ActivationArgs),
     /// Undo the pending swap, naming its activation.
@@ -159,62 +156,11 @@ pub struct SetupArgs {
     /// A frontend host behind `kbf-installer proxy`: the `[proxy]` table of installer.toml.
     #[command(flatten)]
     pub proxy: crate::setup::proxy::ProxyFlags,
-    /// The host's deploy config (`/etc/kbf-installer/deploy.json`) of a frontend or all-in-one
-    /// host: the stage and, if the proxy is not where installer.toml says, where deploy calls.
-    #[command(flatten)]
-    pub deploy: crate::setup::deploy_config::DeployFlags,
     /// The installer.toml `setup` writes (and reads, to keep what it does not set), under the
     /// host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which
     /// is the only value setup accepts. The same flag, with the same meaning, as on `run`.
     #[arg(long, value_parser = kbf_host::HostPath::new)]
     pub installer_config: Option<kbf_host::HostPath>,
-}
-
-#[derive(Args)]
-pub struct UpdateArgs {
-    /// The release to update to (40 hex characters).
-    #[arg(long)]
-    pub commit: CommitId,
-    /// Update this host's frontend: ask the update API of the proxy to swap it, and wait.
-    #[arg(long, required = true)]
-    pub frontend: bool,
-    /// The proxy's public address, `127.0.0.1:port`: the update API is served there.
-    #[arg(long)]
-    pub api: String,
-    /// CA certificates (PEM) the API's certificate is verified against, besides the system's.
-    #[arg(long)]
-    pub api_ca: Option<std::path::PathBuf>,
-    /// The name the API's certificate carries (the address's own IP when none is given).
-    #[arg(long)]
-    pub api_server_name: Option<String>,
-    /// The operator token the API takes: a file of mode 0600 or 0400. `setup` writes it here.
-    #[arg(long, default_value = "/etc/kbf/api-token")]
-    pub token_file: std::path::PathBuf,
-    /// Have the new frontend update the nodes once it has baked. Without it only the
-    /// frontend is swapped.
-    #[arg(long)]
-    pub nodes: bool,
-    /// Where the release comes from: `fetch` (from the source the installer is configured with,
-    /// as every update has) or `staged` (the release this host's package carries). `staged`
-    /// takes no `--nodes` yet.
-    #[arg(long, default_value = "fetch", value_parser = parse_source)]
-    pub source: Source,
-    /// Names this update to the API, so a run repeated after a lost connection is the same
-    /// update. Random when not given.
-    #[arg(long)]
-    pub request_id: Option<String>,
-    /// How long to wait for the update to end, the new frontend's bake included.
-    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
-    pub handover_timeout_s: u64,
-}
-
-/// `--source`: `fetch` or `staged`, nothing else (an unknown word is a usage error).
-fn parse_source(text: &str) -> Result<Source, String> {
-    match text {
-        "fetch" => Ok(Source::Fetch),
-        "staged" => Ok(Source::Staged),
-        _ => Err("a source is fetch or staged".to_owned()),
-    }
 }
 
 #[derive(Args)]
@@ -420,7 +366,6 @@ impl Verb {
             Verb::Setup(_) => "setup",
             Verb::Status => "status",
             Verb::Run(_) => "run",
-            Verb::Update(_) => "update",
             Verb::Confirm(_) => "confirm",
             Verb::Revert(_) => "revert",
             Verb::Rollback(_) => "rollback",
@@ -436,14 +381,10 @@ impl Verb {
         }
     }
 
-    /// Every verb but `status`, `check`, `proxy` (which runs as the unprivileged service
-    /// user) and `update` (a client of the proxy's update API: it needs whoever can read the
-    /// token file, which is the only thing it asks of its user) needs root.
+    /// Every verb but `status`, `check` and `proxy` (which runs as the unprivileged service
+    /// user) needs root.
     pub fn needs_root(&self) -> bool {
-        !matches!(
-            self,
-            Verb::Status | Verb::Check | Verb::Proxy(_) | Verb::Update(_)
-        )
+        !matches!(self, Verb::Status | Verb::Check | Verb::Proxy(_))
     }
 
     /// The pull request of the contract (section 9) that builds the verb, `None` for the
@@ -454,7 +395,6 @@ impl Verb {
             Verb::Run(_)
             | Verb::BootCheck(_)
             | Verb::Proxy(_)
-            | Verb::Update(_)
             | Verb::Confirm(_)
             | Verb::Revert(_)
             | Verb::Rollback(_)

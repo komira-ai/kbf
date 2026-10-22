@@ -245,12 +245,10 @@ mod tests {
         );
     }
 
-    /// Catches a replica that reads every entry as format 1 (a tier command after the
-    /// raise to machine version 2 would not replay: a false property-1 alarm), or
-    /// reads one as format 2 before the raise (a log an older binary refuses taken
-    /// for a good one).
+    /// Asserts that a tier command replays whether or not the log was raised to machine
+    /// version 2 before it, because decoding does not depend on the version.
     #[test]
-    fn a_raise_to_version_2_lets_the_tier_commands_replay() {
+    fn a_tier_command_replays_before_and_after_the_raise_to_version_2() {
         let add = LogCommand::Meta(Command::AddTier {
             server: kbf_meta::ServerId::new(1),
             tier: kbf_meta::TierId::new(1),
@@ -261,9 +259,10 @@ mod tests {
         };
         let mut early = log();
         early.push(tier_entry(4));
-        assert!(
-            replay(&early, 4).is_err(),
-            "a tier command before the raise"
+        let (meta, _) = replay(&early, 4).expect("replays before the raise");
+        assert_eq!(
+            meta.tier(kbf_meta::ServerId::new(1)),
+            Some(kbf_meta::TierId::new(1))
         );
         let mut raised = log();
         raised.push(entry(4, &LogCommand::MachineVersion(MachineVersion::V2)));
@@ -273,6 +272,20 @@ mod tests {
             meta.tier(kbf_meta::ServerId::new(1)),
             Some(kbf_meta::TierId::new(1))
         );
+    }
+
+    /// Asserts that a command this binary does not know breaks replica equality: the
+    /// replica applies nothing for it, so it names the entry instead of skipping it.
+    #[test]
+    fn an_unknown_command_breaks_replica_equality() {
+        let mut unknown = log();
+        unknown.push(Entry {
+            id: LogId::new(Term(1), LogIndex(4)),
+            payload: Payload::Command(vec![0x0a, 0x03, 0xaa, 0x01, 0x00]),
+        });
+        let broken = replay(&unknown, 4).map(|_| ()).expect_err("broken");
+        assert_eq!(broken.0, Property::ReplicaEquality);
+        assert_eq!(broken.1, "entry 4 is Ok(Unknown)");
     }
 
     /// Catches a time check that lets farm time go back (the mutant "`max(now)`

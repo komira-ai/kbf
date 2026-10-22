@@ -167,6 +167,27 @@ fn not_storage(role: PeerRole) -> Status {
     ))
 }
 
+/// Whether `role`, the number a registration names, is the storage role.
+///
+/// A role this build does not name is a node of a later kind: no member is made of it, so
+/// the call leaves no row, member id or boot behind, and it is answered apart from a
+/// registration that names no role at all.
+///
+/// # Errors
+/// INVALID_ARGUMENT for `ROLE_UNSPECIFIED`; UNIMPLEMENTED for a role this build does not
+/// name.
+fn storage_role(role: i32) -> Result<(), Status> {
+    match pb::Role::try_from(role) {
+        Ok(pb::Role::Storage) => Ok(()),
+        Ok(pb::Role::Unspecified) => Err(Status::invalid_argument(
+            "role must be ROLE_STORAGE: only storage nodes register",
+        )),
+        Err(_) => Err(Status::unimplemented(
+            "role not served by this frontend: only ROLE_STORAGE registers",
+        )),
+    }
+}
+
 /// Refuses a caller whose certificate an entry of `denied` names.
 ///
 /// # Errors
@@ -262,11 +283,7 @@ impl Membership for MembershipService {
     ) -> Result<Response<pb::RegisterResponse>, Status> {
         let peer = self.admit(&request).await?;
         let req = request.into_inner();
-        if pb::Role::try_from(req.role) != Ok(pb::Role::Storage) {
-            return Err(Status::invalid_argument(
-                "role must be ROLE_STORAGE: only storage nodes register",
-            ));
-        }
+        storage_role(req.role)?;
         if let Some(peer) = &peer {
             let names = peer.identity().names();
             // A proxied identity carries no serial (see `PeerIdentity::proxied`).

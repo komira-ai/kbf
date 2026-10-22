@@ -4,14 +4,9 @@
 //! Catches:
 //! - a conversion that loses or mixes up a field of any control command or farm input
 //!   (a round trip over generated values, `decode(encode(x)) == x`);
-//! - a decoder that reads an unspecified or unknown enum value as a default, or an
-//!   unset `oneof` as nothing at all, instead of refusing it;
 //! - a decoder that accepts an absent required field, a zero term or machine version,
 //!   a short checkpoint digest, or a value its own type refuses (a custom QoS level, a
 //!   capability request);
-//! - a decoder that accepts bytes `encode` would not write for the value: a field
-//!   repeated, a zero value written, an unknown field, a map or set out of order or
-//!   with a repeat, a capability request in another order or with a key `parse` skips;
 //! - an encoder that writes a wall-clock time it cannot represent.
 
 mod control_support;
@@ -352,7 +347,10 @@ fn generated_control_commands_round_trip() {
 
 const fn kind(command: &LogCommand) -> usize {
     match command {
-        LogCommand::Meta(_) | LogCommand::Bootstrap(_) | LogCommand::Farm(_) => 0,
+        LogCommand::Meta(_)
+        | LogCommand::Bootstrap(_)
+        | LogCommand::Unknown
+        | LogCommand::Farm(_) => 0,
         LogCommand::Report(_) => 1,
         LogCommand::Takeover(_) => 2,
         LogCommand::Checkpoint(_) => 3,
@@ -482,61 +480,42 @@ fn failed(n: i32) -> Option<proto::Outcome> {
     })
 }
 
-fn unknown(field: &'static str, value: i32) -> Result<LogCommand, DecodeError> {
-    Err(DecodeError::UnknownValue { field, value })
-}
+const UNKNOWN: Result<LogCommand, DecodeError> = Ok(LogCommand::Unknown);
 
-/// Catches a decoder that defaults an enum value it does not know, or the unspecified
-/// zero (which is also what an absent field reads as), instead of refusing it: every
-/// enum the control commands carry, at 0 and at a value `log.proto` does not name.
+/// Asserts that a decoder reads an enum value it does not know, or the unspecified zero
+/// (which is also what an absent field reads as), as an unknown command and not as a
+/// default: every enum the control commands carry, at 0 and at a value `log.proto` does
+/// not name.
 #[test]
-fn an_unspecified_or_unknown_enum_value_is_refused() {
+fn an_unspecified_or_unknown_enum_value_decodes_as_unknown() {
     for value in [0, 99] {
-        assert_eq!(
-            dec(&capacity(Some(pcaps(value, 1)))),
-            unknown("CpuCaps.arch", value)
-        );
-        assert_eq!(
-            dec(&capacity(Some(pcaps(1, value)))),
-            unknown("ConsumableAmount.consumable", value)
-        );
-        assert_eq!(
-            dec(&submit(prequest(builtin(1), value, &[]))),
-            unknown("Request.kind", value)
-        );
-        assert_eq!(
-            dec(&submit(prequest(builtin(value), 1, &[]))),
-            unknown("Qos.builtin", value)
-        );
-        assert_eq!(
-            dec(&report(failed(value))),
-            unknown("Outcome.failed", value)
-        );
+        assert_eq!(dec(&capacity(Some(pcaps(value, 1)))), UNKNOWN);
+        assert_eq!(dec(&capacity(Some(pcaps(1, value)))), UNKNOWN);
+        assert_eq!(dec(&submit(prequest(builtin(1), value, &[]))), UNKNOWN);
+        assert_eq!(dec(&submit(prequest(builtin(value), 1, &[]))), UNKNOWN);
+        assert_eq!(dec(&report(failed(value))), UNKNOWN);
     }
 }
 
-/// Catches a decoder that reads an unset `oneof` (a command, input, record, outcome or
-/// QoS kind this binary does not know) as some default.
+/// Asserts that a decoder reads an unset `oneof` (a command, input, record, outcome or
+/// QoS kind this binary does not know) as an unknown command and not as some default.
 #[test]
-fn an_unset_oneof_is_refused() {
-    let none = |name| Err(DecodeError::UnknownCommand(name));
+fn an_unset_oneof_decodes_as_unknown() {
     let empty_input = wrap(proto::log_command::Command::Farm(proto::FarmBatch {
         inputs: vec![proto::FarmInput { input: None }],
         ..Default::default()
     }));
-    assert_eq!(dec(&empty_input), none("FarmInput"));
+    assert_eq!(dec(&empty_input), UNKNOWN);
     let record = proto::ControlRecord { record: None };
     assert_eq!(
         dec(&wrap_input(proto::farm_input::Input::Committed(record))),
-        none("ControlRecord")
+        UNKNOWN
     );
-    assert_eq!(
-        dec(&report(Some(proto::Outcome { outcome: None }))),
-        none("Outcome")
-    );
+    let outcome = proto::Outcome { outcome: None };
+    assert_eq!(dec(&report(Some(outcome))), UNKNOWN);
     assert_eq!(
         dec(&submit(prequest(Some(proto::Qos { level: None }), 1, &[]))),
-        none("Qos")
+        UNKNOWN
     );
 }
 
@@ -716,32 +695,51 @@ fn values_their_types_refuse_are_refused() {
     );
 }
 
-/// Catches a lenient decoder: bytes that decode to a value but are not the bytes
-/// `encode` writes for it are refused, so one value has one encoding.
+/// Asserts that bytes `encode` would not write for a value (a field repeated, a zero
+/// value written, an unknown field, a varint that is not minimal) decode to the value
+/// they stand for, so none of them is refused.
 #[test]
-fn bytes_encode_would_not_write_are_refused() {
-    let not_canonical = Err(DecodeError::NotCanonical);
-    let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
-    // A field repeated: a cordon naming its worker twice (prost keeps the last).
-    let mut once = enc(&batch(FarmInput::Cordon(WorkerId::new("w"))));
+fn bytes_encode_would_not_write_decode_to_their_value() {
+    let cordon = batch(FarmInput::Cordon(WorkerId::new("w")));
+    let mut once = enc(&cordon);
     assert_eq!(hex::encode(&once), "1a0b080110021a0542030a0177");
+    let drain = batch(FarmInput::Drain {
+        worker: WorkerId::new("w"),
+        deadline: FarmTime::from_millis(0),
+    });
+    let mut cases: Vec<(&str, Vec<u8>, LogCommand)> = Vec::new();
+    // A field repeated: a cordon naming its worker twice (prost keeps the last).
     let twice = hex::decode("1a0e080110021a0842060a01770a0177").expect("hex");
-    cases.push(("a repeated field", twice));
+    cases.push(("a repeated field", twice, cordon.clone()));
     // A zero value written: a drain's deadline 0 as `10 00`.
     cases.push((
         "an explicit zero",
         hex::decode("1a0d080110021a074a050a01771000").expect("hex"),
+        drain,
     ));
     // An unknown field inside the tick (field 1 = 1).
     cases.push((
         "an unknown field",
         hex::decode("1a0a080110021a043a020801").expect("hex"),
+        batch(FarmInput::Tick),
     ));
     // A non-minimal varint: the farm time 1 as `81 00`.
     once[2..4].copy_from_slice(&[0x08, 0x81]);
     once.insert(4, 0x00);
     once[1] += 1;
-    cases.push(("a non-minimal varint", once));
+    cases.push(("a non-minimal varint", once, cordon));
+    for (what, bytes, value) in cases {
+        assert_eq!(dec(&bytes), Ok(value), "{what}");
+    }
+}
+
+/// Asserts that a map or a set the encoder would write in another order, or without the
+/// repeat (a key twice, an element twice), or a capability request with a key `parse`
+/// skips, decodes, and that the value it decodes to re-encodes to bytes that decode to
+/// the same value.
+#[test]
+fn maps_and_sets_out_of_order_or_repeated_decode_to_a_stable_value() {
+    let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
     // Maps and sets out of order or with a repeat.
     let exact = |keys: &[&str]| proto::NodeCaps {
         exact: keys
@@ -838,7 +836,8 @@ fn bytes_encode_would_not_write_are_refused() {
         submit(prequest(builtin(1), 1, &[("kbf-lease", "action")])),
     ));
     for (what, bytes) in cases {
-        assert_eq!(dec(&bytes), not_canonical, "{what}");
+        let value = dec(&bytes).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(dec(&enc(&value)), Ok(value), "{what}");
     }
 }
 
@@ -876,11 +875,8 @@ fn control_commands_refuse_an_unknown_format() {
     );
 }
 
-/// Catches: a machine version that names the wrong entry format (mutant "every version
-/// is format 1": a raised log would still refuse the write tier's commands or
-/// `EvictObjects`, or a version-1 log would accept them), and a version this binary
-/// does not know given a format instead of none (it must stop the machine, not be read
-/// as a known one).
+/// Asserts that each machine version names its entry format, and that a version this
+/// binary does not know has no format.
 #[test]
 fn machine_versions_name_their_entry_formats() {
     assert_eq!(MachineVersion::V1.get(), 1);

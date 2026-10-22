@@ -4,9 +4,6 @@
 //! Catches:
 //! - an encoding that changes under a committed log (golden bytes per variant);
 //! - a conversion that loses or mixes up a field (a round trip over generated values);
-//! - a tier command written into, or read from, a format-1 log: a reader without the
-//!   commands must refuse the entry, never skip it (section 9, "a log holding each new
-//!   variant, opened by a reader without it, is refused");
 //! - a tier command numbered onto a field an older reader knows, which it would then
 //!   apply as another command;
 //! - a required field read as a default when absent.
@@ -151,7 +148,7 @@ fn every_tier_command_has_its_golden_bytes() {
 
 /// Every tier command is in the golden set, and only tier commands are: a variant added
 /// to `kbf_meta::Command` fails to compile here until it is placed (the match is
-/// exhaustive), and a format-1 command in this set would hide that format 1 refuses it.
+/// exhaustive), and a format-1 command in this set would hide that format 1 refuses to encode it.
 #[test]
 fn the_golden_set_names_every_tier_command() {
     let mut seen = [false; 5];
@@ -269,11 +266,11 @@ fn generated_tier_commands_round_trip_and_reencode_to_the_same_bytes() {
     }
 }
 
-/// Catches: a tier command written into a format-1 log, and a format-1 reader that
-/// skips one or reads it as something else, which would let a replica without the tier
-/// diverge silently. Mutant: drop the format check in `decode`.
+/// Asserts that the encoder refuses every tier command under format 1, and that the
+/// decoder reads each tier command's bytes under format 1 as the same command as under
+/// format 2, because decoding does not depend on the committed format.
 #[test]
-fn a_format_1_log_refuses_every_tier_command() {
+fn a_format_1_log_is_written_without_tier_commands_and_read_with_them() {
     for (name, command, hex) in golden() {
         assert_eq!(
             enc(Format::V1, &command),
@@ -281,11 +278,7 @@ fn a_format_1_log_refuses_every_tier_command() {
             "{name}"
         );
         let bytes = hex::decode(hex).expect("hex");
-        assert_eq!(
-            dec(Format::V1, &bytes),
-            Err(DecodeError::UnknownCommand("MetaCommand")),
-            "{name}"
-        );
+        assert_eq!(dec(Format::V1, &bytes).as_ref(), Ok(&command), "{name}");
     }
     // Format 2 still reads and writes every format-1 command, with format 1's bytes.
     let collect = Command::Collect;
@@ -325,11 +318,11 @@ enum Format1Command {
 }
 
 /// What an older binary sees in a tier command: nothing at all (the `oneof` unset),
-/// which its decoder refuses as an unknown command
-/// (`meta_codec.rs::a_command_this_binary_does_not_know_is_refused`). Catches: a tier
-/// command numbered onto a format-1 field, which an older binary would apply as that
-/// command. The format-1 commands still decode under the old shape, so the check is
-/// not vacuous.
+/// which its decoder reads as an unknown command
+/// (`meta_codec.rs::a_command_this_binary_does_not_know_decodes_as_unknown`). Asserts
+/// that no tier command is numbered onto a format-1 field, which an older binary would
+/// apply as that command. The format-1 commands still decode under the old shape, so
+/// the check is not vacuous.
 #[test]
 fn an_older_binary_sees_no_command_in_a_tier_entry() {
     for (name, command, _) in golden() {
