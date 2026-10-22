@@ -380,7 +380,10 @@ async fn a_pool_lease_reports_its_usage() {
     let scratch = Scratch::new("usage");
     let users = Users::new("usage", 1);
     let cas = Arc::new(MemoryCas::default());
-    let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
+    let mut config = config(&scratch, users.pool());
+    // The pool tests poll hourly; this one needs the polls the peak and CPU come from.
+    config.poll = Duration::from_millis(20);
+    let rt = NativeRuntime::new(config, Arc::clone(&cas)).expect("runtime");
     let act = scratch.act();
     let spec = Spec::argv(&[&act, "alloc", "208", ";", "burn", "1.5"]);
     let result = lease(&rt, &cas, 1, &spec).await;
@@ -389,7 +392,6 @@ async fn a_pool_lease_reports_its_usage() {
     assert_eq!(usage.basis(), kbf_proto::worker::UsageBasis::MacFootprint);
     assert_eq!(usage.cgroup, None);
     let f = usage.footprint.expect("a footprint block");
-    eprintln!("DIAG {f:?}");
     let peak = f.peak_footprint_bytes.expect("a peak");
     assert!(peak >= 200 << 20, "peak {peak}");
     let user = f.cpu_user_micros.expect("user cpu");

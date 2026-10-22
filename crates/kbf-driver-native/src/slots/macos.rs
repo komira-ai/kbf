@@ -443,7 +443,6 @@ impl UidWatch {
                 .unwrap_or_else(PoisonError::into_inner)
                 .extend(pids.iter().copied());
             let mut meter = meter.lock().unwrap_or_else(PoisonError::into_inner);
-            for p in &pids { tracing::warn!(uid, pid = p, r = ?procs::rusage(*p), "DIAG"); }
             Ok::<_, io::Error>(meter.poll(pids, procs::rusage))
         })
         .await;
