@@ -1263,7 +1263,7 @@ fn learned_sizes_come_from_their_flag() {
     assert_eq!(sizes(&["--learned-sizes", "on"]), LearnedSizes::On);
     for bad in ["", "ON", "true", "yes", "1"] {
         let err = parse(&["--learned-sizes", bad]).expect_err(bad);
-        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{bad}");
     }
 }
 
