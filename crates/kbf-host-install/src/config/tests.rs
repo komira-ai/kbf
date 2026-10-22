@@ -172,6 +172,17 @@ fn continuation_and_stray_lines() {
     );
 }
 
+/// `path`, written relative to the current directory (`../../tmp/...`).
+fn relative_to_cwd(path: &Path) -> String {
+    let up = "../".repeat(std::env::current_dir().unwrap().components().count() - 1);
+    let relative = format!("{up}{}", path.display().to_string().trim_start_matches('/'));
+    assert!(
+        Path::new(&relative).is_file(),
+        "{relative} must reach the key"
+    );
+    relative
+}
+
 /// Catches a key that is accepted without being root's: a missing file, a file of another
 /// owner, a writable file, a key that is not a path (fingerprint, inline), and a list in
 /// which only the second key is bad.
@@ -197,6 +208,9 @@ fn an_untrusted_key_is_refused() {
             "0123456789ABCDEF0123456789ABCDEF01234567".into(),
         ),
         ("relative path", "keys/kbf.gpg".into()),
+        // A relative path that does reach the good key from here is still not a key: sshd's
+        // working directory is not the allowlist's.
+        ("relative path that exists", relative_to_cwd(&good)),
         ("empty", String::new()),
         (
             "inline armor",
