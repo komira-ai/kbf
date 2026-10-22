@@ -78,7 +78,49 @@ pub(crate) fn read_table(layout: &Layout) -> Result<Option<toml::Table>, String>
 
 #[cfg(test)]
 mod tests {
-    use super::first_unit;
+    use super::{first_unit, frontend_host};
+    use crate::testkit::{host_root, mkdirs};
+
+    /// Catches `frontend_host` accepting a mode that is not a frontend: exactly `frontend` and
+    /// `all-in-one` are accepted, and every other mode string of kbf (`storage`,
+    /// `storage-and-daemon`, `daemon`), an unknown one and a missing mode or file is refused,
+    /// the refusal naming the mode it saw.
+    ///
+    /// Mutant planted: `| "storage"` added to the accepted arm of `frontend_host` fails the
+    /// `storage` row; any other mode added fails its own row.
+    #[test]
+    fn exactly_frontend_and_all_in_one_are_frontend_hosts() {
+        // (file text, accepted, text the refusal must contain)
+        let rows: [(Option<&str>, bool, &str); 8] = [
+            (Some("mode = \"frontend\"\n"), true, ""),
+            (Some("mode = \"all-in-one\"\n"), true, ""),
+            (Some("mode = \"storage\"\n"), false, "\"storage\""),
+            (
+                Some("mode = \"storage-and-daemon\"\n"),
+                false,
+                "\"storage-and-daemon\"",
+            ),
+            (Some("mode = \"daemon\"\n"), false, "\"daemon\""),
+            (Some("mode = \"bogus\"\n"), false, "\"bogus\""),
+            (Some("listen = \"x\"\n"), false, "has no mode"),
+            (None, false, "is not there"),
+        ];
+        for (index, (text, accepted, why)) in rows.into_iter().enumerate() {
+            let (layout, root) = host_root(&format!("host-mode-{index}"));
+            if let Some(text) = text {
+                let path = layout.join(&layout.kbf_toml());
+                mkdirs(&root, path.parent().expect("a directory"), 0o755);
+                std::fs::write(&path, text).expect("write kbf.toml");
+            }
+            let got = frontend_host(&layout);
+            if accepted {
+                assert_eq!(got, Ok(()), "{text:?}");
+            } else {
+                let err = got.expect_err(&format!("{text:?} must be refused"));
+                assert!(err.contains(why), "{text:?}: {err}");
+            }
+        }
+    }
 
     /// Catches a mode whose unit list is empty panicking `run` (or being given a default unit)
     /// instead of being refused with the file and the mode named.
