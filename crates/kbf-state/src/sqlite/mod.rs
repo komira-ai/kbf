@@ -22,6 +22,10 @@
 //! - **Backup and restore.** [`backup`] copies the file while a store writes it, into a
 //!   single file that [`check_backup`] checks; [`restore`] (or [`restore_locked`], under
 //!   a [`StoreLock`] the caller took) puts one back while no store has the file open.
+//! - **Newer files.** The layout changes by expansion only, so a file whose schema version is
+//!   newer than this binary's opens when every table and column this binary needs is in it;
+//!   what a newer release added is ignored, and a feed row of a kind this binary does not
+//!   know is skipped and logged (`schema.rs` has the rule).
 //! - **Clock.** Expiry times are stored as nanoseconds on the store's clock, so the clock
 //!   must mean the same thing after a restart: use [`crate::SystemClock`] in production.
 //!

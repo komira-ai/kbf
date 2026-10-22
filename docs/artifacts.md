@@ -202,8 +202,8 @@ sorted by name.
   change on: an installer older than that refuses a kbf that prints it
   (`version-unreadable`), so the installer package that reads `seq` ships before the kbf
   that prints it.
-- `state_schema`: the schema version of the SQLite state file the binary creates and
-  reads.
+- `state_schema`: the schema version of the SQLite state file the binary creates; it
+  also reads a newer file that only adds to this layout.
 - `version`: the package version.
 
 `--json` without `--version` is a usage error. The fields are a contract: the test

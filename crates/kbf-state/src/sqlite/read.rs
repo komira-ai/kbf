@@ -5,7 +5,7 @@ use std::ops::Bound;
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
-use super::schema::{self, KIND_DELETE, KIND_PUT};
+use super::schema::{self, KIND_DELETE, KIND_EXPIRE, KIND_PUT};
 use super::writer::{from_nanos, to_nanos, to_sql, uint};
 use crate::clock::StoreTime;
 use crate::store::{Span, page_of};
@@ -27,19 +27,27 @@ fn stored(row: &Row<'_>) -> rusqlite::Result<(Vec<u8>, i64, Option<i64>)> {
     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
 }
 
-/// A `feed` row.
-fn change_of(row: &Row<'_>) -> rusqlite::Result<Change> {
-    let value: Option<Vec<u8>> = row.get(3)?;
+/// A `feed` row: its revision, and the change it records, which is `None` for a kind this
+/// binary does not know (a newer release wrote it). That row is skipped, not applied as
+/// some other kind, and logged.
+fn feed_row(row: &Row<'_>) -> rusqlite::Result<(Revision, Option<Change>)> {
+    let revision = Revision(uint(row.get(0)?));
     let event = match row.get::<_, i64>(2)? {
-        KIND_PUT => Event::Put(value.unwrap_or_default()),
+        KIND_PUT => Event::Put(row.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default()),
         KIND_DELETE => Event::Delete,
-        _ => Event::Expire,
+        KIND_EXPIRE => Event::Expire,
+        kind => {
+            tracing::warn!("skipped feed row {revision:?} of unknown kind {kind}");
+            return Ok((revision, None));
+        }
     };
-    Ok(Change {
-        revision: Revision(uint(row.get(0)?)),
-        key: row.get(1)?,
+    let key = row.get(1)?;
+    let change = Change {
+        revision,
+        key,
         event,
-    })
+    };
+    Ok((revision, Some(change)))
 }
 
 fn is_live(expires: Option<i64>, now: StoreTime) -> bool {
@@ -154,6 +162,10 @@ fn nothing() {}
 /// The head and the rows come from one deferred read transaction, which in WAL mode
 /// pins the snapshot at its first read: the rows never run past the head, so a short page
 /// can end at the head without skipping a row that committed after it was read.
+///
+/// A row of a kind this binary does not know is left out of the page, but it counts
+/// toward the limit and the cursor: a full page resumes after its last row read, skipped
+/// or not, so the poller moves on.
 pub(super) fn changes_after_head(
     conn: &mut Connection,
     after: Revision,
@@ -167,17 +179,18 @@ pub(super) fn changes_after_head(
         "SELECT revision, key, kind, value FROM feed WHERE revision > ?1 ORDER BY revision LIMIT ?2",
     )?;
     let bounds = [to_sql(after.0), to_sql(limit as u64)];
-    let page = statement.query_map(bounds, change_of)?;
-    let rows = page.collect::<rusqlite::Result<Vec<Change>>>()?;
+    let page = statement.query_map(bounds, feed_row)?;
+    let read = page.collect::<rusqlite::Result<Vec<(Revision, Option<Change>)>>>()?;
     // A full page resumes after its last row; a short one has reached the head, and every
     // revision up to it has committed (there is one writer).
-    let cursor = if rows.len() >= limit {
-        match rows.last() {
-            Some(change) => change.revision,
+    let cursor = if read.len() >= limit {
+        match read.last() {
+            Some((revision, _)) => *revision,
             None => after,
         }
     } else {
         Revision(uint(head).max(after.0))
     };
+    let rows = read.into_iter().filter_map(|(_, change)| change).collect();
     Ok(Changes { rows, cursor })
 }
