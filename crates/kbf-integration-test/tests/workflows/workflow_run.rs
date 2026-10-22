@@ -1,25 +1,53 @@
-//! The `workflow_run` trigger the workflow lint refuses.
+//! The `workflow_run` trigger, allowed in one exact shape and refused in every other.
 //!
 //! A `workflow_run` workflow starts when another workflow completes, runs the default
 //! branch's copy of the file whatever ref the other run was for, and holds this repository's
-//! token and its environments' credentials. The one workflow that had one, `gamma.yml`, is
-//! deleted (gamma moves to kbf-updater), so [`rules`] refuses the trigger in every form and
-//! in every workflow. The message begins `line 0:` (the reader gives no line).
+//! token and its environments' credentials. The release is the one use: it must outlive a push
+//! that cancels the pipeline run it follows, so it is a workflow of its own started by the
+//! success of the pipeline (`release.yml`; see its header). [`rules`] therefore refuses the
+//! trigger in every form and in every workflow but this: `workflows: [pipeline]`, `types:
+//! [completed]` and `branches: [main]`, nothing else. A repository test
+//! (`only_the_release_workflow_follows_the_pipeline`) holds the trigger to `release.yml` and the
+//! workflow named `pipeline` to a push to main alone. The message begins `line 0:` (the reader
+//! gives no line).
 
 use super::*;
 
-/// What a workflow with the trigger is told.
-const REFUSED: &str = "triggers on workflow_run, which no workflow may";
+/// What a workflow with the trigger in any other shape is told.
+const REFUSED: &str = "triggers on workflow_run, which no workflow may but the release after the pipeline (workflows: [pipeline], types: [completed], branches: [main])";
+
+/// The filters of the one allowed shape, by key.
+const ALLOWED: [(&str, &str); 3] = [
+    ("branches", "main"),
+    ("types", "completed"),
+    ("workflows", "pipeline"),
+];
 
 pub(super) fn is_workflow_run(name: &str) -> bool {
     name.trim().eq_ignore_ascii_case("workflow_run")
 }
 
-/// The problems with a workflow that triggers on `workflow_run`: one. Nothing for a workflow
-/// that does not trigger on it, or does not parse (the lint reports that).
+/// Whether the workflow's `workflow_run` filters are exactly [`ALLOWED`].
+fn is_the_allowed_shape(text: &str) -> bool {
+    let Ok(mut filters) = trigger_filters(text, "workflow_run") else {
+        return false;
+    };
+    filters.sort();
+    filters.len() == ALLOWED.len()
+        && filters
+            .iter()
+            .zip(ALLOWED)
+            .all(|((key, values), (want_key, want))| {
+                key == want_key && values.as_slice() == [want.to_owned()]
+            })
+}
+
+/// The problems with a workflow that triggers on `workflow_run`: one unless it is the allowed
+/// shape. Nothing for a workflow that does not trigger on it, or does not parse (the lint
+/// reports that).
 pub(super) fn rules(text: &str) -> Vec<String> {
     let follows = events(text).is_ok_and(|on| on.iter().any(|e| is_workflow_run(e)));
-    if follows {
+    if follows && !is_the_allowed_shape(text) {
         vec![format!("line 0: {REFUSED}")]
     } else {
         Vec::new()
@@ -67,6 +95,64 @@ mod tests {
         }
         assert!(seen > 0, "no workflow file read");
         assert_eq!(found, Vec::<String>::new());
+    }
+
+    /// The `name:` of a workflow text, or empty.
+    fn name_of(text: &str) -> String {
+        text.lines()
+            .find_map(|l| l.strip_prefix("name: "))
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    }
+
+    #[test]
+    fn only_the_release_workflow_follows_the_pipeline() {
+        let dir = crate::repo_root().join(".github/workflows");
+        let mut followers = Vec::new();
+        let mut pipelines = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("workflow dir") {
+            let path = entry.expect("entry").path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !(name.ends_with(".yml") || name.ends_with(".yaml")) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("workflow text");
+            if events(&text).is_ok_and(|on| on.iter().any(|e| is_workflow_run(e))) {
+                followers.push(name.clone());
+            }
+            if name_of(&text) == "pipeline" {
+                pipelines.push(name);
+            }
+        }
+        assert_eq!(
+            followers,
+            ["release.yml"],
+            "the workflows that follow another"
+        );
+        assert_eq!(
+            pipelines,
+            ["pipeline.yml"],
+            "the workflows named `pipeline`"
+        );
+    }
+
+    #[test]
+    fn the_allowed_shape_is_accepted_and_every_other_is_refused() {
+        let on =
+            |body: &str| format!("on:\n  workflow_run:\n{body}\npermissions: {{}}\njobs: {{}}\n");
+        let good = "    workflows: [pipeline]\n    types: [completed]\n    branches: [main]";
+        assert!(rules(&on(good)).is_empty());
+        for bad in [
+            "    workflows: [pipeline, ci]\n    types: [completed]\n    branches: [main]",
+            "    workflows: [ci]\n    types: [completed]\n    branches: [main]",
+            "    workflows: [pipeline]\n    types: [requested]\n    branches: [main]",
+            "    workflows: [pipeline]\n    types: [completed]",
+            "    workflows: [pipeline]\n    types: [completed]\n    branches: ['**']",
+            "    workflows: [pipeline]\n    types: [completed]\n    branches: [main]\n    branches-ignore: [x]",
+        ] {
+            assert_eq!(rules(&on(bad)).len(), 1, "{bad}");
+        }
     }
 
     #[test]

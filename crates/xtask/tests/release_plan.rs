@@ -142,6 +142,24 @@ impl Fx {
         (out.status.code(), text(&out.stdout), text(&out.stderr))
     }
 
+    /// `release plan` for `sha` with exactly the flags in `flags` for the push.
+    fn plan_args(&self, sha: &str, flags: &[&str]) -> (Option<i32>, String, String) {
+        let repo = self.repo();
+        let gh = self.root.join("gh/gh");
+        let out = Command::new(XTASK)
+            .args(["release", "plan", "--repo", REPO, "--sha", sha])
+            .args(flags)
+            .arg("--repo-dir")
+            .arg(&repo)
+            .arg("--gh")
+            .arg(&gh)
+            .env_remove("XTASK_FAKE_DEFECT")
+            .output()
+            .expect("run xtask");
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        (out.status.code(), text(&out.stdout), text(&out.stderr))
+    }
+
     /// The pushed commit is the head and the push is a code change over `before`.
     fn plan_head(&self) -> (Option<i32>, String, String) {
         let head = git(&self.repo(), &["rev-parse", "HEAD"]);
@@ -644,6 +662,64 @@ fn a_sha_or_before_that_is_not_a_commit_is_a_usage_error() {
         assert_eq!(code, Some(2), "{before:?}: {err}");
         assert!(err.contains("--before"), "{err}");
     }
+    assert_eq!(fx.gh_args(), "");
+}
+
+#[test]
+fn before_can_be_read_from_a_file_and_means_the_same() {
+    // Catches: `--before-file` read differently from `--before` (a newline kept, so a
+    // good commit refused; the file ignored), which would classify the release run's push
+    // from the wrong commit.
+    let fx = fx("before-file", "0.1\n");
+    fx.github(&[], &[], &[]);
+    let before = git(&fx.repo(), &["rev-parse", "HEAD"]);
+    let sha = fx.commit(&[("crates/a/src/lib.rs", Some("x"))]);
+    let file = fx.root.join("before");
+    std::fs::write(&file, format!("{before}\n")).expect("before file");
+    let by_flag = fx.plan(&sha, &before, &[]);
+    let (code, out, err) =
+        fx.plan_args(&sha, &["--before-file", file.to_str().expect("utf-8 path")]);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(code, by_flag.0, "{err}");
+    assert_eq!(out, by_flag.1);
+    assert_eq!(value(&out, "code"), "true");
+}
+
+#[test]
+fn a_before_file_that_is_missing_or_holds_no_commit_is_refused() {
+    // Catches: an unreadable or garbage file read as a first push (all code), which would
+    // release a docs-only push.
+    let fx = fx("before-file-bad", "0.1\n");
+    fx.github(&[], &[], &[]);
+    let sha = git(&fx.repo(), &["rev-parse", "HEAD"]);
+    let missing = fx.root.join("absent");
+    let (code, _, err) = fx.plan_args(
+        &sha,
+        &["--before-file", missing.to_str().expect("utf-8 path")],
+    );
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("absent"), "{err}");
+    let junk = fx.root.join("junk");
+    std::fs::write(&junk, "not a commit\n").expect("junk file");
+    let (code, _, err) = fx.plan_args(&sha, &["--before-file", junk.to_str().expect("utf-8 path")]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("--before"), "{err}");
+    assert_eq!(fx.gh_args(), "");
+}
+
+#[test]
+fn before_and_before_file_together_or_neither_are_a_usage_error() {
+    // Catches: two answers to "what did the push replace" taken silently, or none.
+    let fx = fx("before-both", "0.1\n");
+    fx.github(&[], &[], &[]);
+    let sha = git(&fx.repo(), &["rev-parse", "HEAD"]);
+    let file = fx.root.join("before");
+    std::fs::write(&file, format!("{ZERO}\n")).expect("before file");
+    let path = file.to_str().expect("utf-8 path");
+    let (code, _, err) = fx.plan_args(&sha, &["--before", ZERO, "--before-file", path]);
+    assert_eq!(code, Some(2), "{err}");
+    let (code, _, err) = fx.plan_args(&sha, &[]);
+    assert_eq!(code, Some(2), "{err}");
     assert_eq!(fx.gh_args(), "");
 }
 

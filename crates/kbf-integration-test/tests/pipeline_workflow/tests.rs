@@ -1,0 +1,446 @@
+//! Tests of the pipeline lint. The real workflow files are the control (no problem); each other
+//! test changes one thing in one file and names the rule it holds.
+
+use super::*;
+
+const DIR: &str = ".github/workflows";
+
+fn read(name: &str) -> String {
+    std::fs::read_to_string(crate::repo_root().join(DIR).join(name)).expect(name)
+}
+
+fn real() -> Files {
+    let mut others = Vec::new();
+    for entry in std::fs::read_dir(crate::repo_root().join(DIR)).expect("workflow dir") {
+        let name = entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        let own = [
+            "pipeline.yml",
+            "ci.yml",
+            "artifacts.yml",
+            "beta.yml",
+            "release.yml",
+        ];
+        if (name.ends_with(".yml") || name.ends_with(".yaml")) && !own.contains(&name.as_str()) {
+            others.push((name.clone(), read(&name)));
+        }
+    }
+    Files {
+        pipeline: read("pipeline.yml"),
+        ci: read("ci.yml"),
+        artifacts: read("artifacts.yml"),
+        beta: read("beta.yml"),
+        release: read("release.yml"),
+        others,
+    }
+}
+
+/// The problems with `from` replaced by `to` once in the file `file`, which must hold it once.
+fn plant(file: &str, from: &str, to: &str) -> Vec<String> {
+    let mut files = real();
+    let text = match file {
+        "pipeline.yml" => &mut files.pipeline,
+        "ci.yml" => &mut files.ci,
+        "artifacts.yml" => &mut files.artifacts,
+        "beta.yml" => &mut files.beta,
+        "release.yml" => &mut files.release,
+        other => panic!("no file {other}"),
+    };
+    assert_eq!(
+        text.matches(from).count(),
+        1,
+        "`{from}` is not unique in {file}"
+    );
+    *text = text.replace(from, to);
+    problems(&files).unwrap_or_else(|e| vec![e])
+}
+
+fn red(found: &[String], want: &str) {
+    assert!(
+        found.iter().any(|p| p.contains(want)),
+        "want a problem with `{want}`: {found:#?}"
+    );
+}
+
+#[test]
+fn the_real_pipeline_meets_every_rule() {
+    // Catches: the pipeline files drifting from the one sequential pipeline, and the control
+    // for every test below.
+    let found = problems(&real()).expect("the workflows are read");
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+#[test]
+fn the_pipeline_runs_ci_then_artifacts_then_beta_each_needing_the_one_before() {
+    // Catches: a stage that can start before the one it follows (so beta could test files
+    // that are not built yet, or the release follow a run that skipped a check), a stage
+    // calling another workflow, and a stage added or reordered.
+    red(
+        &plant("pipeline.yml", "    needs: [ci]\n", "    needs: []\n"),
+        "the job `artifacts` needs [], not [\"ci\"]",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "    needs: [artifacts]\n",
+            "    needs: [ci]\n",
+        ),
+        "the job `beta` needs [\"ci\"], not [\"artifacts\"]",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "    needs: [beta]\n",
+            "    needs: [artifacts]\n",
+        ),
+        "the job `push` needs",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "uses: ./.github/workflows/beta.yml",
+            "uses: ./.github/workflows/ci.yml",
+        ),
+        "the job `beta` calls",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "  beta:\n",
+            "  extra:\n    needs: [ci]\n    runs-on: ubuntu-24.04\n    steps: []\n\n  beta:\n",
+        ),
+        "the pipeline's jobs are",
+    );
+}
+
+#[test]
+fn a_stage_that_can_be_skipped_or_continue_after_red_is_refused() {
+    // Catches: a skipped stage (a skipped job counts as success for the jobs after it and for
+    // the run), `always()`, `failure()`, `cancelled()` and `continue-on-error`: a red or
+    // cancelled stage must stop the stages after it.
+    red(
+        &plant(
+            "pipeline.yml",
+            "  beta:\n    needs: [artifacts]\n",
+            "  beta:\n    needs: [artifacts]\n    if: ${{ github.event.before != '' }}\n",
+        ),
+        "the job `beta` has `if:",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "  ci:\n",
+            "  ci:\n    if: ${{ always() }}\n",
+        ),
+        "uses `always()`",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
+            "    if: ${{ always() && github.event_name == 'push' }}\n",
+        ),
+        "uses `always()`",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "  beta:\n    needs: [artifacts]\n",
+            "  beta:\n    needs: [artifacts]\n    continue-on-error: true\n",
+        ),
+        "uses `continue-on-error`",
+    );
+}
+
+#[test]
+fn the_called_workflows_still_run_on_pull_requests() {
+    // Catches: the pull-request gate or the merge queue losing ci.yml or artifacts.yml when
+    // their push trigger moved into the pipeline, a called workflow that cannot be called,
+    // and beta (which tests a push to main's artifacts) gaining a pull-request trigger.
+    red(
+        &plant("ci.yml", "  pull_request:\n", ""),
+        "ci.yml does not run on `pull_request`",
+    );
+    red(
+        &plant("ci.yml", "  merge_group:\n", ""),
+        "ci.yml does not run on `merge_group`",
+    );
+    red(
+        &plant(
+            "artifacts.yml",
+            "  pull_request:\n    # `labeled`: adding `needs-artifacts` to an open pull request starts the build.\n    types: [opened, synchronize, reopened, labeled]\n",
+            "",
+        ),
+        "artifacts.yml does not run on `pull_request`",
+    );
+    red(
+        &plant("artifacts.yml", "  merge_group:\n", ""),
+        "artifacts.yml does not run on `merge_group`",
+    );
+    for file in ["ci.yml", "artifacts.yml"] {
+        red(
+            &plant(file, "  workflow_call:\n", ""),
+            &format!("{file} has no `workflow_call` trigger"),
+        );
+    }
+    red(
+        &plant(
+            "beta.yml",
+            "  workflow_call:\n",
+            "  workflow_call:\n  pull_request:\n",
+        ),
+        "beta.yml runs on `pull_request`",
+    );
+}
+
+#[test]
+fn a_push_to_main_runs_each_check_once() {
+    // Catches: a second run of a check beside the pipeline's: a push trigger left on (or put
+    // back on) ci.yml, artifacts.yml or beta.yml, another workflow calling one of them, or the
+    // pipeline not calling one.
+    for file in ["ci.yml", "artifacts.yml", "beta.yml"] {
+        let from = "  workflow_call:\n";
+        red(
+            &plant(
+                file,
+                from,
+                "  workflow_call:\n  push:\n    branches: [main]\n",
+            ),
+            &format!("{file} has a `push` trigger"),
+        );
+    }
+    red(
+        &plant(
+            "release.yml",
+            "\njobs:\n",
+            "\njobs:\n  again:\n    uses: ./.github/workflows/ci.yml\n",
+        ),
+        "ci.yml is called by [\"pipeline.yml\", \"release.yml\"]",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "uses: ./.github/workflows/beta.yml",
+            "uses: ./.github/workflows/ci.yml",
+        ),
+        "beta.yml is called by []",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "on:\n  push:\n    branches: [main]\n",
+            "on:\n  push:\n    branches: [main]\n  pull_request:\n",
+        ),
+        "runs on [\"push\", \"pull_request\"]",
+    );
+}
+
+#[test]
+fn only_a_push_to_main_runs_the_pipeline() {
+    // Catches: the pipeline started by a branch push, a pull request or a hand dispatch (the
+    // attest jobs would sign, or refuse, for them).
+    red(
+        &plant(
+            "pipeline.yml",
+            "    branches: [main]\n",
+            "    branches: [main, 'release/**']\n",
+        ),
+        "is filtered by",
+    );
+    red(
+        &plant("pipeline.yml", "    branches: [main]\n", ""),
+        "is filtered by",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "on:\n  push:\n    branches: [main]\n",
+            "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n",
+        ),
+        "not on `push` alone",
+    );
+}
+
+#[test]
+fn beta_tests_the_artifacts_of_the_same_run_and_builds_no_kbf() {
+    // Catches: a beta that rebuilds the kbf it tests, takes it from another run, skips the
+    // check of the downloaded files, or runs the farm from another directory than the one
+    // holding the artifact's kbf.
+    red(
+        &plant(
+            "beta.yml",
+            "          pattern: assets-*\n          path: dist\n          merge-multiple: true\n",
+            "          pattern: assets-*\n          path: dist\n          merge-multiple: true\n          run-id: 1\n",
+        ),
+        "beta.yml names a `run-id`",
+    );
+    red(
+        &plant(
+            "beta.yml",
+            "          pattern: assets-*\n",
+            "          pattern: bundles-*\n",
+        ),
+        "does not download `assets-*` into `dist`",
+    );
+    red(
+        &plant(
+            "beta.yml",
+            "          name: sha256sums\n",
+            "          name: other\n",
+        ),
+        "does not download `sha256sums` into `dist`",
+    );
+    red(
+        &plant(
+            "beta.yml",
+            "run: cargo xtask verify-assets sums dist",
+            "run: ls dist",
+        ),
+        "does not check the downloaded files",
+    );
+    red(
+        &plant(
+            "beta.yml",
+            "-C \"$RUNNER_TEMP/bin\" kbf",
+            "-C \"$RUNNER_TEMP/bin\" kbf-deploy",
+        ),
+        "does not check the files, then take `kbf` out of the linux-x86_64 tarball",
+    );
+    red(
+        &plant(
+            "beta.yml",
+            "--bin-dir \"$RUNNER_TEMP/bin\"",
+            "--bin-dir target/debug",
+        ),
+        "does not run from `--bin-dir",
+    );
+    red(
+        &plant(
+            "beta.yml",
+            "run: cargo build -p kbf-harness -p kbf-integration-test --bins --locked",
+            "run: cargo build -p kbf-cli -p kbf-harness -p kbf-integration-test --bins --locked",
+        ),
+        "the job `smoke` builds `kbf`",
+    );
+}
+
+#[test]
+fn a_newer_push_cancels_the_older_checks_but_never_a_release() {
+    // Catches: a pipeline that does not cancel its predecessor; a pipeline holding anything
+    // that writes (a tag, a release, the bot's key, an environment), which a cancel could leave
+    // half done; a release in the pipeline's group, or one that cancels a release; a called
+    // workflow whose group would cancel its caller.
+    red(
+        &plant(
+            "pipeline.yml",
+            "  cancel-in-progress: true\n",
+            "  cancel-in-progress: false\n",
+        ),
+        "a newer push must cancel the older run",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "  group: pipeline-${{ github.ref }}\n",
+            "  group: pipeline\n",
+        ),
+        "the pipeline's concurrency is",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "    permissions:\n      contents: read\n\n  artifacts:",
+            "    permissions:\n      contents: write\n\n  artifacts:",
+        ),
+        "the job `ci` grants the scopes",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "  push:\n    needs: [beta]\n",
+            "  push:\n    needs: [beta]\n    environment: release\n",
+        ),
+        "names `environment:`",
+    );
+    red(
+        &plant(
+            "release.yml",
+            "  group: release-${{ github.event.workflow_run.conclusion == 'success' && 'main' || github.run_id }}\n",
+            "  group: pipeline-${{ github.ref }}\n",
+        ),
+        "shares the pipeline's concurrency group",
+    );
+    red(
+        &plant(
+            "ci.yml",
+            "  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}\n",
+            "  group: pipeline-${{ github.ref }}\n",
+        ),
+        "ci.yml has the concurrency group",
+    );
+}
+
+#[test]
+fn only_the_artifacts_call_holds_the_signing_scopes_and_only_for_a_push_to_main() {
+    // Catches: the signing scopes granted to another stage (a called workflow gets at most
+    // what its caller grants), or to the artifacts stage without the push-to-main condition,
+    // or a scope nothing needs.
+    red(
+        &plant(
+            "pipeline.yml",
+            "  beta:\n    needs: [artifacts]\n    uses: ./.github/workflows/beta.yml\n    permissions:\n      contents: read\n",
+            "  beta:\n    needs: [artifacts]\n    uses: ./.github/workflows/beta.yml\n    permissions:\n      contents: read\n      id-token: write\n",
+        ),
+        "the job `beta` grants the scopes",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "      attestations: write\n",
+            "      attestations: write\n      packages: write\n",
+        ),
+        "the job `artifacts` grants the scopes",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
+            "",
+        ),
+        "the job `artifacts` has `if: (none)`",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "  push:\n    needs: [beta]\n    runs-on: ubuntu-24.04\n    timeout-minutes: 5\n    permissions: {}\n",
+            "  push:\n    needs: [beta]\n    runs-on: ubuntu-24.04\n    timeout-minutes: 5\n    permissions:\n      contents: read\n",
+        ),
+        "the job `push` grants the scopes",
+    );
+}
+
+#[test]
+fn the_release_follows_this_pipeline_and_finds_what_it_leaves() {
+    // Catches: a rename of the pipeline the release does not follow (it would never start), a
+    // release that follows another workflow, and a pipeline that does not leave the commit
+    // before the push.
+    red(
+        &plant("pipeline.yml", "name: pipeline\n", "name: main\n"),
+        "pipeline.yml is named",
+    );
+    red(
+        &plant("release.yml", "workflows: [pipeline]", "workflows: [ci]"),
+        "release.yml follows",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "          name: push-before\n",
+            "          name: before\n",
+        ),
+        "does not upload `before` as `push-before`",
+    );
+}

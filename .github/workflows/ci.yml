@@ -5,8 +5,10 @@
 #
 # A pull request runs only this. The rest of the suite (the slow tests, the Arm run, the
 # jobs that need a service, root, crun or a Mac, the packages and the beta smoke) runs on a
-# push to main, in beta.yml. This workflow runs on those pushes too, so
-# the merged result meets the same gate and the Cargo cache below is saved.
+# push to main, in beta.yml. On a push to main this workflow is the first stage of the one
+# pipeline (pipeline.yml calls it, `workflow_call`), so the merged result meets the same gate
+# and the Cargo cache below is saved. It no longer has a push trigger of its own: a push to
+# main runs it once, in the pipeline.
 #
 # The Cargo cache (registry, git checkouts and target) is keyed on the runner, the job,
 # Cargo.lock and rust-toolchain.toml. Every job restores it; only a push saves it, and only
@@ -16,13 +18,14 @@ name: ci
 on:
   pull_request:
   merge_group:
-  push:
-    branches: [main]
+  workflow_call:
 
 permissions: {}
 
+# A pull request's newer run replaces its older one. Called from the pipeline, the group is the
+# run's own (the pipeline's group is what cancels a superseded push).
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:

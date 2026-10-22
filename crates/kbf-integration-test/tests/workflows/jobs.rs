@@ -96,7 +96,10 @@ pub fn push_filters(text: &str) -> Result<Vec<(String, Vec<String>)>, String> {
     trigger_filters(text, "push")
 }
 
-fn trigger_filters(text: &str, trigger: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+/// The filters under the workflow's `trigger` mapping as `(key, values)`: every key
+/// (`types`, `branches`, `workflows`, ...) with its list of strings. An error when `on:`
+/// has no such mapping.
+pub fn trigger_filters(text: &str, trigger: &str) -> Result<Vec<(String, Vec<String>)>, String> {
     let root = yaml::load(text)?;
     let on = get(top_of(&root)?, "on").ok_or("the workflow has no `on:`")?;
     let Value::Map(on) = &on.value else {
@@ -145,39 +148,52 @@ pub fn job_env(text: &str, job: &str) -> Result<Vec<(String, String)>, String> {
     }
 }
 
-/// The inputs of the `workflow_dispatch` trigger as `(name, required)`: none when the trigger
-/// is empty (`workflow_dispatch:`) or has no `inputs:`. An error when `on:` has no
-/// `workflow_dispatch` entry, when it is neither empty nor a mapping, or when `inputs:` is not
-/// a mapping of mappings.
-pub fn dispatch_inputs(text: &str) -> Result<Vec<(String, bool)>, String> {
+/// The reusable workflow the job `job` calls (`uses:`), `None` for a job with steps. An error
+/// when it is not a string.
+pub fn job_uses(text: &str, job: &str) -> Result<Option<String>, String> {
     let root = yaml::load(text)?;
-    let on = get(top_of(&root)?, "on").ok_or("the workflow has no `on:`")?;
-    let Value::Map(on) = &on.value else {
-        return Err("`on:` is not a mapping".to_owned());
+    let found = job_of(&root, job)?;
+    match get(found, "uses") {
+        None => Ok(None),
+        Some(u) => u
+            .as_str()
+            .map(|u| Some(u.to_owned()))
+            .ok_or_else(|| format!("the `uses` of job `{job}` is not a string")),
+    }
+}
+
+/// The workflow's own top-level `concurrency:` as `(group, cancel-in-progress)`, both as
+/// written (`(absent)` for a missing cancel); `None` without one. An error when it is not a mapping of strings with a `group`.
+pub fn concurrency(text: &str) -> Result<Option<(String, String)>, String> {
+    let root = yaml::load(text)?;
+    let Some(c) = get(top_of(&root)?, "concurrency") else {
+        return Ok(None);
     };
-    let Some(dispatch) = get(on, "workflow_dispatch") else {
-        return Err("`on:` has no `workflow_dispatch:` entry".to_owned());
+    let Value::Map(c) = &c.value else {
+        return Err("the top-level `concurrency` is not a mapping".to_owned());
     };
-    let dispatch = match &dispatch.value {
-        Value::Map(dispatch) => dispatch,
-        Value::Scalar { .. } if dispatch.as_str().is_none() => return Ok(Vec::new()),
-        _ => return Err("`on:` has no `workflow_dispatch:` mapping".to_owned()),
-    };
-    let Some(inputs) = get(dispatch, "inputs") else {
-        return Ok(Vec::new());
-    };
-    let Value::Map(inputs) = &inputs.value else {
-        return Err("`workflow_dispatch:` has no `inputs:` mapping".to_owned());
-    };
-    inputs
-        .iter()
-        .map(|(k, v)| {
-            let name = k.as_str().ok_or("a dispatch input name is not a string")?;
-            let Value::Map(spec) = &v.value else {
-                return Err(format!("the dispatch input `{name}` is not a mapping"));
-            };
-            let required = get(spec, "required").and_then(Node::as_str) == Some("true");
-            Ok((name.to_owned(), required))
-        })
-        .collect()
+    let group = get(c, "group")
+        .and_then(Node::as_str)
+        .ok_or("the top-level `concurrency` has no string `group`")?;
+    let cancel = get(c, "cancel-in-progress")
+        .and_then(Node::as_str)
+        .unwrap_or("(absent)");
+    Ok(Some((group.to_owned(), cancel.to_owned())))
+}
+
+/// The workflow's own top-level `env:` as `(name, value)`; empty without one. An error when
+/// it is not a mapping of strings.
+pub fn top_env(text: &str) -> Result<Vec<(String, String)>, String> {
+    let root = yaml::load(text)?;
+    match get(top_of(&root)?, "env").map(|e| &e.value) {
+        None => Ok(Vec::new()),
+        Some(Value::Map(env)) => env
+            .iter()
+            .map(|(k, v)| match (k.as_str(), v.as_str()) {
+                (Some(k), Some(v)) => Ok((k.to_owned(), v.to_owned())),
+                _ => Err("a top-level `env` entry is not a string pair".to_owned()),
+            })
+            .collect(),
+        Some(_) => Err("the top-level `env` is not a mapping".to_owned()),
+    }
 }

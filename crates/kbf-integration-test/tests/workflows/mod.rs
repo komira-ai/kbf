@@ -4,9 +4,9 @@
 //! request code with repository write access. The lint parses each workflow with a
 //! YAML parser (`saphyr-parser`, through [`yaml`]) and evaluates the document. It
 //! refuses a workflow if:
-//! - `on` names the `pull_request_target` or the `workflow_run` trigger (both run with the
-//!   base repository's secrets and token), in any form (a string, a list or a mapping,
-//!   block or flow);
+//! - `on` names the `pull_request_target` trigger, or the `workflow_run` trigger in any shape
+//!   but the one `release.yml` uses ([`workflow_run`]); both run with the base repository's
+//!   secrets and token. Any form (a string, a list or a mapping, block or flow) is read;
 //! - a job's `runs-on` is not exactly one GitHub-hosted runner label from
 //!   [`HOSTED_LABELS`], written out literally: a string, a one-entry list, or a
 //!   mapping holding only `labels:` with such a value. A runner group, an expression
@@ -19,7 +19,7 @@
 //!   `contents` ([`RELEASE_SCOPES`]), which may be `write` only in a job whose `if:` is
 //!   exactly [`RELEASE_PUSH_ONLY`]. So no pull request or merge-queue run holds a
 //!   token that can sign an attestation, every attestation this repository signs names
-//!   `refs/heads/main`, and only a push to `main` of code (never of the pipeline itself) runs a job that can create a release
+//!   `refs/heads/main`, and only the successful pipeline run of a push to `main` of code (never of the pipeline itself) runs a job that can create a release
 //!   (or push to the repository), and `issues` ([`ISSUE_SCOPES`]), which may be `write`
 //!   only in a job whose `if:` is exactly [`ISSUES_MAIN_ONLY`] (the advisories workflow
 //!   keeps one issue; no pull request run holds a token that can write issues);
@@ -83,8 +83,8 @@ mod yaml;
 
 mod jobs;
 pub use jobs::{
-    dispatch_inputs, job_env, job_environment, job_needs, job_outputs, job_permission_levels,
-    push_filters,
+    concurrency, job_env, job_environment, job_needs, job_outputs, job_permission_levels, job_uses,
+    push_filters, top_env, trigger_filters,
 };
 
 use yaml::{Node, Value};
@@ -158,10 +158,11 @@ const SIGNING_PUSH_ONLY: &str =
 /// the repository's contents, which creating a release and uploading its assets need.
 const RELEASE_SCOPES: &[&str] = &["contents"];
 
-/// The one `if:` spelling under which a job may hold [`RELEASE_SCOPES`] for writing: a push
-/// to `main` (never a dispatch, a pull request or a tag), of code, that is not a change to the
+/// The one `if:` spelling under which a job may hold [`RELEASE_SCOPES`] for writing: the
+/// successful run of the pipeline for a push to `main` of this repository (never a pull
+/// request, a tag, or a run that was cancelled or red), of code, that is not a change to the
 /// release pipeline itself (`release plan` outputs, read through the job's `needs`).
-const RELEASE_PUSH_ONLY: &str = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
+const RELEASE_PUSH_ONLY: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
 
 /// Token scopes a job may set to `write` when it runs only on `main`'s ref: the issues
 /// API, which the advisories workflow uses to open, update and close its one issue.
@@ -278,31 +279,6 @@ pub fn events(text: &str) -> Result<Vec<String>, String> {
             .filter_map(|(k, _)| k.as_str().map(str::to_owned))
             .collect(),
     })
-}
-
-/// The `branches:` of the workflow's `push` trigger, in order. An error when the text
-/// does not parse, `on:` is not a mapping with a `push` mapping, or that has no
-/// `branches:` list of strings (a push of any branch would run the workflow).
-pub fn push_branches(text: &str) -> Result<Vec<String>, String> {
-    let root = yaml::load(text)?;
-    let on = get(top_of(&root)?, "on").ok_or("the workflow has no `on:`")?;
-    let Value::Map(on) = &on.value else {
-        return Err("`on:` is not a mapping".to_owned());
-    };
-    let Some(Value::Map(push)) = get(on, "push").map(|p| &p.value) else {
-        return Err("`on:` has no `push:` mapping".to_owned());
-    };
-    let Some(Value::Seq(branches)) = get(push, "branches").map(|b| &b.value) else {
-        return Err("`push:` has no `branches:` list".to_owned());
-    };
-    branches
-        .iter()
-        .map(|b| {
-            b.as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| "a `branches:` entry is not a string".to_owned())
-        })
-        .collect()
 }
 
 /// The job `job`'s own `if:` (its key matched ignoring ASCII case): `None` when it has

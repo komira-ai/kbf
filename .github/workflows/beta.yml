@@ -1,19 +1,25 @@
 # Everything the pull-request gate (ci.yml: lint, and test on the fast set) leaves out, run
-# on a push to main and never on a pull request: the whole nextest run
+# on a push to main as the third stage of the one pipeline (pipeline.yml calls this workflow,
+# `workflow_call`, after ci and artifacts) and never on a pull request: the whole nextest run
 # with its slow tests, the Arm run, the jobs that need a service or a root or a Mac
 # (Postgres, S3 stores, crun, the M1, M2, cross-version and mixed-version cells, macOS), the Linux
 # packages, and the beta smoke below. The stage lint
-# (crates/kbf-integration-test/tests/workflows/stages.rs) allows `push` only.
+# (crates/kbf-integration-test/tests/workflows/stages.rs) allows `workflow_call` only.
 #
 # The beta smoke is a whole farm of real kbf processes (a frontend, three storage nodes, two
 # daemons; Buck2 dials the frontend's REAPI port) under real Buck2 builds, for five minutes,
 # on a hosted runner (docs/design/kbf-cicd.md, sections 3 and 4; scenario B0,
 # `farm_under_build_load`, crates/kbf-harness). It fails on one failed build, one failed
 # action, one lost blob, a process that exits, or a hang, and it writes `beta-result.json`.
-# It builds its own binaries and so is not an attested run: the result says
-# `"attested": false`. The full run of the design, on the attested bytes of artifacts.yml
-# with the update and kill scenarios, is later work; the job that attests its result is not
-# here either, so this workflow holds no `id-token` or `attestations` permission.
+# The `kbf` of the farm is the one in the linux-x86_64 tarball the artifacts stage built and
+# attested earlier in this same run (downloaded from the run, checked against its SHA256SUMS
+# and for the commit and a release build); the release that follows publishes those same
+# files. Only the driver (`kbf-beta`) and the program the sample project's actions run
+# (`kbf-m2-act`) are built here. The result document records no set hash and says
+# `"attested": false`; the full run of the design, with the update and kill scenarios, is later
+# work, and the job that attests its result is not here either, so this workflow holds no
+# `id-token` or `attestations` permission. The other jobs test the commit's source: they
+# build what they run.
 #
 # There is no Envoy in the farm (the no-Envoy ruling): B0 moves behind the kbf-installer's
 # proxy in a later change.
@@ -26,22 +32,12 @@
 name: beta
 
 on:
-  push:
-    branches: [main]
+  workflow_call:
 
 permissions: {}
 
-# One beta run at a time in the whole repository. GitHub
-# keeps at most one running and one pending run per concurrency group: a run queued while
-# another runs waits as pending, and a newer pending run replaces (cancels) the older
-# pending one, so the newest push waits its turn and a run in progress is never cancelled
-# (docs.github.com, "Control the concurrency of workflows and jobs": "any previously pending
-# job or workflow in the concurrency group will be canceled"; a running one is cancelled only
-# with `cancel-in-progress: true`). A pending run that is replaced is "not run", never
-# "passed".
-concurrency:
-  group: beta
-  cancel-in-progress: false
+# No concurrency group: a superseded push is cancelled by the pipeline's group (pipeline.yml),
+# whose run this workflow is a part of.
 
 env:
   CARGO_TERM_COLOR: always
@@ -76,14 +72,34 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      # kbf (every role of the farm), kbf-beta (the scenario) and kbf-m2-act (the program
-      # the sample project's actions run, as plain processes: no container runtime here).
-      - run: cargo build -p kbf-cli -p kbf-harness -p kbf-integration-test --bins --locked
+      # kbf-beta (the scenario) and kbf-m2-act (the program the sample project's actions run,
+      # as plain processes: no container runtime here). The kbf of the farm is not built here.
+      - run: cargo build -p kbf-harness -p kbf-integration-test --bins --locked
+      # The files of the artifacts stage of this run (no run id: the same run), not rebuilt.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: assets-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sha256sums
+          path: dist
+      - name: Every file is the one SHA256SUMS lists
+        run: cargo xtask verify-assets sums dist
+      - name: The kbf in the tarball names this commit and a release build
+        run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" "$GITHUB_SHA"
+      - name: The farm's bin directory
+        run: mkdir -p "$RUNNER_TEMP/bin"
+      - name: The farm's kbf, out of the tarball
+        run: tar -xzf "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/bin" kbf
+      - name: The program the sample project's actions run, built here
+        run: cp target/debug/kbf-m2-act "$RUNNER_TEMP/bin/kbf-m2-act"
       - name: Fetch buck2 (pinned version, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
       - run: $RUNNER_TEMP/tools/buck2 --version
       - name: B0, the farm under build load
-        run: target/debug/kbf-beta b0 --bin-dir target/debug --buck2 "$RUNNER_TEMP/tools/buck2" --project crates/kbf-integration-test/beta/buck2 --work "$RUNNER_TEMP/beta" --duration-secs 300 --concurrency 4 --summary "$GITHUB_STEP_SUMMARY"
+        run: target/debug/kbf-beta b0 --bin-dir "$RUNNER_TEMP/bin" --buck2 "$RUNNER_TEMP/tools/buck2" --project crates/kbf-integration-test/beta/buck2 --work "$RUNNER_TEMP/beta" --duration-secs 300 --concurrency 4 --summary "$GITHUB_STEP_SUMMARY"
       # The process logs, the scraped series, every build's console output and event log,
       # and the result document, kept 90 days whether the run passed or not; a re-run of
       # the same commit keeps its own (the attempt is in the name).

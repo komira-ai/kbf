@@ -52,8 +52,16 @@ pub struct PlanArgs {
     pub sha: String,
     /// The commit the branch was at before the push (`github.event.before`): a SHA, or
     /// all zeros for the first push.
+    #[arg(
+        long,
+        required_unless_present = "before_file",
+        conflicts_with = "before_file"
+    )]
+    pub before: Option<String>,
+    /// A file holding that commit on one line, for a run that has no push event of its own
+    /// (the pipeline run leaves it for the release run). Instead of `--before`.
     #[arg(long)]
-    pub before: String,
+    pub before_file: Option<PathBuf>,
     /// A checkout holding both commits (`fetch-depth: 0`).
     #[arg(long, default_value = ".")]
     pub repo_dir: PathBuf,
@@ -154,7 +162,15 @@ fn before_of(before: &str) -> Result<Option<&str>, Error> {
 /// The `release plan` verb: the lines to print.
 pub fn run(a: &PlanArgs) -> Result<Vec<String>, Error> {
     full_commit("--sha", &a.sha)?;
-    let before = before_of(&a.before)?;
+    let given = match (&a.before, &a.before_file) {
+        (Some(before), _) => before.clone(),
+        (None, Some(file)) => std::fs::read_to_string(file)
+            .map_err(Error::spawn(format!("read {}", file.display())))?
+            .trim_end_matches('\n')
+            .to_owned(),
+        (None, None) => String::new(),
+    };
+    let before = before_of(&given)?;
     if !a.freeze.is_empty() {
         return Err(Error::Refused(vec![format!(
             "frozen: RELEASE_FREEZE is {:?}: nothing is released until an admin clears it",
