@@ -534,6 +534,7 @@ async fn a_successors_recorder_has_no_record_of_a_build_but_its_caller_is_answer
             request: asked,
             call: Some(call),
             described: Described::default(),
+            evidence: Default::default(),
         })
         .expect("queued");
     let [lease] = starts(&mut inbox)[..] else {

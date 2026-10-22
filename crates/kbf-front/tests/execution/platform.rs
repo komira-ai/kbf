@@ -481,7 +481,7 @@ async fn the_default_memory_is_the_one_the_service_is_given() {
 }
 
 /// Catches: a named size that equals the default read as the default (the estimator
-/// would then lower an explicit client ask: mutant, source decided by comparing the
+/// would then lower an explicit client ask: the source decided by comparing the
 /// booked value to the default), one axis's key marking the other's source, a source
 /// recorded for the wrong axis, and a `whole_machine` lease, which names nothing,
 /// reading as a hint.
