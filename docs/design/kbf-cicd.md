@@ -17,8 +17,8 @@ kills a node while a build is running. The assertions are numbers, not logs: zer
 under-replicated blobs back to zero.
 
 A commit that passes beta may be offered to the operator's own farm: **gamma**. For our own build farm the trigger is
-automatic: when a push to `main` has been cut into a release, `gamma.yml` verifies the release, makes the offer for gamma
-and deploys the commit on the farm's frontend host over Tailscale SSH (section 5.4); the new frontend then offers it to
+automatic (RETIRED: `gamma.yml` is deleted, and gamma moves to kbf-updater, package-update design section 13; the text of this page about it is history): when a push to `main` has been cut into a release, `gamma.yml` verified the release, made the offer for gamma
+and deployed the commit on the farm's frontend host over Tailscale SSH (section 5.4); the new frontend then offers it to
 the nodes, which pull it. The deploy is itself a test (no build failed because a connection was dropped). Planned: gamma's
 verdict (gamma verdict TBD, on a generic monitoring library) then comes from the operator's real usage over the metrics
 the gamma farm emits during a 24 hour **bake** (section 7); nothing produces that verdict today.
@@ -123,7 +123,7 @@ result = "beta-result.json"
 
 [[stage]]
 name = "gamma"
-runs = "actions"          # gamma.yml: the offer and the deploy; the bake and the verdict (Planned, section 7) run outside Actions
+runs = "operator"         # gamma.yml is deleted (RETIRED); the deploy moves to kbf-updater; the bake and the verdict (Planned, section 7) run outside Actions
 after = ["beta"]          # the design; release/stages.yml has ["build"] until the beta result is attested
 result = "gamma-verdict.json"
 
@@ -137,8 +137,7 @@ result = "release.json"
 
 The lint refuses a workflow job that names a stage not in the file, an `actions` stage with no job, a `pull_request` trigger
 on any of these workflows, an unpinned `uses:`, and `id-token: write` anywhere but `attest`. `runs = "operator"` stages have
-no job. The stage file as built is `release/stages.yml`, where gamma is an `actions` stage with the jobs `gamma.yml#offer`,
-`gamma.yml#deploy` and `gamma.yml#check`, after the build stage until the beta result is attested.
+no job. The stage file as built is `release/stages.yml`, which lists no gamma stage: `gamma.yml` is deleted and gamma moves to kbf-updater (package-update design, section 13), so `prod` follows `beta`.
 
 ## 3. The artifact every stage consumes
 
@@ -424,7 +423,9 @@ Real usage (builds nobody scripted), real devices and hosts, systemd, the real c
 Beta covers the update logic; gamma covers the environment. A defect that only the operator's environment shows becomes a
 beta scenario in the same change that fixes it (section 11).
 
-### 5.4 The gamma trigger, as built
+### 5.4 The gamma trigger, as built (RETIRED)
+
+> RETIRED: `gamma.yml` is deleted and no release workflow run starts a gamma deploy; gamma moves to kbf-updater (package-update design, section 13). This section describes the workflow as it was, until the xtask `gamma` and `release stage-offer` verbs it names are deleted.
 
 `.github/workflows/gamma.yml` (the stage row `gamma` of `release/stages.yml`: `runs: actions`, event `workflow_run`, the jobs
 `offer` and `deploy`):
@@ -507,7 +508,7 @@ keeps (`pull-updates.md` is the authority for the rows; `split-mode-updates.md` 
 
 ### 6.1 What the offer checks, and who runs it
 
-`kbf release offer` ([P]) is run by the operator, or for gamma by the `offer` job of `gamma.yml` (section 5.4, through
+`kbf release offer` ([P]) is run by the operator, or (RETIRED) for gamma by the `offer` job of the deleted `gamma.yml` (section 5.4, through
 `release stage-offer`): that job has read scopes and no credentials, so running the checks in Actions puts no way into the
 farm there. The one job that reaches the farm is `deploy`, through the Tailscale identity of section 5.4, and only for
 gamma; the offer for prod is not made by a workflow. It refuses on any failed check of 5.1 and sets nothing. It holds no
@@ -544,8 +545,7 @@ The additions:
    on main, naming this commit). This is a release-process check in GitHub; it is **not host-update trust** (hosts never read
    the tag, and verify only the artifact attestation). Nothing judges a verdict document: the annotated tag's message carries
    the **Beta record** `release verdict-write` wrote (commit, set hash, tag, the run ids), as an audit record. A tag with no
-   record, or one that says it failed, passes `verify` the same. The gamma farm's build check is its own workflow
-   (`gamma.yml`) and does not gate the release. **No signing key**: who may push a `v*` tag is
+   record, or one that says it failed, passes `verify` the same. The gamma farm's build check (the retired `gamma.yml`, now kbf-updater) does not gate the release. **No signing key**: who may push a `v*` tag is
    limited by the tag-protection ruleset on main (M19), and the `publish` job is gated by the `prod` environment's
    required reviewer (item 2). A signing key would add key custody without adding protection beyond those two.
 2. **A `prod` environment with a required reviewer**, as kci's prod, on the `publish` job. **One approval per release:** the
