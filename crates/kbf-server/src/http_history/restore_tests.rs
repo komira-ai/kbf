@@ -584,3 +584,29 @@ fn any_one_result_makes_a_listing_and_an_exit_code_is_the_runs() {
     );
     assert!(broken.is_none());
 }
+
+/// Catches: the operation id or the submit evidence dropped when a record becomes a row
+/// again (the history view would lose what the live view had), an absent walk total
+/// restored as 0, the two sources swapped, and a record written before the fields
+/// (nothing set) coming back with evidence claiming the client named nothing.
+#[test]
+fn the_operation_and_the_submit_evidence_come_back_and_old_records_have_none() {
+    use kbf_history::records::BookSource;
+    use kbf_types::OperationId;
+
+    let mut told = run(1, 1_000, 0, RunOutcome::Ok);
+    told.operation_id = Some(77);
+    told.cpu_source = BookSource::Hint.into();
+    told.memory_source = BookSource::Default.into();
+    told.input_bytes = Some(5_000);
+    let (rows, _) = to_rows(&[told], &[]);
+    assert_eq!(rows[0].operation_id, Some(OperationId(77)));
+    let e = rows[0].evidence.expect("evidence");
+    assert_eq!(e.cpu_source, kbf_invocation::BookSource::Hint);
+    assert_eq!(e.memory_source, kbf_invocation::BookSource::Default);
+    assert_eq!((e.input_bytes, e.input_files), (Some(5_000), None));
+
+    let (rows, _) = to_rows(&[run(2, 1_000, 0, RunOutcome::Ok)], &[]);
+    assert_eq!(rows[0].operation_id, None);
+    assert_eq!(rows[0].evidence, None);
+}

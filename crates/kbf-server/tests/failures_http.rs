@@ -43,6 +43,7 @@ fn names_command(action: Digest, command: Digest) -> Event {
         action,
         command,
         shape: None,
+        evidence: None,
     }
 }
 

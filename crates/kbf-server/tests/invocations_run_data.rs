@@ -233,6 +233,7 @@ async fn a_row_answers_its_shape_and_target() {
         action,
         command: digest(99),
         shape,
+        evidence: None,
     };
     server
         .feed([

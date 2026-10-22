@@ -38,6 +38,7 @@ fn queue(farm: &TestFarm, request: Request) -> kbf_front::Ticket {
         request,
         call: None,
         described: Described::default(),
+        evidence: Default::default(),
     })
     .expect("queued")
 }

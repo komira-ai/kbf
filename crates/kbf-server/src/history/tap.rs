@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use kbf_front::Tap;
 use kbf_history::records::{
-    Cgroup, HitHow, HitRecord, MemoryKill, Output, RunOutcome, RunRecord, Timestamps, WireDigest,
+    BookSource, Cgroup, HitHow, HitRecord, MemoryKill, Output, RunOutcome, RunRecord, Timestamps,
+    WireDigest,
 };
 use kbf_history::{Event, EventQueue, InvRef, Minter};
 use kbf_invocation::{
@@ -373,7 +374,22 @@ pub(crate) fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
         } else {
             0
         },
+        operation_id: row.operation_id.map(|o| o.0),
+        cpu_source: book_source(row.evidence.map(|e| e.cpu_source)).into(),
+        memory_source: book_source(row.evidence.map(|e| e.memory_source)).into(),
+        input_bytes: row.evidence.and_then(|e| e.input_bytes),
+        input_files: row.evidence.and_then(|e| e.input_files),
         ..RunRecord::default()
+    }
+}
+
+/// What a run record says of an axis' booking source: `Unspecified` when the row was
+/// never told (no evidence), so that a default is not claimed for a call nobody asked.
+fn book_source(source: Option<kbf_invocation::BookSource>) -> BookSource {
+    match source {
+        None => BookSource::Unspecified,
+        Some(kbf_invocation::BookSource::Default) => BookSource::Default,
+        Some(kbf_invocation::BookSource::Hint) => BookSource::Hint,
     }
 }
 

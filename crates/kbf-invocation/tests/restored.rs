@@ -29,6 +29,8 @@ fn row(n: u8, how: How, outcome: Option<Outcome>) -> ActionRow {
         outputs_truncated: false,
         command: None,
         shape: None,
+        operation_id: None,
+        evidence: None,
     }
 }
 

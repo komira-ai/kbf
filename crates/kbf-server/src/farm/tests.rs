@@ -112,6 +112,7 @@ fn a_report_the_scheduler_does_not_take_is_refused() {
         request,
         call: None,
         described: kbf_front::Described::default(),
+        evidence: Default::default(),
     })
     .expect("submitted");
     let report = Report {
