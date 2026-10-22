@@ -1,4 +1,4 @@
-//! `kbf cluster status|drain|undrain|member|denied|object-store`: a thin client of the operator API
+//! `kbf cluster status|drain|undrain|member|safe-to-stop|denied|object-store`: a thin client of the operator API
 //! (`docs/api.md`) on the frontend's host. It holds no cluster logic: each verb is one
 //! call, and the answer is the API's JSON, printed as it came.
 //!
@@ -13,6 +13,10 @@
 //!   is not undone (the REAPI listener has said GOAWAY): restart it.
 //! - `kbf cluster member <id> --state active|draining`: `POST /v1/members/<id>`, sets a
 //!   storage member's state; this is how a `joining` member is promoted.
+//! - `kbf cluster safe-to-stop <id>`: `GET /v1/members/<id>/safe-to-stop`, whether the host of
+//!   a storage member may be stopped now. A read, but it passes the whole write gate, so it
+//!   needs `--token-file`. Exit 0 if it may, 3 if not (the reasons on stdout), 1 if the call
+//!   failed.
 //! - `kbf cluster denied`: `GET /v1/denied`, the storage deny list with its reasons.
 //! - `kbf cluster object-store ...`: the object-store registration routes
 //!   ([`object_store`]). `denied` and `object-store` pass the whole write gate with a
@@ -21,9 +25,11 @@
 //! Writes need `--token-file`, the token file the server was started with. The API
 //! answers writes from loopback only, so this runs on the frontend's own host. Exit 0
 //! for a 2xx answer, 1 for any other answer or no answer (the error goes to stderr), 2
-//! for a command line that does not parse.
+//! for a command line that does not parse; `safe-to-stop` exits 3 for a 2xx answer that
+//! says the stop is not safe.
 
 pub mod object_store;
+mod safe_to_stop;
 
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -31,7 +37,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand, ValueEnum};
-use kbf_server::api::{DENIED, FRONTEND_DRAIN, NODES};
+use kbf_server::api::{DENIED, FRONTEND_DRAIN, NODES, safe_to_stop_path};
 use kbf_server::api_client::{ClientError, OperatorClient, Reply};
 use serde::Serialize;
 use zeroize::Zeroizing;
@@ -40,8 +46,9 @@ use zeroize::Zeroizing;
 /// `--api-listen`.
 pub const DEFAULT_API: &str = "127.0.0.1:8982";
 
-/// Show, drain and undrain the cluster, set a member's state, list the denied hosts and
-/// manage the object store, through the frontend's operator API.
+/// Show, drain and undrain the cluster, set a member's state, ask whether a member's host may
+/// be stopped, list the denied hosts and manage the object store, through the frontend's
+/// operator API.
 #[derive(Args, Clone, Debug, PartialEq, Eq)]
 pub struct Cluster {
     /// The operator API (the server's `--api-listen`).
@@ -109,6 +116,16 @@ pub enum Verb {
         /// its next heartbeat (default 15 minutes, at most a day).
         #[arg(long, value_name = "SECONDS")]
         for_secs: Option<u64>,
+        /// The file holding the server's operator API token.
+        #[arg(long, value_name = "FILE")]
+        token_file: PathBuf,
+    },
+    /// Ask whether a storage member's host may be stopped now: exit 0 if it may, 3 if not
+    /// (the reasons are printed).
+    SafeToStop {
+        /// The storage member's number (see `GET /v1/members`), or the node id of its host;
+        /// the node id of a host with no storage member is safe, judged as a daemon.
+        id: String,
         /// The file holding the server's operator API token.
         #[arg(long, value_name = "FILE")]
         token_file: PathBuf,
@@ -242,6 +259,7 @@ impl Verb {
                 };
                 Call::Post(format!("/v1/members/{id}"), Body::json(&body))
             }
+            Self::SafeToStop { id, .. } => Call::GetGated(safe_to_stop_path(id)),
             Self::Denied { .. } => Call::GetGated(DENIED.to_owned()),
             Self::ObjectStore { verb } => verb.call(stdin)?,
         })
@@ -254,22 +272,32 @@ impl Verb {
             Self::Status { .. } => None,
             Self::Drain { token_file, .. }
             | Self::Undrain { token_file, .. }
-            | Self::Member { token_file, .. } => Some(token_file),
+            | Self::Member { token_file, .. }
+            | Self::SafeToStop { token_file, .. } => Some(token_file),
             Self::Denied { token } => Some(&token.token_file),
             Self::ObjectStore { verb } => Some(verb.token_file()),
         }
     }
 }
 
+/// Prints a 2xx answer of `verb` and returns the exit status it means: 0, or for
+/// `safe-to-stop` the verdict's ([`safe_to_stop::report`]).
+fn succeeded(verb: &Verb, reply: &Reply) -> ExitCode {
+    if let Verb::SafeToStop { id, .. } = verb {
+        let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
+        return ExitCode::from(safe_to_stop::report(id, reply, &mut out, &mut err));
+    }
+    let _ = writeln!(std::io::stdout(), "{}", reply.body.trim_end());
+    ExitCode::SUCCESS
+}
+
 /// Runs the verb against the API: the answer's body on stdout when it is 2xx (exit 0),
-/// else the reason on stderr (exit 1).
+/// else the reason on stderr (exit 1). `safe-to-stop` prints the verdict instead and exits
+/// 3 when the stop is not safe.
 #[must_use]
 pub fn run(cluster: &Cluster) -> ExitCode {
     match answer(cluster) {
-        Ok(reply) if reply.is_success() => {
-            let _ = writeln!(std::io::stdout(), "{}", reply.body.trim_end());
-            ExitCode::SUCCESS
-        }
+        Ok(reply) if reply.is_success() => succeeded(&cluster.verb, &reply),
         Ok(reply) => {
             eprintln!("kbf cluster: {} {}", reply.status, reply.body.trim_end());
             ExitCode::FAILURE

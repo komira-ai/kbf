@@ -595,10 +595,11 @@ pub fn commit(id: &str) -> CommitId {
 
 pub const OTHER: &str = C;
 
-// The test farm's hosts, from the files under `testdata/testfarm/`: the units are what
-// `kbf-deploy linux render-units --mode` renders with `KBF_BIN_DIR=/usr/local/kbf/current`
-// (a test in kbf-deploy keeps them equal to the kit's output), the state and the helper's
-// memory are what the dev installer and the helper of `feature/pull-updates` wrote.
+// The test farm's hosts, from the files under `testdata/testfarm/`: the units are what the
+// retired `kbf-deploy linux render-units --mode` rendered with
+// `KBF_BIN_DIR=/usr/local/kbf/current` (kept as the old hosts' files; no tool renders them
+// now), the state and the helper's memory are what the dev installer and the helper of
+// `feature/pull-updates` wrote.
 
 pub const FARM_X: &str = "6ed9c1a07f5b4e2d8c3a91f04b7d65e2a8c1f937";
 pub const FARM_Y: &str = "b1e4a7d2c9f0385e6a4d1b7c2f9e0834a5d6c1b2";

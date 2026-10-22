@@ -121,6 +121,16 @@ release it is about to move is the one the offer is for. Nothing is taken from a
   `offer_required`) unless `--no-offer` says so. `--no-offer` is logged on standard error and
   recorded in the summary (`offer.kind: "waived"`); it is for a test farm.
 - **The commit**: the offer's `commit` is `--commit` (`offer_wrong_commit`).
+- **The installer**: the offer's optional `min_installer` is the lowest installer level
+  (`kbf_installer::version::LEVEL`, a whole number raised by one whenever a change means hosts
+  must be upgraded first; the package version is constant and commits are not ordered) that may
+  deploy it. An installer below it refuses first, before any other check, the bundle's files or
+  an upload (`offer_installer_too_old`, exit 3; the detail names both levels), so the node keeps
+  the release it serves and the update controller holds the order. An offer without the field
+  (made before it) is accepted by every level. `release offer` and `release stage-offer` write
+  the level of the tree they run from. An installer from before the field cannot read an offer
+  that has it (the document refuses unknown fields), so a host that old needs its package
+  installed once by hand.
 - **The set**: with an offer the bundle must carry `SHA256SUMS` (one entry, not uploaded). Its
   SHA-256 is the offer's `set_hash` (`offer_set_mismatch`), and every tarball in the bundle,
   and every platform's version facts (`kbf-<commit>-<platform>.version.json`, which the store

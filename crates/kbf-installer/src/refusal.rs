@@ -26,8 +26,6 @@ pub enum Refusal {
     Untrusted { path: PathBuf, fault: TrustFault },
     #[error("settings {}: {fault}", path.display())]
     Settings { path: PathBuf, fault: SettingsFault },
-    #[error("the offer is refused: {0}")]
-    Offer(OfferFault),
     #[error("inbox file {name:?} is refused: {fault}")]
     Inbox { name: String, fault: InboxFault },
     /// The copy's sha256 is not the one the offer names for the file.
@@ -111,7 +109,6 @@ impl Refusal {
         match self {
             Refusal::Untrusted { fault, .. } => fault.code(),
             Refusal::Settings { fault, .. } => fault.code(),
-            Refusal::Offer(fault) => fault.code(),
             Refusal::Inbox { fault, .. } => fault.code(),
             Refusal::HashMismatch { .. } => "hash-mismatch",
             Refusal::NotAttested { .. } => "not-attested",
@@ -174,7 +171,6 @@ impl Refusal {
                 _ => "shape",
             },
             Refusal::Settings { .. }
-            | Refusal::Offer(_)
             | Refusal::Inbox { .. }
             | Refusal::Differs { .. }
             | Refusal::Install(_)
@@ -261,48 +257,6 @@ impl SettingsFault {
             SettingsFault::NoRefs => "settings-no-refs",
             SettingsFault::RunAsRoot => "settings-run-as-root",
             SettingsFault::NotUtf8 => "settings-utf8",
-        }
-    }
-}
-
-/// Why an offer is refused.
-#[derive(Debug, thiserror::Error)]
-pub enum OfferFault {
-    #[error("it is not the JSON an offer is: {0}")]
-    NotAnOffer(String),
-    #[error("its schema is {found}; this build reads only schema {want}")]
-    Schema { found: u64, want: u64 },
-    #[error("it names no component")]
-    NoComponents,
-    #[error("{0:?} is not a component of a release")]
-    UnknownComponent(String),
-    #[error("it names the component {0} twice")]
-    RepeatedComponent(String),
-    #[error("{0:?} is not a plain file name")]
-    BadFileName(String),
-    #[error("it names the file {0:?} twice")]
-    RepeatedFile(String),
-    #[error("{0:?} is not a sha256 (64 lowercase hex digits)")]
-    BadSha256(String),
-    #[error("{0:?} is not a commit (40 lowercase hex digits)")]
-    BadCommit(String),
-    #[error("no `kbf-daemon` is built for a Mac, and it names that component")]
-    DarwinDaemon,
-}
-
-impl OfferFault {
-    pub fn code(&self) -> &'static str {
-        match self {
-            OfferFault::NotAnOffer(_) => "offer-malformed",
-            OfferFault::Schema { .. } => "offer-schema",
-            OfferFault::NoComponents => "offer-no-components",
-            OfferFault::UnknownComponent(_) => "offer-component",
-            OfferFault::RepeatedComponent(_) => "offer-repeated-component",
-            OfferFault::BadFileName(_) => "offer-file-name",
-            OfferFault::RepeatedFile(_) => "offer-repeated-file",
-            OfferFault::BadSha256(_) => "offer-sha256",
-            OfferFault::BadCommit(_) => "offer-commit",
-            OfferFault::DarwinDaemon => "offer-darwin-daemon",
         }
     }
 }

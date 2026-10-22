@@ -181,6 +181,56 @@ node yet, so each of them answers as it did and the tests put a blob there throu
   not answer, or answers missing is owed a debt; a full set journals at once. Nothing calls
   `track` until PR 6.
 
+### As built (PR 5 of the plan)
+
+Still no producer: nothing in a running node calls `Cache::hold`, and `--ram-ack-bytes`
+is 0, so with the flag at its default the set is empty and every number below reads 0.
+
+- `Cache::hold(&VerifiedBlob)` is the producer's entry and the only place a permit is
+  taken: a non-blocking try-acquire of the blob's bytes (`Hold::Held`), `Hold::Duplicate`
+  for a digest already held or the empty blob (no second permit), `Hold::Budget` when the
+  budget has not the bytes (counted as `writethrough{reason=budget}`; the caller commits
+  `Durable`). The permit lives in the Held entry and returns when the entry leaves.
+  `Cache::hold_for_test` holds without a budget.
+- The drain (`Cache::drain_held`, one pass; `run_drain`, the loop `kbf-server` runs only
+  when the budget is over 0) takes at most 1,024 blobs a pass, writes them through the
+  pool's `Whole` path (`pool_commit`: sync, one `PutStaged`; a blob the tier does not take
+  goes to the object store) and removes an entry only after that returned. `Queued`,
+  `Writing`, `Failing{n}` are the entry's states; a failure counts in
+  `drain_failures_total`, logs a warning, and the entry is taken again after the capped
+  backoff of the flusher (1 s doubling to 60 s). A pass that is dropped gives its blobs
+  back.
+- `--ram-drain-deadline` (30 s, at least 1) bounds the drain a storage node makes when it
+  stops: after its calls have ended (and so after the daemon's lease drain, which is what
+  tells the storage half to stop), `drain_for_shutdown` takes every blob, not waiting
+  out a backoff, until none is held or the deadline ends; what it leaves is logged at
+  error level with the blob and byte counts. A stop that passes the deadline loses the
+  blobs that were acknowledged but are held only in RAM; the meta-backup refuses while any
+  are held.
+  The same deadline also bounds the flush of the write tier that follows the drain, and
+  takes what the drain used: `flush_for_shutdown` seals the open block and flushes the
+  staged blocks to the cold store until none is left or the deadline ends. A flush that
+  failed before the stop began is retried at once; one that fails during it waits its
+  backoff, 1 s doubling to 60 s, within the deadline. What it leaves is on the hot store's
+  disk (an acknowledgement follows `fdatasync` and the committed log), is logged at error
+  level with the block and byte counts, and is flushed by the next start. With no budget
+  (`--ram-ack-bytes` 0) the flush still runs.
+  The units set `TimeoutStopSec=infinity`, so the deadline is the only bound on a stop:
+  its 30 s default is not derived from a unit timeout. The bound is one for both phases,
+  not one each: a drain that takes 25 s leaves the flush 5 s, and a drain that ends at the
+  deadline leaves the flush one poll.
+  Only `kbf storage` and the storage half of `storage-and-daemon` run it; a server with
+  no replica holds nothing. A Draining member is **not yet** kept from counting as filled
+  while it holds entries: that belongs with the producer.
+- Metrics, in `Cache::render_metrics`: `kbf_storage_ram_unwritten_bytes`,
+  `kbf_storage_ram_unwritten_blobs`, `kbf_storage_ram_unwritten_oldest_seconds`,
+  `kbf_storage_ram_budget_bytes`, `kbf_storage_ram_drain_failures_total` and
+  `kbf_storage_ram_writethrough_total{reason}` (all six reasons printed; only `budget` is
+  counted until the producer). `kbf_storage_ram_unconfirmed_blobs` waits for the producer
+  too: nothing calls the peer confirmer's `track` before it.
+- `kbf-deploy linux meta-backup` refuses while `kbf_storage_ram_unwritten_bytes` is above
+  0 (a server that does not print it holds none).
+
 ## Rule 3: budget, backpressure and metrics
 
 `--ram-ack-bytes` is per node. At hold time each node makes a **non-blocking**

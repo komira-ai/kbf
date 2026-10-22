@@ -25,6 +25,8 @@ use kbf_update::{Facts, Locator, OrderRecord, Source, Verb};
 
 const UNIT: &str = "kbf.service";
 const T0: u64 = 1_800_000_000;
+const LOG: &str = "var/lib/kbf-meta";
+const OLD_LOG: &[u8] = b"machine version 4\n";
 
 struct Crashy {
     inner: Rc<RefCell<ScratchHost>>,
@@ -275,7 +277,20 @@ fn prep(scn: &str, tag: &str) -> World {
             pass(&w, T0 + 3);
             w.order_in(1, 2, "revert", A);
         }
-        "expire" => {
+        "expire" | "expire_log" => {
+            if scn == "expire_log" {
+                // A storage node with a metadata log; B's first start saves it, then B
+                // raises it.
+                let kbf = w.root.join("etc/kbf");
+                fs::create_dir_all(&kbf).unwrap();
+                fs::write(
+                    kbf.join("kbf.toml"),
+                    "mode = \"storage\"\n[storage]\nmeta_dir = \"/var/lib/kbf-meta\"\n",
+                )
+                .unwrap();
+                fs::create_dir_all(w.root.join(LOG)).unwrap();
+                fs::write(w.root.join(LOG).join("RECORD"), OLD_LOG).unwrap();
+            }
             w.order(5, "activate", B);
             pass(&w, T0);
             let mut out = Vec::new();
@@ -285,6 +300,10 @@ fn prep(scn: &str, tag: &str) -> World {
                 crash_at: w.crash_at.clone(),
             };
             activate::boot_check(&mut ex, &w.layout, T0 + 10, 600, &mut out).unwrap();
+            if scn == "expire_log" {
+                fs::write(w.root.join(LOG).join("RECORD"), b"machine version 5\n").unwrap();
+                fs::write(w.root.join(LOG).join("segment-2"), b"new").unwrap();
+            }
         }
         _ => unreachable!(),
     }
@@ -313,6 +332,22 @@ fn kill_at_every_step_of(scn: &str) {
                 .unwrap_or_default();
             let restarts = w.restarts() - before;
             let mut why = Vec::new();
+            if scn == "expire_log" {
+                // The restart the helper owes runs the unit's start check first: the log is
+                // as the older release left it, whichever step the pass was killed at.
+                let mut ex = Crashy {
+                    inner: w.host.clone(),
+                    counter: w.counter.clone(),
+                    crash_at: w.crash_at.clone(),
+                };
+                activate::boot_check(&mut ex, &w.layout, T0 + 900, 600, &mut Vec::new()).unwrap();
+                let log = w.root.join(LOG);
+                if fs::read(log.join("RECORD")).unwrap() != OLD_LOG
+                    || log.join("segment-2").exists()
+                {
+                    why.push("the metadata log was not put back".to_owned());
+                }
+            }
             if !link.ends_with(&cur) {
                 why.push(format!("link {link} != state {cur}"));
             }
@@ -424,6 +459,18 @@ fn kill_at_every_step_of_a_frontend_revert() {
 #[test]
 fn kill_at_every_step_of_an_expiry() {
     kill_at_every_step_of("expire");
+}
+
+/// Catches a metadata log left raised by a pass killed while it reverted the release that
+/// raised it: at every step of the pass the swap's window runs out in, then passes and the
+/// unit's start check, the links and the state agree and the log is as the older release left
+/// it, with the file the newer one added gone.
+///
+/// Mutant planted: the start check putting the log back only on the path that reverts itself
+/// (and not at a start after a revert some other pass made).
+#[test]
+fn kill_at_every_step_of_an_expiry_that_raised_the_log() {
+    kill_at_every_step_of("expire_log");
 }
 
 /// Catches orders read through a linked spool: the service user owns that directory's

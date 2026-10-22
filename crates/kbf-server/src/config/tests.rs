@@ -261,6 +261,24 @@ fn the_durable_wait_and_the_peer_grace_are_flags_and_the_wait_is_bounded() {
     assert!(message.contains("--durable-wait 60"), "{message}");
 }
 
+/// Catches `--ram-ack-bytes` and `--ram-drain-deadline` that do not reach the node: a
+/// default other than off and 30 s, a deadline of 0 (a stop that drains for no time would
+/// lose what it holds without trying), and a value that is read as another unit.
+#[test]
+fn the_ram_budget_and_its_stop_deadline_are_flags() {
+    let defaults = Args::parse_from(["kbf-server"]);
+    assert_eq!(defaults.ram_ack_bytes(), 0, "off until the producer ships");
+    assert_eq!(defaults.ram_drain_deadline(), Duration::from_secs(30));
+    let set = Args::parse_from([
+        "kbf-server",
+        "--ram-ack-bytes=1073741824",
+        "--ram-drain-deadline=7",
+    ]);
+    assert_eq!(set.ram_ack_bytes(), 1 << 30);
+    assert_eq!(set.ram_drain_deadline(), Duration::from_secs(7));
+    assert!(Args::try_parse_from(["kbf-server", "--ram-drain-deadline=0"]).is_err());
+}
+
 /// Catches a server that starts with a `--segment-upload-max-bytes` larger than one
 /// admission counts (mutant: the flag's upper limit removed). `Cache::admit` counts
 /// at most `kbf_front::MAX_ADMISSION_BYTES` (what its semaphore holds) for one call;

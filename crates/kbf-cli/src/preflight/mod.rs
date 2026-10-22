@@ -22,8 +22,7 @@
 //! - the cold store's S3 key pair is in the environment ([`env`]);
 //! - the container driver's `crun` ([`env`]);
 //! - the open-file limit in force is the floor the units set ([`env`], a warning).
-//! - the host rules `kbf-deploy linux check-units` had (re-homed here; check-units still
-//!   has its copies until it is retired): the directories above a `file://` `--hot-store`
+//! - the host rules `kbf-deploy linux check-units` had (re-homed here; the verb is retired): the directories above a `file://` `--hot-store`
 //!   can be entered by the user kbf runs as ([`traverse`]); the cgroup kbf runs in keeps
 //!   every CPU and NUMA node of the node, for a daemon on the container driver
 //!   ([`cpuset`]); a mode with no storage half has no AWS credential variable in its environment,

@@ -188,19 +188,15 @@ impl<'a> DbMigrator<'a> {
 /// How long a release gets to print its version: the installer's own probe bound.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The `state_schema` the release at `program` (the executable of `release`) declares:
-/// `<program> --version --json`, run as the caller with an empty environment in `/`, read as
-/// strictly as the installer read it when it installed the release, and required to be
-/// `release`'s own build.
+/// What the binary at `program` prints for `--version --json`: run as the caller with an
+/// empty environment in `/`, and read as strictly as the installer read it when it installed
+/// the release. Nothing says whose build it is: [`installed_schema`] adds that check, and a
+/// host that holds one binary and no release (a bundled one) has no commit to compare with.
 ///
 /// # Errors
 /// [`Refusal::SchemaUnknown`]: the program cannot run, runs past [`PROBE_TIMEOUT`], exits
-/// non-zero, prints something else than a version object, or names another commit.
-pub fn installed_schema(
-    runner: &dyn Runner,
-    program: &Path,
-    release: &CommitId,
-) -> Result<u32, PortError> {
+/// non-zero, or prints something else than a version object.
+pub fn probe_version(runner: &dyn Runner, program: &Path) -> Result<Version, PortError> {
     let unknown = |why: String| Refusal::SchemaUnknown.because(why);
     let ran = runner
         .run(&Spawn {
@@ -218,10 +214,34 @@ pub fn installed_schema(
             ran.code, ran.timed_out
         )));
     }
-    let version = Version::parse(&ran.stdout)
-        .and_then(|version| version.check(release).map(|()| version))
-        .map_err(|fault| unknown(fault.to_string()))?;
-    u32::try_from(version.state_schema).map_err(|_| unknown("state_schema is too large".into()))
+    Version::parse(&ran.stdout).map_err(|fault| unknown(fault.to_string()))
+}
+
+/// The `state_schema` `version` declares, as the number the migrations are counted in.
+///
+/// # Errors
+/// [`Refusal::SchemaUnknown`]: it does not fit a `u32`.
+pub fn schema_of(version: &Version) -> Result<u32, PortError> {
+    u32::try_from(version.state_schema)
+        .map_err(|_| Refusal::SchemaUnknown.because("state_schema is too large"))
+}
+
+/// The `state_schema` the release at `program` (the executable of `release`) declares:
+/// [`probe_version`] of it, required to be `release`'s own build.
+///
+/// # Errors
+/// [`Refusal::SchemaUnknown`]: the program cannot run, runs past [`PROBE_TIMEOUT`], exits
+/// non-zero, prints something else than a version object, or names another commit.
+pub fn installed_schema(
+    runner: &dyn Runner,
+    program: &Path,
+    release: &CommitId,
+) -> Result<u32, PortError> {
+    let version = probe_version(runner, program)?;
+    version
+        .check(release)
+        .map_err(|fault| Refusal::SchemaUnknown.because(fault))?;
+    schema_of(&version)
 }
 
 impl Migrator for DbMigrator<'_> {

@@ -47,6 +47,7 @@ http_invocations,http_sched,http_history,enroll/api,managed/http,ui_mount}.rs` a
 | drain a node | `POST /v1/nodes/{node}:drain` | [F] | write |
 | uncordon a node | `POST /v1/nodes/{node}:uncordon` | [F] | write |
 | set a member active or draining (join, leave) | `POST /v1/members/{id}` | [F] | write |
+| may a storage member's host be stopped now (the update gate) | `GET /v1/members/{id}/safe-to-stop` | [F] | write |
 | deny an entry (serial, SPKI hash, node id) | `POST /v1/denied` | [F] | write |
 | allow an entry again | `DELETE /v1/denied` | [F] | write |
 | list the denied entries | `GET /v1/denied` | [N] unit F | write |

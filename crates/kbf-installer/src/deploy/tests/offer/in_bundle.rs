@@ -35,7 +35,7 @@ fn bundle_carrying(offer: Option<&[u8]>) -> Vec<u8> {
 
 /// The two ways to give the same offer, each with the bundle that goes with it: a file's (the
 /// policy holds the document) and the bundle's own.
-fn both_ways(fields: &Fields) -> [(OfferPolicy, Vec<u8>); 2] {
+pub(super) fn both_ways(fields: &Fields) -> [(OfferPolicy, Vec<u8>); 2] {
     let by_file = (policy(Stage::Gamma, fields.doc()), good_bundle());
     let by_bundle = (in_bundle(), bundle_carrying(Some(&offer_of(fields))));
     [by_file, by_bundle]

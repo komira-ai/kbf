@@ -8,7 +8,7 @@
 //!   property list, whose `kbf-installer` command line the real parser (`kbf_installer::cli`)
 //!   refuses, or whose verb is one the binary answers "not implemented";
 //! - a runtime unit that execs `kbf` anywhere but the layout's `releases/current` link, the
-//!   path `setup` and `activate` create and flip (the frontend template runs `slots/%i`);
+//!   path `setup` and `activate` create and flip;
 //! - a property list that is not gated on the macOS configuration directory of the layout, or
 //!   that restarts a launchd label `setup` does not bootstrap.
 //!

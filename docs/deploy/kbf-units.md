@@ -1,20 +1,15 @@
-# Rendering and checking the units of each `kbf` mode
+# The units of each `kbf` mode
 
-`kbf-deploy linux render-units --mode MODE` writes `kbf.slice` and `kbf-<mode>.service`
-for one mode of `kbf` (the modes are described in [All-in-one vs distributed](kbf-modes.md); `frontend`, `storage`, `daemon`, `storage-and-daemon`,
-`all-in-one`; [architecture-v2.md](../design/architecture-v2.md), sections 1 and 11).
-`kbf-deploy linux check-units --mode MODE` reads them back, each with its drop-ins, and
-prints one `FAIL <rule>: <reason>` line per broken rule, then any `SKIP` or `WARN` line
-(neither is a failure), then the summary:
-
-```text
-kbf-deploy linux render-units --config node.conf --out units --kbf-uid 1500 --mode daemon
-kbf-deploy linux check-units --config node.conf --dir units --installable --mode daemon
-```
-
-Exit codes: 0 rendered or every rule holds, 1 a rule is broken, 2 refused (a bad setting,
-a missing `--mode`, a file that cannot be read or written), with a `REFUSED:` line on
-stderr.
+Each mode of `kbf` has one static systemd unit, shipped in the `kbf-installer` package
+(`packaging/linux/units/`: `kbf-frontend.service`, `kbf-storage.service`,
+`kbf-daemon.service`, `kbf-storage-and-daemon.service`, `kbf-all-in-one.service` and the
+shared `kbf.slice`; the modes are described in [All-in-one vs distributed](kbf-modes.md);
+[architecture-v2.md](../design/architecture-v2.md), sections 1 and 11). The files carry no
+host values: the mode's flags are in `/etc/kbf/kbf.toml`, which `kbf-installer setup`
+writes ([kbf-installer-setup.md](kbf-installer-setup.md)), and the units are installed
+disabled and enabled for the host's mode by `kbf-installer`. `kbf-deploy linux render-units`,
+`check-units` and `install-units` rendered, checked and installed units from a settings
+file; they were retired, and nothing renders a unit now.
 
 ## Choosing the mode: `--mode`, `kbf.toml`, enrollment
 
@@ -24,9 +19,7 @@ the start says so on stderr; with neither the start exits 2 naming both. `kbf --
 lists the mode's flags. There is no `node` mode and no `enroll` word.
 
 - **Flags.** A start that gives flags of its mode (`--cold-store`, `--server`, ...) runs on them
-  and does not read the file. The units that `render-units` writes still run the old subcommand
-  forms (`kbf storage ...`, `kbf daemon ...`): they are hidden aliases of the same modes, kept
-  until the units move.
+  and does not read the file. (The packaged units give `--mode=<mode>` and read the file.)
 - **`kbf.toml`.** `kbf --mode=storage|daemon|storage-and-daemon` with at most `--config FILE`
   reads the host's file. On the first start, with the token file `enroll.token_file`
   names, it makes its keys, sends the token and a request for the roles the mode needs
@@ -43,46 +36,45 @@ lists the mode's flags. There is no `node` mode and no `enroll` word.
   yet, or an enrolled node that covers the mode; 2 for a bad config, a missing token file or a
   `node.json` that does not cover the mode.
 
-## What check-units reads
+## How the units are checked
 
-- `kbf-<mode>.service` and `kbf.slice` in `--dir`, and their drop-ins: every `*.conf`
-  file in `<name>.d/` beside them, applied after the unit in file-name order, as
-  systemd applies them. Each key is read as systemd reads it: a single-valued key's
-  last assignment wins, and an empty assignment resets a list (`Environment=`,
-  `EnvironmentFile=`, `PassEnvironment=`, the credential keys, `Delegate=`,
-  `DisableControllers=`, `AllowedCPUs=`, `AllowedMemoryNodes=`).
-- On the host it runs on: `/sys/devices/system/cpu/online` and
-  `/sys/devices/system/node/online` (rule `cpuset`, only when a unit sets a list), the
-  files the unit's `EnvironmentFile=` lines name (rule `credential`), the storage unit's
-  `User=` (`getent passwd`, rule `credential`), the owner and mode of each directory above a
-  `file://` `--hot-store` (rule `traverse`). It does not run `kbf`: whether `kbf` takes a
-  unit's flags is `kbf --mode=<mode> --check` on the node (below). Run it on the node, as
-  root, for all of them.
+- **The files.** `crates/kbf-integration-test/tests/package_units.rs` reads every packaged
+  unit with the same unit parser the docs check uses (`kbf_unitfile`, systemd's reading:
+  continuations, the last assignment wins, an empty assignment resets a list) and holds it to
+  the rules below. Each rule has a mutant in that test (a defect planted in a copy of the real
+  file that the rule must name), and a rule added without one fails the test.
+- **The host.** `kbf --mode=<mode> --check`, which the units run as an `ExecStartPre=` (and
+  every start runs again), reads what only the host knows, as the process that will run: the
+  directories above a `file://` `--hot-store` can be entered (`traverse`), the cgroup keeps
+  every CPU and NUMA node of the node (`cpuset`), and a build node's environment holds no
+  `AWS_*` variable and the cold store's key file, if there is one, is owned and moded as its mode
+  needs (`credential`). The code is `crates/kbf-cli/src/preflight`; a problem prints on standard
+  error and exits 2 (a restart cannot fix it) or 75 (it may heal).
+- **The flags.** Whether `kbf` takes a unit's flags is `kbf --mode=<mode> --check`'s
+  answer, and `crates/kbf-cli/tests/package_units.rs` parses each packaged unit's flags with
+  `kbf`'s own parser.
 
-It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/system`,
-`service.d/` and prefix drop-ins) or changes made with `systemctl set-property` or
-`systemctl edit --runtime`.
+Drop-ins on the host (`/etc/systemd/system/<unit>.d/*.conf`) are the operator's and are not
+checked by the package test.
 
-## The rules
+## The rules the packaged units follow
 
 | rule | what it refuses |
 |---|---|
-| `render` | an `@KEY@` placeholder left; with `--installable`, a `<...>` one |
 | `continuation` | a comment line inside a continued directive (below) |
-| `exec` | an `ExecStart=` that is not `<KBF_BIN_DIR>/kbf <mode>` |
+| `exec` | an `ExecStart=` that runs a program outside the installer's tree, or another mode than the unit's name |
 | `slice` | a unit not in `kbf.slice` |
-| `delegate` | a mode that runs builds without `cpu`, `cpuset`, `memory` and `pids` delegated, or with one of them in `DisableControllers=` (the unit's, or `kbf.slice`'s) |
-| `cpuset` | `AllowedCPUs=` or `AllowedMemoryNodes=` on a mode that runs builds, or on `kbf.slice`, narrower than the node's CPUs or NUMA nodes |
+| `delegate` | a mode that runs builds without `cpu`, `cpuset`, `memory` and `pids` delegated, or with one of them in `DisableControllers=` |
+| `cpuset` | `AllowedCPUs=` or `AllowedMemoryNodes=` on a mode that runs builds, or on `kbf.slice`: the daemon places leases on every CPU and NUMA node of the node |
 | `caps` | a mode that runs builds (`daemon`, `storage-and-daemon`, `all-in-one`) with `MemoryMax=`, `MemoryHigh=`, `CPUQuota=` or `AllowedCPUs=` on its unit: builds are capped by the daemon's own `actions/memory.max`, and a limit on the unit caps the supervisor with them |
 | `swap` | a mode that runs builds with `MemorySwapMax=` on its unit: its leases live in the unit's cgroup and may swap |
 | `oom` | a mode that runs builds without an integer `OOMScoreAdjust=` below 0, the build containers' score (a host-wide OOM kill takes the highest score first) |
-| `credential` | the cold store's key reaching a mode without a storage half (`daemon`, `all-in-one`); the `storage` unit, which holds it, run as root or as `KBF_USER` (the user builds run as), and on the node its key file readable by another user; in the `storage-and-daemon` unit, any way of giving the key but the one `EnvironmentFile=<KBF_ETC>/s3.env` (below), and on the node that file not a plain file of root's with mode 0600 |
-| `storage` | a `storage` or `storage-and-daemon` unit without `--cold-store`, `--meta-dir`, `--storage-listen` or one of the three certificate flags, or with an `s3://` cold store and no `EnvironmentFile=<KBF_ETC>/s3.env` (for `storage-and-daemon`, exactly that path: no `-`, quotes or wildcard) |
-| `state-store` | in the frontend's unit, a `--state-store` that is not a `postgres://` or `postgresql://` URI (a `sqlite://` file is named as dropped); in any unit, a URI that carries a password, an empty or relative SQLite path (the all-in-one's), another scheme, or a value that names a variable (below) |
-| `traverse` | on the node, a `file://` `--hot-store` with an existing directory above it that the unit's `User=` cannot enter (no execute bit for it as owner, group member or other); the message names the directory, its mode and owner, and the user. `install-units --mode` refuses it too, before any step |
-| `ports` | two of a unit's listeners (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) on one port |
+| `credential` | a key given to the unit any way but `kbf.toml`: an `EnvironmentFile=`, an `Environment=` naming a key, secret, token or password, a systemd credential, or an ordering after a MinIO unit |
 | `restart` | a node unit (`storage`, `daemon`, `storage-and-daemon`) without `RestartSec=5` and, in `[Unit]`, `StartLimitIntervalSec=0`: systemd's defaults (100 ms, 5 starts in 10 s) end a quickly repeating failure in `start-limit-hit` with the unit down. The frontend keeps `Restart=on-failure` without them: an old frontend that drained after a handover exits 0 and must stay down |
-| `stop` | a mode that drains on SIGTERM (every mode but `daemon`, whose finite stop the `package_units` test checks) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
+| `stop` | a mode that drains on SIGTERM (every mode but `daemon`, which has a finite stop) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
+
+The test has more rules than these (`install`, `network`, `gate-*`, `user`, `nofile`,
+`notify`, `handover`, `conflicts`, `envoy`, `memory`, ...); its header lists what each catches.
 
 **`delegate`.** systemd reads `Delegate=` this way (systemd.resource-control(5), and
 `config_parse_delegate` in systemd's `src/core/load-fragment.c`): a boolean delegates
@@ -91,22 +83,7 @@ already delegated; an empty value turns delegation on with no controller. So
 `Delegate=yes` followed by `Delegate=memory` still delegates every controller, cpuset
 among them, and the rule passes it. A slice cannot delegate: systemd enables on
 `kbf.slice` every controller a unit under it delegates, unless the slice's
-`DisableControllers=` lists it. The slice template sets only `MemoryMin=`.
-
-**`cpuset`.** The daemon places leases on every CPU and NUMA node of the node
-(`--lease-placement=numa-node` pins each lease to one NUMA node's CPUs and memory). A
-list narrower than the node keeps the unit's cgroup, and every lease in it, off the
-rest. A list is read as systemd reads it (`config_parse_cpu_set` in
-`src/shared/cpu-set-util.c`): words split at spaces, tabs, line breaks and commas by
-`extract_first_word` with `EXTRACT_UNQUOTE` only, so quotes are taken off
-(`AllowedCPUs="0-1"` is the CPUs 0 and 1) and a `\` keeps the next character, with no
-C escapes; an unclosed quote drops the whole assignment; each word a number or range
-as `parse_range` and `safe_atou` read it (`0x`, `0o`, `0b` and a leading `0` pick the
-base), a malformed one ignored. A `%` specifier is not expanded: a `WARN cpuset:` line
-says the value was read as written. When the node's own sets cannot be read
-(check-units run elsewhere), a set list is not compared and a `WARN cpuset:` line says
-so. `StartupAllowedCPUs=` and `StartupAllowedMemoryNodes=` (boot and shutdown only)
-are not read.
+`DisableControllers=` lists it. The slice sets only `MemoryMin=`.
 
 **`continuation`.** systemd.syntax(7): "When a comment line or lines follow a line
 ending with a backslash, the comment block is ignored, so the continued line is
@@ -114,119 +91,32 @@ concatenated with whatever follows the comment block." That holds from systemd 2
 systemd 240 skips such a comment only when the `#` starts the line, and 239 and
 older join the comment into the value (`config_parse` in `src/shared/conf-parser.c`
 before the change that fixed systemd issue 10598), so its words become arguments of an
-`ExecStart=`. The templates put every comment above its directive, and the rule refuses
+`ExecStart=`. The units put every comment above its directive, and the rule refuses
 one inside.
 
-**`credential`.** It refuses, in `[Service]`:
+## What each mode's unit does
 
-- `EnvironmentFile=` naming the key file: its path, with `-`, quotes, `.`, `..` and
-  repeated `/` taken off, is `<KBF_ETC>/s3.env` or ends in `/s3.env`, or it is a
-  wildcard that matches `<KBF_ETC>/s3.env`. systemd expands every path with glibc's
-  `glob(3)` (`safe_glob` in `src/basic/glob-util.c`, no flags, in PID 1's C locale),
-  and the rule reads it the same way: `*`, `?`, `[...]` with ranges, `!` or `^`,
-  `[:alpha:]` and the other C-locale classes, `[=c=]` and `[.c.]`, a leading `.`
-  matched only by a `.`, and `\` escapes, taken off a path with no wildcard too
-  (`/etc/kbf/\s3.env` is the key file). Braces and `~` are plain characters (systemd
-  passes neither `GLOB_BRACE` nor `GLOB_TILDE`), and a `..` after a wildcard is read
-  by its words, as if the wildcard matched some directory;
-- `Environment=` setting any `AWS_*` variable, quoted or not, alone on the line or not:
-  the key pair, `AWS_SESSION_TOKEN`, and `AWS_PROFILE`, `AWS_SHARED_CREDENTIALS_FILE`
-  and `AWS_CONFIG_FILE` (which point an SDK at a key anywhere). A build node talks to no
-  AWS-style store, so no `AWS_*` variable has a use there;
-- `PassEnvironment=` naming an `AWS_*` variable;
-- any `LoadCredential=`, `LoadCredentialEncrypted=`, `SetCredential=`,
-  `SetCredentialEncrypted=` or `ImportCredential=` (opaque to the rule; a build node's
-  units need none);
-- on the node, an `EnvironmentFile=` whose file sets an `AWS_*` variable (a copy or a
-  hard link of the key under another name), or that is a symbolic link (not followed).
-
-What it cannot catch: offline, a file under another name that holds the key or links
-to it, and a wildcard elsewhere that matches a copy named `s3.env`; on the node, the
-files a wildcard `EnvironmentFile=` matches and a file it cannot read (each a
-`SKIP credential:` line); `%` specifiers (not expanded); `UnsetEnvironment=` (not read,
-so a variable it unsets still fails the rule); and the key reaching the node any other
-way: a file the daemon reads by a flag, the service manager's own environment without
-`PassEnvironment=`, or a key file other users can read.
-
-## What each mode's unit carries
-
-- **`storage`**: `--cold-store=s3://<KBF_S3_BUCKET>?endpoint=<MINIO_S3_ENDPOINT>&conditional-put=true`,
-  `--hot-store=file://<KBF_HOT_DIR>`, `--meta-dir=<KBF_META_DIR>`,
-  `--storage-listen=<KBF_LISTEN_ADDRESS>:<KBF_STORAGE_PORT>` (8983 by default: kbf's
-  own default, 8982, is `KBF_API_PORT`'s), and `--storage-tls-cert`, `--storage-tls-key`
-  and `--storage-client-ca` (`storage.pem`, `storage.key`, `ca.pem` under `KBF_ETC`).
-  It runs as `KBF_SERVER_USER` with `EnvironmentFile=<KBF_ETC>/s3.env`, the bucket's
-  key pair: on the node rule `credential` wants that file root's or the server user's,
-  mode 0600. No state store: a storage node reaches it only through a frontend.
-- **`daemon`**: the flags `kbf-daemon`'s unit has (`--server`, `--cas`, its
-  certificates, `--data-dir`, the memory flags, the images, and `--reserve-cpus` and
-  `--lease-placement` when `KBF_RESERVE_CPUS` and `KBF_LEASE_PLACEMENT` are set). `--server`
-  and `--cas` dial the frontend by `KBF_FRONTEND_NAME`, not the node's own
-  `KBF_HOST_NAME` (below); no key.
-- **`all-in-one`**: below; no key (its cold store is a directory); its `--api-token-file` is
-  `KBF_API_TOKEN_FILE` too.
-- **`storage-and-daemon`**: the storage unit's flags (`--cold-store`, with
-  `KBF_S3_PREFIX` as its path, `--meta-dir`, `--hot-store`, `--storage-listen`
-  `<KBF_LISTEN_ADDRESS>:<KBF_STORAGE_PORT>` and the three certificate flags; no `--cas`:
-  the daemon half reads the node's storage in-process), its registration
-  (`--frontend=https://<KBF_FRONTEND_NAME>:<KBF_WORKER_PORT>` and
-  `--advertise-addr=<KBF_HOST_NAME>:<KBF_STORAGE_PORT>`), then the daemon unit's flags,
-  with `--server` the same frontend URL. It runs as `KBF_USER` with
-  `EnvironmentFile=<KBF_ETC>/s3.env` (below). `install-units --mode` makes `--meta-dir`
-  and `--hot-store` the user's, mode 0700. `KBF_HOT_DIR` defaults to `<KBF_DATA_DIR>/hot`
-  (`/var/lib/kbf/hot`), on `--data-dir`'s filesystem: the one cache, and a path `KBF_USER`
-  can reach. It must stay one: `/var/lib/kbf-server` is the server account's, mode 0700,
-  and a hot store under it fails the unit's start with `Permission denied` (rule
-  `traverse`).
-- **`frontend`**: `--listen=<KBF_LISTEN_ADDRESS>:<KBF_REAPI_PORT>` with
-  `--reapi-tls-cert=<KBF_REAPI_CERT>` and `--reapi-tls-key=<KBF_REAPI_KEY>` (a
-  certificate pair the farm's CA did not issue, such as a `tailscale cert` pair, so the
-  file names are settings; default `reapi.pem` and `reapi.key` under `KBF_ETC`);
-  `--worker-listen=<KBF_LISTEN_ADDRESS>:<KBF_WORKER_PORT>` with `worker.pem`,
-  `worker.key` and `--worker-client-ca=ca.pem`; `--api-listen=127.0.0.1:<KBF_API_PORT>`
-  `--api-token-file=<KBF_API_TOKEN_FILE>` (default `api-token` under `KBF_ETC`; the
-  path only, never the token: without it every write to the operator API, `POST
-  /v1/frontend/drain` included, answers 401). The operator puts that file there;
-  `install-units` never makes it, and refuses a missing one, one the server user does
-  not own, or one with a group or other bit (mode 0600 or 0400);
-  `--storage=<KBF_STORAGE_URL>` (required, `https://`) with the frontend's worker
-  certificate as its client identity (`--storage-client-cert`, `--storage-client-key`)
-  and `--storage-ca=ca.pem`; and `--state-store=<KBF_STATE_STORE>`
-  (below). It runs as `KBF_SERVER_USER`, who must own the keys.
-
-`render-units --mode storage` refuses settings without `MINIO_S3_ENDPOINT`: the
-converged units default to the host's own MinIO, but a storage node's bucket need not be
-on the node. Every mode's settings must give the four ports (`KBF_REAPI_PORT`,
-`KBF_WORKER_PORT`, `KBF_API_PORT`, `KBF_STORAGE_PORT`) four values, or nothing renders.
-
-`KBF_HOST_NAME` is the node's own name (the name in its certificates, which it advertises)
-and `KBF_FRONTEND_NAME` the one name it dials for the frontend (the name in the frontend's
-worker certificate); left out, the frontend is the node itself. A farm node sets both: with
-only the first, its daemon dials its own address, where nothing listens, and never
-registers. The `storage` and `daemon` units still carry a `TODO(registration):` comment
-where their `--frontend` and `--advertise-addr` go; only `storage-and-daemon` registers
-today.
-
-`KBF_S3_PREFIX` (default empty: kbf's own `kbf/`) is the cold store's key prefix in the
-bucket, `a/b` or `a/b/`; a fresh prefix is a fresh cold store beside the old.
-`KBF_RESERVE_CPUS` (a whole number) and `KBF_LEASE_PLACEMENT` (`none` or `numa-node`) are
-left to kbf's defaults when empty.
+A mode's flags are its section of `kbf.toml` (`kbf --mode=<mode> --help` lists them;
+`crates/kbf-cli/tests/golden/kbf-<mode>.toml` is one full file per mode); the unit only
+names the mode, the user it runs as, its limits and its restart and stop behavior. A
+daemon's `--server` must name the frontend (the name in the frontend's worker certificate),
+not the node itself: dialing its own address, where nothing listens, it never registers.
 
 ### A listen address that appears late
 
 `network-online.target` does not wait for a VPN or overlay interface, so a listen address
-on one (`KBF_LISTEN_ADDRESS`) can be missing for a few seconds after boot, and the bind
+on one (a listener's address in `kbf.toml`) can be missing for a few seconds after boot, and the bind
 fails with "address not available". kbf retries that one error, and only that one, for up
 to 90 seconds (250 ms, doubling to 2 s between attempts, each wait logged with the
 address), below the units' `TimeoutStartSec=120`; every other bind error (address in use,
 permission) is at once fatal. This covers every listener of `frontend`, `storage`,
 `storage-and-daemon` and `all-in-one`. To order a unit after the service that brings the
 address up (`tailscaled.service`, say), put `After=` and `Wants=` in a systemd drop-in on
-the host, `/etc/systemd/system/<unit>.d/after.conf`; kbf-deploy has no option for it.
+the host, `/etc/systemd/system/<unit>.d/after.conf`; the packaged units carry no option for it.
 
 ### A frontend name that does not resolve yet
 
-`KBF_FRONTEND_NAME` can be a name that a VPN or overlay network's resolver answers, and
+The frontend's name (a daemon's `--server`, a storage node's `--frontend`) can be a name that a VPN or overlay network's resolver answers, and
 that resolver may start after `network-online.target`. A failed lookup at start does not end
 either half of `storage-and-daemon`: the storage half's channel to `--frontend` is lazy, so
 the lookup is part of its first registration, and a failed registration waits (1 s, doubling
@@ -289,57 +179,30 @@ because it learns a node's boot only when the node registers, after the frontend
 
 ### The state store: Postgres for the frontend
 
-The frontend's state store is Postgres (CEO ruling: SQLite is dropped for it). The unit
-gives `--state-store=<KBF_STATE_STORE>`, a `postgres://` URI from the host's settings; the
-default is the host's socket, `postgres:///kbf?host=/run/postgresql`. The URI carries no
-password (kbf refuses one: the command line is readable by every user on the node), so
-the database is reached by the socket or by the server user's own role. The database and
-its schema are `kbf-installer`'s; `install-units` makes no state directory for the
-frontend, and `KBF_STATE_DIR` is gone (a settings file that still sets it is refused as an
-unknown key, naming the line).
-
-Rule `state-store` fails, in the frontend's unit, a `--state-store` that is not a
-`postgres://` or `postgresql://` URI (a `sqlite://` one is named as dropped), and in any
-unit a URI that carries a password (user information with a colon, or a `password`
-parameter), a `sqlite://` path that is empty, relative or not normal, another scheme, and a
-`--state-store=${VAR}` (systemd expands the variable into the command line, so the rule
-cannot read the store it names, and what it holds is in argv, readable by every user). A
-unit with no `--state-store` passes. No message repeats the value.
+The frontend's state store is Postgres (CEO ruling: SQLite is dropped for it). The frontend
+gets `--state-store`, a `postgres://` URI, from `kbf.toml`; the default is the host's socket,
+`postgres:///kbf?host=/run/postgresql`. The URI carries no password (kbf refuses one: the
+command line is readable by every user on the node), so the database is reached by the
+socket or by the server user's own role. The database and its schema are `kbf-installer`'s.
 
 The unit gives no `--handover-socket` (nor a `RuntimeDirectory=` for one): `kbf frontend`
 refuses a Postgres `--state-store` together with it (`HandoverError::PostgresStore`: a Postgres
 store cannot give up its writer role), and the bundled proxy of `docs/design/frontend-proxy.md`
-replaces the handover. Rule `handover` asks for the socket and the preserved directory only
-when the store is SQLite or absent, and fails a unit that gives the socket beside a Postgres
-store. An update of a Postgres frontend is a restart, not `kbf frontend handover`.
+replaces the handover. An update of a Postgres frontend is a restart.
 
-The all-in-one unit still names its SQLite file, so that rule takes `sqlite:///<absolute
-path>` there until the farm is moved (below).
+### Updating a frontend without failing a build
 
-### Updating a frontend without failing a build: `kbf-frontend@.service`
-
-The frontend's unit is a template with two instances, `kbf-frontend@a` and
-`kbf-frontend@b`, that run the same command line; only one serves, and only `@a` is
-enabled at boot. To update, put the new `kbf` in place by rename (`install-units --mode
-frontend --bin-dir DIR --apply` does, and with a serving instance restarts nothing), then
-run, on the frontend's host:
-
-```
-kbf frontend handover --wait
-```
-
-It starts the idle instance with `systemctl start`; the unit is `Type=notify`, so the start
-returns when the new frontend has taken the state store and the daemons over and serves on
-listeners of its own (`--instance`, behind Envoy). The old instance then goes not ready once
-Envoy has seen the new one, answers the builds it holds and exits by itself (`--wait` looks
-at it until it has). Buck2's open streams are not broken, a call that still reaches the old
-frontend is forwarded to the new one, daemons reconnect and keep their runs. A new instance that fails before it is
-ready leaves the old one serving, and the command exits 1 and says so. With both instances
-active (the old one still draining) it refuses. What each party sees, and every failure:
-`docs/design/frontend-handover.md`. Rule `handover` of `check-units --mode frontend`
-refuses a unit that is not `Type=notify`, whose `--handover-socket` is outside a
-`RuntimeDirectory=` kept with `RuntimeDirectoryPreserve=yes`, or that has `Conflicts=`
-(starting an instance would stop the one draining).
+The socket-handover template (two instances, `kbf-frontend@a` and `kbf-frontend@b`, and the
+`kbf frontend handover` command that started the idle one) was retired by a maintainer
+decision: the kbf-installer package no longer ships it, `kbf` no longer has the command, and
+no step of this guide enables it. A frontend keeps its state in Postgres, and `kbf
+frontend` refuses a Postgres `--state-store` together with `--handover-socket`
+(`HandoverError::PostgresStore`), so the template could not start on a host kbf-installer
+set up. A host without the proxy runs `kbf-frontend.service` (one process; an update is a
+restart, and the stop drains, below); a host with the proxy lets kbf-installer's proxy swap
+frontend children (`docs/design/frontend-proxy.md`). `kbf-server`'s own control socket
+stays for the test farm. The retired design is kept as history in
+`docs/design/frontend-handover.md`.
 
 ### Stopping a frontend: TimeoutStopSec=infinity
 
@@ -351,7 +214,7 @@ fails every build in flight. systemd kills a unit with SIGKILL when `TimeoutStop
 runs out, 90 s (`DefaultTimeoutStopSec=`) when the unit gives none. So both units have
 `KillSignal=SIGTERM` and `TimeoutStopSec=infinity` (so do `storage` and
 `storage-and-daemon`: a storage node finishes its large Writes at stop, and systemd's
-90 s default would cut them), and rule `stop` refuses either
+90 s default would cut them), and rule `stop` of the package test refuses either
 missing or changed: it reads `TimeoutSec=` too (it sets the stop timeout as well; the
 last of the two wins) and the drop-ins. It asks for the word `infinity`: `0` means no
 timeout to systemd as well, but reads as "at once" to a person. A daemon is not held for ever:
@@ -362,14 +225,11 @@ a hung daemon still lets a reboot through.
 ### storage-and-daemon and the cold store's key
 
 One unit and one process (the daemon half reads and writes the node's storage
-in-process, one cache on the SSD; architecture-v2.md, sections 1 and 10). The unit holds
-the cold store's key pair through one `EnvironmentFile=<KBF_ETC>/s3.env`, a plain file of
-root's with mode 0600 (systemd reads it as root). Rule `credential` allows exactly that
-line, spelled exactly that way, and refuses every other way a build node is refused
-(`Environment=` or `PassEnvironment=` with an `AWS_*` variable, a systemd credential, a
-wildcard or `-` form of the file, another file that sets `AWS_*`); on the node it refuses
-a key file another user owns or others can read, and `check-units` lists a missing file
-as `SKIP credential:`.
+in-process, one cache on the SSD; architecture-v2.md, sections 1 and 10). The unit reads
+the cold store's key from no `EnvironmentFile=`: `kbf.toml` names where `kbf` gets it, and
+rule `credential` of the package test refuses every other way of giving a key to a unit.
+On the node, `kbf --mode=storage-and-daemon --check` refuses a key file another user owns
+or others can read (`crates/kbf-cli/src/preflight/credential.rs`).
 
 The design keeps the key from builds by uid (sections 9 and 15): the key file the unit's
 user's alone and each action a subordinate id of that user (the container driver's
@@ -382,24 +242,17 @@ environment. So this unit is for a trusted network only, as all-in-one is.
 `kbf all-in-one` runs builds in the process that holds the farm's state and its cold
 store, as one user. The container driver runs each action as a subordinate id of that
 user (`--userns=nomap`), but no test yet proves an action cannot read what the user
-holds (architecture-v2.md, section 9). Until one does, the unit says so in a comment
-and every `check-units --mode all-in-one` prints:
+holds (architecture-v2.md, section 9). Until one does, use it on a trusted single box or
+for development only.
 
-```text
-WARN trusted: kbf all-in-one runs builds beside the farm's state and its cold store, as one user; the container driver runs each action as a subordinate id of that user (--userns=nomap), but no test yet proves an action cannot read what the user holds: use it on a trusted single box or for development only
-```
-
-Its cold store is `file://<KBF_DATA_DIR>/cold`, the single box's shape (section 11), so
-the unit holds no cold-store key and rule `credential` applies to it. Its scheduler
-state is the SQLite file `<KBF_DATA_DIR>/state.db`, which the unit names with
-`--state-store=sqlite://<KBF_DATA_DIR>/state.db`. The default of `kbf all-in-one` is
-now Postgres on the host's socket (`postgres:///kbf?host=/run/postgresql`), so a unit that
-left the flag out would change store when its binary is replaced; the move to Postgres is
-the farm cutover, a held script run with the owner's go.
+Its cold store is a `file://` directory, the single box's shape (section 11), so
+the unit holds no cold-store key and rule `credential` applies to it. The default
+state store of `kbf all-in-one` is Postgres on the host's socket
+(`postgres:///kbf?host=/run/postgresql`).
 
 ## A node's certificate
 
-kbf-deploy issues no certificate. The farm's one issuer makes every certificate of the
+`kbf-deploy` issues no certificate. The farm's one issuer makes every certificate of the
 new modes' mutual TLS from the one CA, each with exactly one role, by this table:
 
 | row | role (`urn:kbf:role:<role>`) | extended key usage | names |
@@ -440,11 +293,11 @@ It prints a `FAIL <check>:` line per failed check and `CERT BROKEN`, or one
 (a file that cannot be read, no certificate, no usable CA, `--node-id` for a row that
 is not `daemon`).
 
-Copy the certificate and its key to the node's `KBF_ETC` (the storage unit reads
-`storage.pem` and `storage.key`), the key owned by the unit's user; `install-units
---mode` refuses a key another user owns or others can read. The frontend unit reads
-`worker.pem` and `worker.key` (the `frontend-worker` row, which is also its client identity
-toward storage), `ca.pem`, and the REAPI pair `KBF_REAPI_CERT` and `KBF_REAPI_KEY`.
+Put the certificate and its key where `kbf.toml` names them (`/etc/kbf` by the installer's
+layout), the key owned by the unit's user; the start refuses a key another user owns or
+others can read (`kbf --mode=<mode> --check`). The frontend reads its worker pair (the
+`frontend-worker` row, which is also its client identity toward storage), the CA, and the
+REAPI pair, which is not the farm CA's.
 
 ## The config file and `--check`
 
@@ -477,8 +330,7 @@ fails a test until it has a group.
 `kbf <mode> --check` parses the flags and the file, runs the startup checks a start runs,
 prints each problem on standard error and exits without starting anything: 0 when nothing
 stops the start (standard output says `kbf <mode>: ok`), 2 when it is refused, 75 when it
-is not ready yet (a restart may help). `kbf check-args` is gone: `kbf-deploy linux
-check-units` and `install-units` no longer run `kbf`, and `--kbf-bin` is gone with it.
+is not ready yet (a restart may help). `kbf check-args` is gone.
 
 ## Enrollment is part of the start
 
@@ -500,37 +352,9 @@ themselves. There is no `node` mode and no `enroll` word.
 
 ## Installing a mode's unit
 
-`kbf-deploy linux install-units --config node.conf --mode MODE [--bin-dir DIR]
-[--apply]` installs one mode's unit on the node, as root:
-
-1. It checks the host, read only: the cgroup v2 memory controller is there
-   (`/sys/fs/cgroup/cgroup.controllers` lists `memory`); no listener of the unit
-   (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) is on a port
-   something else listens on (a running instance of the unit keeps its own ports); a mode
-   that runs builds on a host with no active swap prints a `WARN:` line (`linux swap`
-   makes the swapfile); the unit's
-   `User=` exists and is not root; for a mode that runs builds, the kbf user has subuid
-   and subgid ranges and lingers; `kbf` is an executable in `--bin-dir` (or
-   `KBF_BIN_DIR`); the rendered unit passes `check-units --mode MODE --installable` on
-   this host, its flags parsed by that `kbf`; every `EnvironmentFile=` is there; and
-   each file a key or token flag names (`--key`, `--*-key`, `--*token-file`) is the
-   unit's user's with no group or other bit, and each certificate, CA or deny list flag
-   names a file.
-2. It plans, each step only when the host differs: the new `kbf` (with `--bin-dir`; the
-   old one kept as `kbf.previous`), `kbf.slice` and `kbf-<mode>.service` (the frontend's is
-   the template `kbf-frontend@.service`; 0644, root's),
-   the directories the unit's flags name (the unit's user's: `--data-dir` 0755,
-   `--meta-dir`, a `file://` hot or cold store, and the directory of a `--state-store`
-   SQLite file 0700, which only the all-in-one unit names), then `daemon-reload`, enable
-   and restart; with nothing changed, enable and start only if the unit is not. The frontend
-   is enabled as the template and `kbf-frontend@a` is started only if neither instance is
-   active: a serving instance is never restarted, the plan says to run `kbf frontend
-   handover` ("Updating a frontend without failing a build"). A unit
-   with `--api-listen=127.0.0.1:<port>` (`frontend`, `all-in-one`) is waited for on `/readyz`.
-3. Without `--apply` every step is printed as a `DRY-RUN:` line and nothing is written,
-   reloaded or started.
-
-There is no `--uninstall` for a mode's unit yet. A node moving from the converged units
+`kbf-installer setup` installs the packaged unit of the host's mode and enables it
+([kbf-installer-setup.md](kbf-installer-setup.md)); `kbf-deploy linux install-units` is
+retired. There is no uninstall for a mode's unit yet. A node moving from the converged units
 (`kbf-server.service`) to `kbf-storage.service` stops the old ones first
 (`systemctl disable --now kbf-daemon.service kbf-server.service`): both would hold the
 same directories.

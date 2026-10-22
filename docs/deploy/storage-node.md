@@ -508,30 +508,29 @@ At start the daemon logs the data directory, the leases directory, and the cache
 tree budgets it resolved; the server logs its cold store, hot store (with its budget) and
 metadata directory.
 
-## Rendering and installing a mode's units
+## A mode's units
 
-`kbf-deploy linux render-units --mode MODE`, `check-units --mode MODE` and, as root,
-`install-units --mode MODE` work on one mode of the one `kbf` binary: its unit and
-`kbf.slice`, from templates compiled into the binary
-(`crates/kbf-deploy/templates/linux/`) and a settings file (`config.example` documents
-each key; an unknown or repeated key is refused). They are described, with every rule
-`check-units` applies, in [kbf-units.md](kbf-units.md). The converged form of these
-verbs (no `--mode`: four files for MinIO, `kbf-server` and `kbf-daemon`, with
-`--restart-minio` and `--uninstall`) is gone; the units above remain the hand-written
-example of that layout. A node that still runs `kbf-server.service` and
-`kbf-daemon.service` stops and disables them (`systemctl disable --now`) before it
-installs a mode's unit: both would hold the same directories.
+Each mode of the one `kbf` binary has a packaged unit, installed by `kbf-installer` and
+configured by `/etc/kbf/kbf.toml`; they are described, with the rules they are held to, in
+[kbf-units.md](kbf-units.md). `kbf-deploy linux render-units`, `check-units` and
+`install-units` (and the converged form of them, with `--restart-minio` and `--uninstall`)
+are gone; the units above remain the hand-written example of that layout. A node that still
+runs `kbf-server.service` and `kbf-daemon.service` stops and disables them (`systemctl
+disable --now`) before it installs a mode's unit: both would hold the same directories.
 
 ## The build swapfile
 
 `kbf-deploy linux swap`, as root, reads the host first, prints its plan as `DRY-RUN:`
 lines and changes nothing; `--apply` carries the plan out, stopping at the first step
 that fails. A re-run after an apply plans nothing. Exit codes: 0 done (or nothing to do),
-1 a step failed, 2 refused (`REFUSED:` on stderr, with the fix). It takes the same
-`--config` file as `render-units`.
+1 a step failed, 2 refused (`REFUSED:` on stderr, with the fix). It takes a
+`--config` file that reads two keys, `KBF_SWAP_FILE` and `KBF_SWAP_SIZE`
+(`crates/kbf-deploy/templates/linux/swap.example`). An existing node.conf still works: the
+other keys it sets, those of the retired unit verbs, are ignored (not refused) with one
+warning on stderr naming them; a key that was never valid is refused.
 
 ```text
-sudo kbf-deploy linux swap --config node.conf [--kubelet-allows-swap] [--remove] [--apply]
+sudo kbf-deploy linux swap --config swap.conf [--kubelet-allows-swap] [--remove] [--apply]
 ```
 
 `swap` makes `KBF_SWAP_SIZE` at `KBF_SWAP_FILE` (`fallocate`, `chmod 600`, `mkswap`, on
@@ -564,10 +563,22 @@ kbf-deploy linux meta-verify --archive FILE --into DIR
 - `meta-backup` reads `/metrics` (`--metrics`, default
   `http://127.0.0.1:8982/metrics`, the operator API port) and refuses unless
   `kbf_write_tier_unflushed_bytes` and `kbf_write_tier_unflushed_blocks` are 0 and
-  `kbf_write_tier_flush_conflicts_total` is 0; an answer it cannot read is a refusal.
-  The write tier is not flushed at shutdown, so a block left on the hot store holds
-  acknowledged bytes the object store does not have. A server with a write tier needs
-  `--hot-dir` (its `--hot-store` directory); one without needs none.
+  `kbf_write_tier_flush_conflicts_total` is 0, and refuses while
+  `kbf_storage_ram_unwritten_bytes` (blobs acknowledged from RAM and not yet written to the
+  disk; always 0 until a node acknowledges from RAM) is above 0; an answer it cannot read
+  is a refusal. A server that does not print the RAM family holds none.
+  A stop that passes `--ram-drain-deadline` loses the blobs that were acknowledged but are
+  held only in RAM (the stop logs them at error level, with their count and bytes); that is
+  why `meta-backup` refuses while any are held.
+  `kbf-server` and `kbf-all-in-one` do not flush their write tier at shutdown (the latter
+  refuses `--ram-drain-deadline`), so a block left on the hot store holds acknowledged
+  bytes the object store does not have. (`kbf storage` and
+  `kbf storage-and-daemon` do: after their calls end and the blobs held in RAM are
+  written, they flush the staged blocks to the cold store, within the same
+  `--ram-drain-deadline`; what the deadline leaves is logged at error level with its
+  block count and bytes, stays on the hot store, and is flushed by the next start.) A
+  server with a write tier needs `--hot-dir` (its `--hot-store` directory); one without
+  needs none.
 - It then stops the unit (`--unit`, default `kbf-server`), refuses if the hot store
   holds a `*.blk` block (written between the read and the stop; a flushed copy is
   `*.seg`), and writes `--out`: an uncompressed tar of every file of the directory
@@ -625,9 +636,9 @@ backup.
   [priority](#priorities) order.
 - `kbf-node`'s tests (`src/deploy_doc_tests.rs`) run `kbf-daemon`'s flag parser over
   every daemon unit in `docs/deploy/`.
-- `kbf-deploy`'s tests (`src/linux/tests.rs`) refuse each bad setting and check that an
-  unset key takes the default `config.example` shows. The mode verbs' rules and host
-  verbs are tested as [kbf-units.md](kbf-units.md) says; the swap verb's tests
+- `kbf-deploy`'s tests (`src/linux/config_tests.rs`) refuse each bad swap setting and check
+  that an unset key takes the default `swap.example` shows. The units' rules are tested as
+  [kbf-units.md](kbf-units.md) says; the swap verb's tests
   (`src/linux/swap_tests.rs`) apply each plan into a scratch directory with the tools
   played by a fake, check what landed, and require a re-run to plan nothing; each
   missing prerequisite is a row that must be refused with its own refusal.

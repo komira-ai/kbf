@@ -476,6 +476,29 @@ pub struct Args {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub ram_peer_grace: u64,
+    /// How many bytes of blobs a storage node may hold in RAM, acknowledged to the writer
+    /// and not yet written to its disk. 0, the default, is off: a write is acknowledged
+    /// from disk, as before. Nothing acknowledges from RAM yet, so with any value no blob
+    /// is held and the node behaves as with 0. A blob that finds the budget full is
+    /// written through to the disk before it is acknowledged, never waited for. A node
+    /// that does hold blobs counts them in `kbf_storage_ram_unwritten_bytes`, writes them
+    /// to its disk in the background and, when it stops, within `--ram-drain-deadline`. A
+    /// node can hold this many bytes beside the `--write-bytes-in-flight` it receives.
+    /// Storage nodes only: a server with no replica to hold a second copy holds nothing.
+    #[arg(long, default_value_t = 0)]
+    pub ram_ack_bytes: u64,
+    /// How long, in seconds, a storage node that is stopping waits, after its calls have
+    /// ended, for the blobs it holds in RAM to be written to its disk (`--ram-ack-bytes`)
+    /// and then for the blocks staged on its hot store to be flushed to the cold store: one
+    /// bound for both. The blobs left in RAM when it ends are lost to the stop; the blocks
+    /// left on the hot store are on its disk, flushed by the next start. Both are counted
+    /// in the log. At least 1.
+    #[arg(
+        long,
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub ram_drain_deadline: u64,
     /// How many times a segment PUT is tried. Only a PUT that did not complete
     /// (connect, reset, timeout) or that the store answered 5xx is tried again, after
     /// 100 ms and then four times longer each time, under a new object key; if every
@@ -958,6 +981,20 @@ impl Args {
     #[must_use]
     pub const fn durable_wait(&self) -> Duration {
         Duration::from_secs(self.durable_wait)
+    }
+
+    /// How much a node may hold in RAM acknowledged and not yet on its disk:
+    /// `--ram-ack-bytes`.
+    #[must_use]
+    pub const fn ram_ack_bytes(&self) -> u64 {
+        self.ram_ack_bytes
+    }
+
+    /// How long a stopping node waits to write what it holds in RAM and to flush what is
+    /// staged on its hot store: `--ram-drain-deadline`.
+    #[must_use]
+    pub const fn ram_drain_deadline(&self) -> Duration {
+        Duration::from_secs(self.ram_drain_deadline)
     }
 
     /// How a node's repair worker and peer confirmer are paced: the defaults of

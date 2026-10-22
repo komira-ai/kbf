@@ -53,16 +53,15 @@ fn starts_frontend(unit: &str) -> bool {
         .any(|&(p, arg)| p == name && arg.is_none_or(|a| first == Some(a)))
 }
 
-/// Catches a frontend unit template (or its golden) that lets systemd kill a drain: the
+/// Catches a frontend unit template that lets systemd kill a drain: the
 /// pilot template's `TimeoutStopSec=20`, a template with no stop timeout set (the
 /// default is 90 s), and a new frontend unit added without it. Mutants: the line removed
-/// from any of the templates, or set to a number. The expected four also keep this
+/// from the template, or set to a number. The expected one also keeps this
 /// from passing with nothing to check.
 #[test]
 fn every_frontend_unit_template_waits_for_its_drain() {
     let mut files = Vec::new();
     services(&manifest().join("templates"), &mut files);
-    services(&manifest().join("tests/golden/linux"), &mut files);
     let mut frontends = Vec::new();
     for file in files {
         let unit = std::fs::read_to_string(&file).expect("a unit");
@@ -82,17 +81,9 @@ fn every_frontend_unit_template_waits_for_its_drain() {
         );
     }
     frontends.sort();
-    // Each template and, for the linux ones, its golden.
-    assert_eq!(
-        frontends,
-        [
-            "kbf-all-in-one.service",
-            "kbf-all-in-one.service",
-            "kbf-frontend@.service",
-            "kbf-frontend@.service",
-            "kbf-pilot-server.service",
-        ]
-    );
+    // The pilot template; the `kbf` modes' units are the packaged ones
+    // (crates/kbf-integration-test/tests/package_units.rs holds their stop timeouts).
+    assert_eq!(frontends, ["kbf-pilot-server.service"]);
 }
 
 /// Catches the deploy doc's example server unit showing a stop timeout (or none) that

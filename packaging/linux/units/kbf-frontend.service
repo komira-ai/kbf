@@ -12,8 +12,8 @@
 # binary is the release `releases/current` points at (docs/design/kbf-installer.md, section
 # 7): there are no slots. A host with the proxy runs the frontend as a child of kbf-proxy
 # instead and does not enable this unit; enable one of the two, never both (they bind the
-# same ports). The template kbf-frontend@.service is the handover model (two instances, a
-# control socket, a slot per instance) that the proxy replaces.
+# same ports). The socket handover between two instances (a template unit) is retired: the
+# proxy swaps frontend children instead.
 #
 # No --instance and no --handover-socket: kbf refuses --instance without --handover-socket,
 # and without either the process is a plain frontend. An update is a restart: a stop
@@ -31,7 +31,7 @@ After=network-online.target
 # retries a bind to an address that is not there yet, within its start budget.
 ConditionPathExists=/etc/kbf/kbf.toml
 # A failure that repeats quickly must not use up systemd's start limit (5 starts in 10 s)
-# and leave the frontend down (check-units rule `restart`).
+# and leave the frontend down (package-test rule `restart`).
 StartLimitIntervalSec=0
 
 [Service]
@@ -68,7 +68,7 @@ ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=frontend --config /
 # kbf drains on SIGTERM: new Execute calls are refused, open streams run until their action
 # is done (Buck2 does not recover a stream that breaks), with no deadline, then the server
 # exits. A stop that ends sooner fails every build in flight, so systemd sends SIGTERM and
-# never kills it for taking long (check-units rule `stop`).
+# never kills it for taking long (package-test rule `stop`).
 KillSignal=SIGTERM
 TimeoutStopSec=infinity
 Restart=on-failure

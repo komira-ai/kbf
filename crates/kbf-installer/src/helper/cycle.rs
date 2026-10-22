@@ -20,6 +20,7 @@ use std::time::Duration;
 use crate::CommitId;
 use crate::activate::{self, Activated, Arm, Confirmed, Expiry};
 use crate::layout::{self, Layout, Platform};
+use crate::meta_log;
 use crate::release::{self, ReleaseError};
 use crate::spool::{Entry, read_capped};
 use crate::stage;
@@ -249,6 +250,7 @@ impl<E: Exec> Helper<E> {
     pub fn cycle(&mut self, now: u64) -> Result<(), HelperError> {
         let mut memory = self.load()?;
         self.notice.stamp(&mut memory);
+        self.report_meta_log_refusal(&mut memory)?;
         self.restart_if_owed(&mut memory)?;
         self.expire(now, &mut memory)?;
         self.orders(now, &mut memory)?;
@@ -283,6 +285,17 @@ impl<E: Exec> Helper<E> {
         if let Err(why) = result {
             let _ = writeln!(self.log, "gc: {why}");
         }
+    }
+
+    /// An activation `boot-check` reverted for want of a copy of the metadata log: say why in
+    /// `status.json`. The note is removed once the memory that holds it is saved.
+    fn report_meta_log_refusal(&mut self, memory: &mut Memory) -> Result<(), HelperError> {
+        if let Some(why) = meta_log::refusal(&self.host) {
+            refuse(memory, &why);
+            self.save(memory)?;
+            meta_log::clear_refusal(&self.host);
+        }
+        Ok(())
     }
 
     fn restart_if_owed(&mut self, memory: &mut Memory) -> Result<(), HelperError> {

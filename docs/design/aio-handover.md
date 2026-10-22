@@ -90,8 +90,9 @@ no Envoy file and never reloads Envoy. Routing changes by health, nothing else.
 move to Envoy, so no client or remote daemon changes. Each instance gets three loopback ports
 from one configured base: `a` base+0 (REAPI), +1 (worker), +2 (API); `b` base+10, +11, +12.
 They are fixed at install time because the Envoy file is static; an ephemeral port would need
-a dynamic endpoint source. `install-units` refuses a base whose six ports collide with each
-other, with Envoy's, or with a listener already bound.
+a dynamic endpoint source. The installer's setup refuses a base whose six ports collide with each
+other, with Envoy's, or with a listener already bound (`kbf-deploy linux install-units`, which first
+planned this, is retired).
 
 **REAPI listener (L7).** Envoy terminates the client-facing TLS (REAPI clients present no
 certificate, `--reapi-tls-cert` doc in `kbf-server/src/config.rs`; the REAPI policy runs in
@@ -191,8 +192,8 @@ in step 4.
 ## 5. The update sequence
 
 Two instances of one unit template, `kbf-frontend@a|b` or `kbf-all-in-one@a|b`, each with its
-own port block (a drop-in that `install-units` writes per instance, since configuration is
-flags). Instance letter `i`, predecessor `p` (the other letter).
+own port block (a drop-in the installer writes per instance, since configuration is
+flags; `kbf-deploy linux install-units` is retired). Instance letter `i`, predecessor `p` (the other letter).
 
 ### 5.1 Drain is staged, and readiness goes last
 
@@ -848,7 +849,7 @@ Mirrors `kbf-frontend@.service` (merged, #887), for both modes.
   holds the store and its probes pass), `TimeoutStartSec` finite (all-in-one: `max(120, 3 x recorded replay)`),
   `KillSignal=SIGTERM`, `TimeoutStopSec=infinity`, `Restart=on-failure`, `DefaultInstance=a`, no `Conflicts=`
   between instances, `RestartPreventExitStatus=2`. A per-instance drop-in carries the port block, `--node-id`,
-  `--instance` (the rendered drop-in is the only per-instance difference). `install-units` refuses when the
+  `--instance` (the rendered drop-in is the only per-instance difference). The install refuses when the
   free memory is below both instances' `MemoryMin` (an idle process and a draining one must fit).
 - `kbf-envoy.service`: the restarter with `ExecReload`, `OOMScoreAdjust` below kbf's (an Envoy killed is every open
   stream cut), versioned binary path. `systemctl stop kbf-envoy` is documented as the outage it is.

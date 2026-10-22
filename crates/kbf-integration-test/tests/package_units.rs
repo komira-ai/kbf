@@ -1,20 +1,19 @@
 //! The static unit files of the kbf-installer package (`packaging/linux/units/`) against
-//! the rules `kbf-deploy linux check-units` enforces on the units it renders, and against
+//! the rules `kbf-deploy linux check-units` (retired) enforced on the units it rendered, and against
 //! the kbf-installer contract (docs/design/kbf-installer.md, section 7).
 //!
 //! The package ships these files disabled, with no rendering: kbf-installer's own unit,
-//! each mode's unit, the frontend and Envoy templates, gated on `/etc/kbf/kbf.toml`
+//! each mode's unit, the frontend and Envoy units, gated on `/etc/kbf/kbf.toml`
 //! (`ConditionPathExists=`), on `kbf-installer boot-check` and on `kbf <mode> --check`
 //! (both `ExecStartPre=`; `ExecCondition=` would skip a failed check silently).
-//! kbf-deploy's rule modules are private to it, so the rules are restated here over the
-//! same unit parser (`kbf_unitfile`), each with the defect it catches, and `MUTANTS`
+//! The rules are held here, over the unit parser (`kbf_unitfile`) the docs check uses, each with the defect it catches, and `MUTANTS`
 //! plants one defect per rule in a copy of the real file and requires that rule to name
 //! it. `every_rule_has_a_mutant` fails when a rule is added with no mutant, so no rule
 //! can be one that cannot fail.
 //!
 //! Catches:
-//! - a unit missing a rule of `check-units` that its mode needs (`restart`, `stop`,
-//!   `delegate`, `handover`, `credential`, `caps`, `swap`, `oom`, `cpuset`, user, slice,
+//! - a unit missing a rule that its mode needs (`restart`, `stop`,
+//!   `delegate`, `credential`, `caps`, `swap`, `oom`, `cpuset`, user, slice,
 //!   `LimitNOFILE`), each named below;
 //! - a unit that runs a program outside the installer's tree (`/var/lib/kbf-installer/`),
 //!   another mode than its name, a `--config` or any flag the contract does not give it;
@@ -44,8 +43,6 @@ mod proxy;
 const TREE: &str = "/var/lib/kbf-installer/";
 /// The release kbf-installer flipped to.
 const CURRENT: &str = "/var/lib/kbf-installer/releases/current/";
-/// A frontend instance's slot: the release it runs, until a confirm flips `current`.
-const SLOT: &str = "/var/lib/kbf-installer/slots/%i/";
 /// The pinned Envoy of instance `%i`.
 const ENVOY_BIN: &str = "/usr/bin/envoy";
 /// The installer binary the units call.
@@ -58,12 +55,11 @@ const INSTALLER_CONFIG: &str = "/etc/kbf/installer.toml";
 const ENVOY_CONFIG: &str = "/etc/kbf/envoy/envoy.json";
 
 /// The files of the package, and nothing else.
-const FILES: [&str; 11] = [
+const FILES: [&str; 10] = [
     "kbf-all-in-one.service",
     "kbf-daemon.service",
     "kbf-envoy.service",
     "kbf-frontend.service",
-    "kbf-frontend@.service",
     "kbf-installer.service",
     "kbf-proxy.service",
     "kbf-proxy.socket",
@@ -73,19 +69,18 @@ const FILES: [&str; 11] = [
 ];
 
 /// The runtime units kbf-installer starts before (`Before=` of its unit).
-const RUNTIME: [&str; 8] = [
+const RUNTIME: [&str; 7] = [
     "kbf-all-in-one.service",
     "kbf-daemon.service",
     "kbf-envoy.service",
     "kbf-frontend.service",
-    "kbf-frontend@.service",
     "kbf-proxy.service",
     "kbf-storage-and-daemon.service",
     "kbf-storage.service",
 ];
 
 /// The rules, by the tag a violation starts with.
-const RULES: [&str; 36] = [
+const RULES: [&str; 35] = [
     "install",
     "network",
     "positional",
@@ -108,7 +103,6 @@ const RULES: [&str; 36] = [
     "stop",
     "delegate",
     "notify",
-    "handover",
     "conflicts",
     "swap",
     "caps",
@@ -137,7 +131,7 @@ fn read(name: &str) -> String {
 /// proxy's units start no mode.
 fn mode_of(name: &str) -> Option<&str> {
     let stem = name.strip_suffix(".service")?;
-    let mode = stem.strip_prefix("kbf-")?.trim_end_matches('@');
+    let mode = stem.strip_prefix("kbf-")?;
     (!["envoy", "installer", "proxy"].contains(&mode)).then_some(mode)
 }
 
@@ -154,7 +148,7 @@ fn all<'a>(unit: &'a UnitFile, section: &str, key: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// systemd's `Delegate=` as `config_parse_delegate` reads it (see check-units rule
+/// systemd's `Delegate=` as `config_parse_delegate` reads it (see package rule
 /// `delegate`): a boolean sets all or none, a list adds, an empty value starts over.
 fn delegated(unit: &UnitFile) -> Vec<String> {
     let mut set: Vec<String> = Vec::new();
@@ -238,7 +232,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
                 "kbf.slice sets MemoryMin=, a per-host value".into(),
             );
         }
-        // Catches a slice that disables a controller below it (check-units rule
+        // Catches a slice that disables a controller below it (package rule
         // `delegate`; a slice cannot delegate) or narrows the CPUs or NUMA nodes of
         // every unit in it (`cpuset`; the node's own set is a per-host drop-in, never
         // this static file).
@@ -377,7 +371,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     // Catches a server half run as the user builds run as: the frontend (the state store,
     // the operator token) and a storage node (the cold store's key) run as kbf-server, so an
     // action (run as kbf) cannot read what they hold; the modes that run builds run as kbf.
-    // As kbf-deploy's units do today.
+    // As the retired kbf-deploy units did.
     let want = if mode.is_some_and(|m| ["frontend", "storage"].contains(&m)) {
         "kbf-server"
     } else {
@@ -446,18 +440,13 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     }
 
     let mode = mode.expect("a mode unit");
-    // The frontend for a host without the proxy: not a template, no handover, the release
+    // The frontend for a host without the proxy: no handover, the release
     // `releases/current` points at, its configuration named by `--config`.
     let plain = name == "kbf-frontend.service";
     // Catches a unit that starts another mode (or an old binary) under this mode's name,
     // a `--config` (kbf reads /etc/kbf/kbf.toml itself), or a flag the contract does not
-    // give the mode: the frontend's instance and control socket only.
-    let bin = match (mode, plain) {
-        ("frontend", true) => CURRENT,
-        ("frontend", false) => SLOT,
-        _ => CURRENT,
-    };
-    let kbf = format!("{bin}kbf");
+    // give the mode: the frontend's `--config` only.
+    let kbf = format!("{CURRENT}kbf");
     let mode_flag = format!("--mode={mode}");
     if start.get(..2) != Some(&[kbf.as_str(), mode_flag.as_str()][..]) {
         v(
@@ -484,16 +473,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         }
     }
     let flags: Vec<&str> = start.iter().skip(2).copied().collect();
-    let allowed: &[&str] = if plain {
-        &["--config", CONFIG]
-    } else if mode == "frontend" {
-        &[
-            "--instance=%i",
-            "--handover-socket=/run/kbf-frontend/control.sock",
-        ]
-    } else {
-        &[]
-    };
+    let allowed: &[&str] = if plain { &["--config", CONFIG] } else { &[] };
     if flags != allowed {
         v(
             "flags",
@@ -605,7 +585,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         }
     }
 
-    // Catches a limit on a build node's own unit (check-units rules `caps` and `swap`):
+    // Catches a limit on a build node's own unit (package rules `caps` and `swap`):
     // its leases live in the unit's cgroup, so the builds are capped by the daemon's
     // actions/memory.max alone and a limit here would cap the supervisor with them; and
     // a MemorySwapMax= would turn the daemon's swap watch into an OOM kill of the unit
@@ -623,7 +603,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             v("swap", "a build node sets MemorySwapMax=".into());
         }
         // Catches a build node whose OOM score is not below 0, the build containers'
-        // score (check-units rule `oom`): a host-wide OOM kills the highest score
+        // score (package rule `oom`): a host-wide OOM kills the highest score
         // first, so a lease must die before the daemon that holds them.
         match unit
             .get("OOMScoreAdjust")
@@ -731,46 +711,8 @@ fn violations(name: &str, text: &str) -> Vec<String> {
                 format!("ExecStart= is {start:?}, without --config {CONFIG}"),
             );
         }
-    } else if mode == "frontend" {
-        // Catches a frontend that cannot hand over: no template instance, no --instance,
-        // a control socket outside a preserved RuntimeDirectory=.
-        if !name.ends_with("@.service") {
-            v("handover", "not a template unit".into());
-        }
-        if !start.contains(&"--instance=%i") {
-            v(
-                "handover",
-                "no --instance=%i: a frontend without it refuses every handover".into(),
-            );
-        }
-        let socket = start
-            .iter()
-            .find_map(|w| w.strip_prefix("--handover-socket="));
-        let dirs: Vec<&str> = all(&unit, "Service", "RuntimeDirectory")
-            .into_iter()
-            .flat_map(str::split_whitespace)
-            .collect();
-        let inside = socket
-            .and_then(|s| s.strip_prefix("/run/"))
-            .and_then(|r| r.split_once('/'))
-            .is_some_and(|(dir, file)| !file.is_empty() && dirs.contains(&dir));
-        if !inside {
-            v(
-                "handover",
-                format!("--handover-socket={socket:?} is not in RuntimeDirectory={dirs:?}"),
-            );
-        }
-        if unit.get_in("Service", "RuntimeDirectoryPreserve").map(trim) != Some("yes") {
-            v("handover", "no RuntimeDirectoryPreserve=yes".into());
-        }
-        if unit.get_in("Install", "DefaultInstance").map(trim) != Some("a") {
-            v(
-                "handover",
-                "no DefaultInstance=a: only instance a starts at boot".into(),
-            );
-        }
     }
-    // Catches Conflicts= (a start of one frontend instance would stop the draining other).
+    // Catches Conflicts= (a start of one unit would stop the other, e.g. the frontend the proxy runs).
     if unit
         .get_in("Unit", "Conflicts")
         .is_some_and(|c| !trim(c).is_empty())
@@ -903,15 +845,13 @@ fn every_service_is_gated_on_its_config_and_its_checks() {
         }
         n += 1;
     }
-    assert_eq!(n, 9, "a unit was not checked");
+    assert_eq!(n, 8, "a unit was not checked");
 }
 
 /// The modes whose units `files` hold, sorted.
 fn modes_in<'a>(files: &[&'a str]) -> Vec<&'a str> {
     let mut m: Vec<&str> = files.iter().filter_map(|f| mode_of(f)).collect();
     m.sort_unstable();
-    // The frontend has two units, the template and the plain one: one mode.
-    m.dedup();
     m
 }
 
@@ -934,18 +874,6 @@ fn the_kbf_modes_are_exactly_the_five() {
         .filter(|f| *f != "kbf-storage.service")
         .collect();
     assert_ne!(modes_in(&fewer), want, "a missing mode unit must not pass");
-}
-
-/// Catches the per-instance block of the frontend going missing from the template: the
-/// two instances of `kbf frontend handover` (`kbf_cli::handover::INSTANCES`) run the same line through `%i`.
-#[test]
-fn the_frontend_template_serves_both_instances_through_the_specifier() {
-    assert_eq!(kbf_cli::handover::INSTANCES, ["a", "b"]);
-    let text = read("kbf-frontend@.service");
-    let unit = UnitFile::parse(&text).expect("parses");
-    assert_eq!(unit.get_in("Install", "DefaultInstance"), Some("a"));
-    assert!(text.contains("--instance=%i"));
-    assert!(!text.contains("--instance=a") && !text.contains("--instance=b"));
 }
 
 /// Catches a directory the installer unit may write that nothing makes: with
@@ -1018,22 +946,10 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "gate-check",
     ),
     (
-        "kbf-frontend@.service",
-        "slots/%i/kbf --mode=frontend --instance",
-        "slots/%i/kbf frontend --instance",
-        "positional",
-    ),
-    (
         "kbf-storage.service",
         "Slice=kbf.slice",
         "Slice=system.slice",
         "slice",
-    ),
-    (
-        "kbf-frontend@.service",
-        "LimitNOFILE=1048576",
-        "LimitNOFILE=1024",
-        "nofile",
     ),
     (
         "kbf-storage.service",
@@ -1066,12 +982,6 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "network",
     ),
     (
-        "kbf-frontend@.service",
-        "TimeoutStartSec=120\n",
-        "TimeoutStartSec=60\n",
-        "notify",
-    ),
-    (
         "kbf-envoy.service",
         "StartLimitIntervalSec=0\n",
         "",
@@ -1102,10 +1012,34 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "restart-exit",
     ),
     (
-        "kbf-frontend@.service",
+        "kbf-frontend.service",
         "\nTimeoutStopSec=infinity\n",
         "\nTimeoutStopSec=90\n",
         "stop",
+    ),
+    (
+        "kbf-frontend.service",
+        "\nKillSignal=SIGTERM\n",
+        "\nKillSignal=SIGKILL\n",
+        "stop",
+    ),
+    (
+        "kbf-frontend.service",
+        "\nType=notify\n",
+        "\nType=simple\n",
+        "notify",
+    ),
+    (
+        "kbf-frontend.service",
+        "\nNotifyAccess=main\n",
+        "\nNotifyAccess=none\n",
+        "notify",
+    ),
+    (
+        "kbf-frontend.service",
+        "\nTimeoutStartSec=120\n",
+        "\nTimeoutStartSec=60\n",
+        "notify",
     ),
     (
         "kbf-daemon.service",
@@ -1217,15 +1151,9 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "notify",
     ),
     (
-        "kbf-frontend@.service",
-        "kbf --mode=frontend --instance=%i --handover",
-        "kbf --mode=frontend --handover",
-        "handover",
-    ),
-    (
-        "kbf-frontend@.service",
+        "kbf-frontend.service",
         "[Unit]\nDescription",
-        "[Unit]\nConflicts=kbf-frontend@b.service\nDescription",
+        "[Unit]\nConflicts=kbf-proxy.service\nDescription",
         "conflicts",
     ),
     (

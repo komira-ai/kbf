@@ -437,6 +437,23 @@ impl ProxyArgs {
 pub struct BootArgs {
     #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(120..=1800))]
     pub window_secs: u64,
+    /// The kbf this unit starts, on a bundled host (one with no releases and no state). It
+    /// says the state schema it needs; the database is brought to it before the unit starts.
+    /// Needs --mode.
+    #[arg(long, requires = "mode")]
+    pub kbf: Option<std::path::PathBuf>,
+    /// The mode of the unit that runs the check: only frontend and all-in-one keep state in
+    /// the database. Needs --kbf.
+    #[arg(long, value_enum, requires = "kbf")]
+    pub mode: Option<Mode>,
+}
+
+impl BootArgs {
+    /// The kbf and the mode of a bundled host's unit, when the unit gave them (clap makes
+    /// the two come together or not at all).
+    pub fn bundled(&self) -> Option<(&std::path::Path, Mode)> {
+        self.kbf.as_deref().zip(self.mode)
+    }
 }
 
 impl Verb {

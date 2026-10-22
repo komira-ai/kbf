@@ -236,7 +236,7 @@ async fn the_sandboxed_survey_answers_as_an_unsandboxed_one() {
 
 /// The newest Xcode on this runner, if it has one.
 fn newest_xcode() -> Option<(String, PathBuf)> {
-    xcodes().into_iter().last()
+    xcodes().into_iter().next_back()
 }
 
 /// A project with one target, `hello`, a command-line tool built from `main.c`.

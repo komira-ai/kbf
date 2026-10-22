@@ -241,14 +241,29 @@ impl kbf_cli::preflight::Host for EverythingExists {
             mode: 0o600,
         })
     }
+    fn lstat(&self, path: &std::path::Path) -> std::io::Result<kbf_cli::preflight::host::Lstat> {
+        Ok(kbf_cli::preflight::host::Lstat {
+            stat: self.stat(path)?,
+            gid: 0,
+        })
+    }
     fn read(&self, _: &std::path::Path) -> std::io::Result<Vec<u8>> {
         Ok(Vec::new())
     }
     fn var(&self, _: &str) -> Option<String> {
         Some("x".to_owned())
     }
+    fn var_names(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn euid(&self) -> u32 {
         0
+    }
+    fn egid(&self) -> u32 {
+        0
+    }
+    fn groups(&self) -> Vec<u32> {
+        Vec::new()
     }
     fn nofile(&self) -> u64 {
         1 << 20
@@ -420,44 +435,52 @@ fn a_packaged_unit_edited_with_a_flag_kbf_refuses_is_refused_by_its_parser() {
     );
 }
 
-/// Catches `kbf frontend handover` starting instances the packaged template does not
-/// have: kbf-cli spells the template's name and instances itself, and the package's must
-/// be the same words. The template file is `<TEMPLATE>@.service` and its name is the
-/// frontend mode's; its default instance is the first one a start with none up picks; its
-/// start line, for each instance, is a command line kbf's parser takes (the file, with
-/// the handover socket, stands for the frontend's settings).
-#[test]
-fn the_handover_command_starts_the_instances_of_the_frontends_template() {
-    use kbf_cli::handover::{INSTANCES, TEMPLATE};
-    assert_eq!(TEMPLATE, "kbf-frontend");
-    let template = unit(&format!("{TEMPLATE}@.service"));
-    assert_eq!(
-        template.get_in("Install", "DefaultInstance"),
-        Some(INSTANCES[0])
-    );
-    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "packaged-handover");
-    // The parse accepts a Postgres store beside a control socket, and the runtime refuses
-    // the pairing (`HandoverError::PostgresStore`, in kbf-server's `state_uri`), so this
-    // test does not say that the template and a Postgres store run together. It uses the
-    // SQLite store variant, which `StateStoreUri` still has, so the file stands for a
-    // frontend that hands over.
-    let config = write_config(
-        dir.path(),
-        "[storage-client]\nstorage = \"http://127.0.0.1:1\"\n\n[scheduler]\nstate-store = \"sqlite:///var/lib/kbf-server/state.db\"\n",
-    );
-    for instance in INSTANCES {
-        let argv = template.exec_start();
-        let words: Vec<String> = argv[1..]
+/// The `[listener]` addresses of a `kbf.toml`, `(key, port)`.
+fn listener_ports(text: &str) -> Vec<(String, u16)> {
+    let doc: toml::Table = text.parse().expect("a kbf.toml");
+    let Some(listener) = doc.get("listener").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+    listener
+        .iter()
+        .filter(|(k, _)| k.ends_with("listen"))
+        .map(|(k, v)| {
+            let addr = v.as_str().expect("an address");
+            let port = addr.rsplit(':').next().expect("a port");
+            (k.clone(), port.parse().expect("a number"))
+        })
+        .collect()
+}
+
+/// The first two listener keys that share a port, if any.
+fn shared_port(text: &str) -> Option<(String, String)> {
+    let ports = listener_ports(text);
+    ports.iter().enumerate().find_map(|(i, (a, p))| {
+        ports[i + 1..]
             .iter()
-            .map(|w| w.replace("%i", instance))
-            .collect();
-        assert!(
-            words.contains(&format!("--instance={instance}")),
-            "{instance}: {words:?}"
-        );
-        match parse_with(self::argv(&words, &config), None).map(|p| p.invocation) {
-            Ok(Invocation::Frontend(flags)) => assert!(flags.handover.is_some()),
-            other => panic!("{instance}: not the frontend: {other:?}"),
-        }
+            .find(|(_, q)| q == p)
+            .map(|(b, _)| (a.clone(), b.clone()))
+    })
+}
+
+/// Catches two listeners of one mode on one port (the retired `ports` rule of
+/// `check-units`, now that the listeners are `kbf.toml`'s): every file `kbf-installer setup`
+/// writes, and the by-hand storage file, gives each listener its own port. The planted file
+/// is the mutant: the checker must see two listeners on one port, and there must be
+/// listeners to check.
+#[test]
+fn no_two_listeners_of_a_mode_share_a_port() {
+    let mut seen = 0;
+    for mode in MODES {
+        let text = setup_file(mode.name);
+        seen += listener_ports(text).len();
+        assert_eq!(shared_port(text), None, "{}", mode.name);
     }
+    assert_eq!(shared_port(STORAGE_BY_HAND), None);
+    assert!(seen >= 6, "{seen} listeners read: the files moved?");
+    let planted = "[listener]\nlisten = \"0.0.0.0:8980\"\nworker-listen = \"0.0.0.0:8980\"\n";
+    assert_eq!(
+        shared_port(planted),
+        Some(("listen".to_owned(), "worker-listen".to_owned()))
+    );
 }

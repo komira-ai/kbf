@@ -132,24 +132,30 @@ fn version_json_reports_the_build_identity() {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(
-            fields,
-            [
-                "admin_protocol",
-                "commit",
-                "meta_log",
-                "min_protocol",
-                "profile",
-                "protocol",
-                "relay",
-                "seq",
-                "state_schema",
-                "version"
-            ],
-            "{out}"
-        );
+        // `commit_full` is printed by a build that knows its full commit, and by no other.
+        let known = !kbf_server::BUILD_COMMIT_FULL.is_empty();
+        let full = known.then_some("commit_full");
+        let mut want = vec![
+            "admin_protocol",
+            "commit",
+            "meta_log",
+            "min_protocol",
+            "profile",
+            "protocol",
+            "relay",
+            "seq",
+            "state_schema",
+            "version",
+        ];
+        want.extend(full);
+        want.sort_unstable();
+        assert_eq!(fields, want, "{out}");
         assert_eq!(v["relay"], kbf_cli::version::RELAY);
         assert_eq!(v["commit"], kbf_server::BUILD_COMMIT);
+        assert_eq!(
+            v["commit_full"].as_str().unwrap_or_default(),
+            kbf_server::BUILD_COMMIT_FULL
+        );
         assert_eq!(v["admin_protocol"], kbf_server::managed::ADMIN_PROTOCOL);
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         let profile = if cfg!(debug_assertions) {
@@ -467,33 +473,15 @@ fn check_args_is_not_a_word_of_kbf() {
     }
 }
 
-/// Catches `kbf frontend handover` read as the frontend mode (exit 2 for a word it does
-/// not take, or a start of the frontend), and `kbf frontend` with flags no longer being
-/// the mode. The handover reaches its own entry: with a `systemctl` that is not there it
-/// exits 1 naming the program, starting nothing; a flag of the command that is not
-/// allowed (`--poll-ms` without `--wait`) and a flag of the mode (`--listen`) exit 2.
+/// Catches `kbf frontend` with flags no longer being the mode, and `kbf frontend handover`
+/// (a command of the retired `kbf-frontend@.service` template) coming back: the word is
+/// refused like any positional argument (exit 2) and nothing is started or run.
 #[test]
-fn frontend_handover_is_a_command_and_frontend_stays_a_mode() {
-    let (code, out, err) = run(&[
-        names::FRONTEND,
-        "handover",
-        "--systemctl=/nonexistent/systemctl",
-    ]);
-    assert_eq!(code, Some(1), "{err}");
+fn frontend_stays_a_mode_and_handover_is_not_a_command() {
+    let (code, out, err) = run(&[names::FRONTEND, "handover"]);
+    assert_eq!(code, Some(2), "{err}");
     assert!(out.is_empty(), "{out}");
-    assert_eq!(
-        err,
-        "kbf frontend handover: cannot run /nonexistent/systemctl: No such file or directory (os error 2)\n"
-    );
-    for args in [
-        &[names::FRONTEND, "handover", "--poll-ms=5"][..],
-        &[names::FRONTEND, "handover", "--listen=127.0.0.1:1"][..],
-    ] {
-        let (code, out, err) = run(args);
-        assert_eq!(code, Some(2), "{args:?}: {err}");
-        assert!(out.is_empty(), "{out}");
-        assert!(err.contains("kbf frontend handover"), "{err}");
-    }
+    assert!(!err.contains("kbf frontend handover"), "{err}");
     let (code, _, err) = run(&[names::FRONTEND, "--listen=127.0.0.1:0"]);
     assert_eq!(
         code,

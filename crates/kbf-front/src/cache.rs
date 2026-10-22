@@ -209,6 +209,8 @@ pub struct Cache<M, O> {
     pool: std::sync::OnceLock<Option<WritePool>>,
     /// The blobs held in RAM, which every reader consults before the index.
     held: Held,
+    /// The budget the held set draws on, its drain's counters and its wake-up.
+    ram: ram::Ram,
     /// How long a caller that needs held blobs written waits for them ([`Cache::durable_waiting`]).
     durable_wait: std::time::Duration,
     /// How many waits for held blobs have parked, for a test to wait on.
@@ -279,6 +281,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             pool_config: PoolConfig::DEFAULT,
             pool: std::sync::OnceLock::new(),
             held: Held::default(),
+            ram: ram::Ram::default(),
             durable_wait: held::DEFAULT_DURABLE_WAIT,
             #[cfg(feature = "testkit")]
             parks: tokio::sync::watch::channel(0).0,
@@ -852,6 +855,7 @@ mod flush;
 mod held;
 mod losses;
 mod pool;
+mod ram;
 mod read;
 mod rebuild;
 mod stream;
@@ -871,16 +875,19 @@ pub use consistency::{
 pub use evict::{EVICT_EVERY, EVICT_GRACE, EvictRound};
 pub use flush::{
     FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
+    ShutdownFlush,
 };
 #[cfg(feature = "testkit")]
 pub use held::BetweenHook;
 pub use held::DEFAULT_DURABLE_WAIT;
 use held::Held;
+pub use held::{DrainState, Unwritten};
 pub use losses::Losses;
 #[cfg(feature = "testkit")]
 pub use pool::DrainHook;
 use pool::WritePool;
 pub use pool::{BATCH_BLOBS, BATCH_BYTES, BUFFERED_BLOB_BYTES, PoolConfig};
+pub use ram::{DrainReport, Hold, PASS_BLOBS, ShutdownDrain, WriteThrough};
 pub use read::{BlobRead, MAX_DECODED_BLOB_BYTES, READ_WINDOW_BYTES};
 pub use rebuild::{ADOPT_RECORDS, RebuildConfig, RebuildReport};
 pub(crate) use stream::TierRange;
